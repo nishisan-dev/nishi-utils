@@ -7,12 +7,14 @@ import java.util.stream.Stream;
 public class FixedSizeList<E extends Number> {
     private final List<E> internalList;
     private final int capacity;
+    private final String name;
 
-    public FixedSizeList(int capacity) {
+    public FixedSizeList(String name,int capacity) {
         if (capacity <= 0) {
             throw new IllegalArgumentException("Capacity must be positive.");
         }
         this.capacity = capacity;
+        this.name = name;
         this.internalList = new ArrayList<>(capacity);
     }
 
@@ -50,5 +52,10 @@ public class FixedSizeList<E extends Number> {
                 .mapToDouble(Number::doubleValue)
                 .average()
                 .orElse(0.0);
+    }
+
+
+    public String getName() {
+        return name;
     }
 }
