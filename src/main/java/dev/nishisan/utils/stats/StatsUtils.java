@@ -79,7 +79,7 @@ public class StatsUtils {
      * of the new counter creation. If the name already exists in the map, the existing
      * SimpleValueDTO value will be updated.
      *
-     * @param name the unique identifier for the value to be notified or updated
+     * @param name  the unique identifier for the value to be notified or updated
      * @param value the value to be associated with the specified name
      */
     public void notifyCurrentValue(String name, Long value) {
@@ -99,8 +99,8 @@ public class StatsUtils {
      * the task to the overloaded method.
      *
      * @param name the unique identifier for the value to be notified or updated
-     * @param l the Integer value to be associated with the specified name,
-     *          which will be converted to Long
+     * @param l    the Integer value to be associated with the specified name,
+     *             which will be converted to Long
      */
     public void notifyCurrentValue(String name, Integer l) {
         this.notifyCurrentValue(name, l.longValue());
@@ -152,13 +152,12 @@ public class StatsUtils {
      *
      * @param name the name of the average counter whose average value is to be retrieved
      * @return the calculated average value as a Double if the counter exists,
-     *         or -1.0 if the counter is not found
+     * or -1.0 if the counter is not found
      */
     public Double getAverage(String name) {
         if (this.averages.containsKey(name)) {
             FixedSizeList<Long> reads = this.averages.get(name);
-            Double avg = reads.stream().mapToDouble(a -> a).average().orElse(0.0);
-            return avg;
+            return reads.stream().mapToDouble(a -> a).average().orElse(0.0);
         } else {
             logger.warn(String.format("Average:[%s] Not Found", name));
             return -1D;
@@ -194,7 +193,7 @@ public class StatsUtils {
             while (true) {
                 try {
                     Thread.sleep(10000);
-                    calcStats(true);
+                    caclcStats();
                 } catch (InterruptedException e) {
                     e.printStackTrace();
                 }
@@ -282,7 +281,8 @@ public class StatsUtils {
         if (!expiredCounter.isEmpty()) {
             logger.debug(" ----------------------------------------------------------------------------------------");
             expiredCounter.forEach(k -> {
-                this.counters.remove(k);
+                HitCounterDTO removed = this.counters.remove(k);
+                this.listeners.forEach(l -> l.onHitCounterRemoved(removed));
                 if (print)
                     logger.debug("Counter:[{}] Is Expired...removing", k);
             });
@@ -298,7 +298,7 @@ public class StatsUtils {
      *
      * @param bytes the size in bytes to be converted
      * @return a human-readable string representation of the input size with
-     *         an appropriate SI prefix
+     * an appropriate SI prefix
      */
     public String humanSize(long bytes) {
         if (-1000 < bytes && bytes < 1000) {
@@ -348,7 +348,7 @@ public class StatsUtils {
      * Rounds a given decimal value to the specified number of places.
      * The rounding mode used is {@code BigDecimal.ROUND_HALF_UP}.
      *
-     * @param value the decimal value to be rounded
+     * @param value  the decimal value to be rounded
      * @param places the number of decimal places to round to
      * @return the rounded value as a double
      */
@@ -359,4 +359,10 @@ public class StatsUtils {
     }
 
 
+    public void registerListener(IStatsListener listener) {
+        if (!this.listeners.contains(listener)) {
+            this.listeners.add(listener);
+        }
+
+    }
 }

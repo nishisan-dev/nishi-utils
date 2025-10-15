@@ -29,4 +29,18 @@ public interface IStatsListener {
      *               last calculation time, current rate, and the last update timestamp.
      */
     public void onHitCounterCreated(HitCounterDTO metric);
+
+
+    /**
+     * Callback method triggered when a hit counter is removed.
+     *
+     * @param metric the HitCounterDTO instance representing the hit counter
+     *               that was removed. This object contains information such as the counter's name,
+     *               current value, last calculation time, current rate, last value,
+     *               and the timestamp of the last update.
+     */
+    public void onHitCounterRemoved(HitCounterDTO metric);
+
+
+
 }
