@@ -36,14 +36,18 @@ jobs:
         GITHUB_TOKEN:    ${{ github.token }}
         GITHUB_USERNAME: ${{ github.actor }}
 
-    - name: Commit and Push Version Bump
+    - name: Commit Version Bump
       if: github.ref == 'refs/heads/main'
       run: |
         git config --global user.name 'github-actions[bot]'
         git config --global user.email 'github-actions[bot]@users.noreply.github.com'
         git commit -am "ci: bump version to ${{ env.NEW_VERSION }}"
-        git push
 
+    - name: Push Version Bump
+      if: github.ref == 'refs/heads/main'
+      uses: ad-m/github-push-action@v0.8.0
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
     - name: Create and Push Git Tag
       if: github.ref == 'refs/heads/main'
       run: |
