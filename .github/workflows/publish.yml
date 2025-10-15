@@ -1,51 +1,51 @@
-name: Java CI with Maven
+name: Maven Package
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
 
 jobs:
   build:
+
     runs-on: ubuntu-latest
     permissions:
       contents: write
       packages: write
 
     steps:
-      - uses: actions/checkout@v4
-        with:
-          # to be able to push back to the repo
-          fetch-depth: 0
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
-        with:
-          java-version: '21'
-          distribution: 'temurin'
-          server-id: github # Value of the distributionManagement/repository/id field of the pom.xml
-          settings-path: ${{ github.workspace }} # location for the settings.xml file
+    - uses: actions/checkout@v4
+    - name: Set up JDK 21
+      uses: actions/setup-java@v4
+      with:
+        java-version: '21'
+        distribution: 'temurin'
 
-      - name: Get current version
-        id: current_version
-        run: echo "version=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)" >> $GITHUB_OUTPUT
+    - name: Bump patch version on main
+      if: github.ref == 'refs/heads/main'
+      run: |
+        mvn build-helper:parse-version versions:set -DnewVersion='${parsedVersion.majorVersion}.${parsedVersion.minorVersion}.${parsedVersion.nextIncrementalVersion}' -DgenerateBackupPoms=false
+        echo "NEW_VERSION=$(mvn -q help:evaluate -Dexpression=project.version -DforceStdout)" >> $GITHUB_ENV
 
-      - name: Increment patch version
-        id: new_version
-        run: |
-          version=${{ steps.current_version.outputs.version }}
-          new_version=$(echo $version | awk -F. -v OFS=. '{$3++;print}')
-          echo "version=$new_version" >> $GITHUB_OUTPUT
+    - name: Build with Maven
+      run: mvn -B package --file pom.xml
 
-      - name: Update version in pom.xml
-        run: mvn versions:set -DnewVersion=${{ steps.new_version.outputs.version }}
+    - name: Publish to GitHub Packages
+      run: mvn deploy -s $GITHUB_WORKSPACE/settings.xml
+      env:
+        GITHUB_TOKEN:    ${{ github.token }}
+        GITHUB_USERNAME: ${{ github.actor }}
 
-      - name: Build and publish to GitHub Packages
-        run: mvn -B deploy
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Commit and Push Version Bump
+      if: github.ref == 'refs/heads/main'
+      run: |
+        git config --global user.name 'github-actions[bot]'
+        git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+        git commit -am "ci: bump version to ${{ env.NEW_VERSION }}"
+        git push
 
-      - name: Commit and push version change
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "ci: Bump version to ${{ steps.new_version.outputs.version }}"
-          branch: main
-          file_pattern: pom.xml
+    - name: Create and Push Git Tag
+      if: github.ref == 'refs/heads/main'
+      run: |
+        git tag "v${{ env.NEW_VERSION }}"
+        git push origin "v${{ env.NEW_VERSION }}"
