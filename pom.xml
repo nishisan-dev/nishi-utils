@@ -6,7 +6,7 @@
 
     <groupId>dev.nishisan</groupId>
     <artifactId>nishi-utils</artifactId>
-    <version>1.0-SNAPSHOT</version>
+    <version>1.0.0</version>
     <dependencyManagement>
         <dependencies>
             <dependency>
@@ -46,5 +46,20 @@
         <maven.compiler.target>21</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     </properties>
+
+    <distributionManagement>
+        <repository>
+            <id>github</id>
+            <name>GitHub nishisan-dev Apache Maven Packages</name>
+            <url>https://maven.pkg.github.com/nishisan-dev/nishi-utils</url>
+        </repository>
+    </distributionManagement>
+
+    <scm>
+        <connection>scm:git:git@github.com:nishisan-dev/nishi-utils.git</connection>
+        <developerConnection>scm:git:ssh://git@github.com:nishisan-dev/nishi-utils.git</developerConnection>
+        <url>https://github.com/nishisan-dev/nishi-utils</url>
+      <tag>HEAD</tag>
+  </scm>
 
 </project>
