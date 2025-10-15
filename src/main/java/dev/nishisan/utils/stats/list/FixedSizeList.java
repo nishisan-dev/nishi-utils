@@ -4,7 +4,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Stream;
 
-public class FixedSizeList<E> {
+public class FixedSizeList<E extends Number> {
     private final List<E> internalList;
     private final int capacity;
 
@@ -40,8 +40,15 @@ public class FixedSizeList<E> {
         return internalList.size();
     }
 
-    public Stream<E> stream(){
+    public Stream<E> stream() {
         return internalList.stream();
     }
 
+    public Double getAverage() {
+        return stream()
+                .filter(java.util.Objects::nonNull)
+                .mapToDouble(Number::doubleValue)
+                .average()
+                .orElse(0.0);
+    }
 }
