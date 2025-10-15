@@ -40,7 +40,4 @@ public interface IStatsListener {
      *               and the timestamp of the last update.
      */
     public void onHitCounterRemoved(HitCounterDTO metric);
-
-
-
 }
