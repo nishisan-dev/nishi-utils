@@ -49,7 +49,7 @@ public class StatsUtils {
      */
     public void notifyAverageCounter(String name, Long value) {
         if (!this.averages.containsKey(name)) {
-            FixedSizeList<Long> list = new FixedSizeList<Long>(name,10);
+            FixedSizeList<Long> list = new FixedSizeList<Long>(name, 10);
             this.averages.put(name, list);
             this.listeners.forEach(l -> l.onAverageCounterCreated(list));
             list.add(value);
@@ -177,6 +177,7 @@ public class StatsUtils {
         if (this.counters.containsKey(counter)) {
             metric = this.counters.get(counter);
             metric.increment();
+            this.listeners.forEach(l -> l.onHitCounterIncremented(metric));
             this.counters.replace(counter, metric);
         } else {
             metric = new HitCounterDTO(counter);

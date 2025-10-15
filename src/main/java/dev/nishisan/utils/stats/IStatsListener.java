@@ -4,6 +4,13 @@ import dev.nishisan.utils.stats.dto.HitCounterDTO;
 import dev.nishisan.utils.stats.dto.SimpleValueDTO;
 import dev.nishisan.utils.stats.list.FixedSizeList;
 
+/**
+ * An interface for listening to various events related to statistics counters.
+ * This listener provides callback methods invoked during the lifecycle of
+ * different statistics counters such as average counters, current value counters,
+ * and hit counters. Implementations can use these callbacks to perform specific
+ * actions when the respective events occur.
+ */
 public interface IStatsListener {
     /**
      * Callback method triggered when an average counter is created.
@@ -30,6 +37,16 @@ public interface IStatsListener {
      */
     public void onHitCounterCreated(HitCounterDTO metric);
 
+
+    /**
+     * Callback method triggered when the value of a hit counter is incremented.
+     *
+     * @param metric the HitCounterDTO instance representing the hit counter
+     *               that has been incremented. This object contains details such as the counter's name,
+     *               current value, last calculation time, current rate, last value, and the timestamp
+     *               of the last update.
+     */
+    public void onHitCounterIncremented(HitCounterDTO metric);
 
     /**
      * Callback method triggered when a hit counter is removed.
