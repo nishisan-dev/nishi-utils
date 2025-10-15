@@ -56,4 +56,23 @@ public class HitCounterDTO {
         return lastUpdated;
     }
 
+    public String getName() {
+        return name;
+    }
+
+    public AtomicLong getCurrentValue() {
+        return currentValue;
+    }
+
+    public Long getLastCalc() {
+        return lastCalc;
+    }
+
+    public Double getCurrentRate() {
+        return currentRate;
+    }
+
+    public Long getLastValue() {
+        return lastValue;
+    }
 }
