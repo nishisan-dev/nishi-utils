@@ -1,17 +1,19 @@
 package dev.nishisan.utils.stats.dto;
 
+import java.util.concurrent.atomic.AtomicLong;
+
 public class SimpleValueDTO {
     private String name;
-    private Long value;
+    private AtomicLong value;
 
     public SimpleValueDTO(String name, Long value) {
         this.name = name;
-        this.value = value;
+        this.value = new AtomicLong(value);
     }
 
     public SimpleValueDTO(String name)   {
         this.name = name;
-        this.value = 0L;
+        this.value = new AtomicLong(0L);
     }
 
     public SimpleValueDTO()   {
@@ -26,10 +28,10 @@ public class SimpleValueDTO {
     }
 
     public Long getValue() {
-        return value;
+        return this.value.get();
     }
 
     public void setValue(Long value) {
-        this.value = value;
+        this.value.set(value);
     }
 }

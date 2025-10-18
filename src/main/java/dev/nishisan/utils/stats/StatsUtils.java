@@ -204,6 +204,8 @@ public class StatsUtils {
                 }
             }
         });
+        thread.setDaemon(true);
+        thread.setName("Nishi-Stats-Thread");
         thread.start();
     }
 
