@@ -11,14 +11,23 @@ import dev.nishisan.utils.stats.list.FixedSizeList;
  * and hit counters. Implementations can use these callbacks to perform specific
  * actions when the respective events occur.
  */
-public interface IStatsListener {
+public interface IStatsListener<E extends Number> {
     /**
      * Callback method triggered when an average counter is created.
      *
      * @param list the FixedSizeList instance representing the container for the counter's data.
      *             This list has a fixed capacity and ensures older elements are removed as new ones are added when at capacity.
      */
-    public void onAverageCounterCreated(FixedSizeList list);
+    public void onAverageCounterCreated(FixedSizeList<E> list);
+
+    /**
+     * Callback method triggered when a value is added to an average counter.
+     *
+     * @param list the FixedSizeList instance representing the container for the counter's data.
+     *             This list contains the updated data after the value is added.
+     */
+    public void onAverageCounterValueAdded(FixedSizeList<E> list);
+
 
     /**
      * Callback method triggered when a current value counter is created.
@@ -27,6 +36,14 @@ public interface IStatsListener {
      *              containing information such as the counter's name and its initial value.
      */
     public void onCurrentValueCounterCreated(SimpleValueDTO value);
+
+    /**
+     * Callback method triggered when the value of a current value counter is updated.
+     *
+     * @param value the SimpleValueDTO instance representing the updated counter,
+     *              containing information such as the counter's name and its new value.
+     */
+    public void onCurrentValueCounterUpdated(SimpleValueDTO value);
 
     /**
      * Callback method triggered when a hit counter is created.

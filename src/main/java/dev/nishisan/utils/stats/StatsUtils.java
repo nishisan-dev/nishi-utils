@@ -54,7 +54,9 @@ public class StatsUtils {
             this.listeners.forEach(l -> l.onAverageCounterCreated(list));
             list.add(value);
         } else {
-            this.averages.get(name).add(value);
+            FixedSizeList<Long> list = this.averages.get(name);
+            list.add(value);
+            this.listeners.forEach(l -> l.onAverageCounterValueAdded(list));
         }
     }
 
@@ -88,7 +90,9 @@ public class StatsUtils {
             this.values.put(name, simplesValueDTO);
             this.listeners.forEach(l -> l.onCurrentValueCounterCreated(simplesValueDTO));
         } else {
-            this.values.get(name).setValue(value);
+            SimpleValueDTO statsValue = this.values.get(name);
+            statsValue.setValue(value);
+            this.listeners.forEach(l -> l.onCurrentValueCounterUpdated(simplesValueDTO));
         }
 
     }

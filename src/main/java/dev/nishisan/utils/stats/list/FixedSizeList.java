@@ -8,7 +8,7 @@ public class FixedSizeList<E extends Number> {
     private final List<E> internalList;
     private final int capacity;
     private final String name;
-
+    private E lastAddedElement;
     public FixedSizeList(String name,int capacity) {
         if (capacity <= 0) {
             throw new IllegalArgumentException("Capacity must be positive.");
@@ -23,6 +23,7 @@ public class FixedSizeList<E extends Number> {
             // Remove the first element to make space for the new element at the end
             internalList.remove(0);
         }
+        this.lastAddedElement = element;
         return internalList.add(element);
     }
 
@@ -57,5 +58,18 @@ public class FixedSizeList<E extends Number> {
 
     public String getName() {
         return name;
+    }
+
+
+    public List<E> getInternalList() {
+        return internalList;
+    }
+
+    public int getCapacity() {
+        return capacity;
+    }
+
+    public E getLastAddedElement() {
+        return lastAddedElement;
     }
 }
