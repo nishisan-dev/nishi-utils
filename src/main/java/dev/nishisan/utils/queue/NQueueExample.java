@@ -1,8 +1,6 @@
 package dev.nishisan.utils.queue;
 
-import java.io.ByteArrayInputStream;
 import java.io.IOException;
-import java.io.ObjectInputStream;
 import java.nio.file.Path;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -37,10 +35,7 @@ public final class NQueueExample {
             executor.submit(() -> {
                 try {
                     for (int i = 0; i < 5; i++) {
-                        queue.poll().ifPresent(record -> {
-                            String message = deserialize(record.payload());
-                            System.out.println("Consumed: " + message);
-                        });
+                        queue.poll().ifPresent(message -> System.out.println("Consumed: " + message));
                     }
                 } catch (IOException e) {
                     System.err.println("Failed to poll message: " + e.getMessage());
@@ -57,12 +52,4 @@ public final class NQueueExample {
         }
     }
 
-    private static String deserialize(byte[] payload) {
-        try (ByteArrayInputStream bis = new ByteArrayInputStream(payload);
-             ObjectInputStream ois = new ObjectInputStream(bis)) {
-            return (String) ois.readObject();
-        } catch (IOException | ClassNotFoundException e) {
-            throw new IllegalStateException("Failed to deserialize payload", e);
-        }
-    }
 }
