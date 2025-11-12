@@ -37,6 +37,14 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
+/**
+ * NQueue is a persistent, thread-safe queue implementation that stores
+ * objects in a file-backed structure. It is capable of handling serialized objects
+ * and provides methods for offering, peeking, polling, and reading records based on offsets.
+ * It also supports querying the current size and other metadata of the queue.
+ *
+ * @param <T> the type of elements in the queue, which must be serializable
+ */
 public class NQueue<T extends Serializable> implements Closeable {
     private static final String DATA_FILE = "data.log";
     private static final String META_FILE = "queue.meta";
@@ -176,6 +184,19 @@ public class NQueue<T extends Serializable> implements Closeable {
         } finally {
             lock.unlock();
         }
+    }
+
+    public Optional<T> decodeRecord(NQueueRecord record) throws IOException {
+        lock.lock();
+        try {
+            return Optional.of(deserializeRecord(record));
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public Optional<T> peek() throws IOException {
+        return this.decodeRecord(this.peekRecord().orElse(null));
     }
 
     public Optional<T> poll() throws IOException {
