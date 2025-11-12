@@ -31,6 +31,7 @@ import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
@@ -60,11 +61,15 @@ public class NQueue<T extends Serializable> implements Closeable {
     private final FileChannel dataChannel;
     private final ReentrantLock lock;
     private final Condition notEmpty;
+    private final double compactionWasteThreshold;
+    private final long compactionIntervalNanos;
+    private final int compactionBufferSize;
 
     private long consumerOffset;
     private long producerOffset;
     private long recordCount;
     private long lastIndex;
+    private long lastCompactionTimeNanos;
 
     /**
      * Constructs a new instance of the NQueue class with the specified parameters.
@@ -74,16 +79,26 @@ public class NQueue<T extends Serializable> implements Closeable {
      * @param dataChannel The {@link FileChannel} associated with the queue's data file for efficient file operations.
      * @param state       The initial state of the queue, encapsulating offsets and record count.
      */
-    private NQueue(Path queueDir, RandomAccessFile raf, FileChannel dataChannel, QueueState state) {
+    private NQueue(Path queueDir,
+                   RandomAccessFile raf,
+                   FileChannel dataChannel,
+                   QueueState state,
+                   double compactionWasteThreshold,
+                   long compactionIntervalNanos,
+                   int compactionBufferSize) {
         this.metaPath = queueDir.resolve(META_FILE);
         this.raf = raf;
         this.dataChannel = dataChannel;
         this.lock = new ReentrantLock();
         this.notEmpty = this.lock.newCondition();
+        this.compactionWasteThreshold = compactionWasteThreshold;
+        this.compactionIntervalNanos = compactionIntervalNanos;
+        this.compactionBufferSize = compactionBufferSize;
         this.consumerOffset = state.consumerOffset;
         this.producerOffset = state.producerOffset;
         this.recordCount = state.recordCount;
         this.lastIndex = state.lastIndex;
+        this.lastCompactionTimeNanos = System.nanoTime();
     }
 
     /**
@@ -97,8 +112,24 @@ public class NQueue<T extends Serializable> implements Closeable {
      * @throws IOException if an I/O error occurs during the initialization or access of the queue.
      */
     public static <T extends Serializable> NQueue<T> open(Path baseDir, String queueName) throws IOException {
+        return open(baseDir, queueName, Options.defaults());
+    }
+
+    /**
+     * Opens an existing NQueue or initializes a new one in the specified directory with the given queue name.
+     * This overload allows callers to configure compaction behaviour via {@link Options}.
+     *
+     * @param baseDir   the base directory where the queue will be located; must not be null.
+     * @param queueName the name of the queue to open or initialize; must not be null.
+     * @param options   the options configuring queue behaviour; must not be null.
+     * @param <T>       the type of objects to be stored in the queue, which must implement {@link Serializable}.
+     * @return an instance of {@link NQueue} configured with the specified directory, queue name and options.
+     * @throws IOException if an I/O error occurs during the initialization or access of the queue.
+     */
+    public static <T extends Serializable> NQueue<T> open(Path baseDir, String queueName, Options options) throws IOException {
         Objects.requireNonNull(baseDir, "baseDir");
         Objects.requireNonNull(queueName, "queueName");
+        Objects.requireNonNull(options, "options");
 
         Path queueDir = baseDir.resolve(queueName);
         Files.createDirectories(queueDir);
@@ -132,7 +163,11 @@ public class NQueue<T extends Serializable> implements Closeable {
             persistMeta(metaPath, state);
         }
 
-        return new NQueue<>(queueDir, raf, ch, state);
+        Options.Snapshot snapshot = options.snapshot();
+        return new NQueue<>(queueDir, raf, ch, state,
+                snapshot.compactionWasteThreshold,
+                snapshot.compactionIntervalNanos,
+                snapshot.compactionBufferSize);
     }
 
     /**
@@ -180,6 +215,7 @@ public class NQueue<T extends Serializable> implements Closeable {
 
             dataChannel.force(true);
             persistCurrentStateLocked();
+            maybeCompactLocked();
             notEmpty.signalAll();
             return recordStart;
         } finally {
@@ -590,7 +626,67 @@ public class NQueue<T extends Serializable> implements Closeable {
             consumerOffset = producerOffset;
         }
         persistCurrentStateLocked();
+        maybeCompactLocked();
         return Optional.of(rr.getRecord());
+    }
+
+    private void maybeCompactLocked() throws IOException {
+        long totalBytes = producerOffset;
+        long wastedBytes = consumerOffset;
+        if (totalBytes <= 0 || wastedBytes <= 0) {
+            return;
+        }
+
+        long now = System.nanoTime();
+        boolean intervalExceeded = compactionIntervalNanos > 0 && (now - lastCompactionTimeNanos) >= compactionIntervalNanos;
+        if (recordCount == 0 && !intervalExceeded) {
+            return;
+        }
+
+        double wasteRatio = (double) wastedBytes / (double) totalBytes;
+        boolean wasteExceeded = wasteRatio >= compactionWasteThreshold;
+        if (!wasteExceeded && !(intervalExceeded && wastedBytes > 0)) {
+            return;
+        }
+
+        compactLocked();
+        lastCompactionTimeNanos = now;
+    }
+
+    private void compactLocked() throws IOException {
+        long preservedLength = producerOffset - consumerOffset;
+        if (preservedLength <= 0) {
+            producerOffset = 0L;
+            consumerOffset = 0L;
+            dataChannel.truncate(0L);
+            dataChannel.force(true);
+            persistCurrentStateLocked();
+            return;
+        }
+
+        ByteBuffer buffer = ByteBuffer.allocate(compactionBufferSize);
+        long readOffset = consumerOffset;
+        long writeOffset = 0L;
+
+        while (readOffset < producerOffset) {
+            buffer.clear();
+            int bytesRead = dataChannel.read(buffer, readOffset);
+            if (bytesRead <= 0) {
+                break;
+            }
+            buffer.flip();
+            while (buffer.hasRemaining()) {
+                int written = dataChannel.write(buffer, writeOffset);
+                writeOffset += written;
+            }
+            readOffset += bytesRead;
+        }
+
+        producerOffset = preservedLength;
+        consumerOffset = recordCount > 0 ? 0L : producerOffset;
+        dataChannel.truncate(producerOffset);
+        dataChannel.force(true);
+        persistCurrentStateLocked();
     }
 
     /**
@@ -642,6 +738,65 @@ public class NQueue<T extends Serializable> implements Closeable {
             this.producerOffset = producerOffset;
             this.recordCount = recordCount;
             this.lastIndex = lastIndex;
+        }
+    }
+
+    /**
+     * Options used to configure queue behaviour.
+     */
+    public static final class Options {
+        private double compactionWasteThreshold = 0.5d;
+        private Duration compactionInterval = Duration.ofMinutes(5);
+        private int compactionBufferSize = 128 * 1024;
+
+        private Options() {
+        }
+
+        public static Options defaults() {
+            return new Options();
+        }
+
+        public Options withCompactionWasteThreshold(double threshold) {
+            if (threshold < 0.0d || threshold > 1.0d) {
+                throw new IllegalArgumentException("threshold deve estar no intervalo [0.0, 1.0]");
+            }
+            this.compactionWasteThreshold = threshold;
+            return this;
+        }
+
+        public Options withCompactionInterval(Duration interval) {
+            Objects.requireNonNull(interval, "interval");
+            if (interval.isNegative()) {
+                throw new IllegalArgumentException("interval não pode ser negativo");
+            }
+            this.compactionInterval = interval;
+            return this;
+        }
+
+        public Options withCompactionBufferSize(int bufferSize) {
+            if (bufferSize <= 0) {
+                throw new IllegalArgumentException("bufferSize deve ser positivo");
+            }
+            this.compactionBufferSize = bufferSize;
+            return this;
+        }
+
+        private Snapshot snapshot() {
+            Duration interval = compactionInterval;
+            long intervalNanos = interval != null ? interval.toNanos() : 0L;
+            return new Snapshot(compactionWasteThreshold, intervalNanos, compactionBufferSize);
+        }
+
+        private static final class Snapshot {
+            final double compactionWasteThreshold;
+            final long compactionIntervalNanos;
+            final int compactionBufferSize;
+
+            Snapshot(double compactionWasteThreshold, long compactionIntervalNanos, int compactionBufferSize) {
+                this.compactionWasteThreshold = compactionWasteThreshold;
+                this.compactionIntervalNanos = compactionIntervalNanos;
+                this.compactionBufferSize = compactionBufferSize;
+            }
         }
     }
 }
