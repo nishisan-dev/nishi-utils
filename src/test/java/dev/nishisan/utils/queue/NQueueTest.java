@@ -36,6 +36,10 @@ class NQueueTest {
             queue.offer("foo");
             queue.offer("bar");
 
+            Optional<String> peekedValue = queue.peek();
+            assertTrue(peekedValue.isPresent(), "Expected peeked value to be present");
+            assertEquals("foo", peekedValue.get());
+
             Optional<NQueueRecord> peeked = queue.peekRecord();
             assertTrue(peeked.isPresent(), "Expected peeked record to be present");
             assertEquals("foo", deserialize(peeked.get().payload()));
@@ -45,6 +49,10 @@ class NQueueTest {
             Optional<String> first = queue.poll();
             assertTrue(first.isPresent(), "Expected first record to be present");
             assertEquals("foo", first.get());
+
+            Optional<String> peekedValueSecond = queue.peek();
+            assertTrue(peekedValueSecond.isPresent(), "Expected peeked second value to be present");
+            assertEquals("bar", peekedValueSecond.get());
 
             Optional<NQueueRecord> peekedSecond = queue.peekRecord();
             assertTrue(peekedSecond.isPresent(), "Expected peeked second record to be present");
@@ -114,6 +122,10 @@ class NQueueTest {
             Optional<String> first = queue.poll();
             assertTrue(first.isPresent());
             assertEquals("first", first.get());
+
+            Optional<String> peekedValueSecond = queue.peek();
+            assertTrue(peekedValueSecond.isPresent());
+            assertEquals("second", peekedValueSecond.get());
 
             Optional<NQueueRecord> peekedSecond = queue.peekRecord();
             assertTrue(peekedSecond.isPresent());
@@ -225,6 +237,38 @@ class NQueueTest {
 
             assertTrue(record.isEmpty(), "Poll with timeout should return empty when no data is available");
             assertTrue(elapsed >= 100, "Poll should block for at least most of the timeout interval");
+        }
+    }
+
+    @Test
+    void peekShouldReturnEmptyWhenQueueIsEmpty() throws Exception {
+        try (NQueue<String> queue = NQueue.open(tempDir, "peek-empty")) {
+            assertTrue(queue.peek().isEmpty(), "Peek should return empty when queue is empty");
+            assertTrue(queue.peekRecord().isEmpty(), "Peek record should return empty when queue is empty");
+        }
+    }
+
+    @Test
+    void peekShouldNotConsumeElements() throws Exception {
+        try (NQueue<String> queue = NQueue.open(tempDir, "peek-non-consuming")) {
+            queue.offer("alpha");
+            queue.offer("beta");
+
+            Optional<String> peekedFirst = queue.peek();
+            Optional<String> peekedFirstAgain = queue.peek();
+
+            assertTrue(peekedFirst.isPresent());
+            assertTrue(peekedFirstAgain.isPresent());
+            assertEquals("alpha", peekedFirst.get());
+            assertEquals("alpha", peekedFirstAgain.get());
+
+            Optional<String> first = queue.poll();
+            Optional<String> second = queue.poll();
+
+            assertTrue(first.isPresent());
+            assertTrue(second.isPresent());
+            assertEquals("alpha", first.get());
+            assertEquals("beta", second.get());
         }
     }
 
