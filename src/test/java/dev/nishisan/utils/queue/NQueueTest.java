@@ -3,7 +3,9 @@ package dev.nishisan.utils.queue;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.ObjectInputStream;
 import java.io.Serializable;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -34,7 +36,7 @@ class NQueueTest {
             queue.offer("foo");
             queue.offer("bar");
 
-            Optional<NQueueRecord> peeked = queue.peek();
+            Optional<NQueueRecord> peeked = queue.peekRecord();
             assertTrue(peeked.isPresent(), "Expected peeked record to be present");
             assertEquals("foo", deserialize(peeked.get().payload()));
             assertEquals(0L, peeked.get().meta().getIndex());
@@ -44,7 +46,7 @@ class NQueueTest {
             assertTrue(first.isPresent(), "Expected first record to be present");
             assertEquals("foo", first.get());
 
-            Optional<NQueueRecord> peekedSecond = queue.peek();
+            Optional<NQueueRecord> peekedSecond = queue.peekRecord();
             assertTrue(peekedSecond.isPresent(), "Expected peeked second record to be present");
             assertEquals(1L, peekedSecond.get().meta().getIndex());
 
@@ -78,7 +80,7 @@ class NQueueTest {
             assertTrue(record.isPresent());
             assertEquals("delayed", record.get());
 
-            NQueueReadResult readResult = queue.readAt(offset).orElseThrow();
+            NQueueReadResult readResult = queue.readRecordAt(offset).orElseThrow();
             assertEquals(0L, readResult.getRecord().meta().getIndex());
         } finally {
             executor.shutdownNow();
@@ -104,7 +106,7 @@ class NQueueTest {
         try (NQueue<String> queue = NQueue.open(tempDir, queueName.toString())) {
             assertEquals(2L, queue.size());
 
-            Optional<NQueueRecord> peekedFirst = queue.peek();
+            Optional<NQueueRecord> peekedFirst = queue.peekRecord();
             assertTrue(peekedFirst.isPresent());
             assertEquals("first", deserialize(peekedFirst.get().payload()));
             assertEquals(0L, peekedFirst.get().meta().getIndex());
@@ -113,7 +115,7 @@ class NQueueTest {
             assertTrue(first.isPresent());
             assertEquals("first", first.get());
 
-            Optional<NQueueRecord> peekedSecond = queue.peek();
+            Optional<NQueueRecord> peekedSecond = queue.peekRecord();
             assertTrue(peekedSecond.isPresent());
             assertEquals("second", deserialize(peekedSecond.get().payload()));
             assertEquals(1L, peekedSecond.get().meta().getIndex());
@@ -223,6 +225,15 @@ class NQueueTest {
 
             assertTrue(record.isEmpty(), "Poll with timeout should return empty when no data is available");
             assertTrue(elapsed >= 100, "Poll should block for at least most of the timeout interval");
+        }
+    }
+
+    private static String deserialize(byte[] payload) {
+        try (ByteArrayInputStream bis = new ByteArrayInputStream(payload);
+             ObjectInputStream ois = new ObjectInputStream(bis)) {
+            return (String) ois.readObject();
+        } catch (IOException | ClassNotFoundException e) {
+            throw new IllegalStateException("Failed to deserialize payload", e);
         }
     }
 
