@@ -3,9 +3,7 @@ package dev.nishisan.utils.queue;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
-import java.io.ByteArrayInputStream;
 import java.io.IOException;
-import java.io.ObjectInputStream;
 import java.io.Serializable;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -135,7 +133,10 @@ class NQueueTest {
 
         try (NQueue<String> queue = NQueue.open(tempDir, queueName.toString())) {
             long firstOffset = queue.offer("first");
-            NQueueReadResult firstRead = queue.readAt(firstOffset).orElseThrow();
+            String firstValue = queue.readAt(firstOffset).orElseThrow();
+            assertEquals("first", firstValue);
+
+            NQueueReadResult firstRead = queue.readRecordAt(firstOffset).orElseThrow();
             NQueueQueueMeta metaAfterFirst = NQueueQueueMeta.read(queueDir.resolve("queue.meta"));
 
             assertEquals(firstOffset, metaAfterFirst.getConsumerOffset());
@@ -144,7 +145,10 @@ class NQueueTest {
             assertEquals(firstRead.getRecord().meta().getIndex(), metaAfterFirst.getLastIndex());
 
             long secondOffset = queue.offer("second");
-            NQueueReadResult secondRead = queue.readAt(secondOffset).orElseThrow();
+            String secondValue = queue.readAt(secondOffset).orElseThrow();
+            assertEquals("second", secondValue);
+
+            NQueueReadResult secondRead = queue.readRecordAt(secondOffset).orElseThrow();
             NQueueQueueMeta metaAfterSecond = NQueueQueueMeta.read(queueDir.resolve("queue.meta"));
 
             assertEquals(firstOffset, metaAfterSecond.getConsumerOffset());
@@ -219,20 +223,6 @@ class NQueueTest {
 
             assertTrue(record.isEmpty(), "Poll with timeout should return empty when no data is available");
             assertTrue(elapsed >= 100, "Poll should block for at least most of the timeout interval");
-        }
-    }
-
-    private static String deserialize(byte[] payload) {
-        return deserialize(payload, String.class);
-    }
-
-    private static <T> T deserialize(byte[] payload, Class<T> type) {
-        try (ByteArrayInputStream bis = new ByteArrayInputStream(payload);
-             ObjectInputStream ois = new ObjectInputStream(bis)) {
-            Object obj = ois.readObject();
-            return type.cast(obj);
-        } catch (IOException | ClassNotFoundException e) {
-            throw new IllegalStateException("Failed to deserialize payload", e);
         }
     }
 
