@@ -17,6 +17,10 @@
 
 package dev.nishisan.utils.queue;
 
+/**
+ * Represents the result of a read operation in a queue, containing the retrieved record
+ * and the next offset to be read.
+ */
 public class NQueueReadResult {
     public final NQueueRecord record;
     public final long nextOffset;

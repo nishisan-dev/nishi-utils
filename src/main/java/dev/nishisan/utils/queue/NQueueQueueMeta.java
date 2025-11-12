@@ -26,6 +26,21 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 
+/**
+ * Represents metadata for a queue system, providing access to the consumer offset, producer offset,
+ * record count, and last index. This class is used to manage the metadata of a queue, typically for
+ * persistence purposes. The metadata is stored and retrieved from a specified file path.
+ *
+ * This class includes methods to read metadata from a file and write metadata to a file, ensuring
+ * consistency and integrity via specific validation mechanisms such as magic numbers and versioning.
+ *
+ * The metadata file format includes:
+ * - A magic number to validate the file type.
+ * - A version number for compatibility checks.
+ * - Four long values: consumer offset, producer offset, record count, and last index.
+ *
+ * This class is immutable and thread-safe.
+ */
 final class NQueueQueueMeta {
     private static final int MAGIC = 0x4E_51_4D_54; // 'NQMT'
     private static final short VERSION = 1;

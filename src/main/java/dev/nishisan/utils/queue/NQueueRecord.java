@@ -17,6 +17,13 @@
 
 package dev.nishisan.utils.queue;
 
+/**
+ * Represents a single record in the NQueue system, combining metadata and payload data.
+ *
+ * An NQueueRecord encapsulates the metadata (header information) and the payload that
+ * constitutes the actual data content of the record. The metadata is managed using
+ * the {@link NQueueRecordMetaData} class.
+ */
 public class NQueueRecord {
     private final NQueueRecordMetaData meta;
     private final byte[] payload;
