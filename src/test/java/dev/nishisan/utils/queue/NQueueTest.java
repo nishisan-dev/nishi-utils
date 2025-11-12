@@ -37,16 +37,23 @@ class NQueueTest {
             queue.offer("foo");
             queue.offer("bar");
 
-            Optional<NQueueRecord> first = queue.poll();
-            assertTrue(first.isPresent(), "Expected first record to be present");
-            assertEquals("foo", deserialize(first.get().payload()));
-            assertEquals(0L, first.get().meta().getIndex());
-            assertEquals(String.class.getCanonicalName(), first.get().meta().getClassName());
+            Optional<NQueueRecord> peeked = queue.peek();
+            assertTrue(peeked.isPresent(), "Expected peeked record to be present");
+            assertEquals("foo", deserialize(peeked.get().payload()));
+            assertEquals(0L, peeked.get().meta().getIndex());
+            assertEquals(String.class.getCanonicalName(), peeked.get().meta().getClassName());
 
-            Optional<NQueueRecord> second = queue.poll();
+            Optional<String> first = queue.poll();
+            assertTrue(first.isPresent(), "Expected first record to be present");
+            assertEquals("foo", first.get());
+
+            Optional<NQueueRecord> peekedSecond = queue.peek();
+            assertTrue(peekedSecond.isPresent(), "Expected peeked second record to be present");
+            assertEquals(1L, peekedSecond.get().meta().getIndex());
+
+            Optional<String> second = queue.poll();
             assertTrue(second.isPresent(), "Expected second record to be present");
-            assertEquals("bar", deserialize(second.get().payload()));
-            assertEquals(1L, second.get().meta().getIndex());
+            assertEquals("bar", second.get());
 
             assertTrue(queue.isEmpty());
             assertEquals(0L, queue.getRecordCount());
@@ -57,7 +64,7 @@ class NQueueTest {
     void pollShouldBlockUntilDataBecomesAvailable() throws Exception {
         ExecutorService executor = Executors.newSingleThreadExecutor();
         try (NQueue<String> queue = NQueue.open(tempDir, "blocking")) {
-            Future<Optional<NQueueRecord>> future = executor.submit(() -> {
+            Future<Optional<String>> future = executor.submit(() -> {
                 try {
                     return queue.poll();
                 } catch (IOException e) {
@@ -68,12 +75,14 @@ class NQueueTest {
             Thread.sleep(200);
             assertFalse(future.isDone(), "Poll should block while queue is empty");
 
-            queue.offer("delayed");
+            long offset = queue.offer("delayed");
 
-            Optional<NQueueRecord> record = future.get(2, TimeUnit.SECONDS);
+            Optional<String> record = future.get(2, TimeUnit.SECONDS);
             assertTrue(record.isPresent());
-            assertEquals("delayed", deserialize(record.get().payload()));
-            assertEquals(0L, record.get().meta().getIndex());
+            assertEquals("delayed", record.get());
+
+            NQueueReadResult readResult = queue.readAt(offset).orElseThrow();
+            assertEquals(0L, readResult.getRecord().meta().getIndex());
         } finally {
             executor.shutdownNow();
             executor.awaitTermination(2, TimeUnit.SECONDS);
@@ -98,15 +107,23 @@ class NQueueTest {
         try (NQueue<String> queue = NQueue.open(tempDir, queueName.toString())) {
             assertEquals(2L, queue.size());
 
-            Optional<NQueueRecord> first = queue.poll();
-            assertTrue(first.isPresent());
-            assertEquals("first", deserialize(first.get().payload()));
-            assertEquals(0L, first.get().meta().getIndex());
+            Optional<NQueueRecord> peekedFirst = queue.peek();
+            assertTrue(peekedFirst.isPresent());
+            assertEquals("first", deserialize(peekedFirst.get().payload()));
+            assertEquals(0L, peekedFirst.get().meta().getIndex());
 
-            Optional<NQueueRecord> second = queue.poll();
+            Optional<String> first = queue.poll();
+            assertTrue(first.isPresent());
+            assertEquals("first", first.get());
+
+            Optional<NQueueRecord> peekedSecond = queue.peek();
+            assertTrue(peekedSecond.isPresent());
+            assertEquals("second", deserialize(peekedSecond.get().payload()));
+            assertEquals(1L, peekedSecond.get().meta().getIndex());
+
+            Optional<String> second = queue.poll();
             assertTrue(second.isPresent());
-            assertEquals("second", deserialize(second.get().payload()));
-            assertEquals(1L, second.get().meta().getIndex());
+            assertEquals("second", second.get());
 
             assertTrue(queue.poll(10, TimeUnit.MILLISECONDS).isEmpty());
         }
@@ -136,9 +153,9 @@ class NQueueTest {
             assertEquals(2L, metaAfterSecond.getRecordCount());
             assertEquals(secondRead.getRecord().meta().getIndex(), metaAfterSecond.getLastIndex());
 
-            Optional<NQueueRecord> consumedFirst = queue.poll();
+            Optional<String> consumedFirst = queue.poll();
             assertTrue(consumedFirst.isPresent());
-            assertEquals("first", deserialize(consumedFirst.get().payload()));
+            assertEquals("first", consumedFirst.get());
             NQueueQueueMeta metaAfterPoll = NQueueQueueMeta.read(queueDir.resolve("queue.meta"));
 
             assertEquals(secondOffset, metaAfterPoll.getConsumerOffset());
@@ -146,9 +163,9 @@ class NQueueTest {
             assertEquals(1L, metaAfterPoll.getRecordCount());
             assertEquals(secondRead.getRecord().meta().getIndex(), metaAfterPoll.getLastIndex());
 
-            Optional<NQueueRecord> consumedSecond = queue.poll();
+            Optional<String> consumedSecond = queue.poll();
             assertTrue(consumedSecond.isPresent());
-            assertEquals("second", deserialize(consumedSecond.get().payload()));
+            assertEquals("second", consumedSecond.get());
             NQueueQueueMeta metaAfterEmpty = NQueueQueueMeta.read(queueDir.resolve("queue.meta"));
 
             assertEquals(metaAfterEmpty.getProducerOffset(), metaAfterEmpty.getConsumerOffset());
@@ -175,11 +192,11 @@ class NQueueTest {
                 ThreadLocalRandom rng = ThreadLocalRandom.current();
                 List<ComplexPayload> consumed = new ArrayList<>();
                 while (consumed.size() < expected.size()) {
-                    Optional<NQueueRecord> record = queue.poll();
+                    Optional<ComplexPayload> record = queue.poll();
                     if (record.isEmpty()) {
                         throw new IllegalStateException("Queue returned empty optional while blocking");
                     }
-                    consumed.add(deserialize(record.get().payload(), ComplexPayload.class));
+                    consumed.add(record.get());
                     randomLatency(rng);
                 }
                 return consumed;
@@ -198,7 +215,7 @@ class NQueueTest {
     void pollWithTimeoutShouldReturnEmptyWhenQueueRemainsEmpty() throws Exception {
         try (NQueue<String> queue = NQueue.open(tempDir, "timeout")) {
             long start = System.nanoTime();
-            Optional<NQueueRecord> record = queue.poll(150, TimeUnit.MILLISECONDS);
+            Optional<String> record = queue.poll(150, TimeUnit.MILLISECONDS);
             long elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
 
             assertTrue(record.isEmpty(), "Poll with timeout should return empty when no data is available");
