@@ -127,9 +127,9 @@ public class NQueue<T extends Serializable> implements Closeable {
      * @throws IOException if an I/O error occurs during the initialization or access of the queue.
      */
     public static <T extends Serializable> NQueue<T> open(Path baseDir, String queueName, Options options) throws IOException {
-        Objects.requireNonNull(baseDir, "baseDir");
-        Objects.requireNonNull(queueName, "queueName");
-        Objects.requireNonNull(options, "options");
+        Objects.requireNonNull(baseDir, "baseDir cannot be null");
+        Objects.requireNonNull(queueName, "queueName cannot be null");
+        Objects.requireNonNull(options, "options cannot be null");
 
         Path queueDir = baseDir.resolve(queueName);
         Files.createDirectories(queueDir);
@@ -180,7 +180,7 @@ public class NQueue<T extends Serializable> implements Closeable {
      * @throws IOException if an I/O error occurs during the operation.
      */
     public long offer(T object) throws IOException {
-        Objects.requireNonNull(object, "object");
+        Objects.requireNonNull(object, "cannot add null object to the queue");
         byte[] payload = toBytes(object);
         int payloadLen = payload.length;
 

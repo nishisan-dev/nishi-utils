@@ -19,7 +19,14 @@
         </dependencies>
     </dependencyManagement>
 
+
     <dependencies>
+
+        <dependency>
+            <groupId>dev.nishisan</groupId>
+            <artifactId>requests-common</artifactId>
+            <version>1.2.15</version>
+        </dependency>
 
         <dependency>
             <groupId>org.springframework.boot</groupId>
@@ -81,7 +88,7 @@
         <connection>scm:git:git@github.com:nishisan-dev/nishi-utils.git</connection>
         <developerConnection>scm:git:ssh://git@github.com:nishisan-dev/nishi-utils.git</developerConnection>
         <url>https://github.com/nishisan-dev/nishi-utils</url>
-      <tag>HEAD</tag>
-  </scm>
+        <tag>HEAD</tag>
+    </scm>
 
 </project>
