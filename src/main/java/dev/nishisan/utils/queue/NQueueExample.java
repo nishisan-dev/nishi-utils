@@ -22,6 +22,7 @@ import java.nio.file.Path;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 public final class NQueueExample {
 
@@ -32,36 +33,49 @@ public final class NQueueExample {
         Path baseDir = Path.of("/tmp");
 
         try (NQueue<String> queue = NQueue.open(baseDir, "demo")) {
+            System.out.println("Initial Size:" + queue.size());
             ExecutorService executor = Executors.newFixedThreadPool(2);
-
+            AtomicLong totalOffered = new AtomicLong(0);
+            AtomicLong totalConsumed = new AtomicLong(0);
             executor.submit(() -> {
                 try {
-                    for (int i = 0; i < 5; i++) {
+                    for (int i = 0; i < 5000; i++) {
                         String message = "message-" + i;
                         queue.offer(message);
-                        System.out.println("Produced: " + message + " Size:" + queue.size());
-                        Thread.sleep(150);
+                        totalOffered.incrementAndGet();
+//                        System.out.println("Produced: " + message + " Size:" + queue.size());
+//                        Thread.sleep(150);
                     }
+                    System.out.println("Offered Size:" + queue.size());
                 } catch (IOException e) {
                     System.err.println("Failed to offer message: " + e.getMessage());
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
                 }
             });
 
             executor.submit(() -> {
                 try {
-                    for (int i = 0; i < 5; i++) {
-                        queue.poll().ifPresent(message -> System.out.println("Consumed: " + message));
+                    Thread.sleep(1000);
+                    while (!queue.isEmpty()) {
+                        queue.poll();
+                        totalConsumed.incrementAndGet();
                     }
+                    System.out.println("Total Offered: " + totalOffered.get());
+                    System.out.println("Total Consumed: " + totalConsumed.get());
                 } catch (IOException e) {
                     System.err.println("Failed to poll message: " + e.getMessage());
+                }
+                catch (InterruptedException e) {
+
                 }
             });
 
             executor.shutdown();
-            if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
+//            System.out.println("Final Size:" + queue.size());
+
+
+            if (!executor.awaitTermination(60, TimeUnit.SECONDS)) {
                 executor.shutdownNow();
+                System.out.println("Final Size:" + queue.size());
                 if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
                     System.err.println("Executor did not terminate cleanly.");
                 }
