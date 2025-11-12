@@ -18,11 +18,13 @@
 package dev.nishisan.utils.queue;
 
 import java.io.BufferedOutputStream;
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.ObjectOutputStream;
+import java.io.ObjectInputStream;
 import java.io.RandomAccessFile;
 import java.io.Serializable;
 import java.nio.ByteBuffer;
@@ -163,17 +165,21 @@ public class NQueue<T extends Serializable> implements Closeable {
         }
     }
 
-    public Optional<NQueueRecord> poll() throws IOException {
+    public Optional<T> poll() throws IOException {
         lock.lock();
         try {
             awaitRecords();
-            return consumeNextRecordLocked();
+            Optional<NQueueRecord> record = consumeNextRecordLocked();
+            if (record.isEmpty()) {
+                return Optional.empty();
+            }
+            return Optional.of(deserializeRecord(record.get()));
         } finally {
             lock.unlock();
         }
     }
 
-    public Optional<NQueueRecord> poll(long timeout, TimeUnit unit) throws IOException {
+    public Optional<T> poll(long timeout, TimeUnit unit) throws IOException {
         Objects.requireNonNull(unit, "unit");
         long nanos = unit.toNanos(timeout);
 
@@ -190,7 +196,11 @@ public class NQueue<T extends Serializable> implements Closeable {
                     return Optional.empty();
                 }
             }
-            return consumeNextRecordLocked();
+            Optional<NQueueRecord> record = consumeNextRecordLocked();
+            if (record.isEmpty()) {
+                return Optional.empty();
+            }
+            return Optional.of(deserializeRecord(record.get()));
         } finally {
             lock.unlock();
         }
@@ -364,6 +374,17 @@ public class NQueue<T extends Serializable> implements Closeable {
             oos.writeObject(obj);
             oos.flush();
             return bos.toByteArray();
+        }
+    }
+
+    private T deserializeRecord(NQueueRecord record) throws IOException {
+        try (ByteArrayInputStream bis = new ByteArrayInputStream(record.payload());
+             ObjectInputStream ois = new ObjectInputStream(bis)) {
+            @SuppressWarnings("unchecked")
+            T obj = (T) ois.readObject();
+            return obj;
+        } catch (ClassNotFoundException e) {
+            throw new IOException("Failed to deserialize record payload", e);
         }
     }
 
