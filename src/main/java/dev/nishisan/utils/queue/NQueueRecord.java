@@ -15,12 +15,22 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>
  */
 
-package dev.nishisan.utils.stats.dto;
+package dev.nishisan.utils.queue;
 
-import java.util.ArrayList;
-import java.util.List;
+public class NQueueRecord {
+    private final NQueueMetaData meta;
+    private final byte[] payload;
 
-public class AverageCounterDTO {
-    private String name;
-    private List<Long> values = new ArrayList<>();
+    public NQueueRecord(NQueueMetaData meta, byte[] payload) {
+        this.meta = meta;
+        this.payload = payload;
+    }
+
+    public NQueueMetaData meta() { return meta; }
+    public byte[] payload() { return payload; }
+
+    /** Tamanho total em bytes deste registro (header completo + payload). */
+    public int totalSize() {
+        return meta.totalHeaderSize() + payload.length;
+    }
 }

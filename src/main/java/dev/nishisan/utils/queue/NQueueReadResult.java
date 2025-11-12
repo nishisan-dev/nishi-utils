@@ -15,12 +15,23 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>
  */
 
-package dev.nishisan.utils.stats.dto;
+package dev.nishisan.utils.queue;
 
-import java.util.ArrayList;
-import java.util.List;
+public class NQueueReadResult {
+    public final NQueueRecord record;
+    public final long nextOffset;
 
-public class AverageCounterDTO {
-    private String name;
-    private List<Long> values = new ArrayList<>();
+    public NQueueReadResult(NQueueRecord record, long nextOffset) {
+        this.record = record;
+        this.nextOffset = nextOffset;
+    }
+
+
+    public NQueueRecord getRecord() {
+        return record;
+    }
+
+    public long getNextOffset() {
+        return nextOffset;
+    }
 }
