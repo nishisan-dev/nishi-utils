@@ -37,14 +37,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
-/**
- * NQueue is a persistent, thread-safe queue implementation that stores
- * objects in a file-backed structure. It is capable of handling serialized objects
- * and provides methods for offering, peeking, polling, and reading records based on offsets.
- * It also supports querying the current size and other metadata of the queue.
- *
- * @param <T> the type of elements in the queue, which must be serializable
- */
 public class NQueue<T extends Serializable> implements Closeable {
     private static final String DATA_FILE = "data.log";
     private static final String META_FILE = "queue.meta";
@@ -179,24 +171,29 @@ public class NQueue<T extends Serializable> implements Closeable {
     public Optional<NQueueRecord> peekRecord() throws IOException {
         lock.lock();
         try {
-            awaitRecords();
+            if (recordCount == 0) {
+                return Optional.empty();
+            }
             return readAtInternal(consumerOffset).map(NQueueReadResult::getRecord);
         } finally {
             lock.unlock();
         }
     }
 
-    public Optional<T> decodeRecord(NQueueRecord record) throws IOException {
+    public Optional<T> peek() throws IOException {
         lock.lock();
         try {
-            return Optional.of(deserializeRecord(record));
+            if (recordCount == 0) {
+                return Optional.empty();
+            }
+            Optional<NQueueReadResult> result = readAtInternal(consumerOffset);
+            if (result.isEmpty()) {
+                return Optional.empty();
+            }
+            return Optional.of(deserializeRecord(result.get().getRecord()));
         } finally {
             lock.unlock();
         }
-    }
-
-    public Optional<T> peek() throws IOException {
-        return this.decodeRecord(this.peekRecord().orElse(null));
     }
 
     public Optional<T> poll() throws IOException {
