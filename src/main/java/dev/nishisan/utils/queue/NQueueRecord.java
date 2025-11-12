@@ -18,15 +18,15 @@
 package dev.nishisan.utils.queue;
 
 public class NQueueRecord {
-    private final NQueueMetaData meta;
+    private final NQueueRecordMetaData meta;
     private final byte[] payload;
 
-    public NQueueRecord(NQueueMetaData meta, byte[] payload) {
+    public NQueueRecord(NQueueRecordMetaData meta, byte[] payload) {
         this.meta = meta;
         this.payload = payload;
     }
 
-    public NQueueMetaData meta() { return meta; }
+    public NQueueRecordMetaData meta() { return meta; }
     public byte[] payload() { return payload; }
 
     /** Tamanho total em bytes deste registro (header completo + payload). */
