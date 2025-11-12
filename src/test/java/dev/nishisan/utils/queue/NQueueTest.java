@@ -30,7 +30,6 @@ class NQueueTest {
 
     @Test
     void offerAndPollShouldReturnRecordsInInsertionOrder() throws Exception {
-        System.out.println("TMP DIR IS:"+ tempDir);
         try (NQueue<String> queue = NQueue.open(tempDir, "basic")) {
             queue.offer("foo");
             queue.offer("bar");
