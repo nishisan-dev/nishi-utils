@@ -34,26 +34,19 @@ class NQueueTest {
             queue.offer("foo");
             queue.offer("bar");
 
-            Optional<String> peeked = queue.peek();
+            Optional<NQueueRecord> peeked = queue.peek();
             assertTrue(peeked.isPresent(), "Expected peeked record to be present");
-            assertEquals("foo", peeked.get());
-
-            Optional<NQueueRecord> peekedRecord = queue.peekRecord();
-            assertTrue(peekedRecord.isPresent(), "Expected peeked record metadata to be present");
-            assertEquals(0L, peekedRecord.get().meta().getIndex());
-            assertEquals(String.class.getCanonicalName(), peekedRecord.get().meta().getClassName());
+            assertEquals("foo", deserialize(peeked.get().payload()));
+            assertEquals(0L, peeked.get().meta().getIndex());
+            assertEquals(String.class.getCanonicalName(), peeked.get().meta().getClassName());
 
             Optional<String> first = queue.poll();
             assertTrue(first.isPresent(), "Expected first record to be present");
             assertEquals("foo", first.get());
 
-            Optional<String> peekedSecond = queue.peek();
+            Optional<NQueueRecord> peekedSecond = queue.peek();
             assertTrue(peekedSecond.isPresent(), "Expected peeked second record to be present");
-            assertEquals("bar", peekedSecond.get());
-
-            Optional<NQueueRecord> peekedSecondRecord = queue.peekRecord();
-            assertTrue(peekedSecondRecord.isPresent(), "Expected peeked second record metadata to be present");
-            assertEquals(1L, peekedSecondRecord.get().meta().getIndex());
+            assertEquals(1L, peekedSecond.get().meta().getIndex());
 
             Optional<String> second = queue.poll();
             assertTrue(second.isPresent(), "Expected second record to be present");
@@ -85,10 +78,7 @@ class NQueueTest {
             assertTrue(record.isPresent());
             assertEquals("delayed", record.get());
 
-            String readValue = queue.readAt(offset).orElseThrow();
-            assertEquals("delayed", readValue);
-
-            NQueueReadResult readResult = queue.readRecordAt(offset).orElseThrow();
+            NQueueReadResult readResult = queue.readAt(offset).orElseThrow();
             assertEquals(0L, readResult.getRecord().meta().getIndex());
         } finally {
             executor.shutdownNow();
@@ -114,25 +104,19 @@ class NQueueTest {
         try (NQueue<String> queue = NQueue.open(tempDir, queueName.toString())) {
             assertEquals(2L, queue.size());
 
-            Optional<String> peekedFirst = queue.peek();
+            Optional<NQueueRecord> peekedFirst = queue.peek();
             assertTrue(peekedFirst.isPresent());
-            assertEquals("first", peekedFirst.get());
-
-            Optional<NQueueRecord> peekedFirstRecord = queue.peekRecord();
-            assertTrue(peekedFirstRecord.isPresent());
-            assertEquals(0L, peekedFirstRecord.get().meta().getIndex());
+            assertEquals("first", deserialize(peekedFirst.get().payload()));
+            assertEquals(0L, peekedFirst.get().meta().getIndex());
 
             Optional<String> first = queue.poll();
             assertTrue(first.isPresent());
             assertEquals("first", first.get());
 
-            Optional<String> peekedSecond = queue.peek();
+            Optional<NQueueRecord> peekedSecond = queue.peek();
             assertTrue(peekedSecond.isPresent());
-            assertEquals("second", peekedSecond.get());
-
-            Optional<NQueueRecord> peekedSecondRecord = queue.peekRecord();
-            assertTrue(peekedSecondRecord.isPresent());
-            assertEquals(1L, peekedSecondRecord.get().meta().getIndex());
+            assertEquals("second", deserialize(peekedSecond.get().payload()));
+            assertEquals(1L, peekedSecond.get().meta().getIndex());
 
             Optional<String> second = queue.poll();
             assertTrue(second.isPresent());
