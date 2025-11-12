@@ -171,8 +171,26 @@ public class NQueue<T extends Serializable> implements Closeable {
     public Optional<NQueueRecord> peekRecord() throws IOException {
         lock.lock();
         try {
-            awaitRecords();
+            if (recordCount == 0) {
+                return Optional.empty();
+            }
             return readAtInternal(consumerOffset).map(NQueueReadResult::getRecord);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public Optional<T> peek() throws IOException {
+        lock.lock();
+        try {
+            if (recordCount == 0) {
+                return Optional.empty();
+            }
+            Optional<NQueueReadResult> result = readAtInternal(consumerOffset);
+            if (result.isEmpty()) {
+                return Optional.empty();
+            }
+            return Optional.of(deserializeRecord(result.get().getRecord()));
         } finally {
             lock.unlock();
         }
