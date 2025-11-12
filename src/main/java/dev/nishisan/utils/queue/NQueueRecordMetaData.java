@@ -36,7 +36,7 @@ import java.nio.charset.StandardCharsets;
  * Core functionalities include serialization, deserialization, and size-related calculations
  * for both the prefix and the full header.
  */
-public class NQueueMetaData {
+public class NQueueRecordMetaData {
     // Layout do registro:
     // [ MAGIC(4) ][ VER(1) ][ HEADER_LEN(4) ][ INDEX(8) ][ PAYLOAD_LEN(4) ][ CLASSNAME_LEN(2) ][ CLASSNAME(N) ]
     // (Depois vem o PAYLOAD de PAYLOAD_LEN bytes)
@@ -50,7 +50,7 @@ public class NQueueMetaData {
     private String className;   // nome da classe (UTF-8)
     private int classNameLen;   // cache do comprimento do nome
 
-    public NQueueMetaData(long index, int payloadLen, String className) {
+    public NQueueRecordMetaData(long index, int payloadLen, String className) {
         this.index = index;
         this.payloadLen = payloadLen;
         this.className = className;
@@ -60,7 +60,7 @@ public class NQueueMetaData {
     }
 
 
-    private NQueueMetaData() {
+    private NQueueRecordMetaData() {
         // usado no fromBuffer
     }
 
@@ -122,7 +122,7 @@ public class NQueueMetaData {
     }
 
     /** Lê o header inteiro (após já conhecer headerLen). Retorna meta + bytes lidos. */
-    public static NQueueMetaData fromBuffer(FileChannel ch, long offset, int headerLen) throws IOException {
+    public static NQueueRecordMetaData fromBuffer(FileChannel ch, long offset, int headerLen) throws IOException {
         // Vamos ler o bloco a partir logo após o prefixo
         long headerStart = offset + fixedPrefixSize();
         ByteBuffer hb = ByteBuffer.allocate(headerLen);
@@ -132,7 +132,7 @@ public class NQueueMetaData {
         }
         hb.flip();
 
-        NQueueMetaData m = new NQueueMetaData();
+        NQueueRecordMetaData m = new NQueueRecordMetaData();
         m.headerLen = headerLen;
 
         m.index = hb.getLong();
