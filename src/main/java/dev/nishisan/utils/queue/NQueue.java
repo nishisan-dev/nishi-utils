@@ -31,6 +31,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -135,7 +136,7 @@ public class NQueue<T extends Serializable> implements Closeable {
             }
 
             dataChannel.force(true);
-            persistMeta(metaPath, currentState());
+            persistCurrentStateLocked();
             notEmpty.signalAll();
             return recordStart;
         } finally {
@@ -152,24 +153,44 @@ public class NQueue<T extends Serializable> implements Closeable {
         }
     }
 
+    public Optional<NQueueRecord> peek() throws IOException {
+        lock.lock();
+        try {
+            awaitRecords();
+            return readAtInternal(consumerOffset).map(NQueueReadResult::getRecord);
+        } finally {
+            lock.unlock();
+        }
+    }
+
     public Optional<NQueueRecord> poll() throws IOException {
         lock.lock();
         try {
-            if (recordCount == 0) {
-                return Optional.empty();
+            awaitRecords();
+            return consumeNextRecordLocked();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public Optional<NQueueRecord> poll(long timeout, TimeUnit unit) throws IOException {
+        Objects.requireNonNull(unit, "unit");
+        long nanos = unit.toNanos(timeout);
+
+        lock.lock();
+        try {
+            while (recordCount == 0) {
+                if (nanos <= 0L) {
+                    return Optional.empty();
+                }
+                try {
+                    nanos = notEmpty.awaitNanos(nanos);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return Optional.empty();
+                }
             }
-            Optional<NQueueReadResult> result = readAtInternal(consumerOffset);
-            if (result.isEmpty()) {
-                return Optional.empty();
-            }
-            NQueueReadResult rr = result.get();
-            consumerOffset = rr.getNextOffset();
-            recordCount--;
-            if (recordCount == 0) {
-                consumerOffset = producerOffset;
-            }
-            persistMeta(metaPath, currentState());
-            return Optional.of(rr.getRecord());
+            return consumeNextRecordLocked();
         } finally {
             lock.unlock();
         }
@@ -178,7 +199,16 @@ public class NQueue<T extends Serializable> implements Closeable {
     public long size() throws IOException {
         lock.lock();
         try {
-            return dataChannel.size();
+            return recordCount;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    public boolean isEmpty() {
+        lock.lock();
+        try {
+            return recordCount == 0;
         } finally {
             lock.unlock();
         }
@@ -300,6 +330,32 @@ public class NQueue<T extends Serializable> implements Closeable {
 
     private QueueState currentState() {
         return new QueueState(consumerOffset, producerOffset, recordCount, lastIndex);
+    }
+
+    private void persistCurrentStateLocked() throws IOException {
+        persistMeta(metaPath, currentState());
+    }
+
+    private void awaitRecords() {
+        while (recordCount == 0) {
+            notEmpty.awaitUninterruptibly();
+        }
+    }
+
+    private Optional<NQueueRecord> consumeNextRecordLocked() throws IOException {
+        Optional<NQueueReadResult> result = readAtInternal(consumerOffset);
+        if (result.isEmpty()) {
+            return Optional.empty();
+        }
+
+        NQueueReadResult rr = result.get();
+        consumerOffset = rr.getNextOffset();
+        recordCount--;
+        if (recordCount == 0) {
+            consumerOffset = producerOffset;
+        }
+        persistCurrentStateLocked();
+        return Optional.of(rr.getRecord());
     }
 
     private byte[] toBytes(T obj) throws IOException {
