@@ -6,7 +6,7 @@
 
     <groupId>dev.nishisan</groupId>
     <artifactId>nishi-utils</artifactId>
-    <version>1.0.7</version>
+    <version>1.0.9</version>
     <dependencyManagement>
         <dependencies>
             <dependency>
@@ -18,6 +18,7 @@
             </dependency>
         </dependencies>
     </dependencyManagement>
+
 
     <dependencies>
 
@@ -81,7 +82,7 @@
         <connection>scm:git:git@github.com:nishisan-dev/nishi-utils.git</connection>
         <developerConnection>scm:git:ssh://git@github.com:nishisan-dev/nishi-utils.git</developerConnection>
         <url>https://github.com/nishisan-dev/nishi-utils</url>
-      <tag>HEAD</tag>
-  </scm>
+        <tag>HEAD</tag>
+    </scm>
 
 </project>
