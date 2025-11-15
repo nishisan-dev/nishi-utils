@@ -1,0 +1,170 @@
+package dev.nishisan.utils.ngrid;
+
+import dev.nishisan.utils.ngrid.common.NodeId;
+import dev.nishisan.utils.ngrid.common.NodeInfo;
+import dev.nishisan.utils.ngrid.structures.DistributedMap;
+import dev.nishisan.utils.ngrid.structures.DistributedQueue;
+import dev.nishisan.utils.ngrid.structures.NGridConfig;
+import dev.nishisan.utils.ngrid.structures.NGridNode;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Optional;
+import java.util.concurrent.TimeUnit;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+class NGridIntegrationTest {
+
+    private NGridNode node1;
+    private NGridNode node2;
+    private NGridNode node3;
+
+    private NodeInfo info1;
+    private NodeInfo info2;
+    private NodeInfo info3;
+
+    private Path dir1;
+    private Path dir2;
+    private Path dir3;
+
+    @BeforeEach
+    void setUp() throws IOException {
+        info1 = new NodeInfo(NodeId.of("node-1"), "127.0.0.1", 19001);
+        info2 = new NodeInfo(NodeId.of("node-2"), "127.0.0.1", 19002);
+        info3 = new NodeInfo(NodeId.of("node-3"), "127.0.0.1", 19003);
+
+        Path baseDir = Files.createTempDirectory("ngrid-test");
+        dir1 = Files.createDirectories(baseDir.resolve("node1"));
+        dir2 = Files.createDirectories(baseDir.resolve("node2"));
+        dir3 = Files.createDirectories(baseDir.resolve("node3"));
+
+        node1 = new NGridNode(NGridConfig.builder(info1)
+                .addPeer(info2)
+                .addPeer(info3)
+                .queueDirectory(dir1)
+                .queueName("queue")
+                .replicationQuorum(2)
+                .build());
+        node2 = new NGridNode(NGridConfig.builder(info2)
+                .addPeer(info1)
+                .addPeer(info3)
+                .queueDirectory(dir2)
+                .queueName("queue")
+                .replicationQuorum(2)
+                .build());
+        node3 = new NGridNode(NGridConfig.builder(info3)
+                .addPeer(info1)
+                .addPeer(info2)
+                .queueDirectory(dir3)
+                .queueName("queue")
+                .replicationQuorum(2)
+                .build());
+
+        node1.start();
+        node2.start();
+        node3.start();
+
+        awaitClusterStability();
+    }
+
+    @AfterEach
+    void tearDown() throws IOException {
+        if (node1 != null) {
+            node1.close();
+        }
+        if (node2 != null) {
+            node2.close();
+        }
+        if (node3 != null) {
+            node3.close();
+        }
+    }
+
+    @Test
+    void distributedStructuresMaintainStateAcrossClusterAndRestart() {
+        DistributedQueue<String> queue1 = node1.queue(String.class);
+        DistributedQueue<String> queue2 = node2.queue(String.class);
+        DistributedQueue<String> queue3 = node3.queue(String.class);
+
+        DistributedMap<String, String> map1 = node1.map(String.class, String.class);
+        DistributedMap<String, String> map3 = node3.map(String.class, String.class);
+
+        // Highest ID should become leader
+        assertEquals("node-3", node1.coordinator().leaderInfo().map(info -> info.nodeId().value()).orElseThrow());
+
+        queue3.offer("payload-1");
+        queue3.offer("payload-2");
+
+        Optional<String> peekFromFollower = queue1.peek();
+        assertTrue(peekFromFollower.isPresent());
+        assertEquals("payload-1", peekFromFollower.get());
+
+        Optional<String> polledFromFollower = queue2.poll();
+        assertTrue(polledFromFollower.isPresent());
+        assertEquals("payload-1", polledFromFollower.get());
+
+        Optional<String> remaining = queue3.peek();
+        assertTrue(remaining.isPresent());
+        assertEquals("payload-2", remaining.get());
+
+        map3.put("shared-key", "value-1");
+        Optional<String> fetched = map1.get("shared-key");
+        assertTrue(fetched.isPresent());
+        assertEquals("value-1", fetched.get());
+
+        // Restart node1 using the same storage and ensure queue state is replayed
+        closeQuietly(node1);
+        node1 = new NGridNode(NGridConfig.builder(info1)
+                .addPeer(info2)
+                .addPeer(info3)
+                .queueDirectory(dir1)
+                .queueName("queue")
+                .replicationQuorum(2)
+                .build());
+        node1.start();
+        awaitClusterStability();
+
+        DistributedQueue<String> restartedQueue = node1.queue(String.class);
+        Optional<String> afterRestart = restartedQueue.peek();
+        assertTrue(afterRestart.isPresent());
+        assertEquals("payload-2", afterRestart.get());
+    }
+
+    private void awaitClusterStability() {
+        long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(20);
+        while (System.currentTimeMillis() < deadline) {
+            boolean leadersAgree = node1.coordinator().leaderInfo().isPresent()
+                    && node1.coordinator().leaderInfo().equals(node2.coordinator().leaderInfo())
+                    && node1.coordinator().leaderInfo().equals(node3.coordinator().leaderInfo());
+            boolean allMembers = node1.coordinator().activeMembers().size() == 3
+                    && node2.coordinator().activeMembers().size() == 3
+                    && node3.coordinator().activeMembers().size() == 3;
+            if (leadersAgree && allMembers) {
+                return;
+            }
+            try {
+                Thread.sleep(200);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException(e);
+            }
+        }
+        throw new IllegalStateException("Cluster did not stabilize in time");
+    }
+
+    private void closeQuietly(NGridNode node) {
+        if (node == null) {
+            return;
+        }
+        try {
+            node.close();
+        } catch (IOException ignored) {
+        }
+    }
+}
