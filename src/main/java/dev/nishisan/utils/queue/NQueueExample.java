@@ -31,8 +31,12 @@ public final class NQueueExample {
 
     public static void main(String[] args) throws Exception {
         Path baseDir = Path.of("/tmp");
+        NQueue.Options options = NQueue
+                .Options
+                .defaults()
+                .withFsync(false);
 
-        try (NQueue<String> queue = NQueue.open(baseDir, "demo")) {
+        try (NQueue<String> queue = NQueue.open(baseDir, "demo", options)) {
             System.out.println("Initial Size:" + queue.size());
             ExecutorService executor = Executors.newFixedThreadPool(2);
             AtomicLong totalOffered = new AtomicLong(0);
@@ -63,8 +67,7 @@ public final class NQueueExample {
                     System.out.println("Total Consumed: " + totalConsumed.get());
                 } catch (IOException e) {
                     System.err.println("Failed to poll message: " + e.getMessage());
-                }
-                catch (InterruptedException e) {
+                } catch (InterruptedException e) {
 
                 }
             });

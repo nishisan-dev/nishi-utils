@@ -17,6 +17,8 @@
 
 package dev.nishisan.utils.queue;
 
+import dev.nishisan.utils.stats.StatsUtils;
+
 import java.io.BufferedOutputStream;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -55,7 +57,7 @@ import java.util.concurrent.locks.ReentrantLock;
 public class NQueue<T extends Serializable> implements Closeable {
     private static final String DATA_FILE = "data.log";
     private static final String META_FILE = "queue.meta";
-
+    private final StatsUtils statsUtils = new StatsUtils();
     private final Path metaPath;
     private final RandomAccessFile raf;
     private final FileChannel dataChannel;
@@ -64,7 +66,7 @@ public class NQueue<T extends Serializable> implements Closeable {
     private final double compactionWasteThreshold;
     private final long compactionIntervalNanos;
     private final int compactionBufferSize;
-
+    private final Options options;
     private long consumerOffset;
     private long producerOffset;
     private long recordCount;
@@ -83,6 +85,7 @@ public class NQueue<T extends Serializable> implements Closeable {
                    RandomAccessFile raf,
                    FileChannel dataChannel,
                    QueueState state,
+                   Options optsions,
                    double compactionWasteThreshold,
                    long compactionIntervalNanos,
                    int compactionBufferSize) {
@@ -98,6 +101,7 @@ public class NQueue<T extends Serializable> implements Closeable {
         this.producerOffset = state.producerOffset;
         this.recordCount = state.recordCount;
         this.lastIndex = state.lastIndex;
+        this.options = optsions;
         this.lastCompactionTimeNanos = System.nanoTime();
     }
 
@@ -156,7 +160,7 @@ public class NQueue<T extends Serializable> implements Closeable {
                 persistMeta(metaPath, state);
             } else if (fileSize > state.producerOffset) {
                 ch.truncate(state.producerOffset);
-                ch.force(true);
+                ch.force(options.withFsync);
             }
         } else {
             state = rebuildState(ch);
@@ -165,10 +169,12 @@ public class NQueue<T extends Serializable> implements Closeable {
 
         Options.Snapshot snapshot = options.snapshot();
         return new NQueue<>(queueDir, raf, ch, state,
+                options,
                 snapshot.compactionWasteThreshold,
                 snapshot.compactionIntervalNanos,
                 snapshot.compactionBufferSize);
     }
+
 
     /**
      * Adds the specified object to the queue and returns the file offset at which the object
@@ -180,45 +186,86 @@ public class NQueue<T extends Serializable> implements Closeable {
      * @throws IOException if an I/O error occurs during the operation.
      */
     public long offer(T object) throws IOException {
-        Objects.requireNonNull(object, "cannot add null object to the queue");
+        // Passo 1: Valida que o objeto não seja nulo
+        Objects.requireNonNull(object, "object");
+
+        // Passo 2: Serializa o objeto em um array de bytes para armazenamento
         byte[] payload = toBytes(object);
         int payloadLen = payload.length;
 
+        // Passo 3: Adquire o lock para garantir thread-safety durante toda a operação
         lock.lock();
         try {
+            // Passo 4: Calcula o próximo índice sequencial do registro
+            // Se houver overflow (nextIndex < 0), reseta para 0
             long nextIndex = lastIndex + 1;
             if (nextIndex < 0) {
                 nextIndex = 0;
             }
+
+            // Passo 5: Cria os metadados do registro contendo:
+            // - índice sequencial
+            // - tamanho do payload
+            // - nome canônico da classe do objeto
             NQueueRecordMetaData meta = new NQueueRecordMetaData(nextIndex, payloadLen, object.getClass().getCanonicalName());
+
+            // Passo 6: Determina a posição de escrita no arquivo (offset do produtor)
+            // e salva essa posição como início do registro para retorno
             long writePos = producerOffset;
             long recordStart = writePos;
 
+            // Passo 7: Serializa os metadados em um ByteBuffer e escreve no canal
+            // Garante que todos os bytes do header sejam escritos, mesmo em múltiplas operações
             ByteBuffer hb = meta.toByteBuffer();
             while (hb.hasRemaining()) {
                 int written = dataChannel.write(hb, writePos);
                 writePos += written;
             }
 
+            // Passo 8: Escreve o payload (objeto serializado) no canal após o header
+            // Garante que todos os bytes do payload sejam escritos
             ByteBuffer pb = ByteBuffer.wrap(payload);
             while (pb.hasRemaining()) {
                 int written = dataChannel.write(pb, writePos);
                 writePos += written;
             }
 
+            // Passo 9: Atualiza o estado interno da fila:
+            // - producerOffset: nova posição para próxima escrita
+            // - recordCount:    incrementa contador de registros
+            // - lastIndex:      atualiza último índice usado
             producerOffset = writePos;
             recordCount++;
             lastIndex = nextIndex;
+
+            // Passo 10: Se este for o primeiro registro da fila,
+            // ajusta o consumerOffset para apontar para o início deste registro
             if (recordCount == 1) {
                 consumerOffset = recordStart;
             }
 
-            dataChannel.force(true);
+            // Passo 11: Se fsync for true faz a sincronização dos dados com o disco
+            // para garantir durabilidade em caso de falha
+            dataChannel.force(options.withFsync);
+
+            // Passo 12: Persiste os metadados da fila (offsets, contadores) no arquivo .meta
             persistCurrentStateLocked();
+
+            // Passo 13: Verifica se é necessário compactar o arquivo
+            // (remover espaço desperdiçado por registros já consumidos)
             maybeCompactLocked();
+
+            // Passo 14: Sinaliza threads consumidoras que estão aguardando
+            // que novos dados estão disponíveis
             notEmpty.signalAll();
+
+            // Passo 15: Retorna o offset onde o registro foi armazenado
             return recordStart;
         } finally {
+            // Passo 16: Incrementa contador de métricas para monitoramento
+            statsUtils.notifyHitCounter(NQueueMetrics.OFFERED_EVENT);
+
+            // Passo 17: Libera o lock para permitir outras operações
             lock.unlock();
         }
     }
@@ -307,6 +354,7 @@ public class NQueue<T extends Serializable> implements Closeable {
             }
             return Optional.of(deserializeRecord(result.get().getRecord()));
         } finally {
+            statsUtils.notifyHitCounter(NQueueMetrics.PEEK_EVENT);
             lock.unlock();
         }
     }
@@ -332,6 +380,7 @@ public class NQueue<T extends Serializable> implements Closeable {
             }
             return Optional.of(deserializeRecord(record.get()));
         } finally {
+            statsUtils.notifyHitCounter(NQueueMetrics.POLL_EVENT);
             lock.unlock();
         }
     }
@@ -372,6 +421,7 @@ public class NQueue<T extends Serializable> implements Closeable {
             }
             return Optional.of(deserializeRecord(record.get()));
         } finally {
+            statsUtils.notifyHitCounter(NQueueMetrics.POLL_EVENT);
             lock.unlock();
         }
     }
@@ -630,6 +680,22 @@ public class NQueue<T extends Serializable> implements Closeable {
         return Optional.of(rr.getRecord());
     }
 
+    /**
+     * Determines if compaction should be performed based on specific thresholds and conditions,
+     * and executes the compaction if necessary. This method is invoked while holding a lock to ensure
+     * thread safety during the evaluation and potential modification of shared state.
+     * <p>
+     * Compaction is triggered under the following conditions:
+     * - The total bytes and wasted bytes are greater than zero.
+     * - The record count is not zero, or the elapsed time since the last compaction exceeds a specified interval.
+     * - The waste ratio (calculated as the ratio of wasted bytes to total bytes) exceeds a predefined threshold,
+     * or the compaction interval has been exceeded and there are wasted bytes.
+     * <p>
+     * If conditions are satisfied, the compaction logic is executed, and the timestamp of the last
+     * compaction is updated.
+     *
+     * @throws IOException if an I/O error occurs during the compaction process.
+     */
     private void maybeCompactLocked() throws IOException {
         long totalBytes = producerOffset;
         long wastedBytes = consumerOffset;
@@ -653,13 +719,31 @@ public class NQueue<T extends Serializable> implements Closeable {
         lastCompactionTimeNanos = now;
     }
 
+    /**
+     * Compacts the underlying data storage by removing all consumed data
+     * and shifting the remaining data to the beginning of the storage.
+     * This operation ensures that the storage utilizes space efficiently
+     * by discarding unnecessary data and optimizing future access.
+     * <p>
+     * This method operates on a locked state and should only be invoked
+     * when the calling thread holds the appropriate lock.
+     *
+     * @throws IOException if an I/O error occurs during the compaction process.
+     *                     <p>
+     *                     Key operations performed:
+     *                     1. Calculates the length of data to be preserved.
+     *                     2. Clears storage if no data is to be preserved.
+     *                     3. Copies remaining data to the beginning of the storage.
+     *                     4. Updates the producer and consumer offsets accordingly.
+     *                     5. Truncates excess space and persists the updated state.
+     */
     private void compactLocked() throws IOException {
         long preservedLength = producerOffset - consumerOffset;
         if (preservedLength <= 0) {
             producerOffset = 0L;
             consumerOffset = 0L;
             dataChannel.truncate(0L);
-            dataChannel.force(true);
+            dataChannel.force(options.withFsync);
             persistCurrentStateLocked();
             return;
         }
@@ -685,8 +769,9 @@ public class NQueue<T extends Serializable> implements Closeable {
         producerOffset = preservedLength;
         consumerOffset = recordCount > 0 ? 0L : producerOffset;
         dataChannel.truncate(producerOffset);
-        dataChannel.force(true);
+        dataChannel.force(options.withFsync);
         persistCurrentStateLocked();
+
     }
 
     /**
@@ -748,6 +833,7 @@ public class NQueue<T extends Serializable> implements Closeable {
         private double compactionWasteThreshold = 0.5d;
         private Duration compactionInterval = Duration.ofMinutes(5);
         private int compactionBufferSize = 128 * 1024;
+        private boolean withFsync = true;
 
         private Options() {
         }
@@ -756,6 +842,15 @@ public class NQueue<T extends Serializable> implements Closeable {
             return new Options();
         }
 
+        /**
+         * Sets the compaction waste threshold, which defines the proportion of wasted space
+         * in data structures that can trigger a compaction process. The threshold must be
+         * a value between 0.0 and 1.0 inclusive, representing percentages in decimal form.
+         *
+         * @param threshold the compaction waste threshold as a decimal value between 0.0 and 1.0
+         * @return the current {@code Options} instance for method chaining
+         * @throws IllegalArgumentException if {@code threshold} is less than 0.0 or greater than 1.0
+         */
         public Options withCompactionWasteThreshold(double threshold) {
             if (threshold < 0.0d || threshold > 1.0d) {
                 throw new IllegalArgumentException("threshold deve estar no intervalo [0.0, 1.0]");
@@ -764,6 +859,15 @@ public class NQueue<T extends Serializable> implements Closeable {
             return this;
         }
 
+        /**
+         * Sets the compaction interval, which determines the frequency of compaction operations.
+         * A valid, non-negative interval must be provided.
+         *
+         * @param interval the {@code Duration} specifying the compaction interval; must not be null or negative
+         * @return the current {@code Options} instance for method chaining
+         * @throws NullPointerException if {@code interval} is null
+         * @throws IllegalArgumentException if {@code interval} is negative
+         */
         public Options withCompactionInterval(Duration interval) {
             Objects.requireNonNull(interval, "interval");
             if (interval.isNegative()) {
@@ -773,6 +877,14 @@ public class NQueue<T extends Serializable> implements Closeable {
             return this;
         }
 
+        /**
+         * Sets the buffer size for compaction processes.
+         * This size determines the allocation limit for buffer data during the compaction operation.
+         *
+         * @param bufferSize the size of the buffer in bytes; must be a positive value
+         * @return the current {@code Options} instance for method chaining
+         * @throws IllegalArgumentException if {@code bufferSize} is less than or equal to 0
+         */
         public Options withCompactionBufferSize(int bufferSize) {
             if (bufferSize <= 0) {
                 throw new IllegalArgumentException("bufferSize deve ser positivo");
@@ -781,6 +893,27 @@ public class NQueue<T extends Serializable> implements Closeable {
             return this;
         }
 
+        /**
+         * Configures whether file system synchronization (fsync) should be performed.
+         * When enabled, fsync ensures that data is physically written to disk, improving
+         * data durability at the cost of performance. Disabling fsync may improve performance
+         * but increases the risk of data loss in the event of a crash.
+         *
+         * @param fsync a boolean value indicating whether fsync should be enabled (true) or disabled (false)
+         * @return the current {@code Options} instance for method chaining
+         */
+        public Options withFsync(boolean fsync) {
+            this.withFsync = fsync;
+            return this;
+        }
+
+        /**
+         * Creates a snapshot of the current configuration by encapsulating the values
+         * of compaction waste threshold, compaction interval, and compaction buffer size.
+         * A snapshot is immutable and stores these values for future reference or processing.
+         *
+         * @return a new {@code Snapshot} instance containing the current configuration values
+         */
         private Snapshot snapshot() {
             Duration interval = compactionInterval;
             long intervalNanos = interval != null ? interval.toNanos() : 0L;
@@ -799,4 +932,11 @@ public class NQueue<T extends Serializable> implements Closeable {
             }
         }
     }
+
+
+    public StatsUtils getStatsUtils() {
+        return statsUtils;
+    }
+
+
 }
