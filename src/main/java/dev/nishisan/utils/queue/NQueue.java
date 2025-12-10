@@ -880,8 +880,12 @@ public class NQueue<T extends Serializable> implements Closeable {
 
             // Minimal critical section: close the old channel, atomically switch the file,
             // reopen the channel, and update in-memory offsets/state before releasing the lock.
-            dataChannel.close();
-            raf.close();
+            // Use local variables to avoid exposing closed channels to other threads via volatile fields.
+            FileChannel oldDataChannel = dataChannel;
+            RandomAccessFile oldRaf = raf;
+            
+            oldDataChannel.close();
+            oldRaf.close();
 
             try {
                 Files.move(tempPath, dataPath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
@@ -889,8 +893,11 @@ public class NQueue<T extends Serializable> implements Closeable {
                 Files.move(tempPath, dataPath, StandardCopyOption.REPLACE_EXISTING);
             }
 
-            this.raf = new RandomAccessFile(dataPath.toFile(), "rw");
-            this.dataChannel = this.raf.getChannel();
+            RandomAccessFile newRaf = new RandomAccessFile(dataPath.toFile(), "rw");
+            FileChannel newDataChannel = newRaf.getChannel();
+            
+            this.raf = newRaf;
+            this.dataChannel = newDataChannel;
 
             consumerOffset = recordCount > 0 ? 0L : newProducerOffset;
             producerOffset = newProducerOffset;
