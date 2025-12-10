@@ -502,8 +502,8 @@ public class NQueue<T extends Serializable> implements Closeable {
         Future<?> future;
         lock.lock();
         try {
-            maybeCompactLocked();
             shutdownRequested = true;
+            maybeCompactLocked();
             future = compactionFuture;
         } finally {
             lock.unlock();
