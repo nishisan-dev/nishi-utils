@@ -31,11 +31,17 @@ import java.io.RandomAccessFile;
 import java.io.Serializable;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.time.Duration;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
@@ -58,20 +64,28 @@ public class NQueue<T extends Serializable> implements Closeable {
     private static final String DATA_FILE = "data.log";
     private static final String META_FILE = "queue.meta";
     private final StatsUtils statsUtils = new StatsUtils();
+    private final Path queueDir;
+    private final Path dataPath;
     private final Path metaPath;
-    private final RandomAccessFile raf;
-    private final FileChannel dataChannel;
+    private final Path tempDataPath;
+    private volatile RandomAccessFile raf;
+    private volatile FileChannel dataChannel;
     private final ReentrantLock lock;
     private final Condition notEmpty;
     private final double compactionWasteThreshold;
     private final long compactionIntervalNanos;
     private final int compactionBufferSize;
     private final Options options;
+    private final ExecutorService compactionExecutor;
+    private volatile Future<?> compactionFuture;
     private long consumerOffset;
     private long producerOffset;
     private long recordCount;
     private long lastIndex;
     private long lastCompactionTimeNanos;
+    private volatile boolean closed;
+    private volatile boolean shutdownRequested;
+    private volatile CompactionState compactionState;
 
     /**
      * Constructs a new instance of the NQueue class with the specified parameters.
@@ -90,6 +104,8 @@ public class NQueue<T extends Serializable> implements Closeable {
                    long compactionIntervalNanos,
                    int compactionBufferSize) {
         this.metaPath = queueDir.resolve(META_FILE);
+        this.queueDir = queueDir;
+        this.dataPath = queueDir.resolve(DATA_FILE);
         this.raf = raf;
         this.dataChannel = dataChannel;
         this.lock = new ReentrantLock();
@@ -103,6 +119,13 @@ public class NQueue<T extends Serializable> implements Closeable {
         this.lastIndex = state.lastIndex;
         this.options = optsions;
         this.lastCompactionTimeNanos = System.nanoTime();
+        this.compactionExecutor = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "nqueue-compaction-worker");
+            t.setDaemon(true);
+            return t;
+        });
+        this.compactionState = CompactionState.IDLE;
+        this.tempDataPath = queueDir.resolve(DATA_FILE + ".compacting");
     }
 
     /**
@@ -476,13 +499,35 @@ public class NQueue<T extends Serializable> implements Closeable {
 
     @Override
     public void close() throws IOException {
+        Future<?> future;
+        lock.lock();
+        try {
+            maybeCompactLocked();
+            shutdownRequested = true;
+            future = compactionFuture;
+        } finally {
+            lock.unlock();
+        }
+
+        if (future != null) {
+            try {
+                future.get();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } catch (ExecutionException ignored) {
+                // Exceptions during compaction are ignored on close.
+            }
+        }
+
         lock.lock();
         try {
             dataChannel.close();
             raf.close();
+            closed = true;
         } finally {
             lock.unlock();
         }
+        compactionExecutor.shutdownNow();
     }
 
     /**
@@ -697,6 +742,9 @@ public class NQueue<T extends Serializable> implements Closeable {
      * @throws IOException if an I/O error occurs during the compaction process.
      */
     private void maybeCompactLocked() throws IOException {
+        if (shutdownRequested || compactionState == CompactionState.RUNNING) {
+            return;
+        }
         long totalBytes = producerOffset;
         long wastedBytes = consumerOffset;
         if (totalBytes <= 0 || wastedBytes <= 0) {
@@ -715,8 +763,7 @@ public class NQueue<T extends Serializable> implements Closeable {
             return;
         }
 
-        compactLocked();
-        lastCompactionTimeNanos = now;
+        startCompactionIfIdleLocked(now);
     }
 
     /**
@@ -725,8 +772,9 @@ public class NQueue<T extends Serializable> implements Closeable {
      * This operation ensures that the storage utilizes space efficiently
      * by discarding unnecessary data and optimizing future access.
      * <p>
-     * This method operates on a locked state and should only be invoked
-     * when the calling thread holds the appropriate lock.
+     * The heavy lifting is now delegated to a background compaction worker.
+     * This method simply schedules the asynchronous compaction when invoked
+     * while holding the main queue lock.
      *
      * @throws IOException if an I/O error occurs during the compaction process.
      *                     <p>
@@ -738,40 +786,125 @@ public class NQueue<T extends Serializable> implements Closeable {
      *                     5. Truncates excess space and persists the updated state.
      */
     private void compactLocked() throws IOException {
-        long preservedLength = producerOffset - consumerOffset;
-        if (preservedLength <= 0) {
-            producerOffset = 0L;
-            consumerOffset = 0L;
-            dataChannel.truncate(0L);
-            dataChannel.force(options.withFsync);
-            persistCurrentStateLocked();
+        startCompactionIfIdleLocked(System.nanoTime());
+    }
+
+    private void startCompactionIfIdleLocked(long now) {
+        // Only one compaction worker is allowed at a time. The lock protects the
+        // state snapshot that is handed off to the worker and avoids scheduling
+        // multiple background jobs concurrently.
+        if (shutdownRequested || compactionState != CompactionState.IDLE) {
             return;
         }
 
-        ByteBuffer buffer = ByteBuffer.allocate(compactionBufferSize);
-        long readOffset = consumerOffset;
-        long writeOffset = 0L;
+        QueueState snapshot = currentState();
+        compactionState = CompactionState.RUNNING;
+        try {
+            compactionFuture = compactionExecutor.submit(() -> runCompaction(snapshot));
+            lastCompactionTimeNanos = now;
+        } catch (RuntimeException e) {
+            compactionState = CompactionState.IDLE;
+            throw e;
+        }
+    }
 
-        while (readOffset < producerOffset) {
+    private void runCompaction(QueueState snapshot) {
+        try {
+            Files.deleteIfExists(tempDataPath);
+            try (RandomAccessFile tmpRaf = new RandomAccessFile(tempDataPath.toFile(), "rw");
+                 FileChannel tmpChannel = tmpRaf.getChannel()) {
+                // Copies the active window [consumerOffset, producerOffset) into a temporary file
+                // without holding the main queue lock, allowing offer/poll/peek to proceed. The
+                // only synchronization points happen when switching the live file to the compacted one.
+                copyActiveRegion(snapshot, tmpChannel);
+
+                if (options.withFsync) {
+                    tmpChannel.force(true);
+                }
+
+                finalizeCompaction(snapshot, tempDataPath, tmpChannel.size());
+            }
+        } catch (IOException ignored) {
+            lock.lock();
+            try {
+                compactionState = CompactionState.IDLE;
+            } finally {
+                lock.unlock();
+            }
+        } finally {
+            try {
+                if (compactionState == CompactionState.IDLE) {
+                    Files.deleteIfExists(tempDataPath);
+                }
+            } catch (IOException ignored) {
+                // best-effort cleanup
+            }
+        }
+    }
+
+    private void copyActiveRegion(QueueState snapshot, FileChannel target) throws IOException {
+        ByteBuffer buffer = ByteBuffer.allocate(compactionBufferSize);
+        long readOffset = snapshot.consumerOffset;
+        long limit = snapshot.producerOffset;
+        FileChannel source = this.dataChannel;
+
+        while (readOffset < limit) {
             buffer.clear();
-            int bytesRead = dataChannel.read(buffer, readOffset);
+            int bytesRead = source.read(buffer, readOffset);
             if (bytesRead <= 0) {
                 break;
             }
             buffer.flip();
             while (buffer.hasRemaining()) {
-                int written = dataChannel.write(buffer, writeOffset);
-                writeOffset += written;
+                target.write(buffer);
             }
             readOffset += bytesRead;
         }
+    }
 
-        producerOffset = preservedLength;
-        consumerOffset = recordCount > 0 ? 0L : producerOffset;
-        dataChannel.truncate(producerOffset);
-        dataChannel.force(options.withFsync);
-        persistCurrentStateLocked();
+    private void finalizeCompaction(QueueState snapshot, Path tempPath, long newProducerOffset) throws IOException {
+        lock.lock();
+        try {
+            boolean stateChanged = consumerOffset != snapshot.consumerOffset
+                    || producerOffset != snapshot.producerOffset
+                    || recordCount != snapshot.recordCount
+                    || lastIndex != snapshot.lastIndex;
 
+            if (stateChanged) {
+                // State changed while we copied the active window. Abort this attempt
+                // and immediately reschedule compaction with an updated snapshot if allowed.
+                compactionState = CompactionState.IDLE;
+                startCompactionIfIdleLocked(System.nanoTime());
+                return;
+            }
+
+            // Minimal critical section: close the old channel, atomically switch the file,
+            // reopen the channel, and update in-memory offsets/state before releasing the lock.
+            dataChannel.close();
+            raf.close();
+
+            try {
+                Files.move(tempPath, dataPath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            } catch (AtomicMoveNotSupportedException e) {
+                Files.move(tempPath, dataPath, StandardCopyOption.REPLACE_EXISTING);
+            }
+
+            this.raf = new RandomAccessFile(dataPath.toFile(), "rw");
+            this.dataChannel = this.raf.getChannel();
+
+            consumerOffset = recordCount > 0 ? 0L : newProducerOffset;
+            producerOffset = newProducerOffset;
+
+            persistCurrentStateLocked();
+            if (options.withFsync) {
+                dataChannel.force(true);
+            }
+
+            lastCompactionTimeNanos = System.nanoTime();
+        } finally {
+            compactionState = CompactionState.IDLE;
+            lock.unlock();
+        }
     }
 
     /**
@@ -806,6 +939,11 @@ public class NQueue<T extends Serializable> implements Closeable {
         } catch (ClassNotFoundException e) {
             throw new IOException("Failed to deserialize record payload", e);
         }
+    }
+
+    private enum CompactionState {
+        IDLE,
+        RUNNING
     }
 
     /**
