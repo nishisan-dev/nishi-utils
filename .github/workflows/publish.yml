@@ -23,13 +23,15 @@ jobs:
         distribution: 'temurin'
 
     - name: Bump patch version on main
-      if: github.ref == 'refs/heads/main'
       run: |
         mvn build-helper:parse-version versions:set -DnewVersion='${parsedVersion.majorVersion}.${parsedVersion.minorVersion}.${parsedVersion.nextIncrementalVersion}' -DgenerateBackupPoms=false
         echo "NEW_VERSION=$(mvn -q help:evaluate -Dexpression=project.version -DforceStdout)" >> $GITHUB_ENV
 
     - name: Build with Maven
-      run: mvn -B package --file pom.xml
+      run: mvn -B test --file pom.xml
+
+    - name: Build with Maven
+      run: mvn -B package --file pom.xml  -DskipTests
 
     - name: Publish to GitHub Packages
       if: github.ref == 'refs/heads/main'
