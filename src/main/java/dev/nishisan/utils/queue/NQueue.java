@@ -871,10 +871,11 @@ public class NQueue<T extends Serializable> implements Closeable {
                     || lastIndex != snapshot.lastIndex;
 
             if (stateChanged) {
-                // State changed while we copied the active window. Abort this attempt
-                // and immediately reschedule compaction with an updated snapshot if allowed.
+                // State changed while we copied the active window. Abort this attempt.
+                // Instead of immediately rescheduling compaction, update lastCompactionTimeNanos
+                // to enforce a minimum interval before the next compaction attempt.
                 compactionState = CompactionState.IDLE;
-                startCompactionIfIdleLocked(System.nanoTime());
+                lastCompactionTimeNanos = System.nanoTime();
                 return;
             }
 
