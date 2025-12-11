@@ -35,9 +35,9 @@ class NGridIntegrationTest {
 
     @BeforeEach
     void setUp() throws IOException {
-        info1 = new NodeInfo(NodeId.of("node-1"), "127.0.0.1", 19001);
-        info2 = new NodeInfo(NodeId.of("node-2"), "127.0.0.1", 19002);
-        info3 = new NodeInfo(NodeId.of("node-3"), "127.0.0.1", 19003);
+        info1 = new NodeInfo(NodeId.of("node-1"), "127.0.0.1", 19101);
+        info2 = new NodeInfo(NodeId.of("node-2"), "127.0.0.1", 19102);
+        info3 = new NodeInfo(NodeId.of("node-3"), "127.0.0.1", 19103);
 
         Path baseDir = Files.createTempDirectory("ngrid-test");
         dir1 = Files.createDirectories(baseDir.resolve("node1"));
