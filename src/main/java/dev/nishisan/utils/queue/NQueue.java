@@ -893,7 +893,7 @@ public class NQueue<T extends Serializable> implements Closeable {
             this.raf = new RandomAccessFile(dataPath.toFile(), "rw");
             this.dataChannel = this.raf.getChannel();
 
-            consumerOffset = recordCount > 0 ? 0L : newProducerOffset;
+            consumerOffset = 0L;
             producerOffset = newProducerOffset;
 
             persistCurrentStateLocked();
