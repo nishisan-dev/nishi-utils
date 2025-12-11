@@ -903,7 +903,7 @@ public class NQueue<T extends Serializable> implements Closeable {
             this.raf = newRaf;
             this.dataChannel = newDataChannel;
 
-            consumerOffset = recordCount > 0 ? 0L : newProducerOffset;
+            consumerOffset = 0L;
             producerOffset = newProducerOffset;
 
             persistCurrentStateLocked();
