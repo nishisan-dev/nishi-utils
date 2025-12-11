@@ -16,6 +16,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.jupiter.api.Test;
@@ -198,6 +199,56 @@ class NQueueCompactionTest {
 
         assertEquals(totalRecords, consumed.size(), "All produced records must be consumed");
         assertEquals(offeredOrder, consumed, "FIFO order must be preserved");
+    }
+
+    @Test
+    void resumesCompactionAfterStateChangesDuringCopy() throws Exception {
+        NQueue.Options options = NQueue.Options.defaults()
+                .withCompactionWasteThreshold(0.1d)
+                .withCompactionInterval(Duration.ofMillis(5))
+                .withCompactionBufferSize(256)
+                .withFsync(false);
+
+        Path queueDir = tempDir.resolve("contention");
+        AtomicBoolean running = new AtomicBoolean(true);
+        CountDownLatch workerStarted = new CountDownLatch(1);
+
+        try (NQueue<Integer> queue = NQueue.open(tempDir, "contention", options)) {
+            for (int i = 0; i < 50; i++) {
+                queue.offer(i);
+            }
+
+            for (int i = 0; i < 35; i++) {
+                queue.poll().orElseThrow();
+            }
+
+            Thread worker = new Thread(() -> {
+                workerStarted.countDown();
+                int value = 1_000;
+                while (running.get()) {
+                    try {
+                        queue.offer(value++);
+                        queue.poll(10, TimeUnit.MILLISECONDS);
+                    } catch (Exception e) {
+                        fail("Background worker encountered error", e);
+                    }
+                }
+            });
+            worker.start();
+
+            workerStarted.await();
+            TimeUnit.MILLISECONDS.sleep(200); // Allow background compaction attempts while the worker mutates state
+            running.set(false);
+            worker.join();
+
+            // Drain remaining items to make compaction converge and avoid masking stale files when closing.
+            while (queue.poll(10, TimeUnit.MILLISECONDS).isPresent()) {
+                // keep draining
+            }
+        }
+
+        NQueueQueueMeta meta = awaitMeta(queueDir.resolve("queue.meta"), Duration.ofSeconds(3), m -> m.getConsumerOffset() == m.getProducerOffset());
+        assertEquals(0L, meta.getConsumerOffset(), "Compaction should rewrite file even if a prior attempt was aborted due to state changes");
     }
 
     private record TestMessage(int value) implements java.io.Serializable {
