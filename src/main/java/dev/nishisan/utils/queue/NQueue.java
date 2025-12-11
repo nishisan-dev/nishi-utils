@@ -170,7 +170,7 @@ public class NQueue<T extends Serializable> implements Closeable {
         QueueState state;
         if (Files.exists(metaPath)) {
             NQueueQueueMeta meta = NQueueQueueMeta.read(metaPath);
-            state = new QueueState(meta.getConsumerOffset(), meta.getProducerOffset(), meta.getRecordCount(), meta.getLastIndex());
+            state = new QueueState(meta.getConsumerOffset(), meta.getProducerOffset(), meta.getRecordCount(), meta.getLastIndex(), ch);
 
             long fileSize = ch.size();
             boolean inconsistent = state.consumerOffset < 0
@@ -637,7 +637,7 @@ public class NQueue<T extends Serializable> implements Closeable {
             lastIndex = -1L;
         }
 
-        return new QueueState(consumerOffset, producerOffset, count, lastIndex);
+        return new QueueState(consumerOffset, producerOffset, count, lastIndex, ch);
     }
 
     /**
@@ -659,7 +659,7 @@ public class NQueue<T extends Serializable> implements Closeable {
      * @return an instance of QueueState representing the current state of the queue.
      */
     private QueueState currentState() {
-        return new QueueState(consumerOffset, producerOffset, recordCount, lastIndex);
+        return new QueueState(consumerOffset, producerOffset, recordCount, lastIndex, dataChannel);
     }
 
     /**
@@ -849,7 +849,7 @@ public class NQueue<T extends Serializable> implements Closeable {
         ByteBuffer buffer = ByteBuffer.allocate(compactionBufferSize);
         long readOffset = snapshot.consumerOffset;
         long limit = snapshot.producerOffset;
-        FileChannel source = this.dataChannel;
+        FileChannel source = snapshot.dataChannel;
 
         while (readOffset < limit) {
             buffer.clear();
@@ -884,8 +884,12 @@ public class NQueue<T extends Serializable> implements Closeable {
 
             // Minimal critical section: close the old channel, atomically switch the file,
             // reopen the channel, and update in-memory offsets/state before releasing the lock.
-            dataChannel.close();
-            raf.close();
+            // Use local variables to avoid exposing closed channels to other threads via volatile fields.
+            FileChannel oldDataChannel = dataChannel;
+            RandomAccessFile oldRaf = raf;
+            
+            oldDataChannel.close();
+            oldRaf.close();
 
             try {
                 Files.move(tempPath, dataPath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
@@ -893,10 +897,13 @@ public class NQueue<T extends Serializable> implements Closeable {
                 Files.move(tempPath, dataPath, StandardCopyOption.REPLACE_EXISTING);
             }
 
-            this.raf = new RandomAccessFile(dataPath.toFile(), "rw");
-            this.dataChannel = this.raf.getChannel();
+            RandomAccessFile newRaf = new RandomAccessFile(dataPath.toFile(), "rw");
+            FileChannel newDataChannel = newRaf.getChannel();
+            
+            this.raf = newRaf;
+            this.dataChannel = newDataChannel;
 
-            consumerOffset = recordCount > 0 ? 0L : newProducerOffset;
+            consumerOffset = 0L;
             producerOffset = newProducerOffset;
 
             persistCurrentStateLocked();
@@ -959,12 +966,14 @@ public class NQueue<T extends Serializable> implements Closeable {
         final long producerOffset;
         final long recordCount;
         final long lastIndex;
+        final FileChannel dataChannel;
 
-        QueueState(long consumerOffset, long producerOffset, long recordCount, long lastIndex) {
+        QueueState(long consumerOffset, long producerOffset, long recordCount, long lastIndex, FileChannel dataChannel) {
             this.consumerOffset = consumerOffset;
             this.producerOffset = producerOffset;
             this.recordCount = recordCount;
             this.lastIndex = lastIndex;
+            this.dataChannel = dataChannel;
         }
     }
 
