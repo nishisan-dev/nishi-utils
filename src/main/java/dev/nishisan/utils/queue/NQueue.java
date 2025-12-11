@@ -500,13 +500,29 @@ public class NQueue<T extends Serializable> implements Closeable {
     @Override
     public void close() throws IOException {
         Future<?> future;
+        QueueState inlineSnapshot = null;
         lock.lock();
         try {
             shutdownRequested = true;
-            maybeCompactLocked();
-            future = compactionFuture;
+            if (compactionFuture != null && compactionFuture.isDone()) {
+                compactionFuture = null;
+            }
+            boolean canInlineCompaction = compactionFuture == null && consumerOffset > 0 && producerOffset > consumerOffset;
+            if (canInlineCompaction) {
+                compactionState = CompactionState.RUNNING;
+                inlineSnapshot = currentState();
+                future = null;
+            } else {
+                maybeCompactLocked();
+                future = compactionFuture;
+            }
         } finally {
             lock.unlock();
+        }
+
+        if (inlineSnapshot != null) {
+            runCompaction(inlineSnapshot);
+            future = compactionFuture;
         }
 
         if (future != null) {
@@ -517,6 +533,21 @@ public class NQueue<T extends Serializable> implements Closeable {
             } catch (ExecutionException ignored) {
                 // Exceptions during compaction are ignored on close.
             }
+        }
+
+        QueueState finalInline = null;
+        lock.lock();
+        try {
+            if (consumerOffset > 0 && producerOffset > consumerOffset) {
+                compactionState = CompactionState.RUNNING;
+                finalInline = currentState();
+            }
+        } finally {
+            lock.unlock();
+        }
+
+        if (finalInline != null) {
+            runCompaction(finalInline);
         }
 
         lock.lock();
@@ -742,7 +773,10 @@ public class NQueue<T extends Serializable> implements Closeable {
      * @throws IOException if an I/O error occurs during the compaction process.
      */
     private void maybeCompactLocked() throws IOException {
-        if (shutdownRequested || compactionState == CompactionState.RUNNING) {
+        if (compactionState == CompactionState.RUNNING) {
+            return;
+        }
+        if (shutdownRequested && recordCount == 0) {
             return;
         }
         long totalBytes = producerOffset;
@@ -878,7 +912,14 @@ public class NQueue<T extends Serializable> implements Closeable {
                 // Instead of immediately rescheduling compaction, update lastCompactionTimeNanos
                 // to enforce a minimum interval before the next compaction attempt.
                 compactionState = CompactionState.IDLE;
-                lastCompactionTimeNanos = System.nanoTime();
+                compactionFuture = null;
+                long now = System.nanoTime();
+                // Force the next compaction evaluation to consider the interval exceeded so we
+                // do not stall when the queue becomes empty right after a failed attempt.
+                lastCompactionTimeNanos = compactionIntervalNanos > 0
+                        ? now - compactionIntervalNanos
+                        : now;
+                maybeCompactLocked();
                 return;
             }
 
@@ -914,6 +955,7 @@ public class NQueue<T extends Serializable> implements Closeable {
             lastCompactionTimeNanos = System.nanoTime();
         } finally {
             compactionState = CompactionState.IDLE;
+            compactionFuture = null;
             lock.unlock();
         }
     }
