@@ -832,12 +832,15 @@ public class NQueue<T extends Serializable> implements Closeable {
                 lock.unlock();
             }
         } finally {
+            lock.lock();
             try {
                 if (compactionState == CompactionState.IDLE) {
                     Files.deleteIfExists(tempDataPath);
                 }
             } catch (IOException ignored) {
                 // best-effort cleanup
+            } finally {
+                lock.unlock();
             }
         }
     }
