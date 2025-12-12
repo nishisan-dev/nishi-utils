@@ -11,9 +11,12 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.ServerSocket;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -35,9 +38,15 @@ class NGridIntegrationTest {
 
     @BeforeEach
     void setUp() throws IOException {
-        info1 = new NodeInfo(NodeId.of("node-1"), "127.0.0.1", 19101);
-        info2 = new NodeInfo(NodeId.of("node-2"), "127.0.0.1", 19102);
-        info3 = new NodeInfo(NodeId.of("node-3"), "127.0.0.1", 19103);
+        // Use ephemeral ports to avoid clashes on shared CI runners (e.g. GitHub Actions).
+        // We still pass explicit ports to NodeInfo so peers can connect immediately.
+        int port1 = allocateFreeLocalPort();
+        int port2 = allocateFreeLocalPort(Set.of(port1));
+        int port3 = allocateFreeLocalPort(Set.of(port1, port2));
+
+        info1 = new NodeInfo(NodeId.of("node-1"), "127.0.0.1", port1);
+        info2 = new NodeInfo(NodeId.of("node-2"), "127.0.0.1", port2);
+        info3 = new NodeInfo(NodeId.of("node-3"), "127.0.0.1", port3);
 
         Path baseDir = Files.createTempDirectory("ngrid-test");
         dir1 = Files.createDirectories(baseDir.resolve("node1"));
@@ -166,5 +175,26 @@ class NGridIntegrationTest {
             node.close();
         } catch (IOException ignored) {
         }
+    }
+
+    private static int allocateFreeLocalPort() throws IOException {
+        return allocateFreeLocalPort(Set.of());
+    }
+
+    private static int allocateFreeLocalPort(Set<Integer> avoid) throws IOException {
+        // Bind to port 0 on loopback to get a free ephemeral port from the OS.
+        // Note: as with any free-port selection, there is a small race window between
+        // release and re-bind, but this is far safer than hardcoded ports on CI.
+        for (int attempt = 0; attempt < 50; attempt++) {
+            try (ServerSocket socket = new ServerSocket()) {
+                socket.setReuseAddress(true);
+                socket.bind(new InetSocketAddress("127.0.0.1", 0));
+                int port = socket.getLocalPort();
+                if (port > 0 && !avoid.contains(port)) {
+                    return port;
+                }
+            }
+        }
+        throw new IOException("Unable to allocate a free local port after multiple attempts");
     }
 }
