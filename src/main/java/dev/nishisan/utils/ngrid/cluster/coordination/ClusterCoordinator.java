@@ -17,6 +17,7 @@
 
 package dev.nishisan.utils.ngrid.cluster.coordination;
 
+import dev.nishisan.utils.ngrid.LeaderElectionListener;
 import dev.nishisan.utils.ngrid.cluster.transport.Transport;
 import dev.nishisan.utils.ngrid.cluster.transport.TransportListener;
 import dev.nishisan.utils.ngrid.common.ClusterMessage;
@@ -53,6 +54,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     private final ClusterCoordinatorConfig config;
     private final Map<NodeId, ClusterMember> members = new ConcurrentHashMap<>();
     private final Set<LeadershipListener> leadershipListeners = new CopyOnWriteArraySet<>();
+    private final Set<LeaderElectionListener> leaderElectionListeners = new CopyOnWriteArraySet<>();
     private final ScheduledExecutorService scheduler;
     private final AtomicReference<NodeId> leader = new AtomicReference<>();
 
@@ -120,6 +122,14 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         leadershipListeners.remove(listener);
     }
 
+    public void addLeaderElectionListener(LeaderElectionListener listener) {
+        leaderElectionListeners.add(Objects.requireNonNull(listener, "listener"));
+    }
+
+    public void removeLeaderElectionListener(LeaderElectionListener listener) {
+        leaderElectionListeners.remove(listener);
+    }
+
     private void sendHeartbeat() {
         if (!running) {
             return;
@@ -157,7 +167,16 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 .max(Comparator.naturalOrder());
         NodeId previous = leader.getAndSet(newLeader.orElse(null));
         if (!Objects.equals(previous, newLeader.orElse(null))) {
-            leadershipListeners.forEach(listener -> listener.onLeaderChanged(newLeader.orElse(null)));
+            NodeId currentLeader = newLeader.orElse(null);
+            leadershipListeners.forEach(listener -> listener.onLeaderChanged(currentLeader));
+            
+            // Notify LeaderElectionListener if local node's leadership status changed
+            NodeId localNodeId = transport.local().nodeId();
+            boolean wasLeader = previous != null && previous.equals(localNodeId);
+            boolean isLeader = currentLeader != null && currentLeader.equals(localNodeId);
+            if (wasLeader != isLeader) {
+                leaderElectionListeners.forEach(listener -> listener.onLeadershipChanged(isLeader, currentLeader));
+            }
         }
     }
 

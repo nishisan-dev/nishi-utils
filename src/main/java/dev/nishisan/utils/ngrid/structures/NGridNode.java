@@ -23,6 +23,8 @@ import dev.nishisan.utils.ngrid.cluster.transport.TcpTransport;
 import dev.nishisan.utils.ngrid.cluster.transport.TcpTransportConfig;
 import dev.nishisan.utils.ngrid.cluster.transport.Transport;
 import dev.nishisan.utils.ngrid.map.MapClusterService;
+import dev.nishisan.utils.ngrid.map.MapPersistenceConfig;
+import dev.nishisan.utils.ngrid.map.MapPersistenceMode;
 import dev.nishisan.utils.ngrid.queue.QueueClusterService;
 import dev.nishisan.utils.ngrid.replication.ReplicationConfig;
 import dev.nishisan.utils.ngrid.replication.ReplicationManager;
@@ -79,7 +81,17 @@ public final class NGridNode implements Closeable {
         replicationManager.start();
 
         queueService = new QueueClusterService<>(config.queueDirectory(), config.queueName(), replicationManager);
-        mapService = new MapClusterService<>(replicationManager);
+        if (config.mapPersistenceMode() != null && config.mapPersistenceMode() != MapPersistenceMode.DISABLED) {
+            MapPersistenceConfig persistenceConfig = MapPersistenceConfig.defaults(
+                    config.mapDirectory(),
+                    config.mapName(),
+                    config.mapPersistenceMode()
+            );
+            mapService = new MapClusterService<>(replicationManager, persistenceConfig);
+            mapService.loadFromDisk();
+        } else {
+            mapService = new MapClusterService<>(replicationManager);
+        }
         queue = new DistributedQueue<>(transport, coordinator, queueService);
         map = new DistributedMap<>(transport, coordinator, mapService);
     }
@@ -111,23 +123,59 @@ public final class NGridNode implements Closeable {
         if (!started.compareAndSet(true, false)) {
             return;
         }
-        if (queue != null) {
-            queue.close();
+        IOException first = null;
+        try {
+            if (queue != null) {
+                queue.close();
+            }
+        } catch (IOException e) {
+            first = e;
         }
-        if (map != null) {
-            map.close();
+        try {
+            if (map != null) {
+                map.close();
+            }
+        } catch (IOException e) {
+            if (first == null) {
+                first = e;
+            }
         }
-        if (replicationManager != null) {
-            replicationManager.close();
+        try {
+            if (replicationManager != null) {
+                replicationManager.close();
+            }
+        } catch (IOException e) {
+            if (first == null) {
+                first = e;
+            }
         }
-        if (coordinator != null) {
-            coordinator.close();
+        try {
+            if (coordinator != null) {
+                coordinator.close();
+            }
+        } catch (IOException e) {
+            if (first == null) {
+                first = e;
+            }
         }
-        if (coordinatorScheduler != null) {
-            coordinatorScheduler.shutdownNow();
+        try {
+            if (coordinatorScheduler != null) {
+                coordinatorScheduler.shutdownNow();
+            }
+        } catch (RuntimeException e) {
+            // best-effort shutdown
         }
-        if (transport != null) {
-            transport.close();
+        try {
+            if (transport != null) {
+                transport.close();
+            }
+        } catch (IOException e) {
+            if (first == null) {
+                first = e;
+            }
+        }
+        if (first != null) {
+            throw first;
         }
     }
 }

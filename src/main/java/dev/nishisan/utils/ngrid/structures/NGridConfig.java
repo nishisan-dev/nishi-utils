@@ -18,6 +18,7 @@
 package dev.nishisan.utils.ngrid.structures;
 
 import dev.nishisan.utils.ngrid.common.NodeInfo;
+import dev.nishisan.utils.ngrid.map.MapPersistenceMode;
 
 import java.nio.file.Path;
 import java.util.Collections;
@@ -34,6 +35,9 @@ public final class NGridConfig {
     private final int replicationQuorum;
     private final Path queueDirectory;
     private final String queueName;
+    private final Path mapDirectory;
+    private final String mapName;
+    private final MapPersistenceMode mapPersistenceMode;
 
     private NGridConfig(Builder builder) {
         this.local = builder.local;
@@ -41,6 +45,9 @@ public final class NGridConfig {
         this.replicationQuorum = builder.replicationQuorum;
         this.queueDirectory = builder.queueDirectory;
         this.queueName = builder.queueName;
+        this.mapDirectory = builder.mapDirectory != null ? builder.mapDirectory : builder.queueDirectory.resolve("maps");
+        this.mapName = builder.mapName;
+        this.mapPersistenceMode = builder.mapPersistenceMode;
     }
 
     public NodeInfo local() {
@@ -63,6 +70,18 @@ public final class NGridConfig {
         return queueName;
     }
 
+    public Path mapDirectory() {
+        return mapDirectory;
+    }
+
+    public String mapName() {
+        return mapName;
+    }
+
+    public MapPersistenceMode mapPersistenceMode() {
+        return mapPersistenceMode;
+    }
+
     public static Builder builder(NodeInfo local) {
         return new Builder(local);
     }
@@ -73,6 +92,9 @@ public final class NGridConfig {
         private int replicationQuorum = 2;
         private Path queueDirectory;
         private String queueName = "ngrid";
+        private Path mapDirectory;
+        private String mapName = "map";
+        private MapPersistenceMode mapPersistenceMode = MapPersistenceMode.DISABLED;
 
         private Builder(NodeInfo local) {
             this.local = Objects.requireNonNull(local, "local");
@@ -100,6 +122,21 @@ public final class NGridConfig {
 
         public Builder queueName(String name) {
             this.queueName = Objects.requireNonNull(name, "name");
+            return this;
+        }
+
+        public Builder mapDirectory(Path directory) {
+            this.mapDirectory = Objects.requireNonNull(directory, "directory");
+            return this;
+        }
+
+        public Builder mapName(String name) {
+            this.mapName = Objects.requireNonNull(name, "name");
+            return this;
+        }
+
+        public Builder mapPersistenceMode(MapPersistenceMode mode) {
+            this.mapPersistenceMode = Objects.requireNonNull(mode, "mode");
             return this;
         }
 
