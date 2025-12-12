@@ -1,5 +1,5 @@
 /*
- *  Copyright (C) 2020-2025 Lucas Nishimura <lucas.nishimura@gmail.com>
+ *  Copyright (C) 2020-2025 Lucas Nishimura <lucas.nishimura at gmail.com>
  *
  *  This program is free software: you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -66,6 +66,24 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         this.scheduler = Objects.requireNonNull(scheduler, "scheduler");
     }
 
+    /**
+     * Starts the cluster coordination process, initializing necessary components and tasks.
+     *
+     * This method transitions the cluster coordination to a running state if it is not already running.
+     * It sets the local node as a cluster member, registers itself as a transport listener, and schedules
+     * periodic tasks for sending heartbeats and evicting inactive members. Leadership is also recomputed
+     * upon startup to establish the current cluster leader.
+     *
+     * The following actions are performed:
+     * - The `running` flag is set to true, marking the cluster as active.
+     * - The local node is added to the list of cluster members.
+     * - A listener is added to the transport layer to handle incoming messages and events.
+     * - Heartbeat messages are scheduled to be broadcast at regular intervals as defined in the configuration.
+     * - A task to evict inactive members is scheduled, removing members that miss multiple heartbeats.
+     * - The cluster leader is computed and updated, notifying relevant listeners.
+     *
+     * If the cluster is already running, the method exits without making any changes.
+     */
     public void start() {
         if (running) {
             return;
@@ -98,6 +116,17 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         return leaderId != null && leaderId.equals(transport.local().nodeId());
     }
 
+    /**
+     * Retrieves information about the current leader of the cluster.
+     *
+     * This method attempts to fetch the {@code NodeInfo} of the leader node as identified by
+     * the current leader's {@code NodeId}. If the leader is null or the leader's associated
+     * {@code ClusterMember} is not active, an empty {@code Optional} is returned. Otherwise,
+     * the method returns the {@code NodeInfo} of the active leader wrapped in an {@code Optional}.
+     *
+     * @return an {@code Optional} containing the {@code NodeInfo} of the leader if available and active;
+     *         otherwise, an empty {@code Optional}.
+     */
     public Optional<NodeInfo> leaderInfo() {
         NodeId leaderId = leader.get();
         if (leaderId == null) {
@@ -107,6 +136,13 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         return member != null && member.isActive() ? Optional.of(member.info()) : Optional.empty();
     }
 
+    /**
+     * Retrieves a collection of active cluster members.
+     *
+     * This method filters the cluster members to include only those marked
+     * as active and then maps them to their respective {@code NodeInfo} objects.
+     *
+     * @return a collection of {@code NodeInfo}*/
     public Collection<NodeInfo> activeMembers() {
         return members.values().stream()
                 .filter(ClusterMember::isActive)
@@ -130,6 +166,21 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         leaderElectionListeners.remove(listener);
     }
 
+    /**
+     * Sends a heartbeat message to all nodes in the cluster.
+     *
+     * This method constructs a heartbeat message containing a timestamp
+     * and broadcasts it to all members of the cluster using the transport layer.
+     * The heartbeat message is used by the cluster to confirm that this node
+     * is still active. The method exits immediately if the cluster is not marked
+     * as running.
+     *
+     * The message includes the following:
+     * - Type: HEARTBEAT, to indicate the nature of the message.
+     * - Qualifier: "hb", providing additional context about the message.
+     * - Source: The local node's identifier.
+     * - Payload: A `HeartbeatPayload` containing the current timestamp.
+     */
     private void sendHeartbeat() {
         if (!running) {
             return;
@@ -143,6 +194,17 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         transport.broadcast(heartbeat);
     }
 
+    /**
+     * Scans the cluster members for inactive nodes and evicts them if they have not sent a heartbeat
+     * within the configured timeout period.
+     *
+     * This method checks each cluster member to ensure that it is still active. If a member's last
+     * heartbeat timestamp exceeds the configured heartbeat timeout, the member is marked as inactive.
+     * The leader is then recomputed to reflect the updated state of the cluster. The local node is
+     * excluded from eviction checks.
+     *
+     * If the cluster is not running, the method exits without performing any actions.
+     */
     private void evictDeadMembers() {
         if (!running) {
             return;
@@ -160,6 +222,17 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         }
     }
 
+    /**
+     * Recomputes the leader of the cluster based on currently active members.
+     *
+     * The method identifies the highest-ranking active node by comparing their unique identifiers,
+     * updates the cluster's leader state, and notifies registered listeners if the leadership
+     * status has changed.
+     *
+     * Leadership change is determined by examining the difference between the previous leader
+     * and the newly computed leader. If the local node's leadership state changes, the corresponding
+     * listeners are notified.
+     */
     private void recomputeLeader() {
         Optional<NodeId> newLeader = members.values().stream()
                 .filter(ClusterMember::isActive)
