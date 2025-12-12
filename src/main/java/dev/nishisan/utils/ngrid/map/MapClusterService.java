@@ -20,6 +20,8 @@ package dev.nishisan.utils.ngrid.map;
 import dev.nishisan.utils.ngrid.replication.ReplicationManager;
 import dev.nishisan.utils.ngrid.replication.ReplicationResult;
 
+import java.io.Closeable;
+import java.io.IOException;
 import java.io.Serializable;
 import java.util.Objects;
 import java.util.Optional;
@@ -31,15 +33,25 @@ import java.util.concurrent.ConcurrentMap;
 /**
  * Simple distributed map that relies on the replication layer to keep replicas aligned.
  */
-public final class MapClusterService<K extends Serializable, V extends Serializable> {
+public final class MapClusterService<K extends Serializable, V extends Serializable> implements Closeable {
     public static final String TOPIC = "map";
 
     private final ConcurrentMap<K, V> data = new ConcurrentHashMap<>();
     private final ReplicationManager replicationManager;
+    private final MapPersistence<K, V> persistence;
 
     public MapClusterService(ReplicationManager replicationManager) {
+        this(replicationManager, null);
+    }
+
+    public MapClusterService(ReplicationManager replicationManager, MapPersistenceConfig persistenceConfig) {
         this.replicationManager = Objects.requireNonNull(replicationManager, "replicationManager");
         this.replicationManager.registerHandler(TOPIC, this::applyReplication);
+        if (persistenceConfig != null && persistenceConfig.mode() != MapPersistenceMode.DISABLED) {
+            this.persistence = new MapPersistence<>(persistenceConfig, data);
+        } else {
+            this.persistence = null;
+        }
     }
 
     public Optional<V> put(K key, V value) {
@@ -63,6 +75,18 @@ public final class MapClusterService<K extends Serializable, V extends Serializa
         return Optional.ofNullable(data.get(key));
     }
 
+    /**
+     * Loads map state from disk (snapshot + WAL) and starts the persistence background writer when enabled.
+     * This is a no-op when persistence is disabled.
+     */
+    public void loadFromDisk() {
+        if (persistence == null) {
+            return;
+        }
+        persistence.load();
+        persistence.start();
+    }
+
     private void waitForReplication(CompletableFuture<ReplicationResult> future) {
         future.join();
     }
@@ -73,6 +97,17 @@ public final class MapClusterService<K extends Serializable, V extends Serializa
         switch (command.type()) {
             case PUT -> data.put((K) command.key(), (V) command.value());
             case REMOVE -> data.remove((K) command.key());
+        }
+        if (persistence != null) {
+            // Persist locally on every node (leader and followers) when applying the replicated command.
+            persistence.appendAsync(command.type(), command.key(), command.value());
+        }
+    }
+
+    @Override
+    public void close() throws IOException {
+        if (persistence != null) {
+            persistence.close();
         }
     }
 }

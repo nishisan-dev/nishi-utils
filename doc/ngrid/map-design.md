@@ -42,7 +42,7 @@ Essa abordagem garante consistência semelhante ao modelo "single-writer, multi-
 
 ## **Estrutura Local de Armazenamento**
 
-Cada nó mantém um mapa local em memória, com possibilidade de futura persistência.  
+Cada nó mantém um mapa local em memória, com possibilidade de **persistência local opcional em disco**.
 Elementos armazenados:
 
 - Chave (`K`)
@@ -53,6 +53,46 @@ Elementos armazenados:
     - Timestamp lógico
 
 Não há necessidade de modificar ou acoplar à `NQueue`, pois o mapa é independente.
+
+---
+
+## **Persistência local (opcional)**
+
+O NGrid Map suporta persistência local em disco por nó, com:
+
+- **WAL (Write-Ahead Log)**: registra operações `PUT` e `REMOVE` (append-only).
+- **Snapshot periódico**: serialização completa do mapa para acelerar recuperação.
+- **Escrita assíncrona**: não bloqueia `put/remove` (fila + batching).
+
+### **Modos**
+
+- `DISABLED`: sem persistência (padrão).
+- `ASYNC_NO_FSYNC`: escreve assíncrono sem `fsync` (mais performance, menor durabilidade em crash).
+- `ASYNC_WITH_FSYNC`: escreve assíncrono com `fsync` (mais durabilidade em crash, menor performance).
+
+### **Arquivos**
+
+Estrutura por mapa:
+
+```
+{mapDirectory}/{mapName}/
+├── wal.log          # operações PUT/REMOVE (append-only)
+├── snapshot.dat     # snapshot completo serializado do Map
+└── map.meta         # metadados do snapshot
+```
+
+### **Configuração (por nó)**
+
+A persistência é **decisão local por nó** (não é imposta pelo líder).
+
+- Se um nó estiver com persistência habilitada, ele consegue recuperar o mapa local mais rápido após reinício.
+- Se outro nó estiver sem persistência, ele depende apenas do estado em memória + replicações correntes.
+
+### **Interação com replicação**
+
+- O cluster continua sendo a **fonte de verdade** para consistência global.
+- A persistência local é uma **otimização de durabilidade/boot**: não substitui a replicação.
+- A gravação no WAL acontece quando a operação é **aplicada localmente** (líder e followers persistem o mesmo stream de comandos replicados).
 
 ---
 

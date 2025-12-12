@@ -156,6 +156,7 @@ public final class DistributedMap<K extends Serializable, V extends Serializable
     @Override
     public void close() throws IOException {
         transport.removeListener(this);
+        mapService.close();
     }
 
     private record MapEntry<K extends Serializable, V extends Serializable>(K key, V value) implements Serializable {

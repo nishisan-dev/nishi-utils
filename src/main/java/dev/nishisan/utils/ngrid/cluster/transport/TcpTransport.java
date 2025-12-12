@@ -46,7 +46,6 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
@@ -92,6 +91,7 @@ public final class TcpTransport implements Transport {
         }
         try {
             serverSocket = new ServerSocket();
+            serverSocket.setReuseAddress(true);
             serverSocket.bind(new InetSocketAddress(config.local().host(), config.local().port()));
         } catch (IOException e) {
             throw new IllegalStateException("Unable to bind TCP transport", e);
@@ -276,8 +276,12 @@ public final class TcpTransport implements Transport {
         listeners.forEach(listener -> listener.onPeerConnected(remoteInfo));
         // Merge peers and attempt connections
         payload.peers().forEach(peer -> {
-            if (!peer.nodeId().equals(config.local().nodeId())) {
-                knownPeers.putIfAbsent(peer.nodeId(), peer);
+            if (peer.nodeId().equals(config.local().nodeId())) {
+                return;
+            }
+            boolean added = knownPeers.putIfAbsent(peer.nodeId(), peer) == null;
+            if (added && !isConnected(peer.nodeId())) {
+                scheduler.schedule(() -> ensureConnectionAsync(peer), 100, TimeUnit.MILLISECONDS);
             }
         });
         broadcastPeerList();
@@ -301,7 +305,10 @@ public final class TcpTransport implements Transport {
         PeerUpdatePayload payload = message.payload(PeerUpdatePayload.class);
         for (NodeInfo peer : payload.peers()) {
             if (!peer.nodeId().equals(config.local().nodeId())) {
-                knownPeers.putIfAbsent(peer.nodeId(), peer);
+                boolean added = knownPeers.putIfAbsent(peer.nodeId(), peer) == null;
+                if (added && !isConnected(peer.nodeId())) {
+                    scheduler.schedule(() -> ensureConnectionAsync(peer), 100, TimeUnit.MILLISECONDS);
+                }
             }
         }
     }
