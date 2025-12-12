@@ -507,7 +507,7 @@ public class NQueue<T extends Serializable> implements Closeable {
             if (compactionFuture != null && compactionFuture.isDone()) {
                 compactionFuture = null;
             }
-            boolean canInlineCompaction = compactionFuture == null && consumerOffset > 0 && producerOffset > consumerOffset;
+            boolean canInlineCompaction = compactionFuture == null && consumerOffset > 0 && producerOffset >= consumerOffset;
             if (canInlineCompaction) {
                 compactionState = CompactionState.RUNNING;
                 inlineSnapshot = currentState();
@@ -538,7 +538,7 @@ public class NQueue<T extends Serializable> implements Closeable {
         QueueState finalInline = null;
         lock.lock();
         try {
-            if (consumerOffset > 0 && producerOffset > consumerOffset) {
+            if (consumerOffset > 0 && producerOffset >= consumerOffset) {
                 compactionState = CompactionState.RUNNING;
                 finalInline = currentState();
             }
@@ -776,9 +776,6 @@ public class NQueue<T extends Serializable> implements Closeable {
         if (compactionState == CompactionState.RUNNING) {
             return;
         }
-        if (shutdownRequested && recordCount == 0) {
-            return;
-        }
         long totalBytes = producerOffset;
         long wastedBytes = consumerOffset;
         if (totalBytes <= 0 || wastedBytes <= 0) {
@@ -787,7 +784,10 @@ public class NQueue<T extends Serializable> implements Closeable {
 
         long now = System.nanoTime();
         boolean intervalExceeded = compactionIntervalNanos > 0 && (now - lastCompactionTimeNanos) >= compactionIntervalNanos;
-        if (recordCount == 0 && !intervalExceeded) {
+        // When the queue is empty but the data file still contains bytes (consumerOffset == producerOffset > 0),
+        // we still want to compact to rewrite the file and reset offsets back to 0. On shutdown, this should
+        // always be allowed; otherwise we keep the interval gate to avoid overly aggressive rewrites.
+        if (!shutdownRequested && recordCount == 0 && !intervalExceeded) {
             return;
         }
 
