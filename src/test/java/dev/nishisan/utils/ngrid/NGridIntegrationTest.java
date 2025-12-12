@@ -129,6 +129,7 @@ class NGridIntegrationTest {
 
         // Restart node1 using the same storage and ensure queue state is replayed
         closeQuietly(node1);
+        waitForPortRelease(info1.port());
         node1 = new NGridNode(NGridConfig.builder(info1)
                 .addPeer(info2)
                 .addPeer(info3)
@@ -174,6 +175,37 @@ class NGridIntegrationTest {
         try {
             node.close();
         } catch (IOException ignored) {
+        }
+    }
+
+    private static void waitForPortRelease(int port) {
+        // After closing the ServerSocket, some environments (notably CI) may keep the port
+        // unavailable for a short period due to TIME_WAIT. This helper waits until a bind
+        // succeeds, using a small backoff, to reduce test flakiness.
+        long[] delaysMs = {500, 1000, 1500, 2000, 2500};
+        for (long delay : delaysMs) {
+            if (isPortBindable(port)) {
+                return;
+            }
+            try {
+                Thread.sleep(delay);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException(e);
+            }
+        }
+        if (!isPortBindable(port)) {
+            throw new IllegalStateException("Port " + port + " did not become available in time");
+        }
+    }
+
+    private static boolean isPortBindable(int port) {
+        try (ServerSocket socket = new ServerSocket()) {
+            socket.setReuseAddress(true);
+            socket.bind(new InetSocketAddress("127.0.0.1", port));
+            return true;
+        } catch (IOException e) {
+            return false;
         }
     }
 
