@@ -33,7 +33,6 @@ import java.io.IOException;
 import java.io.Serializable;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -41,9 +40,13 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.concurrent.ScheduledExecutorService;
 
 /**
  * Coordinates quorum based replication leveraging the transport. The manager handles both
@@ -64,6 +67,11 @@ public final class ReplicationManager implements TransportListener, Closeable {
         t.setDaemon(true);
         return t;
     });
+    private final ScheduledExecutorService timeoutScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "ngrid-replication-timeout");
+        t.setDaemon(true);
+        return t;
+    });
 
     private volatile boolean running;
 
@@ -79,6 +87,9 @@ public final class ReplicationManager implements TransportListener, Closeable {
         }
         running = true;
         transport.addListener(this);
+        Duration timeout = config.operationTimeout();
+        long periodMs = Math.max(100L, timeout.toMillis() / 2);
+        timeoutScheduler.scheduleAtFixedRate(this::checkTimeouts, periodMs, periodMs, TimeUnit.MILLISECONDS);
     }
 
     public void stop() {
@@ -162,7 +173,20 @@ public final class ReplicationManager implements TransportListener, Closeable {
 
     @Override
     public void onPeerDisconnected(NodeId peerId) {
-        // No-op for now, pending operations will timeout if quorum unattainable
+        for (PendingOperation operation : pending.values()) {
+            if (operation.isDone()) {
+                continue;
+            }
+            int reachable = reachableMembersCount();
+            if (reachable < operation.quorum) {
+                QuorumUnreachableException ex = new QuorumUnreachableException(
+                        operation.operationId,
+                        operation.quorum,
+                        reachable,
+                        operation.acknowledgementsSnapshot());
+                failOperation(operation, ex);
+            }
+        }
     }
 
     @Override
@@ -220,6 +244,53 @@ public final class ReplicationManager implements TransportListener, Closeable {
     public void close() throws IOException {
         stop();
         executor.shutdownNow();
+        timeoutScheduler.shutdownNow();
+    }
+
+    private int reachableMembersCount() {
+        int reachable = 1; // local node
+        for (NodeInfo member : coordinator.activeMembers()) {
+            NodeId id = member.nodeId();
+            if (id.equals(transport.local().nodeId())) {
+                continue;
+            }
+            if (transport.isConnected(id)) {
+                reachable++;
+            }
+        }
+        return reachable;
+    }
+
+    private void checkTimeouts() {
+        if (!running) {
+            return;
+        }
+        Duration timeout = config.operationTimeout();
+        if (timeout.isZero() || timeout.isNegative()) {
+            return;
+        }
+        Instant now = Instant.now();
+        for (PendingOperation operation : pending.values()) {
+            if (operation.isDone()) {
+                continue;
+            }
+            if (operation.isExpired(now, timeout)) {
+                TimeoutException ex = new TimeoutException("Replication operation timed out operationId=" + operation.operationId
+                                                          + " timeout=" + timeout);
+                failOperation(operation, ex);
+            }
+        }
+    }
+
+    private void failOperation(PendingOperation operation, Throwable error) {
+        if (!pending.remove(operation.operationId, operation)) {
+            return;
+        }
+        operation.fail(error);
+        log.computeIfPresent(operation.operationId, (id, record) -> {
+            record.status(OperationStatus.REJECTED);
+            return record;
+        });
     }
 
     private static final class PendingOperation {
@@ -230,6 +301,7 @@ public final class ReplicationManager implements TransportListener, Closeable {
         private final Set<NodeId> acknowledgements = ConcurrentHashMap.newKeySet();
         private final CompletableFuture<ReplicationResult> future = new CompletableFuture<>();
         private volatile OperationStatus status = OperationStatus.PENDING;
+        private final Instant createdAt = Instant.now();
 
         private PendingOperation(UUID operationId, String topic, Serializable payload, int quorum) {
             this.operationId = operationId;
@@ -246,8 +318,16 @@ public final class ReplicationManager implements TransportListener, Closeable {
             return acknowledgements.size();
         }
 
+        Set<NodeId> acknowledgementsSnapshot() {
+            return Set.copyOf(acknowledgements);
+        }
+
         boolean isCommitted() {
             return status == OperationStatus.COMMITTED;
+        }
+
+        boolean isDone() {
+            return future.isDone();
         }
 
         void complete(OperationStatus status) {
@@ -256,6 +336,18 @@ public final class ReplicationManager implements TransportListener, Closeable {
             }
             this.status = status;
             future.complete(new ReplicationResult(operationId, status));
+        }
+
+        void fail(Throwable error) {
+            if (future.isDone()) {
+                return;
+            }
+            this.status = OperationStatus.REJECTED;
+            future.completeExceptionally(error);
+        }
+
+        boolean isExpired(Instant now, Duration timeout) {
+            return createdAt.plus(timeout).isBefore(now);
         }
 
         CompletableFuture<ReplicationResult> future() {

@@ -47,7 +47,9 @@ import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -63,7 +65,7 @@ public final class TcpTransport implements Transport {
     private final Map<NodeId, NodeInfo> knownPeers = new ConcurrentHashMap<>();
     private final Map<NodeId, Connection> connections = new ConcurrentHashMap<>();
     private final Set<TransportListener> listeners = new CopyOnWriteArraySet<>();
-    private final Map<UUID, CompletableFuture<ClusterMessage>> pendingResponses = new ConcurrentHashMap<>();
+    private final Map<UUID, PendingResponse> pendingResponses = new ConcurrentHashMap<>();
     private final ExecutorService workerPool = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "ngrid-transport-worker");
         t.setDaemon(true);
@@ -162,8 +164,35 @@ public final class TcpTransport implements Transport {
     @Override
     public CompletableFuture<ClusterMessage> sendAndAwait(ClusterMessage message) {
         CompletableFuture<ClusterMessage> future = new CompletableFuture<>();
-        pendingResponses.put(message.messageId(), future);
-        send(message);
+        NodeId destination = message.destination();
+        if (destination == null) {
+            future.completeExceptionally(new IOException("sendAndAwait requires a destination"));
+            return future;
+        }
+        UUID requestId = message.messageId();
+        PendingResponse response = new PendingResponse(destination, future);
+        pendingResponses.put(requestId, response);
+
+        Connection connection = ensureConnection(destination);
+        if (connection == null) {
+            pendingResponses.remove(requestId, response);
+            future.completeExceptionally(new IOException("No connection available for " + destination));
+            return future;
+        }
+        connection.send(message);
+
+        if (!config.requestTimeout().isZero() && !config.requestTimeout().isNegative()) {
+            ScheduledFuture<?> timeoutTask = scheduler.schedule(() -> {
+                PendingResponse pr = pendingResponses.remove(requestId);
+                if (pr != null) {
+                    pr.timeoutTask = null;
+                    pr.future.completeExceptionally(new TimeoutException("Request timed out requestId=" + requestId
+                                                                         + " destination=" + destination
+                                                                         + " timeout=" + config.requestTimeout()));
+                }
+            }, config.requestTimeout().toMillis(), TimeUnit.MILLISECONDS);
+            response.timeoutTask = timeoutTask;
+        }
         return future;
     }
 
@@ -323,9 +352,10 @@ public final class TcpTransport implements Transport {
         }
         Optional<UUID> maybeCorrelation = message.correlationId();
         if (maybeCorrelation.isPresent()) {
-            CompletableFuture<ClusterMessage> future = pendingResponses.remove(maybeCorrelation.get());
-            if (future != null) {
-                future.complete(message);
+            PendingResponse response = pendingResponses.remove(maybeCorrelation.get());
+            if (response != null) {
+                response.cancelTimeout();
+                response.future.complete(message);
                 return;
             }
         }
@@ -335,6 +365,12 @@ public final class TcpTransport implements Transport {
     private void handleDisconnect(Connection connection) {
         connection.remoteId().ifPresent(nodeId -> {
             connections.remove(nodeId, connection);
+            pendingResponses.forEach((requestId, pending) -> {
+                if (nodeId.equals(pending.destination) && pendingResponses.remove(requestId, pending)) {
+                    pending.cancelTimeout();
+                    pending.future.completeExceptionally(new PeerDisconnectedException(nodeId, requestId));
+                }
+            });
             listeners.forEach(listener -> listener.onPeerDisconnected(nodeId));
         });
     }
@@ -351,7 +387,10 @@ public final class TcpTransport implements Transport {
             connection.close();
         }
         connections.clear();
-        pendingResponses.values().forEach(future -> future.completeExceptionally(new IOException("Transport closed")));
+        pendingResponses.values().forEach(pending -> {
+            pending.cancelTimeout();
+            pending.future.completeExceptionally(new IOException("Transport closed"));
+        });
         pendingResponses.clear();
     }
 
@@ -449,6 +488,24 @@ public final class TcpTransport implements Transport {
             try {
                 socket.close();
             } catch (IOException ignored) {
+            }
+        }
+    }
+
+    private static final class PendingResponse {
+        private final NodeId destination;
+        private final CompletableFuture<ClusterMessage> future;
+        private volatile ScheduledFuture<?> timeoutTask;
+
+        private PendingResponse(NodeId destination, CompletableFuture<ClusterMessage> future) {
+            this.destination = destination;
+            this.future = future;
+        }
+
+        private void cancelTimeout() {
+            ScheduledFuture<?> task = timeoutTask;
+            if (task != null) {
+                task.cancel(false);
             }
         }
     }

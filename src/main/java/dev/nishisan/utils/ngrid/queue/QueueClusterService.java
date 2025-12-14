@@ -17,6 +17,7 @@
 
 package dev.nishisan.utils.ngrid.queue;
 
+import dev.nishisan.utils.ngrid.replication.QuorumUnreachableException;
 import dev.nishisan.utils.ngrid.replication.ReplicationManager;
 import dev.nishisan.utils.ngrid.replication.ReplicationResult;
 import dev.nishisan.utils.queue.NQueue;
@@ -29,6 +30,8 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.TimeoutException;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -82,7 +85,18 @@ public final class QueueClusterService<T extends Serializable> implements Closea
     }
 
     private void waitForReplication(CompletableFuture<ReplicationResult> future) {
-        future.join();
+        try {
+            future.join();
+        } catch (CompletionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof TimeoutException) {
+                throw new IllegalStateException("Replication operation timed out", cause);
+            } else if (cause instanceof QuorumUnreachableException) {
+                throw new IllegalStateException("Quorum unreachable for replication operation", cause);
+            } else {
+                throw new IllegalStateException("Replication operation failed", cause != null ? cause : e);
+            }
+        }
     }
 
     @SuppressWarnings("unchecked")

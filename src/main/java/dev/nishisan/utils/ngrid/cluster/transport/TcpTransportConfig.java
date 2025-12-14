@@ -33,12 +33,14 @@ public final class TcpTransportConfig {
     private final Set<NodeInfo> initialPeers;
     private final Duration connectTimeout;
     private final Duration reconnectInterval;
+    private final Duration requestTimeout;
 
     private TcpTransportConfig(Builder builder) {
         this.local = builder.local;
         this.initialPeers = Collections.unmodifiableSet(new HashSet<>(builder.initialPeers));
         this.connectTimeout = builder.connectTimeout;
         this.reconnectInterval = builder.reconnectInterval;
+        this.requestTimeout = builder.requestTimeout;
     }
 
     public NodeInfo local() {
@@ -57,6 +59,13 @@ public final class TcpTransportConfig {
         return reconnectInterval;
     }
 
+    /**
+     * Timeout for request/response style calls (e.g. {@link TcpTransport#sendAndAwait(dev.nishisan.utils.ngrid.common.ClusterMessage)}).
+     */
+    public Duration requestTimeout() {
+        return requestTimeout;
+    }
+
     public static Builder builder(NodeInfo local) {
         return new Builder(local);
     }
@@ -66,6 +75,7 @@ public final class TcpTransportConfig {
         private final Set<NodeInfo> initialPeers = new HashSet<>();
         private Duration connectTimeout = Duration.ofSeconds(5);
         private Duration reconnectInterval = Duration.ofSeconds(3);
+        private Duration requestTimeout = Duration.ofSeconds(10);
 
         private Builder(NodeInfo local) {
             this.local = Objects.requireNonNull(local, "local");
@@ -85,6 +95,11 @@ public final class TcpTransportConfig {
 
         public Builder reconnectInterval(Duration interval) {
             this.reconnectInterval = Objects.requireNonNull(interval, "interval");
+            return this;
+        }
+
+        public Builder requestTimeout(Duration timeout) {
+            this.requestTimeout = Objects.requireNonNull(timeout, "timeout");
             return this;
         }
 
