@@ -1,90 +1,193 @@
-# NGrid — Arquitetura (visão técnica)
+# NGrid – Arquitetura e Visão Técnica
 
-Este documento descreve a arquitetura e os mecanismos internos do **NGrid** (cluster TCP, eleição de líder, replicação com quorum e estruturas distribuídas).
+Este documento descreve a arquitetura do **NGrid**, detalhando suas camadas, mecanismos internos (cluster TCP, eleição de líder, replicação com quorum) e a implementação das estruturas distribuídas.
 
-## Visão geral
+## Visão Geral
 
-O NGrid é uma biblioteca Java que permite executar, em um **cluster de nós**, estruturas distribuídas simples:
+O NGrid é uma biblioteca Java projetada para executar estruturas de dados distribuídas em um **cluster de nós**, garantindo consistência e disponibilidade através de um modelo baseado em líder.
 
-- **Fila distribuída**: `DistributedQueue<T>` (internamente usa `NQueue<T>` como backend persistente local).
+As principais estruturas suportadas são:
+
+- **Fila distribuída**: `DistributedQueue<T>` (utiliza `NQueue<T>` como backend persistente local).
 - **Mapa distribuído**: `DistributedMap<K,V>` (replicado em memória via `ConcurrentHashMap`, com **persistência local opcional** via WAL + snapshot).
 
-O cluster é **leader-based**: leituras/escritas são roteadas ao **líder** (ou executadas localmente se o nó já for líder).
+O cluster opera no modelo **leader-based**: todas as operações de escrita (e leituras que exigem consistência forte) são roteadas para o **líder**. Se o nó atual já for o líder, a execução é local; caso contrário, é feito um encaminhamento transparente.
 
-## Componentes e camadas
+---
 
-### 1) Transporte (TCP)
+## Camadas e Componentes
 
-Implementação: `dev.nishisan.utils.ngrid.cluster.transport.TcpTransport`
+A arquitetura do NGrid é organizada em camadas lógicas que separam a responsabilidade de rede, coordenação, replicação e estruturas de dados.
 
-Responsabilidades principais:
+### 1. Camada de Transporte (TCP)
+**Implementação:** `dev.nishisan.utils.ngrid.cluster.transport.TcpTransport`
 
-- **Conectividade TCP** entre nós.
-- **Descoberta progressiva** (gossip simples) via:
-  - `HANDSHAKE`: troca metadados do nó + lista de peers conhecidos.
-  - `PEER_UPDATE`: broadcast periódico/reativo da lista de peers.
-- **RPC interno** via mensagens `CLIENT_REQUEST`/`CLIENT_RESPONSE` com correlação (`correlationId`) para `sendAndAwait`.
+Responsável pela comunicação de baixo nível entre os nós.
+- **Conectividade:** Mantém conexões TCP persistentes entre os membros do cluster.
+- **Descoberta (Gossip Simples):**
+  - `HANDSHAKE`: Na conexão, troca metadados do nó e lista de peers conhecidos.
+  - `PEER_UPDATE`: Broadcast periódico ou reativo para compartilhar novos peers descobertos, permitindo o fechamento da malha (full mesh).
+- **RPC Interno:** Suporta mensagens do tipo `CLIENT_REQUEST`/`CLIENT_RESPONSE` com correlação (`correlationId`), permitindo chamadas síncronas (`sendAndAwait`).
 
-### 2) Coordenação (membros + líder)
+### 2. Camada de Coordenação
+**Implementação:** `dev.nishisan.utils.ngrid.cluster.coordination.ClusterCoordinator`
 
-Implementação: `dev.nishisan.utils.ngrid.cluster.coordination.ClusterCoordinator`
+Gerencia o estado do cluster e a liderança.
+- **Membros Ativos:** Mantém a lista de membros vivos baseada em mensagens de `HEARTBEAT`.
+- **Detecção de Falhas:** Marca membros como inativos após um timeout sem heartbeat.
+- **Eleição de Líder:**
+  - O mecanismo é **determinístico**: o líder é sempre o nó com o **maior `NodeId` ativo**.
+  - Todos os nós convergem para o mesmo líder assim que a lista de membros é sincronizada.
+  - Expõe APIs para verificar liderança (`isLeader()`) e obter informações do líder atual (`leaderInfo()`).
 
-Responsabilidades principais:
+### 3. Camada de Replicação e Quorum
+**Implementação:** `dev.nishisan.utils.ngrid.replication.ReplicationManager`
 
-- Manter a lista de **membros ativos** com base em `HEARTBEAT`.
-- Marcar membros como inativos por **timeout**.
-- Eleição de líder **determinística**: o líder é o nó com **maior `NodeId` ativo**.
-- Expor:
-  - `isLeader()`
-  - `leaderInfo()`
-  - `activeMembers()`
+Garante a consistência dos dados através da replicação de operações.
+- **Centralização no Líder:** Apenas o líder pode iniciar replicações (`replicate(...)`).
+- **Fluxo de Replicação:**
+  1. O líder envia `REPLICATION_REQUEST` para todos os followers.
+  2. Aguarda `REPLICATION_ACK` dos followers.
+  3. Confirma a operação (`COMMITTED`) quando atinge o **quorum** (maioria, incluindo o próprio líder).
+- **Deduplicação:** Operações recebidas repetidamente (mesmo `operationId`) não são reaplicadas, via conjunto em memória de IDs já aplicados (`applied`).
+- **Cálculo de Quorum:** O quorum efetivo se adapta ao tamanho do cluster ativo:
+  \( \text{quorumEfetivo} = \max(1, \min(\text{config.quorum}, |\text{membrosAtivos}|)) \)
+- **Timeout e quorum inalcançável:**
+  - Se a operação exceder o `operationTimeout` (padrão: 30s), ela pode falhar por timeout.
+  - Se peers desconectarem e o cluster não tiver membros alcançáveis suficientes para satisfazer o quorum, a operação falha como “quorum inalcançável”.
 
-### 3) Replicação com quorum
+### 4. Camada de Estruturas Distribuídas
+**Implementações:** `DistributedQueue`, `DistributedMap`
 
-Implementação: `dev.nishisan.utils.ngrid.replication.ReplicationManager`
+Expõe as APIs de alto nível para o usuário final e faz a ponte com as camadas inferiores.
+- **Roteamento Transparente:**
+  - Se `coordinator.isLeader()`: Executa a operação localmente e inicia a replicação.
+  - Se `!isLeader()`: Encaminha a operação ao líder via `CLIENT_REQUEST` e aguarda a resposta.
+- **Integração com Backend:** Conecta a lógica distribuída com o armazenamento local (como a `NQueue` ou `ConcurrentHashMap`).
 
-Responsabilidades principais:
+### 5. Bootstrap do Nó
+**Implementação:** `dev.nishisan.utils.ngrid.structures.NGridNode`
 
-- Permitir que **apenas o líder** inicie replicações (`replicate(...)`).
-- Enviar `REPLICATION_REQUEST` para os followers e coletar `REPLICATION_ACK`.
-- Confirmar a operação quando atingir **quorum** (inclui o próprio líder).
-- Deduplicação em followers por `operationId` (set `applied`).
+O `NGridNode` é o ponto de entrada que inicializa e integra todos os componentes acima (Transporte, Coordenação, Replicação e Serviços de Mapa/Fila).
 
-Observação: o quorum efetivo é limitado pelo tamanho de `activeMembers()`:
+---
 
-- \(quorumEfetivo = \max(1, \min(config.quorum, membrosAtivos))\)
+## Ciclo de vida e eventos (visão “pé no código”)
 
-### 4) Estruturas distribuídas
+Esta seção descreve os eventos e o ciclo de vida que você vai observar ao usar as classes principais.
 
-Implementações:
+### Ciclo de vida do `NGridNode`
 
-- `dev.nishisan.utils.ngrid.structures.DistributedQueue`
-- `dev.nishisan.utils.ngrid.structures.DistributedMap`
+O `NGridNode` não cria nada “preguiçosamente”: o `start()` sobe todos os componentes e o `close()` derruba em ordem segura (best-effort, acumulando o primeiro `IOException`).
 
-Responsabilidades:
+#### `start()` (ordem real)
 
-- Expor API amigável para o consumidor da biblioteca.
-- **Roteamento para o líder**:
-  - Se `coordinator.isLeader()`: executa localmente.
-  - Caso contrário: envia `CLIENT_REQUEST` ao líder e aguarda `CLIENT_RESPONSE`.
+```mermaid
+sequenceDiagram
+participant App as App
+participant Node as NGridNode
+participant T as TcpTransport
+participant C as ClusterCoordinator
+participant R as ReplicationManager
+participant QS as QueueClusterService
+participant MS as MapClusterService
+participant MP as MapPersistence
 
-### 5) Bootstrap do nó
+App->>Node: start()
+Node->>T: new TcpTransport(config.local+peers)
+Node->>T: start()
+Node->>C: new ClusterCoordinator(transport, defaults, scheduler)
+Node->>C: start()
+Node->>R: new ReplicationManager(transport, coordinator, ReplicationConfig.of(quorum))
+Node->>R: start()
+Node->>QS: new QueueClusterService(queueDirectory, queueName, replicationManager)
+alt mapPersistenceMode != DISABLED
+  Node->>MS: new MapClusterService(replicationManager, MapPersistenceConfig.defaults(...))
+  Node->>MS: loadFromDisk()
+  MS->>MP: load()
+  MS->>MP: start()
+else mapPersistenceMode == DISABLED
+  Node->>MS: new MapClusterService(replicationManager)
+end
+Node->>Node: new DistributedQueue(transport, coordinator, queueService)
+Node->>Node: new DistributedMap(transport, coordinator, mapService)
+```
 
-Implementação: `dev.nishisan.utils.ngrid.structures.NGridNode`
+#### `close()` (ordem real)
 
-O `NGridNode` amarra tudo:
+```mermaid
+sequenceDiagram
+participant App as App
+participant Node as NGridNode
+participant DQ as DistributedQueue
+participant DM as DistributedMap
+participant R as ReplicationManager
+participant C as ClusterCoordinator
+participant S as Scheduler
+participant T as TcpTransport
 
-- `TcpTransport` (rede e descoberta)
-- `ClusterCoordinator` (membros + líder)
-- `ReplicationManager` (quorum/replicação)
-- `QueueClusterService` (fila distribuída em cima de `NQueue`)
-- `MapClusterService` (mapa distribuído em memória, com persistência local opcional quando configurada)
+App->>Node: close()
+Node->>DQ: close()
+Node->>DM: close()
+Node->>R: close()
+Node->>C: close()
+Node->>S: shutdownNow()
+Node->>T: close()
+```
 
-## Fluxos principais
+### Eventos e listeners (cluster)
 
-### Descoberta e formação da malha (mesh)
+#### 1) Eventos de transporte (`TransportListener`)
 
-O `TcpTransport` tenta conectar nos peers iniciais e, a cada `HANDSHAKE`, faz merge das listas de peers e tenta novas conexões.
+O transporte dispara eventos de baixo nível:
+- `onPeerConnected(NodeInfo)`
+- `onPeerDisconnected(NodeId)`
+- `onMessage(ClusterMessage)`
+
+Esses eventos são consumidos por camadas superiores (coordenação, replicação e as fachadas distribuídas).
+
+#### 2) Eventos de liderança (`ClusterCoordinator`)
+
+O `ClusterCoordinator` recomputa o líder sempre que a visão de membros muda (conexão, desconexão, heartbeat, eviction por timeout). Existem dois tipos de callback relevantes:
+
+- `LeadershipListener#onLeaderChanged(NodeId newLeader)`:
+  - Dispara sempre que o líder observado muda (mesmo que o nó local não ganhe/perca liderança).
+- `LeaderElectionListener#onLeadershipChanged(boolean isLeader, NodeId currentLeader)`:
+  - Dispara apenas quando o **nó local** muda seu estado de liderança (ganha ou perde).
+
+```mermaid
+sequenceDiagram
+participant T as Transport
+participant C as ClusterCoordinator
+participant LL as LeadershipListener
+participant EL as LeaderElectionListener
+
+T-->>C: onPeerConnected/onPeerDisconnected/onMessage(HEARTBEAT)
+C->>C: recomputeLeader()
+alt leaderId mudou
+  C-->>LL: onLeaderChanged(newLeader)
+  alt local ganhou/perdeu liderança
+    C-->>EL: onLeadershipChanged(isLeader, newLeader)
+  end
+end
+```
+
+### Ciclo de vida do membro no cluster (simplificado)
+
+```mermaid
+stateDiagram-v2
+  [*] --> Desconhecido
+  Desconhecido --> Ativo: onPeerConnected() ou HEARTBEAT
+  Ativo --> Inativo: onPeerDisconnected()
+  Ativo --> Inativo: heartbeatTimeout (evictDeadMembers)
+  Inativo --> Ativo: reconexao + HEARTBEAT/onPeerConnected
+```
+
+## Fluxos Principais
+
+### Descoberta e Formação da Malha
+
+O processo de descoberta garante que todos os nós se conectem entre si, mesmo que conheçam apenas um peer inicial.
 
 ```mermaid
 sequenceDiagram
@@ -93,52 +196,43 @@ participant B as NodeB
 participant C as NodeC
 
 Note over A,B: A conecta em B (peer inicial)
-A->>B: HANDSHAKE(localInfo,knownPeers)
-B->>A: HANDSHAKE(localInfo,knownPeers)
+A->>B: HANDSHAKE(localInfo, knownPeers)
+B->>A: HANDSHAKE(localInfo, knownPeers)
 
-Note over A,C: A aprende C via lista de peers
+Note over A,C: A aprende sobre C via lista de peers de B
 A->>C: connect()
-A->>C: HANDSHAKE(localInfo,knownPeers)
-C->>A: HANDSHAKE(localInfo,knownPeers)
+A->>C: HANDSHAKE(localInfo, knownPeers)
+C->>A: HANDSHAKE(localInfo, knownPeers)
 
-Note over A,B,C: PEER_UPDATE ajuda late joiners
+Note over A,B,C: PEER_UPDATE ajuda nós que entraram depois (late joiners)
 A-->>B: PEER_UPDATE(peers)
 B-->>C: PEER_UPDATE(peers)
 ```
 
-### Heartbeat e detecção de falha
+### Heartbeat e Eleição
 
-O `ClusterCoordinator` emite `HEARTBEAT` periodicamente e marca membros inativos por timeout.
-
-```mermaid
-sequenceDiagram
-participant Coord as ClusterCoordinator
-participant T as Transport
-participant Peer as PeerNode
-
-Coord->>T: broadcast(HEARTBEAT)
-T-->>Peer: HEARTBEAT
-Peer-->>Coord: HEARTBEAT (via TransportListener)
-Note over Coord: Atualiza lastHeartbeat do membro
-Note over Coord: Se timeout excedido, marca inativo
-```
-
-### Eleição de líder
-
-Política: **maior `NodeId` ativo vence**.
+A saúde do cluster é monitorada continuamente. A eleição é uma consequência direta da visão de membros ativos.
 
 ```mermaid
 flowchart TD
-members[activeMembers] --> pickLeader[pickMaxNodeId]
-pickLeader --> leaderNode[leaderId]
-leaderNode --> isLeaderCheck{localNodeId==leaderId?}
-isLeaderCheck -->|sim| leaderRole[Lider]
-isLeaderCheck -->|nao| followerRole[Follower]
+    subgraph Heartbeat
+    Coord[ClusterCoordinator] -->|broadcast| T[Transport]
+    T -->|HEARTBEAT| Peer[PeerNode]
+    Peer -->|HEARTBEAT| Coord
+    end
+    
+    subgraph Eleicao
+    members[activeMembers] --> pickLeader[pickMaxNodeId]
+    pickLeader --> leaderNode[leaderId]
+    leaderNode --> isLeaderCheck{localNodeId == leaderId?}
+    isLeaderCheck -->|Sim| leaderRole[Líder]
+    isLeaderCheck -->|Não| followerRole[Follower]
+    end
 ```
 
-### Replicação (quorum)
+### Replicação de Operações (Escrita)
 
-Uma operação mutável é aplicada localmente no líder, replicada aos followers e confirmada quando atinge quorum.
+Toda operação que altera estado (`offer`, `put`, `remove`, `poll`) segue este fluxo para garantir consistência:
 
 ```mermaid
 sequenceDiagram
@@ -147,57 +241,70 @@ participant Leader as LeaderNode
 participant F1 as Follower1
 participant F2 as Follower2
 
-Client->>Leader: (API) offer/put/remove/poll
-Leader->>Leader: aplicaLocal(handler.apply)
-Leader->>F1: REPLICATION_REQUEST(operationId,topic,payload)
-Leader->>F2: REPLICATION_REQUEST(operationId,topic,payload)
-F1-->>Leader: REPLICATION_ACK(operationId)
-F2-->>Leader: REPLICATION_ACK(operationId)
-Note over Leader: quando ackCount >= quorum => COMMITTED
-Leader-->>Client: sucesso
+Client->>Leader: offer/put/remove
+Leader->>Leader: Aplica Localmente (Log/Memória)
+Leader->>F1: REPLICATION_REQUEST(opId, payload)
+Leader->>F2: REPLICATION_REQUEST(opId, payload)
+F1-->>Leader: REPLICATION_ACK(opId)
+F2-->>Leader: REPLICATION_ACK(opId)
+Note over Leader: Acks >= Quorum?
+Leader->>Leader: Marca COMMITTED
+Leader-->>Client: Sucesso
 ```
 
-### Roteamento de chamadas (follower → líder)
+---
 
-Se um cliente chama `queue.poll()` ou `map.put(...)` em um follower, o `DistributedQueue/DistributedMap` faz RPC interno:
+## Estruturas Distribuídas em Detalhe
 
-```mermaid
-sequenceDiagram
-participant App as App
-participant F as FollowerNode
-participant L as LeaderNode
+### Fila Distribuída (`DistributedQueue`)
 
-App->>F: queue.poll()
-F->>L: CLIENT_REQUEST(command,body)
-L->>L: executaLocal(command)
-L-->>F: CLIENT_RESPONSE(success,body)
-F-->>App: Optional<T>
-```
+**Integração com NQueue:**
+- Utiliza a biblioteca `NQueue` como backend de persistência em disco em cada nó.
+- Cada nó possui sua própria instância de `NQueue` em um diretório configurado.
 
-## Integração com NQueue (fila persistente local)
+**Operações:**
+- **`offer(item)`**: O líder grava na sua `NQueue` local e replica o item para as `NQueue` dos followers. Confirmado apenas após quorum.
+- **`poll()`**: Coordenado pelo líder. O líder determina qual é o próximo item (via `peek` local), e replica um comando de `POLL` para garantir que todos os nós desenfileirem o mesmo item.
+- **`peek()`**: O líder consulta sua fila local e retorna o item sem removê-lo.
 
-Implementação do backend local: `dev.nishisan.utils.queue.NQueue`
+### Mapa Distribuído (`DistributedMap`)
 
-Integração do NGrid com NQueue: `dev.nishisan.utils.ngrid.queue.QueueClusterService`
+**Armazenamento:**
+- Em memória (`ConcurrentHashMap`) em todos os nós.
+- **Persistência Opcional:** Cada nó pode ser configurado independentemente para persistir dados em disco (WAL + Snapshot), acelerando sua recuperação após reinício.
 
-Pontos importantes:
+**Operações:**
+- **`put(key, value)`**: Enviado ao líder, aplicado, replicado e confirmado. Sobrescreve valores anteriores.
+- **`remove(key)`**: Enviado ao líder, replicado com comando `REMOVE` e aplicado em todos os nós (remoção direta da chave).
+- **`get(key)`**: Servido pelo líder na fachada `DistributedMap` (modelo simples de consistência forte).
 
-- Cada nó abre sua própria `NQueue` (`baseDir` + `queueName`).
-- Operações mutáveis são replicadas via `ReplicationManager` usando o tópico `"queue"`.
-- `poll()` na fila distribuída funciona como:
-  - Ler `peek()` local para descobrir o próximo item.
-  - Replicar um comando `POLL(expectedValue)` para manter as réplicas alinhadas.
-  - Aplicar `queue.poll()` em cada nó na replicação.
+---
 
-## Limitações atuais (MVP)
+## Falhas e respostas típicas (o que você verá em runtime)
 
-- **Leader-based para operações**: followers sempre encaminham operações para o líder.
-- **Map em memória**: `MapClusterService` usa `ConcurrentHashMap` (persistência é opcional por nó).
-- **Persistência do mapa (quando habilitada)**: recuperação local via snapshot + WAL (não substitui a replicação distribuída).
-- **Deduplicação não-durável**: a deduplicação via `applied` é em memória; em reinícios, o cluster depende do estado persistido (fila) + tráfego de replicação corrente.
+### Chamadas do cliente (follower -> líder)
+- Quando você chama `DistributedQueue`/`DistributedMap` em um follower, a chamada vira um `CLIENT_REQUEST` para o líder.
+- Se o nó remoto **não for líder**, ele responde erro “Not the leader” e o cliente recebe exceção (`IllegalStateException`).
 
-## Utilitários relacionados
+### Replicação (líder)
+- **Timeout:** a operação pode falhar se exceder o `operationTimeout` configurado no `ReplicationManager` (padrão ~30s).
+- **Quorum inalcançável:** se peers desconectarem e o cluster não tiver membros alcançáveis suficientes para atingir o quorum efetivo, a operação falha como “quorum unreachable”.
 
-- `dev.nishisan.utils.ngrid.LeaderElectionUtils`: wrapper para criar um serviço de eleição de líder reutilizável (útil quando você quer usar apenas “cluster + líder” sem Map/Queue).
+---
 
+## Tolerância a Falhas e Limitações
 
+### Recuperação de Falha do Líder
+1. Se o líder falha (para de enviar heartbeats).
+2. Os followers detectam o timeout e o removem da lista de membros ativos.
+3. O algoritmo de eleição (`pickMaxNodeId`) seleciona determinísticamente o novo líder entre os nós restantes.
+4. O novo líder assume o controle das operações e da coordenação.
+
+### Limitações Atuais (MVP)
+- **Escrita Centralizada:** Todas as escritas dependem do líder, o que simplifica a consistência mas pode ser um gargalo em clusters muito grandes.
+- **Mapa em Memória:** O tamanho do mapa é limitado pela RAM disponível nos nós (embora a persistência em disco ajude na durabilidade, ela não estende a capacidade de armazenamento).
+- **Deduplicação em Memória:** O registro de operações aplicadas (`applied`) reside em memória. Em caso de reinício total do cluster, a consistência depende do estado persistido (fila/mapa) e do tráfego de replicação.
+
+## Utilitários
+
+- **`LeaderElectionUtils`**: Permite utilizar apenas o mecanismo de eleição de líder e descoberta do NGrid em outras aplicações, sem a necessidade de usar as estruturas de dados distribuídas.

@@ -32,13 +32,13 @@ Coleção de utilitários em Java, com foco em:
 
 ## Instalação (Maven)
 
-Versão do artefato no projeto: **1.0.10** (`pom.xml`).
+Versão do artefato no projeto: **1.0.14** (`pom.xml`).
 
 ```xml
 <dependency>
   <groupId>dev.nishisan</groupId>
   <artifactId>nishi-utils</artifactId>
-  <version>1.0.10</version>
+  <version>1.0.14</version>
 </dependency>
 ```
 
@@ -216,10 +216,52 @@ public class NGridClusterExample {
 - **Replicação**: operação com ID, replicação e ACK até atingir quorum
 - **Estruturas**: `DistributedQueue` e `DistributedMap`
 
-Para detalhes:
+```mermaid
+flowchart TD
+  subgraph nishiUtils [nishi-utils]
+    subgraph nqueue [NQueue]
+      NQueueAPI[NQueue<T>]
+      NQueueFiles["Arquivos: data.log + queue.meta"]
+      NQueueAPI --> NQueueFiles
+    end
 
-- `doc/ngrid/architecture.md`
-- `doc/ngrid/mvp-overview.md`
+    subgraph ngrid [NGrid]
+      NGridNode[NGridNode]
+      Transport[TcpTransport]
+      Coordinator[ClusterCoordinator]
+      Replication[ReplicationManager]
+      DQueue[DistributedQueue]
+      DMap[DistributedMap]
+      QSvc[QueueClusterService]
+      MSvc[MapClusterService]
+      MPersist[MapPersistence\n(WAL + Snapshot)]
+
+      NGridNode --> Transport
+      NGridNode --> Coordinator
+      NGridNode --> Replication
+      NGridNode --> DQueue
+      NGridNode --> DMap
+
+      DQueue --> QSvc
+      QSvc --> NQueueAPI
+
+      DMap --> MSvc
+      MSvc --> MPersist
+    end
+
+    subgraph stats [Stats]
+      StatsUtils[StatsUtils]
+    end
+  end
+```
+
+Para detalhes (docs em pt-BR):
+
+- `doc/ngrid/arquitetura.md`
+- `doc/ngrid/guia-utilizacao.md`
+- `doc/ngrid/map-design.md`
+- `doc/ngrid/nqueue-integration.md`
+- `doc/nqueue-readme.md`
 
 ## Stats (métricas)
 
@@ -241,5 +283,6 @@ mvn test
 ## Licença
 
 Este projeto é distribuído sob **GNU GPL v3** (ou posterior). Veja os cabeçalhos dos arquivos-fonte para detalhes.
+
 
 

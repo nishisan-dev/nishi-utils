@@ -12,7 +12,7 @@ Adicione a dependência do projeto (ajuste a versão conforme seu release):
 <dependency>
   <groupId>dev.nishisan</groupId>
   <artifactId>nishi-utils</artifactId>
-  <version>1.0.10</version>
+  <version>1.0.14</version>
 </dependency>
 ```
 
@@ -109,6 +109,8 @@ import java.util.Optional;
 
 public class NGridThreeNodesExample {
   public static void main(String[] args) throws Exception {
+    // Dica: em testes/ambientes compartilhados (CI), prefira portas efêmeras para evitar colisões.
+    // Para simplificar a demo, aqui ainda usamos portas fixas.
     NodeInfo n1 = new NodeInfo(NodeId.of("node-1"), "127.0.0.1", 9011);
     NodeInfo n2 = new NodeInfo(NodeId.of("node-2"), "127.0.0.1", 9012);
     NodeInfo n3 = new NodeInfo(NodeId.of("node-3"), "127.0.0.1", 9013);
@@ -165,6 +167,31 @@ public class NGridThreeNodesExample {
     }
   }
 }
+```
+
+### Ciclo de vida do nó (start/close) e boas práticas
+
+- **`start()`**: sobe transporte TCP, coordenação (heartbeat + eleição), replicação (quorum + timeout), e por fim as fachadas `DistributedQueue`/`DistributedMap`.
+- **`close()`**: encerra as fachadas e serviços, para o replicador, coordenação, scheduler e transporte (best-effort; se houver erro de IO, propaga o primeiro).
+- **Boas práticas**:
+  - Sempre use `try-with-resources` com `NGridNode`.
+  - Evite reusar o mesmo `nodeId` em dois processos ao mesmo tempo.
+  - Garanta que `queueDirectory` seja persistente se você quiser durabilidade/restart.
+
+```mermaid
+sequenceDiagram
+participant App as App
+participant Node as NGridNode
+participant C as ClusterCoordinator
+participant R as ReplicationManager
+
+App->>Node: start()
+Node->>C: start()
+Node->>R: start()
+Note over Node: Node pronto para aceitar chamadas via DistributedQueue/Map
+App->>Node: close()
+Node->>R: close()
+Node->>C: close()
 ```
 
 ## 3) DistributedQueue (fila distribuída)
@@ -303,6 +330,26 @@ public class LeaderElectionOnlyExample {
 ```
 
 > Nota: o `LeaderElectionService#close()` fecha internamente o `ClusterCoordinator`, que encerra o scheduler (veja o javadoc do utilitário). Use um scheduler dedicado.
+
+### 5.1.1) Eventos de liderança (diferença entre `LeadershipListener` e `LeaderElectionListener`)
+
+- **`LeadershipListener`**: notificado quando o líder observado muda (mesmo que o nó local não ganhe/perca liderança).
+- **`LeaderElectionListener`**: notificado quando o nó local ganha/perde liderança.
+
+```mermaid
+sequenceDiagram
+participant C as ClusterCoordinator
+participant LL as LeadershipListener
+participant EL as LeaderElectionListener
+
+C->>C: recomputeLeader()
+alt leader mudou
+  C-->>LL: onLeaderChanged(newLeader)
+  alt local ganhou/perdeu liderança
+    C-->>EL: onLeadershipChanged(isLeader, newLeader)
+  end
+end
+```
 
 ### 5.2) StatsUtils (métricas simples)
 

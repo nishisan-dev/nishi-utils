@@ -22,8 +22,27 @@ Se você usa Maven, adicione a seguinte dependência ao seu `pom.xml` (lembre-se
 <dependency>
     <groupId>dev.nishisan</groupId>
     <artifactId>nishi-utils</artifactId>
-    <version>1.0.0</version>
+    <version>1.0.14</version>
 </dependency>
+```
+
+## Arquitetura (alto nível)
+
+A `NQueue` é uma fila persistente baseada em **dois arquivos por fila** e um fluxo de **compactação** em background.
+
+```mermaid
+flowchart TD
+  NQ[NQueue<T>]
+  Data[data.log]
+  Meta[queue.meta]
+  Temp[data.log.compacting]
+  Worker[nqueue-compaction-worker]
+
+  NQ --> Data
+  NQ --> Meta
+  NQ --> Worker
+  Worker --> Temp
+  Worker --> Data
 ```
 
 ### 2. Abrindo ou criando uma fila
@@ -49,9 +68,30 @@ try (NQueue<String> queue = NQueue.open(baseDir, queueName)) {
 ```
 **Importante:** É fundamental usar a `NQueue` dentro de um bloco `try-with-resources` ou chamar `queue.close()` explicitamente em um bloco `finally` para garantir que os recursos (arquivos) sejam liberados corretamente.
 
+### Ciclo de vida (open → uso → close)
+
+- **open**: cria `{baseDir}/{queueName}/`, abre `data.log`, lê/valida `queue.meta` e, se necessário, reconstrói offsets para manter consistência.
+- **uso**: `offer/peek/poll` com thread-safety (lock interno) e suporte a `poll(timeout, unit)` (bloqueante).
+- **close**: fecha arquivos e encerra o worker de compactação (best-effort).
+
 ### 3. Adicionando itens (`offer`)
 
 Use o método `offer()` para adicionar um item ao final da fila.
+
+```mermaid
+sequenceDiagram
+participant App as App
+participant Q as NQueue
+participant DF as data.log
+participant MF as queue.meta
+
+App->>Q: offer(obj)
+Q->>Q: lock + serialize(obj)
+Q->>DF: append(header + payload)
+Q->>Q: atualiza producerOffset/recordCount
+Q->>MF: persistMeta(...)
+Q-->>App: offset (long)
+```
 
 ```java
 try (NQueue<String> queue = NQueue.open(baseDir, queueName)) {
@@ -64,6 +104,25 @@ try (NQueue<String> queue = NQueue.open(baseDir, queueName)) {
 ### 4. Consumindo itens (`poll`)
 
 Use o método `poll()` para recuperar e remover o item do início da fila. Se a fila estiver vazia, o método retorna um `Optional.empty()`.
+
+```mermaid
+sequenceDiagram
+participant App as App
+participant Q as NQueue
+participant DF as data.log
+participant MF as queue.meta
+
+App->>Q: poll()
+Q->>Q: lock
+alt fila_vazia
+  Q-->>App: Optional.empty
+else ha_item
+  Q->>DF: read(record at consumerOffset)
+  Q->>Q: consumerOffset += recordSize; recordCount--
+  Q->>MF: persistMeta(...)
+  Q-->>App: Optional(value)
+end
+```
 
 ```java
 try (NQueue<String> queue = NQueue.open(baseDir, queueName)) {
@@ -166,6 +225,8 @@ public class NQueueExample {
 import java.time.Duration;
 
 NQueue.Options options = NQueue.Options.defaults()
+    // Quando true, força fsync em pontos críticos (mais durabilidade, menos performance)
+    .withFsync(false)
     // Inicia a compactação se o espaço desperdiçado for >= 30% do tamanho total
     .withCompactionWasteThreshold(0.3)
     // Força uma compactação a cada 10 minutos se houver qualquer espaço desperdiçado
@@ -189,3 +250,26 @@ A `NQueue` utiliza uma abordagem simples e robusta para persistir os dados. Para
     *   `recordCount`: O número total de itens atualmente na fila.
 
 Quando um item é consumido, apenas o `consumerOffset` é atualizado no arquivo de metadados. O dado permanece no `data.log` até que o processo de **compactação** seja acionado. A compactação copia os dados ainda válidos para o início do arquivo, descartando o espaço ocupado por registros já consumidos.
+
+### Compactação (visão prática)
+
+- A compactação roda em um worker daemon (`nqueue-compaction-worker`).
+- Ela usa um arquivo temporário (`data.log.compacting`) para reescrever apenas os registros ainda válidos e então substitui o `data.log`.
+- Pode ser disparada por:
+  - **waste threshold** (`withCompactionWasteThreshold`)
+  - **intervalo de tempo** (`withCompactionInterval`)
+
+```mermaid
+sequenceDiagram
+participant Q as NQueue
+participant Worker as CompactionWorker
+participant DF as data.log
+participant TMP as data.log.compacting
+participant MF as queue.meta
+
+Q->>Worker: maybeStartCompaction()
+Worker->>DF: read(remainingRecords)
+Worker->>TMP: write(compactedRecords)
+Worker->>DF: replaceWith(TMP)
+Worker->>MF: persistMeta(updatedOffsets)
+```

@@ -54,41 +54,106 @@ A lógica de **ordenação global** e **decisão de entrega** deve vir do líder
 
 ### `offer(item)`
 
-1. Cliente chama `offer` em qualquer nó.
-2. O nó:
-    - Se for líder:
-        - Registra a operação (com ID único) na camada de replicação.
-        - Aplica a operação na sua `NQueue` local (enqueue).
-        - Propaga a operação aos outros nós.
-        - Cada nó replica:
-            - Aplicando a mesma operação na sua `NQueue` local.
-        - Quando o líder recebe confirmações suficientes (quorum), ele:
-            - Marca a operação como `COMMITTED`.
-            - Retorna sucesso ao chamador.
-    - Se não for líder:
-        - Encaminha a operação ao líder via camada de cluster.
-        - Aguarda o resultado.
-        - Retorna o resultado ao chamador.
+Implementação atual (resumo):
+
+1. Cliente chama `offer` em qualquer nó (`DistributedQueue.offer`).
+2. Se o nó for follower, ele envia `CLIENT_REQUEST(queue.offer)` ao líder e aguarda `CLIENT_RESPONSE`.
+3. No líder, `QueueClusterService.offer` dispara `ReplicationManager.replicate("queue", OFFER(value))`.
+4. O `ReplicationManager` aplica a operação localmente primeiro (no handler do tópico `queue`), e só depois envia `REPLICATION_REQUEST` aos followers.
+5. A operação só é considerada bem-sucedida quando `acks >= quorumEfetivo`.
+
+```mermaid
+sequenceDiagram
+participant Client as Client
+participant F as FollowerNode
+participant L as LeaderNode
+participant DQ as DistributedQueue
+participant QS as QueueClusterService
+participant RM as ReplicationManager
+participant NQ as NQueue
+participant F1 as Follower1
+
+Client->>F: offer(value)
+F->>DQ: offer(value)
+DQ->>L: CLIENT_REQUEST("queue.offer", value)
+L->>DQ: onMessage(CLIENT_REQUEST)
+DQ->>QS: offer(value)
+QS->>RM: replicate("queue", OFFER(value))
+RM->>QS: applyReplication(opId, OFFER) (lider)
+QS->>NQ: offer(value)
+RM-->>F1: REPLICATION_REQUEST(opId, OFFER)
+F1-->>RM: REPLICATION_ACK(opId)
+RM->>RM: acks >= quorumEfetivo?
+RM-->>DQ: commit ok
+DQ-->>Client: ok
+```
 
 ### `poll()`
 
-1. Cliente chama `poll` em qualquer nó.
-2. O nó delega para o líder (diretamente ou via roteamento).
-3. O líder:
-    - Decide qual item é o próximo a ser entregue.
-    - Pode ler esse item da sua `NQueue` local.
-    - Opcionalmente, marcar o item como “in-flight” em alguma estrutura de controle.
-    - Devolve o item para o chamador.
-4. A remoção definitiva do item da `NQueue` pode:
-    - Ser imediata, ou
-    - Acontecer após algum tipo de confirmação adicional, dependendo da política de consumo (isso deve ser definido pela lógica de alto nível, não pela NQueue).
+Implementação atual (resumo):
+
+1. O líder faz `peek()` na sua `NQueue` local.
+2. Se estiver vazia, retorna `Optional.empty()`.
+3. Se houver item, o líder replica um comando `POLL(expectedValue)` para todos os nós.
+4. Ao aplicar `POLL` em cada nó:
+   - o nó valida (best-effort) se `peek()` local bate com o `expectedValue` (se não bater, loga warning),
+   - e então executa `NQueue.poll()` localmente.
+
+Isso garante que todos os nós avancem o “ponteiro de consumo” na mesma ordem.
+
+```mermaid
+sequenceDiagram
+participant Client as Client
+participant L as LeaderNode
+participant QS as QueueClusterService
+participant RM as ReplicationManager
+participant NQL as NQueueLeader
+participant F1 as Follower1
+participant NQF as NQueueFollower
+
+Client->>L: poll()
+L->>QS: poll()
+QS->>NQL: peek()
+alt fila_vazia
+  NQL-->>QS: Optional.empty
+  QS-->>Client: Optional.empty
+else ha_item
+  NQL-->>QS: Optional(value)
+  QS->>RM: replicate("queue", POLL(expectedValue))
+  RM->>QS: applyReplication(opId, POLL) (lider)
+  QS->>NQL: poll()
+  RM-->>F1: REPLICATION_REQUEST(opId, POLL)
+  F1->>NQF: peek() (best-effort check)
+  F1->>NQF: poll()
+  F1-->>RM: REPLICATION_ACK(opId)
+  RM-->>Client: Optional(value)
+end
+```
 
 ### `peek()`
 
-1. Cliente chama `peek`.
-2. Operação é encaminhada ao líder.
-3. O líder inspeciona o próximo item da `NQueue` local sem removê-lo.
-4. Retorna o item ao chamador.
+1. Cliente chama `peek()` em qualquer nó.
+2. A fachada roteia ao líder.
+3. O líder faz `NQueue.peek()` e devolve `Optional<T>`.
+
+```mermaid
+sequenceDiagram
+participant Client as Client
+participant Any as AnyNode
+participant L as LeaderNode
+participant DQ as DistributedQueue
+participant QS as QueueClusterService
+participant NQ as NQueue
+
+Client->>Any: peek()
+Any->>DQ: peek()
+DQ->>L: CLIENT_REQUEST("queue.peek", null)
+L->>QS: peek()
+QS->>NQ: peek()
+NQ-->>QS: Optional(value)
+QS-->>DQ: Optional(value)
+DQ-->>Client: Optional(value)
+```
 
 ---
 
@@ -97,16 +162,34 @@ A lógica de **ordenação global** e **decisão de entrega** deve vir do líder
 - Em caso de reinício de um nó:
     - A `NQueue` local deve ser reaberta.
     - Os itens previamente persistidos em disco devem ser carregados.
-- A camada de cluster/coordenação:
-    - Deve sincronizar com o líder atual,
-    - Para garantir que o estado da fila (inclusive mensagens entregues, pendentes e confirmadas) continue consistente com as outras réplicas.
+- No NGrid atual, a consistência da fila é mantida porque **toda alteração** (OFFER/POLL) é feita via replicação por quorum.
+
+### Ciclo de vida da `NQueue` dentro do `NGridNode`
+
+- `NGridNode.start()` cria `QueueClusterService`, que abre `NQueue` (`NQueue.open(baseDir, queueName)`).
+- `DistributedQueue.close()` fecha o `QueueClusterService`, que fecha a `NQueue`.
+
+```mermaid
+sequenceDiagram
+participant Node as NGridNode
+participant QS as QueueClusterService
+participant NQ as NQueue
+participant DQ as DistributedQueue
+
+Node->>QS: new QueueClusterService(baseDir, queueName, replicationManager)
+QS->>NQ: NQueue.open(...)
+Node->>DQ: new DistributedQueue(..., QS)
+Node->>DQ: close()
+DQ->>QS: close()
+QS->>NQ: close()
+```
 
 Detalhes como:
 
 - Como diferenciar itens apenas enfileirados de itens já consumidos,
 - Como lidar com mensagens “in-flight” no momento da parada,
 
-podem ser gerenciados por metadados adicionais na camada distribuída (acima da NQueue), sem alterar a implementação interna da NQueue.
+não fazem parte do modelo atual (o `poll()` já avança definitivamente a fila via replicação). Caso você precise de semântica “ack”/reentrega, isso deve ser implementado **acima** do NGrid (por exemplo, com um protocolo de confirmação e uma estrutura separada de “em processamento”).
 
 ---
 

@@ -1,223 +1,221 @@
-# **map-design.md**
+# NGrid – Mapa Distribuído (design + implementação atual)
 
-## **NGrid – Design do Mapa Distribuído**
+Este documento descreve o **mapa distribuído** do NGrid conforme implementado hoje no código.
 
-O mapa distribuído do NGrid tem como objetivo fornecer uma estrutura compartilhada entre múltiplos nodes, com consistência garantida por meio de liderança, quorum e replicação. Todas as operações mutáveis (`put`, `remove`) devem passar pelo líder. Operações de leitura (`get`) seguem a política definida abaixo.
-
----
-
-## **Objetivos do Mapa Distribuído**
-
-- Manter um conjunto chave→valor replicado entre todos os nós ou entre um subconjunto configurável.
-- Garantir consistência após falhas, trocas de líder ou isolamentos de rede.
-- Evitar resultados duplicados ou inconsistentes utilizando IDs únicos de operação.
-- Suportar as operações principais:
-    - `put(K key, V value)`
-    - `get(K key)`
-    - `remove(K key)`
+Principais classes envolvidas:
+- `dev.nishisan.utils.ngrid.structures.DistributedMap`
+- `dev.nishisan.utils.ngrid.map.MapClusterService`
+- `dev.nishisan.utils.ngrid.replication.ReplicationManager`
+- `dev.nishisan.utils.ngrid.map.MapPersistence` (opcional, por nó)
 
 ---
 
-## **Modelo de Consistência**
+## Objetivo
 
-### **Nível Básico: Consistência Forte no Líder**
-O líder é o único responsável por:
-
-- Determinar a ordem global das operações.
-- Validar operações duplicadas via ID.
-- Aplicar mudanças no seu mapa local.
-- Replicar a mudança aos demais nós.
-- Confirmar a operação ao cliente após atingir quorum.
-
-Essa abordagem garante consistência semelhante ao modelo "single-writer, multi-reader".
-
-### **Quorum**
-- Para operações mutáveis (`put`, `remove`), a confirmação depende de:
-    - Líder + N−1 confirmações (ou conforme configuração).
-- Operações de leitura (`get`):
-    - Podem ser atendidas pelo líder localmente (modelo simples inicial).
-    - Opcionalmente podem ser atendidas por qualquer nó quando houver mecanismo de sincronização estável.
+Fornecer um mapa chave→valor replicado entre nós do cluster, com:
+- **escritas serializadas por líder**
+- **commit por quorum**
+- **replicação de comandos** (`PUT`/`REMOVE`) para manter as réplicas alinhadas
+- **persistência local opcional** (WAL + snapshot) para acelerar restart e melhorar durabilidade local
 
 ---
 
-## **Estrutura Local de Armazenamento**
+## Componentes e responsabilidades
 
-Cada nó mantém um mapa local em memória, com possibilidade de **persistência local opcional em disco**.
-Elementos armazenados:
+### `DistributedMap<K,V>` (fachada “cliente”)
+- Roteia as chamadas para o **líder**.
+- Em nó líder: executa localmente no `MapClusterService`.
+- Em nó follower: envia `CLIENT_REQUEST` ao líder e aguarda resposta.
 
-- Chave (`K`)
-- Valor (`V`)
-- Metadados opcionais, como:
-    - Versão local
-    - Tombstones (remoção lógica)
-    - Timestamp lógico
+### `MapClusterService<K,V>` (estado + integração com replicação)
+- Mantém o estado em memória em um `ConcurrentHashMap`.
+- Para `put/remove`:
+  - dispara `ReplicationManager.replicate("map", MapReplicationCommand...)`
+  - aguarda commit (quorum) ou falha (timeout/quorum inalcançável)
+- Para `get`:
+  - lê do mapa local (no líder, é o caminho efetivo; em followers, a fachada roteia ao líder por padrão)
 
-Não há necessidade de modificar ou acoplar à `NQueue`, pois o mapa é independente.
+### `ReplicationManager` (quorum + deduplicação em memória)
+- Apenas o líder pode iniciar `replicate(...)`.
+- Aplica localmente primeiro e replica para followers.
+- Considera **commitada** quando `acks >= quorumEfetivo`.
+- Deduplica por `operationId` em memória (evita reaplicar a mesma operação).
+
+### `MapPersistence` (opcional, por nó)
+- Persistência **best-effort**: falhas de IO são logadas, mas não devem derrubar a operação do mapa.
+- Mantém:
+  - `wal.log` (append-only)
+  - `snapshot.dat` (snapshot completo periódico)
+  - `map.meta` (metadados do snapshot; best-effort)
 
 ---
 
-## **Persistência local (opcional)**
+## Modelo de consistência e quorum (prático)
 
-O NGrid Map suporta persistência local em disco por nó, com:
+- **Escritas** (`put/remove`): passam pelo líder e só retornam sucesso após quorum.
+- **Leituras** (`get`): a fachada roteia para o líder para manter o modelo simples (consistência forte no líder).
+- **Quorum efetivo** (no líder):
 
-- **WAL (Write-Ahead Log)**: registra operações `PUT` e `REMOVE` (append-only).
-- **Snapshot periódico**: serialização completa do mapa para acelerar recuperação.
-- **Escrita assíncrona**: não bloqueia `put/remove` (fila + batching).
+\[
+quorumEfetivo = \max(1, \min(quorumConfigurado, |\text{membrosAtivos}|))
+\]
 
-### **Modos**
+### Falhas típicas
+- **Timeout**: operação excede `operationTimeout` (padrão ~30s no `ReplicationManager`).
+- **Quorum inalcançável**: peers desconectam e o número de membros alcançáveis fica abaixo do quorum.
 
-- `DISABLED`: sem persistência (padrão).
-- `ASYNC_NO_FSYNC`: escreve assíncrono sem `fsync` (mais performance, menor durabilidade em crash).
-- `ASYNC_WITH_FSYNC`: escreve assíncrono com `fsync` (mais durabilidade em crash, menor performance).
+---
 
-### **Arquivos**
+## Fluxos de operações
 
-Estrutura por mapa:
+### PUT (`put(key, value)`)
+
+- `MapReplicationCommand.put(key, value)` é o comando replicado.
+- O retorno (valor anterior) é calculado no líder e devolvido ao chamador via `CLIENT_RESPONSE`.
+
+```mermaid
+sequenceDiagram
+participant Client as Client
+participant F as FollowerNode
+participant L as LeaderNode
+participant DM as DistributedMap
+participant MS as MapClusterService
+participant RM as ReplicationManager
+participant LF as LeaderFollower
+participant MP as MapPersistence
+
+Client->>F: put(k, v)
+F->>DM: put(k, v)
+DM->>L: CLIENT_REQUEST("map.put", MapEntry(k,v))
+L->>DM: onMessage(CLIENT_REQUEST)
+DM->>MS: put(k, v)
+MS->>RM: replicate("map", PUT(k,v))
+RM->>MS: applyReplication(opId, PUT) (líder aplica local)
+opt persistencia_habilitada
+  MS->>MP: appendAsync(PUT,k,v)
+end
+RM-->>LF: REPLICATION_REQUEST(opId, PUT)
+LF-->>RM: REPLICATION_ACK(opId)
+RM->>RM: acks >= quorumEfetivo?
+RM-->>MS: commit ok
+MS-->>DM: Optional(prev)
+DM-->>Client: Optional(prev)
+```
+
+### GET (`get(key)`)
+
+Por implementação atual, o `get` é servido pelo líder (via roteamento da fachada). Isso simplifica a consistência sem exigir “read-repair” ou validação por versão.
+
+```mermaid
+sequenceDiagram
+participant Client as Client
+participant F as FollowerNode
+participant L as LeaderNode
+participant DM as DistributedMap
+participant MS as MapClusterService
+
+Client->>F: get(k)
+F->>DM: get(k)
+DM->>L: CLIENT_REQUEST("map.get", k)
+L->>DM: onMessage(CLIENT_REQUEST)
+DM->>MS: get(k)
+MS-->>DM: Optional(v)
+DM-->>Client: Optional(v)
+```
+
+### REMOVE (`remove(key)`)
+
+Importante: **não existe tombstone** na implementação atual. O comando replicado é `REMOVE(key)` e cada nó executa `data.remove(key)`.
+
+```mermaid
+sequenceDiagram
+participant Client as Client
+participant L as LeaderNode
+participant MS as MapClusterService
+participant RM as ReplicationManager
+participant F1 as Follower1
+participant MP as MapPersistence
+
+Client->>L: remove(k)
+L->>MS: remove(k)
+MS->>RM: replicate("map", REMOVE(k))
+RM->>MS: applyReplication(opId, REMOVE) (líder aplica local)
+opt persistencia_habilitada
+  MS->>MP: appendAsync(REMOVE,k,null)
+end
+RM-->>F1: REPLICATION_REQUEST(opId, REMOVE)
+F1-->>RM: REPLICATION_ACK(opId)
+RM->>RM: acks >= quorumEfetivo?
+RM-->>Client: Optional(prev)
+```
+
+---
+
+## Persistência local (WAL + snapshot)
+
+### Arquivos
 
 ```
 {mapDirectory}/{mapName}/
-├── wal.log          # operações PUT/REMOVE (append-only)
-├── snapshot.dat     # snapshot completo serializado do Map
-└── map.meta         # metadados do snapshot
+├── wal.log
+├── snapshot.dat
+└── map.meta
 ```
 
-### **Configuração (por nó)**
+### Ciclo de vida (como roda hoje)
 
-A persistência é **decisão local por nó** (não é imposta pelo líder).
+- `loadFromDisk()` (chamado no `NGridNode.start()` quando persistência está habilitada):
+  - cria diretório do mapa
+  - carrega `snapshot.dat` (se existir)
+  - reaplica `wal.log` (se existir)
+  - lê `map.meta` (best-effort)
+- `start()`:
+  - abre `wal.log` para append
+  - inicia uma thread daemon (`ngrid-map-persistence`) que drena uma fila e escreve em batch
+- `appendAsync(type, key, value)`:
+  - enfileira entradas para o writer; não bloqueia o caminho crítico do cluster
+- `maybeSnapshot()`:
+  - dispara por **número de operações** (padrão: 10.000) ou por **tempo** (padrão: 5 min)
+  - faz rotação do WAL e grava snapshot do mapa atual (cópia fraca do `ConcurrentHashMap`)
 
-- Se um nó estiver com persistência habilitada, ele consegue recuperar o mapa local mais rápido após reinício.
-- Se outro nó estiver sem persistência, ele depende apenas do estado em memória + replicações correntes.
+```mermaid
+flowchart TD
+  MS[MapClusterService] -->|applyReplication| MP[MapPersistence]
+  MP -->|append| WAL[wal.log]
+  MP -->|periodico| SNAP[snapshot.dat]
+  MP --> META[map.meta]
+```
 
-### **Interação com replicação**
+### Recuperação no boot (snapshot + WAL)
 
-- O cluster continua sendo a **fonte de verdade** para consistência global.
-- A persistência local é uma **otimização de durabilidade/boot**: não substitui a replicação.
-- A gravação no WAL acontece quando a operação é **aplicada localmente** (líder e followers persistem o mesmo stream de comandos replicados).
+```mermaid
+sequenceDiagram
+participant Node as NGridNode
+participant MS as MapClusterService
+participant MP as MapPersistence
+participant FS as FileSystem
 
----
-
-## **Operações**
-
-### **PUT**
-Fluxo:
-
-1. O nó que recebe a requisição encaminha ao líder (se não for líder).
-2. O líder:
-    - Gera/valida ID único.
-    - Aplica a operação no mapa local (atualiza ou insere).
-    - Replica a operação para os outros nós.
-3. Cada nó replica aplicando a mesma operação localmente.
-4. Ao atingir quorum, o líder confirma ao chamador.
-
-Propriedades:
-
-- Overwrite de valores anteriores.
-- Deduplicação garantida via ID único.
-- Ordem global definida pelo líder.
-
----
-
-### **GET**
-Fluxo simples inicial:
-
-1. O nó recebe a requisição.
-2. Encaminha para o líder.
-3. O líder retorna diretamente o valor associado à chave.
-
-Modo avançado opcional (para versão futura):
-
-- Qualquer nó pode servir GET desde que:
-    - Se mantenha sincronizado com o líder,
-    - E haja registro de versão/timestamp lógico para validação.
+Node->>MS: loadFromDisk()
+MS->>MP: load()
+MP->>FS: read snapshot.dat (se existir)
+MP->>FS: read wal.log (se existir)
+MP-->>MS: estado reconstruido em memoria
+MS->>MP: start()
+```
 
 ---
 
-### **REMOVE**
-Operação equivalente ao PUT, porém aplicando um **tombstone**:
+## Formato do comando replicado (como é de fato)
 
-1. O nó encaminha ao líder.
-2. O líder valida ID, aplica tombstone local.
-3. Replica tombstone para os demais nós.
-4. Após quorum, confirma remoção ao chamador.
-
-Motivo para tombstone:
-
-- Evita inconsistências em caso de mensagens atrasadas.
-- Garante que réplicas atrasadas não reinstalem valores removidos.
+O payload replicado no tópico `map` é `MapReplicationCommand`:
+- `type`: `PUT` ou `REMOVE`
+- `key`: `Serializable` (obrigatório)
+- `value`: `Serializable` (somente em `PUT`)
 
 ---
 
-## **Formato Interno de Operação**
+## Limitações atuais e caminhos de evolução
 
-Cada operação distribuída carrega:
-
-- ID único da operação
-- Tipo (`PUT`, `REMOVE`)
-- Chave (`K`)
-- Valor (`V`) ou tombstone
-- Versão ou timestamp (opcional)
-- Data/hora lógica da operação (opcional)
-- Identificador do líder que decidiu a ordem
-
-Esses metadados servem para:
-
-- Deduplicação
-- Replay após troca de líder
-- Reconstrução de estado no cluster
-
----
-
-## **Recuperação e Falhas**
-
-### **Troca de Líder**
-O novo líder precisa:
-
-- Sincronizar o conjunto de operações commitadas.
-- Adotar o estado de mapa mais atualizado.
-- Garantir que operações antigas não sejam reexecutadas.
-
-Isso pode ser feito com:
-
-- Log replicado das operações (caso exista).
-- Snapshots do mapa.
-- Troca de estado inicial entre líder e seguidores.
-
-### **Nós Atrasados**
-Nós que estiverem offline durante parte da replicação devem:
-
-- Sincronizar estado ao reconectar,
-- Ser trazidos para a versão atual do mapa,
-- Aplicar tombstones e put pendentes conforme necessário.
-
----
-
-## **Simplicidade Inicial**
-Na primeira versão, recomenda-se:
-
-- Replicação completa do mapa entre todos os nós.
-- GET atendido pelo líder.
-- Tombstones simples para remoção.
-- Sem persistência obrigatória.
-- Reconstrução inteira pelo líder ao retomar o cluster.
-
-Após isso, evoluções possíveis:
-
-- Persistência local em disco,
-- GET local com validação de versão,
-- Particionamento / sharding de mapas,
-- Cache inteligente,
-- Replicação incremental.
-
----
-
-## **Resumo Geral**
-
-O mapa distribuído do NGrid deve:
-
-- Ser simples na primeira fase,
-- Usar líder + quorum para consistência,
-- Replicar operações PUT e REMOVE,
-- Guardar estados e versões para troca de líder,
-- Suportar tombstones para evitar reinserção indevida,
-- Atender GET inicialmente via líder para reduzir complexidade,
-- Evoluir gradualmente para um modelo mais eficiente.
+- **Sem tombstones**: remoção é direta; não há marcador lógico.
+- **Deduplicação em memória** (`operationId`): após restart total, o histórico de IDs é perdido (o estado do mapa pode persistir via `snapshot/wal` se habilitado).
+- **Leitura roteada ao líder**: simples e forte; evoluções futuras podem permitir `get` local com validação/versões.
