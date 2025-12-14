@@ -17,6 +17,7 @@
 
 package dev.nishisan.utils.ngrid.replication;
 
+import java.time.Duration;
 import java.util.Objects;
 
 /**
@@ -24,19 +25,53 @@ import java.util.Objects;
  */
 public final class ReplicationConfig {
     private final int quorum;
+    private final Duration operationTimeout;
 
-    private ReplicationConfig(int quorum) {
+    private ReplicationConfig(int quorum, Duration operationTimeout) {
         this.quorum = quorum;
+        this.operationTimeout = Objects.requireNonNull(operationTimeout, "operationTimeout");
     }
 
     public static ReplicationConfig of(int quorum) {
-        if (quorum < 1) {
-            throw new IllegalArgumentException("Quorum must be >= 1");
-        }
-        return new ReplicationConfig(quorum);
+        return builder(quorum).build();
+    }
+
+    public static ReplicationConfig of(int quorum, Duration operationTimeout) {
+        return builder(quorum)
+                .operationTimeout(operationTimeout)
+                .build();
+    }
+
+    public static Builder builder(int quorum) {
+        return new Builder(quorum);
     }
 
     public int quorum() {
         return quorum;
+    }
+
+    public Duration operationTimeout() {
+        return operationTimeout;
+    }
+
+    public static final class Builder {
+        private final int quorum;
+        private Duration operationTimeout = Duration.ofSeconds(30);
+
+        private Builder(int quorum) {
+            if (quorum < 1) {
+                throw new IllegalArgumentException("Quorum must be >= 1");
+            }
+            this.quorum = quorum;
+        }
+
+        public Builder operationTimeout(Duration operationTimeout) {
+            this.operationTimeout = Objects.requireNonNull(operationTimeout, "operationTimeout");
+            return this;
+        }
+
+        public ReplicationConfig build() {
+            return new ReplicationConfig(quorum, operationTimeout);
+        }
     }
 }

@@ -17,6 +17,7 @@
 
 package dev.nishisan.utils.ngrid.map;
 
+import dev.nishisan.utils.ngrid.replication.QuorumUnreachableException;
 import dev.nishisan.utils.ngrid.replication.ReplicationManager;
 import dev.nishisan.utils.ngrid.replication.ReplicationResult;
 
@@ -27,8 +28,10 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.TimeoutException;
 
 /**
  * Simple distributed map that relies on the replication layer to keep replicas aligned.
@@ -88,7 +91,18 @@ public final class MapClusterService<K extends Serializable, V extends Serializa
     }
 
     private void waitForReplication(CompletableFuture<ReplicationResult> future) {
-        future.join();
+        try {
+            future.join();
+        } catch (CompletionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof TimeoutException) {
+                throw new IllegalStateException("Replication operation timed out", cause);
+            } else if (cause instanceof QuorumUnreachableException) {
+                throw new IllegalStateException("Quorum unreachable for replication operation", cause);
+            } else {
+                throw new IllegalStateException("Replication operation failed", cause != null ? cause : e);
+            }
+        }
     }
 
     @SuppressWarnings("unchecked")
