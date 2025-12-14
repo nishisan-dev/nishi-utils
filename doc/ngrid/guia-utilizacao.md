@@ -215,6 +215,21 @@ Node->>C: close()
 - `Optional<V> get(K key)`
 - `Optional<V> remove(K key)`
 
+### Múltiplos mapas (nomeados)
+
+- `node.map(K.class, V.class)` continua existindo e retorna o **mapa padrão**, cujo nome é `config.mapName()` (padrão: `default-map`).
+- Para criar/usar **vários mapas independentes** no mesmo cluster, use `node.getMap("map-name", K.class, V.class)`:
+
+```java
+DistributedMap<String, String> users = node1.getMap("users", String.class, String.class);
+DistributedMap<String, String> sessions = node2.getMap("sessions", String.class, String.class);
+
+users.put("u1", "alice");
+sessions.put("s1", "token-123");
+```
+
+> Nota importante: como cada mapa registra handlers de replicação por nome, **crie o mesmo mapa em todos os nós** (chamando `getMap(...)`) antes de começar a escrever, para evitar que followers recebam replicações de um mapa que ainda não foi inicializado localmente.
+
 ### Observações importantes
 
 - No estado atual, o mapa é mantido em memória (`ConcurrentHashMap`) e replicado via `ReplicationManager`.
@@ -263,13 +278,14 @@ public class NGridMapPersistenceExample {
         .queueName("queue")
         // mapa: persistência local (opcional)
         .mapDirectory(Path.of("/tmp/ngrid/node-1/maps"))
-        .mapName("map")
+        .mapName("default-map") // nome do mapa padrão (usado por node.map(...))
         .mapPersistenceMode(MapPersistenceMode.ASYNC_WITH_FSYNC)
         .build();
 
     try (NGridNode node = new NGridNode(cfg)) {
       node.start();
       // node.map(String.class, String.class)...
+      // node.getMap("users", String.class, String.class)...
     } catch (Exception e) {
       throw new RuntimeException(e);
     }

@@ -30,7 +30,7 @@ Fornecer um mapa chave→valor replicado entre nós do cluster, com:
 ### `MapClusterService<K,V>` (estado + integração com replicação)
 - Mantém o estado em memória em um `ConcurrentHashMap`.
 - Para `put/remove`:
-  - dispara `ReplicationManager.replicate("map", MapReplicationCommand...)`
+  - dispara `ReplicationManager.replicate("map:<mapName>", MapReplicationCommand...)`
   - aguarda commit (quorum) ou falha (timeout/quorum inalcançável)
 - Para `get`:
   - lê do mapa local (no líder, é o caminho efetivo; em followers, a fachada roteia ao líder por padrão)
@@ -86,10 +86,10 @@ participant MP as MapPersistence
 
 Client->>F: put(k, v)
 F->>DM: put(k, v)
-DM->>L: CLIENT_REQUEST("map.put", MapEntry(k,v))
+DM->>L: CLIENT_REQUEST("map.put:<mapName>", MapEntry(k,v))
 L->>DM: onMessage(CLIENT_REQUEST)
 DM->>MS: put(k, v)
-MS->>RM: replicate("map", PUT(k,v))
+MS->>RM: replicate("map:<mapName>", PUT(k,v))
 RM->>MS: applyReplication(opId, PUT) (líder aplica local)
 opt persistencia_habilitada
   MS->>MP: appendAsync(PUT,k,v)
@@ -116,7 +116,7 @@ participant MS as MapClusterService
 
 Client->>F: get(k)
 F->>DM: get(k)
-DM->>L: CLIENT_REQUEST("map.get", k)
+DM->>L: CLIENT_REQUEST("map.get:<mapName>", k)
 L->>DM: onMessage(CLIENT_REQUEST)
 DM->>MS: get(k)
 MS-->>DM: Optional(v)
@@ -138,7 +138,7 @@ participant MP as MapPersistence
 
 Client->>L: remove(k)
 L->>MS: remove(k)
-MS->>RM: replicate("map", REMOVE(k))
+MS->>RM: replicate("map:<mapName>", REMOVE(k))
 RM->>MS: applyReplication(opId, REMOVE) (líder aplica local)
 opt persistencia_habilitada
   MS->>MP: appendAsync(REMOVE,k,null)

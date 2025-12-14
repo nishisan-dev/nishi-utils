@@ -198,6 +198,12 @@ public class NGridClusterExample {
       DistributedMap<String, String> map = node2.map(String.class, String.class);
       map.put("k1", "v1");
       System.out.println("get(k1)=" + map.get("k1").orElse("<vazio>"));
+
+      // Múltiplos mapas (nomeados) no mesmo cluster:
+      DistributedMap<String, String> users = node1.getMap("users", String.class, String.class);
+      DistributedMap<String, String> sessions = node3.getMap("sessions", String.class, String.class);
+      users.put("u1", "alice");
+      sessions.put("s1", "token-123");
     }
   }
 }

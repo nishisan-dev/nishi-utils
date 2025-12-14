@@ -98,7 +98,7 @@ public class QuickStartNGrid {
 | `queueDirectory` | `Path` | Obrigatório | Diretório persistente | Base de dados da fila distribuída (usa NQueue local). |
 | `queueName` | `String` | `"ngrid"` | Um nome por cluster | Subpasta/nome da fila usada pelo serviço de fila. |
 | `mapDirectory` | `Path` | `queueDirectory/maps` | Persistente se usar WAL/snapshot | Diretório base da persistência local do mapa. |
-| `mapName` | `String` | `"map"` | Um nome por cluster | Nome do mapa padrão. |
+| `mapName` | `String` | `"default-map"` | Um nome por cluster | Nome do mapa padrão (usado por `node.map(...)`). |
 | `mapPersistenceMode` | `MapPersistenceMode` | `DISABLED` | `DISABLED` (padrão), `ASYNC_WITH_FSYNC` se quiser durabilidade local | Modo de persistência do mapa: `DISABLED`, `ASYNC_NO_FSYNC`, `ASYNC_WITH_FSYNC`. |
 
 ### MapPersistenceConfig (persistência local do mapa)
@@ -460,7 +460,7 @@ public class NGridMapPersistenceModeExample {
     NGridConfig cfg = NGridConfig.builder(me)
         .queueDirectory(Path.of("./node-1-data"))
         .mapDirectory(Path.of("./node-1-data/maps"))
-        .mapName("map")
+        .mapName("default-map")
         .mapPersistenceMode(MapPersistenceMode.ASYNC_WITH_FSYNC)
         .replicationQuorum(1)
         .build();
