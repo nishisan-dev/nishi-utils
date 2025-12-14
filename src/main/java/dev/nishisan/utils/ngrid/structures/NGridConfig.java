@@ -93,7 +93,7 @@ public final class NGridConfig {
         private Path queueDirectory;
         private String queueName = "ngrid";
         private Path mapDirectory;
-        private String mapName = "map";
+        private String mapName = "default-map";
         private MapPersistenceMode mapPersistenceMode = MapPersistenceMode.DISABLED;
 
         private Builder(NodeInfo local) {

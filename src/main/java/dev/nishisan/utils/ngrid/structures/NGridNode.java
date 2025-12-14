@@ -33,6 +33,9 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.io.Serializable;
 import java.time.Duration;
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -48,8 +51,9 @@ public final class NGridNode implements Closeable {
     private ClusterCoordinator coordinator;
     private ReplicationManager replicationManager;
     private QueueClusterService<Serializable> queueService;
-    private MapClusterService<Serializable, Serializable> mapService;
     private DistributedQueue<Serializable> queue;
+    private final Map<String, MapClusterService<Serializable, Serializable>> mapServices = new ConcurrentHashMap<>();
+    private final Map<String, DistributedMap<Serializable, Serializable>> maps = new ConcurrentHashMap<>();
     private DistributedMap<Serializable, Serializable> map;
     private ScheduledExecutorService coordinatorScheduler;
     private final AtomicBoolean started = new AtomicBoolean();
@@ -81,19 +85,11 @@ public final class NGridNode implements Closeable {
         replicationManager.start();
 
         queueService = new QueueClusterService<>(config.queueDirectory(), config.queueName(), replicationManager);
-        if (config.mapPersistenceMode() != null && config.mapPersistenceMode() != MapPersistenceMode.DISABLED) {
-            MapPersistenceConfig persistenceConfig = MapPersistenceConfig.defaults(
-                    config.mapDirectory(),
-                    config.mapName(),
-                    config.mapPersistenceMode()
-            );
-            mapService = new MapClusterService<>(replicationManager, persistenceConfig);
-            mapService.loadFromDisk();
-        } else {
-            mapService = new MapClusterService<>(replicationManager);
-        }
         queue = new DistributedQueue<>(transport, coordinator, queueService);
-        map = new DistributedMap<>(transport, coordinator, mapService);
+
+        // Default map for backward-compatible API (node.map(...))
+        String defaultMapName = config.mapName();
+        map = maps.computeIfAbsent(defaultMapName, this::createDistributedMap);
     }
 
     @SuppressWarnings("unchecked")
@@ -104,6 +100,15 @@ public final class NGridNode implements Closeable {
     @SuppressWarnings("unchecked")
     public <K extends Serializable, V extends Serializable> DistributedMap<K, V> map(Class<K> keyType, Class<V> valueType) {
         return (DistributedMap<K, V>) map;
+    }
+
+    @SuppressWarnings("unchecked")
+    public <K extends Serializable, V extends Serializable> DistributedMap<K, V> getMap(String name, Class<K> keyType, Class<V> valueType) {
+        Objects.requireNonNull(name, "name");
+        if (!started.get()) {
+            throw new IllegalStateException("Node not started");
+        }
+        return (DistributedMap<K, V>) maps.computeIfAbsent(name, this::createDistributedMap);
     }
 
     public Transport transport() {
@@ -131,13 +136,13 @@ public final class NGridNode implements Closeable {
         } catch (IOException e) {
             first = e;
         }
-        try {
-            if (map != null) {
-                map.close();
-            }
-        } catch (IOException e) {
-            if (first == null) {
-                first = e;
+        for (DistributedMap<Serializable, Serializable> m : maps.values()) {
+            try {
+                m.close();
+            } catch (IOException e) {
+                if (first == null) {
+                    first = e;
+                }
             }
         }
         try {
@@ -177,5 +182,28 @@ public final class NGridNode implements Closeable {
         if (first != null) {
             throw first;
         }
+    }
+
+    private DistributedMap<Serializable, Serializable> createDistributedMap(String mapName) {
+        MapClusterService<Serializable, Serializable> service = mapServices.computeIfAbsent(mapName, this::createMapService);
+        return new DistributedMap<>(transport, coordinator, service, mapName);
+    }
+
+    private MapClusterService<Serializable, Serializable> createMapService(String mapName) {
+        if (config.mapPersistenceMode() != null && config.mapPersistenceMode() != MapPersistenceMode.DISABLED) {
+            MapPersistenceConfig persistenceConfig = MapPersistenceConfig.defaults(
+                    config.mapDirectory(),
+                    mapName,
+                    config.mapPersistenceMode()
+            );
+            MapClusterService<Serializable, Serializable> service = new MapClusterService<>(
+                    replicationManager,
+                    MapClusterService.topicFor(mapName),
+                    persistenceConfig
+            );
+            service.loadFromDisk();
+            return service;
+        }
+        return new MapClusterService<>(replicationManager, MapClusterService.topicFor(mapName), null);
     }
 }

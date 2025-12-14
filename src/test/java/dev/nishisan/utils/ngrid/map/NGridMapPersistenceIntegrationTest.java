@@ -98,6 +98,57 @@ class NGridMapPersistenceIntegrationTest {
         assertEquals("value-1", recovered.get());
     }
 
+    @Test
+    void multipleNamedMapsShouldRecoverAfterFullClusterRestartWhenPersistenceEnabled() throws IOException {
+        // Ensure maps are created on all nodes (handlers are registered per-map)
+        DistributedMap<String, String> users1 = node1.getMap("users", String.class, String.class);
+        DistributedMap<String, String> users2 = node2.getMap("users", String.class, String.class);
+        node3.getMap("users", String.class, String.class);
+
+        DistributedMap<String, String> sessions1 = node1.getMap("sessions", String.class, String.class);
+        node2.getMap("sessions", String.class, String.class);
+        DistributedMap<String, String> sessions3 = node3.getMap("sessions", String.class, String.class);
+
+        assertEquals("node-3", node1.coordinator().leaderInfo().map(info -> info.nodeId().value()).orElseThrow());
+
+        users2.put("u1", "alice");
+        sessions3.put("s1", "token-123");
+
+        assertEquals(Optional.of("alice"), users1.get("u1"));
+        assertEquals(Optional.of("token-123"), sessions1.get("s1"));
+
+        closeQuietly(node1);
+        closeQuietly(node2);
+        closeQuietly(node3);
+
+        node1 = new NGridNode(configFor(info1, dir1, info2, info3));
+        node2 = new NGridNode(configFor(info2, dir2, info1, info3));
+        node3 = new NGridNode(configFor(info3, dir3, info1, info2));
+
+        node1.start();
+        node2.start();
+        node3.start();
+
+        awaitClusterStability();
+
+        // Re-create maps so they load from disk, then validate recovery
+        DistributedMap<String, String> usersAfter1 = node1.getMap("users", String.class, String.class);
+        DistributedMap<String, String> usersAfter2 = node2.getMap("users", String.class, String.class);
+        DistributedMap<String, String> usersAfter3 = node3.getMap("users", String.class, String.class);
+
+        DistributedMap<String, String> sessionsAfter1 = node1.getMap("sessions", String.class, String.class);
+        DistributedMap<String, String> sessionsAfter2 = node2.getMap("sessions", String.class, String.class);
+        DistributedMap<String, String> sessionsAfter3 = node3.getMap("sessions", String.class, String.class);
+
+        assertEquals(Optional.of("alice"), usersAfter1.get("u1"));
+        assertEquals(Optional.of("alice"), usersAfter2.get("u1"));
+        assertEquals(Optional.of("alice"), usersAfter3.get("u1"));
+
+        assertEquals(Optional.of("token-123"), sessionsAfter1.get("s1"));
+        assertEquals(Optional.of("token-123"), sessionsAfter2.get("s1"));
+        assertEquals(Optional.of("token-123"), sessionsAfter3.get("s1"));
+    }
+
     private static NGridConfig configFor(NodeInfo local, Path dir, NodeInfo... peers) {
         NGridConfig.Builder b = NGridConfig.builder(local)
                 .queueDirectory(dir)

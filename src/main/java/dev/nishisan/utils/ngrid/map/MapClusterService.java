@@ -37,19 +37,31 @@ import java.util.concurrent.TimeoutException;
  * Simple distributed map that relies on the replication layer to keep replicas aligned.
  */
 public final class MapClusterService<K extends Serializable, V extends Serializable> implements Closeable {
-    public static final String TOPIC = "map";
+    public static final String TOPIC_PREFIX = "map:";
+    public static final String DEFAULT_MAP_NAME = "default-map";
 
     private final ConcurrentMap<K, V> data = new ConcurrentHashMap<>();
     private final ReplicationManager replicationManager;
     private final MapPersistence<K, V> persistence;
+    private final String topic;
 
     public MapClusterService(ReplicationManager replicationManager) {
         this(replicationManager, null);
     }
 
     public MapClusterService(ReplicationManager replicationManager, MapPersistenceConfig persistenceConfig) {
+        this(replicationManager,
+                topicFor(persistenceConfig != null ? persistenceConfig.mapName() : DEFAULT_MAP_NAME),
+                persistenceConfig);
+    }
+
+    public MapClusterService(ReplicationManager replicationManager, String topic, MapPersistenceConfig persistenceConfig) {
         this.replicationManager = Objects.requireNonNull(replicationManager, "replicationManager");
-        this.replicationManager.registerHandler(TOPIC, this::applyReplication);
+        this.topic = Objects.requireNonNull(topic, "topic");
+        if (this.topic.isBlank()) {
+            throw new IllegalArgumentException("topic cannot be blank");
+        }
+        this.replicationManager.registerHandler(this.topic, this::applyReplication);
         if (persistenceConfig != null && persistenceConfig.mode() != MapPersistenceMode.DISABLED) {
             this.persistence = new MapPersistence<>(persistenceConfig, data);
         } else {
@@ -62,7 +74,7 @@ public final class MapClusterService<K extends Serializable, V extends Serializa
         Objects.requireNonNull(value, "value");
         V previous = data.get(key);
         MapReplicationCommand command = MapReplicationCommand.put(key, value);
-        waitForReplication(replicationManager.replicate(TOPIC, command));
+        waitForReplication(replicationManager.replicate(topic, command));
         return Optional.ofNullable(previous);
     }
 
@@ -70,7 +82,7 @@ public final class MapClusterService<K extends Serializable, V extends Serializa
         Objects.requireNonNull(key, "key");
         V previous = data.get(key);
         MapReplicationCommand command = MapReplicationCommand.remove(key);
-        waitForReplication(replicationManager.replicate(TOPIC, command));
+        waitForReplication(replicationManager.replicate(topic, command));
         return Optional.ofNullable(previous);
     }
 
@@ -123,5 +135,17 @@ public final class MapClusterService<K extends Serializable, V extends Serializa
         if (persistence != null) {
             persistence.close();
         }
+    }
+
+    public String topic() {
+        return topic;
+    }
+
+    public static String topicFor(String mapName) {
+        Objects.requireNonNull(mapName, "mapName");
+        if (mapName.isBlank()) {
+            throw new IllegalArgumentException("mapName cannot be blank");
+        }
+        return TOPIC_PREFIX + mapName;
     }
 }

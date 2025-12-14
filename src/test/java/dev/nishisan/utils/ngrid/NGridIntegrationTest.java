@@ -21,6 +21,7 @@ import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 
 class NGridIntegrationTest {
 
@@ -144,6 +145,33 @@ class NGridIntegrationTest {
         Optional<String> afterRestart = restartedQueue.peek();
         assertTrue(afterRestart.isPresent());
         assertEquals("payload-2", afterRestart.get());
+    }
+
+    @Test
+    void multipleNamedMapsShouldReplicateIndependently() {
+        // Ensure maps are created on all nodes (handlers are registered per-map)
+        DistributedMap<String, String> users1 = node1.getMap("users", String.class, String.class);
+        DistributedMap<String, String> users2 = node2.getMap("users", String.class, String.class);
+        DistributedMap<String, String> users3 = node3.getMap("users", String.class, String.class);
+
+        DistributedMap<String, String> sessions1 = node1.getMap("sessions", String.class, String.class);
+        DistributedMap<String, String> sessions2 = node2.getMap("sessions", String.class, String.class);
+        DistributedMap<String, String> sessions3 = node3.getMap("sessions", String.class, String.class);
+
+        // Write on leader via follower reference and read from other nodes
+        assertEquals("node-3", node1.coordinator().leaderInfo().map(info -> info.nodeId().value()).orElseThrow());
+
+        users2.put("u1", "alice");
+        assertEquals(Optional.of("alice"), users1.get("u1"));
+        assertEquals(Optional.of("alice"), users3.get("u1"));
+
+        sessions1.put("s1", "token-123");
+        assertEquals(Optional.of("token-123"), sessions2.get("s1"));
+        assertEquals(Optional.of("token-123"), sessions3.get("s1"));
+
+        // Independence: keys from one map must not leak into the other
+        assertFalse(users1.get("s1").isPresent());
+        assertFalse(sessions1.get("u1").isPresent());
     }
 
     private void awaitClusterStability() {

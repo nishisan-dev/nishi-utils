@@ -41,18 +41,33 @@ import java.util.concurrent.CompletableFuture;
  * leader based replication.
  */
 public final class DistributedMap<K extends Serializable, V extends Serializable> implements TransportListener, Closeable {
-    private static final String MAP_PUT = "map.put";
-    private static final String MAP_REMOVE = "map.remove";
-    private static final String MAP_GET = "map.get";
+    private static final String COMMAND_PREFIX_PUT = "map.put:";
+    private static final String COMMAND_PREFIX_REMOVE = "map.remove:";
+    private static final String COMMAND_PREFIX_GET = "map.get:";
 
     private final Transport transport;
     private final ClusterCoordinator coordinator;
     private final MapClusterService<K, V> mapService;
+    private final String mapName;
+    private final String mapPutCommand;
+    private final String mapRemoveCommand;
+    private final String mapGetCommand;
 
     public DistributedMap(Transport transport, ClusterCoordinator coordinator, MapClusterService<K, V> mapService) {
+        this(transport, coordinator, mapService, MapClusterService.DEFAULT_MAP_NAME);
+    }
+
+    public DistributedMap(Transport transport, ClusterCoordinator coordinator, MapClusterService<K, V> mapService, String mapName) {
         this.transport = transport;
         this.coordinator = coordinator;
         this.mapService = mapService;
+        this.mapName = mapName;
+        if (this.mapName == null || this.mapName.isBlank()) {
+            throw new IllegalArgumentException("mapName cannot be blank");
+        }
+        this.mapPutCommand = COMMAND_PREFIX_PUT + this.mapName;
+        this.mapRemoveCommand = COMMAND_PREFIX_REMOVE + this.mapName;
+        this.mapGetCommand = COMMAND_PREFIX_GET + this.mapName;
         transport.addListener(this);
     }
 
@@ -62,7 +77,7 @@ public final class DistributedMap<K extends Serializable, V extends Serializable
             return mapService.put(key, value);
         }
         Serializable body = new MapEntry<>(key, value);
-        SerializableOptional<V> result = (SerializableOptional<V>) invokeLeader(MAP_PUT, body);
+        SerializableOptional<V> result = (SerializableOptional<V>) invokeLeader(mapPutCommand, body);
         return result.toOptional();
     }
 
@@ -71,7 +86,7 @@ public final class DistributedMap<K extends Serializable, V extends Serializable
         if (coordinator.isLeader()) {
             return mapService.remove(key);
         }
-        SerializableOptional<V> result = (SerializableOptional<V>) invokeLeader(MAP_REMOVE, key);
+        SerializableOptional<V> result = (SerializableOptional<V>) invokeLeader(mapRemoveCommand, key);
         return result.toOptional();
     }
 
@@ -80,7 +95,7 @@ public final class DistributedMap<K extends Serializable, V extends Serializable
         if (coordinator.isLeader()) {
             return mapService.get(key);
         }
-        SerializableOptional<V> result = (SerializableOptional<V>) invokeLeader(MAP_GET, key);
+        SerializableOptional<V> result = (SerializableOptional<V>) invokeLeader(mapGetCommand, key);
         return result.toOptional();
     }
 
@@ -106,21 +121,23 @@ public final class DistributedMap<K extends Serializable, V extends Serializable
 
     @SuppressWarnings("unchecked")
     private Serializable executeLocal(String command, Serializable body) {
-        return switch (command) {
-            case MAP_PUT -> {
-                MapEntry<K, V> entry = (MapEntry<K, V>) body;
-                yield mapService.put(entry.key(), entry.value())
-                        .map(SerializableOptional::of)
-                        .orElseGet(SerializableOptional::empty);
-            }
-            case MAP_REMOVE -> mapService.remove((K) body)
+        if (command.equals(mapPutCommand)) {
+            MapEntry<K, V> entry = (MapEntry<K, V>) body;
+            return mapService.put(entry.key(), entry.value())
                     .map(SerializableOptional::of)
                     .orElseGet(SerializableOptional::empty);
-            case MAP_GET -> mapService.get((K) body)
+        }
+        if (command.equals(mapRemoveCommand)) {
+            return mapService.remove((K) body)
                     .map(SerializableOptional::of)
                     .orElseGet(SerializableOptional::empty);
-            default -> throw new IllegalArgumentException("Unknown command: " + command);
-        };
+        }
+        if (command.equals(mapGetCommand)) {
+            return mapService.get((K) body)
+                    .map(SerializableOptional::of)
+                    .orElseGet(SerializableOptional::empty);
+        }
+        throw new IllegalArgumentException("Unknown command: " + command);
     }
 
     @Override
@@ -139,7 +156,7 @@ public final class DistributedMap<K extends Serializable, V extends Serializable
             return;
         }
         ClientRequestPayload payload = message.payload(ClientRequestPayload.class);
-        if (!Set.of(MAP_PUT, MAP_REMOVE, MAP_GET).contains(payload.command())) {
+        if (!Set.of(mapPutCommand, mapRemoveCommand, mapGetCommand).contains(payload.command())) {
             return;
         }
         ClientResponsePayload responsePayload;
