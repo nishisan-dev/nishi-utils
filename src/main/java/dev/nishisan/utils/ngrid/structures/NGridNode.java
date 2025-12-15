@@ -145,6 +145,15 @@ public final class NGridNode implements Closeable {
                 }
             }
         }
+        for (MapClusterService<Serializable, Serializable> service : mapServices.values()) {
+            try {
+                service.close();
+            } catch (IOException e) {
+                if (first == null) {
+                    first = e;
+                }
+            }
+        }
         try {
             if (replicationManager != null) {
                 replicationManager.close();
