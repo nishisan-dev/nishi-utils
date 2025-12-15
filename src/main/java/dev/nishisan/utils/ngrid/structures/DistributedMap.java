@@ -173,7 +173,8 @@ public final class DistributedMap<K extends Serializable, V extends Serializable
     @Override
     public void close() throws IOException {
         transport.removeListener(this);
-        mapService.close();
+        // Note: mapService is NOT closed here because it may be shared by multiple DistributedMap instances.
+        // The owner (NGridNode) is responsible for closing MapClusterService instances.
     }
 
     private record MapEntry<K extends Serializable, V extends Serializable>(K key, V value) implements Serializable {
