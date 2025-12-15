@@ -104,7 +104,7 @@ public final class NGridNode implements Closeable {
 
     @SuppressWarnings("unchecked")
     public <K extends Serializable, V extends Serializable> DistributedMap<K, V> getMap(String name, Class<K> keyType, Class<V> valueType) {
-        Objects.requireNonNull(name, "name");
+        Objects.requireNonNull(name, "map name cannot be null");
         if (!started.get()) {
             throw new IllegalStateException("Node not started");
         }
