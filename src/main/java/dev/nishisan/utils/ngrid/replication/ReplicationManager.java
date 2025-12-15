@@ -77,7 +77,7 @@ public final class ReplicationManager implements TransportListener, Closeable {
 
     private volatile boolean running;
 
-    private record Failure(PendingOperation operation, Throwable error) {}
+    private static record Failure(PendingOperation operation, Throwable error) {}
 
     public ReplicationManager(Transport transport, ClusterCoordinator coordinator, ReplicationConfig config) {
         this.transport = Objects.requireNonNull(transport, "transport");
