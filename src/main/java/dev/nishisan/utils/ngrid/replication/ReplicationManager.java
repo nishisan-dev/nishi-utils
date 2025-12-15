@@ -77,6 +77,8 @@ public final class ReplicationManager implements TransportListener, Closeable {
 
     private volatile boolean running;
 
+    private record Failure(PendingOperation operation, Throwable error) {}
+
     public ReplicationManager(Transport transport, ClusterCoordinator coordinator, ReplicationConfig config) {
         this.transport = Objects.requireNonNull(transport, "transport");
         this.coordinator = Objects.requireNonNull(coordinator, "coordinator");
@@ -176,8 +178,6 @@ public final class ReplicationManager implements TransportListener, Closeable {
 
     @Override
     public void onPeerDisconnected(NodeId peerId) {
-        record Failure(PendingOperation operation, Throwable error) {}
-
         int reachable = reachableMembersCount();
         List<Failure> toFail = new ArrayList<>();
         for (PendingOperation operation : pending.values()) {
@@ -279,8 +279,6 @@ public final class ReplicationManager implements TransportListener, Closeable {
             return;
         }
         Instant now = Instant.now();
-        record Failure(PendingOperation operation, Throwable error) {}
-
         List<Failure> toFail = new ArrayList<>();
         for (PendingOperation operation : pending.values()) {
             if (operation.isDone()) {
