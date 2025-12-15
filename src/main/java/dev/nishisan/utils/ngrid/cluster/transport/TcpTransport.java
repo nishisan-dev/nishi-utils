@@ -35,6 +35,8 @@ import java.net.SocketException;
 import java.time.Instant;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -182,16 +184,19 @@ public final class TcpTransport implements Transport {
         connection.send(message);
 
         if (!config.requestTimeout().isZero() && !config.requestTimeout().isNegative()) {
+            long timeoutMs = config.requestTimeout().toMillis();
             ScheduledFuture<?> timeoutTask = scheduler.schedule(() -> {
                 PendingResponse pr = pendingResponses.remove(requestId);
                 if (pr != null) {
-                    pr.timeoutTask = null;
-                    pr.future.completeExceptionally(new TimeoutException("Request timed out requestId=" + requestId
-                                                                         + " destination=" + destination
-                                                                         + " timeout=" + config.requestTimeout()));
+                    pr.clearTimeoutTask();
+                    pr.future.completeExceptionally(new TimeoutException(String.format(
+                            "Request timed out requestId=%s destination=%s timeout=%s",
+                            requestId,
+                            destination,
+                            config.requestTimeout())));
                 }
-            }, config.requestTimeout().toMillis(), TimeUnit.MILLISECONDS);
-            response.timeoutTask = timeoutTask;
+            }, timeoutMs, TimeUnit.MILLISECONDS);
+            response.setTimeoutTask(timeoutTask);
         }
         return future;
     }
@@ -365,12 +370,20 @@ public final class TcpTransport implements Transport {
     private void handleDisconnect(Connection connection) {
         connection.remoteId().ifPresent(nodeId -> {
             connections.remove(nodeId, connection);
-            pendingResponses.forEach((requestId, pending) -> {
-                if (nodeId.equals(pending.destination) && pendingResponses.remove(requestId, pending)) {
+            List<Map.Entry<UUID, PendingResponse>> toFail = new ArrayList<>();
+            for (Map.Entry<UUID, PendingResponse> entry : pendingResponses.entrySet()) {
+                if (nodeId.equals(entry.getValue().destination)) {
+                    toFail.add(entry);
+                }
+            }
+            for (Map.Entry<UUID, PendingResponse> entry : toFail) {
+                UUID requestId = entry.getKey();
+                PendingResponse pending = entry.getValue();
+                if (pendingResponses.remove(requestId, pending)) {
                     pending.cancelTimeout();
                     pending.future.completeExceptionally(new PeerDisconnectedException(nodeId, requestId));
                 }
-            });
+            }
             listeners.forEach(listener -> listener.onPeerDisconnected(nodeId));
         });
     }
@@ -503,9 +516,36 @@ public final class TcpTransport implements Transport {
         }
 
         private void cancelTimeout() {
-            ScheduledFuture<?> task = timeoutTask;
+            ScheduledFuture<?> task;
+            synchronized (this) {
+                task = timeoutTask;
+                timeoutTask = null;
+            }
             if (task != null) {
                 task.cancel(false);
+            }
+        }
+
+        private void setTimeoutTask(ScheduledFuture<?> task) {
+            if (task == null) {
+                return;
+            }
+            boolean cancelNow = false;
+            synchronized (this) {
+                if (future.isDone()) {
+                    cancelNow = true;
+                } else {
+                    timeoutTask = task;
+                }
+            }
+            if (cancelNow) {
+                task.cancel(false);
+            }
+        }
+
+        private void clearTimeoutTask() {
+            synchronized (this) {
+                timeoutTask = null;
             }
         }
     }

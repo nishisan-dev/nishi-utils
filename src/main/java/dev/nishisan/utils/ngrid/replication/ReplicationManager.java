@@ -31,6 +31,8 @@ import dev.nishisan.utils.ngrid.common.ReplicationPayload;
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.Serializable;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -74,6 +76,8 @@ public final class ReplicationManager implements TransportListener, Closeable {
     });
 
     private volatile boolean running;
+
+    private record Failure(PendingOperation operation, Throwable error) {}
 
     public ReplicationManager(Transport transport, ClusterCoordinator coordinator, ReplicationConfig config) {
         this.transport = Objects.requireNonNull(transport, "transport");
@@ -121,6 +125,7 @@ public final class ReplicationManager implements TransportListener, Closeable {
             applied.add(operationId);
         } catch (Exception e) {
             pending.remove(operationId);
+            log.remove(operationId);
             throw new RuntimeException("Failed to apply local operation", e);
         }
         operation.ack(transport.local().nodeId());
@@ -173,19 +178,23 @@ public final class ReplicationManager implements TransportListener, Closeable {
 
     @Override
     public void onPeerDisconnected(NodeId peerId) {
+        int reachable = reachableMembersCount();
+        List<Failure> toFail = new ArrayList<>();
         for (PendingOperation operation : pending.values()) {
             if (operation.isDone()) {
                 continue;
             }
-            int reachable = reachableMembersCount();
             if (reachable < operation.quorum) {
                 QuorumUnreachableException ex = new QuorumUnreachableException(
                         operation.operationId,
                         operation.quorum,
                         reachable,
                         operation.acknowledgementsSnapshot());
-                failOperation(operation, ex);
+                toFail.add(new Failure(operation, ex));
             }
+        }
+        for (Failure failure : toFail) {
+            failOperation(failure.operation(), failure.error());
         }
     }
 
@@ -270,15 +279,21 @@ public final class ReplicationManager implements TransportListener, Closeable {
             return;
         }
         Instant now = Instant.now();
+        List<Failure> toFail = new ArrayList<>();
         for (PendingOperation operation : pending.values()) {
             if (operation.isDone()) {
                 continue;
             }
             if (operation.isExpired(now, timeout)) {
-                TimeoutException ex = new TimeoutException("Replication operation timed out operationId=" + operation.operationId
-                                                          + " timeout=" + timeout);
-                failOperation(operation, ex);
+                TimeoutException ex = new TimeoutException(String.format(
+                        "Replication operation timed out operationId=%s timeout=%s",
+                        operation.operationId,
+                        timeout));
+                toFail.add(new Failure(operation, ex));
             }
+        }
+        for (Failure failure : toFail) {
+            failOperation(failure.operation(), failure.error());
         }
     }
 

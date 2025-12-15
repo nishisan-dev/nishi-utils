@@ -10,6 +10,7 @@ As principais estruturas suportadas são:
 
 - **Fila distribuída**: `DistributedQueue<T>` (utiliza `NQueue<T>` como backend persistente local).
 - **Mapa distribuído**: `DistributedMap<K,V>` (replicado em memória via `ConcurrentHashMap`, com **persistência local opcional** via WAL + snapshot).
+  - O NGrid suporta **múltiplos mapas nomeados** via `NGridNode#getMap("map-name", ...)`. O método `NGridNode#map(...)` continua existindo e retorna o **mapa padrão** (`config.mapName()`, padrão: `default-map`).
 
 O cluster opera no modelo **leader-based**: todas as operações de escrita (e leituras que exigem consistência forte) são roteadas para o **líder**. Se o nó atual já for o líder, a execução é local; caso contrário, é feito um encaminhamento transparente.
 
