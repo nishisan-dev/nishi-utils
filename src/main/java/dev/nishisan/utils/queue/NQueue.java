@@ -72,6 +72,7 @@ public class NQueue<T extends Serializable> implements Closeable {
     private volatile FileChannel dataChannel;
     private final ReentrantLock lock;
     private final Condition notEmpty;
+    private final Object metaWriteLock = new Object();
     private final double compactionWasteThreshold;
     private final long compactionIntervalNanos;
     private final int compactionBufferSize;
@@ -169,8 +170,20 @@ public class NQueue<T extends Serializable> implements Closeable {
 
         QueueState state;
         if (Files.exists(metaPath)) {
-            NQueueQueueMeta meta = NQueueQueueMeta.read(metaPath);
-            state = new QueueState(meta.getConsumerOffset(), meta.getProducerOffset(), meta.getRecordCount(), meta.getLastIndex(), ch);
+            try {
+                NQueueQueueMeta meta = NQueueQueueMeta.read(metaPath);
+                state = new QueueState(meta.getConsumerOffset(), meta.getProducerOffset(), meta.getRecordCount(), meta.getLastIndex(), ch);
+            } catch (IOException e) {
+                // Metadata is corrupt/truncated; rebuild from the data log and overwrite meta.
+                state = rebuildState(ch);
+                persistMeta(metaPath, state);
+                Options.Snapshot snapshot = options.snapshot();
+                return new NQueue<>(queueDir, raf, ch, state,
+                        options,
+                        snapshot.compactionWasteThreshold,
+                        snapshot.compactionIntervalNanos,
+                        snapshot.compactionBufferSize);
+            }
 
             long fileSize = ch.size();
             boolean inconsistent = state.consumerOffset < 0
@@ -217,6 +230,7 @@ public class NQueue<T extends Serializable> implements Closeable {
         int payloadLen = payload.length;
 
         // Passo 3: Adquire o lock para garantir thread-safety durante toda a operação
+        long recordStart = -1L;
         lock.lock();
         try {
             // Passo 4: Calcula o próximo índice sequencial do registro
@@ -235,7 +249,7 @@ public class NQueue<T extends Serializable> implements Closeable {
             // Passo 6: Determina a posição de escrita no arquivo (offset do produtor)
             // e salva essa posição como início do registro para retorno
             long writePos = producerOffset;
-            long recordStart = writePos;
+            recordStart = writePos;
 
             // Passo 7: Serializa os metadados em um ByteBuffer e escreve no canal
             // Garante que todos os bytes do header sejam escritos, mesmo em múltiplas operações
@@ -303,16 +317,18 @@ public class NQueue<T extends Serializable> implements Closeable {
      * @throws IOException if an I/O error occurs while reading or deserializing the object.
      */
     public Optional<T> readAt(long offset) throws IOException {
+        NQueueRecord record;
         lock.lock();
         try {
             Optional<NQueueReadResult> result = readAtInternal(offset);
             if (result.isEmpty()) {
                 return Optional.empty();
             }
-            return Optional.of(deserializeRecord(result.get().getRecord()));
+            record = result.get().getRecord();
         } finally {
             lock.unlock();
         }
+        return Optional.of(deserializeRecord(record));
     }
 
     /**
@@ -366,6 +382,7 @@ public class NQueue<T extends Serializable> implements Closeable {
      * @throws IOException if an I/O error occurs during the operation.
      */
     public Optional<T> peek() throws IOException {
+        NQueueRecord record;
         lock.lock();
         try {
             if (recordCount == 0) {
@@ -375,11 +392,12 @@ public class NQueue<T extends Serializable> implements Closeable {
             if (result.isEmpty()) {
                 return Optional.empty();
             }
-            return Optional.of(deserializeRecord(result.get().getRecord()));
+            record = result.get().getRecord();
         } finally {
             statsUtils.notifyHitCounter(NQueueMetrics.PEEK_EVENT);
             lock.unlock();
         }
+        return Optional.of(deserializeRecord(record));
     }
 
     /**
@@ -401,6 +419,8 @@ public class NQueue<T extends Serializable> implements Closeable {
             if (record.isEmpty()) {
                 return Optional.empty();
             }
+            // Keep deserialization under the same lock so that concurrent consumers observe FIFO
+            // order in the completion order of poll() calls.
             return Optional.of(deserializeRecord(record.get()));
         } finally {
             statsUtils.notifyHitCounter(NQueueMetrics.POLL_EVENT);
@@ -442,6 +462,8 @@ public class NQueue<T extends Serializable> implements Closeable {
             if (record.isEmpty()) {
                 return Optional.empty();
             }
+            // Keep deserialization under the same lock so that concurrent consumers observe FIFO
+            // order in the completion order of poll() calls.
             return Optional.of(deserializeRecord(record.get()));
         } finally {
             statsUtils.notifyHitCounter(NQueueMetrics.POLL_EVENT);
@@ -559,6 +581,11 @@ public class NQueue<T extends Serializable> implements Closeable {
             lock.unlock();
         }
         compactionExecutor.shutdownNow();
+        try {
+            compactionExecutor.awaitTermination(3, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     /**
@@ -573,6 +600,9 @@ public class NQueue<T extends Serializable> implements Closeable {
      * @throws IOException if there is an error reading from the data channel
      */
     private Optional<NQueueReadResult> readAtInternal(long offset) throws IOException {
+        if (!lock.isHeldByCurrentThread()) {
+            throw new IllegalStateException("NQueue internal read must be performed while holding the queue lock");
+        }
         long size = dataChannel.size();
         if (offset + NQueueRecordMetaData.fixedPrefixSize() > size) {
             return Optional.empty();
@@ -707,7 +737,9 @@ public class NQueue<T extends Serializable> implements Closeable {
      * @throws IOException if an I/O error occurs during the persisting process
      */
     private void persistCurrentStateLocked() throws IOException {
-        persistMeta(metaPath, currentState());
+        synchronized (metaWriteLock) {
+            persistMeta(metaPath, currentState());
+        }
     }
 
     /**

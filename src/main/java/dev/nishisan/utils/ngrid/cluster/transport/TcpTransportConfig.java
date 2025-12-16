@@ -34,6 +34,7 @@ public final class TcpTransportConfig {
     private final Duration connectTimeout;
     private final Duration reconnectInterval;
     private final Duration requestTimeout;
+    private final int workerThreads;
 
     private TcpTransportConfig(Builder builder) {
         this.local = builder.local;
@@ -41,6 +42,7 @@ public final class TcpTransportConfig {
         this.connectTimeout = builder.connectTimeout;
         this.reconnectInterval = builder.reconnectInterval;
         this.requestTimeout = builder.requestTimeout;
+        this.workerThreads = builder.workerThreads;
     }
 
     public NodeInfo local() {
@@ -66,6 +68,14 @@ public final class TcpTransportConfig {
         return requestTimeout;
     }
 
+    /**
+     * Worker threads used by the transport to handle accepting connections, reading loops and
+     * asynchronous tasks like reconnect attempts.
+     */
+    public int workerThreads() {
+        return workerThreads;
+    }
+
     public static Builder builder(NodeInfo local) {
         return new Builder(local);
     }
@@ -76,6 +86,7 @@ public final class TcpTransportConfig {
         private Duration connectTimeout = Duration.ofSeconds(5);
         private Duration reconnectInterval = Duration.ofSeconds(3);
         private Duration requestTimeout = Duration.ofSeconds(10);
+        private int workerThreads = Math.max(4, Runtime.getRuntime().availableProcessors());
 
         private Builder(NodeInfo local) {
             this.local = Objects.requireNonNull(local, "local");
@@ -100,6 +111,14 @@ public final class TcpTransportConfig {
 
         public Builder requestTimeout(Duration timeout) {
             this.requestTimeout = Objects.requireNonNull(timeout, "timeout");
+            return this;
+        }
+
+        public Builder workerThreads(int workerThreads) {
+            if (workerThreads < 1) {
+                throw new IllegalArgumentException("workerThreads must be >= 1");
+            }
+            this.workerThreads = workerThreads;
             return this;
         }
 

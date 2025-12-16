@@ -48,6 +48,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
@@ -68,11 +69,8 @@ public final class TcpTransport implements Transport {
     private final Map<NodeId, Connection> connections = new ConcurrentHashMap<>();
     private final Set<TransportListener> listeners = new CopyOnWriteArraySet<>();
     private final Map<UUID, PendingResponse> pendingResponses = new ConcurrentHashMap<>();
-    private final ExecutorService workerPool = Executors.newCachedThreadPool(r -> {
-        Thread t = new Thread(r, "ngrid-transport-worker");
-        t.setDaemon(true);
-        return t;
-    });
+    private final ExecutorService workerPool;
+    private Thread acceptThread;
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "ngrid-transport-scheduler");
         t.setDaemon(true);
@@ -86,6 +84,12 @@ public final class TcpTransport implements Transport {
         this.config = Objects.requireNonNull(config, "config");
         knownPeers.put(config.local().nodeId(), config.local());
         config.initialPeers().forEach(p -> knownPeers.putIfAbsent(p.nodeId(), p));
+        ThreadFactory workerFactory = r -> {
+            Thread t = new Thread(r, "ngrid-transport-worker");
+            t.setDaemon(true);
+            return t;
+        };
+        this.workerPool = Executors.newFixedThreadPool(Math.max(1, config.workerThreads()), workerFactory);
     }
 
     @Override
@@ -101,7 +105,9 @@ public final class TcpTransport implements Transport {
             throw new IllegalStateException("Unable to bind TCP transport", e);
         }
         running = true;
-        workerPool.submit(this::acceptLoop);
+        acceptThread = new Thread(this::acceptLoop, "ngrid-transport-accept");
+        acceptThread.setDaemon(true);
+        acceptThread.start();
         scheduler.scheduleAtFixedRate(this::reconnectLoop,
                 config.reconnectInterval().toMillis(),
                 config.reconnectInterval().toMillis(),
@@ -285,7 +291,9 @@ public final class TcpTransport implements Transport {
             connection.setRemote(preResolved);
             connections.put(preResolved.nodeId(), connection);
         }
-        workerPool.submit(connection::readLoop);
+        Thread reader = new Thread(connection::readLoop, "ngrid-transport-reader");
+        reader.setDaemon(true);
+        reader.start();
         return connection;
     }
 
@@ -304,6 +312,7 @@ public final class TcpTransport implements Transport {
     private void handleHandshake(Connection connection, ClusterMessage message) {
         HandshakePayload payload = message.payload(HandshakePayload.class);
         NodeInfo remoteInfo = payload.local();
+        boolean firstHandshakeOnThisConnection = connection.remoteId().isEmpty();
         connection.setRemote(remoteInfo);
         knownPeers.putIfAbsent(remoteInfo.nodeId(), remoteInfo);
         connections.put(remoteInfo.nodeId(), connection);
@@ -319,8 +328,8 @@ public final class TcpTransport implements Transport {
             }
         });
         broadcastPeerList();
-        // respond with our handshake if inbound connection
-        if (!message.source().equals(config.local().nodeId())) {
+        // Respond with our handshake only once when this was an inbound connection.
+        if (firstHandshakeOnThisConnection) {
             sendHandshake(connection);
         }
     }
@@ -369,7 +378,20 @@ public final class TcpTransport implements Transport {
 
     private void handleDisconnect(Connection connection) {
         connection.remoteId().ifPresent(nodeId -> {
-            connections.remove(nodeId, connection);
+            // Only treat the peer as disconnected when the currently tracked connection goes away.
+            // In rare races, nodes can end up with multiple TCP connections; a stale connection closing
+            // must NOT fail in-flight request/response calls if there is still an active connection.
+            boolean removedActive = connections.remove(nodeId, connection);
+            Connection current = connections.get(nodeId);
+            if (!removedActive && current != null && current.isOpen()) {
+                return;
+            }
+            if (current != null && current.isOpen()) {
+                return;
+            }
+            // Best-effort cleanup: if the peer is no longer connected, drop the per-peer lock.
+            // It will be recreated if we reconnect.
+            connectionLocks.remove(nodeId);
             List<Map.Entry<UUID, PendingResponse>> toFail = new ArrayList<>();
             for (Map.Entry<UUID, PendingResponse> entry : pendingResponses.entrySet()) {
                 if (nodeId.equals(entry.getValue().destination)) {
@@ -394,12 +416,26 @@ public final class TcpTransport implements Transport {
         if (serverSocket != null) {
             serverSocket.close();
         }
+        Thread accept = acceptThread;
+        if (accept != null) {
+            try {
+                accept.join(500);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
         scheduler.shutdownNow();
         workerPool.shutdownNow();
+        try {
+            workerPool.awaitTermination(3, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
         for (Connection connection : connections.values()) {
             connection.close();
         }
         connections.clear();
+        connectionLocks.clear();
         pendingResponses.values().forEach(pending -> {
             pending.cancelTimeout();
             pending.future.completeExceptionally(new IOException("Transport closed"));

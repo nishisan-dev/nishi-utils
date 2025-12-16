@@ -41,6 +41,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -265,8 +266,18 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
         }
         openWalForAppend();
 
-        // Snapshot of the current in-memory state (weakly consistent copy).
-        Map<K, V> snapshot = new HashMap<>(data);
+        // Snapshot of the current in-memory state.
+        // If the backing map is concurrent (typical usage), the copy is weakly consistent but safe.
+        // Otherwise, synchronize on the map instance to avoid ConcurrentModificationException and
+        // ensure a consistent view for snapshotting.
+        Map<K, V> snapshot;
+        if (data instanceof ConcurrentMap<?, ?>) {
+            snapshot = new HashMap<>(data);
+        } else {
+            synchronized (data) {
+                snapshot = new HashMap<>(data);
+            }
+        }
         writeSnapshot(snapshot);
 
         // Compact: delete old WAL now that snapshot exists.

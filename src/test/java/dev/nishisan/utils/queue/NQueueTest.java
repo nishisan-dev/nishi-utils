@@ -141,6 +141,55 @@ class NQueueTest {
     }
 
     @Test
+    void openShouldTruncateIncompleteRecordAtEndOfFile() throws Exception {
+        Path queueName = Path.of("truncate-incomplete");
+        Path queueDir = tempDir.resolve(queueName);
+
+        try (NQueue<String> queue = NQueue.open(tempDir, queueName.toString())) {
+            queue.offer("first");
+            queue.offer("second");
+        }
+
+        Path dataPath = queueDir.resolve("data.log");
+        long size = Files.size(dataPath);
+        assertTrue(size > 8, "Expected data.log to have some bytes");
+
+        // Simulate a crash during append: truncate a few bytes from the end so the last record is incomplete.
+        try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(dataPath.toFile(), "rw")) {
+            raf.setLength(size - 5);
+        }
+
+        try (NQueue<String> queue = NQueue.open(tempDir, queueName.toString())) {
+            assertEquals(1L, queue.size(), "Queue should recover by dropping the incomplete tail record");
+            assertEquals(Optional.of("first"), queue.peek());
+            assertEquals(Optional.of("first"), queue.poll());
+            assertTrue(queue.peek().isEmpty());
+        }
+    }
+
+    @Test
+    void openShouldRecoverWhenMetaFileIsTruncated() throws Exception {
+        Path queueName = Path.of("meta-truncated");
+        Path queueDir = tempDir.resolve(queueName);
+
+        try (NQueue<String> queue = NQueue.open(tempDir, queueName.toString())) {
+            queue.offer("first");
+            queue.offer("second");
+        }
+
+        Path metaPath = queueDir.resolve("queue.meta");
+        byte[] bytes = Files.readAllBytes(metaPath);
+        assertTrue(bytes.length > 4, "Expected queue.meta to have some bytes");
+        Files.write(metaPath, java.util.Arrays.copyOf(bytes, 6)); // invalid/truncated meta
+
+        try (NQueue<String> queue = NQueue.open(tempDir, queueName.toString())) {
+            assertEquals(2L, queue.size(), "Queue should rebuild state when meta is unreadable");
+            assertEquals(Optional.of("first"), queue.poll());
+            assertEquals(Optional.of("second"), queue.poll());
+        }
+    }
+
+    @Test
     void metadataOffsetsShouldRemainConsistentAcrossOperations() throws Exception {
         Path queueName = Path.of("offsets");
         Path queueDir = tempDir.resolve(queueName);

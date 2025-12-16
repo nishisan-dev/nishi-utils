@@ -81,7 +81,11 @@ public final class NGridNode implements Closeable {
         coordinator = new ClusterCoordinator(transport, ClusterCoordinatorConfig.defaults(), coordinatorScheduler);
         coordinator.start();
 
-        replicationManager = new ReplicationManager(transport, coordinator, ReplicationConfig.of(config.replicationQuorum()));
+        ReplicationConfig.Builder replicationBuilder = ReplicationConfig.builder(config.replicationQuorum());
+        if (config.replicationOperationTimeout() != null) {
+            replicationBuilder.operationTimeout(config.replicationOperationTimeout());
+        }
+        replicationManager = new ReplicationManager(transport, coordinator, replicationBuilder.build());
         replicationManager.start();
 
         queueService = new QueueClusterService<>(config.queueDirectory(), config.queueName(), replicationManager);
