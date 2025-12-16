@@ -108,6 +108,14 @@ public final class ReplicationManager implements TransportListener, Closeable {
         handlers.put(topic, handler);
     }
 
+    /**
+     * Exposes the configured replication operation timeout for callers that need to
+     * bound their waiting time (e.g. higher-level services calling {@code future.get(...)}).
+     */
+    public Duration operationTimeout() {
+        return config.operationTimeout();
+    }
+
     public CompletableFuture<ReplicationResult> replicate(String topic, Serializable payload) {
         if (!coordinator.isLeader()) {
             throw new IllegalStateException("Replication can only be initiated by the leader");
@@ -184,6 +192,13 @@ public final class ReplicationManager implements TransportListener, Closeable {
             if (operation.isDone()) {
                 continue;
             }
+            // First, re-check completion based on the acknowledgements we already have.
+            // This avoids failing an operation that may have already reached quorum but
+            // has not yet been observed by a concurrent disconnect callback.
+            checkCompletion(operation);
+            if (operation.isDone()) {
+                continue;
+            }
             if (reachable < operation.quorum) {
                 QuorumUnreachableException ex = new QuorumUnreachableException(
                         operation.operationId,
@@ -254,6 +269,16 @@ public final class ReplicationManager implements TransportListener, Closeable {
         stop();
         executor.shutdownNow();
         timeoutScheduler.shutdownNow();
+        try {
+            executor.awaitTermination(3, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        try {
+            timeoutScheduler.awaitTermination(3, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private int reachableMembersCount() {

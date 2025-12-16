@@ -21,6 +21,7 @@ import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.ngrid.map.MapPersistenceMode;
 
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Objects;
@@ -33,6 +34,7 @@ public final class NGridConfig {
     private final NodeInfo local;
     private final Set<NodeInfo> peers;
     private final int replicationQuorum;
+    private final Duration replicationOperationTimeout;
     private final Path queueDirectory;
     private final String queueName;
     private final Path mapDirectory;
@@ -43,6 +45,7 @@ public final class NGridConfig {
         this.local = builder.local;
         this.peers = Collections.unmodifiableSet(new HashSet<>(builder.peers));
         this.replicationQuorum = builder.replicationQuorum;
+        this.replicationOperationTimeout = builder.replicationOperationTimeout;
         this.queueDirectory = builder.queueDirectory;
         this.queueName = builder.queueName;
         this.mapDirectory = builder.mapDirectory != null ? builder.mapDirectory : builder.queueDirectory.resolve("maps");
@@ -60,6 +63,13 @@ public final class NGridConfig {
 
     public int replicationQuorum() {
         return replicationQuorum;
+    }
+
+    /**
+     * Optional replication operation timeout. When null, the replication layer default is used.
+     */
+    public Duration replicationOperationTimeout() {
+        return replicationOperationTimeout;
     }
 
     public Path queueDirectory() {
@@ -90,6 +100,7 @@ public final class NGridConfig {
         private final NodeInfo local;
         private final Set<NodeInfo> peers = new HashSet<>();
         private int replicationQuorum = 2;
+        private Duration replicationOperationTimeout;
         private Path queueDirectory;
         private String queueName = "ngrid";
         private Path mapDirectory;
@@ -112,6 +123,11 @@ public final class NGridConfig {
                 throw new IllegalArgumentException("Quorum must be >= 1");
             }
             this.replicationQuorum = quorum;
+            return this;
+        }
+
+        public Builder replicationOperationTimeout(Duration timeout) {
+            this.replicationOperationTimeout = Objects.requireNonNull(timeout, "timeout");
             return this;
         }
 

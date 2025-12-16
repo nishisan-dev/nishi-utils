@@ -57,6 +57,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     private final Set<LeaderElectionListener> leaderElectionListeners = new CopyOnWriteArraySet<>();
     private final ScheduledExecutorService scheduler;
     private final AtomicReference<NodeId> leader = new AtomicReference<>();
+    private final Object leaderComputationLock = new Object();
 
     private volatile boolean running;
 
@@ -234,21 +235,23 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      * listeners are notified.
      */
     private void recomputeLeader() {
-        Optional<NodeId> newLeader = members.values().stream()
-                .filter(ClusterMember::isActive)
-                .map(ClusterMember::id)
-                .max(Comparator.naturalOrder());
-        NodeId previous = leader.getAndSet(newLeader.orElse(null));
-        if (!Objects.equals(previous, newLeader.orElse(null))) {
-            NodeId currentLeader = newLeader.orElse(null);
-            leadershipListeners.forEach(listener -> listener.onLeaderChanged(currentLeader));
-            
-            // Notify LeaderElectionListener if local node's leadership status changed
-            NodeId localNodeId = transport.local().nodeId();
-            boolean wasLeader = previous != null && previous.equals(localNodeId);
-            boolean isLeader = currentLeader != null && currentLeader.equals(localNodeId);
-            if (wasLeader != isLeader) {
-                leaderElectionListeners.forEach(listener -> listener.onLeadershipChanged(isLeader, currentLeader));
+        synchronized (leaderComputationLock) {
+            Optional<NodeId> newLeader = members.values().stream()
+                    .filter(ClusterMember::isActive)
+                    .map(ClusterMember::id)
+                    .max(Comparator.naturalOrder());
+            NodeId newLeaderId = newLeader.orElse(null);
+            NodeId previous = leader.getAndSet(newLeaderId);
+            if (!Objects.equals(previous, newLeaderId)) {
+                leadershipListeners.forEach(listener -> listener.onLeaderChanged(newLeaderId));
+
+                // Notify LeaderElectionListener if local node's leadership status changed
+                NodeId localNodeId = transport.local().nodeId();
+                boolean wasLeader = previous != null && previous.equals(localNodeId);
+                boolean isLeader = newLeaderId != null && newLeaderId.equals(localNodeId);
+                if (wasLeader != isLeader) {
+                    leaderElectionListeners.forEach(listener -> listener.onLeadershipChanged(isLeader, newLeaderId));
+                }
             }
         }
     }
@@ -256,9 +259,13 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     @Override
     public void onPeerConnected(NodeInfo peer) {
         members.compute(peer.nodeId(), (id, existing) -> {
-            ClusterMember member = existing == null ? new ClusterMember(peer) : existing;
-            member.touch();
-            return member;
+            // Replace any placeholder member information (e.g. created from a heartbeat before we learned host/port)
+            // or update when host/port changes (e.g. peer restarted on a new port).
+            if (existing == null || !existing.info().equals(peer)) {
+                return new ClusterMember(peer);
+            }
+            existing.touch();
+            return existing;
         });
         recomputeLeader();
     }

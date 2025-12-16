@@ -202,6 +202,61 @@ class NQueueCompactionTest {
     }
 
     @Test
+    void handlesSustainedHighLoadWhileCompacting() throws Exception {
+        NQueue.Options options = NQueue.Options.defaults()
+                .withCompactionWasteThreshold(0.10d)
+                .withCompactionInterval(Duration.ofMillis(5))
+                .withCompactionBufferSize(256)
+                .withFsync(false);
+
+        int producers = 4;
+        int consumers = 2;
+        int total = 500;
+
+        ExecutorService executor = Executors.newFixedThreadPool(producers + consumers);
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicInteger nextSeq = new AtomicInteger();
+        AtomicInteger consumed = new AtomicInteger();
+
+        try (NQueue<TestMessage> queue = NQueue.open(tempDir, "high-load", options)) {
+            List<Future<?>> tasks = new ArrayList<>();
+
+            for (int i = 0; i < producers; i++) {
+                tasks.add(executor.submit(() -> {
+                    start.await();
+                    while (true) {
+                        int seq = nextSeq.getAndIncrement();
+                        if (seq >= total) {
+                            return null;
+                        }
+                        queue.offer(new TestMessage(seq));
+                    }
+                }));
+            }
+
+            for (int i = 0; i < consumers; i++) {
+                tasks.add(executor.submit(() -> {
+                    start.await();
+                    while (consumed.get() < total) {
+                        queue.poll(50, TimeUnit.MILLISECONDS).ifPresent(msg -> consumed.incrementAndGet());
+                    }
+                    return null;
+                }));
+            }
+
+            start.countDown();
+            for (Future<?> f : tasks) {
+                f.get(30, TimeUnit.SECONDS);
+            }
+        } finally {
+            executor.shutdownNow();
+            executor.awaitTermination(5, TimeUnit.SECONDS);
+        }
+
+        assertEquals(total, consumed.get(), "All records should be consumed under sustained load");
+    }
+
+    @Test
     void resumesCompactionAfterStateChangesDuringCopy() throws Exception {
         NQueue.Options options = NQueue.Options.defaults()
                 .withCompactionWasteThreshold(0.1d)

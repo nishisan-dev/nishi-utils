@@ -29,9 +29,11 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Simple distributed map that relies on the replication layer to keep replicas aligned.
@@ -104,8 +106,23 @@ public final class MapClusterService<K extends Serializable, V extends Serializa
 
     private void waitForReplication(CompletableFuture<ReplicationResult> future) {
         try {
-            future.join();
+            long timeoutMs = Math.max(1L, replicationManager.operationTimeout().toMillis());
+            future.get(timeoutMs, TimeUnit.MILLISECONDS);
         } catch (CompletionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof TimeoutException) {
+                throw new IllegalStateException("Replication operation timed out", cause);
+            } else if (cause instanceof QuorumUnreachableException) {
+                throw new IllegalStateException("Quorum unreachable for replication operation", cause);
+            } else {
+                throw new IllegalStateException("Replication operation failed", cause != null ? cause : e);
+            }
+        } catch (TimeoutException e) {
+            throw new IllegalStateException("Replication operation timed out", e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Replication operation interrupted", e);
+        } catch (ExecutionException e) {
             Throwable cause = e.getCause();
             if (cause instanceof TimeoutException) {
                 throw new IllegalStateException("Replication operation timed out", cause);
