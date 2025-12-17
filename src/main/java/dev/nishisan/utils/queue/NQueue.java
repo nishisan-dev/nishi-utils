@@ -102,6 +102,7 @@ public class NQueue<T extends Serializable> implements Closeable {
     private final AtomicLong memoryBufferModeUntil = new AtomicLong(0);
     private final AtomicBoolean drainingInProgress = new AtomicBoolean(false);
     private final AtomicLong drainingEntries = new AtomicLong(0);
+    private final AtomicLong approximateSize = new AtomicLong(0);
     private volatile CountDownLatch drainCompletionLatch;
     private final ExecutorService drainExecutor;
     private final ScheduledExecutorService revalidationExecutor;
@@ -142,6 +143,7 @@ public class NQueue<T extends Serializable> implements Closeable {
         this.producerOffset = state.producerOffset;
         this.recordCount = state.recordCount;
         this.lastIndex = state.lastIndex;
+        this.approximateSize.set(state.recordCount);
         this.options = optsions;
         this.lastCompactionTimeNanos = System.nanoTime();
         this.compactionExecutor = Executors.newSingleThreadExecutor(r -> {
@@ -219,7 +221,11 @@ public class NQueue<T extends Serializable> implements Closeable {
         FileChannel ch = raf.getChannel();
 
         QueueState state;
-        if (Files.exists(metaPath)) {
+        if (options.resetOnRestart) {
+            // Ignorar arquivos existentes e inicializar fila nova
+            state = rebuildState(ch);
+            persistMeta(metaPath, state);
+        } else if (Files.exists(metaPath)) {
             try {
                 NQueueQueueMeta meta = NQueueQueueMeta.read(metaPath);
                 state = new QueueState(meta.getConsumerOffset(), meta.getProducerOffset(), meta.getRecordCount(), meta.getLastIndex(), ch);
@@ -395,6 +401,7 @@ public class NQueue<T extends Serializable> implements Closeable {
         // Update internal state
         producerOffset = writePos;
         recordCount++;
+        approximateSize.incrementAndGet();
         lastIndex = nextIndex;
 
         if (recordCount == 1) {
@@ -637,6 +644,27 @@ public class NQueue<T extends Serializable> implements Closeable {
         } finally {
             lock.unlock();
         }
+    }
+
+    /**
+     * Retrieves the current size of the queue, represented by the total number
+     * of records present in the queue.
+     * <p>
+     * When {@code optimistic} is {@code true}, this method returns an approximate
+     * size without acquiring locks, providing a fast but potentially slightly
+     * inaccurate value. When {@code optimistic} is {@code false}, this method
+     * behaves identically to {@link #size()}, returning an exact value with locks.
+     *
+     * @param optimistic if {@code true}, returns an approximate size without locks;
+     *                   if {@code false}, returns an exact size using locks (same as {@link #size()})
+     * @return the total number of records currently in the queue (approximate if optimistic, exact otherwise)
+     * @throws IOException if an I/O error occurs during the operation (only when optimistic is false)
+     */
+    public long size(boolean optimistic) throws IOException {
+        if (!optimistic) {
+            return size();
+        }
+        return approximateSize.get();
     }
 
     /**
@@ -1023,6 +1051,7 @@ public class NQueue<T extends Serializable> implements Closeable {
         NQueueReadResult rr = result.get();
         consumerOffset = rr.getNextOffset();
         recordCount--;
+        approximateSize.decrementAndGet();
         if (recordCount == 0) {
             consumerOffset = producerOffset;
         }
@@ -1741,6 +1770,7 @@ public class NQueue<T extends Serializable> implements Closeable {
         private int memoryBufferSize = 10000;
         private Duration lockTryTimeout = Duration.ofMillis(10);
         private Duration revalidationInterval = Duration.ofMillis(100);
+        private boolean resetOnRestart = false;
 
         private Options() {
         }
@@ -1878,6 +1908,20 @@ public class NQueue<T extends Serializable> implements Closeable {
                 throw new IllegalArgumentException("interval não pode ser negativo");
             }
             this.revalidationInterval = interval;
+            return this;
+        }
+
+        /**
+         * Configures whether the queue should reset on restart, ignoring existing persistent data.
+         * When enabled, even if persistence files exist, the queue will be initialized as empty,
+         * effectively resetting the queue on each restart.
+         *
+         * @param resetOnRestart if {@code true}, ignores existing persistent data and initializes an empty queue;
+         *                       if {@code false}, loads existing persistent data (default behavior)
+         * @return the current {@code Options} instance for method chaining
+         */
+        public Options withResetOnRestart(boolean resetOnRestart) {
+            this.resetOnRestart = resetOnRestart;
             return this;
         }
 
