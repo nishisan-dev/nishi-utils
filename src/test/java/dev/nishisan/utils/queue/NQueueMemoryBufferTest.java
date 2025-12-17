@@ -4,6 +4,14 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.nio.ByteBuffer;
+import java.nio.MappedByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.channels.ReadableByteChannel;
+import java.nio.channels.WritableByteChannel;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -17,6 +25,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -520,6 +529,192 @@ class NQueueMemoryBufferTest {
         } finally {
             executor.shutdownNow();
             executor.awaitTermination(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void testFifoDuringCompactionAndMemoryMode() throws Exception {
+        NQueue.Options options = NQueue.Options.defaults()
+                .withMemoryBuffer(true)
+                .withMemoryBufferSize(200)
+                .withLockTryTimeout(Duration.ofMillis(10))
+                .withRevalidationInterval(Duration.ofMillis(100))
+                .withFsync(false);
+
+        try (NQueue<Integer> queue = NQueue.open(tempDir, "fifo-compaction", options)) {
+            setAtomicLong(queue, "memoryBufferModeUntil", System.nanoTime() + TimeUnit.SECONDS.toNanos(5));
+            setField(queue, "compactionState", getCompactionState("RUNNING"));
+
+            List<Integer> expected = new ArrayList<>();
+            for (int i = 1; i <= 50; i++) {
+                expected.add(i);
+                queue.offer(i);
+            }
+
+            setField(queue, "compactionState", getCompactionState("IDLE"));
+
+            List<Integer> consumed = new ArrayList<>();
+            for (int i = 0; i < expected.size(); i++) {
+                consumed.add(queue.poll(1, TimeUnit.SECONDS).orElseThrow());
+            }
+
+            assertEquals(expected, consumed);
+        }
+    }
+
+    @Test
+    void testDrainRetryPreservesOrder() throws Exception {
+        NQueue.Options options = NQueue.Options.defaults()
+                .withMemoryBuffer(true)
+                .withMemoryBufferSize(50)
+                .withLockTryTimeout(Duration.ofMillis(10))
+                .withRevalidationInterval(Duration.ofMillis(100))
+                .withFsync(false);
+
+        try (NQueue<Integer> queue = NQueue.open(tempDir, "drain-retry", options)) {
+            Field dataChannelField = NQueue.class.getDeclaredField("dataChannel");
+            dataChannelField.setAccessible(true);
+            FileChannel original = (FileChannel) dataChannelField.get(queue);
+            dataChannelField.set(queue, new FailingFileChannel(original));
+
+            setAtomicLong(queue, "memoryBufferModeUntil", System.nanoTime() + TimeUnit.SECONDS.toNanos(2));
+            setField(queue, "compactionState", getCompactionState("RUNNING"));
+
+            List<Integer> expected = new ArrayList<>();
+            for (int i = 0; i < 20; i++) {
+                expected.add(i);
+                queue.offer(i);
+            }
+
+            setField(queue, "compactionState", getCompactionState("IDLE"));
+
+            Method awaitDrain = NQueue.class.getDeclaredMethod("awaitDrainCompletion");
+            awaitDrain.setAccessible(true);
+            awaitDrain.invoke(queue);
+
+            List<Integer> consumed = new ArrayList<>();
+            for (int i = 0; i < expected.size(); i++) {
+                consumed.add(queue.poll(1, TimeUnit.SECONDS).orElseThrow());
+            }
+
+            assertEquals(expected, consumed);
+        }
+    }
+
+    private static Object getCompactionState(String name) throws Exception {
+        Class<?> compactionEnum = Class.forName("dev.nishisan.utils.queue.NQueue$CompactionState");
+        return Enum.valueOf((Class<Enum>) compactionEnum, name);
+    }
+
+    private static void setField(Object target, String fieldName, Object value) throws Exception {
+        Field field = target.getClass().getDeclaredField(fieldName);
+        field.setAccessible(true);
+        field.set(target, value);
+    }
+
+    private static void setAtomicLong(Object target, String fieldName, long value) throws Exception {
+        Field field = target.getClass().getDeclaredField(fieldName);
+        field.setAccessible(true);
+        AtomicLong atomic = (AtomicLong) field.get(target);
+        atomic.set(value);
+    }
+
+    private static final class FailingFileChannel extends FileChannel {
+        private final FileChannel delegate;
+        private final AtomicBoolean failNext = new AtomicBoolean(true);
+
+        FailingFileChannel(FileChannel delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public int read(ByteBuffer dst) throws IOException {
+            return delegate.read(dst);
+        }
+
+        @Override
+        public int read(ByteBuffer dst, long position) throws IOException {
+            return delegate.read(dst, position);
+        }
+
+        @Override
+        public long read(ByteBuffer[] dsts, int offset, int length) throws IOException {
+            return delegate.read(dsts, offset, length);
+        }
+
+        @Override
+        public int write(ByteBuffer src) throws IOException {
+            return delegate.write(src);
+        }
+
+        @Override
+        public int write(ByteBuffer src, long position) throws IOException {
+            if (failNext.getAndSet(false)) {
+                throw new IOException("forced failure");
+            }
+            return delegate.write(src, position);
+        }
+
+        @Override
+        public long write(ByteBuffer[] srcs, int offset, int length) throws IOException {
+            return delegate.write(srcs, offset, length);
+        }
+
+        @Override
+        public long position() throws IOException {
+            return delegate.position();
+        }
+
+        @Override
+        public FileChannel position(long newPosition) throws IOException {
+            delegate.position(newPosition);
+            return this;
+        }
+
+        @Override
+        public long size() throws IOException {
+            return delegate.size();
+        }
+
+        @Override
+        public FileChannel truncate(long size) throws IOException {
+            delegate.truncate(size);
+            return this;
+        }
+
+        @Override
+        public void force(boolean metaData) throws IOException {
+            delegate.force(metaData);
+        }
+
+        @Override
+        public long transferTo(long position, long count, WritableByteChannel target) throws IOException {
+            return delegate.transferTo(position, count, target);
+        }
+
+        @Override
+        public long transferFrom(ReadableByteChannel src, long position, long count) throws IOException {
+            return delegate.transferFrom(src, position, count);
+        }
+
+        @Override
+        public MappedByteBuffer map(MapMode mode, long position, long size) throws IOException {
+            return delegate.map(mode, position, size);
+        }
+
+        @Override
+        public FileLock tryLock(long position, long size, boolean shared) throws IOException {
+            return delegate.tryLock(position, size, shared);
+        }
+
+        @Override
+        public FileLock lock(long position, long size, boolean shared) throws IOException {
+            return delegate.lock(position, size, shared);
+        }
+
+        @Override
+        protected void implCloseChannel() throws IOException {
+            delegate.close();
         }
     }
 }
