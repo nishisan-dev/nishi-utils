@@ -113,6 +113,7 @@ public class NQueue<T extends Serializable> implements Closeable {
     private final ExecutorService drainExecutor;
     private final ScheduledExecutorService revalidationExecutor;
     private final AtomicBoolean revalidationScheduled = new AtomicBoolean(false);
+    private final AtomicBoolean switchBackRequested = new AtomicBoolean(false);
     private final long lockTryTimeoutNanos;
     private final long revalidationIntervalNanos;
 
@@ -1144,6 +1145,8 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     private void runCompaction(QueueState snapshot) {
+        boolean success = false;
+        Throwable error = null;
         try {
             Files.deleteIfExists(tempDataPath);
             try (RandomAccessFile tmpRaf = new RandomAccessFile(tempDataPath.toFile(), "rw");
@@ -1158,14 +1161,19 @@ public class NQueue<T extends Serializable> implements Closeable {
                 }
 
                 finalizeCompaction(snapshot, tempDataPath, tmpChannel.size());
+                success = true;
             }
         } catch (IOException ignored) {
+            error = ignored;
             lock.lock();
             try {
                 compactionState = CompactionState.IDLE;
             } finally {
                 lock.unlock();
             }
+        } catch (Throwable t) {
+            error = t;
+            throw t;
         } finally {
             lock.lock();
             try {
@@ -1177,7 +1185,82 @@ public class NQueue<T extends Serializable> implements Closeable {
             } finally {
                 lock.unlock();
             }
+
+            onCompactionFinished(success, error);
         }
+    }
+
+    private void onCompactionFinished(boolean success, Throwable error) {
+        if (!enableMemoryBuffer || revalidationExecutor == null) {
+            return;
+        }
+
+        if (!isMemoryModeActive() && !hasInMemoryItems()) {
+            return;
+        }
+
+        if (!switchBackRequested.compareAndSet(false, true)) {
+            return;
+        }
+
+        revalidationExecutor.execute(() -> {
+            try {
+                boolean acquired = false;
+                try {
+                    acquired = lock.tryLock(lockTryTimeoutNanos, TimeUnit.NANOSECONDS);
+                    if (acquired) {
+                        if (compactionState == CompactionState.RUNNING) {
+                            compactionState = CompactionState.IDLE;
+                        }
+                        if (!hasInMemoryItems() && !isCompactingLocked()) {
+                            memoryBufferModeUntil.set(0);
+                            return;
+                        }
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    activateMemoryMode();
+                    return;
+                } finally {
+                    if (acquired) {
+                        lock.unlock();
+                    }
+                }
+
+                tryDrainMemoryBufferSync();
+
+                boolean acquiredAgain = false;
+                try {
+                    acquiredAgain = lock.tryLock(lockTryTimeoutNanos, TimeUnit.NANOSECONDS);
+                    if (!acquiredAgain) {
+                        activateMemoryMode();
+                        return;
+                    }
+
+                    if (compactionState == CompactionState.RUNNING) {
+                        compactionState = CompactionState.IDLE;
+                    }
+
+                    if (!hasInMemoryItems() && !isCompactingLocked()) {
+                        memoryBufferModeUntil.set(0);
+                    } else {
+                        activateMemoryMode();
+                        if (hasInMemoryItems() && !drainingInProgress.get()) {
+                            triggerDrainIfNeeded();
+                        }
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    activateMemoryMode();
+                } finally {
+                    if (acquiredAgain) {
+                        lock.unlock();
+                    }
+                }
+            } finally {
+                switchBackRequested.set(false);
+            }
+        });
     }
 
     private void copyActiveRegion(QueueState snapshot, FileChannel target) throws IOException {
@@ -1322,6 +1405,10 @@ public class NQueue<T extends Serializable> implements Closeable {
         scheduleRevalidationIfNeeded();
     }
 
+    private boolean isMemoryModeActive() {
+        return enableMemoryBuffer && memoryBufferModeUntil.get() > System.nanoTime();
+    }
+
     /**
      * Schedules revalidation if needed.
      */
@@ -1380,6 +1467,10 @@ public class NQueue<T extends Serializable> implements Closeable {
 
     private boolean shouldContinueRevalidation() {
         return memoryBufferModeUntil.get() > System.nanoTime();
+    }
+
+    private boolean isCompactingLocked() {
+        return compactionState == CompactionState.RUNNING;
     }
 
     /**
