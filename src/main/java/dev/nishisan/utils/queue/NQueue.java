@@ -36,13 +36,18 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.BlockingDeque;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
@@ -70,6 +75,7 @@ import java.util.concurrent.CountDownLatch;
 public class NQueue<T extends Serializable> implements Closeable {
     private static final String DATA_FILE = "data.log";
     private static final String META_FILE = "queue.meta";
+    private static final int MEMORY_DRAIN_BATCH_SIZE = 256;
     private final StatsUtils statsUtils = new StatsUtils();
     private final Path queueDir;
     private final Path dataPath;
@@ -98,7 +104,7 @@ public class NQueue<T extends Serializable> implements Closeable {
     // Memory buffer fields
     private final boolean enableMemoryBuffer;
     private final BlockingQueue<MemoryBufferEntry<T>> memoryBuffer;
-    private final BlockingQueue<MemoryBufferEntry<T>> drainingQueue; // Queue for items collected by async drain
+    private final BlockingDeque<MemoryBufferEntry<T>> drainingQueue; // Queue for items collected by async drain
     private final AtomicLong memoryBufferModeUntil = new AtomicLong(0);
     private final AtomicBoolean drainingInProgress = new AtomicBoolean(false);
     private final AtomicLong drainingEntries = new AtomicLong(0);
@@ -106,6 +112,7 @@ public class NQueue<T extends Serializable> implements Closeable {
     private volatile CountDownLatch drainCompletionLatch;
     private final ExecutorService drainExecutor;
     private final ScheduledExecutorService revalidationExecutor;
+    private final AtomicBoolean revalidationScheduled = new AtomicBoolean(false);
     private final long lockTryTimeoutNanos;
     private final long revalidationIntervalNanos;
 
@@ -162,7 +169,7 @@ public class NQueue<T extends Serializable> implements Closeable {
         if (enableMemoryBuffer) {
             this.memoryBuffer = new LinkedBlockingQueue<>(memoryBufferSize);
             // Draining queue can be same size or larger - it holds items collected by async drain
-            this.drainingQueue = new LinkedBlockingQueue<>(memoryBufferSize);
+            this.drainingQueue = new LinkedBlockingDeque<>(memoryBufferSize);
             this.drainExecutor = Executors.newSingleThreadExecutor(r -> {
                 Thread t = new Thread(r, "nqueue-drain-worker");
                 t.setDaemon(true);
@@ -302,47 +309,27 @@ public class NQueue<T extends Serializable> implements Closeable {
 
         // If not in memory mode, try normal lock
         if (!shouldUseMemory) {
-            boolean lockAcquired = false;
-            try {
-                lockAcquired = lock.tryLock(lockTryTimeoutNanos, TimeUnit.NANOSECONDS);
-
-                if (lockAcquired) {
-                    // Lock acquired: check if compaction is running
-                    try {
-                        if (compactionState == CompactionState.RUNNING) {
-                            // Compaction running: activate memory mode
-                            activateMemoryMode();
-                                              lock.unlock();
-                            lockAcquired = false; // Mark as unlocked to prevent double unlock
-                                              return offerToMemoryBuffer(object);
-                        } else {
-                                              if (shouldDrainMemoryBuffer()) {
-                                drainMemoryBufferSync();
-                            }
-                            // Everything OK: write directly to disk
-                            return offerDirectLocked(object);
-                        }
-                    } finally {
-                        if (lockAcquired) {
-                            // After writing to disk, try to drain memory if needed
-                            drainMemoryBufferIfNeeded();
-                            lock.unlock();
-                        }
-                    }
-                } else {
-                    // Lock not available: activate memory mode
+            return withTryLock(() -> {
+                if (compactionState == CompactionState.RUNNING) {
                     activateMemoryMode();
-                    return offerToMemoryBuffer(object);
+                    return enqueueToMemoryAndTriggerDrain(object);
                 }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+
+                if (shouldDrainMemoryBuffer()) {
+                    drainMemoryBufferSync();
+                }
+
+                long offset = offerDirectLocked(object);
+                drainMemoryBufferIfNeeded();
+                return offset;
+            }, () -> {
                 activateMemoryMode();
-                return offerToMemoryBuffer(object);
-            }
-        } else {
-            // Already in memory mode: check if revalidation is needed
-            return offerWithRevalidation(object);
+                return enqueueToMemoryAndTriggerDrain(object);
+            });
         }
+
+        // Already in memory mode: check if revalidation is needed
+        return offerWithRevalidation(object);
     }
 
     /**
@@ -363,58 +350,68 @@ public class NQueue<T extends Serializable> implements Closeable {
      * This is the original offer() logic extracted into a separate method.
      */
     private long offerDirectLocked(T object) throws IOException {
+        long offset = offerBatchLocked(List.of(object), true);
+        statsUtils.notifyHitCounter(NQueueMetrics.OFFERED_EVENT);
+        return offset;
+    }
+
+    private long offerBatchLocked(List<T> items, boolean fsyncAtEnd) throws IOException {
         if (!lock.isHeldByCurrentThread()) {
-            throw new IllegalStateException("offerDirectLocked must be called while holding the lock");
+            throw new IllegalStateException("offerBatchLocked must be called while holding the lock");
+        }
+        if (items.isEmpty()) {
+            return -1;
         }
 
-        // Serialize the object
-        byte[] payload = toBytes(object);
-        int payloadLen = payload.length;
-
-        // Calculate next sequential index
-        long nextIndex = lastIndex + 1;
-        if (nextIndex < 0) {
-            nextIndex = 0;
-        }
-
-        // Create record metadata
-        NQueueRecordMetaData meta = new NQueueRecordMetaData(nextIndex, payloadLen, object.getClass().getCanonicalName());
-
-        // Determine write position
+        long nextIndex = lastIndex;
         long writePos = producerOffset;
-        long recordStart = writePos;
+        long firstRecordStart = -1L;
+        long initialRecordCount = recordCount;
 
-        // Write header
-        ByteBuffer hb = meta.toByteBuffer();
-        while (hb.hasRemaining()) {
-            int written = dataChannel.write(hb, writePos);
-            writePos += written;
+        for (T object : items) {
+            byte[] payload = toBytes(object);
+            int payloadLen = payload.length;
+
+            nextIndex = nextIndex + 1;
+            if (nextIndex < 0) {
+                nextIndex = 0;
+            }
+
+            NQueueRecordMetaData meta = new NQueueRecordMetaData(nextIndex, payloadLen, object.getClass().getCanonicalName());
+            long recordStart = writePos;
+            ByteBuffer hb = meta.toByteBuffer();
+            while (hb.hasRemaining()) {
+                int written = dataChannel.write(hb, writePos);
+                writePos += written;
+            }
+
+            ByteBuffer pb = ByteBuffer.wrap(payload);
+            while (pb.hasRemaining()) {
+                int written = dataChannel.write(pb, writePos);
+                writePos += written;
+            }
+
+            if (firstRecordStart < 0) {
+                firstRecordStart = recordStart;
+            }
         }
 
-        // Write payload
-        ByteBuffer pb = ByteBuffer.wrap(payload);
-        while (pb.hasRemaining()) {
-            int written = dataChannel.write(pb, writePos);
-            writePos += written;
-        }
-
-        // Update internal state
         producerOffset = writePos;
-        recordCount++;
-        approximateSize.incrementAndGet();
+        recordCount += items.size();
+        approximateSize.addAndGet(items.size());
         lastIndex = nextIndex;
 
-        if (recordCount == 1) {
-            consumerOffset = recordStart;
+        if (initialRecordCount == 0 && firstRecordStart >= 0) {
+            consumerOffset = firstRecordStart;
         }
 
-        dataChannel.force(options.withFsync);
         persistCurrentStateLocked();
+        if (fsyncAtEnd && options.withFsync) {
+            dataChannel.force(true);
+        }
         maybeCompactLocked();
         notEmpty.signalAll();
-
-        statsUtils.notifyHitCounter(NQueueMetrics.OFFERED_EVENT);
-        return recordStart;
+        return firstRecordStart;
     }
 
     /**
@@ -1268,26 +1265,7 @@ public class NQueue<T extends Serializable> implements Closeable {
      * Adds an object to the memory buffer as a fallback when lock is unavailable.
      */
     private long offerToMemoryBuffer(T object) throws IOException {
-        MemoryBufferEntry<T> entry = new MemoryBufferEntry<>(object);
-
-        if (memoryBuffer.offer(entry)) {
-            tryDrainMemoryBufferSync();
-            triggerDrainIfNeeded();
-            statsUtils.notifyHitCounter(NQueueMetrics.OFFERED_EVENT);
-            return -1; // Offset will be assigned during drain
-        } else {
-            // Buffer full: block until space is available
-            try {
-                memoryBuffer.put(entry);
-                tryDrainMemoryBufferSync();
-                triggerDrainIfNeeded();
-                statsUtils.notifyHitCounter(NQueueMetrics.OFFERED_EVENT);
-                return -1;
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new IOException("Interrupted while waiting for memory buffer", e);
-            }
-        }
+        return enqueueToMemoryAndTriggerDrain(object);
     }
 
     /**
@@ -1299,63 +1277,36 @@ public class NQueue<T extends Serializable> implements Closeable {
             // Buffer full: force immediate revalidation
             revalidateMemoryMode();
 
-            // Try lock again
-            boolean lockAcquired = false;
-            try {
-                lockAcquired = lock.tryLock(lockTryTimeoutNanos, TimeUnit.NANOSECONDS);
-
-                if (lockAcquired) {
-                    try {
-                        if (compactionState != CompactionState.RUNNING) {
-                            // Lock released: drain and write directly
-                            if (shouldDrainMemoryBuffer()) {
-                                drainMemoryBufferSync();
-                            }
-                            return offerDirectLocked(object);
-                        } else {
-                            // Still in compaction: unlock and block until space
-                            lock.unlock();
-                            lockAcquired = false;
-                            try {
-                                memoryBuffer.put(new MemoryBufferEntry<>(object));
-                                triggerDrainIfNeeded();
-                                return -1;
-                            } catch (InterruptedException e) {
-                                Thread.currentThread().interrupt();
-                                throw new IOException("Interrupted while waiting for memory buffer", e);
-                            }
-                        }
-                    } finally {
-                        if (lockAcquired) {
-                            lock.unlock();
-                        }
+            return withTryLock(() -> {
+                if (compactionState != CompactionState.RUNNING) {
+                    if (shouldDrainMemoryBuffer()) {
+                        drainMemoryBufferSync();
                     }
-                } else {
-                    // Lock still occupied: block until space in buffer
-                    try {
-                        memoryBuffer.put(new MemoryBufferEntry<>(object));
-                        triggerDrainIfNeeded();
-                        return -1;
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        throw new IOException("Interrupted while waiting for memory buffer", e);
-                    }
+                    long offset = offerDirectLocked(object);
+                    drainMemoryBufferIfNeeded();
+                    return offset;
                 }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new IOException("Interrupted while trying to acquire lock", e);
+                activateMemoryMode();
+                return enqueueToMemoryAndTriggerDrain(object);
+            }, () -> enqueueToMemoryAndTriggerDrain(object));
+        }
+
+        return enqueueToMemoryAndTriggerDrain(object);
+    }
+
+    private long enqueueToMemoryAndTriggerDrain(T object) throws IOException {
+        MemoryBufferEntry<T> entry = new MemoryBufferEntry<>(object);
+        try {
+            if (!memoryBuffer.offer(entry)) {
+                memoryBuffer.put(entry);
             }
-        } else {
-            // Buffer has space: add normally
-            if (memoryBuffer.offer(new MemoryBufferEntry<>(object))) {
-                tryDrainMemoryBufferSync();
-                triggerDrainIfNeeded();
-                statsUtils.notifyHitCounter(NQueueMetrics.OFFERED_EVENT);
-                return -1;
-            } else {
-                // Race condition: buffer filled between check and offer
-                return offerWithRevalidation(object); // Retry
-            }
+            tryDrainMemoryBufferSync();
+            triggerDrainIfNeeded();
+            statsUtils.notifyHitCounter(NQueueMetrics.OFFERED_EVENT);
+            return -1;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted while waiting for memory buffer", e);
         }
     }
 
@@ -1375,9 +1326,17 @@ public class NQueue<T extends Serializable> implements Closeable {
      * Schedules revalidation if needed.
      */
     private void scheduleRevalidationIfNeeded() {
-        // Avoid multiple simultaneous revalidations
-        if (revalidationExecutor != null) {
-            revalidationExecutor.schedule(this::revalidateMemoryMode,
+        if (revalidationExecutor != null && revalidationScheduled.compareAndSet(false, true)) {
+            revalidationExecutor.schedule(() -> {
+                        try {
+                            revalidateMemoryMode();
+                        } finally {
+                            revalidationScheduled.set(false);
+                            if (shouldContinueRevalidation()) {
+                                scheduleRevalidationIfNeeded();
+                            }
+                        }
+                    },
                     revalidationIntervalNanos, TimeUnit.NANOSECONDS);
         }
     }
@@ -1398,7 +1357,7 @@ public class NQueue<T extends Serializable> implements Closeable {
 
                 if (lockAcquired) {
                     try {
-                        if (compactionState != CompactionState.RUNNING && !hasMemoryBufferItems()) {
+                        if (compactionState != CompactionState.RUNNING && !hasInMemoryItems()) {
                             // Everything OK: deactivate memory mode
                             memoryBufferModeUntil.set(0);
                         } else {
@@ -1416,10 +1375,11 @@ public class NQueue<T extends Serializable> implements Closeable {
                 Thread.currentThread().interrupt();
                 activateMemoryMode(); // On error, keep memory mode
             }
-        } else {
-            // Still within period: schedule next revalidation
-            scheduleRevalidationIfNeeded();
         }
+    }
+
+    private boolean shouldContinueRevalidation() {
+        return memoryBufferModeUntil.get() > System.nanoTime();
     }
 
     /**
@@ -1434,31 +1394,112 @@ public class NQueue<T extends Serializable> implements Closeable {
         }
     }
 
-    private void tryDrainMemoryBufferSync() {
-        if (!hasMemoryBufferItems()) {
-            return;
-        }
-
+    private <R> R withTryLock(Callable<R> body, Callable<R> onFailure) throws IOException {
         boolean acquired = false;
         try {
             acquired = lock.tryLock(lockTryTimeoutNanos, TimeUnit.NANOSECONDS);
             if (acquired) {
-                drainMemoryBufferSync();
+                return body.call();
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-        } catch (IOException ignored) {
-            // If drain fails, fallback to async drain
+        } catch (Exception e) {
+            if (e instanceof IOException) {
+                throw (IOException) e;
+            }
+            throw new RuntimeException(e);
         } finally {
             if (acquired) {
                 lock.unlock();
             }
         }
+
+        try {
+            return onFailure.call();
+        } catch (Exception e) {
+            if (e instanceof IOException) {
+                throw (IOException) e;
+            }
+            throw new RuntimeException(e);
+        }
+    }
+
+    private void tryDrainMemoryBufferSync() {
+        if (!hasInMemoryItems()) {
+            return;
+        }
+        try {
+            withTryLock(() -> {
+                drainMemoryBufferSync();
+                return null;
+            }, () -> null);
+        } catch (IOException ignored) {
+            // If drain fails, fallback to async drain
+        }
+    }
+
+    private DrainBatchResult<T> acquireDrainBatch(int maxBatchSize) {
+        if (memoryBuffer != null && drainingQueue != null) {
+            while (drainingQueue.size() < maxBatchSize) {
+                MemoryBufferEntry<T> entry = memoryBuffer.poll();
+                if (entry == null) {
+                    break;
+                }
+                if (!drainingQueue.offer(entry)) {
+                    memoryBuffer.offer(entry);
+                    break;
+                }
+                drainingEntries.incrementAndGet();
+            }
+        }
+
+        List<MemoryBufferEntry<T>> batch = new ArrayList<>(maxBatchSize);
+        if (drainingQueue != null) {
+            MemoryBufferEntry<T> entry;
+            while (batch.size() < maxBatchSize && (entry = drainingQueue.poll()) != null) {
+                batch.add(entry);
+            }
+        }
+
+        return new DrainBatchResult<>(batch, 0);
+    }
+
+    private void requeueBatchFront(List<MemoryBufferEntry<T>> batch) {
+        if (drainingQueue == null || batch.isEmpty()) {
+            return;
+        }
+        for (int i = batch.size() - 1; i >= 0; i--) {
+            MemoryBufferEntry<T> entry = batch.get(i);
+            try {
+                drainingQueue.putFirst(entry);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+    }
+
+    private static final class DrainBatchResult<T> {
+        final List<MemoryBufferEntry<T>> entries;
+        final int newlyCounted;
+
+        DrainBatchResult(List<MemoryBufferEntry<T>> entries, int newlyCounted) {
+            this.entries = entries;
+            this.newlyCounted = newlyCounted;
+        }
+
+        boolean isEmpty() {
+            return entries.isEmpty();
+        }
+
+        int size() {
+            return entries.size();
+        }
     }
 
     /**
      * Drains memory buffer asynchronously in background.
-     * 
+     *
      * New approach using draining queue:
      * 1. Try to process items already in draining queue first
      * 2. If draining queue is empty, collect batch from memory buffer
@@ -1472,114 +1513,29 @@ public class NQueue<T extends Serializable> implements Closeable {
      */
     private void drainMemoryBuffer() {
         try {
-            while (true) {
-                // First, try to process items already in draining queue
-                if (drainingQueue != null && !drainingQueue.isEmpty()) {
-                    boolean lockAcquired = false;
+            while (hasInMemoryItems()) {
+                boolean processed;
+                try {
+                    processed = withTryLock(() -> {
+                        drainMemoryBufferSync();
+                        return true;
+                    }, () -> false);
+                } catch (IOException e) {
                     try {
-                        lockAcquired = lock.tryLock(10, TimeUnit.MILLISECONDS);
-                        
-                        if (lockAcquired) {
-                            // Process items from draining queue
-                            java.util.List<MemoryBufferEntry<T>> toProcess = new java.util.ArrayList<>();
-                            drainingQueue.drainTo(toProcess, 100); // Process up to 100 items
-                            
-                            // Update drainingEntries for items we're processing
-                            long processed = toProcess.size();
-                            for (long i = 0; i < processed; i++) {
-                                drainingEntries.decrementAndGet();
-                            }
-                            
-                            // Process items
-                            for (MemoryBufferEntry<T> e : toProcess) {
-                                try {
-                                    offerDirectLocked(e.item);
-                                } catch (IOException ex) {
-                                    // Re-queue the item to memory buffer for a later attempt
-                                    memoryBuffer.offer(e);
-                                }
-                            }
-                            
-                            // Continue loop to check for more items
-                            lock.unlock();
-                            lockAcquired = false;
-                            continue;
-                        }
+                        Thread.sleep(5);
                     } catch (InterruptedException interrupted) {
                         Thread.currentThread().interrupt();
                         break;
-                    } finally {
-                        if (lockAcquired) {
-                            lock.unlock();
-                        }
                     }
+                    continue;
                 }
 
-                // Collect batch of items from memory buffer (max 100 items at a time)
-                java.util.List<MemoryBufferEntry<T>> batch = new java.util.ArrayList<>();
-                MemoryBufferEntry<T> batchEntry;
-                while ((batchEntry = memoryBuffer.poll()) != null && batch.size() < 100) {
-                    batch.add(batchEntry);
-                }
-
-                if (batch.isEmpty()) {
-                    // No items in memory buffer and draining queue is empty (or we couldn't process it)
-                    break; // Nothing to drain
-                }
-
-                // Move items to draining queue (atomic operation)
-                // This ensures items are never "lost" - they're either in memory buffer or draining queue
-                for (MemoryBufferEntry<T> e : batch) {
-                    drainingQueue.offer(e);
-                    drainingEntries.incrementAndGet();
-                }
-
-                // Try to acquire lock to process items from draining queue
-                boolean lockAcquired = false;
-                try {
-                    lockAcquired = lock.tryLock(10, TimeUnit.MILLISECONDS);
-                    
-                    if (lockAcquired) {
-                        // Lock acquired: process items from draining queue
-                        // Drain items from queue to maintain FIFO order
-                        java.util.List<MemoryBufferEntry<T>> toProcess = new java.util.ArrayList<>();
-                        drainingQueue.drainTo(toProcess, 100);
-                        
-                        // Update drainingEntries for items we're processing
-                        long processed = toProcess.size();
-                        for (long i = 0; i < processed; i++) {
-                            drainingEntries.decrementAndGet();
-                        }
-                        
-                        // Process items
-                        for (MemoryBufferEntry<T> e : toProcess) {
-                            try {
-                                offerDirectLocked(e.item);
-                            } catch (IOException ex) {
-                                // Re-queue the item to memory buffer for a later attempt
-                                memoryBuffer.offer(e);
-                            }
-                        }
-                    } else {
-                        // Lock not available: items remain in draining queue
-                        // They will be processed in next iteration or by sync drain
-                        // Wait a bit before trying again to avoid busy-waiting
-                        try {
-                            Thread.sleep(5);
-                        } catch (InterruptedException interrupted) {
-                            Thread.currentThread().interrupt();
-                            break;
-                        }
-                        // Continue loop to try processing again
-                        continue;
-                    }
-                } catch (InterruptedException interrupted) {
-                    Thread.currentThread().interrupt();
-                    // On interruption, items remain in draining queue - they'll be processed later
-                    break;
-                } finally {
-                    if (lockAcquired) {
-                        lock.unlock();
+                if (!processed) {
+                    try {
+                        Thread.sleep(5);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
                     }
                 }
             }
@@ -1592,7 +1548,7 @@ public class NQueue<T extends Serializable> implements Closeable {
                 drainCompletionLatch = null;
             }
             // Handle items that might have been enqueued after the last drain batch
-            if (hasMemoryBufferItems() || (drainingQueue != null && !drainingQueue.isEmpty())) {
+            if (hasInMemoryItems()) {
                 triggerDrainIfNeeded();
             }
         }
@@ -1601,43 +1557,27 @@ public class NQueue<T extends Serializable> implements Closeable {
     /**
      * Drains all items from memory buffer synchronously.
      * Used in poll() and close() to ensure FIFO order.
-     * 
-     * New approach using draining queue:
-     * 1. Collect all items from memory buffer
-     * 2. Atomically transfer all items from draining queue (steal from async drain)
-     * 3. Process all items in FIFO order: memory buffer first, then draining queue
-     * 4. Update drainingEntries to reflect stolen items
-     * 
      * This method must be called while holding the lock.
-     * 
-     * This guarantees strict FIFO order and eliminates race conditions.
      */
     private void drainMemoryBufferSync() throws IOException {
-        // Collect all items from memory buffer
-        java.util.List<MemoryBufferEntry<T>> memoryItems = new java.util.ArrayList<>();
-        if (hasMemoryBufferItems()) {
-            memoryBuffer.drainTo(memoryItems);
-        }
-
-        // Atomically "steal" all items from draining queue
-        // This is the key to eliminating race conditions
-        java.util.List<MemoryBufferEntry<T>> drainingItems = new java.util.ArrayList<>();
-        if (drainingQueue != null && !drainingQueue.isEmpty()) {
-            drainingQueue.drainTo(drainingItems);
-            // Update drainingEntries to reflect items we stole
-            long stolen = drainingItems.size();
-            for (long i = 0; i < stolen; i++) {
-                drainingEntries.decrementAndGet();
+        while (true) {
+            DrainBatchResult<T> batchResult = acquireDrainBatch(MEMORY_DRAIN_BATCH_SIZE);
+            if (batchResult.isEmpty()) {
+                break;
             }
-        }
 
-        // Process all items in FIFO order: memory buffer first, then draining queue
-        // This preserves strict FIFO ordering
-        for (MemoryBufferEntry<T> entry : memoryItems) {
-            offerDirectLocked(entry.item);
-        }
-        for (MemoryBufferEntry<T> entry : drainingItems) {
-            offerDirectLocked(entry.item);
+            List<T> items = new ArrayList<>(batchResult.size());
+            for (MemoryBufferEntry<T> entry : batchResult.entries) {
+                items.add(entry.item);
+            }
+
+            try {
+                offerBatchLocked(items, options.withFsync);
+                drainingEntries.addAndGet(-batchResult.size());
+            } catch (IOException e) {
+                requeueBatchFront(batchResult.entries);
+                throw e;
+            }
         }
     }
 
@@ -1646,7 +1586,7 @@ public class NQueue<T extends Serializable> implements Closeable {
      * Called after normal operations to ensure memory is drained.
      */
     private void drainMemoryBufferIfNeeded() {
-        if (hasMemoryBufferItems() && !drainingInProgress.get()) {
+        if (hasInMemoryItems() && !drainingInProgress.get()) {
             triggerDrainIfNeeded();
         }
     }
@@ -1661,6 +1601,13 @@ public class NQueue<T extends Serializable> implements Closeable {
         return enableMemoryBuffer && memoryBuffer != null && !memoryBuffer.isEmpty();
     }
 
+    private boolean hasInMemoryItems() {
+        return enableMemoryBuffer
+                && ((memoryBuffer != null && !memoryBuffer.isEmpty())
+                || (drainingQueue != null && !drainingQueue.isEmpty())
+                || drainingEntries.get() > 0);
+    }
+
     /**
      * Helper method to check if memory buffer should be drained before operations.
      * Must be called while holding the lock.
@@ -1668,7 +1615,7 @@ public class NQueue<T extends Serializable> implements Closeable {
      * @return true if memory buffer should be drained
      */
     private boolean shouldDrainMemoryBuffer() {
-        return hasMemoryBufferItems();
+        return hasInMemoryItems();
     }
 
     /**
