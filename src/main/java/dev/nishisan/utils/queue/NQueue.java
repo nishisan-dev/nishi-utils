@@ -300,6 +300,7 @@ public class NQueue<T extends Serializable> implements Closeable {
                             // Compaction running: activate memory mode
                             activateMemoryMode();
                             lock.unlock();
+                            lockAcquired = false; // Mark as unlocked to prevent double unlock
                             return offerToMemoryBuffer(object);
                         } else {
                             // Everything OK: write directly to disk
@@ -556,13 +557,35 @@ public class NQueue<T extends Serializable> implements Closeable {
             }
 
             while (recordCount == 0) {
+                // Check memory buffer again before waiting, in case items were added
+                if (enableMemoryBuffer && memoryBuffer != null && !memoryBuffer.isEmpty()) {
+                    drainMemoryBufferSync();
+                    if (recordCount > 0) {
+                        break;
+                    }
+                }
+                
                 if (nanos <= 0L) {
+                    // Final check of memory buffer before returning empty
+                    if (enableMemoryBuffer && memoryBuffer != null && !memoryBuffer.isEmpty()) {
+                        drainMemoryBufferSync();
+                        if (recordCount > 0) {
+                            break;
+                        }
+                    }
                     return Optional.empty();
                 }
                 try {
                     nanos = notEmpty.awaitNanos(nanos);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
+                    // Check memory buffer one more time before returning empty
+                    if (enableMemoryBuffer && memoryBuffer != null && !memoryBuffer.isEmpty()) {
+                        drainMemoryBufferSync();
+                        if (recordCount > 0) {
+                            break;
+                        }
+                    }
                     return Optional.empty();
                 }
             }
@@ -591,7 +614,12 @@ public class NQueue<T extends Serializable> implements Closeable {
     public long size() throws IOException {
         lock.lock();
         try {
-            return recordCount;
+            long size = recordCount;
+            // Include items in memory buffer if enabled
+            if (enableMemoryBuffer && memoryBuffer != null) {
+                size += memoryBuffer.size();
+            }
+            return size;
         } finally {
             lock.unlock();
         }

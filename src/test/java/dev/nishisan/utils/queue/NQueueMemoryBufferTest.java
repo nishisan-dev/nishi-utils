@@ -423,21 +423,57 @@ class NQueueMemoryBufferTest {
                                 consumedList.add(item.get());
                                 consumed.incrementAndGet();
                             } else {
-                                // If no item and producers are done, check if queue is empty
+                                // If no item and producers are done, keep trying until queue is empty
                                 if (producersDone.get()) {
                                     try {
                                         long queueSize = queue.size();
-                                        if (queueSize == 0 && consumed.get() < totalItems) {
+                                        if (queueSize == 0) {
                                             // Wait a bit more in case items are still being drained
                                             Thread.sleep(100);
-                                            if (queue.size() == 0) {
-                                                break;
+                                            // Try polling again
+                                            Optional<Integer> retryItem = queue.poll(100, TimeUnit.MILLISECONDS);
+                                            if (retryItem.isPresent()) {
+                                                consumedList.add(retryItem.get());
+                                                consumed.incrementAndGet();
+                                                continue;
+                                            }
+                                            // Final check: if queue is still empty and we haven't consumed all items,
+                                            // wait a bit more and try one last time
+                                            if (queue.size() == 0 && consumed.get() < totalItems) {
+                                                Thread.sleep(200);
+                                                Optional<Integer> finalItem = queue.poll(200, TimeUnit.MILLISECONDS);
+                                                if (finalItem.isPresent()) {
+                                                    consumedList.add(finalItem.get());
+                                                    consumed.incrementAndGet();
+                                                    continue;
+                                                }
+                                                // If still empty after all retries, break
+                                                if (queue.size() == 0) {
+                                                    break;
+                                                }
                                             }
                                         }
                                     } catch (IOException e) {
                                         throw new RuntimeException(e);
                                     }
                                 }
+                            }
+                        }
+                        
+                        // After main loop, if producers are done, try to consume any remaining items
+                        if (producersDone.get() && consumed.get() < totalItems) {
+                            try {
+                                for (int retry = 0; retry < 10 && consumed.get() < totalItems; retry++) {
+                                    Optional<Integer> remainingItem = queue.poll(200, TimeUnit.MILLISECONDS);
+                                    if (remainingItem.isPresent()) {
+                                        consumedList.add(remainingItem.get());
+                                        consumed.incrementAndGet();
+                                    } else if (queue.size() == 0) {
+                                        break;
+                                    }
+                                }
+                            } catch (IOException e) {
+                                throw new RuntimeException(e);
                             }
                         }
                     } catch (Exception e) {
@@ -456,6 +492,21 @@ class NQueueMemoryBufferTest {
                 executor.awaitTermination(5, TimeUnit.SECONDS);
                 fail("Test did not complete within timeout. Produced: " + produced.get() + 
                      ", Consumed: " + consumed.get() + ", Queue size: " + queue.size());
+            }
+
+            // Try to consume any remaining items before closing
+            while (consumed.get() < totalItems) {
+                try {
+                    Optional<Integer> remainingItem = queue.poll(100, TimeUnit.MILLISECONDS);
+                    if (remainingItem.isPresent()) {
+                        consumedList.add(remainingItem.get());
+                        consumed.incrementAndGet();
+                    } else if (queue.size() == 0) {
+                        break;
+                    }
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
             }
 
             // Verify all items were produced
