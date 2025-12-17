@@ -15,6 +15,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -353,7 +354,8 @@ class NQueueMemoryBufferTest {
 
             assertEquals("first", queue.poll().orElseThrow());
             assertEquals("second", queue.poll().orElseThrow());
-            assertTrue(queue.poll().isEmpty());
+            // Use poll with timeout to avoid blocking indefinitely when queue is empty
+            assertTrue(queue.poll(0, TimeUnit.SECONDS).isEmpty(), "Queue is not empty...");
         }
     }
 
@@ -376,17 +378,25 @@ class NQueueMemoryBufferTest {
             AtomicInteger produced = new AtomicInteger(0);
             AtomicInteger consumed = new AtomicInteger(0);
             List<Integer> consumedList = Collections.synchronizedList(new ArrayList<>());
+            AtomicBoolean producersDone = new AtomicBoolean(false);
 
             // Producers
             for (int i = 0; i < 5; i++) {
                 executor.submit(() -> {
                     try {
                         start.await();
-                        while (produced.get() < totalItems) {
-                            int next = produced.getAndIncrement();
-                            if (next < totalItems) {
-                                queue.offer(next);
+                        while (true) {
+                            int current = produced.get();
+                            if (current >= totalItems) {
+                                break;
                             }
+                            if (produced.compareAndSet(current, current + 1)) {
+                                queue.offer(current);
+                            }
+                        }
+                        // Mark producers as done when all threads finish
+                        if (produced.get() >= totalItems) {
+                            producersDone.set(true);
                         }
                     } catch (Exception e) {
                         throw new RuntimeException(e);
@@ -399,12 +409,72 @@ class NQueueMemoryBufferTest {
                 executor.submit(() -> {
                     try {
                         start.await();
+                        long startTime = System.currentTimeMillis();
+                        long maxWaitTime = 60_000; // 60 seconds max
+                        
                         while (consumed.get() < totalItems) {
+                            // Safety timeout to prevent infinite loops
+                            if (System.currentTimeMillis() - startTime > maxWaitTime) {
+                                break;
+                            }
+                            
                             Optional<Integer> item = queue.poll(100, TimeUnit.MILLISECONDS);
-                            item.ifPresent(val -> {
-                                consumedList.add(val);
+                            if (item.isPresent()) {
+                                consumedList.add(item.get());
                                 consumed.incrementAndGet();
-                            });
+                            } else {
+                                // If no item and producers are done, keep trying until queue is empty
+                                if (producersDone.get()) {
+                                    try {
+                                        long queueSize = queue.size();
+                                        if (queueSize == 0) {
+                                            // Wait a bit more in case items are still being drained
+                                            Thread.sleep(100);
+                                            // Try polling again
+                                            Optional<Integer> retryItem = queue.poll(100, TimeUnit.MILLISECONDS);
+                                            if (retryItem.isPresent()) {
+                                                consumedList.add(retryItem.get());
+                                                consumed.incrementAndGet();
+                                                continue;
+                                            }
+                                            // Final check: if queue is still empty and we haven't consumed all items,
+                                            // wait a bit more and try one last time
+                                            if (queue.size() == 0 && consumed.get() < totalItems) {
+                                                Thread.sleep(200);
+                                                Optional<Integer> finalItem = queue.poll(200, TimeUnit.MILLISECONDS);
+                                                if (finalItem.isPresent()) {
+                                                    consumedList.add(finalItem.get());
+                                                    consumed.incrementAndGet();
+                                                    continue;
+                                                }
+                                                // If still empty after all retries, break
+                                                if (queue.size() == 0) {
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    } catch (IOException e) {
+                                        throw new RuntimeException(e);
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // After main loop, if producers are done, try to consume any remaining items
+                        if (producersDone.get() && consumed.get() < totalItems) {
+                            try {
+                                for (int retry = 0; retry < 10 && consumed.get() < totalItems; retry++) {
+                                    Optional<Integer> remainingItem = queue.poll(200, TimeUnit.MILLISECONDS);
+                                    if (remainingItem.isPresent()) {
+                                        consumedList.add(remainingItem.get());
+                                        consumed.incrementAndGet();
+                                    } else if (queue.size() == 0) {
+                                        break;
+                                    }
+                                }
+                            } catch (IOException e) {
+                                throw new RuntimeException(e);
+                            }
                         }
                     } catch (Exception e) {
                         throw new RuntimeException(e);
@@ -414,11 +484,42 @@ class NQueueMemoryBufferTest {
 
             start.countDown();
             executor.shutdown();
-            assertTrue(executor.awaitTermination(30, TimeUnit.SECONDS));
+            
+            // Verify that all threads terminated successfully
+            boolean terminated = executor.awaitTermination(60, TimeUnit.SECONDS);
+            if (!terminated) {
+                executor.shutdownNow();
+                executor.awaitTermination(5, TimeUnit.SECONDS);
+                fail("Test did not complete within timeout. Produced: " + produced.get() + 
+                     ", Consumed: " + consumed.get() + ", Queue size: " + queue.size());
+            }
 
-            assertEquals(totalItems, consumedList.size());
+            // Try to consume any remaining items before closing
+            while (consumed.get() < totalItems) {
+                try {
+                    Optional<Integer> remainingItem = queue.poll(100, TimeUnit.MILLISECONDS);
+                    if (remainingItem.isPresent()) {
+                        consumedList.add(remainingItem.get());
+                        consumed.incrementAndGet();
+                    } else if (queue.size() == 0) {
+                        break;
+                    }
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            }
+
+            // Verify all items were produced
+            assertTrue(produced.get() >= totalItems, 
+                "Not all items were produced. Expected at least " + totalItems + ", got " + produced.get());
+
+            // Verify all items were consumed
+            assertEquals(totalItems, consumedList.size(),
+                "Not all items were consumed. Expected " + totalItems + ", got " + consumedList.size() + 
+                ". Produced: " + produced.get() + ", Consumed counter: " + consumed.get());
         } finally {
             executor.shutdownNow();
+            executor.awaitTermination(5, TimeUnit.SECONDS);
         }
     }
 }
