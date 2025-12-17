@@ -1211,7 +1211,9 @@ public class NQueue<T extends Serializable> implements Closeable {
                     if (acquired) {
                         if (compactionState == CompactionState.RUNNING) {
                             compactionState = CompactionState.IDLE;
+                            compactionFuture = null;
                         }
+
                         if (!hasInMemoryItems() && !isCompactingLocked()) {
                             memoryBufferModeUntil.set(0);
                             return;
@@ -1235,10 +1237,6 @@ public class NQueue<T extends Serializable> implements Closeable {
                     if (!acquiredAgain) {
                         activateMemoryMode();
                         return;
-                    }
-
-                    if (compactionState == CompactionState.RUNNING) {
-                        compactionState = CompactionState.IDLE;
                     }
 
                     if (!hasInMemoryItems() && !isCompactingLocked()) {
@@ -1383,7 +1381,6 @@ public class NQueue<T extends Serializable> implements Closeable {
             if (!memoryBuffer.offer(entry)) {
                 memoryBuffer.put(entry);
             }
-            tryDrainMemoryBufferSync();
             triggerDrainIfNeeded();
             statsUtils.notifyHitCounter(NQueueMetrics.OFFERED_EVENT);
             return -1;
