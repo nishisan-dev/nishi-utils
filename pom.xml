@@ -6,7 +6,7 @@
 
     <groupId>dev.nishisan</groupId>
     <artifactId>nishi-utils</artifactId>
-    <version>1.0.19</version>
+    <version>1.0.20</version>
     <dependencyManagement>
         <dependencies>
             <dependency>
