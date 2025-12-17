@@ -893,9 +893,11 @@ public class NQueue<T extends Serializable> implements Closeable {
 
         byte[] payload = new byte[meta.getPayloadLen()];
         ByteBuffer pb = ByteBuffer.wrap(payload);
-        int r = dataChannel.read(pb, payloadStart);
-        if (r < payload.length) {
-            throw new EOFException("Payload incompleto.");
+        while (pb.hasRemaining()) {
+            int r = dataChannel.read(pb, payloadStart + pb.position());
+            if (r < 0) {
+                throw new EOFException("Payload incompleto.");
+            }
         }
 
         long nextOffset = payloadEnd;
@@ -1154,13 +1156,13 @@ public class NQueue<T extends Serializable> implements Closeable {
                 // Copies the active window [consumerOffset, producerOffset) into a temporary file
                 // without holding the main queue lock, allowing offer/poll/peek to proceed. The
                 // only synchronization points happen when switching the live file to the compacted one.
-                copyActiveRegion(snapshot, tmpChannel);
+                copyRegion(snapshot.dataChannel, snapshot.consumerOffset, snapshot.producerOffset, tmpChannel);
 
                 if (options.withFsync) {
                     tmpChannel.force(true);
                 }
 
-                finalizeCompaction(snapshot, tempDataPath, tmpChannel.size());
+                finalizeCompaction(snapshot, tempDataPath, tmpChannel);
                 success = true;
             }
         } catch (IOException ignored) {
@@ -1261,78 +1263,124 @@ public class NQueue<T extends Serializable> implements Closeable {
         });
     }
 
-    private void copyActiveRegion(QueueState snapshot, FileChannel target) throws IOException {
-        ByteBuffer buffer = ByteBuffer.allocate(compactionBufferSize);
-        long readOffset = snapshot.consumerOffset;
-        long limit = snapshot.producerOffset;
-        FileChannel source = snapshot.dataChannel;
-
-        while (readOffset < limit) {
-            buffer.clear();
-            int bytesRead = source.read(buffer, readOffset);
-            if (bytesRead <= 0) {
+    private void copyRegion(FileChannel source, long start, long end, FileChannel target) throws IOException {
+        long position = start;
+        long count = end - start;
+        while (count > 0) {
+            long transferred = source.transferTo(position, count, target);
+            if (transferred <= 0) {
                 break;
             }
-            buffer.flip();
-            while (buffer.hasRemaining()) {
-                target.write(buffer);
-            }
-            readOffset += bytesRead;
+            position += transferred;
+            count -= transferred;
         }
     }
 
-    private void finalizeCompaction(QueueState snapshot, Path tempPath, long newProducerOffset) throws IOException {
+    private void finalizeCompaction(QueueState snapshot, Path tempPath, FileChannel tempChannel) throws IOException {
         lock.lock();
         try {
-            boolean stateChanged = consumerOffset != snapshot.consumerOffset
-                    || producerOffset != snapshot.producerOffset
-                    || recordCount != snapshot.recordCount
-                    || lastIndex != snapshot.lastIndex;
+            // "Catch-up" Logic:
+            // The file on disk (active) has likely changed since the snapshot.
+            // We need to append any new data that arrived after the snapshot
+            // and adjust the consumer offset if items were consumed.
 
-            if (stateChanged) {
-                // State changed while we copied the active window. Abort this attempt.
-                // Instead of immediately rescheduling compaction, update lastCompactionTimeNanos
-                // to enforce a minimum interval before the next compaction attempt.
-                compactionState = CompactionState.IDLE;
-                compactionFuture = null;
-                long now = System.nanoTime();
-                // Force the next compaction evaluation to consider the interval exceeded so we
-                // do not stall when the queue becomes empty right after a failed attempt.
-                lastCompactionTimeNanos = compactionIntervalNanos > 0
-                        ? now - compactionIntervalNanos
-                        : now;
-                maybeCompactLocked();
+            // 1. Sanity Check: If producer moved backwards, a reset happened. Abort.
+            if (producerOffset < snapshot.producerOffset) {
                 return;
             }
 
-            // Minimal critical section: close the old channel, atomically switch the file,
-            // reopen the channel, and update in-memory offsets/state before releasing the lock.
-            // Use local variables to avoid exposing closed channels to other threads via volatile fields.
-            FileChannel oldDataChannel = dataChannel;
-            RandomAccessFile oldRaf = raf;
-            
-            oldDataChannel.close();
-            oldRaf.close();
-
-            try {
-                Files.move(tempPath, dataPath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-            } catch (AtomicMoveNotSupportedException e) {
-                Files.move(tempPath, dataPath, StandardCopyOption.REPLACE_EXISTING);
+            // 2. Append Delta (New Writes)
+            long deltaStart = snapshot.producerOffset;
+            long deltaEnd = producerOffset;
+            if (deltaEnd > deltaStart) {
+                copyRegion(dataChannel, deltaStart, deltaEnd, tempChannel);
             }
 
-            RandomAccessFile newRaf = new RandomAccessFile(dataPath.toFile(), "rw");
-            FileChannel newDataChannel = newRaf.getChannel();
+            // 3. Adjust Consumer Offset (New Reads)
+            // Calculate how many bytes were consumed relative to the snapshot start
+            long bytesConsumedSinceSnapshot = consumerOffset - snapshot.consumerOffset;
             
-            this.raf = newRaf;
-            this.dataChannel = newDataChannel;
+            // In the new file, the data starts at offset 0 (which corresponds to snapshot.consumerOffset)
+            // So the new consumer offset is simply the bytes consumed since then.
+            long newConsumerOffset = 0;
+            if (bytesConsumedSinceSnapshot > 0) {
+                newConsumerOffset = bytesConsumedSinceSnapshot;
+            }
+            
+            long newProducerOffset = tempChannel.position();
 
-            consumerOffset = 0L;
-            producerOffset = newProducerOffset;
+            // Safety clamp
+            if (newConsumerOffset > newProducerOffset) {
+                newConsumerOffset = newProducerOffset;
+            }
+
+            if (options.withFsync) {
+                tempChannel.force(true);
+            }
+
+            // 4. Safe Swap (Move First Strategy)
+            // On Linux/Unix, we can move/replace a file even if it's open.
+            // This is much safer because if the move fails, we haven't closed the original channel yet.
+            
+            // First, close the temp channel to ensure all data is flushed to disk
+            tempChannel.close(); 
+            
+            try {
+                try {
+                    Files.move(tempPath, dataPath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+                } catch (AtomicMoveNotSupportedException e) {
+                    Files.move(tempPath, dataPath, StandardCopyOption.REPLACE_EXISTING);
+                }
+            } catch (IOException e) {
+                // If move fails, we just abort. The original channel is still open and valid!
+                // We might want to delete the temp file later (handled by finally/caller).
+                throw new IOException("Compaction failed during file move. Queue state preserved.", e);
+            }
+
+            // 5. Initialize New State & Close Old
+            try {
+                RandomAccessFile newRaf = new RandomAccessFile(dataPath.toFile(), "rw");
+                FileChannel newDataChannel = newRaf.getChannel();
+                
+                // Capture old resources to close them later
+                FileChannel oldDataChannel = dataChannel;
+                RandomAccessFile oldRaf = raf;
+                
+                // Atomic Swap of Memory References
+                this.raf = newRaf;
+                this.dataChannel = newDataChannel;
+                
+                // Update Offsets
+                this.consumerOffset = newConsumerOffset;
+                this.producerOffset = newProducerOffset;
+                
+                // Now it's safe to close the old resources (which point to the unlinked inode)
+                try {
+                    oldDataChannel.close();
+                    oldRaf.close();
+                } catch (IOException ignored) {
+                    // Logging would be good here, but failure to close old handle is not critical for queue operation
+                }
+                
+                persistCurrentStateLocked();
+                lastCompactionTimeNanos = System.nanoTime();
+                
+            } catch (IOException e) {
+                // If opening the new file fails, we are in a weird state:
+                // The file on disk IS the new file (move succeeded), but we failed to open it.
+                // The old channel still points to the old (now deleted) inode.
+                // Technically the queue can continue working with the old channel for a while,
+                // but persistence is desynchronized.
+                // Ideally, we should try to recover or fail hard.
+                throw new IOException("Compaction succeeded on disk but failed to reopen channel.", e);
+            }
+
+            this.consumerOffset = newConsumerOffset;
+            this.producerOffset = newProducerOffset;
+            
+            // recordCount and lastIndex are logical and remain correct.
 
             persistCurrentStateLocked();
-            if (options.withFsync) {
-                dataChannel.force(true);
-            }
 
             lastCompactionTimeNanos = System.nanoTime();
         } finally {
