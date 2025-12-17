@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
@@ -26,6 +27,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.BlockingQueue;
+import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -601,9 +604,68 @@ class NQueueMemoryBufferTest {
         }
     }
 
+    @Test
+    void testCompactionFinishedSwitchesBackToPersistentMode() throws Exception {
+        NQueue.Options options = NQueue.Options.defaults()
+                .withMemoryBuffer(true)
+                .withMemoryBufferSize(10)
+                .withLockTryTimeout(Duration.ofMillis(10))
+                .withRevalidationInterval(Duration.ofMillis(20))
+                .withFsync(false);
+
+        try (NQueue<Integer> queue = NQueue.open(tempDir, "compaction-finished", options)) {
+            Constructor<?> constructor = getMemoryBufferEntryConstructor();
+            BlockingQueue<Object> memoryBuffer = getMemoryBuffer(queue);
+
+            memoryBuffer.offer(constructor.newInstance(1));
+            memoryBuffer.offer(constructor.newInstance(2));
+
+            setAtomicLong(queue, "memoryBufferModeUntil", System.nanoTime() + TimeUnit.SECONDS.toNanos(1));
+            setField(queue, "compactionState", getCompactionState("RUNNING"));
+
+            Method onFinished = NQueue.class.getDeclaredMethod("onCompactionFinished", boolean.class, Throwable.class);
+            onFinished.setAccessible(true);
+            onFinished.invoke(queue, true, null);
+
+            awaitCondition(() -> {
+                try {
+                    return memoryBuffer.isEmpty()
+                            && ((AtomicLong) getFieldValue(queue, "memoryBufferModeUntil")).get() == 0L;
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            }, 3, TimeUnit.SECONDS);
+
+            assertEquals(Optional.of(1), queue.poll(1, TimeUnit.SECONDS));
+            assertEquals(Optional.of(2), queue.poll(1, TimeUnit.SECONDS));
+
+            awaitCondition(() -> {
+                try {
+                    return getFieldValue(queue, "compactionState").equals(getCompactionState("IDLE"));
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            }, 1, TimeUnit.SECONDS);
+        }
+    }
+
     private static Object getCompactionState(String name) throws Exception {
         Class<?> compactionEnum = Class.forName("dev.nishisan.utils.queue.NQueue$CompactionState");
         return Enum.valueOf((Class<Enum>) compactionEnum, name);
+    }
+
+    private static Constructor<?> getMemoryBufferEntryConstructor() throws Exception {
+        Class<?> entryClass = Class.forName("dev.nishisan.utils.queue.NQueue$MemoryBufferEntry");
+        Constructor<?> constructor = entryClass.getDeclaredConstructor(Object.class);
+        constructor.setAccessible(true);
+        return constructor;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static BlockingQueue<Object> getMemoryBuffer(NQueue<?> queue) throws Exception {
+        Field field = queue.getClass().getDeclaredField("memoryBuffer");
+        field.setAccessible(true);
+        return (BlockingQueue<Object>) field.get(queue);
     }
 
     private static void setField(Object target, String fieldName, Object value) throws Exception {
@@ -617,6 +679,23 @@ class NQueueMemoryBufferTest {
         field.setAccessible(true);
         AtomicLong atomic = (AtomicLong) field.get(target);
         atomic.set(value);
+    }
+
+    private static Object getFieldValue(Object target, String fieldName) throws Exception {
+        Field field = target.getClass().getDeclaredField(fieldName);
+        field.setAccessible(true);
+        return field.get(target);
+    }
+
+    private static void awaitCondition(BooleanSupplier condition, long timeout, TimeUnit unit) throws InterruptedException {
+        long deadline = System.nanoTime() + unit.toNanos(timeout);
+        while (System.nanoTime() < deadline) {
+            if (condition.getAsBoolean()) {
+                return;
+            }
+            Thread.sleep(10);
+        }
+        fail("Condition not satisfied within timeout");
     }
 
     private static final class FailingFileChannel extends FileChannel {
