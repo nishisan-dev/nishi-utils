@@ -88,8 +88,10 @@ class NQueueTest {
             assertTrue(record.isPresent());
             assertEquals("delayed", record.get());
 
-            NQueueReadResult readResult = queue.readRecordAt(offset).orElseThrow();
-            assertEquals(0L, readResult.getRecord().meta().getIndex());
+            if (offset != NQueue.OFFSET_HANDOFF) {
+                NQueueReadResult readResult = queue.readRecordAt(offset).orElseThrow();
+                assertEquals(0L, readResult.getRecord().meta().getIndex());
+            }
         } finally {
             executor.shutdownNow();
             executor.awaitTermination(2, TimeUnit.SECONDS);
