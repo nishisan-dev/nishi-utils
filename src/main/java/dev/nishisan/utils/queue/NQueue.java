@@ -56,65 +56,31 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
+
 /**
- * Persistent, thread-safe FIFO queue.
+ * A classe NQueue representa uma implementação de fila persistente e escalável, projetada para
+ * suportar operações simultâneas de produtores e consumidores. Essa classe gerencia dados que
+ * podem ser armazenados tanto em memória quanto em disco, oferecendo alta resiliência e
+ * consistência mesmo em condições de falhas ou reinicialização do sistema.
  *
- * Responsibilities
- * - Provide a durable, append-only, file-backed queue that preserves record order across process restarts.
- * - Support multiple concurrent producers and consumers with predictable blocking semantics.
- * - Persist consumption progress so that already-consumed records are not re-delivered after restart.
- * - Reclaim disk space transparently via background compaction without interrupting producers/consumers.
- * - Optionally stage new records in memory to maintain throughput during high contention or compaction.
+ * A principal responsabilidade da NQueue é coordenar o armazenamento e a recuperação de
+ * elementos de forma ordenada, garantindo controle sobre entrega única de elementos, suporte
+ * a diferentes estratégias de armazenamento e funcionalidades como compactação de dados para
+ * otimização do espaço em disco.
  *
- * Execution flow (high-level)
- * - Enqueue: New records are accepted in FIFO order. Under normal conditions they are durably appended to
- *   the queue log and the logical size is updated. If temporary in-memory staging is enabled and the queue
- *   detects contention or a maintenance window, records may be first placed in a bounded in-memory buffer
- *   and later drained to disk in batches while preserving order.
- * - Dequeue: Consumers obtain the next available record in FIFO order. A blocking variant waits until a
- *   record becomes available; a timed variant returns empty on timeout. A non-destructive peek is also
- *   available. Once a record is returned by a dequeue operation, the queue advances its internal cursor and
- *   persists that advancement, meaning the record will not be re-delivered after a restart.
- * - Startup and recovery: On open, the queue reconstructs its state from persisted metadata. If metadata is
- *   unavailable or inconsistent, it recovers by scanning the log up to the last complete record and discarding
- *   any torn tail, ensuring the queue starts in a consistent state.
- * - Maintenance and compaction: When a configurable threshold of consumed data accumulates, or after a
- *   configured interval, the queue compacts the log in the background by retaining only the unconsumed
- *   segment. This process is atomic from the perspective of users and never discards unconsumed data. Normal
- *   enqueue/dequeue operations remain available during compaction; if in-memory staging is enabled, the queue
- *   may temporarily route new records through the memory buffer to minimize interference.
- * - Shutdown: On close, the queue attempts to flush any staged records, may perform a final compaction when
- *   appropriate, and then closes resources.
+ * No fluxo da aplicação, NQueue desempenha o papel de intermediário entre os sistemas de
+ * produção e consumo, permitindo o gerenciamento eficiente de dados em transição. Suas
+ * operações suportam tolerância a falhas, com mecanismos de persistência que registram o progresso
+ * e o estado atual, assegurando que nenhum dado seja perdido durante a execução de tarefas críticas.
  *
- * Business rules and guarantees
- * - Ordering: Records are delivered strictly in FIFO order, including across restarts. Batched draining from
- *   the in-memory buffer, when enabled, preserves overall enqueue order.
- * - Delivery semantics: Dequeue is at-most-once from the queue’s perspective. After a record is returned to a
- *   consumer, the queue advances and persists its position; the same record will not be redelivered after
- *   a crash or restart.
- * - Durability: With synchronous flushing enabled, records acknowledged by enqueue are durable against process
- *   crashes and OS-level failures subject to underlying storage guarantees. When synchronous flushing is
- *   disabled, a small window of most recent records may be lost on abrupt termination or power failure.
- * - Capacity and backpressure: The on-disk queue grows with available disk space. The optional in-memory
- *   staging buffer is bounded; when it fills, producers may block until space becomes available or until records
- *   are drained to disk. Consumers may block when the queue is empty, depending on the chosen API variant.
- * - Safety during compaction: Compaction never removes unconsumed data and completes with an atomic file
- *   replacement to avoid partial states. If compaction cannot complete, the existing log remains intact.
- * - Concurrency: All public operations are thread-safe. Internal coordination ensures that concurrent
- *   producers and consumers observe consistent queue state and ordering.
- * - Compatibility: Queue elements must be serializable and readable with the application’s classpath on
- *   subsequent runs; schema evolution and cross-version compatibility are the responsibility of the caller.
+ * Essa classe gerencia candidatos ao consumo de fila com bloqueios sofisticados e estratégias
+ * de uso de buffers de memória para otimizações de desempenho. Sua integração com sistemas
+ * externos permite leitura e gravação direta em arquivos e utiliza operações de compactação
+ * para manter um controle eficiente sobre o armazenamento.
  *
- * Configuration overview
- * - Compaction behavior can be tuned by a waste threshold and/or time interval.
- * - Durability can trade throughput vs. safety by toggling synchronous flushes.
- * - In-memory staging can be enabled and sized to absorb bursts and reduce producer contention during
- *   maintenance.
- *
- * This documentation intentionally focuses on observable behavior and operational characteristics rather than
- * implementation specifics.
- *
- * @param <T> Serializable element type stored and retrieved in FIFO order.
+ * Além disso, NQueue é extensível, com opções configuráveis para gerenciamento de estado,
+ * revalidação e estratégias de compactação, tornando-a um componente adaptável para cenários
+ * diversos de processamento de filas.
  */
 public class NQueue<T extends Serializable> implements Closeable {
     private static final String DATA_FILE = "data.log";
@@ -226,9 +192,35 @@ public class NQueue<T extends Serializable> implements Closeable {
         this.maintenanceExecutor.scheduleWithFixedDelay(this::reconcileSize, options.maintenanceIntervalNanos, options.maintenanceIntervalNanos, TimeUnit.NANOSECONDS);
     }
 
+
     /**
-     * Reconciles the optimistic approximate size with the exact size.
-     * Tries to acquire lock opportunistically, but forces it if the last update was too long ago.
+     * Realiza a reconciliação do tamanho aproximado com base no estado atual da aplicação.
+     *
+     * Este método é responsável por atualizar o valor do tamanho aproximado de registros,
+     * sincronizando-o com o tamanho exato observado no momento da execução. Ele é projetado
+     * para ser utilizado em cenários onde a precisão do tamanho deve ser mantida dentro de
+     * um intervalo de tempo específico ou quando forçado por condições configuradas.
+     *
+     * O fluxo de execução do método segue as seguintes etapas:
+     * 1. Verifica se a operação pode continuar, encerrando imediatamente se o estado
+     *    indicar "fechado" ou "solicitação de desligamento" (early return).
+     * 2. Calcula se a reconciliação deve ser forçada com base em um intervalo de tempo máximo
+     *    definido para a reconciliação, comparado ao tempo desde a última atualização.
+     * 3. Tenta adquirir um bloqueio no objeto `lock` para garantir que a operação seja segura
+     *    em ambientes concorrentes. O bloqueio pode ser adquirido de forma condicional ou
+     *    forçada, dependendo do contexto.
+     * 4. Se o bloqueio for bem-sucedido:
+     *    - Calcula o tamanho exato de registros, considerando os dados na memória e
+     *      outras filas de armazenamento relacionadas, caso o buffer de memória esteja ativado.
+     *    - Atualiza o valor do tamanho aproximado e armazena o timestamp da última reconciliação.
+     *    - Libera o bloqueio após a atualização.
+     * 5. Em caso de exceções durante a execução, o erro é registrado ou ignorado, permitindo
+     *    que a aplicação continue operando sem interrupções.
+     *
+     * Este método interage com estruturas de dados internas e aproveita um mecanismo de
+     * bloqueio para garantir consistência em ambientes multithread. É projetado para evitar
+     * impactos significativos no desempenho, utilizando verificações condicionais e
+     * reconciliação apenas quando necessário.
      */
     private void reconcileSize() {
         if (closed || shutdownRequested) return;
@@ -306,15 +298,36 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Enqueues a single record while preserving FIFO order. Depending on configuration and current
-     * conditions, the record may be staged in memory and durably appended later, or appended directly to
-     * the durable log. Producers observe backpressure only when the bounded staging area is saturated
-     * or when direct appends are momentarily contended.
+     * Oferece o objeto fornecido para inserção na fila, utilizando diferentes modos de operação
+     * (memória ou disco) com base no estado atual e nas condições de uso. Este método gerencia
+     * o fluxo de inserção, incluindo otimizações para entrega imediata a consumidores em espera
+     * e controle de recursos, como buffers de memória e bloqueios.
      *
-     * @param object element to append; must be non-null and serializable by the application classpath
-     * @return a logical offset for the first byte of the record when appended directly, or a sentinel value
-     * indicating deferred durability when temporarily staged
-     * @throws IOException if the enqueue cannot be acknowledged due to storage errors
+     * O fluxo do método inicia validando o objeto fornecido, em seguida verifica se o buffer de
+     * memória está habilitado e se o tempo de operação em modo de memória ainda é válido. Caso
+     * esteja, prioriza operações no buffer de memória. Quando o bloqueio é adquirido, o método
+     * avalia se a fila (disco + memória) está vazia e, se possível, realiza a entrega direta do
+     * item a um consumidor em espera.
+     *
+     * Se a operação de compactação está em andamento, o método ativa o modo de memória e executa
+     * a inserção no buffer correspondente. Caso contrário, realiza a drenagem sincronizada do
+     * buffer e procede com a inserção no disco. Dependendo do estado da aplicação, pode acionar
+     * operações complementares para manter a consistência e desempenho da fila.
+     *
+     * Em situações onde o buffer de memória não está habilitado, a inserção ocorre diretamente na
+     * fila principal com lógica semelhante, privilegiando consumidores em espera quando aplicável.
+     *
+     * Este método lida com exceções de I/O, que podem ocorrer caso haja falhas ao acessar recursos
+     * externos como disco ou sistema de arquivos.
+     *
+     * @param object o objeto a ser oferecido na fila; não pode ser nulo. Um valor nulo resultará na
+     *               interrupção imediata do fluxo com uma exceção {@link NullPointerException}.
+     * @return um identificador exclusivo para a posição do objeto na fila, representado por um valor
+     *         long. Pode retornar valores especiais, como {@code OFFSET_HANDOFF}, indicando que o
+     *         item foi entregue diretamente para um consumidor em espera.
+     * @throws IOException se ocorrer um erro de entrada/saída durante operações relacionadas à fila,
+     *                     como acesso ao disco ou falha em buffers de memória.
+     * @throws NullPointerException se o objeto fornecido for nulo.
      */
     public long offer(T object) throws IOException {
         Objects.requireNonNull(object);
@@ -362,13 +375,32 @@ public class NQueue<T extends Serializable> implements Closeable {
         }
     }
 
+
     /**
-     * Retrieves and removes the head of the queue, blocking until an element becomes available. The
-     * consumption cursor is advanced and persisted before the element is delivered, ensuring at-most-once
-     * delivery from the queue’s perspective across restarts.
+     * Recupera o próximo elemento disponível da fila, se houver, garantindo que as operações
+     * sejam realizadas com segurança em ambientes concorrentes e otimizadas para o uso de recursos.
+     * O método utiliza um mecanismo de bloqueio para coordenar a leitura e escrita, garantindo que
+     * dados em memória ou em disco sejam gerenciados de forma apropriada.
      *
-     * @return the next available element
-     * @throws IOException if the queue cannot read or persist consumption progress
+     * O fluxo do método segue os seguintes passos:
+     * 1. Obtém o bloqueio para início da operação.
+     * 2. Se a contagem de registros for zero e não houver itens disponíveis em handoff, sincroniza
+     *    com o buffer de memória para drenar dados persistidos.
+     * 3. Verifica se há um item presente no atributo `handoffItem`:
+     *    - Caso haja, o item é recuperado, removido do atributo e retornado encapsulado em um
+     *      {@code Optional}.
+     * 4. Caso contrário, aguarda até que um item esteja disponível na fila, utilizando
+     *    {@code notEmpty.awaitUninterruptibly()}.
+     * 5. Após liberar o bloqueio, o método consome o próximo registro disponível na fila usando
+     *    {@code consumeNextRecordLocked()}, aplica a desserialização segura no item e o retorna.
+     * 6. Durante o fluxo, realiza notificações de estatísticas de eventos relacionados ao consumo
+     *    utilizando {@code statsUtils.notifyHitCounter}.
+     *
+     * Em caso de erro de entrada/saída, uma exceção {@link IOException} pode ser lançada.
+     *
+     * @return Um {@code Optional} contendo o próximo elemento da fila, se disponível. Retorna
+     *         {@code Optional.empty()} se não houver registros ou se algo impedir a recuperação normal.
+     * @throws IOException Se ocorrer algum problema durante o acesso aos dados persistidos.
      */
     public Optional<T> poll() throws IOException {
         lock.lock();
@@ -401,15 +433,32 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Retrieves and removes the head of the queue, waiting up to the specified time if necessary for an
-     * element to become available. If the wait times out, an empty result is returned. When an element is
-     * returned, the consumption cursor is advanced and persisted.
+     * Tenta recuperar o próximo item disponível na fila dentro do tempo limite especificado.
+     * Esse método implementa uma lógica de polling que verifica a memória, realiza operações
+     * de drenagem sincronizada e aguarda condições específicas para obter o próximo item.
+     * Caso o tempo limite expire ou a operação seja interrompida, pode retornar um valor vazio.
      *
-     * @param timeout maximum time to wait
-     * @param unit    time unit for the timeout
-     * @return the next available element or empty if the timeout elapses
-     * @throws IOException if the queue cannot read or persist consumption progress
-     */
+     * O fluxo do método consiste nas seguintes etapas:
+     * 1. Converte o tempo limite fornecido para nanossegundos e adquire um bloqueio para garantir
+     *    consistência em operações concorrentes.
+     * 2. Caso a contagem de registros na fila esteja vazia, força uma drenagem sincronizada
+     *    dos buffers de memória para tentar carregar dados disponíveis.
+     * 3. Verifica se algum item ("handoffItem") já foi preparado para consumo. Caso exista,
+     *    o item é retornado e removido do estado interno.
+     * 4. Se nenhum item está disponível, entra em um loop onde:
+     *    - Verifica novamente pela possibilidade de drenagem sincronizada de memória.
+     *    - Aguarda uma notificação de que itens foram adicionados ou o tempo limite especificado expire.
+     *    - Caso seja interrompido durante a espera, restaura o estado do thread, realiza uma verificação
+     *      de dados e retorna vazio.
+     * 5. Finalmente, consome e retorna o próximo registro da fila utilizando um método de consumo seguro
+     *    e, quando presente, realiza a desserialização do item.
+     *
+     * Em sua conclusão, o método atualiza contadores relacionados a métricas de polling e libera o bloqueio.
+     *
+     * @param timeout o tempo máximo, na unidade especificada, em que o método deve aguardar para recuperar um item
+     * @param unit a unidade de tempo do parâmetro {@code timeout}, como SEGUNDOS ou MILLISECONDS
+     * @return um {@code Optional<T>} contendo o próximo item disponível na fila. Retorna {@code Optional.empty()}
+     *         caso*/
     public Optional<T> poll(long timeout, TimeUnit unit) throws IOException {
         long nanos = unit.toNanos(timeout);
         lock.lock();
@@ -451,12 +500,30 @@ public class NQueue<T extends Serializable> implements Closeable {
         }
     }
 
+
     /**
-     * Returns, without removing, the element at the head of the queue if present. This operation does not
-     * advance the consumption cursor and therefore does not alter delivery semantics.
+     * Retorna opcionalmente o próximo item da fila para leitura, sem removê-lo.
+     * Este método é utilizado para visualizar o elemento "head" da fila sem
+     * alterá-la, verificando diversas fontes de armazenamento como disco
+     * ou buffers de memória. O método é thread-safe e fornece garantias de
+     * sincronização interna para operações concorrentes.
      *
-     * @return the current head element or empty if the queue is logically empty
-     * @throws IOException if the queue cannot access the stored data
+     * O fluxo de processamento segue as seguintes etapas:
+     * 1. Verifica se existe um item de transferência direta (handoffItem). Se existir, ele é retornado.
+     * 2. Caso contrário, verifica a presença de registros armazenados no disco. Se há registros,
+     *    busca o elemento do início da fila (FIFO) e o desserializa antes de retorná-lo encapsulado
+     *    em um objeto Optional.
+     * 3. Na ausência de registros em disco, e se o buffer de memória estiver habilitado, verifica os
+     *    itens tanto na fila de drenagem quanto no buffer de memória. O elemento mais antigo é retornado,
+     *    caso existente.
+     * 4. Se não houver elementos disponíveis em nenhum dos recursos mencionados, retorna um Optional vazio.
+     *
+     * Este método registra uma métrica de estatísticas para cada execução e garante o desbloqueio do recurso
+     * mesmo em caso de falhas ou exceções.
+     *
+     * @return Um {@code Optional} contendo o próximo item disponível na fila, caso exista, ou {@code Optional.empty()}
+     *         se nenhum item estiver disponível em disco ou em memória.
+     * @throws IOException Caso ocorra um erro ao tentar acessar ou ler do disco.
      */
     public Optional<T> peek() throws IOException {
         lock.lock();
@@ -494,10 +561,22 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Returns the current logical size of the queue using strong accounting. When in-memory staging is
-     * enabled, the count includes both staged and durable records visible to consumers.
+     * Calcula e retorna o tamanho total relacionado a elementos gerenciados por esta classe,
+     * considerando diversos fatores e estados internos.
      *
-     * @return number of elements that would be observed across all sources
+     * O método utiliza um fluxo seguro com bloqueio para evitar condições de corrida durante
+     * o cálculo. Ele contabiliza:
+     * 1. O número de registros principais (recordCount).
+     * 2. O item em processo de transferência (handoffItem), se existente.
+     * 3. O conteúdo armazenado em um buffer de memória (memoryBuffer), caso este esteja ativado.
+     * 4. A fila de drenagem (drainingQueue).
+     *
+     * Esse fluxo permite consolidar todos os elementos relevantes, mesmo em contextos de estados
+     * transitórios ou operacionais da classe.
+     *
+     * @return O tamanho total de elementos, somando registros persistidos, itens em transferência,
+     *         elementos em buffer de memória e elementos na fila de drenagem. O valor pode variar
+     *         dependendo do estado interno dos recursos e das condições verificadas no momento.
      */
     public long size() {
         lock.lock();
@@ -512,12 +591,26 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Returns the queue size, optionally using a fast, approximate counter that may lag under concurrency
-     * but avoids coordination costs. This is useful for monitoring and heuristics where exactness is not
-     * required.
+     * Retorna o tamanho atual de um elemento, podendo utilizar uma abordagem otimista ou não.
+     * O método permite obter uma estimativa aproximada do tamanho ou calcular o valor exato,
+     * dependendo do parâmetro fornecido.
      *
-     * @param optimistic when true, returns a fast approximation; when false, computes a precise value
-     * @return approximate or precise size depending on the chosen mode
+     * O fluxo de execução do método é:
+     * - Se o parâmetro `optimistic` for verdadeiro, o método retorna um valor aproximado
+     *   obtido pela chamada ao método `get()` de `approximateSize`.
+     * - Caso contrário, o método executa a lógica interna do método `size()` para retornar
+     *   o valor exato.
+     *
+     * Este método pode ser utilizado em cenários onde há uma necessidade de desempenho
+     * superior e uma estimativa é suficiente, ou em casos que exijam precisão com o custo
+     * de um cálculo mais detalhado.
+     *
+     * @param optimistic um valor booleano que indica se o tamanho será retornado de forma
+     *                   otimista (utilizando uma estimativa aproximada) ou exata.
+     *                   Se verdadeiro, uma estimativa é retornada; caso contrário, o valor
+     *                   real é calculado.
+     * @return o tamanho do elemento, seja uma estimativa aproximada (se `optimistic` for
+     *         verdadeiro) ou o valor exato (se `optimistic` for falso).
      */
     public long size(boolean optimistic) {
         return optimistic ? approximateSize.get() : size();
@@ -547,14 +640,38 @@ public class NQueue<T extends Serializable> implements Closeable {
         }
     }
 
-    @Override
     /**
-     * Shuts down the queue gracefully. Any staged records are flushed when possible, a final compaction may
-     * be scheduled if appropriate, and all background services and I/O resources are closed. The method
-     * attempts to complete maintenance promptly without compromising data safety.
+     * Fecha e libera todos os recursos utilizados pela classe para assegurar
+     * uma finalização ordenada e segura das operações.
      *
-     * @throws IOException if underlying channels cannot be closed cleanly
-     */
+     * O método segue uma sequência lógica para garantir que todas as atividades
+     * de manutenção, buffers em memória e estados de compactação sejam
+     * adequadamente tratados antes do encerramento dos recursos externos, como
+     * arquivos ou canais de dados. Este método implementa a interface {@code AutoCloseable}.
+     * Caso ocorram erros durante o fechamento, uma exceção {@code IOException} pode ser lançada.
+     *
+     * Fluxo do método:
+     * 1. Interrompe imediatamente o executor responsável por tarefas de manutenção utilizando o método {@code shutdownNow}.
+     * 2. Se o buffer em memória estiver habilitado (`enableMemoryBuffer`), esvazia o buffer sincronamente.
+     *    O esvaziamento é protegido por um bloqueio para evitar acessos concorrentes.
+     * 3. Marca uma solicitação de desligamento por meio da variável `shutdownRequested`.
+     *    Caso haja dados acumulados a serem processados e o estado de compactação seja `IDLE`,
+     *    uma tarefa de compactação é submetida ao executor.
+     * 4. Encerra o executor responsável pelas operações de compactação e aguarda sua finalização,
+     *    com um timeout definido para evitar bloqueios indefinidos.
+     * 5. Se o buffer em memória estiver habilitado, também interrompe imediata e coordenadamente
+     *    os executores relacionados ao esvaziamento de buffers e revalidações.
+     * 6. Fecha todos os canais e streams de dados associados (`dataChannel`, `raf`, `metaChannel`, `metaRaf`),
+     *    assegurando que estejam em um estado apropriado antes do encerramento.
+     *    Essa operação também é protegida por bloqueios para evitar problemas concorrentes.
+     * 7. Marca a instância como encerrada definindo a variável `closed = true`.
+     *
+     * Em cenários de erro:
+     * - Se ocorrerem exceções ao esvaziar o buffer em memória, elas serão ignoradas explicitamente
+     *   para garantir a execução do fluxo de fechamento subsequente.
+     * - Se o método for interrompido durante a espera pela finalização dos executores,
+     *  */
+    @Override
     public void close() throws IOException {
         // Stop maintenance first
         maintenanceExecutor.shutdownNow();
@@ -749,14 +866,36 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Appends a batch of elements directly to durable storage, advancing producer cursors and updating
-     * persistent metadata in one step. When requested by options, a synchronous flush is performed before
-     * returning. Consumers are signaled upon successful append.
+     * Escreve em lote os itens fornecidos no canal de dados associado, atualizando os metadados,
+     * persistindo o estado atual e notificando alterações relevantes na fila.
      *
-     * @param items elements to append in FIFO order
-     * @param fsync whether to request a synchronous flush according to durability settings
-     * @return logical durable offset of the first appended record, or a sentinel when no items are provided
-     * @throws IOException if the append cannot be acknowledged
+     * Este método processa uma lista de itens, convertendo cada um para formato binário,
+     * associando metadados e registrando-os no armazenamento subjacente. Ele também
+     * gerencia ajustes em deslocamentos do produtor e consumidor, bem como
+     * os contadores de registros e métricas associadas. A sincronização no sistema de arquivos
+     * pode ser opcionalmente realizada dependendo do parâmetro fornecido.
+     *
+     * Fluxo do método:
+     * 1. Valida se a lista de itens não está vazia; caso contrário, retorna imediatamente -1.
+     * 2. Inicializa os deslocamentos e contadores iniciais.
+     * 3. Itera sobre cada item da lista:
+     *    - Converte o item para um array de bytes.
+     *    - Calcula e associa os metadados relacionados ao item.
+     *    - Escreve o cabeçalho de metadados e os dados binários do item no canal de dados.
+     *    - Atualiza o deslocamento de escrita.
+     * 4. Atualiza os deslocamentos do produtor e do consumidor, bem como contadores internos.
+     * 5. Persistente o estado atual da fila.
+     * 6. Condicionalmente realiza sincronização forçada no canal, caso solicitado.
+     * 7. Avalia a necessidade de compactação e aciona os sinais e métricas apropriados.
+     *
+     * @param items a lista de itens que serão inseridos em lote na fila. Cada item será serializado,
+     *              armazenado no canal de dados e terá metadados registrados. A lista não pode ser vazia.
+     * @param fsync indica se um sincronismo forçado deve ser executado no canal de dados após
+     *              o processamento do lote. Se verdadeiro, força a gravação no sistema de arquivos.
+     * @return o deslocamento inicial (offset) do primeiro item persistido neste lote. Retorna -1
+     *         se a lista fornecida estiver vazia.
+     * @throws IOException se ocorrerem erros de entrada/saída durante a gravação no canal de dados
+     *                     ou na persistência do estado atual.
      */
     private long offerBatchLocked(List<T> items, boolean fsync) throws IOException {
         if (items.isEmpty()) return -1;
@@ -786,13 +925,32 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Internal read helper that validates the presence of a complete record at the given durable offset and
-     * returns its raw representation together with the next position. Incomplete or inconsistent tails yield
-     * an empty result.
+     * Lê e interpreta um registro em um canal de dados específico com base em um
+     * deslocamento inicial, retornando as informações encapsuladas do registro se forem válidas.
+     * Este método realiza múltiplas verificações de integridade e segue um fluxo rigoroso
+     * para garantir a consistência dos dados lidos.
      *
-     * @param offset durable position to inspect
-     * @return structured result with record and next offset, or empty if no complete record is present
-     * @throws IOException if accessing storage fails
+     * O processo executa os seguintes passos:
+     * 1. Calcula o tamanho total do canal de dados.
+     * 2. Verifica se o deslocamento e o tamanho fixo do prefixo do registro estão dentro dos limites do canal.
+     * 3. Lê o prefixo fixo do cabeçalho a partir do canal no deslocamento especificado.
+     * 4. Calcula o final do cabeçalho e valida se este está dentro do tamanho do canal.
+     * 5. Lê os metadados do registro baseados nos dados do prefixo.
+     * 6. Calcula o final do payload, validando novamente se está dentro do tamanho do canal.
+     * 7. Lê os dados do payload em um byte array, garantindo que tudo seja consumido adequadamente.
+     * 8. Se todas as etapas forem concluídas com sucesso, retorna o resultado encapsulado contendo
+     *    o registro lido e o próximo ponto de leitura no canal.
+     *
+     * Em caso de erro, o método pode retornar um Optional vazio ou lançar uma exceção, dependendo
+     * da natureza do problema encontrado.
+     *
+     * @param offset o deslocamento no canal de dados a partir do qual o registro será lido.
+     *               Deve estar dentro dos limites permitidos pelo tamanho do canal.
+     * @return um <code>Optional</code> contendo um <code>NQueueReadResult</code> que encapsula o
+     *         registro lido e a posição final da leitura no canal. Retorna um Optional vazio se os
+     *         dados no deslocamento não forem válidos para um registro completo.
+     * @throws IOException se ocorrer um erro de leitura no canal de dados, incluindo casos onde
+     *                     EOF é alcançado de forma inesperada durante a leitura do registro.
      */
     private Optional<NQueueReadResult> readAtInternal(long offset) throws IOException {
         long size = dataChannel.size();
@@ -812,12 +970,21 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Removes the head record from the durable log from the queue’s perspective by advancing the consumption
-     * cursor and persisting that advancement. The raw record is returned for subsequent deserialization by
-     * the caller.
+     * Consome o próximo registro disponível na fila de forma segura, garantindo que operações
+     * concorrentes sejam evitadas através de bloqueio.
      *
-     * @return the consumed record if available
-     * @throws IOException if the new state cannot be persisted
+     * O método realiza a leitura do registro no deslocamento atual do consumidor e atualiza
+     * os estados internos relacionados, como o deslocamento do consumidor, o número de registros
+     * restantes e o tamanho aproximado da estrutura. Caso não haja mais registros, o deslocamento
+     * do consumidor será sincronizado com o do produtor.
+     *
+     * Após modificar o estado interno, o método persiste o estado atualizado e avalia a necessidade
+     * de compactação da estrutura de dados subjacente. Caso ocorra falha durante essas operações,
+     * como erros de I/O, será lançado um RuntimeException encapsulando a causa original.
+     *
+     * @return Um {@code Optional} contendo o próximo registro consumido, ou um {@code Optional.empty()}
+     *         caso não existam registros disponíveis.
+     * @throws IOException se ocorrer falha durante a leitura ou na tentativa de persistir o estado.
      */
     private Optional<NQueueRecord> consumeNextRecordLocked() throws IOException {
         return readAtInternal(consumerOffset).map(res -> {
@@ -1151,11 +1318,36 @@ public class NQueue<T extends Serializable> implements Closeable {
         }
     }
 
+
     /**
-     * Performs compaction by assembling a new log containing only the unconsumed segment and then handing it
-     * off for finalization. Progress is reported back to reconcile staging mode with normal operation.
+     * Executa a tarefa de compactação de dados, gerenciando leitura, escrita e
+     * sincronização de estado para garantir integridade e eficiência durante o
+     * processo. Este método é responsável por copiar dados relevantes da área
+     * de armazenamento principal para um arquivo temporário, realizar a
+     * compactação e finalizar a operação com as atualizações necessárias.
      *
-     * @param snap a point-in-time snapshot used to drive compaction
+     * O fluxo do método é dividido em várias etapas:
+     * 1. Remove o arquivo temporário existente, caso ele esteja presente, para garantir um estado limpo.
+     * 2. Cria um novo arquivo temporário e acessa seu canal de escrita.
+     * 3. Identifica os offsets de início e fim para a área de dados que será compactada,
+     *    baseando-se nas posições atuais do consumidor e do produtor. Essa operação é realizada
+     *    de forma protegida por um bloqueio (`lock`) para evitar inconsistências durante o acesso
+     *    concorrente.
+     * 4. Copia o intervalo de dados definido entre os offsets do canal principal para o
+     *    canal do arquivo temporário.
+     * 5. Se a opção de sincronização de disco (`withFsync`) estiver ativada, força a escrita
+     *    do arquivo no disco para garantir persistência.
+     * 6. Finaliza a compactação através da aplicação das alterações e libera os recursos.
+     *
+     * Em cenários de falha, o método gerencia as exceções, redefine o estado de compactação
+     * para ocioso (`IDLE`) e remove o arquivo temporário para evitar resíduos no sistema.
+     * Finalmente, chama a função de callback para sinalizar o término da operação, seja ela
+     * bem-sucedida ou não.
+     *
+     * @param snap estado atual da fila de dados, utilizado para inicializar e
+     *             determinar os offsets de escrita e compactação. Define o
+     *             ponto inicial e final para leitura e manipulação dos dados.
+     * @throws IOException se ocorrerem falhas de I/O durante a leitura ou escrita nos arquivos.
      */
     private void runCompactionTask(QueueState snap) {
         try {
