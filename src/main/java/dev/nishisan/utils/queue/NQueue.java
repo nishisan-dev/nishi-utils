@@ -25,8 +25,8 @@ import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.EOFException;
 import java.io.IOException;
-import java.io.ObjectOutputStream;
 import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
 import java.io.RandomAccessFile;
 import java.io.Serializable;
 import java.nio.ByteBuffer;
@@ -42,8 +42,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.BlockingDeque;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.Callable;
-import java.util.concurrent.ExecutionException;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -56,121 +55,133 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
-import java.util.concurrent.CountDownLatch;
 
 /**
- * NQueue is a class that implements a file-based persistent queue with
- * support for concurrent producers and consumers. This class is designed
- * to handle serialization and deserialization of objects while preserving
- * their order and supporting operations such as offer, poll, and peek.
- * <p>
- * This queue utilizes a backing data file for storage and a metadata file
- * for state persistence, ensuring data integrity and consistency across
- * application runs. Records are stored in a sequential manner, and the
- * internal state is periodically persisted to maintain the integrity of
- * the queue in case of application restarts or failures.
- * <p>
- * Note that objects stored in this queue must implement the Serializable interface.
+ * Persistent, thread-safe FIFO queue.
+ *
+ * Responsibilities
+ * - Provide a durable, append-only, file-backed queue that preserves record order across process restarts.
+ * - Support multiple concurrent producers and consumers with predictable blocking semantics.
+ * - Persist consumption progress so that already-consumed records are not re-delivered after restart.
+ * - Reclaim disk space transparently via background compaction without interrupting producers/consumers.
+ * - Optionally stage new records in memory to maintain throughput during high contention or compaction.
+ *
+ * Execution flow (high-level)
+ * - Enqueue: New records are accepted in FIFO order. Under normal conditions they are durably appended to
+ *   the queue log and the logical size is updated. If temporary in-memory staging is enabled and the queue
+ *   detects contention or a maintenance window, records may be first placed in a bounded in-memory buffer
+ *   and later drained to disk in batches while preserving order.
+ * - Dequeue: Consumers obtain the next available record in FIFO order. A blocking variant waits until a
+ *   record becomes available; a timed variant returns empty on timeout. A non-destructive peek is also
+ *   available. Once a record is returned by a dequeue operation, the queue advances its internal cursor and
+ *   persists that advancement, meaning the record will not be re-delivered after a restart.
+ * - Startup and recovery: On open, the queue reconstructs its state from persisted metadata. If metadata is
+ *   unavailable or inconsistent, it recovers by scanning the log up to the last complete record and discarding
+ *   any torn tail, ensuring the queue starts in a consistent state.
+ * - Maintenance and compaction: When a configurable threshold of consumed data accumulates, or after a
+ *   configured interval, the queue compacts the log in the background by retaining only the unconsumed
+ *   segment. This process is atomic from the perspective of users and never discards unconsumed data. Normal
+ *   enqueue/dequeue operations remain available during compaction; if in-memory staging is enabled, the queue
+ *   may temporarily route new records through the memory buffer to minimize interference.
+ * - Shutdown: On close, the queue attempts to flush any staged records, may perform a final compaction when
+ *   appropriate, and then closes resources.
+ *
+ * Business rules and guarantees
+ * - Ordering: Records are delivered strictly in FIFO order, including across restarts. Batched draining from
+ *   the in-memory buffer, when enabled, preserves overall enqueue order.
+ * - Delivery semantics: Dequeue is at-most-once from the queue’s perspective. After a record is returned to a
+ *   consumer, the queue advances and persists its position; the same record will not be redelivered after
+ *   a crash or restart.
+ * - Durability: With synchronous flushing enabled, records acknowledged by enqueue are durable against process
+ *   crashes and OS-level failures subject to underlying storage guarantees. When synchronous flushing is
+ *   disabled, a small window of most recent records may be lost on abrupt termination or power failure.
+ * - Capacity and backpressure: The on-disk queue grows with available disk space. The optional in-memory
+ *   staging buffer is bounded; when it fills, producers may block until space becomes available or until records
+ *   are drained to disk. Consumers may block when the queue is empty, depending on the chosen API variant.
+ * - Safety during compaction: Compaction never removes unconsumed data and completes with an atomic file
+ *   replacement to avoid partial states. If compaction cannot complete, the existing log remains intact.
+ * - Concurrency: All public operations are thread-safe. Internal coordination ensures that concurrent
+ *   producers and consumers observe consistent queue state and ordering.
+ * - Compatibility: Queue elements must be serializable and readable with the application’s classpath on
+ *   subsequent runs; schema evolution and cross-version compatibility are the responsibility of the caller.
+ *
+ * Configuration overview
+ * - Compaction behavior can be tuned by a waste threshold and/or time interval.
+ * - Durability can trade throughput vs. safety by toggling synchronous flushes.
+ * - In-memory staging can be enabled and sized to absorb bursts and reduce producer contention during
+ *   maintenance.
+ *
+ * This documentation intentionally focuses on observable behavior and operational characteristics rather than
+ * implementation specifics.
+ *
+ * @param <T> Serializable element type stored and retrieved in FIFO order.
  */
 public class NQueue<T extends Serializable> implements Closeable {
     private static final String DATA_FILE = "data.log";
     private static final String META_FILE = "queue.meta";
     private static final int MEMORY_DRAIN_BATCH_SIZE = 256;
+
     private final StatsUtils statsUtils = new StatsUtils();
-    private final Path queueDir;
-    private final Path dataPath;
-    private final Path metaPath;
-    private final Path tempDataPath;
+    private final Path queueDir, dataPath, metaPath, tempDataPath;
     private volatile RandomAccessFile raf;
     private volatile FileChannel dataChannel;
     private final ReentrantLock lock;
     private final Condition notEmpty;
     private final Object metaWriteLock = new Object();
-    private final double compactionWasteThreshold;
-    private final long compactionIntervalNanos;
-    private final int compactionBufferSize;
     private final Options options;
-    private final ExecutorService compactionExecutor;
-    private volatile Future<?> compactionFuture;
-    private long consumerOffset;
-    private long producerOffset;
-    private long recordCount;
-    private long lastIndex;
-    private long lastCompactionTimeNanos;
-    private volatile boolean closed;
-    private volatile boolean shutdownRequested;
-    private volatile CompactionState compactionState;
-    
-    // Memory buffer fields
+    private final AtomicLong approximateSize = new AtomicLong(0);
+
+    private long consumerOffset, producerOffset, recordCount, lastIndex, lastCompactionTimeNanos;
+    private volatile boolean closed, shutdownRequested;
+    private volatile CompactionState compactionState = CompactionState.IDLE;
+
     private final boolean enableMemoryBuffer;
     private final BlockingQueue<MemoryBufferEntry<T>> memoryBuffer;
-    private final BlockingDeque<MemoryBufferEntry<T>> drainingQueue; // Queue for items collected by async drain
+    private final BlockingDeque<MemoryBufferEntry<T>> drainingQueue;
     private final AtomicLong memoryBufferModeUntil = new AtomicLong(0);
-    private final AtomicBoolean drainingInProgress = new AtomicBoolean(false);
-    private final AtomicLong drainingEntries = new AtomicLong(0);
-    private final AtomicLong approximateSize = new AtomicLong(0);
+    private final AtomicBoolean drainingInProgress = new AtomicBoolean(false), switchBackRequested = new AtomicBoolean(false), revalidationScheduled = new AtomicBoolean(false);
     private volatile CountDownLatch drainCompletionLatch;
-    private final ExecutorService drainExecutor;
+
+    private final ExecutorService drainExecutor, compactionExecutor;
     private final ScheduledExecutorService revalidationExecutor;
-    private final AtomicBoolean revalidationScheduled = new AtomicBoolean(false);
-    private final AtomicBoolean switchBackRequested = new AtomicBoolean(false);
-    private final long lockTryTimeoutNanos;
-    private final long revalidationIntervalNanos;
+    private final ScheduledExecutorService maintenanceExecutor;
+
+    private volatile long lastSizeReconciliationTimeNanos = System.nanoTime();
+
 
     /**
-     * Constructs a new instance of the NQueue class with the specified parameters.
+     * Constructs a queue instance bound to the supplied directory and I/O handles, restoring the
+     * persisted state captured in the provided snapshot and applying the chosen options. The constructor
+     * wires concurrency primitives and, when enabled, prepares in-memory staging and maintenance
+     * services used to balance throughput during compaction or contention. Intended for internal use by
+     * factory methods.
      *
-     * @param queueDir    The directory where the queue files are located.
-     * @param raf         The {@link RandomAccessFile} used for accessing the queue's data file.
-     * @param dataChannel The {@link FileChannel} associated with the queue's data file for efficient file operations.
-     * @param state       The initial state of the queue, encapsulating offsets and record count.
+     * @param queueDir base directory for persistent data and metadata
+     * @param raf open random-access handle for the queue log
+     * @param dataChannel file channel associated with the queue log
+     * @param state recovered or rebuilt queue state to initialize cursors and counters
+     * @param options operational configuration snapshot
      */
-    private NQueue(Path queueDir,
-                   RandomAccessFile raf,
-                   FileChannel dataChannel,
-                   QueueState state,
-                   Options optsions,
-                   double compactionWasteThreshold,
-                   long compactionIntervalNanos,
-                   int compactionBufferSize,
-                   boolean enableMemoryBuffer,
-                   int memoryBufferSize,
-                   long lockTryTimeoutNanos,
-                   long revalidationIntervalNanos) {
-        this.metaPath = queueDir.resolve(META_FILE);
+    private NQueue(Path queueDir, RandomAccessFile raf, FileChannel dataChannel, QueueState state, Options options) {
         this.queueDir = queueDir;
         this.dataPath = queueDir.resolve(DATA_FILE);
+        this.metaPath = queueDir.resolve(META_FILE);
+        this.tempDataPath = queueDir.resolve(DATA_FILE + ".compacting");
         this.raf = raf;
         this.dataChannel = dataChannel;
         this.lock = new ReentrantLock();
         this.notEmpty = this.lock.newCondition();
-        this.compactionWasteThreshold = compactionWasteThreshold;
-        this.compactionIntervalNanos = compactionIntervalNanos;
-        this.compactionBufferSize = compactionBufferSize;
         this.consumerOffset = state.consumerOffset;
         this.producerOffset = state.producerOffset;
         this.recordCount = state.recordCount;
         this.lastIndex = state.lastIndex;
         this.approximateSize.set(state.recordCount);
-        this.options = optsions;
+        this.options = options;
+        this.enableMemoryBuffer = options.enableMemoryBuffer;
         this.lastCompactionTimeNanos = System.nanoTime();
-        this.compactionExecutor = Executors.newSingleThreadExecutor(r -> {
-            Thread t = new Thread(r, "nqueue-compaction-worker");
-            t.setDaemon(true);
-            return t;
-        });
-        this.compactionState = CompactionState.IDLE;
-        this.tempDataPath = queueDir.resolve(DATA_FILE + ".compacting");
-        
-        // Initialize memory buffer components
-        this.enableMemoryBuffer = enableMemoryBuffer;
-        this.lockTryTimeoutNanos = lockTryTimeoutNanos;
-        this.revalidationIntervalNanos = revalidationIntervalNanos;
-
         if (enableMemoryBuffer) {
-            this.memoryBuffer = new LinkedBlockingQueue<>(memoryBufferSize);
-            // Draining queue can be same size or larger - it holds items collected by async drain
-            this.drainingQueue = new LinkedBlockingDeque<>(memoryBufferSize);
+            this.memoryBuffer = new LinkedBlockingQueue<>(options.memoryBufferSize);
+            this.drainingQueue = new LinkedBlockingDeque<>(options.memoryBufferSize);
             this.drainExecutor = Executors.newSingleThreadExecutor(r -> {
                 Thread t = new Thread(r, "nqueue-drain-worker");
                 t.setDaemon(true);
@@ -187,357 +198,161 @@ public class NQueue<T extends Serializable> implements Closeable {
             this.drainExecutor = null;
             this.revalidationExecutor = null;
         }
+        this.compactionExecutor = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "nqueue-compaction-worker");
+            t.setDaemon(true);
+            return t;
+        });
+        this.maintenanceExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "nqueue-maintenance-worker");
+            t.setDaemon(true);
+            return t;
+        });
+
+        // Schedule periodic size reconciliation
+        this.maintenanceExecutor.scheduleWithFixedDelay(this::reconcileSize, options.maintenanceIntervalNanos, options.maintenanceIntervalNanos, TimeUnit.NANOSECONDS);
     }
 
     /**
-     * Opens an existing NQueue or initializes a new one in the specified directory with the given queue name.
-     * This method ensures that the queue's metadata and data files are properly initialized and consistent.
+     * Reconciles the optimistic approximate size with the exact size.
+     * Tries to acquire lock opportunistically, but forces it if the last update was too long ago.
+     */
+    private void reconcileSize() {
+        if (closed || shutdownRequested) return;
+
+        long maxDelay = options.maxSizeReconciliationIntervalNanos;
+        boolean forced = maxDelay > 0 && (System.nanoTime() - lastSizeReconciliationTimeNanos) > maxDelay;
+        boolean locked = false;
+
+        try {
+            if (forced) {
+                lock.lock();
+                locked = true;
+            } else {
+                locked = lock.tryLock();
+            }
+
+            if (locked) {
+                try {
+                    long exactSize = recordCount;
+                    if (enableMemoryBuffer) {
+                        exactSize += (long) memoryBuffer.size() + drainingQueue.size();
+                    }
+                    approximateSize.set(exactSize);
+                    lastSizeReconciliationTimeNanos = System.nanoTime();
+                } finally {
+                    lock.unlock();
+                }
+            }
+        } catch (Exception e) {
+            // Log or ignore, just keep running
+        }
+    }
+
+    /**
+     * Opens or creates a named queue under the given base directory using default options. On first use,
+     * the directory structure is created. On subsequent runs, prior state is recovered so that ordering and
+     * consumption progress are preserved. Any incomplete tail data is safely pruned before use.
      *
-     * @param baseDir   the base directory where the queue will be located; must not be null.
-     * @param queueName the name of the queue to open or initialize; must not be null.
-     * @param <T>       the type of objects to be stored in the queue, which must implement {@link Serializable}.
-     * @return an instance of {@link NQueue} configured with the specified directory and queue name.
-     * @throws IOException if an I/O error occurs during the initialization or access of the queue.
+     * @param baseDir   base directory where the queue folder will reside
+     * @param queueName logical queue name used as a directory under the base
+     * @param <T>       serializable element type
+     * @return an operational queue instance ready for concurrent producers and consumers
+     * @throws IOException if the storage cannot be prepared or state cannot be recovered
      */
     public static <T extends Serializable> NQueue<T> open(Path baseDir, String queueName) throws IOException {
         return open(baseDir, queueName, Options.defaults());
     }
 
     /**
-     * Opens an existing NQueue or initializes a new one in the specified directory with the given queue name.
-     * This overload allows callers to configure compaction behaviour via {@link Options}.
+     * Opens or creates a named queue under the given base directory with explicit options. Startup
+     * reconciles metadata with the durable log so the queue begins in a consistent state. When requested,
+     * a rebuild pass is performed to reconstruct state solely from the log.
      *
-     * @param baseDir   the base directory where the queue will be located; must not be null.
-     * @param queueName the name of the queue to open or initialize; must not be null.
-     * @param options   the options configuring queue behaviour; must not be null.
-     * @param <T>       the type of objects to be stored in the queue, which must implement {@link Serializable}.
-     * @return an instance of {@link NQueue} configured with the specified directory, queue name and options.
-     * @throws IOException if an I/O error occurs during the initialization or access of the queue.
+     * @param baseDir   base directory where the queue folder will reside
+     * @param queueName logical queue name used as a directory under the base
+     * @param options   operational configuration controlling durability, compaction, and staging
+     * @param <T>       serializable element type
+     * @return an operational queue instance ready for concurrent producers and consumers
+     * @throws IOException if the storage cannot be prepared or state cannot be recovered
      */
     public static <T extends Serializable> NQueue<T> open(Path baseDir, String queueName, Options options) throws IOException {
-        Objects.requireNonNull(baseDir, "baseDir cannot be null");
-        Objects.requireNonNull(queueName, "queueName cannot be null");
-        Objects.requireNonNull(options, "options cannot be null");
-
-        Path queueDir = baseDir.resolve(queueName);
-        Files.createDirectories(queueDir);
-
-        Path dataPath = queueDir.resolve(DATA_FILE);
-        Path metaPath = queueDir.resolve(META_FILE);
-
-        RandomAccessFile raf = new RandomAccessFile(dataPath.toFile(), "rw");
+        Objects.requireNonNull(baseDir);
+        Objects.requireNonNull(queueName);
+        Objects.requireNonNull(options);
+        Path qDir = baseDir.resolve(queueName);
+        Files.createDirectories(qDir);
+        RandomAccessFile raf = new RandomAccessFile(qDir.resolve(DATA_FILE).toFile(), "rw");
         FileChannel ch = raf.getChannel();
-
-        QueueState state;
-        if (options.resetOnRestart) {
-            // Ignorar arquivos existentes e inicializar fila nova
-            state = rebuildState(ch);
-            persistMeta(metaPath, state);
-        } else if (Files.exists(metaPath)) {
-            try {
-                NQueueQueueMeta meta = NQueueQueueMeta.read(metaPath);
-                state = new QueueState(meta.getConsumerOffset(), meta.getProducerOffset(), meta.getRecordCount(), meta.getLastIndex(), ch);
-            } catch (IOException e) {
-                // Metadata is corrupt/truncated; rebuild from the data log and overwrite meta.
-                state = rebuildState(ch);
-                persistMeta(metaPath, state);
-                Options.Snapshot snapshot = options.snapshot();
-                return new NQueue<>(queueDir, raf, ch, state,
-                        options,
-                        snapshot.compactionWasteThreshold,
-                        snapshot.compactionIntervalNanos,
-                        snapshot.compactionBufferSize,
-                        snapshot.enableMemoryBuffer,
-                        snapshot.memoryBufferSize,
-                        snapshot.lockTryTimeoutNanos,
-                        snapshot.revalidationIntervalNanos);
-            }
-
-            long fileSize = ch.size();
-            boolean inconsistent = state.consumerOffset < 0
-                    || state.producerOffset < 0
-                    || state.consumerOffset > state.producerOffset
-                    || fileSize < state.producerOffset;
-
-            if (inconsistent) {
-                state = rebuildState(ch);
-                persistMeta(metaPath, state);
-            } else if (fileSize > state.producerOffset) {
-                ch.truncate(state.producerOffset);
-                ch.force(options.withFsync);
-            }
-        } else {
-            state = rebuildState(ch);
-            persistMeta(metaPath, state);
+        QueueState state = loadOrRebuildState(ch, qDir.resolve(META_FILE), options);
+        if (ch.size() > state.producerOffset) {
+            ch.truncate(state.producerOffset);
+            ch.force(options.withFsync);
         }
-
-        Options.Snapshot snapshot = options.snapshot();
-        return new NQueue<>(queueDir, raf, ch, state,
-                options,
-                snapshot.compactionWasteThreshold,
-                snapshot.compactionIntervalNanos,
-                snapshot.compactionBufferSize,
-                snapshot.enableMemoryBuffer,
-                snapshot.memoryBufferSize,
-                snapshot.lockTryTimeoutNanos,
-                snapshot.revalidationIntervalNanos);
+        return new NQueue<>(qDir, raf, ch, state, options);
     }
 
-
     /**
-     * Adds the specified object to the queue and returns the file offset at which the object
-     * has been stored. This method ensures thread-safety, persists the state of the queue
-     * after writing the object, and signals any waiting consumers.
-     * <p>
-     * If memory buffer is enabled and the lock is unavailable (e.g., during compaction),
-     * the item will be temporarily stored in memory and drained to disk when the lock becomes available.
+     * Enqueues a single record while preserving FIFO order. Depending on configuration and current
+     * conditions, the record may be staged in memory and durably appended later, or appended directly to
+     * the durable log. Producers observe backpressure only when the bounded staging area is saturated
+     * or when direct appends are momentarily contended.
      *
-     * @param object the object to be added to the queue; must not be null.
-     * @return the file offset at which the object has been stored, or -1 if stored in memory buffer.
-     * @throws IOException if an I/O error occurs during the operation.
+     * @param object element to append; must be non-null and serializable by the application classpath
+     * @return a logical offset for the first byte of the record when appended directly, or a sentinel value
+     * indicating deferred durability when temporarily staged
+     * @throws IOException if the enqueue cannot be acknowledged due to storage errors
      */
     public long offer(T object) throws IOException {
-        Objects.requireNonNull(object, "object");
-
-        // If memory buffer is not enabled, use direct write path
-        if (!enableMemoryBuffer) {
-            return offerDirect(object);
-        }
-
-        // Check if we're in "memory mode" (semaphore active)
-        long memoryModeUntil = memoryBufferModeUntil.get();
-        boolean shouldUseMemory = System.nanoTime() < memoryModeUntil;
-
-        // If not in memory mode, try normal lock
-        if (!shouldUseMemory) {
-            return withTryLock(() -> {
-                if (compactionState == CompactionState.RUNNING) {
-                    activateMemoryMode();
-                    return enqueueToMemoryAndTriggerDrain(object);
-                }
-
-                if (shouldDrainMemoryBuffer()) {
+        Objects.requireNonNull(object);
+        if (enableMemoryBuffer) {
+            if (System.nanoTime() < memoryBufferModeUntil.get()) return offerToMemory(object, true);
+            if (lock.tryLock()) {
+                try {
+                    if (compactionState == CompactionState.RUNNING) {
+                        activateMemoryMode();
+                        return offerToMemory(object, false);
+                    }
                     drainMemoryBufferSync();
+                    long offset = offerDirectLocked(object);
+                    triggerDrainIfNeeded();
+                    return offset;
+                } finally {
+                    lock.unlock();
                 }
-
-                long offset = offerDirectLocked(object);
-                drainMemoryBufferIfNeeded();
-                return offset;
-            }, () -> {
+            } else {
                 activateMemoryMode();
-                return enqueueToMemoryAndTriggerDrain(object);
-            });
-        }
-
-        // Already in memory mode: check if revalidation is needed
-        return offerWithRevalidation(object);
-    }
-
-    /**
-     * Writes an object directly to disk with lock acquisition.
-     * Used when memory buffer is disabled or when lock is available.
-     */
-    private long offerDirect(T object) throws IOException {
-        lock.lock();
-        try {
-            return offerDirectLocked(object);
-        } finally {
-            lock.unlock();
+                return offerToMemory(object, false);
+            }
+        } else {
+            lock.lock();
+            try {
+                return offerDirectLocked(object);
+            } finally {
+                lock.unlock();
+            }
         }
     }
 
     /**
-     * Writes an object directly to disk. Must be called while holding the lock.
-     * This is the original offer() logic extracted into a separate method.
-     */
-    private long offerDirectLocked(T object) throws IOException {
-        long offset = offerBatchLocked(List.of(object), true);
-        statsUtils.notifyHitCounter(NQueueMetrics.OFFERED_EVENT);
-        return offset;
-    }
-
-    private long offerBatchLocked(List<T> items, boolean fsyncAtEnd) throws IOException {
-        if (!lock.isHeldByCurrentThread()) {
-            throw new IllegalStateException("offerBatchLocked must be called while holding the lock");
-        }
-        if (items.isEmpty()) {
-            return -1;
-        }
-
-        long nextIndex = lastIndex;
-        long writePos = producerOffset;
-        long firstRecordStart = -1L;
-        long initialRecordCount = recordCount;
-
-        for (T object : items) {
-            byte[] payload = toBytes(object);
-            int payloadLen = payload.length;
-
-            nextIndex = nextIndex + 1;
-            if (nextIndex < 0) {
-                nextIndex = 0;
-            }
-
-            NQueueRecordMetaData meta = new NQueueRecordMetaData(nextIndex, payloadLen, object.getClass().getCanonicalName());
-            long recordStart = writePos;
-            ByteBuffer hb = meta.toByteBuffer();
-            while (hb.hasRemaining()) {
-                int written = dataChannel.write(hb, writePos);
-                writePos += written;
-            }
-
-            ByteBuffer pb = ByteBuffer.wrap(payload);
-            while (pb.hasRemaining()) {
-                int written = dataChannel.write(pb, writePos);
-                writePos += written;
-            }
-
-            if (firstRecordStart < 0) {
-                firstRecordStart = recordStart;
-            }
-        }
-
-        producerOffset = writePos;
-        recordCount += items.size();
-        approximateSize.addAndGet(items.size());
-        lastIndex = nextIndex;
-
-        if (initialRecordCount == 0 && firstRecordStart >= 0) {
-            consumerOffset = firstRecordStart;
-        }
-
-        persistCurrentStateLocked();
-        if (fsyncAtEnd && options.withFsync) {
-            dataChannel.force(true);
-        }
-        maybeCompactLocked();
-        notEmpty.signalAll();
-        return firstRecordStart;
-    }
-
-    /**
-     * Reads and deserializes a stored object located at the specified file offset
-     * in the queue, if available, and returns it as an {@link Optional}.
+     * Retrieves and removes the head of the queue, blocking until an element becomes available. The
+     * consumption cursor is advanced and persisted before the element is delivered, ensuring at-most-once
+     * delivery from the queue’s perspective across restarts.
      *
-     * @param offset the file offset where the object is expected to be located; must be non-negative.
-     * @return an {@link Optional} containing the deserialized object of type {@code T},
-     * or {@link Optional#empty()} if no valid object exists at the specified offset.
-     * @throws IOException if an I/O error occurs while reading or deserializing the object.
-     */
-    public Optional<T> readAt(long offset) throws IOException {
-        NQueueRecord record;
-        lock.lock();
-        try {
-            Optional<NQueueReadResult> result = readAtInternal(offset);
-            if (result.isEmpty()) {
-                return Optional.empty();
-            }
-            record = result.get().getRecord();
-        } finally {
-            lock.unlock();
-        }
-        return Optional.of(deserializeRecord(record));
-    }
-
-    /**
-     * Reads a record located at the specified file offset in the queue and retrieves
-     * it, along with the offset for the next record, encapsulated in an {@link NQueueReadResult}.
-     * This method ensures thread safety by locking during the operation.
-     *
-     * @param offset the file offset where the record is expected to be located; must be non-negative.
-     * @return an {@link Optional} containing the {@link NQueueReadResult} with the record and next offset,
-     * or {@link Optional#empty()} if no valid record exists at the specified offset.
-     * @throws IOException if an I/O error occurs while reading the record.
-     */
-    public Optional<NQueueReadResult> readRecordAt(long offset) throws IOException {
-        lock.lock();
-        try {
-            return readAtInternal(offset);
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    /**
-     * Retrieves the next available record in the queue without removing it.
-     * If the queue is empty, an empty {@code Optional} is returned.
-     * <p>
-     * This method ensures thread safety by employing a lock during its operation.
-     *
-     * @return an {@code Optional<NQueueRecord>} containing the next available record if the queue is not empty,
-     * or {@code Optional.empty()} if the queue is empty.
-     * @throws IOException if an I/O error occurs during the operation.
-     */
-    public Optional<NQueueRecord> peekRecord() throws IOException {
-        lock.lock();
-        try {
-            if (recordCount == 0) {
-                return Optional.empty();
-            }
-            return readAtInternal(consumerOffset).map(NQueueReadResult::getRecord);
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    /**
-     * Retrieves the next object from the queue without removing it.
-     * If the queue is empty, an empty {@code Optional} is returned.
-     * This method ensures thread safety by employing a lock during operation.
-     *
-     * @return an {@code Optional<T>} containing the next object if the queue is not empty,
-     * or {@code Optional.empty()} if the queue is empty.
-     * @throws IOException if an I/O error occurs during the operation.
-     */
-    public Optional<T> peek() throws IOException {
-        NQueueRecord record;
-        lock.lock();
-        try {
-            if (recordCount == 0) {
-                return Optional.empty();
-            }
-            Optional<NQueueReadResult> result = readAtInternal(consumerOffset);
-            if (result.isEmpty()) {
-                return Optional.empty();
-            }
-            record = result.get().getRecord();
-        } finally {
-            statsUtils.notifyHitCounter(NQueueMetrics.PEEK_EVENT);
-            lock.unlock();
-        }
-        return Optional.of(deserializeRecord(record));
-    }
-
-    /**
-     * Retrieves and removes the next available object from the queue, if one exists.
-     * This operation blocks until a record is available or the thread is interrupted.
-     * <p>
-     * The method ensures thread safety by locking during the operation and deserializes
-     * the retrieved record into an object of type {@code T}.
-     * <p>
-     * If memory buffer is enabled, it will drain all items from memory to disk first
-     * to ensure FIFO order.
-     *
-     * @return an {@code Optional<T>} containing the next object if the queue is not empty,
-     * or {@code Optional.empty()} if the queue is empty.
-     * @throws IOException if an I/O error occurs during the operation.
+     * @return the next available element
+     * @throws IOException if the queue cannot read or persist consumption progress
      */
     public Optional<T> poll() throws IOException {
         lock.lock();
         try {
-            // If memory buffer is enabled, drain it first to ensure FIFO order
-            if (shouldDrainMemoryBuffer()) {
-                drainMemoryBufferSync();
+            // Optimization: Only force a sync drain if the disk queue is empty.
+            // If we have records on disk, consume them first to avoid blocking readers on write I/O.
+            if (recordCount == 0) {
+                 drainMemoryBufferSync();
             }
 
-            awaitRecords();
-            Optional<NQueueRecord> record = consumeNextRecordLocked();
-            if (record.isEmpty()) {
-                return Optional.empty();
-            }
-            // Keep deserialization under the same lock so that concurrent consumers observe FIFO
-            // order in the completion order of poll() calls.
-            return Optional.of(deserializeRecord(record.get()));
+            while (recordCount == 0) notEmpty.awaitUninterruptibly();
+            return consumeNextRecordLocked().map(this::safeDeserialize);
         } finally {
             statsUtils.notifyHitCounter(NQueueMetrics.POLL_EVENT);
             lock.unlock();
@@ -545,65 +360,39 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Retrieves and removes the next available object from the queue, if one exists, within the specified timeout.
-     * This operation blocks until a record is available, the timeout expires, or the thread is interrupted.
-     * <p>
-     * Thread safety is ensured by employing a lock during the operation. If the queue remains empty
-     * within the given timeout or the thread is interrupted, an empty {@code Optional} is returned.
-     * <p>
-     * If memory buffer is enabled, it will drain all items from memory to disk first
-     * to ensure FIFO order.
+     * Retrieves and removes the head of the queue, waiting up to the specified time if necessary for an
+     * element to become available. If the wait times out, an empty result is returned. When an element is
+     * returned, the consumption cursor is advanced and persisted.
      *
-     * @param timeout the maximum time to wait for a record to become available; must be non-negative.
-     * @param unit    the time unit of the {@code timeout} argument; must not be {@code null}.
-     * @return an {@code Optional<T>} containing the next object if the queue is not empty within
-     * the timeout, or {@code Optional.empty()} if no object is available or the thread is interrupted.
-     * @throws IOException if an I/O error occurs during the operation.
+     * @param timeout maximum time to wait
+     * @param unit    time unit for the timeout
+     * @return the next available element or empty if the timeout elapses
+     * @throws IOException if the queue cannot read or persist consumption progress
      */
     public Optional<T> poll(long timeout, TimeUnit unit) throws IOException {
-        Objects.requireNonNull(unit, "unit");
         long nanos = unit.toNanos(timeout);
-
         lock.lock();
         try {
-            // Drain memory buffer first to ensure FIFO order
-            if (shouldDrainMemoryBuffer()) {
-                drainMemoryBufferSync();
+            // Optimization: Only force a sync drain if we absolutely need data and none is on disk
+            if (recordCount == 0) {
+                 drainMemoryBufferSync();
             }
 
             while (recordCount == 0) {
-                // Check and drain memory buffer if needed
-                if (checkAndDrainMemoryBufferIfNeeded()) {
-                    break; // Records available after draining
-                }
+                // If checking memory triggered a drain and resulted in records, break
+                if (checkAndDrainMemorySync()) break;
                 
-                if (nanos <= 0L) {
-                    // Final check before returning empty
-                    checkAndDrainMemoryBufferIfNeeded();
-                    return Optional.empty();
-                }
-                
+                if (nanos <= 0L) return Optional.empty();
                 try {
                     nanos = notEmpty.awaitNanos(nanos);
-                    // After waiting, check memory buffer again
-                    if (checkAndDrainMemoryBufferIfNeeded()) {
-                        break; // Records available after draining
-                    }
+                    if (checkAndDrainMemorySync()) break;
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
-                    // Check memory buffer one more time before returning empty
-                    checkAndDrainMemoryBufferIfNeeded();
+                    checkAndDrainMemorySync();
                     return Optional.empty();
                 }
             }
-            
-            Optional<NQueueRecord> record = consumeNextRecordLocked();
-            if (record.isEmpty()) {
-                return Optional.empty();
-            }
-            // Keep deserialization under the same lock so that concurrent consumers observe FIFO
-            // order in the completion order of poll() calls.
-            return Optional.of(deserializeRecord(record.get()));
+            return consumeNextRecordLocked().map(this::safeDeserialize);
         } finally {
             statsUtils.notifyHitCounter(NQueueMetrics.POLL_EVENT);
             lock.unlock();
@@ -611,138 +400,85 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Retrieves the current size of the queue, represented by the total number
-     * of records present in the queue.
-     * <p>
-     * This method ensures thread safety by employing a lock during the operation.
+     * Returns, without removing, the element at the head of the queue if present. This operation does not
+     * advance the consumption cursor and therefore does not alter delivery semantics.
      *
-     * @return the total number of records currently in the queue.
-     * @throws IOException if an I/O error occurs during the operation.
+     * @return the current head element or empty if the queue is logically empty
+     * @throws IOException if the queue cannot access the stored data
      */
-    public long size() throws IOException {
+    public Optional<T> peek() throws IOException {
         lock.lock();
         try {
-            // With the new approach using draining queue, we can count directly:
-            // - recordCount: items on disk
-            // - memoryBuffer.size(): items in memory buffer (not yet collected)
-            // - drainingQueue.size(): items in draining queue (collected by async drain)
-            
-            long size = recordCount;
-            
+            // 1. If we have records on disk, peek from there (FIFO head)
+            if (recordCount > 0) {
+                return readAtInternal(consumerOffset).map(res -> safeDeserialize(res.getRecord()));
+            }
+
+            // 2. If disk is empty but we have memory buffer enabled, check memory buffers.
+            // NOTE: This does NOT drain/flush to disk, it just looks at what is waiting in RAM.
             if (enableMemoryBuffer) {
-                if (memoryBuffer != null) {
-                    size += memoryBuffer.size();
+                // Draining queue has older items than memoryBuffer, check it first.
+                MemoryBufferEntry<T> fromDrain = drainingQueue.peekFirst();
+                if (fromDrain != null) {
+                    return Optional.of(fromDrain.item);
                 }
-                if (drainingQueue != null) {
-                    size += drainingQueue.size();
+                
+                MemoryBufferEntry<T> fromMem = memoryBuffer.peek();
+                if (fromMem != null) {
+                    return Optional.of(fromMem.item);
                 }
             }
             
-            return size;
+            return Optional.empty();
+        } finally {
+            statsUtils.notifyHitCounter(NQueueMetrics.PEEK_EVENT);
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Returns the current logical size of the queue using strong accounting. When in-memory staging is
+     * enabled, the count includes both staged and durable records visible to consumers.
+     *
+     * @return number of elements that would be observed across all sources
+     */
+    public long size() {
+        lock.lock();
+        try {
+            long s = recordCount;
+            if (enableMemoryBuffer) s += (long) memoryBuffer.size() + drainingQueue.size();
+            return s;
         } finally {
             lock.unlock();
         }
     }
 
     /**
-     * Retrieves the current size of the queue, represented by the total number
-     * of records present in the queue.
-     * <p>
-     * When {@code optimistic} is {@code true}, this method returns an approximate
-     * size without acquiring locks, providing a fast but potentially slightly
-     * inaccurate value. When {@code optimistic} is {@code false}, this method
-     * behaves identically to {@link #size()}, returning an exact value with locks.
+     * Returns the queue size, optionally using a fast, approximate counter that may lag under concurrency
+     * but avoids coordination costs. This is useful for monitoring and heuristics where exactness is not
+     * required.
      *
-     * @param optimistic if {@code true}, returns an approximate size without locks;
-     *                   if {@code false}, returns an exact size using locks (same as {@link #size()})
-     * @return the total number of records currently in the queue (approximate if optimistic, exact otherwise)
-     * @throws IOException if an I/O error occurs during the operation (only when optimistic is false)
+     * @param optimistic when true, returns a fast approximation; when false, computes a precise value
+     * @return approximate or precise size depending on the chosen mode
      */
-    public long size(boolean optimistic) throws IOException {
-        if (!optimistic) {
-            return size();
-        }
-        return approximateSize.get();
+    public long size(boolean optimistic) {
+        return optimistic ? approximateSize.get() : size();
     }
 
     /**
-     * Waits for any ongoing memory buffer drain operations to complete.
-     * 
-     * With the new approach using draining queue, we simply wait for:
-     * - drainingQueue to be empty
-     * - drainingInProgress to be false
-     * 
-     * This is simpler and more reliable than the previous approach.
-     */
-    private void awaitDrainCompletion() {
-        if (!enableMemoryBuffer) {
-            return;
-        }
-        
-        // Quick check first - avoid synchronization overhead if nothing is draining
-        if (!drainingInProgress.get() && (drainingQueue == null || drainingQueue.isEmpty())) {
-            return;
-        }
-        
-        // Wait for drain completion using latch if available
-        CountDownLatch latch = drainCompletionLatch;
-        if (latch != null) {
-            try {
-                // Wait up to 200ms for drain completion
-                boolean completed = latch.await(200, TimeUnit.MILLISECONDS);
-                if (completed && (drainingQueue == null || drainingQueue.isEmpty())) {
-                    return;
-                }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }
-        
-        // Fallback to polling if latch is not available or timeout occurred
-        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(500);
-        while ((drainingInProgress.get() || (drainingQueue != null && !drainingQueue.isEmpty())) 
-               && System.nanoTime() < deadline) {
-            try {
-                Thread.sleep(10);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
-            }
-        }
-    }
-
-    /**
-     * Checks if the queue is empty.
-     * This method is thread-safe, as it locks the internal state during the operation.
-     * Considers disk records, memory buffer items, and draining queue items.
+     * Indicates whether the queue is currently empty according to a precise size check.
      *
-     * @return {@code true} if the queue is empty, {@code false} otherwise.
+     * @return true if no records are pending delivery; false otherwise
      */
     public boolean isEmpty() {
-        lock.lock();
-        try {
-            if (recordCount > 0) {
-                return false;
-            }
-            // Check memory buffer if enabled
-            if (enableMemoryBuffer && memoryBuffer != null && !memoryBuffer.isEmpty()) {
-                return false;
-            }
-            // Check draining queue if enabled
-            if (enableMemoryBuffer && drainingQueue != null && !drainingQueue.isEmpty()) {
-                return false;
-            }
-            return true;
-        } finally {
-            lock.unlock();
-        }
+        return size() == 0;
     }
 
     /**
-     * Retrieves the number of records currently in the queue.
-     * This method ensures thread safety by locking the internal state during the operation.
+     * Returns the count of durable records strictly within the persistent log segment awaiting consumption.
+     * This value does not include items that may be temporarily staged in memory.
      *
-     * @return the total number of records present in the queue.
+     * @return durable record count pending delivery
      */
     public long getRecordCount() {
         lock.lock();
@@ -754,506 +490,132 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     @Override
+    /**
+     * Shuts down the queue gracefully. Any staged records are flushed when possible, a final compaction may
+     * be scheduled if appropriate, and all background services and I/O resources are closed. The method
+     * attempts to complete maintenance promptly without compromising data safety.
+     *
+     * @throws IOException if underlying channels cannot be closed cleanly
+     */
     public void close() throws IOException {
-        // Drain all items from memory before closing
-        if (enableMemoryBuffer && memoryBuffer != null) {
+        // Stop maintenance first
+        maintenanceExecutor.shutdownNow();
+
+        if (enableMemoryBuffer) {
             lock.lock();
             try {
-                drainMemoryBufferSync(); // Drain everything that's in memory
+                drainMemoryBufferSync();
+            } catch (IOException ignored) {
             } finally {
                 lock.unlock();
             }
-
-            // Wait for async drain to finish
-            if (drainExecutor != null) {
-                drainExecutor.shutdown();
-                try {
-                    if (!drainExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
-                        drainExecutor.shutdownNow();
-                    }
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    drainExecutor.shutdownNow();
-                }
-            }
-
-            if (revalidationExecutor != null) {
-                revalidationExecutor.shutdown();
-                try {
-                    if (!revalidationExecutor.awaitTermination(1, TimeUnit.SECONDS)) {
-                        revalidationExecutor.shutdownNow();
-                    }
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    revalidationExecutor.shutdownNow();
-                }
-            }
         }
-
-        Future<?> future;
-        QueueState inlineSnapshot = null;
         lock.lock();
         try {
             shutdownRequested = true;
-            if (compactionFuture != null && compactionFuture.isDone()) {
-                compactionFuture = null;
-            }
-            boolean canInlineCompaction = compactionFuture == null && consumerOffset > 0 && producerOffset >= consumerOffset;
-            if (canInlineCompaction) {
+            if (compactionState == CompactionState.IDLE && consumerOffset > 0) {
+                QueueState snap = currentState();
                 compactionState = CompactionState.RUNNING;
-                inlineSnapshot = currentState();
-                future = null;
-            } else {
-                maybeCompactLocked();
-                future = compactionFuture;
+                compactionExecutor.submit(() -> runCompactionTask(snap));
             }
         } finally {
             lock.unlock();
         }
-
-        if (inlineSnapshot != null) {
-            runCompaction(inlineSnapshot);
-            future = compactionFuture;
+        compactionExecutor.shutdown();
+        try {
+            compactionExecutor.awaitTermination(10, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
-
-        if (future != null) {
-            try {
-                future.get();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            } catch (ExecutionException ignored) {
-                // Exceptions during compaction are ignored on close.
-            }
+        if (enableMemoryBuffer) {
+            drainExecutor.shutdownNow();
+            revalidationExecutor.shutdownNow();
         }
-
-        QueueState finalInline = null;
         lock.lock();
         try {
-            if (consumerOffset > 0 && producerOffset >= consumerOffset) {
-                compactionState = CompactionState.RUNNING;
-                finalInline = currentState();
-            }
-        } finally {
-            lock.unlock();
-        }
-
-        if (finalInline != null) {
-            runCompaction(finalInline);
-        }
-
-        lock.lock();
-        try {
-            dataChannel.close();
-            raf.close();
+            if (dataChannel.isOpen()) dataChannel.close();
+            if (raf != null) raf.close();
             closed = true;
         } finally {
             lock.unlock();
         }
-        compactionExecutor.shutdownNow();
-        try {
-            compactionExecutor.awaitTermination(3, TimeUnit.SECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
     }
 
     /**
-     * Reads data from the specified offset in the internal data channel and attempts to construct
-     * an {@link Optional} containing an {@link NQueueReadResult} if the read operation is successful.
-     * The method ensures that all required parts of the record (header and payload) are complete
-     * based on the metadata and file size.
-     *
-     * @param offset the offset position in the data channel from which to start reading
-     * @return an {@link Optional} containing {@link NQueueReadResult} if a valid record is read,
-     * or an empty {@link Optional} if the offset does not contain a complete record
-     * @throws IOException if there is an error reading from the data channel
+     * Waits briefly for an in-progress memory-buffer drain to complete, if any. Used to improve handoff
+     * between maintenance phases and normal operation without blocking indefinitely.
      */
-    private Optional<NQueueReadResult> readAtInternal(long offset) throws IOException {
-        if (!lock.isHeldByCurrentThread()) {
-            throw new IllegalStateException("NQueue internal read must be performed while holding the queue lock");
-        }
-        long size = dataChannel.size();
-        if (offset + NQueueRecordMetaData.fixedPrefixSize() > size) {
-            return Optional.empty();
-        }
-
-        NQueueRecordMetaData.HeaderPrefix pref = NQueueRecordMetaData.readPrefix(dataChannel, offset);
-        long headerEnd = offset + NQueueRecordMetaData.fixedPrefixSize() + pref.headerLen;
-        if (headerEnd > size) {
-            return Optional.empty();
-        }
-
-        NQueueRecordMetaData meta = NQueueRecordMetaData.fromBuffer(dataChannel, offset, pref.headerLen);
-
-        long payloadStart = headerEnd;
-        long payloadEnd = payloadStart + meta.getPayloadLen();
-        if (payloadEnd > size) {
-            return Optional.empty();
-        }
-
-        byte[] payload = new byte[meta.getPayloadLen()];
-        ByteBuffer pb = ByteBuffer.wrap(payload);
-        int r = dataChannel.read(pb, payloadStart);
-        if (r < payload.length) {
-            throw new EOFException("Payload incompleto.");
-        }
-
-        long nextOffset = payloadEnd;
-        return Optional.of(new NQueueReadResult(new NQueueRecord(meta, payload), nextOffset));
-    }
-
-    /**
-     * Rebuilds the state of a queue by analyzing and repairing the content of a file channel.
-     * Truncates the file channel if corrupted or incomplete data segments are detected.
-     *
-     * @param ch the FileChannel to read and sanitize the queue data from
-     * @return a QueueState object that contains the reconstructed state of the queue,
-     * including consumer offset, producer offset, element count, and last record index
-     * @throws IOException if an I/O error occurs while reading or writing to the file channel
-     */
-    private static QueueState rebuildState(FileChannel ch) throws IOException {
-        long size = ch.size();
-        long offset = 0L;
-        long count = 0L;
-        long lastIndex = -1L;
-
-        while (offset < size) {
-            if (offset + NQueueRecordMetaData.fixedPrefixSize() > size) {
-                ch.truncate(offset);
-                size = offset;
-                break;
-            }
-
-            NQueueRecordMetaData.HeaderPrefix prefix;
+    private void awaitDrainCompletion() {
+        if (!enableMemoryBuffer) return;
+        if (!drainingInProgress.get() && (drainingQueue == null || drainingQueue.isEmpty())) return;
+        CountDownLatch latch = drainCompletionLatch;
+        if (latch != null) {
             try {
-                prefix = NQueueRecordMetaData.readPrefix(ch, offset);
-            } catch (EOFException e) {
-                ch.truncate(offset);
-                size = offset;
-                break;
+                latch.await(200, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
             }
-
-            long headerEnd = offset + NQueueRecordMetaData.fixedPrefixSize() + prefix.headerLen;
-            if (headerEnd > size) {
-                ch.truncate(offset);
-                size = offset;
-                break;
-            }
-
-            NQueueRecordMetaData meta = NQueueRecordMetaData.fromBuffer(ch, offset, prefix.headerLen);
-            long payloadEnd = headerEnd + meta.getPayloadLen();
-            if (payloadEnd > size) {
-                ch.truncate(offset);
-                size = offset;
-                break;
-            }
-
-            offset = payloadEnd;
-            count++;
-            lastIndex = meta.getIndex();
         }
-
-        if (offset != size) {
-            size = offset;
-        }
-        ch.force(true);
-
-        long consumerOffset = count > 0 ? 0L : size;
-        long producerOffset = size;
-        if (lastIndex < 0 && count > 0) {
-            lastIndex = count - 1;
-        }
-        if (count == 0) {
-            lastIndex = -1L;
-        }
-
-        return new QueueState(consumerOffset, producerOffset, count, lastIndex, ch);
     }
 
     /**
-     * Persists the metadata of the queue state to the specified file path.
+     * Callback invoked after a compaction attempt finishes. It reconciles the operating mode with the
+     * current workload, scheduling a revalidation step when necessary to decide whether to continue using
+     * the in-memory staging path or revert to direct durable appends.
      *
-     * @param metaPath the file path where the metadata will be stored
-     * @param state    the current state of the queue containing consumer offset,
-     *                 producer offset, record count, and last index
-     * @throws IOException if an I/O error occurs while writing the metadata
+     * @param success whether the compaction reached a consistent end state
+     * @param error   an optional cause when a failure was detected
      */
-    private static void persistMeta(Path metaPath, QueueState state) throws IOException {
-        NQueueQueueMeta.write(metaPath, state.consumerOffset, state.producerOffset, state.recordCount, state.lastIndex);
-    }
-
-    /**
-     * Retrieves the current state of the queue, encapsulating details such as the
-     * consumer offset, producer offset, record count, and the last index.
-     *
-     * @return an instance of QueueState representing the current state of the queue.
-     */
-    private QueueState currentState() {
-        return new QueueState(consumerOffset, producerOffset, recordCount, lastIndex, dataChannel);
-    }
-
-    /**
-     * Persists the current state to a specified location in a thread-safe manner.
-     * <p>
-     * This method ensures that the current application's state is serialized
-     * and stored persistently using the defined metaPath. It is expected to be
-     * used in scenarios where the state information needs to be saved securely
-     * to prevent data loss.
-     * <p>
-     * The method is designed to be invoked within a synchronized context to
-     * enforce thread-safety when saving state data.
-     *
-     * @throws IOException if an I/O error occurs during the persisting process
-     */
-    private void persistCurrentStateLocked() throws IOException {
-        synchronized (metaWriteLock) {
-            persistMeta(metaPath, currentState());
-        }
-    }
-
-    /**
-     * Waits for records to become available in a thread-safe manner.
-     * This method blocks the current thread until the condition that records are available
-     * is met. The condition is evaluated based on the value of the recordCount field.
-     * <p>
-     * Utilizes the {@code notEmpty} condition to suspend the thread execution until signaled
-     * that the records have been added (i.e., when {@code recordCount > 0}).
-     * The awaiting is uninterruptible.
-     * <p>
-     * Note:
-     * - Ensure the lock associated with the condition is held before invoking this method.
-     * - Use caution when using uninterruptible waits, as they prevent the thread from responding to interruptions.
-     */
-    private void awaitRecords() {
-        while (recordCount == 0) {
-            notEmpty.awaitUninterruptibly();
-        }
-    }
-
-    /**
-     * Consumes the next record in the queue while the current state is locked,
-     * updates the consumer offset, and decrements the record count. If the record
-     * count reaches zero, the consumer offset is reset to the producer offset.
-     * The state is persisted after processing.
-     *
-     * @return an {@code Optional} containing the next {@code NQueueRecord}
-     * if available, or an empty {@code Optional} if no record is present.
-     * @throws IOException if an I/O error occurs while reading the next record.
-     */
-    private Optional<NQueueRecord> consumeNextRecordLocked() throws IOException {
-        Optional<NQueueReadResult> result = readAtInternal(consumerOffset);
-        if (result.isEmpty()) {
-            return Optional.empty();
-        }
-
-        NQueueReadResult rr = result.get();
-        consumerOffset = rr.getNextOffset();
-        recordCount--;
-        approximateSize.decrementAndGet();
-        if (recordCount == 0) {
-            consumerOffset = producerOffset;
-        }
-        persistCurrentStateLocked();
-        maybeCompactLocked();
-        return Optional.of(rr.getRecord());
-    }
-
-    /**
-     * Determines if compaction should be performed based on specific thresholds and conditions,
-     * and executes the compaction if necessary. This method is invoked while holding a lock to ensure
-     * thread safety during the evaluation and potential modification of shared state.
-     * <p>
-     * Compaction is triggered under the following conditions:
-     * - The total bytes and wasted bytes are greater than zero.
-     * - The record count is not zero, or the elapsed time since the last compaction exceeds a specified interval.
-     * - The waste ratio (calculated as the ratio of wasted bytes to total bytes) exceeds a predefined threshold,
-     * or the compaction interval has been exceeded and there are wasted bytes.
-     * <p>
-     * If conditions are satisfied, the compaction logic is executed, and the timestamp of the last
-     * compaction is updated.
-     *
-     * @throws IOException if an I/O error occurs during the compaction process.
-     */
-    private void maybeCompactLocked() throws IOException {
-        if (compactionState == CompactionState.RUNNING) {
-            return;
-        }
-        long totalBytes = producerOffset;
-        long wastedBytes = consumerOffset;
-        if (totalBytes <= 0 || wastedBytes <= 0) {
-            return;
-        }
-
-        long now = System.nanoTime();
-        boolean intervalExceeded = compactionIntervalNanos > 0 && (now - lastCompactionTimeNanos) >= compactionIntervalNanos;
-        // When the queue is empty but the data file still contains bytes (consumerOffset == producerOffset > 0),
-        // we still want to compact to rewrite the file and reset offsets back to 0. On shutdown, this should
-        // always be allowed; otherwise we keep the interval gate to avoid overly aggressive rewrites.
-        if (!shutdownRequested && recordCount == 0 && !intervalExceeded) {
-            return;
-        }
-
-        double wasteRatio = (double) wastedBytes / (double) totalBytes;
-        boolean wasteExceeded = wasteRatio >= compactionWasteThreshold;
-        if (!wasteExceeded && !(intervalExceeded && wastedBytes > 0)) {
-            return;
-        }
-
-        startCompactionIfIdleLocked(now);
-    }
-
-    /**
-     * Compacts the underlying data storage by removing all consumed data
-     * and shifting the remaining data to the beginning of the storage.
-     * This operation ensures that the storage utilizes space efficiently
-     * by discarding unnecessary data and optimizing future access.
-     * <p>
-     * The heavy lifting is now delegated to a background compaction worker.
-     * This method simply schedules the asynchronous compaction when invoked
-     * while holding the main queue lock.
-     *
-     * @throws IOException if an I/O error occurs during the compaction process.
-     *                     <p>
-     *                     Key operations performed:
-     *                     1. Calculates the length of data to be preserved.
-     *                     2. Clears storage if no data is to be preserved.
-     *                     3. Copies remaining data to the beginning of the storage.
-     *                     4. Updates the producer and consumer offsets accordingly.
-     *                     5. Truncates excess space and persists the updated state.
-     */
-    private void compactLocked() throws IOException {
-        startCompactionIfIdleLocked(System.nanoTime());
-    }
-
-    private void startCompactionIfIdleLocked(long now) {
-        // Only one compaction worker is allowed at a time. The lock protects the
-        // state snapshot that is handed off to the worker and avoids scheduling
-        // multiple background jobs concurrently.
-        if (shutdownRequested || compactionState != CompactionState.IDLE) {
-            return;
-        }
-
-        QueueState snapshot = currentState();
-        compactionState = CompactionState.RUNNING;
-        try {
-            compactionFuture = compactionExecutor.submit(() -> runCompaction(snapshot));
-            lastCompactionTimeNanos = now;
-        } catch (RuntimeException e) {
-            compactionState = CompactionState.IDLE;
-            throw e;
-        }
-    }
-
-    private void runCompaction(QueueState snapshot) {
-        boolean success = false;
-        Throwable error = null;
-        try {
-            Files.deleteIfExists(tempDataPath);
-            try (RandomAccessFile tmpRaf = new RandomAccessFile(tempDataPath.toFile(), "rw");
-                 FileChannel tmpChannel = tmpRaf.getChannel()) {
-                // Copies the active window [consumerOffset, producerOffset) into a temporary file
-                // without holding the main queue lock, allowing offer/poll/peek to proceed. The
-                // only synchronization points happen when switching the live file to the compacted one.
-                copyActiveRegion(snapshot, tmpChannel);
-
-                if (options.withFsync) {
-                    tmpChannel.force(true);
-                }
-
-                finalizeCompaction(snapshot, tempDataPath, tmpChannel.size());
-                success = true;
-            }
-        } catch (IOException ignored) {
-            error = ignored;
-            lock.lock();
-            try {
-                compactionState = CompactionState.IDLE;
-            } finally {
-                lock.unlock();
-            }
-        } catch (Throwable t) {
-            error = t;
-            throw t;
-        } finally {
-            lock.lock();
-            try {
-                if (compactionState == CompactionState.IDLE) {
-                    Files.deleteIfExists(tempDataPath);
-                }
-            } catch (IOException ignored) {
-                // best-effort cleanup
-            } finally {
-                lock.unlock();
-            }
-
-            onCompactionFinished(success, error);
-        }
-    }
-
     private void onCompactionFinished(boolean success, Throwable error) {
-        if (!enableMemoryBuffer || revalidationExecutor == null) {
-            return;
+        if (!enableMemoryBuffer) return;
+        boolean acquired = lock.tryLock();
+        if (acquired) {
+            try {
+                if (compactionState == CompactionState.RUNNING) compactionState = CompactionState.IDLE;
+                if (memoryBuffer.isEmpty() && drainingQueue.isEmpty()) {
+                    memoryBufferModeUntil.set(0);
+                    return;
+                }
+            } finally {
+                lock.unlock();
+            }
         }
-
-        if (!isMemoryModeActive() && !hasInMemoryItems()) {
-            return;
-        }
-
-        if (!switchBackRequested.compareAndSet(false, true)) {
-            return;
-        }
-
+        if (!switchBackRequested.compareAndSet(false, true)) return;
         revalidationExecutor.execute(() -> {
             try {
-                boolean acquired = false;
-                try {
-                    acquired = lock.tryLock(lockTryTimeoutNanos, TimeUnit.NANOSECONDS);
-                    if (acquired) {
-                        if (compactionState == CompactionState.RUNNING) {
-                            compactionState = CompactionState.IDLE;
-                            compactionFuture = null;
-                        }
-
-                        if (!hasInMemoryItems() && !isCompactingLocked()) {
+                if (lock.tryLock()) {
+                    try {
+                        if (compactionState != CompactionState.RUNNING && memoryBuffer.isEmpty() && drainingQueue.isEmpty()) {
                             memoryBufferModeUntil.set(0);
                             return;
                         }
-                    }
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    activateMemoryMode();
-                    return;
-                } finally {
-                    if (acquired) {
+                    } finally {
                         lock.unlock();
                     }
                 }
-
-                tryDrainMemoryBufferSync();
-
-                boolean acquiredAgain = false;
                 try {
-                    acquiredAgain = lock.tryLock(lockTryTimeoutNanos, TimeUnit.NANOSECONDS);
-                    if (!acquiredAgain) {
-                        activateMemoryMode();
-                        return;
-                    }
-
-                    if (!hasInMemoryItems() && !isCompactingLocked()) {
-                        memoryBufferModeUntil.set(0);
-                    } else {
-                        activateMemoryMode();
-                        if (hasInMemoryItems() && !drainingInProgress.get()) {
-                            triggerDrainIfNeeded();
+                    if (lock.tryLock(options.lockTryTimeoutNanos, TimeUnit.NANOSECONDS)) {
+                        try {
+                            drainMemoryBufferSync();
+                        } finally {
+                            lock.unlock();
                         }
                     }
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    activateMemoryMode();
-                } finally {
-                    if (acquiredAgain) {
+                } catch (Exception ignored) {
+                }
+                if (lock.tryLock()) {
+                    try {
+                        if (memoryBuffer.isEmpty() && drainingQueue.isEmpty() && compactionState != CompactionState.RUNNING) {
+                            memoryBufferModeUntil.set(0);
+                        } else {
+                            activateMemoryMode();
+                            triggerDrainIfNeeded();
+                        }
+                    } finally {
                         lock.unlock();
                     }
+                } else {
+                    activateMemoryMode();
                 }
             } finally {
                 switchBackRequested.set(false);
@@ -1261,476 +623,260 @@ public class NQueue<T extends Serializable> implements Closeable {
         });
     }
 
-    private void copyActiveRegion(QueueState snapshot, FileChannel target) throws IOException {
-        ByteBuffer buffer = ByteBuffer.allocate(compactionBufferSize);
-        long readOffset = snapshot.consumerOffset;
-        long limit = snapshot.producerOffset;
-        FileChannel source = snapshot.dataChannel;
-
-        while (readOffset < limit) {
-            buffer.clear();
-            int bytesRead = source.read(buffer, readOffset);
-            if (bytesRead <= 0) {
-                break;
-            }
-            buffer.flip();
-            while (buffer.hasRemaining()) {
-                target.write(buffer);
-            }
-            readOffset += bytesRead;
-        }
-    }
-
-    private void finalizeCompaction(QueueState snapshot, Path tempPath, long newProducerOffset) throws IOException {
+    /**
+     * Reads, without advancing the consumption cursor, the record stored at the provided durable offset and
+     * returns the deserialized element if a complete record exists at that position. This is intended for
+     * diagnostic and auditing scenarios.
+     *
+     * @param offset durable position to inspect
+     * @return the element at the offset or empty if no complete record is present
+     * @throws IOException if reading from storage fails
+     */
+    public Optional<T> readAt(long offset) throws IOException {
         lock.lock();
         try {
-            boolean stateChanged = consumerOffset != snapshot.consumerOffset
-                    || producerOffset != snapshot.producerOffset
-                    || recordCount != snapshot.recordCount
-                    || lastIndex != snapshot.lastIndex;
-
-            if (stateChanged) {
-                // State changed while we copied the active window. Abort this attempt.
-                // Instead of immediately rescheduling compaction, update lastCompactionTimeNanos
-                // to enforce a minimum interval before the next compaction attempt.
-                compactionState = CompactionState.IDLE;
-                compactionFuture = null;
-                long now = System.nanoTime();
-                // Force the next compaction evaluation to consider the interval exceeded so we
-                // do not stall when the queue becomes empty right after a failed attempt.
-                lastCompactionTimeNanos = compactionIntervalNanos > 0
-                        ? now - compactionIntervalNanos
-                        : now;
-                maybeCompactLocked();
-                return;
-            }
-
-            // Minimal critical section: close the old channel, atomically switch the file,
-            // reopen the channel, and update in-memory offsets/state before releasing the lock.
-            // Use local variables to avoid exposing closed channels to other threads via volatile fields.
-            FileChannel oldDataChannel = dataChannel;
-            RandomAccessFile oldRaf = raf;
-            
-            oldDataChannel.close();
-            oldRaf.close();
-
-            try {
-                Files.move(tempPath, dataPath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-            } catch (AtomicMoveNotSupportedException e) {
-                Files.move(tempPath, dataPath, StandardCopyOption.REPLACE_EXISTING);
-            }
-
-            RandomAccessFile newRaf = new RandomAccessFile(dataPath.toFile(), "rw");
-            FileChannel newDataChannel = newRaf.getChannel();
-            
-            this.raf = newRaf;
-            this.dataChannel = newDataChannel;
-
-            consumerOffset = 0L;
-            producerOffset = newProducerOffset;
-
-            persistCurrentStateLocked();
-            if (options.withFsync) {
-                dataChannel.force(true);
-            }
-
-            lastCompactionTimeNanos = System.nanoTime();
+            return readAtInternal(offset).map(res -> safeDeserialize(res.getRecord()));
         } finally {
-            compactionState = CompactionState.IDLE;
-            compactionFuture = null;
             lock.unlock();
         }
     }
 
     /**
-     * Adds an object to the memory buffer as a fallback when lock is unavailable.
-     */
-    private long offerToMemoryBuffer(T object) throws IOException {
-        return enqueueToMemoryAndTriggerDrain(object);
-    }
-
-    /**
-     * Handles offer when already in memory mode, with revalidation logic.
-     */
-    private long offerWithRevalidation(T object) throws IOException {
-        // Check if buffer is full
-        if (memoryBuffer.remainingCapacity() == 0) {
-            // Buffer full: force immediate revalidation
-            revalidateMemoryMode();
-
-            return withTryLock(() -> {
-                if (compactionState != CompactionState.RUNNING) {
-                    if (shouldDrainMemoryBuffer()) {
-                        drainMemoryBufferSync();
-                    }
-                    long offset = offerDirectLocked(object);
-                    drainMemoryBufferIfNeeded();
-                    return offset;
-                }
-                activateMemoryMode();
-                return enqueueToMemoryAndTriggerDrain(object);
-            }, () -> enqueueToMemoryAndTriggerDrain(object));
-        }
-
-        return enqueueToMemoryAndTriggerDrain(object);
-    }
-
-    private long enqueueToMemoryAndTriggerDrain(T object) throws IOException {
-        MemoryBufferEntry<T> entry = new MemoryBufferEntry<>(object);
-        try {
-            if (!memoryBuffer.offer(entry)) {
-                memoryBuffer.put(entry);
-            }
-            triggerDrainIfNeeded();
-            statsUtils.notifyHitCounter(NQueueMetrics.OFFERED_EVENT);
-            return -1;
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("Interrupted while waiting for memory buffer", e);
-        }
-    }
-
-    /**
-     * Activates memory mode for a period of time.
-     */
-    private void activateMemoryMode() {
-        // Activate memory mode for a time period
-        long until = System.nanoTime() + revalidationIntervalNanos;
-        memoryBufferModeUntil.updateAndGet(current -> Math.max(current, until));
-
-        // Schedule revalidation if not already scheduled
-        scheduleRevalidationIfNeeded();
-    }
-
-    private boolean isMemoryModeActive() {
-        return enableMemoryBuffer && memoryBufferModeUntil.get() > System.nanoTime();
-    }
-
-    /**
-     * Schedules revalidation if needed.
-     */
-    private void scheduleRevalidationIfNeeded() {
-        if (revalidationExecutor != null && revalidationScheduled.compareAndSet(false, true)) {
-            revalidationExecutor.schedule(() -> {
-                        try {
-                            revalidateMemoryMode();
-                        } finally {
-                            revalidationScheduled.set(false);
-                            if (shouldContinueRevalidation()) {
-                                scheduleRevalidationIfNeeded();
-                            }
-                        }
-                    },
-                    revalidationIntervalNanos, TimeUnit.NANOSECONDS);
-        }
-    }
-
-    /**
-     * Re-validates whether to continue using memory mode or switch back to direct disk writes.
-     */
-    private void revalidateMemoryMode() {
-        // Re-evaluate if we should continue in memory mode
-        long memoryModeUntil = memoryBufferModeUntil.get();
-        long now = System.nanoTime();
-
-        if (now >= memoryModeUntil) {
-            // Period expired: try to return to normal mode
-            boolean lockAcquired = false;
-            try {
-                lockAcquired = lock.tryLock(lockTryTimeoutNanos, TimeUnit.NANOSECONDS);
-
-                if (lockAcquired) {
-                    try {
-                        if (compactionState != CompactionState.RUNNING && !hasInMemoryItems()) {
-                            // Everything OK: deactivate memory mode
-                            memoryBufferModeUntil.set(0);
-                        } else {
-                            // Still needs memory: extend period
-                            activateMemoryMode();
-                        }
-                    } finally {
-                        lock.unlock();
-                    }
-                } else {
-                    // Lock still occupied: extend memory mode
-                    activateMemoryMode();
-                }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                activateMemoryMode(); // On error, keep memory mode
-            }
-        }
-    }
-
-    private boolean shouldContinueRevalidation() {
-        return memoryBufferModeUntil.get() > System.nanoTime();
-    }
-
-    private boolean isCompactingLocked() {
-        return compactionState == CompactionState.RUNNING;
-    }
-
-    /**
-     * Triggers asynchronous drain if needed.
-     */
-    private void triggerDrainIfNeeded() {
-        // Trigger drain only if not already in progress
-        if (drainingInProgress.compareAndSet(false, true)) {
-            // Create a new latch for this drain operation
-            drainCompletionLatch = new CountDownLatch(1);
-            drainExecutor.submit(this::drainMemoryBuffer);
-        }
-    }
-
-    private <R> R withTryLock(Callable<R> body, Callable<R> onFailure) throws IOException {
-        boolean acquired = false;
-        try {
-            acquired = lock.tryLock(lockTryTimeoutNanos, TimeUnit.NANOSECONDS);
-            if (acquired) {
-                return body.call();
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        } catch (Exception e) {
-            if (e instanceof IOException) {
-                throw (IOException) e;
-            }
-            throw new RuntimeException(e);
-        } finally {
-            if (acquired) {
-                lock.unlock();
-            }
-        }
-
-        try {
-            return onFailure.call();
-        } catch (Exception e) {
-            if (e instanceof IOException) {
-                throw (IOException) e;
-            }
-            throw new RuntimeException(e);
-        }
-    }
-
-    private void tryDrainMemoryBufferSync() {
-        if (!hasInMemoryItems()) {
-            return;
-        }
-        try {
-            withTryLock(() -> {
-                drainMemoryBufferSync();
-                return null;
-            }, () -> null);
-        } catch (IOException ignored) {
-            // If drain fails, fallback to async drain
-        }
-    }
-
-    private DrainBatchResult<T> acquireDrainBatch(int maxBatchSize) {
-        if (memoryBuffer != null && drainingQueue != null) {
-            while (drainingQueue.size() < maxBatchSize) {
-                MemoryBufferEntry<T> entry = memoryBuffer.poll();
-                if (entry == null) {
-                    break;
-                }
-                if (!drainingQueue.offer(entry)) {
-                    memoryBuffer.offer(entry);
-                    break;
-                }
-                drainingEntries.incrementAndGet();
-            }
-        }
-
-        List<MemoryBufferEntry<T>> batch = new ArrayList<>(maxBatchSize);
-        if (drainingQueue != null) {
-            MemoryBufferEntry<T> entry;
-            while (batch.size() < maxBatchSize && (entry = drainingQueue.poll()) != null) {
-                batch.add(entry);
-            }
-        }
-
-        return new DrainBatchResult<>(batch, 0);
-    }
-
-    private void requeueBatchFront(List<MemoryBufferEntry<T>> batch) {
-        if (drainingQueue == null || batch.isEmpty()) {
-            return;
-        }
-        for (int i = batch.size() - 1; i >= 0; i--) {
-            MemoryBufferEntry<T> entry = batch.get(i);
-            try {
-                drainingQueue.putFirst(entry);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
-            }
-        }
-    }
-
-    private static final class DrainBatchResult<T> {
-        final List<MemoryBufferEntry<T>> entries;
-        final int newlyCounted;
-
-        DrainBatchResult(List<MemoryBufferEntry<T>> entries, int newlyCounted) {
-            this.entries = entries;
-            this.newlyCounted = newlyCounted;
-        }
-
-        boolean isEmpty() {
-            return entries.isEmpty();
-        }
-
-        int size() {
-            return entries.size();
-        }
-    }
-
-    /**
-     * Drains memory buffer asynchronously in background.
+     * Reads, without advancing the consumption cursor, the record stored at the provided durable offset and
+     * returns its structured representation together with the next record position. This variant exposes
+     * raw metadata for advanced tooling.
      *
-     * New approach using draining queue:
-     * 1. Try to process items already in draining queue first
-     * 2. If draining queue is empty, collect batch from memory buffer
-     * 3. Move items to draining queue (atomic operation)
-     * 4. Increment drainingEntries
-     * 5. Try to acquire lock
-     * 6. If lock acquired: process items from draining queue and decrement drainingEntries
-     * 7. If lock not acquired: items remain in draining queue (will be processed by sync drain or next iteration)
-     * 
-     * This eliminates race conditions - items are never "lost" between memory buffer and draining queue.
+     * @param offset durable position to inspect
+     * @return a structured result with the record and the next offset, or empty if none is available
+     * @throws IOException if reading from storage fails
      */
-    private void drainMemoryBuffer() {
+    public Optional<NQueueReadResult> readRecordAt(long offset) throws IOException {
+        lock.lock();
         try {
-            while (hasInMemoryItems()) {
-                boolean processed;
-                try {
-                    processed = withTryLock(() -> {
-                        drainMemoryBufferSync();
-                        return true;
-                    }, () -> false);
-                } catch (IOException e) {
-                    try {
-                        Thread.sleep(5);
-                    } catch (InterruptedException interrupted) {
-                        Thread.currentThread().interrupt();
-                        break;
-                    }
-                    continue;
-                }
-
-                if (!processed) {
-                    try {
-                        Thread.sleep(5);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        break;
-                    }
-                }
-            }
+            return readAtInternal(offset);
         } finally {
-            drainingInProgress.set(false);
-            // Signal completion to any waiting threads
-            CountDownLatch latch = drainCompletionLatch;
-            if (latch != null) {
-                latch.countDown();
-                drainCompletionLatch = null;
-            }
-            // Handle items that might have been enqueued after the last drain batch
-            if (hasInMemoryItems()) {
-                triggerDrainIfNeeded();
-            }
+            lock.unlock();
         }
     }
 
     /**
-     * Drains all items from memory buffer synchronously.
-     * Used in poll() and close() to ensure FIFO order.
-     * This method must be called while holding the lock.
+     * Returns, without advancing the consumption cursor, the raw representation of the head record if one
+     * exists. This provides visibility into metadata alongside the payload for diagnostic use.
+     *
+     * @return the next record or empty if the queue is logically empty
+     * @throws IOException if reading from storage fails
      */
-    private void drainMemoryBufferSync() throws IOException {
-        while (true) {
-            DrainBatchResult<T> batchResult = acquireDrainBatch(MEMORY_DRAIN_BATCH_SIZE);
-            if (batchResult.isEmpty()) {
-                break;
-            }
+    public Optional<NQueueRecord> peekRecord() throws IOException {
+        lock.lock();
+        try {
+            if (recordCount == 0) return Optional.empty();
+            return readAtInternal(consumerOffset).map(NQueueReadResult::getRecord);
+        } finally {
+            lock.unlock();
+        }
+    }
 
-            List<T> items = new ArrayList<>(batchResult.size());
-            for (MemoryBufferEntry<T> entry : batchResult.entries) {
-                items.add(entry.item);
-            }
+    /**
+     * Appends a single element directly to durable storage. Coordination must already be in place to ensure
+     * exclusive access to mutable state. Intended for internal paths that bypass the in-memory staging layer.
+     *
+     * @param object element to append
+     * @return logical durable offset of the appended record
+     * @throws IOException if the append cannot be acknowledged
+     */
+    private long offerDirectLocked(T object) throws IOException {
+        return offerBatchLocked(List.of(object), true);
+    }
 
+    /**
+     * Appends a batch of elements directly to durable storage, advancing producer cursors and updating
+     * persistent metadata in one step. When requested by options, a synchronous flush is performed before
+     * returning. Consumers are signaled upon successful append.
+     *
+     * @param items elements to append in FIFO order
+     * @param fsync whether to request a synchronous flush according to durability settings
+     * @return logical durable offset of the first appended record, or a sentinel when no items are provided
+     * @throws IOException if the append cannot be acknowledged
+     */
+    private long offerBatchLocked(List<T> items, boolean fsync) throws IOException {
+        if (items.isEmpty()) return -1;
+        long writePos = producerOffset, firstStart = -1, initialCount = recordCount;
+        for (T obj : items) {
+            byte[] payload = toBytes(obj);
+            lastIndex++;
+            if (lastIndex < 0) lastIndex = 0;
+            NQueueRecordMetaData meta = new NQueueRecordMetaData(lastIndex, payload.length, obj.getClass().getCanonicalName());
+            ByteBuffer hb = meta.toByteBuffer();
+            long rStart = writePos;
+            while (hb.hasRemaining()) writePos += dataChannel.write(hb, writePos);
+            ByteBuffer pb = ByteBuffer.wrap(payload);
+            while (pb.hasRemaining()) writePos += dataChannel.write(pb, writePos);
+            if (firstStart < 0) firstStart = rStart;
+        }
+        producerOffset = writePos;
+        recordCount += items.size();
+        approximateSize.addAndGet(items.size());
+        if (initialCount == 0) consumerOffset = firstStart;
+        persistCurrentStateLocked();
+        if (fsync && options.withFsync) dataChannel.force(true);
+        maybeCompactLocked();
+        notEmpty.signalAll();
+        statsUtils.notifyHitCounter(NQueueMetrics.OFFERED_EVENT);
+        return firstStart;
+    }
+
+    /**
+     * Internal read helper that validates the presence of a complete record at the given durable offset and
+     * returns its raw representation together with the next position. Incomplete or inconsistent tails yield
+     * an empty result.
+     *
+     * @param offset durable position to inspect
+     * @return structured result with record and next offset, or empty if no complete record is present
+     * @throws IOException if accessing storage fails
+     */
+    private Optional<NQueueReadResult> readAtInternal(long offset) throws IOException {
+        long size = dataChannel.size();
+        if (offset + NQueueRecordMetaData.fixedPrefixSize() > size) return Optional.empty();
+        NQueueRecordMetaData.HeaderPrefix pref = NQueueRecordMetaData.readPrefix(dataChannel, offset);
+        long hEnd = offset + NQueueRecordMetaData.fixedPrefixSize() + pref.headerLen;
+        if (hEnd > size) return Optional.empty();
+        NQueueRecordMetaData meta = NQueueRecordMetaData.fromBuffer(dataChannel, offset, pref.headerLen);
+        long pEnd = hEnd + meta.getPayloadLen();
+        if (pEnd > size) return Optional.empty();
+        byte[] payload = new byte[meta.getPayloadLen()];
+        ByteBuffer pb = ByteBuffer.wrap(payload);
+        while (pb.hasRemaining()) {
+            if (dataChannel.read(pb, hEnd + (long) pb.position()) < 0) throw new EOFException();
+        }
+        return Optional.of(new NQueueReadResult(new NQueueRecord(meta, payload), pEnd));
+    }
+
+    /**
+     * Removes the head record from the durable log from the queue’s perspective by advancing the consumption
+     * cursor and persisting that advancement. The raw record is returned for subsequent deserialization by
+     * the caller.
+     *
+     * @return the consumed record if available
+     * @throws IOException if the new state cannot be persisted
+     */
+    private Optional<NQueueRecord> consumeNextRecordLocked() throws IOException {
+        return readAtInternal(consumerOffset).map(res -> {
+            consumerOffset = res.getNextOffset();
+            recordCount--;
+            approximateSize.decrementAndGet();
+            if (recordCount == 0) consumerOffset = producerOffset;
             try {
-                offerBatchLocked(items, options.withFsync);
-                drainingEntries.addAndGet(-batchResult.size());
+                persistCurrentStateLocked();
+                maybeCompactLocked();
             } catch (IOException e) {
-                requeueBatchFront(batchResult.entries);
-                throw e;
+                throw new RuntimeException(e);
+            }
+            return res.getRecord();
+        });
+    }
+
+    /**
+     * Persists the current queue cursors and counters so that progress is preserved across restarts. This
+     * method assumes exclusive access to the queue state.
+     *
+     * @throws IOException if the metadata cannot be written
+     */
+    private void persistCurrentStateLocked() throws IOException {
+        synchronized (metaWriteLock) {
+            NQueueQueueMeta.write(metaPath, consumerOffset, producerOffset, recordCount, lastIndex);
+        }
+    }
+
+    /**
+     * Restores a consistent queue state using existing metadata when possible, or by scanning the durable
+     * log to rebuild cursors and counters. When the log contains incomplete data at the tail, the torn tail
+     * is discarded to ensure a consistent starting point.
+     *
+     * @param ch       channel to the durable log
+     * @param metaPath path to the metadata file
+     * @param options  startup options controlling reset behavior
+     * @return recovered state snapshot
+     * @throws IOException if recovery cannot complete
+     */
+    private static QueueState loadOrRebuildState(FileChannel ch, Path metaPath, Options options) throws IOException {
+        if (options.resetOnRestart) {
+            QueueState s = rebuildStateFromLog(ch);
+            NQueueQueueMeta.write(metaPath, s.consumerOffset, s.producerOffset, s.recordCount, s.lastIndex);
+            return s;
+        }
+        if (Files.exists(metaPath)) {
+            try {
+                NQueueQueueMeta meta = NQueueQueueMeta.read(metaPath);
+                QueueState s = new QueueState(meta.getConsumerOffset(), meta.getProducerOffset(), meta.getRecordCount(), meta.getLastIndex());
+                if (s.consumerOffset >= 0 && s.producerOffset >= s.consumerOffset && ch.size() >= s.producerOffset)
+                    return s;
+            } catch (IOException ignored) {
             }
         }
+        QueueState s = rebuildStateFromLog(ch);
+        NQueueQueueMeta.write(metaPath, s.consumerOffset, s.producerOffset, s.recordCount, s.lastIndex);
+        return s;
     }
 
     /**
-     * Checks if memory buffer needs draining and triggers it if needed.
-     * Called after normal operations to ensure memory is drained.
+     * Scans the durable log from the beginning to reconstruct a consistent state snapshot, stopping at the
+     * last complete record. Any partial tail is removed before the state is returned. This operation is used
+     * when metadata is absent or cannot be trusted.
+     *
+     * @param ch channel to the durable log
+     * @return reconstructed state snapshot
+     * @throws IOException if the log cannot be read or reconciled
      */
-    private void drainMemoryBufferIfNeeded() {
-        if (hasInMemoryItems() && !drainingInProgress.get()) {
-            triggerDrainIfNeeded();
+    private static QueueState rebuildStateFromLog(FileChannel ch) throws IOException {
+        long offset = 0, count = 0, lastIdx = -1, size = ch.size();
+        while (offset < size) {
+            try {
+                NQueueRecordMetaData.HeaderPrefix pref = NQueueRecordMetaData.readPrefix(ch, offset);
+                NQueueRecordMetaData meta = NQueueRecordMetaData.fromBuffer(ch, offset, pref.headerLen);
+                offset = offset + NQueueRecordMetaData.fixedPrefixSize() + pref.headerLen + meta.getPayloadLen();
+                if (offset > size) throw new EOFException();
+                count++;
+                lastIdx = meta.getIndex();
+            } catch (Exception e) {
+                ch.truncate(offset);
+                size = offset;
+                break;
+            }
+        }
+        ch.force(true);
+        return new QueueState(count > 0 ? 0 : size, size, count, lastIdx);
+    }
+
+    /**
+     * Transfers a contiguous region from one channel to another. Used by background maintenance to assemble
+     * a compacted log while preserving the unconsumed segment and arrival order.
+     *
+     * @param src   source channel
+     * @param start start position, inclusive
+     * @param end   end position, exclusive
+     * @param dst   destination channel
+     * @throws IOException if the transfer fails
+     */
+    private void copyRegion(FileChannel src, long start, long end, FileChannel dst) throws IOException {
+        long pos = start, count = end - start;
+        while (count > 0) {
+            long t = src.transferTo(pos, count, dst);
+            if (t <= 0) break;
+            pos += t;
+            count -= t;
         }
     }
 
     /**
-     * Helper method to check if memory buffer has items.
-     * Must be called while holding the lock or when memory buffer operations are safe.
+     * Serializes an element to a byte array using the platform’s object serialization mechanism. Used to
+      * produce a durable payload for storage.
      *
-     * @return true if memory buffer is enabled and has items
-     */
-    private boolean hasMemoryBufferItems() {
-        return enableMemoryBuffer && memoryBuffer != null && !memoryBuffer.isEmpty();
-    }
-
-    private boolean hasInMemoryItems() {
-        return enableMemoryBuffer
-                && ((memoryBuffer != null && !memoryBuffer.isEmpty())
-                || (drainingQueue != null && !drainingQueue.isEmpty())
-                || drainingEntries.get() > 0);
-    }
-
-    /**
-     * Helper method to check if memory buffer should be drained before operations.
-     * Must be called while holding the lock.
-     *
-     * @return true if memory buffer should be drained
-     */
-    private boolean shouldDrainMemoryBuffer() {
-        return hasInMemoryItems();
-    }
-
-    /**
-     * Checks and drains memory buffer if needed.
-     * Must be called while holding the lock.
-     * 
-     * @return true if records are now available after draining
-     * @throws IOException if drain operation fails
-     */
-    private boolean checkAndDrainMemoryBufferIfNeeded() throws IOException {
-        if (shouldDrainMemoryBuffer()) {
-            drainMemoryBufferSync();
-            return recordCount > 0;
-        }
-        return false;
-    }
-
-    /**
-     * Converts the given object to its byte array representation.
-     *
-     * @param obj the object to be converted into a byte array. It should be serializable.
-     * @return a byte array representing the serialized form of the given object.
-     * @throws IOException if an I/O error occurs during the serialization process.
+     * @param obj element to serialize
+     * @return binary representation suitable for persistence
+     * @throws IOException if the element cannot be serialized
      */
     private byte[] toBytes(T obj) throws IOException {
-        try (ByteArrayOutputStream bos = new ByteArrayOutputStream();
-             ObjectOutputStream oos = new ObjectOutputStream(new BufferedOutputStream(bos))) {
+        try (ByteArrayOutputStream bos = new ByteArrayOutputStream(); ObjectOutputStream oos = new ObjectOutputStream(new BufferedOutputStream(bos))) {
             oos.writeObject(obj);
             oos.flush();
             return bos.toByteArray();
@@ -1738,35 +884,348 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Deserializes a record from its payload into an object of type T.
+     * Deserializes the payload of a raw record into the expected element type. Errors during deserialization
+     * surface as unchecked failures to signal data that cannot be interpreted on the current classpath.
      *
-     * @param record the NQueueRecord containing the serialized payload to be deserialized
-     * @return an object of type T obtained by deserializing the provided record's payload
-     * @throws IOException if an I/O error occurs during deserialization or the class of the object cannot be found
+     * @param record raw record containing a binary payload
+     * @return deserialized element
      */
-    private T deserializeRecord(NQueueRecord record) throws IOException {
-        try (ByteArrayInputStream bis = new ByteArrayInputStream(record.payload());
-             ObjectInputStream ois = new ObjectInputStream(bis)) {
-            @SuppressWarnings("unchecked")
-            T obj = (T) ois.readObject();
-            return obj;
-        } catch (ClassNotFoundException e) {
-            throw new IOException("Failed to deserialize record payload", e);
+    private T safeDeserialize(NQueueRecord record) {
+        try (ByteArrayInputStream bis = new ByteArrayInputStream(record.payload()); ObjectInputStream ois = new ObjectInputStream(bis)) {
+            return (T) ois.readObject();
+        } catch (Exception e) {
+            throw new RuntimeException(e);
         }
     }
 
-    private enum CompactionState {
-        IDLE,
-        RUNNING
+    /**
+     * Activates a temporary staging mode that routes new enqueues through the in-memory buffer for a short
+     * interval. This helps to smooth producer throughput during maintenance or brief contention bursts. The
+     * mode revalidates itself periodically to decide when to revert to direct appends.
+     */
+    private void activateMemoryMode() {
+        if (!enableMemoryBuffer) return;
+        long until = System.nanoTime() + options.revalidationIntervalNanos;
+        memoryBufferModeUntil.updateAndGet(c -> Math.max(c, until));
+        scheduleRevalidation();
     }
 
     /**
-     * Internal class to track items in the memory buffer with timestamp.
+     * Schedules a future revalidation of the temporary staging mode when not already pending. The scheduled
+     * task verifies whether conditions still warrant staying in memory-buffer mode.
      */
-    private static final class MemoryBufferEntry<T> {
+    private void scheduleRevalidation() {
+        if (revalidationExecutor != null && revalidationScheduled.compareAndSet(false, true)) {
+            revalidationExecutor.schedule(() -> {
+                try {
+                    revalidateMemoryMode();
+                } finally {
+                    revalidationScheduled.set(false);
+                    if (memoryBufferModeUntil.get() > System.nanoTime()) scheduleRevalidation();
+                }
+            }, options.revalidationIntervalNanos, TimeUnit.NANOSECONDS);
+        }
+    }
+
+    /**
+     * Re-evaluates whether the in-memory staging mode should continue. When conditions improve and no staged
+     * work remains, the queue reverts to direct durable appends; otherwise, the staging window is extended.
+     */
+    private void revalidateMemoryMode() {
+        if (System.nanoTime() >= memoryBufferModeUntil.get()) {
+            if (lock.tryLock()) {
+                try {
+                    if (compactionState != CompactionState.RUNNING && (!enableMemoryBuffer || (memoryBuffer.isEmpty() && drainingQueue.isEmpty()))) {
+                        memoryBufferModeUntil.set(0);
+                        return;
+                    }
+                } finally {
+                    lock.unlock();
+                }
+            }
+            activateMemoryMode();
+        }
+    }
+
+    /**
+     * Attempts to place a new element into the bounded in-memory staging buffer. When the buffer is full and
+     * conditions allow, the queue may opportunistically revert to a direct durable append for the current
+     * element. Producers block only when the buffer is at capacity and no immediate fallback is possible.
+     *
+     * @param object             element to stage
+     * @param revalidateIfFull   whether to reassess staging mode when the buffer is saturated
+     * @return a sentinel indicating that durability will be achieved by a later drain
+     * @throws IOException if a fallback durable append is attempted and fails
+     */
+    private long offerToMemory(T object, boolean revalidateIfFull) throws IOException {
+        try {
+            if (revalidateIfFull && memoryBuffer.remainingCapacity() == 0) {
+                revalidateMemoryMode();
+                if (lock.tryLock()) {
+                    try {
+                        if (compactionState != CompactionState.RUNNING) {
+                            drainMemoryBufferSync();
+                            return offerDirectLocked(object);
+                        }
+                    } finally {
+                        lock.unlock();
+                    }
+                }
+            }
+            MemoryBufferEntry<T> e = new MemoryBufferEntry<>(object);
+            if (!memoryBuffer.offer(e)) memoryBuffer.put(e);
+            triggerDrainIfNeeded();
+            return -1;
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            throw new IOException(ex);
+        }
+    }
+
+    /**
+     * Initiates an asynchronous drain from the staging buffer into durable storage when necessary. A single
+     * drain worker is kept active at a time to preserve ordering.
+     */
+    private void triggerDrainIfNeeded() {
+        if (enableMemoryBuffer && !memoryBuffer.isEmpty() && drainingInProgress.compareAndSet(false, true)) {
+            drainCompletionLatch = new CountDownLatch(1);
+            drainExecutor.submit(this::drainMemoryBufferAsync);
+        }
+    }
+
+    /**
+     * Background worker that periodically acquires the necessary coordination to flush staged elements into
+     * durable storage in batches. The worker makes progress opportunistically to minimize interference with
+     * producers and consumers.
+     */
+    private void drainMemoryBufferAsync() {
+        try {
+            while (enableMemoryBuffer && (!memoryBuffer.isEmpty() || !drainingQueue.isEmpty())) {
+                boolean ok = false;
+                try {
+                    if (lock.tryLock(options.lockTryTimeoutNanos, TimeUnit.NANOSECONDS)) {
+                        try {
+                            drainMemoryBufferSync();
+                            ok = true;
+                        } finally {
+                            lock.unlock();
+                        }
+                    }
+                } catch (Exception ignored) {
+                }
+                if (!ok) {
+                    try {
+                        Thread.sleep(5);
+                    } catch (InterruptedException ex) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+            }
+        } finally {
+            drainingInProgress.set(false);
+            if (drainCompletionLatch != null) drainCompletionLatch.countDown();
+            if (enableMemoryBuffer && !memoryBuffer.isEmpty()) triggerDrainIfNeeded();
+        }
+    }
+
+    /**
+     * Synchronously flushes staged elements into durable storage in FIFO order, aggregating work into small
+     * batches to reduce coordination overhead. Failures result in staged entries being retained for a later
+     * retry.
+     *
+     * @throws IOException if persistence fails and the drain cannot complete
+     */
+    private void drainMemoryBufferSync() throws IOException {
+        if (!enableMemoryBuffer) return;
+        while (true) {
+            memoryBuffer.drainTo(drainingQueue, MEMORY_DRAIN_BATCH_SIZE);
+            if (drainingQueue.isEmpty()) break;
+            List<T> batch = new ArrayList<>();
+            List<MemoryBufferEntry<T>> entries = new ArrayList<>();
+            for (int i = 0; i < MEMORY_DRAIN_BATCH_SIZE; i++) {
+                MemoryBufferEntry<T> ent = drainingQueue.poll();
+                if (ent == null) break;
+                batch.add(ent.item);
+                entries.add(ent);
+            }
+            if (batch.isEmpty()) break;
+            try {
+                offerBatchLocked(batch, options.withFsync);
+            } catch (IOException ex) {
+                for (int i = entries.size() - 1; i >= 0; i--) drainingQueue.addFirst(entries.get(i));
+                throw ex;
+            }
+        }
+    }
+
+    /**
+     * Checks for staged work and performs a synchronous drain when present, indicating whether durable
+     * records became available for consumption as a result.
+     *
+     * @return true if at least one durable record is now available; false otherwise
+     * @throws IOException if draining encounters a storage error
+     */
+    private boolean checkAndDrainMemorySync() throws IOException {
+        if (enableMemoryBuffer && (!memoryBuffer.isEmpty() || !drainingQueue.isEmpty())) {
+            drainMemoryBufferSync();
+            return recordCount > 0;
+        }
+        return false;
+    }
+
+    /**
+     * Evaluates whether conditions warrant a background compaction and, when they do, schedules one. The
+     * decision considers the amount of consumed data and an optional time-based trigger, and avoids running
+     * when a compaction is already in progress or shutdown is underway.
+     */
+    private void maybeCompactLocked() {
+        if (compactionState == CompactionState.RUNNING || shutdownRequested) return;
+        if (producerOffset <= 0 || consumerOffset <= 0) return;
+        long now = System.nanoTime();
+        if (((double) consumerOffset / (double) producerOffset) >= options.compactionWasteThreshold || (options.compactionIntervalNanos > 0 && (now - lastCompactionTimeNanos) >= options.compactionIntervalNanos && consumerOffset > 0)) {
+            QueueState snap = currentState();
+            compactionState = CompactionState.RUNNING;
+            lastCompactionTimeNanos = now;
+            compactionExecutor.submit(() -> runCompactionTask(snap));
+        }
+    }
+
+    /**
+     * Performs compaction by assembling a new log containing only the unconsumed segment and then handing it
+     * off for finalization. Progress is reported back to reconcile staging mode with normal operation.
+     *
+     * @param snap a point-in-time snapshot used to drive compaction
+     */
+    private void runCompactionTask(QueueState snap) {
+        try {
+            Files.deleteIfExists(tempDataPath);
+            try (RandomAccessFile tmpRaf = new RandomAccessFile(tempDataPath.toFile(), "rw"); FileChannel tmpCh = tmpRaf.getChannel()) {
+                long copyStartOffset;
+                long copyEndOffset;
+
+                lock.lock();
+                try {
+                    // We start from the CURRENT consumer position to avoid copying already consumed data.
+                    copyStartOffset = consumerOffset;
+                    // We copy up to the current producer position to maximize work done outside the lock.
+                    copyEndOffset = producerOffset;
+                } finally {
+                    lock.unlock();
+                }
+
+                if (copyEndOffset > copyStartOffset) {
+                    copyRegion(dataChannel, copyStartOffset, copyEndOffset, tmpCh);
+                }
+                
+                if (options.withFsync) tmpCh.force(true);
+                finalizeCompaction(copyStartOffset, copyEndOffset, tmpCh);
+            }
+        } catch (Throwable t) {
+            lock.lock();
+            try {
+                compactionState = CompactionState.IDLE;
+            } finally {
+                lock.unlock();
+            }
+            try {
+                Files.deleteIfExists(tempDataPath);
+            } catch (IOException ignored) {
+            }
+        } finally {
+            onCompactionFinished(compactionState == CompactionState.IDLE, null);
+        }
+    }
+
+    /**
+     * Finalizes a compaction by atomically replacing the active log with the compacted version, recalculating
+     * cursors to reflect additional data appended during the copy window, and updating persisted metadata.
+     * Upon completion, producers and consumers continue unaffected.
+     *
+     * @param copyStartOffset durable position where the background copy started
+     * @param copyEndOffset   durable position where the background copy ended
+     * @param tmpCh           channel containing the compacted content
+     * @throws IOException if the replacement or state update cannot be completed
+     */
+    private void finalizeCompaction(long copyStartOffset, long copyEndOffset, FileChannel tmpCh) throws IOException {
+        lock.lock();
+        try {
+            // 1. Copy any data that was appended while we were copying in background
+            if (producerOffset > copyEndOffset) {
+                copyRegion(dataChannel, copyEndOffset, producerOffset, tmpCh);
+            }
+
+            // 2. Calculate new offsets relative to the new file
+            // The new file contains data starting from copyStartOffset.
+            long newPO = tmpCh.position();
+            long newCO = Math.max(0, consumerOffset - copyStartOffset);
+            
+            if (recordCount == 0) {
+                newCO = 0;
+                newPO = 0;
+                tmpCh.truncate(0);
+            }
+            
+            if (newCO > newPO) newCO = newPO;
+            
+            if (options.withFsync) tmpCh.force(true);
+            tmpCh.close();
+
+            // 3. Atomic swap
+            try {
+                Files.move(tempDataPath, dataPath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            } catch (AtomicMoveNotSupportedException e) {
+                Files.move(tempDataPath, dataPath, StandardCopyOption.REPLACE_EXISTING);
+            }
+
+            RandomAccessFile nRaf = new RandomAccessFile(dataPath.toFile(), "rw");
+            FileChannel nCh = nRaf.getChannel();
+            try {
+                dataChannel.close();
+                raf.close();
+            } catch (IOException ignored) {
+            }
+            
+            raf = nRaf;
+            dataChannel = nCh;
+            consumerOffset = newCO;
+            producerOffset = newPO;
+            persistCurrentStateLocked();
+        } finally {
+            compactionState = CompactionState.IDLE;
+            lock.unlock();
+            triggerDrainIfNeeded();
+        }
+    }
+
+    /**
+     * Creates a lightweight snapshot of the queue’s current cursors and counters for use in maintenance and
+     * diagnostics.
+     *
+     * @return current state snapshot
+     */
+    private QueueState currentState() {
+        return new QueueState(consumerOffset, producerOffset, recordCount, lastIndex);
+    }
+
+    /**
+     * Indicates whether the queue is currently compacting or idle from a maintenance perspective.
+     */
+    public enum CompactionState {IDLE, RUNNING}
+
+    /**
+     * Wrapper for elements staged in the in-memory buffer, capturing arrival time to aid operational
+     * decisions and debugging.
+     */
+    private static class MemoryBufferEntry<T> {
         final T item;
         final long timestamp;
 
+        /**
+         * Captures an element destined for later durable append along with its arrival timestamp.
+         *
+         * @param item element to stage
+         */
         MemoryBufferEntry(T item) {
             this.item = item;
             this.timestamp = System.nanoTime();
@@ -1774,234 +1233,239 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Represents the current state of a queue including offsets, record count,
-     * and the last index.
+     * Immutable snapshot of queue cursors and counters used to coordinate operations like compaction and
+     * recovery.
      */
-    private static final class QueueState {
-        final long consumerOffset;
-        final long producerOffset;
-        final long recordCount;
-        final long lastIndex;
-        final FileChannel dataChannel;
+    private static class QueueState {
+        final long consumerOffset, producerOffset, recordCount, lastIndex;
 
-        QueueState(long consumerOffset, long producerOffset, long recordCount, long lastIndex, FileChannel dataChannel) {
-            this.consumerOffset = consumerOffset;
-            this.producerOffset = producerOffset;
-            this.recordCount = recordCount;
-            this.lastIndex = lastIndex;
-            this.dataChannel = dataChannel;
+        /**
+         * Builds a new snapshot capturing the given positions and counters.
+         *
+         * @param co consumer offset
+         * @param po producer offset
+         * @param rc record count
+         * @param li last logical index
+         */
+        QueueState(long co, long po, long rc, long li) {
+            this.consumerOffset = co;
+            this.producerOffset = po;
+            this.recordCount = rc;
+            this.lastIndex = li;
         }
     }
 
     /**
-     * Options used to configure queue behaviour.
+     * Configuration for queue behavior including compaction policy, durability, staging, and coordination
+     * timing. Instances are mutable builders; use fluent setters to construct the desired configuration.
      */
     public static final class Options {
-        private double compactionWasteThreshold = 0.5d;
-        private Duration compactionInterval = Duration.ofMinutes(5);
-        private int compactionBufferSize = 128 * 1024;
-        private boolean withFsync = true;
-        private boolean enableMemoryBuffer = false;
-        private int memoryBufferSize = 10000;
-        private Duration lockTryTimeout = Duration.ofMillis(10);
-        private Duration revalidationInterval = Duration.ofMillis(100);
-        private boolean resetOnRestart = false;
+        double compactionWasteThreshold = 0.5;
+        long compactionIntervalNanos = TimeUnit.MINUTES.toNanos(5);
+        int compactionBufferSize = 128 * 1024;
+        boolean withFsync = true, enableMemoryBuffer = false, resetOnRestart = false;
+        int memoryBufferSize = 10000;
+        long lockTryTimeoutNanos = TimeUnit.MILLISECONDS.toNanos(10), revalidationIntervalNanos = TimeUnit.MILLISECONDS.toNanos(100);
+        long maintenanceIntervalNanos = TimeUnit.SECONDS.toNanos(5);
+        long maxSizeReconciliationIntervalNanos = TimeUnit.MINUTES.toNanos(1);
 
         private Options() {
         }
 
+        /**
+         * Returns a fresh options instance with conservative defaults that favor safety and predictable
+         * maintenance behavior.
+         *
+         * @return new options instance with default values
+         */
         public static Options defaults() {
             return new Options();
         }
 
         /**
-         * Sets the compaction waste threshold, which defines the proportion of wasted space
-         * in data structures that can trigger a compaction process. The threshold must be
-         * a value between 0.0 and 1.0 inclusive, representing percentages in decimal form.
+         * Sets the fraction of consumed data that should trigger a compaction when exceeded. Values close to
+         * zero compact aggressively; values near one compact rarely.
          *
-         * @param threshold the compaction waste threshold as a decimal value between 0.0 and 1.0
-         * @return the current {@code Options} instance for method chaining
-         * @throws IllegalArgumentException if {@code threshold} is less than 0.0 or greater than 1.0
+         * @param t threshold in the range [0.0, 1.0]
+         * @return this builder for chaining
          */
-        public Options withCompactionWasteThreshold(double threshold) {
-            if (threshold < 0.0d || threshold > 1.0d) {
-                throw new IllegalArgumentException("threshold deve estar no intervalo [0.0, 1.0]");
-            }
-            this.compactionWasteThreshold = threshold;
+        public Options withCompactionWasteThreshold(double t) {
+            if (t < 0.0 || t > 1.0) throw new IllegalArgumentException("threshold [0.0, 1.0]");
+            this.compactionWasteThreshold = t;
             return this;
         }
 
         /**
-         * Sets the compaction interval, which determines the frequency of compaction operations.
-         * A valid, non-negative interval must be provided.
+         * Sets a time-based trigger for compaction. When greater than zero, a compaction may be scheduled
+         * after at least this interval has elapsed since the last run and there is data eligible to reclaim.
          *
-         * @param interval the {@code Duration} specifying the compaction interval; must not be null or negative
-         * @return the current {@code Options} instance for method chaining
-         * @throws NullPointerException if {@code interval} is null
-         * @throws IllegalArgumentException if {@code interval} is negative
+         * @param i minimum interval between compactions
+         * @return this builder for chaining
          */
-        public Options withCompactionInterval(Duration interval) {
-            Objects.requireNonNull(interval, "interval");
-            if (interval.isNegative()) {
-                throw new IllegalArgumentException("interval não pode ser negativo");
-            }
-            this.compactionInterval = interval;
+        public Options withCompactionInterval(Duration i) {
+            Objects.requireNonNull(i);
+            if (i.isNegative()) throw new IllegalArgumentException("negative");
+            this.compactionIntervalNanos = i.toNanos();
             return this;
         }
 
         /**
-         * Sets the buffer size for compaction processes.
-         * This size determines the allocation limit for buffer data during the compaction operation.
+         * Sets the internal buffer size used during maintenance activities. Larger buffers may improve
+         * throughput on some systems at the cost of memory.
          *
-         * @param bufferSize the size of the buffer in bytes; must be a positive value
-         * @return the current {@code Options} instance for method chaining
-         * @throws IllegalArgumentException if {@code bufferSize} is less than or equal to 0
+         * @param s positive buffer size in bytes
+         * @return this builder for chaining
          */
-        public Options withCompactionBufferSize(int bufferSize) {
-            if (bufferSize <= 0) {
-                throw new IllegalArgumentException("bufferSize deve ser positivo");
-            }
-            this.compactionBufferSize = bufferSize;
+        public Options withCompactionBufferSize(int s) {
+            if (s <= 0) throw new IllegalArgumentException("positive");
+            this.compactionBufferSize = s;
             return this;
         }
 
         /**
-         * Configures whether file system synchronization (fsync) should be performed.
-         * When enabled, fsync ensures that data is physically written to disk, improving
-         * data durability at the cost of performance. Disabling fsync may improve performance
-         * but increases the risk of data loss in the event of a crash.
+         * Controls whether enqueues request synchronous flushing from the storage layer. Enabling this
+         * increases durability guarantees at the cost of throughput.
          *
-         * @param fsync a boolean value indicating whether fsync should be enabled (true) or disabled (false)
-         * @return the current {@code Options} instance for method chaining
+         * @param f true to enable synchronous flush on critical operations
+         * @return this builder for chaining
          */
-        public Options withFsync(boolean fsync) {
-            this.withFsync = fsync;
+        public Options withFsync(boolean f) {
+            this.withFsync = f;
             return this;
         }
 
         /**
-         * Enables or disables the memory buffer fallback mechanism.
-         * When enabled, if the queue lock is unavailable (e.g., during compaction),
-         * items will be temporarily stored in memory and drained to disk when the lock becomes available.
-         * 
-         * @param enable true to enable memory buffer, false to disable (default)
-         * @return the current {@code Options} instance for method chaining
-         */
-        public Options withMemoryBuffer(boolean enable) {
-            this.enableMemoryBuffer = enable;
-            return this;
-        }
-
-        /**
-         * Sets the maximum size of the memory buffer queue.
-         * When this limit is reached, the system will re-evaluate if the lock is available.
-         * If the lock is still unavailable, operations will block until space becomes available.
-         * 
-         * @param size the maximum number of items in the memory buffer; must be positive
-         * @return the current {@code Options} instance for method chaining
-         * @throws IllegalArgumentException if {@code size} is less than or equal to 0
-         */
-        public Options withMemoryBufferSize(int size) {
-            if (size <= 0) {
-                throw new IllegalArgumentException("memoryBufferSize deve ser positivo");
-            }
-            this.memoryBufferSize = size;
-            return this;
-        }
-
-        /**
-         * Sets the timeout for attempting to acquire the queue lock.
-         * If the lock cannot be acquired within this timeout, the memory buffer fallback will be used.
-         * 
-         * @param timeout the duration to wait for lock acquisition; must not be null or negative
-         * @return the current {@code Options} instance for method chaining
-         * @throws NullPointerException if {@code timeout} is null
-         * @throws IllegalArgumentException if {@code timeout} is negative
-         */
-        public Options withLockTryTimeout(Duration timeout) {
-            Objects.requireNonNull(timeout, "timeout");
-            if (timeout.isNegative()) {
-                throw new IllegalArgumentException("timeout não pode ser negativo");
-            }
-            this.lockTryTimeout = timeout;
-            return this;
-        }
-
-        /**
-         * Sets the interval for re-evaluating whether to continue using the memory buffer
-         * or switch back to direct disk writes. After this interval, the system will check
-         * if the lock is available and if compaction has finished.
-         * 
-         * @param interval the duration between revalidation checks; must not be null or negative
-         * @return the current {@code Options} instance for method chaining
-         * @throws NullPointerException if {@code interval} is null
-         * @throws IllegalArgumentException if {@code interval} is negative
-         */
-        public Options withRevalidationInterval(Duration interval) {
-            Objects.requireNonNull(interval, "interval");
-            if (interval.isNegative()) {
-                throw new IllegalArgumentException("interval não pode ser negativo");
-            }
-            this.revalidationInterval = interval;
-            return this;
-        }
-
-        /**
-         * Configures whether the queue should reset on restart, ignoring existing persistent data.
-         * When enabled, even if persistence files exist, the queue will be initialized as empty,
-         * effectively resetting the queue on each restart.
+         * Enables or disables the in-memory staging buffer used to absorb bursts and decouple producers from
+         * maintenance phases.
          *
-         * @param resetOnRestart if {@code true}, ignores existing persistent data and initializes an empty queue;
-         *                       if {@code false}, loads existing persistent data (default behavior)
-         * @return the current {@code Options} instance for method chaining
+         * @param e true to enable staging
+         * @return this builder for chaining
          */
-        public Options withResetOnRestart(boolean resetOnRestart) {
-            this.resetOnRestart = resetOnRestart;
+        public Options withMemoryBuffer(boolean e) {
+            this.enableMemoryBuffer = e;
             return this;
         }
 
         /**
-         * Creates a snapshot of the current configuration by encapsulating the values
-         * of compaction waste threshold, compaction interval, and compaction buffer size.
-         * A snapshot is immutable and stores these values for future reference or processing.
+         * Sets the maximum number of elements that may be staged in memory when the staging buffer is enabled.
          *
-         * @return a new {@code Snapshot} instance containing the current configuration values
+         * @param s positive capacity in elements
+         * @return this builder for chaining
          */
-        private Snapshot snapshot() {
-            Duration interval = compactionInterval;
-            long intervalNanos = interval != null ? interval.toNanos() : 0L;
-            long lockTryTimeoutNanos = lockTryTimeout != null ? lockTryTimeout.toNanos() : 0L;
-            long revalidationIntervalNanos = revalidationInterval != null ? revalidationInterval.toNanos() : 0L;
-            return new Snapshot(compactionWasteThreshold, intervalNanos, compactionBufferSize,
-                    enableMemoryBuffer, memoryBufferSize, lockTryTimeoutNanos, revalidationIntervalNanos);
+        public Options withMemoryBufferSize(int s) {
+            if (s <= 0) throw new IllegalArgumentException("memoryBufferSize deve ser positivo");
+            this.memoryBufferSize = s;
+            return this;
         }
 
-        private static final class Snapshot {
+        /**
+         * Sets the maximum time the queue will wait when attempting to acquire coordination for draining or
+         * maintenance before retrying. Useful to tune responsiveness under contention.
+         *
+         * @param t maximum wait duration when trying to acquire the lock
+         * @return this builder for chaining
+         */
+        public Options withLockTryTimeout(Duration t) {
+            Objects.requireNonNull(t);
+            if (t.isNegative()) throw new IllegalArgumentException("negative");
+            this.lockTryTimeoutNanos = t.toNanos();
+            return this;
+        }
+
+        /**
+         * Sets the interval at which temporary staging mode should revalidate whether to continue or revert
+         * to direct durable appends.
+         *
+         * @param i time between revalidation checks
+         * @return this builder for chaining
+         */
+        public Options withRevalidationInterval(Duration i) {
+            Objects.requireNonNull(i);
+            if (i.isNegative()) throw new IllegalArgumentException("negative");
+            this.revalidationIntervalNanos = i.toNanos();
+            return this;
+        }
+
+        /**
+         * Sets the interval at which the background maintenance task runs.
+         * This task is responsible for tasks like opportunistic size reconciliation.
+         * Default is 5 seconds.
+         *
+         * @param i interval between maintenance runs
+         * @return this builder for chaining
+         */
+        public Options withMaintenanceInterval(Duration i) {
+            Objects.requireNonNull(i);
+            if (i.isNegative() || i.isZero()) throw new IllegalArgumentException("positive");
+            this.maintenanceIntervalNanos = i.toNanos();
+            return this;
+        }
+
+        /**
+         * Sets the maximum interval allowed without a precise size update. If this interval elapses
+         * without the maintenance task successfully acquiring a lock opportunistically, the next
+         * run will force a lock to ensure the size is reconciled.
+         * <p>
+         * If set to ZERO, forced locking is disabled, and size reconciliation will only happen
+         * when the lock is free (opportunistic only).
+         * Default is 1 minute.
+         *
+         * @param d maximum interval between forced reconciliations, or ZERO to disable
+         * @return this builder for chaining
+         */
+        public Options withMaxSizeReconciliationInterval(Duration d) {
+            Objects.requireNonNull(d);
+            if (d.isNegative()) throw new IllegalArgumentException("negative");
+            this.maxSizeReconciliationIntervalNanos = d.toNanos();
+            return this;
+        }
+
+        /**
+         * When enabled, disregards any previously persisted metadata at startup and reconstructs state solely
+         * from the durable log.
+         *
+         * @param r true to force a rebuild on restart
+         * @return this builder for chaining
+         */
+        public Options withResetOnRestart(boolean r) {
+            this.resetOnRestart = r;
+            return this;
+        }
+
+        /**
+         * Produces an immutable snapshot of the current options for distribution to internal components.
+         *
+         * @return immutable view of the configured values
+         */
+        public Snapshot snapshot() {
+            return new Snapshot(this);
+        }
+
+        /**
+         * Immutable view of option values used by internal components to avoid accidental mutation.
+         */
+        public static class Snapshot {
             final double compactionWasteThreshold;
-            final long compactionIntervalNanos;
-            final int compactionBufferSize;
+            final long compactionIntervalNanos, lockTryTimeoutNanos, revalidationIntervalNanos, maintenanceIntervalNanos, maxSizeReconciliationIntervalNanos;
+            final int compactionBufferSize, memoryBufferSize;
             final boolean enableMemoryBuffer;
-            final int memoryBufferSize;
-            final long lockTryTimeoutNanos;
-            final long revalidationIntervalNanos;
 
-            Snapshot(double compactionWasteThreshold, long compactionIntervalNanos, int compactionBufferSize,
-                    boolean enableMemoryBuffer, int memoryBufferSize, long lockTryTimeoutNanos, long revalidationIntervalNanos) {
-                this.compactionWasteThreshold = compactionWasteThreshold;
-                this.compactionIntervalNanos = compactionIntervalNanos;
-                this.compactionBufferSize = compactionBufferSize;
-                this.enableMemoryBuffer = enableMemoryBuffer;
-                this.memoryBufferSize = memoryBufferSize;
-                this.lockTryTimeoutNanos = lockTryTimeoutNanos;
-                this.revalidationIntervalNanos = revalidationIntervalNanos;
+            /**
+             * Captures the current values from a mutable options builder for safe sharing.
+             *
+             * @param o source options builder
+             */
+            Snapshot(Options o) {
+                this.compactionWasteThreshold = o.compactionWasteThreshold;
+                this.compactionIntervalNanos = o.compactionIntervalNanos;
+                this.compactionBufferSize = o.compactionBufferSize;
+                this.enableMemoryBuffer = o.enableMemoryBuffer;
+                this.memoryBufferSize = o.memoryBufferSize;
+                this.lockTryTimeoutNanos = o.lockTryTimeoutNanos;
+                this.revalidationIntervalNanos = o.revalidationIntervalNanos;
+                this.maintenanceIntervalNanos = o.maintenanceIntervalNanos;
+                this.maxSizeReconciliationIntervalNanos = o.maxSizeReconciliationIntervalNanos;
             }
         }
     }
-
-
-    public StatsUtils getStatsUtils() {
-        return statsUtils;
-    }
-
-
 }
