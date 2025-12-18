@@ -125,6 +125,8 @@ public class NQueue<T extends Serializable> implements Closeable {
     private final Path queueDir, dataPath, metaPath, tempDataPath;
     private volatile RandomAccessFile raf;
     private volatile FileChannel dataChannel;
+    private volatile RandomAccessFile metaRaf;
+    private volatile FileChannel metaChannel;
     private final ReentrantLock lock;
     private final Condition notEmpty;
     private final Object metaWriteLock = new Object();
@@ -162,13 +164,18 @@ public class NQueue<T extends Serializable> implements Closeable {
      * @param state recovered or rebuilt queue state to initialize cursors and counters
      * @param options operational configuration snapshot
      */
-    private NQueue(Path queueDir, RandomAccessFile raf, FileChannel dataChannel, QueueState state, Options options) {
+    private NQueue(Path queueDir, RandomAccessFile raf, FileChannel dataChannel, QueueState state, Options options) throws IOException {
         this.queueDir = queueDir;
         this.dataPath = queueDir.resolve(DATA_FILE);
         this.metaPath = queueDir.resolve(META_FILE);
         this.tempDataPath = queueDir.resolve(DATA_FILE + ".compacting");
         this.raf = raf;
         this.dataChannel = dataChannel;
+        
+        // Initialize metadata channel
+        this.metaRaf = new RandomAccessFile(this.metaPath.toFile(), "rw");
+        this.metaChannel = this.metaRaf.getChannel();
+
         this.lock = new ReentrantLock();
         this.notEmpty = this.lock.newCondition();
         this.consumerOffset = state.consumerOffset;
@@ -535,6 +542,8 @@ public class NQueue<T extends Serializable> implements Closeable {
         try {
             if (dataChannel.isOpen()) dataChannel.close();
             if (raf != null) raf.close();
+            if (metaChannel != null && metaChannel.isOpen()) metaChannel.close();
+            if (metaRaf != null) metaRaf.close();
             closed = true;
         } finally {
             lock.unlock();
@@ -783,7 +792,7 @@ public class NQueue<T extends Serializable> implements Closeable {
      */
     private void persistCurrentStateLocked() throws IOException {
         synchronized (metaWriteLock) {
-            NQueueQueueMeta.write(metaPath, consumerOffset, producerOffset, recordCount, lastIndex);
+            NQueueQueueMeta.update(metaChannel, consumerOffset, producerOffset, recordCount, lastIndex, options.withFsync);
         }
     }
 
