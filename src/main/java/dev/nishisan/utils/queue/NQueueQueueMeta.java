@@ -117,4 +117,23 @@ final class NQueueQueueMeta {
         }
         Files.move(tmp, path, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
     }
+
+    static void update(FileChannel ch, long consumerOffset, long producerOffset, long recordCount, long lastIndex, boolean fsync) throws IOException {
+        ByteBuffer buf = ByteBuffer.allocate(Integer.BYTES + Short.BYTES + Long.BYTES * 4);
+        buf.putInt(MAGIC);
+        buf.putShort(VERSION);
+        buf.putLong(consumerOffset);
+        buf.putLong(producerOffset);
+        buf.putLong(recordCount);
+        buf.putLong(lastIndex);
+        buf.flip();
+
+        ch.position(0);
+        while (buf.hasRemaining()) {
+            ch.write(buf);
+        }
+        if (fsync) {
+            ch.force(false); // Metadata update doesn't necessarily need metadata of the file itself updated if size is constant
+        }
+    }
 }

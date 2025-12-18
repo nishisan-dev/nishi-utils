@@ -13,6 +13,7 @@ jobs:
     permissions:
       contents: write
       packages: write
+      pull-requests: read
 
     steps:
     - uses: actions/checkout@v4
@@ -22,10 +23,23 @@ jobs:
         java-version: '21'
         distribution: 'temurin'
 
-    - name: Bump patch version on main
+    - name: Bump version on main
       if: github.ref == 'refs/heads/main'
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        mvn build-helper:parse-version versions:set -DnewVersion='${parsedVersion.majorVersion}.${parsedVersion.minorVersion}.${parsedVersion.nextIncrementalVersion}' -DgenerateBackupPoms=false
+        # Search for the PR associated with this commit to check for labels
+        PR_LABELS=$(gh pr list --search "${{ github.sha }}" --state merged --json labels --jq '.[].labels[].name' || echo "")
+        echo "PR Labels found: $PR_LABELS"
+
+        if [[ "$PR_LABELS" == *"version-up"* ]]; then
+          echo "Label 'version-up' detected. Performing MAJOR version bump."
+          mvn build-helper:parse-version versions:set -DnewVersion='${parsedVersion.nextMajorVersion}.0.0' -DgenerateBackupPoms=false
+        else
+          echo "Performing standard PATCH version bump."
+          mvn build-helper:parse-version versions:set -DnewVersion='${parsedVersion.majorVersion}.${parsedVersion.minorVersion}.${parsedVersion.nextIncrementalVersion}' -DgenerateBackupPoms=false
+        fi
+        
         echo "NEW_VERSION=$(mvn -q help:evaluate -Dexpression=project.version -DforceStdout)" >> $GITHUB_ENV
 
     - name: Build with Maven

@@ -120,11 +120,18 @@ public class NQueue<T extends Serializable> implements Closeable {
     private static final String DATA_FILE = "data.log";
     private static final String META_FILE = "queue.meta";
     private static final int MEMORY_DRAIN_BATCH_SIZE = 256;
+    /**
+     * Sentinel offset returned when an element is handed off directly to a waiting consumer, bypassing
+     * persistence and staging buffers.
+     */
+    public static final long OFFSET_HANDOFF = -2;
 
     private final StatsUtils statsUtils = new StatsUtils();
     private final Path queueDir, dataPath, metaPath, tempDataPath;
     private volatile RandomAccessFile raf;
     private volatile FileChannel dataChannel;
+    private volatile RandomAccessFile metaRaf;
+    private volatile FileChannel metaChannel;
     private final ReentrantLock lock;
     private final Condition notEmpty;
     private final Object metaWriteLock = new Object();
@@ -134,6 +141,7 @@ public class NQueue<T extends Serializable> implements Closeable {
     private long consumerOffset, producerOffset, recordCount, lastIndex, lastCompactionTimeNanos;
     private volatile boolean closed, shutdownRequested;
     private volatile CompactionState compactionState = CompactionState.IDLE;
+    private T handoffItem;
 
     private final boolean enableMemoryBuffer;
     private final BlockingQueue<MemoryBufferEntry<T>> memoryBuffer;
@@ -162,13 +170,18 @@ public class NQueue<T extends Serializable> implements Closeable {
      * @param state recovered or rebuilt queue state to initialize cursors and counters
      * @param options operational configuration snapshot
      */
-    private NQueue(Path queueDir, RandomAccessFile raf, FileChannel dataChannel, QueueState state, Options options) {
+    private NQueue(Path queueDir, RandomAccessFile raf, FileChannel dataChannel, QueueState state, Options options) throws IOException {
         this.queueDir = queueDir;
         this.dataPath = queueDir.resolve(DATA_FILE);
         this.metaPath = queueDir.resolve(META_FILE);
         this.tempDataPath = queueDir.resolve(DATA_FILE + ".compacting");
         this.raf = raf;
         this.dataChannel = dataChannel;
+        
+        // Initialize metadata channel
+        this.metaRaf = new RandomAccessFile(this.metaPath.toFile(), "rw");
+        this.metaChannel = this.metaRaf.getChannel();
+
         this.lock = new ReentrantLock();
         this.notEmpty = this.lock.newCondition();
         this.consumerOffset = state.consumerOffset;
@@ -309,6 +322,14 @@ public class NQueue<T extends Serializable> implements Closeable {
             if (System.nanoTime() < memoryBufferModeUntil.get()) return offerToMemory(object, true);
             if (lock.tryLock()) {
                 try {
+                    // Short-circuit: if queue is empty (disk + memory) and a consumer is waiting, handoff directly.
+                    if (recordCount == 0 && handoffItem == null && drainingQueue.isEmpty() && memoryBuffer.isEmpty() && lock.hasWaiters(notEmpty)) {
+                        handoffItem = object;
+                        notEmpty.signal();
+                        statsUtils.notifyHitCounter(NQueueMetrics.OFFERED_EVENT);
+                        return OFFSET_HANDOFF;
+                    }
+
                     if (compactionState == CompactionState.RUNNING) {
                         activateMemoryMode();
                         return offerToMemory(object, false);
@@ -327,6 +348,13 @@ public class NQueue<T extends Serializable> implements Closeable {
         } else {
             lock.lock();
             try {
+                // Short-circuit: if queue is empty and a consumer is waiting, handoff directly.
+                if (recordCount == 0 && handoffItem == null && lock.hasWaiters(notEmpty)) {
+                    handoffItem = object;
+                    notEmpty.signal();
+                    statsUtils.notifyHitCounter(NQueueMetrics.OFFERED_EVENT);
+                    return OFFSET_HANDOFF;
+                }
                 return offerDirectLocked(object);
             } finally {
                 lock.unlock();
@@ -347,11 +375,24 @@ public class NQueue<T extends Serializable> implements Closeable {
         try {
             // Optimization: Only force a sync drain if the disk queue is empty.
             // If we have records on disk, consume them first to avoid blocking readers on write I/O.
-            if (recordCount == 0) {
+            if (recordCount == 0 && handoffItem == null) {
                  drainMemoryBufferSync();
             }
 
-            while (recordCount == 0) notEmpty.awaitUninterruptibly();
+            if (handoffItem != null) {
+                T item = handoffItem;
+                handoffItem = null;
+                return Optional.of(item);
+            }
+
+            while (recordCount == 0) {
+                notEmpty.awaitUninterruptibly();
+                if (handoffItem != null) {
+                    T item = handoffItem;
+                    handoffItem = null;
+                    return Optional.of(item);
+                }
+            }
             return consumeNextRecordLocked().map(this::safeDeserialize);
         } finally {
             statsUtils.notifyHitCounter(NQueueMetrics.POLL_EVENT);
@@ -374,8 +415,14 @@ public class NQueue<T extends Serializable> implements Closeable {
         lock.lock();
         try {
             // Optimization: Only force a sync drain if we absolutely need data and none is on disk
-            if (recordCount == 0) {
+            if (recordCount == 0 && handoffItem == null) {
                  drainMemoryBufferSync();
+            }
+
+            if (handoffItem != null) {
+                T item = handoffItem;
+                handoffItem = null;
+                return Optional.of(item);
             }
 
             while (recordCount == 0) {
@@ -385,6 +432,11 @@ public class NQueue<T extends Serializable> implements Closeable {
                 if (nanos <= 0L) return Optional.empty();
                 try {
                     nanos = notEmpty.awaitNanos(nanos);
+                    if (handoffItem != null) {
+                        T item = handoffItem;
+                        handoffItem = null;
+                        return Optional.of(item);
+                    }
                     if (checkAndDrainMemorySync()) break;
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
@@ -409,6 +461,11 @@ public class NQueue<T extends Serializable> implements Closeable {
     public Optional<T> peek() throws IOException {
         lock.lock();
         try {
+            // 0. If we have a handoff item, it is effectively the head
+            if (handoffItem != null) {
+                return Optional.of(handoffItem);
+            }
+
             // 1. If we have records on disk, peek from there (FIFO head)
             if (recordCount > 0) {
                 return readAtInternal(consumerOffset).map(res -> safeDeserialize(res.getRecord()));
@@ -446,6 +503,7 @@ public class NQueue<T extends Serializable> implements Closeable {
         lock.lock();
         try {
             long s = recordCount;
+            if (handoffItem != null) s++;
             if (enableMemoryBuffer) s += (long) memoryBuffer.size() + drainingQueue.size();
             return s;
         } finally {
@@ -535,6 +593,8 @@ public class NQueue<T extends Serializable> implements Closeable {
         try {
             if (dataChannel.isOpen()) dataChannel.close();
             if (raf != null) raf.close();
+            if (metaChannel != null && metaChannel.isOpen()) metaChannel.close();
+            if (metaRaf != null) metaRaf.close();
             closed = true;
         } finally {
             lock.unlock();
@@ -783,7 +843,7 @@ public class NQueue<T extends Serializable> implements Closeable {
      */
     private void persistCurrentStateLocked() throws IOException {
         synchronized (metaWriteLock) {
-            NQueueQueueMeta.write(metaPath, consumerOffset, producerOffset, recordCount, lastIndex);
+            NQueueQueueMeta.update(metaChannel, consumerOffset, producerOffset, recordCount, lastIndex, options.withFsync);
         }
     }
 
