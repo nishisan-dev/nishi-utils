@@ -144,6 +144,10 @@ public class NQueue<T extends Serializable> implements Closeable {
 
     private final ExecutorService drainExecutor, compactionExecutor;
     private final ScheduledExecutorService revalidationExecutor;
+    private final ScheduledExecutorService maintenanceExecutor;
+
+    private volatile long lastSizeReconciliationTimeNanos = System.nanoTime();
+
 
     /**
      * Constructs a queue instance bound to the supplied directory and I/O handles, restoring the
@@ -199,6 +203,50 @@ public class NQueue<T extends Serializable> implements Closeable {
             t.setDaemon(true);
             return t;
         });
+        this.maintenanceExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "nqueue-maintenance-worker");
+            t.setDaemon(true);
+            return t;
+        });
+
+        // Schedule periodic size reconciliation
+        this.maintenanceExecutor.scheduleWithFixedDelay(this::reconcileSize, options.maintenanceIntervalNanos, options.maintenanceIntervalNanos, TimeUnit.NANOSECONDS);
+    }
+
+    /**
+     * Reconciles the optimistic approximate size with the exact size.
+     * Tries to acquire lock opportunistically, but forces it if the last update was too long ago.
+     */
+    private void reconcileSize() {
+        if (closed || shutdownRequested) return;
+
+        long maxDelay = options.maxSizeReconciliationIntervalNanos;
+        boolean forced = maxDelay > 0 && (System.nanoTime() - lastSizeReconciliationTimeNanos) > maxDelay;
+        boolean locked = false;
+
+        try {
+            if (forced) {
+                lock.lock();
+                locked = true;
+            } else {
+                locked = lock.tryLock();
+            }
+
+            if (locked) {
+                try {
+                    long exactSize = recordCount;
+                    if (enableMemoryBuffer) {
+                        exactSize += (long) memoryBuffer.size() + drainingQueue.size();
+                    }
+                    approximateSize.set(exactSize);
+                    lastSizeReconciliationTimeNanos = System.nanoTime();
+                } finally {
+                    lock.unlock();
+                }
+            }
+        } catch (Exception e) {
+            // Log or ignore, just keep running
+        }
     }
 
     /**
@@ -297,7 +345,12 @@ public class NQueue<T extends Serializable> implements Closeable {
     public Optional<T> poll() throws IOException {
         lock.lock();
         try {
-            drainMemoryBufferSync();
+            // Optimization: Only force a sync drain if the disk queue is empty.
+            // If we have records on disk, consume them first to avoid blocking readers on write I/O.
+            if (recordCount == 0) {
+                 drainMemoryBufferSync();
+            }
+
             while (recordCount == 0) notEmpty.awaitUninterruptibly();
             return consumeNextRecordLocked().map(this::safeDeserialize);
         } finally {
@@ -320,9 +373,15 @@ public class NQueue<T extends Serializable> implements Closeable {
         long nanos = unit.toNanos(timeout);
         lock.lock();
         try {
-            drainMemoryBufferSync();
+            // Optimization: Only force a sync drain if we absolutely need data and none is on disk
+            if (recordCount == 0) {
+                 drainMemoryBufferSync();
+            }
+
             while (recordCount == 0) {
+                // If checking memory triggered a drain and resulted in records, break
                 if (checkAndDrainMemorySync()) break;
+                
                 if (nanos <= 0L) return Optional.empty();
                 try {
                     nanos = notEmpty.awaitNanos(nanos);
@@ -350,8 +409,27 @@ public class NQueue<T extends Serializable> implements Closeable {
     public Optional<T> peek() throws IOException {
         lock.lock();
         try {
-            if (recordCount == 0) return Optional.empty();
-            return readAtInternal(consumerOffset).map(res -> safeDeserialize(res.getRecord()));
+            // 1. If we have records on disk, peek from there (FIFO head)
+            if (recordCount > 0) {
+                return readAtInternal(consumerOffset).map(res -> safeDeserialize(res.getRecord()));
+            }
+
+            // 2. If disk is empty but we have memory buffer enabled, check memory buffers.
+            // NOTE: This does NOT drain/flush to disk, it just looks at what is waiting in RAM.
+            if (enableMemoryBuffer) {
+                // Draining queue has older items than memoryBuffer, check it first.
+                MemoryBufferEntry<T> fromDrain = drainingQueue.peekFirst();
+                if (fromDrain != null) {
+                    return Optional.of(fromDrain.item);
+                }
+                
+                MemoryBufferEntry<T> fromMem = memoryBuffer.peek();
+                if (fromMem != null) {
+                    return Optional.of(fromMem.item);
+                }
+            }
+            
+            return Optional.empty();
         } finally {
             statsUtils.notifyHitCounter(NQueueMetrics.PEEK_EVENT);
             lock.unlock();
@@ -420,6 +498,9 @@ public class NQueue<T extends Serializable> implements Closeable {
      * @throws IOException if underlying channels cannot be closed cleanly
      */
     public void close() throws IOException {
+        // Stop maintenance first
+        maintenanceExecutor.shutdownNow();
+
         if (enableMemoryBuffer) {
             lock.lock();
             try {
@@ -1020,16 +1101,25 @@ public class NQueue<T extends Serializable> implements Closeable {
         try {
             Files.deleteIfExists(tempDataPath);
             try (RandomAccessFile tmpRaf = new RandomAccessFile(tempDataPath.toFile(), "rw"); FileChannel tmpCh = tmpRaf.getChannel()) {
-                long actualCO;
+                long copyStartOffset;
+                long copyEndOffset;
+
                 lock.lock();
                 try {
-                    actualCO = consumerOffset;
+                    // We start from the CURRENT consumer position to avoid copying already consumed data.
+                    copyStartOffset = consumerOffset;
+                    // We copy up to the current producer position to maximize work done outside the lock.
+                    copyEndOffset = producerOffset;
                 } finally {
                     lock.unlock();
                 }
-                copyRegion(dataChannel, actualCO, snap.producerOffset, tmpCh);
+
+                if (copyEndOffset > copyStartOffset) {
+                    copyRegion(dataChannel, copyStartOffset, copyEndOffset, tmpCh);
+                }
+                
                 if (options.withFsync) tmpCh.force(true);
-                finalizeCompaction(snap, tmpCh, actualCO);
+                finalizeCompaction(copyStartOffset, copyEndOffset, tmpCh);
             }
         } catch (Throwable t) {
             lock.lock();
@@ -1052,33 +1142,42 @@ public class NQueue<T extends Serializable> implements Closeable {
      * cursors to reflect additional data appended during the copy window, and updating persisted metadata.
      * Upon completion, producers and consumers continue unaffected.
      *
-     * @param snap          snapshot taken at compaction start
-     * @param tmpCh         channel containing the compacted content
-     * @param copiedFromCO  consumer position at the moment data copy began, used to adjust cursors
+     * @param copyStartOffset durable position where the background copy started
+     * @param copyEndOffset   durable position where the background copy ended
+     * @param tmpCh           channel containing the compacted content
      * @throws IOException if the replacement or state update cannot be completed
      */
-    private void finalizeCompaction(QueueState snap, FileChannel tmpCh, long copiedFromCO) throws IOException {
+    private void finalizeCompaction(long copyStartOffset, long copyEndOffset, FileChannel tmpCh) throws IOException {
         lock.lock();
         try {
-            if (producerOffset < snap.producerOffset) return;
-            long delta = producerOffset - snap.producerOffset;
-            if (delta > 0) copyRegion(dataChannel, snap.producerOffset, producerOffset, tmpCh);
-            long bytesConsumedSinceCopyStarted = consumerOffset - copiedFromCO;
+            // 1. Copy any data that was appended while we were copying in background
+            if (producerOffset > copyEndOffset) {
+                copyRegion(dataChannel, copyEndOffset, producerOffset, tmpCh);
+            }
+
+            // 2. Calculate new offsets relative to the new file
+            // The new file contains data starting from copyStartOffset.
             long newPO = tmpCh.position();
-            long newCO = Math.max(0, bytesConsumedSinceCopyStarted);
+            long newCO = Math.max(0, consumerOffset - copyStartOffset);
+            
             if (recordCount == 0) {
                 newCO = 0;
                 newPO = 0;
                 tmpCh.truncate(0);
             }
+            
             if (newCO > newPO) newCO = newPO;
+            
             if (options.withFsync) tmpCh.force(true);
             tmpCh.close();
+
+            // 3. Atomic swap
             try {
                 Files.move(tempDataPath, dataPath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
             } catch (AtomicMoveNotSupportedException e) {
                 Files.move(tempDataPath, dataPath, StandardCopyOption.REPLACE_EXISTING);
             }
+
             RandomAccessFile nRaf = new RandomAccessFile(dataPath.toFile(), "rw");
             FileChannel nCh = nRaf.getChannel();
             try {
@@ -1086,6 +1185,7 @@ public class NQueue<T extends Serializable> implements Closeable {
                 raf.close();
             } catch (IOException ignored) {
             }
+            
             raf = nRaf;
             dataChannel = nCh;
             consumerOffset = newCO;
@@ -1166,6 +1266,8 @@ public class NQueue<T extends Serializable> implements Closeable {
         boolean withFsync = true, enableMemoryBuffer = false, resetOnRestart = false;
         int memoryBufferSize = 10000;
         long lockTryTimeoutNanos = TimeUnit.MILLISECONDS.toNanos(10), revalidationIntervalNanos = TimeUnit.MILLISECONDS.toNanos(100);
+        long maintenanceIntervalNanos = TimeUnit.SECONDS.toNanos(5);
+        long maxSizeReconciliationIntervalNanos = TimeUnit.MINUTES.toNanos(1);
 
         private Options() {
         }
@@ -1285,6 +1387,40 @@ public class NQueue<T extends Serializable> implements Closeable {
         }
 
         /**
+         * Sets the interval at which the background maintenance task runs.
+         * This task is responsible for tasks like opportunistic size reconciliation.
+         * Default is 5 seconds.
+         *
+         * @param i interval between maintenance runs
+         * @return this builder for chaining
+         */
+        public Options withMaintenanceInterval(Duration i) {
+            Objects.requireNonNull(i);
+            if (i.isNegative() || i.isZero()) throw new IllegalArgumentException("positive");
+            this.maintenanceIntervalNanos = i.toNanos();
+            return this;
+        }
+
+        /**
+         * Sets the maximum interval allowed without a precise size update. If this interval elapses
+         * without the maintenance task successfully acquiring a lock opportunistically, the next
+         * run will force a lock to ensure the size is reconciled.
+         * <p>
+         * If set to ZERO, forced locking is disabled, and size reconciliation will only happen
+         * when the lock is free (opportunistic only).
+         * Default is 1 minute.
+         *
+         * @param d maximum interval between forced reconciliations, or ZERO to disable
+         * @return this builder for chaining
+         */
+        public Options withMaxSizeReconciliationInterval(Duration d) {
+            Objects.requireNonNull(d);
+            if (d.isNegative()) throw new IllegalArgumentException("negative");
+            this.maxSizeReconciliationIntervalNanos = d.toNanos();
+            return this;
+        }
+
+        /**
          * When enabled, disregards any previously persisted metadata at startup and reconstructs state solely
          * from the durable log.
          *
@@ -1310,7 +1446,7 @@ public class NQueue<T extends Serializable> implements Closeable {
          */
         public static class Snapshot {
             final double compactionWasteThreshold;
-            final long compactionIntervalNanos, lockTryTimeoutNanos, revalidationIntervalNanos;
+            final long compactionIntervalNanos, lockTryTimeoutNanos, revalidationIntervalNanos, maintenanceIntervalNanos, maxSizeReconciliationIntervalNanos;
             final int compactionBufferSize, memoryBufferSize;
             final boolean enableMemoryBuffer;
 
@@ -1327,6 +1463,8 @@ public class NQueue<T extends Serializable> implements Closeable {
                 this.memoryBufferSize = o.memoryBufferSize;
                 this.lockTryTimeoutNanos = o.lockTryTimeoutNanos;
                 this.revalidationIntervalNanos = o.revalidationIntervalNanos;
+                this.maintenanceIntervalNanos = o.maintenanceIntervalNanos;
+                this.maxSizeReconciliationIntervalNanos = o.maxSizeReconciliationIntervalNanos;
             }
         }
     }
