@@ -192,8 +192,13 @@ public final class DistributedQueue<T extends Serializable> implements Transport
         if (!coordinator.isLeader()) {
             responsePayload = new ClientResponsePayload(payload.requestId(), false, null, "Not the leader");
         } else {
-            Serializable result = executeLocal(payload.command(), payload.body());
-            responsePayload = new ClientResponsePayload(payload.requestId(), true, result, null);
+            try {
+                Serializable result = executeLocal(payload.command(), payload.body());
+                responsePayload = new ClientResponsePayload(payload.requestId(), true, result, null);
+            } catch (RuntimeException e) {
+                String messageText = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+                responsePayload = new ClientResponsePayload(payload.requestId(), false, null, messageText);
+            }
         }
         ClusterMessage response = ClusterMessage.response(message, responsePayload);
         transport.send(response);

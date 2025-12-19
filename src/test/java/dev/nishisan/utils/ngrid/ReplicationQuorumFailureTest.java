@@ -124,7 +124,13 @@ class ReplicationQuorumFailureTest {
             boolean allMembers = node1.coordinator().activeMembers().size() == 3
                     && node2.coordinator().activeMembers().size() == 3
                     && node3.coordinator().activeMembers().size() == 3;
-            if (leadersAgree && allMembers) {
+            boolean connected = node1.transport().isConnected(info2.nodeId())
+                    && node1.transport().isConnected(info3.nodeId())
+                    && node2.transport().isConnected(info1.nodeId())
+                    && node2.transport().isConnected(info3.nodeId())
+                    && node3.transport().isConnected(info1.nodeId())
+                    && node3.transport().isConnected(info2.nodeId());
+            if (leadersAgree && allMembers && connected) {
                 return;
             }
             try {
@@ -167,5 +173,4 @@ class ReplicationQuorumFailureTest {
         throw new IOException("Unable to allocate a free local port after multiple attempts");
     }
 }
-
 
