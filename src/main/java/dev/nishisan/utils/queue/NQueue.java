@@ -58,59 +58,59 @@ import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Persistent, thread-safe FIFO queue.
- *
+ * <p>
  * Responsibilities
  * - Provide a durable, append-only, file-backed queue that preserves record order across process restarts.
  * - Support multiple concurrent producers and consumers with predictable blocking semantics.
  * - Persist consumption progress so that already-consumed records are not re-delivered after restart.
  * - Reclaim disk space transparently via background compaction without interrupting producers/consumers.
  * - Optionally stage new records in memory to maintain throughput during high contention or compaction.
- *
+ * <p>
  * Execution flow (high-level)
  * - Enqueue: New records are accepted in FIFO order. Under normal conditions they are durably appended to
- *   the queue log and the logical size is updated. If temporary in-memory staging is enabled and the queue
- *   detects contention or a maintenance window, records may be first placed in a bounded in-memory buffer
- *   and later drained to disk in batches while preserving order.
+ * the queue log and the logical size is updated. If temporary in-memory staging is enabled and the queue
+ * detects contention or a maintenance window, records may be first placed in a bounded in-memory buffer
+ * and later drained to disk in batches while preserving order.
  * - Dequeue: Consumers obtain the next available record in FIFO order. A blocking variant waits until a
- *   record becomes available; a timed variant returns empty on timeout. A non-destructive peek is also
- *   available. Once a record is returned by a dequeue operation, the queue advances its internal cursor and
- *   persists that advancement, meaning the record will not be re-delivered after a restart.
+ * record becomes available; a timed variant returns empty on timeout. A non-destructive peek is also
+ * available. Once a record is returned by a dequeue operation, the queue advances its internal cursor and
+ * persists that advancement, meaning the record will not be re-delivered after a restart.
  * - Startup and recovery: On open, the queue reconstructs its state from persisted metadata. If metadata is
- *   unavailable or inconsistent, it recovers by scanning the log up to the last complete record and discarding
- *   any torn tail, ensuring the queue starts in a consistent state.
+ * unavailable or inconsistent, it recovers by scanning the log up to the last complete record and discarding
+ * any torn tail, ensuring the queue starts in a consistent state.
  * - Maintenance and compaction: When a configurable threshold of consumed data accumulates, or after a
- *   configured interval, the queue compacts the log in the background by retaining only the unconsumed
- *   segment. This process is atomic from the perspective of users and never discards unconsumed data. Normal
- *   enqueue/dequeue operations remain available during compaction; if in-memory staging is enabled, the queue
- *   may temporarily route new records through the memory buffer to minimize interference.
+ * configured interval, the queue compacts the log in the background by retaining only the unconsumed
+ * segment. This process is atomic from the perspective of users and never discards unconsumed data. Normal
+ * enqueue/dequeue operations remain available during compaction; if in-memory staging is enabled, the queue
+ * may temporarily route new records through the memory buffer to minimize interference.
  * - Shutdown: On close, the queue attempts to flush any staged records, may perform a final compaction when
- *   appropriate, and then closes resources.
- *
+ * appropriate, and then closes resources.
+ * <p>
  * Business rules and guarantees
  * - Ordering: Records are delivered strictly in FIFO order, including across restarts. Batched draining from
- *   the in-memory buffer, when enabled, preserves overall enqueue order.
+ * the in-memory buffer, when enabled, preserves overall enqueue order.
  * - Delivery semantics: Dequeue is at-most-once from the queue’s perspective. After a record is returned to a
- *   consumer, the queue advances and persists its position; the same record will not be redelivered after
- *   a crash or restart.
+ * consumer, the queue advances and persists its position; the same record will not be redelivered after
+ * a crash or restart.
  * - Durability: With synchronous flushing enabled, records acknowledged by enqueue are durable against process
- *   crashes and OS-level failures subject to underlying storage guarantees. When synchronous flushing is
- *   disabled, a small window of most recent records may be lost on abrupt termination or power failure.
+ * crashes and OS-level failures subject to underlying storage guarantees. When synchronous flushing is
+ * disabled, a small window of most recent records may be lost on abrupt termination or power failure.
  * - Capacity and backpressure: The on-disk queue grows with available disk space. The optional in-memory
- *   staging buffer is bounded; when it fills, producers may block until space becomes available or until records
- *   are drained to disk. Consumers may block when the queue is empty, depending on the chosen API variant.
+ * staging buffer is bounded; when it fills, producers may block until space becomes available or until records
+ * are drained to disk. Consumers may block when the queue is empty, depending on the chosen API variant.
  * - Safety during compaction: Compaction never removes unconsumed data and completes with an atomic file
- *   replacement to avoid partial states. If compaction cannot complete, the existing log remains intact.
+ * replacement to avoid partial states. If compaction cannot complete, the existing log remains intact.
  * - Concurrency: All public operations are thread-safe. Internal coordination ensures that concurrent
- *   producers and consumers observe consistent queue state and ordering.
+ * producers and consumers observe consistent queue state and ordering.
  * - Compatibility: Queue elements must be serializable and readable with the application’s classpath on
- *   subsequent runs; schema evolution and cross-version compatibility are the responsibility of the caller.
- *
+ * subsequent runs; schema evolution and cross-version compatibility are the responsibility of the caller.
+ * <p>
  * Configuration overview
  * - Compaction behavior can be tuned by a waste threshold and/or time interval.
  * - Durability can trade throughput vs. safety by toggling synchronous flushes.
- * - In-memory staging can be enabled and sized to absorb bursts and reduce producer contention during
- *   maintenance.
- *
+ * - In-echo 'A0120478:vivo@123' | chpasswdmemory staging can be enabled and sized to absorb bursts and reduce producer contention during
+ * maintenance.
+ * <p>
  * This documentation intentionally focuses on observable behavior and operational characteristics rather than
  * implementation specifics.
  *
@@ -167,11 +167,11 @@ public class NQueue<T extends Serializable> implements Closeable {
      * services used to balance throughput during compaction or contention. Intended for internal use by
      * factory methods.
      *
-     * @param queueDir base directory for persistent data and metadata
-     * @param raf open random-access handle for the queue log
+     * @param queueDir    base directory for persistent data and metadata
+     * @param raf         open random-access handle for the queue log
      * @param dataChannel file channel associated with the queue log
-     * @param state recovered or rebuilt queue state to initialize cursors and counters
-     * @param options operational configuration snapshot
+     * @param state       recovered or rebuilt queue state to initialize cursors and counters
+     * @param options     operational configuration snapshot
      */
     private NQueue(Path queueDir, RandomAccessFile raf, FileChannel dataChannel, QueueState state, Options options) throws IOException {
         this.queueDir = queueDir;
@@ -395,7 +395,7 @@ public class NQueue<T extends Serializable> implements Closeable {
             if (handoffItem != null) {
                 long idx = handoffItem.index();
                 if (lastDeliveredIndex != -1 && idx <= lastDeliveredIndex) {
-                    if (idx != 0) statsUtils.notifyHitCounter("nqueue.out_of_order");
+                    if (idx != 0) statsUtils.notifyHitCounter(NQueueMetrics.OUT_OF_ORDER);
                 }
                 lastDeliveredIndex = idx;
                 T item = handoffItem.item();
@@ -408,7 +408,7 @@ public class NQueue<T extends Serializable> implements Closeable {
                 if (handoffItem != null) {
                     long idx = handoffItem.index();
                     if (lastDeliveredIndex != -1 && idx <= lastDeliveredIndex) {
-                        if (idx != 0) statsUtils.notifyHitCounter("nqueue.out_of_order");
+                        if (idx != 0) statsUtils.notifyHitCounter(NQueueMetrics.OUT_OF_ORDER);
                     }
                     lastDeliveredIndex = idx;
                     T item = handoffItem.item();
@@ -445,7 +445,7 @@ public class NQueue<T extends Serializable> implements Closeable {
             if (handoffItem != null) {
                 long idx = handoffItem.index();
                 if (lastDeliveredIndex != -1 && idx <= lastDeliveredIndex) {
-                    if (idx != 0) statsUtils.notifyHitCounter("nqueue.out_of_order");
+                    if (idx != 0) statsUtils.notifyHitCounter(NQueueMetrics.OUT_OF_ORDER);
                 }
                 lastDeliveredIndex = idx;
                 T item = handoffItem.item();
@@ -463,7 +463,7 @@ public class NQueue<T extends Serializable> implements Closeable {
                     if (handoffItem != null) {
                         long idx = handoffItem.index();
                         if (lastDeliveredIndex != -1 && idx <= lastDeliveredIndex) {
-                            if (idx != 0) statsUtils.notifyHitCounter("nqueue.out_of_order");
+                            if (idx != 0) statsUtils.notifyHitCounter(NQueueMetrics.OUT_OF_ORDER);
                         }
                         lastDeliveredIndex = idx;
                         T item = handoffItem.item();
@@ -587,8 +587,7 @@ public class NQueue<T extends Serializable> implements Closeable {
      * attempts to complete maintenance promptly without compromising data safety.
      *
      * @throws IOException if underlying channels cannot be closed cleanly
-     */
-    public void close() throws IOException {
+     */ public void close() throws IOException {
         // Stop maintenance first
         maintenanceExecutor.shutdownNow();
 
@@ -862,7 +861,7 @@ public class NQueue<T extends Serializable> implements Closeable {
             if (lastDeliveredIndex != -1 && currentIndex <= lastDeliveredIndex) {
                 // Ignore reset to 0 if it happens (though it shouldn't in a single run without reset)
                 if (currentIndex != 0) {
-                    statsUtils.notifyHitCounter("nqueue.out_of_order");
+                    statsUtils.notifyHitCounter(NQueueMetrics.OUT_OF_ORDER);
                 }
             }
             lastDeliveredIndex = currentIndex;
@@ -1058,8 +1057,8 @@ public class NQueue<T extends Serializable> implements Closeable {
      * conditions allow, the queue may opportunistically revert to a direct durable append for the current
      * element. Producers block only when the buffer is at capacity and no immediate fallback is possible.
      *
-     * @param object             element to stage
-     * @param revalidateIfFull   whether to reassess staging mode when the buffer is saturated
+     * @param object           element to stage
+     * @param revalidateIfFull whether to reassess staging mode when the buffer is saturated
      * @return a sentinel indicating that durability will be achieved by a later drain
      * @throws IOException if a fallback durable append is attempted and fails
      */
@@ -1322,6 +1321,11 @@ public class NQueue<T extends Serializable> implements Closeable {
      */
     public enum CompactionState {IDLE, RUNNING}
 
+    /**
+     * Classe que representa um item pré-índiceado, fornecendo a combinação de um elemento e seu índice.
+     * Essa classe desempenha o papel crucial no processo de indexação prévia, permitindo a identificação eficiente dos itens em uma coleção ordenada.
+     * Ela se relaciona com outros componentes responsáveis pela manipulação da coleção, como os métodos de inclusão e remoção de elementos.
+     */
     private static record PreIndexedItem<T>(T item, long index) implements Serializable {
         private static final long serialVersionUID = 1L;
     }
@@ -1378,7 +1382,7 @@ public class NQueue<T extends Serializable> implements Closeable {
         double compactionWasteThreshold = 0.5;
         long compactionIntervalNanos = TimeUnit.MINUTES.toNanos(5);
         int compactionBufferSize = 128 * 1024;
-        boolean withFsync = true, enableMemoryBuffer = false, resetOnRestart = false,allowShortCircuit=true;
+        boolean withFsync = true, enableMemoryBuffer = false, resetOnRestart = false, allowShortCircuit = true;
         int memoryBufferSize = 10000;
         long lockTryTimeoutNanos = TimeUnit.MILLISECONDS.toNanos(10), revalidationIntervalNanos = TimeUnit.MILLISECONDS.toNanos(100);
         long maintenanceIntervalNanos = TimeUnit.SECONDS.toNanos(5);

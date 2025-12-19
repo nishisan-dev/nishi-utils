@@ -1,6 +1,7 @@
 package dev.nishisan.utils.queue;
 
 import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.io.TempDir;
@@ -48,7 +49,7 @@ class NQueueMemoryBufferTest {
         return queue;
     }
 
-    @AfterAll
+    @AfterEach
     void validateConsistency() {
         for (NQueue<?> queue : trackedQueues) {
             Long violations = queue.getStats().getCounterValueOrNull("nqueue.out_of_order");
