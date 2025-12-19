@@ -1,6 +1,7 @@
 package dev.nishisan.utils.queue;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.ByteArrayInputStream;
@@ -9,7 +10,9 @@ import java.io.ObjectInputStream;
 import java.io.Serializable;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -29,10 +32,28 @@ class NQueueTest {
 
     @TempDir
     Path tempDir;
+    
+    private final List<NQueue<?>> trackedQueues = Collections.synchronizedList(new ArrayList<>());
+
+    private <T extends Serializable> NQueue<T> track(NQueue<T> queue) {
+        trackedQueues.add(queue);
+        return queue;
+    }
+
+    @AfterEach
+    void validateConsistency() {
+        for (NQueue<?> queue : trackedQueues) {
+            Long violations = queue.getStats().getCounterValueOrNull("nqueue.out_of_order");
+            if (violations != null && violations > 0) {
+                fail("Queue detected internal FIFO violations: " + violations);
+            }
+        }
+        trackedQueues.clear();
+    }
 
     @Test
     void offerAndPollShouldReturnRecordsInInsertionOrder() throws Exception {
-        try (NQueue<String> queue = NQueue.open(tempDir, "basic")) {
+        try (NQueue<String> queue = track(NQueue.open(tempDir, "basic"))) {
             queue.offer("foo");
             queue.offer("bar");
 
@@ -70,7 +91,7 @@ class NQueueTest {
     @Test
     void pollShouldBlockUntilDataBecomesAvailable() throws Exception {
         ExecutorService executor = Executors.newSingleThreadExecutor();
-        try (NQueue<String> queue = NQueue.open(tempDir, "blocking")) {
+        try (NQueue<String> queue = track(NQueue.open(tempDir, "blocking"))) {
             Future<Optional<String>> future = executor.submit(() -> {
                 try {
                     return queue.poll();
@@ -103,7 +124,7 @@ class NQueueTest {
         Path queueName = Path.of("recovery");
         Path queueDir = tempDir.resolve(queueName);
 
-        try (NQueue<String> queue = NQueue.open(tempDir, queueName.toString())) {
+        try (NQueue<String> queue = track(NQueue.open(tempDir, queueName.toString()))) {
             queue.offer("first");
             queue.offer("second");
         }
@@ -113,7 +134,7 @@ class NQueueTest {
         long corruptedProducerOffset = Files.size(dataPath) + 128;
         NQueueQueueMeta.write(metaPath, 9999L, corruptedProducerOffset, 999L, 999L);
 
-        try (NQueue<String> queue = NQueue.open(tempDir, queueName.toString())) {
+        try (NQueue<String> queue = track(NQueue.open(tempDir, queueName.toString()))) {
             assertEquals(2L, queue.size());
 
             Optional<NQueueRecord> peekedFirst = queue.peekRecord();
@@ -147,7 +168,7 @@ class NQueueTest {
         Path queueName = Path.of("truncate-incomplete");
         Path queueDir = tempDir.resolve(queueName);
 
-        try (NQueue<String> queue = NQueue.open(tempDir, queueName.toString())) {
+        try (NQueue<String> queue = track(NQueue.open(tempDir, queueName.toString()))) {
             queue.offer("first");
             queue.offer("second");
         }
@@ -161,7 +182,7 @@ class NQueueTest {
             raf.setLength(size - 5);
         }
 
-        try (NQueue<String> queue = NQueue.open(tempDir, queueName.toString())) {
+        try (NQueue<String> queue = track(NQueue.open(tempDir, queueName.toString()))) {
             assertEquals(1L, queue.size(), "Queue should recover by dropping the incomplete tail record");
             assertEquals(Optional.of("first"), queue.peek());
             assertEquals(Optional.of("first"), queue.poll());
@@ -174,7 +195,7 @@ class NQueueTest {
         Path queueName = Path.of("meta-truncated");
         Path queueDir = tempDir.resolve(queueName);
 
-        try (NQueue<String> queue = NQueue.open(tempDir, queueName.toString())) {
+        try (NQueue<String> queue = track(NQueue.open(tempDir, queueName.toString()))) {
             queue.offer("first");
             queue.offer("second");
         }
@@ -184,7 +205,7 @@ class NQueueTest {
         assertTrue(bytes.length > 4, "Expected queue.meta to have some bytes");
         Files.write(metaPath, java.util.Arrays.copyOf(bytes, 6)); // invalid/truncated meta
 
-        try (NQueue<String> queue = NQueue.open(tempDir, queueName.toString())) {
+        try (NQueue<String> queue = track(NQueue.open(tempDir, queueName.toString()))) {
             assertEquals(2L, queue.size(), "Queue should rebuild state when meta is unreadable");
             assertEquals(Optional.of("first"), queue.poll());
             assertEquals(Optional.of("second"), queue.poll());
@@ -196,7 +217,7 @@ class NQueueTest {
         Path queueName = Path.of("offsets");
         Path queueDir = tempDir.resolve(queueName);
 
-        try (NQueue<String> queue = NQueue.open(tempDir, queueName.toString())) {
+        try (NQueue<String> queue = track(NQueue.open(tempDir, queueName.toString()))) {
             long firstOffset = queue.offer("first");
             String firstValue = queue.readAt(firstOffset).orElseThrow();
             assertEquals("first", firstValue);
@@ -246,7 +267,7 @@ class NQueueTest {
         List<ComplexPayload> expected = buildComplexPayloads(1000);
 
         ExecutorService executor = Executors.newFixedThreadPool(2);
-        try (NQueue<ComplexPayload> queue = NQueue.open(tempDir, "parallel-complex")) {
+        try (NQueue<ComplexPayload> queue = track(NQueue.open(tempDir, "parallel-complex"))) {
             Future<Void> producer = executor.submit(() -> {
                 ThreadLocalRandom rng = ThreadLocalRandom.current();
                 for (ComplexPayload payload : expected) {
@@ -281,7 +302,7 @@ class NQueueTest {
 
     @Test
     void pollWithTimeoutShouldReturnEmptyWhenQueueRemainsEmpty() throws Exception {
-        try (NQueue<String> queue = NQueue.open(tempDir, "timeout")) {
+        try (NQueue<String> queue = track(NQueue.open(tempDir, "timeout"))) {
             long start = System.nanoTime();
             Optional<String> record = queue.poll(150, TimeUnit.MILLISECONDS);
             long elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
@@ -293,7 +314,7 @@ class NQueueTest {
 
     @Test
     void peekShouldReturnEmptyWhenQueueIsEmpty() throws Exception {
-        try (NQueue<String> queue = NQueue.open(tempDir, "peek-empty")) {
+        try (NQueue<String> queue = track(NQueue.open(tempDir, "peek-empty"))) {
             assertTrue(queue.peek().isEmpty(), "Peek should return empty when queue is empty");
             assertTrue(queue.peekRecord().isEmpty(), "Peek record should return empty when queue is empty");
         }
@@ -301,7 +322,7 @@ class NQueueTest {
 
     @Test
     void peekShouldNotConsumeElements() throws Exception {
-        try (NQueue<String> queue = NQueue.open(tempDir, "peek-non-consuming")) {
+        try (NQueue<String> queue = track(NQueue.open(tempDir, "peek-non-consuming"))) {
             queue.offer("alpha");
             queue.offer("beta");
 
@@ -426,6 +447,77 @@ class NQueueTest {
         @Override
         public int hashCode() {
             return Objects.hash(description, active, timestamp);
+        }
+    }
+
+    @Test
+    void handlesLoadFluctuationsAndTransitions() throws Exception {
+        NQueue.Options options = NQueue.Options.defaults()
+                .withShortCircuit(true)
+                .withCompactionInterval(Duration.ofMillis(100))
+                .withCompactionWasteThreshold(0.5);
+
+        try (NQueue<Integer> queue = NQueue.open(tempDir, "fluctuation", options)) {
+            ExecutorService exec = Executors.newCachedThreadPool();
+            List<Integer> consumed = new ArrayList<>();
+            List<Integer> expected = new ArrayList<>();
+            int totalItems = 0;
+
+            // Phase 1: Short Circuit (Handoff)
+            // Consumer waits, Producer sends.
+            Future<Integer> consumerFuture = exec.submit(() -> queue.poll().orElseThrow());
+            Thread.sleep(50); // Ensure consumer is blocked
+            queue.offer(totalItems++);
+            expected.add(0);
+            consumed.add(consumerFuture.get(1, TimeUnit.SECONDS));
+
+            // Phase 2: Burst (Disk Persistence)
+            // No consumer active, fill queue.
+            int burstSize = 500;
+            for (int i = 0; i < burstSize; i++) {
+                queue.offer(totalItems);
+                expected.add(totalItems);
+                totalItems++;
+            }
+            // Now drain
+            for (int i = 0; i < burstSize; i++) {
+                consumed.add(queue.poll().orElseThrow());
+            }
+
+            // Phase 3: Short Circuit Again
+            consumerFuture = exec.submit(() -> queue.poll().orElseThrow());
+            Thread.sleep(50);
+            queue.offer(totalItems);
+            expected.add(totalItems);
+            totalItems++;
+            consumed.add(consumerFuture.get(1, TimeUnit.SECONDS));
+
+            // Phase 4: Concurrent Stress
+            int stressCount = 1000;
+            Future<?> stressConsumer = exec.submit(() -> {
+               for(int i=0; i<stressCount; i++) {
+                   try {
+                       consumed.add(queue.poll().orElseThrow());
+                   } catch (IOException e) {
+                       throw new RuntimeException(e);
+                   }
+               }
+            });
+            
+            for(int i=0; i<stressCount; i++) {
+                queue.offer(totalItems);
+                expected.add(totalItems);
+                totalItems++;
+            }
+            stressConsumer.get(10, TimeUnit.SECONDS);
+
+            exec.shutdown();
+            
+            assertEquals(expected, consumed, "Order must be preserved across transitions");
+            
+            // Validate internal consistency metric
+            Long violations = queue.getStats().getCounterValueOrNull("nqueue.out_of_order");
+            assertNull(violations, "Internal FIFO violation detected: " + violations);
         }
     }
 }

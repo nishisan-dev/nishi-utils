@@ -25,6 +25,7 @@ import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.ngrid.common.PeerUpdatePayload;
 
 import java.io.Closeable;
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
@@ -307,6 +308,10 @@ public final class TcpTransport implements Transport {
                     LOGGER.log(Level.WARNING, "Server socket closed unexpectedly", se);
                 }
                 break;
+            } catch (EOFException e) {
+                if (running) {
+                    LOGGER.log(Level.INFO, "Connection closed immediately during handshake (EOF): {0}", e.getMessage());
+                }
             } catch (IOException e) {
                 if (running) {
                     LOGGER.log(Level.WARNING, "Error accepting connection", e);

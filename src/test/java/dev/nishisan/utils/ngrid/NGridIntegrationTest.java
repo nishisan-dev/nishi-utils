@@ -166,12 +166,35 @@ class NGridIntegrationTest {
         assertEquals(Optional.of("alice"), users3.get("u1"));
 
         sessions1.put("s1", "token-123");
-        assertEquals(Optional.of("token-123"), sessions2.get("s1"));
-        assertEquals(Optional.of("token-123"), sessions3.get("s1"));
+        assertEventually(() -> assertEquals(Optional.of("token-123"), sessions2.get("s1")));
+        assertEventually(() -> assertEquals(Optional.of("token-123"), sessions3.get("s1")));
 
         // Independence: keys from one map must not leak into the other
         assertFalse(users1.get("s1").isPresent());
         assertFalse(sessions1.get("u1").isPresent());
+    }
+
+    private void assertEventually(Runnable assertion) {
+        long deadline = System.currentTimeMillis() + 5000;
+        Throwable lastError = null;
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                assertion.run();
+                return;
+            } catch (AssertionError | Exception e) {
+                lastError = e;
+                try {
+                    Thread.sleep(100);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException(ie);
+                }
+            }
+        }
+        if (lastError instanceof AssertionError) {
+            throw (AssertionError) lastError;
+        }
+        throw new RuntimeException(lastError);
     }
 
     private void awaitClusterStability() {
