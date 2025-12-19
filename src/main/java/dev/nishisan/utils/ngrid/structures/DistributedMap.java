@@ -27,6 +27,8 @@ import dev.nishisan.utils.ngrid.common.MessageType;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.ngrid.map.MapClusterService;
+import dev.nishisan.utils.ngrid.metrics.NGridMetrics;
+import dev.nishisan.utils.stats.StatsUtils;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -52,16 +54,24 @@ public final class DistributedMap<K extends Serializable, V extends Serializable
     private final String mapPutCommand;
     private final String mapRemoveCommand;
     private final String mapGetCommand;
+    private final StatsUtils stats;
+    private final NodeId localNodeId;
 
     public DistributedMap(Transport transport, ClusterCoordinator coordinator, MapClusterService<K, V> mapService) {
-        this(transport, coordinator, mapService, MapClusterService.DEFAULT_MAP_NAME);
+        this(transport, coordinator, mapService, MapClusterService.DEFAULT_MAP_NAME, null);
     }
 
     public DistributedMap(Transport transport, ClusterCoordinator coordinator, MapClusterService<K, V> mapService, String mapName) {
+        this(transport, coordinator, mapService, mapName, null);
+    }
+
+    public DistributedMap(Transport transport, ClusterCoordinator coordinator, MapClusterService<K, V> mapService, String mapName, StatsUtils stats) {
         this.transport = transport;
         this.coordinator = coordinator;
         this.mapService = mapService;
         this.mapName = mapName;
+        this.stats = stats;
+        this.localNodeId = transport.local().nodeId();
         if (this.mapName == null || this.mapName.isBlank()) {
             throw new IllegalArgumentException("mapName cannot be blank");
         }
@@ -73,7 +83,9 @@ public final class DistributedMap<K extends Serializable, V extends Serializable
 
     @SuppressWarnings("unchecked")
     public Optional<V> put(K key, V value) {
+        recordIngressWrite();
         if (coordinator.isLeader()) {
+            recordMapPut();
             return mapService.put(key, value);
         }
         Serializable body = new MapEntry<>(key, value);
@@ -83,7 +95,9 @@ public final class DistributedMap<K extends Serializable, V extends Serializable
 
     @SuppressWarnings("unchecked")
     public Optional<V> remove(K key) {
+        recordIngressWrite();
         if (coordinator.isLeader()) {
+            recordMapRemove();
             return mapService.remove(key);
         }
         SerializableOptional<V> result = (SerializableOptional<V>) invokeLeader(mapRemoveCommand, key);
@@ -123,11 +137,13 @@ public final class DistributedMap<K extends Serializable, V extends Serializable
     private Serializable executeLocal(String command, Serializable body) {
         if (command.equals(mapPutCommand)) {
             MapEntry<K, V> entry = (MapEntry<K, V>) body;
+            recordMapPut();
             return mapService.put(entry.key(), entry.value())
                     .map(SerializableOptional::of)
                     .orElseGet(SerializableOptional::empty);
         }
         if (command.equals(mapRemoveCommand)) {
+            recordMapRemove();
             return mapService.remove((K) body)
                     .map(SerializableOptional::of)
                     .orElseGet(SerializableOptional::empty);
@@ -175,6 +191,29 @@ public final class DistributedMap<K extends Serializable, V extends Serializable
         transport.removeListener(this);
         // Note: mapService is NOT closed here because it may be shared by multiple DistributedMap instances.
         // The owner (NGridNode) is responsible for closing MapClusterService instances.
+    }
+
+    private void recordMapPut() {
+        if (stats == null) {
+            return;
+        }
+        stats.notifyHitCounter(NGridMetrics.writeNode(localNodeId));
+        stats.notifyHitCounter(NGridMetrics.mapPut(mapName, localNodeId));
+    }
+
+    private void recordMapRemove() {
+        if (stats == null) {
+            return;
+        }
+        stats.notifyHitCounter(NGridMetrics.writeNode(localNodeId));
+        stats.notifyHitCounter(NGridMetrics.mapRemove(mapName, localNodeId));
+    }
+
+    private void recordIngressWrite() {
+        if (stats == null) {
+            return;
+        }
+        stats.notifyHitCounter(NGridMetrics.ingressWrite(localNodeId));
     }
 
     private record MapEntry<K extends Serializable, V extends Serializable>(K key, V value) implements Serializable {

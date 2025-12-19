@@ -144,10 +144,14 @@ class MapClusterServiceConcurrencyTest {
         }
 
         @Override
+        public void addPeer(NodeInfo peer) {
+            // no-op
+        }
+
+        @Override
         public void close() throws IOException {
             listeners.clear();
         }
     }
 }
-
 

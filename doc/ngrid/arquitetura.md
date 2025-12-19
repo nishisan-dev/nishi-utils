@@ -25,6 +25,12 @@ A arquitetura do NGrid é organizada em camadas lógicas que separam a responsab
 
 Responsável pela comunicação de baixo nível entre os nós.
 - **Conectividade:** Mantém conexões TCP persistentes entre os membros do cluster.
+- **Roteamento Inteligente (Sticky Proxy Fallback):**
+  - O transporte implementa uma lógica de roteamento resiliente para contornar falhas de rede parciais (ex: firewalls, NATs).
+  - **Fallback:** Se uma conexão direta falha, o nó procura automaticamente um vizinho que tenha acesso ao destino e estabelece uma rota "Proxy".
+  - **Stickiness:** Uma vez que uma rota Proxy é estabelecida, ela é mantida ("gruda") para evitar latência de novas tentativas de conexão falhas.
+  - **Recuperação Oportunista:** Uma tarefa em background ("Probe") tenta periodicamente restabelecer a conexão direta de forma silenciosa. Se bem-sucedida, a rota é promovida de volta para "Direct".
+  - **TTL:** Mensagens possuem um Time-To-Live para evitar loops infinitos de roteamento.
 - **Descoberta (Gossip Simples):**
   - `HANDSHAKE`: Na conexão, troca metadados do nó e lista de peers conhecidos.
   - `PEER_UPDATE`: Broadcast periódico ou reativo para compartilhar novos peers descobertos, permitindo o fechamento da malha (full mesh).
@@ -36,6 +42,7 @@ Responsável pela comunicação de baixo nível entre os nós.
 Gerencia o estado do cluster e a liderança.
 - **Membros Ativos:** Mantém a lista de membros vivos baseada em mensagens de `HEARTBEAT`.
 - **Detecção de Falhas:** Marca membros como inativos após um timeout sem heartbeat.
+- **Robustez:** As tarefas de heartbeat e detecção de falhas são protegidas contra exceções inesperadas para garantir a estabilidade do agendamento.
 - **Eleição de Líder:**
   - O mecanismo é **determinístico**: o líder é sempre o nó com o **maior `NodeId` ativo**.
   - Todos os nós convergem para o mesmo líder assim que a lista de membros é sincronizada.
@@ -46,13 +53,16 @@ Gerencia o estado do cluster e a liderança.
 
 Garante a consistência dos dados através da replicação de operações.
 - **Centralização no Líder:** Apenas o líder pode iniciar replicações (`replicate(...)`).
+- **Integridade:**
+  - O envio de `REPLICATION_ACK` só ocorre após a operação ser efetivamente processada com sucesso no nó seguidor, evitando falsos positivos de confirmação.
 - **Fluxo de Replicação:**
   1. O líder envia `REPLICATION_REQUEST` para todos os followers.
   2. Aguarda `REPLICATION_ACK` dos followers.
   3. Confirma a operação (`COMMITTED`) quando atinge o **quorum** (maioria, incluindo o próprio líder).
-- **Deduplicação:** Operações recebidas repetidamente (mesmo `operationId`) não são reaplicadas, via conjunto em memória de IDs já aplicados (`applied`).
-- **Cálculo de Quorum:** O quorum efetivo se adapta ao tamanho do cluster ativo:
-  \( \text{quorumEfetivo} = \max(1, \min(\text{config.quorum}, |\text{membrosAtivos}|)) \)
+- **Consistência Configurável (`strictConsistency`):**
+  - **Disponibilidade (Padrão):** O quorum efetivo se adapta ao tamanho do cluster ativo. Útil para clusters dinâmicos onde a disponibilidade é prioridade.
+    \( \text{quorumEfetivo} = \max(1, \min(\text{config.quorum}, |\text{membrosAtivos}|)) \)
+  - **Consistência Estrita (CP):** Se habilitada, o quorum é fixo e baseado na configuração inicial (`replicationFactor`). Se o número de nós ativos for menor que o quorum exigido, as escritas falham para garantir consistência e evitar *split-brain*.
 - **Timeout e quorum inalcançável:**
   - Se a operação exceder o `operationTimeout` (padrão: 30s), ela pode falhar por timeout.
   - Se peers desconectarem e o cluster não tiver membros alcançáveis suficientes para satisfazer o quorum, a operação falha como “quorum inalcançável”.
@@ -273,6 +283,7 @@ Leader-->>Client: Sucesso
 **Armazenamento:**
 - Em memória (`ConcurrentHashMap`) em todos os nós.
 - **Persistência Opcional:** Cada nó pode ser configurado independentemente para persistir dados em disco (WAL + Snapshot), acelerando sua recuperação após reinício.
+  - **Recuperação Robusta:** O mecanismo de carga (`load()`) detecta e recupera automaticamente situações de falha durante a rotação de logs (presença de `wal.log.old`), garantindo que nenhuma operação confirmada seja perdida em caso de crash.
 
 **Operações:**
 - **`put(key, value)`**: Enviado ao líder, aplicado, replicado e confirmado. Sobrescreve valores anteriores.

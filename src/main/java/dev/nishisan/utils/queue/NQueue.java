@@ -323,7 +323,7 @@ public class NQueue<T extends Serializable> implements Closeable {
             if (lock.tryLock()) {
                 try {
                     // Short-circuit: if queue is empty (disk + memory) and a consumer is waiting, handoff directly.
-                    if (recordCount == 0 && handoffItem == null && drainingQueue.isEmpty() && memoryBuffer.isEmpty() && lock.hasWaiters(notEmpty)) {
+                    if (options.allowShortCircuit && recordCount == 0 && handoffItem == null && drainingQueue.isEmpty() && memoryBuffer.isEmpty() && lock.hasWaiters(notEmpty)) {
                         handoffItem = object;
                         notEmpty.signal();
                         statsUtils.notifyHitCounter(NQueueMetrics.OFFERED_EVENT);
@@ -349,7 +349,7 @@ public class NQueue<T extends Serializable> implements Closeable {
             lock.lock();
             try {
                 // Short-circuit: if queue is empty and a consumer is waiting, handoff directly.
-                if (recordCount == 0 && handoffItem == null && lock.hasWaiters(notEmpty)) {
+                if (options.allowShortCircuit && recordCount == 0 && handoffItem == null && lock.hasWaiters(notEmpty)) {
                     handoffItem = object;
                     notEmpty.signal();
                     statsUtils.notifyHitCounter(NQueueMetrics.OFFERED_EVENT);
@@ -1323,7 +1323,7 @@ public class NQueue<T extends Serializable> implements Closeable {
         double compactionWasteThreshold = 0.5;
         long compactionIntervalNanos = TimeUnit.MINUTES.toNanos(5);
         int compactionBufferSize = 128 * 1024;
-        boolean withFsync = true, enableMemoryBuffer = false, resetOnRestart = false;
+        boolean withFsync = true, enableMemoryBuffer = false, resetOnRestart = false, allowShortCircuit = true;
         int memoryBufferSize = 10000;
         long lockTryTimeoutNanos = TimeUnit.MILLISECONDS.toNanos(10), revalidationIntervalNanos = TimeUnit.MILLISECONDS.toNanos(100);
         long maintenanceIntervalNanos = TimeUnit.SECONDS.toNanos(5);
@@ -1391,6 +1391,21 @@ public class NQueue<T extends Serializable> implements Closeable {
          */
         public Options withFsync(boolean f) {
             this.withFsync = f;
+            return this;
+        }
+
+        /**
+         * Controls whether to allow short-circuiting the persistence layer when consumers are waiting.
+         * When true (default), if the queue is empty and consumers are blocked waiting, new elements
+         * are handed off directly to consumers without hitting the disk.
+         * When false, elements are always written to the queue log before delivery, ensuring strict
+         * persistence at the cost of latency.
+         *
+         * @param allow true to allow short-circuit (default), false to enforce persistence path
+         * @return this builder for chaining
+         */
+        public Options withShortCircuit(boolean allow) {
+            this.allowShortCircuit = allow;
             return this;
         }
 
@@ -1508,7 +1523,7 @@ public class NQueue<T extends Serializable> implements Closeable {
             final double compactionWasteThreshold;
             final long compactionIntervalNanos, lockTryTimeoutNanos, revalidationIntervalNanos, maintenanceIntervalNanos, maxSizeReconciliationIntervalNanos;
             final int compactionBufferSize, memoryBufferSize;
-            final boolean enableMemoryBuffer;
+            final boolean enableMemoryBuffer, allowShortCircuit;
 
             /**
              * Captures the current values from a mutable options builder for safe sharing.
@@ -1525,6 +1540,7 @@ public class NQueue<T extends Serializable> implements Closeable {
                 this.revalidationIntervalNanos = o.revalidationIntervalNanos;
                 this.maintenanceIntervalNanos = o.maintenanceIntervalNanos;
                 this.maxSizeReconciliationIntervalNanos = o.maxSizeReconciliationIntervalNanos;
+                this.allowShortCircuit = o.allowShortCircuit;
             }
         }
     }

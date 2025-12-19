@@ -70,6 +70,7 @@ public final class TcpTransport implements Transport {
     private final Set<TransportListener> listeners = new CopyOnWriteArraySet<>();
     private final Map<UUID, PendingResponse> pendingResponses = new ConcurrentHashMap<>();
     private final ExecutorService workerPool;
+    private final NetworkRouter router = new NetworkRouter();
     private Thread acceptThread;
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "ngrid-transport-scheduler");
@@ -92,6 +93,11 @@ public final class TcpTransport implements Transport {
         this.workerPool = Executors.newFixedThreadPool(Math.max(1, config.workerThreads()), workerFactory);
     }
 
+    // For testing purposes
+    NetworkRouter getRouter() {
+        return router;
+    }
+
     @Override
     public void start() {
         if (running) {
@@ -112,6 +118,8 @@ public final class TcpTransport implements Transport {
                 config.reconnectInterval().toMillis(),
                 config.reconnectInterval().toMillis(),
                 TimeUnit.MILLISECONDS);
+        // Opportunistic probe for promoted routes (every 30s)
+        scheduler.scheduleAtFixedRate(this::probeLoop, 30_000, 30_000, TimeUnit.MILLISECONDS);
         // attempt initial outbound connections
         config.initialPeers().forEach(this::ensureConnectionAsync);
     }
@@ -161,11 +169,38 @@ public final class TcpTransport implements Transport {
         if (destination == null) {
             return;
         }
-        Connection connection = ensureConnection(destination);
+        
+        Optional<NodeId> nextHop = router.nextHop(destination);
+        if (nextHop.isEmpty()) {
+            LOGGER.log(Level.WARNING, "No route available for {0}", destination);
+            return;
+        }
+        
+        NodeId target = nextHop.get();
+        Connection connection = ensureConnection(target);
+        
         if (connection != null) {
+            // Check if we are proxying (target != destination)
+            // If so, we might want to decrement TTL here, but it's cleaner to do it on the receiving end before forwarding.
             connection.send(message);
         } else {
-            LOGGER.log(Level.WARNING, "No connection available for {0}", destination);
+            if (target.equals(destination)) {
+                // Direct connection failed. Mark failure and try fallback immediately.
+                LOGGER.warning("Direct connection failed for " + destination + ". Searching for proxy.");
+                router.markDirectFailure(destination);
+                
+                // Retry with new route
+                Optional<NodeId> fallback = router.nextHop(destination);
+                if (fallback.isPresent() && !fallback.get().equals(destination)) {
+                    Connection proxyConn = ensureConnection(fallback.get());
+                    if (proxyConn != null) {
+                        LOGGER.info("Failing over to proxy " + fallback.get() + " for destination " + destination);
+                        proxyConn.send(message);
+                        return;
+                    }
+                }
+            }
+            LOGGER.log(Level.WARNING, "No connection available for {0} (via {1})", new Object[]{destination, target});
         }
     }
 
@@ -181,13 +216,44 @@ public final class TcpTransport implements Transport {
         PendingResponse response = new PendingResponse(destination, future);
         pendingResponses.put(requestId, response);
 
-        Connection connection = ensureConnection(destination);
-        if (connection == null) {
+        // Routing Logic
+        Optional<NodeId> nextHop = router.nextHop(destination);
+        if (nextHop.isEmpty()) {
             pendingResponses.remove(requestId, response);
-            future.completeExceptionally(new IOException("No connection available for " + destination));
+            future.completeExceptionally(new IOException("No route available for " + destination));
             return future;
         }
-        connection.send(message);
+
+        NodeId target = nextHop.get();
+        Connection connection = ensureConnection(target);
+        
+        if (connection != null) {
+            connection.send(message);
+        } else {
+            if (target.equals(destination)) {
+                // Direct failed, try immediate fallback
+                router.markDirectFailure(destination);
+                Optional<NodeId> fallback = router.nextHop(destination);
+                if (fallback.isPresent() && !fallback.get().equals(destination)) {
+                    Connection proxyConn = ensureConnection(fallback.get());
+                    if (proxyConn != null) {
+                        proxyConn.send(message);
+                    } else {
+                        pendingResponses.remove(requestId, response);
+                        future.completeExceptionally(new IOException("No connection available for " + destination + " (via " + fallback.get() + ")"));
+                        return future;
+                    }
+                } else {
+                    pendingResponses.remove(requestId, response);
+                    future.completeExceptionally(new IOException("No connection available for " + destination));
+                    return future;
+                }
+            } else {
+                pendingResponses.remove(requestId, response);
+                future.completeExceptionally(new IOException("No connection available for " + destination + " (via " + target + ")"));
+                return future;
+            }
+        }
 
         if (!config.requestTimeout().isZero() && !config.requestTimeout().isNegative()) {
             long timeoutMs = config.requestTimeout().toMillis();
@@ -211,6 +277,20 @@ public final class TcpTransport implements Transport {
     public boolean isConnected(NodeId nodeId) {
         Connection conn = connections.get(nodeId);
         return conn != null && conn.isOpen();
+    }
+
+    @Override
+    public void addPeer(NodeInfo peer) {
+        if (peer == null || peer.nodeId().equals(config.local().nodeId())) {
+            return;
+        }
+        boolean added = knownPeers.putIfAbsent(peer.nodeId(), peer) == null;
+        if (added && running) {
+            scheduler.schedule(() -> ensureConnectionAsync(peer), 0, TimeUnit.MILLISECONDS);
+        }
+        if (added && running) {
+            broadcastPeerList();
+        }
     }
 
     private void acceptLoop() {
@@ -297,6 +377,33 @@ public final class TcpTransport implements Transport {
         return connection;
     }
 
+    private void probeLoop() {
+        if (!running) {
+            return;
+        }
+        for (Map.Entry<NodeId, NetworkRouter.Route> entry : router.routesSnapshot().entrySet()) {
+            if (entry.getValue().type() == NetworkRouter.RouteType.PROXY) {
+                NodeId target = entry.getKey();
+                workerPool.submit(() -> tryPromoteRoute(target));
+            }
+        }
+    }
+
+    private void tryPromoteRoute(NodeId target) {
+        NodeInfo info = knownPeers.get(target);
+        if (info == null) {
+            return;
+        }
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress(info.host(), info.port()), 2000);
+            // If connected successfully, promote route.
+            router.promoteToDirect(target);
+            LOGGER.info("Route promoted to DIRECT for " + target);
+        } catch (IOException e) {
+            // Still unreachable directly, stay on proxy.
+        }
+    }
+
     private void sendHandshake(Connection connection) {
         NodeInfo localInfo = config.local();
         Set<NodeInfo> peers = Set.copyOf(knownPeers.values());
@@ -316,6 +423,10 @@ public final class TcpTransport implements Transport {
         connection.setRemote(remoteInfo);
         knownPeers.putIfAbsent(remoteInfo.nodeId(), remoteInfo);
         connections.put(remoteInfo.nodeId(), connection);
+        
+        // Feed router with reachability info
+        router.updateReachability(remoteInfo.nodeId(), payload.peers());
+
         listeners.forEach(listener -> listener.onPeerConnected(remoteInfo));
         // Merge peers and attempt connections
         payload.peers().forEach(peer -> {
@@ -346,6 +457,10 @@ public final class TcpTransport implements Transport {
 
     private void handlePeerUpdate(ClusterMessage message) {
         PeerUpdatePayload payload = message.payload(PeerUpdatePayload.class);
+        
+        // Feed router with reachability info
+        router.updateReachability(message.source(), payload.peers());
+
         for (NodeInfo peer : payload.peers()) {
             if (!peer.nodeId().equals(config.local().nodeId())) {
                 boolean added = knownPeers.putIfAbsent(peer.nodeId(), peer) == null;
@@ -364,6 +479,19 @@ public final class TcpTransport implements Transport {
             handlePeerUpdate(message);
             return;
         }
+        
+        // Relay logic
+        NodeId localId = config.local().nodeId();
+        if (message.destination() != null && !message.destination().equals(localId)) {
+            if (message.ttl() <= 0) {
+                LOGGER.fine(() -> "Dropping message with expired TTL from " + message.source());
+                return;
+            }
+            // Forwarding
+            send(message.nextHop());
+            return;
+        }
+
         Optional<UUID> maybeCorrelation = message.correlationId();
         if (maybeCorrelation.isPresent()) {
             PendingResponse response = pendingResponses.remove(maybeCorrelation.get());

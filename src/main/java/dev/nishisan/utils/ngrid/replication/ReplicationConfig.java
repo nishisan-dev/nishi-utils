@@ -26,10 +26,14 @@ import java.util.Objects;
 public final class ReplicationConfig {
     private final int quorum;
     private final Duration operationTimeout;
+    private final Duration retryInterval;
+    private final boolean strictConsistency;
 
-    private ReplicationConfig(int quorum, Duration operationTimeout) {
+    private ReplicationConfig(int quorum, Duration operationTimeout, Duration retryInterval, boolean strictConsistency) {
         this.quorum = quorum;
         this.operationTimeout = Objects.requireNonNull(operationTimeout, "operationTimeout");
+        this.retryInterval = Objects.requireNonNull(retryInterval, "retryInterval");
+        this.strictConsistency = strictConsistency;
     }
 
     public static ReplicationConfig of(int quorum) {
@@ -54,9 +58,19 @@ public final class ReplicationConfig {
         return operationTimeout;
     }
 
+    public Duration retryInterval() {
+        return retryInterval;
+    }
+
+    public boolean strictConsistency() {
+        return strictConsistency;
+    }
+
     public static final class Builder {
         private final int quorum;
         private Duration operationTimeout = Duration.ofSeconds(30);
+        private Duration retryInterval = Duration.ofSeconds(1);
+        private boolean strictConsistency = false;
 
         private Builder(int quorum) {
             if (quorum < 1) {
@@ -70,8 +84,22 @@ public final class ReplicationConfig {
             return this;
         }
 
+        public Builder retryInterval(Duration retryInterval) {
+            Objects.requireNonNull(retryInterval, "retryInterval");
+            if (retryInterval.isNegative() || retryInterval.isZero()) {
+                throw new IllegalArgumentException("retryInterval must be positive");
+            }
+            this.retryInterval = retryInterval;
+            return this;
+        }
+
+        public Builder strictConsistency(boolean strict) {
+            this.strictConsistency = strict;
+            return this;
+        }
+
         public ReplicationConfig build() {
-            return new ReplicationConfig(quorum, operationTimeout);
+            return new ReplicationConfig(quorum, operationTimeout, retryInterval, strictConsistency);
         }
     }
 }

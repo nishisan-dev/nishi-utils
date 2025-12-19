@@ -46,4 +46,6 @@ public interface Transport extends Closeable {
     CompletableFuture<ClusterMessage> sendAndAwait(ClusterMessage message);
 
     boolean isConnected(NodeId nodeId);
+
+    void addPeer(NodeInfo peer);
 }

@@ -116,7 +116,11 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
         try {
             Files.createDirectories(mapDir);
             loadSnapshot();
-            loadWal();
+            if (Files.exists(oldWalPath)) {
+                LOGGER.info("Detected incomplete rotation. Replaying old WAL.");
+                loadWal(oldWalPath);
+            }
+            loadWal(walPath);
             // Meta is best-effort; if missing/corrupt it's ignored.
             readMeta().ifPresent(meta -> lastSnapshotTimeMillis = meta.lastSnapshotTimestamp());
         } catch (IOException e) {
@@ -400,11 +404,11 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
         }
     }
 
-    private void loadWal() throws IOException {
-        if (!Files.exists(walPath)) {
+    private void loadWal(Path path) throws IOException {
+        if (!Files.exists(path)) {
             return;
         }
-        try (RandomAccessFile raf = new RandomAccessFile(walPath.toFile(), "rw");
+        try (RandomAccessFile raf = new RandomAccessFile(path.toFile(), "rw");
              FileChannel ch = raf.getChannel()) {
             long size = ch.size();
             long offset = 0L;

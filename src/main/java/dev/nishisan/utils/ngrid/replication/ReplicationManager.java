@@ -64,6 +64,7 @@ public final class ReplicationManager implements TransportListener, Closeable {
     private final Map<UUID, PendingOperation> pending = new ConcurrentHashMap<>();
     private final Map<UUID, ReplicatedRecord> log = new ConcurrentHashMap<>();
     private final Set<UUID> applied = new CopyOnWriteArraySet<>();
+    private final Set<UUID> processing = ConcurrentHashMap.newKeySet();
     private final ExecutorService executor = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "ngrid-replication");
         t.setDaemon(true);
@@ -94,6 +95,9 @@ public final class ReplicationManager implements TransportListener, Closeable {
         Duration timeout = config.operationTimeout();
         long periodMs = Math.max(100L, timeout.toMillis() / 2);
         timeoutScheduler.scheduleAtFixedRate(this::checkTimeouts, periodMs, periodMs, TimeUnit.MILLISECONDS);
+        Duration retryInterval = config.retryInterval();
+        long retryMs = Math.max(100L, retryInterval.toMillis());
+        timeoutScheduler.scheduleAtFixedRate(this::retryPending, retryMs, retryMs, TimeUnit.MILLISECONDS);
     }
 
     public void stop() {
@@ -117,6 +121,10 @@ public final class ReplicationManager implements TransportListener, Closeable {
     }
 
     public CompletableFuture<ReplicationResult> replicate(String topic, Serializable payload) {
+        return replicate(topic, payload, null);
+    }
+
+    public CompletableFuture<ReplicationResult> replicate(String topic, Serializable payload, Integer quorumOverride) {
         if (!coordinator.isLeader()) {
             throw new IllegalStateException("Replication can only be initiated by the leader");
         }
@@ -125,7 +133,7 @@ public final class ReplicationManager implements TransportListener, Closeable {
             throw new IllegalArgumentException("No replication handler registered for topic: " + topic);
         }
         UUID operationId = UUID.randomUUID();
-        PendingOperation operation = new PendingOperation(operationId, topic, payload, requiredQuorum());
+        PendingOperation operation = new PendingOperation(operationId, topic, payload, requiredQuorum(quorumOverride));
         pending.put(operationId, operation);
         log.put(operationId, new ReplicatedRecord(operationId, topic, payload, OperationStatus.PENDING));
         try {
@@ -141,12 +149,19 @@ public final class ReplicationManager implements TransportListener, Closeable {
         return operation.future();
     }
 
-    private int requiredQuorum() {
+    private int requiredQuorum(Integer override) {
+        int requested = override != null ? override : config.quorum();
+        if (requested < 1) {
+            requested = 1;
+        }
+        if (config.strictConsistency()) {
+            return requested;
+        }
         int members = coordinator.activeMembers().size();
         if (members == 0) {
             members = 1;
         }
-        return Math.max(1, Math.min(config.quorum(), members));
+        return Math.max(1, Math.min(requested, members));
     }
 
     private void replicateToFollowers(PendingOperation operation) {
@@ -163,6 +178,44 @@ public final class ReplicationManager implements TransportListener, Closeable {
             transport.send(message);
         }
         checkCompletion(operation);
+    }
+
+    private void retryPending() {
+        try {
+            if (!running || !coordinator.isLeader()) {
+                return;
+            }
+            for (PendingOperation operation : pending.values()) {
+                if (operation.isDone()) {
+                    continue;
+                }
+                checkCompletion(operation);
+                if (operation.isDone()) {
+                    continue;
+                }
+                ReplicationPayload payload = new ReplicationPayload(operation.operationId, operation.topic, operation.payload);
+                for (NodeInfo member : coordinator.activeMembers()) {
+                    NodeId nodeId = member.nodeId();
+                    if (nodeId.equals(transport.local().nodeId())) {
+                        continue;
+                    }
+                    if (operation.isAcked(nodeId)) {
+                        continue;
+                    }
+                    if (!transport.isConnected(nodeId)) {
+                        continue;
+                    }
+                    ClusterMessage message = ClusterMessage.request(MessageType.REPLICATION_REQUEST,
+                            operation.topic,
+                            transport.local().nodeId(),
+                            nodeId,
+                            payload);
+                    transport.send(message);
+                }
+            }
+        } catch (Throwable t) {
+            LOGGER.log(Level.SEVERE, "Unexpected error in retryPending loop", t);
+        }
     }
 
     private void checkCompletion(PendingOperation operation) {
@@ -186,30 +239,11 @@ public final class ReplicationManager implements TransportListener, Closeable {
 
     @Override
     public void onPeerDisconnected(NodeId peerId) {
-        int reachable = reachableMembersCount();
-        List<Failure> toFail = new ArrayList<>();
         for (PendingOperation operation : pending.values()) {
             if (operation.isDone()) {
                 continue;
             }
-            // First, re-check completion based on the acknowledgements we already have.
-            // This avoids failing an operation that may have already reached quorum but
-            // has not yet been observed by a concurrent disconnect callback.
             checkCompletion(operation);
-            if (operation.isDone()) {
-                continue;
-            }
-            if (reachable < operation.quorum) {
-                QuorumUnreachableException ex = new QuorumUnreachableException(
-                        operation.operationId,
-                        operation.quorum,
-                        reachable,
-                        operation.acknowledgementsSnapshot());
-                toFail.add(new Failure(operation, ex));
-            }
-        }
-        for (Failure failure : toFail) {
-            failOperation(failure.operation(), failure.error());
         }
     }
 
@@ -224,22 +258,30 @@ public final class ReplicationManager implements TransportListener, Closeable {
 
     private void handleReplicationRequest(ClusterMessage message) {
         ReplicationPayload payload = message.payload(ReplicationPayload.class);
-        if (!applied.add(payload.operationId())) {
-            sendAck(payload.operationId(), message.source());
+        UUID opId = payload.operationId();
+        if (applied.contains(opId)) {
+            sendAck(opId, message.source());
+            return;
+        }
+        if (!processing.add(opId)) {
             return;
         }
         ReplicationHandler handler = handlers.get(payload.topic());
         if (handler == null) {
+            processing.remove(opId);
             LOGGER.log(Level.WARNING, "No handler registered for topic {0}", payload.topic());
             return;
         }
         executor.submit(() -> {
             try {
-                handler.apply(payload.operationId(), payload.data());
-                log.putIfAbsent(payload.operationId(), new ReplicatedRecord(payload.operationId(), payload.topic(), payload.data(), OperationStatus.COMMITTED));
-                sendAck(payload.operationId(), message.source());
+                handler.apply(opId, payload.data());
+                log.putIfAbsent(opId, new ReplicatedRecord(opId, payload.topic(), payload.data(), OperationStatus.COMMITTED));
+                applied.add(opId);
+                sendAck(opId, message.source());
             } catch (Exception e) {
                 LOGGER.log(Level.SEVERE, "Failed to apply replicated operation", e);
+            } finally {
+                processing.remove(opId);
             }
         });
     }
@@ -296,29 +338,33 @@ public final class ReplicationManager implements TransportListener, Closeable {
     }
 
     private void checkTimeouts() {
-        if (!running) {
-            return;
-        }
-        Duration timeout = config.operationTimeout();
-        if (timeout.isZero() || timeout.isNegative()) {
-            return;
-        }
-        Instant now = Instant.now();
-        List<Failure> toFail = new ArrayList<>();
-        for (PendingOperation operation : pending.values()) {
-            if (operation.isDone()) {
-                continue;
+        try {
+            if (!running) {
+                return;
             }
-            if (operation.isExpired(now, timeout)) {
-                TimeoutException ex = new TimeoutException(String.format(
-                        "Replication operation timed out operationId=%s timeout=%s",
-                        operation.operationId,
-                        timeout));
-                toFail.add(new Failure(operation, ex));
+            Duration timeout = config.operationTimeout();
+            if (timeout.isZero() || timeout.isNegative()) {
+                return;
             }
-        }
-        for (Failure failure : toFail) {
-            failOperation(failure.operation(), failure.error());
+            Instant now = Instant.now();
+            List<Failure> toFail = new ArrayList<>();
+            for (PendingOperation operation : pending.values()) {
+                if (operation.isDone()) {
+                    continue;
+                }
+                if (operation.isExpired(now, timeout)) {
+                    TimeoutException ex = new TimeoutException(String.format(
+                            "Replication operation timed out operationId=%s timeout=%s",
+                            operation.operationId,
+                            timeout));
+                    toFail.add(new Failure(operation, ex));
+                }
+            }
+            for (Failure failure : toFail) {
+                failOperation(failure.operation(), failure.error());
+            }
+        } catch (Throwable t) {
+            LOGGER.log(Level.SEVERE, "Unexpected error in checkTimeouts loop", t);
         }
     }
 
@@ -360,6 +406,10 @@ public final class ReplicationManager implements TransportListener, Closeable {
 
         Set<NodeId> acknowledgementsSnapshot() {
             return Set.copyOf(acknowledgements);
+        }
+
+        boolean isAcked(NodeId nodeId) {
+            return acknowledgements.contains(nodeId);
         }
 
         boolean isCommitted() {
