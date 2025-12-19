@@ -26,6 +26,9 @@ class LeaderReelectionIntegrationTest {
     private NGridNode node1;
     private NGridNode node2;
     private NGridNode node3;
+    private NodeInfo info1;
+    private NodeInfo info2;
+    private NodeInfo info3;
 
     @BeforeEach
     void setUp() throws IOException {
@@ -33,9 +36,9 @@ class LeaderReelectionIntegrationTest {
         int port2 = allocateFreeLocalPort(Set.of(port1));
         int port3 = allocateFreeLocalPort(Set.of(port1, port2));
 
-        NodeInfo info1 = new NodeInfo(NodeId.of("node-1"), "127.0.0.1", port1);
-        NodeInfo info2 = new NodeInfo(NodeId.of("node-2"), "127.0.0.1", port2);
-        NodeInfo info3 = new NodeInfo(NodeId.of("node-3"), "127.0.0.1", port3);
+        info1 = new NodeInfo(NodeId.of("node-1"), "127.0.0.1", port1);
+        info2 = new NodeInfo(NodeId.of("node-2"), "127.0.0.1", port2);
+        info3 = new NodeInfo(NodeId.of("node-3"), "127.0.0.1", port3);
 
         Path baseDir = Files.createTempDirectory("ngrid-reelection-test");
         Path dir1 = Files.createDirectories(baseDir.resolve("node1"));
@@ -123,7 +126,13 @@ class LeaderReelectionIntegrationTest {
             boolean allMembers = node1.coordinator().activeMembers().size() == 3
                     && node2.coordinator().activeMembers().size() == 3
                     && node3.coordinator().activeMembers().size() == 3;
-            if (leadersAgree && allMembers) {
+            boolean connected = node1.transport().isConnected(info2.nodeId())
+                    && node1.transport().isConnected(info3.nodeId())
+                    && node2.transport().isConnected(info1.nodeId())
+                    && node2.transport().isConnected(info3.nodeId())
+                    && node3.transport().isConnected(info1.nodeId())
+                    && node3.transport().isConnected(info2.nodeId());
+            if (leadersAgree && allMembers && connected) {
                 return;
             }
             try {
