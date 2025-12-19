@@ -85,7 +85,7 @@ public final class TcpTransportConfig {
         private final Set<NodeInfo> initialPeers = new HashSet<>();
         private Duration connectTimeout = Duration.ofSeconds(5);
         private Duration reconnectInterval = Duration.ofSeconds(3);
-        private Duration requestTimeout = Duration.ofSeconds(10);
+        private Duration requestTimeout = Duration.ofSeconds(20);
         private int workerThreads = Math.max(4, Runtime.getRuntime().availableProcessors());
 
         private Builder(NodeInfo local) {

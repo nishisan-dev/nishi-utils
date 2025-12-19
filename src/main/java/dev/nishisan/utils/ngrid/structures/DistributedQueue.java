@@ -27,6 +27,8 @@ import dev.nishisan.utils.ngrid.common.MessageType;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.ngrid.queue.QueueClusterService;
+import dev.nishisan.utils.ngrid.metrics.NGridMetrics;
+import dev.nishisan.utils.stats.StatsUtils;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -48,16 +50,26 @@ public final class DistributedQueue<T extends Serializable> implements Transport
     private final Transport transport;
     private final ClusterCoordinator coordinator;
     private final QueueClusterService<T> queueService;
+    private final StatsUtils stats;
+    private final NodeId localNodeId;
 
     public DistributedQueue(Transport transport, ClusterCoordinator coordinator, QueueClusterService<T> queueService) {
+        this(transport, coordinator, queueService, null);
+    }
+
+    public DistributedQueue(Transport transport, ClusterCoordinator coordinator, QueueClusterService<T> queueService, StatsUtils stats) {
         this.transport = transport;
         this.coordinator = coordinator;
         this.queueService = queueService;
+        this.stats = stats;
+        this.localNodeId = transport.local().nodeId();
         transport.addListener(this);
     }
 
     public void offer(T value) {
+        recordIngressWrite();
         if (coordinator.isLeader()) {
+            recordQueueOffer();
             queueService.offer(value);
         } else {
             invokeLeader(QUEUE_OFFER, value);
@@ -66,8 +78,13 @@ public final class DistributedQueue<T extends Serializable> implements Transport
 
     @SuppressWarnings("unchecked")
     public Optional<T> poll() {
+        recordIngressWrite();
         if (coordinator.isLeader()) {
-            return queueService.poll();
+            Optional<T> value = queueService.poll();
+            if (value.isPresent()) {
+                recordQueuePoll();
+            }
+            return value;
         }
         SerializableOptional<T> result = (SerializableOptional<T>) invokeLeader(QUEUE_POLL, null);
         return result.toOptional();
@@ -83,35 +100,68 @@ public final class DistributedQueue<T extends Serializable> implements Transport
     }
 
     private Serializable invokeLeader(String command, Serializable body) {
-        NodeInfo leaderInfo = coordinator.leaderInfo().orElseThrow(() -> new IllegalStateException("No leader available"));
-        if (leaderInfo.nodeId().equals(transport.local().nodeId())) {
-            return executeLocal(command, body);
+        int attempts = 0;
+        while (attempts < 3) {
+            attempts++;
+            NodeInfo leaderInfo = coordinator.leaderInfo().orElseThrow(() -> new IllegalStateException("No leader available"));
+            if (leaderInfo.nodeId().equals(transport.local().nodeId())) {
+                return executeLocal(command, body);
+            }
+            ClientRequestPayload payload = new ClientRequestPayload(UUID.randomUUID(), command, body);
+            ClusterMessage request = ClusterMessage.request(MessageType.CLIENT_REQUEST,
+                    command,
+                    transport.local().nodeId(),
+                    leaderInfo.nodeId(),
+                    payload);
+            try {
+                CompletableFuture<ClusterMessage> future = transport.sendAndAwait(request);
+                ClusterMessage response = future.join();
+                ClientResponsePayload responsePayload = response.payload(ClientResponsePayload.class);
+                if (!responsePayload.success()) {
+                    if ("Not the leader".equals(responsePayload.error()) && attempts < 3) {
+                        try {
+                            Thread.sleep(100);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            throw new IllegalStateException("Interrupted during retry", e);
+                        }
+                        continue;
+                    }
+                    throw new IllegalStateException(responsePayload.error());
+                }
+                return responsePayload.body();
+            } catch (Exception e) {
+                if (attempts >= 3) {
+                    throw e;
+                }
+                try {
+                    Thread.sleep(100);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("Interrupted during retry", ie);
+                }
+            }
         }
-        ClientRequestPayload payload = new ClientRequestPayload(UUID.randomUUID(), command, body);
-        ClusterMessage request = ClusterMessage.request(MessageType.CLIENT_REQUEST,
-                command,
-                transport.local().nodeId(),
-                leaderInfo.nodeId(),
-                payload);
-        CompletableFuture<ClusterMessage> future = transport.sendAndAwait(request);
-        ClusterMessage response = future.join();
-        ClientResponsePayload responsePayload = response.payload(ClientResponsePayload.class);
-        if (!responsePayload.success()) {
-            throw new IllegalStateException(responsePayload.error());
-        }
-        return responsePayload.body();
+        throw new IllegalStateException("Failed to invoke leader after retries");
     }
 
     @SuppressWarnings("unchecked")
     private Serializable executeLocal(String command, Serializable body) {
         return switch (command) {
             case QUEUE_OFFER -> {
+                recordQueueOffer();
                 queueService.offer((T) body);
                 yield Boolean.TRUE;
             }
-            case QUEUE_POLL -> (Serializable) queueService.poll()
-                    .map(SerializableOptional::of)
-                    .orElseGet(SerializableOptional::empty);
+            case QUEUE_POLL -> {
+                Optional<T> value = queueService.poll();
+                if (value.isPresent()) {
+                    recordQueuePoll();
+                }
+                yield (Serializable) value
+                        .map(SerializableOptional::of)
+                        .orElseGet(SerializableOptional::empty);
+            }
             case QUEUE_PEEK -> (Serializable) queueService.peek()
                     .map(SerializableOptional::of)
                     .orElseGet(SerializableOptional::empty);
@@ -153,5 +203,28 @@ public final class DistributedQueue<T extends Serializable> implements Transport
     public void close() throws IOException {
         transport.removeListener(this);
         queueService.close();
+    }
+
+    private void recordQueueOffer() {
+        if (stats == null) {
+            return;
+        }
+        stats.notifyHitCounter(NGridMetrics.writeNode(localNodeId));
+        stats.notifyHitCounter(NGridMetrics.queueOffer(localNodeId));
+    }
+
+    private void recordQueuePoll() {
+        if (stats == null) {
+            return;
+        }
+        stats.notifyHitCounter(NGridMetrics.writeNode(localNodeId));
+        stats.notifyHitCounter(NGridMetrics.queuePoll(localNodeId));
+    }
+
+    private void recordIngressWrite() {
+        if (stats == null) {
+            return;
+        }
+        stats.notifyHitCounter(NGridMetrics.ingressWrite(localNodeId));
     }
 }

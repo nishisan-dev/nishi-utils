@@ -28,6 +28,7 @@ import dev.nishisan.utils.ngrid.common.NodeInfo;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Collection;
 import java.util.Comparator;
@@ -55,9 +56,17 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     private final Map<NodeId, ClusterMember> members = new ConcurrentHashMap<>();
     private final Set<LeadershipListener> leadershipListeners = new CopyOnWriteArraySet<>();
     private final Set<LeaderElectionListener> leaderElectionListeners = new CopyOnWriteArraySet<>();
+    private final Set<MembershipListener> membershipListeners = new CopyOnWriteArraySet<>();
     private final ScheduledExecutorService scheduler;
     private final AtomicReference<NodeId> leader = new AtomicReference<>();
+
+    public interface MembershipListener {
+        void onMembershipChanged();
+    }
+
     private final Object leaderComputationLock = new Object();
+    private final AtomicReference<NodeId> preferredLeader = new AtomicReference<>();
+    private volatile long preferredLeaderUntilMs;
 
     private volatile boolean running;
 
@@ -117,6 +126,19 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         return leaderId != null && leaderId.equals(transport.local().nodeId());
     }
 
+    public void setPreferredLeader(NodeId leaderId, Duration ttl) {
+        Objects.requireNonNull(ttl, "ttl");
+        if (ttl.isNegative() || ttl.isZero()) {
+            preferredLeader.set(null);
+            preferredLeaderUntilMs = 0L;
+            recomputeLeader();
+            return;
+        }
+        preferredLeader.set(leaderId);
+        preferredLeaderUntilMs = Instant.now().plus(ttl).toEpochMilli();
+        recomputeLeader();
+    }
+
     /**
      * Retrieves information about the current leader of the cluster.
      *
@@ -167,6 +189,18 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         leaderElectionListeners.remove(listener);
     }
 
+    public void addMembershipListener(MembershipListener listener) {
+        membershipListeners.add(Objects.requireNonNull(listener, "listener"));
+    }
+
+    public void removeMembershipListener(MembershipListener listener) {
+        membershipListeners.remove(listener);
+    }
+
+    private void notifyMembershipListeners() {
+        membershipListeners.forEach(MembershipListener::onMembershipChanged);
+    }
+
     /**
      * Sends a heartbeat message to all nodes in the cluster.
      *
@@ -183,16 +217,20 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      * - Payload: A `HeartbeatPayload` containing the current timestamp.
      */
     private void sendHeartbeat() {
-        if (!running) {
-            return;
+        try {
+            if (!running) {
+                return;
+            }
+            HeartbeatPayload payload = HeartbeatPayload.now();
+            ClusterMessage heartbeat = ClusterMessage.request(MessageType.HEARTBEAT,
+                    "hb",
+                    transport.local().nodeId(),
+                    null,
+                    payload);
+            transport.broadcast(heartbeat);
+        } catch (Throwable t) {
+            LOGGER.log(java.util.logging.Level.SEVERE, "Unexpected error in heartbeat task", t);
         }
-        HeartbeatPayload payload = HeartbeatPayload.now();
-        ClusterMessage heartbeat = ClusterMessage.request(MessageType.HEARTBEAT,
-                "hb",
-                transport.local().nodeId(),
-                null,
-                payload);
-        transport.broadcast(heartbeat);
     }
 
     /**
@@ -207,19 +245,28 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      * If the cluster is not running, the method exits without performing any actions.
      */
     private void evictDeadMembers() {
-        if (!running) {
-            return;
-        }
-        long now = Instant.now().toEpochMilli();
-        for (ClusterMember member : members.values()) {
-            if (member.id().equals(transport.local().nodeId())) {
-                continue;
+        try {
+            if (!running) {
+                return;
             }
-            if (member.isActive() && now - member.lastHeartbeat() > config.heartbeatTimeout().toMillis()) {
-                LOGGER.fine(() -> "Marking member inactive due to missed heartbeat: " + member.info());
-                member.markInactive();
+            long now = Instant.now().toEpochMilli();
+            boolean changed = false;
+            for (ClusterMember member : members.values()) {
+                if (member.id().equals(transport.local().nodeId())) {
+                    continue;
+                }
+                if (member.isActive() && now - member.lastHeartbeat() > config.heartbeatTimeout().toMillis()) {
+                    LOGGER.fine(() -> "Marking member inactive due to missed heartbeat: " + member.info());
+                    member.markInactive();
+                    changed = true;
+                }
+            }
+            if (changed) {
                 recomputeLeader();
+                notifyMembershipListeners();
             }
+        } catch (Throwable t) {
+            LOGGER.log(java.util.logging.Level.SEVERE, "Unexpected error in eviction task", t);
         }
     }
 
@@ -236,6 +283,24 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      */
     private void recomputeLeader() {
         synchronized (leaderComputationLock) {
+            NodeId preferred = preferredLeader.get();
+            if (preferred != null && preferredLeaderUntilMs > Instant.now().toEpochMilli()) {
+                ClusterMember preferredMember = members.get(preferred);
+                if (preferredMember != null && preferredMember.isActive()) {
+                    NodeId previous = leader.getAndSet(preferred);
+                    if (!Objects.equals(previous, preferred)) {
+                        leadershipListeners.forEach(listener -> listener.onLeaderChanged(preferred));
+
+                        NodeId localNodeId = transport.local().nodeId();
+                        boolean wasLeader = previous != null && previous.equals(localNodeId);
+                        boolean isLeader = preferred.equals(localNodeId);
+                        if (wasLeader != isLeader) {
+                            leaderElectionListeners.forEach(listener -> listener.onLeadershipChanged(isLeader, preferred));
+                        }
+                    }
+                    return;
+                }
+            }
             Optional<NodeId> newLeader = members.values().stream()
                     .filter(ClusterMember::isActive)
                     .map(ClusterMember::id)
@@ -268,6 +333,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             return existing;
         });
         recomputeLeader();
+        notifyMembershipListeners();
     }
 
     @Override
@@ -275,7 +341,13 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         ClusterMember member = members.get(peerId);
         if (member != null) {
             member.markInactive();
+            NodeId preferred = preferredLeader.get();
+            if (preferred != null && preferred.equals(peerId)) {
+                preferredLeader.set(null);
+                preferredLeaderUntilMs = 0L;
+            }
             recomputeLeader();
+            notifyMembershipListeners();
         }
     }
 

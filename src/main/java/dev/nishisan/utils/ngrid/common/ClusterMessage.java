@@ -28,7 +28,7 @@ import java.util.UUID;
  */
 public final class ClusterMessage implements Serializable {
     @Serial
-    private static final long serialVersionUID = 1L;
+    private static final long serialVersionUID = 2L;
 
     private final UUID messageId;
     private final UUID correlationId;
@@ -37,6 +37,7 @@ public final class ClusterMessage implements Serializable {
     private final NodeId source;
     private final NodeId destination;
     private final Serializable payload;
+    private final int ttl;
 
     public ClusterMessage(UUID messageId,
                           UUID correlationId,
@@ -44,7 +45,8 @@ public final class ClusterMessage implements Serializable {
                           String qualifier,
                           NodeId source,
                           NodeId destination,
-                          Serializable payload) {
+                          Serializable payload,
+                          int ttl) {
         this.messageId = messageId == null ? UUID.randomUUID() : messageId;
         this.correlationId = correlationId;
         this.type = type;
@@ -52,14 +54,37 @@ public final class ClusterMessage implements Serializable {
         this.source = source;
         this.destination = destination;
         this.payload = payload;
+        this.ttl = ttl;
+    }
+
+    // Legacy constructor for backward compatibility if needed, or internal use
+    public ClusterMessage(UUID messageId,
+                          UUID correlationId,
+                          MessageType type,
+                          String qualifier,
+                          NodeId source,
+                          NodeId destination,
+                          Serializable payload) {
+        this(messageId, correlationId, type, qualifier, source, destination, payload, 5);
     }
 
     public static ClusterMessage request(MessageType type, String qualifier, NodeId source, NodeId destination, Serializable payload) {
-        return new ClusterMessage(UUID.randomUUID(), null, type, qualifier, source, destination, payload);
+        return new ClusterMessage(UUID.randomUUID(), null, type, qualifier, source, destination, payload, 5);
     }
 
     public static ClusterMessage response(ClusterMessage request, Serializable payload) {
-        return new ClusterMessage(UUID.randomUUID(), request.messageId, MessageType.CLIENT_RESPONSE, request.qualifier, request.destination(), request.source(), payload);
+        return new ClusterMessage(UUID.randomUUID(), request.messageId, MessageType.CLIENT_RESPONSE, request.qualifier, request.destination(), request.source(), payload, 5);
+    }
+
+    public ClusterMessage nextHop() {
+        if (ttl <= 0) {
+            throw new IllegalStateException("Message TTL expired");
+        }
+        return new ClusterMessage(messageId, correlationId, type, qualifier, source, destination, payload, ttl - 1);
+    }
+
+    public int ttl() {
+        return ttl;
     }
 
     public UUID messageId() {

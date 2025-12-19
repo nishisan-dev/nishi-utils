@@ -14,6 +14,7 @@ Este documento reúne exemplos práticos para:
 - [NQueue (Standalone)](#nqueue-standalone)
 - [NGrid (Cluster distribuído)](#ngrid-cluster-distribuido)
 - [Monitoramento do cluster (liderança e membros)](#monitoramento-do-cluster-lideranca-e-membros)
+- [Métricas e RTT](#metricas-e-rtt)
 - [Persistência do mapa (WAL + snapshot)](#persistencia-do-mapa-wal--snapshot)
 - [Utilitários](#utilitarios)
 - [Solução de problemas](#solucao-de-problemas)
@@ -68,9 +69,9 @@ public class QuickStartNGrid {
     Path d2 = Files.createDirectories(base.resolve("node2"));
     Path d3 = Files.createDirectories(base.resolve("node3"));
 
-    try (NGridNode node1 = new NGridNode(NGridConfig.builder(n1).addPeer(n2).addPeer(n3).queueDirectory(d1).replicationQuorum(2).build());
-         NGridNode node2 = new NGridNode(NGridConfig.builder(n2).addPeer(n1).addPeer(n3).queueDirectory(d2).replicationQuorum(2).build());
-         NGridNode node3 = new NGridNode(NGridConfig.builder(n3).addPeer(n1).addPeer(n2).queueDirectory(d3).replicationQuorum(2).build())) {
+    try (NGridNode node1 = new NGridNode(NGridConfig.builder(n1).addPeer(n2).addPeer(n3).queueDirectory(d1).replicationFactor(2).build());
+         NGridNode node2 = new NGridNode(NGridConfig.builder(n2).addPeer(n1).addPeer(n3).queueDirectory(d2).replicationFactor(2).build());
+         NGridNode node3 = new NGridNode(NGridConfig.builder(n3).addPeer(n1).addPeer(n2).queueDirectory(d3).replicationFactor(2).build())) {
 
       node1.start();
       node2.start();
@@ -93,13 +94,21 @@ public class QuickStartNGrid {
 | Atributo | Tipo | Padrão | Recomendação (quando usar) | Descrição |
 | :--- | :--- | :--- | :--- | :--- |
 | `local` | `NodeInfo` | Obrigatório | Sempre | Identidade do nó local (ID, host, porta). |
-| `peers` / `addPeer(...)` | `Set<NodeInfo>` | Vazio | Sempre (exceto single-node) | Peers iniciais para bootstrap do cluster. |
-| `replicationQuorum` | `int` | `2` | `2` (dev), `2..N` (prod) | Número mínimo de confirmações (inclui o líder) para commit de escritas. |
+| `peers` / `addPeer(...)` | `Set<NodeInfo>` | Vazio | Opcional | Peers iniciais para bootstrap do cluster (pode usar `node.join(...)` após o start). |
+| `replicationFactor` | `int` | `2` | `2` (dev), `2..N` (prod) | Fator de replicação default (número mínimo de confirmações, inclui o líder). |
+| `replicationQuorum` | `int` | `2` | Legado | Mantido por compatibilidade; use `replicationFactor`. |
 | `queueDirectory` | `Path` | Obrigatório | Diretório persistente | Base de dados da fila distribuída (usa NQueue local). |
 | `queueName` | `String` | `"ngrid"` | Um nome por cluster | Subpasta/nome da fila usada pelo serviço de fila. |
+| `queueOptions` | `NQueue.Options` | `defaults()` | Ajuste por cluster | Opções default da NQueue usadas ao criar filas na grid (short-circuit é forçado para false). |
 | `mapDirectory` | `Path` | `queueDirectory/maps` | Persistente se usar WAL/snapshot | Diretório base da persistência local do mapa. |
 | `mapName` | `String` | `"default-map"` | Um nome por cluster | Nome do mapa padrão (usado por `node.map(...)`). |
 | `mapPersistenceMode` | `MapPersistenceMode` | `DISABLED` | `DISABLED` (padrão), `ASYNC_WITH_FSYNC` se quiser durabilidade local | Modo de persistência do mapa: `DISABLED`, `ASYNC_NO_FSYNC`, `ASYNC_WITH_FSYNC`. |
+| `rttProbeInterval` | `Duration` | `2s` | `2s` (observabilidade) | Intervalo de ping RTT entre nós. Use `Duration.ZERO` para desativar. |
+| `leaderReelectionEnabled` | `boolean` | `false` | `true` (se quiser dinâmica) | Ativa reeleição baseada em carga de escrita (ingress). |
+| `leaderReelectionInterval` | `Duration` | `5s` | `5s..10s` | Intervalo para calcular taxa de escrita e sugerir líder. |
+| `leaderReelectionCooldown` | `Duration` | `60s` | `60s+` | Tempo mínimo entre sugestões para evitar thrash. |
+| `leaderReelectionSuggestionTtl` | `Duration` | `30s` | `30s..60s` | Quanto tempo uma sugestão de líder permanece válida. |
+| `leaderReelectionMinDelta` | `double` | `20.0` | Ajustar por workload | Mínima diferença de taxa (ops/s) para trocar de líder. |
 
 ### MapPersistenceConfig (persistência local do mapa)
 
@@ -111,6 +120,16 @@ public class QuickStartNGrid {
 | `snapshotIntervalTime` | `Duration` | `5 min` | Diminua para snapshots mais frequentes | Tempo máximo entre snapshots. |
 | `batchSize` | `int` | `100` | Aumente para throughput | Tamanho do batch para gravar WAL. |
 | `batchTimeout` | `Duration` | `10 ms` | Aumente se a taxa for baixa | Espera máxima para preencher um batch do WAL. |
+
+### DistributedQueueConfig (configuração por fila)
+
+> Use quando quiser criar filas nomeadas com padrões diferentes após o `start()` do node.
+
+| Atributo | Tipo | Padrão | Descrição |
+| :--- | :--- | :--- | :--- |
+| `name` | `String` | Obrigatório | Nome lógico da fila. |
+| `replicationFactor` | `int` | `NGridConfig.replicationFactor` | Fator de replicação específico da fila (override do default da grid). |
+| `queueOptions` | `NQueue.Options` | `NGridConfig.queueOptions` | Opções da NQueue usadas pela fila (short-circuit é forçado para false). |
 
 ---
 
@@ -308,7 +327,7 @@ public class NGridNodeBootstrap {
     NGridConfig config = NGridConfig.builder(me)
         .addPeer(seed)
         .queueDirectory(Path.of("./node-1-data"))
-        .replicationQuorum(2)
+        .replicationFactor(2)
         .build();
 
     try (NGridNode node = new NGridNode(config)) {
@@ -319,7 +338,23 @@ public class NGridNodeBootstrap {
 }
 ```
 
-### 2) DistributedQueue — uso + tratamento de erros
+### 1.1) Join dinâmico (descoberta via um peer)
+
+```java
+import dev.nishisan.utils.ngrid.common.NodeInfo;
+import dev.nishisan.utils.ngrid.structures.NGridNode;
+
+public class NGridJoinExample {
+  public static void main(String[] args) {
+    NGridNode node = null; // suponha start() chamado
+    NodeInfo seed = null;  // peer conhecido
+
+    node.join(seed);
+  }
+}
+```
+
+### 2) DistributedQueue — uso + tratamento de erros (fila padrão)
 
 ```java
 import dev.nishisan.utils.ngrid.structures.DistributedQueue;
@@ -340,6 +375,29 @@ public class DistributedQueueExample {
       // Ex.: "No leader available", "Not the leader", falhas de quorum/timeout propagadas como erro
       System.err.println("DistributedQueue operation failed: " + e.getMessage());
     }
+  }
+}
+```
+
+### 2.1) DistributedQueue — filas nomeadas e configuração por fila
+
+```java
+import dev.nishisan.utils.ngrid.structures.DistributedQueue;
+import dev.nishisan.utils.ngrid.structures.DistributedQueueConfig;
+import dev.nishisan.utils.ngrid.structures.NGridNode;
+import dev.nishisan.utils.queue.NQueue;
+
+public class DistributedQueueNamedExample {
+  public static void main(String[] args) {
+    NGridNode node = null; // suponha start() chamado
+
+    DistributedQueueConfig fastQueue = DistributedQueueConfig.builder("fast")
+        .replicationFactor(2)
+        .queueOptions(NQueue.Options.defaults().withFsync(false).withMemoryBuffer(true))
+        .build();
+
+    DistributedQueue<String> queue = node.getQueue("fast", fastQueue, String.class);
+    queue.offer("job-1");
   }
 }
 ```
@@ -440,6 +498,78 @@ public class NGridMonitoringListeners {
 
 ---
 
+## Métricas e RTT
+
+O NGrid expõe métricas simples via `StatsUtils` e um snapshot estruturado com os principais indicadores.
+As métricas de RTT são coletadas por ping periódico (configurável com `rttProbeInterval`).
+
+### 1) Acesso direto via StatsUtils
+
+```java
+import dev.nishisan.utils.ngrid.structures.NGridNode;
+
+public class NGridMetricsDirectExample {
+  public static void main(String[] args) {
+    NGridNode node = null; // suponha start() chamado
+
+    long writes = node.stats().getCounterValue("ngrid.write.node.node-1");
+    double rtt = node.stats().getAverage("ngrid.rtt.ms.node.node-2");
+    System.out.println("writes=" + writes + " rtt=" + rtt);
+  }
+}
+```
+
+### 2) Snapshot estruturado (DTO)
+
+```java
+import dev.nishisan.utils.ngrid.metrics.NGridStatsSnapshot;
+import dev.nishisan.utils.ngrid.structures.NGridNode;
+
+public class NGridMetricsSnapshotExample {
+  public static void main(String[] args) {
+    NGridNode node = null; // suponha start() chamado
+
+    NGridStatsSnapshot snap = node.metricsSnapshot();
+    System.out.println("capturedAt=" + snap.capturedAt());
+    System.out.println("writesByNode=" + snap.writesByNode());
+    System.out.println("ingressWritesByNode=" + snap.ingressWritesByNode());
+    System.out.println("rttMsByNode=" + snap.rttMsByNode());
+  }
+}
+```
+
+### 3) Reeleição baseada em carga (opcional)
+
+```java
+import dev.nishisan.utils.ngrid.structures.NGridConfig;
+
+import java.time.Duration;
+
+public class NGridReelectionConfigExample {
+  public static void main(String[] args) {
+    NGridConfig cfg = NGridConfig.builder(/* local */ null) // substitua pelo NodeInfo local
+        .leaderReelectionEnabled(true)
+        .leaderReelectionInterval(Duration.ofSeconds(5))
+        .leaderReelectionCooldown(Duration.ofSeconds(60))
+        .leaderReelectionSuggestionTtl(Duration.ofSeconds(30))
+        .leaderReelectionMinDelta(20.0)
+        .build();
+  }
+}
+```
+
+> A decisão de reeleição é feita pelo líder atual com base na taxa de **ingress writes** recebidas por cada nó.
+> As sugestões são distribuídas para o cluster e respeitam cooldown/TTL.
+
+> Dica: para ambientes de teste, reduza `leaderReelectionInterval`, `leaderReelectionCooldown` e `leaderReelectionMinDelta` para acelerar a troca de líder. Em produção, use valores mais conservadores para evitar thrash.
+
+| Cenário | Interval | Cooldown | TTL | MinDelta |
+| :--- | :--- | :--- | :--- | :--- |
+| Teste | `200ms` | `0s..5s` | `2s..5s` | `1.0..5.0` |
+| Produção | `5s..10s` | `60s+` | `30s..60s` | `20.0+` |
+
+---
+
 ## Persistência do mapa (WAL + snapshot)
 
 ### 1) Habilitando no NGridConfig (modo)
@@ -462,7 +592,7 @@ public class NGridMapPersistenceModeExample {
         .mapDirectory(Path.of("./node-1-data/maps"))
         .mapName("default-map")
         .mapPersistenceMode(MapPersistenceMode.ASYNC_WITH_FSYNC)
-        .replicationQuorum(1)
+        .replicationFactor(1)
         .build();
 
     try (NGridNode node = new NGridNode(cfg)) {
@@ -531,6 +661,39 @@ public class AdvancedMapPersistenceConfigExample {
   }
 }
 ```
+
+### 3) Configuração de Consistência Estrita (CP)
+
+Use este modo se evitar *split-brain* for mais importante que disponibilidade. Se o número de nós ativos cair abaixo do `replicationFactor`, as escritas falharão.
+
+```java
+import dev.nishisan.utils.ngrid.common.NodeId;
+import dev.nishisan.utils.ngrid.common.NodeInfo;
+import dev.nishisan.utils.ngrid.structures.NGridConfig;
+import dev.nishisan.utils.ngrid.structures.NGridNode;
+
+public class StrictConsistencyExample {
+  public static void main(String[] args) throws Exception {
+    NodeInfo me = new NodeInfo(NodeId.of("node-1"), "127.0.0.1", 9011);
+
+    NGridConfig cfg = NGridConfig.builder(me)
+        .replicationFactor(3) // Exige confirmação de 3 nós (incluindo líder)
+        .strictConsistency(true) // Ativa modo CP
+        .queueDirectory(java.nio.file.Path.of("./data"))
+        .build();
+
+    try (NGridNode node = new NGridNode(cfg)) {
+      node.start();
+      // Se houver apenas 2 nós vivos, node.queue(...).offer(...) lançará exceção.
+    }
+  }
+}
+```
+
+### 4) Cenário de Roteamento (Proxy)
+
+Não há configuração explícita necessária para ativar o roteamento via proxy. Ele é **automático**.
+Se o Nó A não conseguir conectar diretamente ao Líder (Nó C), mas estiver conectado ao Nó B (que vê C), o NGrid automaticamente usará B como ponte para entregar mensagens e replicação.
 
 ---
 
@@ -608,7 +771,7 @@ public class StatsUtilsExample {
 ### “Quorum unreachable” / timeouts
 
 - Verifique número de membros ativos (`node.coordinator().activeMembers()`).
-- Se o cluster tiver menos membros ativos do que `replicationQuorum`, a operação pode falhar quando não consegue atingir confirmações suficientes.
+- Se o cluster tiver menos membros ativos do que `replicationFactor`, a operação pode falhar quando não consegue atingir confirmações suficientes.
 
 ### Permissões / diretórios de dados
 
@@ -656,7 +819,6 @@ public class StatsUtilsExample {
 
 ## Limitações atuais
 
-- **Uma fila e um mapa por `NGridNode`** (há `queueName` e `mapName`, mas o nó expõe uma instância de cada estrutura).
 - **Leituras do mapa (`get`) são roteadas ao líder** para manter consistência forte e modelo simples.
 - **Deduplicação de operação é em memória** (após restart total, IDs anteriores não são mantidos; persistência do mapa/fila cobre estado, não o histórico de IDs).
 
@@ -684,4 +846,3 @@ public class StatsUtilsExample {
 **Ideia**: publicar eventos em `DistributedQueue<Event>` e manter um “offset” por consumidor em `DistributedMap<String, Long>`.
 
 - Consumidor lê evento, atualiza seu offset no mapa (id do consumidor → último offset processado).
-

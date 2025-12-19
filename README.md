@@ -18,8 +18,9 @@ Coleção de utilitários em Java, com foco em:
 ### NGrid (fila/mapa distribuídos)
 
 - Cluster via **TCP** com descoberta/gossip de peers
+- **Roteamento Inteligente (Sticky Proxy):** Comunicação resiliente entre nós que não se enxergam diretamente (ex: NAT/Firewall), usando pares como intermediários.
 - **Eleição determinística de líder** (por ID)
-- **Replicação com quorum** configurável
+- **Replicação com quorum** configurável (Modos: Disponibilidade ou Consistência Estrita)
 - API cliente transparente: qualquer nó pode encaminhar a operação ao líder
 - Estruturas:
   - `DistributedQueue`: `offer`, `poll`, `peek`

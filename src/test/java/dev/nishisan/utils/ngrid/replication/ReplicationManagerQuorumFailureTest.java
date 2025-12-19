@@ -25,7 +25,7 @@ import static org.junit.jupiter.api.Assertions.*;
 class ReplicationManagerQuorumFailureTest {
 
     @Test
-    void replicateShouldFailFastWhenPeerDisconnectsBeforeAck() throws Exception {
+    void replicateShouldTimeoutWhenPeerDisconnectsBeforeAck() throws Exception {
         NodeInfo local = new NodeInfo(NodeId.of("node-2"), "127.0.0.1", 0);
         NodeInfo peer = new NodeInfo(NodeId.of("node-1"), "127.0.0.1", 0);
 
@@ -40,7 +40,7 @@ class ReplicationManagerQuorumFailureTest {
             assertTrue(coordinator.isLeader(), "Local node should be leader for this test");
 
             ReplicationManager manager = new ReplicationManager(transport, coordinator,
-                    ReplicationConfig.of(2, java.time.Duration.ofSeconds(5)));
+                    ReplicationConfig.of(2, java.time.Duration.ofMillis(500)));
             manager.registerHandler("topic", (operationId, payload) -> {
                 // Local apply ok.
             });
@@ -52,7 +52,7 @@ class ReplicationManagerQuorumFailureTest {
             transport.simulatePeerDisconnected(peer.nodeId());
 
             ExecutionException ex = assertThrows(ExecutionException.class, () -> future.get(2, TimeUnit.SECONDS));
-            assertInstanceOf(QuorumUnreachableException.class, ex.getCause());
+            assertInstanceOf(java.util.concurrent.TimeoutException.class, ex.getCause());
 
             manager.close();
             coordinator.close();
@@ -133,6 +133,11 @@ class ReplicationManagerQuorumFailureTest {
             return Boolean.TRUE.equals(connected.get(nodeId));
         }
 
+        @Override
+        public void addPeer(NodeInfo peer) {
+            // no-op
+        }
+
         void simulatePeerConnected(NodeInfo peer) {
             connected.put(peer.nodeId(), true);
             for (TransportListener l : listenersSet) {
@@ -153,5 +158,3 @@ class ReplicationManagerQuorumFailureTest {
         }
     }
 }
-
-

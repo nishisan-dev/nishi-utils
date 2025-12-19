@@ -1,9 +1,12 @@
 package dev.nishisan.utils.queue;
 
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.io.Serializable;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -32,15 +35,34 @@ import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+@TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class NQueueMemoryBufferTest {
 
     @TempDir
     Path tempDir;
+    
+    private final List<NQueue<?>> trackedQueues = Collections.synchronizedList(new ArrayList<>());
+
+    private <T extends Serializable> NQueue<T> track(NQueue<T> queue) {
+        trackedQueues.add(queue);
+        return queue;
+    }
+
+    @AfterAll
+    void validateConsistency() {
+        for (NQueue<?> queue : trackedQueues) {
+            Long violations = queue.getStats().getCounterValueOrNull("nqueue.out_of_order");
+            if (violations != null && violations > 0) {
+                fail("Queue detected internal FIFO violations: " + violations);
+            }
+        }
+        trackedQueues.clear();
+    }
 
     @Test
     void testMemoryBufferDisabledByDefault() throws Exception {
         // Memory buffer should be disabled by default
-        try (NQueue<String> queue = NQueue.open(tempDir, "default")) {
+        try (NQueue<String> queue = track(NQueue.open(tempDir, "default"))) {
             // Should work normally without memory buffer
             queue.offer("test");
             Optional<String> result = queue.poll();
@@ -57,7 +79,7 @@ class NQueueMemoryBufferTest {
                 .withLockTryTimeout(Duration.ofMillis(10))
                 .withRevalidationInterval(Duration.ofMillis(100));
 
-        try (NQueue<String> queue = NQueue.open(tempDir, "enabled", options)) {
+        try (NQueue<String> queue = track(NQueue.open(tempDir, "enabled", options))) {
             queue.offer("first");
             queue.offer("second");
             queue.offer("third");
@@ -79,7 +101,7 @@ class NQueueMemoryBufferTest {
                 .withCompactionInterval(Duration.ofMillis(5))
                 .withFsync(false);
 
-        try (NQueue<String> queue = NQueue.open(tempDir, "drain-test", options)) {
+        try (NQueue<String> queue = track(NQueue.open(tempDir, "drain-test", options))) {
             // Add items that might trigger memory buffer
             for (int i = 0; i < 10; i++) {
                 queue.offer("item-" + i);
@@ -110,7 +132,7 @@ class NQueueMemoryBufferTest {
                 .withRevalidationInterval(Duration.ofMillis(100))
                 .withFsync(false);
 
-        try (NQueue<Integer> queue = NQueue.open(tempDir, "fifo-test", options)) {
+        try (NQueue<Integer> queue = track(NQueue.open(tempDir, "fifo-test", options))) {
             List<Integer> expected = new ArrayList<>();
             for (int i = 0; i < 100; i++) {
                 expected.add(i);
@@ -139,7 +161,7 @@ class NQueueMemoryBufferTest {
                 .withCompactionInterval(Duration.ofMillis(5))
                 .withFsync(false);
 
-        try (NQueue<String> queue = NQueue.open(tempDir, "compaction-test", options)) {
+        try (NQueue<String> queue = track(NQueue.open(tempDir, "compaction-test", options))) {
             // Add items and consume some to trigger compaction
             for (int i = 0; i < 20; i++) {
                 queue.offer("msg-" + i);
@@ -182,7 +204,7 @@ class NQueueMemoryBufferTest {
                 .withRevalidationInterval(Duration.ofMillis(100))
                 .withFsync(false);
 
-        NQueue<String> queue = NQueue.open(tempDir, "close-test", options);
+        NQueue<String> queue = track(NQueue.open(tempDir, "close-test", options));
         
         // Add items that might be in memory buffer
         for (int i = 0; i < 10; i++) {
@@ -193,7 +215,7 @@ class NQueueMemoryBufferTest {
         queue.close();
 
         // Reopen and verify all items are persisted
-        try (NQueue<String> reopened = NQueue.open(tempDir, "close-test", options)) {
+        try (NQueue<String> reopened = track(NQueue.open(tempDir, "close-test", options))) {
             List<String> consumed = new ArrayList<>();
             while (true) {
                 Optional<String> item = reopened.poll(100, TimeUnit.MILLISECONDS);
@@ -223,7 +245,7 @@ class NQueueMemoryBufferTest {
         int itemsPerThread = 100;
         ExecutorService executor = Executors.newFixedThreadPool(numThreads);
 
-        try (NQueue<Integer> queue = NQueue.open(tempDir, "concurrent-offer", options)) {
+        try (NQueue<Integer> queue = track(NQueue.open(tempDir, "concurrent-offer", options))) {
             List<Future<?>> futures = new ArrayList<>();
             CountDownLatch start = new CountDownLatch(1);
 
@@ -266,7 +288,7 @@ class NQueueMemoryBufferTest {
         int totalItems = 200;
         ExecutorService executor = Executors.newFixedThreadPool(4);
 
-        try (NQueue<Integer> queue = NQueue.open(tempDir, "concurrent-poll", options)) {
+        try (NQueue<Integer> queue = track(NQueue.open(tempDir, "concurrent-poll", options))) {
             // Add all items first
             for (int i = 0; i < totalItems; i++) {
                 queue.offer(i);
@@ -315,7 +337,7 @@ class NQueueMemoryBufferTest {
                 .withRevalidationInterval(Duration.ofMillis(100))
                 .withFsync(false);
 
-        try (NQueue<String> queue = NQueue.open(tempDir, "full-buffer", options)) {
+        try (NQueue<String> queue = track(NQueue.open(tempDir, "full-buffer", options))) {
             // Fill buffer by adding items that might go to memory
             // This test verifies that when buffer is full and lock is unavailable,
             // operations block appropriately
@@ -348,7 +370,7 @@ class NQueueMemoryBufferTest {
                 .withLockTryTimeout(Duration.ofNanos(1)) // Very small timeout
                 .withRevalidationInterval(Duration.ofMillis(100));
 
-        try (NQueue<String> queue = NQueue.open(tempDir, "small-timeout", options)) {
+        try (NQueue<String> queue = track(NQueue.open(tempDir, "small-timeout", options))) {
             // Should still work, just might use memory buffer more often
             queue.offer("test");
             Optional<String> result = queue.poll();
@@ -360,7 +382,7 @@ class NQueueMemoryBufferTest {
     @Test
     void testBackwardCompatibility() throws Exception {
         // Test that existing code without memory buffer still works
-        try (NQueue<String> queue = NQueue.open(tempDir, "backward-compat")) {
+        try (NQueue<String> queue = track(NQueue.open(tempDir, "backward-compat"))) {
             queue.offer("first");
             queue.offer("second");
 
@@ -385,7 +407,7 @@ class NQueueMemoryBufferTest {
         int totalItems = 1000;
         ExecutorService executor = Executors.newFixedThreadPool(10);
 
-        try (NQueue<Integer> queue = NQueue.open(tempDir, "high-load", options)) {
+        try (NQueue<Integer> queue = track(NQueue.open(tempDir, "high-load", options))) {
             CountDownLatch start = new CountDownLatch(1);
             AtomicInteger produced = new AtomicInteger(0);
             AtomicInteger consumed = new AtomicInteger(0);
@@ -544,7 +566,7 @@ class NQueueMemoryBufferTest {
                 .withRevalidationInterval(Duration.ofMillis(100))
                 .withFsync(false);
 
-        try (NQueue<Integer> queue = NQueue.open(tempDir, "fifo-compaction", options)) {
+        try (NQueue<Integer> queue = track(NQueue.open(tempDir, "fifo-compaction", options))) {
             setAtomicLong(queue, "memoryBufferModeUntil", System.nanoTime() + TimeUnit.SECONDS.toNanos(5));
             setField(queue, "compactionState", getCompactionState("RUNNING"));
 
@@ -574,7 +596,7 @@ class NQueueMemoryBufferTest {
                 .withRevalidationInterval(Duration.ofMillis(100))
                 .withFsync(false);
 
-        try (NQueue<Integer> queue = NQueue.open(tempDir, "drain-retry", options)) {
+        try (NQueue<Integer> queue = track(NQueue.open(tempDir, "drain-retry", options))) {
             Field dataChannelField = NQueue.class.getDeclaredField("dataChannel");
             dataChannelField.setAccessible(true);
             FileChannel original = (FileChannel) dataChannelField.get(queue);
@@ -613,12 +635,12 @@ class NQueueMemoryBufferTest {
                 .withRevalidationInterval(Duration.ofMillis(20))
                 .withFsync(false);
 
-        try (NQueue<Integer> queue = NQueue.open(tempDir, "compaction-finished", options)) {
+        try (NQueue<Integer> queue = track(NQueue.open(tempDir, "compaction-finished", options))) {
             Constructor<?> constructor = getMemoryBufferEntryConstructor();
             BlockingQueue<Object> memoryBuffer = getMemoryBuffer(queue);
 
-            memoryBuffer.offer(constructor.newInstance(1));
-            memoryBuffer.offer(constructor.newInstance(2));
+            memoryBuffer.offer(constructor.newInstance(1, 1L));
+            memoryBuffer.offer(constructor.newInstance(2, 2L));
 
             setAtomicLong(queue, "memoryBufferModeUntil", System.nanoTime() + TimeUnit.SECONDS.toNanos(1));
             setField(queue, "compactionState", getCompactionState("RUNNING"));
@@ -656,7 +678,7 @@ class NQueueMemoryBufferTest {
 
     private static Constructor<?> getMemoryBufferEntryConstructor() throws Exception {
         Class<?> entryClass = Class.forName("dev.nishisan.utils.queue.NQueue$MemoryBufferEntry");
-        Constructor<?> constructor = entryClass.getDeclaredConstructor(Object.class);
+        Constructor<?> constructor = entryClass.getDeclaredConstructor(Object.class, long.class);
         constructor.setAccessible(true);
         return constructor;
     }
@@ -797,4 +819,3 @@ class NQueueMemoryBufferTest {
         }
     }
 }
-

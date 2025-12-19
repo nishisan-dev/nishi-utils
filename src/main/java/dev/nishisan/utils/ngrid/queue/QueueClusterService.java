@@ -34,6 +34,7 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -47,42 +48,64 @@ public final class QueueClusterService<T extends Serializable> implements Closea
 
     private final NQueue<T> queue;
     private final ReplicationManager replicationManager;
+    private final ReentrantLock operationLock = new ReentrantLock(true);
+    private final Integer replicationFactor;
 
     public QueueClusterService(Path baseDir, String queueName, ReplicationManager replicationManager) {
+        this(baseDir, queueName, replicationManager, NQueue.Options.defaults(), null);
+    }
+
+    public QueueClusterService(Path baseDir, String queueName, ReplicationManager replicationManager, NQueue.Options options) {
+        this(baseDir, queueName, replicationManager, options, null);
+    }
+
+    public QueueClusterService(Path baseDir, String queueName, ReplicationManager replicationManager, NQueue.Options options, Integer replicationFactor) {
         try {
-            this.queue = NQueue.open(baseDir, queueName);
+            this.queue = NQueue.open(baseDir, queueName, enforceGridOptions(options));
         } catch (IOException e) {
             throw new IllegalStateException("Failed to open NQueue", e);
         }
         this.replicationManager = Objects.requireNonNull(replicationManager, "replicationManager");
+        this.replicationFactor = replicationFactor;
         this.replicationManager.registerHandler(TOPIC, this::applyReplication);
     }
 
     public void offer(T value) {
         Objects.requireNonNull(value, "value");
-        QueueReplicationCommand command = QueueReplicationCommand.offer(value);
-        waitForReplication(replicationManager.replicate(TOPIC, command));
+        operationLock.lock();
+        try {
+            QueueReplicationCommand command = QueueReplicationCommand.offer(value);
+            waitForReplication(replicationManager.replicate(TOPIC, command, replicationFactor));
+        } finally {
+            operationLock.unlock();
+        }
     }
 
     public Optional<T> poll() {
+        operationLock.lock();
         try {
             Optional<T> next = queue.peek();
             if (next.isEmpty()) {
                 return Optional.empty();
             }
             QueueReplicationCommand command = QueueReplicationCommand.poll((Serializable) next.get());
-            waitForReplication(replicationManager.replicate(TOPIC, command));
+            waitForReplication(replicationManager.replicate(TOPIC, command, replicationFactor));
             return next;
         } catch (IOException e) {
             throw new IllegalStateException("Failed to read from queue", e);
+        } finally {
+            operationLock.unlock();
         }
     }
 
     public Optional<T> peek() {
+        operationLock.lock();
         try {
             return queue.peek();
         } catch (IOException e) {
             throw new IllegalStateException("Failed to peek queue", e);
+        } finally {
+            operationLock.unlock();
         }
     }
 
@@ -119,20 +142,39 @@ public final class QueueClusterService<T extends Serializable> implements Closea
     @SuppressWarnings("unchecked")
     private void applyReplication(UUID operationId, Serializable payload) {
         QueueReplicationCommand command = (QueueReplicationCommand) payload;
+        operationLock.lock();
         try {
             switch (command.type()) {
                 case OFFER -> queue.offer((T) command.value());
                 case POLL -> {
                     Optional<T> current = queue.peek();
-                    if (command.value() != null && current.isPresent() && !current.get().equals(command.value())) {
-                        LOGGER.log(Level.WARNING, "POLL replication mismatch. Expected {0} but found {1}", new Object[]{command.value(), current});
+                    Serializable expected = command.value();
+                    if (expected != null) {
+                        if (current.isEmpty()) {
+                            String msg = "POLL replication mismatch. Expected " + expected + " but queue is empty";
+                            LOGGER.severe(msg);
+                            throw new IllegalStateException(msg);
+                        }
+                        if (!current.get().equals(expected)) {
+                            String msg = "POLL replication mismatch. Expected " + expected + " but found " + current.get();
+                            LOGGER.severe(msg);
+                            throw new IllegalStateException(msg);
+                        }
                     }
                     queue.poll();
                 }
             }
         } catch (IOException e) {
             throw new IllegalStateException("Failed to apply replicated queue operation", e);
+        } finally {
+            operationLock.unlock();
         }
+    }
+
+    private static NQueue.Options enforceGridOptions(NQueue.Options options) {
+        Objects.requireNonNull(options, "options");
+        options.withShortCircuit(false);
+        return options;
     }
 
     @Override
