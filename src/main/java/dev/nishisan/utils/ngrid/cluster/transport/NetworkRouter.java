@@ -65,7 +65,7 @@ final class NetworkRouter {
                 return current;
             }
             // Switch to Proxy
-            return findBestProxy(target).map(Route::proxy).orElse(Route.direct());
+            return findBestProxy(target, null).map(Route::proxy).orElse(Route.direct());
         });
     }
     
@@ -74,11 +74,26 @@ final class NetworkRouter {
     }
 
     Optional<NodeId> nextHop(NodeId target) {
+        return nextHop(target, null);
+    }
+
+    Optional<NodeId> nextHop(NodeId target, NodeId exclude) {
         Route route = routes.getOrDefault(target, Route.direct());
         if (route.type() == RouteType.DIRECT) {
+            if (target.equals(exclude)) {
+                // Cannot use direct route if it's the excluded node
+                return findBestProxy(target, exclude).map(NodeId.class::cast);
+            }
             return Optional.of(target);
         }
-        return Optional.ofNullable(route.via());
+        
+        NodeId via = route.via();
+        if (via != null && via.equals(exclude)) {
+            // Current proxy is the excluded node, try to find another one
+            return findBestProxy(target, exclude);
+        }
+        
+        return Optional.ofNullable(via);
     }
 
     boolean isProxy(NodeId target) {
@@ -86,15 +101,16 @@ final class NetworkRouter {
         return route != null && route.type() == RouteType.PROXY;
     }
 
-    private Optional<NodeId> findBestProxy(NodeId target) {
+    private Optional<NodeId> findBestProxy(NodeId target, NodeId exclude) {
         Set<NodeId> candidates = reachabilityMap.getOrDefault(target, Collections.emptySet());
         if (candidates.isEmpty()) {
             LOGGER.warning("No proxy candidates found for " + target);
             return Optional.empty();
         }
-        // Simple strategy: Pick any candidate.
-        // Future improvement: Pick based on latency/load.
-        return candidates.stream().findAny();
+        
+        return candidates.stream()
+                .filter(id -> !id.equals(exclude))
+                .findAny();
     }
     
     Map<NodeId, Route> routesSnapshot() {

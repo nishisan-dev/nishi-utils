@@ -165,14 +165,18 @@ public final class TcpTransport implements Transport {
 
     @Override
     public void send(ClusterMessage message) {
+        send(message, null);
+    }
+
+    private void send(ClusterMessage message, NodeId exclude) {
         NodeId destination = message.destination();
         if (destination == null) {
             return;
         }
         
-        Optional<NodeId> nextHop = router.nextHop(destination);
+        Optional<NodeId> nextHop = router.nextHop(destination, exclude);
         if (nextHop.isEmpty()) {
-            LOGGER.log(Level.WARNING, "No route available for {0}", destination);
+            LOGGER.log(Level.WARNING, "No route available for {0} (excluding {1})", new Object[]{destination, exclude});
             return;
         }
         
@@ -190,7 +194,7 @@ public final class TcpTransport implements Transport {
                 router.markDirectFailure(destination);
                 
                 // Retry with new route
-                Optional<NodeId> fallback = router.nextHop(destination);
+                Optional<NodeId> fallback = router.nextHop(destination, exclude);
                 if (fallback.isPresent() && !fallback.get().equals(destination)) {
                     Connection proxyConn = ensureConnection(fallback.get());
                     if (proxyConn != null) {
@@ -200,7 +204,7 @@ public final class TcpTransport implements Transport {
                     }
                 }
             }
-            LOGGER.log(Level.WARNING, "No connection available for {0} (via {1})", new Object[]{destination, target});
+            LOGGER.log(Level.WARNING, "No connection available for {0} (via {1}, excluding {2})", new Object[]{destination, target, exclude});
         }
     }
 
@@ -217,7 +221,7 @@ public final class TcpTransport implements Transport {
         pendingResponses.put(requestId, response);
 
         // Routing Logic
-        Optional<NodeId> nextHop = router.nextHop(destination);
+        Optional<NodeId> nextHop = router.nextHop(destination, null);
         if (nextHop.isEmpty()) {
             pendingResponses.remove(requestId, response);
             future.completeExceptionally(new IOException("No route available for " + destination));
@@ -233,7 +237,7 @@ public final class TcpTransport implements Transport {
             if (target.equals(destination)) {
                 // Direct failed, try immediate fallback
                 router.markDirectFailure(destination);
-                Optional<NodeId> fallback = router.nextHop(destination);
+                Optional<NodeId> fallback = router.nextHop(destination, null);
                 if (fallback.isPresent() && !fallback.get().equals(destination)) {
                     Connection proxyConn = ensureConnection(fallback.get());
                     if (proxyConn != null) {
@@ -471,7 +475,7 @@ public final class TcpTransport implements Transport {
         }
     }
 
-    private void handleMessage(ClusterMessage message) {
+    private void handleMessage(NodeId senderId, ClusterMessage message) {
         if (message.type() == MessageType.HANDSHAKE) {
             return;
         }
@@ -487,8 +491,8 @@ public final class TcpTransport implements Transport {
                 LOGGER.fine(() -> "Dropping message with expired TTL from " + message.source());
                 return;
             }
-            // Forwarding
-            send(message.nextHop());
+            // Forwarding - exclude the node that just sent us this message to avoid simple loops
+            send(message.nextHop(), senderId);
             return;
         }
 
@@ -639,7 +643,7 @@ public final class TcpTransport implements Transport {
                     if (message.type() == MessageType.HANDSHAKE) {
                         handleHandshake(this, message);
                     } else {
-                        handleMessage(message);
+                        handleMessage(remoteId().orElse(null), message);
                     }
                 }
             } catch (Exception e) {

@@ -332,32 +332,19 @@ public class NQueue<T extends Serializable> implements Closeable {
     public long offer(T object) throws IOException {
         Objects.requireNonNull(object);
         if (enableMemoryBuffer) {
-            if (System.nanoTime() < memoryBufferModeUntil.get()) return offerToMemory(object, true);
+            // Enforce strict FIFO by routing every offer through the memory buffer first.
+            // This acts as the single point of truth for the order of elements.
+            long offset = offerToMemory(object, true);
+            
+            // Opportunistically try to drain the buffer to disk if the lock is available.
             if (lock.tryLock()) {
                 try {
-                    // Short-circuit: if queue is empty (disk + memory) and a consumer is waiting, handoff directly.
-                    if (options.allowShortCircuit && recordCount == 0 && handoffItem == null && drainingQueue.isEmpty() && memoryBuffer.isEmpty() && lock.hasWaiters(notEmpty)) {
-                        handoffItem = object;
-                        notEmpty.signal();
-                        statsUtils.notifyHitCounter(NQueueMetrics.OFFERED_EVENT);
-                        return OFFSET_HANDOFF;
-                    }
-
-                    if (compactionState == CompactionState.RUNNING) {
-                        activateMemoryMode();
-                        return offerToMemory(object, false);
-                    }
                     drainMemoryBufferSync();
-                    long offset = offerDirectLocked(object);
-                    triggerDrainIfNeeded();
-                    return offset;
                 } finally {
                     lock.unlock();
                 }
-            } else {
-                activateMemoryMode();
-                return offerToMemory(object, false);
             }
+            return offset;
         } else {
             lock.lock();
             try {
@@ -1190,10 +1177,7 @@ public class NQueue<T extends Serializable> implements Closeable {
                 revalidateMemoryMode();
                 if (lock.tryLock()) {
                     try {
-                        if (compactionState != CompactionState.RUNNING) {
-                            drainMemoryBufferSync();
-                            return offerDirectLocked(object);
-                        }
+                        drainMemoryBufferSync();
                     } finally {
                         lock.unlock();
                     }
