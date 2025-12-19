@@ -56,8 +56,14 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     private final Map<NodeId, ClusterMember> members = new ConcurrentHashMap<>();
     private final Set<LeadershipListener> leadershipListeners = new CopyOnWriteArraySet<>();
     private final Set<LeaderElectionListener> leaderElectionListeners = new CopyOnWriteArraySet<>();
+    private final Set<MembershipListener> membershipListeners = new CopyOnWriteArraySet<>();
     private final ScheduledExecutorService scheduler;
     private final AtomicReference<NodeId> leader = new AtomicReference<>();
+
+    public interface MembershipListener {
+        void onMembershipChanged();
+    }
+
     private final Object leaderComputationLock = new Object();
     private final AtomicReference<NodeId> preferredLeader = new AtomicReference<>();
     private volatile long preferredLeaderUntilMs;
@@ -183,6 +189,18 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         leaderElectionListeners.remove(listener);
     }
 
+    public void addMembershipListener(MembershipListener listener) {
+        membershipListeners.add(Objects.requireNonNull(listener, "listener"));
+    }
+
+    public void removeMembershipListener(MembershipListener listener) {
+        membershipListeners.remove(listener);
+    }
+
+    private void notifyMembershipListeners() {
+        membershipListeners.forEach(MembershipListener::onMembershipChanged);
+    }
+
     /**
      * Sends a heartbeat message to all nodes in the cluster.
      *
@@ -232,6 +250,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 return;
             }
             long now = Instant.now().toEpochMilli();
+            boolean changed = false;
             for (ClusterMember member : members.values()) {
                 if (member.id().equals(transport.local().nodeId())) {
                     continue;
@@ -239,8 +258,12 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 if (member.isActive() && now - member.lastHeartbeat() > config.heartbeatTimeout().toMillis()) {
                     LOGGER.fine(() -> "Marking member inactive due to missed heartbeat: " + member.info());
                     member.markInactive();
-                    recomputeLeader();
+                    changed = true;
                 }
+            }
+            if (changed) {
+                recomputeLeader();
+                notifyMembershipListeners();
             }
         } catch (Throwable t) {
             LOGGER.log(java.util.logging.Level.SEVERE, "Unexpected error in eviction task", t);
@@ -310,6 +333,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             return existing;
         });
         recomputeLeader();
+        notifyMembershipListeners();
     }
 
     @Override
@@ -323,6 +347,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 preferredLeaderUntilMs = 0L;
             }
             recomputeLeader();
+            notifyMembershipListeners();
         }
     }
 

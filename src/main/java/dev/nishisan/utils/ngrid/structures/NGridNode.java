@@ -47,6 +47,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -75,9 +77,24 @@ public final class NGridNode implements Closeable {
     private LeaderReelectionService leaderReelectionService;
     private final StatsUtils stats = new StatsUtils();
     private final AtomicBoolean started = new AtomicBoolean();
+    private final List<Runnable> resourceListeners = new ArrayList<>();
 
     public NGridNode(NGridConfig config) {
         this.config = config;
+    }
+
+    public void addResourceListener(Runnable listener) {
+        synchronized (resourceListeners) {
+            resourceListeners.add(Objects.requireNonNull(listener));
+        }
+    }
+
+    private void notifyResourceListeners() {
+        List<Runnable> copy;
+        synchronized (resourceListeners) {
+            copy = new ArrayList<>(resourceListeners);
+        }
+        copy.forEach(Runnable::run);
     }
 
     public void start() {
@@ -171,6 +188,14 @@ public final class NGridNode implements Closeable {
             throw new IllegalStateException("Node not started");
         }
         return (DistributedMap<K, V>) maps.computeIfAbsent(name, this::createDistributedMap);
+    }
+
+    public Set<String> getQueueNames() {
+        return queues.keySet();
+    }
+
+    public Set<String> getMapNames() {
+        return maps.keySet();
     }
 
     public Transport transport() {
@@ -371,7 +396,9 @@ public final class NGridNode implements Closeable {
 
     private DistributedQueue<Serializable> createDistributedQueue(String queueName, DistributedQueueConfig queueConfig) {
         QueueClusterService<Serializable> service = queueServices.computeIfAbsent(queueName, key -> createQueueService(key, queueConfig));
-        return new DistributedQueue<>(transport, coordinator, service, stats);
+        DistributedQueue<Serializable> q = new DistributedQueue<>(transport, coordinator, service, stats);
+        notifyResourceListeners();
+        return q;
     }
 
     private QueueClusterService<Serializable> createQueueService(String queueName, DistributedQueueConfig queueConfig) {
@@ -409,7 +436,9 @@ public final class NGridNode implements Closeable {
 
     private DistributedMap<Serializable, Serializable> createDistributedMap(String mapName) {
         MapClusterService<Serializable, Serializable> service = mapServices.computeIfAbsent(mapName, this::createMapService);
-        return new DistributedMap<>(transport, coordinator, service, mapName, stats);
+        DistributedMap<Serializable, Serializable> m = new DistributedMap<>(transport, coordinator, service, mapName, stats);
+        notifyResourceListeners();
+        return m;
     }
 
     private MapClusterService<Serializable, Serializable> createMapService(String mapName) {
