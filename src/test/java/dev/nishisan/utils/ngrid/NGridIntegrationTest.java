@@ -98,6 +98,7 @@ class NGridIntegrationTest {
 
     @Test
     void distributedStructuresMaintainStateAcrossClusterAndRestart() {
+
         DistributedQueue<String> queue1 = node1.queue(String.class);
         DistributedQueue<String> queue2 = node2.queue(String.class);
         DistributedQueue<String> queue3 = node3.queue(String.class);

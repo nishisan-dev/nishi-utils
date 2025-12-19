@@ -21,4 +21,5 @@ public class NQueueMetrics {
     public static String OFFERED_EVENT = "OFFERED_EVENT";
     public static String PEEK_EVENT = "PEEK_EVENT";
     public static String POLL_EVENT = "POLL_EVENT";
+    public static String OUT_OF_ORDER= "NQUEUE.OUT_OF_ORDER";
 }

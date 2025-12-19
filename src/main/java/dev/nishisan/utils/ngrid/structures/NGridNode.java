@@ -157,6 +157,7 @@ public final class NGridNode implements Closeable {
         map = maps.computeIfAbsent(defaultMapName, this::createDistributedMap);
     }
 
+    @Deprecated
     @SuppressWarnings("unchecked")
     public <T extends Serializable> DistributedQueue<T> queue(Class<T> type) {
         return (DistributedQueue<T>) queue;

@@ -143,7 +143,9 @@ class ReplicationQuorumFailureTest {
         }
         try {
             node.close();
+            System.out.println("Closed..." );
         } catch (IOException ignored) {
+            ignored.printStackTrace();
         }
     }
 
