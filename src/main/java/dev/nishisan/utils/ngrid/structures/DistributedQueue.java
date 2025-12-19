@@ -100,23 +100,49 @@ public final class DistributedQueue<T extends Serializable> implements Transport
     }
 
     private Serializable invokeLeader(String command, Serializable body) {
-        NodeInfo leaderInfo = coordinator.leaderInfo().orElseThrow(() -> new IllegalStateException("No leader available"));
-        if (leaderInfo.nodeId().equals(transport.local().nodeId())) {
-            return executeLocal(command, body);
+        int attempts = 0;
+        while (attempts < 3) {
+            attempts++;
+            NodeInfo leaderInfo = coordinator.leaderInfo().orElseThrow(() -> new IllegalStateException("No leader available"));
+            if (leaderInfo.nodeId().equals(transport.local().nodeId())) {
+                return executeLocal(command, body);
+            }
+            ClientRequestPayload payload = new ClientRequestPayload(UUID.randomUUID(), command, body);
+            ClusterMessage request = ClusterMessage.request(MessageType.CLIENT_REQUEST,
+                    command,
+                    transport.local().nodeId(),
+                    leaderInfo.nodeId(),
+                    payload);
+            try {
+                CompletableFuture<ClusterMessage> future = transport.sendAndAwait(request);
+                ClusterMessage response = future.join();
+                ClientResponsePayload responsePayload = response.payload(ClientResponsePayload.class);
+                if (!responsePayload.success()) {
+                    if ("Not the leader".equals(responsePayload.error()) && attempts < 3) {
+                        try {
+                            Thread.sleep(100);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            throw new IllegalStateException("Interrupted during retry", e);
+                        }
+                        continue;
+                    }
+                    throw new IllegalStateException(responsePayload.error());
+                }
+                return responsePayload.body();
+            } catch (Exception e) {
+                if (attempts >= 3) {
+                    throw e;
+                }
+                try {
+                    Thread.sleep(100);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("Interrupted during retry", ie);
+                }
+            }
         }
-        ClientRequestPayload payload = new ClientRequestPayload(UUID.randomUUID(), command, body);
-        ClusterMessage request = ClusterMessage.request(MessageType.CLIENT_REQUEST,
-                command,
-                transport.local().nodeId(),
-                leaderInfo.nodeId(),
-                payload);
-        CompletableFuture<ClusterMessage> future = transport.sendAndAwait(request);
-        ClusterMessage response = future.join();
-        ClientResponsePayload responsePayload = response.payload(ClientResponsePayload.class);
-        if (!responsePayload.success()) {
-            throw new IllegalStateException(responsePayload.error());
-        }
-        return responsePayload.body();
+        throw new IllegalStateException("Failed to invoke leader after retries");
     }
 
     @SuppressWarnings("unchecked")
