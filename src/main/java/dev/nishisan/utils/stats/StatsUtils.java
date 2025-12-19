@@ -146,6 +146,17 @@ public class StatsUtils {
         return -1L;
     }
 
+    /**
+     * Retrieves the current value of a counter without logging if it is missing.
+     *
+     * @param counterName the name of the counter
+     * @return the counter value or null if not present
+     */
+    public Long getCounterValueOrNull(String counterName) {
+        HitCounterDTO metric = this.counters.get(counterName);
+        return metric != null ? metric.getValue() : null;
+    }
+
 
     /**
      * Retrieves the rate of a specified hit counter by its name.
@@ -183,6 +194,20 @@ public class StatsUtils {
             logger.warn(String.format("Average:[%s] Not Found", name));
             return -1D;
         }
+    }
+
+    /**
+     * Retrieves the average of a counter without logging if it is missing.
+     *
+     * @param name the name of the average counter
+     * @return the average value or null if not present
+     */
+    public Double getAverageOrNull(String name) {
+        FixedSizeList<Long> reads = this.averages.get(name);
+        if (reads == null) {
+            return null;
+        }
+        return reads.stream().mapToDouble(a -> a).average().orElse(0.0);
     }
 
     /**

@@ -80,16 +80,17 @@ public class NQueueOptionsExample {
 
 ## 2) NGrid (cluster): configuração e bootstrap
 
-O NGrid funciona com nós descritos por `NodeInfo(nodeId, host, port)` e com uma lista de **peers iniciais**. A descoberta completa tende a convergir via handshake e peer updates.
+O NGrid funciona com nós descritos por `NodeInfo(nodeId, host, port)` e com uma lista de **peers iniciais**. A descoberta completa tende a convergir via handshake e peer updates. Após o `start()`, você também pode adicionar peers dinamicamente com `node.join(...)`.
 
 ### Configuração do nó (NGridConfig)
 
 Campos principais:
 
 - `local(NodeInfo)`: identidade do nó (host/porta para bind).
-- `addPeer(NodeInfo)`: peers iniciais para bootstrap.
-- `replicationQuorum(int)`: quorum configurado (o quorum efetivo é limitado pelo tamanho do cluster ativo).
+- `addPeer(NodeInfo)`: peers iniciais para bootstrap (opcional).
+- `replicationFactor(int)`: fator de replicação default (quorum efetivo é limitado pelo tamanho do cluster ativo).
 - `queueDirectory(Path)` e `queueName(String)`: diretório/nome da `NQueue` local usada pela fila distribuída.
+- **`strictConsistency(boolean)`**: Define o modelo de consistência. `false` (padrão) prioriza disponibilidade (AP), ajustando o quorum aos nós ativos. `true` prioriza consistência (CP), exigindo quorum fixo (`replicationFactor`) mesmo que nós falhem.
 
 ### Exemplo: subir 3 nós em um mesmo processo (demo)
 
@@ -107,7 +108,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Optional;
 
-public class NGridThreeNodesExample {
+public class NGridClusterExample {
   public static void main(String[] args) throws Exception {
     // Dica: em testes/ambientes compartilhados (CI), prefira portas efêmeras para evitar colisões.
     // Para simplificar a demo, aqui ainda usamos portas fixas.
@@ -123,17 +124,17 @@ public class NGridThreeNodesExample {
     try (NGridNode node1 = new NGridNode(NGridConfig.builder(n1)
             .addPeer(n2).addPeer(n3)
             .queueDirectory(dir1).queueName("queue")
-            .replicationQuorum(2)
+            .replicationFactor(2)
             .build());
          NGridNode node2 = new NGridNode(NGridConfig.builder(n2)
             .addPeer(n1).addPeer(n3)
             .queueDirectory(dir2).queueName("queue")
-            .replicationQuorum(2)
+            .replicationFactor(2)
             .build());
          NGridNode node3 = new NGridNode(NGridConfig.builder(n3)
             .addPeer(n1).addPeer(n2)
             .queueDirectory(dir3).queueName("queue")
-            .replicationQuorum(2)
+            .replicationFactor(2)
             .build())) {
 
       node1.start();
@@ -165,6 +166,22 @@ public class NGridThreeNodesExample {
       m3.put("shared-key", "value-1");
       System.out.println("m1.get=" + m1.get("shared-key").orElse("<vazio>"));
     }
+  }
+}
+```
+
+### Adicionando peers dinamicamente (join)
+
+```java
+import dev.nishisan.utils.ngrid.common.NodeInfo;
+import dev.nishisan.utils.ngrid.structures.NGridNode;
+
+public class NGridJoinExample {
+  public static void main(String[] args) {
+    NGridNode node = null; // suponha start() chamado
+    NodeInfo seed = null;  // peer conhecido
+
+    node.join(seed);
   }
 }
 ```
@@ -300,7 +317,7 @@ Notas:
 
 ## 5) Utilitários
 
-### 5.1) LeaderElectionUtils (somente cluster + liderança)
+### 5.1) LeaderElectionUtils (somente cluster + eleição)
 
 Quando você quer apenas “descoberta + eleição de líder” (sem usar `NGridNode` completo), use `LeaderElectionUtils`.
 
@@ -397,11 +414,9 @@ public class StatsUtilsExample {
 ### Quorum
 
 - Ajuste `replicationQuorum` para equilibrar disponibilidade e consistência.
-- Se o cluster tiver menos membros ativos do que o quorum configurado, o NGrid reduz para um quorum efetivo viável.
+- Se o cluster tiver menos membros ativos do que o quorum configurado, o NGrid reduz para um quorum efetivo viável (se `strictConsistency=false`) ou falha a operação (se `strictConsistency=true`).
 
 ### Persistência (fila)
 
 - Se você quer mais durabilidade, mantenha `NQueue.Options.withFsync(true)` (default).
 - Para alta taxa de escrita em dev/benchmark, `withFsync(false)` pode ser aceitável (com risco de perda no crash).
-
-
