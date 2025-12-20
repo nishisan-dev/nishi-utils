@@ -50,6 +50,7 @@ public final class NGridConfig {
     private final String mapName;
     private final MapPersistenceMode mapPersistenceMode;
     private final boolean strictConsistency;
+    private final int transportWorkerThreads;
 
     private NGridConfig(Builder builder) {
         this.local = builder.local;
@@ -71,6 +72,7 @@ public final class NGridConfig {
         this.mapName = builder.mapName;
         this.mapPersistenceMode = builder.mapPersistenceMode;
         this.strictConsistency = builder.strictConsistency;
+        this.transportWorkerThreads = builder.transportWorkerThreads;
     }
 
     public NodeInfo local() {
@@ -102,6 +104,10 @@ public final class NGridConfig {
 
     public boolean strictConsistency() {
         return strictConsistency;
+    }
+    
+    public int transportWorkerThreads() {
+        return transportWorkerThreads;
     }
 
     public boolean leaderReelectionEnabled() {
@@ -171,9 +177,18 @@ public final class NGridConfig {
         private String mapName = "default-map";
         private MapPersistenceMode mapPersistenceMode = MapPersistenceMode.DISABLED;
         private boolean strictConsistency = false;
+        private int transportWorkerThreads = 2;
 
         private Builder(NodeInfo local) {
             this.local = Objects.requireNonNull(local, "local");
+        }
+
+        public Builder transportWorkerThreads(int threads) {
+            if (threads < 1) {
+                throw new IllegalArgumentException("transportWorkerThreads must be >= 1");
+            }
+            this.transportWorkerThreads = threads;
+            return this;
         }
 
         public Builder strictConsistency(boolean strict) {

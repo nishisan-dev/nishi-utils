@@ -283,21 +283,17 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      */
     private void recomputeLeader() {
         synchronized (leaderComputationLock) {
+            long activeCount = members.values().stream().filter(ClusterMember::isActive).count();
+            if (activeCount < config.minClusterSize()) {
+                updateLeader(null);
+                return;
+            }
+
             NodeId preferred = preferredLeader.get();
             if (preferred != null && preferredLeaderUntilMs > Instant.now().toEpochMilli()) {
                 ClusterMember preferredMember = members.get(preferred);
                 if (preferredMember != null && preferredMember.isActive()) {
-                    NodeId previous = leader.getAndSet(preferred);
-                    if (!Objects.equals(previous, preferred)) {
-                        leadershipListeners.forEach(listener -> listener.onLeaderChanged(preferred));
-
-                        NodeId localNodeId = transport.local().nodeId();
-                        boolean wasLeader = previous != null && previous.equals(localNodeId);
-                        boolean isLeader = preferred.equals(localNodeId);
-                        if (wasLeader != isLeader) {
-                            leaderElectionListeners.forEach(listener -> listener.onLeadershipChanged(isLeader, preferred));
-                        }
-                    }
+                    updateLeader(preferred);
                     return;
                 }
             }
@@ -305,18 +301,21 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                     .filter(ClusterMember::isActive)
                     .map(ClusterMember::id)
                     .max(Comparator.naturalOrder());
-            NodeId newLeaderId = newLeader.orElse(null);
-            NodeId previous = leader.getAndSet(newLeaderId);
-            if (!Objects.equals(previous, newLeaderId)) {
-                leadershipListeners.forEach(listener -> listener.onLeaderChanged(newLeaderId));
+            updateLeader(newLeader.orElse(null));
+        }
+    }
 
-                // Notify LeaderElectionListener if local node's leadership status changed
-                NodeId localNodeId = transport.local().nodeId();
-                boolean wasLeader = previous != null && previous.equals(localNodeId);
-                boolean isLeader = newLeaderId != null && newLeaderId.equals(localNodeId);
-                if (wasLeader != isLeader) {
-                    leaderElectionListeners.forEach(listener -> listener.onLeadershipChanged(isLeader, newLeaderId));
-                }
+    private void updateLeader(NodeId newLeaderId) {
+        NodeId previous = leader.getAndSet(newLeaderId);
+        if (!Objects.equals(previous, newLeaderId)) {
+            leadershipListeners.forEach(listener -> listener.onLeaderChanged(newLeaderId));
+
+            // Notify LeaderElectionListener if local node's leadership status changed
+            NodeId localNodeId = transport.local().nodeId();
+            boolean wasLeader = previous != null && previous.equals(localNodeId);
+            boolean isLeader = newLeaderId != null && newLeaderId.equals(localNodeId);
+            if (wasLeader != isLeader) {
+                leaderElectionListeners.forEach(listener -> listener.onLeadershipChanged(isLeader, newLeaderId));
             }
         }
     }

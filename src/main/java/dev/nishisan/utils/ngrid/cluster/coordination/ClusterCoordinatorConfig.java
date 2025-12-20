@@ -26,20 +26,29 @@ import java.util.Objects;
 public final class ClusterCoordinatorConfig {
     private final Duration heartbeatInterval;
     private final Duration heartbeatTimeout;
+    private final int minClusterSize;
 
-    private ClusterCoordinatorConfig(Duration heartbeatInterval, Duration heartbeatTimeout) {
+    private ClusterCoordinatorConfig(Duration heartbeatInterval, Duration heartbeatTimeout, int minClusterSize) {
         this.heartbeatInterval = heartbeatInterval;
         this.heartbeatTimeout = heartbeatTimeout;
+        this.minClusterSize = minClusterSize;
     }
 
     public static ClusterCoordinatorConfig defaults() {
-        return new ClusterCoordinatorConfig(Duration.ofSeconds(1), Duration.ofSeconds(5));
+        return new ClusterCoordinatorConfig(Duration.ofSeconds(1), Duration.ofSeconds(5), 1);
     }
 
     public static ClusterCoordinatorConfig of(Duration interval, Duration timeout) {
+        return of(interval, timeout, 1);
+    }
+
+    public static ClusterCoordinatorConfig of(Duration interval, Duration timeout, int minClusterSize) {
         Objects.requireNonNull(interval, "interval");
         Objects.requireNonNull(timeout, "timeout");
-        return new ClusterCoordinatorConfig(interval, timeout);
+        if (minClusterSize < 1) {
+            throw new IllegalArgumentException("minClusterSize must be >= 1");
+        }
+        return new ClusterCoordinatorConfig(interval, timeout, minClusterSize);
     }
 
     public Duration heartbeatInterval() {
@@ -48,5 +57,9 @@ public final class ClusterCoordinatorConfig {
 
     public Duration heartbeatTimeout() {
         return heartbeatTimeout;
+    }
+
+    public int minClusterSize() {
+        return minClusterSize;
     }
 }
