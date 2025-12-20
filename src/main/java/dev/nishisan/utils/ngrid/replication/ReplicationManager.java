@@ -18,6 +18,7 @@
 package dev.nishisan.utils.ngrid.replication;
 
 import dev.nishisan.utils.ngrid.cluster.coordination.ClusterCoordinator;
+import dev.nishisan.utils.ngrid.cluster.coordination.LeadershipListener;
 import dev.nishisan.utils.ngrid.cluster.transport.Transport;
 import dev.nishisan.utils.ngrid.cluster.transport.TransportListener;
 import dev.nishisan.utils.ngrid.common.ClusterMessage;
@@ -54,7 +55,7 @@ import java.util.concurrent.ScheduledExecutorService;
  * Coordinates quorum based replication leveraging the transport. The manager handles both
  * leader initiated operations and replication requests coming from other nodes.
  */
-public final class ReplicationManager implements TransportListener, Closeable {
+public final class ReplicationManager implements TransportListener, LeadershipListener, Closeable {
     private static final Logger LOGGER = Logger.getLogger(ReplicationManager.class.getName());
 
     private final Transport transport;
@@ -92,6 +93,7 @@ public final class ReplicationManager implements TransportListener, Closeable {
         }
         running = true;
         transport.addListener(this);
+        coordinator.addLeadershipListener(this);
         Duration timeout = config.operationTimeout();
         long periodMs = Math.max(100L, timeout.toMillis() / 2);
         timeoutScheduler.scheduleAtFixedRate(this::checkTimeouts, periodMs, periodMs, TimeUnit.MILLISECONDS);
@@ -106,6 +108,8 @@ public final class ReplicationManager implements TransportListener, Closeable {
         }
         running = false;
         transport.removeListener(this);
+        coordinator.removeLeadershipListener(this);
+        failAllPending("ReplicationManager stopped");
     }
 
     public void registerHandler(String topic, ReplicationHandler handler) {
@@ -136,15 +140,10 @@ public final class ReplicationManager implements TransportListener, Closeable {
         PendingOperation operation = new PendingOperation(operationId, topic, payload, requiredQuorum(quorumOverride));
         pending.put(operationId, operation);
         log.put(operationId, new ReplicatedRecord(operationId, topic, payload, OperationStatus.PENDING));
-        try {
-            handler.apply(operationId, payload);
-            applied.add(operationId);
-        } catch (Exception e) {
-            pending.remove(operationId);
-            log.remove(operationId);
-            throw new RuntimeException("Failed to apply local operation", e);
-        }
+        
+        // Local node acknowledges receipt, but defers application until quorum
         operation.ack(transport.local().nodeId());
+        
         replicateToFollowers(operation);
         return operation.future();
     }
@@ -223,6 +222,21 @@ public final class ReplicationManager implements TransportListener, Closeable {
             return;
         }
         if (operation.ackCount() >= operation.quorum) {
+            if (!operation.localApplied) {
+                ReplicationHandler handler = handlers.get(operation.topic);
+                if (handler != null) {
+                    try {
+                        handler.apply(operation.operationId, operation.payload);
+                        applied.add(operation.operationId);
+                        operation.localApplied = true;
+                    } catch (Exception e) {
+                        LOGGER.log(Level.SEVERE, "Failed to apply committed operation locally", e);
+                        operation.fail(e);
+                        return;
+                    }
+                }
+            }
+            
             operation.complete(OperationStatus.COMMITTED);
             log.computeIfPresent(operation.operationId, (id, record) -> {
                 record.status(OperationStatus.COMMITTED);
@@ -379,6 +393,24 @@ public final class ReplicationManager implements TransportListener, Closeable {
         });
     }
 
+    @Override
+    public void onLeaderChanged(NodeId newLeader) {
+        if (!transport.local().nodeId().equals(newLeader)) {
+            failAllPending("Lost leadership to " + newLeader);
+        }
+    }
+
+    private void failAllPending(String reason) {
+        if (pending.isEmpty()) {
+            return;
+        }
+        IllegalStateException ex = new IllegalStateException(reason);
+        List<PendingOperation> toFail = new ArrayList<>(pending.values());
+        for (PendingOperation op : toFail) {
+            failOperation(op, ex);
+        }
+    }
+
     private static final class PendingOperation {
         private final UUID operationId;
         private final String topic;
@@ -388,6 +420,7 @@ public final class ReplicationManager implements TransportListener, Closeable {
         private final CompletableFuture<ReplicationResult> future = new CompletableFuture<>();
         private volatile OperationStatus status = OperationStatus.PENDING;
         private final Instant createdAt = Instant.now();
+        private volatile boolean localApplied = false;
 
         private PendingOperation(UUID operationId, String topic, Serializable payload, int quorum) {
             this.operationId = operationId;

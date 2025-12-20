@@ -119,8 +119,8 @@ public final class TcpTransport implements Transport {
                 config.reconnectInterval().toMillis(),
                 config.reconnectInterval().toMillis(),
                 TimeUnit.MILLISECONDS);
-        // Opportunistic probe for promoted routes (every 30s)
-        scheduler.scheduleAtFixedRate(this::probeLoop, 30_000, 30_000, TimeUnit.MILLISECONDS);
+        // Opportunistic probe for promoted routes (every 3s)
+        scheduler.scheduleAtFixedRate(this::probeLoop, 3_000, 3_000, TimeUnit.MILLISECONDS);
         // attempt initial outbound connections
         config.initialPeers().forEach(this::ensureConnectionAsync);
     }

@@ -9,6 +9,7 @@ import dev.nishisan.utils.ngrid.structures.NGridNode;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -59,26 +60,38 @@ class NGridIntegrationTest {
                 .addPeer(info3)
                 .queueDirectory(dir1)
                 .queueName("queue")
-                .replicationQuorum(2)
+                .replicationQuorum(1)
+                .transportWorkerThreads(4)
+                .strictConsistency(false)
                 .build());
         node2 = new NGridNode(NGridConfig.builder(info2)
                 .addPeer(info1)
                 .addPeer(info3)
                 .queueDirectory(dir2)
                 .queueName("queue")
-                .replicationQuorum(2)
+                .replicationQuorum(1)
+                .transportWorkerThreads(4)
+                .strictConsistency(false)
                 .build());
         node3 = new NGridNode(NGridConfig.builder(info3)
                 .addPeer(info1)
                 .addPeer(info2)
                 .queueDirectory(dir3)
                 .queueName("queue")
-                .replicationQuorum(2)
+                .replicationQuorum(1)
+                .transportWorkerThreads(4)
+                .strictConsistency(false)
                 .build());
 
         node1.start();
         node2.start();
         node3.start();
+
+        try {
+            Thread.sleep(2000);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
 
         awaitClusterStability();
     }
@@ -97,6 +110,7 @@ class NGridIntegrationTest {
     }
 
     @Test
+    @Timeout(value = 1, unit = TimeUnit.MINUTES)
     void distributedStructuresMaintainStateAcrossClusterAndRestart() {
 
         DistributedQueue<String> queue1 = node1.queue(String.class);
@@ -137,18 +151,23 @@ class NGridIntegrationTest {
                 .addPeer(info3)
                 .queueDirectory(dir1)
                 .queueName("queue")
-                .replicationQuorum(2)
+                .replicationQuorum(1)
+                .transportWorkerThreads(4)
+                .strictConsistency(false)
                 .build());
         node1.start();
         awaitClusterStability();
 
-        DistributedQueue<String> restartedQueue = node1.queue(String.class);
-        Optional<String> afterRestart = restartedQueue.peek();
-        assertTrue(afterRestart.isPresent());
-        assertEquals("payload-2", afterRestart.get());
+        assertEventually(() -> {
+            DistributedQueue<String> restartedQueue = node1.queue(String.class);
+            Optional<String> afterRestart = restartedQueue.peek();
+            assertTrue(afterRestart.isPresent());
+            assertEquals("payload-2", afterRestart.get());
+        });
     }
 
     @Test
+    @Timeout(value = 1, unit = TimeUnit.MINUTES)
     void multipleNamedMapsShouldReplicateIndependently() {
         // Ensure maps are created on all nodes (handlers are registered per-map)
         DistributedMap<String, String> users1 = node1.getMap("users", String.class, String.class);

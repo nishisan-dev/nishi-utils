@@ -45,6 +45,7 @@ Gerencia o estado do cluster e a liderança.
 - **Robustez:** As tarefas de heartbeat e detecção de falhas são protegidas contra exceções inesperadas para garantir a estabilidade do agendamento.
 - **Eleição de Líder:**
   - O mecanismo é **determinístico**: o líder é sempre o nó com o **maior `NodeId` ativo**.
+  - **Proteção contra Split-Brain:** O coordenador exige um número mínimo de membros ativos (`minClusterSize`) para declarar um líder. Se a rede particionar e um grupo de nós ficar abaixo desse mínimo, eles não elegerão líder, evitando divergência de estado.
   - Todos os nós convergem para o mesmo líder assim que a lista de membros é sincronizada.
   - Expõe APIs para verificar liderança (`isLeader()`) e obter informações do líder atual (`leaderInfo()`).
 
@@ -55,14 +56,17 @@ Garante a consistência dos dados através da replicação de operações.
 - **Centralização no Líder:** Apenas o líder pode iniciar replicações (`replicate(...)`).
 - **Integridade:**
   - O envio de `REPLICATION_ACK` só ocorre após a operação ser efetivamente processada com sucesso no nó seguidor, evitando falsos positivos de confirmação.
-- **Fluxo de Replicação:**
-  1. O líder envia `REPLICATION_REQUEST` para todos os followers.
-  2. Aguarda `REPLICATION_ACK` dos followers.
-  3. Confirma a operação (`COMMITTED`) quando atinge o **quorum** (maioria, incluindo o próprio líder).
+- **Fluxo de Replicação (Consistente):**
+  1. O líder recebe a operação e a registra como `PENDING`.
+  2. O líder envia `REPLICATION_REQUEST` para todos os followers.
+  3. Followers aplicam a operação localmente e respondem `REPLICATION_ACK`.
+  4. O líder aguarda os ACKs. Quando `Acks >= Quorum`, o líder **aplica a operação no seu próprio estado** e marca como `COMMITTED`.
+  5. O sucesso é retornado ao cliente.
+- **Fail-Fast:** Se o nó perder a liderança enquanto aguarda o quórum, todas as operações pendentes são canceladas imediatamente com erro "Lost leadership".
 - **Consistência Configurável (`strictConsistency`):**
   - **Disponibilidade (Padrão):** O quorum efetivo se adapta ao tamanho do cluster ativo. Útil para clusters dinâmicos onde a disponibilidade é prioridade.
     \( \text{quorumEfetivo} = \max(1, \min(\text{config.quorum}, |\text{membrosAtivos}|)) \)
-  - **Consistência Estrita (CP):** Se habilitada, o quorum é fixo e baseado na configuração inicial (`replicationFactor`). Se o número de nós ativos for menor que o quorum exigido, as escritas falham para garantir consistência e evitar *split-brain*.
+  - **Consistência Estrita (CP):** Se habilitada, o quorum é fixo e baseado na configuração inicial (`replicationFactor`). Se o número de nós ativos for menor que o quorum exigido, as escritas falham para garantir consistência e evitar *split-brain*. No modo estrito, o líder nunca aplica a mudança localmente sem confirmação da maioria.
 - **Timeout e quorum inalcançável:**
   - Se a operação exceder o `operationTimeout` (padrão: 30s), ela pode falhar por timeout.
   - Se peers desconectarem e o cluster não tiver membros alcançáveis suficientes para satisfazer o quorum, a operação falha como “quorum inalcançável”.
@@ -253,13 +257,13 @@ participant F1 as Follower1
 participant F2 as Follower2
 
 Client->>Leader: offer/put/remove
-Leader->>Leader: Aplica Localmente (Log/Memória)
+Note over Leader: Registra PENDING
 Leader->>F1: REPLICATION_REQUEST(opId, payload)
 Leader->>F2: REPLICATION_REQUEST(opId, payload)
 F1-->>Leader: REPLICATION_ACK(opId)
 F2-->>Leader: REPLICATION_ACK(opId)
 Note over Leader: Acks >= Quorum?
-Leader->>Leader: Marca COMMITTED
+Leader->>Leader: Aplica Localmente (Commit)
 Leader-->>Client: Sucesso
 ```
 

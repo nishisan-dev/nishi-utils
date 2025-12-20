@@ -103,7 +103,8 @@ public final class NGridNode implements Closeable {
         }
         TcpTransportConfig.Builder transportBuilder = TcpTransportConfig.builder(config.local())
                 .connectTimeout(Duration.ofSeconds(5))
-                .reconnectInterval(Duration.ofSeconds(2));
+                .reconnectInterval(Duration.ofMillis(500))
+                .workerThreads(config.transportWorkerThreads());
         config.peers().forEach(transportBuilder::addPeer);
         transport = new TcpTransport(transportBuilder.build());
         transport.start();
