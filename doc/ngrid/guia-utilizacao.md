@@ -90,9 +90,12 @@ Campos principais:
 - `addPeer(NodeInfo)`: peers iniciais para bootstrap (opcional).
 - `replicationFactor(int)`: fator de replicação default (quorum efetivo é limitado pelo tamanho do cluster ativo).
 - `queueDirectory(Path)` e `queueName(String)`: diretório/nome da `NQueue` local usada pela fila distribuída.
-- **`strictConsistency(boolean)`**: Define o modelo de consistência. `false` (padrão) prioriza disponibilidade (AP), ajustando o quorum aos nós ativos. `true` prioriza consistência (CP), exigindo quorum fixo (`replicationFactor`) mesmo que nós falhem.
+- **`strictConsistency(boolean)`**: Define o modelo de consistência. `false` (padrão) prioriza disponibilidade (AP), ajustando o quorum aos nós ativos. `true` prioriza consistência (CP), exigindo quorum fixo (`replicationFactor`) mesmo que nós falhem. **Nota:** No modo estrito, o líder aguarda o quórum antes de aplicar a mudança localmente.
+- **`transportWorkerThreads(int)`**: Número de threads dedicadas ao processamento de IO e conexões (padrão: 2). Aumente em clusters com muitos nós ou alta latência de handshake.
 
-### Exemplo: subir 3 nós em um mesmo processo (demo)
+### Proteção contra Split-Brain
+
+O NGrid agora exige um número mínimo de membros ativos para eleger um líder. Por padrão, esse valor é 1 (o nó pode ser líder sozinho). Em produção, recomenda-se configurar o cluster para exigir a maioria dos nós para evitar que partições de rede criem múltiplos líderes. (Veja `ClusterCoordinatorConfig` para customização avançada).
 
 > Para produção, normalmente cada nó roda em seu processo/host. Aqui é apenas uma demo local.
 
