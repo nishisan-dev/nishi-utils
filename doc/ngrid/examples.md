@@ -103,6 +103,8 @@ public class QuickStartNGrid {
 | `mapDirectory` | `Path` | `queueDirectory/maps` | Persistente se usar WAL/snapshot | Diretório base da persistência local do mapa. |
 | `mapName` | `String` | `"default-map"` | Um nome por cluster | Nome do mapa padrão (usado por `node.map(...)`). |
 | `mapPersistenceMode` | `MapPersistenceMode` | `DISABLED` | `DISABLED` (padrão), `ASYNC_WITH_FSYNC` se quiser durabilidade local | Modo de persistência do mapa: `DISABLED`, `ASYNC_NO_FSYNC`, `ASYNC_WITH_FSYNC`. |
+| `strictConsistency` | `boolean` | `false` | `true` (produção CP) | Se `true`, líder espera quorum fixo antes de aplicar localmente. Protege contra split-brain. |
+| `transportWorkerThreads` | `int` | `2` | Aumentar em alta carga | Número de threads para I/O e handshakes. Útil aumentar em clusters grandes (>5 nós). |
 | `rttProbeInterval` | `Duration` | `2s` | `2s` (observabilidade) | Intervalo de ping RTT entre nós. Use `Duration.ZERO` para desativar. |
 | `leaderReelectionEnabled` | `boolean` | `false` | `true` (se quiser dinâmica) | Ativa reeleição baseada em carga de escrita (ingress). |
 | `leaderReelectionInterval` | `Duration` | `5s` | `5s..10s` | Intervalo para calcular taxa de escrita e sugerir líder. |
@@ -777,6 +779,13 @@ public class StatsUtilsExample {
 
 - `queueDirectory` e `mapDirectory` devem ser graváveis.
 - Para durabilidade entre execuções, não use diretórios temporários.
+
+### Proteção contra Split-Brain (MinClusterSize)
+
+O NGrid possui uma configuração de segurança (no `ClusterCoordinatorConfig`) chamada `minClusterSize`.
+- Se o número de membros ativos for menor que esse valor, o nó **não assumirá a liderança**.
+- Isso evita que, em caso de partição de rede, múltiplos "ilhas" de nós elejam líderes concorrentes.
+- Em produção, configure `minClusterSize` para a maioria simples (`(N/2) + 1`).
 
 ---
 
