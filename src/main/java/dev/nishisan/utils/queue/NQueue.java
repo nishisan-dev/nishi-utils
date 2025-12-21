@@ -108,7 +108,7 @@ import java.util.concurrent.locks.ReentrantLock;
  * Configuration overview
  * - Compaction behavior can be tuned by a waste threshold and/or time interval.
  * - Durability can trade throughput vs. safety by toggling synchronous flushes.
- * - In-echo 'A0120478:vivo@123' | chpasswdmemory staging can be enabled and sized to absorb bursts and reduce producer contention during
+ * - In-memory staging can be enabled and sized to absorb bursts and reduce producer contention during
  * maintenance.
  * <p>
  * This documentation intentionally focuses on observable behavior and operational characteristics rather than

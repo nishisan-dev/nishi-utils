@@ -73,6 +73,14 @@ final class NQueueQueueMeta {
         return lastIndex;
     }
 
+    /**
+     * Reads metadata from a specified file path and constructs an {@code NQueueQueueMeta} object.
+     *
+     * @param path the {@code Path} object pointing to the metadata file to read
+     * @return an {@code NQueueQueueMeta} object containing metadata information read from the file
+     * @throws IOException if an I/O error occurs while reading the file,
+     *                     if the file is incomplete, or if the content is invalid
+     */
     static NQueueQueueMeta read(Path path) throws IOException {
         try (FileChannel ch = FileChannel.open(path, StandardOpenOption.READ)) {
             ByteBuffer buf = ByteBuffer.allocate(Integer.BYTES + Short.BYTES + Long.BYTES * 4);
@@ -97,6 +105,18 @@ final class NQueueQueueMeta {
         }
     }
 
+    /**
+     * Writes queue metadata to a specified file path.
+     * The metadata includes consumer offset, producer offset, record count, and the last index.
+     * This method ensures atomic file replacement using a temporary file and atomic move.
+     *
+     * @param path           the {@code Path} object pointing to the file where the metadata will be written
+     * @param consumerOffset the consumer offset to be stored in the metadata
+     * @param producerOffset the producer offset to be stored in the metadata
+     * @param recordCount    the record count to be stored in the metadata
+     * @param lastIndex      the last index to be stored in the metadata
+     * @throws IOException   if an I/O error occurs during file writing or directory creation
+     */
     static void write(Path path, long consumerOffset, long producerOffset, long recordCount, long lastIndex) throws IOException {
         Path tmp = path.resolveSibling(path.getFileName().toString() + ".tmp");
         ByteBuffer buf = ByteBuffer.allocate(Integer.BYTES + Short.BYTES + Long.BYTES * 4);
@@ -118,6 +138,21 @@ final class NQueueQueueMeta {
         Files.move(tmp, path, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
     }
 
+    /**
+     * Updates metadata information in the specified file channel. This method writes
+     * metadata such as consumer offset, producer offset, record count, and last index
+     * to the beginning of the file channel and optionally performs an fsync to ensure
+     * data persistence.
+     *
+     * @param ch             the {@code FileChannel} to which metadata will be written
+     * @param consumerOffset the consumer offset to be updated in the metadata
+     * @param producerOffset the producer offset to be updated in the metadata
+     * @param recordCount    the record count to be updated in the metadata
+     * @param lastIndex      the last index to be updated in the metadata
+     * @param fsync          a boolean indicating whether to force synchronization of
+     *                       file data to the underlying storage
+     * @throws IOException   if an I/O error occurs during writing or syncing
+     */
     static void update(FileChannel ch, long consumerOffset, long producerOffset, long recordCount, long lastIndex, boolean fsync) throws IOException {
         ByteBuffer buf = ByteBuffer.allocate(Integer.BYTES + Short.BYTES + Long.BYTES * 4);
         buf.putInt(MAGIC);
