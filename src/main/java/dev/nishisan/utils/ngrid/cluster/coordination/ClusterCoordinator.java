@@ -126,6 +126,18 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         return leaderId != null && leaderId.equals(transport.local().nodeId());
     }
 
+    /**
+     * Sets the preferred leader for the cluster with an optional time-to-live (TTL).
+     *
+     * A preferred leader is a node that is temporarily prioritized as the leader for
+     * the duration specified by the TTL. If the TTL is null, zero, or negative,
+     * the preferred leader is cleared, and the leader is recomputed immediately.
+     *
+     * @param leaderId the identifier of the node to be set as the preferred leader;
+     *                 may be null to clear the current preference.
+     * @param ttl the duration for which the specified node should be preferred as the leader;
+     *            must be non-negative and non-zero, otherwise the preference is cleared.
+     */
     public void setPreferredLeader(NodeId leaderId, Duration ttl) {
         Objects.requireNonNull(ttl, "ttl");
         if (ttl.isNegative() || ttl.isZero()) {

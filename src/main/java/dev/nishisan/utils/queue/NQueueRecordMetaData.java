@@ -50,6 +50,13 @@ public class NQueueRecordMetaData {
     private String className;   // nome da classe (UTF-8)
     private int classNameLen;   // cache do comprimento do nome
 
+    /**
+     * Constructs a new instance of NQueueRecordMetaData.
+     *
+     * @param index The record index, represented as a long value.
+     * @param payloadLen The length of the payload, represented as an integer.
+     * @param className The name of the class, represented as a String in UTF-8 encoding.
+     */
     public NQueueRecordMetaData(long index, int payloadLen, String className) {
         this.index = index;
         this.payloadLen = payloadLen;

@@ -15,7 +15,9 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>
  */
 
-package dev.nishisan.utils.queue;
+package dev.nishisan.utils.queue.examples;
+
+import dev.nishisan.utils.queue.NQueue;
 
 import java.io.IOException;
 import java.nio.file.Path;
