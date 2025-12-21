@@ -142,6 +142,8 @@ public class NQueue<T extends Serializable> implements Closeable {
 
     private long consumerOffset, producerOffset, recordCount, lastIndex, lastCompactionTimeNanos;
     private long lastDeliveredIndex = -1;
+    private long outOfOrderCount = 0;
+    private final boolean orderDetectionEnabled;
     private volatile boolean closed, shutdownRequested;
     private volatile CompactionState compactionState = CompactionState.IDLE;
     private PreIndexedItem<T> handoffItem;
@@ -195,6 +197,7 @@ public class NQueue<T extends Serializable> implements Closeable {
         this.approximateSize.set(state.recordCount);
         this.options = options;
         this.enableMemoryBuffer = options.enableMemoryBuffer;
+        this.orderDetectionEnabled = options.enableOrderDetection;
         this.lastCompactionTimeNanos = System.nanoTime();
         if (enableMemoryBuffer) {
             this.memoryBuffer = new LinkedBlockingQueue<>(options.memoryBufferSize);
@@ -394,10 +397,7 @@ public class NQueue<T extends Serializable> implements Closeable {
 
             if (handoffItem != null) {
                 long idx = handoffItem.index();
-                if (lastDeliveredIndex != -1 && idx <= lastDeliveredIndex) {
-                    if (idx != 0) statsUtils.notifyHitCounter(NQueueMetrics.OUT_OF_ORDER);
-                }
-                lastDeliveredIndex = idx;
+                recordDeliveryIndex(idx);
                 T item = handoffItem.item();
                 handoffItem = null;
                 return Optional.of(item);
@@ -407,10 +407,7 @@ public class NQueue<T extends Serializable> implements Closeable {
                 notEmpty.awaitUninterruptibly();
                 if (handoffItem != null) {
                     long idx = handoffItem.index();
-                    if (lastDeliveredIndex != -1 && idx <= lastDeliveredIndex) {
-                        if (idx != 0) statsUtils.notifyHitCounter(NQueueMetrics.OUT_OF_ORDER);
-                    }
-                    lastDeliveredIndex = idx;
+                    recordDeliveryIndex(idx);
                     T item = handoffItem.item();
                     handoffItem = null;
                     return Optional.of(item);
@@ -444,10 +441,7 @@ public class NQueue<T extends Serializable> implements Closeable {
 
             if (handoffItem != null) {
                 long idx = handoffItem.index();
-                if (lastDeliveredIndex != -1 && idx <= lastDeliveredIndex) {
-                    if (idx != 0) statsUtils.notifyHitCounter(NQueueMetrics.OUT_OF_ORDER);
-                }
-                lastDeliveredIndex = idx;
+                recordDeliveryIndex(idx);
                 T item = handoffItem.item();
                 handoffItem = null;
                 return Optional.of(item);
@@ -462,10 +456,7 @@ public class NQueue<T extends Serializable> implements Closeable {
                     nanos = notEmpty.awaitNanos(nanos);
                     if (handoffItem != null) {
                         long idx = handoffItem.index();
-                        if (lastDeliveredIndex != -1 && idx <= lastDeliveredIndex) {
-                            if (idx != 0) statsUtils.notifyHitCounter(NQueueMetrics.OUT_OF_ORDER);
-                        }
-                        lastDeliveredIndex = idx;
+                        recordDeliveryIndex(idx);
                         T item = handoffItem.item();
                         handoffItem = null;
                         return Optional.of(item);
@@ -858,13 +849,7 @@ public class NQueue<T extends Serializable> implements Closeable {
     private Optional<NQueueRecord> consumeNextRecordLocked() throws IOException {
         return readAtInternal(consumerOffset).map(res -> {
             long currentIndex = res.getRecord().meta().getIndex();
-            if (lastDeliveredIndex != -1 && currentIndex <= lastDeliveredIndex) {
-                // Ignore reset to 0 if it happens (though it shouldn't in a single run without reset)
-                if (currentIndex != 0) {
-                    statsUtils.notifyHitCounter(NQueueMetrics.OUT_OF_ORDER);
-                }
-            }
-            lastDeliveredIndex = currentIndex;
+            recordDeliveryIndex(currentIndex);
 
             consumerOffset = res.getNextOffset();
             recordCount--;
@@ -1331,6 +1316,47 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
+     * Centralized out-of-order delivery detector. Increments the outOfOrderCount and notifies metrics if enabled.
+     * Called whenever a record is delivered to a consumer (handoff or disk).
+     */
+    private void recordDeliveryIndex(long seq) {
+        if (!orderDetectionEnabled) return;
+        if (lastDeliveredIndex != -1 && seq <= lastDeliveredIndex) {
+            if (seq != 0) {
+                outOfOrderCount++;
+                statsUtils.notifyHitCounter(NQueueMetrics.OUT_OF_ORDER);
+            }
+        }
+        lastDeliveredIndex = seq;
+    }
+
+    /**
+     * For debugging/diagnostics only. Returns the last delivered sequence index observed by the internal
+     * order detector, or -1 if no delivery was recorded.
+     */
+    public long getLastDeliveredIndex() {
+        lock.lock();
+        try {
+            return lastDeliveredIndex;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * For debugging/diagnostics only. Returns how many out-of-order events the internal detector recorded
+     * during this queue instance lifetime.
+     */
+    public long getOutOfOrderCount() {
+        lock.lock();
+        try {
+            return outOfOrderCount;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
      * Wrapper for elements staged in the in-memory buffer, capturing arrival time to aid operational
      * decisions and debugging.
      */
@@ -1383,6 +1409,7 @@ public class NQueue<T extends Serializable> implements Closeable {
         long compactionIntervalNanos = TimeUnit.MINUTES.toNanos(5);
         int compactionBufferSize = 128 * 1024;
         boolean withFsync = true, enableMemoryBuffer = false, resetOnRestart = false, allowShortCircuit = true;
+        boolean enableOrderDetection = false;
         int memoryBufferSize = 10000;
         long lockTryTimeoutNanos = TimeUnit.MILLISECONDS.toNanos(10), revalidationIntervalNanos = TimeUnit.MILLISECONDS.toNanos(100);
         long maintenanceIntervalNanos = TimeUnit.SECONDS.toNanos(5);
@@ -1493,6 +1520,20 @@ public class NQueue<T extends Serializable> implements Closeable {
         }
 
         /**
+         * Enables or disables the internal out-of-order delivery detector.
+         * When enabled, the queue will keep a lightweight monotonicity check of delivered record indices and
+         * increment the {@link NQueueMetrics#OUT_OF_ORDER} counter if a regression/duplicate is observed.
+         * Default is disabled to avoid any overhead in the hot path.
+         *
+         * @param e true to enable detection, false to disable (default)
+         * @return this builder for chaining
+         */
+        public Options withOrderDetection(boolean e) {
+            this.enableOrderDetection = e;
+            return this;
+        }
+
+        /**
          * Sets the maximum time the queue will wait when attempting to acquire coordination for draining or
          * maintenance before retrying. Useful to tune responsiveness under contention.
          *
@@ -1583,6 +1624,7 @@ public class NQueue<T extends Serializable> implements Closeable {
             final long compactionIntervalNanos, lockTryTimeoutNanos, revalidationIntervalNanos, maintenanceIntervalNanos, maxSizeReconciliationIntervalNanos;
             final int compactionBufferSize, memoryBufferSize;
             final boolean enableMemoryBuffer, allowShortCircuit;
+            final boolean enableOrderDetection;
 
             /**
              * Captures the current values from a mutable options builder for safe sharing.
@@ -1600,6 +1642,7 @@ public class NQueue<T extends Serializable> implements Closeable {
                 this.maintenanceIntervalNanos = o.maintenanceIntervalNanos;
                 this.maxSizeReconciliationIntervalNanos = o.maxSizeReconciliationIntervalNanos;
                 this.allowShortCircuit = o.allowShortCircuit;
+                this.enableOrderDetection = o.enableOrderDetection;
             }
         }
     }
