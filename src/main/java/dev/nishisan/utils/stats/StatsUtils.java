@@ -33,6 +33,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 
 /**
@@ -49,6 +50,8 @@ public class StatsUtils {
     private SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssX");
     private Long usedMemory = 0L;
     private List<IStatsListener> listeners = new ArrayList<>();
+    private Thread statsThread;
+    private AtomicBoolean running = new AtomicBoolean(true);
 
     public StatsUtils() {
         this.startStatsThread();
@@ -236,19 +239,19 @@ public class StatsUtils {
      * Creates a thread to call calcStats() every 10 seconds.
      */
     public void startStatsThread() {
-        Thread thread = new Thread(() -> {
-            while (true) {
+        this.statsThread = new Thread(() -> {
+            while (running.get()) {
                 try {
                     Thread.sleep(10000);
                     caclcStats();
                 } catch (InterruptedException e) {
-                    e.printStackTrace();
+                    logger.debug("Shutting Down Stats Thread");
                 }
             }
         });
-        thread.setDaemon(true);
-        thread.setName("Nishi-Stats-Thread");
-        thread.start();
+        this.statsThread.setDaemon(true);
+        this.statsThread.setName("Nishi-Stats-Thread");
+        this.statsThread.start();
     }
 
     /**
@@ -407,6 +410,15 @@ public class StatsUtils {
         return bd.doubleValue();
     }
 
+
+    public void shutdown() {
+        try {
+            this.running.set(false);
+            this.statsThread.interrupt();
+        } catch (Exception e) {
+            //Omit
+        }
+    }
 
     public void registerListener(IStatsListener listener) {
         if (!this.listeners.contains(listener)) {

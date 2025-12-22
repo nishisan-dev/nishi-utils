@@ -581,7 +581,7 @@ public class NQueue<T extends Serializable> implements Closeable {
      */ public void close() throws IOException {
         // Stop maintenance first
         maintenanceExecutor.shutdownNow();
-
+        statsUtils.shutdown();
         if (enableMemoryBuffer) {
             lock.lock();
             try {
