@@ -230,6 +230,7 @@ public class StatsUtils {
             this.counters.replace(counter, metric);
         } else {
             metric = new HitCounterDTO(counter);
+            metric.increment();
             this.counters.put(counter, metric);
             this.listeners.forEach(l -> l.onHitCounterCreated(metric));
         }
@@ -406,7 +407,7 @@ public class StatsUtils {
      */
     private double round(double value, int places) {
         BigDecimal bd = new BigDecimal(value);
-        bd = bd.setScale(places, BigDecimal.ROUND_HALF_UP);
+        bd = bd.setScale(places, java.math.RoundingMode.HALF_UP);
         return bd.doubleValue();
     }
 
