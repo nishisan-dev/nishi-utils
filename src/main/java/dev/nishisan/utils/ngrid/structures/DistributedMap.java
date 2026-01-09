@@ -55,22 +55,37 @@ public final class DistributedMap<K extends Serializable, V extends Serializable
     private final String mapRemoveCommand;
     private final String mapGetCommand;
     private final StatsUtils stats;
+    private final dev.nishisan.utils.ngrid.replication.ReplicationManager replicationManager;
     private final NodeId localNodeId;
 
     public DistributedMap(Transport transport, ClusterCoordinator coordinator, MapClusterService<K, V> mapService) {
-        this(transport, coordinator, mapService, MapClusterService.DEFAULT_MAP_NAME, null);
+        this(transport, coordinator, mapService, MapClusterService.DEFAULT_MAP_NAME, null, null);
     }
 
     public DistributedMap(Transport transport, ClusterCoordinator coordinator, MapClusterService<K, V> mapService, String mapName) {
-        this(transport, coordinator, mapService, mapName, null);
+        this(transport, coordinator, mapService, mapName, null, null);
     }
 
-    public DistributedMap(Transport transport, ClusterCoordinator coordinator, MapClusterService<K, V> mapService, String mapName, StatsUtils stats) {
+    public DistributedMap(Transport transport,
+                          ClusterCoordinator coordinator,
+                          MapClusterService<K, V> mapService,
+                          String mapName,
+                          StatsUtils stats) {
+        this(transport, coordinator, mapService, mapName, stats, null);
+    }
+
+    public DistributedMap(Transport transport,
+                          ClusterCoordinator coordinator,
+                          MapClusterService<K, V> mapService,
+                          String mapName,
+                          StatsUtils stats,
+                          dev.nishisan.utils.ngrid.replication.ReplicationManager replicationManager) {
         this.transport = transport;
         this.coordinator = coordinator;
         this.mapService = mapService;
         this.mapName = mapName;
         this.stats = stats;
+        this.replicationManager = replicationManager;
         this.localNodeId = transport.local().nodeId();
         if (this.mapName == null || this.mapName.isBlank()) {
             throw new IllegalArgumentException("mapName cannot be blank");
@@ -106,9 +121,36 @@ public final class DistributedMap<K extends Serializable, V extends Serializable
 
     @SuppressWarnings("unchecked")
     public Optional<V> get(K key) {
+        return get(key, Consistency.STRONG);
+    }
+
+    public Optional<V> get(K key, Consistency consistency) {
         if (coordinator.isLeader()) {
             return mapService.get(key);
         }
+
+        boolean canReadLocally = false;
+        if (consistency.level() == ConsistencyLevel.EVENTUAL) {
+            canReadLocally = true;
+        } else if (consistency.level() == ConsistencyLevel.BOUNDED) {
+            long leaderWatermark = coordinator.getTrackedLeaderHighWatermark();
+            if (leaderWatermark < 0) {
+                // Leader watermark unknown, conservatively route to leader or fail?
+                // For now, fallback to leader.
+                canReadLocally = false;
+            } else {
+                long localSequence = replicationManager != null ? replicationManager.getLastAppliedSequence() : 0;
+                long lag = leaderWatermark - localSequence;
+                if (lag <= consistency.maxLag()) {
+                    canReadLocally = true;
+                }
+            }
+        }
+
+        if (canReadLocally) {
+            return mapService.get(key);
+        }
+
         SerializableOptional<V> result = (SerializableOptional<V>) invokeLeader(mapGetCommand, key);
         return result.toOptional();
     }

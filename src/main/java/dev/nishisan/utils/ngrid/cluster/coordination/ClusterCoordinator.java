@@ -59,6 +59,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     private final Set<MembershipListener> membershipListeners = new CopyOnWriteArraySet<>();
     private final ScheduledExecutorService scheduler;
     private final AtomicReference<NodeId> leader = new AtomicReference<>();
+    private volatile java.util.function.LongSupplier leaderHighWatermarkSupplier = () -> -1L;
+    private volatile long trackedLeaderHighWatermark = -1L;
 
     public interface MembershipListener {
         void onMembershipChanged();
@@ -74,6 +76,14 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         this.transport = Objects.requireNonNull(transport, "transport");
         this.config = Objects.requireNonNull(config, "config");
         this.scheduler = Objects.requireNonNull(scheduler, "scheduler");
+    }
+
+    public void setLeaderHighWatermarkSupplier(java.util.function.LongSupplier supplier) {
+        this.leaderHighWatermarkSupplier = Objects.requireNonNull(supplier);
+    }
+
+    public long getTrackedLeaderHighWatermark() {
+        return trackedLeaderHighWatermark;
     }
 
     /**
@@ -233,7 +243,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             if (!running) {
                 return;
             }
-            HeartbeatPayload payload = HeartbeatPayload.now();
+            HeartbeatPayload payload = HeartbeatPayload.now(leaderHighWatermarkSupplier.getAsLong());
             ClusterMessage heartbeat = ClusterMessage.request(MessageType.HEARTBEAT,
                     "hb",
                     transport.local().nodeId(),
@@ -365,8 +375,12 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     @Override
     public void onMessage(ClusterMessage message) {
         if (message.type() == MessageType.HEARTBEAT) {
-            message.payload(HeartbeatPayload.class);
+            HeartbeatPayload payload = message.payload(HeartbeatPayload.class);
             NodeId source = message.source();
+            NodeId currentLeader = leader.get();
+            if (currentLeader != null && currentLeader.equals(source)) {
+                trackedLeaderHighWatermark = payload.leaderHighWatermark();
+            }
             members.computeIfAbsent(source, id -> new ClusterMember(findPeerInfo(source).orElseGet(() -> new NodeInfo(source, "", 0)))).touch();
             recomputeLeader();
         }

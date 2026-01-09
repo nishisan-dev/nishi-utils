@@ -38,6 +38,7 @@ public final class NGridConfig {
     private final int replicationFactor;
     private final Duration replicationOperationTimeout;
     private final Duration rttProbeInterval;
+    private final Duration heartbeatInterval;
     private final boolean leaderReelectionEnabled;
     private final Duration leaderReelectionInterval;
     private final Duration leaderReelectionCooldown;
@@ -63,6 +64,7 @@ public final class NGridConfig {
         this.replicationFactor = effectiveReplication;
         this.replicationOperationTimeout = builder.replicationOperationTimeout;
         this.rttProbeInterval = builder.rttProbeInterval;
+        this.heartbeatInterval = builder.heartbeatInterval;
         this.leaderReelectionEnabled = builder.leaderReelectionEnabled;
         this.leaderReelectionInterval = builder.leaderReelectionInterval;
         this.leaderReelectionCooldown = builder.leaderReelectionCooldown;
@@ -106,6 +108,10 @@ public final class NGridConfig {
 
     public Duration rttProbeInterval() {
         return rttProbeInterval;
+    }
+
+    public Duration heartbeatInterval() {
+        return heartbeatInterval;
     }
 
     public boolean strictConsistency() {
@@ -183,6 +189,7 @@ public final class NGridConfig {
         private Integer replicationFactor;
         private Duration replicationOperationTimeout;
         private Duration rttProbeInterval = Duration.ofSeconds(2);
+        private Duration heartbeatInterval = Duration.ofSeconds(1);
         private boolean leaderReelectionEnabled = false;
         private Duration leaderReelectionInterval = Duration.ofSeconds(5);
         private Duration leaderReelectionCooldown = Duration.ofSeconds(60);
@@ -266,6 +273,15 @@ public final class NGridConfig {
                 throw new IllegalArgumentException("interval must be >= 0");
             }
             this.rttProbeInterval = interval;
+            return this;
+        }
+
+        public Builder heartbeatInterval(Duration interval) {
+            Objects.requireNonNull(interval, "interval");
+            if (interval.isNegative() || interval.isZero()) {
+                throw new IllegalArgumentException("interval must be positive");
+            }
+            this.heartbeatInterval = interval;
             return this;
         }
 

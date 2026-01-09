@@ -66,6 +66,9 @@ public final class ReplicationManager implements TransportListener, LeadershipLi
     private final Map<UUID, ReplicatedRecord> log = new ConcurrentHashMap<>();
     private final Set<UUID> applied = new CopyOnWriteArraySet<>();
     private final Set<UUID> processing = ConcurrentHashMap.newKeySet();
+    private final java.util.concurrent.atomic.AtomicLong globalSequence = new java.util.concurrent.atomic.AtomicLong(0);
+    private volatile long lastAppliedSequence = 0;
+
     private final ExecutorService executor = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "ngrid-replication");
         t.setDaemon(true);
@@ -116,6 +119,14 @@ public final class ReplicationManager implements TransportListener, LeadershipLi
         handlers.put(topic, handler);
     }
 
+    public long getGlobalSequence() {
+        return globalSequence.get();
+    }
+
+    public long getLastAppliedSequence() {
+        return lastAppliedSequence;
+    }
+
     /**
      * Exposes the configured replication operation timeout for callers that need to
      * bound their waiting time (e.g. higher-level services calling {@code future.get(...)}).
@@ -164,7 +175,9 @@ public final class ReplicationManager implements TransportListener, LeadershipLi
     }
 
     private void replicateToFollowers(PendingOperation operation) {
-        ReplicationPayload payload = new ReplicationPayload(operation.operationId, operation.topic, operation.payload);
+        long seq = globalSequence.incrementAndGet();
+        operation.sequence = seq;
+        ReplicationPayload payload = new ReplicationPayload(operation.operationId, seq, operation.topic, operation.payload);
         for (NodeInfo member : coordinator.activeMembers()) {
             if (member.nodeId().equals(transport.local().nodeId())) {
                 continue;
@@ -192,7 +205,7 @@ public final class ReplicationManager implements TransportListener, LeadershipLi
                 if (operation.isDone()) {
                     continue;
                 }
-                ReplicationPayload payload = new ReplicationPayload(operation.operationId, operation.topic, operation.payload);
+                ReplicationPayload payload = new ReplicationPayload(operation.operationId, operation.sequence, operation.topic, operation.payload);
                 for (NodeInfo member : coordinator.activeMembers()) {
                     NodeId nodeId = member.nodeId();
                     if (nodeId.equals(transport.local().nodeId())) {
@@ -227,6 +240,7 @@ public final class ReplicationManager implements TransportListener, LeadershipLi
                 if (handler != null) {
                     try {
                         handler.apply(operation.operationId, operation.payload);
+                        lastAppliedSequence = Math.max(lastAppliedSequence, operation.sequence);
                         applied.add(operation.operationId);
                         operation.localApplied = true;
                     } catch (Exception e) {
@@ -289,6 +303,7 @@ public final class ReplicationManager implements TransportListener, LeadershipLi
         executor.submit(() -> {
             try {
                 handler.apply(opId, payload.data());
+                lastAppliedSequence = Math.max(lastAppliedSequence, payload.sequence());
                 log.putIfAbsent(opId, new ReplicatedRecord(opId, payload.topic(), payload.data(), OperationStatus.COMMITTED));
                 applied.add(opId);
                 sendAck(opId, message.source());
@@ -416,6 +431,7 @@ public final class ReplicationManager implements TransportListener, LeadershipLi
         private final String topic;
         private final Serializable payload;
         private final int quorum;
+        private volatile long sequence;
         private final Set<NodeId> acknowledgements = ConcurrentHashMap.newKeySet();
         private final CompletableFuture<ReplicationResult> future = new CompletableFuture<>();
         private volatile OperationStatus status = OperationStatus.PENDING;

@@ -27,20 +27,31 @@ import java.util.UUID;
  */
 public final class ReplicationPayload implements Serializable {
     @Serial
-    private static final long serialVersionUID = 1L;
+    private static final long serialVersionUID = 2L;
 
     private final UUID operationId;
+    private final long sequence;
     private final String topic;
     private final Serializable data;
 
-    public ReplicationPayload(UUID operationId, String topic, Serializable data) {
+    public ReplicationPayload(UUID operationId, long sequence, String topic, Serializable data) {
         this.operationId = Objects.requireNonNull(operationId, "operationId");
+        this.sequence = sequence;
         this.topic = Objects.requireNonNull(topic, "topic");
         this.data = Objects.requireNonNull(data, "data");
     }
 
+    // Legacy constructor for backward compatibility
+    public ReplicationPayload(UUID operationId, String topic, Serializable data) {
+        this(operationId, -1L, topic, data);
+    }
+
     public UUID operationId() {
         return operationId;
+    }
+
+    public long sequence() {
+        return sequence;
     }
 
     public String topic() {

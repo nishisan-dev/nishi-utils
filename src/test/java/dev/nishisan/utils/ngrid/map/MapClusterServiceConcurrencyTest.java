@@ -140,7 +140,12 @@ class MapClusterServiceConcurrencyTest {
 
         @Override
         public boolean isConnected(NodeId nodeId) {
-            return nodeId.equals(local.nodeId());
+            return true;
+        }
+
+        @Override
+        public boolean isReachable(NodeId nodeId) {
+            return true;
         }
 
         @Override
