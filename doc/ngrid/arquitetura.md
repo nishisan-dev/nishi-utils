@@ -320,6 +320,13 @@ Leader-->>Client: Sucesso
 3. O algoritmo de eleição (`pickMaxNodeId`) seleciona determinísticamente o novo líder entre os nós restantes.
 4. O novo líder assume o controle das operações e da coordenação.
 
+### Resiliência e Auto-Cura (Catch-up)
+O NGrid implementa um mecanismo de **sincronização de estado (State Sync)** para recuperar nós que ficaram offline ou entraram tardiamente no cluster.
+
+1. **Detecção de Atraso (Lag):** O `ReplicationManager` monitora continuamente a diferença entre a sequência global do líder (`leaderHighWatermark`) e a última operação aplicada localmente. Se o atraso exceder um limiar configurado (padrão: 500 operações), o nó inicia o processo de **Catch-up**.
+2. **Snapshot Transfer:** O nó solicita ao líder um snapshot do estado atual. Para evitar gargalos de rede e memória, a transferência é feita em **chunks** (paginada).
+3. **Instalação:** O nó limpa seu estado local (`resetState`) e instala os chunks recebidos. Ao finalizar, atualiza sua sequência local para corresponder à do líder e retoma a replicação incremental normal.
+
 ### Limitações Atuais (MVP)
 - **Escrita Centralizada:** Todas as escritas dependem do líder, o que simplifica a consistência mas pode ser um gargalo em clusters muito grandes.
 - **Mapa em Memória:** O tamanho do mapa é limitado pela RAM disponível nos nós (embora a persistência em disco ajude na durabilidade, ela não estende a capacidade de armazenamento).
