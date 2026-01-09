@@ -19,6 +19,9 @@ package dev.nishisan.utils.stats.dto;
 
 import java.util.concurrent.atomic.AtomicLong;
 
+/**
+ * DTO that stores a named value backed by an atomic counter.
+ */
 public class SimpleValueDTO {
     private String name;
     private AtomicLong value;

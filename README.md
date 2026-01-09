@@ -17,11 +17,14 @@ Coleção de utilitários em Java, com foco em:
 
 ### NGrid (fila/mapa distribuídos)
 
-- Cluster via **TCP** com descoberta/gossip de peers
-- **Roteamento Inteligente (Sticky Proxy):** Comunicação resiliente entre nós que não se enxergam diretamente (ex: NAT/Firewall), usando pares como intermediários.
-- **Eleição determinística de líder** (por ID)
-- **Replicação com quorum** configurável (Modos: Disponibilidade ou Consistência Estrita)
+- Cluster via **TCP** com descoberta de peers e heartbeats
+- **Roteamento Inteligente (Sticky Proxy)** com otimização por RTT para alcançar nós inacessíveis diretamente
+- **Eleição determinística de líder** (por ID) e reeleição opcional guiada por taxa de escrita
+- **Replicação com quorum** configurável (modos: disponibilidade ou consistência estrita)
 - API cliente transparente: qualquer nó pode encaminhar a operação ao líder
+- **Consistência de leitura** para mapas: forte, eventual ou limitada por lag
+- **Sincronização de estado (catch-up)** por snapshot em chunks para mapas distribuídos
+- **Persistência opcional de mapa** com WAL + snapshot (recuperação robusta em crash/rotação)
 - Estruturas:
   - `DistributedQueue`: `offer`, `poll`, `peek`
   - `DistributedMap`: `put`, `get`, `remove`
@@ -210,11 +213,13 @@ public class NGridClusterExample {
 }
 ```
 
-### Observações/limitações atuais (MVP)
+### Observações/limitações atuais
 
 - Operações são **roteadas ao líder** para consistência.
-- O mapa é mantido em memória (e replicado); snapshot/catch-up completo ainda é uma evolução natural.
+- O mapa é mantido em memória (e replicado); persistência em disco é **durabilidade**, não expansão de capacidade.
 - O `replicationQuorum` define quantos nós (incluindo o líder) precisam confirmar para a operação ser considerada commitada.
+- **Catch-up de fila distribuída** ainda não é implementado; nós atrasados dependem da replicação online.
+- O conjunto de operações aplicadas para deduplicação fica em memória; após reinício total do cluster ele começa vazio.
 
 ## Arquitetura (resumo)
 
@@ -290,6 +295,4 @@ mvn test
 ## Licença
 
 Este projeto é distribuído sob **GNU GPL v3** (ou posterior). Veja os cabeçalhos dos arquivos-fonte para detalhes.
-
-
 

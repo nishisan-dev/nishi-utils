@@ -21,6 +21,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Stream;
 
+/**
+ * Fixed-capacity list that evicts the oldest element when full.
+ */
 public class FixedSizeList<E extends Number> {
     private final List<E> internalList;
     private final int capacity;

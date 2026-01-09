@@ -25,7 +25,6 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -65,6 +64,14 @@ final class NetworkRouter {
         this.localLatenciesSupplier = localLatenciesSupplier;
     }
 
+    /**
+     * Updates the reachability information of nodes and re-evaluates routes if necessary.
+     *
+     * @param sourcePeer The {@link NodeId} of the peer reporting the reachability data.
+     * @param knownByPeer A collection of {@link NodeInfo} objects representing nodes known by the reporting peer.
+     * @param latenciesFromSource A map of {@link NodeId} to latency values, indicating the latencies
+     *                             reported by the peer for each target node.
+     */
     void updateReachability(NodeId sourcePeer, Collection<NodeInfo> knownByPeer, Map<NodeId, Double> latenciesFromSource) {
         reportedLatencies.put(sourcePeer, new HashMap<>(latenciesFromSource));
         for (NodeInfo target : knownByPeer) {
@@ -82,6 +89,12 @@ final class NetworkRouter {
         }
     }
 
+    /**
+     * Updates the routing information by marking a target node as unreachable for direct communication.
+     * Attempts to find the best proxy node for routing if a direct route fails.
+     *
+     * @param target The {@link NodeId} of the target node for which the direct communication has failed.
+     */
     void markDirectFailure(NodeId target) {
         routes.compute(target, (id, current) -> {
             if (current != null && current.type() == RouteType.PROXY) {
@@ -90,7 +103,7 @@ final class NetworkRouter {
             return findBestProxy(target, null).map(Route::proxy).orElse(Route.direct());
         });
     }
-    
+
     void promoteToDirect(NodeId target) {
         routes.put(target, Route.direct());
     }
@@ -101,30 +114,44 @@ final class NetworkRouter {
 
     Optional<NodeId> nextHop(NodeId target, NodeId exclude) {
         Route route = routes.getOrDefault(target, Route.direct());
-        
+
         // Phase 2: Even if we are DIRECT, check if there is a proxy path that is MUCH better
         if (route.type() == RouteType.DIRECT) {
             if (target.equals(exclude)) {
                 return findBestProxy(target, exclude);
             }
-            
+
             Optional<NodeId> betterProxy = findSignificantlyBetterProxy(target, exclude);
             if (betterProxy.isPresent()) {
                 LOGGER.info("RTT Optimization: Routing to " + target + " via proxy " + betterProxy.get());
                 return betterProxy;
             }
-            
+
             return Optional.of(target);
         }
-        
+
         NodeId via = route.via();
         if (via != null && via.equals(exclude)) {
             return findBestProxy(target, exclude);
         }
-        
+
         return Optional.ofNullable(via);
     }
 
+    /**
+     * Attempts to find a proxy node for routing to the target node that provides significantly
+     * better performance, as compared to the direct route latency.
+     *
+     * This method evaluates the round-trip time (RTT) to the target node through direct communication.
+     * If a candidate proxy with a substantially lower cost-to-reach is available while meeting the defined
+     * performance threshold, this proxy is selected and returned.
+     *
+     * @param target The {@link NodeId} of the target node for which a better proxy is being searched.
+     * @param exclude The {@link NodeId} of a node to exclude from proxy consideration, typically used
+     *                for avoiding routing through a specified node.
+     * @return An {@link Optional} containing the {@link NodeId} of the significantly better proxy
+     *         node if one is found; otherwise, an empty {@link Optional}.
+     */
     private Optional<NodeId> findSignificantlyBetterProxy(NodeId target, NodeId exclude) {
         Map<NodeId, Double> local = localLatenciesSupplier.get();
         Double directRtt = local.get(target);
@@ -155,26 +182,26 @@ final class NetworkRouter {
         }
 
         Map<NodeId, Double> local = localLatenciesSupplier.get();
-        
+
         List<PathCost> scoredCandidates = candidates.stream()
                 .filter(id -> !id.equals(exclude))
                 .map(proxyId -> {
                     Double rttToProxy = local.get(proxyId);
                     Map<NodeId, Double> proxyReported = reportedLatencies.get(proxyId);
                     Double rttFromProxyToTarget = proxyReported != null ? proxyReported.get(target) : null;
-                    
+
                     if (rttToProxy != null && rttFromProxyToTarget != null) {
                         return new PathCost(proxyId, rttToProxy + rttFromProxyToTarget);
                     }
                     // If no RTT info, use a very high but not MAX_VALUE cost to allow it as fallback
-                    return new PathCost(proxyId, 1000000.0); 
+                    return new PathCost(proxyId, 1000000.0);
                 })
                 .toList();
 
         return scoredCandidates.stream()
                 .min(Comparator.comparingDouble(PathCost::cost));
     }
-    
+
     Map<NodeId, Route> routesSnapshot() {
         return Collections.unmodifiableMap(new ConcurrentHashMap<>(routes));
     }

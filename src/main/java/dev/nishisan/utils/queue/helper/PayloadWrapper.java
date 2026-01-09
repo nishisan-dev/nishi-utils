@@ -2,6 +2,9 @@ package dev.nishisan.utils.queue.helper;
 
 import java.io.Serializable;
 
+/**
+ * Wraps a payload with a sequence number for ordered processing.
+ */
 public class PayloadWrapper<T extends Serializable> {
     private T payload;
     private long seq;

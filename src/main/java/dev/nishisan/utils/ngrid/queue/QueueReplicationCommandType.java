@@ -17,6 +17,9 @@
 
 package dev.nishisan.utils.ngrid.queue;
 
+/**
+ * Replication command types supported by distributed queues.
+ */
 public enum QueueReplicationCommandType {
     OFFER,
     POLL
