@@ -30,6 +30,7 @@ import java.text.StringCharacterIterator;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -288,7 +289,7 @@ public class StatsUtils {
                 HitCounterDTO v = entry.getValue();
                 v.calc();
                 if (print)
-                    logger.debug(String.format("  Stats:  [%-35s]:=[%10.3f]/s Current Value:(%11d)", k, round(v.getRate(), 3), v.getValue()));
+                    logger.debug(String.format(Locale.US, "  Stats:  [%-35s]:=[%10.3f]/s Current Value:(%11d)", k, round(v.getRate(), 3), v.getValue()));
             });
         } else {
             if (print)
@@ -310,7 +311,7 @@ public class StatsUtils {
             try {
                 Double avg = v.stream().mapToDouble(a -> a).average().orElse(0.0);
                 if (print)
-                    logger.debug(String.format("  Average: [%-34s]:=[%10.3f]", k, round(avg, 3)));
+                    logger.debug(String.format(Locale.US, "  Average: [%-34s]:=[%10.3f]", k, round(avg, 3)));
             } catch (Exception ex) {
                 //
                 // É seguro ignorar esse erro já que é só stats :)
@@ -362,7 +363,7 @@ public class StatsUtils {
             bytes /= 1000;
             ci.next();
         }
-        return String.format("%.1f %cB", bytes / 1000.0, ci.current());
+        return String.format(Locale.US, "%.1f %cB", bytes / 1000.0, ci.current());
     }
 
     /**

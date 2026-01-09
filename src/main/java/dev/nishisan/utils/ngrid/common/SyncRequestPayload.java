@@ -17,22 +17,34 @@
 
 package dev.nishisan.utils.ngrid.common;
 
+import java.io.Serial;
+import java.io.Serializable;
+import java.util.Objects;
+
 /**
- * Enumerates the built-in message types exchanged between transport and higher-level
- * components. Additional application specific commands can be encoded using the
- * {@link ClusterMessage#qualifier()} field.
+ * Request for state synchronization.
  */
-public enum MessageType {
-    HANDSHAKE,
-    PEER_UPDATE,
-    HEARTBEAT,
-    PING,
-    LEADER_SCORE,
-    LEADER_SUGGESTION,
-    REPLICATION_REQUEST,
-    REPLICATION_ACK,
-    CLIENT_REQUEST,
-    CLIENT_RESPONSE,
-    SYNC_REQUEST,
-    SYNC_RESPONSE
+public final class SyncRequestPayload implements Serializable {
+    @Serial
+    private static final long serialVersionUID = 1L;
+
+    private final String topic;
+    private final int chunkIndex;
+
+    public SyncRequestPayload(String topic) {
+        this(topic, 0);
+    }
+
+    public SyncRequestPayload(String topic, int chunkIndex) {
+        this.topic = Objects.requireNonNull(topic, "topic");
+        this.chunkIndex = chunkIndex;
+    }
+
+    public String topic() {
+        return topic;
+    }
+
+    public int chunkIndex() {
+        return chunkIndex;
+    }
 }

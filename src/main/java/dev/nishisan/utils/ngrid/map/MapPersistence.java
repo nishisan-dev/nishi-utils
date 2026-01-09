@@ -308,7 +308,7 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
         }
     }
 
-    private void maybeSnapshot() {
+    public void maybeSnapshot() {
         boolean byOps = config.snapshotIntervalOperations() > 0 && opsSinceSnapshot >= config.snapshotIntervalOperations();
         boolean byTime = config.snapshotIntervalTime() != null
                 && !config.snapshotIntervalTime().isZero()

@@ -151,6 +151,11 @@ class LeaderReelectionServiceTest {
         }
 
         @Override
+        public boolean isReachable(NodeId nodeId) {
+            return true;
+        }
+
+        @Override
         public void addPeer(NodeInfo peer) {
             // no-op
         }

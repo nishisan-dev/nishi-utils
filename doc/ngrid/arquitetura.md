@@ -25,11 +25,15 @@ A arquitetura do NGrid é organizada em camadas lógicas que separam a responsab
 
 Responsável pela comunicação de baixo nível entre os nós.
 - **Conectividade:** Mantém conexões TCP persistentes entre os membros do cluster.
-- **Roteamento Inteligente (Sticky Proxy Fallback):**
-  - O transporte implementa uma lógica de roteamento resiliente para contornar falhas de rede parciais (ex: firewalls, NATs).
-  - **Fallback:** Se uma conexão direta falha, o nó procura automaticamente um vizinho que tenha acesso ao destino e estabelece uma rota "Proxy".
-  - **Stickiness:** Uma vez que uma rota Proxy é estabelecida, ela é mantida ("gruda") para evitar latência de novas tentativas de conexão falhas.
-  - **Recuperação Oportunista:** Uma tarefa em background ("Probe") tenta periodicamente restabelecer a conexão direta de forma silenciosa. Se bem-sucedida, a rota é promovida de volta para "Direct".
+- **Roteamento Inteligente (Mesh & RTT Optimization):**
+  - O transporte implementa uma lógica de roteamento resiliente e otimizada para malha (full mesh).
+  - **Fase 1 (Resiliência):** Se a conexão direta falha, o nó busca automaticamente um vizinho (Proxy) que tenha acesso ao destino, garantindo entrega mesmo com falhas parciais de link.
+  - **Fase 2 (Otimização por Custo):**
+    - O `RttMonitor` coleta métricas de latência para todos os vizinhos diretos.
+    - Essas métricas são disseminadas no cluster via Gossip (`Handshake` e `PeerUpdate`).
+    - O `NetworkRouter` calcula o custo das rotas (`RTT_local_proxy + RTT_proxy_destino`).
+    - Se uma rota via Proxy for significativamente mais rápida que a direta (ganho > 15%) ou se a direta estiver degradada, o tráfego é otimizado automaticamente.
+  - **Stickiness & Recuperação:** Rotas Proxy são mantidas enquanto forem vantajosas ou necessárias. Uma tarefa em background ("Probe") tenta periodicamente restabelecer a conexão direta de forma silenciosa.
   - **TTL:** Mensagens possuem um Time-To-Live para evitar loops infinitos de roteamento.
 - **Descoberta (Gossip Simples):**
   - `HANDSHAKE`: Na conexão, troca metadados do nó e lista de peers conhecidos.
@@ -219,7 +223,7 @@ A->>C: connect()
 A->>C: HANDSHAKE(localInfo, knownPeers)
 C->>A: HANDSHAKE(localInfo, knownPeers)
 
-Note over A,B,C: PEER_UPDATE ajuda nós que entraram depois (late joiners)
+Note over A,C: PEER_UPDATE ajuda nós que entraram depois (late joiners)
 A-->>B: PEER_UPDATE(peers)
 B-->>C: PEER_UPDATE(peers)
 ```
@@ -315,6 +319,13 @@ Leader-->>Client: Sucesso
 2. Os followers detectam o timeout e o removem da lista de membros ativos.
 3. O algoritmo de eleição (`pickMaxNodeId`) seleciona determinísticamente o novo líder entre os nós restantes.
 4. O novo líder assume o controle das operações e da coordenação.
+
+### Resiliência e Auto-Cura (Catch-up)
+O NGrid implementa um mecanismo de **sincronização de estado (State Sync)** para recuperar nós que ficaram offline ou entraram tardiamente no cluster.
+
+1. **Detecção de Atraso (Lag):** O `ReplicationManager` monitora continuamente a diferença entre a sequência global do líder (`leaderHighWatermark`) e a última operação aplicada localmente. Se o atraso exceder um limiar configurado (padrão: 500 operações), o nó inicia o processo de **Catch-up**.
+2. **Snapshot Transfer:** O nó solicita ao líder um snapshot do estado atual. Para evitar gargalos de rede e memória, a transferência é feita em **chunks** (paginada).
+3. **Instalação:** O nó limpa seu estado local (`resetState`) e instala os chunks recebidos. Ao finalizar, atualiza sua sequência local para corresponder à do líder e retoma a replicação incremental normal.
 
 ### Limitações Atuais (MVP)
 - **Escrita Centralizada:** Todas as escritas dependem do líder, o que simplifica a consistência mas pode ser um gargalo em clusters muito grandes.

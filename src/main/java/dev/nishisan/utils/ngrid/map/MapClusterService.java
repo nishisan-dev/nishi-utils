@@ -18,12 +18,17 @@
 package dev.nishisan.utils.ngrid.map;
 
 import dev.nishisan.utils.ngrid.replication.QuorumUnreachableException;
+import dev.nishisan.utils.ngrid.replication.ReplicationHandler;
 import dev.nishisan.utils.ngrid.replication.ReplicationManager;
 import dev.nishisan.utils.ngrid.replication.ReplicationResult;
 
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.Serializable;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
@@ -38,7 +43,7 @@ import java.util.concurrent.TimeUnit;
 /**
  * Simple distributed map that relies on the replication layer to keep replicas aligned.
  */
-public final class MapClusterService<K extends Serializable, V extends Serializable> implements Closeable {
+public final class MapClusterService<K extends Serializable, V extends Serializable> implements Closeable, ReplicationHandler {
     public static final String TOPIC_PREFIX = "map:";
     public static final String DEFAULT_MAP_NAME = "default-map";
 
@@ -63,7 +68,7 @@ public final class MapClusterService<K extends Serializable, V extends Serializa
         if (this.topic.isBlank()) {
             throw new IllegalArgumentException("topic cannot be blank");
         }
-        this.replicationManager.registerHandler(this.topic, this::applyReplication);
+        this.replicationManager.registerHandler(this.topic, this);
         if (persistenceConfig != null && persistenceConfig.mode() != MapPersistenceMode.DISABLED) {
             this.persistence = new MapPersistence<>(persistenceConfig, data);
         } else {
@@ -134,8 +139,9 @@ public final class MapClusterService<K extends Serializable, V extends Serializa
         }
     }
 
+    @Override
     @SuppressWarnings("unchecked")
-    private void applyReplication(UUID operationId, Serializable payload) {
+    public void apply(UUID operationId, Serializable payload) {
         MapReplicationCommand command = (MapReplicationCommand) payload;
         switch (command.type()) {
             case PUT -> data.put((K) command.key(), (V) command.value());
@@ -144,6 +150,48 @@ public final class MapClusterService<K extends Serializable, V extends Serializa
         if (persistence != null) {
             // Persist locally on every node (leader and followers) when applying the replicated command.
             persistence.appendAsync(command.type(), command.key(), command.value());
+        }
+    }
+
+    @Override
+    public SnapshotChunk getSnapshotChunk(int chunkIndex) {
+        int chunkSize = 1000;
+        List<Map.Entry<K, V>> entries = new ArrayList<>(data.entrySet());
+        int start = chunkIndex * chunkSize;
+        if (start >= entries.size()) {
+            return new SnapshotChunk(new HashMap<>(), false);
+        }
+        int end = Math.min(start + chunkSize, entries.size());
+        Map<K, V> chunk = new HashMap<>();
+        for (int i = start; i < end; i++) {
+            Map.Entry<K, V> e = entries.get(i);
+            chunk.put(e.getKey(), e.getValue());
+        }
+        return new SnapshotChunk((Serializable) chunk, end < entries.size());
+    }
+
+    @Override
+    public Serializable getSnapshot() {
+        return new HashMap<>(data);
+    }
+
+    @Override
+    public void resetState() {
+        data.clear();
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public void installSnapshot(Serializable snapshot) {
+        if (snapshot instanceof Map<?, ?> newMap) {
+            // Note: For chunked install, we should probably not clear if it's not the first chunk.
+            // But how do we know if it's the first?
+            // Let's refine the ReplicationManager logic to tell the handler.
+            // For now, let's assume if it's a Map, we just putAll.
+            data.putAll((Map<? extends K, ? extends V>) newMap);
+            if (persistence != null) {
+                persistence.maybeSnapshot();
+            }
         }
     }
 

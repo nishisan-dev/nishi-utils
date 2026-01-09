@@ -102,11 +102,12 @@ public final class NGridNode implements Closeable {
             return;
         }
         TcpTransportConfig.Builder transportBuilder = TcpTransportConfig.builder(config.local())
-                .connectTimeout(Duration.ofSeconds(5))
-                .reconnectInterval(Duration.ofMillis(500))
+                .connectTimeout(config.connectTimeout())
+                .reconnectInterval(config.reconnectInterval())
+                .requestTimeout(config.requestTimeout())
                 .workerThreads(config.transportWorkerThreads());
         config.peers().forEach(transportBuilder::addPeer);
-        transport = new TcpTransport(transportBuilder.build());
+        transport = new TcpTransport(transportBuilder.build(), stats);
         transport.start();
 
         coordinatorScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -114,7 +115,11 @@ public final class NGridNode implements Closeable {
             t.setDaemon(true);
             return t;
         });
-        coordinator = new ClusterCoordinator(transport, ClusterCoordinatorConfig.defaults(), coordinatorScheduler);
+        ClusterCoordinatorConfig coordinatorConfig = ClusterCoordinatorConfig.of(
+                config.heartbeatInterval(),
+                Duration.ofSeconds(5)
+        );
+        coordinator = new ClusterCoordinator(transport, coordinatorConfig, coordinatorScheduler);
         coordinator.start();
 
         metricsScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -145,6 +150,8 @@ public final class NGridNode implements Closeable {
         replicationBuilder.strictConsistency(config.strictConsistency());
         replicationManager = new ReplicationManager(transport, coordinator, replicationBuilder.build());
         replicationManager.start();
+        
+        coordinator.setLeaderHighWatermarkSupplier(() -> coordinator.isLeader() ? replicationManager.getGlobalSequence() : replicationManager.getLastAppliedSequence());
 
         NQueue.Options queueOptions = config.queueOptions() != null ? config.queueOptions() : NQueue.Options.defaults();
         defaultQueueConfig = DistributedQueueConfig.builder(config.queueName())
@@ -438,7 +445,7 @@ public final class NGridNode implements Closeable {
 
     private DistributedMap<Serializable, Serializable> createDistributedMap(String mapName) {
         MapClusterService<Serializable, Serializable> service = mapServices.computeIfAbsent(mapName, this::createMapService);
-        DistributedMap<Serializable, Serializable> m = new DistributedMap<>(transport, coordinator, service, mapName, stats);
+        DistributedMap<Serializable, Serializable> m = new DistributedMap<>(transport, coordinator, service, mapName, stats, replicationManager);
         notifyResourceListeners();
         return m;
     }

@@ -38,6 +38,7 @@ public final class NGridConfig {
     private final int replicationFactor;
     private final Duration replicationOperationTimeout;
     private final Duration rttProbeInterval;
+    private final Duration heartbeatInterval;
     private final boolean leaderReelectionEnabled;
     private final Duration leaderReelectionInterval;
     private final Duration leaderReelectionCooldown;
@@ -50,6 +51,9 @@ public final class NGridConfig {
     private final String mapName;
     private final MapPersistenceMode mapPersistenceMode;
     private final boolean strictConsistency;
+    private final Duration connectTimeout;
+    private final Duration reconnectInterval;
+    private final Duration requestTimeout;
     private final int transportWorkerThreads;
 
     private NGridConfig(Builder builder) {
@@ -60,6 +64,7 @@ public final class NGridConfig {
         this.replicationFactor = effectiveReplication;
         this.replicationOperationTimeout = builder.replicationOperationTimeout;
         this.rttProbeInterval = builder.rttProbeInterval;
+        this.heartbeatInterval = builder.heartbeatInterval;
         this.leaderReelectionEnabled = builder.leaderReelectionEnabled;
         this.leaderReelectionInterval = builder.leaderReelectionInterval;
         this.leaderReelectionCooldown = builder.leaderReelectionCooldown;
@@ -72,6 +77,9 @@ public final class NGridConfig {
         this.mapName = builder.mapName;
         this.mapPersistenceMode = builder.mapPersistenceMode;
         this.strictConsistency = builder.strictConsistency;
+        this.connectTimeout = builder.connectTimeout;
+        this.reconnectInterval = builder.reconnectInterval;
+        this.requestTimeout = builder.requestTimeout;
         this.transportWorkerThreads = builder.transportWorkerThreads;
     }
 
@@ -102,8 +110,24 @@ public final class NGridConfig {
         return rttProbeInterval;
     }
 
+    public Duration heartbeatInterval() {
+        return heartbeatInterval;
+    }
+
     public boolean strictConsistency() {
         return strictConsistency;
+    }
+
+    public Duration connectTimeout() {
+        return connectTimeout;
+    }
+
+    public Duration reconnectInterval() {
+        return reconnectInterval;
+    }
+
+    public Duration requestTimeout() {
+        return requestTimeout;
     }
     
     public int transportWorkerThreads() {
@@ -165,6 +189,7 @@ public final class NGridConfig {
         private Integer replicationFactor;
         private Duration replicationOperationTimeout;
         private Duration rttProbeInterval = Duration.ofSeconds(2);
+        private Duration heartbeatInterval = Duration.ofSeconds(1);
         private boolean leaderReelectionEnabled = false;
         private Duration leaderReelectionInterval = Duration.ofSeconds(5);
         private Duration leaderReelectionCooldown = Duration.ofSeconds(60);
@@ -177,10 +202,28 @@ public final class NGridConfig {
         private String mapName = "default-map";
         private MapPersistenceMode mapPersistenceMode = MapPersistenceMode.DISABLED;
         private boolean strictConsistency = false;
+        private Duration connectTimeout = Duration.ofSeconds(5);
+        private Duration reconnectInterval = Duration.ofMillis(500);
+        private Duration requestTimeout = Duration.ofSeconds(20);
         private int transportWorkerThreads = 2;
 
         private Builder(NodeInfo local) {
             this.local = Objects.requireNonNull(local, "local");
+        }
+
+        public Builder connectTimeout(Duration timeout) {
+            this.connectTimeout = Objects.requireNonNull(timeout, "timeout");
+            return this;
+        }
+
+        public Builder reconnectInterval(Duration interval) {
+            this.reconnectInterval = Objects.requireNonNull(interval, "interval");
+            return this;
+        }
+
+        public Builder requestTimeout(Duration timeout) {
+            this.requestTimeout = Objects.requireNonNull(timeout, "timeout");
+            return this;
         }
 
         public Builder transportWorkerThreads(int threads) {
@@ -230,6 +273,15 @@ public final class NGridConfig {
                 throw new IllegalArgumentException("interval must be >= 0");
             }
             this.rttProbeInterval = interval;
+            return this;
+        }
+
+        public Builder heartbeatInterval(Duration interval) {
+            Objects.requireNonNull(interval, "interval");
+            if (interval.isNegative() || interval.isZero()) {
+                throw new IllegalArgumentException("interval must be positive");
+            }
+            this.heartbeatInterval = interval;
             return this;
         }
 

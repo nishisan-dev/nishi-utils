@@ -20,42 +20,46 @@ package dev.nishisan.utils.ngrid.common;
 import java.io.Serial;
 import java.io.Serializable;
 import java.util.Objects;
-import java.util.UUID;
 
 /**
- * Encapsulates an operation that must be replicated across cluster members.
+ * Response carrying a state snapshot for synchronization.
  */
-public final class ReplicationPayload implements Serializable {
+public final class SyncResponsePayload implements Serializable {
     @Serial
-    private static final long serialVersionUID = 2L;
+    private static final long serialVersionUID = 1L;
 
-    private final UUID operationId;
-    private final long sequence;
     private final String topic;
+    private final long sequence;
+    private final int chunkIndex;
+    private final boolean hasMore;
     private final Serializable data;
 
-    public ReplicationPayload(UUID operationId, long sequence, String topic, Serializable data) {
-        this.operationId = Objects.requireNonNull(operationId, "operationId");
-        this.sequence = sequence;
+    public SyncResponsePayload(String topic, long sequence, Serializable data) {
+        this(topic, sequence, 0, false, data);
+    }
+
+    public SyncResponsePayload(String topic, long sequence, int chunkIndex, boolean hasMore, Serializable data) {
         this.topic = Objects.requireNonNull(topic, "topic");
-        this.data = Objects.requireNonNull(data, "data");
+        this.sequence = sequence;
+        this.chunkIndex = chunkIndex;
+        this.hasMore = hasMore;
+        this.data = data;
     }
 
-    // Legacy constructor for backward compatibility
-    public ReplicationPayload(UUID operationId, String topic, Serializable data) {
-        this(operationId, -1L, topic, data);
-    }
-
-    public UUID operationId() {
-        return operationId;
+    public String topic() {
+        return topic;
     }
 
     public long sequence() {
         return sequence;
     }
 
-    public String topic() {
-        return topic;
+    public int chunkIndex() {
+        return chunkIndex;
+    }
+
+    public boolean hasMore() {
+        return hasMore;
     }
 
     public Serializable data() {

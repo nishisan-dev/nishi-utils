@@ -26,19 +26,32 @@ import java.time.Instant;
  */
 public final class HeartbeatPayload implements Serializable {
     @Serial
-    private static final long serialVersionUID = 1L;
+    private static final long serialVersionUID = 2L;
 
     private final long epochMilli;
+    private final long leaderHighWatermark;
 
-    public HeartbeatPayload(long epochMilli) {
+    public HeartbeatPayload(long epochMilli, long leaderHighWatermark) {
         this.epochMilli = epochMilli;
+        this.leaderHighWatermark = leaderHighWatermark;
     }
 
+    public static HeartbeatPayload now(long leaderHighWatermark) {
+        return new HeartbeatPayload(Instant.now().toEpochMilli(), leaderHighWatermark);
+    }
+
+    /**
+     * Legacy factory for backward compatibility or non-leader heartbeats.
+     */
     public static HeartbeatPayload now() {
-        return new HeartbeatPayload(Instant.now().toEpochMilli());
+        return new HeartbeatPayload(Instant.now().toEpochMilli(), -1L);
     }
 
     public long epochMilli() {
         return epochMilli;
+    }
+
+    public long leaderHighWatermark() {
+        return leaderHighWatermark;
     }
 }

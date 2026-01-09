@@ -28,11 +28,14 @@ import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.ngrid.common.OperationStatus;
 import dev.nishisan.utils.ngrid.common.ReplicationAckPayload;
 import dev.nishisan.utils.ngrid.common.ReplicationPayload;
+import dev.nishisan.utils.ngrid.common.SyncRequestPayload;
+import dev.nishisan.utils.ngrid.common.SyncResponsePayload;
 
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.Serializable;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -57,6 +60,7 @@ import java.util.concurrent.ScheduledExecutorService;
  */
 public final class ReplicationManager implements TransportListener, LeadershipListener, Closeable {
     private static final Logger LOGGER = Logger.getLogger(ReplicationManager.class.getName());
+    private static final long SYNC_THRESHOLD = 500; // Trigger sync if lag > 500 ops
 
     private final Transport transport;
     private final ClusterCoordinator coordinator;
@@ -66,6 +70,10 @@ public final class ReplicationManager implements TransportListener, LeadershipLi
     private final Map<UUID, ReplicatedRecord> log = new ConcurrentHashMap<>();
     private final Set<UUID> applied = new CopyOnWriteArraySet<>();
     private final Set<UUID> processing = ConcurrentHashMap.newKeySet();
+    private final java.util.concurrent.atomic.AtomicLong globalSequence = new java.util.concurrent.atomic.AtomicLong(0);
+    private volatile long lastAppliedSequence = 0;
+    private final Set<String> syncingTopics = ConcurrentHashMap.newKeySet();
+
     private final ExecutorService executor = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "ngrid-replication");
         t.setDaemon(true);
@@ -100,6 +108,7 @@ public final class ReplicationManager implements TransportListener, LeadershipLi
         Duration retryInterval = config.retryInterval();
         long retryMs = Math.max(100L, retryInterval.toMillis());
         timeoutScheduler.scheduleAtFixedRate(this::retryPending, retryMs, retryMs, TimeUnit.MILLISECONDS);
+        timeoutScheduler.scheduleAtFixedRate(this::checkLagAndSync, 2000, 2000, TimeUnit.MILLISECONDS);
     }
 
     public void stop() {
@@ -114,6 +123,32 @@ public final class ReplicationManager implements TransportListener, LeadershipLi
 
     public void registerHandler(String topic, ReplicationHandler handler) {
         handlers.put(topic, handler);
+    }
+
+    public long getGlobalSequence() {
+        return globalSequence.get();
+    }
+
+    public long getLastAppliedSequence() {
+        return lastAppliedSequence;
+    }
+
+    private void checkLagAndSync() {
+        if (!running || coordinator.isLeader()) {
+            return;
+        }
+        long leaderWatermark = coordinator.getTrackedLeaderHighWatermark();
+        if (leaderWatermark < 0) {
+            return;
+        }
+        long lag = leaderWatermark - lastAppliedSequence;
+        if (lag > SYNC_THRESHOLD) {
+            for (String topic : handlers.keySet()) {
+                if (syncingTopics.add(topic)) {
+                    requestSync(topic);
+                }
+            }
+        }
     }
 
     /**
@@ -164,7 +199,9 @@ public final class ReplicationManager implements TransportListener, LeadershipLi
     }
 
     private void replicateToFollowers(PendingOperation operation) {
-        ReplicationPayload payload = new ReplicationPayload(operation.operationId, operation.topic, operation.payload);
+        long seq = globalSequence.incrementAndGet();
+        operation.sequence = seq;
+        ReplicationPayload payload = new ReplicationPayload(operation.operationId, seq, operation.topic, operation.payload);
         for (NodeInfo member : coordinator.activeMembers()) {
             if (member.nodeId().equals(transport.local().nodeId())) {
                 continue;
@@ -192,7 +229,7 @@ public final class ReplicationManager implements TransportListener, LeadershipLi
                 if (operation.isDone()) {
                     continue;
                 }
-                ReplicationPayload payload = new ReplicationPayload(operation.operationId, operation.topic, operation.payload);
+                ReplicationPayload payload = new ReplicationPayload(operation.operationId, operation.sequence, operation.topic, operation.payload);
                 for (NodeInfo member : coordinator.activeMembers()) {
                     NodeId nodeId = member.nodeId();
                     if (nodeId.equals(transport.local().nodeId())) {
@@ -201,7 +238,7 @@ public final class ReplicationManager implements TransportListener, LeadershipLi
                     if (operation.isAcked(nodeId)) {
                         continue;
                     }
-                    if (!transport.isConnected(nodeId)) {
+                    if (!transport.isReachable(nodeId)) {
                         continue;
                     }
                     ClusterMessage message = ClusterMessage.request(MessageType.REPLICATION_REQUEST,
@@ -227,6 +264,7 @@ public final class ReplicationManager implements TransportListener, LeadershipLi
                 if (handler != null) {
                     try {
                         handler.apply(operation.operationId, operation.payload);
+                        lastAppliedSequence = Math.max(lastAppliedSequence, operation.sequence);
                         applied.add(operation.operationId);
                         operation.localApplied = true;
                     } catch (Exception e) {
@@ -267,7 +305,79 @@ public final class ReplicationManager implements TransportListener, LeadershipLi
             handleReplicationRequest(message);
         } else if (message.type() == MessageType.REPLICATION_ACK) {
             handleReplicationAck(message);
+        } else if (message.type() == MessageType.SYNC_REQUEST) {
+            handleSyncRequest(message);
+        } else if (message.type() == MessageType.SYNC_RESPONSE) {
+            handleSyncResponse(message);
         }
+    }
+
+    private void handleSyncRequest(ClusterMessage message) {
+        if (!coordinator.isLeader()) return;
+        SyncRequestPayload payload = message.payload(SyncRequestPayload.class);
+        ReplicationHandler handler = handlers.get(payload.topic());
+        if (handler == null) return;
+
+        ReplicationHandler.SnapshotChunk chunk = handler.getSnapshotChunk(payload.chunkIndex());
+        if (chunk == null) return;
+
+        long seq = globalSequence.get();
+        SyncResponsePayload responsePayload = new SyncResponsePayload(payload.topic(), seq, payload.chunkIndex(), chunk.hasMore(), chunk.data());
+        ClusterMessage response = new ClusterMessage(UUID.randomUUID(),
+                message.messageId(),
+                MessageType.SYNC_RESPONSE,
+                message.qualifier(),
+                transport.local().nodeId(),
+                message.source(),
+                responsePayload,
+                5);
+        transport.send(response);
+    }
+
+    private void handleSyncResponse(ClusterMessage message) {
+        SyncResponsePayload payload = message.payload(SyncResponsePayload.class);
+        ReplicationHandler handler = handlers.get(payload.topic());
+        if (handler == null) return;
+
+        executor.submit(() -> {
+            try {
+                if (payload.chunkIndex() == 0) {
+                    LOGGER.info(() -> "Starting sync for " + payload.topic() + " at sequence " + payload.sequence());
+                    handler.resetState();
+                }
+                handler.installSnapshot(payload.data());
+                
+                if (payload.hasMore()) {
+                    requestSync(payload.topic(), payload.chunkIndex() + 1);
+                } else {
+                    LOGGER.info(() -> "Sync completed for " + payload.topic() + ". Final sequence: " + payload.sequence());
+                    lastAppliedSequence = Math.max(lastAppliedSequence, payload.sequence());
+                    syncingTopics.remove(payload.topic());
+                }
+            } catch (Exception e) {
+                LOGGER.log(Level.SEVERE, "Failed to install snapshot chunk", e);
+                syncingTopics.remove(payload.topic()); // allow retry
+            }
+        });
+    }
+
+    private void requestSync(String topic) {
+        requestSync(topic, 0);
+    }
+
+    private void requestSync(String topic, int chunkIndex) {
+        coordinator.leaderInfo().ifPresent(leader -> {
+            if (chunkIndex == 0) {
+                LOGGER.info(() -> "Lag detected (" + (coordinator.getTrackedLeaderHighWatermark() - lastAppliedSequence) + "). Requesting sync for " + topic);
+            }
+            SyncRequestPayload payload = new SyncRequestPayload(topic, chunkIndex);
+            ClusterMessage request = ClusterMessage.request(MessageType.SYNC_REQUEST,
+                    "sync",
+                    transport.local().nodeId(),
+                    leader.nodeId(),
+                    payload);
+            transport.send(request);
+        });
     }
 
     private void handleReplicationRequest(ClusterMessage message) {
@@ -289,6 +399,7 @@ public final class ReplicationManager implements TransportListener, LeadershipLi
         executor.submit(() -> {
             try {
                 handler.apply(opId, payload.data());
+                lastAppliedSequence = Math.max(lastAppliedSequence, payload.sequence());
                 log.putIfAbsent(opId, new ReplicatedRecord(opId, payload.topic(), payload.data(), OperationStatus.COMMITTED));
                 applied.add(opId);
                 sendAck(opId, message.source());
@@ -344,7 +455,7 @@ public final class ReplicationManager implements TransportListener, LeadershipLi
             if (id.equals(transport.local().nodeId())) {
                 continue;
             }
-            if (transport.isConnected(id)) {
+            if (transport.isReachable(id)) {
                 reachable++;
             }
         }
@@ -416,6 +527,7 @@ public final class ReplicationManager implements TransportListener, LeadershipLi
         private final String topic;
         private final Serializable payload;
         private final int quorum;
+        private volatile long sequence;
         private final Set<NodeId> acknowledgements = ConcurrentHashMap.newKeySet();
         private final CompletableFuture<ReplicationResult> future = new CompletableFuture<>();
         private volatile OperationStatus status = OperationStatus.PENDING;

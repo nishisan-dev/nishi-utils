@@ -127,10 +127,12 @@ class ReplicationManagerQuorumFailureTest {
 
         @Override
         public boolean isConnected(NodeId nodeId) {
-            if (nodeId.equals(local.nodeId())) {
-                return true;
-            }
             return Boolean.TRUE.equals(connected.get(nodeId));
+        }
+
+        @Override
+        public boolean isReachable(NodeId nodeId) {
+            return isConnected(nodeId);
         }
 
         @Override

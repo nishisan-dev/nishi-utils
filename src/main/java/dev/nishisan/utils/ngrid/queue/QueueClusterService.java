@@ -18,6 +18,7 @@
 package dev.nishisan.utils.ngrid.queue;
 
 import dev.nishisan.utils.ngrid.replication.QuorumUnreachableException;
+import dev.nishisan.utils.ngrid.replication.ReplicationHandler;
 import dev.nishisan.utils.ngrid.replication.ReplicationManager;
 import dev.nishisan.utils.ngrid.replication.ReplicationResult;
 import dev.nishisan.utils.queue.NQueue;
@@ -42,7 +43,7 @@ import java.util.logging.Logger;
  * Coordinates queue operations with the replication manager ensuring that the persistent
  * {@link NQueue} backend stays consistent across cluster members.
  */
-public final class QueueClusterService<T extends Serializable> implements Closeable {
+public final class QueueClusterService<T extends Serializable> implements Closeable, ReplicationHandler {
     private static final Logger LOGGER = Logger.getLogger(QueueClusterService.class.getName());
     public static final String TOPIC = "queue";
 
@@ -67,7 +68,7 @@ public final class QueueClusterService<T extends Serializable> implements Closea
         }
         this.replicationManager = Objects.requireNonNull(replicationManager, "replicationManager");
         this.replicationFactor = replicationFactor;
-        this.replicationManager.registerHandler(TOPIC, this::applyReplication);
+        this.replicationManager.registerHandler(TOPIC, this);
     }
 
     public void offer(T value) {
@@ -139,8 +140,9 @@ public final class QueueClusterService<T extends Serializable> implements Closea
         }
     }
 
+    @Override
     @SuppressWarnings("unchecked")
-    private void applyReplication(UUID operationId, Serializable payload) {
+    public void apply(UUID operationId, Serializable payload) {
         QueueReplicationCommand command = (QueueReplicationCommand) payload;
         operationLock.lock();
         try {
@@ -169,6 +171,12 @@ public final class QueueClusterService<T extends Serializable> implements Closea
         } finally {
             operationLock.unlock();
         }
+    }
+
+    @Override
+    public SnapshotChunk getSnapshotChunk(int chunkIndex) {
+        // Queue catch-up not implemented yet
+        return null;
     }
 
     private static NQueue.Options enforceGridOptions(NQueue.Options options) {
