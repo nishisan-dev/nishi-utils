@@ -201,7 +201,7 @@ public final class ReplicationManager implements TransportListener, LeadershipLi
                     if (operation.isAcked(nodeId)) {
                         continue;
                     }
-                    if (!transport.isConnected(nodeId)) {
+                    if (!transport.isReachable(nodeId)) {
                         continue;
                     }
                     ClusterMessage message = ClusterMessage.request(MessageType.REPLICATION_REQUEST,
@@ -344,7 +344,7 @@ public final class ReplicationManager implements TransportListener, LeadershipLi
             if (id.equals(transport.local().nodeId())) {
                 continue;
             }
-            if (transport.isConnected(id)) {
+            if (transport.isReachable(id)) {
                 reachable++;
             }
         }

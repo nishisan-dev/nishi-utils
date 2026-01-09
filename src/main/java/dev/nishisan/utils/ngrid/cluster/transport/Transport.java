@@ -47,5 +47,7 @@ public interface Transport extends Closeable {
 
     boolean isConnected(NodeId nodeId);
 
+    boolean isReachable(NodeId nodeId);
+
     void addPeer(NodeInfo peer);
 }

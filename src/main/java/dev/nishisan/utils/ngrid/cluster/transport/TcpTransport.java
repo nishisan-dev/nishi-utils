@@ -282,6 +282,14 @@ public final class TcpTransport implements Transport {
     }
 
     @Override
+    public boolean isReachable(NodeId nodeId) {
+        if (isConnected(nodeId)) {
+            return true;
+        }
+        return router.nextHop(nodeId).isPresent();
+    }
+
+    @Override
     public void addPeer(NodeInfo peer) {
         if (peer == null || peer.nodeId().equals(config.local().nodeId())) {
             return;
