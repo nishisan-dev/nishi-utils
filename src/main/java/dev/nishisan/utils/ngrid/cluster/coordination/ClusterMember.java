@@ -24,6 +24,9 @@ import java.time.Instant;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicLong;
 
+/**
+ * Internal representation of a cluster member with heartbeat tracking.
+ */
 final class ClusterMember {
     private final NodeInfo nodeInfo;
     private final AtomicLong lastHeartbeat = new AtomicLong();

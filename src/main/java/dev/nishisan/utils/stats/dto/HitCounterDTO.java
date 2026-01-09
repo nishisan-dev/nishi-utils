@@ -20,6 +20,9 @@ package dev.nishisan.utils.stats.dto;
 import java.time.LocalDateTime;
 import java.util.concurrent.atomic.AtomicLong;
 
+/**
+ * DTO that tracks a counter and its calculated hit rate over time.
+ */
 public class HitCounterDTO {
     private String name;
     private AtomicLong currentValue = new AtomicLong(0L);

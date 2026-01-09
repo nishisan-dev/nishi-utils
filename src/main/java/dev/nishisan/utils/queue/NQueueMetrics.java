@@ -17,6 +17,9 @@
 
 package dev.nishisan.utils.queue;
 
+/**
+ * Metric keys emitted by {@link NQueue} operations.
+ */
 public class NQueueMetrics {
     public static String OFFERED_EVENT = "OFFERED_EVENT";
     public static String PEEK_EVENT = "PEEK_EVENT";

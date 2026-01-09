@@ -327,6 +327,16 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         }
     }
 
+    /**
+     * Updates the leader of the cluster and notifies listeners of leadership changes if necessary.
+     *
+     * This method changes the current leader to the specified {@code newLeaderId}.
+     * If the leader changes, registered leadership listeners and leader election listeners
+     * are notified. It also determines if the local node's leadership status has changed,
+     * and updates the relevant listeners accordingly.
+     *
+     * @param newLeaderId the identifier of the new leader; may be {@code null} if no leader is present.
+     */
     private void updateLeader(NodeId newLeaderId) {
         NodeId previous = leader.getAndSet(newLeaderId);
         if (!Objects.equals(previous, newLeaderId)) {
