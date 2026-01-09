@@ -223,7 +223,7 @@ A->>C: connect()
 A->>C: HANDSHAKE(localInfo, knownPeers)
 C->>A: HANDSHAKE(localInfo, knownPeers)
 
-Note over A,B,C: PEER_UPDATE ajuda nós que entraram depois (late joiners)
+Note over A,C: PEER_UPDATE ajuda nós que entraram depois (late joiners)
 A-->>B: PEER_UPDATE(peers)
 B-->>C: PEER_UPDATE(peers)
 ```
