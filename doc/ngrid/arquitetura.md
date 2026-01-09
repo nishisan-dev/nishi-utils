@@ -25,11 +25,15 @@ A arquitetura do NGrid é organizada em camadas lógicas que separam a responsab
 
 Responsável pela comunicação de baixo nível entre os nós.
 - **Conectividade:** Mantém conexões TCP persistentes entre os membros do cluster.
-- **Roteamento Inteligente (Sticky Proxy Fallback):**
-  - O transporte implementa uma lógica de roteamento resiliente para contornar falhas de rede parciais (ex: firewalls, NATs).
-  - **Fallback:** Se uma conexão direta falha, o nó procura automaticamente um vizinho que tenha acesso ao destino e estabelece uma rota "Proxy".
-  - **Stickiness:** Uma vez que uma rota Proxy é estabelecida, ela é mantida ("gruda") para evitar latência de novas tentativas de conexão falhas.
-  - **Recuperação Oportunista:** Uma tarefa em background ("Probe") tenta periodicamente restabelecer a conexão direta de forma silenciosa. Se bem-sucedida, a rota é promovida de volta para "Direct".
+- **Roteamento Inteligente (Mesh & RTT Optimization):**
+  - O transporte implementa uma lógica de roteamento resiliente e otimizada para malha (full mesh).
+  - **Fase 1 (Resiliência):** Se a conexão direta falha, o nó busca automaticamente um vizinho (Proxy) que tenha acesso ao destino, garantindo entrega mesmo com falhas parciais de link.
+  - **Fase 2 (Otimização por Custo):**
+    - O `RttMonitor` coleta métricas de latência para todos os vizinhos diretos.
+    - Essas métricas são disseminadas no cluster via Gossip (`Handshake` e `PeerUpdate`).
+    - O `NetworkRouter` calcula o custo das rotas (`RTT_local_proxy + RTT_proxy_destino`).
+    - Se uma rota via Proxy for significativamente mais rápida que a direta (ganho > 15%) ou se a direta estiver degradada, o tráfego é otimizado automaticamente.
+  - **Stickiness & Recuperação:** Rotas Proxy são mantidas enquanto forem vantajosas ou necessárias. Uma tarefa em background ("Probe") tenta periodicamente restabelecer a conexão direta de forma silenciosa.
   - **TTL:** Mensagens possuem um Time-To-Live para evitar loops infinitos de roteamento.
 - **Descoberta (Gossip Simples):**
   - `HANDSHAKE`: Na conexão, troca metadados do nó e lista de peers conhecidos.

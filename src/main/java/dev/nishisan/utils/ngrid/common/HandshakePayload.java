@@ -20,7 +20,9 @@ package dev.nishisan.utils.ngrid.common;
 import java.io.Serial;
 import java.io.Serializable;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 
@@ -30,14 +32,20 @@ import java.util.Set;
  */
 public final class HandshakePayload implements Serializable {
     @Serial
-    private static final long serialVersionUID = 1L;
+    private static final long serialVersionUID = 2L;
 
     private final NodeInfo local;
     private final Set<NodeInfo> peers;
+    private final Map<NodeId, Double> latencies;
 
     public HandshakePayload(NodeInfo local, Set<NodeInfo> peers) {
+        this(local, peers, Collections.emptyMap());
+    }
+
+    public HandshakePayload(NodeInfo local, Set<NodeInfo> peers, Map<NodeId, Double> latencies) {
         this.local = Objects.requireNonNull(local, "local");
         this.peers = Collections.unmodifiableSet(new HashSet<>(Objects.requireNonNull(peers, "peers")));
+        this.latencies = Collections.unmodifiableMap(new HashMap<>(Objects.requireNonNull(latencies, "latencies")));
     }
 
     public NodeInfo local() {
@@ -46,5 +54,9 @@ public final class HandshakePayload implements Serializable {
 
     public Set<NodeInfo> peers() {
         return peers;
+    }
+
+    public Map<NodeId, Double> latencies() {
+        return latencies;
     }
 }

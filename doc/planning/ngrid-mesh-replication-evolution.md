@@ -25,12 +25,15 @@ The goal is to leverage the existing `NetworkRouter` capabilities to allow the c
     *   **Message Ordering:** Critical. If message $T_1$ is sent directly (stalls) and $T_2$ is sent via proxy (fast), $T_2$ might arrive before $T_1$.
     *   *Mitigation:* The `ReplicationManager` already handles ordering via WAL/Log Index, but the transport layer must ensure causal delivery or the application must handle out-of-order retries gracefully.
 
-#### Phase 2: Optimization (Cost-Based Routing)
+#### Phase 2: Optimization (Cost-Based Routing) - **IMPLEMENTED**
 **Goal:** Optimize data flow based on network metrics (RTT, Throughput).
 
 *   **Mechanism:**
     *   Integrate `RttMonitor` metrics into `NetworkRouter`.
-    *   Use a pathfinding algorithm (e.g., simplified Dijkstra) to find the "lowest cost" path.
+    *   **Gossip Extension:** Added latency map to `PeerUpdatePayload` and `HandshakePayload`. Nodes now share their local RTT views with peers.
+    *   **Routing Logic:** The router calculates path cost: `DirectCost = RTT(Direct)` vs `ProxyCost = RTT(ToProxy) + RTT(ProxyToTarget)`.
+    *   **Hysteresis:** Routes only switch to Proxy if the improvement is significant (> 15%) to prevent flapping.
+    *   **Fallback:** If metrics are unavailable, it falls back to connectivity-based proxying (Phase 1).
     *   **Scenario:** In a multi-region setup (Region A, Region B), the Leader in Region A sends *one* message to a "Bridge Node" in Region B. The Bridge Node then redistributes it to other nodes in Region B (Gossip/Multicast tree style).
 *   **Benefits:** Reduces Leader bandwidth usage; optimizes cross-region latency.
 

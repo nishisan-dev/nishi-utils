@@ -107,7 +107,7 @@ public final class NGridNode implements Closeable {
                 .requestTimeout(config.requestTimeout())
                 .workerThreads(config.transportWorkerThreads());
         config.peers().forEach(transportBuilder::addPeer);
-        transport = new TcpTransport(transportBuilder.build());
+        transport = new TcpTransport(transportBuilder.build(), stats);
         transport.start();
 
         coordinatorScheduler = Executors.newSingleThreadScheduledExecutor(r -> {

@@ -692,10 +692,12 @@ public class StrictConsistencyExample {
 }
 ```
 
-### 4) Cenário de Roteamento (Proxy)
+### 4) Cenário de Roteamento (Proxy e Otimização)
 
-Não há configuração explícita necessária para ativar o roteamento via proxy. Ele é **automático**.
-Se o Nó A não conseguir conectar diretamente ao Líder (Nó C), mas estiver conectado ao Nó B (que vê C), o NGrid automaticamente usará B como ponte para entregar mensagens e replicação.
+Não há configuração explícita necessária para ativar o roteamento via proxy ou a otimização por RTT. Ele é **automático**.
+
+- **Resiliência:** Se o Nó A não conseguir conectar diretamente ao Líder (Nó C), mas estiver conectado ao Nó B (que vê C), o NGrid automaticamente usará B como ponte.
+- **Performance:** Se a conexão direta A->C estiver lenta (ex: latência alta), mas o caminho A->B->C for significativamente mais rápido (com base nas métricas de RTT trocadas pelo cluster), o NGrid poderá optar pela rota via B automaticamente.
 
 ---
 

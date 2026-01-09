@@ -23,6 +23,7 @@ import dev.nishisan.utils.ngrid.common.MessageType;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.ngrid.common.PeerUpdatePayload;
+import dev.nishisan.utils.stats.StatsUtils;
 
 import java.io.Closeable;
 import java.io.EOFException;
@@ -37,6 +38,7 @@ import java.time.Instant;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -68,13 +70,14 @@ public final class TcpTransport implements Transport {
     private static final Logger LOGGER = Logger.getLogger(TcpTransport.class.getName());
 
     private final TcpTransportConfig config;
+    private final StatsUtils stats;
     private final Map<NodeId, NodeInfo> knownPeers = new ConcurrentHashMap<>();
     private final Map<NodeId, Connection> connections = new ConcurrentHashMap<>();
     private final Set<TransportListener> listeners = new CopyOnWriteArraySet<>();
     private final Map<UUID, PendingResponse> pendingResponses = new ConcurrentHashMap<>();
     // Use Virtual Threads for per-task execution
     private final ExecutorService workerPool = Executors.newVirtualThreadPerTaskExecutor();
-    private final NetworkRouter router = new NetworkRouter();
+    private final NetworkRouter router = new NetworkRouter(this::collectLatencies);
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "ngrid-transport-scheduler");
         t.setDaemon(true);
@@ -85,7 +88,12 @@ public final class TcpTransport implements Transport {
     private ServerSocket serverSocket;
 
     public TcpTransport(TcpTransportConfig config) {
+        this(config, null);
+    }
+
+    public TcpTransport(TcpTransportConfig config, StatsUtils stats) {
         this.config = Objects.requireNonNull(config, "config");
+        this.stats = stats;
         knownPeers.put(config.local().nodeId(), config.local());
         config.initialPeers().forEach(p -> knownPeers.putIfAbsent(p.nodeId(), p));
     }
@@ -433,7 +441,7 @@ public final class TcpTransport implements Transport {
     private void sendHandshake(Connection connection) {
         NodeInfo localInfo = config.local();
         Set<NodeInfo> peers = Set.copyOf(knownPeers.values());
-        HandshakePayload payload = new HandshakePayload(localInfo, peers);
+        HandshakePayload payload = new HandshakePayload(localInfo, peers, collectLatencies());
         ClusterMessage message = ClusterMessage.request(MessageType.HANDSHAKE,
                 "hello",
                 localInfo.nodeId(),
@@ -451,7 +459,7 @@ public final class TcpTransport implements Transport {
         connections.put(remoteInfo.nodeId(), connection);
         
         // Feed router with reachability info
-        router.updateReachability(remoteInfo.nodeId(), payload.peers());
+        router.updateReachability(remoteInfo.nodeId(), payload.peers(), payload.latencies());
 
         listeners.forEach(listener -> listener.onPeerConnected(remoteInfo));
         // Merge peers and attempt connections
@@ -472,7 +480,7 @@ public final class TcpTransport implements Transport {
     }
 
     private void broadcastPeerList() {
-        PeerUpdatePayload payload = new PeerUpdatePayload(Set.copyOf(knownPeers.values()));
+        PeerUpdatePayload payload = new PeerUpdatePayload(Set.copyOf(knownPeers.values()), collectLatencies());
         ClusterMessage update = ClusterMessage.request(MessageType.PEER_UPDATE,
                 "peer-update",
                 config.local().nodeId(),
@@ -481,11 +489,25 @@ public final class TcpTransport implements Transport {
         broadcast(update);
     }
 
+    private Map<NodeId, Double> collectLatencies() {
+        if (stats == null) {
+            return Collections.emptyMap();
+        }
+        Map<NodeId, Double> latencies = new HashMap<>();
+        for (NodeId nodeId : knownPeers.keySet()) {
+            Double rtt = stats.getAverageOrNull(dev.nishisan.utils.ngrid.metrics.NGridMetrics.rttMs(nodeId));
+            if (rtt != null) {
+                latencies.put(nodeId, rtt);
+            }
+        }
+        return latencies;
+    }
+
     private void handlePeerUpdate(ClusterMessage message) {
         PeerUpdatePayload payload = message.payload(PeerUpdatePayload.class);
         
         // Feed router with reachability info
-        router.updateReachability(message.source(), payload.peers());
+        router.updateReachability(message.source(), payload.peers(), payload.latencies());
 
         for (NodeInfo peer : payload.peers()) {
             if (!peer.nodeId().equals(config.local().nodeId())) {
