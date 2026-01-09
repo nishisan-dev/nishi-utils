@@ -241,7 +241,7 @@ flowchart TD
       DMap[DistributedMap]
       QSvc[QueueClusterService]
       MSvc[MapClusterService]
-      MPersist[MapPersistence\n(WAL + Snapshot)]
+      MPersist["MapPersistence\n(WAL + Snapshot)"]
 
       NGridNode --> Transport
       NGridNode --> Coordinator
