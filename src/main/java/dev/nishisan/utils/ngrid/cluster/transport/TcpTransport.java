@@ -61,6 +61,8 @@ import java.util.logging.Logger;
  * TCP based transport implementation. It provides best-effort reconnection semantics and
  * a simple handshake protocol that exchanges the list of known peers to gradually form a
  * mesh between all nodes.
+ * <p>
+ * This implementation uses Virtual Threads (Java 21+) to handle concurrency efficiently.
  */
 public final class TcpTransport implements Transport {
     private static final Logger LOGGER = Logger.getLogger(TcpTransport.class.getName());
@@ -70,9 +72,9 @@ public final class TcpTransport implements Transport {
     private final Map<NodeId, Connection> connections = new ConcurrentHashMap<>();
     private final Set<TransportListener> listeners = new CopyOnWriteArraySet<>();
     private final Map<UUID, PendingResponse> pendingResponses = new ConcurrentHashMap<>();
-    private final ExecutorService workerPool;
+    // Use Virtual Threads for per-task execution
+    private final ExecutorService workerPool = Executors.newVirtualThreadPerTaskExecutor();
     private final NetworkRouter router = new NetworkRouter();
-    private Thread acceptThread;
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "ngrid-transport-scheduler");
         t.setDaemon(true);
@@ -86,12 +88,6 @@ public final class TcpTransport implements Transport {
         this.config = Objects.requireNonNull(config, "config");
         knownPeers.put(config.local().nodeId(), config.local());
         config.initialPeers().forEach(p -> knownPeers.putIfAbsent(p.nodeId(), p));
-        ThreadFactory workerFactory = r -> {
-            Thread t = new Thread(r, "ngrid-transport-worker");
-            t.setDaemon(true);
-            return t;
-        };
-        this.workerPool = Executors.newFixedThreadPool(Math.max(1, config.workerThreads()), workerFactory);
     }
 
     // For testing purposes
@@ -107,14 +103,15 @@ public final class TcpTransport implements Transport {
         try {
             serverSocket = new ServerSocket();
             serverSocket.setReuseAddress(true);
-            serverSocket.bind(new InetSocketAddress(config.local().host(), config.local().port()));
+            serverSocket.bind(new InetSocketAddress(config.local().host(), config.local().port()), 100);
         } catch (IOException e) {
             throw new IllegalStateException("Unable to bind TCP transport", e);
         }
         running = true;
-        acceptThread = new Thread(this::acceptLoop, "ngrid-transport-accept");
-        acceptThread.setDaemon(true);
-        acceptThread.start();
+        
+        // Use a Virtual Thread for the accept loop
+        Thread.ofVirtual().name("ngrid-transport-accept").start(this::acceptLoop);
+
         scheduler.scheduleAtFixedRate(this::reconnectLoop,
                 config.reconnectInterval().toMillis(),
                 config.reconnectInterval().toMillis(),
@@ -299,9 +296,11 @@ public final class TcpTransport implements Transport {
     }
 
     private void acceptLoop() {
+        LOGGER.info("Transport accept loop started on port " + config.local().port());
         while (running) {
             try {
                 Socket socket = serverSocket.accept();
+                LOGGER.fine(() -> "Accepted connection from " + socket.getRemoteSocketAddress());
                 registerConnection(socket, null);
             } catch (SocketException se) {
                 if (running) {
@@ -324,7 +323,9 @@ public final class TcpTransport implements Transport {
         if (!running) {
             return;
         }
-        for (NodeInfo peer : knownPeers.values()) {
+        List<NodeInfo> peers = new ArrayList<>(knownPeers.values());
+        Collections.shuffle(peers); // Randomize order to reduce contention
+        for (NodeInfo peer : peers) {
             if (peer.nodeId().equals(config.local().nodeId())) {
                 continue;
             }
@@ -333,7 +334,13 @@ public final class TcpTransport implements Transport {
     }
 
     private void ensureConnectionAsync(NodeInfo peer) {
-        workerPool.submit(() -> ensureConnection(peer.nodeId()));
+        workerPool.submit(() -> {
+            try {
+                ensureConnection(peer.nodeId());
+            } catch (Throwable t) {
+                LOGGER.log(Level.WARNING, "Unexpected error in connection task for " + peer, t);
+            }
+        });
     }
 
     private Connection ensureConnection(NodeId nodeId) {
@@ -354,11 +361,13 @@ public final class TcpTransport implements Transport {
                 return current;
             }
             try {
+                LOGGER.fine(() -> "Initiating connection to " + nodeInfo);
                 Socket socket = new Socket();
                 socket.connect(new InetSocketAddress(nodeInfo.host(), nodeInfo.port()),
                         (int) config.connectTimeout().toMillis());
                 Connection connection = registerConnection(socket, nodeInfo);
                 sendHandshake(connection);
+                LOGGER.fine(() -> "Connected to " + nodeInfo);
                 return connection;
             } catch (IOException e) {
                 LOGGER.log(Level.FINE, "Unable to connect to {0}: {1}", new Object[]{nodeInfo, e.getMessage()});
@@ -380,9 +389,9 @@ public final class TcpTransport implements Transport {
             connection.setRemote(preResolved);
             connections.put(preResolved.nodeId(), connection);
         }
-        Thread reader = new Thread(connection::readLoop, "ngrid-transport-reader");
-        reader.setDaemon(true);
-        reader.start();
+        // Use Virtual Thread for reading
+        Thread.ofVirtual().name("ngrid-transport-reader").start(connection::readLoop);
+        LOGGER.fine(() -> "Registered connection: " + socket.getRemoteSocketAddress());
         return connection;
     }
 
@@ -553,16 +562,10 @@ public final class TcpTransport implements Transport {
         if (serverSocket != null) {
             serverSocket.close();
         }
-        Thread accept = acceptThread;
-        if (accept != null) {
-            try {
-                accept.join(500);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }
+        // Accept thread will die when socket closes or running is false
+        
         scheduler.shutdownNow();
-        workerPool.shutdownNow();
+        workerPool.shutdownNow(); // Virtual threads will be interrupted
         try {
             workerPool.awaitTermination(3, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
@@ -585,11 +588,6 @@ public final class TcpTransport implements Transport {
         private final ObjectOutputStream outputStream;
         private final ObjectInputStream inputStream;
         private final ConcurrentLinkedQueue<ClusterMessage> outbound = new ConcurrentLinkedQueue<>();
-        private final ExecutorService writer = Executors.newSingleThreadExecutor(r -> {
-            Thread t = new Thread(r, "ngrid-transport-writer");
-            t.setDaemon(true);
-            return t;
-        });
         private volatile NodeInfo remote;
         private volatile boolean open = true;
 
@@ -598,7 +596,8 @@ public final class TcpTransport implements Transport {
             this.outputStream = new ObjectOutputStream(socket.getOutputStream());
             this.outputStream.flush();
             this.inputStream = new ObjectInputStream(socket.getInputStream());
-            writer.submit(this::drainOutbound);
+            // Use Virtual Thread for writing (one per connection to ensure order)
+            Thread.ofVirtual().name("ngrid-transport-writer").start(this::drainOutbound);
         }
 
         void setRemote(NodeInfo remote) {
@@ -625,7 +624,12 @@ public final class TcpTransport implements Transport {
                 while (isOpen()) {
                     ClusterMessage message = outbound.poll();
                     if (message == null) {
-                        TimeUnit.MILLISECONDS.sleep(5);
+                        try {
+                            Thread.sleep(5); // Virtual threads sleep efficiently
+                        } catch (InterruptedException e) {
+                             Thread.currentThread().interrupt();
+                             break;
+                        }
                         continue;
                     }
                     synchronized (outputStream) {
@@ -663,14 +667,19 @@ public final class TcpTransport implements Transport {
 
         @Override
         public void close() throws IOException {
+            if (open) {
+                LOGGER.fine(() -> "Closing connection to " + remote);
+            }
             open = false;
-            writer.shutdownNow();
+            // No need to shutdown writer executor anymore, the flag + socket close will kill it
             socket.close();
         }
 
         private void closeQuietly() {
+            if (open) {
+                LOGGER.fine(() -> "Quietly closing connection to " + remote);
+            }
             open = false;
-            writer.shutdownNow();
             try {
                 socket.close();
             } catch (IOException ignored) {
