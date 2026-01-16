@@ -50,7 +50,9 @@ public final class QueueClusterService<T extends Serializable> implements Closea
     public static final String TOPIC = "queue";
 
     private final NQueue<T> queue;
+    private final String queueName;
     private final ReplicationManager replicationManager;
+    private final ReentrantLock clientLock = new ReentrantLock(true);
     private final ReentrantLock operationLock = new ReentrantLock(true);
     private final Integer replicationFactor;
 
@@ -67,6 +69,7 @@ public final class QueueClusterService<T extends Serializable> implements Closea
     public QueueClusterService(Path baseDir, String queueName, ReplicationManager replicationManager, NQueue.Options options, Integer replicationFactor) {
         try {
             this.queue = NQueue.open(baseDir, queueName, enforceGridOptions(options));
+            this.queueName = queueName;
             this.offsetManager = new OffsetManager(baseDir.resolve(queueName).resolve("offsets.dat"));
         } catch (IOException e) {
             throw new IllegalStateException("Failed to open NQueue", e);
@@ -78,12 +81,12 @@ public final class QueueClusterService<T extends Serializable> implements Closea
 
     public void offer(T value) {
         Objects.requireNonNull(value, "value");
-        operationLock.lock();
+        clientLock.lock();
         try {
             QueueReplicationCommand command = QueueReplicationCommand.offer(value);
             waitForReplication(replicationManager.replicate(TOPIC, command, replicationFactor));
         } finally {
-            operationLock.unlock();
+            clientLock.unlock();
         }
     }
 
@@ -92,10 +95,14 @@ public final class QueueClusterService<T extends Serializable> implements Closea
     }
 
     public Optional<T> poll(NodeId consumerId) {
+        clientLock.lock();
         operationLock.lock();
         try {
             // If consumerId is provided, we use the offset-based consumption (Log mode)
-            if (consumerId != null) {
+            // BUT only if the queue is configured for TIME_BASED retention.
+            // If it is DELETE_ON_CONSUME, we ignore the consumerId and perform a destructive poll
+            // to maintain backward compatibility and expected Queue semantics.
+            if (consumerId != null && queue.getRetentionPolicy() == NQueue.Options.RetentionPolicy.TIME_BASED) {
                 long nextIndex = offsetManager.getOffset(consumerId);
                 
                 // If nextIndex is 0 (new consumer), we might want to start from the beginning.
@@ -149,16 +156,21 @@ public final class QueueClusterService<T extends Serializable> implements Closea
                 return Optional.empty();
             }
             QueueReplicationCommand command = QueueReplicationCommand.poll((Serializable) next.get());
+            operationLock.unlock();
             waitForReplication(replicationManager.replicate(TOPIC, command, replicationFactor));
             return next;
         } catch (IOException e) {
             throw new IllegalStateException("Failed to read from queue", e);
         } finally {
-            operationLock.unlock();
+            if (operationLock.isHeldByCurrentThread()) {
+                operationLock.unlock();
+            }
+            clientLock.unlock();
         }
     }
 
     public Optional<T> peek() {
+        clientLock.lock();
         operationLock.lock();
         try {
             return queue.peek();
@@ -166,6 +178,7 @@ public final class QueueClusterService<T extends Serializable> implements Closea
             throw new IllegalStateException("Failed to peek queue", e);
         } finally {
             operationLock.unlock();
+            clientLock.unlock();
         }
     }
 
@@ -244,6 +257,7 @@ public final class QueueClusterService<T extends Serializable> implements Closea
     @SuppressWarnings("unchecked")
     public void apply(UUID operationId, Serializable payload) {
         QueueReplicationCommand command = (QueueReplicationCommand) payload;
+        long start = System.nanoTime();
         operationLock.lock();
         try {
             switch (command.type()) {
@@ -270,6 +284,8 @@ public final class QueueClusterService<T extends Serializable> implements Closea
             throw new IllegalStateException("Failed to apply replicated queue operation", e);
         } finally {
             operationLock.unlock();
+            long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+            LOGGER.info(() -> "Applied replication command " + command.type() + " in " + elapsedMs + "ms on " + queueName);
         }
     }
 

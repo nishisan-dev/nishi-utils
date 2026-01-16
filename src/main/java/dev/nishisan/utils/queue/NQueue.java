@@ -316,6 +316,10 @@ public class NQueue<T extends Serializable> implements Closeable {
         return statsUtils;
     }
 
+    public Options.RetentionPolicy getRetentionPolicy() {
+        return options.retentionPolicy;
+    }
+
     /**
      * Enqueues a single record while preserving FIFO order. Depending on configuration and current
      * conditions, the record may be staged in memory and durably appended later, or appended directly to

@@ -392,6 +392,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
     private void handleReplicationRequest(ClusterMessage message) {
         ReplicationPayload payload = message.payload(ReplicationPayload.class);
         UUID opId = payload.operationId();
+        LOGGER.info(() -> "Replication request " + opId + " for topic " + payload.topic() + " from " + message.source());
         if (applied.contains(opId)) {
             sendAck(opId, message.source());
             return;
@@ -421,6 +422,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
     }
 
     private void sendAck(UUID operationId, NodeId destination) {
+        LOGGER.info(() -> "Sending replication ack for " + operationId + " to " + destination);
         ReplicationAckPayload ackPayload = new ReplicationAckPayload(operationId, true);
         ClusterMessage ack = ClusterMessage.request(MessageType.REPLICATION_ACK,
                 "ack",
@@ -436,6 +438,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         if (operation == null) {
             return;
         }
+        LOGGER.info(() -> "Replication ack for " + payload.operationId() + " from " + message.source());
         operation.ack(message.source());
         checkCompletion(operation);
     }
