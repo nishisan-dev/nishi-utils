@@ -180,6 +180,14 @@ public final class TcpTransport implements Transport {
             return;
         }
         
+        // Priority 1: If we have an active, open connection to this node, use it!
+        // This bypasses routing logic for already connected peers (including discovery clients).
+        Connection activeConn = connections.get(destination);
+        if (activeConn != null && activeConn.isOpen()) {
+            activeConn.send(message);
+            return;
+        }
+
         Optional<NodeId> nextHop = router.nextHop(destination, exclude);
         if (nextHop.isEmpty()) {
             LOGGER.log(Level.WARNING, "No route available for {0} (excluding {1})", new Object[]{destination, exclude});
@@ -302,8 +310,19 @@ public final class TcpTransport implements Transport {
         if (peer == null || peer.nodeId().equals(config.local().nodeId())) {
             return;
         }
+        if (peer.host().equals(config.local().host()) && peer.port() == config.local().port()) {
+            return;
+        }
+        for (Map.Entry<NodeId, NodeInfo> entry : knownPeers.entrySet()) {
+            NodeInfo existing = entry.getValue();
+            if (!entry.getKey().equals(peer.nodeId())
+                    && existing.host().equals(peer.host())
+                    && existing.port() == peer.port()) {
+                knownPeers.remove(entry.getKey());
+            }
+        }
         boolean added = knownPeers.putIfAbsent(peer.nodeId(), peer) == null;
-        if (added && running) {
+        if (added && running && shouldInitiate(peer)) {
             scheduler.schedule(() -> ensureConnectionAsync(peer), 0, TimeUnit.MILLISECONDS);
         }
         if (added && running) {
@@ -342,7 +361,10 @@ public final class TcpTransport implements Transport {
         List<NodeInfo> peers = new ArrayList<>(knownPeers.values());
         Collections.shuffle(peers); // Randomize order to reduce contention
         for (NodeInfo peer : peers) {
-            if (peer.nodeId().equals(config.local().nodeId())) {
+            if (peer.nodeId().equals(config.local().nodeId()) || peer.port() <= 0) {
+                continue;
+            }
+            if (!shouldInitiate(peer)) {
                 continue;
             }
             ensureConnectionAsync(peer);
@@ -400,7 +422,7 @@ public final class TcpTransport implements Transport {
 
     private Connection registerConnection(Socket socket, NodeInfo preResolved) throws IOException {
         socket.setTcpNoDelay(true);
-        Connection connection = new Connection(socket);
+        Connection connection = new Connection(socket, preResolved != null);
         if (preResolved != null) {
             connection.setRemote(preResolved);
             connections.put(preResolved.nodeId(), connection);
@@ -455,8 +477,28 @@ public final class TcpTransport implements Transport {
         NodeInfo remoteInfo = payload.local();
         boolean firstHandshakeOnThisConnection = connection.remoteId().isEmpty();
         connection.setRemote(remoteInfo);
-        knownPeers.putIfAbsent(remoteInfo.nodeId(), remoteInfo);
-        connections.put(remoteInfo.nodeId(), connection);
+        List<NodeId> staleIds = new ArrayList<>();
+        for (Map.Entry<NodeId, NodeInfo> entry : knownPeers.entrySet()) {
+            NodeInfo existing = entry.getValue();
+            if (!entry.getKey().equals(remoteInfo.nodeId())
+                    && existing.host().equals(remoteInfo.host())
+                    && existing.port() == remoteInfo.port()) {
+                staleIds.add(entry.getKey());
+            }
+        }
+        for (NodeId staleId : staleIds) {
+            knownPeers.remove(staleId);
+            Connection staleConn = connections.remove(staleId);
+            if (staleConn != null) {
+                staleConn.closeQuietly();
+            }
+        }
+        knownPeers.put(remoteInfo.nodeId(), remoteInfo);
+        
+        Connection previous = connections.put(remoteInfo.nodeId(), connection);
+        if (previous != null && previous != connection) {
+            previous.closeQuietly();
+        }
         
         // Feed router with reachability info
         router.updateReachability(remoteInfo.nodeId(), payload.peers(), payload.latencies());
@@ -467,8 +509,21 @@ public final class TcpTransport implements Transport {
             if (peer.nodeId().equals(config.local().nodeId())) {
                 return;
             }
+            if (peer.host().equals(config.local().host()) && peer.port() == config.local().port()) {
+                return;
+            }
+            for (Map.Entry<NodeId, NodeInfo> entry : knownPeers.entrySet()) {
+                NodeInfo existing = entry.getValue();
+                if (!entry.getKey().equals(peer.nodeId())
+                        && existing.host().equals(peer.host())
+                        && existing.port() == peer.port()) {
+                    knownPeers.remove(entry.getKey());
+                }
+            }
             boolean added = knownPeers.putIfAbsent(peer.nodeId(), peer) == null;
-            if (added && !isConnected(peer.nodeId())) {
+            
+            // Only attempt reverse connection if the peer has a valid port (not a discovery client)
+            if (added && !isConnected(peer.nodeId()) && peer.port() > 0 && shouldInitiate(peer)) {
                 scheduler.schedule(() -> ensureConnectionAsync(peer), 100, TimeUnit.MILLISECONDS);
             }
         });
@@ -511,12 +566,32 @@ public final class TcpTransport implements Transport {
 
         for (NodeInfo peer : payload.peers()) {
             if (!peer.nodeId().equals(config.local().nodeId())) {
-                boolean added = knownPeers.putIfAbsent(peer.nodeId(), peer) == null;
-                if (added && !isConnected(peer.nodeId())) {
+                if (peer.host().equals(config.local().host()) && peer.port() == config.local().port()) {
+                    continue;
+                }
+                for (Map.Entry<NodeId, NodeInfo> entry : knownPeers.entrySet()) {
+                    NodeInfo existing = entry.getValue();
+                    if (!entry.getKey().equals(peer.nodeId())
+                            && existing.host().equals(peer.host())
+                            && existing.port() == peer.port()) {
+                        knownPeers.remove(entry.getKey());
+                    }
+                }
+                boolean added = knownPeers.compute(peer.nodeId(), (id, existing) -> {
+                    if (existing == null || !existing.equals(peer)) {
+                        return peer;
+                    }
+                    return existing;
+                }) == peer;
+                if (added && !isConnected(peer.nodeId()) && shouldInitiate(peer)) {
                     scheduler.schedule(() -> ensureConnectionAsync(peer), 100, TimeUnit.MILLISECONDS);
                 }
             }
         }
+    }
+
+    private boolean shouldInitiate(NodeInfo peer) {
+        return config.local().nodeId().compareTo(peer.nodeId()) < 0;
     }
 
     private void handleMessage(NodeId senderId, ClusterMessage message) {
@@ -549,22 +624,25 @@ public final class TcpTransport implements Transport {
                 return;
             }
         }
-        listeners.forEach(listener -> listener.onMessage(message));
+        listeners.forEach(listener -> workerPool.submit(() -> listener.onMessage(message)));
     }
 
     private void handleDisconnect(Connection connection) {
         connection.remoteId().ifPresent(nodeId -> {
+            LOGGER.info(() -> "Handling disconnect from " + nodeId + " (remote=" + connection.remote + ", open=" + connection.isOpen() + ")");
             // Only treat the peer as disconnected when the currently tracked connection goes away.
             // In rare races, nodes can end up with multiple TCP connections; a stale connection closing
             // must NOT fail in-flight request/response calls if there is still an active connection.
             boolean removedActive = connections.remove(nodeId, connection);
             Connection current = connections.get(nodeId);
             if (!removedActive && current != null && current.isOpen()) {
+                LOGGER.info(() -> "Ignoring disconnect for " + nodeId + " because an active connection remains");
                 return;
             }
             if (current != null && current.isOpen()) {
                 return;
             }
+            LOGGER.info(() -> "Disconnect confirmed for " + nodeId + "; failing pending responses");
             // Best-effort cleanup: if the peer is no longer connected, drop the per-peer lock.
             // It will be recreated if we reconnect.
             connectionLocks.remove(nodeId);
@@ -618,11 +696,13 @@ public final class TcpTransport implements Transport {
         private final ObjectOutputStream outputStream;
         private final ObjectInputStream inputStream;
         private final ConcurrentLinkedQueue<ClusterMessage> outbound = new ConcurrentLinkedQueue<>();
+        private final boolean outboundInitiated;
         private volatile NodeInfo remote;
         private volatile boolean open = true;
 
-        private Connection(Socket socket) throws IOException {
+        private Connection(Socket socket, boolean outboundInitiated) throws IOException {
             this.socket = socket;
+            this.outboundInitiated = outboundInitiated;
             this.outputStream = new ObjectOutputStream(socket.getOutputStream());
             this.outputStream.flush();
             this.inputStream = new ObjectInputStream(socket.getInputStream());
@@ -687,7 +767,8 @@ public final class TcpTransport implements Transport {
                 }
             } catch (Exception e) {
                 if (open) {
-                    LOGGER.log(Level.FINE, "Connection closed {0} at {1}: {2}", new Object[]{remote, Instant.now(), e.getMessage()});
+                    LOGGER.log(Level.INFO, "Connection closed {0} at {1}", new Object[]{remote, Instant.now()});
+                    LOGGER.log(Level.INFO, "Connection close exception", e);
                 }
             } finally {
                 closeQuietly();

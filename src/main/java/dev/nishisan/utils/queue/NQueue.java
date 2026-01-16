@@ -316,6 +316,10 @@ public class NQueue<T extends Serializable> implements Closeable {
         return statsUtils;
     }
 
+    public Options.RetentionPolicy getRetentionPolicy() {
+        return options.retentionPolicy;
+    }
+
     /**
      * Enqueues a single record while preserving FIFO order. Depending on configuration and current
      * conditions, the record may be staged in memory and durably appended later, or appended directly to
@@ -743,6 +747,46 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
+     * Reads, without advancing the consumption cursor, the record with the specific logical index.
+     * This method scans the log to find the record. Since offsets change during compaction, this is the
+     * reliable way to retrieve records by identity in a distributed context.
+     *
+     * @param index logical index to find
+     * @return a structured result with the record and the next offset, or empty if not found/expired
+     * @throws IOException if reading from storage fails
+     */
+    public Optional<NQueueReadResult> readRecordAtIndex(long index) throws IOException {
+        lock.lock();
+        try {
+            long offset = 0;
+            long size = dataChannel.size();
+            while (offset < size) {
+                 NQueueRecordMetaData.HeaderPrefix pref = NQueueRecordMetaData.readPrefix(dataChannel, offset);
+                 NQueueRecordMetaData meta = NQueueRecordMetaData.fromBuffer(dataChannel, offset, pref.headerLen);
+                 
+                 if (meta.getIndex() == index) {
+                     long hEnd = offset + NQueueRecordMetaData.fixedPrefixSize() + pref.headerLen;
+                     long pEnd = hEnd + meta.getPayloadLen();
+                     byte[] payload = new byte[meta.getPayloadLen()];
+                     ByteBuffer pb = ByteBuffer.wrap(payload);
+                     while (pb.hasRemaining()) {
+                        if (dataChannel.read(pb, hEnd + (long) pb.position()) < 0) throw new EOFException();
+                     }
+                     return Optional.of(new NQueueReadResult(new NQueueRecord(meta, payload), pEnd));
+                 } else if (meta.getIndex() > index) {
+                     // We passed the index, so it must have been compacted away (or doesn't exist yet if we are ahead)
+                     return Optional.empty();
+                 }
+
+                 offset += NQueueRecordMetaData.fixedPrefixSize() + pref.headerLen + meta.getPayloadLen();
+            }
+            return Optional.empty();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
      * Returns, without advancing the consumption cursor, the raw representation of the head record if one
      * exists. This provides visibility into metadata alongside the payload for diagnostic use.
      *
@@ -792,7 +836,7 @@ public class NQueue<T extends Serializable> implements Closeable {
             long idx = pItem.index();
             lastIndex = idx; // Update lastIndex to the sequence provided
 
-            NQueueRecordMetaData meta = new NQueueRecordMetaData(idx, payload.length, obj.getClass().getCanonicalName());
+            NQueueRecordMetaData meta = new NQueueRecordMetaData(idx, System.currentTimeMillis(), payload.length, obj.getClass().getCanonicalName());
             ByteBuffer hb = meta.toByteBuffer();
             long rStart = writePos;
             while (hb.hasRemaining()) writePos += dataChannel.write(hb, writePos);
@@ -1174,9 +1218,45 @@ public class NQueue<T extends Serializable> implements Closeable {
      */
     private void maybeCompactLocked() {
         if (compactionState == CompactionState.RUNNING || shutdownRequested) return;
-        if (producerOffset <= 0 || consumerOffset <= 0) return;
+        if (producerOffset <= 0) return;
+
         long now = System.nanoTime();
-        if (((double) consumerOffset / (double) producerOffset) >= options.compactionWasteThreshold || (options.compactionIntervalNanos > 0 && (now - lastCompactionTimeNanos) >= options.compactionIntervalNanos && consumerOffset > 0)) {
+        boolean shouldCompact = false;
+
+        if (options.retentionPolicy == Options.RetentionPolicy.TIME_BASED) {
+            // Check if the oldest record (at the beginning of the file) has expired.
+            if (options.retentionTimeNanos > 0 && recordCount > 0) {
+                try {
+                    // Try reading the first header at offset 0
+                    if (dataChannel.size() > NQueueRecordMetaData.fixedPrefixSize()) {
+                        NQueueRecordMetaData.HeaderPrefix pref = NQueueRecordMetaData.readPrefix(dataChannel, 0);
+                        NQueueRecordMetaData meta = NQueueRecordMetaData.fromBuffer(dataChannel, 0, pref.headerLen);
+                        long recordAge = System.currentTimeMillis() - meta.getTimestamp();
+                        // Convert nanos to millis for comparison
+                        if (recordAge > TimeUnit.NANOSECONDS.toMillis(options.retentionTimeNanos)) {
+                            shouldCompact = true;
+                        }
+                    }
+                } catch (IOException e) {
+                   // Ignore read errors
+                }
+            }
+        } else {
+            // Default DELETE_ON_CONSUME behavior
+            if (consumerOffset <= 0) return;
+             if (((double) consumerOffset / (double) producerOffset) >= options.compactionWasteThreshold) {
+                 shouldCompact = true;
+             }
+        }
+
+        // Common time-based interval trigger
+        if (!shouldCompact && options.compactionIntervalNanos > 0 && (now - lastCompactionTimeNanos) >= options.compactionIntervalNanos && producerOffset > 0) {
+             if (options.retentionPolicy == Options.RetentionPolicy.TIME_BASED || consumerOffset > 0) {
+                 shouldCompact = true;
+             }
+        }
+
+        if (shouldCompact) {
             QueueState snap = currentState();
             compactionState = CompactionState.RUNNING;
             lastCompactionTimeNanos = now;
@@ -1194,17 +1274,24 @@ public class NQueue<T extends Serializable> implements Closeable {
         try {
             Files.deleteIfExists(tempDataPath);
             try (RandomAccessFile tmpRaf = new RandomAccessFile(tempDataPath.toFile(), "rw"); FileChannel tmpCh = tmpRaf.getChannel()) {
-                long copyStartOffset;
+                long copyStartOffset = 0;
                 long copyEndOffset;
 
                 lock.lock();
                 try {
-                    // We start from the CURRENT consumer position to avoid copying already consumed data.
-                    copyStartOffset = consumerOffset;
                     // We copy up to the current producer position to maximize work done outside the lock.
                     copyEndOffset = producerOffset;
+                    
+                    if (options.retentionPolicy == Options.RetentionPolicy.DELETE_ON_CONSUME) {
+                         // Start from consumer position
+                         copyStartOffset = consumerOffset;
+                    } 
                 } finally {
                     lock.unlock();
+                }
+                
+                if (options.retentionPolicy == Options.RetentionPolicy.TIME_BASED) {
+                    copyStartOffset = findTimeBasedCutoff(copyEndOffset);
                 }
 
                 if (copyEndOffset > copyStartOffset) {
@@ -1228,6 +1315,33 @@ public class NQueue<T extends Serializable> implements Closeable {
         } finally {
             onCompactionFinished(compactionState == CompactionState.IDLE, null);
         }
+    }
+    
+    private long findTimeBasedCutoff(long limitOffset) throws IOException {
+        long offset = 0;
+        long retentionMillis = TimeUnit.NANOSECONDS.toMillis(options.retentionTimeNanos);
+        long now = System.currentTimeMillis();
+        long cutoffTime = now - retentionMillis;
+        
+        while (offset < limitOffset) {
+            try {
+                 NQueueRecordMetaData.HeaderPrefix pref = NQueueRecordMetaData.readPrefix(dataChannel, offset);
+                 NQueueRecordMetaData meta = NQueueRecordMetaData.fromBuffer(dataChannel, offset, pref.headerLen);
+                 
+                 // If records have timestamp 0 (legacy), they are treated as very old.
+                 // If we find a record strictly younger than cutoffTime (timestamp >= cutoffTime), 
+                 // this is the start of valid data.
+                 if (meta.getTimestamp() >= cutoffTime) {
+                     return offset;
+                 }
+                 
+                 // Skip this record (it's expired)
+                 offset += NQueueRecordMetaData.fixedPrefixSize() + pref.headerLen + meta.getPayloadLen();
+            } catch (EOFException e) {
+                break;
+            }
+        }
+        return offset; // All records expired or limit reached
     }
 
     /**
@@ -1405,6 +1519,11 @@ public class NQueue<T extends Serializable> implements Closeable {
      * timing. Instances are mutable builders; use fluent setters to construct the desired configuration.
      */
     public static final class Options {
+        public enum RetentionPolicy {
+            DELETE_ON_CONSUME,
+            TIME_BASED
+        }
+
         double compactionWasteThreshold = 0.5;
         long compactionIntervalNanos = TimeUnit.MINUTES.toNanos(5);
         int compactionBufferSize = 128 * 1024;
@@ -1414,6 +1533,8 @@ public class NQueue<T extends Serializable> implements Closeable {
         long lockTryTimeoutNanos = TimeUnit.MILLISECONDS.toNanos(10), revalidationIntervalNanos = TimeUnit.MILLISECONDS.toNanos(100);
         long maintenanceIntervalNanos = TimeUnit.SECONDS.toNanos(5);
         long maxSizeReconciliationIntervalNanos = TimeUnit.MINUTES.toNanos(1);
+        RetentionPolicy retentionPolicy = RetentionPolicy.DELETE_ON_CONSUME;
+        long retentionTimeNanos = 0;
 
         private Options() {
         }
@@ -1426,6 +1547,19 @@ public class NQueue<T extends Serializable> implements Closeable {
          */
         public static Options defaults() {
             return new Options();
+        }
+
+        public Options withRetentionPolicy(RetentionPolicy policy) {
+            Objects.requireNonNull(policy);
+            this.retentionPolicy = policy;
+            return this;
+        }
+
+        public Options withRetentionTime(Duration retention) {
+            Objects.requireNonNull(retention);
+            if (retention.isNegative()) throw new IllegalArgumentException("negative");
+            this.retentionTimeNanos = retention.toNanos();
+            return this;
         }
 
         /**
@@ -1625,6 +1759,8 @@ public class NQueue<T extends Serializable> implements Closeable {
             final int compactionBufferSize, memoryBufferSize;
             final boolean enableMemoryBuffer, allowShortCircuit;
             final boolean enableOrderDetection;
+            final RetentionPolicy retentionPolicy;
+            final long retentionTimeNanos;
 
             /**
              * Captures the current values from a mutable options builder for safe sharing.
@@ -1643,6 +1779,8 @@ public class NQueue<T extends Serializable> implements Closeable {
                 this.maxSizeReconciliationIntervalNanos = o.maxSizeReconciliationIntervalNanos;
                 this.allowShortCircuit = o.allowShortCircuit;
                 this.enableOrderDetection = o.enableOrderDetection;
+                this.retentionPolicy = o.retentionPolicy;
+                this.retentionTimeNanos = o.retentionTimeNanos;
             }
         }
     }

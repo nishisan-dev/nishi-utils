@@ -1,0 +1,56 @@
+# Configuração completa para um Seed Node (Líder/Server)
+# Este nó define as políticas do cluster e serve como ponto de entrada.
+
+node:
+  id: "seed-1"            # ID fixo para o seed
+  host: "10.0.0.1"        # Endereço IP acessível pelos outros nós
+  port: 9000              # Porta TCP
+  roles:
+    - "SEED"
+    - "COORDINATOR"
+  dirs:
+    base: "/var/lib/ngrid/seed-1"
+
+# Configurações de Autodiscover (Server Side)
+# Habilita este nó a responder requisições de configuração
+autodiscover:
+  enabled: false          # O seed já tem a config, então false para client-mode
+  secret: "my-cluster-secret-token-2026" # Segredo compartilhado
+
+# Políticas Globais do Cluster (serão enviadas para novos nós)
+cluster:
+  name: "production-cluster"
+  replication:
+    factor: 3             # Replicar dados em 3 nós
+    strict: true          # Exigir quórum estrito (CP)
+  transport:
+    workers: 4            # Threads de IO
+  seeds:                  # Lista de seeds para failover
+    - "10.0.0.1:9000"
+    - "10.0.0.2:9000"
+
+# Configuração da Fila Padrão
+queue:
+  name: "global-events"
+  retention:
+    policy: "TIME_BASED"  # Modo Stream (Log Distribuído)
+    duration: "48h"       # Retém mensagens por 48 horas
+  performance:
+    fsync: true           # Durabilidade máxima
+    memory-buffer:
+      enabled: true
+      size: 10000
+    short-circuit: false  # Força persistência antes da entrega
+  compaction:
+    threshold: 0.5
+    interval: "30m"
+
+# Definição de Mapas Persistentes
+maps:
+  - name: "user-sessions"
+    key-type: "java.lang.String"
+    value-type: "java.lang.String"
+    persistence: "DISABLED" # Apenas memória (rápido)
+  
+  - name: "product-inventory"
+    persistence: "ASYNC_WITH_FSYNC" # Persistido em disco

@@ -37,12 +37,14 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.logging.Logger;
 
 /**
  * Public facing distributed queue API. It routes client calls to the current leader and
  * processes remote requests when the local node is in charge.
  */
 public final class DistributedQueue<T extends Serializable> implements TransportListener, Closeable {
+    private static final Logger LOGGER = Logger.getLogger(DistributedQueue.class.getName());
     private static final String QUEUE_OFFER = "queue.offer";
     private static final String QUEUE_POLL = "queue.poll";
     private static final String QUEUE_PEEK = "queue.peek";
@@ -105,7 +107,7 @@ public final class DistributedQueue<T extends Serializable> implements Transport
             attempts++;
             NodeInfo leaderInfo = coordinator.leaderInfo().orElseThrow(() -> new IllegalStateException("No leader available"));
             if (leaderInfo.nodeId().equals(transport.local().nodeId())) {
-                return executeLocal(command, body);
+                return executeLocal(command, body, transport.local().nodeId());
             }
             ClientRequestPayload payload = new ClientRequestPayload(UUID.randomUUID(), command, body);
             ClusterMessage request = ClusterMessage.request(MessageType.CLIENT_REQUEST,
@@ -119,6 +121,7 @@ public final class DistributedQueue<T extends Serializable> implements Transport
                 ClientResponsePayload responsePayload = response.payload(ClientResponsePayload.class);
                 if (!responsePayload.success()) {
                     if ("Not the leader".equals(responsePayload.error()) && attempts < 3) {
+                        LOGGER.info(() -> "Leader rejected request; retrying " + command + " from " + transport.local().nodeId());
                         try {
                             Thread.sleep(100);
                         } catch (InterruptedException e) {
@@ -146,7 +149,7 @@ public final class DistributedQueue<T extends Serializable> implements Transport
     }
 
     @SuppressWarnings("unchecked")
-    private Serializable executeLocal(String command, Serializable body) {
+    private Serializable executeLocal(String command, Serializable body, NodeId requestingNode) {
         return switch (command) {
             case QUEUE_OFFER -> {
                 recordQueueOffer();
@@ -154,7 +157,7 @@ public final class DistributedQueue<T extends Serializable> implements Transport
                 yield Boolean.TRUE;
             }
             case QUEUE_POLL -> {
-                Optional<T> value = queueService.poll();
+                Optional<T> value = queueService.poll(requestingNode);
                 if (value.isPresent()) {
                     recordQueuePoll();
                 }
@@ -188,12 +191,15 @@ public final class DistributedQueue<T extends Serializable> implements Transport
         if (!Set.of(QUEUE_OFFER, QUEUE_POLL, QUEUE_PEEK).contains(payload.command())) {
             return;
         }
+        LOGGER.info(() -> "Received client request " + payload.command() + " from " + message.source()
+                + " (leader=" + coordinator.isLeader() + ")");
         ClientResponsePayload responsePayload;
         if (!coordinator.isLeader()) {
+            LOGGER.info(() -> "Rejecting client request (not leader) for " + payload.command() + " from " + message.source());
             responsePayload = new ClientResponsePayload(payload.requestId(), false, null, "Not the leader");
         } else {
             try {
-                Serializable result = executeLocal(payload.command(), payload.body());
+                Serializable result = executeLocal(payload.command(), payload.body(), message.source());
                 responsePayload = new ClientResponsePayload(payload.requestId(), true, result, null);
             } catch (RuntimeException e) {
                 String messageText = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
