@@ -414,8 +414,8 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
             long offset = 0L;
             while (offset < size) {
                 ByteBuffer lenBuf = ByteBuffer.allocate(4);
-                int r = ch.read(lenBuf, offset);
-                if (r < 0) {
+                int r = readFully(ch, lenBuf, offset);
+                if (r <= 0) {
                     break;
                 }
                 if (r < 4) {
@@ -437,12 +437,18 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
                 }
                 byte[] payload = new byte[entryLen];
                 ByteBuffer pb = ByteBuffer.wrap(payload);
-                int read = ch.read(pb, entryStart);
+                int read = readFully(ch, pb, entryStart);
                 if (read < entryLen) {
                     ch.truncate(offset);
                     break;
                 }
-                applyDecoded(payload);
+                try {
+                    applyDecoded(payload);
+                } catch (Exception e) {
+                    LOGGER.log(Level.WARNING, "Invalid WAL entry detected, truncating", e);
+                    ch.truncate(offset);
+                    break;
+                }
                 offset = entryEnd;
             }
         }
@@ -456,7 +462,11 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
                 throw new IOException("Unsupported WAL entry format");
             }
             int typeOrdinal = in.readUnsignedByte();
-            MapReplicationCommandType type = MapReplicationCommandType.values()[typeOrdinal];
+            MapReplicationCommandType[] values = MapReplicationCommandType.values();
+            if (typeOrdinal < 0 || typeOrdinal >= values.length) {
+                throw new IOException("Invalid WAL entry type");
+            }
+            MapReplicationCommandType type = values[typeOrdinal];
             in.readLong(); // timestamp (reserved for future use)
             int keyLen = in.readInt();
             if (keyLen <= 0 || keyLen > (16 * 1024 * 1024)) {
@@ -535,6 +545,18 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
         walChannel.position(walChannel.size());
     }
 
+    private int readFully(FileChannel channel, ByteBuffer buffer, long offset) throws IOException {
+        int total = 0;
+        while (buffer.hasRemaining()) {
+            int read = channel.read(buffer, offset + total);
+            if (read <= 0) {
+                break;
+            }
+            total += read;
+        }
+        return total;
+    }
+
     private void closeWalQuietly() {
         FileChannel ch = walChannel;
         RandomAccessFile raf = walRaf;
@@ -582,5 +604,4 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
         }
     }
 }
-
 

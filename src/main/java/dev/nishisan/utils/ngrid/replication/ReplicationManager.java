@@ -269,7 +269,7 @@ public final class ReplicationManager implements TransportListener, LeadershipLi
                         operation.localApplied = true;
                     } catch (Exception e) {
                         LOGGER.log(Level.SEVERE, "Failed to apply committed operation locally", e);
-                        operation.fail(e);
+                        failOperation(operation, e);
                         return;
                     }
                 }
