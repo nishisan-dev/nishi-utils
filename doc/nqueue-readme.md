@@ -85,6 +85,26 @@ flowchart TD
 - `StatsUtils getStats()`
 - `void close()`
 
+## Politica de Retencao (Stream Mode vs Queue Mode)
+
+A `NQueue` suporta dois modos de operacao principais:
+
+1. **Queue Mode (Padrao):** `RetentionPolicy.DELETE_ON_CONSUME`. O item e considerado "removido" assim que consumido (`poll`). A compactacao remove os itens ja consumidos para economizar espaco.
+2. **Stream Mode (Log):** `RetentionPolicy.TIME_BASED`. Os itens persistem por um tempo determinado (`retentionTime`) independente do consumo. Isso permite que multiplos consumidores leiam o mesmo log em posicoes diferentes (leitura nao destrutiva).
+
+Configuracao do modo Stream:
+
+```java
+NQueue.Options options = NQueue.Options.defaults()
+    .withRetentionPolicy(NQueue.Options.RetentionPolicy.TIME_BASED)
+    .withRetentionTime(Duration.ofHours(24)); // Retem mensagens por 24h
+
+// A compactacao ocorrera apenas para mensagens mais antigas que 24h
+try (NQueue<String> queue = NQueue.open(baseDir, "stream-topic", options)) {
+    queue.offer("evento-1");
+}
+```
+
 ## Offsets e retorno do offer
 
 - Quando o item e persistido diretamente, `offer` retorna o **offset** (posicao) do registro no `data.log`.

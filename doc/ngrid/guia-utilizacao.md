@@ -78,6 +78,16 @@ public class NQueueOptionsExample {
 }
 ```
 
+### Modo Stream (Log Distribuído)
+
+Para usar a fila como um log de eventos (Stream) onde as mensagens persistem por tempo e múltiplos consumidores leem independentemente:
+
+```java
+NQueue.Options options = NQueue.Options.defaults()
+    .withRetentionPolicy(NQueue.Options.RetentionPolicy.TIME_BASED)
+    .withRetentionTime(Duration.ofHours(24)); // Retém por 24h
+```
+
 ## 2) NGrid (cluster): configuração e bootstrap
 
 O NGrid funciona com nós descritos por `NodeInfo(nodeId, host, port)` e com uma lista de **peers iniciais**. A descoberta completa tende a convergir via handshake e peer updates. Após o `start()`, você também pode adicionar peers dinamicamente com `node.join(...)`.
@@ -162,8 +172,15 @@ public class NGridClusterExample {
       Optional<String> peekFollower = q1.peek(); // roteia para líder
       System.out.println("peekFollower=" + peekFollower.orElse("<vazio>"));
 
+      // Consumo tradicional (Queue Mode - destrutivo)
       Optional<String> polledFollower = q2.poll(); // roteia para líder
       System.out.println("polledFollower=" + polledFollower.orElse("<vazio>"));
+      
+      // Consumo persistente (Log Mode - por consumidor)
+      // O offset é salvo no cluster associado ao NodeId do chamador (neste caso n2)
+      // Isso permite que n2 continue de onde parou mesmo após reconexão.
+      // Requer que a NQueue esteja configurada com RetentionPolicy.TIME_BASED
+      // Optional<String> streamItem = q2.poll(); 
 
       // Mapa distribuído
       m3.put("shared-key", "value-1");
@@ -226,6 +243,7 @@ Node->>C: close()
 
 - Se você chamar em um **follower**, a operação será encaminhada ao **líder** via `CLIENT_REQUEST/CLIENT_RESPONSE`.
 - No backend, o NGrid usa `QueueClusterService` + `ReplicationManager` e persiste em `NQueue` local (um diretório por nó).
+- **Consumo Persistente**: Ao chamar `poll()`, o sistema identifica automaticamente o `NodeId` do nó que fez a requisição. Se a fila estiver configurada em modo `RetentionPolicy.TIME_BASED`, o cluster gerenciará um offset persistente para este consumidor. Isso garante que, se o nó cair e voltar, continuará lendo a partir da última mensagem não consumida por ele.
 
 ## 4) DistributedMap (mapa distribuído)
 

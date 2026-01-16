@@ -58,7 +58,7 @@ import java.util.concurrent.ScheduledExecutorService;
  * Coordinates quorum based replication leveraging the transport. The manager handles both
  * leader initiated operations and replication requests coming from other nodes.
  */
-public final class ReplicationManager implements TransportListener, LeadershipListener, Closeable {
+public class ReplicationManager implements TransportListener, LeadershipListener, Closeable {
     private static final Logger LOGGER = Logger.getLogger(ReplicationManager.class.getName());
     private static final long SYNC_THRESHOLD = 500; // Trigger sync if lag > 500 ops
 
@@ -93,6 +93,15 @@ public final class ReplicationManager implements TransportListener, LeadershipLi
         this.transport = Objects.requireNonNull(transport, "transport");
         this.coordinator = Objects.requireNonNull(coordinator, "coordinator");
         this.config = Objects.requireNonNull(config, "config");
+    }
+
+    /**
+     * Protected constructor for testing purposes only.
+     */
+    protected ReplicationManager() {
+        this.transport = null;
+        this.coordinator = null;
+        this.config = null;
     }
 
     public void start() {

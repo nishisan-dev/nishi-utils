@@ -32,11 +32,17 @@ public final class NodeInfo implements Serializable {
     private final NodeId nodeId;
     private final String host;
     private final int port;
+    private final java.util.Set<String> roles;
 
     public NodeInfo(NodeId nodeId, String host, int port) {
+        this(nodeId, host, port, java.util.Collections.emptySet());
+    }
+
+    public NodeInfo(NodeId nodeId, String host, int port, java.util.Set<String> roles) {
         this.nodeId = Objects.requireNonNull(nodeId, "nodeId");
         this.host = Objects.requireNonNull(host, "host");
         this.port = port;
+        this.roles = java.util.Collections.unmodifiableSet(new java.util.HashSet<>(Objects.requireNonNull(roles, "roles")));
     }
 
     public NodeId nodeId() {
@@ -49,6 +55,10 @@ public final class NodeInfo implements Serializable {
 
     public int port() {
         return port;
+    }
+    
+    public java.util.Set<String> roles() {
+        return roles;
     }
 
     @Override
@@ -65,6 +75,6 @@ public final class NodeInfo implements Serializable {
 
     @Override
     public String toString() {
-        return nodeId + "@" + host + ':' + port;
+        return nodeId + "@" + host + ':' + port + roles;
     }
 }

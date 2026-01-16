@@ -22,6 +22,7 @@ Coleção de utilitários em Java, com foco em:
 - **Eleição determinística de líder** (por ID) e reeleição opcional guiada por taxa de escrita
 - **Replicação com quorum** configurável (modos: disponibilidade ou consistência estrita)
 - API cliente transparente: qualquer nó pode encaminhar a operação ao líder
+- **Log Distribuído & Streaming**: suporte a retenção por tempo e múltiplos consumidores persistentes (consumer groups)
 - **Consistência de leitura** para mapas: forte, eventual ou limitada por lag
 - **Sincronização de estado (catch-up)** por snapshot em chunks para mapas distribuídos
 - **Persistência opcional de mapa** com WAL + snapshot (recuperação robusta em crash/rotação)

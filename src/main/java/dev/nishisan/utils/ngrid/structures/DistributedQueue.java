@@ -105,7 +105,7 @@ public final class DistributedQueue<T extends Serializable> implements Transport
             attempts++;
             NodeInfo leaderInfo = coordinator.leaderInfo().orElseThrow(() -> new IllegalStateException("No leader available"));
             if (leaderInfo.nodeId().equals(transport.local().nodeId())) {
-                return executeLocal(command, body);
+                return executeLocal(command, body, transport.local().nodeId());
             }
             ClientRequestPayload payload = new ClientRequestPayload(UUID.randomUUID(), command, body);
             ClusterMessage request = ClusterMessage.request(MessageType.CLIENT_REQUEST,
@@ -146,7 +146,7 @@ public final class DistributedQueue<T extends Serializable> implements Transport
     }
 
     @SuppressWarnings("unchecked")
-    private Serializable executeLocal(String command, Serializable body) {
+    private Serializable executeLocal(String command, Serializable body, NodeId requestingNode) {
         return switch (command) {
             case QUEUE_OFFER -> {
                 recordQueueOffer();
@@ -154,7 +154,7 @@ public final class DistributedQueue<T extends Serializable> implements Transport
                 yield Boolean.TRUE;
             }
             case QUEUE_POLL -> {
-                Optional<T> value = queueService.poll();
+                Optional<T> value = queueService.poll(requestingNode);
                 if (value.isPresent()) {
                     recordQueuePoll();
                 }
@@ -193,7 +193,7 @@ public final class DistributedQueue<T extends Serializable> implements Transport
             responsePayload = new ClientResponsePayload(payload.requestId(), false, null, "Not the leader");
         } else {
             try {
-                Serializable result = executeLocal(payload.command(), payload.body());
+                Serializable result = executeLocal(payload.command(), payload.body(), message.source());
                 responsePayload = new ClientResponsePayload(payload.requestId(), true, result, null);
             } catch (RuntimeException e) {
                 String messageText = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
