@@ -181,14 +181,11 @@ public final class TcpTransport implements Transport {
         }
         
         // Priority 1: If we have an active, open connection to this node, use it!
+        // This bypasses routing logic for already connected peers (including discovery clients).
         Connection activeConn = connections.get(destination);
         if (activeConn != null && activeConn.isOpen()) {
             activeConn.send(message);
             return;
-        } else if (activeConn != null) {
-            LOGGER.fine(() -> "Connection found for " + destination + " but it is CLOSED");
-        } else {
-            LOGGER.fine(() -> "No direct connection found in map for " + destination + ". Map keys: " + connections.keySet());
         }
 
         Optional<NodeId> nextHop = router.nextHop(destination, exclude);
@@ -500,25 +497,7 @@ public final class TcpTransport implements Transport {
         
         Connection previous = connections.put(remoteInfo.nodeId(), connection);
         if (previous != null && previous != connection) {
-            boolean preferOutbound = shouldInitiate(remoteInfo);
-            boolean previousOutbound = previous.outboundInitiated;
-            boolean connectionOutbound = connection.outboundInitiated;
-            if (preferOutbound && !connectionOutbound && previousOutbound) {
-                connections.put(remoteInfo.nodeId(), previous);
-                LOGGER.info("Keeping existing outbound connection for " + remoteInfo.nodeId() + " and closing new inbound connection");
-                connection.closeQuietly();
-                return;
-            }
-            if (!preferOutbound && connectionOutbound && !previousOutbound) {
-                connections.put(remoteInfo.nodeId(), previous);
-                LOGGER.info("Keeping existing inbound connection for " + remoteInfo.nodeId() + " and closing new outbound connection");
-                connection.closeQuietly();
-                return;
-            }
-            LOGGER.info("Replaced existing connection for " + remoteInfo.nodeId() + " with new connection");
             previous.closeQuietly();
-        } else {
-            LOGGER.info("Registered new connection for " + remoteInfo.nodeId());
         }
         
         // Feed router with reachability info
