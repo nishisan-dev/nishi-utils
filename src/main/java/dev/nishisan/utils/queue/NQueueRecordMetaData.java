@@ -43,6 +43,9 @@ public class NQueueRecordMetaData {
 
     public static final int MAGIC = 0x4E_51_4D_44; // 'NQMD'
     public static final byte VERSION = 0x01;
+    private static final int MIN_HEADER_LEN = 8 + 4 + 2;
+    private static final int MAX_HEADER_LEN = 4096;
+    private static final int MAX_CLASSNAME_LEN = 1024;
 
     private int headerLen;      // tamanho do bloco de header após HEADER_LEN
     private long index;         // índice sequencial
@@ -62,8 +65,14 @@ public class NQueueRecordMetaData {
         this.payloadLen = payloadLen;
         this.className = className;
         this.classNameLen = className.getBytes(StandardCharsets.UTF_8).length;
+        if (this.classNameLen <= 0 || this.classNameLen > MAX_CLASSNAME_LEN) {
+            throw new IllegalArgumentException("className length out of bounds");
+        }
         // headerLen = tamanho de [INDEX(8) + PAYLOAD_LEN(4) + CLASSNAME_LEN(2) + CLASSNAME(N)]
         this.headerLen = 8 + 4 + 2 + this.classNameLen;
+        if (this.headerLen < MIN_HEADER_LEN || this.headerLen > MAX_HEADER_LEN) {
+            throw new IllegalArgumentException("header length out of bounds");
+        }
     }
 
 
@@ -125,6 +134,9 @@ public class NQueueRecordMetaData {
         byte ver = prefix.get();
         if (ver != VERSION) throw new IOException("Versão de header não suportada: " + ver);
         int headerLen = prefix.getInt();
+        if (headerLen < MIN_HEADER_LEN || headerLen > MAX_HEADER_LEN) {
+            throw new IOException("HEADER_LEN inválido: " + headerLen);
+        }
         return new HeaderPrefix(ver, headerLen);
     }
 
@@ -146,6 +158,13 @@ public class NQueueRecordMetaData {
         m.payloadLen = hb.getInt();
 
         int nameLen = Short.toUnsignedInt(hb.getShort());
+        if (nameLen <= 0 || nameLen > MAX_CLASSNAME_LEN) {
+            throw new IOException("CLASSNAME_LEN inválido: " + nameLen);
+        }
+        int expectedHeaderLen = 8 + 4 + 2 + nameLen;
+        if (headerLen < expectedHeaderLen) {
+            throw new IOException("Header menor que o esperado: " + headerLen);
+        }
         m.classNameLen = nameLen;
 
         byte[] nameBytes = new byte[nameLen];
