@@ -32,6 +32,7 @@ import java.util.Set;
  * Configuration container used to bootstrap an {@link NGridNode} instance.
  */
 public final class NGridConfig {
+    private final String clusterName;
     private final NodeInfo local;
     private final Set<NodeInfo> peers;
     private final int replicationQuorum;
@@ -57,6 +58,7 @@ public final class NGridConfig {
     private final int transportWorkerThreads;
 
     private NGridConfig(Builder builder) {
+        this.clusterName = builder.clusterName;
         this.local = builder.local;
         this.peers = Collections.unmodifiableSet(new HashSet<>(builder.peers));
         int effectiveReplication = builder.replicationFactor != null ? builder.replicationFactor : builder.replicationQuorum;
@@ -81,6 +83,10 @@ public final class NGridConfig {
         this.reconnectInterval = builder.reconnectInterval;
         this.requestTimeout = builder.requestTimeout;
         this.transportWorkerThreads = builder.transportWorkerThreads;
+    }
+
+    public String clusterName() {
+        return clusterName;
     }
 
     public NodeInfo local() {
@@ -183,6 +189,7 @@ public final class NGridConfig {
     }
 
     public static final class Builder {
+        private String clusterName = "default-cluster";
         private final NodeInfo local;
         private final Set<NodeInfo> peers = new HashSet<>();
         private int replicationQuorum = 2;
@@ -209,6 +216,11 @@ public final class NGridConfig {
 
         private Builder(NodeInfo local) {
             this.local = Objects.requireNonNull(local, "local");
+        }
+
+        public Builder clusterName(String name) {
+            this.clusterName = Objects.requireNonNull(name, "clusterName");
+            return this;
         }
 
         public Builder connectTimeout(Duration timeout) {

@@ -5,7 +5,12 @@ import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
 import com.fasterxml.jackson.dataformat.yaml.YAMLGenerator;
 
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.util.function.Function;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class NGridConfigLoader {
 
@@ -20,7 +25,48 @@ public class NGridConfigLoader {
     }
 
     public static NGridYamlConfig load(Path yamlFile) throws IOException {
-        return mapper.readValue(yamlFile.toFile(), NGridYamlConfig.class);
+        return load(yamlFile, System::getenv);
+    }
+
+    public static NGridYamlConfig load(Path yamlFile, Function<String, String> envProvider) throws IOException {
+        String content = Files.readString(yamlFile);
+        String processedContent = resolveVariables(content, envProvider);
+        return mapper.readValue(processedContent, NGridYamlConfig.class);
+    }
+
+    private static String resolveVariables(String content, Function<String, String> envProvider) {
+        // Regex handles ${VAR} and ${VAR:defaultValue}
+        Pattern pattern = Pattern.compile("\\$\\{([^}]+)\\}");
+        Matcher matcher = pattern.matcher(content);
+        StringBuilder builder = new StringBuilder();
+        int i = 0;
+        while (matcher.find()) {
+            String replacement = getReplacement(matcher.group(1), envProvider);
+            builder.append(content, i, matcher.start());
+            if (replacement == null) {
+                builder.append(matcher.group(0));
+            } else {
+                builder.append(replacement);
+            }
+            i = matcher.end();
+        }
+        builder.append(content.substring(i));
+        return builder.toString();
+    }
+
+    private static String getReplacement(String group, Function<String, String> envProvider) {
+        String[] parts = group.split(":", 2);
+        String varName = parts[0];
+        String defaultValue = parts.length > 1 ? parts[1] : null;
+
+        String value = envProvider.apply(varName);
+        if (value != null) {
+            return value;
+        }
+        if (defaultValue != null) {
+            return defaultValue;
+        }
+        throw new IllegalArgumentException("Environment variable or property '" + varName + "' not found and no default value provided.");
     }
 
     public static void save(Path yamlFile, NGridYamlConfig config) throws IOException {
@@ -52,11 +98,17 @@ public class NGridConfigLoader {
         dev.nishisan.utils.ngrid.structures.NGridConfig.Builder builder = dev.nishisan.utils.ngrid.structures.NGridConfig.builder(localNode);
 
         // Base Directory
-        Path baseDir = java.nio.file.Path.of(nodeConfig.getDirs().getBase());
-        
+        Path baseDir = null;
+        if (nodeConfig.getDirs() != null && nodeConfig.getDirs().getBase() != null) {
+            baseDir = Path.of(nodeConfig.getDirs().getBase());
+        }
+
         // Cluster Policy
         ClusterPolicyConfig clusterConfig = yamlConfig.getCluster();
         if (clusterConfig != null) {
+            if (clusterConfig.getName() != null) {
+                builder.clusterName(clusterConfig.getName());
+            }
             if (clusterConfig.getReplication() != null) {
                 builder.replicationFactor(clusterConfig.getReplication().getFactor());
                 builder.strictConsistency(clusterConfig.getReplication().isStrict());
@@ -156,21 +208,21 @@ public class NGridConfigLoader {
         return builder.build();
     }
 
-    private static java.time.Duration parseDuration(String s) {
+    private static Duration parseDuration(String s) {
         if (s == null || s.isBlank()) return null;
         s = s.trim().toUpperCase();
         try {
-            return java.time.Duration.parse(s); // Try standard ISO-8601 first (PT10M)
+            return Duration.parse(s); // Try standard ISO-8601 first (PT10M)
         } catch (java.time.format.DateTimeParseException e) {
             // Fallback for simple "10m", "2h", "30s"
             if (s.endsWith("H")) {
-                return java.time.Duration.ofHours(Long.parseLong(s.substring(0, s.length() - 1)));
+                return Duration.ofHours(Long.parseLong(s.substring(0, s.length() - 1)));
             } else if (s.endsWith("M")) {
-                return java.time.Duration.ofMinutes(Long.parseLong(s.substring(0, s.length() - 1)));
+                return Duration.ofMinutes(Long.parseLong(s.substring(0, s.length() - 1)));
             } else if (s.endsWith("S")) {
-                return java.time.Duration.ofSeconds(Long.parseLong(s.substring(0, s.length() - 1)));
+                return Duration.ofSeconds(Long.parseLong(s.substring(0, s.length() - 1)));
             } else if (s.endsWith("MS")) {
-                return java.time.Duration.ofMillis(Long.parseLong(s.substring(0, s.length() - 2)));
+                return Duration.ofMillis(Long.parseLong(s.substring(0, s.length() - 2)));
             }
             throw e;
         }

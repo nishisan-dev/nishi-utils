@@ -395,6 +395,10 @@ public final class NGridNode implements Closeable {
         return maps.keySet();
     }
 
+    public NGridConfig config() {
+        return config;
+    }
+
     public Transport transport() {
         return transport;
     }
