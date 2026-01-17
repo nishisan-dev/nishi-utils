@@ -18,6 +18,7 @@ Coleção de utilitários em Java, com foco em:
 ### NGrid (fila/mapa distribuídos)
 
 - Cluster via **TCP** com descoberta de peers e heartbeats
+- **Configuração via YAML**: suporte a variáveis de ambiente (`${VAR}`) para fácil deployment em containers.
 - **Roteamento Inteligente (Sticky Proxy)** com otimização por RTT para alcançar nós inacessíveis diretamente
 - **Eleição determinística de líder** (por ID) e reeleição opcional guiada por taxa de escrita
 - **Replicação com quorum** configurável (modos: disponibilidade ou consistência estrita)
