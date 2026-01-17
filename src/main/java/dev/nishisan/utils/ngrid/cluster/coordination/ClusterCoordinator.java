@@ -44,8 +44,10 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Logger;
 
 /**
- * Maintains the cluster membership and performs a deterministic leader election based on
- * the highest active {@link NodeId}. The coordinator also emits heartbeat messages using
+ * Maintains the cluster membership and performs a deterministic leader election
+ * based on
+ * the highest active {@link NodeId}. The coordinator also emits heartbeat
+ * messages using
  * the underlying {@link Transport}.
  */
 public final class ClusterCoordinator implements TransportListener, Closeable {
@@ -72,7 +74,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
 
     private volatile boolean running;
 
-    public ClusterCoordinator(Transport transport, ClusterCoordinatorConfig config, ScheduledExecutorService scheduler) {
+    public ClusterCoordinator(Transport transport, ClusterCoordinatorConfig config,
+            ScheduledExecutorService scheduler) {
         this.transport = Objects.requireNonNull(transport, "transport");
         this.config = Objects.requireNonNull(config, "config");
         this.scheduler = Objects.requireNonNull(scheduler, "scheduler");
@@ -87,22 +90,30 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     }
 
     /**
-     * Starts the cluster coordination process, initializing necessary components and tasks.
+     * Starts the cluster coordination process, initializing necessary components
+     * and tasks.
      *
-     * This method transitions the cluster coordination to a running state if it is not already running.
-     * It sets the local node as a cluster member, registers itself as a transport listener, and schedules
-     * periodic tasks for sending heartbeats and evicting inactive members. Leadership is also recomputed
+     * This method transitions the cluster coordination to a running state if it is
+     * not already running.
+     * It sets the local node as a cluster member, registers itself as a transport
+     * listener, and schedules
+     * periodic tasks for sending heartbeats and evicting inactive members.
+     * Leadership is also recomputed
      * upon startup to establish the current cluster leader.
      *
      * The following actions are performed:
      * - The `running` flag is set to true, marking the cluster as active.
      * - The local node is added to the list of cluster members.
-     * - A listener is added to the transport layer to handle incoming messages and events.
-     * - Heartbeat messages are scheduled to be broadcast at regular intervals as defined in the configuration.
-     * - A task to evict inactive members is scheduled, removing members that miss multiple heartbeats.
+     * - A listener is added to the transport layer to handle incoming messages and
+     * events.
+     * - Heartbeat messages are scheduled to be broadcast at regular intervals as
+     * defined in the configuration.
+     * - A task to evict inactive members is scheduled, removing members that miss
+     * multiple heartbeats.
      * - The cluster leader is computed and updated, notifying relevant listeners.
      *
-     * If the cluster is already running, the method exits without making any changes.
+     * If the cluster is already running, the method exits without making any
+     * changes.
      */
     public void start() {
         if (running) {
@@ -137,16 +148,20 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     }
 
     /**
-     * Sets the preferred leader for the cluster with an optional time-to-live (TTL).
+     * Sets the preferred leader for the cluster with an optional time-to-live
+     * (TTL).
      *
-     * A preferred leader is a node that is temporarily prioritized as the leader for
+     * A preferred leader is a node that is temporarily prioritized as the leader
+     * for
      * the duration specified by the TTL. If the TTL is null, zero, or negative,
      * the preferred leader is cleared, and the leader is recomputed immediately.
      *
      * @param leaderId the identifier of the node to be set as the preferred leader;
      *                 may be null to clear the current preference.
-     * @param ttl the duration for which the specified node should be preferred as the leader;
-     *            must be non-negative and non-zero, otherwise the preference is cleared.
+     * @param ttl      the duration for which the specified node should be preferred
+     *                 as the leader;
+     *                 must be non-negative and non-zero, otherwise the preference
+     *                 is cleared.
      */
     public void setPreferredLeader(NodeId leaderId, Duration ttl) {
         Objects.requireNonNull(ttl, "ttl");
@@ -164,12 +179,17 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     /**
      * Retrieves information about the current leader of the cluster.
      *
-     * This method attempts to fetch the {@code NodeInfo} of the leader node as identified by
-     * the current leader's {@code NodeId}. If the leader is null or the leader's associated
-     * {@code ClusterMember} is not active, an empty {@code Optional} is returned. Otherwise,
-     * the method returns the {@code NodeInfo} of the active leader wrapped in an {@code Optional}.
+     * This method attempts to fetch the {@code NodeInfo} of the leader node as
+     * identified by
+     * the current leader's {@code NodeId}. If the leader is null or the leader's
+     * associated
+     * {@code ClusterMember} is not active, an empty {@code Optional} is returned.
+     * Otherwise,
+     * the method returns the {@code NodeInfo} of the active leader wrapped in an
+     * {@code Optional}.
      *
-     * @return an {@code Optional} containing the {@code NodeInfo} of the leader if available and active;
+     * @return an {@code Optional} containing the {@code NodeInfo} of the leader if
+     *         available and active;
      *         otherwise, an empty {@code Optional}.
      */
     public Optional<NodeInfo> leaderInfo() {
@@ -187,12 +207,71 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      * This method filters the cluster members to include only those marked
      * as active and then maps them to their respective {@code NodeInfo} objects.
      *
-     * @return a collection of {@code NodeInfo}*/
+     * @return a collection of {@code NodeInfo}
+     */
     public Collection<NodeInfo> activeMembers() {
         return members.values().stream()
                 .filter(ClusterMember::isActive)
                 .map(ClusterMember::info)
                 .toList();
+    }
+
+    /**
+     * Waits for the cluster to stabilize with a default timeout of 10 seconds.
+     * 
+     * A cluster is considered stable when:
+     * - A leader has been elected (leaderInfo() is present)
+     * - The cluster has at least the minimum required size (activeMembers >=
+     * minClusterSize)
+     * 
+     * @throws InterruptedException  if the thread is interrupted while waiting
+     * @throws IllegalStateException if the cluster does not stabilize within the
+     *                               timeout
+     */
+    public void awaitLocalStability() throws InterruptedException {
+        awaitLocalStability(Duration.ofSeconds(10));
+    }
+
+    /**
+     * Waits for the cluster to stabilize with a specified timeout.
+     * 
+     * A cluster is considered stable when:
+     * - A leader has been elected (leaderInfo() is present)
+     * - The cluster has at least the minimum required size (activeMembers >=
+     * minClusterSize)
+     * 
+     * @param timeout the maximum time to wait for stability
+     * @throws InterruptedException  if the thread is interrupted while waiting
+     * @throws IllegalStateException if the cluster does not stabilize within the
+     *                               timeout
+     */
+    public void awaitLocalStability(Duration timeout) throws InterruptedException {
+        Objects.requireNonNull(timeout, "timeout");
+        if (timeout.isNegative() || timeout.isZero()) {
+            throw new IllegalArgumentException("Timeout must be positive");
+        }
+
+        long deadline = System.currentTimeMillis() + timeout.toMillis();
+        while (System.currentTimeMillis() < deadline) {
+            if (isStable()) {
+                return;
+            }
+            Thread.sleep(200);
+        }
+        throw new IllegalStateException(String.format(
+                "Cluster did not stabilize within %s. Current state: leader=%s, activeMembers=%d, minClusterSize=%d",
+                timeout, leaderInfo().map(NodeInfo::nodeId).orElse(null),
+                activeMembers().size(), config.minClusterSize()));
+    }
+
+    /**
+     * Checks if the cluster is currently stable.
+     * 
+     * @return true if a leader is present and the cluster has sufficient active
+     *         members
+     */
+    private boolean isStable() {
+        return leaderInfo().isPresent() && activeMembers().size() >= config.minClusterSize();
     }
 
     public void addLeadershipListener(LeadershipListener listener) {
@@ -256,15 +335,20 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     }
 
     /**
-     * Scans the cluster members for inactive nodes and evicts them if they have not sent a heartbeat
+     * Scans the cluster members for inactive nodes and evicts them if they have not
+     * sent a heartbeat
      * within the configured timeout period.
      *
-     * This method checks each cluster member to ensure that it is still active. If a member's last
-     * heartbeat timestamp exceeds the configured heartbeat timeout, the member is marked as inactive.
-     * The leader is then recomputed to reflect the updated state of the cluster. The local node is
+     * This method checks each cluster member to ensure that it is still active. If
+     * a member's last
+     * heartbeat timestamp exceeds the configured heartbeat timeout, the member is
+     * marked as inactive.
+     * The leader is then recomputed to reflect the updated state of the cluster.
+     * The local node is
      * excluded from eviction checks.
      *
-     * If the cluster is not running, the method exits without performing any actions.
+     * If the cluster is not running, the method exits without performing any
+     * actions.
      */
     private void evictDeadMembers() {
         try {
@@ -295,12 +379,16 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     /**
      * Recomputes the leader of the cluster based on currently active members.
      *
-     * The method identifies the highest-ranking active node by comparing their unique identifiers,
-     * updates the cluster's leader state, and notifies registered listeners if the leadership
+     * The method identifies the highest-ranking active node by comparing their
+     * unique identifiers,
+     * updates the cluster's leader state, and notifies registered listeners if the
+     * leadership
      * status has changed.
      *
-     * Leadership change is determined by examining the difference between the previous leader
-     * and the newly computed leader. If the local node's leadership state changes, the corresponding
+     * Leadership change is determined by examining the difference between the
+     * previous leader
+     * and the newly computed leader. If the local node's leadership state changes,
+     * the corresponding
      * listeners are notified.
      */
     private void recomputeLeader() {
@@ -328,14 +416,18 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     }
 
     /**
-     * Updates the leader of the cluster and notifies listeners of leadership changes if necessary.
+     * Updates the leader of the cluster and notifies listeners of leadership
+     * changes if necessary.
      *
      * This method changes the current leader to the specified {@code newLeaderId}.
-     * If the leader changes, registered leadership listeners and leader election listeners
-     * are notified. It also determines if the local node's leadership status has changed,
+     * If the leader changes, registered leadership listeners and leader election
+     * listeners
+     * are notified. It also determines if the local node's leadership status has
+     * changed,
      * and updates the relevant listeners accordingly.
      *
-     * @param newLeaderId the identifier of the new leader; may be {@code null} if no leader is present.
+     * @param newLeaderId the identifier of the new leader; may be {@code null} if
+     *                    no leader is present.
      */
     private void updateLeader(NodeId newLeaderId) {
         NodeId previous = leader.getAndSet(newLeaderId);
@@ -355,7 +447,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     @Override
     public void onPeerConnected(NodeInfo peer) {
         members.compute(peer.nodeId(), (id, existing) -> {
-            // Replace any placeholder member information (e.g. created from a heartbeat before we learned host/port)
+            // Replace any placeholder member information (e.g. created from a heartbeat
+            // before we learned host/port)
             // or update when host/port changes (e.g. peer restarted on a new port).
             if (existing == null || !existing.info().equals(peer)) {
                 return new ClusterMember(peer);
@@ -391,7 +484,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             if (currentLeader != null && currentLeader.equals(source)) {
                 trackedLeaderHighWatermark = payload.leaderHighWatermark();
             }
-            members.computeIfAbsent(source, id -> new ClusterMember(findPeerInfo(source).orElseGet(() -> new NodeInfo(source, "", 0)))).touch();
+            members.computeIfAbsent(source,
+                    id -> new ClusterMember(findPeerInfo(source).orElseGet(() -> new NodeInfo(source, "", 0)))).touch();
             recomputeLeader();
         }
     }
