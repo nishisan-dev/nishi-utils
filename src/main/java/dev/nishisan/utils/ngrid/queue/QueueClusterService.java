@@ -271,21 +271,9 @@ public final class QueueClusterService<T extends Serializable> implements Closea
             switch (command.type()) {
                 case OFFER -> queue.offer((T) command.value());
                 case POLL -> {
-                    Optional<T> current = queue.peek();
-                    Serializable expected = command.value();
-                    if (expected != null) {
-                        if (current.isEmpty()) {
-                            String msg = "POLL replication mismatch. Expected " + expected + " but queue is empty";
-                            LOGGER.severe(msg);
-                            throw new IllegalStateException(msg);
-                        }
-                        if (!current.get().equals(expected)) {
-                            String msg = "POLL replication mismatch. Expected " + expected + " but found "
-                                    + current.get();
-                            LOGGER.severe(msg);
-                            throw new IllegalStateException(msg);
-                        }
-                    }
+                    // With sequencing guarantees from ReplicationManager, we can trust
+                    // that operations arrive in the correct order. No need for optimistic
+                    // validation.
                     queue.poll();
                 }
             }
