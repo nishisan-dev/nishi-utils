@@ -80,10 +80,10 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
     private volatile boolean running;
 
-    // Sequence ordering structures
-    private final PriorityQueue<BufferedReplication> sequenceBuffer = new PriorityQueue<>();
-    private volatile long nextExpectedSequence = 1;
-    private final Map<Long, Instant> sequenceWaitStart = new ConcurrentHashMap<>();
+    // Sequence ordering structures - PER TOPIC
+    private final Map<String, PriorityQueue<BufferedReplication>> sequenceBufferByTopic = new ConcurrentHashMap<>();
+    private final Map<String, Long> nextExpectedSequenceByTopic = new ConcurrentHashMap<>();
+    private final Map<String, Map<Long, Instant>> sequenceWaitStartByTopic = new ConcurrentHashMap<>();
     private static final Duration SEQUENCE_WAIT_TIMEOUT = Duration.ofSeconds(1);
     private final Path sequenceStatePath;
     private final ReentrantLock sequenceBufferLock = new ReentrantLock();
@@ -437,34 +437,42 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         }
 
         // Lock to manipulate buffer and sequence
+        String topic = payload.topic();
         sequenceBufferLock.lock();
         try {
-            if (seq == nextExpectedSequence) {
+            // Initialize per-topic structures if needed
+            long nextExpected = nextExpectedSequenceByTopic.computeIfAbsent(topic, k -> 1L);
+            PriorityQueue<BufferedReplication> buffer = sequenceBufferByTopic.computeIfAbsent(
+                    topic, k -> new PriorityQueue<>());
+            Map<Long, Instant> waitStart = sequenceWaitStartByTopic.computeIfAbsent(
+                    topic, k -> new ConcurrentHashMap<>());
+
+            if (seq == nextExpected) {
                 // Correct sequence, apply immediately
                 applyReplication(payload, message);
-                nextExpectedSequence++;
+                nextExpectedSequenceByTopic.put(topic, nextExpected + 1);
                 saveSequenceState();
 
                 // Process buffer to apply consecutive sequences
-                processSequenceBuffer();
-            } else if (seq > nextExpectedSequence) {
+                processSequenceBuffer(topic);
+            } else if (seq > nextExpected) {
                 // Future sequence, add to buffer
                 BufferedReplication buffered = new BufferedReplication(
                         payload, message, Instant.now());
-                sequenceBuffer.add(buffered);
-                sequenceWaitStart.putIfAbsent(seq, Instant.now());
+                buffer.add(buffered);
+                waitStart.putIfAbsent(seq, Instant.now());
 
                 LOGGER.info(() -> String.format(
-                        "Buffered future sequence seq=%d (expecting=%d)",
-                        seq, nextExpectedSequence));
+                        "Buffered future sequence seq=%d (expecting=%d) for topic=%s",
+                        seq, nextExpected, topic));
 
                 // Check if we have gaps and if timeout expired
-                checkForMissingSequences();
+                checkForMissingSequences(topic);
             } else {
                 // Old sequence (duplicate or already processed), ignore
                 LOGGER.warning(() -> String.format(
-                        "Received old sequence seq=%d (expecting=%d), ignoring",
-                        seq, nextExpectedSequence));
+                        "Received old sequence seq=%d (expecting=%d) for topic=%s, ignoring",
+                        seq, nextExpected, topic));
             }
         } finally {
             sequenceBufferLock.unlock();
@@ -512,25 +520,35 @@ public class ReplicationManager implements TransportListener, LeadershipListener
      * Processes buffered sequences in order (must be called with sequenceBufferLock
      * held).
      */
-    private void processSequenceBuffer() {
-        while (!sequenceBuffer.isEmpty()) {
-            BufferedReplication next = sequenceBuffer.peek();
+    private void processSequenceBuffer(String topic) {
+        PriorityQueue<BufferedReplication> buffer = sequenceBufferByTopic.get(topic);
+        Map<Long, Instant> waitStart = sequenceWaitStartByTopic.get(topic);
 
-            if (next.sequence() != nextExpectedSequence) {
+        if (buffer == null || buffer.isEmpty()) {
+            return;
+        }
+
+        while (!buffer.isEmpty()) {
+            BufferedReplication next = buffer.peek();
+            long nextExpected = nextExpectedSequenceByTopic.get(topic);
+
+            if (next.sequence() != nextExpected) {
                 // Next in buffer is not the expected one, stop
                 break;
             }
 
             // Remove from buffer and apply
-            sequenceBuffer.poll();
-            sequenceWaitStart.remove(next.sequence());
+            buffer.poll();
+            if (waitStart != null) {
+                waitStart.remove(next.sequence());
+            }
 
             applyReplication(next.payload(), next.originalMessage());
-            nextExpectedSequence++;
+            nextExpectedSequenceByTopic.put(topic, nextExpected + 1);
             saveSequenceState();
 
             LOGGER.info(() -> String.format(
-                    "Processed buffered sequence seq=%d", next.sequence()));
+                    "Processed buffered sequence seq=%d for topic=%s", next.sequence(), topic));
         }
     }
 
@@ -538,26 +556,30 @@ public class ReplicationManager implements TransportListener, LeadershipListener
      * Checks for missing sequences and requests them if timeout expired
      * (must be called with sequenceBufferLock held).
      */
-    private void checkForMissingSequences() {
-        if (sequenceBuffer.isEmpty()) {
+    private void checkForMissingSequences(String topic) {
+        PriorityQueue<BufferedReplication> buffer = sequenceBufferByTopic.get(topic);
+        Map<Long, Instant> waitStart = sequenceWaitStartByTopic.get(topic);
+
+        if (buffer == null || buffer.isEmpty() || waitStart == null) {
             return;
         }
 
         Instant now = Instant.now();
-        long nextInBuffer = sequenceBuffer.peek().sequence();
-        long gap = nextInBuffer - nextExpectedSequence;
+        long nextInBuffer = buffer.peek().sequence();
+        long nextExpected = nextExpectedSequenceByTopic.get(topic);
+        long gap = nextInBuffer - nextExpected;
 
         if (gap > 0) {
             // We have a gap, check timeout
-            Instant waitStart = sequenceWaitStart.get(nextInBuffer);
+            Instant waitStartTime = waitStart.get(nextInBuffer);
 
-            if (waitStart != null) {
-                Duration waited = Duration.between(waitStart, now);
+            if (waitStartTime != null) {
+                Duration waited = Duration.between(waitStartTime, now);
 
                 if (waited.compareTo(SEQUENCE_WAIT_TIMEOUT) > 0) {
                     LOGGER.warning(() -> String.format(
-                            "Timeout waiting for seq=%d (waited %dms), will request from leader",
-                            nextExpectedSequence, waited.toMillis()));
+                            "Timeout waiting for seq=%d (waited %dms) for topic=%s, will request from leader",
+                            nextExpected, waited.toMillis(), topic));
 
                     // Note: Request will be implemented in Phase 3
                     // For now, just log the gap
@@ -758,11 +780,12 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
         try (java.io.ObjectInputStream ois = new java.io.ObjectInputStream(
                 Files.newInputStream(sequenceStatePath))) {
-            nextExpectedSequence = ois.readLong();
-            LOGGER.info(() -> "Loaded sequence state: nextExpected=" + nextExpectedSequence);
+            @SuppressWarnings("unchecked")
+            Map<String, Long> loaded = (Map<String, Long>) ois.readObject();
+            nextExpectedSequenceByTopic.putAll(loaded);
+            LOGGER.info(() -> "Loaded sequence state: " + loaded);
         } catch (Exception e) {
             LOGGER.log(Level.WARNING, "Failed to load sequence state, starting from 1", e);
-            nextExpectedSequence = 1;
         }
     }
 
@@ -774,7 +797,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             Files.createDirectories(sequenceStatePath.getParent());
             try (java.io.ObjectOutputStream oos = new java.io.ObjectOutputStream(
                     Files.newOutputStream(sequenceStatePath))) {
-                oos.writeLong(nextExpectedSequence);
+                oos.writeObject(new HashMap<>(nextExpectedSequenceByTopic));
             }
         } catch (IOException e) {
             LOGGER.log(Level.WARNING, "Failed to save sequence state", e);
