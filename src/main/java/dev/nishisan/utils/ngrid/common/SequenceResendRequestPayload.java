@@ -17,27 +17,13 @@
 
 package dev.nishisan.utils.ngrid.common;
 
+import java.io.Serializable;
+
 /**
- * Enumerates the built-in message types exchanged between transport and
- * higher-level
- * components. Additional application specific commands can be encoded using the
- * {@link ClusterMessage#qualifier()} field.
+ * Payload for requesting missing replication sequences from the leader.
  */
-public enum MessageType {
-    HANDSHAKE,
-    PEER_UPDATE,
-    HEARTBEAT,
-    PING,
-    LEADER_SCORE,
-    LEADER_SUGGESTION,
-    REPLICATION_REQUEST,
-    REPLICATION_ACK,
-    CLIENT_REQUEST,
-    CLIENT_RESPONSE,
-    SYNC_REQUEST,
-    SYNC_RESPONSE,
-    CONFIG_FETCH_REQUEST,
-    CONFIG_FETCH_RESPONSE,
-    SEQUENCE_RESEND_REQUEST,
-    SEQUENCE_RESEND_RESPONSE
+public record SequenceResendRequestPayload(
+        String topic,
+        long fromSequence,
+        long toSequence) implements Serializable {
 }

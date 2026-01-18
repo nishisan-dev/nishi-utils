@@ -17,6 +17,7 @@
 
 package dev.nishisan.utils.ngrid.replication;
 
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Objects;
 
@@ -28,12 +29,15 @@ public final class ReplicationConfig {
     private final Duration operationTimeout;
     private final Duration retryInterval;
     private final boolean strictConsistency;
+    private final Path dataDirectory;
 
-    private ReplicationConfig(int quorum, Duration operationTimeout, Duration retryInterval, boolean strictConsistency) {
+    private ReplicationConfig(int quorum, Duration operationTimeout, Duration retryInterval, boolean strictConsistency,
+            Path dataDirectory) {
         this.quorum = quorum;
         this.operationTimeout = Objects.requireNonNull(operationTimeout, "operationTimeout");
         this.retryInterval = Objects.requireNonNull(retryInterval, "retryInterval");
         this.strictConsistency = strictConsistency;
+        this.dataDirectory = Objects.requireNonNull(dataDirectory, "dataDirectory");
     }
 
     public static ReplicationConfig of(int quorum) {
@@ -66,11 +70,16 @@ public final class ReplicationConfig {
         return strictConsistency;
     }
 
+    public Path dataDirectory() {
+        return dataDirectory;
+    }
+
     public static final class Builder {
         private final int quorum;
         private Duration operationTimeout = Duration.ofSeconds(30);
         private Duration retryInterval = Duration.ofSeconds(1);
         private boolean strictConsistency = false;
+        private Path dataDirectory;
 
         private Builder(int quorum) {
             if (quorum < 1) {
@@ -98,8 +107,16 @@ public final class ReplicationConfig {
             return this;
         }
 
+        public Builder dataDirectory(Path dataDirectory) {
+            this.dataDirectory = Objects.requireNonNull(dataDirectory, "dataDirectory");
+            return this;
+        }
+
         public ReplicationConfig build() {
-            return new ReplicationConfig(quorum, operationTimeout, retryInterval, strictConsistency);
+            if (dataDirectory == null) {
+                throw new IllegalStateException("dataDirectory must be set");
+            }
+            return new ReplicationConfig(quorum, operationTimeout, retryInterval, strictConsistency, dataDirectory);
         }
     }
 }

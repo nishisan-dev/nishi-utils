@@ -318,6 +318,19 @@ public final class NGridNode implements Closeable {
             replicationBuilder.operationTimeout(config.replicationOperationTimeout());
         }
         replicationBuilder.strictConsistency(config.strictConsistency());
+
+        // Determine replication data directory
+        Path replicationDataDir;
+        if (config.dataDirectory() != null) {
+            replicationDataDir = config.dataDirectory().resolve("replication");
+        } else if (config.queueDirectory() != null) {
+            // Fallback for legacy config
+            replicationDataDir = config.queueDirectory().getParent().resolve("replication");
+        } else {
+            throw new IllegalStateException("Neither dataDirectory nor queueDirectory is configured");
+        }
+        replicationBuilder.dataDirectory(replicationDataDir);
+
         replicationManager = new ReplicationManager(transport, coordinator, replicationBuilder.build());
         replicationManager.start();
 

@@ -30,32 +30,25 @@ import dev.nishisan.utils.ngrid.common.ReplicationAckPayload;
 import dev.nishisan.utils.ngrid.common.ReplicationPayload;
 import dev.nishisan.utils.ngrid.common.SyncRequestPayload;
 import dev.nishisan.utils.ngrid.common.SyncResponsePayload;
+import dev.nishisan.utils.ngrid.common.SequenceResendRequestPayload;
+import dev.nishisan.utils.ngrid.common.SequenceResendResponsePayload;
 
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.Serializable;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import java.util.Set;
-import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CopyOnWriteArraySet;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeoutException;
-import java.util.concurrent.TimeUnit;
-import java.util.logging.Level;
-import java.util.logging.Logger;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.concurrent.ScheduledExecutorService;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 /**
- * Coordinates quorum based replication leveraging the transport. The manager handles both
+ * Coordinates quorum based replication leveraging the transport. The manager
+ * handles both
  * leader initiated operations and replication requests coming from other nodes.
  */
 public class ReplicationManager implements TransportListener, LeadershipListener, Closeable {
@@ -87,12 +80,40 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
     private volatile boolean running;
 
-    private static record Failure(PendingOperation operation, Throwable error) {}
+    // Sequence ordering structures
+    private final PriorityQueue<BufferedReplication> sequenceBuffer = new PriorityQueue<>();
+    private volatile long nextExpectedSequence = 1;
+    private final Map<Long, Instant> sequenceWaitStart = new ConcurrentHashMap<>();
+    private static final Duration SEQUENCE_WAIT_TIMEOUT = Duration.ofSeconds(1);
+    private final Path sequenceStatePath;
+    private final ReentrantLock sequenceBufferLock = new ReentrantLock();
+
+    private static record Failure(PendingOperation operation, Throwable error) {
+    }
+
+    /**
+     * Buffered replication operation waiting for its sequence turn.
+     */
+    private static record BufferedReplication(
+            ReplicationPayload payload,
+            ClusterMessage originalMessage,
+            Instant receivedAt) implements Comparable<BufferedReplication> {
+        long sequence() {
+            return payload.sequence();
+        }
+
+        @Override
+        public int compareTo(BufferedReplication other) {
+            return Long.compare(this.sequence(), other.sequence());
+        }
+    }
 
     public ReplicationManager(Transport transport, ClusterCoordinator coordinator, ReplicationConfig config) {
         this.transport = Objects.requireNonNull(transport, "transport");
         this.coordinator = Objects.requireNonNull(coordinator, "coordinator");
         this.config = Objects.requireNonNull(config, "config");
+        this.sequenceStatePath = config.dataDirectory().resolve("sequence-state.dat");
+        loadSequenceState();
     }
 
     /**
@@ -102,6 +123,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         this.transport = null;
         this.coordinator = null;
         this.config = null;
+        this.sequenceStatePath = null;
     }
 
     public void start() {
@@ -162,7 +184,8 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
     /**
      * Exposes the configured replication operation timeout for callers that need to
-     * bound their waiting time (e.g. higher-level services calling {@code future.get(...)}).
+     * bound their waiting time (e.g. higher-level services calling
+     * {@code future.get(...)}).
      */
     public Duration operationTimeout() {
         return config.operationTimeout();
@@ -184,10 +207,10 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         PendingOperation operation = new PendingOperation(operationId, topic, payload, requiredQuorum(quorumOverride));
         pending.put(operationId, operation);
         log.put(operationId, new ReplicatedRecord(operationId, topic, payload, OperationStatus.PENDING));
-        
+
         // Local node acknowledges receipt, but defers application until quorum
         operation.ack(transport.local().nodeId());
-        
+
         replicateToFollowers(operation);
         return operation.future();
     }
@@ -210,7 +233,8 @@ public class ReplicationManager implements TransportListener, LeadershipListener
     private void replicateToFollowers(PendingOperation operation) {
         long seq = globalSequence.incrementAndGet();
         operation.sequence = seq;
-        ReplicationPayload payload = new ReplicationPayload(operation.operationId, seq, operation.topic, operation.payload);
+        ReplicationPayload payload = new ReplicationPayload(operation.operationId, seq, operation.topic,
+                operation.payload);
         for (NodeInfo member : coordinator.activeMembers()) {
             if (member.nodeId().equals(transport.local().nodeId())) {
                 continue;
@@ -238,7 +262,8 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                 if (operation.isDone()) {
                     continue;
                 }
-                ReplicationPayload payload = new ReplicationPayload(operation.operationId, operation.sequence, operation.topic, operation.payload);
+                ReplicationPayload payload = new ReplicationPayload(operation.operationId, operation.sequence,
+                        operation.topic, operation.payload);
                 for (NodeInfo member : coordinator.activeMembers()) {
                     NodeId nodeId = member.nodeId();
                     if (nodeId.equals(transport.local().nodeId())) {
@@ -283,7 +308,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                     }
                 }
             }
-            
+
             operation.complete(OperationStatus.COMMITTED);
             log.computeIfPresent(operation.operationId, (id, record) -> {
                 record.status(OperationStatus.COMMITTED);
@@ -322,16 +347,20 @@ public class ReplicationManager implements TransportListener, LeadershipListener
     }
 
     private void handleSyncRequest(ClusterMessage message) {
-        if (!coordinator.isLeader()) return;
+        if (!coordinator.isLeader())
+            return;
         SyncRequestPayload payload = message.payload(SyncRequestPayload.class);
         ReplicationHandler handler = handlers.get(payload.topic());
-        if (handler == null) return;
+        if (handler == null)
+            return;
 
         ReplicationHandler.SnapshotChunk chunk = handler.getSnapshotChunk(payload.chunkIndex());
-        if (chunk == null) return;
+        if (chunk == null)
+            return;
 
         long seq = globalSequence.get();
-        SyncResponsePayload responsePayload = new SyncResponsePayload(payload.topic(), seq, payload.chunkIndex(), chunk.hasMore(), chunk.data());
+        SyncResponsePayload responsePayload = new SyncResponsePayload(payload.topic(), seq, payload.chunkIndex(),
+                chunk.hasMore(), chunk.data());
         ClusterMessage response = new ClusterMessage(UUID.randomUUID(),
                 message.messageId(),
                 MessageType.SYNC_RESPONSE,
@@ -346,7 +375,8 @@ public class ReplicationManager implements TransportListener, LeadershipListener
     private void handleSyncResponse(ClusterMessage message) {
         SyncResponsePayload payload = message.payload(SyncResponsePayload.class);
         ReplicationHandler handler = handlers.get(payload.topic());
-        if (handler == null) return;
+        if (handler == null)
+            return;
 
         executor.submit(() -> {
             try {
@@ -355,11 +385,12 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                     handler.resetState();
                 }
                 handler.installSnapshot(payload.data());
-                
+
                 if (payload.hasMore()) {
                     requestSync(payload.topic(), payload.chunkIndex() + 1);
                 } else {
-                    LOGGER.info(() -> "Sync completed for " + payload.topic() + ". Final sequence: " + payload.sequence());
+                    LOGGER.info(
+                            () -> "Sync completed for " + payload.topic() + ". Final sequence: " + payload.sequence());
                     lastAppliedSequence = Math.max(lastAppliedSequence, payload.sequence());
                     syncingTopics.remove(payload.topic());
                 }
@@ -377,7 +408,8 @@ public class ReplicationManager implements TransportListener, LeadershipListener
     private void requestSync(String topic, int chunkIndex) {
         coordinator.leaderInfo().ifPresent(leader -> {
             if (chunkIndex == 0) {
-                LOGGER.info(() -> "Lag detected (" + (coordinator.getTrackedLeaderHighWatermark() - lastAppliedSequence) + "). Requesting sync for " + topic);
+                LOGGER.info(() -> "Lag detected (" + (coordinator.getTrackedLeaderHighWatermark() - lastAppliedSequence)
+                        + "). Requesting sync for " + topic);
             }
             SyncRequestPayload payload = new SyncRequestPayload(topic, chunkIndex);
             ClusterMessage request = ClusterMessage.request(MessageType.SYNC_REQUEST,
@@ -392,7 +424,8 @@ public class ReplicationManager implements TransportListener, LeadershipListener
     private void handleReplicationRequest(ClusterMessage message) {
         ReplicationPayload payload = message.payload(ReplicationPayload.class);
         UUID opId = payload.operationId();
-        LOGGER.info(() -> "Replication request " + opId + " for topic " + payload.topic() + " from " + message.source());
+        LOGGER.info(
+                () -> "Replication request " + opId + " for topic " + payload.topic() + " from " + message.source());
         if (applied.contains(opId)) {
             sendAck(opId, message.source());
             return;
@@ -410,7 +443,8 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             try {
                 handler.apply(opId, payload.data());
                 lastAppliedSequence = Math.max(lastAppliedSequence, payload.sequence());
-                log.putIfAbsent(opId, new ReplicatedRecord(opId, payload.topic(), payload.data(), OperationStatus.COMMITTED));
+                log.putIfAbsent(opId,
+                        new ReplicatedRecord(opId, payload.topic(), payload.data(), OperationStatus.COMMITTED));
                 applied.add(opId);
                 sendAck(opId, message.source());
             } catch (Exception e) {
@@ -599,6 +633,40 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
         CompletableFuture<ReplicationResult> future() {
             return future;
+        }
+    }
+
+    /**
+     * Loads the last saved sequence state from disk.
+     */
+    private void loadSequenceState() {
+        if (!Files.exists(sequenceStatePath)) {
+            LOGGER.info(() -> "No saved sequence state found, starting from sequence 1");
+            return;
+        }
+
+        try (java.io.ObjectInputStream ois = new java.io.ObjectInputStream(
+                Files.newInputStream(sequenceStatePath))) {
+            nextExpectedSequence = ois.readLong();
+            LOGGER.info(() -> "Loaded sequence state: nextExpected=" + nextExpectedSequence);
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING, "Failed to load sequence state, starting from 1", e);
+            nextExpectedSequence = 1;
+        }
+    }
+
+    /**
+     * Saves the current sequence state to disk.
+     */
+    private void saveSequenceState() {
+        try {
+            Files.createDirectories(sequenceStatePath.getParent());
+            try (java.io.ObjectOutputStream oos = new java.io.ObjectOutputStream(
+                    Files.newOutputStream(sequenceStatePath))) {
+                oos.writeLong(nextExpectedSequence);
+            }
+        } catch (IOException e) {
+            LOGGER.log(Level.WARNING, "Failed to save sequence state", e);
         }
     }
 }
