@@ -38,7 +38,7 @@ import static org.junit.jupiter.api.Assertions.*;
  * - Consumer polls messages from each queue
  * - Validates queue isolation (messages don't leak between queues)
  */
-@Disabled("POLL replication mismatch bug - objects are not matching across replicas")
+@Disabled("Replication ordering bug - OFFER/POLL operations arrive out of order at replicas")
 class MultiQueueClusterIntegrationTest {
 
     @TempDir
@@ -52,35 +52,15 @@ class MultiQueueClusterIntegrationTest {
     private int producerPort;
     private int consumerPort;
 
-    // Test message types
-    static class Order implements Serializable {
-        final String orderId;
-        final double amount;
-
-        Order(String orderId, double amount) {
-            this.orderId = orderId;
-            this.amount = amount;
-        }
+    // Test message types - using records for automatic equals/hashCode
+    // implementation
+    record Order(String orderId, double amount) implements Serializable {
     }
 
-    static class Event implements Serializable {
-        final String eventType;
-        final long timestamp;
-
-        Event(String eventType, long timestamp) {
-            this.eventType = eventType;
-            this.timestamp = timestamp;
-        }
+    record Event(String eventType, long timestamp) implements Serializable {
     }
 
-    static class LogEntry implements Serializable {
-        final String level;
-        final String message;
-
-        LogEntry(String level, String message) {
-            this.level = level;
-            this.message = message;
-        }
+    record LogEntry(String level, String message) implements Serializable {
     }
 
     @BeforeEach
