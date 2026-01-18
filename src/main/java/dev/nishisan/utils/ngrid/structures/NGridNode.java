@@ -342,7 +342,15 @@ public final class NGridNode implements Closeable {
                 .queueOptions(queueOptions)
                 .replicationFactor(config.replicationFactor())
                 .build();
-        queue = getQueue(config.queueName(), defaultQueueConfig, Serializable.class);
+
+        // Only create default queue if no queues are explicitly configured
+        // This maintains backward compatibility with single-queue API
+        if (config.queues() == null || config.queues().isEmpty()) {
+            queue = getQueue(config.queueName(), defaultQueueConfig, Serializable.class);
+        } else {
+            // For multi-queue setup, queue() accessor will throw IllegalStateException
+            queue = null;
+        }
 
         String defaultMapName = config.mapName();
         map = maps.computeIfAbsent(defaultMapName, this::createDistributedMap);

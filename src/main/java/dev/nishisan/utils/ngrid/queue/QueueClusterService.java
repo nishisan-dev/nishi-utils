@@ -80,6 +80,7 @@ public final class QueueClusterService<T extends Serializable> implements Closea
         }
         this.replicationManager = Objects.requireNonNull(replicationManager, "replicationManager");
         this.replicationFactor = replicationFactor;
+        LOGGER.info(() -> "QueueClusterService created: queueName=" + queueName + ", topic=" + topic);
         this.replicationManager.registerHandler(topic, this);
     }
 
