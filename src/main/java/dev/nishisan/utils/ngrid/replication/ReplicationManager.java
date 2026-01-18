@@ -424,35 +424,146 @@ public class ReplicationManager implements TransportListener, LeadershipListener
     private void handleReplicationRequest(ClusterMessage message) {
         ReplicationPayload payload = message.payload(ReplicationPayload.class);
         UUID opId = payload.operationId();
-        LOGGER.info(
-                () -> "Replication request " + opId + " for topic " + payload.topic() + " from " + message.source());
+        long seq = payload.sequence();
+
+        LOGGER.info(() -> String.format(
+                "Replication request opId=%s seq=%d topic=%s from=%s",
+                opId, seq, payload.topic(), message.source()));
+
+        // Already applied previously
         if (applied.contains(opId)) {
             sendAck(opId, message.source());
             return;
         }
-        if (!processing.add(opId)) {
-            return;
+
+        // Lock to manipulate buffer and sequence
+        sequenceBufferLock.lock();
+        try {
+            if (seq == nextExpectedSequence) {
+                // Correct sequence, apply immediately
+                applyReplication(payload, message);
+                nextExpectedSequence++;
+                saveSequenceState();
+
+                // Process buffer to apply consecutive sequences
+                processSequenceBuffer();
+            } else if (seq > nextExpectedSequence) {
+                // Future sequence, add to buffer
+                BufferedReplication buffered = new BufferedReplication(
+                        payload, message, Instant.now());
+                sequenceBuffer.add(buffered);
+                sequenceWaitStart.putIfAbsent(seq, Instant.now());
+
+                LOGGER.info(() -> String.format(
+                        "Buffered future sequence seq=%d (expecting=%d)",
+                        seq, nextExpectedSequence));
+
+                // Check if we have gaps and if timeout expired
+                checkForMissingSequences();
+            } else {
+                // Old sequence (duplicate or already processed), ignore
+                LOGGER.warning(() -> String.format(
+                        "Received old sequence seq=%d (expecting=%d), ignoring",
+                        seq, nextExpectedSequence));
+            }
+        } finally {
+            sequenceBufferLock.unlock();
         }
+    }
+
+    /**
+     * Applies a replication operation immediately (must be called with
+     * sequenceBufferLock held).
+     */
+    private void applyReplication(ReplicationPayload payload, ClusterMessage message) {
+        UUID opId = payload.operationId();
+
+        if (!processing.add(opId)) {
+            return; // Already being processed
+        }
+
         ReplicationHandler handler = handlers.get(payload.topic());
         if (handler == null) {
             processing.remove(opId);
             LOGGER.log(Level.WARNING, "No handler registered for topic {0}", payload.topic());
             return;
         }
+
         executor.submit(() -> {
             try {
                 handler.apply(opId, payload.data());
                 lastAppliedSequence = Math.max(lastAppliedSequence, payload.sequence());
-                log.putIfAbsent(opId,
-                        new ReplicatedRecord(opId, payload.topic(), payload.data(), OperationStatus.COMMITTED));
+                log.putIfAbsent(opId, new ReplicatedRecord(
+                        opId, payload.topic(), payload.data(), OperationStatus.COMMITTED));
                 applied.add(opId);
                 sendAck(opId, message.source());
+
+                LOGGER.info(() -> String.format(
+                        "Applied replication opId=%s seq=%d", opId, payload.sequence()));
             } catch (Exception e) {
                 LOGGER.log(Level.SEVERE, "Failed to apply replicated operation", e);
             } finally {
                 processing.remove(opId);
             }
         });
+    }
+
+    /**
+     * Processes buffered sequences in order (must be called with sequenceBufferLock
+     * held).
+     */
+    private void processSequenceBuffer() {
+        while (!sequenceBuffer.isEmpty()) {
+            BufferedReplication next = sequenceBuffer.peek();
+
+            if (next.sequence() != nextExpectedSequence) {
+                // Next in buffer is not the expected one, stop
+                break;
+            }
+
+            // Remove from buffer and apply
+            sequenceBuffer.poll();
+            sequenceWaitStart.remove(next.sequence());
+
+            applyReplication(next.payload(), next.originalMessage());
+            nextExpectedSequence++;
+            saveSequenceState();
+
+            LOGGER.info(() -> String.format(
+                    "Processed buffered sequence seq=%d", next.sequence()));
+        }
+    }
+
+    /**
+     * Checks for missing sequences and requests them if timeout expired
+     * (must be called with sequenceBufferLock held).
+     */
+    private void checkForMissingSequences() {
+        if (sequenceBuffer.isEmpty()) {
+            return;
+        }
+
+        Instant now = Instant.now();
+        long nextInBuffer = sequenceBuffer.peek().sequence();
+        long gap = nextInBuffer - nextExpectedSequence;
+
+        if (gap > 0) {
+            // We have a gap, check timeout
+            Instant waitStart = sequenceWaitStart.get(nextInBuffer);
+
+            if (waitStart != null) {
+                Duration waited = Duration.between(waitStart, now);
+
+                if (waited.compareTo(SEQUENCE_WAIT_TIMEOUT) > 0) {
+                    LOGGER.warning(() -> String.format(
+                            "Timeout waiting for seq=%d (waited %dms), will request from leader",
+                            nextExpectedSequence, waited.toMillis()));
+
+                    // Note: Request will be implemented in Phase 3
+                    // For now, just log the gap
+                }
+            }
+        }
     }
 
     private void sendAck(UUID operationId, NodeId destination) {
