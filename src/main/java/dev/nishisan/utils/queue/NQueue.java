@@ -1562,6 +1562,26 @@ public class NQueue<T extends Serializable> implements Closeable {
             return this;
         }
 
+        public Options copy() {
+            Options copy = new Options();
+            copy.compactionWasteThreshold = this.compactionWasteThreshold;
+            copy.compactionIntervalNanos = this.compactionIntervalNanos;
+            copy.compactionBufferSize = this.compactionBufferSize;
+            copy.withFsync = this.withFsync;
+            copy.enableMemoryBuffer = this.enableMemoryBuffer;
+            copy.resetOnRestart = this.resetOnRestart;
+            copy.allowShortCircuit = this.allowShortCircuit;
+            copy.enableOrderDetection = this.enableOrderDetection;
+            copy.memoryBufferSize = this.memoryBufferSize;
+            copy.lockTryTimeoutNanos = this.lockTryTimeoutNanos;
+            copy.revalidationIntervalNanos = this.revalidationIntervalNanos;
+            copy.maintenanceIntervalNanos = this.maintenanceIntervalNanos;
+            copy.maxSizeReconciliationIntervalNanos = this.maxSizeReconciliationIntervalNanos;
+            copy.retentionPolicy = this.retentionPolicy;
+            copy.retentionTimeNanos = this.retentionTimeNanos;
+            return copy;
+        }
+
         /**
          * Sets the fraction of consumed data that should trigger a compaction when exceeded. Values close to
          * zero compact aggressively; values near one compact rarely.

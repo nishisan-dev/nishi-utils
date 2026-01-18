@@ -348,8 +348,12 @@ public final class NGridNode implements Closeable {
         if (config.queues() == null || config.queues().isEmpty()) {
             queue = getQueue(config.queueName(), defaultQueueConfig, Serializable.class);
         } else {
-            // For multi-queue setup, queue() accessor will throw IllegalStateException
+            // For multi-queue setup, eagerly register all configured queues so leaders can serve requests.
             queue = null;
+            for (QueueConfig queueConfig : config.queues()) {
+                DistributedQueueConfig effectiveConfig = toDistributedQueueConfig(queueConfig);
+                getQueue(queueConfig.name(), effectiveConfig, Serializable.class);
+            }
         }
 
         String defaultMapName = config.mapName();
@@ -619,7 +623,7 @@ public final class NGridNode implements Closeable {
             DistributedQueueConfig queueConfig) {
         QueueClusterService<Serializable> service = queueServices.computeIfAbsent(queueName,
                 key -> createQueueService(key, queueConfig));
-        DistributedQueue<Serializable> q = new DistributedQueue<>(transport, coordinator, service, stats);
+        DistributedQueue<Serializable> q = new DistributedQueue<>(transport, coordinator, service, queueName, stats);
         notifyResourceListeners();
         return q;
     }
@@ -671,6 +675,23 @@ public final class NGridNode implements Closeable {
                     .build();
         }
         return queueConfig;
+    }
+
+    private DistributedQueueConfig toDistributedQueueConfig(QueueConfig queueConfig) {
+        NQueue.Options options = queueConfig.nqueueOptions();
+        if (options == null) {
+            options = config.queueOptions() != null ? config.queueOptions() : NQueue.Options.defaults();
+        }
+        options = options.copy();
+        QueueConfig.RetentionPolicy retention = queueConfig.retention();
+        if (retention != null && retention.type() == QueueConfig.RetentionPolicy.Type.TIME_BASED) {
+            options.withRetentionPolicy(NQueue.Options.RetentionPolicy.TIME_BASED)
+                    .withRetentionTime(retention.duration());
+        }
+        return DistributedQueueConfig.builder(queueConfig.name())
+                .replicationFactor(config.replicationFactor())
+                .queueOptions(options)
+                .build();
     }
 
     private DistributedMap<Serializable, Serializable> createDistributedMap(String mapName) {

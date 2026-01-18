@@ -86,13 +86,16 @@ public final class QueueClusterService<T extends Serializable> implements Closea
 
     public void offer(T value) {
         Objects.requireNonNull(value, "value");
+        CompletableFuture<ReplicationResult> future;
         clientLock.lock();
         try {
             QueueReplicationCommand command = QueueReplicationCommand.offer(value);
-            waitForReplication(replicationManager.replicate(topic, command, replicationFactor));
+            future = replicationManager.replicate(topic, command, replicationFactor);
         } finally {
-            clientLock.unlock();
+            clientLock.unlock(); // Release lock BEFORE waiting
         }
+        // Wait for replication OUTSIDE of lock to avoid deadlock
+        waitForReplication(future);
     }
 
     public Optional<T> poll() {
@@ -164,8 +167,20 @@ public final class QueueClusterService<T extends Serializable> implements Closea
                 return Optional.empty();
             }
             QueueReplicationCommand command = QueueReplicationCommand.poll((Serializable) next.get());
+            CompletableFuture<ReplicationResult> future = replicationManager.replicate(topic, command,
+                    replicationFactor);
+
+            // CRITICAL: Release BOTH locks before waiting to avoid deadlock
+            // The NQueue has its own internal lock - if we hold operationLock while
+            // waiting,
+            // and replication tries to apply() which needs operationLock to call
+            // queue.offer(),
+            // we get a classic deadlock
             operationLock.unlock();
-            waitForReplication(replicationManager.replicate(topic, command, replicationFactor));
+            clientLock.unlock();
+
+            // Wait for replication OUTSIDE of locks
+            waitForReplication(future);
             return next;
         } catch (IOException e) {
             throw new IllegalStateException("Failed to read from queue", e);
@@ -173,7 +188,9 @@ public final class QueueClusterService<T extends Serializable> implements Closea
             if (operationLock.isHeldByCurrentThread()) {
                 operationLock.unlock();
             }
-            clientLock.unlock();
+            if (clientLock.isHeldByCurrentThread()) {
+                clientLock.unlock();
+            }
         }
     }
 
