@@ -42,15 +42,16 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * Coordinates queue operations with the replication manager ensuring that the persistent
+ * Coordinates queue operations with the replication manager ensuring that the
+ * persistent
  * {@link NQueue} backend stays consistent across cluster members.
  */
 public final class QueueClusterService<T extends Serializable> implements Closeable, ReplicationHandler {
     private static final Logger LOGGER = Logger.getLogger(QueueClusterService.class.getName());
-    public static final String TOPIC = "queue";
 
     private final NQueue<T> queue;
     private final String queueName;
+    private final String topic; // Per-queue topic
     private final ReplicationManager replicationManager;
     private final ReentrantLock clientLock = new ReentrantLock(true);
     private final ReentrantLock operationLock = new ReentrantLock(true);
@@ -60,23 +61,26 @@ public final class QueueClusterService<T extends Serializable> implements Closea
         this(baseDir, queueName, replicationManager, NQueue.Options.defaults(), null);
     }
 
-    public QueueClusterService(Path baseDir, String queueName, ReplicationManager replicationManager, NQueue.Options options) {
+    public QueueClusterService(Path baseDir, String queueName, ReplicationManager replicationManager,
+            NQueue.Options options) {
         this(baseDir, queueName, replicationManager, options, null);
     }
 
     private final OffsetManager offsetManager;
 
-    public QueueClusterService(Path baseDir, String queueName, ReplicationManager replicationManager, NQueue.Options options, Integer replicationFactor) {
+    public QueueClusterService(Path baseDir, String queueName, ReplicationManager replicationManager,
+            NQueue.Options options, Integer replicationFactor) {
         try {
             this.queue = NQueue.open(baseDir, queueName, enforceGridOptions(options));
             this.queueName = queueName;
+            this.topic = "queue:" + queueName; // Per-queue topic
             this.offsetManager = new OffsetManager(baseDir.resolve(queueName).resolve("offsets.dat"));
         } catch (IOException e) {
             throw new IllegalStateException("Failed to open NQueue", e);
         }
         this.replicationManager = Objects.requireNonNull(replicationManager, "replicationManager");
         this.replicationFactor = replicationFactor;
-        this.replicationManager.registerHandler(TOPIC, this);
+        this.replicationManager.registerHandler(topic, this);
     }
 
     public void offer(T value) {
@@ -84,7 +88,7 @@ public final class QueueClusterService<T extends Serializable> implements Closea
         clientLock.lock();
         try {
             QueueReplicationCommand command = QueueReplicationCommand.offer(value);
-            waitForReplication(replicationManager.replicate(TOPIC, command, replicationFactor));
+            waitForReplication(replicationManager.replicate(topic, command, replicationFactor));
         } finally {
             clientLock.unlock();
         }
@@ -100,26 +104,29 @@ public final class QueueClusterService<T extends Serializable> implements Closea
         try {
             // If consumerId is provided, we use the offset-based consumption (Log mode)
             // BUT only if the queue is configured for TIME_BASED retention.
-            // If it is DELETE_ON_CONSUME, we ignore the consumerId and perform a destructive poll
+            // If it is DELETE_ON_CONSUME, we ignore the consumerId and perform a
+            // destructive poll
             // to maintain backward compatibility and expected Queue semantics.
             if (consumerId != null && queue.getRetentionPolicy() == NQueue.Options.RetentionPolicy.TIME_BASED) {
                 long nextIndex = offsetManager.getOffset(consumerId);
-                
+
                 // If nextIndex is 0 (new consumer), we might want to start from the beginning.
                 // But if the queue starts at 1 (which it does), asking for 0 will fail.
                 // We should check "earliest available" if we miss.
-                
+
                 Optional<dev.nishisan.utils.queue.NQueueReadResult> result = queue.readRecordAtIndex(nextIndex);
-                
+
                 if (result.isEmpty()) {
-                    // Check if we are behind (expired) or if nextIndex is simply 0 and queue starts at 1
+                    // Check if we are behind (expired) or if nextIndex is simply 0 and queue starts
+                    // at 1
                     Optional<dev.nishisan.utils.queue.NQueueRecord> oldest = queue.peekRecord();
                     if (oldest.isPresent()) {
                         long oldestIndex = oldest.get().meta().getIndex();
                         if (oldestIndex > nextIndex) {
                             // We are behind (or asking for 0 when start is 1). Fast-forward.
                             long finalNextIndex = nextIndex;
-                            LOGGER.info(() -> "Consumer " + consumerId + " offset " + finalNextIndex + " is behind/invalid. Fast-forwarding to " + oldestIndex);
+                            LOGGER.info(() -> "Consumer " + consumerId + " offset " + finalNextIndex
+                                    + " is behind/invalid. Fast-forwarding to " + oldestIndex);
                             nextIndex = oldestIndex;
                             offsetManager.updateOffset(consumerId, nextIndex); // Persist correction
                             result = queue.readRecordAtIndex(nextIndex);
@@ -131,13 +138,13 @@ public final class QueueClusterService<T extends Serializable> implements Closea
                     dev.nishisan.utils.queue.NQueueRecord record = result.get().getRecord();
                     // Deserialize payload
                     try (java.io.ByteArrayInputStream bis = new java.io.ByteArrayInputStream(record.payload());
-                         java.io.ObjectInputStream ois = new java.io.ObjectInputStream(bis)) {
+                            java.io.ObjectInputStream ois = new java.io.ObjectInputStream(bis)) {
                         T item = (T) ois.readObject();
-                        
+
                         // Advance offset to next record
                         long newOffset = record.meta().getIndex() + 1;
                         offsetManager.updateOffset(consumerId, newOffset);
-                        
+
                         return Optional.of(item);
                     } catch (Exception e) {
                         LOGGER.log(Level.SEVERE, "Failed to deserialize record", e);
@@ -149,7 +156,7 @@ public final class QueueClusterService<T extends Serializable> implements Closea
                     return Optional.empty();
                 }
             }
-            
+
             // Legacy/Queue Mode (Destructive)
             Optional<T> next = queue.peek();
             if (next.isEmpty()) {
@@ -157,7 +164,7 @@ public final class QueueClusterService<T extends Serializable> implements Closea
             }
             QueueReplicationCommand command = QueueReplicationCommand.poll((Serializable) next.get());
             operationLock.unlock();
-            waitForReplication(replicationManager.replicate(TOPIC, command, replicationFactor));
+            waitForReplication(replicationManager.replicate(topic, command, replicationFactor));
             return next;
         } catch (IOException e) {
             throw new IllegalStateException("Failed to read from queue", e);
@@ -203,7 +210,8 @@ public final class QueueClusterService<T extends Serializable> implements Closea
         }
 
         private void load() {
-            if (!Files.exists(storagePath)) return;
+            if (!Files.exists(storagePath))
+                return;
             try (java.io.ObjectInputStream ois = new java.io.ObjectInputStream(Files.newInputStream(storagePath))) {
                 java.util.Map<String, Long> raw = (java.util.Map<String, Long>) ois.readObject();
                 raw.forEach((k, v) -> offsets.put(NodeId.of(k), v));
@@ -272,7 +280,8 @@ public final class QueueClusterService<T extends Serializable> implements Closea
                             throw new IllegalStateException(msg);
                         }
                         if (!current.get().equals(expected)) {
-                            String msg = "POLL replication mismatch. Expected " + expected + " but found " + current.get();
+                            String msg = "POLL replication mismatch. Expected " + expected + " but found "
+                                    + current.get();
                             LOGGER.severe(msg);
                             throw new IllegalStateException(msg);
                         }
@@ -285,7 +294,8 @@ public final class QueueClusterService<T extends Serializable> implements Closea
         } finally {
             operationLock.unlock();
             long elapsedMs = (System.nanoTime() - start) / 1_000_000;
-            LOGGER.info(() -> "Applied replication command " + command.type() + " in " + elapsedMs + "ms on " + queueName);
+            LOGGER.info(
+                    () -> "Applied replication command " + command.type() + " in " + elapsedMs + "ms on " + queueName);
         }
     }
 
