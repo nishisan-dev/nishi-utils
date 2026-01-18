@@ -305,10 +305,48 @@ public final class QueueClusterService<T extends Serializable> implements Closea
         }
     }
 
+    private static final int SNAPSHOT_CHUNK_SIZE = 1000;
+
     @Override
     public SnapshotChunk getSnapshotChunk(int chunkIndex) {
-        // Queue catch-up not implemented yet
-        return null;
+        try {
+            int startIndex = chunkIndex * SNAPSHOT_CHUNK_SIZE;
+            NQueue.ReadRangeResult<T> result = queue.readRange(startIndex, SNAPSHOT_CHUNK_SIZE);
+
+            if (result.items().isEmpty() && !result.hasMore()) {
+                // No more data
+                return new SnapshotChunk(new java.util.ArrayList<>(), false);
+            }
+
+            @SuppressWarnings("unchecked")
+            java.util.ArrayList<Serializable> chunk = new java.util.ArrayList<>(
+                    (java.util.Collection<Serializable>) result.items());
+            return new SnapshotChunk(chunk, result.hasMore());
+        } catch (IOException e) {
+            LOGGER.log(Level.WARNING, "Failed to get snapshot chunk " + chunkIndex, e);
+            return null;
+        }
+    }
+
+    @Override
+    public void resetState() throws Exception {
+        // For queues, we clear by polling all items
+        // This is called before installing a snapshot
+        while (queue.size() > 0) {
+            queue.poll(100, java.util.concurrent.TimeUnit.MILLISECONDS);
+        }
+        LOGGER.info(() -> "Queue " + queueName + " state reset for snapshot install");
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public void installSnapshot(Serializable snapshot) throws Exception {
+        if (snapshot instanceof java.util.List<?> items) {
+            for (Object item : items) {
+                queue.offer((T) item);
+            }
+            LOGGER.info(() -> "Installed " + items.size() + " items to queue " + queueName);
+        }
     }
 
     private static NQueue.Options enforceGridOptions(NQueue.Options options) {
