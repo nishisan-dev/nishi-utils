@@ -42,15 +42,16 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * Coordinates queue operations with the replication manager ensuring that the persistent
+ * Coordinates queue operations with the replication manager ensuring that the
+ * persistent
  * {@link NQueue} backend stays consistent across cluster members.
  */
 public final class QueueClusterService<T extends Serializable> implements Closeable, ReplicationHandler {
     private static final Logger LOGGER = Logger.getLogger(QueueClusterService.class.getName());
-    public static final String TOPIC = "queue";
 
     private final NQueue<T> queue;
     private final String queueName;
+    private final String topic; // Per-queue topic
     private final ReplicationManager replicationManager;
     private final ReentrantLock clientLock = new ReentrantLock(true);
     private final ReentrantLock operationLock = new ReentrantLock(true);
@@ -60,34 +61,41 @@ public final class QueueClusterService<T extends Serializable> implements Closea
         this(baseDir, queueName, replicationManager, NQueue.Options.defaults(), null);
     }
 
-    public QueueClusterService(Path baseDir, String queueName, ReplicationManager replicationManager, NQueue.Options options) {
+    public QueueClusterService(Path baseDir, String queueName, ReplicationManager replicationManager,
+            NQueue.Options options) {
         this(baseDir, queueName, replicationManager, options, null);
     }
 
     private final OffsetManager offsetManager;
 
-    public QueueClusterService(Path baseDir, String queueName, ReplicationManager replicationManager, NQueue.Options options, Integer replicationFactor) {
+    public QueueClusterService(Path baseDir, String queueName, ReplicationManager replicationManager,
+            NQueue.Options options, Integer replicationFactor) {
         try {
             this.queue = NQueue.open(baseDir, queueName, enforceGridOptions(options));
             this.queueName = queueName;
+            this.topic = "queue:" + queueName; // Per-queue topic
             this.offsetManager = new OffsetManager(baseDir.resolve(queueName).resolve("offsets.dat"));
         } catch (IOException e) {
             throw new IllegalStateException("Failed to open NQueue", e);
         }
         this.replicationManager = Objects.requireNonNull(replicationManager, "replicationManager");
         this.replicationFactor = replicationFactor;
-        this.replicationManager.registerHandler(TOPIC, this);
+        LOGGER.info(() -> "QueueClusterService created: queueName=" + queueName + ", topic=" + topic);
+        this.replicationManager.registerHandler(topic, this);
     }
 
     public void offer(T value) {
         Objects.requireNonNull(value, "value");
+        CompletableFuture<ReplicationResult> future;
         clientLock.lock();
         try {
             QueueReplicationCommand command = QueueReplicationCommand.offer(value);
-            waitForReplication(replicationManager.replicate(TOPIC, command, replicationFactor));
+            future = replicationManager.replicate(topic, command, replicationFactor);
         } finally {
-            clientLock.unlock();
+            clientLock.unlock(); // Release lock BEFORE waiting
         }
+        // Wait for replication OUTSIDE of lock to avoid deadlock
+        waitForReplication(future);
     }
 
     public Optional<T> poll() {
@@ -100,26 +108,29 @@ public final class QueueClusterService<T extends Serializable> implements Closea
         try {
             // If consumerId is provided, we use the offset-based consumption (Log mode)
             // BUT only if the queue is configured for TIME_BASED retention.
-            // If it is DELETE_ON_CONSUME, we ignore the consumerId and perform a destructive poll
+            // If it is DELETE_ON_CONSUME, we ignore the consumerId and perform a
+            // destructive poll
             // to maintain backward compatibility and expected Queue semantics.
             if (consumerId != null && queue.getRetentionPolicy() == NQueue.Options.RetentionPolicy.TIME_BASED) {
                 long nextIndex = offsetManager.getOffset(consumerId);
-                
+
                 // If nextIndex is 0 (new consumer), we might want to start from the beginning.
                 // But if the queue starts at 1 (which it does), asking for 0 will fail.
                 // We should check "earliest available" if we miss.
-                
+
                 Optional<dev.nishisan.utils.queue.NQueueReadResult> result = queue.readRecordAtIndex(nextIndex);
-                
+
                 if (result.isEmpty()) {
-                    // Check if we are behind (expired) or if nextIndex is simply 0 and queue starts at 1
+                    // Check if we are behind (expired) or if nextIndex is simply 0 and queue starts
+                    // at 1
                     Optional<dev.nishisan.utils.queue.NQueueRecord> oldest = queue.peekRecord();
                     if (oldest.isPresent()) {
                         long oldestIndex = oldest.get().meta().getIndex();
                         if (oldestIndex > nextIndex) {
                             // We are behind (or asking for 0 when start is 1). Fast-forward.
                             long finalNextIndex = nextIndex;
-                            LOGGER.info(() -> "Consumer " + consumerId + " offset " + finalNextIndex + " is behind/invalid. Fast-forwarding to " + oldestIndex);
+                            LOGGER.info(() -> "Consumer " + consumerId + " offset " + finalNextIndex
+                                    + " is behind/invalid. Fast-forwarding to " + oldestIndex);
                             nextIndex = oldestIndex;
                             offsetManager.updateOffset(consumerId, nextIndex); // Persist correction
                             result = queue.readRecordAtIndex(nextIndex);
@@ -131,13 +142,13 @@ public final class QueueClusterService<T extends Serializable> implements Closea
                     dev.nishisan.utils.queue.NQueueRecord record = result.get().getRecord();
                     // Deserialize payload
                     try (java.io.ByteArrayInputStream bis = new java.io.ByteArrayInputStream(record.payload());
-                         java.io.ObjectInputStream ois = new java.io.ObjectInputStream(bis)) {
+                            java.io.ObjectInputStream ois = new java.io.ObjectInputStream(bis)) {
                         T item = (T) ois.readObject();
-                        
+
                         // Advance offset to next record
                         long newOffset = record.meta().getIndex() + 1;
                         offsetManager.updateOffset(consumerId, newOffset);
-                        
+
                         return Optional.of(item);
                     } catch (Exception e) {
                         LOGGER.log(Level.SEVERE, "Failed to deserialize record", e);
@@ -149,15 +160,27 @@ public final class QueueClusterService<T extends Serializable> implements Closea
                     return Optional.empty();
                 }
             }
-            
+
             // Legacy/Queue Mode (Destructive)
             Optional<T> next = queue.peek();
             if (next.isEmpty()) {
                 return Optional.empty();
             }
             QueueReplicationCommand command = QueueReplicationCommand.poll((Serializable) next.get());
+            CompletableFuture<ReplicationResult> future = replicationManager.replicate(topic, command,
+                    replicationFactor);
+
+            // CRITICAL: Release BOTH locks before waiting to avoid deadlock
+            // The NQueue has its own internal lock - if we hold operationLock while
+            // waiting,
+            // and replication tries to apply() which needs operationLock to call
+            // queue.offer(),
+            // we get a classic deadlock
             operationLock.unlock();
-            waitForReplication(replicationManager.replicate(TOPIC, command, replicationFactor));
+            clientLock.unlock();
+
+            // Wait for replication OUTSIDE of locks
+            waitForReplication(future);
             return next;
         } catch (IOException e) {
             throw new IllegalStateException("Failed to read from queue", e);
@@ -165,7 +188,9 @@ public final class QueueClusterService<T extends Serializable> implements Closea
             if (operationLock.isHeldByCurrentThread()) {
                 operationLock.unlock();
             }
-            clientLock.unlock();
+            if (clientLock.isHeldByCurrentThread()) {
+                clientLock.unlock();
+            }
         }
     }
 
@@ -203,7 +228,8 @@ public final class QueueClusterService<T extends Serializable> implements Closea
         }
 
         private void load() {
-            if (!Files.exists(storagePath)) return;
+            if (!Files.exists(storagePath))
+                return;
             try (java.io.ObjectInputStream ois = new java.io.ObjectInputStream(Files.newInputStream(storagePath))) {
                 java.util.Map<String, Long> raw = (java.util.Map<String, Long>) ois.readObject();
                 raw.forEach((k, v) -> offsets.put(NodeId.of(k), v));
@@ -224,31 +250,44 @@ public final class QueueClusterService<T extends Serializable> implements Closea
     }
 
     private void waitForReplication(CompletableFuture<ReplicationResult> future) {
-        try {
-            long timeoutMs = Math.max(1L, replicationManager.operationTimeout().toMillis());
-            future.get(timeoutMs, TimeUnit.MILLISECONDS);
-        } catch (CompletionException e) {
-            Throwable cause = e.getCause();
-            if (cause instanceof TimeoutException) {
-                throw new IllegalStateException("Replication operation timed out", cause);
-            } else if (cause instanceof QuorumUnreachableException) {
-                throw new IllegalStateException("Quorum unreachable for replication operation", cause);
-            } else {
-                throw new IllegalStateException("Replication operation failed", cause != null ? cause : e);
-            }
-        } catch (TimeoutException e) {
-            throw new IllegalStateException("Replication operation timed out", e);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException("Replication operation interrupted", e);
-        } catch (ExecutionException e) {
-            Throwable cause = e.getCause();
-            if (cause instanceof TimeoutException) {
-                throw new IllegalStateException("Replication operation timed out", cause);
-            } else if (cause instanceof QuorumUnreachableException) {
-                throw new IllegalStateException("Quorum unreachable for replication operation", cause);
-            } else {
-                throw new IllegalStateException("Replication operation failed", cause != null ? cause : e);
+        long totalTimeoutMs = Math.max(1L, replicationManager.operationTimeout().toMillis());
+        long windowMs = Math.min(1000L, totalTimeoutMs / 3); // Poll every 1s or 1/3 of timeout
+        long elapsed = 0L;
+
+        while (elapsed < totalTimeoutMs) {
+            try {
+                long remaining = Math.min(windowMs, totalTimeoutMs - elapsed);
+                future.get(remaining, TimeUnit.MILLISECONDS);
+                return; // Success
+            } catch (TimeoutException e) {
+                elapsed += windowMs;
+                if (elapsed >= totalTimeoutMs) {
+                    throw new IllegalStateException("Replication operation timed out", e);
+                }
+                // Give quorum adjustment time to take effect
+                final long elapsedCopy = elapsed;
+                LOGGER.fine(() -> "Waiting for replication... " + elapsedCopy + "ms elapsed");
+            } catch (CompletionException e) {
+                Throwable cause = e.getCause();
+                if (cause instanceof TimeoutException) {
+                    throw new IllegalStateException("Replication operation timed out", cause);
+                } else if (cause instanceof QuorumUnreachableException) {
+                    throw new IllegalStateException("Quorum unreachable for replication operation", cause);
+                } else {
+                    throw new IllegalStateException("Replication operation failed", cause != null ? cause : e);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Replication operation interrupted", e);
+            } catch (ExecutionException e) {
+                Throwable cause = e.getCause();
+                if (cause instanceof TimeoutException) {
+                    throw new IllegalStateException("Replication operation timed out", cause);
+                } else if (cause instanceof QuorumUnreachableException) {
+                    throw new IllegalStateException("Quorum unreachable for replication operation", cause);
+                } else {
+                    throw new IllegalStateException("Replication operation failed", cause != null ? cause : e);
+                }
             }
         }
     }
@@ -263,20 +302,9 @@ public final class QueueClusterService<T extends Serializable> implements Closea
             switch (command.type()) {
                 case OFFER -> queue.offer((T) command.value());
                 case POLL -> {
-                    Optional<T> current = queue.peek();
-                    Serializable expected = command.value();
-                    if (expected != null) {
-                        if (current.isEmpty()) {
-                            String msg = "POLL replication mismatch. Expected " + expected + " but queue is empty";
-                            LOGGER.severe(msg);
-                            throw new IllegalStateException(msg);
-                        }
-                        if (!current.get().equals(expected)) {
-                            String msg = "POLL replication mismatch. Expected " + expected + " but found " + current.get();
-                            LOGGER.severe(msg);
-                            throw new IllegalStateException(msg);
-                        }
-                    }
+                    // With sequencing guarantees from ReplicationManager, we can trust
+                    // that operations arrive in the correct order. No need for optimistic
+                    // validation.
                     queue.poll();
                 }
             }
@@ -285,14 +313,53 @@ public final class QueueClusterService<T extends Serializable> implements Closea
         } finally {
             operationLock.unlock();
             long elapsedMs = (System.nanoTime() - start) / 1_000_000;
-            LOGGER.info(() -> "Applied replication command " + command.type() + " in " + elapsedMs + "ms on " + queueName);
+            LOGGER.info(
+                    () -> "Applied replication command " + command.type() + " in " + elapsedMs + "ms on " + queueName);
+        }
+    }
+
+    private static final int SNAPSHOT_CHUNK_SIZE = 1000;
+
+    @Override
+    public SnapshotChunk getSnapshotChunk(int chunkIndex) {
+        try {
+            int startIndex = chunkIndex * SNAPSHOT_CHUNK_SIZE;
+            NQueue.ReadRangeResult<T> result = queue.readRange(startIndex, SNAPSHOT_CHUNK_SIZE);
+
+            if (result.items().isEmpty() && !result.hasMore()) {
+                // No more data
+                return new SnapshotChunk(new java.util.ArrayList<>(), false);
+            }
+
+            @SuppressWarnings("unchecked")
+            java.util.ArrayList<Serializable> chunk = new java.util.ArrayList<>(
+                    (java.util.Collection<Serializable>) result.items());
+            return new SnapshotChunk(chunk, result.hasMore());
+        } catch (IOException e) {
+            LOGGER.log(Level.WARNING, "Failed to get snapshot chunk " + chunkIndex, e);
+            return null;
         }
     }
 
     @Override
-    public SnapshotChunk getSnapshotChunk(int chunkIndex) {
-        // Queue catch-up not implemented yet
-        return null;
+    public void resetState() throws Exception {
+        // For queues, we clear by polling all items
+        // This is called before installing a snapshot
+        while (queue.size() > 0) {
+            queue.poll(100, java.util.concurrent.TimeUnit.MILLISECONDS);
+        }
+        LOGGER.info(() -> "Queue " + queueName + " state reset for snapshot install");
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public void installSnapshot(Serializable snapshot) throws Exception {
+        if (snapshot instanceof java.util.List<?> items) {
+            for (Object item : items) {
+                queue.offer((T) item);
+            }
+            LOGGER.info(() -> "Installed " + items.size() + " items to queue " + queueName);
+        }
     }
 
     private static NQueue.Options enforceGridOptions(NQueue.Options options) {

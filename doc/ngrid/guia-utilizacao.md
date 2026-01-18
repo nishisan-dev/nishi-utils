@@ -22,6 +22,8 @@ Adicione a dependência do projeto (ajuste a versão conforme seu release):
 - **NGridNode**: “processo” de um nó do cluster (inicia transporte TCP, coordenação, replicação e expõe fila/mapa).
 - **DistributedQueue / DistributedMap**: fachadas que roteiam chamadas ao **líder**.
 - **Quorum**: número mínimo de confirmações para “commit” de operações replicadas.
+- **Data Directory**: raiz única (`node.dirs.base`) para filas, mapas e estado de replicação.
+- **Tópicos por fila/mapa**: cada estrutura replica com sequências independentes (evita bloqueios entre filas).
 
 ## 1) NQueue (fila local persistente)
 
@@ -99,7 +101,9 @@ Campos principais:
 - `local(NodeInfo)`: identidade do nó (host/porta para bind).
 - `addPeer(NodeInfo)`: peers iniciais para bootstrap (opcional).
 - `replicationFactor(int)`: fator de replicação default (quorum efetivo é limitado pelo tamanho do cluster ativo).
-- `queueDirectory(Path)` e `queueName(String)`: diretório/nome da `NQueue` local usada pela fila distribuída.
+- `dataDirectory(Path)`: diretório base para filas, mapas e estado de replicação (recomendado).
+- `addQueue(QueueConfig)`: adiciona uma fila distribuída (multi-queue).
+- `queueDirectory(Path)` e `queueName(String)`: modo legado de fila única (compatibilidade).
 - **`strictConsistency(boolean)`**: Define o modelo de consistência. `false` (padrão) prioriza disponibilidade (AP), ajustando o quorum aos nós ativos. `true` prioriza consistência (CP), exigindo quorum fixo (`replicationFactor`) mesmo que nós falhem. **Nota:** No modo estrito, o líder aguarda o quórum antes de aplicar a mudança localmente.
 - **`transportWorkerThreads(int)`**: Número de threads dedicadas ao processamento de IO e conexões (padrão: 2). Aumente em clusters com muitos nós ou alta latência de handshake.
 
@@ -126,6 +130,7 @@ import dev.nishisan.utils.ngrid.structures.DistributedMap;
 import dev.nishisan.utils.ngrid.structures.DistributedQueue;
 import dev.nishisan.utils.ngrid.structures.NGridConfig;
 import dev.nishisan.utils.ngrid.structures.NGridNode;
+import dev.nishisan.utils.ngrid.structures.QueueConfig;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -143,20 +148,21 @@ public class NGridClusterExample {
     Path dir1 = Files.createDirectories(baseDir.resolve("node1"));
     Path dir2 = Files.createDirectories(baseDir.resolve("node2"));
     Path dir3 = Files.createDirectories(baseDir.resolve("node3"));
+    QueueConfig queueConfig = QueueConfig.builder("queue").build();
 
     try (NGridNode node1 = new NGridNode(NGridConfig.builder(n1)
             .addPeer(n2).addPeer(n3)
-            .queueDirectory(dir1).queueName("queue")
+            .dataDirectory(dir1).addQueue(queueConfig)
             .replicationFactor(2)
             .build());
          NGridNode node2 = new NGridNode(NGridConfig.builder(n2)
             .addPeer(n1).addPeer(n3)
-            .queueDirectory(dir2).queueName("queue")
+            .dataDirectory(dir2).addQueue(queueConfig)
             .replicationFactor(2)
             .build());
          NGridNode node3 = new NGridNode(NGridConfig.builder(n3)
             .addPeer(n1).addPeer(n2)
-            .queueDirectory(dir3).queueName("queue")
+            .dataDirectory(dir3).addQueue(queueConfig)
             .replicationFactor(2)
             .build())) {
 
@@ -200,6 +206,35 @@ public class NGridClusterExample {
 }
 ```
 
+### 2.1) Multiplas filas e TypedQueue
+
+Quando `queues` esta configurado (via YAML ou `addQueue(...)`), o NGrid cria cada fila com topico e sequencia proprios. Isso evita bloqueios entre filas e permite politicas de retencao diferentes.
+
+```java
+import dev.nishisan.utils.ngrid.structures.TypedQueue;
+import dev.nishisan.utils.ngrid.structures.QueueConfig;
+
+public final class AppQueues {
+  public static final TypedQueue<Order> ORDERS = TypedQueue.of("orders", Order.class);
+  public static final TypedQueue<Event> EVENTS = TypedQueue.of("events", Event.class);
+}
+
+QueueConfig ordersCfg = QueueConfig.builder("orders").build();
+QueueConfig eventsCfg = QueueConfig.builder("events").build();
+
+NGridNode node = new NGridNode(NGridConfig.builder(local)
+    .dataDirectory(Path.of("/var/ngrid/node-1"))
+    .addQueue(ordersCfg)
+    .addQueue(eventsCfg)
+    .build());
+node.start();
+
+DistributedQueue<Order> orders = node.getQueue(AppQueues.ORDERS);
+DistributedQueue<Event> events = node.getQueue(AppQueues.EVENTS);
+```
+
+> Dica: em clusters multi-queue, os comandos sao roteados por nome (`queue.offer:{queue}`), entao o lider sempre sabe qual fila atender.
+
 ### Adicionando peers dinamicamente (join)
 
 ```java
@@ -223,7 +258,7 @@ public class NGridJoinExample {
 - **Boas práticas**:
   - Sempre use `try-with-resources` com `NGridNode`.
   - Evite reusar o mesmo `nodeId` em dois processos ao mesmo tempo.
-  - Garanta que `queueDirectory` seja persistente se você quiser durabilidade/restart.
+  - Garanta que `dataDirectory` seja persistente se você quiser durabilidade/restart.
 
 ```mermaid
 sequenceDiagram
@@ -254,6 +289,49 @@ Node->>C: close()
 - Se você chamar em um **follower**, a operação será encaminhada ao **líder** via `CLIENT_REQUEST/CLIENT_RESPONSE`.
 - No backend, o NGrid usa `QueueClusterService` + `ReplicationManager` e persiste em `NQueue` local (um diretório por nó).
 - **Consumo Persistente**: Ao chamar `poll()`, o sistema identifica automaticamente o `NodeId` do nó que fez a requisição. Se a fila estiver configurada em modo `RetentionPolicy.TIME_BASED`, o cluster gerenciará um offset persistente para este consumidor. Isso garante que, se o nó cair e voltar, continuará lendo a partir da última mensagem não consumida por ele.
+
+### Modos de consumo (Queue vs Log)
+
+O comportamento do `poll()` depende da politica de retencao da fila:
+
+- **DELETE_ON_CONSUME (fila classica)**: o item e removido no commit. Todos os consumidores avancam o mesmo ponteiro global.
+- **TIME_BASED (log/stream)**: o item permanece por tempo e cada consumidor avanca seu **offset** individual.
+
+Exemplo de log distribuido com dois consumidores distintos (NodeId diferentes):
+
+```java
+DistributedQueue<String> events = node.getQueue("events", String.class);
+
+// Consumidor A (node-A)
+Optional<String> a1 = events.poll();
+
+// Consumidor B (node-B)
+Optional<String> b1 = events.poll();
+```
+
+> Importante: offsets sao persistidos por `NodeId`. Use IDs estaveis e, em log mode, execute consumidores em nos distintos para isolar offsets. Se o retention expirar, o offset pode ser avancado para o item mais antigo disponivel.
+
+### Resiliencia em filas (catch-up e reenvio)
+
+Quando um follower fica atrasado, o NGrid combina **reenvio de sequencias** com **snapshot em chunks**:
+
+- **Gap curto**: o follower solicita ao lider o reenvio das sequencias faltantes e aplica na ordem correta.
+- **Gap grande**: se o atraso ultrapassar o limiar de sincronizacao (por padrao ~500 operacoes), o follower inicia **catch-up por snapshot**, em chunks (ex.: 1000 itens por chunk).
+
+Isso garante que um no que ficou offline consiga recuperar rapidamente o estado da fila, mesmo que muitos eventos tenham ocorrido.
+
+```java
+// Exemplo conceitual: follower atrasado entra no cluster
+NGridNode follower = new NGridNode(NGridConfig.builder(infoF)
+    .addPeer(infoL)
+    .dataDirectory(dirF)
+    .addQueue(QueueConfig.builder("orders").build())
+    .replicationFactor(1)
+    .build());
+follower.start();
+
+// O follower detecta lag e dispara sincronizacao automatica
+```
 
 ## 4) DistributedMap (mapa distribuído)
 
@@ -310,6 +388,7 @@ import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.ngrid.map.MapPersistenceMode;
 import dev.nishisan.utils.ngrid.structures.NGridConfig;
 import dev.nishisan.utils.ngrid.structures.NGridNode;
+import dev.nishisan.utils.ngrid.structures.QueueConfig;
 
 import java.nio.file.Path;
 
@@ -322,8 +401,8 @@ public class NGridMapPersistenceExample {
         // .addPeer(...)
         .replicationQuorum(2)
         // fila distribuída (obrigatório hoje)
-        .queueDirectory(Path.of("/tmp/ngrid/node-1"))
-        .queueName("queue")
+        .dataDirectory(Path.of("/tmp/ngrid/node-1"))
+        .addQueue(QueueConfig.builder("queue").build())
         // mapa: persistência local (opcional)
         .mapDirectory(Path.of("/tmp/ngrid/node-1/maps"))
         .mapName("default-map") // nome do mapa padrão (usado por node.map(...))

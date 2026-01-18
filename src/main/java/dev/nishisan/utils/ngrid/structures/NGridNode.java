@@ -318,6 +318,19 @@ public final class NGridNode implements Closeable {
             replicationBuilder.operationTimeout(config.replicationOperationTimeout());
         }
         replicationBuilder.strictConsistency(config.strictConsistency());
+
+        // Determine replication data directory
+        Path replicationDataDir;
+        if (config.dataDirectory() != null) {
+            replicationDataDir = config.dataDirectory().resolve("replication");
+        } else if (config.queueDirectory() != null) {
+            // Fallback for legacy config
+            replicationDataDir = config.queueDirectory().getParent().resolve("replication");
+        } else {
+            throw new IllegalStateException("Neither dataDirectory nor queueDirectory is configured");
+        }
+        replicationBuilder.dataDirectory(replicationDataDir);
+
         replicationManager = new ReplicationManager(transport, coordinator, replicationBuilder.build());
         replicationManager.start();
 
@@ -329,7 +342,22 @@ public final class NGridNode implements Closeable {
                 .queueOptions(queueOptions)
                 .replicationFactor(config.replicationFactor())
                 .build();
-        queue = getQueue(config.queueName(), defaultQueueConfig, Serializable.class);
+
+        // Only create default queue if no queues are explicitly configured
+        // This maintains backward compatibility with single-queue API
+        if (config.queues() == null || config.queues().isEmpty()) {
+            queue = getQueue(config.queueName(), defaultQueueConfig, Serializable.class);
+        } else {
+            // For multi-queue setup, eagerly register all configured queues so leaders can serve requests.
+            queue = null;
+            for (QueueConfig queueConfig : config.queues()) {
+                DistributedQueueConfig effectiveConfig = toDistributedQueueConfig(queueConfig);
+                DistributedQueue<Serializable> created = getQueue(queueConfig.name(), effectiveConfig, Serializable.class);
+                if (queue == null && config.queues().size() == 1) {
+                    queue = created;
+                }
+            }
+        }
 
         String defaultMapName = config.mapName();
         map = maps.computeIfAbsent(defaultMapName, this::createDistributedMap);
@@ -338,6 +366,9 @@ public final class NGridNode implements Closeable {
     @Deprecated
     @SuppressWarnings("unchecked")
     public <T extends Serializable> DistributedQueue<T> queue(Class<T> type) {
+        if (queue == null) {
+            throw new IllegalStateException("Multiple queues configured; use getQueue(name, type) instead");
+        }
         return (DistributedQueue<T>) queue;
     }
 
@@ -598,7 +629,7 @@ public final class NGridNode implements Closeable {
             DistributedQueueConfig queueConfig) {
         QueueClusterService<Serializable> service = queueServices.computeIfAbsent(queueName,
                 key -> createQueueService(key, queueConfig));
-        DistributedQueue<Serializable> q = new DistributedQueue<>(transport, coordinator, service, stats);
+        DistributedQueue<Serializable> q = new DistributedQueue<>(transport, coordinator, service, queueName, stats);
         notifyResourceListeners();
         return q;
     }
@@ -650,6 +681,25 @@ public final class NGridNode implements Closeable {
                     .build();
         }
         return queueConfig;
+    }
+
+    private DistributedQueueConfig toDistributedQueueConfig(QueueConfig queueConfig) {
+        NQueue.Options options = queueConfig.nqueueOptions();
+        if (options == null) {
+            options = config.queueOptions() != null ? config.queueOptions() : NQueue.Options.defaults();
+        }
+        options = options.copy();
+        if (config.queueDirectory() == null) {
+            QueueConfig.RetentionPolicy retention = queueConfig.retention();
+            if (retention != null && retention.type() == QueueConfig.RetentionPolicy.Type.TIME_BASED) {
+                options.withRetentionPolicy(NQueue.Options.RetentionPolicy.TIME_BASED)
+                        .withRetentionTime(retention.duration());
+            }
+        }
+        return DistributedQueueConfig.builder(queueConfig.name())
+                .replicationFactor(config.replicationFactor())
+                .queueOptions(options)
+                .build();
     }
 
     private DistributedMap<Serializable, Serializable> createDistributedMap(String mapName) {

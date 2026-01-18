@@ -1,18 +1,17 @@
 package dev.nishisan.utils.ngrid.config;
 
-import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.structures.DistributedMap;
 import dev.nishisan.utils.ngrid.structures.DistributedQueue;
 import dev.nishisan.utils.ngrid.structures.NGridNode;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Optional;
@@ -37,9 +36,9 @@ class NGridAutodiscoverIntegrationTest {
         int seedPort = allocateFreeLocalPort();
         newNodePort = allocateFreeLocalPort(Set.of(seedPort));
         seedConfigFile = tempDir.resolve("seed.yaml");
-        
+
         NGridYamlConfig seedConfig = new NGridYamlConfig();
-        
+
         NodeIdentityConfig seedIdentity = new NodeIdentityConfig();
         seedIdentity.setId("seed-1");
         seedIdentity.setHost("127.0.0.1");
@@ -61,7 +60,8 @@ class NGridAutodiscoverIntegrationTest {
         rep.setFactor(2); // Match cluster size to ensure stability
         rep.setStrict(true);
         clusterPolicy.setReplication(rep);
-        // CRITICAL: The policy must include the seed address so the new node knows how to rejoin!
+        // CRITICAL: The policy must include the seed address so the new node knows how
+        // to rejoin!
         clusterPolicy.setSeeds(List.of("127.0.0.1:" + seedPort));
         seedConfig.setCluster(clusterPolicy);
 
@@ -79,12 +79,12 @@ class NGridAutodiscoverIntegrationTest {
         // Start Seed Node
         seedNode = new NGridNode(seedConfigFile);
         seedNode.start();
-        
+
         // Setup New Node Configuration (Minimal)
         newNodeConfigFile = tempDir.resolve("new-node.yaml");
-        
+
         NGridYamlConfig newConfig = new NGridYamlConfig();
-        
+
         NodeIdentityConfig newIdentity = new NodeIdentityConfig();
         newIdentity.setId("new-node-1");
         newIdentity.setHost("127.0.0.1");
@@ -99,17 +99,20 @@ class NGridAutodiscoverIntegrationTest {
         newAuto.setSecret("super-secret-token");
         newAuto.setSeed("127.0.0.1:" + seedPort);
         newConfig.setAutodiscover(newAuto);
-        
+
         NGridConfigLoader.save(newNodeConfigFile, newConfig);
     }
 
     @AfterEach
     void tearDown() throws IOException {
-        if (newNode != null) newNode.close();
-        if (seedNode != null) seedNode.close();
+        if (newNode != null)
+            newNode.close();
+        if (seedNode != null)
+            seedNode.close();
     }
 
     @Test
+    @Timeout(30) // Prevent test from hanging indefinitely
     void testZeroTouchBootstrap() throws Exception {
         // Start New Node - this should trigger autodiscover
         newNode = new NGridNode(newNodeConfigFile);
@@ -117,45 +120,50 @@ class NGridAutodiscoverIntegrationTest {
 
         // 1. Verify Runtime State via Disk Config
         NGridYamlConfig updatedConfig = NGridConfigLoader.load(newNodeConfigFile);
-        
+
         // Assert Autodiscover is disabled
-        assertFalse(updatedConfig.getAutodiscover().isEnabled(), "Autodiscover should be disabled after successful bootstrap");
-        
+        assertFalse(updatedConfig.getAutodiscover().isEnabled(),
+                "Autodiscover should be disabled after successful bootstrap");
+
         // Assert Policies received
         assertNotNull(updatedConfig.getCluster(), "Cluster config should be present");
         assertEquals(2, updatedConfig.getCluster().getReplication().getFactor());
         assertEquals("global-queue", updatedConfig.getQueue().getName());
-        
+
         // 2. Restart Node to prove persistence and join cluster
         newNode.close();
-        
+
         // Give time for port release
         waitForPortRelease(newNodePort);
-        
+
         // Re-open using the same file (which is now updated)
         newNode = new NGridNode(newNodeConfigFile);
         newNode.start();
-        
+
         awaitClusterStability();
 
         // 3. Validate Functional Queue Behavior (using the policy-defined queue)
-        seedNode.getQueue("global-queue", String.class);
-        DistributedQueue<String> queue = newNode.getQueue("global-queue", String.class);
-        queue.offer("hello-from-new-node");
-        
-        Optional<String> polled = queue.poll();
+        DistributedQueue<String> newNodeQueue = newNode.getQueue("global-queue", String.class);
+        DistributedQueue<String> seedNodeQueue = seedNode.getQueue("global-queue", String.class);
+
+        newNodeQueue.offer("hello-from-new-node");
+
+        // Wait for replication to seedNode
+        awaitQueueReplication(seedNodeQueue, "hello-from-new-node");
+
+        // Verify we can poll from seed (proving replication works)
+        Optional<String> polled = seedNodeQueue.poll();
         assertTrue(polled.isPresent());
         assertEquals("hello-from-new-node", polled.get());
-        
+
         // 4. Validate Map Behavior
         seedNode.getMap("test-map", String.class, String.class);
         DistributedMap<String, String> map = newNode.getMap("test-map", String.class, String.class);
         map.put("key1", "value1");
-        
+
         // Verify replication to seed (eventual consistency)
         DistributedMap<String, String> seedMap = seedNode.getMap("test-map", String.class, String.class);
-        Thread.sleep(500); // Give time for replication
-        assertEquals("value1", seedMap.get("key1").orElse(null));
+        awaitMapReplication(seedMap, "key1", "value1");
     }
 
     private static int allocateFreeLocalPort() throws IOException {
@@ -177,7 +185,7 @@ class NGridAutodiscoverIntegrationTest {
     }
 
     private static void waitForPortRelease(int port) {
-        long[] delaysMs = {500, 1000, 1500, 2000, 2500};
+        long[] delaysMs = { 500, 1000, 1500, 2000, 2500 };
         for (long delay : delaysMs) {
             if (isPortBindable(port)) {
                 return;
@@ -224,5 +232,39 @@ class NGridAutodiscoverIntegrationTest {
             }
         }
         throw new IllegalStateException("Cluster did not stabilize in time");
+    }
+
+    private void awaitMapReplication(DistributedMap<String, String> map, String key, String expectedValue) {
+        long deadline = System.currentTimeMillis() + 5000; // 5 seconds timeout
+        while (System.currentTimeMillis() < deadline) {
+            Optional<String> value = map.get(key);
+            if (value.isPresent() && expectedValue.equals(value.get())) {
+                return;
+            }
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException(e);
+            }
+        }
+        fail("Map replication did not complete in time. Expected: " + expectedValue + " for key: " + key);
+    }
+
+    private void awaitQueueReplication(DistributedQueue<String> queue, String expectedValue) {
+        long deadline = System.currentTimeMillis() + 5000; // 5 seconds timeout
+        while (System.currentTimeMillis() < deadline) {
+            Optional<String> value = queue.peek();
+            if (value.isPresent() && expectedValue.equals(value.get())) {
+                return;
+            }
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException(e);
+            }
+        }
+        fail("Queue replication did not complete in time. Expected: " + expectedValue);
     }
 }

@@ -60,58 +60,94 @@ import java.util.concurrent.locks.ReentrantLock;
  * Persistent, thread-safe FIFO queue.
  * <p>
  * Responsibilities
- * - Provide a durable, append-only, file-backed queue that preserves record order across process restarts.
- * - Support multiple concurrent producers and consumers with predictable blocking semantics.
- * - Persist consumption progress so that already-consumed records are not re-delivered after restart.
- * - Reclaim disk space transparently via background compaction without interrupting producers/consumers.
- * - Optionally stage new records in memory to maintain throughput during high contention or compaction.
+ * - Provide a durable, append-only, file-backed queue that preserves record
+ * order across process restarts.
+ * - Support multiple concurrent producers and consumers with predictable
+ * blocking semantics.
+ * - Persist consumption progress so that already-consumed records are not
+ * re-delivered after restart.
+ * - Reclaim disk space transparently via background compaction without
+ * interrupting producers/consumers.
+ * - Optionally stage new records in memory to maintain throughput during high
+ * contention or compaction.
  * <p>
  * Execution flow (high-level)
- * - Enqueue: New records are accepted in FIFO order. Under normal conditions they are durably appended to
- * the queue log and the logical size is updated. If temporary in-memory staging is enabled and the queue
- * detects contention or a maintenance window, records may be first placed in a bounded in-memory buffer
+ * - Enqueue: New records are accepted in FIFO order. Under normal conditions
+ * they are durably appended to
+ * the queue log and the logical size is updated. If temporary in-memory staging
+ * is enabled and the queue
+ * detects contention or a maintenance window, records may be first placed in a
+ * bounded in-memory buffer
  * and later drained to disk in batches while preserving order.
- * - Dequeue: Consumers obtain the next available record in FIFO order. A blocking variant waits until a
- * record becomes available; a timed variant returns empty on timeout. A non-destructive peek is also
- * available. Once a record is returned by a dequeue operation, the queue advances its internal cursor and
- * persists that advancement, meaning the record will not be re-delivered after a restart.
- * - Startup and recovery: On open, the queue reconstructs its state from persisted metadata. If metadata is
- * unavailable or inconsistent, it recovers by scanning the log up to the last complete record and discarding
+ * - Dequeue: Consumers obtain the next available record in FIFO order. A
+ * blocking variant waits until a
+ * record becomes available; a timed variant returns empty on timeout. A
+ * non-destructive peek is also
+ * available. Once a record is returned by a dequeue operation, the queue
+ * advances its internal cursor and
+ * persists that advancement, meaning the record will not be re-delivered after
+ * a restart.
+ * - Startup and recovery: On open, the queue reconstructs its state from
+ * persisted metadata. If metadata is
+ * unavailable or inconsistent, it recovers by scanning the log up to the last
+ * complete record and discarding
  * any torn tail, ensuring the queue starts in a consistent state.
- * - Maintenance and compaction: When a configurable threshold of consumed data accumulates, or after a
- * configured interval, the queue compacts the log in the background by retaining only the unconsumed
- * segment. This process is atomic from the perspective of users and never discards unconsumed data. Normal
- * enqueue/dequeue operations remain available during compaction; if in-memory staging is enabled, the queue
- * may temporarily route new records through the memory buffer to minimize interference.
- * - Shutdown: On close, the queue attempts to flush any staged records, may perform a final compaction when
+ * - Maintenance and compaction: When a configurable threshold of consumed data
+ * accumulates, or after a
+ * configured interval, the queue compacts the log in the background by
+ * retaining only the unconsumed
+ * segment. This process is atomic from the perspective of users and never
+ * discards unconsumed data. Normal
+ * enqueue/dequeue operations remain available during compaction; if in-memory
+ * staging is enabled, the queue
+ * may temporarily route new records through the memory buffer to minimize
+ * interference.
+ * - Shutdown: On close, the queue attempts to flush any staged records, may
+ * perform a final compaction when
  * appropriate, and then closes resources.
  * <p>
  * Business rules and guarantees
- * - Ordering: Records are delivered strictly in FIFO order, including across restarts. Batched draining from
+ * - Ordering: Records are delivered strictly in FIFO order, including across
+ * restarts. Batched draining from
  * the in-memory buffer, when enabled, preserves overall enqueue order.
- * - Delivery semantics: Dequeue is at-most-once from the queue’s perspective. After a record is returned to a
- * consumer, the queue advances and persists its position; the same record will not be redelivered after
+ * - Delivery semantics: Dequeue is at-most-once from the queue’s perspective.
+ * After a record is returned to a
+ * consumer, the queue advances and persists its position; the same record will
+ * not be redelivered after
  * a crash or restart.
- * - Durability: With synchronous flushing enabled, records acknowledged by enqueue are durable against process
- * crashes and OS-level failures subject to underlying storage guarantees. When synchronous flushing is
- * disabled, a small window of most recent records may be lost on abrupt termination or power failure.
- * - Capacity and backpressure: The on-disk queue grows with available disk space. The optional in-memory
- * staging buffer is bounded; when it fills, producers may block until space becomes available or until records
- * are drained to disk. Consumers may block when the queue is empty, depending on the chosen API variant.
- * - Safety during compaction: Compaction never removes unconsumed data and completes with an atomic file
- * replacement to avoid partial states. If compaction cannot complete, the existing log remains intact.
- * - Concurrency: All public operations are thread-safe. Internal coordination ensures that concurrent
+ * - Durability: With synchronous flushing enabled, records acknowledged by
+ * enqueue are durable against process
+ * crashes and OS-level failures subject to underlying storage guarantees. When
+ * synchronous flushing is
+ * disabled, a small window of most recent records may be lost on abrupt
+ * termination or power failure.
+ * - Capacity and backpressure: The on-disk queue grows with available disk
+ * space. The optional in-memory
+ * staging buffer is bounded; when it fills, producers may block until space
+ * becomes available or until records
+ * are drained to disk. Consumers may block when the queue is empty, depending
+ * on the chosen API variant.
+ * - Safety during compaction: Compaction never removes unconsumed data and
+ * completes with an atomic file
+ * replacement to avoid partial states. If compaction cannot complete, the
+ * existing log remains intact.
+ * - Concurrency: All public operations are thread-safe. Internal coordination
+ * ensures that concurrent
  * producers and consumers observe consistent queue state and ordering.
- * - Compatibility: Queue elements must be serializable and readable with the application’s classpath on
- * subsequent runs; schema evolution and cross-version compatibility are the responsibility of the caller.
+ * - Compatibility: Queue elements must be serializable and readable with the
+ * application’s classpath on
+ * subsequent runs; schema evolution and cross-version compatibility are the
+ * responsibility of the caller.
  * <p>
  * Configuration overview
  * - Compaction behavior can be tuned by a waste threshold and/or time interval.
  * - Durability can trade throughput vs. safety by toggling synchronous flushes.
- * - In-memory staging can be enabled and sized to absorb bursts and reduce producer contention during
+ * - In-memory staging can be enabled and sized to absorb bursts and reduce
+ * producer contention during
  * maintenance.
  * <p>
- * This documentation intentionally focuses on observable behavior and operational characteristics rather than
+ * This documentation intentionally focuses on observable behavior and
+ * operational characteristics rather than
  * implementation specifics.
  *
  * @param <T> Serializable element type stored and retrieved in FIFO order.
@@ -121,7 +157,8 @@ public class NQueue<T extends Serializable> implements Closeable {
     private static final String META_FILE = "queue.meta";
     private static final int MEMORY_DRAIN_BATCH_SIZE = 256;
     /**
-     * Sentinel offset returned when an element is handed off directly to a waiting consumer, bypassing
+     * Sentinel offset returned when an element is handed off directly to a waiting
+     * consumer, bypassing
      * persistence and staging buffers.
      */
     public static final long OFFSET_HANDOFF = -2;
@@ -152,7 +189,8 @@ public class NQueue<T extends Serializable> implements Closeable {
     private final BlockingQueue<MemoryBufferEntry<T>> memoryBuffer;
     private final BlockingDeque<MemoryBufferEntry<T>> drainingQueue;
     private final AtomicLong memoryBufferModeUntil = new AtomicLong(0);
-    private final AtomicBoolean drainingInProgress = new AtomicBoolean(false), switchBackRequested = new AtomicBoolean(false), revalidationScheduled = new AtomicBoolean(false);
+    private final AtomicBoolean drainingInProgress = new AtomicBoolean(false),
+            switchBackRequested = new AtomicBoolean(false), revalidationScheduled = new AtomicBoolean(false);
     private volatile CountDownLatch drainCompletionLatch;
 
     private final ExecutorService drainExecutor, compactionExecutor;
@@ -161,21 +199,26 @@ public class NQueue<T extends Serializable> implements Closeable {
 
     private volatile long lastSizeReconciliationTimeNanos = System.nanoTime();
 
-
     /**
-     * Constructs a queue instance bound to the supplied directory and I/O handles, restoring the
-     * persisted state captured in the provided snapshot and applying the chosen options. The constructor
-     * wires concurrency primitives and, when enabled, prepares in-memory staging and maintenance
-     * services used to balance throughput during compaction or contention. Intended for internal use by
+     * Constructs a queue instance bound to the supplied directory and I/O handles,
+     * restoring the
+     * persisted state captured in the provided snapshot and applying the chosen
+     * options. The constructor
+     * wires concurrency primitives and, when enabled, prepares in-memory staging
+     * and maintenance
+     * services used to balance throughput during compaction or contention. Intended
+     * for internal use by
      * factory methods.
      *
      * @param queueDir    base directory for persistent data and metadata
      * @param raf         open random-access handle for the queue log
      * @param dataChannel file channel associated with the queue log
-     * @param state       recovered or rebuilt queue state to initialize cursors and counters
+     * @param state       recovered or rebuilt queue state to initialize cursors and
+     *                    counters
      * @param options     operational configuration snapshot
      */
-    private NQueue(Path queueDir, RandomAccessFile raf, FileChannel dataChannel, QueueState state, Options options) throws IOException {
+    private NQueue(Path queueDir, RandomAccessFile raf, FileChannel dataChannel, QueueState state, Options options)
+            throws IOException {
         this.queueDir = queueDir;
         this.dataPath = queueDir.resolve(DATA_FILE);
         this.metaPath = queueDir.resolve(META_FILE);
@@ -230,15 +273,18 @@ public class NQueue<T extends Serializable> implements Closeable {
         });
 
         // Schedule periodic size reconciliation
-        this.maintenanceExecutor.scheduleWithFixedDelay(this::reconcileSize, options.maintenanceIntervalNanos, options.maintenanceIntervalNanos, TimeUnit.NANOSECONDS);
+        this.maintenanceExecutor.scheduleWithFixedDelay(this::reconcileSize, options.maintenanceIntervalNanos,
+                options.maintenanceIntervalNanos, TimeUnit.NANOSECONDS);
     }
 
     /**
      * Reconciles the optimistic approximate size with the exact size.
-     * Tries to acquire lock opportunistically, but forces it if the last update was too long ago.
+     * Tries to acquire lock opportunistically, but forces it if the last update was
+     * too long ago.
      */
     private void reconcileSize() {
-        if (closed || shutdownRequested) return;
+        if (closed || shutdownRequested)
+            return;
 
         long maxDelay = options.maxSizeReconciliationIntervalNanos;
         boolean forced = maxDelay > 0 && (System.nanoTime() - lastSizeReconciliationTimeNanos) > maxDelay;
@@ -270,33 +316,44 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Opens or creates a named queue under the given base directory using default options. On first use,
-     * the directory structure is created. On subsequent runs, prior state is recovered so that ordering and
-     * consumption progress are preserved. Any incomplete tail data is safely pruned before use.
+     * Opens or creates a named queue under the given base directory using default
+     * options. On first use,
+     * the directory structure is created. On subsequent runs, prior state is
+     * recovered so that ordering and
+     * consumption progress are preserved. Any incomplete tail data is safely pruned
+     * before use.
      *
      * @param baseDir   base directory where the queue folder will reside
      * @param queueName logical queue name used as a directory under the base
      * @param <T>       serializable element type
-     * @return an operational queue instance ready for concurrent producers and consumers
-     * @throws IOException if the storage cannot be prepared or state cannot be recovered
+     * @return an operational queue instance ready for concurrent producers and
+     *         consumers
+     * @throws IOException if the storage cannot be prepared or state cannot be
+     *                     recovered
      */
     public static <T extends Serializable> NQueue<T> open(Path baseDir, String queueName) throws IOException {
         return open(baseDir, queueName, Options.defaults());
     }
 
     /**
-     * Opens or creates a named queue under the given base directory with explicit options. Startup
-     * reconciles metadata with the durable log so the queue begins in a consistent state. When requested,
+     * Opens or creates a named queue under the given base directory with explicit
+     * options. Startup
+     * reconciles metadata with the durable log so the queue begins in a consistent
+     * state. When requested,
      * a rebuild pass is performed to reconstruct state solely from the log.
      *
      * @param baseDir   base directory where the queue folder will reside
      * @param queueName logical queue name used as a directory under the base
-     * @param options   operational configuration controlling durability, compaction, and staging
+     * @param options   operational configuration controlling durability,
+     *                  compaction, and staging
      * @param <T>       serializable element type
-     * @return an operational queue instance ready for concurrent producers and consumers
-     * @throws IOException if the storage cannot be prepared or state cannot be recovered
+     * @return an operational queue instance ready for concurrent producers and
+     *         consumers
+     * @throws IOException if the storage cannot be prepared or state cannot be
+     *                     recovered
      */
-    public static <T extends Serializable> NQueue<T> open(Path baseDir, String queueName, Options options) throws IOException {
+    public static <T extends Serializable> NQueue<T> open(Path baseDir, String queueName, Options options)
+            throws IOException {
         Objects.requireNonNull(baseDir);
         Objects.requireNonNull(queueName);
         Objects.requireNonNull(options);
@@ -321,25 +378,34 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Enqueues a single record while preserving FIFO order. Depending on configuration and current
-     * conditions, the record may be staged in memory and durably appended later, or appended directly to
-     * the durable log. Producers observe backpressure only when the bounded staging area is saturated
+     * Enqueues a single record while preserving FIFO order. Depending on
+     * configuration and current
+     * conditions, the record may be staged in memory and durably appended later, or
+     * appended directly to
+     * the durable log. Producers observe backpressure only when the bounded staging
+     * area is saturated
      * or when direct appends are momentarily contended.
      *
-     * @param object element to append; must be non-null and serializable by the application classpath
-     * @return a logical offset for the first byte of the record when appended directly, or a sentinel value
-     * indicating deferred durability when temporarily staged
-     * @throws IOException if the enqueue cannot be acknowledged due to storage errors
+     * @param object element to append; must be non-null and serializable by the
+     *               application classpath
+     * @return a logical offset for the first byte of the record when appended
+     *         directly, or a sentinel value
+     *         indicating deferred durability when temporarily staged
+     * @throws IOException if the enqueue cannot be acknowledged due to storage
+     *                     errors
      */
     public long offer(T object) throws IOException {
         Objects.requireNonNull(object);
 
         if (enableMemoryBuffer) {
-            if (System.nanoTime() < memoryBufferModeUntil.get()) return offerToMemory(object, true);
+            if (System.nanoTime() < memoryBufferModeUntil.get())
+                return offerToMemory(object, true);
             if (lock.tryLock()) {
                 try {
-                    // Short-circuit: if queue is empty (disk + memory) and a consumer is waiting, handoff directly.
-                    if (options.allowShortCircuit && recordCount == 0 && handoffItem == null && drainingQueue.isEmpty() && memoryBuffer.isEmpty() && lock.hasWaiters(notEmpty)) {
+                    // Short-circuit: if queue is empty (disk + memory) and a consumer is waiting,
+                    // handoff directly.
+                    if (options.allowShortCircuit && recordCount == 0 && handoffItem == null && drainingQueue.isEmpty()
+                            && memoryBuffer.isEmpty() && lock.hasWaiters(notEmpty)) {
                         long seq = globalSequence.incrementAndGet();
                         PreIndexedItem<T> pItem = new PreIndexedItem<>(object, seq);
                         handoffItem = pItem;
@@ -383,8 +449,10 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Retrieves and removes the head of the queue, blocking until an element becomes available. The
-     * consumption cursor is advanced and persisted before the element is delivered, ensuring at-most-once
+     * Retrieves and removes the head of the queue, blocking until an element
+     * becomes available. The
+     * consumption cursor is advanced and persisted before the element is delivered,
+     * ensuring at-most-once
      * delivery from the queue’s perspective across restarts.
      *
      * @return the next available element
@@ -394,7 +462,8 @@ public class NQueue<T extends Serializable> implements Closeable {
         lock.lock();
         try {
             // Optimization: Only force a sync drain if the disk queue is empty.
-            // If we have records on disk, consume them first to avoid blocking readers on write I/O.
+            // If we have records on disk, consume them first to avoid blocking readers on
+            // write I/O.
             if (recordCount == 0 && handoffItem == null) {
                 drainMemoryBufferSync();
             }
@@ -425,8 +494,10 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Retrieves and removes the head of the queue, waiting up to the specified time if necessary for an
-     * element to become available. If the wait times out, an empty result is returned. When an element is
+     * Retrieves and removes the head of the queue, waiting up to the specified time
+     * if necessary for an
+     * element to become available. If the wait times out, an empty result is
+     * returned. When an element is
      * returned, the consumption cursor is advanced and persisted.
      *
      * @param timeout maximum time to wait
@@ -438,7 +509,8 @@ public class NQueue<T extends Serializable> implements Closeable {
         long nanos = unit.toNanos(timeout);
         lock.lock();
         try {
-            // Optimization: Only force a sync drain if we absolutely need data and none is on disk
+            // Optimization: Only force a sync drain if we absolutely need data and none is
+            // on disk
             if (recordCount == 0 && handoffItem == null) {
                 drainMemoryBufferSync();
             }
@@ -453,9 +525,11 @@ public class NQueue<T extends Serializable> implements Closeable {
 
             while (recordCount == 0) {
                 // If checking memory triggered a drain and resulted in records, break
-                if (checkAndDrainMemorySync()) break;
+                if (checkAndDrainMemorySync())
+                    break;
 
-                if (nanos <= 0L) return Optional.empty();
+                if (nanos <= 0L)
+                    return Optional.empty();
                 try {
                     nanos = notEmpty.awaitNanos(nanos);
                     if (handoffItem != null) {
@@ -465,7 +539,8 @@ public class NQueue<T extends Serializable> implements Closeable {
                         handoffItem = null;
                         return Optional.of(item);
                     }
-                    if (checkAndDrainMemorySync()) break;
+                    if (checkAndDrainMemorySync())
+                        break;
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     checkAndDrainMemorySync();
@@ -480,8 +555,10 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Returns, without removing, the element at the head of the queue if present. This operation does not
-     * advance the consumption cursor and therefore does not alter delivery semantics.
+     * Returns, without removing, the element at the head of the queue if present.
+     * This operation does not
+     * advance the consumption cursor and therefore does not alter delivery
+     * semantics.
      *
      * @return the current head element or empty if the queue is logically empty
      * @throws IOException if the queue cannot access the stored data
@@ -500,7 +577,8 @@ public class NQueue<T extends Serializable> implements Closeable {
             }
 
             // 2. If disk is empty but we have memory buffer enabled, check memory buffers.
-            // NOTE: This does NOT drain/flush to disk, it just looks at what is waiting in RAM.
+            // NOTE: This does NOT drain/flush to disk, it just looks at what is waiting in
+            // RAM.
             if (enableMemoryBuffer) {
                 // Draining queue has older items than memoryBuffer, check it first.
                 MemoryBufferEntry<T> fromDrain = drainingQueue.peekFirst();
@@ -522,8 +600,10 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Returns the current logical size of the queue using strong accounting. When in-memory staging is
-     * enabled, the count includes both staged and durable records visible to consumers.
+     * Returns the current logical size of the queue using strong accounting. When
+     * in-memory staging is
+     * enabled, the count includes both staged and durable records visible to
+     * consumers.
      *
      * @return number of elements that would be observed across all sources
      */
@@ -531,8 +611,10 @@ public class NQueue<T extends Serializable> implements Closeable {
         lock.lock();
         try {
             long s = recordCount;
-            if (handoffItem != null) s++;
-            if (enableMemoryBuffer) s += (long) memoryBuffer.size() + drainingQueue.size();
+            if (handoffItem != null)
+                s++;
+            if (enableMemoryBuffer)
+                s += (long) memoryBuffer.size() + drainingQueue.size();
             return s;
         } finally {
             lock.unlock();
@@ -540,11 +622,14 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Returns the queue size, optionally using a fast, approximate counter that may lag under concurrency
-     * but avoids coordination costs. This is useful for monitoring and heuristics where exactness is not
+     * Returns the queue size, optionally using a fast, approximate counter that may
+     * lag under concurrency
+     * but avoids coordination costs. This is useful for monitoring and heuristics
+     * where exactness is not
      * required.
      *
-     * @param optimistic when true, returns a fast approximation; when false, computes a precise value
+     * @param optimistic when true, returns a fast approximation; when false,
+     *                   computes a precise value
      * @return approximate or precise size depending on the chosen mode
      */
     public long size(boolean optimistic) {
@@ -552,7 +637,8 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Indicates whether the queue is currently empty according to a precise size check.
+     * Indicates whether the queue is currently empty according to a precise size
+     * check.
      *
      * @return true if no records are pending delivery; false otherwise
      */
@@ -561,7 +647,8 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Returns the count of durable records strictly within the persistent log segment awaiting consumption.
+     * Returns the count of durable records strictly within the persistent log
+     * segment awaiting consumption.
      * This value does not include items that may be temporarily staged in memory.
      *
      * @return durable record count pending delivery
@@ -575,14 +662,71 @@ public class NQueue<T extends Serializable> implements Closeable {
         }
     }
 
+    /**
+     * Reads a range of items from the queue without consuming them.
+     * This is useful for creating snapshots for replication.
+     * 
+     * @param startIndex zero-based logical index to start reading from
+     * @param maxItems   maximum number of items to read
+     * @return result containing the items and whether more items are available
+     * @throws IOException if reading fails
+     */
+    public ReadRangeResult<T> readRange(int startIndex, int maxItems) throws IOException {
+        lock.lock();
+        try {
+            List<T> items = new ArrayList<>();
+            long offset = consumerOffset;
+            int currentIndex = 0;
+
+            // Skip to startIndex
+            while (currentIndex < startIndex && offset < producerOffset) {
+                Optional<NQueueReadResult> result = readAtInternal(offset);
+                if (result.isEmpty())
+                    break;
+                offset = result.get().getNextOffset();
+                currentIndex++;
+            }
+
+            // Read up to maxItems
+            int readCount = 0;
+            while (readCount < maxItems && offset < producerOffset) {
+                Optional<NQueueReadResult> result = readAtInternal(offset);
+                if (result.isEmpty())
+                    break;
+                items.add(safeDeserialize(result.get().getRecord()));
+                offset = result.get().getNextOffset();
+                readCount++;
+            }
+
+            boolean hasMore = offset < producerOffset;
+            return new ReadRangeResult<>(items, hasMore, currentIndex + readCount);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Result of a range read operation.
+     * 
+     * @param items     the items read
+     * @param hasMore   whether more items are available after this range
+     * @param nextIndex the next index to continue reading from
+     */
+    public record ReadRangeResult<T>(List<T> items, boolean hasMore, int nextIndex) implements Serializable {
+        private static final long serialVersionUID = 1L;
+    }
+
     @Override
     /**
-     * Shuts down the queue gracefully. Any staged records are flushed when possible, a final compaction may
-     * be scheduled if appropriate, and all background services and I/O resources are closed. The method
+     * Shuts down the queue gracefully. Any staged records are flushed when
+     * possible, a final compaction may
+     * be scheduled if appropriate, and all background services and I/O resources
+     * are closed. The method
      * attempts to complete maintenance promptly without compromising data safety.
      *
      * @throws IOException if underlying channels cannot be closed cleanly
-     */ public void close() throws IOException {
+     */
+    public void close() throws IOException {
         // Stop maintenance first
         maintenanceExecutor.shutdownNow();
         statsUtils.shutdown();
@@ -618,10 +762,14 @@ public class NQueue<T extends Serializable> implements Closeable {
         }
         lock.lock();
         try {
-            if (dataChannel.isOpen()) dataChannel.close();
-            if (raf != null) raf.close();
-            if (metaChannel != null && metaChannel.isOpen()) metaChannel.close();
-            if (metaRaf != null) metaRaf.close();
+            if (dataChannel.isOpen())
+                dataChannel.close();
+            if (raf != null)
+                raf.close();
+            if (metaChannel != null && metaChannel.isOpen())
+                metaChannel.close();
+            if (metaRaf != null)
+                metaRaf.close();
             closed = true;
         } finally {
             lock.unlock();
@@ -629,12 +777,16 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Waits briefly for an in-progress memory-buffer drain to complete, if any. Used to improve handoff
-     * between maintenance phases and normal operation without blocking indefinitely.
+     * Waits briefly for an in-progress memory-buffer drain to complete, if any.
+     * Used to improve handoff
+     * between maintenance phases and normal operation without blocking
+     * indefinitely.
      */
     private void awaitDrainCompletion() {
-        if (!enableMemoryBuffer) return;
-        if (!drainingInProgress.get() && (drainingQueue == null || drainingQueue.isEmpty())) return;
+        if (!enableMemoryBuffer)
+            return;
+        if (!drainingInProgress.get() && (drainingQueue == null || drainingQueue.isEmpty()))
+            return;
         CountDownLatch latch = drainCompletionLatch;
         if (latch != null) {
             try {
@@ -646,19 +798,23 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Callback invoked after a compaction attempt finishes. It reconciles the operating mode with the
-     * current workload, scheduling a revalidation step when necessary to decide whether to continue using
+     * Callback invoked after a compaction attempt finishes. It reconciles the
+     * operating mode with the
+     * current workload, scheduling a revalidation step when necessary to decide
+     * whether to continue using
      * the in-memory staging path or revert to direct durable appends.
      *
      * @param success whether the compaction reached a consistent end state
      * @param error   an optional cause when a failure was detected
      */
     private void onCompactionFinished(boolean success, Throwable error) {
-        if (!enableMemoryBuffer) return;
+        if (!enableMemoryBuffer)
+            return;
         boolean acquired = lock.tryLock();
         if (acquired) {
             try {
-                if (compactionState == CompactionState.RUNNING) compactionState = CompactionState.IDLE;
+                if (compactionState == CompactionState.RUNNING)
+                    compactionState = CompactionState.IDLE;
                 if (memoryBuffer.isEmpty() && drainingQueue.isEmpty()) {
                     memoryBufferModeUntil.set(0);
                     return;
@@ -667,12 +823,14 @@ public class NQueue<T extends Serializable> implements Closeable {
                 lock.unlock();
             }
         }
-        if (!switchBackRequested.compareAndSet(false, true)) return;
+        if (!switchBackRequested.compareAndSet(false, true))
+            return;
         revalidationExecutor.execute(() -> {
             try {
                 if (lock.tryLock()) {
                     try {
-                        if (compactionState != CompactionState.RUNNING && memoryBuffer.isEmpty() && drainingQueue.isEmpty()) {
+                        if (compactionState != CompactionState.RUNNING && memoryBuffer.isEmpty()
+                                && drainingQueue.isEmpty()) {
                             memoryBufferModeUntil.set(0);
                             return;
                         }
@@ -692,7 +850,8 @@ public class NQueue<T extends Serializable> implements Closeable {
                 }
                 if (lock.tryLock()) {
                     try {
-                        if (memoryBuffer.isEmpty() && drainingQueue.isEmpty() && compactionState != CompactionState.RUNNING) {
+                        if (memoryBuffer.isEmpty() && drainingQueue.isEmpty()
+                                && compactionState != CompactionState.RUNNING) {
                             memoryBufferModeUntil.set(0);
                         } else {
                             activateMemoryMode();
@@ -711,8 +870,10 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Reads, without advancing the consumption cursor, the record stored at the provided durable offset and
-     * returns the deserialized element if a complete record exists at that position. This is intended for
+     * Reads, without advancing the consumption cursor, the record stored at the
+     * provided durable offset and
+     * returns the deserialized element if a complete record exists at that
+     * position. This is intended for
      * diagnostic and auditing scenarios.
      *
      * @param offset durable position to inspect
@@ -729,12 +890,15 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Reads, without advancing the consumption cursor, the record stored at the provided durable offset and
-     * returns its structured representation together with the next record position. This variant exposes
+     * Reads, without advancing the consumption cursor, the record stored at the
+     * provided durable offset and
+     * returns its structured representation together with the next record position.
+     * This variant exposes
      * raw metadata for advanced tooling.
      *
      * @param offset durable position to inspect
-     * @return a structured result with the record and the next offset, or empty if none is available
+     * @return a structured result with the record and the next offset, or empty if
+     *         none is available
      * @throws IOException if reading from storage fails
      */
     public Optional<NQueueReadResult> readRecordAt(long offset) throws IOException {
@@ -747,12 +911,15 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Reads, without advancing the consumption cursor, the record with the specific logical index.
-     * This method scans the log to find the record. Since offsets change during compaction, this is the
+     * Reads, without advancing the consumption cursor, the record with the specific
+     * logical index.
+     * This method scans the log to find the record. Since offsets change during
+     * compaction, this is the
      * reliable way to retrieve records by identity in a distributed context.
      *
      * @param index logical index to find
-     * @return a structured result with the record and the next offset, or empty if not found/expired
+     * @return a structured result with the record and the next offset, or empty if
+     *         not found/expired
      * @throws IOException if reading from storage fails
      */
     public Optional<NQueueReadResult> readRecordAtIndex(long index) throws IOException {
@@ -761,24 +928,26 @@ public class NQueue<T extends Serializable> implements Closeable {
             long offset = 0;
             long size = dataChannel.size();
             while (offset < size) {
-                 NQueueRecordMetaData.HeaderPrefix pref = NQueueRecordMetaData.readPrefix(dataChannel, offset);
-                 NQueueRecordMetaData meta = NQueueRecordMetaData.fromBuffer(dataChannel, offset, pref.headerLen);
-                 
-                 if (meta.getIndex() == index) {
-                     long hEnd = offset + NQueueRecordMetaData.fixedPrefixSize() + pref.headerLen;
-                     long pEnd = hEnd + meta.getPayloadLen();
-                     byte[] payload = new byte[meta.getPayloadLen()];
-                     ByteBuffer pb = ByteBuffer.wrap(payload);
-                     while (pb.hasRemaining()) {
-                        if (dataChannel.read(pb, hEnd + (long) pb.position()) < 0) throw new EOFException();
-                     }
-                     return Optional.of(new NQueueReadResult(new NQueueRecord(meta, payload), pEnd));
-                 } else if (meta.getIndex() > index) {
-                     // We passed the index, so it must have been compacted away (or doesn't exist yet if we are ahead)
-                     return Optional.empty();
-                 }
+                NQueueRecordMetaData.HeaderPrefix pref = NQueueRecordMetaData.readPrefix(dataChannel, offset);
+                NQueueRecordMetaData meta = NQueueRecordMetaData.fromBuffer(dataChannel, offset, pref.headerLen);
 
-                 offset += NQueueRecordMetaData.fixedPrefixSize() + pref.headerLen + meta.getPayloadLen();
+                if (meta.getIndex() == index) {
+                    long hEnd = offset + NQueueRecordMetaData.fixedPrefixSize() + pref.headerLen;
+                    long pEnd = hEnd + meta.getPayloadLen();
+                    byte[] payload = new byte[meta.getPayloadLen()];
+                    ByteBuffer pb = ByteBuffer.wrap(payload);
+                    while (pb.hasRemaining()) {
+                        if (dataChannel.read(pb, hEnd + (long) pb.position()) < 0)
+                            throw new EOFException();
+                    }
+                    return Optional.of(new NQueueReadResult(new NQueueRecord(meta, payload), pEnd));
+                } else if (meta.getIndex() > index) {
+                    // We passed the index, so it must have been compacted away (or doesn't exist
+                    // yet if we are ahead)
+                    return Optional.empty();
+                }
+
+                offset += NQueueRecordMetaData.fixedPrefixSize() + pref.headerLen + meta.getPayloadLen();
             }
             return Optional.empty();
         } finally {
@@ -787,8 +956,10 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Returns, without advancing the consumption cursor, the raw representation of the head record if one
-     * exists. This provides visibility into metadata alongside the payload for diagnostic use.
+     * Returns, without advancing the consumption cursor, the raw representation of
+     * the head record if one
+     * exists. This provides visibility into metadata alongside the payload for
+     * diagnostic use.
      *
      * @return the next record or empty if the queue is logically empty
      * @throws IOException if reading from storage fails
@@ -796,7 +967,8 @@ public class NQueue<T extends Serializable> implements Closeable {
     public Optional<NQueueRecord> peekRecord() throws IOException {
         lock.lock();
         try {
-            if (recordCount == 0) return Optional.empty();
+            if (recordCount == 0)
+                return Optional.empty();
             return readAtInternal(consumerOffset).map(NQueueReadResult::getRecord);
         } finally {
             lock.unlock();
@@ -804,8 +976,10 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Appends a single element directly to durable storage. Coordination must already be in place to ensure
-     * exclusive access to mutable state. Intended for internal paths that bypass the in-memory staging layer.
+     * Appends a single element directly to durable storage. Coordination must
+     * already be in place to ensure
+     * exclusive access to mutable state. Intended for internal paths that bypass
+     * the in-memory staging layer.
      *
      * @param object element to append
      * @return logical durable offset of the appended record
@@ -818,17 +992,22 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Appends a batch of elements directly to durable storage, advancing producer cursors and updating
-     * persistent metadata in one step. When requested by options, a synchronous flush is performed before
+     * Appends a batch of elements directly to durable storage, advancing producer
+     * cursors and updating
+     * persistent metadata in one step. When requested by options, a synchronous
+     * flush is performed before
      * returning. Consumers are signaled upon successful append.
      *
      * @param items elements to append in FIFO order
-     * @param fsync whether to request a synchronous flush according to durability settings
-     * @return logical durable offset of the first appended record, or a sentinel when no items are provided
+     * @param fsync whether to request a synchronous flush according to durability
+     *              settings
+     * @return logical durable offset of the first appended record, or a sentinel
+     *         when no items are provided
      * @throws IOException if the append cannot be acknowledged
      */
     private long offerBatchLocked(List<PreIndexedItem<T>> items, boolean fsync) throws IOException {
-        if (items.isEmpty()) return -1;
+        if (items.isEmpty())
+            return -1;
         long writePos = producerOffset, firstStart = -1, initialCount = recordCount;
         for (PreIndexedItem<T> pItem : items) {
             T obj = pItem.item();
@@ -836,20 +1015,26 @@ public class NQueue<T extends Serializable> implements Closeable {
             long idx = pItem.index();
             lastIndex = idx; // Update lastIndex to the sequence provided
 
-            NQueueRecordMetaData meta = new NQueueRecordMetaData(idx, System.currentTimeMillis(), payload.length, obj.getClass().getCanonicalName());
+            NQueueRecordMetaData meta = new NQueueRecordMetaData(idx, System.currentTimeMillis(), payload.length,
+                    obj.getClass().getCanonicalName());
             ByteBuffer hb = meta.toByteBuffer();
             long rStart = writePos;
-            while (hb.hasRemaining()) writePos += dataChannel.write(hb, writePos);
+            while (hb.hasRemaining())
+                writePos += dataChannel.write(hb, writePos);
             ByteBuffer pb = ByteBuffer.wrap(payload);
-            while (pb.hasRemaining()) writePos += dataChannel.write(pb, writePos);
-            if (firstStart < 0) firstStart = rStart;
+            while (pb.hasRemaining())
+                writePos += dataChannel.write(pb, writePos);
+            if (firstStart < 0)
+                firstStart = rStart;
         }
         producerOffset = writePos;
         recordCount += items.size();
         approximateSize.addAndGet(items.size());
-        if (initialCount == 0) consumerOffset = firstStart;
+        if (initialCount == 0)
+            consumerOffset = firstStart;
         persistCurrentStateLocked();
-        if (fsync && options.withFsync) dataChannel.force(true);
+        if (fsync && options.withFsync)
+            dataChannel.force(true);
         maybeCompactLocked();
         notEmpty.signalAll();
         statsUtils.notifyHitCounter(NQueueMetrics.OFFERED_EVENT);
@@ -857,34 +1042,43 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Internal read helper that validates the presence of a complete record at the given durable offset and
-     * returns its raw representation together with the next position. Incomplete or inconsistent tails yield
+     * Internal read helper that validates the presence of a complete record at the
+     * given durable offset and
+     * returns its raw representation together with the next position. Incomplete or
+     * inconsistent tails yield
      * an empty result.
      *
      * @param offset durable position to inspect
-     * @return structured result with record and next offset, or empty if no complete record is present
+     * @return structured result with record and next offset, or empty if no
+     *         complete record is present
      * @throws IOException if accessing storage fails
      */
     private Optional<NQueueReadResult> readAtInternal(long offset) throws IOException {
         long size = dataChannel.size();
-        if (offset + NQueueRecordMetaData.fixedPrefixSize() > size) return Optional.empty();
+        if (offset + NQueueRecordMetaData.fixedPrefixSize() > size)
+            return Optional.empty();
         NQueueRecordMetaData.HeaderPrefix pref = NQueueRecordMetaData.readPrefix(dataChannel, offset);
         long hEnd = offset + NQueueRecordMetaData.fixedPrefixSize() + pref.headerLen;
-        if (hEnd > size) return Optional.empty();
+        if (hEnd > size)
+            return Optional.empty();
         NQueueRecordMetaData meta = NQueueRecordMetaData.fromBuffer(dataChannel, offset, pref.headerLen);
         long pEnd = hEnd + meta.getPayloadLen();
-        if (pEnd > size) return Optional.empty();
+        if (pEnd > size)
+            return Optional.empty();
         byte[] payload = new byte[meta.getPayloadLen()];
         ByteBuffer pb = ByteBuffer.wrap(payload);
         while (pb.hasRemaining()) {
-            if (dataChannel.read(pb, hEnd + (long) pb.position()) < 0) throw new EOFException();
+            if (dataChannel.read(pb, hEnd + (long) pb.position()) < 0)
+                throw new EOFException();
         }
         return Optional.of(new NQueueReadResult(new NQueueRecord(meta, payload), pEnd));
     }
 
     /**
-     * Removes the head record from the durable log from the queue’s perspective by advancing the consumption
-     * cursor and persisting that advancement. The raw record is returned for subsequent deserialization by
+     * Removes the head record from the durable log from the queue’s perspective by
+     * advancing the consumption
+     * cursor and persisting that advancement. The raw record is returned for
+     * subsequent deserialization by
      * the caller.
      *
      * @return the consumed record if available
@@ -898,7 +1092,8 @@ public class NQueue<T extends Serializable> implements Closeable {
             consumerOffset = res.getNextOffset();
             recordCount--;
             approximateSize.decrementAndGet();
-            if (recordCount == 0) consumerOffset = producerOffset;
+            if (recordCount == 0)
+                consumerOffset = producerOffset;
             try {
                 persistCurrentStateLocked();
                 maybeCompactLocked();
@@ -910,20 +1105,24 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Persists the current queue cursors and counters so that progress is preserved across restarts. This
+     * Persists the current queue cursors and counters so that progress is preserved
+     * across restarts. This
      * method assumes exclusive access to the queue state.
      *
      * @throws IOException if the metadata cannot be written
      */
     private void persistCurrentStateLocked() throws IOException {
         synchronized (metaWriteLock) {
-            NQueueQueueMeta.update(metaChannel, consumerOffset, producerOffset, recordCount, lastIndex, options.withFsync);
+            NQueueQueueMeta.update(metaChannel, consumerOffset, producerOffset, recordCount, lastIndex,
+                    options.withFsync);
         }
     }
 
     /**
-     * Restores a consistent queue state using existing metadata when possible, or by scanning the durable
-     * log to rebuild cursors and counters. When the log contains incomplete data at the tail, the torn tail
+     * Restores a consistent queue state using existing metadata when possible, or
+     * by scanning the durable
+     * log to rebuild cursors and counters. When the log contains incomplete data at
+     * the tail, the torn tail
      * is discarded to ensure a consistent starting point.
      *
      * @param ch       channel to the durable log
@@ -941,7 +1140,8 @@ public class NQueue<T extends Serializable> implements Closeable {
         if (Files.exists(metaPath)) {
             try {
                 NQueueQueueMeta meta = NQueueQueueMeta.read(metaPath);
-                QueueState s = new QueueState(meta.getConsumerOffset(), meta.getProducerOffset(), meta.getRecordCount(), meta.getLastIndex());
+                QueueState s = new QueueState(meta.getConsumerOffset(), meta.getProducerOffset(), meta.getRecordCount(),
+                        meta.getLastIndex());
                 if (s.consumerOffset >= 0 && s.producerOffset >= s.consumerOffset && ch.size() >= s.producerOffset)
                     return s;
             } catch (IOException ignored) {
@@ -953,8 +1153,10 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Scans the durable log from the beginning to reconstruct a consistent state snapshot, stopping at the
-     * last complete record. Any partial tail is removed before the state is returned. This operation is used
+     * Scans the durable log from the beginning to reconstruct a consistent state
+     * snapshot, stopping at the
+     * last complete record. Any partial tail is removed before the state is
+     * returned. This operation is used
      * when metadata is absent or cannot be trusted.
      *
      * @param ch channel to the durable log
@@ -968,7 +1170,8 @@ public class NQueue<T extends Serializable> implements Closeable {
                 NQueueRecordMetaData.HeaderPrefix pref = NQueueRecordMetaData.readPrefix(ch, offset);
                 NQueueRecordMetaData meta = NQueueRecordMetaData.fromBuffer(ch, offset, pref.headerLen);
                 offset = offset + NQueueRecordMetaData.fixedPrefixSize() + pref.headerLen + meta.getPayloadLen();
-                if (offset > size) throw new EOFException();
+                if (offset > size)
+                    throw new EOFException();
                 count++;
                 lastIdx = meta.getIndex();
             } catch (Exception e) {
@@ -982,7 +1185,8 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Transfers a contiguous region from one channel to another. Used by background maintenance to assemble
+     * Transfers a contiguous region from one channel to another. Used by background
+     * maintenance to assemble
      * a compacted log while preserving the unconsumed segment and arrival order.
      *
      * @param src   source channel
@@ -995,14 +1199,16 @@ public class NQueue<T extends Serializable> implements Closeable {
         long pos = start, count = end - start;
         while (count > 0) {
             long t = src.transferTo(pos, count, dst);
-            if (t <= 0) break;
+            if (t <= 0)
+                break;
             pos += t;
             count -= t;
         }
     }
 
     /**
-     * Serializes an element to a byte array using the platform’s object serialization mechanism. Used to
+     * Serializes an element to a byte array using the platform’s object
+     * serialization mechanism. Used to
      * produce a durable payload for storage.
      *
      * @param obj element to serialize
@@ -1010,7 +1216,8 @@ public class NQueue<T extends Serializable> implements Closeable {
      * @throws IOException if the element cannot be serialized
      */
     private byte[] toBytes(T obj) throws IOException {
-        try (ByteArrayOutputStream bos = new ByteArrayOutputStream(); ObjectOutputStream oos = new ObjectOutputStream(new BufferedOutputStream(bos))) {
+        try (ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                ObjectOutputStream oos = new ObjectOutputStream(new BufferedOutputStream(bos))) {
             oos.writeObject(obj);
             oos.flush();
             return bos.toByteArray();
@@ -1018,14 +1225,17 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Deserializes the payload of a raw record into the expected element type. Errors during deserialization
-     * surface as unchecked failures to signal data that cannot be interpreted on the current classpath.
+     * Deserializes the payload of a raw record into the expected element type.
+     * Errors during deserialization
+     * surface as unchecked failures to signal data that cannot be interpreted on
+     * the current classpath.
      *
      * @param record raw record containing a binary payload
      * @return deserialized element
      */
     private T safeDeserialize(NQueueRecord record) {
-        try (ByteArrayInputStream bis = new ByteArrayInputStream(record.payload()); ObjectInputStream ois = new ObjectInputStream(bis)) {
+        try (ByteArrayInputStream bis = new ByteArrayInputStream(record.payload());
+                ObjectInputStream ois = new ObjectInputStream(bis)) {
             return (T) ois.readObject();
         } catch (Exception e) {
             throw new RuntimeException(e);
@@ -1033,19 +1243,24 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Activates a temporary staging mode that routes new enqueues through the in-memory buffer for a short
-     * interval. This helps to smooth producer throughput during maintenance or brief contention bursts. The
-     * mode revalidates itself periodically to decide when to revert to direct appends.
+     * Activates a temporary staging mode that routes new enqueues through the
+     * in-memory buffer for a short
+     * interval. This helps to smooth producer throughput during maintenance or
+     * brief contention bursts. The
+     * mode revalidates itself periodically to decide when to revert to direct
+     * appends.
      */
     private void activateMemoryMode() {
-        if (!enableMemoryBuffer) return;
+        if (!enableMemoryBuffer)
+            return;
         long until = System.nanoTime() + options.revalidationIntervalNanos;
         memoryBufferModeUntil.updateAndGet(c -> Math.max(c, until));
         scheduleRevalidation();
     }
 
     /**
-     * Schedules a future revalidation of the temporary staging mode when not already pending. The scheduled
+     * Schedules a future revalidation of the temporary staging mode when not
+     * already pending. The scheduled
      * task verifies whether conditions still warrant staying in memory-buffer mode.
      */
     private void scheduleRevalidation() {
@@ -1055,21 +1270,25 @@ public class NQueue<T extends Serializable> implements Closeable {
                     revalidateMemoryMode();
                 } finally {
                     revalidationScheduled.set(false);
-                    if (memoryBufferModeUntil.get() > System.nanoTime()) scheduleRevalidation();
+                    if (memoryBufferModeUntil.get() > System.nanoTime())
+                        scheduleRevalidation();
                 }
             }, options.revalidationIntervalNanos, TimeUnit.NANOSECONDS);
         }
     }
 
     /**
-     * Re-evaluates whether the in-memory staging mode should continue. When conditions improve and no staged
-     * work remains, the queue reverts to direct durable appends; otherwise, the staging window is extended.
+     * Re-evaluates whether the in-memory staging mode should continue. When
+     * conditions improve and no staged
+     * work remains, the queue reverts to direct durable appends; otherwise, the
+     * staging window is extended.
      */
     private void revalidateMemoryMode() {
         if (System.nanoTime() >= memoryBufferModeUntil.get()) {
             if (lock.tryLock()) {
                 try {
-                    if (compactionState != CompactionState.RUNNING && (!enableMemoryBuffer || (memoryBuffer.isEmpty() && drainingQueue.isEmpty()))) {
+                    if (compactionState != CompactionState.RUNNING
+                            && (!enableMemoryBuffer || (memoryBuffer.isEmpty() && drainingQueue.isEmpty()))) {
                         memoryBufferModeUntil.set(0);
                         return;
                     }
@@ -1082,13 +1301,18 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Attempts to place a new element into the bounded in-memory staging buffer. When the buffer is full and
-     * conditions allow, the queue may opportunistically revert to a direct durable append for the current
-     * element. Producers block only when the buffer is at capacity and no immediate fallback is possible.
+     * Attempts to place a new element into the bounded in-memory staging buffer.
+     * When the buffer is full and
+     * conditions allow, the queue may opportunistically revert to a direct durable
+     * append for the current
+     * element. Producers block only when the buffer is at capacity and no immediate
+     * fallback is possible.
      *
      * @param object           element to stage
-     * @param revalidateIfFull whether to reassess staging mode when the buffer is saturated
-     * @return a sentinel indicating that durability will be achieved by a later drain
+     * @param revalidateIfFull whether to reassess staging mode when the buffer is
+     *                         saturated
+     * @return a sentinel indicating that durability will be achieved by a later
+     *         drain
      * @throws IOException if a fallback durable append is attempted and fails
      */
     private long offerToMemory(T object, boolean revalidateIfFull) throws IOException {
@@ -1109,7 +1333,8 @@ public class NQueue<T extends Serializable> implements Closeable {
             synchronized (memoryMutex) {
                 long seq = globalSequence.incrementAndGet();
                 MemoryBufferEntry<T> e = new MemoryBufferEntry<>(object, seq);
-                if (!memoryBuffer.offer(e)) memoryBuffer.put(e);
+                if (!memoryBuffer.offer(e))
+                    memoryBuffer.put(e);
             }
             triggerDrainIfNeeded();
             return -1;
@@ -1120,7 +1345,8 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Initiates an asynchronous drain from the staging buffer into durable storage when necessary. A single
+     * Initiates an asynchronous drain from the staging buffer into durable storage
+     * when necessary. A single
      * drain worker is kept active at a time to preserve ordering.
      */
     private void triggerDrainIfNeeded() {
@@ -1131,8 +1357,10 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Background worker that periodically acquires the necessary coordination to flush staged elements into
-     * durable storage in batches. The worker makes progress opportunistically to minimize interference with
+     * Background worker that periodically acquires the necessary coordination to
+     * flush staged elements into
+     * durable storage in batches. The worker makes progress opportunistically to
+     * minimize interference with
      * producers and consumers.
      */
     private void drainMemoryBufferAsync() {
@@ -1161,43 +1389,53 @@ public class NQueue<T extends Serializable> implements Closeable {
             }
         } finally {
             drainingInProgress.set(false);
-            if (drainCompletionLatch != null) drainCompletionLatch.countDown();
-            if (enableMemoryBuffer && !memoryBuffer.isEmpty()) triggerDrainIfNeeded();
+            if (drainCompletionLatch != null)
+                drainCompletionLatch.countDown();
+            if (enableMemoryBuffer && !memoryBuffer.isEmpty())
+                triggerDrainIfNeeded();
         }
     }
 
     /**
-     * Synchronously flushes staged elements into durable storage in FIFO order, aggregating work into small
-     * batches to reduce coordination overhead. Failures result in staged entries being retained for a later
+     * Synchronously flushes staged elements into durable storage in FIFO order,
+     * aggregating work into small
+     * batches to reduce coordination overhead. Failures result in staged entries
+     * being retained for a later
      * retry.
      *
      * @throws IOException if persistence fails and the drain cannot complete
      */
     private void drainMemoryBufferSync() throws IOException {
-        if (!enableMemoryBuffer) return;
+        if (!enableMemoryBuffer)
+            return;
         while (true) {
             memoryBuffer.drainTo(drainingQueue, MEMORY_DRAIN_BATCH_SIZE);
-            if (drainingQueue.isEmpty()) break;
+            if (drainingQueue.isEmpty())
+                break;
             List<PreIndexedItem<T>> batch = new ArrayList<>();
             List<MemoryBufferEntry<T>> entries = new ArrayList<>();
             for (int i = 0; i < MEMORY_DRAIN_BATCH_SIZE; i++) {
                 MemoryBufferEntry<T> ent = drainingQueue.poll();
-                if (ent == null) break;
+                if (ent == null)
+                    break;
                 batch.add(new PreIndexedItem<>(ent.item, ent.index));
                 entries.add(ent);
             }
-            if (batch.isEmpty()) break;
+            if (batch.isEmpty())
+                break;
             try {
                 offerBatchLocked(batch, options.withFsync);
             } catch (IOException ex) {
-                for (int i = entries.size() - 1; i >= 0; i--) drainingQueue.addFirst(entries.get(i));
+                for (int i = entries.size() - 1; i >= 0; i--)
+                    drainingQueue.addFirst(entries.get(i));
                 throw ex;
             }
         }
     }
 
     /**
-     * Checks for staged work and performs a synchronous drain when present, indicating whether durable
+     * Checks for staged work and performs a synchronous drain when present,
+     * indicating whether durable
      * records became available for consumption as a result.
      *
      * @return true if at least one durable record is now available; false otherwise
@@ -1212,13 +1450,17 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Evaluates whether conditions warrant a background compaction and, when they do, schedules one. The
-     * decision considers the amount of consumed data and an optional time-based trigger, and avoids running
+     * Evaluates whether conditions warrant a background compaction and, when they
+     * do, schedules one. The
+     * decision considers the amount of consumed data and an optional time-based
+     * trigger, and avoids running
      * when a compaction is already in progress or shutdown is underway.
      */
     private void maybeCompactLocked() {
-        if (compactionState == CompactionState.RUNNING || shutdownRequested) return;
-        if (producerOffset <= 0) return;
+        if (compactionState == CompactionState.RUNNING || shutdownRequested)
+            return;
+        if (producerOffset <= 0)
+            return;
 
         long now = System.nanoTime();
         boolean shouldCompact = false;
@@ -1238,22 +1480,24 @@ public class NQueue<T extends Serializable> implements Closeable {
                         }
                     }
                 } catch (IOException e) {
-                   // Ignore read errors
+                    // Ignore read errors
                 }
             }
         } else {
             // Default DELETE_ON_CONSUME behavior
-            if (consumerOffset <= 0) return;
-             if (((double) consumerOffset / (double) producerOffset) >= options.compactionWasteThreshold) {
-                 shouldCompact = true;
-             }
+            if (consumerOffset <= 0)
+                return;
+            if (((double) consumerOffset / (double) producerOffset) >= options.compactionWasteThreshold) {
+                shouldCompact = true;
+            }
         }
 
         // Common time-based interval trigger
-        if (!shouldCompact && options.compactionIntervalNanos > 0 && (now - lastCompactionTimeNanos) >= options.compactionIntervalNanos && producerOffset > 0) {
-             if (options.retentionPolicy == Options.RetentionPolicy.TIME_BASED || consumerOffset > 0) {
-                 shouldCompact = true;
-             }
+        if (!shouldCompact && options.compactionIntervalNanos > 0
+                && (now - lastCompactionTimeNanos) >= options.compactionIntervalNanos && producerOffset > 0) {
+            if (options.retentionPolicy == Options.RetentionPolicy.TIME_BASED || consumerOffset > 0) {
+                shouldCompact = true;
+            }
         }
 
         if (shouldCompact) {
@@ -1265,31 +1509,35 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Performs compaction by assembling a new log containing only the unconsumed segment and then handing it
-     * off for finalization. Progress is reported back to reconcile staging mode with normal operation.
+     * Performs compaction by assembling a new log containing only the unconsumed
+     * segment and then handing it
+     * off for finalization. Progress is reported back to reconcile staging mode
+     * with normal operation.
      *
      * @param snap a point-in-time snapshot used to drive compaction
      */
     private void runCompactionTask(QueueState snap) {
         try {
             Files.deleteIfExists(tempDataPath);
-            try (RandomAccessFile tmpRaf = new RandomAccessFile(tempDataPath.toFile(), "rw"); FileChannel tmpCh = tmpRaf.getChannel()) {
+            try (RandomAccessFile tmpRaf = new RandomAccessFile(tempDataPath.toFile(), "rw");
+                    FileChannel tmpCh = tmpRaf.getChannel()) {
                 long copyStartOffset = 0;
                 long copyEndOffset;
 
                 lock.lock();
                 try {
-                    // We copy up to the current producer position to maximize work done outside the lock.
+                    // We copy up to the current producer position to maximize work done outside the
+                    // lock.
                     copyEndOffset = producerOffset;
-                    
+
                     if (options.retentionPolicy == Options.RetentionPolicy.DELETE_ON_CONSUME) {
-                         // Start from consumer position
-                         copyStartOffset = consumerOffset;
-                    } 
+                        // Start from consumer position
+                        copyStartOffset = consumerOffset;
+                    }
                 } finally {
                     lock.unlock();
                 }
-                
+
                 if (options.retentionPolicy == Options.RetentionPolicy.TIME_BASED) {
                     copyStartOffset = findTimeBasedCutoff(copyEndOffset);
                 }
@@ -1298,7 +1546,8 @@ public class NQueue<T extends Serializable> implements Closeable {
                     copyRegion(dataChannel, copyStartOffset, copyEndOffset, tmpCh);
                 }
 
-                if (options.withFsync) tmpCh.force(true);
+                if (options.withFsync)
+                    tmpCh.force(true);
                 finalizeCompaction(copyStartOffset, copyEndOffset, tmpCh);
             }
         } catch (Throwable t) {
@@ -1316,27 +1565,28 @@ public class NQueue<T extends Serializable> implements Closeable {
             onCompactionFinished(compactionState == CompactionState.IDLE, null);
         }
     }
-    
+
     private long findTimeBasedCutoff(long limitOffset) throws IOException {
         long offset = 0;
         long retentionMillis = TimeUnit.NANOSECONDS.toMillis(options.retentionTimeNanos);
         long now = System.currentTimeMillis();
         long cutoffTime = now - retentionMillis;
-        
+
         while (offset < limitOffset) {
             try {
-                 NQueueRecordMetaData.HeaderPrefix pref = NQueueRecordMetaData.readPrefix(dataChannel, offset);
-                 NQueueRecordMetaData meta = NQueueRecordMetaData.fromBuffer(dataChannel, offset, pref.headerLen);
-                 
-                 // If records have timestamp 0 (legacy), they are treated as very old.
-                 // If we find a record strictly younger than cutoffTime (timestamp >= cutoffTime), 
-                 // this is the start of valid data.
-                 if (meta.getTimestamp() >= cutoffTime) {
-                     return offset;
-                 }
-                 
-                 // Skip this record (it's expired)
-                 offset += NQueueRecordMetaData.fixedPrefixSize() + pref.headerLen + meta.getPayloadLen();
+                NQueueRecordMetaData.HeaderPrefix pref = NQueueRecordMetaData.readPrefix(dataChannel, offset);
+                NQueueRecordMetaData meta = NQueueRecordMetaData.fromBuffer(dataChannel, offset, pref.headerLen);
+
+                // If records have timestamp 0 (legacy), they are treated as very old.
+                // If we find a record strictly younger than cutoffTime (timestamp >=
+                // cutoffTime),
+                // this is the start of valid data.
+                if (meta.getTimestamp() >= cutoffTime) {
+                    return offset;
+                }
+
+                // Skip this record (it's expired)
+                offset += NQueueRecordMetaData.fixedPrefixSize() + pref.headerLen + meta.getPayloadLen();
             } catch (EOFException e) {
                 break;
             }
@@ -1345,8 +1595,10 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Finalizes a compaction by atomically replacing the active log with the compacted version, recalculating
-     * cursors to reflect additional data appended during the copy window, and updating persisted metadata.
+     * Finalizes a compaction by atomically replacing the active log with the
+     * compacted version, recalculating
+     * cursors to reflect additional data appended during the copy window, and
+     * updating persisted metadata.
      * Upon completion, producers and consumers continue unaffected.
      *
      * @param copyStartOffset durable position where the background copy started
@@ -1373,9 +1625,11 @@ public class NQueue<T extends Serializable> implements Closeable {
                 tmpCh.truncate(0);
             }
 
-            if (newCO > newPO) newCO = newPO;
+            if (newCO > newPO)
+                newCO = newPO;
 
-            if (options.withFsync) tmpCh.force(true);
+            if (options.withFsync)
+                tmpCh.force(true);
             tmpCh.close();
 
             // 3. Atomic swap
@@ -1406,7 +1660,8 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Creates a lightweight snapshot of the queue’s current cursors and counters for use in maintenance and
+     * Creates a lightweight snapshot of the queue’s current cursors and counters
+     * for use in maintenance and
      * diagnostics.
      *
      * @return current state snapshot
@@ -1416,25 +1671,33 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Indicates whether the queue is currently compacting or idle from a maintenance perspective.
+     * Indicates whether the queue is currently compacting or idle from a
+     * maintenance perspective.
      */
-    public enum CompactionState {IDLE, RUNNING}
+    public enum CompactionState {
+        IDLE, RUNNING
+    }
 
     /**
-     * Classe que representa um item pré-índiceado, fornecendo a combinação de um elemento e seu índice.
-     * Essa classe desempenha o papel crucial no processo de indexação prévia, permitindo a identificação eficiente dos itens em uma coleção ordenada.
-     * Ela se relaciona com outros componentes responsáveis pela manipulação da coleção, como os métodos de inclusão e remoção de elementos.
+     * Classe que representa um item pré-índiceado, fornecendo a combinação de um
+     * elemento e seu índice.
+     * Essa classe desempenha o papel crucial no processo de indexação prévia,
+     * permitindo a identificação eficiente dos itens em uma coleção ordenada.
+     * Ela se relaciona com outros componentes responsáveis pela manipulação da
+     * coleção, como os métodos de inclusão e remoção de elementos.
      */
     private static record PreIndexedItem<T>(T item, long index) implements Serializable {
         private static final long serialVersionUID = 1L;
     }
 
     /**
-     * Centralized out-of-order delivery detector. Increments the outOfOrderCount and notifies metrics if enabled.
+     * Centralized out-of-order delivery detector. Increments the outOfOrderCount
+     * and notifies metrics if enabled.
      * Called whenever a record is delivered to a consumer (handoff or disk).
      */
     private void recordDeliveryIndex(long seq) {
-        if (!orderDetectionEnabled) return;
+        if (!orderDetectionEnabled)
+            return;
         if (lastDeliveredIndex != -1 && seq <= lastDeliveredIndex) {
             if (seq != 0) {
                 outOfOrderCount++;
@@ -1445,7 +1708,8 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * For debugging/diagnostics only. Returns the last delivered sequence index observed by the internal
+     * For debugging/diagnostics only. Returns the last delivered sequence index
+     * observed by the internal
      * order detector, or -1 if no delivery was recorded.
      */
     public long getLastDeliveredIndex() {
@@ -1458,7 +1722,8 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * For debugging/diagnostics only. Returns how many out-of-order events the internal detector recorded
+     * For debugging/diagnostics only. Returns how many out-of-order events the
+     * internal detector recorded
      * during this queue instance lifetime.
      */
     public long getOutOfOrderCount() {
@@ -1471,7 +1736,8 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Wrapper for elements staged in the in-memory buffer, capturing arrival time to aid operational
+     * Wrapper for elements staged in the in-memory buffer, capturing arrival time
+     * to aid operational
      * decisions and debugging.
      */
     private static class MemoryBufferEntry<T> {
@@ -1480,7 +1746,8 @@ public class NQueue<T extends Serializable> implements Closeable {
         final long timestamp;
 
         /**
-         * Captures an element destined for later durable append along with its arrival timestamp.
+         * Captures an element destined for later durable append along with its arrival
+         * timestamp.
          *
          * @param item element to stage
          */
@@ -1492,7 +1759,8 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Immutable snapshot of queue cursors and counters used to coordinate operations like compaction and
+     * Immutable snapshot of queue cursors and counters used to coordinate
+     * operations like compaction and
      * recovery.
      */
     private static class QueueState {
@@ -1515,8 +1783,10 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
-     * Configuration for queue behavior including compaction policy, durability, staging, and coordination
-     * timing. Instances are mutable builders; use fluent setters to construct the desired configuration.
+     * Configuration for queue behavior including compaction policy, durability,
+     * staging, and coordination
+     * timing. Instances are mutable builders; use fluent setters to construct the
+     * desired configuration.
      */
     public static final class Options {
         public enum RetentionPolicy {
@@ -1530,7 +1800,8 @@ public class NQueue<T extends Serializable> implements Closeable {
         boolean withFsync = true, enableMemoryBuffer = false, resetOnRestart = false, allowShortCircuit = true;
         boolean enableOrderDetection = false;
         int memoryBufferSize = 10000;
-        long lockTryTimeoutNanos = TimeUnit.MILLISECONDS.toNanos(10), revalidationIntervalNanos = TimeUnit.MILLISECONDS.toNanos(100);
+        long lockTryTimeoutNanos = TimeUnit.MILLISECONDS.toNanos(10),
+                revalidationIntervalNanos = TimeUnit.MILLISECONDS.toNanos(100);
         long maintenanceIntervalNanos = TimeUnit.SECONDS.toNanos(5);
         long maxSizeReconciliationIntervalNanos = TimeUnit.MINUTES.toNanos(1);
         RetentionPolicy retentionPolicy = RetentionPolicy.DELETE_ON_CONSUME;
@@ -1540,7 +1811,8 @@ public class NQueue<T extends Serializable> implements Closeable {
         }
 
         /**
-         * Returns a fresh options instance with conservative defaults that favor safety and predictable
+         * Returns a fresh options instance with conservative defaults that favor safety
+         * and predictable
          * maintenance behavior.
          *
          * @return new options instance with default values
@@ -1557,59 +1829,91 @@ public class NQueue<T extends Serializable> implements Closeable {
 
         public Options withRetentionTime(Duration retention) {
             Objects.requireNonNull(retention);
-            if (retention.isNegative()) throw new IllegalArgumentException("negative");
+            if (retention.isNegative())
+                throw new IllegalArgumentException("negative");
             this.retentionTimeNanos = retention.toNanos();
             return this;
         }
 
+        public Options copy() {
+            Options copy = new Options();
+            copy.compactionWasteThreshold = this.compactionWasteThreshold;
+            copy.compactionIntervalNanos = this.compactionIntervalNanos;
+            copy.compactionBufferSize = this.compactionBufferSize;
+            copy.withFsync = this.withFsync;
+            copy.enableMemoryBuffer = this.enableMemoryBuffer;
+            copy.resetOnRestart = this.resetOnRestart;
+            copy.allowShortCircuit = this.allowShortCircuit;
+            copy.enableOrderDetection = this.enableOrderDetection;
+            copy.memoryBufferSize = this.memoryBufferSize;
+            copy.lockTryTimeoutNanos = this.lockTryTimeoutNanos;
+            copy.revalidationIntervalNanos = this.revalidationIntervalNanos;
+            copy.maintenanceIntervalNanos = this.maintenanceIntervalNanos;
+            copy.maxSizeReconciliationIntervalNanos = this.maxSizeReconciliationIntervalNanos;
+            copy.retentionPolicy = this.retentionPolicy;
+            copy.retentionTimeNanos = this.retentionTimeNanos;
+            return copy;
+        }
+
         /**
-         * Sets the fraction of consumed data that should trigger a compaction when exceeded. Values close to
+         * Sets the fraction of consumed data that should trigger a compaction when
+         * exceeded. Values close to
          * zero compact aggressively; values near one compact rarely.
          *
          * @param t threshold in the range [0.0, 1.0]
          * @return this builder for chaining
          */
         public Options withCompactionWasteThreshold(double t) {
-            if (t < 0.0 || t > 1.0) throw new IllegalArgumentException("threshold [0.0, 1.0]");
+            if (t < 0.0 || t > 1.0)
+                throw new IllegalArgumentException("threshold [0.0, 1.0]");
             this.compactionWasteThreshold = t;
             return this;
         }
 
         /**
-         * Sets a time-based trigger for compaction. When greater than zero, a compaction may be scheduled
-         * after at least this interval has elapsed since the last run and there is data eligible to reclaim.
+         * Sets a time-based trigger for compaction. When greater than zero, a
+         * compaction may be scheduled
+         * after at least this interval has elapsed since the last run and there is data
+         * eligible to reclaim.
          *
          * @param i minimum interval between compactions
          * @return this builder for chaining
          */
         public Options withCompactionInterval(Duration i) {
             Objects.requireNonNull(i);
-            if (i.isNegative()) throw new IllegalArgumentException("negative");
+            if (i.isNegative())
+                throw new IllegalArgumentException("negative");
             this.compactionIntervalNanos = i.toNanos();
             return this;
         }
 
         /**
-         * Sets the internal buffer size used during maintenance activities. Larger buffers may improve
+         * Sets the internal buffer size used during maintenance activities. Larger
+         * buffers may improve
          * throughput on some systems at the cost of memory.
          *
          * @param s positive buffer size in bytes
          * @return this builder for chaining
          */
         public Options withCompactionBufferSize(int s) {
-            if (s <= 0) throw new IllegalArgumentException("positive");
+            if (s <= 0)
+                throw new IllegalArgumentException("positive");
             this.compactionBufferSize = s;
             return this;
         }
 
         /**
-         * Controls whether to allow short-circuiting the persistence layer when consumers are waiting.
-         * When true (default), if the queue is empty and consumers are blocked waiting, new elements
+         * Controls whether to allow short-circuiting the persistence layer when
+         * consumers are waiting.
+         * When true (default), if the queue is empty and consumers are blocked waiting,
+         * new elements
          * are handed off directly to consumers without hitting the disk.
-         * When false, elements are always written to the queue log before delivery, ensuring strict
+         * When false, elements are always written to the queue log before delivery,
+         * ensuring strict
          * persistence at the cost of latency.
          *
-         * @param allow true to allow short-circuit (default), false to enforce persistence path
+         * @param allow true to allow short-circuit (default), false to enforce
+         *              persistence path
          * @return this builder for chaining
          */
         public Options withShortCircuit(boolean allow) {
@@ -1618,7 +1922,8 @@ public class NQueue<T extends Serializable> implements Closeable {
         }
 
         /**
-         * Controls whether enqueues request synchronous flushing from the storage layer. Enabling this
+         * Controls whether enqueues request synchronous flushing from the storage
+         * layer. Enabling this
          * increases durability guarantees at the cost of throughput.
          *
          * @param f true to enable synchronous flush on critical operations
@@ -1630,7 +1935,8 @@ public class NQueue<T extends Serializable> implements Closeable {
         }
 
         /**
-         * Enables or disables the in-memory staging buffer used to absorb bursts and decouple producers from
+         * Enables or disables the in-memory staging buffer used to absorb bursts and
+         * decouple producers from
          * maintenance phases.
          *
          * @param e true to enable staging
@@ -1642,21 +1948,25 @@ public class NQueue<T extends Serializable> implements Closeable {
         }
 
         /**
-         * Sets the maximum number of elements that may be staged in memory when the staging buffer is enabled.
+         * Sets the maximum number of elements that may be staged in memory when the
+         * staging buffer is enabled.
          *
          * @param s positive capacity in elements
          * @return this builder for chaining
          */
         public Options withMemoryBufferSize(int s) {
-            if (s <= 0) throw new IllegalArgumentException("memoryBufferSize deve ser positivo");
+            if (s <= 0)
+                throw new IllegalArgumentException("memoryBufferSize deve ser positivo");
             this.memoryBufferSize = s;
             return this;
         }
 
         /**
          * Enables or disables the internal out-of-order delivery detector.
-         * When enabled, the queue will keep a lightweight monotonicity check of delivered record indices and
-         * increment the {@link NQueueMetrics#OUT_OF_ORDER} counter if a regression/duplicate is observed.
+         * When enabled, the queue will keep a lightweight monotonicity check of
+         * delivered record indices and
+         * increment the {@link NQueueMetrics#OUT_OF_ORDER} counter if a
+         * regression/duplicate is observed.
          * Default is disabled to avoid any overhead in the hot path.
          *
          * @param e true to enable detection, false to disable (default)
@@ -1668,7 +1978,8 @@ public class NQueue<T extends Serializable> implements Closeable {
         }
 
         /**
-         * Sets the maximum time the queue will wait when attempting to acquire coordination for draining or
+         * Sets the maximum time the queue will wait when attempting to acquire
+         * coordination for draining or
          * maintenance before retrying. Useful to tune responsiveness under contention.
          *
          * @param t maximum wait duration when trying to acquire the lock
@@ -1676,13 +1987,15 @@ public class NQueue<T extends Serializable> implements Closeable {
          */
         public Options withLockTryTimeout(Duration t) {
             Objects.requireNonNull(t);
-            if (t.isNegative()) throw new IllegalArgumentException("negative");
+            if (t.isNegative())
+                throw new IllegalArgumentException("negative");
             this.lockTryTimeoutNanos = t.toNanos();
             return this;
         }
 
         /**
-         * Sets the interval at which temporary staging mode should revalidate whether to continue or revert
+         * Sets the interval at which temporary staging mode should revalidate whether
+         * to continue or revert
          * to direct durable appends.
          *
          * @param i time between revalidation checks
@@ -1690,7 +2003,8 @@ public class NQueue<T extends Serializable> implements Closeable {
          */
         public Options withRevalidationInterval(Duration i) {
             Objects.requireNonNull(i);
-            if (i.isNegative()) throw new IllegalArgumentException("negative");
+            if (i.isNegative())
+                throw new IllegalArgumentException("negative");
             this.revalidationIntervalNanos = i.toNanos();
             return this;
         }
@@ -1705,17 +2019,21 @@ public class NQueue<T extends Serializable> implements Closeable {
          */
         public Options withMaintenanceInterval(Duration i) {
             Objects.requireNonNull(i);
-            if (i.isNegative() || i.isZero()) throw new IllegalArgumentException("positive");
+            if (i.isNegative() || i.isZero())
+                throw new IllegalArgumentException("positive");
             this.maintenanceIntervalNanos = i.toNanos();
             return this;
         }
 
         /**
-         * Sets the maximum interval allowed without a precise size update. If this interval elapses
-         * without the maintenance task successfully acquiring a lock opportunistically, the next
+         * Sets the maximum interval allowed without a precise size update. If this
+         * interval elapses
+         * without the maintenance task successfully acquiring a lock opportunistically,
+         * the next
          * run will force a lock to ensure the size is reconciled.
          * <p>
-         * If set to ZERO, forced locking is disabled, and size reconciliation will only happen
+         * If set to ZERO, forced locking is disabled, and size reconciliation will only
+         * happen
          * when the lock is free (opportunistic only).
          * Default is 1 minute.
          *
@@ -1724,13 +2042,15 @@ public class NQueue<T extends Serializable> implements Closeable {
          */
         public Options withMaxSizeReconciliationInterval(Duration d) {
             Objects.requireNonNull(d);
-            if (d.isNegative()) throw new IllegalArgumentException("negative");
+            if (d.isNegative())
+                throw new IllegalArgumentException("negative");
             this.maxSizeReconciliationIntervalNanos = d.toNanos();
             return this;
         }
 
         /**
-         * When enabled, disregards any previously persisted metadata at startup and reconstructs state solely
+         * When enabled, disregards any previously persisted metadata at startup and
+         * reconstructs state solely
          * from the durable log.
          *
          * @param r true to force a rebuild on restart
@@ -1742,7 +2062,8 @@ public class NQueue<T extends Serializable> implements Closeable {
         }
 
         /**
-         * Produces an immutable snapshot of the current options for distribution to internal components.
+         * Produces an immutable snapshot of the current options for distribution to
+         * internal components.
          *
          * @return immutable view of the configured values
          */
@@ -1751,11 +2072,13 @@ public class NQueue<T extends Serializable> implements Closeable {
         }
 
         /**
-         * Immutable view of option values used by internal components to avoid accidental mutation.
+         * Immutable view of option values used by internal components to avoid
+         * accidental mutation.
          */
         public static class Snapshot {
             final double compactionWasteThreshold;
-            final long compactionIntervalNanos, lockTryTimeoutNanos, revalidationIntervalNanos, maintenanceIntervalNanos, maxSizeReconciliationIntervalNanos;
+            final long compactionIntervalNanos, lockTryTimeoutNanos, revalidationIntervalNanos,
+                    maintenanceIntervalNanos, maxSizeReconciliationIntervalNanos;
             final int compactionBufferSize, memoryBufferSize;
             final boolean enableMemoryBuffer, allowShortCircuit;
             final boolean enableOrderDetection;

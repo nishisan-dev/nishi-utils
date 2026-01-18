@@ -45,24 +45,39 @@ import java.util.logging.Logger;
  */
 public final class DistributedQueue<T extends Serializable> implements TransportListener, Closeable {
     private static final Logger LOGGER = Logger.getLogger(DistributedQueue.class.getName());
-    private static final String QUEUE_OFFER = "queue.offer";
-    private static final String QUEUE_POLL = "queue.poll";
-    private static final String QUEUE_PEEK = "queue.peek";
+    private static final String COMMAND_PREFIX_OFFER = "queue.offer:";
+    private static final String COMMAND_PREFIX_POLL = "queue.poll:";
+    private static final String COMMAND_PREFIX_PEEK = "queue.peek:";
 
     private final Transport transport;
     private final ClusterCoordinator coordinator;
     private final QueueClusterService<T> queueService;
+    private final String queueName;
+    private final String queueOfferCommand;
+    private final String queuePollCommand;
+    private final String queuePeekCommand;
     private final StatsUtils stats;
     private final NodeId localNodeId;
 
-    public DistributedQueue(Transport transport, ClusterCoordinator coordinator, QueueClusterService<T> queueService) {
-        this(transport, coordinator, queueService, null);
+    public DistributedQueue(Transport transport,
+            ClusterCoordinator coordinator,
+            QueueClusterService<T> queueService,
+            String queueName) {
+        this(transport, coordinator, queueService, queueName, null);
     }
 
-    public DistributedQueue(Transport transport, ClusterCoordinator coordinator, QueueClusterService<T> queueService, StatsUtils stats) {
+    public DistributedQueue(Transport transport,
+            ClusterCoordinator coordinator,
+            QueueClusterService<T> queueService,
+            String queueName,
+            StatsUtils stats) {
         this.transport = transport;
         this.coordinator = coordinator;
         this.queueService = queueService;
+        this.queueName = queueName;
+        this.queueOfferCommand = COMMAND_PREFIX_OFFER + queueName;
+        this.queuePollCommand = COMMAND_PREFIX_POLL + queueName;
+        this.queuePeekCommand = COMMAND_PREFIX_PEEK + queueName;
         this.stats = stats;
         this.localNodeId = transport.local().nodeId();
         transport.addListener(this);
@@ -74,7 +89,7 @@ public final class DistributedQueue<T extends Serializable> implements Transport
             recordQueueOffer();
             queueService.offer(value);
         } else {
-            invokeLeader(QUEUE_OFFER, value);
+            invokeLeader(queueOfferCommand, value);
         }
     }
 
@@ -88,7 +103,7 @@ public final class DistributedQueue<T extends Serializable> implements Transport
             }
             return value;
         }
-        SerializableOptional<T> result = (SerializableOptional<T>) invokeLeader(QUEUE_POLL, null);
+        SerializableOptional<T> result = (SerializableOptional<T>) invokeLeader(queuePollCommand, null);
         return result.toOptional();
     }
 
@@ -97,7 +112,7 @@ public final class DistributedQueue<T extends Serializable> implements Transport
         if (coordinator.isLeader()) {
             return queueService.peek();
         }
-        SerializableOptional<T> result = (SerializableOptional<T>) invokeLeader(QUEUE_PEEK, null);
+        SerializableOptional<T> result = (SerializableOptional<T>) invokeLeader(queuePeekCommand, null);
         return result.toOptional();
     }
 
@@ -150,26 +165,26 @@ public final class DistributedQueue<T extends Serializable> implements Transport
 
     @SuppressWarnings("unchecked")
     private Serializable executeLocal(String command, Serializable body, NodeId requestingNode) {
-        return switch (command) {
-            case QUEUE_OFFER -> {
-                recordQueueOffer();
-                queueService.offer((T) body);
-                yield Boolean.TRUE;
+        if (queueOfferCommand.equals(command)) {
+            recordQueueOffer();
+            queueService.offer((T) body);
+            return Boolean.TRUE;
+        }
+        if (queuePollCommand.equals(command)) {
+            Optional<T> value = queueService.poll(requestingNode);
+            if (value.isPresent()) {
+                recordQueuePoll();
             }
-            case QUEUE_POLL -> {
-                Optional<T> value = queueService.poll(requestingNode);
-                if (value.isPresent()) {
-                    recordQueuePoll();
-                }
-                yield (Serializable) value
-                        .map(SerializableOptional::of)
-                        .orElseGet(SerializableOptional::empty);
-            }
-            case QUEUE_PEEK -> (Serializable) queueService.peek()
+            return (Serializable) value
                     .map(SerializableOptional::of)
                     .orElseGet(SerializableOptional::empty);
-            default -> throw new IllegalArgumentException("Unknown command: " + command);
-        };
+        }
+        if (queuePeekCommand.equals(command)) {
+            return (Serializable) queueService.peek()
+                    .map(SerializableOptional::of)
+                    .orElseGet(SerializableOptional::empty);
+        }
+        throw new IllegalArgumentException("Unknown command: " + command);
     }
 
     @Override
@@ -188,11 +203,11 @@ public final class DistributedQueue<T extends Serializable> implements Transport
             return;
         }
         ClientRequestPayload payload = message.payload(ClientRequestPayload.class);
-        if (!Set.of(QUEUE_OFFER, QUEUE_POLL, QUEUE_PEEK).contains(payload.command())) {
+        if (!Set.of(queueOfferCommand, queuePollCommand, queuePeekCommand).contains(payload.command())) {
             return;
         }
-        LOGGER.info(() -> "Received client request " + payload.command() + " from " + message.source()
-                + " (leader=" + coordinator.isLeader() + ")");
+        LOGGER.info(() -> "Received client request " + payload.command() + " for queue " + queueName + " from "
+                + message.source() + " (leader=" + coordinator.isLeader() + ")");
         ClientResponsePayload responsePayload;
         if (!coordinator.isLeader()) {
             LOGGER.info(() -> "Rejecting client request (not leader) for " + payload.command() + " from " + message.source());
