@@ -9,6 +9,7 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -20,10 +21,13 @@ class ProxyRoutingIntegrationTest {
 
     @Test
     void shouldRouteViaProxyWhenDirectLinkFails() throws Exception {
-        // Setup 3 Nodes: A -> 9010, B -> 9011, C -> 9012
-        NodeInfo infoA = new NodeInfo(NodeId.of("node-a"), "localhost", 9010);
-        NodeInfo infoB = new NodeInfo(NodeId.of("node-b"), "localhost", 9011);
-        NodeInfo infoC = new NodeInfo(NodeId.of("node-c"), "localhost", 9012);
+        int portA = allocateFreeLocalPort();
+        int portB = allocateFreeLocalPort(Set.of(portA));
+        int portC = allocateFreeLocalPort(Set.of(portA, portB));
+
+        NodeInfo infoA = new NodeInfo(NodeId.of("node-a"), "localhost", portA);
+        NodeInfo infoB = new NodeInfo(NodeId.of("node-b"), "localhost", portB);
+        NodeInfo infoC = new NodeInfo(NodeId.of("node-c"), "localhost", portC);
 
         // A knows B, C knows B. B acts as the hub initially.
         TcpTransportConfig confA = TcpTransportConfig.builder(infoA).addPeer(infoB).build();
@@ -41,6 +45,10 @@ class ProxyRoutingIntegrationTest {
             // Wait for full mesh (A should discover C via B)
             waitForDiscovery(transA, infoC.nodeId());
             waitForDiscovery(transC, infoA.nodeId());
+            waitForConnected(transA, infoB.nodeId());
+            waitForConnected(transB, infoA.nodeId());
+            waitForConnected(transB, infoC.nodeId());
+            waitForConnected(transC, infoB.nodeId());
 
             System.out.println("Mesh converged.");
 
@@ -75,6 +83,7 @@ class ProxyRoutingIntegrationTest {
             });
 
             ClusterMessage msg = ClusterMessage.request(MessageType.PING, "proxy-test", infoA.nodeId(), infoC.nodeId(), HeartbeatPayload.now());
+            waitForProxyRoute(transA, infoC.nodeId(), infoB.nodeId());
             transA.send(msg);
 
             // Assert delivery
@@ -92,5 +101,48 @@ class ProxyRoutingIntegrationTest {
             Thread.sleep(100);
         }
         throw new RuntimeException("Peer " + target + " not discovered by " + transport.local().nodeId());
+    }
+
+    private void waitForConnected(TcpTransport transport, NodeId target) throws InterruptedException {
+        long start = System.currentTimeMillis();
+        while (System.currentTimeMillis() - start < 5000) {
+            if (transport.isConnected(target)) {
+                return;
+            }
+            Thread.sleep(50);
+        }
+        throw new RuntimeException("Peer " + target + " not connected by " + transport.local().nodeId());
+    }
+
+    private void waitForProxyRoute(TcpTransport transport, NodeId target, NodeId expectedProxy)
+            throws InterruptedException {
+        long start = System.currentTimeMillis();
+        while (System.currentTimeMillis() - start < 5000) {
+            Optional<NodeId> hop = transport.getRouter().nextHop(target);
+            if (hop.isPresent() && hop.get().equals(expectedProxy)) {
+                return;
+            }
+            Thread.sleep(50);
+        }
+        throw new RuntimeException("Proxy route not established from " + transport.local().nodeId()
+                + " to " + target + " via " + expectedProxy);
+    }
+
+    private static int allocateFreeLocalPort() throws java.io.IOException {
+        return allocateFreeLocalPort(Set.of());
+    }
+
+    private static int allocateFreeLocalPort(Set<Integer> avoid) throws java.io.IOException {
+        for (int attempt = 0; attempt < 50; attempt++) {
+            try (java.net.ServerSocket socket = new java.net.ServerSocket()) {
+                socket.setReuseAddress(true);
+                socket.bind(new java.net.InetSocketAddress("127.0.0.1", 0));
+                int port = socket.getLocalPort();
+                if (port > 0 && !avoid.contains(port)) {
+                    return port;
+                }
+            }
+        }
+        throw new java.io.IOException("Unable to allocate a free local port");
     }
 }

@@ -220,6 +220,7 @@ Resultado: o request do producer para o seed **fica sem resposta** e expira (tim
 2. **Eager init** das filas configuradas no `NGridNode` para garantir listener + handler no líder.
 3. **Aplicar retenção TIME_BASED** das `QueueConfig` nas `NQueue.Options` para habilitar `poll` por offset.
 4. **Evitar double-apply no líder** com CAS (`localApplyStarted`) para não duplicar registros.
+5. **Compatibilidade legacy**: quando `queueDirectory` é usado (API antiga), manter `DELETE_ON_CONSUME` para preservar semântica destrutiva do `poll`.
 
 ---
 
@@ -295,4 +296,4 @@ Separar replicação em 2 fases:
 
 ---
 
-**Última Atualização**: 2026-01-18T00:38:58-03:00
+**Última Atualização**: 2026-01-18T00:48:32-03:00

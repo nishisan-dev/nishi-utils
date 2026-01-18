@@ -352,7 +352,10 @@ public final class NGridNode implements Closeable {
             queue = null;
             for (QueueConfig queueConfig : config.queues()) {
                 DistributedQueueConfig effectiveConfig = toDistributedQueueConfig(queueConfig);
-                getQueue(queueConfig.name(), effectiveConfig, Serializable.class);
+                DistributedQueue<Serializable> created = getQueue(queueConfig.name(), effectiveConfig, Serializable.class);
+                if (queue == null && config.queues().size() == 1) {
+                    queue = created;
+                }
             }
         }
 
@@ -363,6 +366,9 @@ public final class NGridNode implements Closeable {
     @Deprecated
     @SuppressWarnings("unchecked")
     public <T extends Serializable> DistributedQueue<T> queue(Class<T> type) {
+        if (queue == null) {
+            throw new IllegalStateException("Multiple queues configured; use getQueue(name, type) instead");
+        }
         return (DistributedQueue<T>) queue;
     }
 
@@ -683,10 +689,12 @@ public final class NGridNode implements Closeable {
             options = config.queueOptions() != null ? config.queueOptions() : NQueue.Options.defaults();
         }
         options = options.copy();
-        QueueConfig.RetentionPolicy retention = queueConfig.retention();
-        if (retention != null && retention.type() == QueueConfig.RetentionPolicy.Type.TIME_BASED) {
-            options.withRetentionPolicy(NQueue.Options.RetentionPolicy.TIME_BASED)
-                    .withRetentionTime(retention.duration());
+        if (config.queueDirectory() == null) {
+            QueueConfig.RetentionPolicy retention = queueConfig.retention();
+            if (retention != null && retention.type() == QueueConfig.RetentionPolicy.Type.TIME_BASED) {
+                options.withRetentionPolicy(NQueue.Options.RetentionPolicy.TIME_BASED)
+                        .withRetentionTime(retention.duration());
+            }
         }
         return DistributedQueueConfig.builder(queueConfig.name())
                 .replicationFactor(config.replicationFactor())

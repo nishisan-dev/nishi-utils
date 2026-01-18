@@ -31,13 +31,17 @@ class MapClusterServiceConcurrencyTest {
         InMemoryTransport transport = new InMemoryTransport(local);
         ExecutorService scheduler = Executors.newSingleThreadExecutor();
         try {
+            java.nio.file.Path replicationDir = java.nio.file.Files.createTempDirectory("replication-concurrency");
             ClusterCoordinator coordinator = new ClusterCoordinator(transport, ClusterCoordinatorConfig.defaults(),
                     java.util.concurrent.Executors.newSingleThreadScheduledExecutor());
             coordinator.start();
 
             // Single-node "cluster": local is always leader and quorum=1, so replicate completes immediately.
             ReplicationManager replicationManager = new ReplicationManager(transport, coordinator,
-                    ReplicationConfig.of(1, java.time.Duration.ofSeconds(2)));
+                    ReplicationConfig.builder(1)
+                            .operationTimeout(java.time.Duration.ofSeconds(2))
+                            .dataDirectory(replicationDir)
+                            .build());
             replicationManager.start();
 
             MapClusterService<String, String> map = new MapClusterService<>(replicationManager, "map:test", null);
@@ -159,4 +163,3 @@ class MapClusterServiceConcurrencyTest {
         }
     }
 }
-
