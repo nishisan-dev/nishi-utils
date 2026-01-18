@@ -23,8 +23,10 @@ import dev.nishisan.utils.queue.NQueue;
 
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 
@@ -45,9 +47,18 @@ public final class NGridConfig {
     private final Duration leaderReelectionCooldown;
     private final Duration leaderReelectionSuggestionTtl;
     private final double leaderReelectionMinDelta;
+
+    // New fields for multiple queues
+    private final Path dataDirectory;
+    private final List<QueueConfig> queues;
+
+    // Legacy fields (deprecated but maintained for compatibility)
+    @Deprecated
     private final Path queueDirectory;
+    @Deprecated
     private final String queueName;
     private final NQueue.Options queueOptions;
+
     private final Path mapDirectory;
     private final String mapName;
     private final MapPersistenceMode mapPersistenceMode;
@@ -61,7 +72,8 @@ public final class NGridConfig {
         this.clusterName = builder.clusterName;
         this.local = builder.local;
         this.peers = Collections.unmodifiableSet(new HashSet<>(builder.peers));
-        int effectiveReplication = builder.replicationFactor != null ? builder.replicationFactor : builder.replicationQuorum;
+        int effectiveReplication = builder.replicationFactor != null ? builder.replicationFactor
+                : builder.replicationQuorum;
         this.replicationQuorum = effectiveReplication;
         this.replicationFactor = effectiveReplication;
         this.replicationOperationTimeout = builder.replicationOperationTimeout;
@@ -72,10 +84,18 @@ public final class NGridConfig {
         this.leaderReelectionCooldown = builder.leaderReelectionCooldown;
         this.leaderReelectionSuggestionTtl = builder.leaderReelectionSuggestionTtl;
         this.leaderReelectionMinDelta = builder.leaderReelectionMinDelta;
+
+        // New fields
+        this.dataDirectory = builder.dataDirectory != null ? builder.dataDirectory : builder.queueDirectory;
+        this.queues = Collections.unmodifiableList(new ArrayList<>(builder.queues));
+
+        // Legacy fields (deprecated)
         this.queueDirectory = builder.queueDirectory;
         this.queueName = builder.queueName;
         this.queueOptions = builder.queueOptions;
-        this.mapDirectory = builder.mapDirectory != null ? builder.mapDirectory : builder.queueDirectory.resolve("maps");
+
+        this.mapDirectory = builder.mapDirectory != null ? builder.mapDirectory
+                : (dataDirectory != null ? dataDirectory.resolve("maps") : builder.queueDirectory.resolve("maps"));
         this.mapName = builder.mapName;
         this.mapPersistenceMode = builder.mapPersistenceMode;
         this.strictConsistency = builder.strictConsistency;
@@ -106,7 +126,8 @@ public final class NGridConfig {
     }
 
     /**
-     * Optional replication operation timeout. When null, the replication layer default is used.
+     * Optional replication operation timeout. When null, the replication layer
+     * default is used.
      */
     public Duration replicationOperationTimeout() {
         return replicationOperationTimeout;
@@ -135,7 +156,7 @@ public final class NGridConfig {
     public Duration requestTimeout() {
         return requestTimeout;
     }
-    
+
     public int transportWorkerThreads() {
         return transportWorkerThreads;
     }
@@ -160,10 +181,36 @@ public final class NGridConfig {
         return leaderReelectionMinDelta;
     }
 
+    /**
+     * @return the data directory for all distributed structures
+     * @since 2.1.0
+     */
+    public Path dataDirectory() {
+        return dataDirectory;
+    }
+
+    /**
+     * @return the list of configured queues
+     * @since 2.1.0
+     */
+    public List<QueueConfig> queues() {
+        return queues;
+    }
+
+    /**
+     * @return the legacy queue directory (deprecated)
+     * @deprecated Use {@link #dataDirectory()} instead
+     */
+    @Deprecated
     public Path queueDirectory() {
         return queueDirectory;
     }
 
+    /**
+     * @return the legacy queue name (deprecated)
+     * @deprecated Use {@link #queues()} instead
+     */
+    @Deprecated
     public String queueName() {
         return queueName;
     }
@@ -202,9 +249,18 @@ public final class NGridConfig {
         private Duration leaderReelectionCooldown = Duration.ofSeconds(60);
         private Duration leaderReelectionSuggestionTtl = Duration.ofSeconds(30);
         private double leaderReelectionMinDelta = 20.0;
+
+        // New fields
+        private Path dataDirectory;
+        private final List<QueueConfig> queues = new ArrayList<>();
+
+        // Legacy fields (deprecated)
+        @Deprecated
         private Path queueDirectory;
+        @Deprecated
         private String queueName = "ngrid";
         private NQueue.Options queueOptions;
+
         private Path mapDirectory;
         private String mapName = "default-map";
         private MapPersistenceMode mapPersistenceMode = MapPersistenceMode.DISABLED;
@@ -248,6 +304,27 @@ public final class NGridConfig {
 
         public Builder strictConsistency(boolean strict) {
             this.strictConsistency = strict;
+            return this;
+        }
+
+        /**
+         * Sets the data directory for all distributed structures.
+         * This is the recommended way to configure storage location.
+         * 
+         * @since 2.1.0
+         */
+        public Builder dataDirectory(Path directory) {
+            this.dataDirectory = Objects.requireNonNull(directory, "dataDirectory");
+            return this;
+        }
+
+        /**
+         * Adds a queue configuration. Multiple queues can be added.
+         * 
+         * @since 2.1.0
+         */
+        public Builder addQueue(QueueConfig config) {
+            this.queues.add(Objects.requireNonNull(config, "queue config"));
             return this;
         }
 
@@ -337,19 +414,33 @@ public final class NGridConfig {
             return this;
         }
 
+        /**
+         * Sets the queu directory (legacy API).
+         * 
+         * @deprecated Use {@link #dataDirectory(Path)} instead
+         */
+        @Deprecated
         public Builder queueDirectory(Path directory) {
             this.queueDirectory = Objects.requireNonNull(directory, "directory");
             return this;
         }
 
+        /**
+         * Sets the queue name (legacy API).
+         * 
+         * @deprecated Use {@link #addQueue(QueueConfig)} instead
+         */
+        @Deprecated
         public Builder queueName(String name) {
             this.queueName = Objects.requireNonNull(name, "name");
             return this;
         }
 
         /**
-         * Options applied to the underlying {@link NQueue} instance. The grid layer will
-         * always disable short-circuiting to preserve ordering and disk-first semantics.
+         * Options applied to the underlying {@link NQueue} instance. The grid layer
+         * will
+         * always disable short-circuiting to preserve ordering and disk-first
+         * semantics.
          */
         public Builder queueOptions(NQueue.Options options) {
             this.queueOptions = Objects.requireNonNull(options, "options");
@@ -372,9 +463,25 @@ public final class NGridConfig {
         }
 
         public NGridConfig build() {
-            if (queueDirectory == null) {
-                throw new IllegalStateException("Queue directory must be specified");
+            // Backward compatibility: convert legacy config to new format
+            if (queueDirectory != null && dataDirectory == null) {
+                dataDirectory = queueDirectory;
             }
+
+            if (queues.isEmpty() && queueDirectory != null) {
+                // Legacy mode: create a single queue from queueName
+                QueueConfig.Builder queueBuilder = QueueConfig.builder(queueName);
+                if (queueOptions != null) {
+                    queueBuilder.nqueueOptions(queueOptions);
+                }
+                queues.add(queueBuilder.build());
+            }
+
+            if (dataDirectory == null) {
+                throw new IllegalStateException(
+                        "Data directory must be specified (use dataDirectory() or legacy queueDirectory())");
+            }
+
             return new NGridConfig(this);
         }
     }

@@ -18,6 +18,8 @@ Coleção de utilitários em Java, com foco em:
 ### NGrid (fila/mapa distribuídos)
 
 - Cluster via **TCP** com descoberta de peers e heartbeats
+- **Configuração via YAML**: suporte a variáveis de ambiente (`${VAR}`) para fácil deployment em containers.
+- **Múltiplas Filas (Novo em 2.1.0)**: suporte a múltiplas filas distribuídas independentes com API type-safe
 - **Roteamento Inteligente (Sticky Proxy)** com otimização por RTT para alcançar nós inacessíveis diretamente
 - **Eleição determinística de líder** (por ID) e reeleição opcional guiada por taxa de escrita
 - **Replicação com quorum** configurável (modos: disponibilidade ou consistência estrita)
@@ -213,6 +215,76 @@ public class NGridClusterExample {
   }
 }
 ```
+
+### Múltiplas Filas (Novo em 2.1.0)
+
+A partir da versão 2.1.0, você pode configurar múltiplas filas independentes no mesmo cluster:
+
+#### Configuração via YAML
+
+```yaml
+node:
+  id: worker-1
+  host: 127.0.0.1
+  port: 7001
+  dirs:
+    base: /var/ngrid/data
+
+cluster:
+  name: my-cluster
+  replication:
+    factor: 2
+    strict: false
+  seeds:
+    - 127.0.0.1:7001
+
+# Múltiplas filas
+queues:
+  - name: orders
+    retention:
+      policy: TIME_BASED
+      duration: 24h
+  
+  - name: events
+    retention:
+      policy: TIME_BASED
+      duration: 1h
+  
+  - name: logs
+    retention:
+      policy: TIME_BASED
+      duration: 7d
+```
+
+#### API Type-Safe
+
+```java
+import dev.nishisan.utils.ngrid.structures.TypedQueue;
+
+// Definir tipos de fila (recomendado usar constantes)
+public final class AppQueues {
+    public static final TypedQueue<Order> ORDERS = 
+        TypedQueue.of("orders", Order.class);
+    
+    public static final TypedQueue<Event> EVENTS = 
+        TypedQueue.of("events", Event.class);
+}
+
+// Usar com type-safety
+NGridNode node = new NGridNode(Path.of("config.yaml"));
+node.start();
+
+DistributedQueue<Order> orders = node.getQueue(AppQueues.ORDERS);
+DistributedQueue<Event> events = node.getQueue(AppQueues.EVENTS);
+
+orders.offer(new Order("order-123", 99.99));
+events.offer(new Event("user.login", System.currentTimeMillis()));
+
+Optional<Order> order = orders.poll();
+Optional<Event> event = events.poll();
+```
+
+Para mais detalhes, consulte a [documentação completa de configuração YAML](doc/ngrid/ngrid_yaml_config_guide.md).
 
 ### Observações/limitações atuais
 

@@ -21,6 +21,9 @@ public class NGridYamlConfig {
     @JsonProperty("queue")
     private QueuePolicyConfig queue;
 
+    @JsonProperty("queues")
+    private List<QueuePolicyConfig> queues = Collections.emptyList();
+
     @JsonProperty("maps")
     private List<MapPolicyConfig> maps = Collections.emptyList();
 
@@ -54,6 +57,14 @@ public class NGridYamlConfig {
 
     public void setQueue(QueuePolicyConfig queue) {
         this.queue = queue;
+    }
+
+    public List<QueuePolicyConfig> getQueues() {
+        return queues;
+    }
+
+    public void setQueues(List<QueuePolicyConfig> queues) {
+        this.queues = queues;
     }
 
     public List<MapPolicyConfig> getMaps() {
