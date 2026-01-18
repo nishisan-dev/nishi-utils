@@ -86,6 +86,16 @@ class QueueNodeFailoverIntegrationTest {
         node3.start();
 
         awaitClusterStability();
+
+        // Pre-create queues on ALL nodes to ensure handlers are registered
+        // before any replication attempts. This is necessary because dynamic
+        // queue creation via getQueue() only registers the handler locally.
+        node1.getQueue("failover-queue", String.class);
+        node2.getQueue("failover-queue", String.class);
+        node3.getQueue("failover-queue", String.class);
+        node1.getQueue("stress-queue", String.class);
+        node2.getQueue("stress-queue", String.class);
+        node3.getQueue("stress-queue", String.class);
     }
 
     @AfterEach

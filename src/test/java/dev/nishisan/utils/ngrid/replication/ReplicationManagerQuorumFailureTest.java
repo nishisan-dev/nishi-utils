@@ -33,10 +33,12 @@ class ReplicationManagerQuorumFailureTest {
         ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
         try {
             java.nio.file.Path replicationDir = java.nio.file.Files.createTempDirectory("replication-quorum-failure");
-            ClusterCoordinator coordinator = new ClusterCoordinator(transport, ClusterCoordinatorConfig.defaults(), scheduler);
+            ClusterCoordinator coordinator = new ClusterCoordinator(transport, ClusterCoordinatorConfig.defaults(),
+                    scheduler);
             coordinator.start();
 
-            // Simulate peer connection so coordinator sees 2 active members and local becomes leader.
+            // Simulate peer connection so coordinator sees 2 active members and local
+            // becomes leader.
             transport.simulatePeerConnected(peer);
             assertTrue(coordinator.isLeader(), "Local node should be leader for this test");
 
@@ -44,6 +46,7 @@ class ReplicationManagerQuorumFailureTest {
                     ReplicationConfig.builder(2)
                             .operationTimeout(java.time.Duration.ofMillis(500))
                             .dataDirectory(replicationDir)
+                            .strictConsistency(true) // Require strict quorum - no dynamic adjustment
                             .build());
             manager.registerHandler("topic", (operationId, payload) -> {
                 // Local apply ok.

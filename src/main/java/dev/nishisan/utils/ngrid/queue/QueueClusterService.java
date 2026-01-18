@@ -250,31 +250,44 @@ public final class QueueClusterService<T extends Serializable> implements Closea
     }
 
     private void waitForReplication(CompletableFuture<ReplicationResult> future) {
-        try {
-            long timeoutMs = Math.max(1L, replicationManager.operationTimeout().toMillis());
-            future.get(timeoutMs, TimeUnit.MILLISECONDS);
-        } catch (CompletionException e) {
-            Throwable cause = e.getCause();
-            if (cause instanceof TimeoutException) {
-                throw new IllegalStateException("Replication operation timed out", cause);
-            } else if (cause instanceof QuorumUnreachableException) {
-                throw new IllegalStateException("Quorum unreachable for replication operation", cause);
-            } else {
-                throw new IllegalStateException("Replication operation failed", cause != null ? cause : e);
-            }
-        } catch (TimeoutException e) {
-            throw new IllegalStateException("Replication operation timed out", e);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException("Replication operation interrupted", e);
-        } catch (ExecutionException e) {
-            Throwable cause = e.getCause();
-            if (cause instanceof TimeoutException) {
-                throw new IllegalStateException("Replication operation timed out", cause);
-            } else if (cause instanceof QuorumUnreachableException) {
-                throw new IllegalStateException("Quorum unreachable for replication operation", cause);
-            } else {
-                throw new IllegalStateException("Replication operation failed", cause != null ? cause : e);
+        long totalTimeoutMs = Math.max(1L, replicationManager.operationTimeout().toMillis());
+        long windowMs = Math.min(1000L, totalTimeoutMs / 3); // Poll every 1s or 1/3 of timeout
+        long elapsed = 0L;
+
+        while (elapsed < totalTimeoutMs) {
+            try {
+                long remaining = Math.min(windowMs, totalTimeoutMs - elapsed);
+                future.get(remaining, TimeUnit.MILLISECONDS);
+                return; // Success
+            } catch (TimeoutException e) {
+                elapsed += windowMs;
+                if (elapsed >= totalTimeoutMs) {
+                    throw new IllegalStateException("Replication operation timed out", e);
+                }
+                // Give quorum adjustment time to take effect
+                final long elapsedCopy = elapsed;
+                LOGGER.fine(() -> "Waiting for replication... " + elapsedCopy + "ms elapsed");
+            } catch (CompletionException e) {
+                Throwable cause = e.getCause();
+                if (cause instanceof TimeoutException) {
+                    throw new IllegalStateException("Replication operation timed out", cause);
+                } else if (cause instanceof QuorumUnreachableException) {
+                    throw new IllegalStateException("Quorum unreachable for replication operation", cause);
+                } else {
+                    throw new IllegalStateException("Replication operation failed", cause != null ? cause : e);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Replication operation interrupted", e);
+            } catch (ExecutionException e) {
+                Throwable cause = e.getCause();
+                if (cause instanceof TimeoutException) {
+                    throw new IllegalStateException("Replication operation timed out", cause);
+                } else if (cause instanceof QuorumUnreachableException) {
+                    throw new IllegalStateException("Quorum unreachable for replication operation", cause);
+                } else {
+                    throw new IllegalStateException("Replication operation failed", cause != null ? cause : e);
+                }
             }
         }
     }

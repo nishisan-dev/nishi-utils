@@ -351,6 +351,14 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             if (operation.isDone()) {
                 continue;
             }
+            // Dynamically adjust quorum based on reachable members
+            if (!config.strictConsistency()) {
+                int newQuorum = computeQuorumForReachable(operation.originalQuorum);
+                operation.updateQuorum(newQuorum);
+                LOGGER.info(() -> String.format(
+                        "Peer %s disconnected, adjusted quorum from %d to %d for operation %s",
+                        peerId, operation.originalQuorum, newQuorum, operation.operationId));
+            }
             checkCompletion(operation);
         }
     }
@@ -716,6 +724,22 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         return reachable;
     }
 
+    /**
+     * Computes the effective quorum based on currently reachable members.
+     * In non-strict consistency mode, this allows operations to complete
+     * with a reduced quorum when peers disconnect (e.g., during failover).
+     *
+     * @param originalQuorum the originally requested quorum
+     * @return the adjusted quorum, at least 1 and at most originalQuorum
+     */
+    private int computeQuorumForReachable(int originalQuorum) {
+        if (config.strictConsistency()) {
+            return originalQuorum;
+        }
+        int reachable = reachableMembersCount();
+        return Math.max(1, Math.min(originalQuorum, reachable));
+    }
+
     private void checkTimeouts() {
         try {
             if (!running) {
@@ -780,7 +804,8 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         private final UUID operationId;
         private final String topic;
         private final Serializable payload;
-        private final int quorum;
+        private final int originalQuorum;
+        private volatile int quorum;
         private volatile long sequence;
         private final Set<NodeId> acknowledgements = ConcurrentHashMap.newKeySet();
         private final CompletableFuture<ReplicationResult> future = new CompletableFuture<>();
@@ -795,7 +820,16 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             this.operationId = operationId;
             this.topic = topic;
             this.payload = payload;
+            this.originalQuorum = quorum;
             this.quorum = quorum;
+        }
+
+        /**
+         * Updates the quorum to a new value, typically when peers disconnect.
+         * The new quorum cannot exceed the original quorum and must be at least 1.
+         */
+        void updateQuorum(int newQuorum) {
+            this.quorum = Math.max(1, Math.min(newQuorum, originalQuorum));
         }
 
         void ack(NodeId nodeId) {
