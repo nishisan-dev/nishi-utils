@@ -66,7 +66,8 @@ public class NGridConfigLoader {
         if (defaultValue != null) {
             return defaultValue;
         }
-        throw new IllegalArgumentException("Environment variable or property '" + varName + "' not found and no default value provided.");
+        throw new IllegalArgumentException(
+                "Environment variable or property '" + varName + "' not found and no default value provided.");
     }
 
     public static void save(Path yamlFile, NGridYamlConfig config) throws IOException {
@@ -78,24 +79,24 @@ public class NGridConfigLoader {
     }
 
     public static dev.nishisan.utils.ngrid.structures.NGridConfig convertToDomain(NGridYamlConfig yamlConfig,
-                                                                                  dev.nishisan.utils.ngrid.common.NodeInfo seedInfo) {
+            dev.nishisan.utils.ngrid.common.NodeInfo seedInfo) {
         NodeIdentityConfig nodeConfig = yamlConfig.getNode();
         if (nodeConfig == null) {
             throw new IllegalArgumentException("Node configuration is missing");
         }
 
-        dev.nishisan.utils.ngrid.common.NodeId nodeId = nodeConfig.getId() != null ?
-                dev.nishisan.utils.ngrid.common.NodeId.of(nodeConfig.getId()) :
-                dev.nishisan.utils.ngrid.common.NodeId.randomId();
+        dev.nishisan.utils.ngrid.common.NodeId nodeId = nodeConfig.getId() != null
+                ? dev.nishisan.utils.ngrid.common.NodeId.of(nodeConfig.getId())
+                : dev.nishisan.utils.ngrid.common.NodeId.randomId();
 
         dev.nishisan.utils.ngrid.common.NodeInfo localNode = new dev.nishisan.utils.ngrid.common.NodeInfo(
                 nodeId,
                 nodeConfig.getHost(),
                 nodeConfig.getPort(),
-                nodeConfig.getRoles()
-        );
+                nodeConfig.getRoles());
 
-        dev.nishisan.utils.ngrid.structures.NGridConfig.Builder builder = dev.nishisan.utils.ngrid.structures.NGridConfig.builder(localNode);
+        dev.nishisan.utils.ngrid.structures.NGridConfig.Builder builder = dev.nishisan.utils.ngrid.structures.NGridConfig
+                .builder(localNode);
 
         // Base Directory
         Path baseDir = null;
@@ -124,18 +125,19 @@ public class NGridConfigLoader {
                     if (seedNode.getHost().equals(nodeConfig.getHost()) && seedNode.getPort() == nodeConfig.getPort()) {
                         continue;
                     }
-                    String nodeIdValue = seedNode.getId() != null ? seedNode.getId() : "seed-" + seedNode.getHost() + ":" + seedNode.getPort();
+                    String nodeIdValue = seedNode.getId() != null ? seedNode.getId()
+                            : "seed-" + seedNode.getHost() + ":" + seedNode.getPort();
                     builder.addPeer(new dev.nishisan.utils.ngrid.common.NodeInfo(
                             dev.nishisan.utils.ngrid.common.NodeId.of(nodeIdValue),
                             seedNode.getHost(),
-                            seedNode.getPort()
-                    ));
+                            seedNode.getPort()));
                 }
             } else if (clusterConfig.getSeeds() != null) {
                 for (String seed : clusterConfig.getSeeds()) {
                     String[] parts = seed.split(":");
                     if (parts.length == 2) {
-                        if (parts[0].equals(nodeConfig.getHost()) && Integer.parseInt(parts[1]) == nodeConfig.getPort()) {
+                        if (parts[0].equals(nodeConfig.getHost())
+                                && Integer.parseInt(parts[1]) == nodeConfig.getPort()) {
                             continue;
                         }
                         if (seedInfo != null
@@ -147,8 +149,10 @@ public class NGridConfigLoader {
                         // For seed peers, we create a temporary NodeInfo.
                         // Ideally, discovery will update the NodeId later.
                         // We use a temporary placeholder ID for the seed.
-                        dev.nishisan.utils.ngrid.common.NodeId seedId = dev.nishisan.utils.ngrid.common.NodeId.of("seed-" + seed); 
-                        builder.addPeer(new dev.nishisan.utils.ngrid.common.NodeInfo(seedId, parts[0], Integer.parseInt(parts[1])));
+                        dev.nishisan.utils.ngrid.common.NodeId seedId = dev.nishisan.utils.ngrid.common.NodeId
+                                .of("seed-" + seed);
+                        builder.addPeer(new dev.nishisan.utils.ngrid.common.NodeInfo(seedId, parts[0],
+                                Integer.parseInt(parts[1])));
                     }
                 }
             } else if (seedInfo != null) {
@@ -156,60 +160,114 @@ public class NGridConfigLoader {
             }
         }
 
-        // Queue Policy
-        QueuePolicyConfig queueConfig = yamlConfig.getQueue();
-        if (queueConfig != null) {
-            dev.nishisan.utils.queue.NQueue.Options options = dev.nishisan.utils.queue.NQueue.Options.defaults();
-            
-            if (queueConfig.getRetention() != null) {
-                if ("TIME_BASED".equalsIgnoreCase(queueConfig.getRetention().getPolicy())) {
-                    options.withRetentionPolicy(dev.nishisan.utils.queue.NQueue.Options.RetentionPolicy.TIME_BASED);
-                    options.withRetentionTime(parseDuration(queueConfig.getRetention().getDuration()));
-                } else {
-                    options.withRetentionPolicy(dev.nishisan.utils.queue.NQueue.Options.RetentionPolicy.DELETE_ON_CONSUME);
-                }
-            }
+        // Queue Policy - Support both single queue (legacy) and multiple queues (new)
+        java.util.List<QueuePolicyConfig> queueConfigs = yamlConfig.getQueues();
 
-            if (queueConfig.getPerformance() != null) {
-                options.withFsync(queueConfig.getPerformance().isFsync());
-                options.withShortCircuit(queueConfig.getPerformance().isShortCircuit());
-                if (queueConfig.getPerformance().getMemoryBuffer() != null) {
-                    options.withMemoryBuffer(queueConfig.getPerformance().getMemoryBuffer().isEnabled());
-                    options.withMemoryBufferSize(queueConfig.getPerformance().getMemoryBuffer().getSize());
-                }
+        // Backward compatibility: if queues array is empty, check for legacy single
+        // queue
+        if (queueConfigs == null || queueConfigs.isEmpty()) {
+            QueuePolicyConfig singleQueue = yamlConfig.getQueue();
+            if (singleQueue != null) {
+                queueConfigs = java.util.List.of(singleQueue);
             }
+        }
 
-            if (queueConfig.getCompaction() != null) {
-                options.withCompactionWasteThreshold(queueConfig.getCompaction().getThreshold());
-                options.withCompactionInterval(parseDuration(queueConfig.getCompaction().getInterval()));
+        // Convert and add all queues
+        if (queueConfigs != null && !queueConfigs.isEmpty()) {
+            for (QueuePolicyConfig qpc : queueConfigs) {
+                builder.addQueue(convertQueuePolicyToQueueConfig(qpc));
             }
-            
-            builder.queueOptions(options);
-            
-            // Default queue directory/name
-            builder.queueDirectory(baseDir.resolve("queue"));
-            if (queueConfig.getName() != null) {
-                builder.queueName(queueConfig.getName());
+            // Set data directory for queue storage
+            if (baseDir != null) {
+                builder.dataDirectory(baseDir);
             }
         } else {
-             builder.queueDirectory(baseDir.resolve("queue"));
+            // No queues configured - just set data directory
+            if (baseDir != null) {
+                builder.dataDirectory(baseDir);
+            }
         }
 
         // Map Policy (Default/Main map)
         // NGridConfig currently supports one main map via builder.
-        // Additional maps from the list will need to be handled by the node after start, 
+        // Additional maps from the list will need to be handled by the node after
+        // start,
         // OR we map the first one here if meaningful.
         // For now, we set the map directory.
         builder.mapDirectory(baseDir.resolve("maps"));
-        
+
         // If maps list is present, pick the first one as default or just set directory?
         // Let's set defaults.
-        
+
+        return builder.build();
+    }
+
+    /**
+     * Converts a YAML QueuePolicyConfig to a domain QueueConfig.
+     */
+    private static dev.nishisan.utils.ngrid.structures.QueueConfig convertQueuePolicyToQueueConfig(
+            QueuePolicyConfig qpc) {
+        if (qpc == null || qpc.getName() == null) {
+            throw new IllegalArgumentException("Queue configuration must have a name");
+        }
+
+        dev.nishisan.utils.ngrid.structures.QueueConfig.Builder builder = dev.nishisan.utils.ngrid.structures.QueueConfig
+                .builder(qpc.getName());
+
+        // Convert Retention Policy
+        if (qpc.getRetention() != null && qpc.getRetention().getPolicy() != null) {
+            String policy = qpc.getRetention().getPolicy().trim().toUpperCase();
+
+            if ("TIME_BASED".equals(policy)) {
+                Duration duration = parseDuration(qpc.getRetention().getDuration());
+                if (duration != null) {
+                    builder.retention(
+                            dev.nishisan.utils.ngrid.structures.QueueConfig.RetentionPolicy.timeBased(duration));
+                }
+            } else if ("SIZE_BASED".equals(policy)) {
+                // Note: QueuePolicyConfig doesn't have a maxSize field yet
+                // For now, we'll use a default time-based policy
+                // TODO: Add maxSize field to QueuePolicyConfig.RetentionConfig if needed
+                builder.retention(
+                        dev.nishisan.utils.ngrid.structures.QueueConfig.RetentionPolicy.timeBased(Duration.ofDays(7)));
+            } else if ("COUNT_BASED".equals(policy)) {
+                // Note: QueuePolicyConfig doesn't have a maxItems field yet
+                // For now, we'll use a default time-based policy
+                // TODO: Add maxItems field to QueuePolicyConfig.RetentionConfig if needed
+                builder.retention(
+                        dev.nishisan.utils.ngrid.structures.QueueConfig.RetentionPolicy.timeBased(Duration.ofDays(7)));
+            }
+        }
+
+        // Convert Performance settings to NQueue.Options
+        if (qpc.getPerformance() != null) {
+            dev.nishisan.utils.queue.NQueue.Options options = dev.nishisan.utils.queue.NQueue.Options.defaults();
+
+            options.withFsync(qpc.getPerformance().isFsync());
+            options.withShortCircuit(qpc.getPerformance().isShortCircuit());
+
+            if (qpc.getPerformance().getMemoryBuffer() != null) {
+                options.withMemoryBuffer(qpc.getPerformance().getMemoryBuffer().isEnabled());
+                options.withMemoryBufferSize(qpc.getPerformance().getMemoryBuffer().getSize());
+            }
+
+            if (qpc.getCompaction() != null) {
+                options.withCompactionWasteThreshold(qpc.getCompaction().getThreshold());
+                Duration compactionInterval = parseDuration(qpc.getCompaction().getInterval());
+                if (compactionInterval != null) {
+                    options.withCompactionInterval(compactionInterval);
+                }
+            }
+
+            builder.nqueueOptions(options);
+        }
+
         return builder.build();
     }
 
     private static Duration parseDuration(String s) {
-        if (s == null || s.isBlank()) return null;
+        if (s == null || s.isBlank())
+            return null;
         s = s.trim().toUpperCase();
         try {
             return Duration.parse(s); // Try standard ISO-8601 first (PT10M)

@@ -21,10 +21,10 @@ class NGridConfigLoaderTest {
     @Test
     void shouldLoadAndConvertToDomain() throws IOException {
         Path yamlFile = tempDir.resolve("ngrid-test.yaml");
-        
+
         // Create a mock YAML config programmatically to save to file first
         NGridYamlConfig yamlConfig = new NGridYamlConfig();
-        
+
         NodeIdentityConfig node = new NodeIdentityConfig();
         node.setId("test-node-1");
         node.setHost("127.0.0.1");
@@ -50,7 +50,7 @@ class NGridConfigLoaderTest {
         retention.setPolicy("TIME_BASED");
         retention.setDuration("24h");
         queue.setRetention(retention);
-        
+
         QueuePolicyConfig.PerformanceConfig performance = new QueuePolicyConfig.PerformanceConfig();
         performance.setFsync(false);
         performance.setShortCircuit(true);
@@ -59,7 +59,7 @@ class NGridConfigLoaderTest {
         memory.setSize(5000);
         performance.setMemoryBuffer(memory);
         queue.setPerformance(performance);
-        
+
         yamlConfig.setQueue(queue);
 
         // Save to file
@@ -78,21 +78,21 @@ class NGridConfigLoaderTest {
         assertEquals("127.0.0.1", domainConfig.local().host());
         assertEquals(9000, domainConfig.local().port());
         assertTrue(domainConfig.local().roles().contains("PRODUCER"));
-        
+
         // Assert Cluster
         assertEquals(3, domainConfig.replicationFactor());
         assertTrue(domainConfig.strictConsistency());
         assertEquals(2, domainConfig.peers().size()); // 2 seeds
 
-        // Assert Queue
-        assertEquals("main-queue", domainConfig.queueName());
-        // assertEquals(NQueue.Options.RetentionPolicy.TIME_BASED, domainConfig.queueOptions().snapshot().retentionPolicy); 
-        // Cannot access package-private field in test easily. Trusting loader logic verified by integration/functional tests later.
-        
+        // Assert Queues - NEW API
+        assertNotNull(domainConfig.queues());
+        assertEquals(1, domainConfig.queues().size());
+        assertEquals("main-queue", domainConfig.queues().get(0).name());
+
         // Let's verify paths
-        assertEquals(Path.of("/tmp/ngrid-data/queue"), domainConfig.queueDirectory());
+        assertEquals(Path.of("/tmp/ngrid-data"), domainConfig.dataDirectory());
     }
-    
+
     @Test
     void testDurationParsing() throws IOException {
         Path yamlFile = tempDir.resolve("duration.yaml");
@@ -102,19 +102,21 @@ class NGridConfigLoaderTest {
         node.setDirs(new NodeIdentityConfig.DirsConfig());
         node.getDirs().setBase("/tmp");
         config.setNode(node);
-        
+
         QueuePolicyConfig q = new QueuePolicyConfig();
+        q.setName("test-queue"); // Add queue name
         QueuePolicyConfig.RetentionConfig r = new QueuePolicyConfig.RetentionConfig();
         r.setPolicy("TIME_BASED");
         r.setDuration("10m");
         q.setRetention(r);
         config.setQueue(q);
-        
+
         NGridConfigLoader.save(yamlFile, config);
         NGridConfig domain = NGridConfigLoader.convertToDomain(NGridConfigLoader.load(yamlFile));
-        
-        // Duration "10m" parsing check (indirectly via QueueOptions if we could inspect it)
-        // Since we can't easily inspect Options internal state without NQueue instance, 
+
+        // Duration "10m" parsing check (indirectly via QueueOptions if we could inspect
+        // it)
+        // Since we can't easily inspect Options internal state without NQueue instance,
         // we trust convertToDomain didn't throw exception on "10m".
     }
 }
