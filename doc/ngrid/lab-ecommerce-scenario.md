@@ -49,6 +49,7 @@ import dev.nishisan.utils.ngrid.structures.DistributedMap;
 import dev.nishisan.utils.ngrid.structures.DistributedQueue;
 import dev.nishisan.utils.ngrid.structures.NGridConfig;
 import dev.nishisan.utils.ngrid.structures.NGridNode;
+import dev.nishisan.utils.ngrid.structures.QueueConfig;
 
 import java.io.Serializable;
 import java.nio.file.Files;
@@ -80,7 +81,8 @@ public class EcommerceLab {
 
         for (NodeInfo info : nodesInfo) {
             NGridConfig.Builder builder = NGridConfig.builder(info)
-                    .queueDirectory(labDir.resolve(info.nodeId().value()))
+                    .dataDirectory(labDir.resolve(info.nodeId().value()))
+                    .addQueue(QueueConfig.builder("orders").build())
                     .replicationFactor(3) // Quorum de escrita = 2 (maioria de 3)
                     .heartbeatInterval(Duration.ofMillis(500))
                     .rttProbeInterval(Duration.ofSeconds(1)); // Para otimização de malha rápida

@@ -19,14 +19,17 @@ Coleção de utilitários em Java, com foco em:
 
 - Cluster via **TCP** com descoberta de peers e heartbeats
 - **Configuração via YAML**: suporte a variáveis de ambiente (`${VAR}`) para fácil deployment em containers.
-- **Múltiplas Filas (Novo em 2.1.0)**: suporte a múltiplas filas distribuídas independentes com API type-safe
+- **Múltiplas Filas (2.1.0+)**: filas distribuídas independentes com API type-safe
+- **Sequenciamento por tópico** (por fila/mapa), evitando bloqueios lógicos em multi-queue
+- **Roteamento por nome da fila** (comandos `queue.offer:{queue}` etc.) e init eager no líder
 - **Roteamento Inteligente (Sticky Proxy)** com otimização por RTT para alcançar nós inacessíveis diretamente
 - **Eleição determinística de líder** (por ID) e reeleição opcional guiada por taxa de escrita
 - **Replicação com quorum** configurável (modos: disponibilidade ou consistência estrita)
 - API cliente transparente: qualquer nó pode encaminhar a operação ao líder
-- **Log Distribuído & Streaming**: suporte a retenção por tempo e múltiplos consumidores persistentes (consumer groups)
+- **Log Distribuído & Streaming**: retenção por tempo + consumo persistente por NodeId (offset)
 - **Consistência de leitura** para mapas: forte, eventual ou limitada por lag
-- **Sincronização de estado (catch-up)** por snapshot em chunks para mapas distribuídos
+- **Sincronização de estado (catch-up)** por snapshot em chunks para mapas **e filas**
+- **Reenvio de sequência** quando gaps são detectados (com fallback para snapshot)
 - **Persistência opcional de mapa** com WAL + snapshot (recuperação robusta em crash/rotação)
 - Estruturas:
   - `DistributedQueue`: `offer`, `poll`, `peek`
@@ -161,6 +164,7 @@ import dev.nishisan.utils.ngrid.structures.DistributedMap;
 import dev.nishisan.utils.ngrid.structures.DistributedQueue;
 import dev.nishisan.utils.ngrid.structures.NGridConfig;
 import dev.nishisan.utils.ngrid.structures.NGridNode;
+import dev.nishisan.utils.ngrid.structures.QueueConfig;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -176,20 +180,21 @@ public class NGridClusterExample {
     Path d1 = Files.createDirectories(base.resolve("node1"));
     Path d2 = Files.createDirectories(base.resolve("node2"));
     Path d3 = Files.createDirectories(base.resolve("node3"));
+    QueueConfig queueConfig = QueueConfig.builder("queue").build();
 
     try (NGridNode node1 = new NGridNode(NGridConfig.builder(n1)
         .addPeer(n2).addPeer(n3)
-        .queueDirectory(d1).queueName("queue")
+        .dataDirectory(d1).addQueue(queueConfig)
         .replicationQuorum(2)
         .build());
          NGridNode node2 = new NGridNode(NGridConfig.builder(n2)
              .addPeer(n1).addPeer(n3)
-             .queueDirectory(d2).queueName("queue")
+             .dataDirectory(d2).addQueue(queueConfig)
              .replicationQuorum(2)
              .build());
          NGridNode node3 = new NGridNode(NGridConfig.builder(n3)
              .addPeer(n1).addPeer(n2)
-             .queueDirectory(d3).queueName("queue")
+             .dataDirectory(d3).addQueue(queueConfig)
              .replicationQuorum(2)
              .build())) {
 
@@ -291,8 +296,9 @@ Para mais detalhes, consulte a [documentação completa de configuração YAML](
 - Operações são **roteadas ao líder** para consistência.
 - O mapa é mantido em memória (e replicado); persistência em disco é **durabilidade**, não expansão de capacidade.
 - O `replicationQuorum` define quantos nós (incluindo o líder) precisam confirmar para a operação ser considerada commitada.
-- **Catch-up de fila distribuída** ainda não é implementado; nós atrasados dependem da replicação online.
-- O conjunto de operações aplicadas para deduplicação fica em memória; após reinício total do cluster ele começa vazio.
+- **Catch-up de filas e mapas** usa snapshot em chunks quando há atraso relevante.
+- Offsets de consumo em modo `TIME_BASED` são persistidos por `NodeId`; se o retention expirar, o consumidor pode ser avançado para o item mais antigo disponível.
+- `queueDirectory` (legado) preserva semântica **DELETE_ON_CONSUME**; para log distribuído, prefira `dataDirectory` + retention `TIME_BASED`.
 
 ## Arquitetura (resumo)
 
@@ -346,6 +352,7 @@ Para detalhes (docs em pt-BR):
 - `doc/ngrid/guia-utilizacao.md`
 - `doc/ngrid/map-design.md`
 - `doc/ngrid/nqueue-integration.md`
+- `doc/ngrid/playbook-resiliencia.md`
 - `doc/nqueue-readme.md`
 
 ## Stats (métricas)
@@ -368,4 +375,3 @@ mvn test
 ## Licença
 
 Este projeto é distribuído sob **GNU GPL v3** (ou posterior). Veja os cabeçalhos dos arquivos-fonte para detalhes.
-

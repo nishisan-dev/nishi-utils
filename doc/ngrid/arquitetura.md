@@ -60,6 +60,8 @@ Garante a consistência dos dados através da replicação de operações.
 - **Centralização no Líder:** Apenas o líder pode iniciar replicações (`replicate(...)`).
 - **Integridade:**
   - O envio de `REPLICATION_ACK` só ocorre após a operação ser efetivamente processada com sucesso no nó seguidor, evitando falsos positivos de confirmação.
+- **Sequenciamento por tópico:** filas e mapas possuem sequências independentes, evitando bloqueios entre estruturas diferentes.
+- **Persistência de sequência:** o estado de sequência é salvo em disco (`{dataDirectory}/replication/sequence-state.dat`) para recuperação após restart.
 - **Fluxo de Replicação (Consistente):**
   1. O líder recebe a operação e a registra como `PENDING`.
   2. O líder envia `REPLICATION_REQUEST` para todos os followers.
@@ -74,6 +76,9 @@ Garante a consistência dos dados através da replicação de operações.
 - **Timeout e quorum inalcançável:**
   - Se a operação exceder o `operationTimeout` (padrão: 30s), ela pode falhar por timeout.
   - Se peers desconectarem e o cluster não tiver membros alcançáveis suficientes para satisfazer o quorum, a operação falha como “quorum inalcançável”.
+- **Resiliência (gaps e catch-up):**
+  - Se um follower detectar gaps curtos, ele solicita **reenvio de sequência** ao líder.
+  - Se o atraso for grande, o follower aciona **sync por snapshot em chunks** (mapas e filas).
 
 ### 4. Camada de Estruturas Distribuídas
 **Implementações:** `DistributedQueue`, `DistributedMap`
@@ -83,6 +88,7 @@ Expõe as APIs de alto nível para o usuário final e faz a ponte com as camadas
   - Se `coordinator.isLeader()`: Executa a operação localmente e inicia a replicação.
   - Se `!isLeader()`: Encaminha a operação ao líder via `CLIENT_REQUEST` e aguarda a resposta.
 - **Integração com Backend:** Conecta a lógica distribuída com o armazenamento local (como a `NQueue` ou `ConcurrentHashMap`).
+- **Multi-queue:** comandos incluem o nome da fila (`queue.offer:{fila}`), e o líder registra listeners por fila no startup (init eager).
 
 ### 5. Bootstrap do Nó
 **Implementação:** `dev.nishisan.utils.ngrid.structures.NGridNode`
@@ -119,7 +125,7 @@ Node->>C: new ClusterCoordinator(transport, defaults, scheduler)
 Node->>C: start()
 Node->>R: new ReplicationManager(transport, coordinator, ReplicationConfig.of(quorum))
 Node->>R: start()
-Node->>QS: new QueueClusterService(queueDirectory, queueName, replicationManager)
+Node->>QS: new QueueClusterService(dataDirectory/queues/{queue}, queueName, replicationManager)
 alt mapPersistenceMode != DISABLED
   Node->>MS: new MapClusterService(replicationManager, MapPersistenceConfig.defaults(...))
   Node->>MS: loadFromDisk()
@@ -131,6 +137,8 @@ end
 Node->>Node: new DistributedQueue(transport, coordinator, queueService)
 Node->>Node: new DistributedMap(transport, coordinator, mapService)
 ```
+
+Em configuracoes multi-queue, o `NGridNode` cria um `QueueClusterService` por fila configurada e registra os listeners logo no startup.
 
 #### `close()` (ordem real)
 

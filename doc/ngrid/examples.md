@@ -13,6 +13,10 @@ Este documento reúne exemplos práticos para:
 - [Configuração](#configuracao)
 - [NQueue (Standalone)](#nqueue-standalone)
 - [NGrid (Cluster distribuído)](#ngrid-cluster-distribuido)
+- [Multi-queue e Log/Stream](#multi-queue-e-logstream)
+- [Resiliência e Catch-up](#resiliencia-e-catch-up)
+- [Failover e Consistência](#failover-e-consistencia)
+- [Playbook de Resiliencia](#playbook-de-resiliencia)
 - [Monitoramento do cluster (liderança e membros)](#monitoramento-do-cluster-lideranca-e-membros)
 - [Métricas e RTT](#metricas-e-rtt)
 - [Persistência do mapa (WAL + snapshot)](#persistencia-do-mapa-wal--snapshot)
@@ -54,6 +58,7 @@ import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.ngrid.structures.DistributedQueue;
 import dev.nishisan.utils.ngrid.structures.NGridConfig;
 import dev.nishisan.utils.ngrid.structures.NGridNode;
+import dev.nishisan.utils.ngrid.structures.QueueConfig;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -68,10 +73,11 @@ public class QuickStartNGrid {
     Path d1 = Files.createDirectories(base.resolve("node1"));
     Path d2 = Files.createDirectories(base.resolve("node2"));
     Path d3 = Files.createDirectories(base.resolve("node3"));
+    QueueConfig queueConfig = QueueConfig.builder("queue").build();
 
-    try (NGridNode node1 = new NGridNode(NGridConfig.builder(n1).addPeer(n2).addPeer(n3).queueDirectory(d1).replicationFactor(2).build());
-         NGridNode node2 = new NGridNode(NGridConfig.builder(n2).addPeer(n1).addPeer(n3).queueDirectory(d2).replicationFactor(2).build());
-         NGridNode node3 = new NGridNode(NGridConfig.builder(n3).addPeer(n1).addPeer(n2).queueDirectory(d3).replicationFactor(2).build())) {
+    try (NGridNode node1 = new NGridNode(NGridConfig.builder(n1).addPeer(n2).addPeer(n3).dataDirectory(d1).addQueue(queueConfig).replicationFactor(2).build());
+         NGridNode node2 = new NGridNode(NGridConfig.builder(n2).addPeer(n1).addPeer(n3).dataDirectory(d2).addQueue(queueConfig).replicationFactor(2).build());
+         NGridNode node3 = new NGridNode(NGridConfig.builder(n3).addPeer(n1).addPeer(n2).dataDirectory(d3).addQueue(queueConfig).replicationFactor(2).build())) {
 
       node1.start();
       node2.start();
@@ -97,10 +103,12 @@ public class QuickStartNGrid {
 | `peers` / `addPeer(...)` | `Set<NodeInfo>` | Vazio | Opcional | Peers iniciais para bootstrap do cluster (pode usar `node.join(...)` após o start). |
 | `replicationFactor` | `int` | `2` | `2` (dev), `2..N` (prod) | Fator de replicação default (número mínimo de confirmações, inclui o líder). |
 | `replicationQuorum` | `int` | `2` | Legado | Mantido por compatibilidade; use `replicationFactor`. |
-| `queueDirectory` | `Path` | Obrigatório | Diretório persistente | Base de dados da fila distribuída (usa NQueue local). |
-| `queueName` | `String` | `"ngrid"` | Um nome por cluster | Subpasta/nome da fila usada pelo serviço de fila. |
+| `dataDirectory` | `Path` | Obrigatório | Diretório persistente | Raiz única para filas, mapas e estado de replicação. |
+| `queues` | `List<QueueConfig>` | Vazio | `1..N` filas | Filas configuradas (multi-queue). |
+| `queueDirectory` | `Path` | Legado | Compatibilidade | Base de dados da fila distribuída (modo antigo). |
+| `queueName` | `String` | `"ngrid"` | Compatibilidade | Nome da fila única do modo legado. |
 | `queueOptions` | `NQueue.Options` | `defaults()` | Ajuste por cluster | Opções default da NQueue usadas ao criar filas na grid (short-circuit é forçado para false). |
-| `mapDirectory` | `Path` | `queueDirectory/maps` | Persistente se usar WAL/snapshot | Diretório base da persistência local do mapa. |
+| `mapDirectory` | `Path` | `dataDirectory/maps` | Persistente se usar WAL/snapshot | Diretório base da persistência local do mapa. |
 | `mapName` | `String` | `"default-map"` | Um nome por cluster | Nome do mapa padrão (usado por `node.map(...)`). |
 | `mapPersistenceMode` | `MapPersistenceMode` | `DISABLED` | `DISABLED` (padrão), `ASYNC_WITH_FSYNC` se quiser durabilidade local | Modo de persistência do mapa: `DISABLED`, `ASYNC_NO_FSYNC`, `ASYNC_WITH_FSYNC`. |
 | `strictConsistency` | `boolean` | `false` | `true` (produção CP) | Se `true`, líder espera quorum fixo antes de aplicar localmente. Protege contra split-brain. |
@@ -318,6 +326,8 @@ import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.ngrid.structures.NGridConfig;
 import dev.nishisan.utils.ngrid.structures.NGridNode;
+import dev.nishisan.utils.ngrid.structures.QueueConfig;
+import dev.nishisan.utils.ngrid.structures.QueueConfig;
 
 import java.nio.file.Path;
 
@@ -328,7 +338,8 @@ public class NGridNodeBootstrap {
 
     NGridConfig config = NGridConfig.builder(me)
         .addPeer(seed)
-        .queueDirectory(Path.of("./node-1-data"))
+        .dataDirectory(Path.of("./node-1-data"))
+        .addQueue(QueueConfig.builder("queue").build())
         .replicationFactor(2)
         .build();
 
@@ -439,11 +450,13 @@ participant Leader as LeaderNode
 participant F1 as Follower1
 participant F2 as Follower2
 
-Leader->>Leader: applyLocally(op)
 Leader->>F1: REPLICATION_REQUEST(op)
 Leader->>F2: REPLICATION_REQUEST(op)
+F1->>F1: apply(op)
+F2->>F2: apply(op)
 F1-->>Leader: REPLICATION_ACK
 F2-->>Leader: REPLICATION_ACK
+Leader->>Leader: applyLocally(op)
 Note over Leader: commit quando acks >= quorum
 ```
 
@@ -459,6 +472,95 @@ Esse teste demonstra:
 - estado persistindo na fila (via NQueue local) após restart de um nó
 
 ---
+
+## Multi-queue e Log/Stream
+
+### 1) Configuracao de filas com politicas distintas
+
+```java
+QueueConfig ordersCfg = QueueConfig.builder("orders").build();
+QueueConfig eventsCfg = QueueConfig.builder("events").build();
+QueueConfig logsCfg = QueueConfig.builder("logs").build();
+
+NGridNode node = new NGridNode(NGridConfig.builder(local)
+    .dataDirectory(Path.of("/var/ngrid/node-1"))
+    .addQueue(ordersCfg)
+    .addQueue(eventsCfg)
+    .addQueue(logsCfg)
+    .replicationFactor(2)
+    .build());
+node.start();
+
+DistributedQueue<Order> orders = node.getQueue("orders", Order.class);
+DistributedQueue<Event> events = node.getQueue("events", Event.class);
+```
+
+### 2) Log distribuido com offsets por consumidor
+
+```java
+DistributedQueue<String> events = node.getQueue("events", String.class);
+
+// Consumidor A (NodeId A)
+Optional<String> a1 = events.poll();
+Optional<String> a2 = events.poll();
+
+// Consumidor B (NodeId B)
+Optional<String> b1 = events.poll();
+```
+
+Boas praticas:
+
+- Use `TIME_BASED` para permitir consumo persistente por NodeId.
+- IDs estaveis garantem que o offset sobreviva a restart.
+- Se o retention expirar, o offset pode ser ajustado para o item mais antigo.
+
+## Resiliência e Catch-up
+
+### 1) Follower atrasado com snapshot
+
+```java
+// Lider enfileira muitas operacoes
+DistributedQueue<String> q = leader.getQueue("orders", String.class);
+for (int i = 0; i < 1200; i++) {
+  q.offer("item-" + i);
+}
+
+// Follower entra depois e sincroniza via snapshot
+NGridNode follower = new NGridNode(NGridConfig.builder(infoF)
+    .addPeer(infoL)
+    .dataDirectory(dirF)
+    .addQueue(QueueConfig.builder("orders").build())
+    .replicationFactor(1)
+    .build());
+follower.start();
+```
+
+### 2) Reenvio de sequencias faltantes (gap curto)
+
+Quando um follower recebe uma sequencia futura (ex.: seq=10 e esperava seq=7), ele solicita ao lider o reenvio das sequencias faltantes. Esse caminho evita snapshot quando o atraso e pequeno.
+
+## Failover e Consistência
+
+### 1) Consistencia estrita (CP)
+
+```java
+NGridNode node = new NGridNode(NGridConfig.builder(local)
+    .dataDirectory(Path.of("/var/ngrid/node-1"))
+    .addQueue(QueueConfig.builder("orders").build())
+    .replicationFactor(3)
+    .strictConsistency(true)
+    .build());
+```
+
+No modo estrito, o lider so confirma a operacao apos atingir o quorum fixo. Em caso de perda de membros, as escritas falham rapidamente (consistencia acima de disponibilidade).
+
+### 2) Failover com quorum ajustavel (AP)
+
+Em `strictConsistency(false)`, o quorum se ajusta ao numero de membros alcancaveis. Isso permite continuar escrevendo durante falhas de rede ou restart parcial do cluster.
+
+## Playbook de Resiliencia
+
+Veja o playbook completo em `doc/ngrid/playbook-resiliencia.md`.
 
 ## Monitoramento do cluster (liderança e membros)
 
@@ -582,6 +684,7 @@ import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.ngrid.map.MapPersistenceMode;
 import dev.nishisan.utils.ngrid.structures.NGridConfig;
 import dev.nishisan.utils.ngrid.structures.NGridNode;
+import dev.nishisan.utils.ngrid.structures.QueueConfig;
 
 import java.nio.file.Path;
 
@@ -590,7 +693,8 @@ public class NGridMapPersistenceModeExample {
     NodeInfo me = new NodeInfo(NodeId.of("node-1"), "127.0.0.1", 9011);
 
     NGridConfig cfg = NGridConfig.builder(me)
-        .queueDirectory(Path.of("./node-1-data"))
+        .dataDirectory(Path.of("./node-1-data"))
+        .addQueue(QueueConfig.builder("queue").build())
         .mapDirectory(Path.of("./node-1-data/maps"))
         .mapName("default-map")
         .mapPersistenceMode(MapPersistenceMode.ASYNC_WITH_FSYNC)
@@ -681,7 +785,8 @@ public class StrictConsistencyExample {
     NGridConfig cfg = NGridConfig.builder(me)
         .replicationFactor(3) // Exige confirmação de 3 nós (incluindo líder)
         .strictConsistency(true) // Ativa modo CP
-        .queueDirectory(java.nio.file.Path.of("./data"))
+        .dataDirectory(java.nio.file.Path.of("./data"))
+        .addQueue(QueueConfig.builder("queue").build())
         .build();
 
     try (NGridNode node = new NGridNode(cfg)) {
@@ -779,7 +884,7 @@ public class StatsUtilsExample {
 
 ### Permissões / diretórios de dados
 
-- `queueDirectory` e `mapDirectory` devem ser graváveis.
+- `dataDirectory` e `mapDirectory` devem ser graváveis.
 - Para durabilidade entre execuções, não use diretórios temporários.
 
 ### Proteção contra Split-Brain (MinClusterSize)
@@ -806,7 +911,7 @@ O NGrid possui uma configuração de segurança (no `ClusterCoordinatorConfig`) 
 ## Boas práticas
 
 - **Sempre use `try-with-resources`** com `NGridNode` e `NQueue` (garante `close()` mesmo em exceções).
-- **Use diretórios persistentes** para `queueDirectory`/`mapDirectory` se você quer durabilidade entre execuções.
+- **Use diretórios persistentes** para `dataDirectory`/`mapDirectory` se você quer durabilidade entre execuções.
 - **Não reuse `nodeId` em dois processos ao mesmo tempo** (vai gerar comportamento indefinido no cluster).
 - **Evite chamar APIs distribuídas “imediatamente” após `start()`** em testes: espere o cluster estabilizar (ver `NGridIntegrationTest`).
 - **LeaderElectionUtils**: forneça um `ScheduledExecutorService` dedicado (o `ClusterCoordinator#close()` encerra o scheduler usado).
@@ -832,6 +937,7 @@ O NGrid possui uma configuração de segurança (no `ClusterCoordinatorConfig`) 
 
 - **Leituras do mapa (`get`) são roteadas ao líder** para manter consistência forte e modelo simples.
 - **Deduplicação de operação é em memória** (após restart total, IDs anteriores não são mantidos; persistência do mapa/fila cobre estado, não o histórico de IDs).
+- **Offsets em log mode** são por `NodeId` e podem ser avançados quando o retention expira (use IDs estáveis).
 
 ---
 
@@ -856,4 +962,5 @@ O NGrid possui uma configuração de segurança (no `ClusterCoordinatorConfig`) 
 
 **Ideia**: publicar eventos em `DistributedQueue<Event>` e manter um “offset” por consumidor em `DistributedMap<String, Long>`.
 
-- Consumidor lê evento, atualiza seu offset no mapa (id do consumidor → último offset processado).
+- Em `TIME_BASED`, o NGrid já mantém o offset do consumidor (por `NodeId`).
+- Para processamento idempotente, combine com `DistributedMap` (ex.: `event:{id} -> status`).

@@ -1,9 +1,9 @@
-# Configuração Mínima para Bootstrap (Zero-Touch Provisioning)
-# Use este modelo para novos nós que devem entrar no cluster automaticamente.
+# Configuracao Minima para Bootstrap (Zero-Touch Provisioning)
+# Use este modelo para novos nos que devem entrar no cluster automaticamente.
 
 node:
-  # id: "node-xyz"      # Opcional: se omitido, gera UUID aleatório
-  host: "10.0.0.50"     # IP deste novo nó
+  # id: "node-xyz"      # Opcional: se omitido, gera UUID aleatorio
+  host: "10.0.0.50"     # IP deste novo no
   port: 9000            # Porta local
   dirs:
     base: "/var/lib/ngrid/data"
@@ -11,7 +11,7 @@ node:
 autodiscover:
   enabled: true
   secret: "my-cluster-secret-token-2026" # Deve bater com o do Seed
-  seed: "10.0.0.1:9000"                  # Endereço do Seed Node
+  seed: "10.0.0.1:9000"                  # Endereco do Seed Node
 
-# As seções 'cluster', 'queue' e 'maps' serão baixadas automaticamente 
-# e este arquivo será atualizado pelo próprio nó após o bootstrap.
+# As secoes 'cluster', 'queues' e 'maps' serao baixadas automaticamente
+# e este arquivo sera atualizado pelo proprio no apos o bootstrap.

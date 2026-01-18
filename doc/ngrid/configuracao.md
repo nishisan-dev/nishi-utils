@@ -1,10 +1,18 @@
-# Guia de Configuração (YAML)
+# Guia de Configuracao (YAML)
 
-O NGrid suporta carregamento de configurações a partir de arquivos YAML, facilitando o gerenciamento de ambientes (Dev, Staging, Prod) e deployment em containers (Docker/Kubernetes).
+O NGrid suporta carregamento de configuracoes a partir de arquivos YAML, facilitando o gerenciamento de ambientes (Dev, Staging, Prod) e deployment em containers (Docker/Kubernetes).
 
-## Carregando a configuração
+A configuracao atual suporta:
 
-Utilize a classe `NGridConfigLoader` para ler o arquivo YAML e convertê-lo para o objeto de configuração do NGrid.
+- **Single-queue (legado)** via `queue:`
+- **Multi-queue (recomendado)** via `queues:`
+- **Diretorio unico de dados** (`node.dirs.base`) que abriga filas, mapas e estado de replicacao
+
+> Dica: use `queues:` para habilitar multiplas filas e retention `TIME_BASED` (log distribuido com offsets).
+
+## Carregando a configuracao
+
+Utilize a classe `NGridConfigLoader` para ler o arquivo YAML e converte-lo para o objeto de configuracao do NGrid.
 
 ```java
 import dev.nishisan.utils.ngrid.config.NGridConfigLoader;
@@ -20,10 +28,10 @@ public class ConfigLoaderExample {
         Path configFile = Path.of("ngrid-config.yaml");
         NGridYamlConfig yamlConfig = NGridConfigLoader.load(configFile);
 
-        // 2. Converter para a configuração de domínio
+        // 2. Converter para a configuracao de dominio
         NGridConfig config = NGridConfigLoader.convertToDomain(yamlConfig);
 
-        // 3. Iniciar o nó
+        // 3. Iniciar o no
         try (NGridNode node = new NGridNode(config)) {
             node.start();
             // ...
@@ -34,66 +42,109 @@ public class ConfigLoaderExample {
 
 ## Estrutura do Arquivo YAML
 
-Um arquivo de configuração típico possui as seções: `node`, `cluster` e `queue`.
+Um arquivo de configuracao tipico possui as secoes: `node`, `cluster`, `queues` e `maps`.
 
 ```yaml
 node:
-  # Identificador único do nó. Se omitido, um ID aleatório será gerado.
+  # Identificador unico do no. Se omitido, um ID aleatorio sera gerado.
   id: node-1
-  # Endereço IP ou Hostname para bind do servidor TCP
+  # Endereco IP ou Hostname para bind do servidor TCP
   host: 127.0.0.1
   # Porta TCP
   port: 9000
   dirs:
-    # Diretório base para armazenamento de dados (filas, mapas)
+    # Diretorio base para armazenamento de dados (filas, mapas, estado de replicacao)
     base: ./data
 
 cluster:
   # Nome do cluster (opcional)
   name: my-cluster
   replication:
-    # Número de cópias dos dados (fator de replicação)
+    # Numero de copias dos dados (fator de replicacao)
     factor: 3
-    # Se true, exige quorum estrito para operações de escrita (CP). 
+    # Se true, exige quorum estrito para operacoes de escrita (CP).
     # Se false, prioriza disponibilidade (AP).
     strict: false
   transport:
     workers: 4
-  # Lista de nós sementes para descoberta inicial (formato host:port)
+  # Lista de nos sementes para descoberta inicial (formato host:port)
   seeds:
     - 127.0.0.1:9001
     - 127.0.0.1:9002
 
+# Multiplas filas (recomendado)
+queues:
+  - name: orders
+    retention:
+      # Politicas: TIME_BASED (log/stream) ou DELETE_ON_CONSUME (fila classica)
+      policy: TIME_BASED
+      duration: 24h
+    performance:
+      fsync: true
+      short-circuit: false
+      memory-buffer:
+        enabled: true
+        size: 10240
+    compaction:
+      threshold: 0.3
+      interval: 10m
+
+  - name: events
+    retention:
+      policy: TIME_BASED
+      duration: 6h
+
+  - name: jobs
+    retention:
+      policy: DELETE_ON_CONSUME
+
+# Mapas (metadados de bootstrap para autodiscover)
+maps:
+  - name: inventory
+    key-type: java.lang.String
+    value-type: java.lang.Integer
+    persistence: ASYNC_WITH_FSYNC
+```
+
+### Estrutura de diretorios (dataDirectory)
+
+Quando `node.dirs.base` esta configurado, o NGrid organiza os dados assim:
+
+```
+{base}/
+├── queues/
+│   ├── orders/
+│   ├── events/
+│   └── jobs/
+├── maps/
+│   └── ...
+└── replication/
+    └── sequence-state.dat
+```
+
+## Queue unica (legado)
+
+Se `queues:` estiver ausente, o NGrid aceita a secao `queue:` como configuracao unica. Esse modo existe por compatibilidade e preserva a semantica historica.
+
+```yaml
 queue:
   name: main-queue
   retention:
-    # Políticas: DELETE_ON_CONSUME (padrão) ou TIME_BASED
-    policy: TIME_BASED
-    # Duração da retenção (ex: 10m, 2h, 1d) - Apenas para TIME_BASED
-    duration: 24h
+    policy: DELETE_ON_CONSUME
   performance:
-    # Habilita fsync para durabilidade máxima (true/false)
     fsync: true
-    # Otimização para consumidores rápidos
-    shortCircuit: true
-    memoryBuffer:
-      enabled: true
-      size: 10240
-  compaction:
-    # Limiar de desperdício para compactação (0.0 a 1.0)
-    threshold: 0.3
-    # Intervalo de verificação
-    interval: 10m
 ```
 
-## Variáveis de Ambiente
+> Nota: Em configuracoes legadas com `queueDirectory`, o comportamento padrao e **DELETE_ON_CONSUME**.
 
-O arquivo YAML suporta **interpolação de variáveis de ambiente**, permitindo injetar valores sensíveis ou dinâmicos em tempo de execução.
+## Variaveis de Ambiente
+
+O arquivo YAML suporta **interpolacao de variaveis de ambiente**, permitindo injetar valores sensiveis ou dinamicos em tempo de execucao.
 
 ### Sintaxe
 
-- `${VAR_NAME}`: Substitui pelo valor da variável de ambiente `VAR_NAME`. Lança erro se a variável não existir.
-- `${VAR_NAME:default_value}`: Usa `default_value` caso a variável `VAR_NAME` não esteja definida.
+- `${VAR_NAME}`: Substitui pelo valor da variavel de ambiente `VAR_NAME`. Lanca erro se a variavel nao existir.
+- `${VAR_NAME:default_value}`: Usa `default_value` caso a variavel `VAR_NAME` nao esteja definida.
 
 ### Exemplo
 
@@ -110,8 +161,8 @@ cluster:
 ```
 
 Neste exemplo:
-1. `id` assumirá o valor de `POD_NAME` ou "node-default".
-2. `host` assumirá o valor de `POD_IP` (lança erro se não definido).
-3. `port` assumirá o valor de `PORT` ou 9000.
+1. `id` assumira o valor de `POD_NAME` ou "node-default".
+2. `host` assumira o valor de `POD_IP` (lanca erro se nao definido).
+3. `port` assumira o valor de `PORT` ou 9000.
 
-Isso é especialmente útil em ambientes como **Kubernetes**, onde o nome do pod e IP são atribuídos dinamicamente.
+Isso e especialmente util em ambientes como **Kubernetes**, onde o nome do pod e IP sao atribuidos dinamicamente.
