@@ -65,7 +65,8 @@ public class ReplicationManager implements TransportListener, LeadershipListener
     private final Set<UUID> processing = ConcurrentHashMap.newKeySet();
     private final java.util.concurrent.atomic.AtomicLong globalSequence = new java.util.concurrent.atomic.AtomicLong(0);
     private final Map<String, java.util.concurrent.atomic.AtomicLong> sequenceByTopic = new ConcurrentHashMap<>();
-    private final java.util.concurrent.atomic.AtomicLong appliedSequence = new java.util.concurrent.atomic.AtomicLong(0);
+    private final java.util.concurrent.atomic.AtomicLong appliedSequence = new java.util.concurrent.atomic.AtomicLong(
+            0);
     private volatile long lastAppliedSequence = 0;
     private final Set<String> syncingTopics = ConcurrentHashMap.newKeySet();
 
@@ -240,6 +241,10 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         globalSequence.incrementAndGet();
         long seq = nextSequenceForTopic(operation.topic);
         operation.sequence = seq;
+
+        // Persist sequence state for leader recovery
+        saveSequenceState();
+
         ReplicationPayload payload = new ReplicationPayload(operation.operationId, seq, operation.topic,
                 operation.payload);
         for (NodeInfo member : coordinator.activeMembers()) {
@@ -781,8 +786,10 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         private final CompletableFuture<ReplicationResult> future = new CompletableFuture<>();
         private volatile OperationStatus status = OperationStatus.PENDING;
         private final Instant createdAt = Instant.now();
-        private final java.util.concurrent.atomic.AtomicBoolean localApplied = new java.util.concurrent.atomic.AtomicBoolean(false);
-        private final java.util.concurrent.atomic.AtomicBoolean localApplyStarted = new java.util.concurrent.atomic.AtomicBoolean(false);
+        private final java.util.concurrent.atomic.AtomicBoolean localApplied = new java.util.concurrent.atomic.AtomicBoolean(
+                false);
+        private final java.util.concurrent.atomic.AtomicBoolean localApplyStarted = new java.util.concurrent.atomic.AtomicBoolean(
+                false);
 
         private PendingOperation(UUID operationId, String topic, Serializable payload, int quorum) {
             this.operationId = operationId;
@@ -874,7 +881,25 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             @SuppressWarnings("unchecked")
             Map<String, Long> loaded = (Map<String, Long>) ois.readObject();
             nextExpectedSequenceByTopic.putAll(loaded);
-            LOGGER.info(() -> "Loaded sequence state: " + loaded);
+
+            // Load globalSequence (stored as "_global" key for compatibility)
+            Long savedGlobal = loaded.get("_global");
+            if (savedGlobal != null) {
+                globalSequence.set(savedGlobal);
+            }
+
+            // Load per-topic sequences (keys starting with "_topic:")
+            loaded.entrySet().stream()
+                    .filter(e -> e.getKey().startsWith("_topic:"))
+                    .forEach(e -> {
+                        String topic = e.getKey().substring(7); // Remove "_topic:" prefix
+                        sequenceByTopic.computeIfAbsent(topic,
+                                k -> new java.util.concurrent.atomic.AtomicLong(0))
+                                .set(e.getValue());
+                    });
+
+            LOGGER.info(() -> "Loaded sequence state: global=" + globalSequence.get() +
+                    ", topics=" + sequenceByTopic.keySet());
         } catch (Exception e) {
             LOGGER.log(Level.WARNING, "Failed to load sequence state, starting from 1", e);
         }
@@ -882,13 +907,28 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
     /**
      * Saves the current sequence state to disk.
+     * Saves:
+     * - nextExpectedSequenceByTopic (for followers)
+     * - globalSequence (for leader, stored as "_global" key)
+     * - sequenceByTopic (for leader, stored as "_topic:{topic}" keys)
      */
     private void saveSequenceState() {
+        if (sequenceStatePath == null) {
+            return; // Test mode, no persistence
+        }
         try {
             Files.createDirectories(sequenceStatePath.getParent());
+            Map<String, Long> toSave = new HashMap<>(nextExpectedSequenceByTopic);
+
+            // Add global sequence
+            toSave.put("_global", globalSequence.get());
+
+            // Add per-topic sequences
+            sequenceByTopic.forEach((topic, seq) -> toSave.put("_topic:" + topic, seq.get()));
+
             try (java.io.ObjectOutputStream oos = new java.io.ObjectOutputStream(
                     Files.newOutputStream(sequenceStatePath))) {
-                oos.writeObject(new HashMap<>(nextExpectedSequenceByTopic));
+                oos.writeObject(toSave);
             }
         } catch (IOException e) {
             LOGGER.log(Level.WARNING, "Failed to save sequence state", e);
