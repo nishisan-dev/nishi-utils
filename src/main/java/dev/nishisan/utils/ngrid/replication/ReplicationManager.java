@@ -482,6 +482,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
     /**
      * Applies a replication operation immediately (must be called with
      * sequenceBufferLock held).
+     * Executes SYNCHRONOUSLY to avoid race condition with sequence advancement.
      */
     private void applyReplication(ReplicationPayload payload, ClusterMessage message) {
         UUID opId = payload.operationId();
@@ -497,23 +498,22 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             return;
         }
 
-        executor.submit(() -> {
-            try {
-                handler.apply(opId, payload.data());
-                lastAppliedSequence = Math.max(lastAppliedSequence, payload.sequence());
-                log.putIfAbsent(opId, new ReplicatedRecord(
-                        opId, payload.topic(), payload.data(), OperationStatus.COMMITTED));
-                applied.add(opId);
-                sendAck(opId, message.source());
+        // Execute SYNCHRONOUSLY to ensure operation is applied before sequence advances
+        try {
+            handler.apply(opId, payload.data());
+            lastAppliedSequence = Math.max(lastAppliedSequence, payload.sequence());
+            log.putIfAbsent(opId, new ReplicatedRecord(
+                    opId, payload.topic(), payload.data(), OperationStatus.COMMITTED));
+            applied.add(opId);
+            sendAck(opId, message.source());
 
-                LOGGER.info(() -> String.format(
-                        "Applied replication opId=%s seq=%d", opId, payload.sequence()));
-            } catch (Exception e) {
-                LOGGER.log(Level.SEVERE, "Failed to apply replicated operation", e);
-            } finally {
-                processing.remove(opId);
-            }
-        });
+            LOGGER.info(() -> String.format(
+                    "Applied replication opId=%s seq=%d", opId, payload.sequence()));
+        } catch (Exception e) {
+            LOGGER.log(Level.SEVERE, "Failed to apply replicated operation", e);
+        } finally {
+            processing.remove(opId);
+        }
     }
 
     /**
