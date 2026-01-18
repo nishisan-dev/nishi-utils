@@ -423,6 +423,21 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                             () -> "Sync completed for " + payload.topic() + ". Final sequence: " + payload.sequence());
                     appliedSequence.updateAndGet(current -> Math.max(current, payload.sequence()));
                     lastAppliedSequence = appliedSequence.get();
+                    sequenceBufferLock.lock();
+                    try {
+                        nextExpectedSequenceByTopic.put(payload.topic(), payload.sequence() + 1);
+                        PriorityQueue<BufferedReplication> buffer = sequenceBufferByTopic.get(payload.topic());
+                        if (buffer != null) {
+                            buffer.clear();
+                        }
+                        Map<Long, Instant> waitStart = sequenceWaitStartByTopic.get(payload.topic());
+                        if (waitStart != null) {
+                            waitStart.clear();
+                        }
+                        saveSequenceState();
+                    } finally {
+                        sequenceBufferLock.unlock();
+                    }
                     syncingTopics.remove(payload.topic());
                 }
             } catch (Exception e) {

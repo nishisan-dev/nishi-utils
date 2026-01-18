@@ -1,0 +1,45 @@
+# Configuração Mínima para Bootstrap (Zero-Touch Provisioning)
+# Use este modelo para novos nós que devem entrar no cluster automaticamente.
+
+node:
+  # id: "node-xyz"      # Opcional: se omitido, gera UUID aleatório
+  host: ${HOST:127.0.0.1} # Endereco IP acessivel pelos outros nos
+  port: ${PORT:9213}      # Porta TCP
+  dirs:
+    base: ${BASE_DIR:/tmp/client-1}
+
+autodiscover:
+  enabled: false
+  secret: "my-cluster-secret-token-2026" # Deve bater com o do Seed
+  seed: ${SEED_HOST:127.0.0.1:9000}                 # Endereco do Seed Node
+
+# Politicas Globais do Cluster
+cluster:
+  name: "production-cluster"
+  replication:
+    factor: 1
+    strict: true
+  transport:
+    workers: 4
+  seeds:
+    - ${SEED_HOST:127.0.0.1:9000}
+
+# Configuracao de Filas (multi-queue)
+queues:
+  - name: "global-events"
+    retention:
+      policy: "TIME_BASED"
+      duration: "48h"
+    performance:
+      fsync: true
+      memory-buffer:
+        enabled: true
+        size: 10000
+      short-circuit: false
+    compaction:
+      threshold: 0.5
+      interval: "30m"
+
+  - name: "jobs"
+    retention:
+      policy: "DELETE_ON_CONSUME"
