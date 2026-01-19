@@ -41,9 +41,11 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Simple distributed map that relies on the replication layer to keep replicas aligned.
+ * Simple distributed map that relies on the replication layer to keep replicas
+ * aligned.
  */
-public final class MapClusterService<K extends Serializable, V extends Serializable> implements Closeable, ReplicationHandler {
+public final class MapClusterService<K extends Serializable, V extends Serializable>
+        implements Closeable, ReplicationHandler {
     public static final String TOPIC_PREFIX = "map:";
     public static final String DEFAULT_MAP_NAME = "default-map";
 
@@ -62,7 +64,8 @@ public final class MapClusterService<K extends Serializable, V extends Serializa
                 persistenceConfig);
     }
 
-    public MapClusterService(ReplicationManager replicationManager, String topic, MapPersistenceConfig persistenceConfig) {
+    public MapClusterService(ReplicationManager replicationManager, String topic,
+            MapPersistenceConfig persistenceConfig) {
         this.replicationManager = Objects.requireNonNull(replicationManager, "replicationManager");
         this.topic = Objects.requireNonNull(topic, "topic");
         if (this.topic.isBlank()) {
@@ -98,7 +101,8 @@ public final class MapClusterService<K extends Serializable, V extends Serializa
     }
 
     /**
-     * Loads map state from disk (snapshot + WAL) and starts the persistence background writer when enabled.
+     * Loads map state from disk (snapshot + WAL) and starts the persistence
+     * background writer when enabled.
      * This is a no-op when persistence is disabled.
      */
     public void loadFromDisk() {
@@ -144,11 +148,28 @@ public final class MapClusterService<K extends Serializable, V extends Serializa
     public void apply(UUID operationId, Serializable payload) {
         MapReplicationCommand command = (MapReplicationCommand) payload;
         switch (command.type()) {
-            case PUT -> data.put((K) command.key(), (V) command.value());
+            case PUT -> {
+                // For offset maps, apply monotonic semantics: only accept higher values
+                if (topic.equals("map:_ngrid-queue-offsets") && command.value() instanceof Long newValue) {
+                    data.compute((K) command.key(), (k, currentValue) -> {
+                        if (currentValue instanceof Long currentLong) {
+                            if (newValue > currentLong) {
+                                return (V) newValue;
+                            }
+                            // Ignore regression
+                            return currentValue;
+                        }
+                        return (V) newValue;
+                    });
+                } else {
+                    data.put((K) command.key(), (V) command.value());
+                }
+            }
             case REMOVE -> data.remove((K) command.key());
         }
         if (persistence != null) {
-            // Persist locally on every node (leader and followers) when applying the replicated command.
+            // Persist locally on every node (leader and followers) when applying the
+            // replicated command.
             persistence.appendAsync(command.type(), command.key(), command.value());
         }
     }
@@ -184,11 +205,28 @@ public final class MapClusterService<K extends Serializable, V extends Serializa
     @SuppressWarnings("unchecked")
     public void installSnapshot(Serializable snapshot) {
         if (snapshot instanceof Map<?, ?> newMap) {
-            // Note: For chunked install, we should probably not clear if it's not the first chunk.
-            // But how do we know if it's the first?
-            // Let's refine the ReplicationManager logic to tell the handler.
-            // For now, let's assume if it's a Map, we just putAll.
-            data.putAll((Map<? extends K, ? extends V>) newMap);
+            // For offset maps, apply monotonic semantics during snapshot install
+            if (topic.equals("map:_ngrid-queue-offsets")) {
+                for (Map.Entry<?, ?> entry : newMap.entrySet()) {
+                    K key = (K) entry.getKey();
+                    V newValue = (V) entry.getValue();
+                    if (newValue instanceof Long newLong) {
+                        data.compute(key, (k, currentValue) -> {
+                            if (currentValue instanceof Long currentLong) {
+                                if (newLong > currentLong) {
+                                    return (V) newLong;
+                                }
+                                return currentValue;
+                            }
+                            return newValue;
+                        });
+                    } else {
+                        data.put(key, newValue);
+                    }
+                }
+            } else {
+                data.putAll((Map<? extends K, ? extends V>) newMap);
+            }
             if (persistence != null) {
                 persistence.maybeSnapshot();
             }
