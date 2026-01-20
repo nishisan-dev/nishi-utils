@@ -22,12 +22,12 @@ autodiscover:
 cluster:
   name: "production-cluster"
   replication:
-    factor: 1             # Replicar dados em 1 no (demo local)
+    factor: 2             # Replicar dados em 1 no (demo local)
     strict: true          # Exigir quorum estrito (CP)
   transport:
     workers: 4            # Threads de IO
   seeds:                  # Lista de seeds para failover
-    - "127.0.0.1:9000"
+    - "192.168.5.89:9000"
     - "192.168.5.90:9000"
     - "192.168.5.91:9000"
 
@@ -49,7 +49,8 @@ queues:
 
   - name: "jobs"
     retention:
-      policy: "DELETE_ON_CONSUME"
+      policy: "TIME_BASED"
+      duration: "24h"
 
 # Definicao de Mapas Persistentes
 maps:

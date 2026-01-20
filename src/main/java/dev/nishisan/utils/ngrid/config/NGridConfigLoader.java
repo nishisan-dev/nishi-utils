@@ -224,6 +224,9 @@ public class NGridConfigLoader {
                     builder.retention(
                             dev.nishisan.utils.ngrid.structures.QueueConfig.RetentionPolicy.timeBased(duration));
                 }
+            } else if ("DELETE_ON_CONSUME".equals(policy)) {
+                throw new IllegalArgumentException(
+                        "Retention policy DELETE_ON_CONSUME is not supported for NGrid YAML queues");
             } else if ("SIZE_BASED".equals(policy)) {
                 // Note: QueuePolicyConfig doesn't have a maxSize field yet
                 // For now, we'll use a default time-based policy

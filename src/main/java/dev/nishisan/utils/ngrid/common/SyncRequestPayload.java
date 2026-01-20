@@ -30,14 +30,20 @@ public final class SyncRequestPayload implements Serializable {
 
     private final String topic;
     private final int chunkIndex;
+    private final boolean allowFollowerResponse;
 
     public SyncRequestPayload(String topic) {
         this(topic, 0);
     }
 
     public SyncRequestPayload(String topic, int chunkIndex) {
+        this(topic, chunkIndex, false);
+    }
+
+    public SyncRequestPayload(String topic, int chunkIndex, boolean allowFollowerResponse) {
         this.topic = Objects.requireNonNull(topic, "topic");
         this.chunkIndex = chunkIndex;
+        this.allowFollowerResponse = allowFollowerResponse;
     }
 
     public String topic() {
@@ -46,5 +52,9 @@ public final class SyncRequestPayload implements Serializable {
 
     public int chunkIndex() {
         return chunkIndex;
+    }
+
+    public boolean allowFollowerResponse() {
+        return allowFollowerResponse;
     }
 }

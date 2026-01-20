@@ -69,6 +69,10 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             0);
     private volatile long lastAppliedSequence = 0;
     private final Set<String> syncingTopics = ConcurrentHashMap.newKeySet();
+    private final Set<String> leaderSyncTopics = ConcurrentHashMap.newKeySet();
+    private final java.util.concurrent.atomic.AtomicBoolean leaderSyncing = new java.util.concurrent.atomic.AtomicBoolean(
+            false);
+    private final java.util.concurrent.atomic.AtomicReference<NodeId> lastLeader = new java.util.concurrent.atomic.AtomicReference<>();
 
     // Multi-thread executor to prevent starvation when callbacks recursively submit
     // tasks
@@ -147,6 +151,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         long retryMs = Math.max(100L, retryInterval.toMillis());
         timeoutScheduler.scheduleAtFixedRate(this::retryPending, retryMs, retryMs, TimeUnit.MILLISECONDS);
         timeoutScheduler.scheduleAtFixedRate(this::checkLagAndSync, 2000, 2000, TimeUnit.MILLISECONDS);
+        timeoutScheduler.scheduleAtFixedRate(this::retryLeaderSync, 500, 500, TimeUnit.MILLISECONDS);
     }
 
     public void stop() {
@@ -169,6 +174,10 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
     public long getLastAppliedSequence() {
         return lastAppliedSequence;
+    }
+
+    public boolean isLeaderSyncing() {
+        return leaderSyncing.get();
     }
 
     private void checkLagAndSync() {
@@ -377,9 +386,10 @@ public class ReplicationManager implements TransportListener, LeadershipListener
     }
 
     private void handleSyncRequest(ClusterMessage message) {
-        if (!coordinator.isLeader())
-            return;
         SyncRequestPayload payload = message.payload(SyncRequestPayload.class);
+        if (!coordinator.isLeader() && !payload.allowFollowerResponse()) {
+            return;
+        }
         ReplicationHandler handler = handlers.get(payload.topic());
         if (handler == null)
             return;
@@ -388,7 +398,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         if (chunk == null)
             return;
 
-        long seq = globalSequence.get();
+        long seq = coordinator.isLeader() ? globalSequence.get() : appliedSequence.get();
         SyncResponsePayload responsePayload = new SyncResponsePayload(payload.topic(), seq, payload.chunkIndex(),
                 chunk.hasMore(), chunk.data());
         ClusterMessage response = new ClusterMessage(UUID.randomUUID(),
@@ -410,6 +420,20 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
         executor.submit(() -> {
             try {
+                long currentNext;
+                sequenceBufferLock.lock();
+                try {
+                    currentNext = nextExpectedSequenceByTopic.getOrDefault(payload.topic(), 1L);
+                } finally {
+                    sequenceBufferLock.unlock();
+                }
+                long currentApplied = Math.max(0L, currentNext - 1L);
+                if (payload.sequence() < currentApplied) {
+                    LOGGER.warning(() -> "Ignoring stale sync for " + payload.topic()
+                            + " (sequence=" + payload.sequence() + ", current=" + currentApplied + ")");
+                    syncingTopics.remove(payload.topic());
+                    return;
+                }
                 if (payload.chunkIndex() == 0) {
                     LOGGER.info(() -> "Starting sync for " + payload.topic() + " at sequence " + payload.sequence());
                     handler.resetState();
@@ -439,6 +463,9 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                         sequenceBufferLock.unlock();
                     }
                     syncingTopics.remove(payload.topic());
+                    if (leaderSyncTopics.remove(payload.topic()) && leaderSyncTopics.isEmpty()) {
+                        leaderSyncing.set(false);
+                    }
                 }
             } catch (Exception e) {
                 LOGGER.log(Level.SEVERE, "Failed to install snapshot chunk", e);
@@ -467,18 +494,41 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         });
     }
 
+    private void requestSyncFrom(NodeId target, String topic, int chunkIndex, boolean allowFollowerResponse) {
+        if (target == null) {
+            return;
+        }
+        SyncRequestPayload payload = new SyncRequestPayload(topic, chunkIndex, allowFollowerResponse);
+        ClusterMessage request = ClusterMessage.request(MessageType.SYNC_REQUEST,
+                "sync",
+                transport.local().nodeId(),
+                target,
+                payload);
+        transport.send(request);
+    }
+
     private void handleReplicationRequest(ClusterMessage message) {
         ReplicationPayload payload = message.payload(ReplicationPayload.class);
         UUID opId = payload.operationId();
         long seq = payload.sequence();
+        String localNodeId = transport.local().nodeId().value();
 
         LOGGER.info(() -> String.format(
-                "Replication request opId=%s seq=%d topic=%s from=%s",
-                opId, seq, payload.topic(), message.source()));
+                "[%s] Replication request opId=%s seq=%d topic=%s from=%s",
+                localNodeId, opId, seq, payload.topic(), message.source()));
 
-        // Already applied previously
+        // Already applied previously - send ACK and skip
         if (applied.contains(opId)) {
+            LOGGER.fine(() -> String.format(
+                    "[%s] Skipping already-applied opId=%s", localNodeId, opId));
             sendAck(opId, message.source());
+            return;
+        }
+
+        // Already being processed - skip entirely (dedup guard)
+        if (processing.contains(opId)) {
+            LOGGER.fine(() -> String.format(
+                    "[%s] Skipping already-processing opId=%s", localNodeId, opId));
             return;
         }
 
@@ -524,15 +574,24 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                 // Apply asynchronously with callback
                 applyReplication(payload, message, onSuccess);
             } else if (seq > nextExpected) {
-                // Future sequence, add to buffer
+                // Future sequence - check for duplicates before buffering
+                boolean alreadyBuffered = buffer.stream()
+                        .anyMatch(b -> b.payload().operationId().equals(opId));
+                if (alreadyBuffered) {
+                    LOGGER.fine(() -> String.format(
+                            "[%s] Ignoring duplicate buffered opId=%s seq=%d topic=%s",
+                            localNodeId, opId, seq, topic));
+                    return;
+                }
+
                 BufferedReplication buffered = new BufferedReplication(
                         payload, message, Instant.now());
                 buffer.add(buffered);
                 waitStart.putIfAbsent(seq, Instant.now());
 
                 LOGGER.info(() -> String.format(
-                        "Buffered future sequence seq=%d (expecting=%d) for topic=%s",
-                        seq, nextExpected, topic));
+                        "[%s] Buffered future sequence opId=%s seq=%d (expecting=%d) for topic=%s",
+                        localNodeId, opId, seq, nextExpected, topic));
 
                 // Check if we have gaps and if timeout expired
                 checkForMissingSequences(topic);
@@ -555,8 +614,11 @@ public class ReplicationManager implements TransportListener, LeadershipListener
      */
     private void applyReplication(ReplicationPayload payload, ClusterMessage message, Runnable onSuccess) {
         UUID opId = payload.operationId();
+        String localNodeId = transport.local().nodeId().value();
 
         if (!processing.add(opId)) {
+            LOGGER.fine(() -> String.format(
+                    "[%s] applyReplication: already processing opId=%s", localNodeId, opId));
             return; // Already being processed
         }
 
@@ -579,7 +641,8 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                 }
 
                 LOGGER.info(() -> String.format(
-                        "Applied replication opId=%s seq=%d", opId, payload.sequence()));
+                        "[%s] Applied replication opId=%s seq=%d topic=%s",
+                        localNodeId, opId, payload.sequence(), payload.topic()));
             } catch (Exception e) {
                 LOGGER.log(Level.SEVERE, "Failed to apply replicated operation", e);
             } finally {
@@ -679,15 +742,19 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                             "Timeout waiting for seq=%d (waited %dms) for topic=%s, will request from leader",
                             nextExpected, waited.toMillis(), topic));
 
-                    // Note: Request will be implemented in Phase 3
-                    // For now, just log the gap
+                    if (syncingTopics.add(topic)) {
+                        requestSync(topic);
+                    }
                 }
             }
         }
     }
 
     private void sendAck(UUID operationId, NodeId destination) {
-        LOGGER.info(() -> "Sending replication ack for " + operationId + " to " + destination);
+        String localNodeId = transport.local().nodeId().value();
+        LOGGER.info(() -> String.format(
+                "[%s] Sending replication ack for %s to %s",
+                localNodeId, operationId, destination));
         ReplicationAckPayload ackPayload = new ReplicationAckPayload(operationId, true);
         ClusterMessage ack = ClusterMessage.request(MessageType.REPLICATION_ACK,
                 "ack",
@@ -799,9 +866,57 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
     @Override
     public void onLeaderChanged(NodeId newLeader) {
-        if (!transport.local().nodeId().equals(newLeader)) {
+        NodeId localId = transport.local().nodeId();
+        NodeId previousLeader = lastLeader.getAndSet(newLeader);
+        if (!localId.equals(newLeader)) {
+            if (previousLeader != null && previousLeader.equals(localId)) {
+                leaderSyncing.set(false);
+                leaderSyncTopics.clear();
+            }
             failAllPending("Lost leadership to " + newLeader);
+            return;
         }
+        leaderSyncTopics.clear();
+        leaderSyncTopics.addAll(handlers.keySet());
+        leaderSyncing.set(!leaderSyncTopics.isEmpty());
+        attemptLeaderSync(previousLeader, localId);
+    }
+
+    private NodeId resolveSyncSource(NodeId previousLeader, NodeId localId) {
+        Set<NodeId> active = coordinator.activeMembers().stream()
+                .map(NodeInfo::nodeId)
+                .collect(java.util.stream.Collectors.toSet());
+        if (previousLeader != null && !previousLeader.equals(localId) && active.contains(previousLeader)) {
+            return previousLeader;
+        }
+        return active.stream()
+                .filter(nodeId -> !nodeId.equals(localId))
+                .findFirst()
+                .orElse(null);
+    }
+
+    private void attemptLeaderSync(NodeId previousLeader, NodeId localId) {
+        if (!leaderSyncing.get() || leaderSyncTopics.isEmpty()) {
+            return;
+        }
+        NodeId syncSource = resolveSyncSource(previousLeader, localId);
+        if (syncSource == null) {
+            return;
+        }
+        for (String topic : leaderSyncTopics) {
+            requestSyncFrom(syncSource, topic, 0, true);
+        }
+    }
+
+    private void retryLeaderSync() {
+        if (!running || !coordinator.isLeader()) {
+            return;
+        }
+        if (!leaderSyncing.get()) {
+            return;
+        }
+        NodeId localId = transport.local().nodeId();
+        attemptLeaderSync(lastLeader.get(), localId);
     }
 
     private void failAllPending(String reason) {

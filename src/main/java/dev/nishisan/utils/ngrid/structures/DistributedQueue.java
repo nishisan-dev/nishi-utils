@@ -113,17 +113,25 @@ public final class DistributedQueue<T extends Serializable>
     public Optional<T> poll() {
         recordIngressWrite();
         if (coordinator.isLeader()) {
-            // Use localNodeId as consumerId to activate offset-based consumption
-            // This ensures monotonic offset tracking for failover resilience
-            Optional<T> value = queueService.poll(localNodeId);
-            if (value.isPresent()) {
-                recordQueuePoll();
-            }
-            return value;
+            return queueService.poll(localNodeId);
         }
         queueService.syncOffsetsIfNeeded();
-        SerializableOptional<T> result = (SerializableOptional<T>) invokeLeader(queuePollCommand, null);
-        return result.toOptional();
+        Long offsetHint = queueService.getCurrentOffset(localNodeId);
+        Serializable result = invokeLeader(queuePollCommand, offsetHint);
+        if (result instanceof SerializableOptional) {
+            SerializableOptional<?> opt = (SerializableOptional<?>) result;
+            if (opt.isPresent()) {
+                Object val = opt.value();
+                if (val instanceof QueueClusterService.QueueRecord) {
+                    QueueClusterService.QueueRecord<T> record = (QueueClusterService.QueueRecord<T>) val;
+                    queueService.updateLocalOffset(localNodeId, record.offset() + 1);
+                    return Optional.of(record.value());
+                }
+                return Optional.of((T) val);
+            }
+            return Optional.empty();
+        }
+        return Optional.empty();
     }
 
     @SuppressWarnings("unchecked")
@@ -238,13 +246,14 @@ public final class DistributedQueue<T extends Serializable>
             return Boolean.TRUE;
         }
         if (queuePollCommand.equals(command)) {
-            Optional<T> value = queueService.poll(requestingNode);
-            if (value.isPresent()) {
+            Long hintOffset = body instanceof Long ? (Long) body : null;
+            Optional<QueueClusterService.QueueRecord<T>> recordOpt = queueService.pollRecord(requestingNode,
+                    hintOffset);
+            if (recordOpt.isPresent()) {
                 recordQueuePoll();
+                return SerializableOptional.of(recordOpt.get());
             }
-            return (Serializable) value
-                    .map(SerializableOptional::of)
-                    .orElseGet(SerializableOptional::empty);
+            return SerializableOptional.empty();
         }
         if (queuePeekCommand.equals(command)) {
             return (Serializable) queueService.peek()

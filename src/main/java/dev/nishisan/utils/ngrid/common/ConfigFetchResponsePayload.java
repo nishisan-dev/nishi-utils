@@ -14,23 +14,33 @@ import java.util.Objects;
  */
 public final class ConfigFetchResponsePayload implements Serializable {
     @Serial
-    private static final long serialVersionUID = 2L;
+    private static final long serialVersionUID = 3L;
 
     private final ClusterPolicyConfig cluster;
     private final QueuePolicyConfig queue;
+    private final List<QueuePolicyConfig> queues;
     private final List<MapPolicyConfig> maps;
     private final NodeInfo seedInfo;
 
     public ConfigFetchResponsePayload(ClusterPolicyConfig cluster, QueuePolicyConfig queue, List<MapPolicyConfig> maps) {
-        this(cluster, queue, maps, null);
+        this(cluster, queue, queue != null ? List.of(queue) : List.of(), maps, null);
     }
 
     public ConfigFetchResponsePayload(ClusterPolicyConfig cluster,
                                       QueuePolicyConfig queue,
                                       List<MapPolicyConfig> maps,
                                       NodeInfo seedInfo) {
+        this(cluster, queue, queue != null ? List.of(queue) : List.of(), maps, seedInfo);
+    }
+
+    public ConfigFetchResponsePayload(ClusterPolicyConfig cluster,
+                                      QueuePolicyConfig queue,
+                                      List<QueuePolicyConfig> queues,
+                                      List<MapPolicyConfig> maps,
+                                      NodeInfo seedInfo) {
         this.cluster = Objects.requireNonNull(cluster, "cluster");
         this.queue = Objects.requireNonNull(queue, "queue");
+        this.queues = Objects.requireNonNull(queues, "queues");
         this.maps = Objects.requireNonNull(maps, "maps");
         this.seedInfo = seedInfo;
     }
@@ -41,6 +51,10 @@ public final class ConfigFetchResponsePayload implements Serializable {
 
     public QueuePolicyConfig queue() {
         return queue;
+    }
+
+    public List<QueuePolicyConfig> queues() {
+        return queues;
     }
 
     public List<MapPolicyConfig> maps() {

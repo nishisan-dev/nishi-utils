@@ -298,7 +298,7 @@ Para mais detalhes, consulte a [documentação completa de configuração YAML](
 - O `replicationQuorum` define quantos nós (incluindo o líder) precisam confirmar para a operação ser considerada commitada.
 - **Catch-up de filas e mapas** usa snapshot em chunks quando há atraso relevante.
 - Offsets de consumo em modo `TIME_BASED` são persistidos por `NodeId`; se o retention expirar, o consumidor pode ser avançado para o item mais antigo disponível.
-- `queueDirectory` (legado) preserva semântica **DELETE_ON_CONSUME**; para log distribuído, prefira `dataDirectory` + retention `TIME_BASED`.
+- `queueDirectory` (legado) mantém semântica destrutiva; no NGrid moderno o padrão é `TIME_BASED`.
 
 ## Arquitetura (resumo)
 

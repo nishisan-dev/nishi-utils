@@ -1,0 +1,37 @@
+
+node:
+  id: "seed-1"
+  host: "127.0.0.1"
+  port: 9100
+  roles:
+    - "SEED"
+    - "COORDINATOR"
+  dirs:
+    base: "/tmp/ngrid-scenario/seed"
+
+autodiscover:
+  enabled: false
+  secret: "scenario-secret"
+
+cluster:
+  name: "scenario-cluster"
+  replication:
+    factor: 2
+    strict: true
+  transport:
+    workers: 4
+  seeds:
+    - "127.0.0.1:9100"
+
+queues:
+  - name: "global-events"
+    retention:
+      policy: "TIME_BASED"
+      duration: "48h"
+    performance:
+      fsync: false
+      memory-buffer:
+        enabled: true
+        size: 10000
+      short-circuit: false
+

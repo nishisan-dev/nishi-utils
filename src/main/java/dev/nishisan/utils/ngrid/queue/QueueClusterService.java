@@ -112,6 +112,10 @@ public final class QueueClusterService<T extends Serializable> implements Closea
     }
 
     public Optional<T> poll(NodeId consumerId) {
+        return poll(consumerId, null);
+    }
+
+    public Optional<T> poll(NodeId consumerId, Long hintOffset) {
         ensureLeaderReady();
         clientLock.lock();
         operationLock.lock();
@@ -121,8 +125,16 @@ public final class QueueClusterService<T extends Serializable> implements Closea
             // If it is DELETE_ON_CONSUME, we ignore the consumerId and perform a
             // destructive poll
             // to maintain backward compatibility and expected Queue semantics.
+            LOGGER.info(() -> String.format("poll: consumerId=%s, retentionPolicy=%s, queueName=%s",
+                    consumerId, queue.getRetentionPolicy(), queueName));
             if (consumerId != null && queue.getRetentionPolicy() == NQueue.Options.RetentionPolicy.TIME_BASED) {
-                long nextIndex = offsetStore.getOffset(consumerId);
+                long storedOffset = offsetStore.getOffset(consumerId);
+                long nextIndex = storedOffset;
+                if (hintOffset != null && hintOffset > storedOffset) {
+                    LOGGER.info(() -> "Forwarding offset for " + consumerId + " from " + storedOffset + " to hint "
+                            + hintOffset);
+                    nextIndex = hintOffset;
+                }
 
                 // If nextIndex is 0 (new consumer), we might want to start from the beginning.
                 // But if the queue starts at 1 (which it does), asking for 0 will fail.
@@ -273,17 +285,24 @@ public final class QueueClusterService<T extends Serializable> implements Closea
     }
 
     private void safeUpdateOffset(NodeId consumerId, long offset) {
+        if (distributedOffsetStore != null) {
+            try {
+                // Critical: Update distributed store FIRST.
+                // If this fails (replication timeout/partition), we must NOT update local store
+                // and we must NOT return the message to the client (throw exception).
+                // This ensures that the state remains consistent: if client gets data, offset
+                // is committed.
+                distributedOffsetStore.updateOffset(consumerId, offset);
+                pendingOffsetSync.set(false);
+            } catch (RuntimeException e) {
+                LOGGER.log(Level.WARNING, "Failed to update distributed offset for " + consumerId, e);
+                // Propagate exception to abort the poll
+                throw e;
+            }
+        }
+        // Only update local store if distributed update succeeded (or if running in
+        // local-only mode)
         localOffsetStore.updateOffset(consumerId, offset);
-        if (distributedOffsetStore == null) {
-            return;
-        }
-        try {
-            distributedOffsetStore.updateOffset(consumerId, offset);
-            pendingOffsetSync.set(false);
-        } catch (RuntimeException e) {
-            pendingOffsetSync.set(true);
-            LOGGER.log(Level.WARNING, "Failed to update distributed offset for " + consumerId, e);
-        }
     }
 
     public void syncOffsetsIfNeeded() {
@@ -430,5 +449,46 @@ public final class QueueClusterService<T extends Serializable> implements Closea
         if (replicationManager.isLeaderSyncing()) {
             throw new IllegalStateException("Leader sync in progress");
         }
+    }
+
+    public long getCurrentOffset(NodeId consumerId) {
+        long local = localOffsetStore.getOffset(consumerId);
+        long distributed = distributedOffsetStore != null ? distributedOffsetStore.getOffset(consumerId) : 0;
+        return Math.max(local, distributed);
+    }
+
+    public void updateLocalOffset(NodeId consumerId, long offset) {
+        localOffsetStore.updateOffset(consumerId, offset);
+    }
+
+    public static class QueueRecord<T> implements Serializable {
+        private final long offset;
+        private final T value;
+
+        public QueueRecord(long offset, T value) {
+            this.offset = offset;
+            this.value = value;
+        }
+
+        public long offset() {
+            return offset;
+        }
+
+        public T value() {
+            return value;
+        }
+    }
+
+    public Optional<QueueRecord<T>> pollRecord(NodeId consumerId, Long hintOffset) {
+        Optional<T> val = poll(consumerId, hintOffset);
+        if (val.isEmpty())
+            return Optional.empty();
+        // poll() updates safeUpdateOffset, so getCurrentOffset should reflect the NEW
+        // offset (next index)
+        // But we want the offset OF THE ITEM.
+        // safeUpdateOffset updates to nextIndex (item.index + 1).
+        // So item.index = currentOffset - 1.
+        long current = getCurrentOffset(consumerId);
+        return Optional.of(new QueueRecord<>(current - 1, val.get()));
     }
 }

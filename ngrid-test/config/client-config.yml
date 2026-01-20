@@ -2,7 +2,7 @@
 # Use este modelo para novos nós que devem entrar no cluster automaticamente.
 
 node:
-  # id: "node-xyz"      # Opcional: se omitido, gera UUID aleatório
+  id: ${NODE_ID:client-1} # ID fixo para persistir offset entre restarts
   host: ${HOST:127.0.0.1} # Endereco IP acessivel pelos outros nos
   port: ${PORT:9213}      # Porta TCP
   dirs:
@@ -17,7 +17,7 @@ autodiscover:
 cluster:
   name: "production-cluster"
   replication:
-    factor: 1
+    factor: 2
     strict: true
   transport:
     workers: 4
@@ -42,4 +42,5 @@ queues:
 
   - name: "jobs"
     retention:
-      policy: "DELETE_ON_CONSUME"
+      policy: "TIME_BASED"
+      duration: "24h"

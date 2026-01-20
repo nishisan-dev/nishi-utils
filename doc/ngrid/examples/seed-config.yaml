@@ -47,7 +47,8 @@ queues:
 
   - name: "jobs"
     retention:
-      policy: "DELETE_ON_CONSUME"
+      policy: "TIME_BASED"
+      duration: "24h"
 
 # Definicao de Mapas Persistentes
 maps:

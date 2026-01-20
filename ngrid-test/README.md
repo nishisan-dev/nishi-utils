@@ -28,6 +28,15 @@ Modo autodiscover (client-auto):
 java -jar ngrid-test/target/ngrid-test-1.0-SNAPSHOT-jar-with-dependencies.jar client-auto
 ```
 
+## Scenario local (seed + 2 clients + kill/restart)
+
+Executa um cenario automatico com 1 seed e 2 clients na mesma maquina,
+fila `global-events` com replication factor 2 e kill/restart do seed.
+
+```bash
+java -jar ngrid-test/target/ngrid-test-1.0-SNAPSHOT-jar-with-dependencies.jar scenario-1
+```
+
 ## Lab (3 hosts com IPs fixos)
 
 Topologia:
@@ -49,6 +58,7 @@ java -jar ngrid-test/target/ngrid-test-1.0-SNAPSHOT-jar-with-dependencies.jar se
 ### Client 1 (192.168.5.90)
 
 ```bash
+export NODE_ID=client-1
 export HOST=192.168.5.90
 export PORT=9000
 export BASE_DIR=/tmp/ngrid-client-1
@@ -57,15 +67,40 @@ export SEED_HOST=192.168.5.89:9000
 java -jar ngrid-test/target/ngrid-test-1.0-SNAPSHOT-jar-with-dependencies.jar client
 ```
 
+Client 1 (autodiscover):
+
+```bash
+export NODE_ID=client-1
+export HOST=192.168.5.90
+export PORT=9000
+export BASE_DIR=/tmp/ngrid-client-1
+export SEED_HOST=192.168.5.89:9000
+
+java -jar ngrid-test/target/ngrid-test-1.0-SNAPSHOT-jar-with-dependencies.jar client-auto
+```
+
 ### Client 2 (192.168.5.91)
 
 ```bash
+export NODE_ID=client-2
 export HOST=192.168.5.91
 export PORT=9000
 export BASE_DIR=/tmp/ngrid-client-2
 export SEED_HOST=192.168.5.89:9000
 
 java -jar ngrid-test/target/ngrid-test-1.0-SNAPSHOT-jar-with-dependencies.jar client
+```
+
+Client 2 (autodiscover):
+
+```bash
+export NODE_ID=client-2
+export HOST=192.168.5.91
+export PORT=9000
+export BASE_DIR=/tmp/ngrid-client-2
+export SEED_HOST=192.168.5.89:9000
+
+java -jar ngrid-test/target/ngrid-test-1.0-SNAPSHOT-jar-with-dependencies.jar client-auto
 ```
 
 > Dica: libere a porta 9000 nos tres hosts e garanta que os IPs se enxerguem na rede.
@@ -85,6 +120,7 @@ Client:
 - `PORT` (default: `9213`)
 - `BASE_DIR` (default: `/tmp/client-1`)
 - `SEED_HOST` (default: `127.0.0.1:9000`)
+- `NODE_ID` (default: `client-1`, persiste offset entre restarts)
 
 ## Dependencia do nishi-utils
 

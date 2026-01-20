@@ -2,7 +2,7 @@
 # Use este modelo quando quiser baixar politicas do seed automaticamente.
 
 node:
-  # id: "node-xyz"      # Opcional: se omitido, gera UUID aleatorio
+  id: ${NODE_ID:client-1} # ID fixo para persistir offset entre restarts
   host: ${HOST:127.0.0.1} # Endereco IP acessivel pelos outros nos
   port: ${PORT:9213}      # Porta TCP
   dirs:

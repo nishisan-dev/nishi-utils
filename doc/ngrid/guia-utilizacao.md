@@ -283,19 +283,22 @@ Node->>C: close()
 - `offer(T value)`
 - `Optional<T> peek()`
 - `Optional<T> poll()`
+- `Optional<T> pollWhenAvailable(Duration timeout)` (long-poll com notificação)
 
 ### Observações importantes
 
 - Se você chamar em um **follower**, a operação será encaminhada ao **líder** via `CLIENT_REQUEST/CLIENT_RESPONSE`.
 - No backend, o NGrid usa `QueueClusterService` + `ReplicationManager` e persiste em `NQueue` local (um diretório por nó).
 - **Consumo Persistente**: Ao chamar `poll()`, o sistema identifica automaticamente o `NodeId` do nó que fez a requisição. Se a fila estiver configurada em modo `RetentionPolicy.TIME_BASED`, o cluster gerenciará um offset persistente para este consumidor. Isso garante que, se o nó cair e voltar, continuará lendo a partir da última mensagem não consumida por ele.
+- **Subscribe/Notify (reduz storm)**: filas fazem subscribe automático no líder. Use `pollWhenAvailable(...)` para esperar notificação antes de buscar dados.
 
 ### Modos de consumo (Queue vs Log)
 
-O comportamento do `poll()` depende da politica de retencao da fila:
+No NGrid moderno (configurado via `dataDirectory` + `queues`), o modo padrao e **TIME_BASED** (log/stream).
+O modo **DELETE_ON_CONSUME** fica restrito ao legado (`queueDirectory`) e nao e exposto no YAML do NGrid.
 
-- **DELETE_ON_CONSUME (fila classica)**: o item e removido no commit. Todos os consumidores avancam o mesmo ponteiro global.
 - **TIME_BASED (log/stream)**: o item permanece por tempo e cada consumidor avanca seu **offset** individual.
+- **DELETE_ON_CONSUME (legado)**: o item e removido no commit. Todos os consumidores avancam o mesmo ponteiro global.
 
 Exemplo de log distribuido com dois consumidores distintos (NodeId diferentes):
 
