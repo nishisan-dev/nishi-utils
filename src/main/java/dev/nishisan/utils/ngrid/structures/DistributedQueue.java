@@ -113,7 +113,8 @@ public final class DistributedQueue<T extends Serializable>
     public Optional<T> poll() {
         recordIngressWrite();
         if (coordinator.isLeader()) {
-            return queueService.poll(localNodeId);
+            Long hintOffset = queueService.getCurrentOffset(localNodeId);
+            return queueService.poll(localNodeId, hintOffset);
         }
         queueService.syncOffsetsIfNeeded();
         Long offsetHint = queueService.getCurrentOffset(localNodeId);

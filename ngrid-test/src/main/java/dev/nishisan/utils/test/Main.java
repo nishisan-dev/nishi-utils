@@ -32,11 +32,15 @@ public class Main {
                 node.getMapNames().forEach(System.out::println);
                 DistributedQueue<String> queue = node.getQueue("global-events", String.class);
                 int index = 0;
+                String epochPrefix = System.getenv("NG_MESSAGE_EPOCH");
+                String prefix = epochPrefix != null && !epochPrefix.isBlank()
+                        ? "INDEX-" + epochPrefix + "-"
+                        : "INDEX-";
 
                 node.coordinator().awaitLocalStability();
 
                 while (true) {
-                    String msg= "INDEX-" + index;
+                    String msg = prefix + index;
                     //produz aqui
                     System.out.println("Enviando:");
                     queue.offer(msg);
