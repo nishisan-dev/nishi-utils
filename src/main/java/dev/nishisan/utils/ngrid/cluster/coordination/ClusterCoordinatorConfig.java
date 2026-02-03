@@ -17,6 +17,7 @@
 
 package dev.nishisan.utils.ngrid.cluster.coordination;
 
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Objects;
 
@@ -27,28 +28,36 @@ public final class ClusterCoordinatorConfig {
     private final Duration heartbeatInterval;
     private final Duration heartbeatTimeout;
     private final int minClusterSize;
+    private final Path dataDirectory;
 
-    private ClusterCoordinatorConfig(Duration heartbeatInterval, Duration heartbeatTimeout, int minClusterSize) {
+    private ClusterCoordinatorConfig(Duration heartbeatInterval, Duration heartbeatTimeout,
+            int minClusterSize, Path dataDirectory) {
         this.heartbeatInterval = heartbeatInterval;
         this.heartbeatTimeout = heartbeatTimeout;
         this.minClusterSize = minClusterSize;
+        this.dataDirectory = dataDirectory;
     }
 
     public static ClusterCoordinatorConfig defaults() {
-        return new ClusterCoordinatorConfig(Duration.ofSeconds(1), Duration.ofSeconds(5), 1);
+        return new ClusterCoordinatorConfig(Duration.ofSeconds(1), Duration.ofSeconds(5), 1, null);
     }
 
     public static ClusterCoordinatorConfig of(Duration interval, Duration timeout) {
-        return of(interval, timeout, 1);
+        return of(interval, timeout, 1, null);
     }
 
     public static ClusterCoordinatorConfig of(Duration interval, Duration timeout, int minClusterSize) {
+        return of(interval, timeout, minClusterSize, null);
+    }
+
+    public static ClusterCoordinatorConfig of(Duration interval, Duration timeout, int minClusterSize,
+            Path dataDirectory) {
         Objects.requireNonNull(interval, "interval");
         Objects.requireNonNull(timeout, "timeout");
         if (minClusterSize < 1) {
             throw new IllegalArgumentException("minClusterSize must be >= 1");
         }
-        return new ClusterCoordinatorConfig(interval, timeout, minClusterSize);
+        return new ClusterCoordinatorConfig(interval, timeout, minClusterSize, dataDirectory);
     }
 
     public Duration heartbeatInterval() {
@@ -61,5 +70,9 @@ public final class ClusterCoordinatorConfig {
 
     public int minClusterSize() {
         return minClusterSize;
+    }
+
+    public Path dataDirectory() {
+        return dataDirectory;
     }
 }

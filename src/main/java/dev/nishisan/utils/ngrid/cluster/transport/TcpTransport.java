@@ -762,6 +762,14 @@ public final class TcpTransport implements Transport {
                     if (message.type() == MessageType.HANDSHAKE) {
                         handleHandshake(this, message);
                     } else {
+                        if (remote == null && message.source() != null) {
+                            NodeInfo inferred = new NodeInfo(
+                                    message.source(),
+                                    socket.getInetAddress().getHostAddress(),
+                                    socket.getPort());
+                            remote = inferred;
+                            connections.putIfAbsent(inferred.nodeId(), this);
+                        }
                         handleMessage(remoteId().orElse(null), message);
                     }
                 }

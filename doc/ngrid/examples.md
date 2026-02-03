@@ -384,6 +384,8 @@ public class DistributedQueueExample {
       q.offer("job-1"); // pode ser chamado em follower; será roteado ao líder
       Optional<String> job = q.poll();
       System.out.println("job=" + job.orElse("<vazio>"));
+      // long-poll com notificação (reduz storm quando a fila está vazia)
+      // Optional<String> next = q.pollWhenAvailable(Duration.ofSeconds(5));
     } catch (IllegalStateException e) {
       // Ex.: "No leader available", "Not the leader", falhas de quorum/timeout propagadas como erro
       System.err.println("DistributedQueue operation failed: " + e.getMessage());

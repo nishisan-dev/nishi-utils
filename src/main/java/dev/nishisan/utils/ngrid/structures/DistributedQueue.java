@@ -18,6 +18,7 @@
 package dev.nishisan.utils.ngrid.structures;
 
 import dev.nishisan.utils.ngrid.cluster.coordination.ClusterCoordinator;
+import dev.nishisan.utils.ngrid.cluster.coordination.LeadershipListener;
 import dev.nishisan.utils.ngrid.cluster.transport.Transport;
 import dev.nishisan.utils.ngrid.cluster.transport.TransportListener;
 import dev.nishisan.utils.ngrid.common.ClientRequestPayload;
@@ -26,6 +27,9 @@ import dev.nishisan.utils.ngrid.common.ClusterMessage;
 import dev.nishisan.utils.ngrid.common.MessageType;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
+import dev.nishisan.utils.ngrid.common.QueueNotifyPayload;
+import dev.nishisan.utils.ngrid.common.QueueSubscribePayload;
+import dev.nishisan.utils.ngrid.common.QueueUnsubscribePayload;
 import dev.nishisan.utils.ngrid.queue.QueueClusterService;
 import dev.nishisan.utils.ngrid.metrics.NGridMetrics;
 import dev.nishisan.utils.stats.StatsUtils;
@@ -33,17 +37,22 @@ import dev.nishisan.utils.stats.StatsUtils;
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.Serializable;
+import java.time.Duration;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Logger;
 
 /**
- * Public facing distributed queue API. It routes client calls to the current leader and
+ * Public facing distributed queue API. It routes client calls to the current
+ * leader and
  * processes remote requests when the local node is in charge.
  */
-public final class DistributedQueue<T extends Serializable> implements TransportListener, Closeable {
+public final class DistributedQueue<T extends Serializable>
+        implements TransportListener, LeadershipListener, Closeable {
     private static final Logger LOGGER = Logger.getLogger(DistributedQueue.class.getName());
     private static final String COMMAND_PREFIX_OFFER = "queue.offer:";
     private static final String COMMAND_PREFIX_POLL = "queue.poll:";
@@ -58,6 +67,10 @@ public final class DistributedQueue<T extends Serializable> implements Transport
     private final String queuePeekCommand;
     private final StatsUtils stats;
     private final NodeId localNodeId;
+    private final Set<NodeId> subscribers = ConcurrentHashMap.newKeySet();
+    private final Object notificationMonitor = new Object();
+    private final AtomicBoolean notified = new AtomicBoolean(false);
+    private volatile NodeId subscribedLeader;
 
     public DistributedQueue(Transport transport,
             ClusterCoordinator coordinator,
@@ -81,6 +94,8 @@ public final class DistributedQueue<T extends Serializable> implements Transport
         this.stats = stats;
         this.localNodeId = transport.local().nodeId();
         transport.addListener(this);
+        coordinator.addLeadershipListener(this);
+        subscribeIfLeaderPresent();
     }
 
     public void offer(T value) {
@@ -88,6 +103,7 @@ public final class DistributedQueue<T extends Serializable> implements Transport
         if (coordinator.isLeader()) {
             recordQueueOffer();
             queueService.offer(value);
+            notifySubscribers();
         } else {
             invokeLeader(queueOfferCommand, value);
         }
@@ -97,14 +113,26 @@ public final class DistributedQueue<T extends Serializable> implements Transport
     public Optional<T> poll() {
         recordIngressWrite();
         if (coordinator.isLeader()) {
-            Optional<T> value = queueService.poll();
-            if (value.isPresent()) {
-                recordQueuePoll();
-            }
-            return value;
+            Long hintOffset = queueService.getCurrentOffset(localNodeId);
+            return queueService.poll(localNodeId, hintOffset);
         }
-        SerializableOptional<T> result = (SerializableOptional<T>) invokeLeader(queuePollCommand, null);
-        return result.toOptional();
+        queueService.syncOffsetsIfNeeded();
+        Long offsetHint = queueService.getCurrentOffset(localNodeId);
+        Serializable result = invokeLeader(queuePollCommand, offsetHint);
+        if (result instanceof SerializableOptional) {
+            SerializableOptional<?> opt = (SerializableOptional<?>) result;
+            if (opt.isPresent()) {
+                Object val = opt.value();
+                if (val instanceof QueueClusterService.QueueRecord) {
+                    QueueClusterService.QueueRecord<T> record = (QueueClusterService.QueueRecord<T>) val;
+                    queueService.updateLocalOffset(localNodeId, record.offset() + 1);
+                    return Optional.of(record.value());
+                }
+                return Optional.of((T) val);
+            }
+            return Optional.empty();
+        }
+        return Optional.empty();
     }
 
     @SuppressWarnings("unchecked")
@@ -116,11 +144,57 @@ public final class DistributedQueue<T extends Serializable> implements Transport
         return result.toOptional();
     }
 
+    public Optional<T> pollWhenAvailable(Duration timeout) {
+        if (timeout == null || timeout.isNegative() || timeout.isZero()) {
+            return poll();
+        }
+        if (coordinator.isLeader()) {
+            return poll();
+        }
+        Optional<T> immediate = poll();
+        if (immediate.isPresent()) {
+            return immediate;
+        }
+        subscribeIfLeaderPresent();
+        long deadline = System.currentTimeMillis() + timeout.toMillis();
+        while (System.currentTimeMillis() < deadline) {
+            if (consumeNotification()) {
+                return poll();
+            }
+            long remaining = deadline - System.currentTimeMillis();
+            if (remaining <= 0) {
+                break;
+            }
+            waitForNotification(remaining);
+        }
+        return Optional.empty();
+    }
+
+    public void subscribe() {
+        subscribeIfLeaderPresent();
+    }
+
+    public void unsubscribe() {
+        NodeInfo leaderInfo = coordinator.leaderInfo().orElse(null);
+        if (leaderInfo == null || leaderInfo.nodeId().equals(localNodeId)) {
+            return;
+        }
+        QueueUnsubscribePayload payload = new QueueUnsubscribePayload(queueName);
+        ClusterMessage request = ClusterMessage.request(MessageType.QUEUE_UNSUBSCRIBE,
+                "queue-unsubscribe",
+                localNodeId,
+                leaderInfo.nodeId(),
+                payload);
+        transport.send(request);
+        subscribedLeader = null;
+    }
+
     private Serializable invokeLeader(String command, Serializable body) {
         int attempts = 0;
         while (attempts < 3) {
             attempts++;
-            NodeInfo leaderInfo = coordinator.leaderInfo().orElseThrow(() -> new IllegalStateException("No leader available"));
+            NodeInfo leaderInfo = coordinator.leaderInfo()
+                    .orElseThrow(() -> new IllegalStateException("No leader available"));
             if (leaderInfo.nodeId().equals(transport.local().nodeId())) {
                 return executeLocal(command, body, transport.local().nodeId());
             }
@@ -136,7 +210,8 @@ public final class DistributedQueue<T extends Serializable> implements Transport
                 ClientResponsePayload responsePayload = response.payload(ClientResponsePayload.class);
                 if (!responsePayload.success()) {
                     if ("Not the leader".equals(responsePayload.error()) && attempts < 3) {
-                        LOGGER.info(() -> "Leader rejected request; retrying " + command + " from " + transport.local().nodeId());
+                        LOGGER.info(() -> "Leader rejected request; retrying " + command + " from "
+                                + transport.local().nodeId());
                         try {
                             Thread.sleep(100);
                         } catch (InterruptedException e) {
@@ -168,16 +243,18 @@ public final class DistributedQueue<T extends Serializable> implements Transport
         if (queueOfferCommand.equals(command)) {
             recordQueueOffer();
             queueService.offer((T) body);
+            notifySubscribers();
             return Boolean.TRUE;
         }
         if (queuePollCommand.equals(command)) {
-            Optional<T> value = queueService.poll(requestingNode);
-            if (value.isPresent()) {
+            Long hintOffset = body instanceof Long ? (Long) body : null;
+            Optional<QueueClusterService.QueueRecord<T>> recordOpt = queueService.pollRecord(requestingNode,
+                    hintOffset);
+            if (recordOpt.isPresent()) {
                 recordQueuePoll();
+                return SerializableOptional.of(recordOpt.get());
             }
-            return (Serializable) value
-                    .map(SerializableOptional::of)
-                    .orElseGet(SerializableOptional::empty);
+            return SerializableOptional.empty();
         }
         if (queuePeekCommand.equals(command)) {
             return (Serializable) queueService.peek()
@@ -194,11 +271,46 @@ public final class DistributedQueue<T extends Serializable> implements Transport
 
     @Override
     public void onPeerDisconnected(NodeId peerId) {
-        // no-op
+        subscribers.remove(peerId);
+        if (peerId != null && peerId.equals(subscribedLeader)) {
+            subscribedLeader = null;
+        }
     }
 
     @Override
     public void onMessage(ClusterMessage message) {
+        if (message.type() == MessageType.QUEUE_NOTIFY) {
+            QueueNotifyPayload payload = message.payload(QueueNotifyPayload.class);
+            if (queueName.equals(payload.queueName())) {
+                markNotified();
+            }
+            return;
+        }
+        if (message.type() == MessageType.QUEUE_SUBSCRIBE) {
+            if (!coordinator.isLeader()) {
+                return;
+            }
+            QueueSubscribePayload payload = message.payload(QueueSubscribePayload.class);
+            if (!queueName.equals(payload.queueName())) {
+                return;
+            }
+            subscribers.add(message.source());
+            if (queueService.peek().isPresent()) {
+                notifySubscriber(message.source());
+            }
+            return;
+        }
+        if (message.type() == MessageType.QUEUE_UNSUBSCRIBE) {
+            if (!coordinator.isLeader()) {
+                return;
+            }
+            QueueUnsubscribePayload payload = message.payload(QueueUnsubscribePayload.class);
+            if (!queueName.equals(payload.queueName())) {
+                return;
+            }
+            subscribers.remove(message.source());
+            return;
+        }
         if (message.type() != MessageType.CLIENT_REQUEST) {
             return;
         }
@@ -210,11 +322,15 @@ public final class DistributedQueue<T extends Serializable> implements Transport
                 + message.source() + " (leader=" + coordinator.isLeader() + ")");
         ClientResponsePayload responsePayload;
         if (!coordinator.isLeader()) {
-            LOGGER.info(() -> "Rejecting client request (not leader) for " + payload.command() + " from " + message.source());
+            LOGGER.info(() -> "Rejecting client request (not leader) for " + payload.command() + " from "
+                    + message.source());
             responsePayload = new ClientResponsePayload(payload.requestId(), false, null, "Not the leader");
         } else {
             try {
                 Serializable result = executeLocal(payload.command(), payload.body(), message.source());
+                if (queuePollCommand.equals(payload.command())) {
+                    subscribers.add(message.source());
+                }
                 responsePayload = new ClientResponsePayload(payload.requestId(), true, result, null);
             } catch (RuntimeException e) {
                 String messageText = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
@@ -228,6 +344,8 @@ public final class DistributedQueue<T extends Serializable> implements Transport
     @Override
     public void close() throws IOException {
         transport.removeListener(this);
+        coordinator.removeLeadershipListener(this);
+        unsubscribe();
         queueService.close();
     }
 
@@ -237,6 +355,86 @@ public final class DistributedQueue<T extends Serializable> implements Transport
         }
         stats.notifyHitCounter(NGridMetrics.writeNode(localNodeId));
         stats.notifyHitCounter(NGridMetrics.queueOffer(localNodeId));
+    }
+
+    @Override
+    public void onLeaderChanged(NodeId newLeader) {
+        if (localNodeId.equals(newLeader)) {
+            subscribedLeader = null;
+            return;
+        }
+        subscribedLeader = null;
+        queueService.syncOffsetsIfNeeded();
+        subscribeIfLeaderPresent();
+    }
+
+    private void subscribeIfLeaderPresent() {
+        NodeInfo leaderInfo = coordinator.leaderInfo().orElse(null);
+        if (leaderInfo == null) {
+            return;
+        }
+        if (leaderInfo.nodeId().equals(localNodeId)) {
+            return;
+        }
+        if (leaderInfo.nodeId().equals(subscribedLeader)) {
+            return;
+        }
+        queueService.syncOffsetsIfNeeded();
+        QueueSubscribePayload payload = new QueueSubscribePayload(queueName);
+        ClusterMessage request = ClusterMessage.request(MessageType.QUEUE_SUBSCRIBE,
+                "queue-subscribe",
+                localNodeId,
+                leaderInfo.nodeId(),
+                payload);
+        transport.send(request);
+        markNotified();
+        subscribedLeader = leaderInfo.nodeId();
+    }
+
+    private void notifySubscribers() {
+        if (!coordinator.isLeader()) {
+            return;
+        }
+        for (NodeId subscriber : subscribers) {
+            notifySubscriber(subscriber);
+        }
+    }
+
+    private void notifySubscriber(NodeId subscriber) {
+        if (subscriber == null || subscriber.equals(localNodeId)) {
+            return;
+        }
+        QueueNotifyPayload payload = new QueueNotifyPayload(queueName);
+        ClusterMessage notify = ClusterMessage.request(MessageType.QUEUE_NOTIFY,
+                "queue-notify",
+                localNodeId,
+                subscriber,
+                payload);
+        transport.send(notify);
+    }
+
+    private void markNotified() {
+        notified.set(true);
+        synchronized (notificationMonitor) {
+            notificationMonitor.notifyAll();
+        }
+    }
+
+    private boolean consumeNotification() {
+        return notified.getAndSet(false);
+    }
+
+    private void waitForNotification(long millis) {
+        synchronized (notificationMonitor) {
+            if (notified.get()) {
+                return;
+            }
+            try {
+                notificationMonitor.wait(millis);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 
     private void recordQueuePoll() {

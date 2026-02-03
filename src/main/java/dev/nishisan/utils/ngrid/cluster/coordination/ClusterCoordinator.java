@@ -28,6 +28,8 @@ import dev.nishisan.utils.ngrid.common.NodeInfo;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Collection;
@@ -40,7 +42,9 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
@@ -61,8 +65,11 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     private final Set<MembershipListener> membershipListeners = new CopyOnWriteArraySet<>();
     private final ScheduledExecutorService scheduler;
     private final AtomicReference<NodeId> leader = new AtomicReference<>();
+    private final AtomicLong leaderEpoch = new AtomicLong(0);
     private volatile java.util.function.LongSupplier leaderHighWatermarkSupplier = () -> -1L;
     private volatile long trackedLeaderHighWatermark = -1L;
+    private volatile long trackedLeaderEpoch = 0L;
+    private final Path epochPath;
 
     public interface MembershipListener {
         void onMembershipChanged();
@@ -79,6 +86,10 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         this.transport = Objects.requireNonNull(transport, "transport");
         this.config = Objects.requireNonNull(config, "config");
         this.scheduler = Objects.requireNonNull(scheduler, "scheduler");
+        this.epochPath = config.dataDirectory() != null
+                ? config.dataDirectory().resolve("leader-epoch.dat")
+                : null;
+        loadEpoch();
     }
 
     public void setLeaderHighWatermarkSupplier(java.util.function.LongSupplier supplier) {
@@ -87,6 +98,47 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
 
     public long getTrackedLeaderHighWatermark() {
         return trackedLeaderHighWatermark;
+    }
+
+    /**
+     * Returns the current leader epoch. The epoch is incremented each time
+     * a new leader is elected.
+     */
+    public long getLeaderEpoch() {
+        return leaderEpoch.get();
+    }
+
+    /**
+     * Returns the last known leader epoch received via heartbeat.
+     */
+    public long getTrackedLeaderEpoch() {
+        return trackedLeaderEpoch;
+    }
+
+    private void loadEpoch() {
+        if (epochPath == null || !Files.exists(epochPath)) {
+            return;
+        }
+        try {
+            String content = Files.readString(epochPath).trim();
+            long loaded = Long.parseLong(content);
+            leaderEpoch.set(loaded);
+            LOGGER.info(() -> "Loaded leader epoch: " + loaded);
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING, "Failed to load epoch, starting from 0", e);
+        }
+    }
+
+    private void persistEpoch(long epoch) {
+        if (epochPath == null) {
+            return;
+        }
+        try {
+            Files.createDirectories(epochPath.getParent());
+            Files.writeString(epochPath, String.valueOf(epoch));
+        } catch (Exception e) {
+            LOGGER.log(Level.SEVERE, "Failed to persist epoch", e);
+        }
     }
 
     /**
@@ -322,7 +374,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             if (!running) {
                 return;
             }
-            HeartbeatPayload payload = HeartbeatPayload.now(leaderHighWatermarkSupplier.getAsLong());
+            HeartbeatPayload payload = HeartbeatPayload.now(leaderHighWatermarkSupplier.getAsLong(), leaderEpoch.get());
             ClusterMessage heartbeat = ClusterMessage.request(MessageType.HEARTBEAT,
                     "hb",
                     transport.local().nodeId(),
@@ -432,6 +484,13 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     private void updateLeader(NodeId newLeaderId) {
         NodeId previous = leader.getAndSet(newLeaderId);
         if (!Objects.equals(previous, newLeaderId)) {
+            // Increment epoch on leader change
+            if (newLeaderId != null && newLeaderId.equals(transport.local().nodeId())) {
+                long newEpoch = leaderEpoch.incrementAndGet();
+                persistEpoch(newEpoch);
+                LOGGER.info(() -> "New leader epoch: " + newEpoch);
+            }
+
             leadershipListeners.forEach(listener -> listener.onLeaderChanged(newLeaderId));
 
             // Notify LeaderElectionListener if local node's leadership status changed
@@ -483,6 +542,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             NodeId currentLeader = leader.get();
             if (currentLeader != null && currentLeader.equals(source)) {
                 trackedLeaderHighWatermark = payload.leaderHighWatermark();
+                trackedLeaderEpoch = payload.leaderEpoch();
             }
             members.computeIfAbsent(source,
                     id -> new ClusterMember(findPeerInfo(source).orElseGet(() -> new NodeInfo(source, "", 0)))).touch();

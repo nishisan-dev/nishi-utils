@@ -92,10 +92,10 @@ DQ-->>Client: ok
 
 ### `poll()`
 
-O comportamento depende da politica de retencao:
+No NGrid moderno, o padrao e **TIME_BASED**; **DELETE_ON_CONSUME** fica restrito ao legado.
 
-- **DELETE_ON_CONSUME**: poll destrutivo replicado para todos os nos.
 - **TIME_BASED**: poll por offset (log mode) associado ao `NodeId` do consumidor.
+- **DELETE_ON_CONSUME (legado)**: poll destrutivo replicado para todos os nos.
 
 ```mermaid
 sequenceDiagram

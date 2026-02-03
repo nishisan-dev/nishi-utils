@@ -76,7 +76,7 @@ cluster:
 queues:
   - name: orders
     retention:
-      # Politicas: TIME_BASED (log/stream) ou DELETE_ON_CONSUME (fila classica)
+      # Politica suportada no NGrid: TIME_BASED (log/stream)
       policy: TIME_BASED
       duration: 24h
     performance:
@@ -96,7 +96,8 @@ queues:
 
   - name: jobs
     retention:
-      policy: DELETE_ON_CONSUME
+      policy: TIME_BASED
+      duration: 24h
 
 # Mapas (metadados de bootstrap para autodiscover)
 maps:
@@ -130,12 +131,13 @@ Se `queues:` estiver ausente, o NGrid aceita a secao `queue:` como configuracao 
 queue:
   name: main-queue
   retention:
-    policy: DELETE_ON_CONSUME
+    policy: TIME_BASED
+    duration: 24h
   performance:
     fsync: true
 ```
 
-> Nota: Em configuracoes legadas com `queueDirectory`, o comportamento padrao e **DELETE_ON_CONSUME**.
+> Nota: Em configuracoes legadas com `queueDirectory`, o comportamento historico e destrutivo (DELETE_ON_CONSUME).
 
 ## Variaveis de Ambiente
 

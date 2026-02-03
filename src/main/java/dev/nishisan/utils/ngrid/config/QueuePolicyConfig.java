@@ -54,7 +54,7 @@ public class QueuePolicyConfig implements Serializable {
     public static class RetentionConfig implements Serializable {
         @Serial
         private static final long serialVersionUID = 1L;
-        private String policy; // TIME_BASED, DELETE_ON_CONSUME
+        private String policy; // TIME_BASED
         private String duration; // "24h"
 
         public String getPolicy() {

@@ -1,0 +1,17 @@
+# Configuracao Minima para Bootstrap (Autodiscover)
+# Use este modelo quando quiser baixar politicas do seed automaticamente.
+
+node:
+  id: ${NODE_ID:client-1} # ID fixo para persistir offset entre restarts
+  host: ${HOST:127.0.0.1} # Endereco IP acessivel pelos outros nos
+  port: ${PORT:9213}      # Porta TCP
+  dirs:
+    base: ${BASE_DIR:/tmp/client-1}
+
+autodiscover:
+  enabled: true
+  secret: "my-cluster-secret-token-2026" # Deve bater com o do Seed
+  seed: ${SEED_HOST:127.0.0.1:9000}       # Endereco do Seed Node
+
+# As secoes 'cluster', 'queues' e 'maps' serao baixadas automaticamente
+# e este arquivo sera atualizado pelo proprio no apos o bootstrap.

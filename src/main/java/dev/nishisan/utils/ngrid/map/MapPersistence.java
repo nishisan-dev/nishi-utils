@@ -75,6 +75,7 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
 
     private final LinkedBlockingQueue<WALEntry> queue = new LinkedBlockingQueue<>();
     private final AtomicBoolean running = new AtomicBoolean();
+    private final Object walLock = new Object();
 
     private volatile RandomAccessFile walRaf;
     private volatile FileChannel walChannel;
@@ -190,6 +191,35 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
     }
 
     /**
+     * Appends a WAL entry synchronously. Used for critical maps that must survive hard crashes.
+     */
+    public void appendSync(MapReplicationCommandType type, Serializable key, Serializable value) {
+        if (config.mode() == MapPersistenceMode.DISABLED) {
+            return;
+        }
+        Objects.requireNonNull(type, "type");
+        Objects.requireNonNull(key, "key");
+        FileChannel ch = walChannel;
+        if (ch == null) {
+            return;
+        }
+        WALEntry entry = new WALEntry(System.currentTimeMillis(), type, key, value);
+        synchronized (walLock) {
+            try {
+                ByteBuffer buffer = encode(entry);
+                while (buffer.hasRemaining()) {
+                    ch.write(buffer);
+                }
+                if (config.mode() == MapPersistenceMode.ASYNC_WITH_FSYNC) {
+                    ch.force(true);
+                }
+            } catch (IOException e) {
+                LOGGER.log(Level.WARNING, "Failed to append WAL entry synchronously", e);
+            }
+        }
+    }
+
+    /**
      * Closes the map persistence process and releases associated resources.
      *
      * This method performs the following operations:
@@ -293,18 +323,20 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
         if (ch == null) {
             return;
         }
-        try {
-            for (WALEntry entry : batch) {
-                ByteBuffer buffer = encode(entry);
-                while (buffer.hasRemaining()) {
-                    ch.write(buffer);
+        synchronized (walLock) {
+            try {
+                for (WALEntry entry : batch) {
+                    ByteBuffer buffer = encode(entry);
+                    while (buffer.hasRemaining()) {
+                        ch.write(buffer);
+                    }
                 }
+                if (config.mode() == MapPersistenceMode.ASYNC_WITH_FSYNC) {
+                    ch.force(true);
+                }
+            } catch (IOException e) {
+                LOGGER.log(Level.WARNING, "Failed to append WAL batch", e);
             }
-            if (config.mode() == MapPersistenceMode.ASYNC_WITH_FSYNC) {
-                ch.force(true);
-            }
-        } catch (IOException e) {
-            LOGGER.log(Level.WARNING, "Failed to append WAL batch", e);
         }
     }
 
@@ -604,4 +636,3 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
         }
     }
 }
-

@@ -249,3 +249,60 @@ mvn test -Dtest=CatchUpIntegrationTest
 mvn test -Dtest=QueueNodeFailoverIntegrationTest
 mvn test -Dtest=LeaderReelectionIntegrationTest
 ```
+
+---
+
+## Troubleshooting
+
+### Duplicação de mensagens após failover
+
+**Sintoma:** Após failover, consumidores recebem mensagens que já haviam consumido anteriormente.
+
+**Causas identificadas:**
+
+1. **Duplicação no buffer de replicação (corrigido)**
+   - Quando uma mensagem chega com sequência futura (ex: seq=31 quando esperando seq=21), ela vai para o buffer.
+   - O problema: se a mesma mensagem chegar novamente (via retransmissão TCP ou retry do líder), ela era adicionada novamente ao buffer.
+   - **Correção:** Verificar se `opId` já existe no buffer antes de adicionar (em `ReplicationManager.handleReplicationRequest`).
+
+2. **RetentionPolicy não configurada como TIME_BASED**
+   - O offset-based consumption só funciona se `RetentionPolicy == TIME_BASED`.
+   - Se a fila usa `DELETE_ON_CONSUME` (padrão), o `consumerId` é ignorado e poll é destrutivo.
+   - Após snapshot install, todos os itens são restaurados e reconsumeidos.
+   - **Diagnóstico:** Log adicionado em `QueueClusterService.poll()`:
+     ```
+     poll: consumerId=client-1, retentionPolicy=TIME_BASED, queueName=global-events
+     ```
+   - **Correção:** Configurar fila com `policy: TIME_BASED` no YAML e verificar se a config está sendo aplicada.
+
+3. **Snapshot restaura itens já consumidos**
+   - Em modo destrutivo, o snapshot do líder pode conter itens que já foram consumidos pelos followers.
+   - **Correção:** Usar offset-based consumption (TIME_BASED) para pular itens já consumidos.
+
+4. **Volatilidade do DistributedOffsetStore para Clientes**
+   - Se os offsets de consumidores (clientes) estiverem armazenados apenas no `DistributedOffsetStore` e o cluster perder dados (ex: restart de seed sem persistência em disco garantida para o mapa), o offset reseta para 0.
+   - **Sintoma:** Cliente reinicia o consumo do zero após falha do cluster, gerando duplicatas massivas.
+   - **Correção (Implementada):** Mecanismo de "Offset Hint". O cliente mantém um cache local do offset e o envia para o líder a cada `poll`. O líder usa `max(stored, hint)`.
+   - **Verificação:** Buscar logs "Forwarding offset for {client} from {stored} to hint {hint}".
+
+
+- [ ] Verificar se logs mostram `retentionPolicy=TIME_BASED` no poll
+- [ ] Verificar se `consumerId` não é `null` no poll
+- [ ] Verificar se `Buffered future sequence` aparece apenas 1x por opId (dedup funcionando)
+- [ ] Verificar se `Applied replication` aparece apenas 1x por nó por opId
+
+### Logs úteis para debugging
+
+```bash
+# Contar duplicações de replicação por nó
+grep -E "\[client-1\].*Replication request" /tmp/ngrid-scenario.log | sort | uniq -c | sort -rn | head -20
+
+# Verificar se buffer está deduplicando
+grep "Buffered future sequence" /tmp/ngrid-scenario.log | wc -l
+
+# Verificar aplicações duplicadas
+grep -E "\[client-1\].*Applied replication" /tmp/ngrid-scenario.log | sort | uniq -c | sort -rn | head -10
+
+# Verificar RetentionPolicy em uso
+grep "poll: consumerId" /tmp/ngrid-scenario.log | head -5
+```

@@ -69,7 +69,8 @@ queues:
 
   - name: jobs
     retention:
-      policy: DELETE_ON_CONSUME
+      policy: TIME_BASED
+      duration: 24h
 ```
 
 ### Inicializacao do Seed Node
@@ -157,7 +158,8 @@ queues:
 
   - name: jobs
     retention:
-      policy: DELETE_ON_CONSUME
+      policy: TIME_BASED
+      duration: 24h
 ```
 
 ### Inicializacao do Consumer Node

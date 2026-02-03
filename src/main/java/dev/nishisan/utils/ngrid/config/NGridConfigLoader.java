@@ -8,10 +8,12 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.List;
 import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import dev.nishisan.utils.ngrid.map.MapPersistenceMode;
 public class NGridConfigLoader {
 
     private static final ObjectMapper mapper;
@@ -198,6 +200,24 @@ public class NGridConfigLoader {
 
         // If maps list is present, pick the first one as default or just set directory?
         // Let's set defaults.
+        List<MapPolicyConfig> mapConfigs = yamlConfig.getMaps();
+        if (mapConfigs != null && !mapConfigs.isEmpty()) {
+            for (MapPolicyConfig mapConfig : mapConfigs) {
+                if (mapConfig == null) {
+                    continue;
+                }
+                String persistence = mapConfig.getPersistence();
+                if (persistence != null && !persistence.isBlank()) {
+                    String normalized = persistence.trim().toUpperCase();
+                    try {
+                        builder.mapPersistenceMode(MapPersistenceMode.valueOf(normalized));
+                    } catch (IllegalArgumentException ignored) {
+                        // Ignore invalid values and keep defaults
+                    }
+                    break;
+                }
+            }
+        }
 
         return builder.build();
     }
@@ -224,6 +244,9 @@ public class NGridConfigLoader {
                     builder.retention(
                             dev.nishisan.utils.ngrid.structures.QueueConfig.RetentionPolicy.timeBased(duration));
                 }
+            } else if ("DELETE_ON_CONSUME".equals(policy)) {
+                throw new IllegalArgumentException(
+                        "Retention policy DELETE_ON_CONSUME is not supported for NGrid YAML queues");
             } else if ("SIZE_BASED".equals(policy)) {
                 // Note: QueuePolicyConfig doesn't have a maxSize field yet
                 // For now, we'll use a default time-based policy

@@ -1,0 +1,63 @@
+
+# Configuracao completa para um Seed Node (Lider/Server)
+# Este no define as politicas do cluster e serve como ponto de entrada.
+
+node:
+  id:  ${NG_NODE_ID:seed-1}                 # ID fixo para o seed
+  host: ${NG_NODE_HOST:127.0.0.1}           # Endereco IP acessivel pelos outros nos
+  port: ${NG_NODE_PORT:9000}                # Porta TCP
+  roles:
+    - "SEED"
+    - "COORDINATOR"
+  dirs:
+    base: ${NG_BASE_DIR:/tmp/ngrid}
+
+# Configuracoes de Autodiscover (Server Side)
+# Habilita este no a responder requisicoes de configuracao
+autodiscover:
+  enabled: false          # O seed ja tem a config, entao false para client-mode
+  secret: "my-cluster-secret-token-2026" # Segredo compartilhado
+
+# Politicas Globais do Cluster (serao enviadas para novos nos)
+cluster:
+  name: "production-cluster"
+  replication:
+    factor: 2             # Replicar dados em 1 no (demo local)
+    strict: true          # Exigir quorum estrito (CP)
+  transport:
+    workers: 4            # Threads de IO
+  seeds:                  # Lista de seeds para failover
+    - "192.168.5.89:9000"
+    - "192.168.5.90:9000"
+    - "192.168.5.91:9000"
+
+# Configuracao de Filas (multi-queue)
+queues:
+  - name: "global-events"
+    retention:
+      policy: "TIME_BASED"  # Modo Stream (Log Distribuido)
+      duration: "48h"       # Rete mensagens por 48 horas
+    performance:
+      fsync: true           # Durabilidade maxima
+      memory-buffer:
+        enabled: true
+        size: 10000
+      short-circuit: false  # Forca persistencia antes da entrega
+    compaction:
+      threshold: 0.5
+      interval: "30m"
+
+  - name: "jobs"
+    retention:
+      policy: "TIME_BASED"
+      duration: "24h"
+
+# Definicao de Mapas Persistentes
+maps:
+  - name: "user-sessions"
+    key-type: "java.lang.String"
+    value-type: "java.lang.String"
+    persistence: "DISABLED" # Apenas memoria (rapido)
+
+  - name: "product-inventory"
+    persistence: "ASYNC_WITH_FSYNC" # Persistido em disco

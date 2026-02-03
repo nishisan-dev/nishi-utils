@@ -32,6 +32,7 @@ import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.ngrid.config.NGridConfigLoader;
 import dev.nishisan.utils.ngrid.config.NGridYamlConfig;
+import dev.nishisan.utils.ngrid.config.QueuePolicyConfig;
 import dev.nishisan.utils.ngrid.map.MapClusterService;
 import dev.nishisan.utils.ngrid.map.MapPersistenceConfig;
 import dev.nishisan.utils.ngrid.map.MapPersistenceMode;
@@ -40,6 +41,8 @@ import dev.nishisan.utils.ngrid.metrics.NGridMetrics;
 import dev.nishisan.utils.ngrid.metrics.NGridStatsSnapshot;
 import dev.nishisan.utils.ngrid.metrics.RttMonitor;
 import dev.nishisan.utils.ngrid.queue.QueueClusterService;
+import dev.nishisan.utils.ngrid.queue.DistributedOffsetStore;
+import dev.nishisan.utils.ngrid.queue.OffsetStore;
 import dev.nishisan.utils.ngrid.replication.ReplicationConfig;
 import dev.nishisan.utils.ngrid.replication.ReplicationManager;
 import dev.nishisan.utils.queue.NQueue;
@@ -220,6 +223,12 @@ public final class NGridNode implements Closeable {
                         yamlConfig.setCluster(responsePayload.cluster());
 
                         yamlConfig.setQueue(responsePayload.queue());
+                        if (responsePayload.queues() != null && !responsePayload.queues().isEmpty()) {
+                            yamlConfig.setQueues(responsePayload.queues());
+                            if (responsePayload.queue() == null) {
+                                yamlConfig.setQueue(responsePayload.queues().get(0));
+                            }
+                        }
 
                         yamlConfig.setMaps(responsePayload.maps());
 
@@ -641,6 +650,11 @@ public final class NGridNode implements Closeable {
         }
         int replicationFactor = queueConfig.replicationFactor() != null ? queueConfig.replicationFactor()
                 : config.replicationFactor();
+        OffsetStore offsetStore = null;
+        if (config.queueDirectory() == null) {
+            DistributedMap<String, Long> offsets = getMap("_ngrid-queue-offsets", String.class, Long.class);
+            offsetStore = new DistributedOffsetStore(offsets, queueName);
+        }
 
         // Determine queue directory
         // For new API: dataDirectory/queues/{queueName}
@@ -655,7 +669,7 @@ public final class NGridNode implements Closeable {
         }
 
         return new QueueClusterService<>(queueDir, queueName, replicationManager, options,
-                replicationFactor);
+                replicationFactor, offsetStore);
     }
 
     private DistributedQueueConfig buildQueueConfig(String queueName, DistributedQueueConfig queueConfig) {
@@ -691,10 +705,9 @@ public final class NGridNode implements Closeable {
         options = options.copy();
         if (config.queueDirectory() == null) {
             QueueConfig.RetentionPolicy retention = queueConfig.retention();
-            if (retention != null && retention.type() == QueueConfig.RetentionPolicy.Type.TIME_BASED) {
-                options.withRetentionPolicy(NQueue.Options.RetentionPolicy.TIME_BASED)
-                        .withRetentionTime(retention.duration());
-            }
+            Duration retentionTime = retention != null ? retention.duration() : Duration.ofDays(7);
+            options.withRetentionPolicy(NQueue.Options.RetentionPolicy.TIME_BASED)
+                    .withRetentionTime(retentionTime);
         }
         return DistributedQueueConfig.builder(queueConfig.name())
                 .replicationFactor(config.replicationFactor())
@@ -741,9 +754,15 @@ public final class NGridNode implements Closeable {
 
             if (secret != null && secret.equals(payload.secret())) {
                 LOGGER.info(() -> "Autodiscover secret valid for " + message.source() + ". Sending configuration...");
+                QueuePolicyConfig queuePolicy = yamlConfig.getQueue();
+                java.util.List<QueuePolicyConfig> queuePolicies = yamlConfig.getQueues();
+                if (queuePolicy == null && queuePolicies != null && !queuePolicies.isEmpty()) {
+                    queuePolicy = queuePolicies.get(0);
+                }
                 ConfigFetchResponsePayload responsePayload = new ConfigFetchResponsePayload(
                         yamlConfig.getCluster(),
-                        yamlConfig.getQueue(),
+                        queuePolicy,
+                        queuePolicies != null ? java.util.List.copyOf(queuePolicies) : java.util.List.of(),
                         yamlConfig.getMaps(),
                         config.local());
 
