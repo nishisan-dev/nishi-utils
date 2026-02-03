@@ -170,7 +170,12 @@ public final class MapClusterService<K extends Serializable, V extends Serializa
         if (persistence != null) {
             // Persist locally on every node (leader and followers) when applying the
             // replicated command.
-            persistence.appendAsync(command.type(), command.key(), command.value());
+            if (topic.equals("map:_ngrid-queue-offsets")) {
+                // Offsets must survive hard crashes to avoid duplicate delivery.
+                persistence.appendSync(command.type(), command.key(), command.value());
+            } else {
+                persistence.appendAsync(command.type(), command.key(), command.value());
+            }
         }
     }
 

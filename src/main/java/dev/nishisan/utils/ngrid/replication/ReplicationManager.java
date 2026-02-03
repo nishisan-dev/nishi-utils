@@ -398,7 +398,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         if (chunk == null)
             return;
 
-        long seq = coordinator.isLeader() ? globalSequence.get() : appliedSequence.get();
+        long seq = getSyncSequenceForTopic(payload.topic());
         SyncResponsePayload responsePayload = new SyncResponsePayload(payload.topic(), seq, payload.chunkIndex(),
                 chunk.hasMore(), chunk.data());
         ClusterMessage response = new ClusterMessage(UUID.randomUUID(),
@@ -645,6 +645,11 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                         localNodeId, opId, payload.sequence(), payload.topic()));
             } catch (Exception e) {
                 LOGGER.log(Level.SEVERE, "Failed to apply replicated operation", e);
+                if (syncingTopics.add(payload.topic())) {
+                    LOGGER.warning(() -> "Apply failed for topic " + payload.topic()
+                            + ", requesting sync to recover");
+                    requestSync(payload.topic());
+                }
             } finally {
                 processing.remove(opId);
             }
@@ -1029,6 +1034,20 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
     private void recordApplied() {
         lastAppliedSequence = appliedSequence.incrementAndGet();
+    }
+
+    private long getSyncSequenceForTopic(String topic) {
+        if (coordinator.isLeader()) {
+            java.util.concurrent.atomic.AtomicLong counter = sequenceByTopic.get(topic);
+            return counter != null ? counter.get() : 0L;
+        }
+        sequenceBufferLock.lock();
+        try {
+            long next = nextExpectedSequenceByTopic.getOrDefault(topic, 1L);
+            return Math.max(0L, next - 1L);
+        } finally {
+            sequenceBufferLock.unlock();
+        }
     }
 
     /**

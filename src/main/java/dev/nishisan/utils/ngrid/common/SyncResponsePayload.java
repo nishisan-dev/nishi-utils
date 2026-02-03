@@ -23,6 +23,7 @@ import java.util.Objects;
 
 /**
  * Response carrying a state snapshot for synchronization.
+ * The sequence refers to the last applied sequence for the specific topic.
  */
 public final class SyncResponsePayload implements Serializable {
     @Serial
