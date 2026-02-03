@@ -372,6 +372,17 @@ Veja: `src/main/java/dev/nishisan/utils/stats/StatsUtils.java`.
 mvn test
 ```
 
+### Testes de Durabilidade (NGrid)
+
+Para validar a durabilidade de offsets e mensagens após crash abrupto:
+
+```bash
+mvn test -Dtest=NGridDurabilityTest
+```
+
+Estes testes usam `docker kill` (SIGKILL) para simular falhas reais.
+Veja: `doc/ngrid/testcontainers-tests.md`
+
 ## Licença
 
 Este projeto é distribuído sob **GNU GPL v3** (ou posterior). Veja os cabeçalhos dos arquivos-fonte para detalhes.

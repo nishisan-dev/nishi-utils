@@ -70,3 +70,41 @@ mvn test -Dtest=NGridTestcontainersSmokeTest
 ```
 
 Docker must be running locally.
+
+---
+
+## Durability Tests
+
+The `NGridDurabilityTest` class focuses on validating **crash recovery** scenarios using `docker kill` (SIGKILL) to simulate abrupt failures.
+
+### Tests
+
+| Test | Validates |
+|------|-----------|
+| `shouldRecoverOffsetAfterCrashAndNotReceiveDuplicates` | Client offset durability - no duplicates after client crash |
+| `shouldRecoverMessagesAfterSeedCrash` | Queue durability - messages available after seed crash |
+| `shouldMaintainIndependentOffsetsAfterMultiClientCrash` | Multi-client independence - each client recovers its own offset |
+
+### Crash Simulation
+
+Uses Docker's kill command to send SIGKILL:
+
+```java
+container.getDockerClient()
+    .killContainerCmd(container.getContainerId())
+    .exec();
+```
+
+This simulates a hard crash (power failure, OOM kill, etc.) without graceful shutdown.
+
+### What is Validated
+
+- **Queue (`global-events`)**: Messages survive seed crash
+- **Map (`_ngrid-queue-offsets`)**: Consumer offsets survive client crash (prevents duplicates)
+
+### Running
+
+```bash
+mvn test -Dtest=NGridDurabilityTest
+```
+
