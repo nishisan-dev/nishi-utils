@@ -73,6 +73,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
     private final java.util.concurrent.atomic.AtomicBoolean leaderSyncing = new java.util.concurrent.atomic.AtomicBoolean(
             false);
     private final java.util.concurrent.atomic.AtomicReference<NodeId> lastLeader = new java.util.concurrent.atomic.AtomicReference<>();
+    private volatile long lastSeenLeaderEpoch = 0L;
 
     // Multi-thread executor to prevent starvation when callbacks recursively submit
     // tasks
@@ -254,8 +255,8 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         // Persist sequence state for leader recovery
         saveSequenceState();
 
-        ReplicationPayload payload = new ReplicationPayload(operation.operationId, seq, operation.topic,
-                operation.payload);
+        ReplicationPayload payload = new ReplicationPayload(operation.operationId, seq,
+                coordinator.getLeaderEpoch(), operation.topic, operation.payload);
         for (NodeInfo member : coordinator.activeMembers()) {
             if (member.nodeId().equals(transport.local().nodeId())) {
                 continue;
@@ -284,7 +285,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                     continue;
                 }
                 ReplicationPayload payload = new ReplicationPayload(operation.operationId, operation.sequence,
-                        operation.topic, operation.payload);
+                        coordinator.getLeaderEpoch(), operation.topic, operation.payload);
                 for (NodeInfo member : coordinator.activeMembers()) {
                     NodeId nodeId = member.nodeId();
                     if (nodeId.equals(transport.local().nodeId())) {
@@ -523,6 +524,18 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                     "[%s] Skipping already-applied opId=%s", localNodeId, opId));
             sendAck(opId, message.source());
             return;
+        }
+
+        // FENCING: Reject commands from stale leader epochs
+        long payloadEpoch = payload.epoch();
+        if (payloadEpoch < lastSeenLeaderEpoch) {
+            LOGGER.warning(() -> String.format(
+                    "[%s] Rejecting stale replication from epoch %d (current: %d) opId=%s",
+                    localNodeId, payloadEpoch, lastSeenLeaderEpoch, opId));
+            return;
+        }
+        if (payloadEpoch > lastSeenLeaderEpoch) {
+            lastSeenLeaderEpoch = payloadEpoch;
         }
 
         // Already being processed - skip entirely (dedup guard)
