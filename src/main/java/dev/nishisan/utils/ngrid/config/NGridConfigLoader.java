@@ -20,6 +20,8 @@ import dev.nishisan.utils.ngrid.map.MapPersistenceMode;
  */
 public class NGridConfigLoader {
 
+    private static final ObjectMapper mapper;
+
     /** Utility class — prevents instantiation. */
     private NGridConfigLoader() {
     }
