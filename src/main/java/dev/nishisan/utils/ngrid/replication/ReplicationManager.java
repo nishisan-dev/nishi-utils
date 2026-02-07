@@ -1070,6 +1070,16 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         return count > 0 ? (double) totalConvergenceTimeMs.get() / count : 0.0;
     }
 
+    /**
+     * Returns the number of replication operations currently awaiting quorum
+     * acknowledgement.
+     *
+     * @return pending operations count
+     */
+    public int getPendingOperationsCount() {
+        return pending.size();
+    }
+
     private void sendAck(UUID operationId, NodeId destination) {
         String localNodeId = transport.local().nodeId().value();
         LOGGER.info(() -> String.format(

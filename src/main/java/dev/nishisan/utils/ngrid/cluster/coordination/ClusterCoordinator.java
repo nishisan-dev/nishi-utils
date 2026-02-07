@@ -272,6 +272,17 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     }
 
     /**
+     * Returns the number of currently active members in the cluster.
+     *
+     * @return active member count
+     */
+    public int getActiveMembersCount() {
+        return (int) members.values().stream()
+                .filter(ClusterMember::isActive)
+                .count();
+    }
+
+    /**
      * Waits for the cluster to stabilize with a default timeout of 10 seconds.
      * 
      * A cluster is considered stable when:
