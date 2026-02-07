@@ -72,7 +72,14 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     private volatile Instant leaseExpiresAt = Instant.MIN;
     private final Path epochPath;
 
+    /**
+     * Listener notified whenever the cluster membership changes (member joins,
+     * leaves, or becomes inactive).
+     */
     public interface MembershipListener {
+        /**
+         * Invoked when the set of active cluster members changes.
+         */
         void onMembershipChanged();
     }
 
@@ -82,6 +89,13 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
 
     private volatile boolean running;
 
+    /**
+     * Creates a new cluster coordinator.
+     *
+     * @param transport the transport layer used for inter-node communication
+     * @param config    coordination configuration (intervals, timeouts, etc.)
+     * @param scheduler shared scheduler for periodic heartbeat and eviction tasks
+     */
     public ClusterCoordinator(Transport transport, ClusterCoordinatorConfig config,
             ScheduledExecutorService scheduler) {
         this.transport = Objects.requireNonNull(transport, "transport");
@@ -93,10 +107,21 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         loadEpoch();
     }
 
+    /**
+     * Registers a supplier that provides the leader's high watermark offset,
+     * included in heartbeat payloads so followers can track replication progress.
+     *
+     * @param supplier the high watermark supplier
+     */
     public void setLeaderHighWatermarkSupplier(java.util.function.LongSupplier supplier) {
         this.leaderHighWatermarkSupplier = Objects.requireNonNull(supplier);
     }
 
+    /**
+     * Returns the last known leader high watermark received via heartbeat.
+     *
+     * @return the tracked leader high watermark offset
+     */
     public long getTrackedLeaderHighWatermark() {
         return trackedLeaderHighWatermark;
     }
@@ -104,6 +129,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     /**
      * Returns the current leader epoch. The epoch is incremented each time
      * a new leader is elected.
+     *
+     * @return the current leader epoch
      */
     public long getLeaderEpoch() {
         return leaderEpoch.get();
@@ -111,6 +138,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
 
     /**
      * Returns the last known leader epoch received via heartbeat.
+     *
+     * @return the tracked leader epoch
      */
     public long getTrackedLeaderEpoch() {
         return trackedLeaderEpoch;
@@ -189,6 +218,11 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         recomputeLeader();
     }
 
+    /**
+     * Stops the cluster coordination process, removing this node as a transport
+     * listener. Scheduled heartbeat and eviction tasks remain in the executor
+     * but will no-op since the running flag is cleared.
+     */
     public void stop() {
         if (!running) {
             return;
@@ -197,6 +231,11 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         transport.removeListener(this);
     }
 
+    /**
+     * Returns whether the local node is the current cluster leader.
+     *
+     * @return {@code true} if this node is the leader
+     */
     public boolean isLeader() {
         NodeId leaderId = leader.get();
         return leaderId != null && leaderId.equals(transport.local().nodeId());
@@ -340,26 +379,57 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         return leaderInfo().isPresent() && activeMembers().size() >= config.minClusterSize();
     }
 
+    /**
+     * Registers a listener to be notified of leadership changes.
+     *
+     * @param listener the listener to add
+     */
     public void addLeadershipListener(LeadershipListener listener) {
         leadershipListeners.add(listener);
     }
 
+    /**
+     * Removes a previously registered leadership listener.
+     *
+     * @param listener the listener to remove
+     */
     public void removeLeadershipListener(LeadershipListener listener) {
         leadershipListeners.remove(listener);
     }
 
+    /**
+     * Registers a listener to be notified when the local node's leadership
+     * status changes.
+     *
+     * @param listener the listener to add
+     */
     public void addLeaderElectionListener(LeaderElectionListener listener) {
         leaderElectionListeners.add(Objects.requireNonNull(listener, "listener"));
     }
 
+    /**
+     * Removes a previously registered leader election listener.
+     *
+     * @param listener the listener to remove
+     */
     public void removeLeaderElectionListener(LeaderElectionListener listener) {
         leaderElectionListeners.remove(listener);
     }
 
+    /**
+     * Registers a listener to be notified when cluster membership changes.
+     *
+     * @param listener the listener to add
+     */
     public void addMembershipListener(MembershipListener listener) {
         membershipListeners.add(Objects.requireNonNull(listener, "listener"));
     }
 
+    /**
+     * Removes a previously registered membership listener.
+     *
+     * @param listener the listener to remove
+     */
     public void removeMembershipListener(MembershipListener listener) {
         membershipListeners.remove(listener);
     }
@@ -560,6 +630,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      * Returns {@code true} if this node is the current leader and holds a valid
      * (non-expired) lease. This method should be checked before accepting write
      * operations to prevent data divergence during network partitions.
+     *
+     * @return {@code true} if this node is leader with a valid lease
      */
     public boolean hasValidLease() {
         return isLeader() && Instant.now().isBefore(leaseExpiresAt);

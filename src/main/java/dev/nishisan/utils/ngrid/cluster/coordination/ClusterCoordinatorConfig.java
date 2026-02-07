@@ -40,20 +40,53 @@ public final class ClusterCoordinatorConfig {
         this.dataDirectory = dataDirectory;
     }
 
+    /**
+     * Returns a default configuration with 1 second heartbeat interval,
+     * 5 second timeout, and minimum cluster size of 1.
+     *
+     * @return default configuration
+     */
     public static ClusterCoordinatorConfig defaults() {
         Duration defaultTimeout = Duration.ofSeconds(5);
         return new ClusterCoordinatorConfig(Duration.ofSeconds(1), defaultTimeout,
                 defaultTimeout.multipliedBy(3), 1, null);
     }
 
+    /**
+     * Creates a configuration with the given interval and timeout.
+     *
+     * @param interval heartbeat interval
+     * @param timeout  heartbeat timeout
+     * @return a new configuration
+     */
     public static ClusterCoordinatorConfig of(Duration interval, Duration timeout) {
         return of(interval, timeout, null, 1, null);
     }
 
+    /**
+     * Creates a configuration with the given interval, timeout, and minimum cluster
+     * size.
+     *
+     * @param interval       heartbeat interval
+     * @param timeout        heartbeat timeout
+     * @param minClusterSize minimum active members for leader election
+     * @return a new configuration
+     */
     public static ClusterCoordinatorConfig of(Duration interval, Duration timeout, int minClusterSize) {
         return of(interval, timeout, null, minClusterSize, null);
     }
 
+    /**
+     * Creates a configuration with the given interval, timeout, minimum cluster
+     * size,
+     * and data directory.
+     *
+     * @param interval       heartbeat interval
+     * @param timeout        heartbeat timeout
+     * @param minClusterSize minimum active members for leader election
+     * @param dataDirectory  directory for persistent state
+     * @return a new configuration
+     */
     public static ClusterCoordinatorConfig of(Duration interval, Duration timeout, int minClusterSize,
             Path dataDirectory) {
         return of(interval, timeout, null, minClusterSize, dataDirectory);
@@ -68,6 +101,7 @@ public final class ClusterCoordinatorConfig {
      *                       {@code 3 × timeout}
      * @param minClusterSize minimum active members for leader election
      * @param dataDirectory  directory for persistent state (epoch file)
+     * @return a new configuration
      */
     public static ClusterCoordinatorConfig of(Duration interval, Duration timeout, Duration leaseTimeout,
             int minClusterSize, Path dataDirectory) {
@@ -80,29 +114,50 @@ public final class ClusterCoordinatorConfig {
         return new ClusterCoordinatorConfig(interval, timeout, effectiveLease, minClusterSize, dataDirectory);
     }
 
+    /**
+     * Returns the heartbeat broadcast interval.
+     *
+     * @return heartbeat interval
+     */
     public Duration heartbeatInterval() {
         return heartbeatInterval;
     }
 
+    /**
+     * Returns the heartbeat timeout used to detect dead members.
+     *
+     * @return heartbeat timeout
+     */
     public Duration heartbeatTimeout() {
         return heartbeatTimeout;
     }
 
     /**
      * Returns the leader lease timeout. A leader that has not received
-     * acknowledgment
-     * from a majority of followers within this duration will step down
-     * automatically.
-     * Defaults to {@code 3 × heartbeatTimeout}.
+     * acknowledgment from a majority of followers within this duration will
+     * step down automatically. Defaults to {@code 3 × heartbeatTimeout}.
+     *
+     * @return leader lease timeout
      */
     public Duration leaseTimeout() {
         return leaseTimeout;
     }
 
+    /**
+     * Returns the minimum number of active members required for leader election.
+     *
+     * @return minimum cluster size
+     */
     public int minClusterSize() {
         return minClusterSize;
     }
 
+    /**
+     * Returns the directory used for persistent state (e.g. epoch file),
+     * or {@code null} if no persistence is configured.
+     *
+     * @return data directory path, or {@code null}
+     */
     public Path dataDirectory() {
         return dataDirectory;
     }

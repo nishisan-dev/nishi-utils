@@ -24,5 +24,10 @@ import dev.nishisan.utils.ngrid.common.NodeId;
  */
 @FunctionalInterface
 public interface LeadershipListener {
+    /**
+     * Called when the cluster leader changes.
+     *
+     * @param newLeader the new leader node ID
+     */
     void onLeaderChanged(NodeId newLeader);
 }
