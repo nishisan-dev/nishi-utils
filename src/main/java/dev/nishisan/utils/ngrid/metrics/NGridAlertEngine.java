@@ -26,6 +26,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
@@ -85,6 +86,7 @@ public final class NGridAlertEngine implements Closeable {
     private volatile long previousGapsDetected = -1;
     private volatile long previousSnapshotFallbackCount = -1;
     private volatile boolean running;
+    private volatile ScheduledFuture<?> evaluationTask;
 
     private NGridAlertEngine(Builder builder) {
         this.snapshotSupplier = Objects.requireNonNull(builder.snapshotSupplier, "snapshotSupplier");
@@ -106,7 +108,8 @@ public final class NGridAlertEngine implements Closeable {
         }
         running = true;
         long periodMs = Math.max(500L, evaluationInterval.toMillis());
-        scheduler.scheduleAtFixedRate(this::evaluate, periodMs, periodMs, TimeUnit.MILLISECONDS);
+        evaluationTask = scheduler.scheduleAtFixedRate(this::evaluateScheduled, periodMs, periodMs,
+                TimeUnit.MILLISECONDS);
     }
 
     /**
@@ -161,6 +164,13 @@ public final class NGridAlertEngine implements Closeable {
         } catch (Throwable t) {
             LOGGER.log(Level.WARNING, "Alert evaluation failed", t);
         }
+    }
+
+    private void evaluateScheduled() {
+        if (!running) {
+            return;
+        }
+        evaluate();
     }
 
     private void evaluateReplicationLag(NGridOperationalSnapshot snapshot) {
@@ -265,6 +275,11 @@ public final class NGridAlertEngine implements Closeable {
     @Override
     public void close() {
         running = false;
+        ScheduledFuture<?> task = evaluationTask;
+        if (task != null) {
+            task.cancel(false);
+            evaluationTask = null;
+        }
     }
 
     /**

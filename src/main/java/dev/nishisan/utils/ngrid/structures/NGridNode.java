@@ -617,14 +617,12 @@ public final class NGridNode implements Closeable {
         double avgConvergence = replicationManager.getAverageConvergenceTimeMs();
         int pendingOps = replicationManager.getPendingOperationsCount();
 
-        // Count reachable nodes
-        int totalNodes = activeMembersCount;
+        // Count reachable nodes from the expected cluster membership (configured peers
+        // + local), so quorum reflects partitions even when membership views shrink.
+        int totalNodes = config.peers().size() + 1;
         int reachable = 1; // local node is always reachable
-        for (NodeInfo member : coordinator.activeMembers()) {
-            if (member.nodeId().equals(config.local().nodeId())) {
-                continue;
-            }
-            if (transport.isReachable(member.nodeId())) {
+        for (NodeInfo peer : config.peers()) {
+            if (transport.isReachable(peer.nodeId())) {
                 reachable++;
             }
         }

@@ -29,6 +29,7 @@ import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
@@ -57,6 +58,7 @@ public final class NGridDashboardReporter implements Closeable {
     private final Path outputPath;
     private final Duration reportInterval;
     private volatile boolean running;
+    private volatile ScheduledFuture<?> reportTask;
 
     private static final ObjectMapper YAML_MAPPER;
 
@@ -93,7 +95,7 @@ public final class NGridDashboardReporter implements Closeable {
         }
         running = true;
         long periodMs = Math.max(1000L, reportInterval.toMillis());
-        scheduler.scheduleAtFixedRate(this::report, periodMs, periodMs, TimeUnit.MILLISECONDS);
+        reportTask = scheduler.scheduleAtFixedRate(this::reportScheduled, periodMs, periodMs, TimeUnit.MILLISECONDS);
     }
 
     /**
@@ -117,6 +119,13 @@ public final class NGridDashboardReporter implements Closeable {
         } catch (Throwable t) {
             LOGGER.log(Level.WARNING, "Dashboard report generation failed", t);
         }
+    }
+
+    private void reportScheduled() {
+        if (!running) {
+            return;
+        }
+        report();
     }
 
     /**
@@ -199,5 +208,10 @@ public final class NGridDashboardReporter implements Closeable {
     @Override
     public void close() {
         running = false;
+        ScheduledFuture<?> task = reportTask;
+        if (task != null) {
+            task.cancel(false);
+            reportTask = null;
+        }
     }
 }
