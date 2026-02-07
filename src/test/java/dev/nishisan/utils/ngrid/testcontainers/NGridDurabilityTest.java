@@ -16,6 +16,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import static org.junit.jupiter.api.Assertions.*;
+import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 
 /**
  * Testes de durabilidade para validar que offsets e mensagens são
@@ -27,6 +28,7 @@ import static org.junit.jupiter.api.Assertions.*;
  * validar explicitamente a durabilidade de estado persistido.
  * </p>
  */
+@EnabledIfSystemProperty(named = "ngrid.test.docker", matches = "true")
 class NGridDurabilityTest {
   private static final ImageFromDockerfile IMAGE = new ImageFromDockerfile("ngrid-test-durability", false)
       .withFileFromPath("Dockerfile", Path.of("ngrid-test/Dockerfile"))
