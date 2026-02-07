@@ -357,11 +357,13 @@ public final class NGridNode implements Closeable {
         if (config.queues() == null || config.queues().isEmpty()) {
             queue = getQueue(config.queueName(), defaultQueueConfig, Serializable.class);
         } else {
-            // For multi-queue setup, eagerly register all configured queues so leaders can serve requests.
+            // For multi-queue setup, eagerly register all configured queues so leaders can
+            // serve requests.
             queue = null;
             for (QueueConfig queueConfig : config.queues()) {
                 DistributedQueueConfig effectiveConfig = toDistributedQueueConfig(queueConfig);
-                DistributedQueue<Serializable> created = getQueue(queueConfig.name(), effectiveConfig, Serializable.class);
+                DistributedQueue<Serializable> created = getQueue(queueConfig.name(), effectiveConfig,
+                        Serializable.class);
                 if (queue == null && config.queues().size() == 1) {
                     queue = created;
                 }
@@ -725,11 +727,18 @@ public final class NGridNode implements Closeable {
     }
 
     private MapClusterService<Serializable, Serializable> createMapService(String mapName) {
-        if (config.mapPersistenceMode() != null && config.mapPersistenceMode() != MapPersistenceMode.DISABLED) {
+        // Infrastructure maps (like offset tracking) always persist regardless of user
+        // configuration
+        MapPersistenceMode effectiveMode = config.mapPersistenceMode();
+        if ("_ngrid-queue-offsets".equals(mapName)
+                && (effectiveMode == null || effectiveMode == MapPersistenceMode.DISABLED)) {
+            effectiveMode = MapPersistenceMode.ASYNC_WITH_FSYNC;
+        }
+        if (effectiveMode != null && effectiveMode != MapPersistenceMode.DISABLED) {
             MapPersistenceConfig persistenceConfig = MapPersistenceConfig.defaults(
                     config.mapDirectory(),
                     mapName,
-                    config.mapPersistenceMode());
+                    effectiveMode);
             MapClusterService<Serializable, Serializable> service = new MapClusterService<>(
                     replicationManager,
                     MapClusterService.topicFor(mapName),
