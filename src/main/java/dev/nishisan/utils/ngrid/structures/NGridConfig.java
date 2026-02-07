@@ -42,6 +42,7 @@ public final class NGridConfig {
     private final Duration replicationOperationTimeout;
     private final Duration rttProbeInterval;
     private final Duration heartbeatInterval;
+    private final Duration leaseTimeout;
     private final boolean leaderReelectionEnabled;
     private final Duration leaderReelectionInterval;
     private final Duration leaderReelectionCooldown;
@@ -79,6 +80,7 @@ public final class NGridConfig {
         this.replicationOperationTimeout = builder.replicationOperationTimeout;
         this.rttProbeInterval = builder.rttProbeInterval;
         this.heartbeatInterval = builder.heartbeatInterval;
+        this.leaseTimeout = builder.leaseTimeout;
         this.leaderReelectionEnabled = builder.leaderReelectionEnabled;
         this.leaderReelectionInterval = builder.leaderReelectionInterval;
         this.leaderReelectionCooldown = builder.leaderReelectionCooldown;
@@ -139,6 +141,14 @@ public final class NGridConfig {
 
     public Duration heartbeatInterval() {
         return heartbeatInterval;
+    }
+
+    /**
+     * Optional leader lease timeout. When {@code null}, the coordinator will use
+     * its default ({@code 3 × heartbeatTimeout}).
+     */
+    public Duration leaseTimeout() {
+        return leaseTimeout;
     }
 
     public boolean strictConsistency() {
@@ -244,6 +254,7 @@ public final class NGridConfig {
         private Duration replicationOperationTimeout;
         private Duration rttProbeInterval = Duration.ofSeconds(2);
         private Duration heartbeatInterval = Duration.ofSeconds(1);
+        private Duration leaseTimeout;
         private boolean leaderReelectionEnabled = false;
         private Duration leaderReelectionInterval = Duration.ofSeconds(5);
         private Duration leaderReelectionCooldown = Duration.ofSeconds(60);
@@ -371,6 +382,20 @@ public final class NGridConfig {
                 throw new IllegalArgumentException("interval must be positive");
             }
             this.heartbeatInterval = interval;
+            return this;
+        }
+
+        /**
+         * Sets the leader lease timeout. A leader that has not received
+         * acknowledgment from followers within this duration will step down.
+         * If not set, defaults to {@code 3 × heartbeatTimeout}.
+         */
+        public Builder leaseTimeout(Duration timeout) {
+            Objects.requireNonNull(timeout, "timeout");
+            if (timeout.isNegative() || timeout.isZero()) {
+                throw new IllegalArgumentException("timeout must be positive");
+            }
+            this.leaseTimeout = timeout;
             return this;
         }
 

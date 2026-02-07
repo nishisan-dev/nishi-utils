@@ -18,6 +18,7 @@
 package dev.nishisan.utils.ngrid.replication;
 
 import dev.nishisan.utils.ngrid.cluster.coordination.ClusterCoordinator;
+import dev.nishisan.utils.ngrid.cluster.coordination.LeaseExpiredException;
 import dev.nishisan.utils.ngrid.cluster.coordination.LeadershipListener;
 import dev.nishisan.utils.ngrid.cluster.transport.Transport;
 import dev.nishisan.utils.ngrid.cluster.transport.TransportListener;
@@ -215,6 +216,9 @@ public class ReplicationManager implements TransportListener, LeadershipListener
     public CompletableFuture<ReplicationResult> replicate(String topic, Serializable payload, Integer quorumOverride) {
         if (!coordinator.isLeader()) {
             throw new IllegalStateException("Replication can only be initiated by the leader");
+        }
+        if (!coordinator.hasValidLease()) {
+            throw new LeaseExpiredException("Leader lease expired, write rejected to prevent data divergence");
         }
         ReplicationHandler handler = handlers.get(topic);
         if (handler == null) {

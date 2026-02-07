@@ -27,37 +27,57 @@ import java.util.Objects;
 public final class ClusterCoordinatorConfig {
     private final Duration heartbeatInterval;
     private final Duration heartbeatTimeout;
+    private final Duration leaseTimeout;
     private final int minClusterSize;
     private final Path dataDirectory;
 
     private ClusterCoordinatorConfig(Duration heartbeatInterval, Duration heartbeatTimeout,
-            int minClusterSize, Path dataDirectory) {
+            Duration leaseTimeout, int minClusterSize, Path dataDirectory) {
         this.heartbeatInterval = heartbeatInterval;
         this.heartbeatTimeout = heartbeatTimeout;
+        this.leaseTimeout = leaseTimeout;
         this.minClusterSize = minClusterSize;
         this.dataDirectory = dataDirectory;
     }
 
     public static ClusterCoordinatorConfig defaults() {
-        return new ClusterCoordinatorConfig(Duration.ofSeconds(1), Duration.ofSeconds(5), 1, null);
+        Duration defaultTimeout = Duration.ofSeconds(5);
+        return new ClusterCoordinatorConfig(Duration.ofSeconds(1), defaultTimeout,
+                defaultTimeout.multipliedBy(3), 1, null);
     }
 
     public static ClusterCoordinatorConfig of(Duration interval, Duration timeout) {
-        return of(interval, timeout, 1, null);
+        return of(interval, timeout, null, 1, null);
     }
 
     public static ClusterCoordinatorConfig of(Duration interval, Duration timeout, int minClusterSize) {
-        return of(interval, timeout, minClusterSize, null);
+        return of(interval, timeout, null, minClusterSize, null);
     }
 
     public static ClusterCoordinatorConfig of(Duration interval, Duration timeout, int minClusterSize,
             Path dataDirectory) {
+        return of(interval, timeout, null, minClusterSize, dataDirectory);
+    }
+
+    /**
+     * Creates a configuration with an explicit lease timeout.
+     *
+     * @param interval       heartbeat interval
+     * @param timeout        heartbeat timeout (used to detect dead members)
+     * @param leaseTimeout   leader lease timeout; if {@code null}, defaults to
+     *                       {@code 3 × timeout}
+     * @param minClusterSize minimum active members for leader election
+     * @param dataDirectory  directory for persistent state (epoch file)
+     */
+    public static ClusterCoordinatorConfig of(Duration interval, Duration timeout, Duration leaseTimeout,
+            int minClusterSize, Path dataDirectory) {
         Objects.requireNonNull(interval, "interval");
         Objects.requireNonNull(timeout, "timeout");
         if (minClusterSize < 1) {
             throw new IllegalArgumentException("minClusterSize must be >= 1");
         }
-        return new ClusterCoordinatorConfig(interval, timeout, minClusterSize, dataDirectory);
+        Duration effectiveLease = leaseTimeout != null ? leaseTimeout : timeout.multipliedBy(3);
+        return new ClusterCoordinatorConfig(interval, timeout, effectiveLease, minClusterSize, dataDirectory);
     }
 
     public Duration heartbeatInterval() {
@@ -66,6 +86,17 @@ public final class ClusterCoordinatorConfig {
 
     public Duration heartbeatTimeout() {
         return heartbeatTimeout;
+    }
+
+    /**
+     * Returns the leader lease timeout. A leader that has not received
+     * acknowledgment
+     * from a majority of followers within this duration will step down
+     * automatically.
+     * Defaults to {@code 3 × heartbeatTimeout}.
+     */
+    public Duration leaseTimeout() {
+        return leaseTimeout;
     }
 
     public int minClusterSize() {

@@ -298,7 +298,10 @@ public final class NGridNode implements Closeable {
         });
         ClusterCoordinatorConfig coordinatorConfig = ClusterCoordinatorConfig.of(
                 config.heartbeatInterval(),
-                Duration.ofSeconds(5));
+                Duration.ofSeconds(5),
+                config.leaseTimeout(),
+                1,
+                null);
         coordinator = new ClusterCoordinator(transport, coordinatorConfig, coordinatorScheduler);
         coordinator.start();
 

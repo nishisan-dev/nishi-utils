@@ -69,6 +69,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     private volatile java.util.function.LongSupplier leaderHighWatermarkSupplier = () -> -1L;
     private volatile long trackedLeaderHighWatermark = -1L;
     private volatile long trackedLeaderEpoch = 0L;
+    private volatile Instant leaseExpiresAt = Instant.MIN;
     private final Path epochPath;
 
     public interface MembershipListener {
@@ -172,6 +173,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             return;
         }
         running = true;
+        // Initialize lease so a freshly started leader has a valid window
+        this.leaseExpiresAt = Instant.now().plus(config.leaseTimeout());
         NodeInfo local = transport.local();
         members.put(local.nodeId(), new ClusterMember(local));
         transport.addListener(this);
@@ -381,6 +384,11 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                     null,
                     payload);
             transport.broadcast(heartbeat);
+
+            // Renew lease on successful heartbeat broadcast
+            if (isLeader()) {
+                this.leaseExpiresAt = Instant.now().plus(config.leaseTimeout());
+            }
         } catch (Throwable t) {
             LOGGER.log(java.util.logging.Level.SEVERE, "Unexpected error in heartbeat task", t);
         }
@@ -407,6 +415,14 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             if (!running) {
                 return;
             }
+
+            // Check leader lease expiry before processing members
+            if (isLeader() && Instant.now().isAfter(leaseExpiresAt)) {
+                LOGGER.warning("Leader lease expired — stepping down to prevent split-brain");
+                stepDown();
+                return;
+            }
+
             long now = Instant.now().toEpochMilli();
             boolean changed = false;
             for (ClusterMember member : members.values()) {
@@ -501,6 +517,36 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 leaderElectionListeners.forEach(listener -> listener.onLeadershipChanged(isLeader, newLeaderId));
             }
         }
+    }
+
+    /**
+     * Forces the current leader to step down. Clears the leader reference,
+     * increments the epoch, and notifies all listeners.
+     * This is called when the leader's lease expires, preventing an isolated
+     * leader from accepting writes.
+     */
+    private void stepDown() {
+        synchronized (leaderComputationLock) {
+            NodeId previous = leader.getAndSet(null);
+            if (previous != null && previous.equals(transport.local().nodeId())) {
+                long newEpoch = leaderEpoch.incrementAndGet();
+                persistEpoch(newEpoch);
+                LOGGER.warning(() -> "Leader stepped down. New epoch: " + newEpoch);
+
+                leadershipListeners.forEach(listener -> listener.onLeaderChanged(null));
+                leaderElectionListeners.forEach(listener -> listener.onLeadershipChanged(false, null));
+                notifyMembershipListeners();
+            }
+        }
+    }
+
+    /**
+     * Returns {@code true} if this node is the current leader and holds a valid
+     * (non-expired) lease. This method should be checked before accepting write
+     * operations to prevent data divergence during network partitions.
+     */
+    public boolean hasValidLease() {
+        return isLeader() && Instant.now().isBefore(leaseExpiresAt);
     }
 
     @Override
