@@ -19,7 +19,7 @@ package dev.nishisan.utils.ngrid.structures;
 
 import dev.nishisan.utils.ngrid.cluster.coordination.ClusterCoordinator;
 import dev.nishisan.utils.ngrid.cluster.coordination.ClusterCoordinatorConfig;
-import dev.nishisan.utils.ngrid.cluster.coordination.LeadershipListener;
+
 import dev.nishisan.utils.ngrid.cluster.transport.TcpTransport;
 import dev.nishisan.utils.ngrid.cluster.transport.TcpTransportConfig;
 import dev.nishisan.utils.ngrid.cluster.transport.Transport;
@@ -38,6 +38,10 @@ import dev.nishisan.utils.ngrid.map.MapPersistenceConfig;
 import dev.nishisan.utils.ngrid.map.MapPersistenceMode;
 import dev.nishisan.utils.ngrid.metrics.LeaderReelectionService;
 import dev.nishisan.utils.ngrid.metrics.NGridMetrics;
+import dev.nishisan.utils.ngrid.metrics.NGridAlertEngine;
+import dev.nishisan.utils.ngrid.metrics.NGridAlertListener;
+import dev.nishisan.utils.ngrid.metrics.NGridDashboardReporter;
+import dev.nishisan.utils.ngrid.metrics.NGridOperationalSnapshot;
 import dev.nishisan.utils.ngrid.metrics.NGridStatsSnapshot;
 import dev.nishisan.utils.ngrid.metrics.RttMonitor;
 import dev.nishisan.utils.ngrid.queue.QueueClusterService;
@@ -59,13 +63,13 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Optional;
+
 import java.util.Set;
-import java.util.concurrent.CompletableFuture;
+
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
+
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -95,6 +99,8 @@ public final class NGridNode implements Closeable {
     private ScheduledExecutorService metricsScheduler;
     private RttMonitor rttMonitor;
     private LeaderReelectionService leaderReelectionService;
+    private NGridAlertEngine alertEngine;
+    private NGridDashboardReporter dashboardReporter;
     private final StatsUtils stats = new StatsUtils();
     private final AtomicBoolean started = new AtomicBoolean();
     private final List<Runnable> resourceListeners = new ArrayList<>();
@@ -298,7 +304,10 @@ public final class NGridNode implements Closeable {
         });
         ClusterCoordinatorConfig coordinatorConfig = ClusterCoordinatorConfig.of(
                 config.heartbeatInterval(),
-                Duration.ofSeconds(5));
+                Duration.ofSeconds(5),
+                config.leaseTimeout(),
+                1,
+                null);
         coordinator = new ClusterCoordinator(transport, coordinatorConfig, coordinatorScheduler);
         coordinator.start();
 
@@ -357,11 +366,13 @@ public final class NGridNode implements Closeable {
         if (config.queues() == null || config.queues().isEmpty()) {
             queue = getQueue(config.queueName(), defaultQueueConfig, Serializable.class);
         } else {
-            // For multi-queue setup, eagerly register all configured queues so leaders can serve requests.
+            // For multi-queue setup, eagerly register all configured queues so leaders can
+            // serve requests.
             queue = null;
             for (QueueConfig queueConfig : config.queues()) {
                 DistributedQueueConfig effectiveConfig = toDistributedQueueConfig(queueConfig);
-                DistributedQueue<Serializable> created = getQueue(queueConfig.name(), effectiveConfig, Serializable.class);
+                DistributedQueue<Serializable> created = getQueue(queueConfig.name(), effectiveConfig,
+                        Serializable.class);
                 if (queue == null && config.queues().size() == 1) {
                     queue = created;
                 }
@@ -370,6 +381,24 @@ public final class NGridNode implements Closeable {
 
         String defaultMapName = config.mapName();
         map = maps.computeIfAbsent(defaultMapName, this::createDistributedMap);
+
+        // ── Observability: Alert Engine + Dashboard Reporter ──
+        alertEngine = NGridAlertEngine.builder(this::operationalSnapshot, metricsScheduler)
+                .build();
+        alertEngine.start();
+
+        Path dashboardPath = null;
+        if (config.dataDirectory() != null) {
+            dashboardPath = config.dataDirectory().resolve("dashboard.yaml");
+        } else if (config.queueDirectory() != null) {
+            dashboardPath = config.queueDirectory().getParent().resolve("dashboard.yaml");
+        }
+        if (dashboardPath != null) {
+            dashboardReporter = new NGridDashboardReporter(
+                    this::operationalSnapshot, metricsScheduler,
+                    dashboardPath, Duration.ofSeconds(10));
+            dashboardReporter.start();
+        }
     }
 
     @Deprecated
@@ -459,6 +488,26 @@ public final class NGridNode implements Closeable {
         return replicationManager;
     }
 
+    /**
+     * Returns the alert engine for this node. May be null if the node has not
+     * started.
+     */
+    public NGridAlertEngine alertEngine() {
+        return alertEngine;
+    }
+
+    /**
+     * Registers an alert listener on the embedded alert engine.
+     *
+     * @throws IllegalStateException if the node has not started
+     */
+    public void addAlertListener(NGridAlertListener listener) {
+        if (alertEngine == null) {
+            throw new IllegalStateException("Node not started; alert engine not available");
+        }
+        alertEngine.addListener(listener);
+    }
+
     public StatsUtils stats() {
         return stats;
     }
@@ -539,6 +588,72 @@ public final class NGridNode implements Closeable {
                 rttFailuresByNode);
     }
 
+    /**
+     * Captures a comprehensive operational snapshot of this node, aggregating
+     * cluster state, replication health, and I/O metrics into a single immutable
+     * object suitable for dashboards and alerting engines.
+     *
+     * @return an operational snapshot of the current node state
+     * @since 2.1.0
+     */
+    public NGridOperationalSnapshot operationalSnapshot() {
+        String localId = config.local().nodeId().value();
+        String leaderId = coordinator.leaderInfo()
+                .map(info -> info.nodeId().value())
+                .orElse("unknown");
+        long leaderEpoch = coordinator.getLeaderEpoch();
+        long trackedLeaderEpoch = coordinator.getTrackedLeaderEpoch();
+        int activeMembersCount = coordinator.getActiveMembersCount();
+        boolean isLeader = coordinator.isLeader();
+        boolean hasValidLease = coordinator.hasValidLease();
+        long trackedHighWatermark = coordinator.getTrackedLeaderHighWatermark();
+
+        long globalSeq = replicationManager.getGlobalSequence();
+        long lastApplied = replicationManager.getLastAppliedSequence();
+        long lag = Math.max(0, trackedHighWatermark - lastApplied);
+        long gaps = replicationManager.getGapsDetected();
+        long resendSuccess = replicationManager.getResendSuccessCount();
+        long snapshotFallback = replicationManager.getSnapshotFallbackCount();
+        double avgConvergence = replicationManager.getAverageConvergenceTimeMs();
+        int pendingOps = replicationManager.getPendingOperationsCount();
+
+        // Count reachable nodes
+        int totalNodes = activeMembersCount;
+        int reachable = 1; // local node is always reachable
+        for (NodeInfo member : coordinator.activeMembers()) {
+            if (member.nodeId().equals(config.local().nodeId())) {
+                continue;
+            }
+            if (transport.isReachable(member.nodeId())) {
+                reachable++;
+            }
+        }
+
+        NGridStatsSnapshot ioStats = metricsSnapshot();
+
+        return new NGridOperationalSnapshot(
+                localId,
+                leaderId,
+                leaderEpoch,
+                trackedLeaderEpoch,
+                activeMembersCount,
+                isLeader,
+                hasValidLease,
+                trackedHighWatermark,
+                globalSeq,
+                lastApplied,
+                lag,
+                gaps,
+                resendSuccess,
+                snapshotFallback,
+                avgConvergence,
+                pendingOps,
+                reachable,
+                totalNodes,
+                ioStats,
+                Instant.now());
+    }
+
     @Override
     public void close() throws IOException {
         if (!started.compareAndSet(true, false)) {
@@ -596,6 +711,20 @@ public final class NGridNode implements Closeable {
             if (first == null) {
                 first = new IOException("Failed to stop leader reelection service", e);
             }
+        }
+        try {
+            if (alertEngine != null) {
+                alertEngine.close();
+            }
+        } catch (RuntimeException e) {
+            // best-effort shutdown
+        }
+        try {
+            if (dashboardReporter != null) {
+                dashboardReporter.close();
+            }
+        } catch (RuntimeException e) {
+            // best-effort shutdown
         }
         try {
             if (coordinator != null) {
@@ -725,11 +854,18 @@ public final class NGridNode implements Closeable {
     }
 
     private MapClusterService<Serializable, Serializable> createMapService(String mapName) {
-        if (config.mapPersistenceMode() != null && config.mapPersistenceMode() != MapPersistenceMode.DISABLED) {
+        // Infrastructure maps (like offset tracking) always persist regardless of user
+        // configuration
+        MapPersistenceMode effectiveMode = config.mapPersistenceMode();
+        if ("_ngrid-queue-offsets".equals(mapName)
+                && (effectiveMode == null || effectiveMode == MapPersistenceMode.DISABLED)) {
+            effectiveMode = MapPersistenceMode.ASYNC_WITH_FSYNC;
+        }
+        if (effectiveMode != null && effectiveMode != MapPersistenceMode.DISABLED) {
             MapPersistenceConfig persistenceConfig = MapPersistenceConfig.defaults(
                     config.mapDirectory(),
                     mapName,
-                    config.mapPersistenceMode());
+                    effectiveMode);
             MapClusterService<Serializable, Serializable> service = new MapClusterService<>(
                     replicationManager,
                     MapClusterService.topicFor(mapName),

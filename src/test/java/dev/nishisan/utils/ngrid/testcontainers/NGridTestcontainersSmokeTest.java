@@ -18,7 +18,9 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 
+@EnabledIfSystemProperty(named = "ngrid.test.docker", matches = "true")
 class NGridTestcontainersSmokeTest {
     private static final ImageFromDockerfile IMAGE = new ImageFromDockerfile("ngrid-test-tc", false)
             .withFileFromPath("Dockerfile", Path.of("ngrid-test/Dockerfile"))
@@ -143,7 +145,8 @@ class NGridTestcontainersSmokeTest {
         }
     }
 
-    private boolean waitForLog(GenericContainer<?> container, String needle, Duration timeout) throws InterruptedException {
+    private boolean waitForLog(GenericContainer<?> container, String needle, Duration timeout)
+            throws InterruptedException {
         long deadline = System.currentTimeMillis() + timeout.toMillis();
         while (System.currentTimeMillis() < deadline) {
             if (container.getLogs().contains(needle)) {

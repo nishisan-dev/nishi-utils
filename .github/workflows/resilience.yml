@@ -1,0 +1,88 @@
+name: NGrid Resilience Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - feature/queue-consumer
+  workflow_dispatch:
+    inputs:
+      soak_duration_minutes:
+        description: 'Soak test duration in minutes'
+        required: false
+        default: '720'
+      run_soak:
+        description: 'Run soak test (true/false)'
+        required: false
+        default: 'false'
+
+jobs:
+  resilience-tests:
+    name: Resilience Tests (In-Process)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Run NGrid resilience tests
+        run: mvn -B test -Presilience
+
+  docker-resilience-tests:
+    name: Docker Resilience Tests (Testcontainers)
+    needs: resilience-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Run Testcontainers durability tests
+        run: mvn -B test -Pdocker-resilience
+
+  soak-test:
+    name: Soak Test (Long-Running)
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.run_soak == 'true'
+    needs: docker-resilience-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 1500
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Run soak test
+        run: |
+          mvn -B test -Psoak \
+            -Dngrid.soak.durationMinutes=${{ github.event.inputs.soak_duration_minutes }}
+
+      - name: Upload soak report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-report
+          path: target/soak-report.md
+          retention-days: 30

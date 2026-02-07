@@ -153,6 +153,82 @@
                 </plugins>
             </build>
         </profile>
+
+        <!-- Resilience: NGrid integration tests (in-process, no Docker) -->
+        <profile>
+            <id>resilience</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-surefire-plugin</artifactId>
+                        <version>3.2.5</version>
+                        <configuration>
+                            <forkCount>1</forkCount>
+                            <reuseForks>false</reuseForks>
+                            <forkedProcessTimeoutInSeconds>600</forkedProcessTimeoutInSeconds>
+                            <includes>
+                                <include>**/ngrid/**Test.java</include>
+                            </includes>
+                            <excludes>
+                                <exclude>**/testcontainers/**</exclude>
+                                <exclude>**/soak/**</exclude>
+                            </excludes>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <!-- Docker Resilience: Testcontainers-based durability and smoke tests -->
+        <profile>
+            <id>docker-resilience</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-surefire-plugin</artifactId>
+                        <version>3.2.5</version>
+                        <configuration>
+                            <forkCount>1</forkCount>
+                            <reuseForks>false</reuseForks>
+                            <forkedProcessTimeoutInSeconds>900</forkedProcessTimeoutInSeconds>
+                            <includes>
+                                <include>**/testcontainers/**Test.java</include>
+                            </includes>
+                            <systemPropertyVariables>
+                                <ngrid.test.docker>true</ngrid.test.docker>
+                            </systemPropertyVariables>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <!-- Soak: Long-running load test with leader churn -->
+        <profile>
+            <id>soak</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-surefire-plugin</artifactId>
+                        <version>3.2.5</version>
+                        <configuration>
+                            <forkCount>1</forkCount>
+                            <reuseForks>false</reuseForks>
+                            <forkedProcessTimeoutInSeconds>86400</forkedProcessTimeoutInSeconds>
+                            <includes>
+                                <include>**/soak/NGridSoakTest.java</include>
+                            </includes>
+                            <systemPropertyVariables>
+                                <ngrid.soak.enabled>true</ngrid.soak.enabled>
+                            </systemPropertyVariables>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
     </profiles>
 
 </project>
