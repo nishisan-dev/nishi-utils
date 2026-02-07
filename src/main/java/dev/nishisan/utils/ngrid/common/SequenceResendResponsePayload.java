@@ -23,9 +23,13 @@ import java.util.List;
 /**
  * Response from leader containing either the missing replication operations
  * or a list of sequence numbers that the leader also doesn't have.
+ *
+ * @param topic            the replication topic
+ * @param operations       the replayed operations covering the gap
+ * @param missingSequences sequence numbers the leader could not supply
  */
 public record SequenceResendResponsePayload(
-        String topic,
-        List<ReplicationPayload> operations,
-        List<Long> missingSequences) implements Serializable {
+                String topic,
+                List<ReplicationPayload> operations,
+                List<Long> missingSequences) implements Serializable {
 }

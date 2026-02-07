@@ -32,20 +32,42 @@ public final class LeaderSuggestionPayload implements Serializable {
     private final double writeRate;
     private final long epochMilli;
 
+    /**
+     * Creates a leader suggestion payload.
+     *
+     * @param leaderId   the suggested leader ID
+     * @param writeRate  the write rate
+     * @param epochMilli the timestamp
+     */
     public LeaderSuggestionPayload(NodeId leaderId, double writeRate, long epochMilli) {
         this.leaderId = Objects.requireNonNull(leaderId, "leaderId");
         this.writeRate = writeRate;
         this.epochMilli = epochMilli;
     }
 
+    /**
+     * Returns the suggested leader ID.
+     *
+     * @return the leader ID
+     */
     public NodeId leaderId() {
         return leaderId;
     }
 
+    /**
+     * Returns the write rate.
+     *
+     * @return the write rate
+     */
     public double writeRate() {
         return writeRate;
     }
 
+    /**
+     * Returns the timestamp.
+     *
+     * @return the epoch millis
+     */
     public long epochMilli() {
         return epochMilli;
     }

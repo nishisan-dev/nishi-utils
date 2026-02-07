@@ -32,20 +32,42 @@ public final class LeaderScorePayload implements Serializable {
     private final double writeRate;
     private final long epochMilli;
 
+    /**
+     * Creates a leader score payload.
+     *
+     * @param nodeId     the node ID
+     * @param writeRate  the write rate
+     * @param epochMilli the timestamp
+     */
     public LeaderScorePayload(NodeId nodeId, double writeRate, long epochMilli) {
         this.nodeId = Objects.requireNonNull(nodeId, "nodeId");
         this.writeRate = writeRate;
         this.epochMilli = epochMilli;
     }
 
+    /**
+     * Returns the node ID.
+     *
+     * @return the node ID
+     */
     public NodeId nodeId() {
         return nodeId;
     }
 
+    /**
+     * Returns the write rate.
+     *
+     * @return the write rate
+     */
     public double writeRate() {
         return writeRate;
     }
 
+    /**
+     * Returns the timestamp.
+     *
+     * @return the epoch millis
+     */
     public long epochMilli() {
         return epochMilli;
     }

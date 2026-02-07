@@ -13,10 +13,20 @@ public final class ConfigFetchRequestPayload implements Serializable {
 
     private final String secret;
 
+    /**
+     * Creates a config fetch request with the given secret.
+     *
+     * @param secret the shared authentication secret
+     */
     public ConfigFetchRequestPayload(String secret) {
         this.secret = Objects.requireNonNull(secret, "secret");
     }
 
+    /**
+     * Returns the authentication secret.
+     *
+     * @return the secret
+     */
     public String secret() {
         return secret;
     }

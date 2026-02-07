@@ -33,20 +33,42 @@ public final class ClientRequestPayload implements Serializable {
     private final String command;
     private final Serializable body;
 
+    /**
+     * Creates a new client request payload.
+     *
+     * @param requestId unique identifier for this request
+     * @param command   the command to execute on the leader
+     * @param body      optional serializable payload for the command
+     */
     public ClientRequestPayload(UUID requestId, String command, Serializable body) {
         this.requestId = Objects.requireNonNull(requestId, "requestId");
         this.command = Objects.requireNonNull(command, "command");
         this.body = body;
     }
 
+    /**
+     * Returns the unique request identifier.
+     *
+     * @return the request ID
+     */
     public UUID requestId() {
         return requestId;
     }
 
+    /**
+     * Returns the command name to be executed.
+     *
+     * @return the command
+     */
     public String command() {
         return command;
     }
 
+    /**
+     * Returns the optional request body payload.
+     *
+     * @return the body, may be {@code null}
+     */
     public Serializable body() {
         return body;
     }

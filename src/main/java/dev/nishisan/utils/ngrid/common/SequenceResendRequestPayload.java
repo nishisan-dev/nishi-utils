@@ -21,9 +21,13 @@ import java.io.Serializable;
 
 /**
  * Payload for requesting missing replication sequences from the leader.
+ *
+ * @param topic        the replication topic
+ * @param fromSequence the start of the missing range (inclusive)
+ * @param toSequence   the end of the missing range (inclusive)
  */
 public record SequenceResendRequestPayload(
-        String topic,
-        long fromSequence,
-        long toSequence) implements Serializable {
+                String topic,
+                long fromSequence,
+                long toSequence) implements Serializable {
 }
