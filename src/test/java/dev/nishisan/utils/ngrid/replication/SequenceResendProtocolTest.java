@@ -173,7 +173,22 @@ class SequenceResendProtocolTest {
         try {
             // Replicate an operation to populate the replication log
             leaderManager.replicate(TOPIC, "test-data");
-            Thread.sleep(300);
+            Thread.sleep(200);
+
+            // Commit the operation: emulate ACK from peer so leader marks it COMMITTED.
+            ClusterMessage replicationRequest = leaderTransport.getSentMessages().stream()
+                    .filter(m -> m.type() == MessageType.REPLICATION_REQUEST && TOPIC.equals(m.qualifier()))
+                    .findFirst()
+                    .orElseThrow();
+            ReplicationPayload replicated = replicationRequest.payload(ReplicationPayload.class);
+            ClusterMessage ack = ClusterMessage.request(
+                    MessageType.REPLICATION_ACK,
+                    "ack",
+                    peerNode.nodeId(),
+                    leaderNode.nodeId(),
+                    new ReplicationAckPayload(replicated.operationId(), true));
+            leaderTransport.deliverToListeners(ack);
+            Thread.sleep(150);
 
             // Now simulate a SEQUENCE_RESEND_REQUEST from the follower
             SequenceResendRequestPayload resendRequest = new SequenceResendRequestPayload(TOPIC, 1, 1);
