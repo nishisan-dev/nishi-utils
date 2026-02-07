@@ -39,10 +39,15 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * Distributed map facade exposing a subset of {@link java.util.Map} operations with
+ * Distributed map facade exposing a subset of {@link java.util.Map} operations
+ * with
  * leader based replication.
+ *
+ * @param <K> the key type
+ * @param <V> the value type
  */
-public final class DistributedMap<K extends Serializable, V extends Serializable> implements TransportListener, Closeable {
+public final class DistributedMap<K extends Serializable, V extends Serializable>
+        implements TransportListener, Closeable {
     private static final String COMMAND_PREFIX_PUT = "map.put:";
     private static final String COMMAND_PREFIX_REMOVE = "map.remove:";
     private static final String COMMAND_PREFIX_GET = "map.get:";
@@ -58,28 +63,66 @@ public final class DistributedMap<K extends Serializable, V extends Serializable
     private final dev.nishisan.utils.ngrid.replication.ReplicationManager replicationManager;
     private final NodeId localNodeId;
 
+    /**
+     * Creates a distributed map with default name and no stats or replication
+     * manager.
+     *
+     * @param transport   the cluster transport
+     * @param coordinator the cluster coordinator
+     * @param mapService  the underlying map cluster service
+     */
     public DistributedMap(Transport transport, ClusterCoordinator coordinator, MapClusterService<K, V> mapService) {
         this(transport, coordinator, mapService, MapClusterService.DEFAULT_MAP_NAME, null, null);
     }
 
-    public DistributedMap(Transport transport, ClusterCoordinator coordinator, MapClusterService<K, V> mapService, String mapName) {
+    /**
+     * Creates a distributed map with a custom name and no stats or replication
+     * manager.
+     *
+     * @param transport   the cluster transport
+     * @param coordinator the cluster coordinator
+     * @param mapService  the underlying map cluster service
+     * @param mapName     the map name
+     */
+    public DistributedMap(Transport transport, ClusterCoordinator coordinator, MapClusterService<K, V> mapService,
+            String mapName) {
         this(transport, coordinator, mapService, mapName, null, null);
     }
 
+    /**
+     * Creates a distributed map with optional stats.
+     *
+     * @param transport   the cluster transport
+     * @param coordinator the cluster coordinator
+     * @param mapService  the underlying map cluster service
+     * @param mapName     the map name
+     * @param stats       stats utility, or {@code null}
+     */
     public DistributedMap(Transport transport,
-                          ClusterCoordinator coordinator,
-                          MapClusterService<K, V> mapService,
-                          String mapName,
-                          StatsUtils stats) {
+            ClusterCoordinator coordinator,
+            MapClusterService<K, V> mapService,
+            String mapName,
+            StatsUtils stats) {
         this(transport, coordinator, mapService, mapName, stats, null);
     }
 
+    /**
+     * Creates a distributed map with all configuration options.
+     *
+     * @param transport          the cluster transport
+     * @param coordinator        the cluster coordinator
+     * @param mapService         the underlying map cluster service
+     * @param mapName            the map name
+     * @param stats              stats utility, or {@code null}
+     * @param replicationManager the replication manager for bounded reads, or
+     *                           {@code null}
+     */
     public DistributedMap(Transport transport,
-                          ClusterCoordinator coordinator,
-                          MapClusterService<K, V> mapService,
-                          String mapName,
-                          StatsUtils stats,
-                          dev.nishisan.utils.ngrid.replication.ReplicationManager replicationManager) {
+            ClusterCoordinator coordinator,
+            MapClusterService<K, V> mapService,
+            String mapName,
+            StatsUtils stats,
+            dev.nishisan.utils.ngrid.replication.ReplicationManager replicationManager) {
         this.transport = transport;
         this.coordinator = coordinator;
         this.mapService = mapService;
@@ -96,6 +139,13 @@ public final class DistributedMap<K extends Serializable, V extends Serializable
         transport.addListener(this);
     }
 
+    /**
+     * Puts a key-value pair into the distributed map.
+     *
+     * @param key   the key
+     * @param value the value
+     * @return the previous value, or empty
+     */
     @SuppressWarnings("unchecked")
     public Optional<V> put(K key, V value) {
         recordIngressWrite();
@@ -108,6 +158,12 @@ public final class DistributedMap<K extends Serializable, V extends Serializable
         return result.toOptional();
     }
 
+    /**
+     * Removes the entry for a key from the distributed map.
+     *
+     * @param key the key to remove
+     * @return the previous value, or empty
+     */
     @SuppressWarnings("unchecked")
     public Optional<V> remove(K key) {
         recordIngressWrite();
@@ -119,11 +175,24 @@ public final class DistributedMap<K extends Serializable, V extends Serializable
         return result.toOptional();
     }
 
+    /**
+     * Retrieves the value for a key using {@link Consistency#STRONG}.
+     *
+     * @param key the key
+     * @return the value, or empty
+     */
     @SuppressWarnings("unchecked")
     public Optional<V> get(K key) {
         return get(key, Consistency.STRONG);
     }
 
+    /**
+     * Retrieves the value for a key with the specified consistency level.
+     *
+     * @param key         the key
+     * @param consistency the desired consistency
+     * @return the value, or empty
+     */
     public Optional<V> get(K key, Consistency consistency) {
         if (coordinator.isLeader()) {
             return mapService.get(key);
@@ -159,7 +228,8 @@ public final class DistributedMap<K extends Serializable, V extends Serializable
         int attempts = 0;
         while (attempts < 3) {
             attempts++;
-            NodeInfo leaderInfo = coordinator.leaderInfo().orElseThrow(() -> new IllegalStateException("No leader available"));
+            NodeInfo leaderInfo = coordinator.leaderInfo()
+                    .orElseThrow(() -> new IllegalStateException("No leader available"));
             if (leaderInfo.nodeId().equals(transport.local().nodeId())) {
                 return executeLocal(command, body);
             }
@@ -224,16 +294,19 @@ public final class DistributedMap<K extends Serializable, V extends Serializable
         throw new IllegalArgumentException("Unknown command: " + command);
     }
 
+    /** {@inheritDoc} */
     @Override
     public void onPeerConnected(NodeInfo peer) {
         // no-op
     }
 
+    /** {@inheritDoc} */
     @Override
     public void onPeerDisconnected(NodeId peerId) {
         // no-op
     }
 
+    /** {@inheritDoc} */
     @Override
     public void onMessage(ClusterMessage message) {
         if (message.type() != MessageType.CLIENT_REQUEST) {
@@ -259,10 +332,12 @@ public final class DistributedMap<K extends Serializable, V extends Serializable
         transport.send(response);
     }
 
+    /** {@inheritDoc} */
     @Override
     public void close() throws IOException {
         transport.removeListener(this);
-        // Note: mapService is NOT closed here because it may be shared by multiple DistributedMap instances.
+        // Note: mapService is NOT closed here because it may be shared by multiple
+        // DistributedMap instances.
         // The owner (NGridNode) is responsible for closing MapClusterService instances.
     }
 

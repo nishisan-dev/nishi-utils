@@ -42,6 +42,11 @@ public record NGridAlert(
     /**
      * Convenience factory for creating an alert with current timestamp and no extra
      * metadata.
+     *
+     * @param alertType the alert type
+     * @param severity  the severity level
+     * @param message   the human-readable message
+     * @return the alert
      */
     public static NGridAlert of(String alertType, AlertSeverity severity, String message) {
         return new NGridAlert(alertType, severity, message, Instant.now(), Map.of());
@@ -50,6 +55,12 @@ public record NGridAlert(
     /**
      * Convenience factory for creating an alert with current timestamp and
      * metadata.
+     *
+     * @param alertType the alert type
+     * @param severity  the severity level
+     * @param message   the human-readable message
+     * @param metadata  additional key-value context
+     * @return the alert
      */
     public static NGridAlert of(String alertType, AlertSeverity severity, String message,
             Map<String, String> metadata) {

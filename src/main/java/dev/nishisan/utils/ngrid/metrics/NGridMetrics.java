@@ -35,34 +35,84 @@ public final class NGridMetrics {
     private NGridMetrics() {
     }
 
+    /**
+     * Returns the write metric key for a node.
+     * 
+     * @param nodeId the node
+     * @return the metric key
+     */
     public static String writeNode(NodeId nodeId) {
         return WRITE_NODE_PREFIX + nodeId.value();
     }
 
+    /**
+     * Returns the ingress write metric key.
+     * 
+     * @param nodeId the node
+     * @return the metric key
+     */
     public static String ingressWrite(NodeId nodeId) {
         return INGRESS_WRITE_PREFIX + nodeId.value();
     }
 
+    /**
+     * Returns the queue offer metric key.
+     * 
+     * @param nodeId the node
+     * @return the metric key
+     */
     public static String queueOffer(NodeId nodeId) {
         return QUEUE_OFFER_PREFIX + nodeId.value();
     }
 
+    /**
+     * Returns the queue poll metric key.
+     * 
+     * @param nodeId the node
+     * @return the metric key
+     */
     public static String queuePoll(NodeId nodeId) {
         return QUEUE_POLL_PREFIX + nodeId.value();
     }
 
+    /**
+     * Returns the map put metric key.
+     * 
+     * @param mapName the map
+     * @param nodeId  the node
+     * @return the metric key
+     */
     public static String mapPut(String mapName, NodeId nodeId) {
         return MAP_PUT_PREFIX + mapName + ".node." + nodeId.value();
     }
 
+    /**
+     * Returns the map remove metric key.
+     * 
+     * @param mapName the map
+     * @param nodeId  the node
+     * @return the metric key
+     */
     public static String mapRemove(String mapName, NodeId nodeId) {
         return MAP_REMOVE_PREFIX + mapName + ".node." + nodeId.value();
     }
 
+    /**
+     * Returns the RTT metric key.
+     * 
+     * @param nodeId the node
+     * @return the metric key
+     */
     public static String rttMs(NodeId nodeId) {
         return RTT_PREFIX + nodeId.value();
     }
 
+    /**
+     * Returns the RTT failure metric key.
+     * 
+     * @param nodeId the node
+     * @return the metric key
+     */
     public static String rttFailure(NodeId nodeId) {
         return RTT_FAILURE_PREFIX + nodeId.value();
     }

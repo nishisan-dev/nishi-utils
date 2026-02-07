@@ -21,13 +21,15 @@ import java.io.Serializable;
 
 /**
  * A single WAL entry representing a mutating operation (PUT/REMOVE).
+ *
+ * @param timestamp the time the operation was recorded
+ * @param type      the operation type (PUT or REMOVE)
+ * @param key       the entry key
+ * @param value     the entry value, or {@code null} for REMOVE operations
  */
 public record WALEntry(
-        long timestamp,
-        MapReplicationCommandType type,
-        Serializable key,
-        Serializable value
-) {
+                long timestamp,
+                MapReplicationCommandType type,
+                Serializable key,
+                Serializable value) {
 }
-
-

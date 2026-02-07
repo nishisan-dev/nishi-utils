@@ -21,16 +21,22 @@ import java.io.Serializable;
 import java.util.UUID;
 
 /**
- * Callback invoked to apply a replicated operation locally or manage state snapshots.
+ * Callback invoked to apply a replicated operation locally or manage state
+ * snapshots.
  */
 public interface ReplicationHandler {
     /**
      * Applies a single replicated operation.
+     *
+     * @param operationId the operation identifier
+     * @param payload     the serialized operation payload
+     * @throws Exception if the operation cannot be applied
      */
     void apply(UUID operationId, Serializable payload) throws Exception;
 
     /**
      * Returns a snapshot chunk.
+     * 
      * @param chunkIndex Index of the chunk requested.
      * @return A SnapshotChunk or null if no handler.
      */
@@ -41,6 +47,8 @@ public interface ReplicationHandler {
 
     /**
      * Returns a full snapshot of the current state.
+     *
+     * @return the snapshot, or {@code null} if unavailable
      * @deprecated Use {@link #getSnapshotChunk(int)} for better scalability.
      */
     @Deprecated
@@ -50,6 +58,8 @@ public interface ReplicationHandler {
 
     /**
      * Resets the local state, typically before installing a multi-chunk snapshot.
+     *
+     * @throws Exception if the state cannot be reset
      */
     default void resetState() throws Exception {
         // no-op by default
@@ -57,10 +67,14 @@ public interface ReplicationHandler {
 
     /**
      * Installs a full snapshot or a chunk of it.
+     *
+     * @param snapshot the snapshot data to install
+     * @throws Exception if the snapshot cannot be installed
      */
     default void installSnapshot(Serializable snapshot) throws Exception {
         // no-op by default
     }
 
-    record SnapshotChunk(Serializable data, boolean hasMore) implements Serializable {}
+    record SnapshotChunk(Serializable data, boolean hasMore) implements Serializable {
+    }
 }

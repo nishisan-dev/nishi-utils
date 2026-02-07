@@ -14,9 +14,15 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import dev.nishisan.utils.ngrid.map.MapPersistenceMode;
+
+/**
+ * Loads, saves, and converts NGrid YAML configuration files.
+ */
 public class NGridConfigLoader {
 
-    private static final ObjectMapper mapper;
+    /** Utility class — prevents instantiation. */
+    private NGridConfigLoader() {
+    }
 
     static {
         // Configure mapper to minimize quotes in YAML for cleaner output
@@ -72,14 +78,34 @@ public class NGridConfigLoader {
                 "Environment variable or property '" + varName + "' not found and no default value provided.");
     }
 
+    /**
+     * Saves a YAML config to a file.
+     *
+     * @param yamlFile the output file
+     * @param config   the config to save
+     * @throws IOException if writing fails
+     */
     public static void save(Path yamlFile, NGridYamlConfig config) throws IOException {
         mapper.writeValue(yamlFile.toFile(), config);
     }
 
+    /**
+     * Converts a YAML config to the domain NGridConfig.
+     *
+     * @param yamlConfig the YAML config
+     * @return the domain config
+     */
     public static dev.nishisan.utils.ngrid.structures.NGridConfig convertToDomain(NGridYamlConfig yamlConfig) {
         return convertToDomain(yamlConfig, null);
     }
 
+    /**
+     * Converts a YAML config to the domain NGridConfig with seed info.
+     *
+     * @param yamlConfig the YAML config
+     * @param seedInfo   optional seed node info
+     * @return the domain config
+     */
     public static dev.nishisan.utils.ngrid.structures.NGridConfig convertToDomain(NGridYamlConfig yamlConfig,
             dev.nishisan.utils.ngrid.common.NodeInfo seedInfo) {
         NodeIdentityConfig nodeConfig = yamlConfig.getNode();

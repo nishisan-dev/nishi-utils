@@ -23,13 +23,22 @@ import java.util.stream.Stream;
 
 /**
  * Fixed-capacity list that evicts the oldest element when full.
+ *
+ * @param <E> the numeric element type
  */
 public class FixedSizeList<E extends Number> {
     private final List<E> internalList;
     private final int capacity;
     private final String name;
     private E lastAddedElement;
-    public FixedSizeList(String name,int capacity) {
+
+    /**
+     * Creates a fixed-size list with the given name and capacity.
+     *
+     * @param name     the list name
+     * @param capacity the maximum capacity
+     */
+    public FixedSizeList(String name, int capacity) {
         if (capacity <= 0) {
             throw new IllegalArgumentException("Capacity must be positive.");
         }
@@ -38,6 +47,12 @@ public class FixedSizeList<E extends Number> {
         this.internalList = new ArrayList<>(capacity);
     }
 
+    /**
+     * Adds an element, evicting the oldest if at capacity.
+     *
+     * @param element the element to add
+     * @return {@code true} if the element was added
+     */
     public boolean add(E element) {
         if (internalList.size() == capacity) {
             // Remove the first element to make space for the new element at the end
@@ -47,6 +62,11 @@ public class FixedSizeList<E extends Number> {
         return internalList.add(element);
     }
 
+    /**
+     * Removes and returns the last element.
+     *
+     * @return the last element, or {@code null} if empty
+     */
     public E removeLast() {
         if (internalList.isEmpty()) {
             return null; // Or throw an exception
@@ -54,19 +74,40 @@ public class FixedSizeList<E extends Number> {
         return internalList.remove(internalList.size() - 1);
     }
 
+    /**
+     * Returns the element at the given index.
+     *
+     * @param index the index
+     * @return the element
+     */
     public E get(int index) {
         return internalList.get(index);
     }
 
+    /**
+     * Returns the number of elements in this list.
+     *
+     * @return the size
+     */
     public int size() {
 
         return internalList.size();
     }
 
+    /**
+     * Returns a stream of the elements.
+     *
+     * @return the element stream
+     */
     public Stream<E> stream() {
         return internalList.stream();
     }
 
+    /**
+     * Computes the average of all non-null elements.
+     *
+     * @return the average, or {@code 0.0} if empty
+     */
     public Double getAverage() {
         return stream()
                 .filter(java.util.Objects::nonNull)
@@ -75,20 +116,38 @@ public class FixedSizeList<E extends Number> {
                 .orElse(0.0);
     }
 
-
+    /**
+     * Returns the name of this list.
+     *
+     * @return the name
+     */
     public String getName() {
         return name;
     }
 
-
+    /**
+     * Returns the internal list backing this fixed-size list.
+     *
+     * @return the internal list
+     */
     public List<E> getInternalList() {
         return internalList;
     }
 
+    /**
+     * Returns the maximum capacity.
+     *
+     * @return the capacity
+     */
     public int getCapacity() {
         return capacity;
     }
 
+    /**
+     * Returns the last added element.
+     *
+     * @return the last added element, or {@code null}
+     */
     public E getLastAddedElement() {
         return lastAddedElement;
     }

@@ -20,17 +20,18 @@ package dev.nishisan.utils.ngrid;
 import dev.nishisan.utils.ngrid.common.NodeId;
 
 /**
- * Listener that is notified when the local node gains or loses leadership, and also whenever
+ * Listener that is notified when the local node gains or loses leadership, and
+ * also whenever
  * the observed leader changes.
  */
 @FunctionalInterface
 public interface LeaderElectionListener {
 
     /**
+     * Called when the local node gains or loses leadership.
+     *
      * @param isLeader      whether the local node is the leader after the change
      * @param currentLeader the current leader id (may be {@code null} if unknown)
      */
     void onLeadershipChanged(boolean isLeader, NodeId currentLeader);
 }
-
-

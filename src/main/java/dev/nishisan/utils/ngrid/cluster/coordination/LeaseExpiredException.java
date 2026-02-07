@@ -26,10 +26,21 @@ package dev.nishisan.utils.ngrid.cluster.coordination;
  */
 public class LeaseExpiredException extends RuntimeException {
 
+    /**
+     * Creates a lease expired exception with the given message.
+     *
+     * @param message the detail message
+     */
     public LeaseExpiredException(String message) {
         super(message);
     }
 
+    /**
+     * Creates a lease expired exception with a message and cause.
+     *
+     * @param message the detail message
+     * @param cause   the cause
+     */
     public LeaseExpiredException(String message, Throwable cause) {
         super(message, cause);
     }

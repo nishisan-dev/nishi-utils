@@ -19,12 +19,13 @@ package dev.nishisan.utils.ngrid.map;
 
 /**
  * Metadata persisted alongside the snapshot/WAL files.
+ *
+ * @param lastSnapshotOffset    the offset of the last snapshot
+ * @param lastSnapshotTimestamp the timestamp of the last snapshot
+ * @param version               the metadata format version
  */
 public record MapMetadata(
-        long lastSnapshotOffset,
-        long lastSnapshotTimestamp,
-        int version
-) {
+                long lastSnapshotOffset,
+                long lastSnapshotTimestamp,
+                int version) {
 }
-
-

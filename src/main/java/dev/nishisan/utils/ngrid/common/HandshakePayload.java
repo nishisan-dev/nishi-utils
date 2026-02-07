@@ -27,7 +27,8 @@ import java.util.Objects;
 import java.util.Set;
 
 /**
- * Payload exchanged during the initial handshake containing local node metadata and the
+ * Payload exchanged during the initial handshake containing local node metadata
+ * and the
  * peer list currently known by the sender.
  */
 public final class HandshakePayload implements Serializable {
@@ -38,24 +39,52 @@ public final class HandshakePayload implements Serializable {
     private final Set<NodeInfo> peers;
     private final Map<NodeId, Double> latencies;
 
+    /**
+     * Creates a handshake payload without latency information.
+     *
+     * @param local the local node information
+     * @param peers the set of known peers
+     */
     public HandshakePayload(NodeInfo local, Set<NodeInfo> peers) {
         this(local, peers, Collections.emptyMap());
     }
 
+    /**
+     * Creates a handshake payload with latency information.
+     *
+     * @param local     the local node information
+     * @param peers     the set of known peers
+     * @param latencies measured latencies to known peers
+     */
     public HandshakePayload(NodeInfo local, Set<NodeInfo> peers, Map<NodeId, Double> latencies) {
         this.local = Objects.requireNonNull(local, "local");
         this.peers = Collections.unmodifiableSet(new HashSet<>(Objects.requireNonNull(peers, "peers")));
         this.latencies = Collections.unmodifiableMap(new HashMap<>(Objects.requireNonNull(latencies, "latencies")));
     }
 
+    /**
+     * Returns the local node information.
+     *
+     * @return the local node info
+     */
     public NodeInfo local() {
         return local;
     }
 
+    /**
+     * Returns the set of known peers.
+     *
+     * @return the peers
+     */
     public Set<NodeInfo> peers() {
         return peers;
     }
 
+    /**
+     * Returns the latency map.
+     *
+     * @return the latencies
+     */
     public Map<NodeId, Double> latencies() {
         return latencies;
     }

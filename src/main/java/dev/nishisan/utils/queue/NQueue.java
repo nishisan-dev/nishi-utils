@@ -711,6 +711,7 @@ public class NQueue<T extends Serializable> implements Closeable {
      * @param items     the items read
      * @param hasMore   whether more items are available after this range
      * @param nextIndex the next index to continue reading from
+     * @param <T>       the element type
      */
     public record ReadRangeResult<T>(List<T> items, boolean hasMore, int nextIndex) implements Serializable {
         private static final long serialVersionUID = 1L;

@@ -34,7 +34,8 @@ import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.ScheduledExecutorService;
 
 /**
- * Utility factory for a reusable leader election service built on top of NGrid's
+ * Utility factory for a reusable leader election service built on top of
+ * NGrid's
  * {@link ClusterCoordinator}.
  */
 public final class LeaderElectionUtils {
@@ -45,17 +46,25 @@ public final class LeaderElectionUtils {
     /**
      * Creates a leader election service.
      *
-     * <p><strong>Note:</strong> {@link ClusterCoordinator#close()} shuts down the provided scheduler.
+     * <p>
+     * <strong>Note:</strong> {@link ClusterCoordinator#close()} shuts down the
+     * provided scheduler.
      * Provide a dedicated {@link ScheduledExecutorService} for this service.
+     *
+     * @param transport the cluster transport
+     * @param config    the coordinator config
+     * @param scheduler the scheduler
+     * @return the service instance
      */
     public static LeaderElectionService create(Transport transport,
-                                               ClusterCoordinatorConfig config,
-                                               ScheduledExecutorService scheduler) {
+            ClusterCoordinatorConfig config,
+            ScheduledExecutorService scheduler) {
         return new LeaderElectionService(transport, config, scheduler);
     }
 
     /**
-     * Leader election service wrapper that exposes leader-related information and listener hooks.
+     * Leader election service wrapper that exposes leader-related information and
+     * listener hooks.
      */
     public static final class LeaderElectionService implements Closeable {
         private final Transport transport;
@@ -65,49 +74,83 @@ public final class LeaderElectionUtils {
         private final LeadershipListener internalLeadershipListener = this::notifyLeadershipChange;
 
         private LeaderElectionService(Transport transport,
-                                      ClusterCoordinatorConfig config,
-                                      ScheduledExecutorService scheduler) {
+                ClusterCoordinatorConfig config,
+                ScheduledExecutorService scheduler) {
             this.transport = Objects.requireNonNull(transport, "transport");
             Objects.requireNonNull(config, "config");
             Objects.requireNonNull(scheduler, "scheduler");
             this.coordinator = new ClusterCoordinator(transport, config, scheduler);
         }
 
+        /**
+         * Starts the leader election service, registering the internal listener and
+         * beginning the cluster coordinator.
+         */
         public void start() {
             coordinator.addLeadershipListener(internalLeadershipListener);
             coordinator.start();
         }
 
+        /**
+         * Returns whether the local node is the current leader.
+         *
+         * @return {@code true} if the local node is the leader
+         */
         public boolean isLeader() {
             return coordinator.isLeader();
         }
 
+        /**
+         * Returns information about the current leader, if known.
+         *
+         * @return the leader info, or empty if unknown
+         */
         public Optional<NodeInfo> leaderInfo() {
             return coordinator.leaderInfo();
         }
 
+        /**
+         * Returns the currently active cluster members.
+         *
+         * @return the active members
+         */
         public Collection<NodeInfo> activeMembers() {
             return coordinator.activeMembers();
         }
 
         /**
-         * Adds a listener that is notified when the local node gains or loses leadership.
+         * Adds a listener that is notified when the local node gains or loses
+         * leadership.
+         *
+         * @param listener the listener to add
          */
         public void addLeaderElectionListener(LeaderElectionListener listener) {
             electionListeners.add(Objects.requireNonNull(listener, "listener"));
         }
 
+        /**
+         * Removes a previously registered election listener.
+         *
+         * @param listener the listener to remove
+         */
         public void removeLeaderElectionListener(LeaderElectionListener listener) {
             electionListeners.remove(listener);
         }
 
         /**
          * Adds a raw coordinator listener (notified on any leader id change).
+         *
+         * @param listener the listener to add
          */
         public void addLeadershipListener(LeadershipListener listener) {
             coordinator.addLeadershipListener(Objects.requireNonNull(listener, "listener"));
         }
 
+        /**
+         * Removes a previously registered raw coordinator listener.
+         *
+         * @param listener the listener to remove
+         */
         public void removeLeadershipListener(LeadershipListener listener) {
             coordinator.removeLeadershipListener(listener);
         }
@@ -126,5 +169,3 @@ public final class LeaderElectionUtils {
         }
     }
 }
-
-

@@ -26,4 +26,8 @@ import java.util.List;
 public class AverageCounterDTO {
     private String name;
     private List<Long> values = new ArrayList<>();
+
+    /** Creates a default average counter DTO. */
+    public AverageCounterDTO() {
+    }
 }

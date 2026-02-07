@@ -26,6 +26,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
@@ -37,7 +38,7 @@ import java.util.logging.Logger;
  * against an {@link NGridOperationalSnapshot} and dispatches
  * {@link NGridAlert} events to registered {@link NGridAlertListener listeners}.
  *
- * <h3>Built-in Alert Types</h3>
+ * <h2>Built-in Alert Types</h2>
  * <ul>
  * <li>{@code PERSISTENCE_FAILURE} — triggered via
  * {@link PersistenceHealthListener} callback (CRITICAL)</li>
@@ -62,11 +63,17 @@ public final class NGridAlertEngine implements Closeable {
     private static final Logger LOGGER = Logger.getLogger(NGridAlertEngine.class.getName());
 
     // Alert type constants
+    /** Alert type for persistence failures. */
     public static final String PERSISTENCE_FAILURE = "PERSISTENCE_FAILURE";
+    /** Alert type for high replication lag. */
     public static final String HIGH_REPLICATION_LAG = "HIGH_REPLICATION_LAG";
+    /** Alert type for expired leader leases. */
     public static final String LEADER_LEASE_EXPIRED = "LEADER_LEASE_EXPIRED";
+    /** Alert type for low quorum. */
     public static final String LOW_QUORUM = "LOW_QUORUM";
+    /** Alert type for high gap rate. */
     public static final String HIGH_GAP_RATE = "HIGH_GAP_RATE";
+    /** Alert type for snapshot fallback spikes. */
     public static final String SNAPSHOT_FALLBACK_SPIKE = "SNAPSHOT_FALLBACK_SPIKE";
 
     private final Supplier<NGridOperationalSnapshot> snapshotSupplier;
@@ -85,6 +92,7 @@ public final class NGridAlertEngine implements Closeable {
     private volatile long previousGapsDetected = -1;
     private volatile long previousSnapshotFallbackCount = -1;
     private volatile boolean running;
+    private volatile ScheduledFuture<?> evaluationTask;
 
     private NGridAlertEngine(Builder builder) {
         this.snapshotSupplier = Objects.requireNonNull(builder.snapshotSupplier, "snapshotSupplier");
@@ -106,11 +114,14 @@ public final class NGridAlertEngine implements Closeable {
         }
         running = true;
         long periodMs = Math.max(500L, evaluationInterval.toMillis());
-        scheduler.scheduleAtFixedRate(this::evaluate, periodMs, periodMs, TimeUnit.MILLISECONDS);
+        evaluationTask = scheduler.scheduleAtFixedRate(this::evaluateScheduled, periodMs, periodMs,
+                TimeUnit.MILLISECONDS);
     }
 
     /**
      * Registers an alert listener.
+     *
+     * @param listener the listener to add
      */
     public void addListener(NGridAlertListener listener) {
         listeners.add(Objects.requireNonNull(listener, "listener"));
@@ -118,6 +129,8 @@ public final class NGridAlertEngine implements Closeable {
 
     /**
      * Removes a previously registered listener.
+     *
+     * @param listener the listener to remove
      */
     public void removeListener(NGridAlertListener listener) {
         listeners.remove(listener);
@@ -161,6 +174,13 @@ public final class NGridAlertEngine implements Closeable {
         } catch (Throwable t) {
             LOGGER.log(Level.WARNING, "Alert evaluation failed", t);
         }
+    }
+
+    private void evaluateScheduled() {
+        if (!running) {
+            return;
+        }
+        evaluate();
     }
 
     private void evaluateReplicationLag(NGridOperationalSnapshot snapshot) {
@@ -265,11 +285,18 @@ public final class NGridAlertEngine implements Closeable {
     @Override
     public void close() {
         running = false;
+        ScheduledFuture<?> task = evaluationTask;
+        if (task != null) {
+            task.cancel(false);
+            evaluationTask = null;
+        }
     }
 
     /**
      * Returns the number of currently registered listeners.
      * Mainly for testing.
+     *
+     * @return the listener count
      */
     public int listenerCount() {
         return listeners.size();
@@ -277,11 +304,21 @@ public final class NGridAlertEngine implements Closeable {
 
     // ── Builder ──
 
+    /**
+     * Creates a builder for an alert engine.
+     *
+     * @param snapshotSupplier supplier of operational snapshots
+     * @param scheduler        the scheduler for periodic evaluation
+     * @return the builder
+     */
     public static Builder builder(Supplier<NGridOperationalSnapshot> snapshotSupplier,
             ScheduledExecutorService scheduler) {
         return new Builder(snapshotSupplier, scheduler);
     }
 
+    /**
+     * Builder for {@link NGridAlertEngine}.
+     */
     public static final class Builder {
         private final Supplier<NGridOperationalSnapshot> snapshotSupplier;
         private final ScheduledExecutorService scheduler;
@@ -298,36 +335,77 @@ public final class NGridAlertEngine implements Closeable {
             this.scheduler = scheduler;
         }
 
+        /**
+         * Sets the evaluation interval.
+         * 
+         * @param interval the interval
+         * @return this builder
+         */
         public Builder evaluationInterval(Duration interval) {
             this.evaluationInterval = Objects.requireNonNull(interval);
             return this;
         }
 
+        /**
+         * Sets the alert cooldown.
+         * 
+         * @param cooldown the cooldown
+         * @return this builder
+         */
         public Builder alertCooldown(Duration cooldown) {
             this.alertCooldown = Objects.requireNonNull(cooldown);
             return this;
         }
 
+        /**
+         * Sets the lag warning threshold.
+         * 
+         * @param threshold the threshold
+         * @return this builder
+         */
         public Builder lagWarningThreshold(long threshold) {
             this.lagWarningThreshold = threshold;
             return this;
         }
 
+        /**
+         * Sets the lag critical threshold.
+         * 
+         * @param threshold the threshold
+         * @return this builder
+         */
         public Builder lagCriticalThreshold(long threshold) {
             this.lagCriticalThreshold = threshold;
             return this;
         }
 
+        /**
+         * Sets the gap rate threshold.
+         * 
+         * @param threshold the threshold
+         * @return this builder
+         */
         public Builder gapRateThreshold(long threshold) {
             this.gapRateThreshold = threshold;
             return this;
         }
 
+        /**
+         * Sets the snapshot fallback threshold.
+         * 
+         * @param threshold the threshold
+         * @return this builder
+         */
         public Builder snapshotFallbackThreshold(long threshold) {
             this.snapshotFallbackThreshold = threshold;
             return this;
         }
 
+        /**
+         * Builds the alert engine.
+         * 
+         * @return the engine
+         */
         public NGridAlertEngine build() {
             return new NGridAlertEngine(this);
         }

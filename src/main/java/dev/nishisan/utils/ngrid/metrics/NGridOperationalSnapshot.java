@@ -30,35 +30,56 @@ import java.time.Instant;
  * </p>
  *
  * @since 2.1.0
+ *
+ * @param localNodeId                the local node identifier
+ * @param leaderId                   the current leader identifier
+ * @param leaderEpoch                the leader epoch
+ * @param trackedLeaderEpoch         the tracked leader epoch
+ * @param activeMembersCount         the number of active cluster members
+ * @param isLeader                   whether the local node is the leader
+ * @param hasValidLease              whether the leader lease is valid
+ * @param trackedLeaderHighWatermark the tracked high watermark
+ * @param globalSequence             the global replication sequence
+ * @param lastAppliedSequence        the last applied sequence
+ * @param replicationLag             the replication lag
+ * @param gapsDetected               the number of gaps detected
+ * @param resendSuccessCount         the number of successful resends
+ * @param snapshotFallbackCount      the number of snapshot fallbacks
+ * @param averageConvergenceTimeMs   the average convergence time in ms
+ * @param pendingOperationsCount     the pending operations count
+ * @param reachableNodesCount        the number of reachable nodes
+ * @param totalNodesCount            the total number of nodes
+ * @param ioStats                    the I/O statistics snapshot
+ * @param capturedAt                 the timestamp when the snapshot was taken
  */
 public record NGridOperationalSnapshot(
-        // ── Cluster ──
-        String localNodeId,
-        String leaderId,
-        long leaderEpoch,
-        long trackedLeaderEpoch,
-        int activeMembersCount,
-        boolean isLeader,
-        boolean hasValidLease,
-        long trackedLeaderHighWatermark,
+                // ── Cluster ──
+                String localNodeId,
+                String leaderId,
+                long leaderEpoch,
+                long trackedLeaderEpoch,
+                int activeMembersCount,
+                boolean isLeader,
+                boolean hasValidLease,
+                long trackedLeaderHighWatermark,
 
-        // ── Replication ──
-        long globalSequence,
-        long lastAppliedSequence,
-        long replicationLag,
-        long gapsDetected,
-        long resendSuccessCount,
-        long snapshotFallbackCount,
-        double averageConvergenceTimeMs,
-        int pendingOperationsCount,
+                // ── Replication ──
+                long globalSequence,
+                long lastAppliedSequence,
+                long replicationLag,
+                long gapsDetected,
+                long resendSuccessCount,
+                long snapshotFallbackCount,
+                double averageConvergenceTimeMs,
+                int pendingOperationsCount,
 
-        // ── Health ──
-        int reachableNodesCount,
-        int totalNodesCount,
+                // ── Health ──
+                int reachableNodesCount,
+                int totalNodesCount,
 
-        // ── I/O Stats ──
-        NGridStatsSnapshot ioStats,
+                // ── I/O Stats ──
+                NGridStatsSnapshot ioStats,
 
-        // ── Timestamp ──
-        Instant capturedAt) {
+                // ── Timestamp ──
+                Instant capturedAt) {
 }

@@ -23,6 +23,8 @@ import java.util.Optional;
 
 /**
  * Serializable representation of an optional value used in RPC style responses.
+ *
+ * @param <T> the value type
  */
 public final class SerializableOptional<T extends Serializable> implements Serializable {
     @Serial
@@ -36,22 +38,50 @@ public final class SerializableOptional<T extends Serializable> implements Seria
         this.value = value;
     }
 
+    /**
+     * Creates a present optional wrapping the given value.
+     *
+     * @param <T>   the value type
+     * @param value the value
+     * @return a present optional
+     */
     public static <T extends Serializable> SerializableOptional<T> of(T value) {
         return new SerializableOptional<>(true, value);
     }
 
+    /**
+     * Creates an empty optional.
+     *
+     * @param <T> the value type
+     * @return an empty optional
+     */
     public static <T extends Serializable> SerializableOptional<T> empty() {
         return new SerializableOptional<>(false, null);
     }
 
+    /**
+     * Converts this to a standard {@link Optional}.
+     *
+     * @return the optional value
+     */
     public Optional<T> toOptional() {
         return present ? Optional.ofNullable(value) : Optional.empty();
     }
 
+    /**
+     * Returns whether a value is present.
+     *
+     * @return {@code true} if present
+     */
     public boolean isPresent() {
         return present;
     }
 
+    /**
+     * Returns the value, or {@code null} if empty.
+     *
+     * @return the value
+     */
     public T value() {
         return value;
     }

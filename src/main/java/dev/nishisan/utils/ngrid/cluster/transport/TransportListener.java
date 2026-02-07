@@ -22,12 +22,28 @@ import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
 
 /**
- * Listener for transport events including message delivery and peer connectivity changes.
+ * Listener for transport events including message delivery and peer
+ * connectivity changes.
  */
 public interface TransportListener {
+    /**
+     * Invoked when a new peer connects to the transport layer.
+     *
+     * @param peer information about the connected peer
+     */
     void onPeerConnected(NodeInfo peer);
 
+    /**
+     * Invoked when a peer disconnects from the transport layer.
+     *
+     * @param peerId identifier of the disconnected peer
+     */
     void onPeerDisconnected(NodeId peerId);
 
+    /**
+     * Invoked when a cluster message is received from a peer.
+     *
+     * @param message the received cluster message
+     */
     void onMessage(ClusterMessage message);
 }

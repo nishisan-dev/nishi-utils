@@ -38,7 +38,8 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Broadcasts local write rates and suggests leader changes based on ingress write load.
+ * Broadcasts local write rates and suggests leader changes based on ingress
+ * write load.
  */
 public final class LeaderReelectionService implements TransportListener, Closeable {
     private final Transport transport;
@@ -55,14 +56,26 @@ public final class LeaderReelectionService implements TransportListener, Closeab
     private volatile long lastSuggestionAtMs;
     private volatile boolean running;
 
+    /**
+     * Creates a leader reelection service.
+     *
+     * @param transport     the cluster transport
+     * @param coordinator   the cluster coordinator
+     * @param stats         the stats utility
+     * @param scheduler     the scheduler for periodic tasks
+     * @param interval      the broadcast interval
+     * @param cooldown      the cooldown between suggestions
+     * @param suggestionTtl the TTL for leader suggestions
+     * @param minDelta      the minimum write rate delta to trigger a suggestion
+     */
     public LeaderReelectionService(Transport transport,
-                                   ClusterCoordinator coordinator,
-                                   StatsUtils stats,
-                                   ScheduledExecutorService scheduler,
-                                   Duration interval,
-                                   Duration cooldown,
-                                   Duration suggestionTtl,
-                                   double minDelta) {
+            ClusterCoordinator coordinator,
+            StatsUtils stats,
+            ScheduledExecutorService scheduler,
+            Duration interval,
+            Duration cooldown,
+            Duration suggestionTtl,
+            double minDelta) {
         this.transport = Objects.requireNonNull(transport, "transport");
         this.coordinator = Objects.requireNonNull(coordinator, "coordinator");
         this.stats = Objects.requireNonNull(stats, "stats");
@@ -73,6 +86,9 @@ public final class LeaderReelectionService implements TransportListener, Closeab
         this.minDelta = minDelta;
     }
 
+    /**
+     * Starts the periodic write-rate broadcast and leader evaluation cycle.
+     */
     public void start() {
         if (running) {
             return;
@@ -86,6 +102,9 @@ public final class LeaderReelectionService implements TransportListener, Closeab
         scheduler.scheduleAtFixedRate(this::tick, periodMs, periodMs, TimeUnit.MILLISECONDS);
     }
 
+    /**
+     * Stops the service and removes the transport listener.
+     */
     public void stop() {
         if (!running) {
             return;
