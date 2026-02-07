@@ -264,7 +264,7 @@ public final class NGridConfig {
         private Path mapDirectory;
         private String mapName = "default-map";
         private MapPersistenceMode mapPersistenceMode = MapPersistenceMode.DISABLED;
-        private boolean strictConsistency = false;
+        private boolean strictConsistency = true;
         private Duration connectTimeout = Duration.ofSeconds(5);
         private Duration reconnectInterval = Duration.ofMillis(500);
         private Duration requestTimeout = Duration.ofSeconds(20);

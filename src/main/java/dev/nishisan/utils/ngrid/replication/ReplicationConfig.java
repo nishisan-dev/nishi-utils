@@ -78,7 +78,7 @@ public final class ReplicationConfig {
         private final int quorum;
         private Duration operationTimeout = Duration.ofSeconds(30);
         private Duration retryInterval = Duration.ofSeconds(1);
-        private boolean strictConsistency = false;
+        private boolean strictConsistency = true;
         private Path dataDirectory;
 
         private Builder(int quorum) {
