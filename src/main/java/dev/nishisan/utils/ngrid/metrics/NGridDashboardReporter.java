@@ -71,6 +71,8 @@ public final class NGridDashboardReporter implements Closeable {
     }
 
     /**
+     * Creates a dashboard reporter.
+     *
      * @param snapshotSupplier supplies the operational snapshot on each tick
      * @param scheduler        shared scheduler for periodic execution
      * @param outputPath       path to write the YAML dashboard file
