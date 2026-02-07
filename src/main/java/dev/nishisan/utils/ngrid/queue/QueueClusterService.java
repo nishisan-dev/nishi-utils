@@ -43,8 +43,9 @@ import java.util.logging.Logger;
 
 /**
  * Coordinates queue operations with the replication manager ensuring that the
- * persistent
- * {@link NQueue} backend stays consistent across cluster members.
+ * persistent {@link NQueue} backend stays consistent across cluster members.
+ *
+ * @param <T> the queue element type
  */
 public final class QueueClusterService<T extends Serializable> implements Closeable, ReplicationHandler {
     private static final Logger LOGGER = Logger.getLogger(QueueClusterService.class.getName());
@@ -59,10 +60,25 @@ public final class QueueClusterService<T extends Serializable> implements Closea
     private final java.util.concurrent.atomic.AtomicBoolean pendingOffsetSync = new java.util.concurrent.atomic.AtomicBoolean(
             false);
 
+    /**
+     * Creates a queue cluster service with default options.
+     *
+     * @param baseDir            the base directory for queue storage
+     * @param queueName          the queue name
+     * @param replicationManager the replication manager
+     */
     public QueueClusterService(Path baseDir, String queueName, ReplicationManager replicationManager) {
         this(baseDir, queueName, replicationManager, NQueue.Options.defaults(), null, null);
     }
 
+    /**
+     * Creates a queue cluster service with custom options.
+     *
+     * @param baseDir            the base directory for queue storage
+     * @param queueName          the queue name
+     * @param replicationManager the replication manager
+     * @param options            the queue options
+     */
     public QueueClusterService(Path baseDir, String queueName, ReplicationManager replicationManager,
             NQueue.Options options) {
         this(baseDir, queueName, replicationManager, options, null, null);
@@ -72,6 +88,17 @@ public final class QueueClusterService<T extends Serializable> implements Closea
     private final LocalOffsetStore localOffsetStore;
     private final DistributedOffsetStore distributedOffsetStore;
 
+    /**
+     * Creates a queue cluster service with full configuration.
+     *
+     * @param baseDir            the base directory for queue storage
+     * @param queueName          the queue name
+     * @param replicationManager the replication manager
+     * @param options            the queue options
+     * @param replicationFactor  the desired replication factor, or {@code null} for
+     *                           default
+     * @param offsetStore        the offset store, or {@code null} for local-only
+     */
     public QueueClusterService(Path baseDir, String queueName, ReplicationManager replicationManager,
             NQueue.Options options, Integer replicationFactor, OffsetStore offsetStore) {
         try {
@@ -92,6 +119,11 @@ public final class QueueClusterService<T extends Serializable> implements Closea
         this.replicationManager.registerHandler(topic, this);
     }
 
+    /**
+     * Offers a value to the queue, replicating the operation across the cluster.
+     *
+     * @param value the value to offer
+     */
     public void offer(T value) {
         Objects.requireNonNull(value, "value");
         ensureLeaderReady();
@@ -364,6 +396,7 @@ public final class QueueClusterService<T extends Serializable> implements Closea
         }
     }
 
+    /** {@inheritDoc} */
     @Override
     @SuppressWarnings("unchecked")
     public void apply(UUID operationId, Serializable payload) {
@@ -392,6 +425,7 @@ public final class QueueClusterService<T extends Serializable> implements Closea
 
     private static final int SNAPSHOT_CHUNK_SIZE = 1000;
 
+    /** {@inheritDoc} */
     @Override
     public SnapshotChunk getSnapshotChunk(int chunkIndex) {
         try {
@@ -413,6 +447,7 @@ public final class QueueClusterService<T extends Serializable> implements Closea
         }
     }
 
+    /** {@inheritDoc} */
     @Override
     public void resetState() throws Exception {
         // For queues, we clear by polling all items
@@ -423,6 +458,7 @@ public final class QueueClusterService<T extends Serializable> implements Closea
         LOGGER.info(() -> "Queue " + queueName + " state reset for snapshot install");
     }
 
+    /** {@inheritDoc} */
     @Override
     @SuppressWarnings("unchecked")
     public void installSnapshot(Serializable snapshot) throws Exception {
@@ -440,6 +476,7 @@ public final class QueueClusterService<T extends Serializable> implements Closea
         return options;
     }
 
+    /** {@inheritDoc} */
     @Override
     public void close() throws IOException {
         queue.close();
@@ -451,43 +488,78 @@ public final class QueueClusterService<T extends Serializable> implements Closea
         }
     }
 
+    /**
+     * Returns the current consumer offset for the given consumer.
+     *
+     * @param consumerId the consumer node ID
+     * @return the current offset
+     */
     public long getCurrentOffset(NodeId consumerId) {
         long local = localOffsetStore.getOffset(consumerId);
         long distributed = distributedOffsetStore != null ? distributedOffsetStore.getOffset(consumerId) : 0;
         return Math.max(local, distributed);
     }
 
+    /**
+     * Updates the local offset for a consumer.
+     *
+     * @param consumerId the consumer node ID
+     * @param offset     the new offset
+     */
     public void updateLocalOffset(NodeId consumerId, long offset) {
         localOffsetStore.updateOffset(consumerId, offset);
     }
 
+    /**
+     * A queue record pairing an offset with its value.
+     *
+     * @param <T> the value type
+     */
     public static class QueueRecord<T> implements Serializable {
         private final long offset;
         private final T value;
 
+        /**
+         * Creates a new queue record.
+         *
+         * @param offset the record offset
+         * @param value  the record value
+         */
         public QueueRecord(long offset, T value) {
             this.offset = offset;
             this.value = value;
         }
 
+        /**
+         * Returns the record offset.
+         *
+         * @return the offset
+         */
         public long offset() {
             return offset;
         }
 
+        /**
+         * Returns the record value.
+         *
+         * @return the value
+         */
         public T value() {
             return value;
         }
     }
 
+    /**
+     * Polls the next record for a consumer, returning offset and value.
+     *
+     * @param consumerId the consumer node ID
+     * @param hintOffset the offset hint, or {@code null}
+     * @return the next record, or empty
+     */
     public Optional<QueueRecord<T>> pollRecord(NodeId consumerId, Long hintOffset) {
         Optional<T> val = poll(consumerId, hintOffset);
         if (val.isEmpty())
             return Optional.empty();
-        // poll() updates safeUpdateOffset, so getCurrentOffset should reflect the NEW
-        // offset (next index)
-        // But we want the offset OF THE ITEM.
-        // safeUpdateOffset updates to nextIndex (item.index + 1).
-        // So item.index = currentOffset - 1.
         long current = getCurrentOffset(consumerId);
         return Optional.of(new QueueRecord<>(current - 1, val.get()));
     }

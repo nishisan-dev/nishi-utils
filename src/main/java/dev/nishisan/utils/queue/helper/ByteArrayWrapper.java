@@ -24,16 +24,27 @@ package dev.nishisan.utils.queue.helper;
 public class ByteArrayWrapper {
     private final byte[] bytes;
 
+    /**
+     * Creates a new wrapper for the given byte array.
+     *
+     * @param bytes the byte array to wrap
+     */
     public ByteArrayWrapper(byte[] bytes) {
         this.bytes = bytes;
     }
 
+    /**
+     * Returns the wrapped byte array.
+     *
+     * @return the byte array
+     */
     public byte[] getBytes() {
         return bytes;
     }
 
     /**
-     * Creates a new instance of ByteArrayWrapper that encapsulates the provided byte array.
+     * Creates a new instance of ByteArrayWrapper that encapsulates the provided
+     * byte array.
      *
      * @param bytes the byte array to be wrapped in a ByteArrayWrapper
      * @return a new instance of ByteArrayWrapper containing the provided byte array
