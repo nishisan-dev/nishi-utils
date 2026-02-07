@@ -29,10 +29,10 @@ import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.ngrid.common.OperationStatus;
 import dev.nishisan.utils.ngrid.common.ReplicationAckPayload;
 import dev.nishisan.utils.ngrid.common.ReplicationPayload;
-import dev.nishisan.utils.ngrid.common.SyncRequestPayload;
-import dev.nishisan.utils.ngrid.common.SyncResponsePayload;
 import dev.nishisan.utils.ngrid.common.SequenceResendRequestPayload;
 import dev.nishisan.utils.ngrid.common.SequenceResendResponsePayload;
+import dev.nishisan.utils.ngrid.common.SyncRequestPayload;
+import dev.nishisan.utils.ngrid.common.SyncResponsePayload;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -101,6 +101,25 @@ public class ReplicationManager implements TransportListener, LeadershipListener
     private final Path sequenceStatePath;
     private final ReentrantLock sequenceBufferLock = new ReentrantLock();
 
+    // Leader-side replication log indexed by sequence (per topic) for resend
+    // support
+    private final Map<String, java.util.NavigableMap<Long, ReplicationPayload>> replicationLogBySequence = new ConcurrentHashMap<>();
+
+    // Resend tracking (follower-side)
+    private final Set<String> resendPendingTopics = ConcurrentHashMap.newKeySet();
+    private final Map<String, Instant> resendStartByTopic = new ConcurrentHashMap<>();
+
+    // Metrics
+    private final java.util.concurrent.atomic.AtomicLong gapsDetected = new java.util.concurrent.atomic.AtomicLong(0);
+    private final java.util.concurrent.atomic.AtomicLong resendSuccessCount = new java.util.concurrent.atomic.AtomicLong(
+            0);
+    private final java.util.concurrent.atomic.AtomicLong snapshotFallbackCount = new java.util.concurrent.atomic.AtomicLong(
+            0);
+    private final java.util.concurrent.atomic.AtomicLong totalConvergenceTimeMs = new java.util.concurrent.atomic.AtomicLong(
+            0);
+    private final java.util.concurrent.atomic.AtomicLong convergenceCount = new java.util.concurrent.atomic.AtomicLong(
+            0);
+
     private static record Failure(PendingOperation operation, Throwable error) {
     }
 
@@ -154,6 +173,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         timeoutScheduler.scheduleAtFixedRate(this::retryPending, retryMs, retryMs, TimeUnit.MILLISECONDS);
         timeoutScheduler.scheduleAtFixedRate(this::checkLagAndSync, 2000, 2000, TimeUnit.MILLISECONDS);
         timeoutScheduler.scheduleAtFixedRate(this::retryLeaderSync, 500, 500, TimeUnit.MILLISECONDS);
+        timeoutScheduler.scheduleAtFixedRate(this::checkResendTimeouts, 500, 500, TimeUnit.MILLISECONDS);
     }
 
     public void stop() {
@@ -261,6 +281,10 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
         ReplicationPayload payload = new ReplicationPayload(operation.operationId, seq,
                 coordinator.getLeaderEpoch(), operation.topic, operation.payload);
+
+        // Index in sequence-based log for resend support
+        indexReplicationPayload(operation.topic, seq, payload);
+
         for (NodeInfo member : coordinator.activeMembers()) {
             if (member.nodeId().equals(transport.local().nodeId())) {
                 continue;
@@ -387,6 +411,10 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             handleSyncRequest(message);
         } else if (message.type() == MessageType.SYNC_RESPONSE) {
             handleSyncResponse(message);
+        } else if (message.type() == MessageType.SEQUENCE_RESEND_REQUEST) {
+            handleSequenceResendRequest(message);
+        } else if (message.type() == MessageType.SEQUENCE_RESEND_RESPONSE) {
+            handleSequenceResendResponse(message);
         }
     }
 
@@ -736,7 +764,10 @@ public class ReplicationManager implements TransportListener, LeadershipListener
     }
 
     /**
-     * Checks for missing sequences and requests them if timeout expired
+     * Checks for missing sequences and manages hybrid recovery:
+     * 1. If gap <= resendGapThreshold and no resend in-flight: send
+     * SEQUENCE_RESEND_REQUEST
+     * 2. If gap > resendGapThreshold: fallback directly to snapshot sync
      * (must be called with sequenceBufferLock held).
      */
     private void checkForMissingSequences(String topic) {
@@ -752,24 +783,257 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         long nextExpected = nextExpectedSequenceByTopic.get(topic);
         long gap = nextInBuffer - nextExpected;
 
-        if (gap > 0) {
-            // We have a gap, check timeout
-            Instant waitStartTime = waitStart.get(nextInBuffer);
+        if (gap <= 0) {
+            return;
+        }
 
-            if (waitStartTime != null) {
-                Duration waited = Duration.between(waitStartTime, now);
+        gapsDetected.incrementAndGet();
 
-                if (waited.compareTo(SEQUENCE_WAIT_TIMEOUT) > 0) {
-                    LOGGER.warning(() -> String.format(
-                            "Timeout waiting for seq=%d (waited %dms) for topic=%s, will request from leader",
-                            nextExpected, waited.toMillis(), topic));
+        // Check timeout for initial wait
+        Instant waitStartTime = waitStart.get(nextInBuffer);
+        if (waitStartTime == null) {
+            return;
+        }
+        Duration waited = Duration.between(waitStartTime, now);
+        if (waited.compareTo(SEQUENCE_WAIT_TIMEOUT) <= 0) {
+            return; // Still within initial wait period
+        }
 
-                    if (syncingTopics.add(topic)) {
-                        requestSync(topic);
+        // Already have a resend in-flight for this topic? Skip.
+        if (resendPendingTopics.contains(topic)) {
+            return;
+        }
+
+        if (gap <= config.resendGapThreshold()) {
+            // Small gap: try resend first
+            LOGGER.info(() -> String.format(
+                    "Gap detected for topic=%s: expecting=%d, nextInBuffer=%d (gap=%d). Attempting resend.",
+                    topic, nextExpected, nextInBuffer, gap));
+            requestSequenceResend(topic, nextExpected, nextInBuffer - 1);
+        } else {
+            // Large gap: fallback directly to snapshot sync
+            LOGGER.warning(() -> String.format(
+                    "Large gap detected for topic=%s: expecting=%d, nextInBuffer=%d (gap=%d > threshold=%d). Falling back to snapshot sync.",
+                    topic, nextExpected, nextInBuffer, gap, config.resendGapThreshold()));
+            snapshotFallbackCount.incrementAndGet();
+            if (syncingTopics.add(topic)) {
+                requestSync(topic);
+            }
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // Sequence Resend Protocol
+    // ──────────────────────────────────────────────────────────
+
+    /**
+     * Indexes a replication payload in the sequence-based log (leader-side).
+     * Enforces retention by evicting oldest entries beyond the configured limit.
+     */
+    private void indexReplicationPayload(String topic, long sequence, ReplicationPayload payload) {
+        java.util.NavigableMap<Long, ReplicationPayload> topicLog = replicationLogBySequence
+                .computeIfAbsent(topic, k -> java.util.Collections.synchronizedNavigableMap(new java.util.TreeMap<>()));
+        topicLog.put(sequence, payload);
+
+        // Enforce retention limit
+        int retention = config.replicationLogRetention();
+        while (topicLog.size() > retention) {
+            topicLog.pollFirstEntry();
+        }
+    }
+
+    /**
+     * Sends a SEQUENCE_RESEND_REQUEST to the leader (follower-side).
+     */
+    private void requestSequenceResend(String topic, long fromSequence, long toSequence) {
+        coordinator.leaderInfo().ifPresentOrElse(leader -> {
+            resendPendingTopics.add(topic);
+            resendStartByTopic.put(topic, Instant.now());
+
+            SequenceResendRequestPayload payload = new SequenceResendRequestPayload(topic, fromSequence, toSequence);
+            ClusterMessage request = ClusterMessage.request(
+                    MessageType.SEQUENCE_RESEND_REQUEST,
+                    "resend",
+                    transport.local().nodeId(),
+                    leader.nodeId(),
+                    payload);
+
+            LOGGER.info(() -> String.format(
+                    "Sending SEQUENCE_RESEND_REQUEST to leader %s for topic=%s, range=[%d..%d]",
+                    leader.nodeId(), topic, fromSequence, toSequence));
+
+            transport.send(request);
+        }, () -> {
+            LOGGER.warning(
+                    () -> "Cannot send SEQUENCE_RESEND_REQUEST: no leader known. Falling back to snapshot sync.");
+            snapshotFallbackCount.incrementAndGet();
+            if (syncingTopics.add(topic)) {
+                requestSync(topic);
+            }
+        });
+    }
+
+    /**
+     * Handles an incoming SEQUENCE_RESEND_REQUEST on the leader.
+     * Looks up the requested sequence range in the replication log and responds.
+     */
+    private void handleSequenceResendRequest(ClusterMessage message) {
+        if (!coordinator.isLeader()) {
+            LOGGER.fine(() -> "Ignoring SEQUENCE_RESEND_REQUEST: not the leader.");
+            return;
+        }
+
+        SequenceResendRequestPayload request = (SequenceResendRequestPayload) message.payload();
+        String topic = request.topic();
+        long from = request.fromSequence();
+        long to = request.toSequence();
+
+        LOGGER.info(() -> String.format(
+                "Received SEQUENCE_RESEND_REQUEST from %s for topic=%s, range=[%d..%d]",
+                message.source(), topic, from, to));
+
+        java.util.NavigableMap<Long, ReplicationPayload> topicLog = replicationLogBySequence.get(topic);
+
+        List<ReplicationPayload> operations = new ArrayList<>();
+        List<Long> missingSequences = new ArrayList<>();
+
+        if (topicLog != null) {
+            synchronized (topicLog) {
+                for (long seq = from; seq <= to; seq++) {
+                    ReplicationPayload payload = topicLog.get(seq);
+                    if (payload != null) {
+                        operations.add(payload);
+                    } else {
+                        missingSequences.add(seq);
                     }
                 }
             }
+        } else {
+            // No log at all for this topic
+            for (long seq = from; seq <= to; seq++) {
+                missingSequences.add(seq);
+            }
         }
+
+        SequenceResendResponsePayload response = new SequenceResendResponsePayload(topic, operations, missingSequences);
+        ClusterMessage responseMessage = ClusterMessage.request(
+                MessageType.SEQUENCE_RESEND_RESPONSE,
+                "resend",
+                transport.local().nodeId(),
+                message.source(),
+                response);
+
+        LOGGER.info(() -> String.format(
+                "Responding to SEQUENCE_RESEND_REQUEST for topic=%s: %d operations, %d missing",
+                topic, operations.size(), missingSequences.size()));
+
+        transport.send(responseMessage);
+    }
+
+    /**
+     * Handles an incoming SEQUENCE_RESEND_RESPONSE on the follower.
+     * Applies resent operations or falls back to snapshot sync.
+     */
+    private void handleSequenceResendResponse(ClusterMessage message) {
+        SequenceResendResponsePayload response = (SequenceResendResponsePayload) message.payload();
+        String topic = response.topic();
+
+        // Clear resend-pending state
+        resendPendingTopics.remove(topic);
+        Instant startTime = resendStartByTopic.remove(topic);
+
+        if (!response.missingSequences().isEmpty()) {
+            // Leader couldn't provide all sequences — fallback to snapshot
+            LOGGER.warning(() -> String.format(
+                    "Leader reported %d missing sequences for topic=%s. Falling back to snapshot sync.",
+                    response.missingSequences().size(), topic));
+            snapshotFallbackCount.incrementAndGet();
+            if (syncingTopics.add(topic)) {
+                requestSync(topic);
+            }
+            return;
+        }
+
+        if (response.operations().isEmpty()) {
+            LOGGER.fine(() -> "Received empty SEQUENCE_RESEND_RESPONSE for topic=" + topic);
+            return;
+        }
+
+        LOGGER.info(() -> String.format(
+                "Received SEQUENCE_RESEND_RESPONSE for topic=%s with %d operations. Applying...",
+                topic, response.operations().size()));
+
+        // Re-inject operations as replication requests — the existing sequence/buffer
+        // logic handles ordering
+        for (ReplicationPayload payload : response.operations()) {
+            ClusterMessage synthetic = ClusterMessage.request(
+                    MessageType.REPLICATION_REQUEST,
+                    null,
+                    message.source(),
+                    transport.local().nodeId(),
+                    payload);
+            handleReplicationRequest(synthetic);
+        }
+
+        // Record convergence metrics
+        resendSuccessCount.incrementAndGet();
+        if (startTime != null) {
+            long elapsedMs = Duration.between(startTime, Instant.now()).toMillis();
+            totalConvergenceTimeMs.addAndGet(elapsedMs);
+            convergenceCount.incrementAndGet();
+        }
+
+        LOGGER.info(() -> String.format(
+                "Successfully applied %d resent operations for topic=%s.",
+                response.operations().size(), topic));
+    }
+
+    /**
+     * Periodically checks if resend requests have timed out and falls back to
+     * snapshot sync.
+     */
+    private void checkResendTimeouts() {
+        if (!running || coordinator.isLeader()) {
+            return;
+        }
+
+        Instant now = Instant.now();
+        for (String topic : resendPendingTopics) {
+            Instant start = resendStartByTopic.get(topic);
+            if (start != null && Duration.between(start, now).compareTo(config.resendTimeout()) > 0) {
+                LOGGER.warning(() -> String.format(
+                        "Resend request timed out for topic=%s (timeout=%s). Falling back to snapshot sync.",
+                        topic, config.resendTimeout()));
+
+                resendPendingTopics.remove(topic);
+                resendStartByTopic.remove(topic);
+                snapshotFallbackCount.incrementAndGet();
+                if (syncingTopics.add(topic)) {
+                    requestSync(topic);
+                }
+            }
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // Metrics API
+    // ──────────────────────────────────────────────────────────
+
+    public long getGapsDetected() {
+        return gapsDetected.get();
+    }
+
+    public long getResendSuccessCount() {
+        return resendSuccessCount.get();
+    }
+
+    public long getSnapshotFallbackCount() {
+        return snapshotFallbackCount.get();
+    }
+
+    public double getAverageConvergenceTimeMs() {
+        long count = convergenceCount.get();
+        return count > 0 ? (double) totalConvergenceTimeMs.get() / count : 0.0;
     }
 
     private void sendAck(UUID operationId, NodeId destination) {

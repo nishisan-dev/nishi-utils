@@ -30,14 +30,20 @@ public final class ReplicationConfig {
     private final Duration retryInterval;
     private final boolean strictConsistency;
     private final Path dataDirectory;
+    private final int resendGapThreshold;
+    private final Duration resendTimeout;
+    private final int replicationLogRetention;
 
     private ReplicationConfig(int quorum, Duration operationTimeout, Duration retryInterval, boolean strictConsistency,
-            Path dataDirectory) {
+            Path dataDirectory, int resendGapThreshold, Duration resendTimeout, int replicationLogRetention) {
         this.quorum = quorum;
         this.operationTimeout = Objects.requireNonNull(operationTimeout, "operationTimeout");
         this.retryInterval = Objects.requireNonNull(retryInterval, "retryInterval");
         this.strictConsistency = strictConsistency;
         this.dataDirectory = Objects.requireNonNull(dataDirectory, "dataDirectory");
+        this.resendGapThreshold = resendGapThreshold;
+        this.resendTimeout = Objects.requireNonNull(resendTimeout, "resendTimeout");
+        this.replicationLogRetention = replicationLogRetention;
     }
 
     public static ReplicationConfig of(int quorum) {
@@ -74,12 +80,27 @@ public final class ReplicationConfig {
         return dataDirectory;
     }
 
+    public int resendGapThreshold() {
+        return resendGapThreshold;
+    }
+
+    public Duration resendTimeout() {
+        return resendTimeout;
+    }
+
+    public int replicationLogRetention() {
+        return replicationLogRetention;
+    }
+
     public static final class Builder {
         private final int quorum;
         private Duration operationTimeout = Duration.ofSeconds(30);
         private Duration retryInterval = Duration.ofSeconds(1);
         private boolean strictConsistency = true;
         private Path dataDirectory;
+        private int resendGapThreshold = 50;
+        private Duration resendTimeout = Duration.ofSeconds(2);
+        private int replicationLogRetention = 1000;
 
         private Builder(int quorum) {
             if (quorum < 1) {
@@ -112,11 +133,37 @@ public final class ReplicationConfig {
             return this;
         }
 
+        public Builder resendGapThreshold(int threshold) {
+            if (threshold < 1) {
+                throw new IllegalArgumentException("resendGapThreshold must be >= 1");
+            }
+            this.resendGapThreshold = threshold;
+            return this;
+        }
+
+        public Builder resendTimeout(Duration timeout) {
+            Objects.requireNonNull(timeout, "resendTimeout");
+            if (timeout.isNegative() || timeout.isZero()) {
+                throw new IllegalArgumentException("resendTimeout must be positive");
+            }
+            this.resendTimeout = timeout;
+            return this;
+        }
+
+        public Builder replicationLogRetention(int retention) {
+            if (retention < 1) {
+                throw new IllegalArgumentException("replicationLogRetention must be >= 1");
+            }
+            this.replicationLogRetention = retention;
+            return this;
+        }
+
         public ReplicationConfig build() {
             if (dataDirectory == null) {
                 throw new IllegalStateException("dataDirectory must be set");
             }
-            return new ReplicationConfig(quorum, operationTimeout, retryInterval, strictConsistency, dataDirectory);
+            return new ReplicationConfig(quorum, operationTimeout, retryInterval, strictConsistency, dataDirectory,
+                    resendGapThreshold, resendTimeout, replicationLogRetention);
         }
     }
 }
