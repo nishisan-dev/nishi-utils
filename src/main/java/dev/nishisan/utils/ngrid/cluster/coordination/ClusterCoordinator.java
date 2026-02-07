@@ -384,11 +384,6 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                     null,
                     payload);
             transport.broadcast(heartbeat);
-
-            // Renew lease on successful heartbeat broadcast
-            if (isLeader()) {
-                this.leaseExpiresAt = Instant.now().plus(config.leaseTimeout());
-            }
         } catch (Throwable t) {
             LOGGER.log(java.util.logging.Level.SEVERE, "Unexpected error in heartbeat task", t);
         }
@@ -438,6 +433,16 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             if (changed) {
                 recomputeLeader();
                 notifyMembershipListeners();
+            }
+
+            // Renew lease ONLY if the leader still has a majority of active members.
+            // This ensures an isolated leader's lease expires naturally.
+            if (isLeader()) {
+                long totalExpected = transport.peers().size() + 1; // peers + self
+                long activeCount = members.values().stream().filter(ClusterMember::isActive).count();
+                if (activeCount > totalExpected / 2) {
+                    this.leaseExpiresAt = Instant.now().plus(config.leaseTimeout());
+                }
             }
         } catch (Throwable t) {
             LOGGER.log(java.util.logging.Level.SEVERE, "Unexpected error in eviction task", t);
@@ -585,6 +590,18 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         if (message.type() == MessageType.HEARTBEAT) {
             HeartbeatPayload payload = message.payload(HeartbeatPayload.class);
             NodeId source = message.source();
+
+            // FENCING: Reject heartbeats from leaders with stale epochs.
+            // This prevents an ex-leader that stepped down from being
+            // re-accepted as a valid leader after reconnecting.
+            long heartbeatEpoch = payload.leaderEpoch();
+            if (heartbeatEpoch > 0 && heartbeatEpoch < trackedLeaderEpoch) {
+                LOGGER.fine(() -> String.format(
+                        "Ignoring heartbeat from %s with stale epoch %d (current: %d)",
+                        source, heartbeatEpoch, trackedLeaderEpoch));
+                return;
+            }
+
             NodeId currentLeader = leader.get();
             if (currentLeader != null && currentLeader.equals(source)) {
                 trackedLeaderHighWatermark = payload.leaderHighWatermark();
