@@ -245,7 +245,8 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             throw new IllegalArgumentException("No replication handler registered for topic: " + topic);
         }
         UUID operationId = UUID.randomUUID();
-        PendingOperation operation = new PendingOperation(operationId, topic, payload, requiredQuorum(quorumOverride));
+        PendingOperation operation = new PendingOperation(operationId, topic, payload,
+                coordinator.getLeaderEpoch(), requiredQuorum(quorumOverride));
         pending.put(operationId, operation);
         log.put(operationId, new ReplicatedRecord(operationId, topic, payload, OperationStatus.PENDING));
 
@@ -281,9 +282,6 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
         ReplicationPayload payload = new ReplicationPayload(operation.operationId, seq,
                 coordinator.getLeaderEpoch(), operation.topic, operation.payload);
-
-        // Index in sequence-based log for resend support
-        indexReplicationPayload(operation.topic, seq, payload);
 
         for (NodeInfo member : coordinator.activeMembers()) {
             if (member.nodeId().equals(transport.local().nodeId())) {
@@ -375,6 +373,14 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             record.status(OperationStatus.COMMITTED);
             return record;
         });
+        // Only committed operations are eligible for resend.
+        ReplicationPayload committedPayload = new ReplicationPayload(
+                operation.operationId,
+                operation.sequence,
+                operation.epoch,
+                operation.topic,
+                operation.payload);
+        indexReplicationPayload(operation.topic, operation.sequence, committedPayload);
         pending.remove(operation.operationId);
     }
 
@@ -787,8 +793,6 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             return;
         }
 
-        gapsDetected.incrementAndGet();
-
         // Check timeout for initial wait
         Instant waitStartTime = waitStart.get(nextInBuffer);
         if (waitStartTime == null) {
@@ -805,12 +809,14 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         }
 
         if (gap <= config.resendGapThreshold()) {
+            gapsDetected.incrementAndGet();
             // Small gap: try resend first
             LOGGER.info(() -> String.format(
                     "Gap detected for topic=%s: expecting=%d, nextInBuffer=%d (gap=%d). Attempting resend.",
                     topic, nextExpected, nextInBuffer, gap));
             requestSequenceResend(topic, nextExpected, nextInBuffer - 1);
         } else {
+            gapsDetected.incrementAndGet();
             // Large gap: fallback directly to snapshot sync
             LOGGER.warning(() -> String.format(
                     "Large gap detected for topic=%s: expecting=%d, nextInBuffer=%d (gap=%d > threshold=%d). Falling back to snapshot sync.",
@@ -892,6 +898,24 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                 "Received SEQUENCE_RESEND_REQUEST from %s for topic=%s, range=[%d..%d]",
                 message.source(), topic, from, to));
 
+        if (from <= 0 || to < from) {
+            LOGGER.warning(() -> String.format(
+                    "Invalid SEQUENCE_RESEND_REQUEST for topic=%s: range=[%d..%d]. Requesting snapshot fallback.",
+                    topic, from, to));
+            sendSequenceResendResponse(topic, message.source(), List.of(), List.of(from));
+            return;
+        }
+
+        long maxRange = Math.max(1000L, (long) config.replicationLogRetention());
+        long rangeSize = (to - from) + 1L;
+        if (rangeSize > maxRange) {
+            LOGGER.warning(() -> String.format(
+                    "SEQUENCE_RESEND_REQUEST range too large for topic=%s: size=%d (max=%d). Requesting snapshot fallback.",
+                    topic, rangeSize, maxRange));
+            sendSequenceResendResponse(topic, message.source(), List.of(), List.of(from));
+            return;
+        }
+
         java.util.NavigableMap<Long, ReplicationPayload> topicLog = replicationLogBySequence.get(topic);
 
         List<ReplicationPayload> operations = new ArrayList<>();
@@ -901,7 +925,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             synchronized (topicLog) {
                 for (long seq = from; seq <= to; seq++) {
                     ReplicationPayload payload = topicLog.get(seq);
-                    if (payload != null) {
+                    if (payload != null && isOperationCommitted(payload.operationId())) {
                         operations.add(payload);
                     } else {
                         missingSequences.add(seq);
@@ -915,12 +939,17 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             }
         }
 
+        sendSequenceResendResponse(topic, message.source(), operations, missingSequences);
+    }
+
+    private void sendSequenceResendResponse(String topic, NodeId destination, List<ReplicationPayload> operations,
+            List<Long> missingSequences) {
         SequenceResendResponsePayload response = new SequenceResendResponsePayload(topic, operations, missingSequences);
         ClusterMessage responseMessage = ClusterMessage.request(
                 MessageType.SEQUENCE_RESEND_RESPONSE,
                 "resend",
                 transport.local().nodeId(),
-                message.source(),
+                destination,
                 response);
 
         LOGGER.info(() -> String.format(
@@ -928,6 +957,11 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                 topic, operations.size(), missingSequences.size()));
 
         transport.send(responseMessage);
+    }
+
+    private boolean isOperationCommitted(UUID operationId) {
+        ReplicatedRecord record = log.get(operationId);
+        return record != null && record.status() == OperationStatus.COMMITTED;
     }
 
     /**
@@ -1220,6 +1254,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         private final UUID operationId;
         private final String topic;
         private final Serializable payload;
+        private final long epoch;
         private final int originalQuorum;
         private volatile int quorum;
         private volatile long sequence;
@@ -1232,10 +1267,11 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         private final java.util.concurrent.atomic.AtomicBoolean localApplyStarted = new java.util.concurrent.atomic.AtomicBoolean(
                 false);
 
-        private PendingOperation(UUID operationId, String topic, Serializable payload, int quorum) {
+        private PendingOperation(UUID operationId, String topic, Serializable payload, long epoch, int quorum) {
             this.operationId = operationId;
             this.topic = topic;
             this.payload = payload;
+            this.epoch = epoch;
             this.originalQuorum = quorum;
             this.quorum = quorum;
         }
