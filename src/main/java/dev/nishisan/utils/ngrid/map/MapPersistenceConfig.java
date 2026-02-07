@@ -34,6 +34,7 @@ public final class MapPersistenceConfig {
 
     private final int batchSize;
     private final Duration batchTimeout;
+    private final PersistenceHealthListener healthListener;
 
     private MapPersistenceConfig(Builder builder) {
         this.mode = Objects.requireNonNull(builder.mode, "mode");
@@ -43,6 +44,7 @@ public final class MapPersistenceConfig {
         this.snapshotIntervalTime = Objects.requireNonNull(builder.snapshotIntervalTime, "snapshotIntervalTime");
         this.batchSize = builder.batchSize;
         this.batchTimeout = Objects.requireNonNull(builder.batchTimeout, "batchTimeout");
+        this.healthListener = builder.healthListener;
         validate();
     }
 
@@ -88,6 +90,10 @@ public final class MapPersistenceConfig {
         return batchTimeout;
     }
 
+    public PersistenceHealthListener healthListener() {
+        return healthListener;
+    }
+
     private void validate() {
         if (mapName.isBlank()) {
             throw new IllegalArgumentException("mapName cannot be blank");
@@ -114,6 +120,8 @@ public final class MapPersistenceConfig {
         private Duration snapshotIntervalTime = Duration.ofMinutes(5);
         private int batchSize = 100;
         private Duration batchTimeout = Duration.ofMillis(10);
+        private PersistenceHealthListener healthListener = (name, type, cause) -> {
+        };
 
         private Builder(Path mapDirectory, String mapName) {
             this.mapDirectory = Objects.requireNonNull(mapDirectory, "mapDirectory");
@@ -145,10 +153,13 @@ public final class MapPersistenceConfig {
             return this;
         }
 
+        public Builder healthListener(PersistenceHealthListener listener) {
+            this.healthListener = Objects.requireNonNull(listener, "healthListener");
+            return this;
+        }
+
         public MapPersistenceConfig build() {
             return new MapPersistenceConfig(this);
         }
     }
 }
-
-

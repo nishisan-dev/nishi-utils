@@ -245,6 +245,22 @@ public final class MapClusterService<K extends Serializable, V extends Serializa
         }
     }
 
+    /**
+     * Returns {@code true} if no persistence failures have occurred.
+     * This is always {@code true} when persistence is disabled.
+     */
+    public boolean isHealthy() {
+        return persistence == null || persistence.failureCount() == 0;
+    }
+
+    /**
+     * Returns the number of persistence failures since this service was created.
+     * Returns 0 when persistence is disabled.
+     */
+    public long persistenceFailureCount() {
+        return persistence != null ? persistence.failureCount() : 0;
+    }
+
     public String topic() {
         return topic;
     }
