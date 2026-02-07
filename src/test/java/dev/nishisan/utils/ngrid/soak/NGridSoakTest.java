@@ -91,6 +91,15 @@ class NGridSoakTest {
                 + ", churn=" + churnIntervalSeconds + "s");
 
         SoakTestReporter reporter = new SoakTestReporter();
+        if (durationMinutes <= 0) {
+            throw new IllegalArgumentException("ngrid.soak.durationMinutes must be > 0");
+        }
+        if (opsPerSecond <= 0) {
+            throw new IllegalArgumentException("ngrid.soak.opsPerSecond must be > 0");
+        }
+        if (churnIntervalSeconds <= 0) {
+            throw new IllegalArgumentException("ngrid.soak.churnIntervalSeconds must be > 0");
+        }
 
         // ── Setup cluster ──
         int port1 = allocateFreeLocalPort();
@@ -128,8 +137,10 @@ class NGridSoakTest {
 
         // ── Control flags ──
         AtomicBoolean running = new AtomicBoolean(true);
+        AtomicLong sequenceGenerator = new AtomicLong(0);
         AtomicLong offeredCount = new AtomicLong(0);
         AtomicLong errorCount = new AtomicLong(0);
+        ConcurrentHashMap<String, Boolean> offeredItems = new ConcurrentHashMap<>();
         ConcurrentHashMap<String, Boolean> consumed = new ConcurrentHashMap<>();
         AtomicLong duplicateCount = new AtomicLong(0);
 
@@ -139,7 +150,7 @@ class NGridSoakTest {
         Thread producer = new Thread(() -> {
             long intervalNanos = 1_000_000_000L / opsPerSecond;
             while (running.get() && System.currentTimeMillis() < deadlineMs) {
-                long seqNum = offeredCount.incrementAndGet();
+                long seqNum = sequenceGenerator.incrementAndGet();
                 String item = "soak-" + seqNum;
                 try {
                     NGridNode leader = findLeader(nodes);
@@ -151,6 +162,8 @@ class NGridSoakTest {
                     long start = System.nanoTime();
                     DistributedQueue<String> queue = leader.getQueue(QUEUE_NAME, String.class);
                     queue.offer(item);
+                    offeredItems.put(item, Boolean.TRUE);
+                    offeredCount.incrementAndGet();
                     reporter.recordOfferLatency(System.nanoTime() - start);
                 } catch (Exception e) {
                     errorCount.incrementAndGet();
@@ -336,8 +349,8 @@ class NGridSoakTest {
 
         // Count lost messages
         long lostMessages = 0;
-        for (long i = 1; i <= totalOffered; i++) {
-            if (!consumed.containsKey("soak-" + i)) {
+        for (String offeredItem : offeredItems.keySet()) {
+            if (!consumed.containsKey(offeredItem)) {
                 lostMessages++;
             }
         }
