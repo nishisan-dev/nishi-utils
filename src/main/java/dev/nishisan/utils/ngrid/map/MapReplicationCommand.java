@@ -38,22 +38,50 @@ public final class MapReplicationCommand implements Serializable {
         this.value = value;
     }
 
+    /**
+     * Creates a PUT replication command.
+     *
+     * @param key   the key
+     * @param value the value
+     * @return the command
+     */
     public static MapReplicationCommand put(Serializable key, Serializable value) {
         return new MapReplicationCommand(MapReplicationCommandType.PUT, key, value);
     }
 
+    /**
+     * Creates a REMOVE replication command.
+     *
+     * @param key the key
+     * @return the command
+     */
     public static MapReplicationCommand remove(Serializable key) {
         return new MapReplicationCommand(MapReplicationCommandType.REMOVE, key, null);
     }
 
+    /**
+     * Returns the command type.
+     * 
+     * @return the type
+     */
     public MapReplicationCommandType type() {
         return type;
     }
 
+    /**
+     * Returns the key.
+     * 
+     * @return the key
+     */
     public Serializable key() {
         return key;
     }
 
+    /**
+     * Returns the value (may be {@code null} for REMOVE).
+     * 
+     * @return the value
+     */
     public Serializable value() {
         return value;
     }

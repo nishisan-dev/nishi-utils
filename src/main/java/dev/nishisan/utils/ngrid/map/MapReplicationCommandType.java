@@ -21,6 +21,8 @@ package dev.nishisan.utils.ngrid.map;
  * Replication command types supported by distributed maps.
  */
 public enum MapReplicationCommandType {
+    /** Insert or update an entry. */
     PUT,
+    /** Remove an entry by key. */
     REMOVE
 }

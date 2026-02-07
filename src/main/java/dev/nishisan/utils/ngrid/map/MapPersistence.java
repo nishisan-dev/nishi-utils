@@ -55,6 +55,9 @@ import java.util.logging.Logger;
  * <p>
  * This component is intentionally best-effort: write failures are logged but do
  * not fail map operations.
+ *
+ * @param <K> the key type
+ * @param <V> the value type
  */
 public final class MapPersistence<K extends Serializable, V extends Serializable> implements Closeable {
     private static final Logger LOGGER = Logger.getLogger(MapPersistence.class.getName());
@@ -89,6 +92,12 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
     private long opsSinceSnapshot;
     private long lastSnapshotTimeMillis;
 
+    /**
+     * Creates a new map persistence instance.
+     *
+     * @param config the persistence configuration
+     * @param data   the in-memory map to persist
+     */
     public MapPersistence(MapPersistenceConfig config, Map<K, V> data) {
         this.config = Objects.requireNonNull(config, "config");
         this.data = Objects.requireNonNull(data, "data");
@@ -106,6 +115,8 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
 
     /**
      * Returns the number of persistence failures since this instance was created.
+     *
+     * @return the failure count
      */
     public long failureCount() {
         return failureCount.get();
@@ -228,6 +239,10 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
     /**
      * Appends a WAL entry synchronously. Used for critical maps that must survive
      * hard crashes.
+     *
+     * @param type  the replication command type
+     * @param key   the key
+     * @param value the value, may be {@code null} for REMOVE operations
      */
     public void appendSync(MapReplicationCommandType type, Serializable key, Serializable value) {
         if (config.mode() == MapPersistenceMode.DISABLED) {
@@ -400,6 +415,10 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
         }
     }
 
+    /**
+     * Triggers a snapshot if the configured interval (by operations or time) has
+     * been exceeded.
+     */
     public void maybeSnapshot() {
         boolean byOps = config.snapshotIntervalOperations() > 0
                 && opsSinceSnapshot >= config.snapshotIntervalOperations();

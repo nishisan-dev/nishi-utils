@@ -48,6 +48,14 @@ public final class MapPersistenceConfig {
         validate();
     }
 
+    /**
+     * Creates a default configuration.
+     *
+     * @param mapDirectory the persistence directory
+     * @param mapName      the map name
+     * @param mode         the persistence mode
+     * @return the config
+     */
     public static MapPersistenceConfig defaults(Path mapDirectory, String mapName, MapPersistenceMode mode) {
         return builder(mapDirectory, mapName)
                 .mode(mode)
@@ -58,38 +66,85 @@ public final class MapPersistenceConfig {
                 .build();
     }
 
+    /**
+     * Creates a builder.
+     *
+     * @param mapDirectory the persistence directory
+     * @param mapName      the map name
+     * @return the builder
+     */
     public static Builder builder(Path mapDirectory, String mapName) {
         return new Builder(mapDirectory, mapName);
     }
 
+    /**
+     * Returns the persistence mode.
+     * 
+     * @return the mode
+     */
     public MapPersistenceMode mode() {
         return mode;
     }
 
+    /**
+     * Returns the persistence directory.
+     * 
+     * @return the directory
+     */
     public Path mapDirectory() {
         return mapDirectory;
     }
 
+    /**
+     * Returns the map name.
+     * 
+     * @return the map name
+     */
     public String mapName() {
         return mapName;
     }
 
+    /**
+     * Returns the snapshot interval in operations.
+     * 
+     * @return the interval
+     */
     public int snapshotIntervalOperations() {
         return snapshotIntervalOperations;
     }
 
+    /**
+     * Returns the snapshot interval in time.
+     * 
+     * @return the interval
+     */
     public Duration snapshotIntervalTime() {
         return snapshotIntervalTime;
     }
 
+    /**
+     * Returns the WAL batch size.
+     * 
+     * @return the batch size
+     */
     public int batchSize() {
         return batchSize;
     }
 
+    /**
+     * Returns the WAL batch timeout.
+     * 
+     * @return the timeout
+     */
     public Duration batchTimeout() {
         return batchTimeout;
     }
 
+    /**
+     * Returns the health listener.
+     * 
+     * @return the listener
+     */
     public PersistenceHealthListener healthListener() {
         return healthListener;
     }
@@ -112,6 +167,9 @@ public final class MapPersistenceConfig {
         }
     }
 
+    /**
+     * Builder for {@link MapPersistenceConfig}.
+     */
     public static final class Builder {
         private final Path mapDirectory;
         private final String mapName;
@@ -128,36 +186,77 @@ public final class MapPersistenceConfig {
             this.mapName = Objects.requireNonNull(mapName, "mapName");
         }
 
+        /**
+         * Sets the persistence mode.
+         * 
+         * @param mode the mode
+         * @return this builder
+         */
         public Builder mode(MapPersistenceMode mode) {
             this.mode = Objects.requireNonNull(mode, "mode");
             return this;
         }
 
+        /**
+         * Sets the snapshot interval in operations.
+         * 
+         * @param operations the count
+         * @return this builder
+         */
         public Builder snapshotIntervalOperations(int operations) {
             this.snapshotIntervalOperations = operations;
             return this;
         }
 
+        /**
+         * Sets the snapshot interval in time.
+         * 
+         * @param time the duration
+         * @return this builder
+         */
         public Builder snapshotIntervalTime(Duration time) {
             this.snapshotIntervalTime = Objects.requireNonNull(time, "time");
             return this;
         }
 
+        /**
+         * Sets the WAL batch size.
+         * 
+         * @param batchSize the batch size
+         * @return this builder
+         */
         public Builder batchSize(int batchSize) {
             this.batchSize = batchSize;
             return this;
         }
 
+        /**
+         * Sets the WAL batch timeout.
+         * 
+         * @param timeout the timeout
+         * @return this builder
+         */
         public Builder batchTimeout(Duration timeout) {
             this.batchTimeout = Objects.requireNonNull(timeout, "timeout");
             return this;
         }
 
+        /**
+         * Sets the health listener.
+         * 
+         * @param listener the listener
+         * @return this builder
+         */
         public Builder healthListener(PersistenceHealthListener listener) {
             this.healthListener = Objects.requireNonNull(listener, "healthListener");
             return this;
         }
 
+        /**
+         * Builds the configuration.
+         * 
+         * @return the config
+         */
         public MapPersistenceConfig build() {
             return new MapPersistenceConfig(this);
         }

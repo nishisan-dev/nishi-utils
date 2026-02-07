@@ -43,10 +43,15 @@ import java.util.concurrent.TimeUnit;
 /**
  * Simple distributed map that relies on the replication layer to keep replicas
  * aligned.
+ *
+ * @param <K> the key type
+ * @param <V> the value type
  */
 public final class MapClusterService<K extends Serializable, V extends Serializable>
         implements Closeable, ReplicationHandler {
+    /** Topic prefix for map replication messages. */
     public static final String TOPIC_PREFIX = "map:";
+    /** Default map name when none is specified. */
     public static final String DEFAULT_MAP_NAME = "default-map";
 
     private final ConcurrentMap<K, V> data = new ConcurrentHashMap<>();
@@ -54,16 +59,38 @@ public final class MapClusterService<K extends Serializable, V extends Serializa
     private final MapPersistence<K, V> persistence;
     private final String topic;
 
+    /**
+     * Creates a map cluster service backed by the given replication manager
+     * with no persistence.
+     *
+     * @param replicationManager the replication manager
+     */
     public MapClusterService(ReplicationManager replicationManager) {
         this(replicationManager, null);
     }
 
+    /**
+     * Creates a map cluster service with optional persistence configuration.
+     *
+     * @param replicationManager the replication manager
+     * @param persistenceConfig  persistence configuration, or {@code null} to
+     *                           disable
+     */
     public MapClusterService(ReplicationManager replicationManager, MapPersistenceConfig persistenceConfig) {
         this(replicationManager,
                 topicFor(persistenceConfig != null ? persistenceConfig.mapName() : DEFAULT_MAP_NAME),
                 persistenceConfig);
     }
 
+    /**
+     * Creates a map cluster service with explicit topic and persistence
+     * configuration.
+     *
+     * @param replicationManager the replication manager
+     * @param topic              the replication topic
+     * @param persistenceConfig  persistence configuration, or {@code null} to
+     *                           disable
+     */
     public MapClusterService(ReplicationManager replicationManager, String topic,
             MapPersistenceConfig persistenceConfig) {
         this.replicationManager = Objects.requireNonNull(replicationManager, "replicationManager");
@@ -79,6 +106,13 @@ public final class MapClusterService<K extends Serializable, V extends Serializa
         }
     }
 
+    /**
+     * Puts a key-value pair into the map, replicating the operation to the cluster.
+     *
+     * @param key   the key
+     * @param value the value
+     * @return the previous value associated with the key, or empty
+     */
     public Optional<V> put(K key, V value) {
         Objects.requireNonNull(key, "key");
         Objects.requireNonNull(value, "value");
@@ -88,6 +122,12 @@ public final class MapClusterService<K extends Serializable, V extends Serializa
         return Optional.ofNullable(previous);
     }
 
+    /**
+     * Removes the mapping for a key, replicating the operation to the cluster.
+     *
+     * @param key the key to remove
+     * @return the previous value, or empty if not present
+     */
     public Optional<V> remove(K key) {
         Objects.requireNonNull(key, "key");
         V previous = data.get(key);
@@ -96,6 +136,12 @@ public final class MapClusterService<K extends Serializable, V extends Serializa
         return Optional.ofNullable(previous);
     }
 
+    /**
+     * Retrieves the value associated with a key from the local replica.
+     *
+     * @param key the key to look up
+     * @return an optional containing the value, or empty if not present
+     */
     public Optional<V> get(K key) {
         return Optional.ofNullable(data.get(key));
     }
@@ -143,6 +189,7 @@ public final class MapClusterService<K extends Serializable, V extends Serializa
         }
     }
 
+    /** {@inheritDoc} */
     @Override
     @SuppressWarnings("unchecked")
     public void apply(UUID operationId, Serializable payload) {
@@ -179,6 +226,7 @@ public final class MapClusterService<K extends Serializable, V extends Serializa
         }
     }
 
+    /** {@inheritDoc} */
     @Override
     public SnapshotChunk getSnapshotChunk(int chunkIndex) {
         int chunkSize = 1000;
@@ -196,16 +244,19 @@ public final class MapClusterService<K extends Serializable, V extends Serializa
         return new SnapshotChunk((Serializable) chunk, end < entries.size());
     }
 
+    /** {@inheritDoc} */
     @Override
     public Serializable getSnapshot() {
         return new HashMap<>(data);
     }
 
+    /** {@inheritDoc} */
     @Override
     public void resetState() {
         data.clear();
     }
 
+    /** {@inheritDoc} */
     @Override
     @SuppressWarnings("unchecked")
     public void installSnapshot(Serializable snapshot) {
@@ -238,6 +289,7 @@ public final class MapClusterService<K extends Serializable, V extends Serializa
         }
     }
 
+    /** {@inheritDoc} */
     @Override
     public void close() throws IOException {
         if (persistence != null) {
@@ -248,6 +300,8 @@ public final class MapClusterService<K extends Serializable, V extends Serializa
     /**
      * Returns {@code true} if no persistence failures have occurred.
      * This is always {@code true} when persistence is disabled.
+     *
+     * @return {@code true} if healthy
      */
     public boolean isHealthy() {
         return persistence == null || persistence.failureCount() == 0;
@@ -256,15 +310,28 @@ public final class MapClusterService<K extends Serializable, V extends Serializa
     /**
      * Returns the number of persistence failures since this service was created.
      * Returns 0 when persistence is disabled.
+     *
+     * @return the failure count
      */
     public long persistenceFailureCount() {
         return persistence != null ? persistence.failureCount() : 0;
     }
 
+    /**
+     * Returns the replication topic used by this service.
+     *
+     * @return the topic string
+     */
     public String topic() {
         return topic;
     }
 
+    /**
+     * Returns the replication topic for the given map name.
+     *
+     * @param mapName the map name
+     * @return the topic string prefixed with {@value TOPIC_PREFIX}
+     */
     public static String topicFor(String mapName) {
         Objects.requireNonNull(mapName, "mapName");
         if (mapName.isBlank()) {
