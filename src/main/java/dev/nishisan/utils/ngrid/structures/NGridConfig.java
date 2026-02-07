@@ -123,6 +123,11 @@ public final class NGridConfig {
         return replicationQuorum;
     }
 
+    /**
+     * Returns the replication factor.
+     * 
+     * @return the factor
+     */
     public int replicationFactor() {
         return replicationFactor;
     }
@@ -241,6 +246,12 @@ public final class NGridConfig {
         return mapPersistenceMode;
     }
 
+    /**
+     * Creates a builder for the given local node.
+     * 
+     * @param local the local node info
+     * @return the builder
+     */
     public static Builder builder(NodeInfo local) {
         return new Builder(local);
     }

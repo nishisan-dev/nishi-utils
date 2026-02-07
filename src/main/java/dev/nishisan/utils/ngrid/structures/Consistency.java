@@ -42,7 +42,8 @@ public final class Consistency {
     public static final Consistency EVENTUAL = new Consistency(ConsistencyLevel.EVENTUAL, Long.MAX_VALUE);
 
     /**
-     * Bounded consistency. Reads from local state if the replication lag (Leader Sequence - Local Sequence)
+     * Bounded consistency. Reads from local state if the replication lag (Leader
+     * Sequence - Local Sequence)
      * is less than or equal to {@code maxLag}.
      *
      * @param maxLag Maximum allowed sequence lag. Must be >= 0.
@@ -55,10 +56,20 @@ public final class Consistency {
         return new Consistency(ConsistencyLevel.BOUNDED, maxLag);
     }
 
+    /**
+     * Returns the consistency level.
+     *
+     * @return the level
+     */
     public ConsistencyLevel level() {
         return level;
     }
 
+    /**
+     * Returns the maximum allowed replication lag.
+     *
+     * @return the max lag
+     */
     public long maxLag() {
         return maxLag;
     }

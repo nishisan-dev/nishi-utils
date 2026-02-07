@@ -48,8 +48,9 @@ import java.util.logging.Logger;
 
 /**
  * Public facing distributed queue API. It routes client calls to the current
- * leader and
- * processes remote requests when the local node is in charge.
+ * leader and processes remote requests when the local node is in charge.
+ *
+ * @param <T> the element type
  */
 public final class DistributedQueue<T extends Serializable>
         implements TransportListener, LeadershipListener, Closeable {
@@ -72,6 +73,14 @@ public final class DistributedQueue<T extends Serializable>
     private final AtomicBoolean notified = new AtomicBoolean(false);
     private volatile NodeId subscribedLeader;
 
+    /**
+     * Creates a distributed queue with no stats tracking.
+     *
+     * @param transport    the cluster transport
+     * @param coordinator  the cluster coordinator
+     * @param queueService the underlying queue cluster service
+     * @param queueName    the queue name
+     */
     public DistributedQueue(Transport transport,
             ClusterCoordinator coordinator,
             QueueClusterService<T> queueService,
@@ -79,6 +88,15 @@ public final class DistributedQueue<T extends Serializable>
         this(transport, coordinator, queueService, queueName, null);
     }
 
+    /**
+     * Creates a distributed queue with optional stats tracking.
+     *
+     * @param transport    the cluster transport
+     * @param coordinator  the cluster coordinator
+     * @param queueService the underlying queue cluster service
+     * @param queueName    the queue name
+     * @param stats        stats utility, or {@code null}
+     */
     public DistributedQueue(Transport transport,
             ClusterCoordinator coordinator,
             QueueClusterService<T> queueService,
@@ -98,6 +116,11 @@ public final class DistributedQueue<T extends Serializable>
         subscribeIfLeaderPresent();
     }
 
+    /**
+     * Offers an element to the distributed queue.
+     *
+     * @param value the element to offer
+     */
     public void offer(T value) {
         recordIngressWrite();
         if (coordinator.isLeader()) {
@@ -109,6 +132,11 @@ public final class DistributedQueue<T extends Serializable>
         }
     }
 
+    /**
+     * Polls the next element from the distributed queue.
+     *
+     * @return the next element, or empty if the queue is empty
+     */
     @SuppressWarnings("unchecked")
     public Optional<T> poll() {
         recordIngressWrite();
@@ -135,6 +163,11 @@ public final class DistributedQueue<T extends Serializable>
         return Optional.empty();
     }
 
+    /**
+     * Peeks at the head of the distributed queue without removing it.
+     *
+     * @return the head element, or empty if the queue is empty
+     */
     @SuppressWarnings("unchecked")
     public Optional<T> peek() {
         if (coordinator.isLeader()) {
@@ -144,6 +177,12 @@ public final class DistributedQueue<T extends Serializable>
         return result.toOptional();
     }
 
+    /**
+     * Polls when an element becomes available, blocking up to the given timeout.
+     *
+     * @param timeout the maximum duration to wait
+     * @return the next element, or empty if the timeout expired
+     */
     public Optional<T> pollWhenAvailable(Duration timeout) {
         if (timeout == null || timeout.isNegative() || timeout.isZero()) {
             return poll();
@@ -170,10 +209,16 @@ public final class DistributedQueue<T extends Serializable>
         return Optional.empty();
     }
 
+    /**
+     * Subscribes to queue notifications from the current leader.
+     */
     public void subscribe() {
         subscribeIfLeaderPresent();
     }
 
+    /**
+     * Unsubscribes from queue notifications.
+     */
     public void unsubscribe() {
         NodeInfo leaderInfo = coordinator.leaderInfo().orElse(null);
         if (leaderInfo == null || leaderInfo.nodeId().equals(localNodeId)) {
@@ -264,11 +309,13 @@ public final class DistributedQueue<T extends Serializable>
         throw new IllegalArgumentException("Unknown command: " + command);
     }
 
+    /** {@inheritDoc} */
     @Override
     public void onPeerConnected(NodeInfo peer) {
         // no-op
     }
 
+    /** {@inheritDoc} */
     @Override
     public void onPeerDisconnected(NodeId peerId) {
         subscribers.remove(peerId);
@@ -277,6 +324,7 @@ public final class DistributedQueue<T extends Serializable>
         }
     }
 
+    /** {@inheritDoc} */
     @Override
     public void onMessage(ClusterMessage message) {
         if (message.type() == MessageType.QUEUE_NOTIFY) {
@@ -341,6 +389,7 @@ public final class DistributedQueue<T extends Serializable>
         transport.send(response);
     }
 
+    /** {@inheritDoc} */
     @Override
     public void close() throws IOException {
         transport.removeListener(this);
@@ -357,6 +406,7 @@ public final class DistributedQueue<T extends Serializable>
         stats.notifyHitCounter(NGridMetrics.queueOffer(localNodeId));
     }
 
+    /** {@inheritDoc} */
     @Override
     public void onLeaderChanged(NodeId newLeader) {
         if (localNodeId.equals(newLeader)) {

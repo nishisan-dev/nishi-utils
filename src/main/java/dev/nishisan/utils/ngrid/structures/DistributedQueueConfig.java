@@ -35,22 +35,46 @@ public final class DistributedQueueConfig {
         this.queueOptions = builder.queueOptions;
     }
 
+    /**
+     * Creates a builder for a new queue configuration.
+     *
+     * @param name the queue name
+     * @return the builder
+     */
     public static Builder builder(String name) {
         return new Builder(name);
     }
 
+    /**
+     * Returns the queue name.
+     *
+     * @return the name
+     */
     public String name() {
         return name;
     }
 
+    /**
+     * Returns the replication factor, or {@code null} to use the cluster default.
+     *
+     * @return the replication factor
+     */
     public Integer replicationFactor() {
         return replicationFactor;
     }
 
+    /**
+     * Returns the queue options.
+     *
+     * @return the queue options
+     */
     public NQueue.Options queueOptions() {
         return queueOptions;
     }
 
+    /**
+     * Builder for {@link DistributedQueueConfig}.
+     */
     public static final class Builder {
         private final String name;
         private Integer replicationFactor;
@@ -60,6 +84,12 @@ public final class DistributedQueueConfig {
             this.name = Objects.requireNonNull(name, "name");
         }
 
+        /**
+         * Sets the replication factor.
+         *
+         * @param factor the replication factor (must be &gt;= 1)
+         * @return this builder
+         */
         public Builder replicationFactor(int factor) {
             if (factor < 1) {
                 throw new IllegalArgumentException("Replication factor must be >= 1");
@@ -68,11 +98,22 @@ public final class DistributedQueueConfig {
             return this;
         }
 
+        /**
+         * Sets the queue options.
+         *
+         * @param options the queue options
+         * @return this builder
+         */
         public Builder queueOptions(NQueue.Options options) {
             this.queueOptions = Objects.requireNonNull(options, "options");
             return this;
         }
 
+        /**
+         * Builds the queue configuration.
+         *
+         * @return the configuration
+         */
         public DistributedQueueConfig build() {
             return new DistributedQueueConfig(this);
         }
