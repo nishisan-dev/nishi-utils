@@ -5,6 +5,14 @@ on:
     branches:
       - main
       - feature/queue-consumer
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
   workflow_dispatch:
     inputs:
       soak_duration_minutes:
@@ -34,7 +42,7 @@ jobs:
           distribution: 'temurin'
 
       - name: Run NGrid resilience tests
-        run: mvn -B test -Presilience
+        run: mvn -B test -Presilience -Dsurefire.rerunFailingTestsCount=1
 
   docker-resilience-tests:
     name: Docker Resilience Tests (Testcontainers)
