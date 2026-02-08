@@ -59,7 +59,10 @@ class QueueRestartConsistencyTest {
         }
 
         // Phase 2: Restart node with same directory, verify data
-        try (NGridNode node = new NGridNode(NGridConfig.builder(info)
+        // Allocate a new port to avoid TCP TIME_WAIT conflicts
+        int port2 = allocateFreeLocalPort();
+        NodeInfo info2 = new NodeInfo(NodeId.of("restart-test"), "127.0.0.1", port2);
+        try (NGridNode node = new NGridNode(NGridConfig.builder(info2)
                 .queueDirectory(dir)
                 .replicationFactor(1)
                 .build())) {
@@ -110,7 +113,10 @@ class QueueRestartConsistencyTest {
         }
 
         // Phase 2: Restart and verify remaining items
-        try (NGridNode node = new NGridNode(NGridConfig.builder(info)
+        // Allocate a new port to avoid TCP TIME_WAIT conflicts
+        int port2 = allocateFreeLocalPort();
+        NodeInfo info2 = new NodeInfo(NodeId.of("partial-restart"), "127.0.0.1", port2);
+        try (NGridNode node = new NGridNode(NGridConfig.builder(info2)
                 .queueDirectory(dir)
                 .replicationFactor(1)
                 .build())) {
@@ -160,7 +166,10 @@ class QueueRestartConsistencyTest {
         }
 
         // Phase 2: Restart and verify sequence continues
-        try (NGridNode node = new NGridNode(NGridConfig.builder(info)
+        // Allocate a new port to avoid TCP TIME_WAIT conflicts
+        int port2 = allocateFreeLocalPort();
+        NodeInfo info2 = new NodeInfo(NodeId.of("sequence-restart"), "127.0.0.1", port2);
+        try (NGridNode node = new NGridNode(NGridConfig.builder(info2)
                 .queueDirectory(dir)
                 .replicationFactor(1)
                 .build())) {
