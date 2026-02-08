@@ -5,8 +5,8 @@ COPY pom.xml /workspace/pom.xml
 COPY src /workspace/src
 COPY ngrid-test /workspace/ngrid-test
 
-RUN mvn -q -DskipTests -Dmaven.javadoc.skip=true install
-RUN mvn -q -f ngrid-test/pom.xml -DskipTests package
+RUN mvn -DskipTests -Dmaven.javadoc.skip=true install
+RUN mvn -f ngrid-test/pom.xml -DskipTests package
 
 FROM eclipse-temurin:21-jre
 WORKDIR /app
