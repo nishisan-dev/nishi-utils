@@ -11,6 +11,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
 import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -345,7 +346,7 @@ class SequenceGapRecoveryIntegrationTest {
     private void awaitClusterStability(NGridNode... nodes) {
         if (nodes.length < 2)
             return;
-        long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(20);
+        long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(30);
         while (System.currentTimeMillis() < deadline) {
             boolean leadersAgree = true;
             boolean allConnected = true;
@@ -457,10 +458,12 @@ class SequenceGapRecoveryIntegrationTest {
     }
 
     private int allocateFreeLocalPort(Set<Integer> avoid) {
-        for (int attempt = 0; attempt < 20; attempt++) {
-            try (ServerSocket ss = new ServerSocket(0)) {
-                int port = ss.getLocalPort();
-                if (!avoid.contains(port)) {
+        for (int attempt = 0; attempt < 50; attempt++) {
+            try (ServerSocket socket = new ServerSocket()) {
+                socket.setReuseAddress(true);
+                socket.bind(new InetSocketAddress("127.0.0.1", 0));
+                int port = socket.getLocalPort();
+                if (port > 0 && !avoid.contains(port)) {
                     return port;
                 }
             } catch (IOException e) {
