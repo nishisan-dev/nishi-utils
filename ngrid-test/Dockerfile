@@ -6,7 +6,9 @@ COPY src /workspace/src
 COPY ngrid-test /workspace/ngrid-test
 
 RUN mvn -DskipTests -Dmaven.javadoc.skip=true install
-RUN mvn -f ngrid-test/pom.xml -DskipTests package
+RUN NISHI_UTILS_VERSION="$(mvn -q -f /workspace/pom.xml help:evaluate -Dexpression=project.version -DforceStdout)" \
+    && echo "Using nishi-utils version: ${NISHI_UTILS_VERSION}" \
+    && mvn -f ngrid-test/pom.xml -DskipTests -Dnishi.utils.version="${NISHI_UTILS_VERSION}" package
 
 FROM eclipse-temurin:21-jre
 WORKDIR /app
