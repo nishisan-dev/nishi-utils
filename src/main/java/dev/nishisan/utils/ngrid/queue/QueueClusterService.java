@@ -294,6 +294,15 @@ public final class QueueClusterService<T extends Serializable> implements Closea
             return new java.util.HashMap<>(offsets);
         }
 
+        /**
+         * Clears all consumer offsets. Called during snapshot install so that
+         * the new NQueue indices align with a fresh offset baseline.
+         */
+        void reset() {
+            offsets.clear();
+            save();
+        }
+
         private void load() {
             if (!Files.exists(storagePath))
                 return;
@@ -455,7 +464,11 @@ public final class QueueClusterService<T extends Serializable> implements Closea
         while (queue.size() > 0) {
             queue.poll(100, java.util.concurrent.TimeUnit.MILLISECONDS);
         }
-        LOGGER.info(() -> "Queue " + queueName + " state reset for snapshot install");
+        // Reset consumer offsets so they align with the new snapshot indices.
+        // Without this, stale offsets cause duplicate message delivery after
+        // snapshot install because the NQueue assigns new indices starting from 1.
+        localOffsetStore.reset();
+        LOGGER.info(() -> "Queue " + queueName + " state reset for snapshot install (offsets cleared)");
     }
 
     /** {@inheritDoc} */
