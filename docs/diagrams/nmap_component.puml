@@ -1,0 +1,75 @@
+@startuml nmap_component
+!theme plain
+
+title NMap — Diagrama de Componentes
+skinparam componentStyle rectangle
+skinparam backgroundColor white
+skinparam defaultFontName Inter
+
+package "dev.nishisan.utils.map" as pkg_map {
+
+    component "NMap<K,V>" as NMap <<Facade>> #LightBlue {
+        portin " put / get / remove " as api
+        portin " open / close " as lifecycle
+    }
+
+    component "NMapConfig" as Config <<Configuration>> {
+        portin " Builder " as builder
+    }
+
+    component "NMapPersistence<K,V>" as Persistence <<Engine>> #LightGreen {
+        portin " appendAsync / appendSync " as wal_api
+        portin " load / close " as pers_lifecycle
+    }
+
+    interface "NMapHealthListener" as HealthListener <<Callback>> #LightYellow
+
+    enum "NMapPersistenceMode" as Mode {
+        DISABLED
+        ASYNC_NO_FSYNC
+        ASYNC_WITH_FSYNC
+    }
+
+    enum "NMapOperationType" as OpType {
+        PUT
+        REMOVE
+    }
+
+    entity "NMapWALEntry" as WALEntry <<Record>>
+    entity "NMapMetadata" as Metadata <<Record>>
+}
+
+package "NGrid Cluster" as pkg_ngrid #WhiteSmoke {
+    component "MapClusterService" as MCS
+    component "NGridNode" as Node
+    component "NGridAlertEngine" as AlertEngine
+}
+
+' --- Relações internas do NMap ---
+NMap --> Config : configura
+NMap --> Persistence : delega persistência
+Config --> Mode : define modo
+Config --> HealthListener : registra callback
+Persistence --> WALEntry : grava/lê
+Persistence --> Metadata : grava/lê
+Persistence --> OpType : usa
+Persistence --> HealthListener : notifica falhas
+
+' --- Integração com NGrid ---
+Node --> NMap : cria via open()
+Node --> Config : constrói
+MCS --> Persistence : appendAsync/Sync
+AlertEngine --> HealthListener : implementa callback
+
+' --- Storage ---
+database "Filesystem" as FS {
+    file "snapshot.dat" as snap
+    file "wal.log" as wal
+    file "meta.json" as meta
+}
+
+Persistence --> snap : escreve/lê
+Persistence --> wal : append-only
+Persistence --> meta : versiona
+
+@enduml

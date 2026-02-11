@@ -18,7 +18,7 @@
 package dev.nishisan.utils.ngrid.structures;
 
 import dev.nishisan.utils.ngrid.common.NodeInfo;
-import dev.nishisan.utils.ngrid.map.MapPersistenceMode;
+import dev.nishisan.utils.map.NMapPersistenceMode;
 import dev.nishisan.utils.queue.NQueue;
 
 import java.nio.file.Path;
@@ -62,7 +62,7 @@ public final class NGridConfig {
 
     private final Path mapDirectory;
     private final String mapName;
-    private final MapPersistenceMode mapPersistenceMode;
+    private final NMapPersistenceMode mapPersistenceMode;
     private final boolean strictConsistency;
     private final Duration connectTimeout;
     private final Duration reconnectInterval;
@@ -242,7 +242,7 @@ public final class NGridConfig {
         return mapName;
     }
 
-    public MapPersistenceMode mapPersistenceMode() {
+    public NMapPersistenceMode mapPersistenceMode() {
         return mapPersistenceMode;
     }
 
@@ -285,7 +285,7 @@ public final class NGridConfig {
 
         private Path mapDirectory;
         private String mapName = "default-map";
-        private MapPersistenceMode mapPersistenceMode = MapPersistenceMode.DISABLED;
+        private NMapPersistenceMode mapPersistenceMode = NMapPersistenceMode.DISABLED;
         private boolean strictConsistency = true;
         private Duration connectTimeout = Duration.ofSeconds(5);
         private Duration reconnectInterval = Duration.ofMillis(500);
@@ -493,7 +493,7 @@ public final class NGridConfig {
             return this;
         }
 
-        public Builder mapPersistenceMode(MapPersistenceMode mode) {
+        public Builder mapPersistenceMode(NMapPersistenceMode mode) {
             this.mapPersistenceMode = Objects.requireNonNull(mode, "mode");
             return this;
         }

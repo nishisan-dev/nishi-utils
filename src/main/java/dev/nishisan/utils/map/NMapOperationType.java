@@ -15,24 +15,14 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>
  */
 
-package dev.nishisan.utils.ngrid.map;
+package dev.nishisan.utils.map;
 
 /**
- * Persistence mode for the NGrid distributed map.
+ * Operation types supported by {@link NMap}.
  */
-public enum MapPersistenceMode {
-    /**
-     * No persistence; map stays purely in-memory (current behaviour).
-     */
-    DISABLED,
-    /**
-     * Async disk writes without fsync (better throughput, weaker durability on crash).
-     */
-    ASYNC_NO_FSYNC,
-    /**
-     * Async disk writes with fsync (better durability on crash, lower throughput).
-     */
-    ASYNC_WITH_FSYNC
+public enum NMapOperationType {
+    /** Insert or update an entry. */
+    PUT,
+    /** Remove an entry by key. */
+    REMOVE
 }
-
-

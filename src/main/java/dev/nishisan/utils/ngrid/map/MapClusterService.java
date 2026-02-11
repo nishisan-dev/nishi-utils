@@ -17,6 +17,10 @@
 
 package dev.nishisan.utils.ngrid.map;
 
+import dev.nishisan.utils.map.NMapConfig;
+import dev.nishisan.utils.map.NMapOperationType;
+import dev.nishisan.utils.map.NMapPersistence;
+import dev.nishisan.utils.map.NMapPersistenceMode;
 import dev.nishisan.utils.ngrid.replication.QuorumUnreachableException;
 import dev.nishisan.utils.ngrid.replication.ReplicationHandler;
 import dev.nishisan.utils.ngrid.replication.ReplicationManager;
@@ -25,6 +29,7 @@ import dev.nishisan.utils.ngrid.replication.ReplicationResult;
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.Serializable;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -42,7 +47,8 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * Simple distributed map that relies on the replication layer to keep replicas
- * aligned.
+ * aligned. Persistence is delegated to the standalone {@link NMapPersistence}
+ * engine.
  *
  * @param <K> the key type
  * @param <V> the value type
@@ -56,7 +62,7 @@ public final class MapClusterService<K extends Serializable, V extends Serializa
 
     private final ConcurrentMap<K, V> data = new ConcurrentHashMap<>();
     private final ReplicationManager replicationManager;
-    private final MapPersistence<K, V> persistence;
+    private final NMapPersistence<K, V> persistence;
     private final String topic;
 
     /**
@@ -66,41 +72,47 @@ public final class MapClusterService<K extends Serializable, V extends Serializa
      * @param replicationManager the replication manager
      */
     public MapClusterService(ReplicationManager replicationManager) {
-        this(replicationManager, null);
+        this(replicationManager, topicFor(DEFAULT_MAP_NAME), null);
     }
 
     /**
-     * Creates a map cluster service with optional persistence configuration.
-     *
-     * @param replicationManager the replication manager
-     * @param persistenceConfig  persistence configuration, or {@code null} to
-     *                           disable
-     */
-    public MapClusterService(ReplicationManager replicationManager, MapPersistenceConfig persistenceConfig) {
-        this(replicationManager,
-                topicFor(persistenceConfig != null ? persistenceConfig.mapName() : DEFAULT_MAP_NAME),
-                persistenceConfig);
-    }
-
-    /**
-     * Creates a map cluster service with explicit topic and persistence
-     * configuration.
+     * Creates a map cluster service with explicit topic and no persistence.
      *
      * @param replicationManager the replication manager
      * @param topic              the replication topic
-     * @param persistenceConfig  persistence configuration, or {@code null} to
-     *                           disable
+     * @param unused             kept for backward compatibility (pass {@code null})
      */
     public MapClusterService(ReplicationManager replicationManager, String topic,
-            MapPersistenceConfig persistenceConfig) {
+            @SuppressWarnings("unused") Void unused) {
         this.replicationManager = Objects.requireNonNull(replicationManager, "replicationManager");
         this.topic = Objects.requireNonNull(topic, "topic");
         if (this.topic.isBlank()) {
             throw new IllegalArgumentException("topic cannot be blank");
         }
         this.replicationManager.registerHandler(this.topic, this);
-        if (persistenceConfig != null && persistenceConfig.mode() != MapPersistenceMode.DISABLED) {
-            this.persistence = new MapPersistence<>(persistenceConfig, data);
+        this.persistence = null;
+    }
+
+    /**
+     * Creates a map cluster service with persistence backed by the standalone
+     * {@link NMapPersistence} engine.
+     *
+     * @param replicationManager the replication manager
+     * @param topic              the replication topic
+     * @param baseDir            base directory for map persistence files
+     * @param mapName            logical map name (used for subdirectory)
+     * @param nmapConfig         persistence configuration
+     */
+    public MapClusterService(ReplicationManager replicationManager, String topic,
+            Path baseDir, String mapName, NMapConfig nmapConfig) {
+        this.replicationManager = Objects.requireNonNull(replicationManager, "replicationManager");
+        this.topic = Objects.requireNonNull(topic, "topic");
+        if (this.topic.isBlank()) {
+            throw new IllegalArgumentException("topic cannot be blank");
+        }
+        this.replicationManager.registerHandler(this.topic, this);
+        if (nmapConfig != null && nmapConfig.mode() != NMapPersistenceMode.DISABLED) {
+            this.persistence = new NMapPersistence<>(nmapConfig, data, baseDir, mapName);
         } else {
             this.persistence = null;
         }
@@ -215,13 +227,14 @@ public final class MapClusterService<K extends Serializable, V extends Serializa
             case REMOVE -> data.remove((K) command.key());
         }
         if (persistence != null) {
+            NMapOperationType opType = command.type();
             // Persist locally on every node (leader and followers) when applying the
             // replicated command.
             if (topic.equals("map:_ngrid-queue-offsets")) {
                 // Offsets must survive hard crashes to avoid duplicate delivery.
-                persistence.appendSync(command.type(), command.key(), command.value());
+                persistence.appendSync(opType, command.key(), command.value());
             } else {
-                persistence.appendAsync(command.type(), command.key(), command.value());
+                persistence.appendAsync(opType, command.key(), command.value());
             }
         }
     }

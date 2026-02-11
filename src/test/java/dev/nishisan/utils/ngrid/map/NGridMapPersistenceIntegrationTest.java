@@ -156,7 +156,7 @@ class NGridMapPersistenceIntegrationTest {
                 .replicationQuorum(2)
                 .mapDirectory(dir.resolve("maps"))
                 .mapName("map")
-                .mapPersistenceMode(MapPersistenceMode.ASYNC_WITH_FSYNC);
+                .mapPersistenceMode(dev.nishisan.utils.map.NMapPersistenceMode.ASYNC_WITH_FSYNC);
         for (NodeInfo peer : peers) {
             b.addPeer(peer);
         }
@@ -219,4 +219,3 @@ class NGridMapPersistenceIntegrationTest {
         throw new IOException("Unable to allocate a free local port after multiple attempts");
     }
 }
-

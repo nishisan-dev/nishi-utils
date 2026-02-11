@@ -15,7 +15,7 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>
  */
 
-package dev.nishisan.utils.ngrid.map;
+package dev.nishisan.utils.map;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
@@ -44,13 +44,13 @@ import java.util.Objects;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * Local disk persistence for the distributed map. Uses an append-only WAL and
+ * Local disk persistence engine for {@link NMap}. Uses an append-only WAL and
  * periodic full snapshots.
  * <p>
  * This component is intentionally best-effort: write failures are logged but do
@@ -59,20 +59,20 @@ import java.util.logging.Logger;
  * @param <K> the key type
  * @param <V> the value type
  */
-public final class MapPersistence<K extends Serializable, V extends Serializable> implements Closeable {
-    private static final Logger LOGGER = Logger.getLogger(MapPersistence.class.getName());
+public final class NMapPersistence<K extends Serializable, V extends Serializable> implements Closeable {
+    private static final Logger LOGGER = Logger.getLogger(NMapPersistence.class.getName());
 
     private static final String WAL_FILE = "wal.log";
     private static final String SNAPSHOT_FILE = "snapshot.dat";
     private static final String META_FILE = "map.meta";
 
     // Entry framing + compatibility
-    private static final int ENTRY_MAGIC = 0x4E475741; // "NGWA"
+    private static final int ENTRY_MAGIC = 0x4E4D5741; // "NMWA"
     private static final int ENTRY_VERSION = 1;
 
-    private final MapPersistenceConfig config;
+    private final NMapConfig config;
     private final Map<K, V> data;
-    private final PersistenceHealthListener healthListener;
+    private final NMapHealthListener healthListener;
     private final AtomicLong failureCount = new AtomicLong();
     private final Path mapDir;
     private final Path walPath;
@@ -81,7 +81,7 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
     private final Path tempSnapshotPath;
     private final Path oldWalPath;
 
-    private final LinkedBlockingQueue<WALEntry> queue = new LinkedBlockingQueue<>();
+    private final LinkedBlockingQueue<NMapWALEntry> queue = new LinkedBlockingQueue<>();
     private final AtomicBoolean running = new AtomicBoolean();
     private final Object walLock = new Object();
 
@@ -93,19 +93,23 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
     private long lastSnapshotTimeMillis;
 
     /**
-     * Creates a new map persistence instance.
+     * Creates a new persistence instance.
      *
-     * @param config the persistence configuration
-     * @param data   the in-memory map to persist
+     * @param config  the persistence configuration
+     * @param data    the in-memory map to persist
+     * @param baseDir the base directory for persistence files
+     * @param mapName the map name (used as subdirectory)
      */
-    public MapPersistence(MapPersistenceConfig config, Map<K, V> data) {
+    public NMapPersistence(NMapConfig config, Map<K, V> data, Path baseDir, String mapName) {
         this.config = Objects.requireNonNull(config, "config");
         this.data = Objects.requireNonNull(data, "data");
         this.healthListener = config.healthListener() != null
                 ? config.healthListener()
                 : (name, type, cause) -> {
                 };
-        this.mapDir = config.mapDirectory().resolve(config.mapName());
+        Objects.requireNonNull(baseDir, "baseDir");
+        Objects.requireNonNull(mapName, "mapName");
+        this.mapDir = baseDir.resolve(mapName);
         this.walPath = mapDir.resolve(WAL_FILE);
         this.snapshotPath = mapDir.resolve(SNAPSHOT_FILE);
         this.metaPath = mapDir.resolve(META_FILE);
@@ -123,28 +127,11 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
     }
 
     /**
-     * Loads the map persistence state from disk if persistence mode is enabled.
-     *
-     * This method first checks the persistence mode using the configuration. If the
-     * mode is
-     * {@code DISABLED}, the method exits without performing any action.
-     *
-     * It attempts to prepare the necessary directories, load snapshot data, and
-     * rebuild the
-     * state from the write-ahead log (WAL). Additionally, it tries to read
-     * metadata, which
-     * includes the last snapshot timestamp, but does not require it to proceed, as
-     * reading
-     * metadata is a best-effort operation. If the metadata is read successfully,
-     * the timestamp
-     * of the last snapshot is updated.
-     *
-     * Any {@link IOException} encountered during the process is logged for
-     * debugging or error
-     * analysis, and the method continues without propagating the exception further.
+     * Loads state from disk (snapshot + WAL replay). No-op when persistence is
+     * disabled.
      */
     public void load() {
-        if (config.mode() == MapPersistenceMode.DISABLED) {
+        if (config.mode() == NMapPersistenceMode.DISABLED) {
             return;
         }
         try {
@@ -155,7 +142,6 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
                 loadWal(oldWalPath);
             }
             loadWal(walPath);
-            // Meta is best-effort; if missing/corrupt it's ignored.
             readMeta().ifPresent(meta -> lastSnapshotTimeMillis = meta.lastSnapshotTimestamp());
         } catch (IOException e) {
             LOGGER.log(Level.WARNING, "Failed to load map persistence state", e);
@@ -163,28 +149,10 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
     }
 
     /**
-     * Starts the map persistence process based on the defined configuration mode.
-     *
-     * Checks if the persistence mode is enabled. If persistence is disabled, this
-     * method exits
-     * without performing any actions. If the persistence process is already
-     * running, it does not
-     * start another instance.
-     *
-     * If persistence is enabled and not running, this method:
-     * - Creates necessary directories for storing persistence files.
-     * - Opens the write-ahead log (WAL) file for appending data.
-     * - Sets the initial snapshot time if it was not restored from metadata.
-     * - Creates and starts a dedicated background writer thread for handling
-     * persistence tasks.
-     *
-     * If an {@link IOException} occurs during initialization (such as directory
-     * creation or WAL opening),
-     * the persistence process is not started, the running state is reset, and a
-     * warning is logged.
+     * Starts the background writer thread. No-op when persistence is disabled.
      */
     public void start() {
-        if (config.mode() == MapPersistenceMode.DISABLED) {
+        if (config.mode() == NMapPersistenceMode.DISABLED) {
             return;
         }
         if (!running.compareAndSet(false, true)) {
@@ -193,7 +161,6 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
         try {
             Files.createDirectories(mapDir);
             openWalForAppend();
-            // Set initial snapshot time if not restored from meta.
             if (lastSnapshotTimeMillis <= 0) {
                 lastSnapshotTimeMillis = System.currentTimeMillis();
             }
@@ -201,51 +168,42 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
             running.set(false);
             LOGGER.log(Level.WARNING, "Failed to start map persistence (WAL open)", e);
             failureCount.incrementAndGet();
-            healthListener.onPersistenceFailure(config.mapName(),
-                    PersistenceHealthListener.PersistenceFailureType.WAL_OPEN, e);
+            healthListener.onPersistenceFailure(mapDir.getFileName().toString(),
+                    NMapHealthListener.PersistenceFailureType.WAL_OPEN, e);
             return;
         }
 
-        writerThread = new Thread(this::runWriterLoop, "ngrid-map-persistence");
+        writerThread = new Thread(this::runWriterLoop, "nmap-persistence");
         writerThread.setDaemon(true);
         writerThread.start();
     }
 
     /**
-     * Appends a write-ahead log (WAL) entry asynchronously for a given replication
-     * command.
+     * Appends a WAL entry asynchronously.
      *
-     * This method creates a new WAL entry, capturing the provided replication
-     * command type,
-     * key, and value, then queues it for asynchronous processing. If the
-     * persistence mode
-     * is disabled, the method exits without performing any operation.
-     *
-     * @param type  the type of the replication command, such as PUT or REMOVE. Must
-     *              not be null.
-     * @param key   the key associated with the command. Must not be null.
-     * @param value the value associated with the command. Can be null depending on
-     *              the command type.
+     * @param type  the operation type
+     * @param key   the key
+     * @param value the value (may be null for REMOVE)
      */
-    public void appendAsync(MapReplicationCommandType type, Serializable key, Serializable value) {
-        if (config.mode() == MapPersistenceMode.DISABLED) {
+    public void appendAsync(NMapOperationType type, Serializable key, Serializable value) {
+        if (config.mode() == NMapPersistenceMode.DISABLED) {
             return;
         }
         Objects.requireNonNull(type, "type");
         Objects.requireNonNull(key, "key");
-        queue.offer(new WALEntry(System.currentTimeMillis(), type, key, value));
+        queue.offer(new NMapWALEntry(System.currentTimeMillis(), type, key, value));
     }
 
     /**
      * Appends a WAL entry synchronously. Used for critical maps that must survive
      * hard crashes.
      *
-     * @param type  the replication command type
+     * @param type  the operation type
      * @param key   the key
-     * @param value the value, may be {@code null} for REMOVE operations
+     * @param value the value (may be null for REMOVE)
      */
-    public void appendSync(MapReplicationCommandType type, Serializable key, Serializable value) {
-        if (config.mode() == MapPersistenceMode.DISABLED) {
+    public void appendSync(NMapOperationType type, Serializable key, Serializable value) {
+        if (config.mode() == NMapPersistenceMode.DISABLED) {
             return;
         }
         Objects.requireNonNull(type, "type");
@@ -254,46 +212,28 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
         if (ch == null) {
             return;
         }
-        WALEntry entry = new WALEntry(System.currentTimeMillis(), type, key, value);
+        NMapWALEntry entry = new NMapWALEntry(System.currentTimeMillis(), type, key, value);
         synchronized (walLock) {
             try {
                 ByteBuffer buffer = encode(entry);
                 while (buffer.hasRemaining()) {
                     ch.write(buffer);
                 }
-                if (config.mode() == MapPersistenceMode.ASYNC_WITH_FSYNC) {
+                if (config.mode() == NMapPersistenceMode.ASYNC_WITH_FSYNC) {
                     ch.force(true);
                 }
             } catch (IOException e) {
                 LOGGER.log(Level.WARNING, "Failed to append WAL entry synchronously", e);
                 failureCount.incrementAndGet();
-                healthListener.onPersistenceFailure(config.mapName(),
-                        PersistenceHealthListener.PersistenceFailureType.WAL_WRITE, e);
+                healthListener.onPersistenceFailure(mapDir.getFileName().toString(),
+                        NMapHealthListener.PersistenceFailureType.WAL_WRITE, e);
             }
         }
     }
 
-    /**
-     * Closes the map persistence process and releases associated resources.
-     *
-     * This method performs the following operations:
-     * - If the persistence mode is {@code DISABLED}, it exits immediately without
-     * making any changes.
-     * - Updates the state to indicate that the persistence process is no longer
-     * running.
-     * - Waits for the associated writer thread to finish execution, with a maximum
-     * timeout of 10 seconds.
-     * If interrupted during the wait, the thread is re-interrupted.
-     * - Cleans up and safely closes any resources associated with the write-ahead
-     * log (WAL) by invoking
-     * {@code closeWalQuietly()}.
-     *
-     * @throws IOException if an error occurs during thread handling or resource
-     *                     cleanup operations.
-     */
     @Override
     public void close() throws IOException {
-        if (config.mode() == MapPersistenceMode.DISABLED) {
+        if (config.mode() == NMapPersistenceMode.DISABLED) {
             return;
         }
         running.set(false);
@@ -306,113 +246,6 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
             }
         }
         closeWalQuietly();
-    }
-
-    /**
-     * Executes the main persistence loop in a dedicated thread. This method
-     * continuously processes
-     * write-ahead log (WAL) entries queued for persistence until the processing is
-     * terminated.
-     *
-     * The method operates as follows:
-     * - Polls entries from the queue with a timeout defined by the `batchTimeout`
-     * configuration.
-     * - If a timeout occurs without entries, attempts to create a snapshot if
-     * criteria are met
-     * using the `maybeSnapshot` method.
-     * - If entries are available, forms a batch of entries up to the size specified
-     * by the
-     * `batchSize` configuration and writes the batch to persistent storage using
-     * the
-     * `writeBatch` method, while tracking the number of operations processed since
-     * the
-     * last snapshot.
-     * - Continuously checks for graceful shutdown to stop processing once all
-     * queued entries
-     * are handled.
-     *
-     * Handles shutdown by:
-     * - Responding to an `InterruptedException` to clear interruption status and
-     * gracefully
-     * stop processing.
-     * - Attempting a final best-effort flush of remaining entries in the queue
-     * during shutdown.
-     * If any errors occur while processing this final flush, logs the exception but
-     * does
-     * not propagate it further.
-     *
-     * This method is intended to be called on a long-running background thread as
-     * part of
-     * the map persistence lifecycle.
-     */
-    private void runWriterLoop() {
-        Duration batchTimeout = config.batchTimeout();
-        long batchTimeoutMs = Math.max(1L, batchTimeout.toMillis());
-
-        while (running.get() || !queue.isEmpty()) {
-            try {
-                WALEntry first = queue.poll(batchTimeoutMs, TimeUnit.MILLISECONDS);
-                if (first == null) {
-                    maybeSnapshot();
-                    continue;
-                }
-                List<WALEntry> batch = new ArrayList<>(config.batchSize());
-                batch.add(first);
-                queue.drainTo(batch, Math.max(0, config.batchSize() - 1));
-
-                writeBatch(batch);
-                opsSinceSnapshot += batch.size();
-                maybeSnapshot();
-            } catch (InterruptedException e) {
-                // Graceful shutdown: do not keep the interrupted flag set while using
-                // FileChannel,
-                // otherwise writes can fail with ClosedByInterruptException.
-                running.set(false);
-                Thread.interrupted(); // clear interruption status
-                continue;
-            } catch (Exception e) {
-                LOGGER.log(Level.WARNING, "Unexpected error in persistence writer loop", e);
-            }
-        }
-
-        // Final best-effort flush on shutdown
-        try {
-            List<WALEntry> remaining = new ArrayList<>();
-            queue.drainTo(remaining);
-            if (!remaining.isEmpty()) {
-                writeBatch(remaining);
-            }
-        } catch (Exception e) {
-            LOGGER.log(Level.WARNING, "Failed to flush remaining WAL entries on shutdown", e);
-        }
-    }
-
-    private void writeBatch(List<WALEntry> batch) {
-        if (batch.isEmpty()) {
-            return;
-        }
-        FileChannel ch = walChannel;
-        if (ch == null) {
-            return;
-        }
-        synchronized (walLock) {
-            try {
-                for (WALEntry entry : batch) {
-                    ByteBuffer buffer = encode(entry);
-                    while (buffer.hasRemaining()) {
-                        ch.write(buffer);
-                    }
-                }
-                if (config.mode() == MapPersistenceMode.ASYNC_WITH_FSYNC) {
-                    ch.force(true);
-                }
-            } catch (IOException e) {
-                LOGGER.log(Level.WARNING, "Failed to append WAL batch", e);
-                failureCount.incrementAndGet();
-                healthListener.onPersistenceFailure(config.mapName(),
-                        PersistenceHealthListener.PersistenceFailureType.WAL_WRITE, e);
-            }
-        }
     }
 
     /**
@@ -435,27 +268,89 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
         } catch (Exception e) {
             LOGGER.log(Level.WARNING, "Failed to create map snapshot", e);
             failureCount.incrementAndGet();
-            healthListener.onPersistenceFailure(config.mapName(),
-                    PersistenceHealthListener.PersistenceFailureType.SNAPSHOT_WRITE, e);
+            healthListener.onPersistenceFailure(mapDir.getFileName().toString(),
+                    NMapHealthListener.PersistenceFailureType.SNAPSHOT_WRITE, e);
         }
     }
 
-    /**
-     * Rotates WAL so the new WAL contains only operations after the rotation,
-     * writes a snapshot,
-     * then deletes the old WAL (compact).
-     */
+    // ── Writer Loop ──────────────────────────────────────────────────────
+
+    private void runWriterLoop() {
+        Duration batchTimeout = config.batchTimeout();
+        long batchTimeoutMs = Math.max(1L, batchTimeout.toMillis());
+
+        while (running.get() || !queue.isEmpty()) {
+            try {
+                NMapWALEntry first = queue.poll(batchTimeoutMs, TimeUnit.MILLISECONDS);
+                if (first == null) {
+                    maybeSnapshot();
+                    continue;
+                }
+                List<NMapWALEntry> batch = new ArrayList<>(config.batchSize());
+                batch.add(first);
+                queue.drainTo(batch, Math.max(0, config.batchSize() - 1));
+
+                writeBatch(batch);
+                opsSinceSnapshot += batch.size();
+                maybeSnapshot();
+            } catch (InterruptedException e) {
+                running.set(false);
+                Thread.interrupted();
+                continue;
+            } catch (Exception e) {
+                LOGGER.log(Level.WARNING, "Unexpected error in persistence writer loop", e);
+            }
+        }
+
+        // Final best-effort flush on shutdown
+        try {
+            List<NMapWALEntry> remaining = new ArrayList<>();
+            queue.drainTo(remaining);
+            if (!remaining.isEmpty()) {
+                writeBatch(remaining);
+            }
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING, "Failed to flush remaining WAL entries on shutdown", e);
+        }
+    }
+
+    private void writeBatch(List<NMapWALEntry> batch) {
+        if (batch.isEmpty()) {
+            return;
+        }
+        FileChannel ch = walChannel;
+        if (ch == null) {
+            return;
+        }
+        synchronized (walLock) {
+            try {
+                for (NMapWALEntry entry : batch) {
+                    ByteBuffer buffer = encode(entry);
+                    while (buffer.hasRemaining()) {
+                        ch.write(buffer);
+                    }
+                }
+                if (config.mode() == NMapPersistenceMode.ASYNC_WITH_FSYNC) {
+                    ch.force(true);
+                }
+            } catch (IOException e) {
+                LOGGER.log(Level.WARNING, "Failed to append WAL batch", e);
+                failureCount.incrementAndGet();
+                healthListener.onPersistenceFailure(mapDir.getFileName().toString(),
+                        NMapHealthListener.PersistenceFailureType.WAL_WRITE, e);
+            }
+        }
+    }
+
+    // ── Snapshot ─────────────────────────────────────────────────────────
+
     private void createSnapshotAndRotateWal() throws IOException {
-        // Best-effort: flush whatever is currently in queue to the current WAL before
-        // rotation.
-        List<WALEntry> preRotate = new ArrayList<>();
+        List<NMapWALEntry> preRotate = new ArrayList<>();
         queue.drainTo(preRotate, config.batchSize());
         if (!preRotate.isEmpty()) {
             writeBatch(preRotate);
         }
 
-        // Rotate WAL: wal.log -> wal.log.old; create new wal.log for subsequent
-        // entries.
         closeWalQuietly();
         try {
             Files.deleteIfExists(oldWalPath);
@@ -463,17 +358,10 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
                 Files.move(walPath, oldWalPath, StandardCopyOption.REPLACE_EXISTING);
             }
         } catch (IOException e) {
-            // If rotation fails, keep going (snapshot can still be written).
             LOGGER.log(Level.WARNING, "Failed to rotate WAL before snapshot", e);
         }
         openWalForAppend();
 
-        // Snapshot of the current in-memory state.
-        // If the backing map is concurrent (typical usage), the copy is weakly
-        // consistent but safe.
-        // Otherwise, synchronize on the map instance to avoid
-        // ConcurrentModificationException and
-        // ensure a consistent view for snapshotting.
         Map<K, V> snapshot;
         if (data instanceof ConcurrentMap<?, ?>) {
             snapshot = new HashMap<>(data);
@@ -484,15 +372,13 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
         }
         writeSnapshot(snapshot);
 
-        // Compact: delete old WAL now that snapshot exists.
         try {
             Files.deleteIfExists(oldWalPath);
         } catch (IOException e) {
             LOGGER.log(Level.WARNING, "Failed to delete rotated WAL after snapshot", e);
         }
 
-        // Persist meta best-effort.
-        writeMeta(new MapMetadata(0L, System.currentTimeMillis(), ENTRY_VERSION));
+        writeMeta(new NMapMetadata(0L, System.currentTimeMillis(), ENTRY_VERSION));
     }
 
     private void writeSnapshot(Map<K, V> snapshot) throws IOException {
@@ -525,6 +411,8 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
         }
     }
 
+    // ── WAL Replay ──────────────────────────────────────────────────────
+
     private void loadWal(Path path) throws IOException {
         if (!Files.exists(path)) {
             return;
@@ -540,7 +428,6 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
                     break;
                 }
                 if (r < 4) {
-                    // Partial header: truncate.
                     ch.truncate(offset);
                     break;
                 }
@@ -575,6 +462,7 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
         }
     }
 
+    @SuppressWarnings("unchecked")
     private void applyDecoded(byte[] payload) throws IOException {
         try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(payload))) {
             int magic = in.readInt();
@@ -583,11 +471,11 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
                 throw new IOException("Unsupported WAL entry format");
             }
             int typeOrdinal = in.readUnsignedByte();
-            MapReplicationCommandType[] values = MapReplicationCommandType.values();
+            NMapOperationType[] values = NMapOperationType.values();
             if (typeOrdinal < 0 || typeOrdinal >= values.length) {
                 throw new IOException("Invalid WAL entry type");
             }
-            MapReplicationCommandType type = values[typeOrdinal];
+            NMapOperationType type = values[typeOrdinal];
             in.readLong(); // timestamp (reserved for future use)
             int keyLen = in.readInt();
             if (keyLen <= 0 || keyLen > (16 * 1024 * 1024)) {
@@ -604,9 +492,7 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
                 byte[] valueBytes = in.readNBytes(valueLen);
                 value = deserialize(valueBytes);
             }
-            @SuppressWarnings("unchecked")
             K k = (K) key;
-            @SuppressWarnings("unchecked")
             V v = (V) value;
             switch (type) {
                 case PUT -> data.put(k, v);
@@ -615,7 +501,9 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
         }
     }
 
-    private ByteBuffer encode(WALEntry entry) throws IOException {
+    // ── Encoding / Decoding ─────────────────────────────────────────────
+
+    private ByteBuffer encode(NMapWALEntry entry) throws IOException {
         byte[] keyBytes = serialize(entry.key());
         byte[] valueBytes = entry.value() != null ? serialize(entry.value()) : new byte[0];
 
@@ -652,12 +540,15 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
     }
 
     private static Serializable deserialize(byte[] bytes) throws IOException {
-        try (ObjectInputStream ois = new ObjectInputStream(new BufferedInputStream(new ByteArrayInputStream(bytes)))) {
+        try (ObjectInputStream ois = new ObjectInputStream(
+                new BufferedInputStream(new ByteArrayInputStream(bytes)))) {
             return (Serializable) ois.readObject();
         } catch (ClassNotFoundException e) {
             throw new IOException("Failed to deserialize WAL field", e);
         }
     }
+
+    // ── WAL I/O ─────────────────────────────────────────────────────────
 
     private void openWalForAppend() throws IOException {
         Files.createDirectories(mapDir);
@@ -697,7 +588,9 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
         }
     }
 
-    private void writeMeta(MapMetadata meta) {
+    // ── Metadata ────────────────────────────────────────────────────────
+
+    private void writeMeta(NMapMetadata meta) {
         try {
             Files.deleteIfExists(metaPath);
             try (DataOutputStream out = new DataOutputStream(
@@ -712,15 +605,16 @@ public final class MapPersistence<K extends Serializable, V extends Serializable
         }
     }
 
-    private java.util.Optional<MapMetadata> readMeta() {
+    private java.util.Optional<NMapMetadata> readMeta() {
         if (!Files.exists(metaPath)) {
             return java.util.Optional.empty();
         }
-        try (DataInputStream in = new DataInputStream(new BufferedInputStream(Files.newInputStream(metaPath)))) {
+        try (DataInputStream in = new DataInputStream(
+                new BufferedInputStream(Files.newInputStream(metaPath)))) {
             int version = in.readInt();
             long offset = in.readLong();
             long ts = in.readLong();
-            return java.util.Optional.of(new MapMetadata(offset, ts, version));
+            return java.util.Optional.of(new NMapMetadata(offset, ts, version));
         } catch (IOException e) {
             return java.util.Optional.empty();
         }
