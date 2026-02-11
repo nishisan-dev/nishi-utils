@@ -30,6 +30,7 @@ public final class NMapConfig {
     private final int batchSize;
     private final Duration batchTimeout;
     private final NMapHealthListener healthListener;
+    private final NMapOffloadStrategyFactory offloadStrategyFactory;
 
     private NMapConfig(Builder builder) {
         this.mode = Objects.requireNonNull(builder.mode, "mode");
@@ -38,6 +39,7 @@ public final class NMapConfig {
         this.batchSize = builder.batchSize;
         this.batchTimeout = Objects.requireNonNull(builder.batchTimeout, "batchTimeout");
         this.healthListener = builder.healthListener;
+        this.offloadStrategyFactory = builder.offloadStrategyFactory;
         validate();
     }
 
@@ -105,6 +107,14 @@ public final class NMapConfig {
         return healthListener;
     }
 
+    /**
+     * Returns the offload strategy factory, or {@code null} if none configured
+     * (default: in-memory).
+     */
+    public NMapOffloadStrategyFactory offloadStrategyFactory() {
+        return offloadStrategyFactory;
+    }
+
     private void validate() {
         if (snapshotIntervalOperations < 0) {
             throw new IllegalArgumentException("snapshotIntervalOperations must be >= 0");
@@ -131,6 +141,7 @@ public final class NMapConfig {
         private Duration batchTimeout = Duration.ofMillis(10);
         private NMapHealthListener healthListener = (name, type, cause) -> {
         };
+        private NMapOffloadStrategyFactory offloadStrategyFactory;
 
         private Builder() {
         }
@@ -168,6 +179,16 @@ public final class NMapConfig {
         /** Sets the health listener. */
         public Builder healthListener(NMapHealthListener listener) {
             this.healthListener = Objects.requireNonNull(listener, "healthListener");
+            return this;
+        }
+
+        /**
+         * Sets the offload strategy factory. When set, the strategy will be used
+         * instead of the default in-memory storage. Pass {@code null} to use the
+         * default in-memory strategy.
+         */
+        public Builder offloadStrategyFactory(NMapOffloadStrategyFactory factory) {
+            this.offloadStrategyFactory = factory;
             return this;
         }
 
