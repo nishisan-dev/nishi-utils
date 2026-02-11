@@ -34,7 +34,7 @@ import java.util.function.BiConsumer;
  * WAL + snapshot engine. Analogous to {@link dev.nishisan.utils.queue.NQueue},
  * {@code NMap} can be used <b>independently</b> of NGrid.
  *
- * <h3>Quick start</h3>
+ * <h2>Quick start</h2>
  * 
  * <pre>{@code
  * try (NMap<String, String> map = NMap.open(Path.of("/data"), "mymap")) {
@@ -43,7 +43,7 @@ import java.util.function.BiConsumer;
  * }
  * }</pre>
  *
- * <h3>In-memory mode</h3>
+ * <h2>In-memory mode</h2>
  * 
  * <pre>{@code
  * try (NMap<String, String> map = NMap.open(Path.of("/tmp"), "ephemeral", NMapConfig.inMemory())) {
