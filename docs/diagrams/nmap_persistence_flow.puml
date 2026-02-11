@@ -1,0 +1,52 @@
+@startuml nmap_persistence_flow
+!theme plain
+
+title NMap — Fluxo de Persistência (WAL + Snapshot)
+skinparam backgroundColor white
+skinparam defaultFontName Inter
+skinparam activityBackgroundColor #F0F0F0
+
+start
+
+:Aplicação chama\n**put(key, value)**;
+
+:NMap armazena em\nConcurrentHashMap;
+
+if (Persistência habilitada?) then (sim)
+    :Cria NMapWALEntry\n(PUT, key, value);
+
+    if (Modo = ASYNC_WITH_FSYNC\nou ASYNC_NO_FSYNC?) then (ASYNC)
+        :Enfileira no\nLinkedBlockingQueue;
+
+        fork
+            :Background Writer\ndrena batch;
+            :Serializa e escreve\nentradas no WAL;
+
+            if (fsync habilitado?) then (sim)
+                :channel.force(true);
+            else (não)
+            endif
+
+            :Incrementa\nopsSinceSnapshot;
+
+            if (ops >= snapshotInterval\n|| tempo >= snapshotTime?) then (sim)
+                :Serializa mapa completo\nem snapshot.dat.tmp;
+                :Rename atômico para\nsnapshot.dat;
+                :Apaga WAL;
+                :Reset contadores;
+            else (não)
+            endif
+        fork again
+        end fork
+    else (SYNC)
+        :Serializa e escreve\ndiretamente no WAL;
+        :channel.force(true);
+    endif
+else (não)
+endif
+
+:Retorna Optional<V>\ncom valor anterior;
+
+stop
+
+@enduml
