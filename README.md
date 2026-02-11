@@ -2,11 +2,22 @@
 
 Coleção de utilitários em Java, com foco em:
 
+- **NMap**: mapa **persistente** standalone (WAL + snapshot), com **offloading plugável** (in-memory, disco, híbrido com LRU).
 - **NQueue**: fila **persistente** (FIFO) baseada em arquivos, segura para múltiplas threads.
 - **NGrid**: infraestrutura **distribuída** via TCP com **fila** e **mapa** (replicação por líder + quorum).
 - **Stats**: utilitários para **métricas/estatísticas** simples (contadores, médias, valores, memória).
 
-## Funcionalidades
+### NMap (mapa persistente standalone)
+
+- **Persistência WAL + snapshot** com recuperação robusta a falhas
+- **Offloading plugável** via `NMapOffloadStrategy`:
+  - `InMemoryStrategy` (default): `ConcurrentHashMap`, zero mudança para quem já usa
+  - `DiskOffloadStrategy`: todas as entries em disco, índice leve em memória
+  - `HybridOffloadStrategy`: cache in-memory limitado com spillover automático para disco
+- **Políticas de evicção**: `LRU` (Least Recently Used) e `SIZE_THRESHOLD` (por volume)
+- **Warm-up automático**: entries frias são promovidas ao `get()`
+- **Observabilidade**: integração com `StatsUtils` (hit/miss, evictions, latência de disco)
+- **Thread-safe**: todas as operações são concorrentes
 
 ### NQueue (fila persistente)
 
@@ -149,6 +160,128 @@ public class ProducerConsumer {
   }
 }
 ```
+
+## Uso: NMap
+
+### Básico (persistência WAL + snapshot)
+
+```java
+import dev.nishisan.utils.map.NMap;
+
+import java.nio.file.Path;
+
+public class NMapExample {
+  public static void main(String[] args) throws Exception {
+    Path baseDir = Path.of("/tmp/maps");
+
+    try (NMap<String, String> map = NMap.open(baseDir, "usuarios")) {
+      map.put("u1", "Alice");
+      map.put("u2", "Bob");
+
+      System.out.println("u1=" + map.get("u1").orElse("<vazio>"));
+      System.out.println("size=" + map.size());
+    }
+    // Reabrindo: dados são reconstruídos do WAL/snapshot
+    try (NMap<String, String> map = NMap.open(baseDir, "usuarios")) {
+      System.out.println("u2=" + map.get("u2").orElse("<vazio>")); // Bob
+    }
+  }
+}
+```
+
+### In-memory (sem persistência)
+
+```java
+import dev.nishisan.utils.map.NMap;
+import dev.nishisan.utils.map.NMapConfig;
+import dev.nishisan.utils.map.NMapPersistenceMode;
+
+try (NMap<String, String> map = NMap.open(
+        Path.of("/tmp"), "cache", NMapConfig.inMemory())) {
+  map.put("key", "value");
+}
+```
+
+### Offloading: Disco completo
+
+```java
+import dev.nishisan.utils.map.DiskOffloadStrategy;
+
+NMapConfig cfg = NMapConfig.builder()
+    .mode(NMapPersistenceMode.DISABLED)
+    .offloadStrategyFactory(DiskOffloadStrategy::new)
+    .build();
+
+try (NMap<String, String> map = NMap.open(Path.of("/data"), "big-map", cfg)) {
+  // Todas as entries vão direto para disco
+  for (int i = 0; i < 1_000_000; i++) {
+    map.put("k" + i, "v" + i);
+  }
+}
+```
+
+### Offloading: Híbrido com LRU
+
+Mantém as N entries mais acessadas em memória e faz spillover das demais
+para disco automaticamente. Warm-up transparente no `get()`.
+
+```java
+import dev.nishisan.utils.map.EvictionPolicy;
+import dev.nishisan.utils.map.HybridOffloadStrategy;
+
+NMapConfig cfg = NMapConfig.builder()
+    .mode(NMapPersistenceMode.DISABLED)
+    .offloadStrategyFactory((baseDir, name) ->
+        HybridOffloadStrategy.<String, String>builder(baseDir, name)
+            .evictionPolicy(EvictionPolicy.LRU)       // ou SIZE_THRESHOLD
+            .maxInMemoryEntries(10_000)
+            .build())
+    .build();
+
+try (NMap<String, String> map = NMap.open(Path.of("/data"), "sessions", cfg)) {
+  map.put("session-1", "alice");
+  map.get("session-1"); // hot: leitura do cache
+}
+```
+
+### Observabilidade com StatsUtils
+
+O `HybridOffloadStrategy` emite métricas via `StatsUtils` quando configurado:
+
+```java
+import dev.nishisan.utils.stats.StatsUtils;
+import dev.nishisan.utils.map.NMapMetrics;
+
+StatsUtils stats = new StatsUtils();
+
+NMapConfig cfg = NMapConfig.builder()
+    .mode(NMapPersistenceMode.DISABLED)
+    .offloadStrategyFactory((baseDir, name) ->
+        HybridOffloadStrategy.<String, String>builder(baseDir, name)
+            .evictionPolicy(EvictionPolicy.LRU)
+            .maxInMemoryEntries(10_000)
+            .stats(stats)       // ← ativa métricas
+            .build())
+    .build();
+
+// Métricas disponíveis:
+// stats.getCounterValue(NMapMetrics.CACHE_HIT)     → taxa de cache hit
+// stats.getCounterValue(NMapMetrics.EVICTION)       → entries movidas para disco
+// stats.getCounterValue(NMapMetrics.WARM_UP)        → entries promovidas para memória
+// stats.getAverage(NMapMetrics.DISK_READ_LATENCY)   → latência média de leitura (ms)
+```
+
+| Métrica | Tipo | Descrição |
+|---------|------|-----------|
+| `NMAP.GET_HIT` | Counter | Cada `get()` |
+| `NMAP.CACHE_HIT` | Counter | Entry encontrada em memória |
+| `NMAP.CACHE_MISS` | Counter | Entry não encontrada em memória |
+| `NMAP.EVICTION` | Counter | Entry movida para disco |
+| `NMAP.WARM_UP` | Counter | Entry promovida de disco para memória |
+| `NMAP.HOT_SIZE` | Gauge | Entries em memória |
+| `NMAP.COLD_SIZE` | Gauge | Entries em disco |
+| `NMAP.DISK_READ_LATENCY` | Average | Latência de leitura (ms) |
+| `NMAP.DISK_WRITE_LATENCY` | Average | Latência de escrita (ms) |
 
 ## Uso: NGrid
 
@@ -310,8 +443,23 @@ Para mais detalhes, consulte a [documentação completa de configuração YAML](
 ```mermaid
 flowchart TD
   subgraph nishiUtils [nishi-utils]
+    subgraph nmap [NMap Standalone]
+      NMapAPI["NMap&lt;K,V&gt;"]
+      Strategy{NMapOffloadStrategy}
+      InMem[InMemoryStrategy]
+      Disk[DiskOffloadStrategy]
+      Hybrid[HybridOffloadStrategy]
+      Metrics[NMapMetrics + StatsUtils]
+
+      NMapAPI --> Strategy
+      Strategy --> InMem
+      Strategy --> Disk
+      Strategy --> Hybrid
+      Hybrid -.-> Metrics
+    end
+
     subgraph nqueue [NQueue]
-      NQueueAPI[NQueue<T>]
+      NQueueAPI["NQueue&lt;T&gt;"]
       NQueueFiles["Arquivos: data.log + queue.meta"]
       NQueueAPI --> NQueueFiles
     end
@@ -370,6 +518,12 @@ Veja: `src/main/java/dev/nishisan/utils/stats/StatsUtils.java`.
 
 ```bash
 mvn test
+```
+
+### Testes de NMap (Standalone + Offloading)
+
+```bash
+mvn test -Dtest=NMapTest,NMapRecoveryTest,NMapOffloadTest,HybridOffloadStrategyTest
 ```
 
 ### Testes de Durabilidade (NGrid)
