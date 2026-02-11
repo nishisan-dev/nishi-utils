@@ -15,21 +15,24 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>
  */
 
-package dev.nishisan.utils.ngrid.map;
-
-import java.io.Serializable;
+package dev.nishisan.utils.map;
 
 /**
- * A single WAL entry representing a mutating operation (PUT/REMOVE).
- *
- * @param timestamp the time the operation was recorded
- * @param type      the operation type (PUT or REMOVE)
- * @param key       the entry key
- * @param value     the entry value, or {@code null} for REMOVE operations
+ * Persistence mode for the {@link NMap} persistent map.
  */
-public record WALEntry(
-                long timestamp,
-                MapReplicationCommandType type,
-                Serializable key,
-                Serializable value) {
+public enum NMapPersistenceMode {
+    /**
+     * No persistence; map stays purely in-memory.
+     */
+    DISABLED,
+    /**
+     * Async disk writes without fsync (better throughput, weaker durability on
+     * crash).
+     */
+    ASYNC_NO_FSYNC,
+    /**
+     * Async disk writes with fsync (better durability on crash, lower
+     * throughput).
+     */
+    ASYNC_WITH_FSYNC
 }

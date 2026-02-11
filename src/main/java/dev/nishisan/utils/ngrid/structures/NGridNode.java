@@ -34,8 +34,8 @@ import dev.nishisan.utils.ngrid.config.NGridConfigLoader;
 import dev.nishisan.utils.ngrid.config.NGridYamlConfig;
 import dev.nishisan.utils.ngrid.config.QueuePolicyConfig;
 import dev.nishisan.utils.ngrid.map.MapClusterService;
-import dev.nishisan.utils.ngrid.map.MapPersistenceConfig;
-import dev.nishisan.utils.ngrid.map.MapPersistenceMode;
+import dev.nishisan.utils.map.NMapConfig;
+import dev.nishisan.utils.map.NMapPersistenceMode;
 import dev.nishisan.utils.ngrid.metrics.LeaderReelectionService;
 import dev.nishisan.utils.ngrid.metrics.NGridMetrics;
 import dev.nishisan.utils.ngrid.metrics.NGridAlertEngine;
@@ -854,20 +854,21 @@ public final class NGridNode implements Closeable {
     private MapClusterService<Serializable, Serializable> createMapService(String mapName) {
         // Infrastructure maps (like offset tracking) always persist regardless of user
         // configuration
-        MapPersistenceMode effectiveMode = config.mapPersistenceMode();
+        NMapPersistenceMode effectiveMode = config.mapPersistenceMode();
         if ("_ngrid-queue-offsets".equals(mapName)
-                && (effectiveMode == null || effectiveMode == MapPersistenceMode.DISABLED)) {
-            effectiveMode = MapPersistenceMode.ASYNC_WITH_FSYNC;
+                && (effectiveMode == null || effectiveMode == NMapPersistenceMode.DISABLED)) {
+            effectiveMode = NMapPersistenceMode.ASYNC_WITH_FSYNC;
         }
-        if (effectiveMode != null && effectiveMode != MapPersistenceMode.DISABLED) {
-            MapPersistenceConfig persistenceConfig = MapPersistenceConfig.defaults(
-                    config.mapDirectory(),
-                    mapName,
-                    effectiveMode);
+        if (effectiveMode != null && effectiveMode != NMapPersistenceMode.DISABLED) {
+            NMapConfig nmapConfig = NMapConfig.builder()
+                    .mode(effectiveMode)
+                    .build();
             MapClusterService<Serializable, Serializable> service = new MapClusterService<>(
                     replicationManager,
                     MapClusterService.topicFor(mapName),
-                    persistenceConfig);
+                    config.mapDirectory(),
+                    mapName,
+                    nmapConfig);
             service.loadFromDisk();
             return service;
         }

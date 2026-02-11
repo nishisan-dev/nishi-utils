@@ -15,17 +15,17 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>
  */
 
-package dev.nishisan.utils.ngrid.map;
+package dev.nishisan.utils.map;
 
 /**
  * Callback interface invoked when a persistence operation fails.
  * <p>
- * By default, {@link MapPersistence} uses a no-op listener. External components
+ * By default, {@link NMap} uses a no-op listener. External components
  * (metrics, alerting, circuit breakers) can register a custom listener via
- * {@link MapPersistenceConfig.Builder#healthListener(PersistenceHealthListener)}.
+ * {@link NMapConfig.Builder#healthListener(NMapHealthListener)}.
  */
 @FunctionalInterface
-public interface PersistenceHealthListener {
+public interface NMapHealthListener {
 
     /**
      * Called when a persistence operation fails.

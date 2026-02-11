@@ -17,22 +17,25 @@
 
 package dev.nishisan.utils.ngrid.map;
 
+import dev.nishisan.utils.map.NMapOperationType;
+
 import java.io.Serial;
 import java.io.Serializable;
 import java.util.Objects;
 
 /**
  * Serializable replication command for distributed map operations.
+ * Uses {@link NMapOperationType} to indicate the operation type.
  */
 public final class MapReplicationCommand implements Serializable {
     @Serial
     private static final long serialVersionUID = 1L;
 
-    private final MapReplicationCommandType type;
+    private final NMapOperationType type;
     private final Serializable key;
     private final Serializable value;
 
-    private MapReplicationCommand(MapReplicationCommandType type, Serializable key, Serializable value) {
+    private MapReplicationCommand(NMapOperationType type, Serializable key, Serializable value) {
         this.type = Objects.requireNonNull(type, "type");
         this.key = Objects.requireNonNull(key, "key");
         this.value = value;
@@ -46,7 +49,7 @@ public final class MapReplicationCommand implements Serializable {
      * @return the command
      */
     public static MapReplicationCommand put(Serializable key, Serializable value) {
-        return new MapReplicationCommand(MapReplicationCommandType.PUT, key, value);
+        return new MapReplicationCommand(NMapOperationType.PUT, key, value);
     }
 
     /**
@@ -56,7 +59,7 @@ public final class MapReplicationCommand implements Serializable {
      * @return the command
      */
     public static MapReplicationCommand remove(Serializable key) {
-        return new MapReplicationCommand(MapReplicationCommandType.REMOVE, key, null);
+        return new MapReplicationCommand(NMapOperationType.REMOVE, key, null);
     }
 
     /**
@@ -64,7 +67,7 @@ public final class MapReplicationCommand implements Serializable {
      * 
      * @return the type
      */
-    public MapReplicationCommandType type() {
+    public NMapOperationType type() {
         return type;
     }
 

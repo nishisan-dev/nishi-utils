@@ -17,7 +17,7 @@
 
 package dev.nishisan.utils.ngrid.metrics;
 
-import dev.nishisan.utils.ngrid.map.PersistenceHealthListener;
+import dev.nishisan.utils.map.NMapHealthListener;
 
 import java.io.Closeable;
 import java.time.Duration;
@@ -41,7 +41,7 @@ import java.util.logging.Logger;
  * <h2>Built-in Alert Types</h2>
  * <ul>
  * <li>{@code PERSISTENCE_FAILURE} — triggered via
- * {@link PersistenceHealthListener} callback (CRITICAL)</li>
+ * {@link NMapHealthListener} callback (CRITICAL)</li>
  * <li>{@code HIGH_REPLICATION_LAG} — replication lag exceeds threshold
  * (WARNING/CRITICAL)</li>
  * <li>{@code LEADER_LEASE_EXPIRED} — leader has no valid lease (CRITICAL)</li>
@@ -138,12 +138,12 @@ public final class NGridAlertEngine implements Closeable {
 
     /**
      * Manually fires a persistence failure alert. Intended to be called by the
-     * {@link PersistenceHealthListener} callback.
+     * {@link NMapHealthListener} callback.
      *
      * @param failureType the persistence failure type
      * @param cause       the exception that caused the failure
      */
-    public void firePersistenceFailure(PersistenceHealthListener.PersistenceFailureType failureType,
+    public void firePersistenceFailure(NMapHealthListener.PersistenceFailureType failureType,
             Throwable cause) {
         dispatch(NGridAlert.of(
                 PERSISTENCE_FAILURE,

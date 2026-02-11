@@ -1,6 +1,6 @@
 package dev.nishisan.utils.ngrid.metrics;
 
-import dev.nishisan.utils.ngrid.map.PersistenceHealthListener;
+import dev.nishisan.utils.map.NMapHealthListener;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -198,7 +198,7 @@ class NGridAlertEngineTest {
         engine.addListener(captured::add);
 
         engine.firePersistenceFailure(
-                PersistenceHealthListener.PersistenceFailureType.WAL_WRITE,
+                NMapHealthListener.PersistenceFailureType.WAL_WRITE,
                 new RuntimeException("disk full"));
 
         assertEquals(1, captured.size());

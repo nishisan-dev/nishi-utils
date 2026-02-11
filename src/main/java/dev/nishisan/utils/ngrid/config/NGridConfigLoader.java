@@ -13,7 +13,7 @@ import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-import dev.nishisan.utils.ngrid.map.MapPersistenceMode;
+import dev.nishisan.utils.map.NMapPersistenceMode;
 
 /**
  * Loads, saves, and converts NGrid YAML configuration files.
@@ -238,7 +238,7 @@ public class NGridConfigLoader {
                 if (persistence != null && !persistence.isBlank()) {
                     String normalized = persistence.trim().toUpperCase();
                     try {
-                        builder.mapPersistenceMode(MapPersistenceMode.valueOf(normalized));
+                        builder.mapPersistenceMode(NMapPersistenceMode.valueOf(normalized));
                     } catch (IllegalArgumentException ignored) {
                         // Ignore invalid values and keep defaults
                     }

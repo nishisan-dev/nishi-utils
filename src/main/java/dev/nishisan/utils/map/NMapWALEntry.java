@@ -15,14 +15,21 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>
  */
 
-package dev.nishisan.utils.ngrid.map;
+package dev.nishisan.utils.map;
+
+import java.io.Serializable;
 
 /**
- * Replication command types supported by distributed maps.
+ * A single WAL entry representing a mutating operation (PUT/REMOVE).
+ *
+ * @param timestamp the time the operation was recorded
+ * @param type      the operation type (PUT or REMOVE)
+ * @param key       the entry key
+ * @param value     the entry value, or {@code null} for REMOVE operations
  */
-public enum MapReplicationCommandType {
-    /** Insert or update an entry. */
-    PUT,
-    /** Remove an entry by key. */
-    REMOVE
+public record NMapWALEntry(
+        long timestamp,
+        NMapOperationType type,
+        Serializable key,
+        Serializable value) {
 }
