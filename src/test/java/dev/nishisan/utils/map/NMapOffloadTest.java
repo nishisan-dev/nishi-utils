@@ -22,7 +22,12 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -182,6 +187,65 @@ class NMapOffloadTest {
             // Mutate original — snapshot should not change
             map.put("c", "3");
             assertFalse(snap.containsKey("c"));
+        }
+    }
+
+    /**
+     * Verifica que duas chaves com mesmo {@code hashCode()} coexistem corretamente
+     * em disco.
+     * "Aa" e "BB" têm hashCode() == 2112 em Java (garantia do JLS para String).
+     * Antes da correção com SHA-1, ambas gerariam o mesmo nome de arquivo,
+     * silenciando um dos valores.
+     */
+    @Test
+    void diskOffloadHashCollisionTest() throws Exception {
+        String key1 = "Aa"; // hashCode = 2112
+        String key2 = "BB"; // hashCode = 2112
+        assertEquals(key1.hashCode(), key2.hashCode(), "Pre-condition: same hashCode");
+
+        try (NMap<String, String> map = NMap.open(tempDir, "hash-collision", diskConfig())) {
+            map.put(key1, "value-for-Aa");
+            map.put(key2, "value-for-BB");
+
+            assertEquals(Optional.of("value-for-Aa"), map.get(key1));
+            assertEquals(Optional.of("value-for-BB"), map.get(key2));
+            assertEquals(2, map.size());
+        }
+
+        // Verificar sobrevivência a restart
+        try (NMap<String, String> map = NMap.open(tempDir, "hash-collision", diskConfig())) {
+            assertEquals(Optional.of("value-for-Aa"), map.get(key1), "key1 deve sobreviver ao restart");
+            assertEquals(Optional.of("value-for-BB"), map.get(key2), "key2 deve sobreviver ao restart");
+            assertEquals(2, map.size());
+        }
+    }
+
+    /**
+     * Verifica que {@link DiskOffloadStrategy} é thread-safe sob carga concorrente
+     * de escritas e leituras.
+     */
+    @Test
+    void diskOffloadConcurrentPutAndGet() throws Exception {
+        int threads = 8;
+        int opsPerThread = 200;
+        try (NMap<String, String> map = NMap.open(tempDir, "concurrent", diskConfig())) {
+            ExecutorService exec = Executors.newFixedThreadPool(threads);
+            List<Future<?>> futures = new ArrayList<>();
+            for (int t = 0; t < threads; t++) {
+                int tid = t;
+                futures.add(exec.submit(() -> {
+                    for (int i = 0; i < opsPerThread; i++) {
+                        String key = "t" + tid + "-k" + i;
+                        map.put(key, "v" + i);
+                        map.get(key);
+                    }
+                }));
+            }
+            for (Future<?> f : futures) {
+                f.get(); // propaga exceções de threads
+            }
+            exec.shutdown();
+            assertEquals(threads * opsPerThread, map.size());
         }
     }
 }
