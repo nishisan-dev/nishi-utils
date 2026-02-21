@@ -92,6 +92,19 @@ public final class InMemoryStrategy<K extends Serializable, V extends Serializab
         data.putAll(entries);
     }
 
+    /**
+     * Returns the underlying {@link java.util.concurrent.ConcurrentHashMap}
+     * directly.
+     *
+     * <p>
+     * <b>Design note:</b> This intentionally exposes the mutable backing map to
+     * allow
+     * {@link NMapPersistence} (same package) to attach listeners and operate on
+     * live data
+     * without copying. Callers outside this package <em>must not</em> mutate the
+     * returned
+     * map directly; use the {@link NMap} API instead.
+     */
     @Override
     public Map<K, V> asMap() {
         return data;

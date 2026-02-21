@@ -261,6 +261,11 @@ public final class NMap<K extends Serializable, V extends Serializable> implemen
      * Returns an unmodifiable snapshot of the current map state.
      *
      * @return an immutable copy of the map
+     * @implNote When using a disk-backed strategy ({@link DiskOffloadStrategy},
+     *           {@link HybridOffloadStrategy}), this method iterates all entries
+     *           from disk and may perform N synchronous I/O operations —
+     *           potentially
+     *           slow for large maps. Use with caution in latency-sensitive paths.
      */
     public Map<K, V> snapshot() {
         return Collections.unmodifiableMap(new ConcurrentHashMap<>(storage.asMap()));
