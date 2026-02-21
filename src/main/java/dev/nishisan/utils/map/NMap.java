@@ -30,11 +30,12 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BiConsumer;
 
 /**
- * A standalone persistent map backed by a {@link ConcurrentHashMap} plus a
- * WAL + snapshot engine. Analogous to {@link dev.nishisan.utils.queue.NQueue},
- * {@code NMap} can be used <b>independently</b> of NGrid.
+ * A standalone persistent map backed by a pluggable storage strategy plus an
+ * optional WAL + snapshot engine. Analogous to
+ * {@link dev.nishisan.utils.queue.NQueue}, {@code NMap} can be used
+ * <b>independently</b> of NGrid.
  *
- * <h3>Quick start</h3>
+ * <h2>Quick start (in-memory, default)</h2>
  * 
  * <pre>{@code
  * try (NMap<String, String> map = NMap.open(Path.of("/data"), "mymap")) {
@@ -43,7 +44,20 @@ import java.util.function.BiConsumer;
  * }
  * }</pre>
  *
- * <h3>In-memory mode</h3>
+ * <h2>Disk offloading</h2>
+ * 
+ * <pre>{@code
+ * NMapConfig cfg = NMapConfig.builder()
+ *         .mode(NMapPersistenceMode.DISABLED) // WAL not needed
+ *         .offloadStrategyFactory(DiskOffloadStrategy::new)
+ *         .build();
+ * try (NMap<String, String> map = NMap.open(Path.of("/data"), "offloaded", cfg)) {
+ *     map.put("key", "value");
+ *     // Entry is stored on disk, not in heap
+ * }
+ * }</pre>
+ *
+ * <h2>In-memory mode</h2>
  * 
  * <pre>{@code
  * try (NMap<String, String> map = NMap.open(Path.of("/tmp"), "ephemeral", NMapConfig.inMemory())) {
@@ -56,7 +70,7 @@ import java.util.function.BiConsumer;
  */
 public final class NMap<K extends Serializable, V extends Serializable> implements Closeable {
 
-    private final ConcurrentHashMap<K, V> data;
+    private final NMapOffloadStrategy<K, V> storage;
     private final NMapPersistence<K, V> persistence;
     private final NMapConfig config;
     private final String name;
@@ -64,10 +78,17 @@ public final class NMap<K extends Serializable, V extends Serializable> implemen
     private NMap(Path baseDir, String name, NMapConfig config) {
         this.name = Objects.requireNonNull(name, "name");
         this.config = Objects.requireNonNull(config, "config");
-        this.data = new ConcurrentHashMap<>();
 
-        if (config.mode() != NMapPersistenceMode.DISABLED) {
-            this.persistence = new NMapPersistence<>(config, data, baseDir, name);
+        // Instantiate storage strategy
+        if (config.offloadStrategyFactory() != null) {
+            this.storage = config.offloadStrategyFactory().create(baseDir, name);
+        } else {
+            this.storage = new InMemoryStrategy<>();
+        }
+
+        // Persistence engine: only for non-inherently-persistent strategies
+        if (config.mode() != NMapPersistenceMode.DISABLED && !storage.isInherentlyPersistent()) {
+            this.persistence = new NMapPersistence<>(config, storage.asMap(), baseDir, name);
         } else {
             this.persistence = null;
         }
@@ -125,7 +146,7 @@ public final class NMap<K extends Serializable, V extends Serializable> implemen
     public Optional<V> put(K key, V value) {
         Objects.requireNonNull(key, "key");
         Objects.requireNonNull(value, "value");
-        V prev = data.put(key, value);
+        V prev = storage.put(key, value);
         if (persistence != null) {
             persistence.appendAsync(NMapOperationType.PUT, key, value);
         }
@@ -140,7 +161,7 @@ public final class NMap<K extends Serializable, V extends Serializable> implemen
      */
     public Optional<V> remove(K key) {
         Objects.requireNonNull(key, "key");
-        V prev = data.remove(key);
+        V prev = storage.remove(key);
         if (prev != null && persistence != null) {
             persistence.appendAsync(NMapOperationType.REMOVE, key, null);
         }
@@ -162,9 +183,9 @@ public final class NMap<K extends Serializable, V extends Serializable> implemen
      */
     public void clear() {
         if (persistence != null) {
-            data.keySet().forEach(k -> persistence.appendAsync(NMapOperationType.REMOVE, k, null));
+            storage.keySet().forEach(k -> persistence.appendAsync(NMapOperationType.REMOVE, k, null));
         }
-        data.clear();
+        storage.clear();
     }
 
     // ── Read Operations ─────────────────────────────────────────────────
@@ -177,7 +198,7 @@ public final class NMap<K extends Serializable, V extends Serializable> implemen
      */
     public Optional<V> get(K key) {
         Objects.requireNonNull(key, "key");
-        return Optional.ofNullable(data.get(key));
+        return Optional.ofNullable(storage.get(key));
     }
 
     /**
@@ -188,7 +209,7 @@ public final class NMap<K extends Serializable, V extends Serializable> implemen
      */
     public boolean containsKey(K key) {
         Objects.requireNonNull(key, "key");
-        return data.containsKey(key);
+        return storage.containsKey(key);
     }
 
     /**
@@ -197,7 +218,7 @@ public final class NMap<K extends Serializable, V extends Serializable> implemen
      * @return the number of entries
      */
     public int size() {
-        return data.size();
+        return storage.size();
     }
 
     /**
@@ -206,7 +227,7 @@ public final class NMap<K extends Serializable, V extends Serializable> implemen
      * @return true if the map is empty
      */
     public boolean isEmpty() {
-        return data.isEmpty();
+        return storage.isEmpty();
     }
 
     /**
@@ -215,7 +236,7 @@ public final class NMap<K extends Serializable, V extends Serializable> implemen
      * @return the keys
      */
     public Set<K> keySet() {
-        return Collections.unmodifiableSet(data.keySet());
+        return Collections.unmodifiableSet(storage.keySet());
     }
 
     /**
@@ -224,7 +245,7 @@ public final class NMap<K extends Serializable, V extends Serializable> implemen
      * @return the entries
      */
     public Set<Map.Entry<K, V>> entrySet() {
-        return Collections.unmodifiableSet(data.entrySet());
+        return Collections.unmodifiableSet(storage.entrySet());
     }
 
     /**
@@ -233,7 +254,7 @@ public final class NMap<K extends Serializable, V extends Serializable> implemen
      * @param action the action to run on each entry
      */
     public void forEach(BiConsumer<? super K, ? super V> action) {
-        data.forEach(action);
+        storage.forEach(action);
     }
 
     /**
@@ -242,7 +263,7 @@ public final class NMap<K extends Serializable, V extends Serializable> implemen
      * @return an immutable copy of the map
      */
     public Map<K, V> snapshot() {
-        return Collections.unmodifiableMap(new ConcurrentHashMap<>(data));
+        return Collections.unmodifiableMap(new ConcurrentHashMap<>(storage.asMap()));
     }
 
     /**
@@ -269,10 +290,14 @@ public final class NMap<K extends Serializable, V extends Serializable> implemen
      * Provides direct access to the underlying map for NGrid's
      * {@code MapClusterService}. Package-private.
      *
-     * @return the underlying concurrent map
+     * @return the underlying concurrent map (only valid for in-memory strategy)
      */
     ConcurrentHashMap<K, V> internalMap() {
-        return data;
+        if (storage instanceof InMemoryStrategy<K, V> inMem) {
+            return inMem.internalMap();
+        }
+        throw new UnsupportedOperationException(
+                "internalMap() is only supported with InMemoryStrategy");
     }
 
     /**
@@ -285,6 +310,15 @@ public final class NMap<K extends Serializable, V extends Serializable> implemen
         return persistence;
     }
 
+    /**
+     * Returns the active offload strategy. Package-private.
+     *
+     * @return the strategy
+     */
+    NMapOffloadStrategy<K, V> strategy() {
+        return storage;
+    }
+
     // ── Lifecycle ───────────────────────────────────────────────────────
 
     @Override
@@ -292,5 +326,6 @@ public final class NMap<K extends Serializable, V extends Serializable> implemen
         if (persistence != null) {
             persistence.close();
         }
+        storage.close();
     }
 }
