@@ -394,20 +394,62 @@ public class NQueue<T extends Serializable> implements Closeable {
      * @throws IOException if the enqueue cannot be acknowledged due to storage
      *                     errors
      */
+    /**
+     * Enqueues a record without a key or headers. See
+     * {@link #offer(byte[], NQueueHeaders, Object)} for the full signature.
+     *
+     * @param object element to append
+     * @return logical offset of the appended record, or {@link #OFFSET_HANDOFF}
+     * @throws IOException if persistence fails
+     */
     public long offer(T object) throws IOException {
+        return offer(null, NQueueHeaders.empty(), object);
+    }
+
+    /**
+     * Enqueues a record with a routing key but no custom headers.
+     *
+     * @param key    optional routing/partitioning key ({@code null} = absent)
+     * @param object element to append
+     * @return logical offset of the appended record, or {@link #OFFSET_HANDOFF}
+     * @throws IOException if persistence fails
+     */
+    public long offer(byte[] key, T object) throws IOException {
+        return offer(key, NQueueHeaders.empty(), object);
+    }
+
+    /**
+     * Enqueues a record with a routing key and custom headers.
+     * <p>
+     * Depending on configuration and current conditions, the record may be staged
+     * in memory and durably appended later, or appended directly to the durable
+     * log.
+     *
+     * @param key     optional routing/partitioning key ({@code null} = absent)
+     * @param headers record headers; use {@link NQueueHeaders#empty()} when none
+     * @param object  element to append; must be non-null and serializable
+     * @return logical offset of the appended record, or {@link #OFFSET_HANDOFF}
+     *         when handed off directly to a waiting consumer
+     * @throws IOException if the enqueue cannot be acknowledged due to storage
+     *                     errors
+     */
+    public long offer(byte[] key, NQueueHeaders headers, T object) throws IOException {
         Objects.requireNonNull(object);
+        Objects.requireNonNull(headers);
 
         if (enableMemoryBuffer) {
             if (System.nanoTime() < memoryBufferModeUntil.get())
-                return offerToMemory(object, true);
+                return offerToMemory(key, headers, object, true);
             if (lock.tryLock()) {
                 try {
                     // Short-circuit: if queue is empty (disk + memory) and a consumer is waiting,
-                    // handoff directly.
-                    if (options.allowShortCircuit && recordCount == 0 && handoffItem == null && drainingQueue.isEmpty()
-                            && memoryBuffer.isEmpty() && lock.hasWaiters(notEmpty)) {
+                    // handoff directly. Key/headers are not carried through the short-circuit path
+                    // (handoff bypasses disk), so we skip it when a key is present to ensure
+                    // key is always stored durably.
+                    if (key == null && options.allowShortCircuit && recordCount == 0 && handoffItem == null
+                            && drainingQueue.isEmpty() && memoryBuffer.isEmpty() && lock.hasWaiters(notEmpty)) {
                         long seq = globalSequence.incrementAndGet();
-                        PreIndexedItem<T> pItem = new PreIndexedItem<>(object, seq);
+                        PreIndexedItem<T> pItem = new PreIndexedItem<>(object, seq, null, NQueueHeaders.empty());
                         handoffItem = pItem;
                         notEmpty.signal();
                         statsUtils.notifyHitCounter(NQueueMetrics.OFFERED_EVENT);
@@ -416,10 +458,10 @@ public class NQueue<T extends Serializable> implements Closeable {
 
                     if (compactionState == CompactionState.RUNNING) {
                         activateMemoryMode();
-                        return offerToMemory(object, false);
+                        return offerToMemory(key, headers, object, false);
                     }
                     drainMemoryBufferSync();
-                    long offset = offerDirectLocked(object);
+                    long offset = offerDirectLocked(key, headers, object);
                     triggerDrainIfNeeded();
                     return offset;
                 } finally {
@@ -427,21 +469,22 @@ public class NQueue<T extends Serializable> implements Closeable {
                 }
             } else {
                 activateMemoryMode();
-                return offerToMemory(object, false);
+                return offerToMemory(key, headers, object, false);
             }
         } else {
             lock.lock();
             try {
-                // Short-circuit: if queue is empty and a consumer is waiting, handoff directly.
-                if (options.allowShortCircuit && recordCount == 0 && handoffItem == null && lock.hasWaiters(notEmpty)) {
+                // Short-circuit: skip when key is present (must go to disk for durability)
+                if (key == null && options.allowShortCircuit && recordCount == 0 && handoffItem == null
+                        && lock.hasWaiters(notEmpty)) {
                     long seq = globalSequence.incrementAndGet();
-                    PreIndexedItem<T> pItem = new PreIndexedItem<>(object, seq);
+                    PreIndexedItem<T> pItem = new PreIndexedItem<>(object, seq, null, NQueueHeaders.empty());
                     handoffItem = pItem;
                     notEmpty.signal();
                     statsUtils.notifyHitCounter(NQueueMetrics.OFFERED_EVENT);
                     return OFFSET_HANDOFF;
                 }
-                return offerDirectLocked(object);
+                return offerDirectLocked(key, headers, object);
             } finally {
                 lock.unlock();
             }
@@ -986,9 +1029,9 @@ public class NQueue<T extends Serializable> implements Closeable {
      * @return logical durable offset of the appended record
      * @throws IOException if the append cannot be acknowledged
      */
-    private long offerDirectLocked(T object) throws IOException {
+    private long offerDirectLocked(byte[] key, NQueueHeaders headers, T object) throws IOException {
         long seq = globalSequence.incrementAndGet();
-        PreIndexedItem<T> pItem = new PreIndexedItem<>(object, seq);
+        PreIndexedItem<T> pItem = new PreIndexedItem<>(object, seq, key, headers);
         return offerBatchLocked(List.of(pItem), true);
     }
 
@@ -1014,9 +1057,14 @@ public class NQueue<T extends Serializable> implements Closeable {
             T obj = pItem.item();
             byte[] payload = toBytes(obj);
             long idx = pItem.index();
-            lastIndex = idx; // Update lastIndex to the sequence provided
+            lastIndex = idx;
 
-            NQueueRecordMetaData meta = new NQueueRecordMetaData(idx, System.currentTimeMillis(), payload.length,
+            NQueueRecordMetaData meta = new NQueueRecordMetaData(
+                    idx,
+                    System.currentTimeMillis(),
+                    pItem.key(),
+                    pItem.headers(),
+                    payload.length,
                     obj.getClass().getCanonicalName());
             ByteBuffer hb = meta.toByteBuffer();
             long rStart = writePos;
@@ -1316,7 +1364,8 @@ public class NQueue<T extends Serializable> implements Closeable {
      *         drain
      * @throws IOException if a fallback durable append is attempted and fails
      */
-    private long offerToMemory(T object, boolean revalidateIfFull) throws IOException {
+    private long offerToMemory(byte[] key, NQueueHeaders headers, T object, boolean revalidateIfFull)
+            throws IOException {
         try {
             if (revalidateIfFull && memoryBuffer.remainingCapacity() == 0) {
                 revalidateMemoryMode();
@@ -1324,7 +1373,7 @@ public class NQueue<T extends Serializable> implements Closeable {
                     try {
                         if (compactionState != CompactionState.RUNNING) {
                             drainMemoryBufferSync();
-                            return offerDirectLocked(object);
+                            return offerDirectLocked(key, headers, object);
                         }
                     } finally {
                         lock.unlock();
@@ -1333,7 +1382,7 @@ public class NQueue<T extends Serializable> implements Closeable {
             }
             synchronized (memoryMutex) {
                 long seq = globalSequence.incrementAndGet();
-                MemoryBufferEntry<T> e = new MemoryBufferEntry<>(object, seq);
+                MemoryBufferEntry<T> e = new MemoryBufferEntry<>(object, seq, key, headers);
                 if (!memoryBuffer.offer(e))
                     memoryBuffer.put(e);
             }
@@ -1419,7 +1468,7 @@ public class NQueue<T extends Serializable> implements Closeable {
                 MemoryBufferEntry<T> ent = drainingQueue.poll();
                 if (ent == null)
                     break;
-                batch.add(new PreIndexedItem<>(ent.item, ent.index));
+                batch.add(new PreIndexedItem<>(ent.item, ent.index, ent.key, ent.headers));
                 entries.add(ent);
             }
             if (batch.isEmpty())
@@ -1687,7 +1736,8 @@ public class NQueue<T extends Serializable> implements Closeable {
      * Ela se relaciona com outros componentes responsáveis pela manipulação da
      * coleção, como os métodos de inclusão e remoção de elementos.
      */
-    private static record PreIndexedItem<T>(T item, long index) implements Serializable {
+    private static record PreIndexedItem<T>(T item, long index, byte[] key, NQueueHeaders headers)
+            implements Serializable {
         private static final long serialVersionUID = 1L;
     }
 
@@ -1745,17 +1795,24 @@ public class NQueue<T extends Serializable> implements Closeable {
         final T item;
         final long index;
         final long timestamp;
+        final byte[] key;
+        final NQueueHeaders headers;
 
         /**
          * Captures an element destined for later durable append along with its arrival
          * timestamp.
          *
-         * @param item element to stage
+         * @param item    element to stage
+         * @param index   pre-assigned sequence index
+         * @param key     optional routing key
+         * @param headers record headers
          */
-        MemoryBufferEntry(T item, long index) {
+        MemoryBufferEntry(T item, long index, byte[] key, NQueueHeaders headers) {
             this.item = item;
             this.index = index;
             this.timestamp = System.nanoTime();
+            this.key = key;
+            this.headers = headers != null ? headers : NQueueHeaders.empty();
         }
     }
 
