@@ -41,7 +41,7 @@ class NQueueMemoryBufferTest {
 
     @TempDir
     Path tempDir;
-    
+
     private final List<NQueue<?>> trackedQueues = Collections.synchronizedList(new ArrayList<>());
 
     private <T extends Serializable> NQueue<T> track(NQueue<T> queue) {
@@ -206,7 +206,7 @@ class NQueueMemoryBufferTest {
                 .withFsync(false);
 
         NQueue<String> queue = track(NQueue.open(tempDir, "close-test", options));
-        
+
         // Add items that might be in memory buffer
         for (int i = 0; i < 10; i++) {
             queue.offer("item-" + i);
@@ -446,13 +446,13 @@ class NQueueMemoryBufferTest {
                         start.await();
                         long startTime = System.currentTimeMillis();
                         long maxWaitTime = 60_000; // 60 seconds max
-                        
+
                         while (consumed.get() < totalItems) {
                             // Safety timeout to prevent infinite loops
                             if (System.currentTimeMillis() - startTime > maxWaitTime) {
                                 break;
                             }
-                            
+
                             Optional<Integer> item = queue.poll(100, TimeUnit.MILLISECONDS);
                             if (item.isPresent()) {
                                 consumedList.add(item.get());
@@ -494,7 +494,7 @@ class NQueueMemoryBufferTest {
                                 }
                             }
                         }
-                        
+
                         // After main loop, if producers are done, try to consume any remaining items
                         if (producersDone.get() && consumed.get() < totalItems) {
                             try {
@@ -519,14 +519,14 @@ class NQueueMemoryBufferTest {
 
             start.countDown();
             executor.shutdown();
-            
+
             // Verify that all threads terminated successfully
             boolean terminated = executor.awaitTermination(60, TimeUnit.SECONDS);
             if (!terminated) {
                 executor.shutdownNow();
                 executor.awaitTermination(5, TimeUnit.SECONDS);
-                fail("Test did not complete within timeout. Produced: " + produced.get() + 
-                     ", Consumed: " + consumed.get() + ", Queue size: " + queue.size());
+                fail("Test did not complete within timeout. Produced: " + produced.get() +
+                        ", Consumed: " + consumed.get() + ", Queue size: " + queue.size());
             }
 
             // Try to consume any remaining items before closing
@@ -545,13 +545,13 @@ class NQueueMemoryBufferTest {
             }
 
             // Verify all items were produced
-            assertTrue(produced.get() >= totalItems, 
-                "Not all items were produced. Expected at least " + totalItems + ", got " + produced.get());
+            assertTrue(produced.get() >= totalItems,
+                    "Not all items were produced. Expected at least " + totalItems + ", got " + produced.get());
 
             // Verify all items were consumed
             assertEquals(totalItems, consumedList.size(),
-                "Not all items were consumed. Expected " + totalItems + ", got " + consumedList.size() + 
-                ". Produced: " + produced.get() + ", Consumed counter: " + consumed.get());
+                    "Not all items were consumed. Expected " + totalItems + ", got " + consumedList.size() +
+                            ". Produced: " + produced.get() + ", Consumed counter: " + consumed.get());
         } finally {
             executor.shutdownNow();
             executor.awaitTermination(5, TimeUnit.SECONDS);
@@ -640,8 +640,10 @@ class NQueueMemoryBufferTest {
             Constructor<?> constructor = getMemoryBufferEntryConstructor();
             BlockingQueue<Object> memoryBuffer = getMemoryBuffer(queue);
 
-            memoryBuffer.offer(constructor.newInstance(1, 1L));
-            memoryBuffer.offer(constructor.newInstance(2, 2L));
+            // Pass null for key and NQueueHeaders.empty() for headers
+            Object emptyHeaders = dev.nishisan.utils.queue.NQueueHeaders.empty();
+            memoryBuffer.offer(constructor.newInstance(1, 1L, null, emptyHeaders));
+            memoryBuffer.offer(constructor.newInstance(2, 2L, null, emptyHeaders));
 
             setAtomicLong(queue, "memoryBufferModeUntil", System.nanoTime() + TimeUnit.SECONDS.toNanos(1));
             setField(queue, "compactionState", getCompactionState("RUNNING"));
@@ -679,7 +681,9 @@ class NQueueMemoryBufferTest {
 
     private static Constructor<?> getMemoryBufferEntryConstructor() throws Exception {
         Class<?> entryClass = Class.forName("dev.nishisan.utils.queue.NQueue$MemoryBufferEntry");
-        Constructor<?> constructor = entryClass.getDeclaredConstructor(Object.class, long.class);
+        Constructor<?> constructor = entryClass.getDeclaredConstructor(
+                Object.class, long.class, byte[].class,
+                Class.forName("dev.nishisan.utils.queue.NQueueHeaders"));
         constructor.setAccessible(true);
         return constructor;
     }
@@ -710,7 +714,8 @@ class NQueueMemoryBufferTest {
         return field.get(target);
     }
 
-    private static void awaitCondition(BooleanSupplier condition, long timeout, TimeUnit unit) throws InterruptedException {
+    private static void awaitCondition(BooleanSupplier condition, long timeout, TimeUnit unit)
+            throws InterruptedException {
         long deadline = System.nanoTime() + unit.toNanos(timeout);
         while (System.nanoTime() < deadline) {
             if (condition.getAsBoolean()) {
