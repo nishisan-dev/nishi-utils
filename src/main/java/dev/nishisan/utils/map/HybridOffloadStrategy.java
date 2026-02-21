@@ -21,6 +21,7 @@ import dev.nishisan.utils.stats.StatsUtils;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
@@ -29,9 +30,12 @@ import java.io.UncheckedIOException;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.AbstractMap;
 import java.util.AbstractSet;
 import java.util.Collections;
+import java.util.HexFormat;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -490,10 +494,31 @@ public final class HybridOffloadStrategy<K extends Serializable, V extends Seria
 
     // ── Disk I/O ────────────────────────────────────────────────────────
 
+    /**
+     * Generates a collision-free file path for a given key using a SHA-1
+     * digest of the serialized key bytes. Unlike {@code hashCode()}, SHA-1
+     * produces a 160-bit fingerprint that never collides in practice, ensuring
+     * two distinct keys always map to different files.
+     */
     private Path pathForKey(K key) {
-        int hash = key.hashCode();
-        String fileName = String.format("%08x", hash) + ENTRY_SUFFIX;
-        return offloadDir.resolve(fileName);
+        return offloadDir.resolve(keyHash(key) + ENTRY_SUFFIX);
+    }
+
+    /**
+     * Computes the SHA-1 hex digest of the serialized key.
+     */
+    private String keyHash(K key) {
+        try {
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            try (ObjectOutputStream oos = new ObjectOutputStream(baos)) {
+                oos.writeObject(key);
+            }
+            byte[] digest = MessageDigest.getInstance("SHA-1").digest(baos.toByteArray());
+            return HexFormat.of().formatHex(digest);
+        } catch (IOException | NoSuchAlgorithmException e) {
+            // SHA-1 is always available per JDK spec; IO on byte array never fails
+            throw new UncheckedIOException(new IOException("Failed to compute key hash", e));
+        }
     }
 
     private void serializeEntry(Path path, K key, V value) throws IOException {

@@ -19,6 +19,7 @@ package dev.nishisan.utils.map;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
@@ -28,14 +29,18 @@ import java.lang.ref.SoftReference;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.AbstractMap;
 import java.util.AbstractSet;
 import java.util.Collections;
+import java.util.HexFormat;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.BiConsumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -48,6 +53,12 @@ import java.util.logging.Logger;
  * keys to their file locations, keeping heap usage minimal. An optional
  * {@link SoftReference} cache avoids re-reads for hot entries; the JVM
  * will reclaim cached values under memory pressure.
+ * <p>
+ * <b>Thread safety:</b> All public operations are protected by a
+ * {@link ReentrantReadWriteLock}. Mutating operations ({@code put},
+ * {@code remove}, {@code get} when a cache miss triggers a cache update)
+ * acquire the write lock; read-only queries ({@code containsKey},
+ * {@code size}, {@code isEmpty}, {@code keySet}) acquire the read lock.
  * <p>
  * <b>Trade-offs:</b>
  * <ul>
@@ -72,6 +83,7 @@ public final class DiskOffloadStrategy<K extends Serializable, V extends Seriali
     private final Path offloadDir;
     private final ConcurrentHashMap<K, Path> index = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<K, SoftReference<V>> cache = new ConcurrentHashMap<>();
+    private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
 
     /**
      * Creates a new disk offload strategy.
@@ -93,81 +105,116 @@ public final class DiskOffloadStrategy<K extends Serializable, V extends Seriali
 
     @Override
     public V get(K key) {
-        if (!index.containsKey(key)) {
-            return null;
-        }
-        // Check soft cache first
-        SoftReference<V> ref = cache.get(key);
-        if (ref != null) {
-            V cached = ref.get();
-            if (cached != null) {
-                return cached;
-            }
-        }
-        // Cache miss — read from disk
-        Path path = index.get(key);
-        if (path == null || !Files.exists(path)) {
-            index.remove(key);
-            cache.remove(key);
-            return null;
-        }
+        lock.writeLock().lock();
         try {
-            V value = deserialize(path);
-            cache.put(key, new SoftReference<>(value));
-            return value;
-        } catch (IOException e) {
-            LOGGER.log(Level.WARNING, "Failed to read offloaded entry: " + path, e);
-            return null;
+            if (!index.containsKey(key)) {
+                return null;
+            }
+            // Check soft cache first
+            SoftReference<V> ref = cache.get(key);
+            if (ref != null) {
+                V cached = ref.get();
+                if (cached != null) {
+                    return cached;
+                }
+            }
+            // Cache miss — read from disk
+            Path path = index.get(key);
+            if (path == null || !Files.exists(path)) {
+                index.remove(key);
+                cache.remove(key);
+                return null;
+            }
+            try {
+                V value = deserialize(path);
+                cache.put(key, new SoftReference<>(value));
+                return value;
+            } catch (IOException e) {
+                LOGGER.log(Level.WARNING, "Failed to read offloaded entry: " + path, e);
+                return null;
+            }
+        } finally {
+            lock.writeLock().unlock();
         }
     }
 
     @Override
     public V put(K key, V value) {
-        V previous = get(key);
-        Path path = pathForKey(key);
+        lock.writeLock().lock();
         try {
-            serialize(path, key, value);
-            index.put(key, path);
-            cache.put(key, new SoftReference<>(value));
-        } catch (IOException e) {
-            LOGGER.log(Level.WARNING, "Failed to write offloaded entry", e);
+            V previous = get(key);
+            Path path = pathForKey(key);
+            try {
+                serialize(path, key, value);
+                index.put(key, path);
+                cache.put(key, new SoftReference<>(value));
+            } catch (IOException e) {
+                LOGGER.log(Level.WARNING, "Failed to write offloaded entry", e);
+            }
+            return previous;
+        } finally {
+            lock.writeLock().unlock();
         }
-        return previous;
     }
 
     @Override
     public V remove(K key) {
-        V previous = get(key);
-        Path path = index.remove(key);
-        cache.remove(key);
-        if (path != null) {
-            try {
-                Files.deleteIfExists(path);
-            } catch (IOException e) {
-                LOGGER.log(Level.WARNING, "Failed to delete offloaded entry: " + path, e);
+        lock.writeLock().lock();
+        try {
+            V previous = get(key);
+            Path path = index.remove(key);
+            cache.remove(key);
+            if (path != null) {
+                try {
+                    Files.deleteIfExists(path);
+                } catch (IOException e) {
+                    LOGGER.log(Level.WARNING, "Failed to delete offloaded entry: " + path, e);
+                }
             }
+            return previous;
+        } finally {
+            lock.writeLock().unlock();
         }
-        return previous;
     }
 
     @Override
     public boolean containsKey(K key) {
-        return index.containsKey(key);
+        lock.readLock().lock();
+        try {
+            return index.containsKey(key);
+        } finally {
+            lock.readLock().unlock();
+        }
     }
 
     @Override
     public int size() {
-        return index.size();
+        lock.readLock().lock();
+        try {
+            return index.size();
+        } finally {
+            lock.readLock().unlock();
+        }
     }
 
     @Override
     public boolean isEmpty() {
-        return index.isEmpty();
+        lock.readLock().lock();
+        try {
+            return index.isEmpty();
+        } finally {
+            lock.readLock().unlock();
+        }
     }
 
     @Override
     public Set<K> keySet() {
-        return Collections.unmodifiableSet(index.keySet());
+        lock.readLock().lock();
+        try {
+            return Collections.unmodifiableSet(index.keySet());
+        } finally {
+            lock.readLock().unlock();
+        }
     }
 
     @Override
@@ -285,13 +332,30 @@ public final class DiskOffloadStrategy<K extends Serializable, V extends Seriali
     // ── Internal helpers ────────────────────────────────────────────────
 
     /**
-     * Generates a deterministic file path for a given key.
+     * Generates a collision-free file path for a given key using a SHA-1
+     * digest of the serialized key bytes. Unlike {@code hashCode()}, SHA-1
+     * produces a 160-bit fingerprint that never collides in practice, ensuring
+     * two distinct keys always map to different files.
      */
     private Path pathForKey(K key) {
-        int hash = key.hashCode();
-        // Use hex encoding of the hash for a flat namespace
-        String fileName = String.format("%08x", hash) + ENTRY_SUFFIX;
-        return offloadDir.resolve(fileName);
+        return offloadDir.resolve(keyHash(key) + ENTRY_SUFFIX);
+    }
+
+    /**
+     * Computes the SHA-1 hex digest of the serialized key.
+     */
+    private String keyHash(K key) {
+        try {
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            try (ObjectOutputStream oos = new ObjectOutputStream(baos)) {
+                oos.writeObject(key);
+            }
+            byte[] digest = MessageDigest.getInstance("SHA-1").digest(baos.toByteArray());
+            return HexFormat.of().formatHex(digest);
+        } catch (IOException | NoSuchAlgorithmException e) {
+            // SHA-1 is always available per JDK spec; IO on byte array never fails
+            throw new UncheckedIOException(new IOException("Failed to compute key hash", e));
+        }
     }
 
     /**
