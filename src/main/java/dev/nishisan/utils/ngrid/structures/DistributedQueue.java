@@ -118,6 +118,16 @@ public final class DistributedQueue<T extends Serializable>
     }
 
     /**
+     * Returns the underlying {@link QueueClusterService}.
+     *
+     * <p>
+     * <b>For testing only.</b> Do not use in production code.
+     */
+    public QueueClusterService<T> queueService() {
+        return queueService;
+    }
+
+    /**
      * Offers an element to the distributed queue without key or headers.
      *
      * @param value the element to offer

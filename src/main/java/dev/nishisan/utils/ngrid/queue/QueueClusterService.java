@@ -499,6 +499,16 @@ public final class QueueClusterService<T extends Serializable> implements Closea
         return options;
     }
 
+    /**
+     * Returns the underlying {@link NQueue} instance.
+     *
+     * <p>
+     * <b>For testing only.</b> Do not use in production code.
+     */
+    public NQueue<T> queue() {
+        return queue;
+    }
+
     /** {@inheritDoc} */
     @Override
     public void close() throws IOException {
