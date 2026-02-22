@@ -160,11 +160,8 @@ public final class DistributedQueue<T extends Serializable>
             queueService.offer(key, headers, value);
             notifySubscribers();
         } else {
-            // Forward to leader; key/headers are embedded in OfferPayload for transmission.
-            // For simplicity we reuse the same value path; key/headers routing at the
-            // leader
-            // is handled by QueueClusterService which receives the command via replication.
-            invokeLeader(queueOfferCommand, value);
+            // Forward to leader with full metadata via OfferPayload envelope.
+            invokeLeader(queueOfferCommand, new OfferPayload<>(key, headers, value));
         }
     }
 
@@ -323,7 +320,13 @@ public final class DistributedQueue<T extends Serializable>
     private Serializable executeLocal(String command, Serializable body, NodeId requestingNode) {
         if (queueOfferCommand.equals(command)) {
             recordQueueOffer();
-            queueService.offer((T) body);
+            if (body instanceof OfferPayload<?>) {
+                OfferPayload<T> payload = (OfferPayload<T>) body;
+                queueService.offer(payload.key(), payload.headers(), payload.value());
+            } else {
+                // Legacy path: plain value without key/headers
+                queueService.offer((T) body);
+            }
             notifySubscribers();
             return Boolean.TRUE;
         }
