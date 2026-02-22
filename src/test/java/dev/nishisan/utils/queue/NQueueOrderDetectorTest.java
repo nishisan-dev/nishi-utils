@@ -65,37 +65,38 @@ class NQueueOrderDetectorTest {
                 .withCompactionWasteThreshold(0.1)
                 .withCompactionInterval(Duration.ofMillis(50))
                 .withRevalidationInterval(Duration.ofMillis(10))
-                .withLockTryTimeout(Duration.ofMillis(1));
+                .withLockTryTimeout(Duration.ofMillis(1))
+                .withShortCircuit(false);
+
+        // Order detection validates delivery order of indices assigned by the
+        // global sequence counter. With multiple concurrent producers the
+        // assignment order is non-deterministic, so the detector would report
+        // false positives. We therefore use a single producer here.
+        int total = 2000;
 
         try (NQueue<Integer> queue = NQueue.open(tempDir, "mem-compact-detector", options)) {
-            int producers = 4;
-            int perProducer = 500;
-            int total = producers * perProducer;
-
-            ExecutorService exec = Executors.newFixedThreadPool(producers + 2);
+            ExecutorService exec = Executors.newFixedThreadPool(2);
             try {
                 CountDownLatch start = new CountDownLatch(1);
                 List<Future<?>> futures = new ArrayList<>();
 
-                // Producers
-                for (int p = 0; p < producers; p++) {
-                    final int id = p;
-                    futures.add(exec.submit(() -> {
-                        start.await();
-                        for (int i = 0; i < perProducer; i++) {
-                            queue.offer(id * perProducer + i);
-                        }
-                        return null;
-                    }));
-                }
+                // Single producer – ensures global sequence matches write order.
+                futures.add(exec.submit(() -> {
+                    start.await();
+                    for (int i = 0; i < total; i++) {
+                        queue.offer(i);
+                    }
+                    return null;
+                }));
 
-                // Consumers
+                // Single consumer
                 futures.add(exec.submit(() -> {
                     start.await();
                     int consumed = 0;
                     while (consumed < total) {
                         Optional<Integer> v = queue.poll(2, TimeUnit.SECONDS);
-                        if (v.isPresent()) consumed++;
+                        if (v.isPresent())
+                            consumed++;
                     }
                     return null;
                 }));
@@ -118,4 +119,3 @@ class NQueueOrderDetectorTest {
         }
     }
 }
-

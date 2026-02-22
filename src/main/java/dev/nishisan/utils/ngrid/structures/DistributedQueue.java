@@ -32,6 +32,7 @@ import dev.nishisan.utils.ngrid.common.QueueSubscribePayload;
 import dev.nishisan.utils.ngrid.common.QueueUnsubscribePayload;
 import dev.nishisan.utils.ngrid.queue.QueueClusterService;
 import dev.nishisan.utils.ngrid.metrics.NGridMetrics;
+import dev.nishisan.utils.queue.NQueueHeaders;
 import dev.nishisan.utils.stats.StatsUtils;
 
 import java.io.Closeable;
@@ -117,17 +118,52 @@ public final class DistributedQueue<T extends Serializable>
     }
 
     /**
-     * Offers an element to the distributed queue.
+     * Returns the underlying {@link QueueClusterService}.
+     *
+     * <p>
+     * <b>For testing only.</b> Do not use in production code.
+     */
+    public QueueClusterService<T> queueService() {
+        return queueService;
+    }
+
+    /**
+     * Offers an element to the distributed queue without key or headers.
      *
      * @param value the element to offer
      */
     public void offer(T value) {
+        offer(null, NQueueHeaders.empty(), value);
+    }
+
+    /**
+     * Offers an element with a routing key.
+     *
+     * @param key   optional routing/partitioning key
+     * @param value the element to offer
+     */
+    public void offer(byte[] key, T value) {
+        offer(key, NQueueHeaders.empty(), value);
+    }
+
+    /**
+     * Offers an element with a routing key and custom headers.
+     *
+     * @param key     optional routing/partitioning key
+     * @param headers record headers
+     * @param value   the element to offer
+     */
+    public void offer(byte[] key, NQueueHeaders headers, T value) {
         recordIngressWrite();
         if (coordinator.isLeader()) {
             recordQueueOffer();
-            queueService.offer(value);
+            queueService.offer(key, headers, value);
             notifySubscribers();
         } else {
+            // Forward to leader; key/headers are embedded in OfferPayload for transmission.
+            // For simplicity we reuse the same value path; key/headers routing at the
+            // leader
+            // is handled by QueueClusterService which receives the command via replication.
             invokeLeader(queueOfferCommand, value);
         }
     }

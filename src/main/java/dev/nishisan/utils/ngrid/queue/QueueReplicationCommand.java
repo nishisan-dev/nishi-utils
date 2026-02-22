@@ -17,31 +17,50 @@
 
 package dev.nishisan.utils.ngrid.queue;
 
+import dev.nishisan.utils.queue.NQueueHeaders;
+
 import java.io.Serial;
 import java.io.Serializable;
 import java.util.Objects;
 
 /**
  * Serializable command replicated across the cluster for queue operations.
+ * Carries the optional routing key and headers introduced by the V3 record
+ * format.
  */
 public final class QueueReplicationCommand implements Serializable {
     @Serial
-    private static final long serialVersionUID = 1L;
+    private static final long serialVersionUID = 2L;
 
     private final QueueReplicationCommandType type;
     private final Serializable value;
+    private final byte[] key; // nullable, routing/partitioning key
+    private final NQueueHeaders headers; // never null
 
-    private QueueReplicationCommand(QueueReplicationCommandType type, Serializable value) {
+    private QueueReplicationCommand(QueueReplicationCommandType type, Serializable value,
+            byte[] key, NQueueHeaders headers) {
         this.type = Objects.requireNonNull(type, "type");
         this.value = value;
+        this.key = key;
+        this.headers = headers != null ? headers : NQueueHeaders.empty();
     }
 
+    /**
+     * Creates an OFFER command without key or headers (simple queue use-case).
+     */
     public static QueueReplicationCommand offer(Serializable value) {
-        return new QueueReplicationCommand(QueueReplicationCommandType.OFFER, value);
+        return new QueueReplicationCommand(QueueReplicationCommandType.OFFER, value, null, NQueueHeaders.empty());
+    }
+
+    /**
+     * Creates an OFFER command with key and headers (Kafka-like use-case).
+     */
+    public static QueueReplicationCommand offer(byte[] key, NQueueHeaders headers, Serializable value) {
+        return new QueueReplicationCommand(QueueReplicationCommandType.OFFER, value, key, headers);
     }
 
     public static QueueReplicationCommand poll(Serializable value) {
-        return new QueueReplicationCommand(QueueReplicationCommandType.POLL, value);
+        return new QueueReplicationCommand(QueueReplicationCommandType.POLL, value, null, NQueueHeaders.empty());
     }
 
     public QueueReplicationCommandType type() {
@@ -50,5 +69,15 @@ public final class QueueReplicationCommand implements Serializable {
 
     public Serializable value() {
         return value;
+    }
+
+    /** Returns the routing/partitioning key, or {@code null} if absent. */
+    public byte[] key() {
+        return key;
+    }
+
+    /** Returns the record headers; never {@code null}. */
+    public NQueueHeaders headers() {
+        return headers;
     }
 }

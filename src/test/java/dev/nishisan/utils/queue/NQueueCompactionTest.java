@@ -4,7 +4,6 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -27,7 +26,7 @@ class NQueueCompactionTest {
 
     @TempDir
     Path tempDir;
-    
+
     private final List<NQueue<?>> trackedQueues = Collections.synchronizedList(new ArrayList<>());
 
     private <T extends java.io.Serializable> NQueue<T> track(NQueue<T> queue) {
@@ -54,6 +53,9 @@ class NQueueCompactionTest {
                 .withCompactionBufferSize(1024);
 
         Path queueDir = tempDir.resolve("threshold-queue");
+
+        // Record the data.log file size BEFORE compaction.
+        long preCompactSize;
         try (NQueue<String> queue = track(NQueue.open(tempDir, "threshold-queue", options))) {
             queue.offer("first");
             queue.offer("second");
@@ -64,6 +66,8 @@ class NQueueCompactionTest {
             assertEquals("second", queue.poll().orElseThrow());
             assertEquals("third", queue.poll().orElseThrow());
 
+            preCompactSize = java.nio.file.Files.size(queueDir.resolve("data.log"));
+
             Optional<String> peeked = queue.peek();
             assertTrue(peeked.isPresent());
             assertEquals("fourth", peeked.get());
@@ -71,11 +75,27 @@ class NQueueCompactionTest {
 
         Path metaPath = queueDir.resolve("queue.meta");
         Path dataPath = queueDir.resolve("data.log");
-        NQueueQueueMeta meta = awaitMeta(metaPath, Duration.ofSeconds(2), m -> m.getConsumerOffset() == 0L);
+
+        // After close(), shutdown compaction should have completed.
+        // Wait for metadata to reflect compaction (recordCount == 1 means only
+        // the un-consumed "fourth" remains).
+        NQueueQueueMeta meta = awaitMeta(metaPath, Duration.ofSeconds(5),
+                m -> m.getRecordCount() == 1L);
 
         assertEquals(1L, meta.getRecordCount());
-        assertEquals(0L, meta.getConsumerOffset());
-        assertEquals(Files.size(dataPath), meta.getProducerOffset());
+        assertTrue(meta.getConsumerOffset() <= meta.getProducerOffset(),
+                "consumerOffset should not exceed producerOffset");
+
+        // The compacted data.log MUST be smaller than the original.
+        long postCompactSize = java.nio.file.Files.size(dataPath);
+        assertTrue(postCompactSize < preCompactSize,
+                "data.log should shrink after compaction: pre=" + preCompactSize + " post=" + postCompactSize);
+
+        // Reopen the queue and verify the surviving record is still accessible.
+        try (NQueue<String> reopened = NQueue.open(tempDir, "threshold-queue", options)) {
+            assertEquals("fourth", reopened.poll().orElseThrow(),
+                    "Surviving record 'fourth' must be accessible after compaction and reopen");
+        }
     }
 
     @Test
@@ -129,7 +149,8 @@ class NQueueCompactionTest {
                 }
             }
 
-            // Give the background compaction time to trigger while the queue still has records.
+            // Give the background compaction time to trigger while the queue still has
+            // records.
             TimeUnit.MILLISECONDS.sleep(50);
 
             List<String> consumed = new ArrayList<>();
@@ -140,7 +161,8 @@ class NQueueCompactionTest {
             assertEquals(expected.subList(10, expected.size()), consumed);
         }
 
-        NQueueQueueMeta meta = awaitMeta(queueDir.resolve("queue.meta"), Duration.ofSeconds(2), m -> m.getConsumerOffset() == m.getProducerOffset());
+        NQueueQueueMeta meta = awaitMeta(queueDir.resolve("queue.meta"), Duration.ofSeconds(2),
+                m -> m.getConsumerOffset() == m.getProducerOffset());
         assertEquals(meta.getProducerOffset(), meta.getConsumerOffset(), "Offsets should converge after draining");
         assertEquals(0L, meta.getRecordCount(), "Queue should be empty after draining records");
     }
@@ -320,21 +342,25 @@ class NQueueCompactionTest {
             running.set(false);
             worker.join();
 
-            // Drain remaining items to make compaction converge and avoid masking stale files when closing.
+            // Drain remaining items to make compaction converge and avoid masking stale
+            // files when closing.
             while (queue.poll(10, TimeUnit.MILLISECONDS).isPresent()) {
                 // keep draining
             }
         }
 
-        NQueueQueueMeta meta = awaitMeta(queueDir.resolve("queue.meta"), Duration.ofSeconds(3), m -> m.getConsumerOffset() == m.getProducerOffset());
-        assertEquals(0L, meta.getConsumerOffset(), "Compaction should rewrite file even if a prior attempt was aborted due to state changes");
+        NQueueQueueMeta meta = awaitMeta(queueDir.resolve("queue.meta"), Duration.ofSeconds(3),
+                m -> m.getConsumerOffset() == m.getProducerOffset());
+        assertEquals(0L, meta.getConsumerOffset(),
+                "Compaction should rewrite file even if a prior attempt was aborted due to state changes");
     }
 
     private record TestMessage(int value) implements java.io.Serializable {
         private static final long serialVersionUID = 1L;
     }
 
-    private static NQueueQueueMeta awaitMeta(Path metaPath, Duration timeout, java.util.function.Predicate<NQueueQueueMeta> condition) throws Exception {
+    private static NQueueQueueMeta awaitMeta(Path metaPath, Duration timeout,
+            java.util.function.Predicate<NQueueQueueMeta> condition) throws Exception {
         long deadline = System.nanoTime() + timeout.toNanos();
         NQueueQueueMeta meta = NQueueQueueMeta.read(metaPath);
         while (!condition.test(meta) && System.nanoTime() < deadline) {

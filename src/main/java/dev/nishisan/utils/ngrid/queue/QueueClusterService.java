@@ -23,6 +23,7 @@ import dev.nishisan.utils.ngrid.replication.ReplicationHandler;
 import dev.nishisan.utils.ngrid.replication.ReplicationManager;
 import dev.nishisan.utils.ngrid.replication.ReplicationResult;
 import dev.nishisan.utils.queue.NQueue;
+import dev.nishisan.utils.queue.NQueueHeaders;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -120,22 +121,44 @@ public final class QueueClusterService<T extends Serializable> implements Closea
     }
 
     /**
-     * Offers a value to the queue, replicating the operation across the cluster.
+     * Offers a value to the queue without key or headers.
      *
      * @param value the value to offer
      */
     public void offer(T value) {
+        offer(null, NQueueHeaders.empty(), value);
+    }
+
+    /**
+     * Offers a value to the queue with a routing key.
+     *
+     * @param key   optional routing/partitioning key
+     * @param value the value to offer
+     */
+    public void offer(byte[] key, T value) {
+        offer(key, NQueueHeaders.empty(), value);
+    }
+
+    /**
+     * Offers a value to the queue with a routing key and custom headers,
+     * replicating the operation across the cluster.
+     *
+     * @param key     optional routing/partitioning key
+     * @param headers record headers
+     * @param value   the value to offer
+     */
+    public void offer(byte[] key, NQueueHeaders headers, T value) {
         Objects.requireNonNull(value, "value");
+        Objects.requireNonNull(headers, "headers");
         ensureLeaderReady();
         CompletableFuture<ReplicationResult> future;
         clientLock.lock();
         try {
-            QueueReplicationCommand command = QueueReplicationCommand.offer(value);
+            QueueReplicationCommand command = QueueReplicationCommand.offer(key, headers, value);
             future = replicationManager.replicate(topic, command, replicationFactor);
         } finally {
-            clientLock.unlock(); // Release lock BEFORE waiting
+            clientLock.unlock();
         }
-        // Wait for replication OUTSIDE of lock to avoid deadlock
         waitForReplication(future);
     }
 
@@ -414,7 +437,7 @@ public final class QueueClusterService<T extends Serializable> implements Closea
         operationLock.lock();
         try {
             switch (command.type()) {
-                case OFFER -> queue.offer((T) command.value());
+                case OFFER -> queue.offer(command.key(), command.headers(), (T) command.value());
                 case POLL -> {
                     // With sequencing guarantees from ReplicationManager, we can trust
                     // that operations arrive in the correct order. No need for optimistic
@@ -487,6 +510,16 @@ public final class QueueClusterService<T extends Serializable> implements Closea
         Objects.requireNonNull(options, "options");
         options.withShortCircuit(false);
         return options;
+    }
+
+    /**
+     * Returns the underlying {@link NQueue} instance.
+     *
+     * <p>
+     * <b>For testing only.</b> Do not use in production code.
+     */
+    public NQueue<T> queue() {
+        return queue;
     }
 
     /** {@inheritDoc} */
