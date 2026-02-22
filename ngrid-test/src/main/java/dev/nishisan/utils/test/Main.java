@@ -13,10 +13,14 @@ public class Main {
             System.err.println("Uso: java -jar ngrid-test.jar [server|client|client-auto|scenario-1]");
             return;
         }
-        if (args[0].equals("server")) startServer();
-        if (args[0].equals("client")) startClient();
-        if (args[0].equals("client-auto")) startClientAuto();
-        if (args[0].equals("scenario-1")) startScenario1();
+        if (args[0].equals("server"))
+            startServer();
+        if (args[0].equals("client"))
+            startClient();
+        if (args[0].equals("client-auto"))
+            startClientAuto();
+        if (args[0].equals("scenario-1"))
+            startScenario1();
     }
 
     private void startServer() {
@@ -41,7 +45,8 @@ public class Main {
 
                 while (true) {
                     String msg = prefix + index;
-                    //produz aqui
+                    // produz aqui
+                    System.out.println("CURRENT_LEADER_STATUS:" + node.coordinator().isLeader());
                     System.out.println("Enviando:");
                     queue.offer(msg);
                     System.out.println("Enviado: " + msg);
@@ -53,19 +58,17 @@ public class Main {
                     }
                 }
 
-
-//                Thread.currentThread().join();
+                // Thread.currentThread().join();
             } catch (Exception e) {
                 throw new RuntimeException(e);
             }
-
 
         } catch (Exception e) {
             e.printStackTrace();
         }
     }
 
-    private void startClient(){
+    private void startClient() {
         Path yamlFile = Paths.get("config/client-config.yml");
         try {
 
@@ -86,7 +89,7 @@ public class Main {
                             System.out.println(value);
                             return true;
                         }).orElse(false);
-                    } catch (IllegalStateException e) {
+                    } catch (RuntimeException e) {
                         System.err.println("Poll falhou (provavel troca de lider): " + e.getMessage());
                     }
 
@@ -96,13 +99,12 @@ public class Main {
                 throw new RuntimeException(e);
             }
 
-
         } catch (Exception e) {
             e.printStackTrace();
         }
     }
 
-    private void startClientAuto(){
+    private void startClientAuto() {
         Path yamlFile = Paths.get("config/client-autodiscover.yml");
         try {
 
@@ -127,13 +129,11 @@ public class Main {
                         System.err.println("Poll falhou (provavel troca de lider): " + e.getMessage());
                     }
 
-
                 }
 
             } catch (Exception e) {
                 throw new RuntimeException(e);
             }
-
 
         } catch (Exception e) {
             e.printStackTrace();
@@ -165,8 +165,9 @@ public class Main {
         client1Thread.start();
         client2Thread.start();
 
-        java.util.concurrent.ScheduledExecutorService scheduler = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(
-                r -> new Thread(r, "ngrid-scenario-control"));
+        java.util.concurrent.ScheduledExecutorService scheduler = java.util.concurrent.Executors
+                .newSingleThreadScheduledExecutor(
+                        r -> new Thread(r, "ngrid-scenario-control"));
         scheduler.schedule(() -> {
             NGridNode seed = seedRef.getAndSet(null);
             if (seed != null) {
@@ -271,8 +272,8 @@ public class Main {
             DistributedQueue<String> queue = node.getQueue("global-events", String.class);
             node.coordinator().awaitLocalStability();
             final java.util.Set<String> seen = new java.util.HashSet<>();
-            final java.util.concurrent.atomic.AtomicInteger currentEpoch =
-                    new java.util.concurrent.atomic.AtomicInteger(-1);
+            final java.util.concurrent.atomic.AtomicInteger currentEpoch = new java.util.concurrent.atomic.AtomicInteger(
+                    -1);
             while (running.get()) {
                 try {
                     queue.pollWhenAvailable(Duration.ofSeconds(2))
