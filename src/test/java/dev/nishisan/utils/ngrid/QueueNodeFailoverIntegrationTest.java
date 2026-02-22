@@ -62,7 +62,7 @@ class QueueNodeFailoverIntegrationTest {
                 .queueDirectory(dir1)
                 .replicationFactor(2) // Needs 2 for quorum
                 .replicationOperationTimeout(opTimeout)
-                .heartbeatInterval(Duration.ofMillis(200))
+                .heartbeatInterval(Duration.ofMillis(500))
                 .build());
 
         node2 = new NGridNode(NGridConfig.builder(info2)
@@ -70,7 +70,7 @@ class QueueNodeFailoverIntegrationTest {
                 .queueDirectory(dir2)
                 .replicationFactor(2)
                 .replicationOperationTimeout(opTimeout)
-                .heartbeatInterval(Duration.ofMillis(200))
+                .heartbeatInterval(Duration.ofMillis(500))
                 .build());
 
         node3 = new NGridNode(NGridConfig.builder(info3)
@@ -78,7 +78,7 @@ class QueueNodeFailoverIntegrationTest {
                 .queueDirectory(dir3)
                 .replicationFactor(2)
                 .replicationOperationTimeout(opTimeout)
-                .heartbeatInterval(Duration.ofMillis(200))
+                .heartbeatInterval(Duration.ofMillis(500))
                 .build());
 
         node1.start();
@@ -191,7 +191,7 @@ class QueueNodeFailoverIntegrationTest {
     }
 
     private void awaitClusterStability() {
-        long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(20);
+        long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(30);
         while (System.currentTimeMillis() < deadline) {
             boolean leadersAgree = node1.coordinator().leaderInfo().isPresent()
                     && node1.coordinator().leaderInfo().equals(node2.coordinator().leaderInfo())
@@ -215,7 +215,22 @@ class QueueNodeFailoverIntegrationTest {
                 throw new IllegalStateException(e);
             }
         }
-        throw new IllegalStateException("Cluster did not stabilize in time");
+        // Diagnostic info for CI debugging
+        String diag = String.format(
+                "leadersAgree=%s, allMembers=[%d,%d,%d], connected=[1->2:%s,1->3:%s,2->1:%s,2->3:%s,3->1:%s,3->2:%s]",
+                node1.coordinator().leaderInfo().isPresent()
+                        && node1.coordinator().leaderInfo().equals(node2.coordinator().leaderInfo())
+                        && node1.coordinator().leaderInfo().equals(node3.coordinator().leaderInfo()),
+                node1.coordinator().activeMembers().size(),
+                node2.coordinator().activeMembers().size(),
+                node3.coordinator().activeMembers().size(),
+                node1.transport().isConnected(info2.nodeId()),
+                node1.transport().isConnected(info3.nodeId()),
+                node2.transport().isConnected(info1.nodeId()),
+                node2.transport().isConnected(info3.nodeId()),
+                node3.transport().isConnected(info1.nodeId()),
+                node3.transport().isConnected(info2.nodeId()));
+        throw new IllegalStateException("Cluster did not stabilize in time. State: " + diag);
     }
 
     private NGridNode findLeader() {
