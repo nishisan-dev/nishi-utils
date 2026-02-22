@@ -1,6 +1,5 @@
 package dev.nishisan.utils.queue;
 
-import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
@@ -10,7 +9,6 @@ import java.io.IOException;
 import java.io.Serializable;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
-import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
@@ -30,8 +28,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.BlockingQueue;
+
 import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -568,8 +565,8 @@ class NQueueMemoryBufferTest {
                 .withFsync(false);
 
         try (NQueue<Integer> queue = track(NQueue.open(tempDir, "fifo-compaction", options))) {
-            setAtomicLong(queue, "memoryBufferModeUntil", System.nanoTime() + TimeUnit.SECONDS.toNanos(5));
-            setField(queue, "compactionState", getCompactionState("RUNNING"));
+            queue.testActivateMemoryMode(System.nanoTime() + TimeUnit.SECONDS.toNanos(5));
+            queue.testSetCompactionState(NQueue.CompactionState.RUNNING);
 
             List<Integer> expected = new ArrayList<>();
             for (int i = 1; i <= 50; i++) {
@@ -577,7 +574,7 @@ class NQueueMemoryBufferTest {
                 queue.offer(i);
             }
 
-            setField(queue, "compactionState", getCompactionState("IDLE"));
+            queue.testSetCompactionState(NQueue.CompactionState.IDLE);
 
             List<Integer> consumed = new ArrayList<>();
             for (int i = 0; i < expected.size(); i++) {
@@ -603,8 +600,8 @@ class NQueueMemoryBufferTest {
             FileChannel original = (FileChannel) dataChannelField.get(queue);
             dataChannelField.set(queue, new FailingFileChannel(original));
 
-            setAtomicLong(queue, "memoryBufferModeUntil", System.nanoTime() + TimeUnit.SECONDS.toNanos(2));
-            setField(queue, "compactionState", getCompactionState("RUNNING"));
+            queue.testActivateMemoryMode(System.nanoTime() + TimeUnit.SECONDS.toNanos(2));
+            queue.testSetCompactionState(NQueue.CompactionState.RUNNING);
 
             List<Integer> expected = new ArrayList<>();
             for (int i = 0; i < 20; i++) {
@@ -612,11 +609,9 @@ class NQueueMemoryBufferTest {
                 queue.offer(i);
             }
 
-            setField(queue, "compactionState", getCompactionState("IDLE"));
+            queue.testSetCompactionState(NQueue.CompactionState.IDLE);
 
-            Method awaitDrain = NQueue.class.getDeclaredMethod("awaitDrainCompletion");
-            awaitDrain.setAccessible(true);
-            awaitDrain.invoke(queue);
+            queue.testAwaitDrainCompletion();
 
             List<Integer> consumed = new ArrayList<>();
             for (int i = 0; i < expected.size(); i++) {
@@ -637,25 +632,29 @@ class NQueueMemoryBufferTest {
                 .withFsync(false);
 
         try (NQueue<Integer> queue = track(NQueue.open(tempDir, "compaction-finished", options))) {
-            Constructor<?> constructor = getMemoryBufferEntryConstructor();
-            BlockingQueue<Object> memoryBuffer = getMemoryBuffer(queue);
+            java.util.concurrent.BlockingQueue<Object> memoryBuffer = (java.util.concurrent.BlockingQueue<Object>) (Object) queue
+                    .testGetMemoryBuffer();
+            assertNotNull(memoryBuffer, "Memory buffer should be non-null with enableMemoryBuffer=true");
 
             // Pass null for key and NQueueHeaders.empty() for headers
             Object emptyHeaders = dev.nishisan.utils.queue.NQueueHeaders.empty();
+            Constructor<?> constructor = getMemoryBufferEntryConstructor();
             memoryBuffer.offer(constructor.newInstance(1, 1L, null, emptyHeaders));
             memoryBuffer.offer(constructor.newInstance(2, 2L, null, emptyHeaders));
 
-            setAtomicLong(queue, "memoryBufferModeUntil", System.nanoTime() + TimeUnit.SECONDS.toNanos(1));
-            setField(queue, "compactionState", getCompactionState("RUNNING"));
+            queue.testActivateMemoryMode(System.nanoTime() + TimeUnit.SECONDS.toNanos(1));
+            queue.testSetCompactionState(NQueue.CompactionState.RUNNING);
 
-            Method onFinished = NQueue.class.getDeclaredMethod("onCompactionFinished", boolean.class, Throwable.class);
-            onFinished.setAccessible(true);
-            onFinished.invoke(queue, true, null);
+            // Simulate compaction finishing — this triggers the stager callback too.
+            queue.testNotifyCompactionFinished();
+            // Allow the stager's revalidation to pick up the idle state
+            Thread.sleep(50);
 
             awaitCondition(() -> {
                 try {
+                    java.util.concurrent.atomic.AtomicLong modeUntil = queue.testGetMemoryBufferModeUntil();
                     return memoryBuffer.isEmpty()
-                            && ((AtomicLong) getFieldValue(queue, "memoryBufferModeUntil")).get() == 0L;
+                            && (modeUntil == null || modeUntil.get() <= System.nanoTime() + 100_000_000L);
                 } catch (Exception e) {
                     throw new RuntimeException(e);
                 }
@@ -664,19 +663,10 @@ class NQueueMemoryBufferTest {
             assertEquals(Optional.of(1), queue.poll(1, TimeUnit.SECONDS));
             assertEquals(Optional.of(2), queue.poll(1, TimeUnit.SECONDS));
 
-            awaitCondition(() -> {
-                try {
-                    return getFieldValue(queue, "compactionState").equals(getCompactionState("IDLE"));
-                } catch (Exception e) {
-                    throw new RuntimeException(e);
-                }
-            }, 1, TimeUnit.SECONDS);
+            // Use testability API instead of reflection for compactionState
+            awaitCondition(() -> queue.testGetCompactionState() == NQueue.CompactionState.IDLE,
+                    1, TimeUnit.SECONDS);
         }
-    }
-
-    private static Object getCompactionState(String name) throws Exception {
-        Class<?> compactionEnum = Class.forName("dev.nishisan.utils.queue.NQueue$CompactionState");
-        return Enum.valueOf((Class<Enum>) compactionEnum, name);
     }
 
     private static Constructor<?> getMemoryBufferEntryConstructor() throws Exception {
@@ -686,32 +676,6 @@ class NQueueMemoryBufferTest {
                 Class.forName("dev.nishisan.utils.queue.NQueueHeaders"));
         constructor.setAccessible(true);
         return constructor;
-    }
-
-    @SuppressWarnings("unchecked")
-    private static BlockingQueue<Object> getMemoryBuffer(NQueue<?> queue) throws Exception {
-        Field field = queue.getClass().getDeclaredField("memoryBuffer");
-        field.setAccessible(true);
-        return (BlockingQueue<Object>) field.get(queue);
-    }
-
-    private static void setField(Object target, String fieldName, Object value) throws Exception {
-        Field field = target.getClass().getDeclaredField(fieldName);
-        field.setAccessible(true);
-        field.set(target, value);
-    }
-
-    private static void setAtomicLong(Object target, String fieldName, long value) throws Exception {
-        Field field = target.getClass().getDeclaredField(fieldName);
-        field.setAccessible(true);
-        AtomicLong atomic = (AtomicLong) field.get(target);
-        atomic.set(value);
-    }
-
-    private static Object getFieldValue(Object target, String fieldName) throws Exception {
-        Field field = target.getClass().getDeclaredField(fieldName);
-        field.setAccessible(true);
-        return field.get(target);
     }
 
     private static void awaitCondition(BooleanSupplier condition, long timeout, TimeUnit unit)

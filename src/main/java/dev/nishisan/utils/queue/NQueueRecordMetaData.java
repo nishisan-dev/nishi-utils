@@ -26,7 +26,7 @@ import java.nio.charset.StandardCharsets;
 /**
  * Represents the on-disk metadata header for an NQueue record (Version 3).
  *
- * <h3>Binary layout</h3>
+ * <h2>Binary layout</h2>
  * 
  * <pre>
  * ┌─────────── Fixed Prefix (9 bytes) ───────────┐
