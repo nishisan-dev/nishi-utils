@@ -59,7 +59,7 @@ Versão do artefato no projeto: **1.0.14** (`pom.xml`).
 <dependency>
   <groupId>dev.nishisan</groupId>
   <artifactId>nishi-utils</artifactId>
-  <version>1.0.14</version>
+  <version>3.0.3</version>
 </dependency>
 ```
 
