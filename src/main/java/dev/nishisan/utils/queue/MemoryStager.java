@@ -252,14 +252,15 @@ class MemoryStager<T extends Serializable> {
      * indicating whether durable records became available.
      * Must be called while the queue lock is held.
      *
-     * @param recordCount current durable record count
+     * @param recordCountSupplier supplies the current durable record count
+     *                            (evaluated <b>after</b> drain completes)
      * @return true if at least one durable record is now available
      * @throws IOException if draining encounters a storage error
      */
-    boolean checkAndDrain(long recordCount) throws IOException {
+    boolean checkAndDrain(java.util.function.LongSupplier recordCountSupplier) throws IOException {
         if (!memoryBuffer.isEmpty() || !drainingQueue.isEmpty()) {
             drainSync();
-            return recordCount > 0;
+            return recordCountSupplier.getAsLong() > 0;
         }
         return false;
     }

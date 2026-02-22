@@ -455,10 +455,12 @@ public class NQueue<T extends Serializable> implements Closeable {
         PreIndexedItem<T> pItem = new PreIndexedItem<>(object, seq, key, headers);
         long result = stager.offerToMemory(key, headers, pItem, revalidateIfFull);
         if (result == Long.MIN_VALUE) {
-            // Stager signalled: drain complete, fall through to direct offer
+            // Stager signalled: drain complete, fall through to direct offer.
+            // Reuse the pre-indexed item so the already-allocated sequence is
+            // preserved, avoiding index gaps.
             lock.lock();
             try {
-                return offerDirectLocked(key, headers, object);
+                return offerBatchLocked(List.of(pItem), true);
             } finally {
                 lock.unlock();
             }
@@ -531,7 +533,7 @@ public class NQueue<T extends Serializable> implements Closeable {
             }
 
             while (recordCount == 0) {
-                if (enableMemoryBuffer && stager.checkAndDrain(recordCount))
+                if (enableMemoryBuffer && stager.checkAndDrain(() -> recordCount))
                     break;
 
                 if (nanos <= 0L)
@@ -545,12 +547,12 @@ public class NQueue<T extends Serializable> implements Closeable {
                         handoffItem = null;
                         return Optional.of(item);
                     }
-                    if (enableMemoryBuffer && stager.checkAndDrain(recordCount))
+                    if (enableMemoryBuffer && stager.checkAndDrain(() -> recordCount))
                         break;
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     if (enableMemoryBuffer)
-                        stager.checkAndDrain(recordCount);
+                        stager.checkAndDrain(() -> recordCount);
                     return Optional.empty();
                 }
             }
