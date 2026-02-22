@@ -482,16 +482,16 @@ public final class QueueClusterService<T extends Serializable> implements Closea
     /** {@inheritDoc} */
     @Override
     public void resetState() throws Exception {
-        // For queues, we clear by polling all items
-        // This is called before installing a snapshot
-        while (queue.size() > 0) {
-            queue.poll(100, java.util.concurrent.TimeUnit.MILLISECONDS);
-        }
+        // Close the queue first — this drains the MemoryStager synchronously,
+        // flushes any pending data, and shuts down background workers.
+        // This eliminates the race condition where the stager could drain
+        // items to disk AFTER the offset reset.
+        queue.close();
+        // Truncate all data files and reopen with a fresh empty state.
+        queue.truncateAndReopen();
         // Reset consumer offsets so they align with the new snapshot indices.
-        // Without this, stale offsets cause duplicate message delivery after
-        // snapshot install because the NQueue assigns new indices starting from 1.
         localOffsetStore.reset();
-        LOGGER.info(() -> "Queue " + queueName + " state reset for snapshot install (offsets cleared)");
+        LOGGER.info(() -> "Queue " + queueName + " state reset for snapshot install (truncated + offsets cleared)");
     }
 
     /** {@inheritDoc} */

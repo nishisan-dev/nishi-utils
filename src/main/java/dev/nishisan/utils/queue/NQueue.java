@@ -741,6 +741,80 @@ public class NQueue<T extends Serializable> implements Closeable {
     }
 
     /**
+     * Truncates all queue data and reopens with a clean state.
+     * <p>
+     * This is a destructive operation: all records, metadata, and consumer
+     * progress are permanently lost. The queue is left open and ready for
+     * new enqueues with indices starting from 1.
+     * <p>
+     * The queue <b>must</b> be closed (via {@link #close()}) before calling
+     * this method. Intended for snapshot-install scenarios where the entire
+     * queue content is replaced atomically.
+     *
+     * @throws IOException           if the files cannot be deleted or recreated
+     * @throws IllegalStateException if the queue has not been closed first
+     */
+    public void truncateAndReopen() throws IOException {
+        if (!closed) {
+            throw new IllegalStateException("Queue must be closed before truncateAndReopen");
+        }
+
+        // Delete existing data files
+        Files.deleteIfExists(dataPath);
+        Files.deleteIfExists(metaPath);
+        Files.deleteIfExists(tempDataPath);
+
+        // Reopen with fresh I/O handles
+        RandomAccessFile newRaf = new RandomAccessFile(dataPath.toFile(), "rw");
+        FileChannel newCh = newRaf.getChannel();
+
+        this.raf = newRaf;
+        this.dataChannel = newCh;
+        this.metaRaf = new RandomAccessFile(metaPath.toFile(), "rw");
+        this.metaChannel = this.metaRaf.getChannel();
+
+        // Reset all cursors to zero
+        this.consumerOffset = 0;
+        this.producerOffset = 0;
+        this.recordCount = 0;
+        this.lastIndex = 0;
+        this.globalSequence.set(0);
+        this.approximateSize.set(0);
+        this.lastDeliveredIndex = -1;
+        this.outOfOrderCount = 0;
+        this.handoffItem = null;
+        this.closed = false;
+        this.shutdownRequested = false;
+
+        // Reinitialize MemoryStager (fresh buffer, no stale entries)
+        if (enableMemoryBuffer) {
+            this.stager = new MemoryStager<>(options, lock,
+                    batch -> offerBatchLocked(batch, options.withFsync),
+                    () -> this.compactionEngine != null
+                            && this.compactionEngine.getState() == CompactionState.RUNNING);
+        }
+
+        // Reinitialize CompactionEngine (fresh state, no pending compaction)
+        this.compactionEngine = new CompactionEngine(
+                options, dataPath, tempDataPath, lock,
+                this::currentState,
+                this::applyCompactionResult,
+                compactionRunning -> {
+                    if (this.stager != null) {
+                        this.stager.onCompactionFinished(compactionRunning);
+                    }
+                });
+
+        // Persist the empty state so recovery doesn't see stale metadata
+        lock.lock();
+        try {
+            persistCurrentStateLocked();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
      * Reads, without advancing the consumption cursor, the record stored at the
      * provided durable offset.
      *
