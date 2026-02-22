@@ -175,6 +175,8 @@ public final class NGridNode implements Closeable {
 
             socket.setTcpNoDelay(true);
 
+            socket.setSoTimeout(15_000); // Evita hang silencioso: seed pode aceitar mas não responder
+
             java.io.ObjectOutputStream oos = new java.io.ObjectOutputStream(socket.getOutputStream());
 
             oos.flush();
@@ -302,11 +304,12 @@ public final class NGridNode implements Closeable {
             t.setDaemon(true);
             return t;
         });
+        int minClusterSize = Math.max(1, Math.min(config.replicationQuorum(), config.peers().size() + 1));
         ClusterCoordinatorConfig coordinatorConfig = ClusterCoordinatorConfig.of(
                 config.heartbeatInterval(),
                 Duration.ofSeconds(5),
                 config.leaseTimeout(),
-                1,
+                minClusterSize,
                 null);
         coordinator = new ClusterCoordinator(transport, coordinatorConfig, coordinatorScheduler);
         coordinator.start();
