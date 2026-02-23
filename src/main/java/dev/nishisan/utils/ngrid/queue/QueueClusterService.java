@@ -463,6 +463,9 @@ public final class QueueClusterService<T extends Serializable> implements Closea
     @Override
     public SnapshotChunk getSnapshotChunk(int chunkIndex) {
         try {
+            if (chunkIndex == 0) {
+                queue.flush();
+            }
             int startIndex = chunkIndex * SNAPSHOT_CHUNK_SIZE;
             NQueue.ReadRangeResult<T> result = queue.readRange(startIndex, SNAPSHOT_CHUNK_SIZE);
 
@@ -487,7 +490,6 @@ public final class QueueClusterService<T extends Serializable> implements Closea
         LOGGER.info(() -> "Queue " + queueName + " became leader");
     }
 
-    /** {@inheritDoc} */
     @Override
     public void resetState() throws Exception {
         // Close the queue first — this drains the MemoryStager synchronously,
@@ -497,8 +499,16 @@ public final class QueueClusterService<T extends Serializable> implements Closea
         queue.close();
         // Truncate all data files and reopen with a fresh empty state.
         queue.truncateAndReopen();
-        // Reset consumer offsets so they align with the new snapshot indices.
+        // Reset local consumer offsets so they align with the new snapshot indices.
         localOffsetStore.reset();
+        // Also clear the distributed offset store. After a snapshot install the
+        // queue index counter restarts from 0 (or 1). Any stale per-consumer
+        // offset that survives in the distributed map would cause the leader to
+        // "fast-forward" the client past messages that were never delivered from
+        // the new epoch, producing duplicate deliveries (INDEX-N-0 x2).
+        if (distributedOffsetStore != null) {
+            distributedOffsetStore.reset();
+        }
         LOGGER.info(() -> "Queue " + queueName + " state reset for snapshot install (truncated + offsets cleared)");
     }
 
