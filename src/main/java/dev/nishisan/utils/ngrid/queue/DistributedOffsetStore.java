@@ -4,8 +4,6 @@ import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.structures.DistributedMap;
 
 import java.util.Objects;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Offset store backed by a {@link DistributedMap}, ensuring offsets survive
@@ -14,8 +12,6 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class DistributedOffsetStore implements OffsetStore {
     private final DistributedMap<String, Long> offsets;
     private final String queueName;
-    /** Tracks all keys that have ever had an offset written, enabling reset(). */
-    private final Set<String> knownKeys = ConcurrentHashMap.newKeySet();
 
     /**
      * Creates a distributed offset store.
@@ -42,7 +38,6 @@ public final class DistributedOffsetStore implements OffsetStore {
             // Ignore regression - monotonic offset guarantee
             return;
         }
-        knownKeys.add(key);
         offsets.put(key, offset);
     }
 
@@ -50,12 +45,14 @@ public final class DistributedOffsetStore implements OffsetStore {
      * Resets all consumer offsets for this queue. Should be called when the queue
      * state is completely replaced (e.g., after a snapshot install) so that
      * stale offsets from the previous epoch do not cause duplicate deliveries.
+     *
+     * <p>
+     * Uses {@link DistributedMap#removeByPrefix(String)} which scans the live
+     * in-memory state of the {@code MapClusterService} — so it works correctly
+     * even after a JVM restart when {@code knownKeys} would otherwise be empty.
      */
     public void reset() {
-        for (String key : knownKeys) {
-            offsets.remove(key);
-        }
-        knownKeys.clear();
+        offsets.removeByPrefix(queueName + ":");
     }
 
     private String keyFor(NodeId nodeId) {
