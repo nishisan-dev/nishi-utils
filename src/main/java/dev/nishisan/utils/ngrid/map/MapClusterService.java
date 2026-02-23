@@ -149,6 +149,31 @@ public final class MapClusterService<K extends Serializable, V extends Serializa
     }
 
     /**
+     * Removes all entries whose string key starts with {@code prefix} from the
+     * <em>local</em> in-memory state only, writing tombstone entries to the
+     * persistence layer if enabled. No Raft replication is triggered.
+     *
+     * <p>
+     * This is intentionally <em>local-only</em> so it can be called safely
+     * during {@link #resetState()}, which runs while the cluster is installing a
+     * snapshot and may not yet have quorum for write operations.
+     *
+     * @param prefix the key prefix (must not be null)
+     */
+    @SuppressWarnings("unchecked")
+    public void clearLocalByPrefix(String prefix) {
+        Objects.requireNonNull(prefix, "prefix");
+        for (K key : new java.util.ArrayList<>(data.keySet())) {
+            if (key instanceof String s && s.startsWith(prefix)) {
+                data.remove(key);
+                if (persistence != null) {
+                    persistence.appendSync(NMapOperationType.REMOVE, key, null);
+                }
+            }
+        }
+    }
+
+    /**
      * Retrieves the value associated with a key from the local replica.
      *
      * @param key the key to look up

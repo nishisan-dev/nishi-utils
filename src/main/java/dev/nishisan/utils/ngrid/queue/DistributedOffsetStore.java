@@ -41,6 +41,20 @@ public final class DistributedOffsetStore implements OffsetStore {
         offsets.put(key, offset);
     }
 
+    /**
+     * Resets all consumer offsets for this queue. Should be called when the queue
+     * state is completely replaced (e.g., after a snapshot install) so that
+     * stale offsets from the previous epoch do not cause duplicate deliveries.
+     *
+     * <p>
+     * Uses {@link DistributedMap#removeByPrefix(String)} which scans the live
+     * in-memory state of the {@code MapClusterService} — so it works correctly
+     * even after a JVM restart when {@code knownKeys} would otherwise be empty.
+     */
+    public void reset() {
+        offsets.removeByPrefix(queueName + ":");
+    }
+
     private String keyFor(NodeId nodeId) {
         return queueName + ":" + nodeId.value();
     }

@@ -156,7 +156,7 @@ public class NGridConfigLoader {
                         continue;
                     }
                     String nodeIdValue = seedNode.getId() != null ? seedNode.getId()
-                            : "seed-" + seedNode.getHost() + ":" + seedNode.getPort();
+                            : defaultSeedNodeId(seedNode.getHost(), seedNode.getPort());
                     builder.addPeer(new dev.nishisan.utils.ngrid.common.NodeInfo(
                             dev.nishisan.utils.ngrid.common.NodeId.of(nodeIdValue),
                             seedNode.getHost(),
@@ -179,8 +179,8 @@ public class NGridConfigLoader {
                         // For seed peers, we create a temporary NodeInfo.
                         // Ideally, discovery will update the NodeId later.
                         // We use a temporary placeholder ID for the seed.
-                        dev.nishisan.utils.ngrid.common.NodeId seedId = dev.nishisan.utils.ngrid.common.NodeId
-                                .of("seed-" + seed);
+                        dev.nishisan.utils.ngrid.common.NodeId seedId = provisionalSeedNodeId(parts[0],
+                                Integer.parseInt(parts[1]));
                         builder.addPeer(new dev.nishisan.utils.ngrid.common.NodeInfo(seedId, parts[0],
                                 Integer.parseInt(parts[1])));
                     }
@@ -314,6 +314,18 @@ public class NGridConfigLoader {
         }
 
         return builder.build();
+    }
+
+    private static String defaultSeedNodeId(String host, int port) {
+        String normalizedHost = host == null ? "" : host.trim();
+        if (normalizedHost.startsWith("seed-")) {
+            return normalizedHost;
+        }
+        return "seed-" + normalizedHost + ":" + port;
+    }
+
+    private static dev.nishisan.utils.ngrid.common.NodeId provisionalSeedNodeId(String host, int port) {
+        return dev.nishisan.utils.ngrid.common.NodeId.of(defaultSeedNodeId(host, port));
     }
 
     private static Duration parseDuration(String s) {

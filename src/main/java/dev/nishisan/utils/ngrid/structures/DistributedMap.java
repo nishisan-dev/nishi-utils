@@ -176,6 +176,21 @@ public final class DistributedMap<K extends Serializable, V extends Serializable
     }
 
     /**
+     * Removes all entries whose string key starts with {@code prefix} from the
+     * local in-memory state, persisting tombstones to disk if enabled.
+     * No Raft replication is triggered — safe to call during snapshot install.
+     *
+     * <p>
+     * Used by {@link dev.nishisan.utils.ngrid.queue.DistributedOffsetStore#reset()}
+     * to clear stale consumer offsets after a queue snapshot install.
+     *
+     * @param prefix the key prefix (must not be null)
+     */
+    public void removeByPrefix(String prefix) {
+        mapService.clearLocalByPrefix(prefix);
+    }
+
+    /**
      * Retrieves the value for a key using {@link Consistency#STRONG}.
      *
      * @param key the key

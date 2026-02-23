@@ -77,4 +77,15 @@ public interface ReplicationHandler {
 
     record SnapshotChunk(Serializable data, boolean hasMore) implements Serializable {
     }
+
+    /**
+     * Called when the local node is promoted to leader.
+     * Handlers can use this callback to perform any necessary state cleanup
+     * (e.g., truncating stale persistent data) or initialization required
+     * exclusively by the leader.
+     *
+     * @throws Exception if an error occurs during the callback
+     */
+    default void onBecameLeader() throws Exception {
+    }
 }

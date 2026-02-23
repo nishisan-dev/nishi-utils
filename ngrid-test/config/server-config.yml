@@ -27,9 +27,7 @@ cluster:
   transport:
     workers: 4            # Threads de IO
   seeds:                  # Lista de seeds para failover
-    - "192.168.5.89:9000"
-    - "192.168.5.90:9000"
-    - "192.168.5.91:9000"
+    - ${SEED_HOST:seed-1:9000}
 
 # Configuracao de Filas (multi-queue)
 queues:

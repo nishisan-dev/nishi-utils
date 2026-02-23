@@ -83,7 +83,34 @@ public class NGridNodeContainer extends GenericContainer<NGridNodeContainer> {
      * Informa se o container logou que se tornou líder.
      */
     public boolean isLeader() {
-        return getLogs().contains("Is Leader: true")
-                || getLogs().contains("Is Leader:true");
+        String logs = getLogs();
+        Boolean latest = null;
+        for (String line : logs.split("\\R")) {
+            Boolean fromLoop = parseLeaderValue(line, "CURRENT_LEADER_STATUS:");
+            if (fromLoop != null) {
+                latest = fromLoop;
+                continue;
+            }
+            Boolean fromStartup = parseLeaderValue(line, "Is Leader:");
+            if (fromStartup != null) {
+                latest = fromStartup;
+            }
+        }
+        return latest != null ? latest : false;
+    }
+
+    private Boolean parseLeaderValue(String line, String marker) {
+        int idx = line.indexOf(marker);
+        if (idx < 0) {
+            return null;
+        }
+        String suffix = line.substring(idx + marker.length()).trim();
+        if (suffix.startsWith("true")) {
+            return true;
+        }
+        if (suffix.startsWith("false")) {
+            return false;
+        }
+        return null;
     }
 }

@@ -696,7 +696,23 @@ public class NQueue<T extends Serializable> implements Closeable {
         private static final long serialVersionUID = 1L;
     }
 
-    @Override
+    /**
+     * Forces any staged records in the memory buffer to be persisted to the durable
+     * log.
+     *
+     * @throws IOException if persistence fails
+     */
+    public void flush() throws IOException {
+        if (enableMemoryBuffer && stager != null) {
+            lock.lock();
+            try {
+                stager.drainSync();
+            } finally {
+                lock.unlock();
+            }
+        }
+    }
+
     /**
      * Shuts down the queue gracefully, flushing staged records and closing all
      * resources.

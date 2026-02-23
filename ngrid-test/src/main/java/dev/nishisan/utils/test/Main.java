@@ -48,13 +48,20 @@ public class Main {
                     // produz aqui
                     System.out.println("CURRENT_LEADER_STATUS:" + node.coordinator().isLeader());
                     System.out.println("Enviando:");
-                    queue.offer(msg);
-                    System.out.println("Enviado: " + msg);
-                    index++;
+                    try {
+                        queue.offer(msg);
+                        System.out.println("Enviado: " + msg);
+                        index++;
+                    } catch (RuntimeException e) {
+                        // Leader transitions are expected in failover tests. Keep the node alive
+                        // and retry on the next cycle.
+                        System.err.println("Offer falhou (lider indisponivel/transicao): " + e.getMessage());
+                    }
                     try {
                         Thread.sleep(2000);
                     } catch (InterruptedException e) {
-                        throw new RuntimeException(e);
+                        Thread.currentThread().interrupt();
+                        break;
                     }
                 }
 
