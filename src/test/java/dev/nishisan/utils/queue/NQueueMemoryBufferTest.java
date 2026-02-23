@@ -632,6 +632,7 @@ class NQueueMemoryBufferTest {
                 .withFsync(false);
 
         try (NQueue<Integer> queue = track(NQueue.open(tempDir, "compaction-finished", options))) {
+            @SuppressWarnings("unchecked")
             java.util.concurrent.BlockingQueue<Object> memoryBuffer = (java.util.concurrent.BlockingQueue<Object>) (Object) queue
                     .testGetMemoryBuffer();
             assertNotNull(memoryBuffer, "Memory buffer should be non-null with enableMemoryBuffer=true");

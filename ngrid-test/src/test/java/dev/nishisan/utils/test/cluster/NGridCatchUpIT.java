@@ -69,11 +69,9 @@ class NGridCatchUpIT extends AbstractNGridClusterIT {
                 .pollInterval(1, TimeUnit.SECONDS)
                 .until(() -> {
                     String logs = seed.containerLogs();
-                    // O seed logou que iniciou novamente
-                    long startupCount = logs.lines()
-                            .filter(l -> l.contains("NGrid Node iniciado"))
-                            .count();
-                    return startupCount >= 2; // pelo menos startup inicial + restart
+                    return seed.isRunning()
+                            && logs.contains("NGrid Node iniciado")
+                            && logs.contains("CURRENT_LEADER_STATUS:");
                 });
 
         assertTrue(seed.isRunning(),

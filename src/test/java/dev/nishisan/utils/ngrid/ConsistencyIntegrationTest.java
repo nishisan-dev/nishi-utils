@@ -31,31 +31,33 @@ class ConsistencyIntegrationTest {
                 .addPeer(infoF)
                 .queueDirectory(dirL)
                 .replicationFactor(2)
-                .heartbeatInterval(Duration.ofMillis(100)) // fast heartbeats to propagate watermark
+                .heartbeatInterval(Duration.ofMillis(250)) // fast heartbeats to propagate watermark
                 .build());
-             NGridNode follower = new NGridNode(NGridConfig.builder(infoF)
-                     .addPeer(infoL)
-                     .queueDirectory(dirF)
-                     .replicationFactor(2)
-                     .heartbeatInterval(Duration.ofMillis(100))
-                     .build())) {
+                NGridNode follower = new NGridNode(NGridConfig.builder(infoF)
+                        .addPeer(infoL)
+                        .queueDirectory(dirF)
+                        .replicationFactor(2)
+                        .heartbeatInterval(Duration.ofMillis(250))
+                        .build())) {
 
             leader.start();
             follower.start();
 
             // Wait for leader election and cluster convergence
             long start = System.currentTimeMillis();
-            while (leader.coordinator().leaderInfo().isEmpty() || 
-                   follower.coordinator().leaderInfo().isEmpty() ||
-                   leader.coordinator().activeMembers().size() < 2 ||
-                   follower.coordinator().activeMembers().size() < 2) {
+            while (leader.coordinator().leaderInfo().isEmpty() ||
+                    follower.coordinator().leaderInfo().isEmpty() ||
+                    leader.coordinator().activeMembers().size() < 2 ||
+                    follower.coordinator().activeMembers().size() < 2) {
                 Thread.sleep(100);
                 if (System.currentTimeMillis() - start > 10000) {
-                    throw new IllegalStateException("Cluster did not form or converge. Leader members: " + leader.coordinator().activeMembers().size());
+                    throw new IllegalStateException("Cluster did not form or converge. Leader members: "
+                            + leader.coordinator().activeMembers().size());
                 }
             }
 
-            // Ensure "leader" node is actually the leader (by ID "leader" vs "follower", "leader" > "follower" alphabetically? No, "l" > "f", so leader wins)
+            // Ensure "leader" node is actually the leader (by ID "leader" vs "follower",
+            // "leader" > "follower" alphabetically? No, "l" > "f", so leader wins)
             // Wait, "leader" > "follower" ? 'l' is 108, 'f' is 102. Yes.
             assertTrue(leader.coordinator().isLeader(), "Node 'leader' should be the leader");
 
@@ -64,7 +66,7 @@ class ConsistencyIntegrationTest {
 
             // Write to leader
             mapL.put("key1", "value1");
-            
+
             // Verify Leader has it
             assertEquals("value1", mapL.get("key1").orElse(null), "Leader should have the value locally");
 
@@ -90,7 +92,7 @@ class ConsistencyIntegrationTest {
             // Now test BOUNDED consistency
             // Since we waited, lag should be 0.
             assertEquals("value1", mapF.get("key1", Consistency.bounded(5)).orElse(null));
-            
+
             // Should also work with strict 0 lag
             assertEquals("value1", mapF.get("key1", Consistency.bounded(0)).orElse(null));
         }

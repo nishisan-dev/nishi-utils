@@ -119,4 +119,30 @@ class NGridConfigLoaderTest {
         // Since we can't easily inspect Options internal state without NQueue instance,
         // we trust convertToDomain didn't throw exception on "10m".
     }
+
+    @Test
+    void shouldNotDuplicateSeedPrefixWhenSeedHostAlreadyHasPrefix() {
+        NGridYamlConfig config = new NGridYamlConfig();
+
+        NodeIdentityConfig node = new NodeIdentityConfig();
+        node.setId("node-2");
+        node.setHost("node-2");
+        node.setPort(9000);
+        NodeIdentityConfig.DirsConfig dirs = new NodeIdentityConfig.DirsConfig();
+        dirs.setBase("/tmp/ngrid-config-loader-test");
+        node.setDirs(dirs);
+        config.setNode(node);
+
+        ClusterPolicyConfig cluster = new ClusterPolicyConfig();
+        cluster.setSeeds(List.of("seed-1:9000"));
+        config.setCluster(cluster);
+
+        NGridConfig domain = NGridConfigLoader.convertToDomain(config);
+
+        assertEquals(1, domain.peers().size());
+        var peer = domain.peers().iterator().next();
+        assertEquals("seed-1", peer.nodeId().value());
+        assertEquals("seed-1", peer.host());
+        assertEquals(9000, peer.port());
+    }
 }

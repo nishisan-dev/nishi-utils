@@ -55,6 +55,9 @@ import java.util.logging.Logger;
 public class ReplicationManager implements TransportListener, LeadershipListener, Closeable {
     private static final Logger LOGGER = Logger.getLogger(ReplicationManager.class.getName());
     private static final long SYNC_THRESHOLD = 500; // Trigger sync if lag > 500 ops
+    // For small lag (<= SYNC_THRESHOLD), only trigger snapshot sync if lag is
+    // stalled for a while, avoiding aggressive sync while follower is progressing.
+    private static final Duration SMALL_LAG_STALL_SYNC_TIMEOUT = Duration.ofSeconds(4);
 
     private final Transport transport;
     private final ClusterCoordinator coordinator;
@@ -75,6 +78,8 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             false);
     private final java.util.concurrent.atomic.AtomicReference<NodeId> lastLeader = new java.util.concurrent.atomic.AtomicReference<>();
     private volatile long lastSeenLeaderEpoch = 0L;
+    private volatile long smallLagObservedAppliedSequence = -1L;
+    private volatile Instant smallLagObservedAt = null;
 
     // Multi-thread executor to prevent starvation when callbacks recursively submit
     // tasks
@@ -198,6 +203,26 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         return lastAppliedSequence;
     }
 
+    /**
+     * Resets the persisted sequence state. Used when stale data from a previous
+     * epoch is truncated — the old sequence numbers become invalid and the
+     * ReplicationManager must start fresh so followers can sync correctly.
+     */
+    public void resetSequenceState() {
+        globalSequence.set(0);
+        lastAppliedSequence = 0;
+        nextExpectedSequenceByTopic.clear();
+        sequenceByTopic.clear();
+        if (sequenceStatePath != null) {
+            try {
+                Files.deleteIfExists(sequenceStatePath);
+                LOGGER.info("Sequence state reset due to epoch truncation");
+            } catch (IOException e) {
+                LOGGER.log(Level.WARNING, "Failed to delete sequence state file", e);
+            }
+        }
+    }
+
     public boolean isLeaderSyncing() {
         return leaderSyncing.get();
     }
@@ -211,13 +236,52 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             return;
         }
         long lag = leaderWatermark - lastAppliedSequence;
+        if (lag <= 0) {
+            resetSmallLagTracking();
+            return;
+        }
         if (lag > SYNC_THRESHOLD) {
-            for (String topic : handlers.keySet()) {
-                if (syncingTopics.add(topic)) {
-                    requestSync(topic);
-                }
+            resetSmallLagTracking();
+            requestSyncForAllTopics();
+            return;
+        }
+        if (shouldSyncForStalledSmallLag()) {
+            LOGGER.info(() -> "Small lag stalled at " + lag
+                    + " operations. Triggering catch-up sync for registered topics.");
+            requestSyncForAllTopics();
+        }
+    }
+
+    private void requestSyncForAllTopics() {
+        for (String topic : handlers.keySet()) {
+            if (syncingTopics.add(topic)) {
+                requestSync(topic);
             }
         }
+    }
+
+    private boolean shouldSyncForStalledSmallLag() {
+        long appliedNow = lastAppliedSequence;
+        Instant now = Instant.now();
+
+        if (smallLagObservedAt == null || appliedNow != smallLagObservedAppliedSequence) {
+            smallLagObservedAppliedSequence = appliedNow;
+            smallLagObservedAt = now;
+            return false;
+        }
+
+        if (Duration.between(smallLagObservedAt, now).compareTo(SMALL_LAG_STALL_SYNC_TIMEOUT) < 0) {
+            return false;
+        }
+
+        // Rate-limit repeated fallback sync attempts while lag stays unchanged.
+        smallLagObservedAt = now;
+        return true;
+    }
+
+    private void resetSmallLagTracking() {
+        smallLagObservedAppliedSequence = lastAppliedSequence;
+        smallLagObservedAt = null;
     }
 
     /**
@@ -1209,6 +1273,15 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         leaderSyncTopics.clear();
         leaderSyncTopics.addAll(handlers.keySet());
         leaderSyncing.set(!leaderSyncTopics.isEmpty());
+        // Notify handlers of leadership promotion so they can clean up stale data
+        // (e.g., truncate queues with persisted data from a previous epoch).
+        for (ReplicationHandler handler : handlers.values()) {
+            try {
+                handler.onBecameLeader();
+            } catch (Exception e) {
+                LOGGER.log(Level.SEVERE, "Handler onBecameLeader failed", e);
+            }
+        }
         attemptLeaderSync(previousLeader, localId);
     }
 

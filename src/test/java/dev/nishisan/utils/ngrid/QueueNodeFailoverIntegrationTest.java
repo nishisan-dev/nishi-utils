@@ -112,8 +112,8 @@ class QueueNodeFailoverIntegrationTest {
     @Test
     @Timeout(value = 60, unit = TimeUnit.SECONDS)
     void testDataPersistsAfterLeaderFailover() throws Exception {
-        // Find current leader
-        NGridNode leader = findLeader();
+        // Find current leader and wait until it's fully synced
+        NGridNode leader = awaitNewLeader(15_000);
         assertNotNull(leader, "Should have a leader");
 
         DistributedQueue<String> queue = leader.getQueue("failover-queue", String.class);
@@ -150,7 +150,7 @@ class QueueNodeFailoverIntegrationTest {
     @Test
     @Timeout(value = 90, unit = TimeUnit.SECONDS)
     void testWritesDuringFailover() throws Exception {
-        NGridNode leader = findLeader();
+        NGridNode leader = awaitNewLeader(15_000);
         assertNotNull(leader, "Should have a leader");
 
         DistributedQueue<String> queue = leader.getQueue("stress-queue", String.class);
@@ -242,21 +242,6 @@ class QueueNodeFailoverIntegrationTest {
             }
         }
         throw new IllegalStateException("No leader elected in time");
-    }
-
-    private NGridNode findLeader() {
-        String leaderId = node1.coordinator().leaderInfo()
-                .map(l -> l.nodeId().value())
-                .orElse(null);
-        if (leaderId == null)
-            return null;
-        if (leaderId.equals(info1.nodeId().value()))
-            return node1;
-        if (leaderId.equals(info2.nodeId().value()))
-            return node2;
-        if (leaderId.equals(info3.nodeId().value()))
-            return node3;
-        return null;
     }
 
     private void disableNode(NGridNode node) {

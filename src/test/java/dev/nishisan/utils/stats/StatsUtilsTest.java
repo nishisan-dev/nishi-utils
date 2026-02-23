@@ -51,7 +51,8 @@ class StatsUtilsTest {
     void testNotifyCurrentValue() {
         String valueName = "testValue";
         statsUtils.notifyCurrentValue(valueName, 100L);
-        // StatsUtils doesn't have a direct getter for CurrentValue in the public API exposed for reading?
+        // StatsUtils doesn't have a direct getter for CurrentValue in the public API
+        // exposed for reading?
         // Checking the code: public void notifyCurrentValue... but no getValue?
         // Wait, looking at StatsUtils.java, there is no getValue(String name).
         // It only logs them in calcStats.
@@ -89,13 +90,14 @@ class StatsUtilsTest {
 
     @Test
     void testGetDateFromMsec() {
-        // 1 day, 1 hour, 1 minute, 1 second = 86400 + 3600 + 60 + 1 = 90061 seconds = 90061000 ms
+        // 1 day, 1 hour, 1 minute, 1 second = 86400 + 3600 + 60 + 1 = 90061 seconds =
+        // 90061000 ms
         long msec = 90061000L;
         String result = statsUtils.getDateFromMsec(msec);
         assertEquals("[1] - 01:01:01", result);
 
         // Test 0
-         assertEquals("[0] - 00:00:00", statsUtils.getDateFromMsec(0));
+        assertEquals("[0] - 00:00:00", statsUtils.getDateFromMsec(0));
     }
 
     @Test
@@ -107,14 +109,14 @@ class StatsUtilsTest {
         AtomicBoolean valCreated = new AtomicBoolean(false);
         AtomicBoolean valUpdated = new AtomicBoolean(false);
 
-        statsUtils.registerListener(new IStatsListener() {
+        statsUtils.registerListener(new IStatsListener<Long>() {
             @Override
-            public void onAverageCounterCreated(FixedSizeList list) {
+            public void onAverageCounterCreated(FixedSizeList<Long> list) {
                 avgCreated.set(true);
             }
 
             @Override
-            public void onAverageCounterValueAdded(FixedSizeList list) {
+            public void onAverageCounterValueAdded(FixedSizeList<Long> list) {
                 avgAdded.set(true);
             }
 

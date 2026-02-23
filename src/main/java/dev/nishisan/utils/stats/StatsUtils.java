@@ -36,11 +36,13 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-
 /**
- * Utility class for monitoring statistics and metrics, such as counters, averages, and memory usage.
- * Provides functionality to update, retrieve, and calculate various statistical data points.
- * It also supports notifying listeners about updates and changes to these statistics.
+ * Utility class for monitoring statistics and metrics, such as counters,
+ * averages, and memory usage.
+ * Provides functionality to update, retrieve, and calculate various statistical
+ * data points.
+ * It also supports notifying listeners about updates and changes to these
+ * statistics.
  */
 public class StatsUtils {
 
@@ -50,7 +52,7 @@ public class StatsUtils {
     private final ConcurrentMap<String, FixedSizeList<Long>> averages = new ConcurrentHashMap<>();
     private SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssX");
     private Long usedMemory = 0L;
-    private List<IStatsListener> listeners = new ArrayList<>();
+    private List<IStatsListener<Long>> listeners = new ArrayList<>();
     private Thread statsThread;
     private AtomicBoolean running = new AtomicBoolean(true);
 
@@ -63,7 +65,8 @@ public class StatsUtils {
      * If the specified counter name does not exist in the averages map,
      * a new counter is created with a FixedSizeList of capacity 10,
      * listeners are notified, and the provided value is added to the list.
-     * If the counter already exists, the specified value is added to the existing list.
+     * If the counter already exists, the specified value is added to the existing
+     * list.
      *
      * @param name  the name of the average counter
      * @param value the value to be added to the average counter
@@ -86,7 +89,8 @@ public class StatsUtils {
      * If the specified counter name does not exist in the averages map,
      * a new counter is created with a FixedSizeList of capacity 10,
      * listeners are notified, and the provided value is added to the list.
-     * If the counter already exists, the specified value is added to the existing list.
+     * If the counter already exists, the specified value is added to the existing
+     * list.
      *
      * @param name  the name of the average counter
      * @param value the value to be added to the average counter
@@ -96,10 +100,13 @@ public class StatsUtils {
     }
 
     /**
-     * Notifies the system of a current value update or creation. If the specified name
-     * is not already present in the values map, a new SimpleValueDTO will be created
+     * Notifies the system of a current value update or creation. If the specified
+     * name
+     * is not already present in the values map, a new SimpleValueDTO will be
+     * created
      * and added to the map. Additionally, all registered listeners will be notified
-     * of the new counter creation. If the name already exists in the map, the existing
+     * of the new counter creation. If the name already exists in the map, the
+     * existing
      * SimpleValueDTO value will be updated.
      *
      * @param name  the unique identifier for the value to be notified or updated
@@ -120,7 +127,8 @@ public class StatsUtils {
 
     /**
      * Notifies the system of a current value update or creation. This method acts
-     * as a wrapper, converting the provided Integer value to a Long before delegating
+     * as a wrapper, converting the provided Integer value to a Long before
+     * delegating
      * the task to the overloaded method.
      *
      * @param name the unique identifier for the value to be notified or updated
@@ -131,14 +139,14 @@ public class StatsUtils {
         this.notifyCurrentValue(name, l.longValue());
     }
 
-
     /**
      * Retrieves the current value of a specific hit counter based on its name.
      * If the counter with the specified name exists, its value is returned.
      * If the counter is not found, a warning is logged, and -1 is returned.
      *
      * @param counterName the name of the counter whose value is to be retrieved
-     * @return the current value of the counter if it exists, or -1 if the counter is not found
+     * @return the current value of the counter if it exists, or -1 if the counter
+     *         is not found
      */
     public Long getCounterValue(String counterName) {
         if (this.counters.containsKey(counterName)) {
@@ -161,14 +169,14 @@ public class StatsUtils {
         return metric != null ? metric.getValue() : null;
     }
 
-
     /**
      * Retrieves the rate of a specified hit counter by its name.
      * If the counter exists, its current rate is returned.
      * If the counter does not exist, a warning is logged, and -1.0 is returned.
      *
      * @param counterName the name of the hit counter whose rate is to be retrieved
-     * @return the current rate of the counter if it exists, or -1.0 if the counter is not found
+     * @return the current rate of the counter if it exists, or -1.0 if the counter
+     *         is not found
      */
     public Double getCounterRate(String counterName) {
         if (this.counters.containsKey(counterName)) {
@@ -186,9 +194,10 @@ public class StatsUtils {
      * and returns the average of the values stored in the associated FixedSizeList.
      * If the counter does not exist, a warning is logged, and -1.0 is returned.
      *
-     * @param name the name of the average counter whose average value is to be retrieved
+     * @param name the name of the average counter whose average value is to be
+     *             retrieved
      * @return the calculated average value as a Double if the counter exists,
-     * or -1.0 if the counter is not found
+     *         or -1.0 if the counter is not found
      */
     public Double getAverage(String name) {
         if (this.averages.containsKey(name)) {
@@ -215,9 +224,11 @@ public class StatsUtils {
     }
 
     /**
-     * Notifies the system of a hit counter update or creation. If the specified counter
+     * Notifies the system of a hit counter update or creation. If the specified
+     * counter
      * name already exists in the counters map, it increments the counter's value.
-     * Otherwise, a new hit counter is created and added to the counters map, and all
+     * Otherwise, a new hit counter is created and added to the counters map, and
+     * all
      * registered listeners are notified of the new hit counter creation.
      *
      * @param counter the name of the hit counter to be updated or created
@@ -258,7 +269,8 @@ public class StatsUtils {
 
     /**
      * Wrapper method for calculating and logging system statistics.
-     * This method invokes the main {@code calcStats} method with the default parameter,
+     * This method invokes the main {@code calcStats} method with the default
+     * parameter,
      * setting {@code print} to {@code false}. It is used for internal statistics
      * calculation without logging the results.
      */
@@ -267,12 +279,16 @@ public class StatsUtils {
     }
 
     /**
-     * Calculates and logs system statistics including memory usage, counters, averages, and values.
+     * Calculates and logs system statistics including memory usage, counters,
+     * averages, and values.
      * It also performs maintenance tasks such as removing expired counters.
-     * This method operates dynamically and logs information based on the provided input parameter.
+     * This method operates dynamically and logs information based on the provided
+     * input parameter.
      *
-     * @param print a boolean indicating whether the calculated statistics should be logged.
-     *              If true, detailed statistics are printed using the logger; otherwise, statistics are calculated but not logged.
+     * @param print a boolean indicating whether the calculated statistics should be
+     *              logged.
+     *              If true, detailed statistics are printed using the logger;
+     *              otherwise, statistics are calculated but not logged.
      */
     public void calcStats(boolean print) {
 
@@ -282,14 +298,16 @@ public class StatsUtils {
 
         if (!this.counters.isEmpty()) {
             if (print)
-                logger.debug(" ---------------------------------------------------------------------------------------------");
+                logger.debug(
+                        " ---------------------------------------------------------------------------------------------");
 
             this.counters.entrySet().stream().sorted(Map.Entry.comparingByKey()).forEach((entry) -> {
                 String k = entry.getKey();
                 HitCounterDTO v = entry.getValue();
                 v.calc();
                 if (print)
-                    logger.debug(String.format(Locale.US, "  Stats:  [%-35s]:=[%10.3f]/s Current Value:(%11d)", k, round(v.getRate(), 3), v.getValue()));
+                    logger.debug(String.format(Locale.US, "  Stats:  [%-35s]:=[%10.3f]/s Current Value:(%11d)", k,
+                            round(v.getRate(), 3), v.getValue()));
             });
         } else {
             if (print)
@@ -297,7 +315,8 @@ public class StatsUtils {
         }
         if (!this.values.isEmpty()) {
             if (print)
-                logger.debug(" ---------------------------------------------------------------------------------------------");
+                logger.debug(
+                        " ---------------------------------------------------------------------------------------------");
         }
         this.values.entrySet().stream().sorted(Map.Entry.comparingByKey()).forEach((entry) -> {
             if (print)
@@ -305,7 +324,8 @@ public class StatsUtils {
         });
         if (!this.averages.isEmpty()) {
             if (print)
-                logger.debug(" ---------------------------------------------------------------------------------------------");
+                logger.debug(
+                        " ---------------------------------------------------------------------------------------------");
         }
         this.averages.forEach((k, v) -> {
             try {
@@ -344,7 +364,6 @@ public class StatsUtils {
 
     }
 
-
     /**
      * Converts a given byte size into a human-readable format using SI prefixes,
      * such as kB, MB, GB, etc. The method scales down the size in increments of
@@ -352,7 +371,7 @@ public class StatsUtils {
      *
      * @param bytes the size in bytes to be converted
      * @return a human-readable string representation of the input size with
-     * an appropriate SI prefix
+     *         an appropriate SI prefix
      */
     public String humanSize(long bytes) {
         if (-1000 < bytes && bytes < 1000) {
@@ -367,11 +386,13 @@ public class StatsUtils {
     }
 
     /**
-     * Converts a given time difference in milliseconds into a formatted string representation
+     * Converts a given time difference in milliseconds into a formatted string
+     * representation
      * showing days, hours, minutes, and seconds.
      *
      * @param diffMSec the time difference in milliseconds to be converted
-     * @return a formatted string representing the time in the format "[days] - HH:mm:ss"
+     * @return a formatted string representing the time in the format "[days] -
+     *         HH:mm:ss"
      */
     public String getDateFromMsec(long diffMSec) {
         int left = 0;
@@ -412,17 +433,16 @@ public class StatsUtils {
         return bd.doubleValue();
     }
 
-
     public void shutdown() {
         try {
             this.running.set(false);
             this.statsThread.interrupt();
         } catch (Exception e) {
-            //Omit
+            // Omit
         }
     }
 
-    public void registerListener(IStatsListener listener) {
+    public void registerListener(IStatsListener<Long> listener) {
         if (!this.listeners.contains(listener)) {
             this.listeners.add(listener);
         }

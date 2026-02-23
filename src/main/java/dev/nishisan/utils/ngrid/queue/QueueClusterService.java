@@ -220,6 +220,7 @@ public final class QueueClusterService<T extends Serializable> implements Closea
                     // Deserialize payload
                     try (java.io.ByteArrayInputStream bis = new java.io.ByteArrayInputStream(record.payload());
                             java.io.ObjectInputStream ois = new java.io.ObjectInputStream(bis)) {
+                        @SuppressWarnings("unchecked")
                         T item = (T) ois.readObject();
 
                         // Advance offset to next record
@@ -330,6 +331,7 @@ public final class QueueClusterService<T extends Serializable> implements Closea
             if (!Files.exists(storagePath))
                 return;
             try (java.io.ObjectInputStream ois = new java.io.ObjectInputStream(Files.newInputStream(storagePath))) {
+                @SuppressWarnings("unchecked")
                 java.util.Map<String, Long> raw = (java.util.Map<String, Long>) ois.readObject();
                 raw.forEach((k, v) -> offsets.put(NodeId.of(k), v));
             } catch (Exception e) {
@@ -477,6 +479,12 @@ public final class QueueClusterService<T extends Serializable> implements Closea
             LOGGER.log(Level.WARNING, "Failed to get snapshot chunk " + chunkIndex, e);
             return null;
         }
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public void onBecameLeader() throws Exception {
+        LOGGER.info(() -> "Queue " + queueName + " became leader");
     }
 
     /** {@inheritDoc} */

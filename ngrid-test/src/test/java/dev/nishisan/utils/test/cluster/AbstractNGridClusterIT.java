@@ -74,6 +74,7 @@ public abstract class AbstractNGridClusterIT {
      */
     protected long countLeaders() {
         return Stream.of(seed, node2, node3)
+                .filter(c -> c != null && c.isRunning())
                 .filter(NGridNodeContainer::isLeader)
                 .count();
     }
