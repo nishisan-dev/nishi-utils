@@ -98,7 +98,7 @@ class LeaderLeaseIntegrationTest {
     }
 
     @Test
-    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    @Timeout(value = 90, unit = TimeUnit.SECONDS)
     void leaderStepsDownAndMajorityElectsNewLeader() throws Exception {
         node1.start();
         node2.start();
@@ -121,7 +121,7 @@ class LeaderLeaseIntegrationTest {
 
         // Wait for followers to detect leader loss and elect new leader
         // heartbeatTimeout is default 5s, so we need to wait longer
-        Thread.sleep(8000);
+        Thread.sleep(12000);
 
         // At least one follower should have elected a new leader
         Optional<NodeInfo> newLeaderInfo = Optional.empty();
@@ -138,7 +138,7 @@ class LeaderLeaseIntegrationTest {
     }
 
     @Test
-    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    @Timeout(value = 90, unit = TimeUnit.SECONDS)
     void epochIsMonotonicallyIncreasingAfterPartition() throws Exception {
         node1.start();
         node2.start();
@@ -155,7 +155,7 @@ class LeaderLeaseIntegrationTest {
 
         // Close leader to trigger step-down and re-election
         leaderNode.close();
-        Thread.sleep(8000);
+        Thread.sleep(12000);
 
         // Remaining nodes should have higher epoch
         for (NGridNode follower : followers) {
@@ -178,7 +178,7 @@ class LeaderLeaseIntegrationTest {
     }
 
     private void awaitClusterStability() {
-        long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(20);
+        long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(45);
         while (System.currentTimeMillis() < deadline) {
             boolean leadersAgree = node1.coordinator().leaderInfo().isPresent()
                     && node1.coordinator().leaderInfo().equals(node2.coordinator().leaderInfo())

@@ -111,6 +111,11 @@ class SequenceGapRecoveryIntegrationTest {
             node3.start();
             awaitClusterStability(node1, node2, node3);
 
+            // Allow leader sync to complete before issuing any operations.
+            // Without this barrier the very first offer may hit "Leader sync in progress"
+            // on a slow CI runner where the sync handshake hasn't finished yet.
+            node1.coordinator().awaitLocalStability();
+
             // Pre-create queue on ALL nodes to ensure handlers are registered
             node1.getQueue(QUEUE_NAME, String.class);
             node2.getQueue(QUEUE_NAME, String.class);
