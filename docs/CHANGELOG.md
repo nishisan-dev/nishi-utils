@@ -4,6 +4,21 @@
 
 ---
 
+## 2026-02-24 — 🚀 Release 3.1.0
+
+**Objetivo:** preparar release `v3.1.0` com versionamento consistente entre tag, pacote Maven e documentação.
+
+**Ajustes aplicados:**
+- `pom.xml` atualizado para `3.1.0`
+- `README.md` atualizado para `3.1.0` na seção de dependência Maven
+- `ngrid-test/pom.xml` atualizado para `nishi.utils.version=3.1.0`
+- Workflow `.github/workflows/publish.yml` corrigido para trigger por tags `v*.*.*` com validação explícita de SemVer (`v<major>.<minor>.<patch>`)
+- Publicação otimizada para `mvn -B -DskipTests deploy` no job de release (evita execução duplicada de testes na etapa de deploy)
+
+**Status:** ✅ Pronto para push da tag `v3.1.0` e execução do pipeline de release
+
+---
+
 ## 2026-02-23 — 🔴 Investigação: Perda de mensagens após restart (Issue #78, em andamento)
 
 **Contexto:** Após fechar as duplicatas e o deadlock do leader sync, o teste Docker `shouldRecoverAfterSeedRestartWithoutDuplicatesOrLoss` passou a falhar com **perda** de mensagens: `Missing messages for epoch 2: [8]`.

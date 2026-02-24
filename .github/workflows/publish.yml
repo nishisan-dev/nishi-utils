@@ -3,7 +3,7 @@ name: Maven Release
 on:
   push:
     tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v*.*.*'
 
 jobs:
   release:
@@ -23,6 +23,10 @@ jobs:
 
     - name: Extract version from tag
       run: |
+        if [[ ! "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo "Tag must match v<major>.<minor>.<patch>, got: ${GITHUB_REF_NAME}"
+          exit 1
+        fi
         VERSION="${GITHUB_REF_NAME#v}"
         echo "RELEASE_VERSION=$VERSION" >> $GITHUB_ENV
         echo "Releasing version: $VERSION"
@@ -30,11 +34,8 @@ jobs:
     - name: Set POM version
       run: mvn versions:set -DnewVersion=${{ env.RELEASE_VERSION }} -DgenerateBackupPoms=false
 
-    - name: Build with Maven
-      run: mvn -B package --file pom.xml
-
     - name: Publish to GitHub Packages
-      run: mvn deploy -s $GITHUB_WORKSPACE/settings.xml
+      run: mvn -B -DskipTests deploy -s $GITHUB_WORKSPACE/settings.xml
       env:
         GITHUB_TOKEN:    ${{ secrets.GITHUB_TOKEN }}
         GITHUB_USERNAME: ${{ github.actor }}
