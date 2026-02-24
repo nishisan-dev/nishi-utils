@@ -65,7 +65,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
     private final Map<String, ReplicationHandler> handlers = new ConcurrentHashMap<>();
     private final Map<UUID, PendingOperation> pending = new ConcurrentHashMap<>();
     private final Map<UUID, ReplicatedRecord> log = new ConcurrentHashMap<>();
-    private final Set<UUID> applied = new CopyOnWriteArraySet<>();
+    private final LinkedHashSet<UUID> applied = new LinkedHashSet<>();
     private final Set<UUID> processing = ConcurrentHashMap.newKeySet();
     private final java.util.concurrent.atomic.AtomicLong globalSequence = new java.util.concurrent.atomic.AtomicLong(0);
     private final Map<String, java.util.concurrent.atomic.AtomicLong> sequenceByTopic = new ConcurrentHashMap<>();
@@ -179,6 +179,9 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         timeoutScheduler.scheduleAtFixedRate(this::checkLagAndSync, 2000, 2000, TimeUnit.MILLISECONDS);
         timeoutScheduler.scheduleAtFixedRate(this::retryLeaderSync, 500, 500, TimeUnit.MILLISECONDS);
         timeoutScheduler.scheduleAtFixedRate(this::checkResendTimeouts, 500, 500, TimeUnit.MILLISECONDS);
+        // Periodic memory eviction for the operation audit log
+        long cleanupPeriodMs = Math.max(5000L, timeout.toMillis() * 5);
+        timeoutScheduler.scheduleAtFixedRate(this::trimLog, cleanupPeriodMs, cleanupPeriodMs, TimeUnit.MILLISECONDS);
     }
 
     public void stop() {
@@ -201,6 +204,27 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
     public long getLastAppliedSequence() {
         return lastAppliedSequence;
+    }
+
+    /**
+     * Returns the current number of entries in the applied-operations dedup set.
+     * Intended for testing and observability.
+     */
+    public int getAppliedSetSize() {
+        sequenceBufferLock.lock();
+        try {
+            return applied.size();
+        } finally {
+            sequenceBufferLock.unlock();
+        }
+    }
+
+    /**
+     * Returns the current number of entries in the operation audit log.
+     * Intended for testing and observability.
+     */
+    public int getOperationLogSize() {
+        return log.size();
     }
 
     /**
@@ -413,7 +437,13 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                         try {
                             handler.apply(operation.operationId, operation.payload);
                             recordApplied();
-                            applied.add(operation.operationId);
+                            sequenceBufferLock.lock();
+                            try {
+                                applied.add(operation.operationId);
+                                trimApplied();
+                            } finally {
+                                sequenceBufferLock.unlock();
+                            }
                             operation.markLocalApplied();
 
                             // Complete operation after successful apply
@@ -620,13 +650,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                 "[%s] Replication request opId=%s seq=%d topic=%s from=%s",
                 localNodeId, opId, seq, payload.topic(), message.source()));
 
-        // Already applied previously - send ACK and skip
-        if (applied.contains(opId)) {
-            LOGGER.fine(() -> String.format(
-                    "[%s] Skipping already-applied opId=%s", localNodeId, opId));
-            sendAck(opId, message.source());
-            return;
-        }
+        // Already applied previously - send ACK and skip (checked below under lock)
 
         // FENCING: Reject commands from stale leader epochs
         long payloadEpoch = payload.epoch();
@@ -651,6 +675,14 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         String topic = payload.topic();
         sequenceBufferLock.lock();
         try {
+            // Already applied previously - send ACK and skip (safe check under lock)
+            if (applied.contains(opId)) {
+                LOGGER.fine(() -> String.format(
+                        "[%s] Skipping already-applied opId=%s", localNodeId, opId));
+                sendAck(opId, message.source());
+                return;
+            }
+
             // Initialize per-topic structures if needed
             long nextExpected = nextExpectedSequenceByTopic.computeIfAbsent(topic, k -> 1L);
             PriorityQueue<BufferedReplication> buffer = sequenceBufferByTopic.computeIfAbsent(
@@ -670,6 +702,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                             log.putIfAbsent(opId, new ReplicatedRecord(
                                     opId, payload.topic(), payload.data(), OperationStatus.COMMITTED));
                             applied.add(opId);
+                            trimApplied();
 
                             // SEND ACK (only after successful apply)
                             sendAck(opId, message.source());
@@ -810,6 +843,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                                     next.payload().topic(), next.payload().data(),
                                     OperationStatus.COMMITTED));
                     applied.add(next.payload().operationId());
+                    trimApplied();
 
                     // SEND ACK
                     sendAck(next.payload().operationId(), next.originalMessage().source());
@@ -1434,6 +1468,46 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
     private void recordApplied() {
         lastAppliedSequence = appliedSequence.incrementAndGet();
+    }
+
+    /**
+     * Evicts the oldest entries from the {@code applied} dedup set when it exceeds
+     * {@link ReplicationConfig#appliedSetMaxSize()}.
+     *
+     * <p>
+     * Must be called while {@link #sequenceBufferLock} is held.
+     */
+    private void trimApplied() {
+        int maxSize = config.appliedSetMaxSize();
+        while (applied.size() > maxSize) {
+            Iterator<UUID> it = applied.iterator();
+            if (it.hasNext()) {
+                it.next();
+                it.remove();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /**
+     * Removes committed entries from the operation audit log ({@code log}) when
+     * its size exceeds {@link ReplicationConfig#operationLogMaxSize()}.
+     * Scheduled periodically by the timeout scheduler.
+     */
+    private void trimLog() {
+        try {
+            int maxSize = config.operationLogMaxSize();
+            if (log.size() <= maxSize) {
+                return;
+            }
+            // Remove only COMMITTED entries — PENDING entries must not be evicted
+            log.entrySet().removeIf(e -> e.getValue().status() == OperationStatus.COMMITTED
+                    && log.size() > maxSize);
+            LOGGER.fine(() -> "Operation log trimmed to " + log.size() + " entries");
+        } catch (Throwable t) {
+            LOGGER.log(Level.WARNING, "Unexpected error during trimLog", t);
+        }
     }
 
     private long getSyncSequenceForTopic(String topic) {

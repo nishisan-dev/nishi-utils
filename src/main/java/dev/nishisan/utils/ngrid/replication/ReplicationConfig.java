@@ -33,9 +33,12 @@ public final class ReplicationConfig {
     private final int resendGapThreshold;
     private final Duration resendTimeout;
     private final int replicationLogRetention;
+    private final int appliedSetMaxSize;
+    private final int operationLogMaxSize;
 
     private ReplicationConfig(int quorum, Duration operationTimeout, Duration retryInterval, boolean strictConsistency,
-            Path dataDirectory, int resendGapThreshold, Duration resendTimeout, int replicationLogRetention) {
+            Path dataDirectory, int resendGapThreshold, Duration resendTimeout, int replicationLogRetention,
+            int appliedSetMaxSize, int operationLogMaxSize) {
         this.quorum = quorum;
         this.operationTimeout = Objects.requireNonNull(operationTimeout, "operationTimeout");
         this.retryInterval = Objects.requireNonNull(retryInterval, "retryInterval");
@@ -44,6 +47,8 @@ public final class ReplicationConfig {
         this.resendGapThreshold = resendGapThreshold;
         this.resendTimeout = Objects.requireNonNull(resendTimeout, "resendTimeout");
         this.replicationLogRetention = replicationLogRetention;
+        this.appliedSetMaxSize = appliedSetMaxSize;
+        this.operationLogMaxSize = operationLogMaxSize;
     }
 
     public static ReplicationConfig of(int quorum) {
@@ -92,6 +97,26 @@ public final class ReplicationConfig {
         return replicationLogRetention;
     }
 
+    /**
+     * Maximum number of entries to keep in the dedup guard ({@code applied} set).
+     * Oldest entries are evicted FIFO when the limit is reached.
+     *
+     * @return the cap for the applied-operations set
+     */
+    public int appliedSetMaxSize() {
+        return appliedSetMaxSize;
+    }
+
+    /**
+     * Maximum number of entries to keep in the operation audit log.
+     * Committed entries are periodically trimmed when the limit is reached.
+     *
+     * @return the cap for the operation log map
+     */
+    public int operationLogMaxSize() {
+        return operationLogMaxSize;
+    }
+
     public static final class Builder {
         private final int quorum;
         private Duration operationTimeout = Duration.ofSeconds(30);
@@ -101,6 +126,8 @@ public final class ReplicationConfig {
         private int resendGapThreshold = 50;
         private Duration resendTimeout = Duration.ofSeconds(2);
         private int replicationLogRetention = 1000;
+        private int appliedSetMaxSize = 5000;
+        private int operationLogMaxSize = 2000;
 
         private Builder(int quorum) {
             if (quorum < 1) {
@@ -158,12 +185,43 @@ public final class ReplicationConfig {
             return this;
         }
 
+        /**
+         * Sets the maximum number of entries in the applied-operations dedup set.
+         * Oldest UUIDs are evicted FIFO when the limit is exceeded.
+         *
+         * @param maxSize maximum entries (must be >= 1)
+         * @return this builder
+         */
+        public Builder appliedSetMaxSize(int maxSize) {
+            if (maxSize < 1) {
+                throw new IllegalArgumentException("appliedSetMaxSize must be >= 1");
+            }
+            this.appliedSetMaxSize = maxSize;
+            return this;
+        }
+
+        /**
+         * Sets the maximum number of entries in the operation audit log.
+         * Committed entries are periodically trimmed when the limit is exceeded.
+         *
+         * @param maxSize maximum entries (must be >= 1)
+         * @return this builder
+         */
+        public Builder operationLogMaxSize(int maxSize) {
+            if (maxSize < 1) {
+                throw new IllegalArgumentException("operationLogMaxSize must be >= 1");
+            }
+            this.operationLogMaxSize = maxSize;
+            return this;
+        }
+
         public ReplicationConfig build() {
             if (dataDirectory == null) {
                 throw new IllegalStateException("dataDirectory must be set");
             }
             return new ReplicationConfig(quorum, operationTimeout, retryInterval, strictConsistency, dataDirectory,
-                    resendGapThreshold, resendTimeout, replicationLogRetention);
+                    resendGapThreshold, resendTimeout, replicationLogRetention,
+                    appliedSetMaxSize, operationLogMaxSize);
         }
     }
 }
