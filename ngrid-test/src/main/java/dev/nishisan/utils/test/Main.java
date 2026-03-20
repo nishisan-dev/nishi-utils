@@ -21,6 +21,10 @@ public class Main {
             startClientAuto();
         if (args[0].equals("scenario-1"))
             startScenario1();
+        if (args[0].equals("map-stress"))
+            startMapStress();
+        if (args[0].equals("map-reader"))
+            startMapReader();
     }
 
     private void startServer() {
@@ -350,6 +354,122 @@ public class Main {
                     });
         } catch (Exception e) {
             System.err.println("Falha ao limpar " + path + ": " + e.getMessage());
+        }
+    }
+
+    private void startMapStress() {
+        Path yamlFile = Paths.get("config/map-stress-config.yml");
+        String mapName = System.getenv().getOrDefault("NG_MAP_NAME", "stress-map");
+        int ratePerSec = Integer.parseInt(System.getenv().getOrDefault("MAP_RATE_PER_SEC", "50"));
+        String epochPrefix = System.getenv().getOrDefault("NG_MESSAGE_EPOCH", "1");
+        long sleepMs = 1000 / Math.max(1, ratePerSec);
+
+        try {
+            try (NGridNode node = new NGridNode(yamlFile)) {
+                node.start();
+                System.out.println("NGrid Map-Stress iniciado com sucesso!");
+                System.out.println("ID Local: " + node.transport().local().nodeId());
+                System.out.println("Is Leader:" + node.coordinator().isLeader());
+                
+                node.coordinator().addLeaderElectionListener((isLeader, currentLeader) ->
+                        System.out.println("CURRENT_LEADER_STATUS:" + isLeader));
+                
+                dev.nishisan.utils.ngrid.structures.DistributedMap<String, String> map = node.getMap(mapName, String.class, String.class);
+                
+                node.coordinator().awaitLocalStability();
+                System.out.println("CURRENT_LEADER_STATUS:" + node.coordinator().isLeader());
+                
+                int index = 0;
+                while (true) {
+                    String key = "key-" + index;
+                    String value = "val-" + epochPrefix + "-" + index;
+                    try {
+                        map.put(key, value);
+                        System.out.println("MAP-PUT:" + epochPrefix + "-" + index + "=" + key + ":" + value);
+                        index++;
+                    } catch (RuntimeException e) {
+                        System.err.println("MAP-PUT-FAIL:" + epochPrefix + "-" + index + "=" + e.getMessage());
+                    }
+                    
+                    try {
+                        Thread.sleep(sleepMs);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void startMapReader() {
+        Path yamlFile = Paths.get("config/map-reader-config.yml");
+        String mapName = System.getenv().getOrDefault("NG_MAP_NAME", "stress-map");
+        int keyLimit = Integer.parseInt(System.getenv().getOrDefault("NG_READ_KEY_LIMIT", "1000"));
+
+        try {
+            try (NGridNode node = new NGridNode(yamlFile)) {
+                node.start();
+                System.out.println("NGrid Map-Reader iniciado com sucesso!");
+                System.out.println("ID Local: " + node.transport().local().nodeId());
+                System.out.println("Is Leader:" + node.coordinator().isLeader());
+                
+                node.coordinator().addLeaderElectionListener((isLeader, currentLeader) ->
+                        System.out.println("CURRENT_LEADER_STATUS:" + isLeader));
+                
+                dev.nishisan.utils.ngrid.structures.DistributedMap<String, String> map = node.getMap(mapName, String.class, String.class);
+                
+                node.coordinator().awaitLocalStability();
+                System.out.println("CURRENT_LEADER_STATUS:" + node.coordinator().isLeader());
+                
+                java.util.Random random = new java.util.Random();
+                long lastKeySetTime = System.currentTimeMillis();
+                
+                while (true) {
+                    int index = random.nextInt(keyLimit);
+                    String key = "key-" + index;
+                    boolean useStrong = random.nextBoolean();
+                    
+                    try {
+                        dev.nishisan.utils.ngrid.structures.Consistency consistency = useStrong ? 
+                                dev.nishisan.utils.ngrid.structures.Consistency.STRONG : 
+                                dev.nishisan.utils.ngrid.structures.Consistency.EVENTUAL;
+                                
+                        java.util.Optional<String> result = map.get(key, consistency);
+                        String consistencyLabel = useStrong ? "STRONG" : "EVENTUAL";
+                        
+                        if (result.isPresent()) {
+                            System.out.println("MAP-READ-" + consistencyLabel + ":" + key + "=" + result.get());
+                        } else {
+                            System.out.println("MAP-READ-" + consistencyLabel + ":" + key + "=MISSING");
+                        }
+                    } catch (RuntimeException e) {
+                        System.err.println("MAP-READ-FAIL:" + key + "=" + e.getMessage());
+                    }
+                    
+                    long now = System.currentTimeMillis();
+                    if (now - lastKeySetTime > 1000) {
+                        try {
+                            int count = map.keySet().size();
+                            System.out.println("MAP-KEYSET:count=" + count);
+                        } catch (RuntimeException e) {
+                            System.err.println("MAP-KEYSET-FAIL:" + e.getMessage());
+                        }
+                        lastKeySetTime = now;
+                    }
+                    
+                    try {
+                        Thread.sleep(50);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
         }
     }
 }
