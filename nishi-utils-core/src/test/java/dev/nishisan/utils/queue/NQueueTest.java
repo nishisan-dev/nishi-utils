@@ -1,0 +1,523 @@
+package dev.nishisan.utils.queue;
+
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.Serializable;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Random;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+class NQueueTest {
+
+    @TempDir
+    Path tempDir;
+    
+    private final List<NQueue<?>> trackedQueues = Collections.synchronizedList(new ArrayList<>());
+
+    private <T extends Serializable> NQueue<T> track(NQueue<T> queue) {
+        trackedQueues.add(queue);
+        return queue;
+    }
+
+    @AfterEach
+    void validateConsistency() {
+        for (NQueue<?> queue : trackedQueues) {
+            Long violations = queue.getStats().getCounterValueOrNull("nqueue.out_of_order");
+            if (violations != null && violations > 0) {
+                fail("Queue detected internal FIFO violations: " + violations);
+            }
+        }
+        trackedQueues.clear();
+    }
+
+    @Test
+    void offerAndPollShouldReturnRecordsInInsertionOrder() throws Exception {
+        try (NQueue<String> queue = track(NQueue.open(tempDir, "basic"))) {
+            queue.offer("foo");
+            queue.offer("bar");
+
+            Optional<String> peekedValue = queue.peek();
+            assertTrue(peekedValue.isPresent(), "Expected peeked value to be present");
+            assertEquals("foo", peekedValue.get());
+
+            Optional<NQueueRecord> peeked = queue.peekRecord();
+            assertTrue(peeked.isPresent(), "Expected peeked record to be present");
+            assertEquals("foo", deserialize(peeked.get().payload()));
+            assertEquals(0L, peeked.get().meta().getIndex());
+            assertEquals(String.class.getCanonicalName(), peeked.get().meta().getClassName());
+
+            Optional<String> first = queue.poll();
+            assertTrue(first.isPresent(), "Expected first record to be present");
+            assertEquals("foo", first.get());
+
+            Optional<String> peekedValueSecond = queue.peek();
+            assertTrue(peekedValueSecond.isPresent(), "Expected peeked second value to be present");
+            assertEquals("bar", peekedValueSecond.get());
+
+            Optional<NQueueRecord> peekedSecond = queue.peekRecord();
+            assertTrue(peekedSecond.isPresent(), "Expected peeked second record to be present");
+            assertEquals(1L, peekedSecond.get().meta().getIndex());
+
+            Optional<String> second = queue.poll();
+            assertTrue(second.isPresent(), "Expected second record to be present");
+            assertEquals("bar", second.get());
+
+            assertTrue(queue.isEmpty());
+            assertEquals(0L, queue.getRecordCount());
+        }
+    }
+
+    @Test
+    void pollShouldBlockUntilDataBecomesAvailable() throws Exception {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try (NQueue<String> queue = track(NQueue.open(tempDir, "blocking"))) {
+            Future<Optional<String>> future = executor.submit(() -> {
+                try {
+                    return queue.poll();
+                } catch (IOException e) {
+                    throw new IllegalStateException("Unexpected failure while polling", e);
+                }
+            });
+
+            Thread.sleep(200);
+            assertFalse(future.isDone(), "Poll should block while queue is empty");
+
+            long offset = queue.offer("delayed");
+
+            Optional<String> record = future.get(2, TimeUnit.SECONDS);
+            assertTrue(record.isPresent());
+            assertEquals("delayed", record.get());
+
+            if (offset != NQueue.OFFSET_HANDOFF) {
+                NQueueReadResult readResult = queue.readRecordAt(offset).orElseThrow();
+                assertEquals(0L, readResult.getRecord().meta().getIndex());
+            }
+        } finally {
+            executor.shutdownNow();
+            executor.awaitTermination(2, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void openShouldRecoverStateWhenMetadataIsCorrupted() throws Exception {
+        Path queueName = Path.of("recovery");
+        Path queueDir = tempDir.resolve(queueName);
+
+        try (NQueue<String> queue = track(NQueue.open(tempDir, queueName.toString()))) {
+            queue.offer("first");
+            queue.offer("second");
+        }
+
+        Path metaPath = queueDir.resolve("queue.meta");
+        Path dataPath = queueDir.resolve("data.log");
+        long corruptedProducerOffset = Files.size(dataPath) + 128;
+        NQueueQueueMeta.write(metaPath, 9999L, corruptedProducerOffset, 999L, 999L);
+
+        try (NQueue<String> queue = track(NQueue.open(tempDir, queueName.toString()))) {
+            assertEquals(2L, queue.size());
+
+            Optional<NQueueRecord> peekedFirst = queue.peekRecord();
+            assertTrue(peekedFirst.isPresent());
+            assertEquals("first", deserialize(peekedFirst.get().payload()));
+            assertEquals(0L, peekedFirst.get().meta().getIndex());
+
+            Optional<String> first = queue.poll();
+            assertTrue(first.isPresent());
+            assertEquals("first", first.get());
+
+            Optional<String> peekedValueSecond = queue.peek();
+            assertTrue(peekedValueSecond.isPresent());
+            assertEquals("second", peekedValueSecond.get());
+
+            Optional<NQueueRecord> peekedSecond = queue.peekRecord();
+            assertTrue(peekedSecond.isPresent());
+            assertEquals("second", deserialize(peekedSecond.get().payload()));
+            assertEquals(1L, peekedSecond.get().meta().getIndex());
+
+            Optional<String> second = queue.poll();
+            assertTrue(second.isPresent());
+            assertEquals("second", second.get());
+
+            assertTrue(queue.poll(10, TimeUnit.MILLISECONDS).isEmpty());
+        }
+    }
+
+    @Test
+    void openShouldTruncateIncompleteRecordAtEndOfFile() throws Exception {
+        Path queueName = Path.of("truncate-incomplete");
+        Path queueDir = tempDir.resolve(queueName);
+
+        try (NQueue<String> queue = track(NQueue.open(tempDir, queueName.toString()))) {
+            queue.offer("first");
+            queue.offer("second");
+        }
+
+        Path dataPath = queueDir.resolve("data.log");
+        long size = Files.size(dataPath);
+        assertTrue(size > 8, "Expected data.log to have some bytes");
+
+        // Simulate a crash during append: truncate a few bytes from the end so the last record is incomplete.
+        try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(dataPath.toFile(), "rw")) {
+            raf.setLength(size - 5);
+        }
+
+        try (NQueue<String> queue = track(NQueue.open(tempDir, queueName.toString()))) {
+            assertEquals(1L, queue.size(), "Queue should recover by dropping the incomplete tail record");
+            assertEquals(Optional.of("first"), queue.peek());
+            assertEquals(Optional.of("first"), queue.poll());
+            assertTrue(queue.peek().isEmpty());
+        }
+    }
+
+    @Test
+    void openShouldRecoverWhenMetaFileIsTruncated() throws Exception {
+        Path queueName = Path.of("meta-truncated");
+        Path queueDir = tempDir.resolve(queueName);
+
+        try (NQueue<String> queue = track(NQueue.open(tempDir, queueName.toString()))) {
+            queue.offer("first");
+            queue.offer("second");
+        }
+
+        Path metaPath = queueDir.resolve("queue.meta");
+        byte[] bytes = Files.readAllBytes(metaPath);
+        assertTrue(bytes.length > 4, "Expected queue.meta to have some bytes");
+        Files.write(metaPath, java.util.Arrays.copyOf(bytes, 6)); // invalid/truncated meta
+
+        try (NQueue<String> queue = track(NQueue.open(tempDir, queueName.toString()))) {
+            assertEquals(2L, queue.size(), "Queue should rebuild state when meta is unreadable");
+            assertEquals(Optional.of("first"), queue.poll());
+            assertEquals(Optional.of("second"), queue.poll());
+        }
+    }
+
+    @Test
+    void metadataOffsetsShouldRemainConsistentAcrossOperations() throws Exception {
+        Path queueName = Path.of("offsets");
+        Path queueDir = tempDir.resolve(queueName);
+
+        try (NQueue<String> queue = track(NQueue.open(tempDir, queueName.toString()))) {
+            long firstOffset = queue.offer("first");
+            String firstValue = queue.readAt(firstOffset).orElseThrow();
+            assertEquals("first", firstValue);
+
+            NQueueReadResult firstRead = queue.readRecordAt(firstOffset).orElseThrow();
+            NQueueQueueMeta metaAfterFirst = NQueueQueueMeta.read(queueDir.resolve("queue.meta"));
+
+            assertEquals(firstOffset, metaAfterFirst.getConsumerOffset());
+            assertEquals(firstRead.getNextOffset(), metaAfterFirst.getProducerOffset());
+            assertEquals(1L, metaAfterFirst.getRecordCount());
+            assertEquals(firstRead.getRecord().meta().getIndex(), metaAfterFirst.getLastIndex());
+
+            long secondOffset = queue.offer("second");
+            String secondValue = queue.readAt(secondOffset).orElseThrow();
+            assertEquals("second", secondValue);
+
+            NQueueReadResult secondRead = queue.readRecordAt(secondOffset).orElseThrow();
+            NQueueQueueMeta metaAfterSecond = NQueueQueueMeta.read(queueDir.resolve("queue.meta"));
+
+            assertEquals(firstOffset, metaAfterSecond.getConsumerOffset());
+            assertEquals(secondRead.getNextOffset(), metaAfterSecond.getProducerOffset());
+            assertEquals(2L, metaAfterSecond.getRecordCount());
+            assertEquals(secondRead.getRecord().meta().getIndex(), metaAfterSecond.getLastIndex());
+
+            Optional<String> consumedFirst = queue.poll();
+            assertTrue(consumedFirst.isPresent());
+            assertEquals("first", consumedFirst.get());
+            NQueueQueueMeta metaAfterPoll = NQueueQueueMeta.read(queueDir.resolve("queue.meta"));
+
+            assertEquals(secondOffset, metaAfterPoll.getConsumerOffset());
+            assertEquals(metaAfterSecond.getProducerOffset(), metaAfterPoll.getProducerOffset());
+            assertEquals(1L, metaAfterPoll.getRecordCount());
+            assertEquals(secondRead.getRecord().meta().getIndex(), metaAfterPoll.getLastIndex());
+
+            Optional<String> consumedSecond = queue.poll();
+            assertTrue(consumedSecond.isPresent());
+            assertEquals("second", consumedSecond.get());
+            NQueueQueueMeta metaAfterEmpty = NQueueQueueMeta.read(queueDir.resolve("queue.meta"));
+
+            assertEquals(metaAfterEmpty.getProducerOffset(), metaAfterEmpty.getConsumerOffset());
+            assertEquals(0L, metaAfterEmpty.getRecordCount());
+        }
+    }
+
+    @Test
+    void parallelOfferAndPollShouldHandleComplexPayloads() throws Exception {
+        List<ComplexPayload> expected = buildComplexPayloads(1000);
+
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try (NQueue<ComplexPayload> queue = track(NQueue.open(tempDir, "parallel-complex"))) {
+            Future<Void> producer = executor.submit(() -> {
+                ThreadLocalRandom rng = ThreadLocalRandom.current();
+                for (ComplexPayload payload : expected) {
+                    queue.offer(payload);
+                    randomLatency(rng);
+                }
+                return null;
+            });
+
+            Future<List<ComplexPayload>> consumer = executor.submit(() -> {
+                ThreadLocalRandom rng = ThreadLocalRandom.current();
+                List<ComplexPayload> consumed = new ArrayList<>();
+                while (consumed.size() < expected.size()) {
+                    Optional<ComplexPayload> record = queue.poll();
+                    if (record.isEmpty()) {
+                        throw new IllegalStateException("Queue returned empty optional while blocking");
+                    }
+                    consumed.add(record.get());
+                    randomLatency(rng);
+                }
+                return consumed;
+            });
+
+            producer.get(60, TimeUnit.SECONDS);
+            List<ComplexPayload> consumed = consumer.get(60, TimeUnit.SECONDS);
+            assertEquals(expected, consumed, "Consumed payloads should match the enqueued ones");
+        } finally {
+            executor.shutdownNow();
+            executor.awaitTermination(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void pollWithTimeoutShouldReturnEmptyWhenQueueRemainsEmpty() throws Exception {
+        try (NQueue<String> queue = track(NQueue.open(tempDir, "timeout"))) {
+            long start = System.nanoTime();
+            Optional<String> record = queue.poll(150, TimeUnit.MILLISECONDS);
+            long elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+
+            assertTrue(record.isEmpty(), "Poll with timeout should return empty when no data is available");
+            assertTrue(elapsed >= 100, "Poll should block for at least most of the timeout interval");
+        }
+    }
+
+    @Test
+    void peekShouldReturnEmptyWhenQueueIsEmpty() throws Exception {
+        try (NQueue<String> queue = track(NQueue.open(tempDir, "peek-empty"))) {
+            assertTrue(queue.peek().isEmpty(), "Peek should return empty when queue is empty");
+            assertTrue(queue.peekRecord().isEmpty(), "Peek record should return empty when queue is empty");
+        }
+    }
+
+    @Test
+    void peekShouldNotConsumeElements() throws Exception {
+        try (NQueue<String> queue = track(NQueue.open(tempDir, "peek-non-consuming"))) {
+            queue.offer("alpha");
+            queue.offer("beta");
+
+            Optional<String> peekedFirst = queue.peek();
+            Optional<String> peekedFirstAgain = queue.peek();
+
+            assertTrue(peekedFirst.isPresent());
+            assertTrue(peekedFirstAgain.isPresent());
+            assertEquals("alpha", peekedFirst.get());
+            assertEquals("alpha", peekedFirstAgain.get());
+
+            Optional<String> first = queue.poll();
+            Optional<String> second = queue.poll();
+
+            assertTrue(first.isPresent());
+            assertTrue(second.isPresent());
+            assertEquals("alpha", first.get());
+            assertEquals("beta", second.get());
+        }
+    }
+
+    private static String deserialize(byte[] payload) {
+        try (ByteArrayInputStream bis = new ByteArrayInputStream(payload);
+             ObjectInputStream ois = new ObjectInputStream(bis)) {
+            return (String) ois.readObject();
+        } catch (IOException | ClassNotFoundException e) {
+            throw new IllegalStateException("Failed to deserialize payload", e);
+        }
+    }
+
+    private static void randomLatency(ThreadLocalRandom random) throws InterruptedException {
+        long millis = random.nextLong(0, 3);
+        if (millis > 0) {
+            TimeUnit.MILLISECONDS.sleep(millis);
+        }
+    }
+
+    private static List<ComplexPayload> buildComplexPayloads(int total) {
+        Random random = new Random(1729L);
+        return IntStream.range(0, total)
+                .mapToObj(index -> ComplexPayload.random(index, random))
+                .collect(Collectors.toList());
+    }
+
+    private static final class ComplexPayload implements Serializable {
+        private static final long serialVersionUID = 1L;
+
+        private final int id;
+        private final String name;
+        private final List<Integer> values;
+        private final Map<String, Double> attributes;
+        private final Nested nested;
+
+        private ComplexPayload(int id, String name, List<Integer> values, Map<String, Double> attributes, Nested nested) {
+            this.id = id;
+            this.name = name;
+            this.values = List.copyOf(values);
+            this.attributes = Map.copyOf(attributes);
+            this.nested = nested;
+        }
+
+        static ComplexPayload random(int id, Random random) {
+            String name = "payload-" + id;
+
+            int valueCount = 3 + random.nextInt(3);
+            List<Integer> values = new ArrayList<>(valueCount);
+            for (int i = 0; i < valueCount; i++) {
+                values.add(random.nextInt(10_000));
+            }
+
+            int attributeCount = 2 + random.nextInt(3);
+            Map<String, Double> attributes = new java.util.LinkedHashMap<>();
+            for (int i = 0; i < attributeCount; i++) {
+                attributes.put("attr-" + i, random.nextDouble());
+            }
+
+            Nested nested = new Nested("nested-" + id, random.nextBoolean(), random.nextLong());
+            return new ComplexPayload(id, name, values, attributes, nested);
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            ComplexPayload that = (ComplexPayload) o;
+            return id == that.id
+                    && Objects.equals(name, that.name)
+                    && Objects.equals(values, that.values)
+                    && Objects.equals(attributes, that.attributes)
+                    && Objects.equals(nested, that.nested);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(id, name, values, attributes, nested);
+        }
+    }
+
+    private static final class Nested implements Serializable {
+        private static final long serialVersionUID = 1L;
+
+        private final String description;
+        private final boolean active;
+        private final long timestamp;
+
+        Nested(String description, boolean active, long timestamp) {
+            this.description = description;
+            this.active = active;
+            this.timestamp = timestamp;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            Nested nested = (Nested) o;
+            return active == nested.active
+                    && timestamp == nested.timestamp
+                    && Objects.equals(description, nested.description);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(description, active, timestamp);
+        }
+    }
+
+    @Test
+    void handlesLoadFluctuationsAndTransitions() throws Exception {
+        NQueue.Options options = NQueue.Options.defaults()
+                .withShortCircuit(true)
+                .withCompactionInterval(Duration.ofMillis(100))
+                .withCompactionWasteThreshold(0.5);
+
+        try (NQueue<Integer> queue = NQueue.open(tempDir, "fluctuation", options)) {
+            ExecutorService exec = Executors.newCachedThreadPool();
+            List<Integer> consumed = new ArrayList<>();
+            List<Integer> expected = new ArrayList<>();
+            int totalItems = 0;
+
+            // Phase 1: Short Circuit (Handoff)
+            // Consumer waits, Producer sends.
+            Future<Integer> consumerFuture = exec.submit(() -> queue.poll().orElseThrow());
+            Thread.sleep(50); // Ensure consumer is blocked
+            queue.offer(totalItems++);
+            expected.add(0);
+            consumed.add(consumerFuture.get(1, TimeUnit.SECONDS));
+
+            // Phase 2: Burst (Disk Persistence)
+            // No consumer active, fill queue.
+            int burstSize = 500;
+            for (int i = 0; i < burstSize; i++) {
+                queue.offer(totalItems);
+                expected.add(totalItems);
+                totalItems++;
+            }
+            // Now drain
+            for (int i = 0; i < burstSize; i++) {
+                consumed.add(queue.poll().orElseThrow());
+            }
+
+            // Phase 3: Short Circuit Again
+            consumerFuture = exec.submit(() -> queue.poll().orElseThrow());
+            Thread.sleep(50);
+            queue.offer(totalItems);
+            expected.add(totalItems);
+            totalItems++;
+            consumed.add(consumerFuture.get(1, TimeUnit.SECONDS));
+
+            // Phase 4: Concurrent Stress
+            int stressCount = 1000;
+            Future<?> stressConsumer = exec.submit(() -> {
+               for(int i=0; i<stressCount; i++) {
+                   try {
+                       consumed.add(queue.poll().orElseThrow());
+                   } catch (IOException e) {
+                       throw new RuntimeException(e);
+                   }
+               }
+            });
+            
+            for(int i=0; i<stressCount; i++) {
+                queue.offer(totalItems);
+                expected.add(totalItems);
+                totalItems++;
+            }
+            stressConsumer.get(10, TimeUnit.SECONDS);
+
+            exec.shutdown();
+            
+            assertEquals(expected, consumed, "Order must be preserved across transitions");
+            
+            // Validate internal consistency metric
+            Long violations = queue.getStats().getCounterValueOrNull("nqueue.out_of_order");
+            assertNull(violations, "Internal FIFO violation detected: " + violations);
+        }
+    }
+}

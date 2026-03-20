@@ -32,10 +32,10 @@ jobs:
         echo "Releasing version: $VERSION"
 
     - name: Set POM version
-      run: mvn versions:set -DnewVersion=${{ env.RELEASE_VERSION }} -DgenerateBackupPoms=false
+      run: mvn versions:set -DnewVersion=${{ env.RELEASE_VERSION }} -DgenerateBackupPoms=false -DprocessAllModules=true
 
     - name: Build and publish to GitHub Packages
-      run: mvn -B -DskipTests deploy -s $GITHUB_WORKSPACE/settings.xml
+      run: mvn -B -DskipTests -pl nishi-utils-core deploy -s $GITHUB_WORKSPACE/settings.xml
       env:
         GITHUB_TOKEN:    ${{ secrets.GITHUB_TOKEN }}
         GITHUB_USERNAME: ${{ github.actor }}
@@ -45,9 +45,9 @@ jobs:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         gh release upload "${{ github.event.release.tag_name }}" \
-          target/nishi-utils-${{ env.RELEASE_VERSION }}.jar \
-          target/nishi-utils-${{ env.RELEASE_VERSION }}-sources.jar \
-          target/nishi-utils-${{ env.RELEASE_VERSION }}-javadoc.jar \
+          nishi-utils-core/target/nishi-utils-core-${{ env.RELEASE_VERSION }}.jar \
+          nishi-utils-core/target/nishi-utils-core-${{ env.RELEASE_VERSION }}-sources.jar \
+          nishi-utils-core/target/nishi-utils-core-${{ env.RELEASE_VERSION }}-javadoc.jar \
           --clobber
 
     - name: Prune old releases (keep last 5)

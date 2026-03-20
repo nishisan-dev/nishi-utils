@@ -4,22 +4,21 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <repositories>
-        <repository>
-            <id>github</id>
-            <url>https://maven.pkg.github.com/nishisan-dev/nishi-utils</url>
-        </repository>
-    </repositories>
+    <parent>
+        <groupId>dev.nishisan</groupId>
+        <artifactId>nishi-utils-parent</artifactId>
+        <version>3.1.0</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
 
-    <groupId>dev.nishisan.utils.test</groupId>
     <artifactId>ngrid-test</artifactId>
-    <version>1.0-SNAPSHOT</version>
+    <packaging>jar</packaging>
 
     <dependencies>
         <dependency>
             <groupId>dev.nishisan</groupId>
-            <artifactId>nishi-utils</artifactId>
-            <version>${nishi.utils.version}</version>
+            <artifactId>nishi-utils-core</artifactId>
+            <version>${project.version}</version>
         </dependency>
         <dependency>
             <groupId>org.slf4j</groupId>
@@ -41,7 +40,7 @@
         </dependency>
         <dependency>
             <groupId>org.testcontainers</groupId>
-            <artifactId>junit-jupiter</artifactId>
+            <artifactId>testcontainers-junit-jupiter</artifactId>
             <version>${testcontainers.version}</version>
             <scope>test</scope>
         </dependency>
@@ -107,6 +106,10 @@
                     <excludes>
                         <exclude>**/*IT.java</exclude>
                     </excludes>
+                    <environmentVariables>
+                        <TESTCONTAINERS_RYUK_DISABLED>true</TESTCONTAINERS_RYUK_DISABLED>
+                        <DOCKER_HOST>unix:///var/run/docker.sock</DOCKER_HOST>
+                    </environmentVariables>
                 </configuration>
             </plugin>
             <!-- Failsafe: testes de integracao (*IT.java) em mvn verify -->
@@ -120,6 +123,12 @@
                             <goal>integration-test</goal>
                             <goal>verify</goal>
                         </goals>
+                        <configuration>
+                            <environmentVariables>
+                                <TESTCONTAINERS_RYUK_DISABLED>true</TESTCONTAINERS_RYUK_DISABLED>
+                                <DOCKER_HOST>unix:///var/run/docker.sock</DOCKER_HOST>
+                            </environmentVariables>
+                        </configuration>
                     </execution>
                 </executions>
             </plugin>
@@ -134,6 +143,7 @@
                         <phase>pre-integration-test</phase>
                         <goals><goal>run</goal></goals>
                         <configuration>
+                            <skip>${skip.docker.build}</skip>
                             <target>
                                 <exec executable="docker"
                                       dir="${project.basedir}/.."
@@ -153,11 +163,11 @@
         </plugins>
     </build>
     <properties>
-        <nishi.utils.version>3.1.0</nishi.utils.version>
+        <skip.docker.build>false</skip.docker.build>
         <maven.compiler.source>21</maven.compiler.source>
         <maven.compiler.target>21</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <testcontainers.version>1.20.4</testcontainers.version>
+        <testcontainers.version>2.0.3</testcontainers.version>
         <junit.version>5.11.4</junit.version>
     </properties>
 
