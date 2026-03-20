@@ -29,6 +29,7 @@ import dev.nishisan.utils.ngrid.replication.ReplicationResult;
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.Serializable;
+import java.util.Collections;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -181,6 +182,17 @@ public final class MapClusterService<K extends Serializable, V extends Serializa
      */
     public Optional<V> get(K key) {
         return Optional.ofNullable(data.get(key));
+    }
+
+    /**
+     * Returns an unmodifiable view of the keys in the local replica.
+     * This is an eventually-consistent snapshot — no replication or
+     * leader routing is involved.
+     *
+     * @return an unmodifiable set of keys
+     */
+    public java.util.Set<K> keySet() {
+        return Collections.unmodifiableSet(data.keySet());
     }
 
     /**

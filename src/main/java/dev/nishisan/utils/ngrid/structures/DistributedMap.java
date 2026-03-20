@@ -150,6 +150,9 @@ public final class DistributedMap<K extends Serializable, V extends Serializable
     public Optional<V> put(K key, V value) {
         recordIngressWrite();
         if (coordinator.isLeader()) {
+            if (!coordinator.hasValidLease()) {
+                throw new IllegalStateException("Leader lease expired, cannot accept writes");
+            }
             recordMapPut();
             return mapService.put(key, value);
         }
@@ -168,6 +171,9 @@ public final class DistributedMap<K extends Serializable, V extends Serializable
     public Optional<V> remove(K key) {
         recordIngressWrite();
         if (coordinator.isLeader()) {
+            if (!coordinator.hasValidLease()) {
+                throw new IllegalStateException("Leader lease expired, cannot accept writes");
+            }
             recordMapRemove();
             return mapService.remove(key);
         }
@@ -199,6 +205,17 @@ public final class DistributedMap<K extends Serializable, V extends Serializable
     @SuppressWarnings("unchecked")
     public Optional<V> get(K key) {
         return get(key, Consistency.STRONG);
+    }
+
+    /**
+     * Returns an unmodifiable view of the keys in the local replica.
+     * This is an eventually-consistent snapshot — no replication or
+     * leader routing is involved.
+     *
+     * @return an unmodifiable set of keys
+     */
+    public Set<K> keySet() {
+        return mapService.keySet();
     }
 
     /**
@@ -240,11 +257,18 @@ public final class DistributedMap<K extends Serializable, V extends Serializable
     }
 
     private Serializable invokeLeader(String command, Serializable body) {
-        int attempts = 0;
-        while (attempts < 3) {
-            attempts++;
-            NodeInfo leaderInfo = coordinator.leaderInfo()
-                    .orElseThrow(() -> new IllegalStateException("No leader available"));
+        int maxAttempts = 5;
+        long backoffMs = 200;
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            NodeInfo leaderInfo = coordinator.leaderInfo().orElse(null);
+            if (leaderInfo == null) {
+                if (attempt >= maxAttempts) {
+                    throw new IllegalStateException("No leader available after " + maxAttempts + " attempts");
+                }
+                sleep(backoffMs);
+                backoffMs = Math.min(backoffMs * 2, 2000);
+                continue;
+            }
             if (leaderInfo.nodeId().equals(transport.local().nodeId())) {
                 return executeLocal(command, body);
             }
@@ -259,31 +283,32 @@ public final class DistributedMap<K extends Serializable, V extends Serializable
                 ClusterMessage response = future.join();
                 ClientResponsePayload responsePayload = response.payload(ClientResponsePayload.class);
                 if (!responsePayload.success()) {
-                    if ("Not the leader".equals(responsePayload.error()) && attempts < 3) {
-                        try {
-                            Thread.sleep(100);
-                        } catch (InterruptedException e) {
-                            Thread.currentThread().interrupt();
-                            throw new IllegalStateException("Interrupted during retry", e);
-                        }
+                    if ("Not the leader".equals(responsePayload.error()) && attempt < maxAttempts) {
+                        sleep(backoffMs);
+                        backoffMs = Math.min(backoffMs * 2, 2000);
                         continue;
                     }
                     throw new IllegalStateException(responsePayload.error());
                 }
                 return responsePayload.body();
             } catch (Exception e) {
-                if (attempts >= 3) {
+                if (attempt >= maxAttempts) {
                     throw e;
                 }
-                try {
-                    Thread.sleep(100);
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    throw new IllegalStateException("Interrupted during retry", ie);
-                }
+                sleep(backoffMs);
+                backoffMs = Math.min(backoffMs * 2, 2000);
             }
         }
         throw new IllegalStateException("Failed to invoke leader after retries");
+    }
+
+    private static void sleep(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted during retry backoff", e);
+        }
     }
 
     @SuppressWarnings("unchecked")
