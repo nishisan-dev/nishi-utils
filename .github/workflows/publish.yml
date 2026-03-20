@@ -1,9 +1,8 @@
 name: Maven Release
 
 on:
-  push:
-    tags:
-      - 'v*.*.*'
+  release:
+    types: [created]
 
 jobs:
   release:
@@ -23,31 +22,33 @@ jobs:
 
     - name: Extract version from tag
       run: |
-        if [[ ! "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-          echo "Tag must match v<major>.<minor>.<patch>, got: ${GITHUB_REF_NAME}"
+        TAG="${{ github.event.release.tag_name }}"
+        if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo "Tag must match v<major>.<minor>.<patch>, got: $TAG"
           exit 1
         fi
-        VERSION="${GITHUB_REF_NAME#v}"
+        VERSION="${TAG#v}"
         echo "RELEASE_VERSION=$VERSION" >> $GITHUB_ENV
         echo "Releasing version: $VERSION"
 
     - name: Set POM version
       run: mvn versions:set -DnewVersion=${{ env.RELEASE_VERSION }} -DgenerateBackupPoms=false
 
-    - name: Publish to GitHub Packages
+    - name: Build and publish to GitHub Packages
       run: mvn -B -DskipTests deploy -s $GITHUB_WORKSPACE/settings.xml
       env:
         GITHUB_TOKEN:    ${{ secrets.GITHUB_TOKEN }}
         GITHUB_USERNAME: ${{ github.actor }}
 
-    - name: Create GitHub Release
-      uses: softprops/action-gh-release@v2
-      with:
-        tag_name: ${{ github.ref_name }}
-        name: "Release ${{ github.ref_name }}"
-        generate_release_notes: true
+    - name: Upload artifacts to release
       env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        gh release upload "${{ github.event.release.tag_name }}" \
+          target/nishi-utils-${{ env.RELEASE_VERSION }}.jar \
+          target/nishi-utils-${{ env.RELEASE_VERSION }}-sources.jar \
+          target/nishi-utils-${{ env.RELEASE_VERSION }}-javadoc.jar \
+          --clobber
 
     - name: Prune old releases (keep last 5)
       env:
@@ -60,6 +61,6 @@ jobs:
           COUNT=$((COUNT + 1))
           if [ "$COUNT" -gt "$KEEP" ]; then
             echo "Deleting release $TAG (keeping tags)"
-            gh release delete "$TAG" --yes --cleanup-tag=false
+            gh release delete "$TAG" --yes
           fi
         done
