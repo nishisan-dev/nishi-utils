@@ -1,68 +1,136 @@
 # NGrid – Mapa Distribuído (design + implementação atual)
 
+> **Última atualização:** 2026-03-20
+
 Este documento descreve o **mapa distribuído** do NGrid conforme implementado hoje no código.
 
 Principais classes envolvidas:
 - `dev.nishisan.utils.ngrid.structures.DistributedMap`
 - `dev.nishisan.utils.ngrid.map.MapClusterService`
 - `dev.nishisan.utils.ngrid.replication.ReplicationManager`
-- `dev.nishisan.utils.ngrid.map.MapPersistence` (opcional, por nó)
+- `dev.nishisan.utils.map.NMapPersistence` (opcional, por nó)
+- `dev.nishisan.utils.ngrid.structures.Consistency` / `ConsistencyLevel`
 
 ---
 
 ## Objetivo
 
 Fornecer um mapa chave→valor replicado entre nós do cluster, com:
-- **escritas serializadas por líder**
-- **commit por quorum**
-- **replicação de comandos** (`PUT`/`REMOVE`) para manter as réplicas alinhadas
-- **persistência local opcional** (WAL + snapshot) para acelerar restart e melhorar durabilidade local
+- **Escritas serializadas por líder** com validação de lease
+- **Commit por quorum** (estrito ou dinâmico)
+- **Replicação de comandos** (`PUT`/`REMOVE`) para manter as réplicas alinhadas
+- **Persistência local opcional** (WAL + Snapshot) para acelerar restart e melhorar durabilidade local
+- **Leituras com 3 níveis de consistência** (STRONG, BOUNDED, EVENTUAL)
 
 ---
 
 ## Componentes e responsabilidades
 
-### `DistributedMap<K,V>` (fachada “cliente”)
-- Roteia as chamadas para o **líder**.
-- Em nó líder: executa localmente no `MapClusterService`.
-- Em nó follower: envia `CLIENT_REQUEST` ao líder e aguarda resposta.
+### `DistributedMap<K,V>` (fachada "cliente")
+
+- Roteia as chamadas de escrita para o **líder**.
+- Em nó líder: valida **leader lease** antes de aceitar writes, executa localmente no `MapClusterService`.
+- Em nó follower: envia `CLIENT_REQUEST` ao líder via `invokeLeader()` com **retry + backoff exponencial** (5 tentativas, 200ms→2s).
+- Leituras (`get`) respeitam o nível de consistência configurado (ver seção abaixo).
+- Expõe `keySet()` para leitura eventually-consistent das chaves locais.
+- Expõe `removeByPrefix()` para limpeza local durante snapshot install (sem replicação).
 
 ### `MapClusterService<K,V>` (estado + integração com replicação)
+
 - Mantém o estado em memória em um `ConcurrentHashMap`.
 - Para `put/remove`:
   - dispara `ReplicationManager.replicate("map:<mapName>", MapReplicationCommand...)`
   - aguarda commit (quorum) ou falha (timeout/quorum inalcançável)
 - Para `get`:
-  - lê do mapa local (no líder, é o caminho efetivo; em followers, a fachada roteia ao líder por padrão)
+  - lê do mapa local diretamente
+- Implementa `ReplicationHandler`:
+  - `apply()` — aplica PUT/REMOVE localmente. Para offset maps (`_ngrid-queue-offsets`), usa semântica monotônica: `max(stored, new)`.
+  - `getSnapshotChunk()` — retorna snapshot paginado (1000 itens/chunk) para catch-up de followers.
+  - `installSnapshot()` — instala snapshot recebido. Para offset maps, respeita semântica monotônica.
+  - `resetState()` — limpa estado antes de snapshot install.
+- Expõe health check: `isHealthy()` e `persistenceFailureCount()`.
 
-### `ReplicationManager` (quorum + deduplicação em memória)
+### `ReplicationManager` (quorum + deduplicação)
+
 - Apenas o líder pode iniciar `replicate(...)`.
-- Aplica localmente primeiro e replica para followers.
+- Valida **leader lease** antes de aceitar writes — rejeita com `LeaseExpiredException` se expirado.
+- Replica para followers e aguarda ACKs.
 - Considera **commitada** quando `acks >= quorumEfetivo`.
 - Deduplica por `operationId` em memória (evita reaplicar a mesma operação).
+- Resend de sequências faltantes via `SEQUENCE_RESEND_REQUEST/RESPONSE`.
+- Catch-up de followers via snapshot chunked quando lag > threshold (500 ops).
 
-### `MapPersistence` (opcional, por nó)
-- Persistência **best-effort**: falhas de IO são logadas, mas não devem derrubar a operação do mapa.
+### `NMapPersistence` (opcional, por nó)
+
+- Persistência com modos configuráveis: `DISABLED`, `ASYNC_NO_FSYNC`, `ASYNC_WITH_FSYNC`.
+- Para offset maps (`_ngrid-queue-offsets`): usa `appendSync()` (escrita síncrona) para garantir durabilidade em crash.
+- Para mapas genéricos: usa `appendAsync()` (batch background).
 - Mantém:
   - `wal.log` (append-only)
   - `snapshot.dat` (snapshot completo periódico)
-  - `map.meta` (metadados do snapshot; best-effort)
+  - `meta.json` (metadados do snapshot)
 
 ---
 
-## Modelo de consistência e quorum (prático)
+## Níveis de Consistência de Leitura
+
+O `DistributedMap.get()` suporta 3 níveis de consistência configuráveis:
+
+| Nível | Comportamento | Latência | Uso típico |
+|---|---|---|---|
+| `STRONG` (default) | Roteia ao líder | Maior (RPC) | Dados críticos, leitura após escrita |
+| `BOUNDED` | Local se lag ≤ maxLag, senão líder | Variável | Caches com tolerância controlada |
+| `EVENTUAL` | Sempre local | Mínima | Dashboards, métricas, dados não-críticos |
+
+```java
+// Leitura forte (default)
+Optional<V> value = map.get("key");
+
+// Leitura eventual (local, sem RPC)
+Optional<V> value = map.get("key", Consistency.EVENTUAL);
+
+// Leitura bounded (local se lag <= 10 operações)
+Optional<V> value = map.get("key", Consistency.bounded(10));
+```
+
+---
+
+## Proteções em Cenários de Falha
+
+### Leader Lease
+
+- O líder mantém um lease baseado em heartbeat de followers.
+- `DistributedMap.put()` e `remove()` verificam `coordinator.hasValidLease()` antes de aceitar writes.
+- Se o lease expirou (líder isolado): `IllegalStateException("Leader lease expired, cannot accept writes")`.
+- O `ReplicationManager` também rejeita com `LeaseExpiredException`.
+
+### Epoch Fencing
+
+- Cada eleição incrementa o epoch (persistido em `leader-epoch.dat`).
+- Replicações com epoch antigo são rejeitadas pelo follower.
+- Dados escritos no lado minoritário de uma partição são descartados na reconexão.
+
+### Monotonic Offsets
+
+- Para o map interno `_ngrid-queue-offsets`, o `apply()` usa `max(stored, new)` — nunca regride offsets.
+- Evita duplicidade de mensagens em queues após failover/restart.
+
+---
+
+## Modelo de Quorum
 
 - **Escritas** (`put/remove`): passam pelo líder e só retornam sucesso após quorum.
-- **Leituras** (`get`): a fachada roteia para o líder para manter o modelo simples (consistência forte no líder).
 - **Quorum efetivo** (no líder):
 
-\[
-quorumEfetivo = \max(1, \min(quorumConfigurado, |\text{membrosAtivos}|))
-\]
+| Modo | Cálculo |
+|---|---|
+| `strictConsistency=true` | Quorum configurado (fixo) — falha se inalcançável |
+| `strictConsistency=false` | `max(1, min(quorumConfigurado, membrosAtivos))` — adapta dinamicamente |
 
 ### Falhas típicas
-- **Timeout**: operação excede `operationTimeout` (padrão ~30s no `ReplicationManager`).
-- **Quorum inalcançável**: peers desconectam e o número de membros alcançáveis fica abaixo do quorum.
+- **Timeout**: operação excede `operationTimeout` (default 30s).
+- **Quorum inalcançável**: peers desconectam e `strictConsistency=true` impede writes.
+- **Lease expirado**: líder isolado sem heartbeat de followers.
 
 ---
 
@@ -82,15 +150,17 @@ participant DM as DistributedMap
 participant MS as MapClusterService
 participant RM as ReplicationManager
 participant LF as LeaderFollower
-participant MP as MapPersistence
+participant MP as NMapPersistence
 
 Client->>F: put(k, v)
 F->>DM: put(k, v)
+Note over DM: isLeader()? → invokeLeader()
 DM->>L: CLIENT_REQUEST("map.put:<mapName>", MapEntry(k,v))
 L->>DM: onMessage(CLIENT_REQUEST)
+Note over DM: hasValidLease()? ✅
 DM->>MS: put(k, v)
 MS->>RM: replicate("map:<mapName>", PUT(k,v))
-RM->>MS: applyReplication(opId, PUT) (líder aplica local)
+RM->>MS: apply(opId, PUT) (líder aplica local)
 opt persistencia_habilitada
   MS->>MP: appendAsync(PUT,k,v)
 end
@@ -102,30 +172,27 @@ MS-->>DM: Optional(prev)
 DM-->>Client: Optional(prev)
 ```
 
-### GET (`get(key)`)
+### GET (`get(key, consistency)`)
 
-Por implementação atual, o `get` é servido pelo líder (via roteamento da fachada). Isso simplifica a consistência sem exigir “read-repair” ou validação por versão.
+O comportamento depende do nível de consistência e de quem é o nó:
 
 ```mermaid
-sequenceDiagram
-participant Client as Client
-participant F as FollowerNode
-participant L as LeaderNode
-participant DM as DistributedMap
-participant MS as MapClusterService
-
-Client->>F: get(k)
-F->>DM: get(k)
-DM->>L: CLIENT_REQUEST("map.get:<mapName>", k)
-L->>DM: onMessage(CLIENT_REQUEST)
-DM->>MS: get(k)
-MS-->>DM: Optional(v)
-DM-->>Client: Optional(v)
+flowchart TD
+  A[get key, consistency] --> B{isLeader?}
+  B -->|Sim| C[Leitura local]
+  B -->|Não| D{Consistency level?}
+  D -->|EVENTUAL| C
+  D -->|BOUNDED| E{lag <= maxLag?}
+  E -->|Sim| C
+  E -->|Não| F[Roteia ao líder]
+  D -->|STRONG| F
+  F --> G[CLIENT_REQUEST → Líder]
+  G --> C
 ```
 
 ### REMOVE (`remove(key)`)
 
-Importante: **não existe tombstone** na implementação atual. O comando replicado é `REMOVE(key)` e cada nó executa `data.remove(key)`.
+**Não existe tombstone** na implementação atual. O comando replicado é `REMOVE(key)` e cada nó executa `data.remove(key)`.
 
 ```mermaid
 sequenceDiagram
@@ -134,12 +201,13 @@ participant L as LeaderNode
 participant MS as MapClusterService
 participant RM as ReplicationManager
 participant F1 as Follower1
-participant MP as MapPersistence
+participant MP as NMapPersistence
 
 Client->>L: remove(k)
+Note over L: hasValidLease()? ✅
 L->>MS: remove(k)
 MS->>RM: replicate("map:<mapName>", REMOVE(k))
-RM->>MS: applyReplication(opId, REMOVE) (líder aplica local)
+RM->>MS: apply(opId, REMOVE) (líder aplica local)
 opt persistencia_habilitada
   MS->>MP: appendAsync(REMOVE,k,null)
 end
@@ -151,48 +219,54 @@ RM-->>Client: Optional(prev)
 
 ---
 
-## Persistência local (WAL + snapshot)
+## Persistência local (WAL + Snapshot)
 
 ### Arquivos
 
 ```
 {mapDirectory}/{mapName}/
-├── wal.log
-├── snapshot.dat
-└── map.meta
+├── snapshot.dat      ← Snapshot completo serializado (Java ObjectStream)
+├── wal.log           ← WAL append-only com entradas binárias
+└── meta.json         ← Metadados (versão do snapshot, contadores)
 ```
 
-### Ciclo de vida (como roda hoje)
+### Ciclo de vida
 
 - `loadFromDisk()` (chamado no `NGridNode.start()` quando persistência está habilitada):
   - cria diretório do mapa
   - carrega `snapshot.dat` (se existir)
   - reaplica `wal.log` (se existir)
-  - lê `map.meta` (best-effort)
+  - lê `meta.json` (best-effort)
 - `start()`:
   - abre `wal.log` para append
-  - inicia uma thread daemon (`ngrid-map-persistence`) que drena uma fila e escreve em batch
+  - inicia uma thread daemon que drena uma fila e escreve em batch
 - `appendAsync(type, key, value)`:
-  - enfileira entradas para o writer; não bloqueia o caminho crítico do cluster
+  - enfileira entradas para o writer; não bloqueia o caminho crítico
+- `appendSync(type, key, value)`:
+  - escrita síncrona; usado para offset maps críticos
 - `maybeSnapshot()`:
-  - dispara por **número de operações** (padrão: 10.000) ou por **tempo** (padrão: 5 min)
-  - faz rotação do WAL e grava snapshot do mapa atual (cópia fraca do `ConcurrentHashMap`)
+  - dispara por **número de operações** (default: 10.000) ou por **tempo** (default: 5 min)
+  - faz rotação do WAL e grava snapshot do mapa atual
 
-```mermaid
-flowchart TD
-  MS[MapClusterService] -->|applyReplication| MP[MapPersistence]
-  MP -->|append| WAL[wal.log]
-  MP -->|periodico| SNAP[snapshot.dat]
-  MP --> META[map.meta]
-```
+### Modos de Persistência
 
-### Recuperação no boot (snapshot + WAL)
+| Modo | Durabilidade | Throughput | Uso típico |
+|---|---|---|---|
+| `DISABLED` | Nenhuma | Máximo | Caches, dados transientes |
+| `ASYNC_NO_FSYNC` | Eventual | Alto | Dados recuperáveis de outra fonte |
+| `ASYNC_WITH_FSYNC` | Forte | Moderado | Dados críticos, offsets de fila |
+
+---
+
+## Recuperação e Catch-up
+
+### Boot (snapshot + WAL)
 
 ```mermaid
 sequenceDiagram
 participant Node as NGridNode
 participant MS as MapClusterService
-participant MP as MapPersistence
+participant MP as NMapPersistence
 participant FS as FileSystem
 
 Node->>MS: loadFromDisk()
@@ -203,19 +277,56 @@ MP-->>MS: estado reconstruido em memoria
 MS->>MP: start()
 ```
 
+### Catch-up de Follower Atrasado
+
+Quando um follower detecta lag significativo (> 500 ops ou stalled por > 4s):
+
+1. Follower envia `SYNC_REQUEST` ao líder para cada tópico registrado.
+2. Líder responde com `SYNC_RESPONSE` contendo chunks de snapshot (1000 itens/chunk).
+3. Follower executa `resetState()` + `installSnapshot()` progressivamente.
+4. Após último chunk, follower atualiza `nextExpectedSequence` e continua replicação normal.
+
 ---
 
-## Formato do comando replicado (como é de fato)
+## API Pública (`DistributedMap<K,V>`)
 
-O payload replicado no tópico `map` é `MapReplicationCommand`:
+| Método | Retorno | Descrição |
+|---|---|---|
+| `put(key, value)` | `Optional<V>` | Insere/atualiza, retorna valor anterior (replicado) |
+| `remove(key)` | `Optional<V>` | Remove e retorna valor anterior (replicado) |
+| `get(key)` | `Optional<V>` | Leitura STRONG (default — roteia ao líder) |
+| `get(key, consistency)` | `Optional<V>` | Leitura com nível de consistência configurável |
+| `keySet()` | `Set<K>` | Visão imutável das chaves (local, eventually-consistent) |
+| `removeByPrefix(prefix)` | `void` | Remove chaves com prefixo (local-only, sem replicação) |
+| `close()` | `void` | Remove listener do transport |
+
+---
+
+## Formato do comando replicado
+
+O payload replicado no tópico `map:<mapName>` é `MapReplicationCommand`:
 - `type`: `PUT` ou `REMOVE`
 - `key`: `Serializable` (obrigatório)
 - `value`: `Serializable` (somente em `PUT`)
 
 ---
 
-## Limitações atuais e caminhos de evolução
+## Testes de cobertura
 
-- **Sem tombstones**: remoção é direta; não há marcador lógico.
-- **Deduplicação em memória** (`operationId`): após restart total, o histórico de IDs é perdido (o estado do mapa pode persistir via `snapshot/wal` se habilitado).
-- **Leitura roteada ao líder**: simples e forte; evoluções futuras podem permitir `get` local com validação/versões.
+| Teste | Tipo | Cobertura |
+|---|---|---|
+| `MapNodeFailoverIntegrationTest` | Integração (3 nós) | Failover do líder, STRONG reads pós-failover, lease expirado, keySet |
+| `NGridMapPersistenceIntegrationTest` | Integração (3 nós) | Full cluster restart, named maps recovery |
+| `MapClusterServiceConcurrencyTest` | Concorrência | 8 threads × 500 ops put/remove sem deadlock |
+
+---
+
+## Configuração via `NGridConfig`
+
+| Parâmetro | Default | Descrição |
+|---|---|---|
+| `mapDirectory` | `{dataDirectory}/maps` | Diretório base para persistência de mapas |
+| `mapName` | `"default-map"` | Nome do mapa padrão |
+| `mapPersistenceMode` | `DISABLED` | Modo de persistência para mapas do usuário |
+
+> **Nota:** O mapa de offsets (`_ngrid-queue-offsets`) sempre usa `ASYNC_WITH_FSYNC` independente da configuração do usuário.

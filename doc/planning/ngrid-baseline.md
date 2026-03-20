@@ -232,3 +232,19 @@
 | G5 | Sem métricas exportáveis (apenas java.util.logging) | **P1** | Fase 4 |
 | G6 | Sem teste de partição longa com divergência | **P1** | Fase 2 |
 | G7 | Dados do lado minoritário descartados sem log | **P1** | Fase 2 |
+
+---
+
+## 6. Atualização de Status (2026-03-20)
+
+> **211 testes passando, 0 falhas, 0 erros.**
+
+| Gap | Status Atual | Evidência |
+|---|---|---|
+| G1 | ✅ **Resolvido** — Leader lease implementado | `DistributedMap.put()` verifica `hasValidLease()`, `ReplicationManager.replicate()` rejeita com `LeaseExpiredException`. `strictConsistency` default mudou para `true` no Builder. |
+| G2 | 🟡 **Parcial** — Offset maps sempre com fsync | `createMapService()` força `ASYNC_WITH_FSYNC` para `_ngrid-queue-offsets` mesmo com default `DISABLED`. Mapas genéricos dependem da config do usuário. |
+| G3 | ✅ **Resolvido** — HealthCheck + AlertEngine | `MapClusterService.isHealthy()` e `persistenceFailureCount()`. `NGridAlertEngine` dispara alertas `PERSISTENCE_FAILURE`. Testes: `NGridAlertEngineTest` (13 cenários). |
+| G4 | ✅ **Resolvido** — Leader lease step-down | `ClusterCoordinator.hasValidLease()`, step-down automático quando lease expira. Testes: `LeaderLeaseIntegrationTest`, `LeaderLeaseStepDownTest`. |
+| G5 | 🟡 **Parcial** — Métricas internas existem | `NGridMetrics`, `NGridOperationalSnapshot`, `NGridDashboardReporter` com testes. Falta integração com Prometheus/OpenTelemetry. |
+| G6 | 🔴 **Aberto** — Sem teste de partição longa | Epoch fencing protege, mas sem teste automatizado de split-brain write + reconexão. |
+| G7 | 🟡 **Parcial** | Epoch fencing rejeita comandos do líder antigo (log via `LOGGER.warning`), mas sem log explícito de "dados descartados" no follower. |
