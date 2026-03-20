@@ -1,0 +1,40 @@
+node:
+  id: ${NG_NODE_ID:client-1}
+  host: ${NG_NODE_HOST:127.0.0.1}
+  port: ${NG_NODE_PORT:9001}
+  dirs:
+    base: ${NG_BASE_DIR:/tmp/ngrid}
+
+autodiscover:
+  enabled: false
+  secret: "my-cluster-secret-token-2026"
+
+cluster:
+  name: "production-cluster"
+  replication:
+    factor: 3
+    strict: true
+  transport:
+    workers: 4
+  seeds:
+    - ${SEED_HOST:seed-1:9000}
+
+queues:
+  - name: "global-events"
+    retention:
+      policy: "TIME_BASED"
+      duration: "48h"
+    performance:
+      fsync: true
+      memory-buffer:
+        enabled: true
+        size: 1000
+
+maps:
+  - name: "stress-map"
+    key-type: "java.lang.String"
+    value-type: "java.lang.String"
+    persistence: "ASYNC_WITH_FSYNC"
+
+  - name: "_ngrid-queue-offsets"
+    persistence: "ASYNC_WITH_FSYNC"
