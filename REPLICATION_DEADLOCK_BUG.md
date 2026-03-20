@@ -1,6 +1,6 @@
 # Bug: Deadlock de Replicação no NGrid
 
-**Status**: 🟡 Fix aplicado (teste alvo OK)  
+**Status**: ✅ Resolvido — estável desde 2026-01-18 (211 testes verdes, 0 falhas)  
 **Severidade**: Critical  
 **Teste Afetado**: `MultiQueueClusterIntegrationTest.shouldHandleMultipleQueuesIndependently()`  
 **Sintoma**: Timeout de 105.8 segundos (RPC timeout de 35s × 3 retry attempts)

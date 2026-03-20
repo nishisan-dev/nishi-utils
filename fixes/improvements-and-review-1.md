@@ -1,13 +1,28 @@
 # Revisão de código - nishi-utils (NGrid)
 
-## Problemas encontrados
+> **Última atualização:** 2026-03-20
 
-1. **Operações de replicação podem ficar bloqueadas para sempre**: `MapClusterService` invoca `future.join()` para cada operação de escrita, mas o `ReplicationManager` não possui qualquer timeout ou tratamento em `onPeerDisconnected`, apesar do comentário indicar o contrário. Se o líder perder quorum (ex.: follower cai após ser considerado ativo), o futuro nunca é concluído e a thread do cliente fica bloqueada indefinidamente. É necessário adicionar timeouts ou cancelamento/rollback quando o quorum se torna inalcançável.
-2. **Futuro pendente vazado em chamadas request/response**: `TcpTransport.sendAndAwait` registra a `pendingResponses` e completa o futuro apenas quando a resposta chega ou na chamada explícita a `close()`. Se o peer desconectar sem responder, esse futuro nunca é completado/cancelado, podendo acumular memória e bloquear chamadas dependentes. O `handleDisconnect` também não limpa pendências associadas ao peer desconectado.
+## Problemas encontrados e status de resolução
 
-## Melhorias recomendadas
+### ✅ 1. Operações de replicação bloqueadas indefinidamente
+**Problema original:** `MapClusterService` invocava `future.join()` sem timeout, bloqueando a thread do cliente se o líder perdesse quorum.
 
-- Adicionar timeouts configuráveis e retry/backoff nas operações de replicação para evitar blocos indefinidos e dar feedback aos chamadores quando o quorum não puder ser atingido.
-- Limpar e completar excepcionalmente `pendingResponses` quando uma conexão é encerrada ou quando um timeout expirar, evitando vazamentos e chamadas que nunca retornam.
-- Considerar uma política de reconexão/backoff exponencial e limite de conexões simultâneas para evitar tempestades de threads no `TcpTransport`, dado o uso de `newCachedThreadPool` e um writer dedicado por conexão.
-- Propagar eventos de desconexão para reavaliar quorum/liderança imediatamente, reduzindo janelas onde a aplicação acredita ter quorum enquanto peers já caíram.
+**Resolução:** 
+- `MapClusterService.waitForReplication()` agora usa `future.get(timeoutMs, TimeUnit.MILLISECONDS)` com timeout configurável via `ReplicationManager.operationTimeout()`.
+- `QuorumUnreachableException` é lançada quando quorum é inalcançável.
+- Quorum dinâmico adapta em `onPeerDisconnected()` quando `strictConsistency=false`.
+- Leader lease impede writes em líder isolado.
+
+### ✅ 2. Futuro pendente vazado em chamadas request/response
+**Problema original:** `TcpTransport.sendAndAwait` não completava futuros quando peer desconectava, acumulando memória.
+
+**Resolução:**
+- `handleDisconnect` agora completa excepcionalmente todos os `pendingResponses` associados ao peer desconectado.
+- Request timeout configurável garante que futuros são limpos mesmo em cenários de falha silenciosa.
+
+## Melhorias recomendadas — Status
+
+- ~~Adicionar timeouts configuráveis e retry/backoff~~ → ✅ Implementado
+- ~~Limpar pendingResponses quando conexão encerra~~ → ✅ Implementado
+- ~~Propagar eventos de desconexão para reavaliar quorum/liderança~~ → ✅ Implementado (`onPeerDisconnected` em `ReplicationManager`)
+- Otimizar pool de threads no `TcpTransport` → 🟡 Sem urgência (Virtual Threads considerar futuramente)
