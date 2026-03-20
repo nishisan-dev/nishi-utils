@@ -48,3 +48,18 @@ jobs:
         generate_release_notes: true
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Prune old releases (keep last 5)
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        KEEP=5
+        RELEASES=$(gh release list --limit 100 --json tagName --jq '.[].tagName')
+        COUNT=0
+        for TAG in $RELEASES; do
+          COUNT=$((COUNT + 1))
+          if [ "$COUNT" -gt "$KEEP" ]; then
+            echo "Deleting release $TAG (keeping tags)"
+            gh release delete "$TAG" --yes --cleanup-tag=false
+          fi
+        done
