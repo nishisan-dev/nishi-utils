@@ -364,9 +364,9 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             Thread.sleep(200);
         }
         throw new IllegalStateException(String.format(
-                "Cluster did not stabilize within %s. Current state: leader=%s, activeMembers=%d, minClusterSize=%d",
+                "Cluster did not stabilize within %s. Current state: leader=%s, activeMembers=%d, requiredActiveMembers=%d",
                 timeout, leaderInfo().map(NodeInfo::nodeId).orElse(null),
-                activeMembers().size(), config.minClusterSize()));
+                activeMembers().size(), requiredActiveMembersForLeadership()));
     }
 
     /**
@@ -376,7 +376,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      *         members
      */
     private boolean isStable() {
-        return leaderInfo().isPresent() && activeMembers().size() >= config.minClusterSize();
+        return leaderInfo().isPresent() && activeMembers().size() >= requiredActiveMembersForLeadership();
     }
 
     /**
@@ -516,12 +516,11 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 notifyMembershipListeners();
             }
 
-            // Renew lease ONLY if the leader still has a majority of active members.
-            // This ensures an isolated leader's lease expires naturally.
+            // Renew lease only while the node still has enough active members to
+            // legitimately hold leadership for the currently known cluster size.
             if (isLeader()) {
-                long totalExpected = transport.peers().size() + 1; // peers + self
                 long activeCount = members.values().stream().filter(ClusterMember::isActive).count();
-                if (activeCount > totalExpected / 2) {
+                if (activeCount >= requiredActiveMembersForLeadership()) {
                     this.leaseExpiresAt = Instant.now().plus(config.leaseTimeout());
                 }
             }
@@ -548,7 +547,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     private void recomputeLeader() {
         synchronized (leaderComputationLock) {
             long activeCount = members.values().stream().filter(ClusterMember::isActive).count();
-            if (activeCount < config.minClusterSize()) {
+            if (activeCount < requiredActiveMembersForLeadership()) {
                 updateLeader(null);
                 return;
             }
@@ -567,6 +566,13 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                     .max(Comparator.naturalOrder());
             updateLeader(newLeader.orElse(null));
         }
+    }
+
+    private int requiredActiveMembersForLeadership() {
+        // transport.peers() is backed by knownPeers and already includes the local node.
+        int totalExpected = Math.max(1, transport.peers().size());
+        int dynamicMajority = (totalExpected / 2) + 1;
+        return Math.max(config.minClusterSize(), dynamicMajority);
     }
 
     /**
