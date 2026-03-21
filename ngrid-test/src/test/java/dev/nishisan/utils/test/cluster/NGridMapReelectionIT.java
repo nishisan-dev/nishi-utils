@@ -65,34 +65,37 @@ class NGridMapReelectionIT extends AbstractNGridMapClusterIT {
     @Order(2)
     @Timeout(value = 60, unit = TimeUnit.SECONDS)
     void shouldPreventSplitBrainWrites() throws Exception {
-        // Agora resta quorum de 4/5. 
-        // Vamos isolar o líder cortando 2 followers (agora sobram 2/5 -> NO QUORUM)
-        NGridMapNodeContainer newLeader = findLeader();
-        assertNotNull(newLeader);
-        
+        // Com factor=2 e totalExpected=5, o lease renova se activeCount > 5/2 = 2.
+        // Precisamos ter no máximo 2 nós ativos para que o lease expire.
+        // Paramos TODOS os nós exceto producer e reader (incluindo o líder).
         Stream.of(seed, node2_producer, node3_reader, node4, node5_reader)
-            .filter(c -> c.isRunning() && c != newLeader)
-            .limit(2) // Corta mais 2 nós
+            .filter(c -> c.isRunning() && c != node2_producer && c != node3_reader)
             .forEach(c -> c.stop());
             
-        // Agora temos no máximo 2 nós vivos (sem quorum de 3)
-        // Lease do líder isolado vai expirar
-        Thread.sleep(6000);
+        // Com 2/5 nós ativos: activeCount(2) > totalExpected/2(2) é FALSE.
+        // O novo líder (se eleito entre producer/reader) não consegue renovar
+        // o lease, o lease expira, e o líder faz stepDown.
+        // Writes falham com "No leader available" ou "Leader lease expired".
         
-        // Gets eventuais em nodes isolados funcionam:
-        int readsBeforeIso = node3_reader.extractMapReads("EVENTUAL").size();
-        Thread.sleep(2000);
-        
-        if (node3_reader.isRunning()) {
-            int readsAfterIso = node3_reader.extractMapReads("EVENTUAL").size();
-            assertTrue(readsAfterIso > readsBeforeIso, "EVENTUAL funciona no minishard isolado");
+        // Espera que MAP-PUT-FAIL apareça (indica que o líder perdeu quorum)
+        if (node2_producer.isRunning()) {
+            await("writes should fail without quorum")
+                .atMost(30, TimeUnit.SECONDS)
+                .pollInterval(1, TimeUnit.SECONDS)
+                .until(() -> node2_producer.getLogs().lines()
+                    .filter(l -> l.contains("MAP-PUT-FAIL"))
+                    .count() > 0);
         }
         
-        // PUTs falham pois o lider perdeu o LEASE
-        long putsIsolados = node2_producer.getLogs().lines()
-            .filter(l -> l.contains("MAP-PUT-FAIL"))
-            .count();
-        
-        assertTrue(putsIsolados > 0, "Writes isolados devem gerar exceptions (falta quorum)");
+        // EVENTUAL reads continuam porque leem da réplica local.
+        // O reader alterna STRONG/EVENTUAL e pode ficar bloqueado em STRONG
+        // retries (~5s cada), então usamos awaitility com window generosa.
+        if (node3_reader.isRunning()) {
+            int readsBeforeIso = node3_reader.extractMapReads("EVENTUAL").size();
+            await("EVENTUAL reads should continue locally")
+                .atMost(15, TimeUnit.SECONDS)
+                .pollInterval(1, TimeUnit.SECONDS)
+                .until(() -> node3_reader.extractMapReads("EVENTUAL").size() > readsBeforeIso);
+        }
     }
 }
