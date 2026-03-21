@@ -36,6 +36,10 @@ public class Main {
                 System.out.println("NGrid Node iniciado com sucesso!");
                 System.out.println("ID Local: " + node.transport().local().nodeId());
                 System.out.println("Is Leader:" + node.coordinator().isLeader());
+                
+                node.coordinator().addLeaderElectionListener((isLeader, currentLeader) ->
+                        System.out.println("CURRENT_LEADER_STATUS:" + isLeader));
+                
                 node.getQueueNames().forEach(System.out::println);
                 node.getMapNames().forEach(System.out::println);
                 DistributedQueue<String> queue = node.getQueue("global-events", String.class);
