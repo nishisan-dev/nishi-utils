@@ -17,6 +17,12 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class NGridMapLeaderCrashIT extends AbstractNGridMapClusterIT {
 
+    private boolean runningNodesSeeAtLeast(int expectedActiveMembers) {
+        return Stream.of(seed, node2_producer, node3_reader, node4, node5_reader)
+                .filter(c -> c != null && c.isRunning())
+                .allMatch(c -> c.latestActiveMembersCount() >= expectedActiveMembers);
+    }
+
     @Test
     @Order(1)
     @Timeout(value = 60, unit = TimeUnit.SECONDS)
@@ -25,7 +31,9 @@ class NGridMapLeaderCrashIT extends AbstractNGridMapClusterIT {
         await("initial stability")
             .atMost(30, TimeUnit.SECONDS)
             .pollInterval(500, TimeUnit.MILLISECONDS)
-            .until(() -> countLeaders() == 1 && !node2_producer.extractMapPuts().isEmpty());
+            .until(() -> countLeaders() == 1
+                    && runningNodesSeeAtLeast(5)
+                    && !node2_producer.extractMapPuts().isEmpty());
 
         NGridMapNodeContainer leader = findLeader();
         assertNotNull(leader, "Deve haver um líder");
@@ -47,7 +55,7 @@ class NGridMapLeaderCrashIT extends AbstractNGridMapClusterIT {
                 long leaders = Stream.of(seed, node2_producer, node3_reader, node4, node5_reader)
                         .filter(c -> c.isRunning() && c.isLeader())
                         .count();
-                return leaders == 1;
+                return leaders == 1 && runningNodesSeeAtLeast(4);
             });
 
         // Deixa rodar mais 3s no novo líder
@@ -74,6 +82,11 @@ class NGridMapLeaderCrashIT extends AbstractNGridMapClusterIT {
     @Order(2)
     @Timeout(value = 60, unit = TimeUnit.SECONDS)
     void shouldSurviveDoubleCrash() throws Exception {
+        await("cluster healed after first crash")
+            .atMost(30, TimeUnit.SECONDS)
+            .pollInterval(500, TimeUnit.MILLISECONDS)
+            .until(() -> countLeaders() == 1 && runningNodesSeeAtLeast(4));
+
         // Derruba mais um nó (follower que não seja producer nem reader)
         NGridMapNodeContainer nodeToKill = Stream.of(seed, node2_producer, node3_reader, node4, node5_reader)
             .filter(c -> c.isRunning() && c != node2_producer && c != node3_reader)
@@ -87,7 +100,8 @@ class NGridMapLeaderCrashIT extends AbstractNGridMapClusterIT {
         // Ainda temos quorum (3/5 vivos com factor=2) - espera estabilizar
         await("new leader if needed")
             .atMost(30, TimeUnit.SECONDS)
-            .until(() -> countLeaders() >= 1);
+            .pollInterval(500, TimeUnit.MILLISECONDS)
+            .until(() -> countLeaders() >= 1 && runningNodesSeeAtLeast(3));
             
         // Producer deve continuar gerando puts com o quorum restante.
         // Usa awaitility pois o producer pode ficar bloqueado em invokeLeader()

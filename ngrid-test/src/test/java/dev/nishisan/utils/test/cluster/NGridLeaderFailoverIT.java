@@ -46,10 +46,13 @@ class NGridLeaderFailoverIT extends AbstractNGridClusterIT {
     @Order(2)
     @Timeout(value = 90, unit = TimeUnit.SECONDS)
     void shouldElectNewLeaderAfterSeedDies() {
-        // Garante estabilização inicial
-        await("initial cluster stable")
+        // Garante que os sobreviventes já conhecem o cluster inteiro
+        await("initial cluster converged")
                 .atMost(30, TimeUnit.SECONDS)
-                .until(() -> countLeaders() >= 1);
+                .pollInterval(500, TimeUnit.MILLISECONDS)
+                .until(() -> countLeaders() == 1
+                        && Stream.of(seed, node2, node3)
+                                .allMatch(c -> c.latestActiveMembersCount() >= 3));
 
         // Para o seed — simula crash real (docker stop → SIGTERM no processo)
         seed.stop();
@@ -66,6 +69,12 @@ class NGridLeaderFailoverIT extends AbstractNGridClusterIT {
                             "Pelo menos 1 nó sobrevivente deve ser líder após o seed cair."
                                     + "\nnode-2 líder: " + node2.isLeader()
                                     + "\nnode-3 líder: " + node3.isLeader());
+                    assertTrue(Stream.of(node2, node3)
+                                    .filter(NGridNodeContainer::isRunning)
+                                    .allMatch(c -> c.latestActiveMembersCount() >= 2),
+                            "Os sobreviventes devem convergir para 2 membros ativos após o failover."
+                                    + "\nnode-2 ativos: " + node2.latestActiveMembersCount()
+                                    + "\nnode-3 ativos: " + node3.latestActiveMembersCount());
                 });
     }
 
