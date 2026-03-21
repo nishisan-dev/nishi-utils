@@ -12,7 +12,7 @@ autodiscover:
 cluster:
   name: "production-cluster"
   replication:
-    factor: 3
+    factor: 2
     strict: true
   transport:
     workers: 4
