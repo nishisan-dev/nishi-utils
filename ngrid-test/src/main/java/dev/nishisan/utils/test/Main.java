@@ -8,6 +8,8 @@ import java.nio.file.Paths;
 import java.time.Duration;
 
 public class Main {
+    private static final long STATUS_LOG_INTERVAL_MS = 1000;
+
     public Main(String[] args) {
         if (args == null || args.length == 0) {
             System.err.println("Uso: java -jar ngrid-test.jar [server|client|client-auto|scenario-1]");
@@ -50,11 +52,12 @@ public class Main {
                         : "INDEX-";
 
                 node.coordinator().awaitLocalStability();
+                logClusterStatus(node);
 
                 while (true) {
                     String msg = prefix + index;
                     // produz aqui
-                    System.out.println("CURRENT_LEADER_STATUS:" + node.coordinator().isLeader());
+                    logClusterStatus(node);
                     System.out.println("Enviando:");
                     try {
                         queue.offer(msg);
@@ -379,12 +382,19 @@ public class Main {
                         System.out.println("CURRENT_LEADER_STATUS:" + isLeader));
                 
                 dev.nishisan.utils.ngrid.structures.DistributedMap<String, String> map = node.getMap(mapName, String.class, String.class);
-                
+
                 node.coordinator().awaitLocalStability();
-                System.out.println("CURRENT_LEADER_STATUS:" + node.coordinator().isLeader());
-                
+                long lastStatusLogTime = 0;
+                logClusterStatus(node);
+
                 int index = 0;
                 while (true) {
+                    long now = System.currentTimeMillis();
+                    if (now - lastStatusLogTime >= STATUS_LOG_INTERVAL_MS) {
+                        logClusterStatus(node);
+                        lastStatusLogTime = now;
+                    }
+
                     String key = "key-" + index;
                     String value = "val-" + epochPrefix + "-" + index;
                     try {
@@ -424,17 +434,25 @@ public class Main {
                         System.out.println("CURRENT_LEADER_STATUS:" + isLeader));
                 
                 dev.nishisan.utils.ngrid.structures.DistributedMap<String, String> map = node.getMap(mapName, String.class, String.class);
-                
+
                 node.coordinator().awaitLocalStability();
-                System.out.println("CURRENT_LEADER_STATUS:" + node.coordinator().isLeader());
-                
+                long lastStatusLogTime = 0;
+                logClusterStatus(node);
+
                 java.util.Random random = new java.util.Random();
+                long readIteration = 0;
                 long lastKeySetTime = System.currentTimeMillis();
-                
+
                 while (true) {
+                    long now = System.currentTimeMillis();
+                    if (now - lastStatusLogTime >= STATUS_LOG_INTERVAL_MS) {
+                        logClusterStatus(node);
+                        lastStatusLogTime = now;
+                    }
+
                     int index = random.nextInt(keyLimit);
                     String key = "key-" + index;
-                    boolean useStrong = random.nextBoolean();
+                    boolean useStrong = (readIteration++ % 2) == 0;
                     
                     try {
                         dev.nishisan.utils.ngrid.structures.Consistency consistency = useStrong ? 
@@ -453,7 +471,6 @@ public class Main {
                         System.err.println("MAP-READ-FAIL:" + key + "=" + e.getMessage());
                     }
                     
-                    long now = System.currentTimeMillis();
                     if (now - lastKeySetTime > 1000) {
                         try {
                             int count = map.keySet().size();
@@ -475,5 +492,13 @@ public class Main {
         } catch (Exception e) {
             e.printStackTrace();
         }
+    }
+
+    private void logClusterStatus(NGridNode node) {
+        var snapshot = node.operationalSnapshot();
+        System.out.println("CURRENT_LEADER_STATUS:" + snapshot.isLeader());
+        System.out.println("CURRENT_LEADER_ID:" + snapshot.leaderId());
+        System.out.println("ACTIVE_MEMBERS_COUNT:" + snapshot.activeMembersCount());
+        System.out.println("REACHABLE_NODES_COUNT:" + snapshot.reachableNodesCount());
     }
 }

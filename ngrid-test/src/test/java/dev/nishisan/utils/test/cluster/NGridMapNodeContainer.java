@@ -73,6 +73,14 @@ public class NGridMapNodeContainer extends GenericContainer<NGridMapNodeContaine
         return latest != null ? latest : false;
     }
 
+    public int latestActiveMembersCount() {
+        return parseLatestInt("ACTIVE_MEMBERS_COUNT:");
+    }
+
+    public int latestReachableNodesCount() {
+        return parseLatestInt("REACHABLE_NODES_COUNT:");
+    }
+
     public List<String> extractMapPuts() {
         List<String> puts = new ArrayList<>();
         for (String line : getLogs().split("\\R")) {
@@ -94,5 +102,21 @@ public class NGridMapNodeContainer extends GenericContainer<NGridMapNodeContaine
             }
         }
         return reads;
+    }
+
+    private int parseLatestInt(String marker) {
+        Integer latest = null;
+        for (String line : getLogs().split("\\R")) {
+            int idx = line.indexOf(marker);
+            if (idx < 0) {
+                continue;
+            }
+            String suffix = line.substring(idx + marker.length()).trim();
+            try {
+                latest = Integer.parseInt(suffix);
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return latest != null ? latest : -1;
     }
 }
