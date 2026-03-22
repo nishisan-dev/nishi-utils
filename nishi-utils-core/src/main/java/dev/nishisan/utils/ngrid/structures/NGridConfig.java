@@ -36,6 +36,7 @@ import java.util.Set;
 public final class NGridConfig {
     private final String clusterName;
     private final NodeInfo local;
+    private final DeploymentProfile deploymentProfile;
     private final Set<NodeInfo> peers;
     private final int replicationQuorum;
     private final int replicationFactor;
@@ -73,6 +74,7 @@ public final class NGridConfig {
     private NGridConfig(Builder builder) {
         this.clusterName = builder.clusterName;
         this.local = builder.local;
+        this.deploymentProfile = builder.deploymentProfile;
         this.peers = Collections.unmodifiableSet(new HashSet<>(builder.peers));
         int effectiveReplication = builder.replicationFactor != null ? builder.replicationFactor
                 : builder.replicationQuorum;
@@ -111,6 +113,16 @@ public final class NGridConfig {
 
     public String clusterName() {
         return clusterName;
+    }
+
+    /**
+     * Returns the deployment profile for this configuration.
+     *
+     * @return the deployment profile (never null)
+     * @since 3.2.0
+     */
+    public DeploymentProfile deploymentProfile() {
+        return deploymentProfile;
     }
 
     public NodeInfo local() {
@@ -271,6 +283,7 @@ public final class NGridConfig {
     public static final class Builder {
         private String clusterName = "default-cluster";
         private final NodeInfo local;
+        private DeploymentProfile deploymentProfile = DeploymentProfile.DEV;
         private final Set<NodeInfo> peers = new HashSet<>();
         private int replicationQuorum = 2;
         private Integer replicationFactor;
@@ -307,6 +320,24 @@ public final class NGridConfig {
 
         private Builder(NodeInfo local) {
             this.local = Objects.requireNonNull(local, "local");
+        }
+
+        /**
+         * Sets the deployment profile. When set to {@link DeploymentProfile#PRODUCTION},
+         * the {@link #build()} method enforces strict safety invariants:
+         * <ul>
+         *   <li>{@code strictConsistency} must be {@code true}</li>
+         *   <li>{@code replicationFactor} must be {@code >= 2}</li>
+         *   <li>Maps with persistence {@code DISABLED} are rejected</li>
+         * </ul>
+         *
+         * @param profile the deployment profile (default: {@link DeploymentProfile#DEV})
+         * @return this builder
+         * @since 3.2.0
+         */
+        public Builder deploymentProfile(DeploymentProfile profile) {
+            this.deploymentProfile = Objects.requireNonNull(profile, "profile");
+            return this;
         }
 
         public Builder clusterName(String name) {
@@ -541,7 +572,38 @@ public final class NGridConfig {
                         "Data directory must be specified (use dataDirectory() or legacy queueDirectory())");
             }
 
+            // ── Production guardrails ──
+            if (deploymentProfile == DeploymentProfile.PRODUCTION) {
+                validateProductionConfig();
+            }
+
             return new NGridConfig(this);
+        }
+
+        private void validateProductionConfig() {
+            int effectiveFactor = replicationFactor != null ? replicationFactor : replicationQuorum;
+
+            if (!strictConsistency) {
+                throw new IllegalArgumentException(
+                        "[PRODUCTION] strictConsistency must be true. "
+                                + "Relaxed consistency is not allowed in production profile. "
+                                + "Set strictConsistency(true) or use DeploymentProfile.STAGING.");
+            }
+
+            if (effectiveFactor < 2) {
+                throw new IllegalArgumentException(
+                        "[PRODUCTION] replicationFactor must be >= 2 (current: " + effectiveFactor + "). "
+                                + "Single-replica deployment is not safe for production.");
+            }
+
+            for (MapConfig map : configuredMaps) {
+                if (map.persistenceMode() == NMapPersistenceMode.DISABLED) {
+                    throw new IllegalArgumentException(
+                            "[PRODUCTION] Map '" + map.name() + "' has persistence DISABLED. "
+                                    + "All maps must be persisted in production profile. "
+                                    + "Set persistence to ASYNC_WITH_FSYNC or SYNC.");
+                }
+            }
         }
     }
 }
