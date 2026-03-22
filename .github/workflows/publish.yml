@@ -5,7 +5,32 @@ on:
     types: [created]
 
 jobs:
+  resilience-gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up JDK 21
+      uses: actions/setup-java@v4
+      with:
+        java-version: '21'
+        distribution: 'temurin'
+
+    - name: Build Docker test image
+      run: docker build -t ngrid-test:latest -f ngrid-test/Dockerfile .
+
+    - name: Run resilience integration tests
+      run: |
+        mvn -pl ngrid-test verify \
+          -Dngrid.test.docker=true \
+          -Dtest='NGridLeaderFailoverIT,NGridMapLeaderCrashIT,NGridMapReelectionIT,NGridMapConcurrentWriteFailoverIT,NGridPartitionResilienceIT,NGridQueueConcurrentFailoverIT' \
+          -DfailIfNoTests=false
+
   release:
+    needs: resilience-gate
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -64,3 +89,4 @@ jobs:
             gh release delete "$TAG" --yes
           fi
         done
+
