@@ -12,18 +12,19 @@ Adicione a dependência do projeto (ajuste a versão conforme seu release):
 <dependency>
   <groupId>dev.nishisan</groupId>
   <artifactId>nishi-utils</artifactId>
-  <version>1.0.14</version>
+  <version>3.1.0</version>
 </dependency>
 ```
 
 ## Conceitos rápidos
 
 - **NQueue**: fila persistente local em disco (por diretório), com `offer/poll/peek`.
-- **NGridNode**: “processo” de um nó do cluster (inicia transporte TCP, coordenação, replicação e expõe fila/mapa).
+- **NGridNode**: "processo" de um nó do cluster (inicia transporte TCP, coordenação, replicação e expõe fila/mapa).
 - **DistributedQueue / DistributedMap**: fachadas que roteiam chamadas ao **líder**.
-- **Quorum**: número mínimo de confirmações para “commit” de operações replicadas.
+- **Quorum**: número mínimo de confirmações para "commit" de operações replicadas.
 - **Data Directory**: raiz única (`node.dirs.base`) para filas, mapas e estado de replicação.
 - **Tópicos por fila/mapa**: cada estrutura replica com sequências independentes (evita bloqueios entre filas).
+- **DeploymentProfile**: perfil de deploy (`DEV`, `STAGING`, `PRODUCTION`) que ativa guardrails de segurança em produção.
 
 ## 1) NQueue (fila local persistente)
 
@@ -100,12 +101,28 @@ Campos principais:
 
 - `local(NodeInfo)`: identidade do nó (host/porta para bind).
 - `addPeer(NodeInfo)`: peers iniciais para bootstrap (opcional).
-- `replicationFactor(int)`: fator de replicação default (quorum efetivo é limitado pelo tamanho do cluster ativo).
+- `replicationFactor(int)`: fator de replicação para quorum de escrita (quorum efetivo é limitado pelo tamanho do cluster ativo).
 - `dataDirectory(Path)`: diretório base para filas, mapas e estado de replicação (recomendado).
 - `addQueue(QueueConfig)`: adiciona uma fila distribuída (multi-queue).
-- `queueDirectory(Path)` e `queueName(String)`: modo legado de fila única (compatibilidade).
-- **`strictConsistency(boolean)`**: Define o modelo de consistência. `false` (padrão) prioriza disponibilidade (AP), ajustando o quorum aos nós ativos. `true` prioriza consistência (CP), exigindo quorum fixo (`replicationFactor`) mesmo que nós falhem. **Nota:** No modo estrito, o líder aguarda o quórum antes de aplicar a mudança localmente.
+- `addMap(MapConfig)`: adiciona um mapa distribuído (multi-map).
+- `queueDirectory(Path)` e `queueName(String)`: modo legado de fila única (compatibilidade, **deprecated**).
+- **`strictConsistency(boolean)`**: Define o modelo de consistência. `true` (padrão) prioriza consistência (CP), exigindo quorum fixo (`replicationFactor`) mesmo que nós falhem. `false` prioriza disponibilidade (AP), ajustando o quorum aos nós ativos. **Nota:** No modo estrito, o líder aguarda o quórum antes de aplicar a mudança localmente.
 - **`transportWorkerThreads(int)`**: Número de threads dedicadas ao processamento de IO e conexões (padrão: 2). Aumente em clusters com muitos nós ou alta latência de handshake.
+- **`deploymentProfile(DeploymentProfile)`**: Perfil de deploy que ativa guardrails de segurança (veja seção dedicada).
+
+#### Configurações de transporte
+
+O Builder aceita configurações adicionais que afetam a comunicação entre nós:
+
+| Método | Default | Descrição |
+|---|---|---|
+| `clusterName(String)` | `"default-cluster"` | Nome lógico do cluster |
+| `connectTimeout(Duration)` | 5s | Timeout para conexão TCP com peers |
+| `reconnectInterval(Duration)` | 500ms | Intervalo entre tentativas de reconexão |
+| `requestTimeout(Duration)` | 20s | Timeout para requisições CLIENT_REQUEST |
+| `heartbeatInterval(Duration)` | 1s | Intervalo de heartbeat entre nós |
+| `leaseTimeout(Duration)` | `3 × heartbeat` | Tempo sem ACK antes do líder fazer step-down |
+| `rttProbeInterval(Duration)` | 2s | Intervalo de sondagem de RTT entre nós |
 
 #### Configuração via YAML
 
@@ -113,8 +130,41 @@ Você também pode carregar a configuração a partir de um arquivo YAML, com su
 Para detalhes completos e exemplos, consulte: [doc/ngrid/configuracao.md](configuracao.md).
 
 ```java
+// Opção 1: Carregar manualmente
 NGridYamlConfig yamlConfig = NGridConfigLoader.load(Path.of("config.yaml"));
 NGridConfig config = NGridConfigLoader.convertToDomain(yamlConfig);
+
+// Opção 2: Construtor direto (recomendado)
+NGridNode node = new NGridNode(Path.of("config.yaml"));
+node.start();
+```
+
+### DeploymentProfile (guardrails de produção)
+
+O `DeploymentProfile` controla validações de segurança no `build()`:
+
+| Perfil | Comportamento |
+|---|---|
+| `DEV` (padrão) | Nenhum guardrail aplicado |
+| `STAGING` | Nenhum guardrail aplicado |
+| `PRODUCTION` | Valida invariantes de segurança |
+
+Quando `PRODUCTION` é selecionado, o `build()` exige:
+- `strictConsistency` = `true`
+- `replicationFactor` ≥ 2
+- Todos os mapas configurados via `addMap()` devem ter persistência habilitada (não pode ser `DISABLED`)
+
+```java
+NGridConfig cfg = NGridConfig.builder(local)
+    .deploymentProfile(DeploymentProfile.PRODUCTION)
+    .strictConsistency(true)
+    .replicationFactor(3)
+    .dataDirectory(Path.of("/var/ngrid/node-1"))
+    .addQueue(QueueConfig.builder("orders").build())
+    .addMap(MapConfig.builder("sessions")
+        .persistenceMode(NMapPersistenceMode.ASYNC_WITH_FSYNC)
+        .build())
+    .build();
 ```
 
 ### Proteção contra Split-Brain
@@ -235,6 +285,49 @@ DistributedQueue<Event> events = node.getQueue(AppQueues.EVENTS);
 
 > Dica: em clusters multi-queue, os comandos sao roteados por nome (`queue.offer:{queue}`), entao o lider sempre sabe qual fila atender.
 
+#### Configuração avançada de QueueConfig
+
+O `QueueConfig.Builder` suporta opções adicionais:
+
+```java
+QueueConfig cfg = QueueConfig.builder("orders")
+    .retention(QueueConfig.RetentionPolicy.timeBased(Duration.ofDays(7))) // padrão
+    // .retention(QueueConfig.RetentionPolicy.sizeBased(1_000_000_000L)) // 1GB
+    // .retention(QueueConfig.RetentionPolicy.countBased(100_000))        // 100k items
+    .maxSizeBytes(500_000_000L)  // limite de tamanho
+    .maxItems(50_000)            // limite de itens
+    .compressionEnabled(false)   // compressão de items
+    .nqueueOptions(NQueue.Options.defaults().withFsync(true)) // opções do NQueue
+    .build();
+```
+
+### 2.2) Multiplos mapas e MapConfig
+
+Análogo às filas, o Builder aceita `.addMap(MapConfig)` para declarar mapas no config:
+
+```java
+import dev.nishisan.utils.ngrid.structures.MapConfig;
+import dev.nishisan.utils.map.NMapPersistenceMode;
+
+MapConfig usersCfg = MapConfig.builder("users")
+    .persistenceMode(NMapPersistenceMode.ASYNC_WITH_FSYNC)
+    .build();
+
+MapConfig sessionsCfg = MapConfig.builder("sessions")
+    .persistenceMode(NMapPersistenceMode.ASYNC_NO_FSYNC)
+    .build();
+
+NGridConfig cfg = NGridConfig.builder(local)
+    .dataDirectory(Path.of("/var/ngrid/node-1"))
+    .addQueue(QueueConfig.builder("events").build())
+    .addMap(usersCfg)
+    .addMap(sessionsCfg)
+    .replicationFactor(2)
+    .build();
+```
+
+> Nota: mapas configurados via `addMap()` são eagerly registrados no `start()`, garantindo que o líder esteja pronto para servir requests desde o início.
+
 ### Adicionando peers dinamicamente (join)
 
 ```java
@@ -250,6 +343,23 @@ public class NGridJoinExample {
   }
 }
 ```
+
+### Autodiscovery via seed node
+
+O NGrid suporta autodiscovery: um nó novo pode buscar automaticamente a configuração do cluster conectando-se a um seed node. Configure via YAML:
+
+```yaml
+autodiscover:
+  enabled: true
+  seed: "192.168.1.10:9011"
+  secret: "meu-segredo-compartilhado"
+```
+
+Quando habilitado, durante o `start()`:
+1. O nó conecta ao seed via socket TCP.
+2. Envia um handshake seguido de `CONFIG_FETCH_REQUEST`.
+3. Recebe a configuração do cluster (peers, filas, mapas).
+4. Salva a configuração localmente e desativa o autodiscover para reinícios futuros.
 
 ### Ciclo de vida do nó (start/close) e boas práticas
 
@@ -280,7 +390,9 @@ Node->>C: close()
 
 ### API principal
 
-- `offer(T value)`
+- `offer(T value)` — insere sem key/headers
+- `offer(byte[] key, T value)` — insere com routing key
+- `offer(byte[] key, NQueueHeaders headers, T value)` — insere com routing key e headers customizados
 - `Optional<T> peek()`
 - `Optional<T> poll()`
 - `Optional<T> pollWhenAvailable(Duration timeout)` (long-poll com notificação)
@@ -341,8 +453,40 @@ follower.start();
 ### API principal
 
 - `Optional<V> put(K key, V value)`
-- `Optional<V> get(K key)`
+- `Optional<V> get(K key)` — consistência `STRONG` (padrão, roteia ao líder)
+- `Optional<V> get(K key, Consistency consistency)` — com nível de consistência configurável
 - `Optional<V> remove(K key)`
+- `Set<K> keySet()` — leitura local (eventual consistency)
+- `boolean containsKey(K key)` — leitura local (eventual consistency)
+- `int size()` — contagem local (eventual consistency)
+- `boolean isEmpty()` — verifica se vazio (local)
+- `void putAll(Map<K, V> entries)` — insere múltiplos entries (cada put é replicado individualmente)
+- `void removeByPrefix(String prefix)` — remove entries por prefixo (operação local, sem replicação)
+
+### Níveis de consistência para leitura
+
+O `get()` aceita um segundo argumento `Consistency` para controlar o trade-off entre latência e frescor dos dados:
+
+```java
+import dev.nishisan.utils.ngrid.structures.Consistency;
+
+DistributedMap<String, String> map = node.getMap("users", String.class, String.class);
+
+// STRONG (padrão): sempre roteia ao líder — dado mais fresco, maior latência
+Optional<String> strong = map.get("user-1"); // equivale a get("user-1", Consistency.STRONG)
+
+// EVENTUAL: lê da réplica local — menor latência, pode estar defasado
+Optional<String> eventual = map.get("user-1", Consistency.EVENTUAL);
+
+// BOUNDED: lê da réplica local se o lag de replicação for aceitável
+Optional<String> bounded = map.get("user-1", Consistency.bounded(5)); // maxLag=5 sequências
+```
+
+| Nível | Roteia ao líder? | Garantia |
+|---|---|---|
+| `STRONG` | Sempre | Dado mais recente |
+| `EVENTUAL` | Nunca | Dado potencialmente defasado |
+| `BOUNDED` | Se lag > maxLag | Frescor limitado pelo maxLag |
 
 ### Múltiplos mapas (nomeados)
 
@@ -362,7 +506,8 @@ sessions.put("s1", "token-123");
 ### Observações importantes
 
 - No estado atual, o mapa é mantido em memória (`ConcurrentHashMap`) e replicado via `ReplicationManager`.
-- `get()` também é roteado ao líder na fachada (`DistributedMap`), mantendo um modelo simples de consistência.
+- `get()` com `Consistency.STRONG` (padrão) é roteado ao líder na fachada (`DistributedMap`), mantendo um modelo simples de consistência.
+- Operações de escrita (`put`/`remove`) verificam se o líder possui lease válido antes de aceitar.
 
 ### Persistência local do mapa (opcional)
 
@@ -383,12 +528,12 @@ Arquivos por mapa:
 └── map.meta
 ```
 
-Exemplo de configuração:
+Exemplo de configuração (API legada — mapa único):
 
 ```java
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
-import dev.nishisan.utils.ngrid.map.MapPersistenceMode;
+import dev.nishisan.utils.map.NMapPersistenceMode;
 import dev.nishisan.utils.ngrid.structures.NGridConfig;
 import dev.nishisan.utils.ngrid.structures.NGridNode;
 import dev.nishisan.utils.ngrid.structures.QueueConfig;
@@ -402,14 +547,14 @@ public class NGridMapPersistenceExample {
     NGridConfig cfg = NGridConfig.builder(local)
         // bootstrap do cluster (exemplo)
         // .addPeer(...)
-        .replicationQuorum(2)
+        .replicationFactor(2)
         // fila distribuída (obrigatório hoje)
         .dataDirectory(Path.of("/tmp/ngrid/node-1"))
         .addQueue(QueueConfig.builder("queue").build())
         // mapa: persistência local (opcional)
         .mapDirectory(Path.of("/tmp/ngrid/node-1/maps"))
         .mapName("default-map") // nome do mapa padrão (usado por node.map(...))
-        .mapPersistenceMode(MapPersistenceMode.ASYNC_WITH_FSYNC)
+        .mapPersistenceMode(NMapPersistenceMode.ASYNC_WITH_FSYNC)
         .build();
 
     try (NGridNode node = new NGridNode(cfg)) {
@@ -423,16 +568,88 @@ public class NGridMapPersistenceExample {
 }
 ```
 
+Exemplo de configuração (API nova — multi-map via `MapConfig`):
+
+```java
+import dev.nishisan.utils.ngrid.structures.MapConfig;
+import dev.nishisan.utils.map.NMapPersistenceMode;
+
+NGridConfig cfg = NGridConfig.builder(local)
+    .dataDirectory(Path.of("/var/ngrid/node-1"))
+    .addQueue(QueueConfig.builder("events").build())
+    .addMap(MapConfig.builder("users")
+        .persistenceMode(NMapPersistenceMode.ASYNC_WITH_FSYNC)
+        .build())
+    .addMap(MapConfig.builder("cache")
+        .persistenceMode(NMapPersistenceMode.DISABLED) // OK para DEV
+        .build())
+    .replicationFactor(2)
+    .build();
+```
+
 Notas:
 
 - A persistência é **local** e não altera o modelo de consistência do cluster.
 - `ASYNC_WITH_FSYNC` prioriza durabilidade em crash; `ASYNC_NO_FSYNC` prioriza performance.
 
-## 5) Utilitários
+## 5) Leader Reelection (baseada em RTT)
 
-### 5.1) LeaderElectionUtils (somente cluster + eleição)
+O NGrid suporta reeleição de líder baseada em latência de rede (RTT). Quando habilitada, o cluster pode sugerir a migração da liderança para um nó com melhor RTT.
 
-Quando você quer apenas “descoberta + eleição de líder” (sem usar `NGridNode` completo), use `LeaderElectionUtils`.
+```java
+NGridConfig cfg = NGridConfig.builder(local)
+    .leaderReelectionEnabled(true)
+    .leaderReelectionInterval(Duration.ofSeconds(5))       // intervalo de avaliação
+    .leaderReelectionCooldown(Duration.ofSeconds(60))      // cooldown entre reeleições
+    .leaderReelectionMinDelta(20.0)                         // delta mínimo de RTT (ms)
+    // ... demais configs
+    .build();
+```
+
+| Parâmetro | Default | Descrição |
+|---|---|---|
+| `leaderReelectionEnabled` | `false` | Habilita/desabilita a reeleição |
+| `leaderReelectionInterval` | 5s | Frequência de avaliação de RTT |
+| `leaderReelectionCooldown` | 60s | Tempo mínimo entre reeleições |
+| `leaderReelectionSuggestionTtl` | 30s | TTL de uma sugestão de reeleição |
+| `leaderReelectionMinDelta` | 20.0 | Delta mínimo de RTT (ms) para disparar sugestão |
+
+## 6) Métricas e Observabilidade
+
+O NGrid expõe métricas e alertas para monitoramento operacional.
+
+### Snapshot operacional
+
+```java
+NGridOperationalSnapshot snapshot = node.operationalSnapshot();
+
+System.out.println("Leader: " + snapshot.leaderId());
+System.out.println("Is Leader: " + snapshot.isLeader());
+System.out.println("Active Members: " + snapshot.activeMembersCount());
+System.out.println("Replication Lag: " + snapshot.lag());
+System.out.println("Pending Ops: " + snapshot.pendingOps());
+System.out.println("Reachable: " + snapshot.reachable() + "/" + snapshot.totalNodes());
+```
+
+### Alert Engine
+
+O `NGridAlertEngine` monitora condições operacionais e dispara alertas automaticamente:
+
+```java
+node.addAlertListener(alert -> {
+  System.out.println("[ALERT] " + alert);
+});
+```
+
+### Dashboard Reporter
+
+Quando o `dataDirectory` está configurado, o NGrid grava automaticamente um arquivo `dashboard.yaml` com o estado operacional a cada 10 segundos.
+
+## 7) Utilitários
+
+### 7.1) LeaderElectionUtils (somente cluster + eleição)
+
+Quando você quer apenas "descoberta + eleição de líder" (sem usar `NGridNode` completo), use `LeaderElectionUtils`.
 
 ```java
 import dev.nishisan.utils.ngrid.LeaderElectionListener;
@@ -477,7 +694,7 @@ public class LeaderElectionOnlyExample {
 
 > Nota: o `LeaderElectionService#close()` fecha internamente o `ClusterCoordinator`, que encerra o scheduler (veja o javadoc do utilitário). Use um scheduler dedicado.
 
-### 5.1.1) Eventos de liderança (diferença entre `LeadershipListener` e `LeaderElectionListener`)
+### 7.1.1) Eventos de liderança (diferença entre `LeadershipListener` e `LeaderElectionListener`)
 
 - **`LeadershipListener`**: notificado quando o líder observado muda (mesmo que o nó local não ganhe/perca liderança).
 - **`LeaderElectionListener`**: notificado quando o nó local ganha/perde liderança.
@@ -497,9 +714,9 @@ alt leader mudou
 end
 ```
 
-### 5.2) StatsUtils (métricas simples)
+### 7.2) StatsUtils (métricas simples)
 
-O `NQueue` já expõe contadores internos por `StatsUtils` (ex.: `queue.getStatsUtils()`), mas você também pode usar `StatsUtils` diretamente:
+O `NQueue` já expõe contadores internos por `StatsUtils` (ex.: `queue.getStats()`), mas você também pode usar `StatsUtils` diretamente:
 
 ```java
 import dev.nishisan.utils.stats.StatsUtils;
@@ -508,8 +725,8 @@ public class StatsUtilsExample {
   public static void main(String[] args) {
     StatsUtils stats = new StatsUtils();
     stats.notifyHitCounter("requests.total");
-    stats.notifyAverageCounter("latency.ms", 10);
-    stats.notifyAverageCounter("latency.ms", 20);
+    stats.notifyAverageCounter("latency.ms", 10L);
+    stats.notifyAverageCounter("latency.ms", 20L);
 
     System.out.println("requests.total=" + stats.getCounterValue("requests.total"));
     System.out.println("latency.avg=" + stats.getAverage("latency.ms"));
@@ -526,8 +743,8 @@ public class StatsUtilsExample {
 
 ### Quorum
 
-- Ajuste `replicationQuorum` para equilibrar disponibilidade e consistência.
-- Se o cluster tiver menos membros ativos do que o quorum configurado, o NGrid reduz para um quorum efetivo viável (se `strictConsistency=false`) ou falha a operação (se `strictConsistency=true`).
+- Ajuste `replicationFactor` para equilibrar disponibilidade e consistência.
+- Se o cluster tiver menos membros ativos do que o quorum configurado, o NGrid reduz para um quorum efetivo viável (se `strictConsistency=false`) ou falha a operação (se `strictConsistency=true`, que é o padrão).
 
 ### Persistência (fila)
 
