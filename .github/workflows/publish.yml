@@ -23,7 +23,7 @@ jobs:
       run: docker build -t ngrid-test:latest -f ngrid-test/Dockerfile .
 
     - name: Install parent and core modules
-      run: mvn -B -DskipTests -pl nishi-utils-core install -am
+      run: mvn -B -DskipTests -Dmaven.javadoc.skip=true -pl nishi-utils-core install -am
 
     - name: Run resilience integration tests
       run: |

@@ -24,7 +24,7 @@ package dev.nishisan.utils.ngrid.structures;
  * {@link NGridConfig.Builder} and {@link NGridNode} APIs. The existing
  * API remains fully available and is used internally by this facade.
  *
- * <h3>Usage Examples</h3>
+ * <h2>Usage Examples</h2>
  *
  * <b>Local cluster (dev/tests):</b>
  * <pre>{@code
