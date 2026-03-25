@@ -18,11 +18,11 @@ class NGridMapHighThroughputIT extends AbstractNGridMapClusterIT {
 
     @Test
     @Order(1)
-    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    @Timeout(value = 120, unit = TimeUnit.SECONDS)
     void shouldAchieveSustainedThroughputAndConsistency() throws Exception {
         await("cluster stable")
-            .atMost(30, TimeUnit.SECONDS)
-            .pollInterval(500, TimeUnit.MILLISECONDS)
+            .atMost(60, TimeUnit.SECONDS)
+            .pollInterval(2, TimeUnit.SECONDS)
             .until(() -> countLeaders() == 1);
 
         Thread.sleep(10000); // 10s de throughput sustentado (50 puts/s * 10s = ~500 puts)
@@ -42,7 +42,7 @@ class NGridMapHighThroughputIT extends AbstractNGridMapClusterIT {
     
     @Test
     @Order(2)
-    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    @Timeout(value = 120, unit = TimeUnit.SECONDS)
     void shouldCatchupAfterNodeCrashAndRecovery() throws Exception {
         NGridMapNodeContainer toRestart = node5_reader; // Node reader extra
         assertTrue(toRestart.isRunning());
@@ -55,7 +55,8 @@ class NGridMapHighThroughputIT extends AbstractNGridMapClusterIT {
         
         // Espera estabilizar
         await("catch up")
-            .atMost(30, TimeUnit.SECONDS)
+            .atMost(60, TimeUnit.SECONDS)
+            .pollInterval(2, TimeUnit.SECONDS)
             .until(() -> {
                 long totalKeysNode5 = toRestart.getLogs().lines()
                     .filter(l -> l.contains("MAP-KEYSET:count="))

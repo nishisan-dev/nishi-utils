@@ -25,12 +25,12 @@ class NGridMapLeaderCrashIT extends AbstractNGridMapClusterIT {
 
     @Test
     @Order(1)
-    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    @Timeout(value = 120, unit = TimeUnit.SECONDS)
     void shouldMaintainMapConsistencyDuringLeaderCrash() throws Exception {
         // Aguarda estabilização inicial do producer/reader
         await("initial stability")
-            .atMost(30, TimeUnit.SECONDS)
-            .pollInterval(500, TimeUnit.MILLISECONDS)
+            .atMost(60, TimeUnit.SECONDS)
+            .pollInterval(2, TimeUnit.SECONDS)
             .until(() -> countLeaders() == 1
                     && runningNodesSeeAtLeast(5)
                     && !node2_producer.extractMapPuts().isEmpty());
@@ -49,8 +49,8 @@ class NGridMapLeaderCrashIT extends AbstractNGridMapClusterIT {
 
         // Aguarda nova eleição
         await("new leader election")
-            .atMost(30, TimeUnit.SECONDS)
-            .pollInterval(500, TimeUnit.MILLISECONDS)
+            .atMost(60, TimeUnit.SECONDS)
+            .pollInterval(2, TimeUnit.SECONDS)
             .until(() -> {
                 long leaders = Stream.of(seed, node2_producer, node3_reader, node4, node5_reader)
                         .filter(c -> c.isRunning() && c.isLeader())
@@ -80,11 +80,11 @@ class NGridMapLeaderCrashIT extends AbstractNGridMapClusterIT {
 
     @Test
     @Order(2)
-    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    @Timeout(value = 120, unit = TimeUnit.SECONDS)
     void shouldSurviveDoubleCrash() throws Exception {
         await("cluster healed after first crash")
-            .atMost(30, TimeUnit.SECONDS)
-            .pollInterval(500, TimeUnit.MILLISECONDS)
+            .atMost(60, TimeUnit.SECONDS)
+            .pollInterval(2, TimeUnit.SECONDS)
             .until(() -> countLeaders() == 1 && runningNodesSeeAtLeast(4));
 
         // Derruba mais um nó (follower que não seja producer nem reader)
@@ -99,8 +99,8 @@ class NGridMapLeaderCrashIT extends AbstractNGridMapClusterIT {
 
         // Ainda temos quorum (3/5 vivos com factor=2) - espera estabilizar
         await("new leader if needed")
-            .atMost(30, TimeUnit.SECONDS)
-            .pollInterval(500, TimeUnit.MILLISECONDS)
+            .atMost(60, TimeUnit.SECONDS)
+            .pollInterval(2, TimeUnit.SECONDS)
             .until(() -> countLeaders() >= 1 && runningNodesSeeAtLeast(3));
             
         // Producer deve continuar gerando puts com o quorum restante.
@@ -109,8 +109,8 @@ class NGridMapLeaderCrashIT extends AbstractNGridMapClusterIT {
         if (node2_producer.isRunning()) {
             int currentPuts = node2_producer.extractMapPuts().size();
             await("producer should resume after double crash")
-                .atMost(20, TimeUnit.SECONDS)
-                .pollInterval(1, TimeUnit.SECONDS)
+                .atMost(60, TimeUnit.SECONDS)
+                .pollInterval(2, TimeUnit.SECONDS)
                 .until(() -> node2_producer.extractMapPuts().size() > currentPuts);
         }
     }

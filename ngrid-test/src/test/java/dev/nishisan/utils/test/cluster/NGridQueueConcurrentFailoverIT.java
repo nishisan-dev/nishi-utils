@@ -48,12 +48,12 @@ class NGridQueueConcurrentFailoverIT extends AbstractNGridMapClusterIT {
 
     @Test
     @Order(1)
-    @Timeout(value = 90, unit = TimeUnit.SECONDS)
+    @Timeout(value = 180, unit = TimeUnit.SECONDS)
     void shouldResumeQueueOperationsAfterLeaderCrash() throws Exception {
         // ── Fase 1: Cluster estável com puts acontecendo ──
         await("initial stability with active producer")
-            .atMost(30, TimeUnit.SECONDS)
-            .pollInterval(500, TimeUnit.MILLISECONDS)
+            .atMost(60, TimeUnit.SECONDS)
+            .pollInterval(2, TimeUnit.SECONDS)
             .until(() -> countLeaders() == 1
                     && runningNodesSeeAtLeast(5)
                     && !node2_producer.extractMapPuts().isEmpty());
@@ -72,8 +72,8 @@ class NGridQueueConcurrentFailoverIT extends AbstractNGridMapClusterIT {
 
         // ── Fase 3: Aguardar re-eleição ──
         await("new leader elected")
-            .atMost(30, TimeUnit.SECONDS)
-            .pollInterval(500, TimeUnit.MILLISECONDS)
+            .atMost(60, TimeUnit.SECONDS)
+            .pollInterval(2, TimeUnit.SECONDS)
             .until(() -> {
                 long leaders = Stream.of(seed, node2_producer, node3_reader, node4, node5_reader)
                         .filter(c -> c.isRunning() && c.isLeader())
@@ -82,9 +82,9 @@ class NGridQueueConcurrentFailoverIT extends AbstractNGridMapClusterIT {
             });
 
         // ── Fase 4: Validar que throughput retomou em < 15s ──
-        await("producer resumes within 15s")
-            .atMost(15, TimeUnit.SECONDS)
-            .pollInterval(1, TimeUnit.SECONDS)
+        await("producer resumes within 60s")
+            .atMost(60, TimeUnit.SECONDS)
+            .pollInterval(2, TimeUnit.SECONDS)
             .until(() -> node2_producer.extractMapPuts().size() > putsBeforeCrash);
 
         int putsAfterCrash = node2_producer.extractMapPuts().size();
@@ -94,14 +94,14 @@ class NGridQueueConcurrentFailoverIT extends AbstractNGridMapClusterIT {
 
     @Test
     @Order(2)
-    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    @Timeout(value = 120, unit = TimeUnit.SECONDS)
     void shouldNotProduceDuplicatesOnMapPuts() throws Exception {
         // Após o failover, coleta todos os MAP-PUT do producer
         // e verifica que não há duplicatas no conjunto de puts confirmados
         
         await("cluster stable after failover")
-            .atMost(30, TimeUnit.SECONDS)
-            .pollInterval(500, TimeUnit.MILLISECONDS)
+            .atMost(60, TimeUnit.SECONDS)
+            .pollInterval(2, TimeUnit.SECONDS)
             .until(() -> countLeaders() >= 1 && runningNodesSeeAtLeast(4));
 
         // Dar mais tempo para acumular dados

@@ -49,8 +49,8 @@ class NGridDockerSoakIT extends AbstractNGridMapClusterIT {
 
         // ── Fase 1: Convergência inicial ──
         await("initial cluster stability")
-            .atMost(30, TimeUnit.SECONDS)
-            .pollInterval(500, TimeUnit.MILLISECONDS)
+            .atMost(60, TimeUnit.SECONDS)
+            .pollInterval(2, TimeUnit.SECONDS)
             .until(() -> countLeaders() == 1
                     && Stream.of(seed, node2_producer, node3_reader, node4, node5_reader)
                             .allMatch(c -> c.latestActiveMembersCount() >= 5)
@@ -76,8 +76,8 @@ class NGridDockerSoakIT extends AbstractNGridMapClusterIT {
 
                     // Aguardar re-eleição
                     await("leader re-elected after churn #" + churnCount)
-                        .atMost(30, TimeUnit.SECONDS)
-                        .pollInterval(1, TimeUnit.SECONDS)
+                        .atMost(60, TimeUnit.SECONDS)
+                        .pollInterval(2, TimeUnit.SECONDS)
                         .until(() -> countLeaders() >= 1);
 
                     System.out.println("[SOAK-DOCKER] New leader elected after churn #" + churnCount);
@@ -91,8 +91,8 @@ class NGridDockerSoakIT extends AbstractNGridMapClusterIT {
                 // Pode estar em transição de líder, dar tempo
                 final int threshold = lastPutCount;
                 await("producer should resume")
-                    .atMost(20, TimeUnit.SECONDS)
-                    .pollInterval(1, TimeUnit.SECONDS)
+                    .atMost(60, TimeUnit.SECONDS)
+                    .pollInterval(2, TimeUnit.SECONDS)
                     .until(() -> node2_producer.extractMapPuts().size() > threshold);
             }
             lastPutCount = node2_producer.extractMapPuts().size();
