@@ -82,14 +82,26 @@ public class NGridMapNodeContainer extends GenericContainer<NGridMapNodeContaine
     }
 
     public List<String> extractMapPuts() {
-        List<String> puts = new ArrayList<>();
+        return extractLogLines("MAP-PUT:");
+    }
+
+    public List<String> extractMapPutFails() {
+        return extractLogLines("MAP-PUT-FAIL:");
+    }
+
+    /**
+     * Extrai linhas do log do container que contenham o marcador especificado.
+     * Retorna o conteúdo após o marcador para cada ocorrência.
+     */
+    public List<String> extractLogLines(String marker) {
+        List<String> result = new ArrayList<>();
         for (String line : getLogs().split("\\R")) {
-            int idx = line.indexOf("MAP-PUT:");
+            int idx = line.indexOf(marker);
             if (idx >= 0) {
-                puts.add(line.substring(idx + 8).trim());
+                result.add(line.substring(idx + marker.length()).trim());
             }
         }
-        return puts;
+        return result;
     }
 
     public List<String> extractMapReads(String consistency) {
