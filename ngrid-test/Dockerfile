@@ -11,7 +11,7 @@ RUN mvn -f ngrid-test/pom.xml -DskipTests -Dskip.docker.build=true package
 FROM eclipse-temurin:21-jre
 WORKDIR /app
 
-COPY --from=build /workspace/ngrid-test/target/ngrid-test-3.1.0-jar-with-dependencies.jar /app/ngrid-test.jar
+COPY --from=build /workspace/ngrid-test/target/ngrid-test-jar-with-dependencies.jar /app/ngrid-test.jar
 COPY --from=build /workspace/ngrid-test/config /app/config
 
 ENTRYPOINT ["java", "-jar", "/app/ngrid-test.jar"]
