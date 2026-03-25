@@ -6,9 +6,8 @@
 
     <groupId>dev.nishisan</groupId>
     <artifactId>nishi-utils-parent</artifactId>
-    <version>3.1.0</version>
+    <version>3.5.0</version>
     <packaging>pom</packaging>
-
     <modules>
         <module>nishi-utils-core</module>
         <module>ngrid-test</module>
