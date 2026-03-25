@@ -646,7 +646,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         long seq = payload.sequence();
         String localNodeId = transport.local().nodeId().value();
 
-        LOGGER.info(() -> String.format(
+        LOGGER.fine(() -> String.format(
                 "[%s] Replication request opId=%s seq=%d topic=%s from=%s",
                 localNodeId, opId, seq, payload.topic(), message.source()));
 
@@ -737,7 +737,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                 buffer.add(buffered);
                 waitStart.putIfAbsent(seq, Instant.now());
 
-                LOGGER.info(() -> String.format(
+                LOGGER.fine(() -> String.format(
                         "[%s] Buffered future sequence opId=%s seq=%d (expecting=%d) for topic=%s",
                         localNodeId, opId, seq, nextExpected, topic));
 
@@ -788,7 +788,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                     onSuccess.run();
                 }
 
-                LOGGER.info(() -> String.format(
+                LOGGER.fine(() -> String.format(
                         "[%s] Applied replication opId=%s seq=%d topic=%s",
                         localNodeId, opId, payload.sequence(), payload.topic()));
             } catch (Exception e) {
@@ -852,7 +852,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                     nextExpectedSequenceByTopic.put(topic, nextExpected + 1);
                     saveSequenceState();
 
-                    LOGGER.info(() -> String.format(
+                    LOGGER.fine(() -> String.format(
                             "Processed buffered sequence seq=%d for topic=%s", next.sequence(), topic));
 
                     // RECURSION: Process next buffered item
@@ -1180,7 +1180,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
     private void sendAck(UUID operationId, NodeId destination) {
         String localNodeId = transport.local().nodeId().value();
-        LOGGER.info(() -> String.format(
+        LOGGER.fine(() -> String.format(
                 "[%s] Sending replication ack for %s to %s",
                 localNodeId, operationId, destination));
         ReplicationAckPayload ackPayload = new ReplicationAckPayload(operationId, true);
@@ -1198,7 +1198,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         if (operation == null) {
             return;
         }
-        LOGGER.info(() -> "Replication ack for " + payload.operationId() + " from " + message.source());
+        LOGGER.fine(() -> "Replication ack for " + payload.operationId() + " from " + message.source());
         operation.ack(message.source());
         checkCompletion(operation);
     }
