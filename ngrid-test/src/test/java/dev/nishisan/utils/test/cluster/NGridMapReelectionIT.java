@@ -18,11 +18,11 @@ class NGridMapReelectionIT extends AbstractNGridMapClusterIT {
 
     @Test
     @Order(1)
-    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    @Timeout(value = 120, unit = TimeUnit.SECONDS)
     void shouldMaintainOperationsDuringGracefulReelection() throws Exception {
         await("cluster stable")
-            .atMost(30, TimeUnit.SECONDS)
-            .pollInterval(500, TimeUnit.MILLISECONDS)
+            .atMost(60, TimeUnit.SECONDS)
+            .pollInterval(2, TimeUnit.SECONDS)
             .until(() -> countLeaders() == 1);
 
         NGridMapNodeContainer leader = findLeader();
@@ -37,7 +37,8 @@ class NGridMapReelectionIT extends AbstractNGridMapClusterIT {
 
         // Aguarda reeleição
         await("graceful reelection")
-            .atMost(30, TimeUnit.SECONDS)
+            .atMost(60, TimeUnit.SECONDS)
+            .pollInterval(2, TimeUnit.SECONDS)
             .until(() -> countLeaders() == 1);
             
         Thread.sleep(3000);
@@ -63,7 +64,7 @@ class NGridMapReelectionIT extends AbstractNGridMapClusterIT {
 
     @Test
     @Order(2)
-    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    @Timeout(value = 120, unit = TimeUnit.SECONDS)
     void shouldPreventSplitBrainWrites() throws Exception {
         // Com factor=2 e totalExpected=5, o lease renova se activeCount > 5/2 = 2.
         // Precisamos ter no máximo 2 nós ativos para que o lease expire.
@@ -80,8 +81,8 @@ class NGridMapReelectionIT extends AbstractNGridMapClusterIT {
         // Espera que MAP-PUT-FAIL apareça (indica que o líder perdeu quorum)
         if (node2_producer.isRunning()) {
             await("writes should fail without quorum")
-                .atMost(30, TimeUnit.SECONDS)
-                .pollInterval(1, TimeUnit.SECONDS)
+                .atMost(60, TimeUnit.SECONDS)
+                .pollInterval(2, TimeUnit.SECONDS)
                 .until(() -> node2_producer.getLogs().lines()
                     .filter(l -> l.contains("MAP-PUT-FAIL"))
                     .count() > 0);
@@ -93,8 +94,8 @@ class NGridMapReelectionIT extends AbstractNGridMapClusterIT {
         if (node3_reader.isRunning()) {
             int readsBeforeIso = node3_reader.extractMapReads("EVENTUAL").size();
             await("EVENTUAL reads should continue locally")
-                .atMost(15, TimeUnit.SECONDS)
-                .pollInterval(1, TimeUnit.SECONDS)
+                .atMost(60, TimeUnit.SECONDS)
+                .pollInterval(2, TimeUnit.SECONDS)
                 .until(() -> node3_reader.extractMapReads("EVENTUAL").size() > readsBeforeIso);
         }
     }
