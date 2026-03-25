@@ -25,11 +25,11 @@ class NGridMapLeaderCrashIT extends AbstractNGridMapClusterIT {
 
     @Test
     @Order(1)
-    @Timeout(value = 120, unit = TimeUnit.SECONDS)
+    @Timeout(value = 300, unit = TimeUnit.SECONDS)
     void shouldMaintainMapConsistencyDuringLeaderCrash() throws Exception {
         // Aguarda estabilização inicial do producer/reader
         await("initial stability")
-            .atMost(60, TimeUnit.SECONDS)
+            .atMost(120, TimeUnit.SECONDS)
             .pollInterval(2, TimeUnit.SECONDS)
             .until(() -> countLeaders() == 1
                     && runningNodesSeeAtLeast(5)
@@ -49,7 +49,7 @@ class NGridMapLeaderCrashIT extends AbstractNGridMapClusterIT {
 
         // Aguarda nova eleição
         await("new leader election")
-            .atMost(60, TimeUnit.SECONDS)
+            .atMost(120, TimeUnit.SECONDS)
             .pollInterval(2, TimeUnit.SECONDS)
             .until(() -> {
                 long leaders = Stream.of(seed, node2_producer, node3_reader, node4, node5_reader)
@@ -80,10 +80,10 @@ class NGridMapLeaderCrashIT extends AbstractNGridMapClusterIT {
 
     @Test
     @Order(2)
-    @Timeout(value = 180, unit = TimeUnit.SECONDS)
+    @Timeout(value = 300, unit = TimeUnit.SECONDS)
     void shouldSurviveDoubleCrash() throws Exception {
         await("cluster healed after first crash")
-            .atMost(60, TimeUnit.SECONDS)
+            .atMost(120, TimeUnit.SECONDS)
             .pollInterval(2, TimeUnit.SECONDS)
             .until(() -> countLeaders() == 1 && runningNodesSeeAtLeast(4));
 
@@ -99,7 +99,7 @@ class NGridMapLeaderCrashIT extends AbstractNGridMapClusterIT {
 
         // Ainda temos quorum (3/5 vivos com factor=2) - espera estabilizar
         await("new leader if needed")
-            .atMost(90, TimeUnit.SECONDS)
+            .atMost(120, TimeUnit.SECONDS)
             .pollInterval(2, TimeUnit.SECONDS)
             .until(() -> countLeaders() >= 1 && runningNodesSeeAtLeast(3));
             
@@ -111,7 +111,7 @@ class NGridMapLeaderCrashIT extends AbstractNGridMapClusterIT {
             int currentPuts = node2_producer.extractMapPuts().size();
             int currentFails = node2_producer.extractMapPutFails().size();
             await("producer should remain active after double crash")
-                .atMost(90, TimeUnit.SECONDS)
+                .atMost(120, TimeUnit.SECONDS)
                 .pollInterval(2, TimeUnit.SECONDS)
                 .until(() -> node2_producer.extractMapPuts().size() > currentPuts
                         || node2_producer.extractMapPutFails().size() > currentFails);

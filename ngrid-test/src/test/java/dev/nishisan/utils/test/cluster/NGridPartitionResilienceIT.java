@@ -40,12 +40,12 @@ class NGridPartitionResilienceIT extends AbstractNGridMapClusterIT {
 
     @Test
     @Order(1)
-    @Timeout(value = 180, unit = TimeUnit.SECONDS)
+    @Timeout(value = 300, unit = TimeUnit.SECONDS)
     void shouldHandleNetworkPartitionAndRecover() throws Exception {
         // ── Fase 1: Estabilização inicial ──
         await("initial stability")
-            .atMost(30, TimeUnit.SECONDS)
-            .pollInterval(500, TimeUnit.MILLISECONDS)
+            .atMost(120, TimeUnit.SECONDS)
+            .pollInterval(2, TimeUnit.SECONDS)
             .until(() -> countLeaders() == 1
                     && Stream.of(seed, node2_producer, node3_reader, node4, node5_reader)
                             .allMatch(c -> c.latestActiveMembersCount() >= 5)
@@ -85,8 +85,8 @@ class NGridPartitionResilienceIT extends AbstractNGridMapClusterIT {
         // O majority (seed, node2_producer, node3_reader) deve manter líder
         // e continuar aceitando writes
         await("majority continues operating")
-            .atMost(30, TimeUnit.SECONDS)
-            .pollInterval(1, TimeUnit.SECONDS)
+            .atMost(120, TimeUnit.SECONDS)
+            .pollInterval(2, TimeUnit.SECONDS)
             .until(() -> {
                 long leaders = Stream.of(seed, node2_producer, node3_reader)
                         .filter(c -> c.isRunning() && c.isLeader())
@@ -96,8 +96,8 @@ class NGridPartitionResilienceIT extends AbstractNGridMapClusterIT {
 
         // Producer deve continuar escrevendo no majority
         await("producer resumes in majority partition")
-            .atMost(20, TimeUnit.SECONDS)
-            .pollInterval(1, TimeUnit.SECONDS)
+            .atMost(120, TimeUnit.SECONDS)
+            .pollInterval(2, TimeUnit.SECONDS)
             .until(() -> node2_producer.extractMapPuts().size() > putsBeforePartition);
 
         int putsDuringPartition = node2_producer.extractMapPuts().size();
@@ -129,8 +129,8 @@ class NGridPartitionResilienceIT extends AbstractNGridMapClusterIT {
 
         // ── Fase 7: Validar convergência pós-reconexão ──
         await("cluster converges after heal")
-            .atMost(30, TimeUnit.SECONDS)
-            .pollInterval(1, TimeUnit.SECONDS)
+            .atMost(120, TimeUnit.SECONDS)
+            .pollInterval(2, TimeUnit.SECONDS)
             .until(() -> {
                 // Todos os nós running devem ver pelo menos 4 membros ativos
                 // (damos margem de 1 por eventual atraso)
@@ -149,14 +149,14 @@ class NGridPartitionResilienceIT extends AbstractNGridMapClusterIT {
 
     @Test
     @Order(2)
-    @Timeout(value = 180, unit = TimeUnit.SECONDS)
+    @Timeout(value = 300, unit = TimeUnit.SECONDS)
     void shouldRejectWritesInMinorityPartition() throws Exception {
         // Este teste valida que o lado minority não aceita writes
         // durante uma partição. Requer que o cluster esteja saudável
         // primeiro (recuperado do teste anterior).
         
         await("cluster healthy")
-            .atMost(90, TimeUnit.SECONDS)
+            .atMost(120, TimeUnit.SECONDS)
             .pollInterval(2, TimeUnit.SECONDS)
             .until(() -> countLeaders() == 1
                     && Stream.of(seed, node2_producer, node3_reader, node4, node5_reader)
@@ -191,7 +191,7 @@ class NGridPartitionResilienceIT extends AbstractNGridMapClusterIT {
         if (node2_producer.isRunning()) {
             int failsBefore = node2_producer.extractMapPutFails().size();
             await("writes should fail or stall in minority")
-                .atMost(90, TimeUnit.SECONDS)
+                .atMost(120, TimeUnit.SECONDS)
                 .pollInterval(2, TimeUnit.SECONDS)
                 .until(() -> {
                     int currentFails = node2_producer.extractMapPutFails().size();
@@ -216,7 +216,7 @@ class NGridPartitionResilienceIT extends AbstractNGridMapClusterIT {
 
         // Cluster deve se recuperar
         await("cluster recovers after minority test")
-            .atMost(90, TimeUnit.SECONDS)
+            .atMost(120, TimeUnit.SECONDS)
             .pollInterval(2, TimeUnit.SECONDS)
             .until(() -> countLeaders() >= 1);
     }

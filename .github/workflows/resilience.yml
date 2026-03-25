@@ -62,7 +62,7 @@ jobs:
           distribution: 'temurin'
 
       - name: Run Testcontainers durability tests
-        run: mvn -B test -Pdocker-resilience
+        run: mvn -B verify -Pdocker-resilience -pl ngrid-test
 
   soak-test:
     name: Soak Test (Long-Running)

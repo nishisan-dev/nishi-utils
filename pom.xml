@@ -192,20 +192,37 @@
             <id>docker-resilience</id>
             <build>
                 <plugins>
+                    <!-- Skip surefire (unit tests) neste profile -->
                     <plugin>
                         <groupId>org.apache.maven.plugins</groupId>
                         <artifactId>maven-surefire-plugin</artifactId>
+                        <version>3.2.5</version>
+                        <configuration>
+                            <skip>true</skip>
+                        </configuration>
+                    </plugin>
+                    <!-- Failsafe para ITs Docker -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-failsafe-plugin</artifactId>
                         <version>3.2.5</version>
                         <configuration>
                             <forkCount>1</forkCount>
                             <reuseForks>false</reuseForks>
                             <forkedProcessTimeoutInSeconds>900</forkedProcessTimeoutInSeconds>
                             <includes>
-                                <include>**/testcontainers/**Test.java</include>
+                                <include>**/cluster/*IT.java</include>
                             </includes>
+                            <excludes>
+                                <exclude>**/soak/**</exclude>
+                            </excludes>
                             <systemPropertyVariables>
                                 <ngrid.test.docker>true</ngrid.test.docker>
                             </systemPropertyVariables>
+                            <environmentVariables>
+                                <TESTCONTAINERS_RYUK_DISABLED>true</TESTCONTAINERS_RYUK_DISABLED>
+                                <DOCKER_HOST>unix:///var/run/docker.sock</DOCKER_HOST>
+                            </environmentVariables>
                         </configuration>
                     </plugin>
                 </plugins>
