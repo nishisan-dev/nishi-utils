@@ -93,6 +93,70 @@ NQueue.Options options = NQueue.Options.defaults()
 
 ## 2) NGrid (cluster): configuração e bootstrap
 
+### Quick Start — API Simplificada (`NGrid` facade)
+
+A forma mais rápida de criar um cluster é usando a facade `NGrid`. Para dev/testes locais, use `NGrid.local(n)`:
+
+```java
+import dev.nishisan.utils.ngrid.structures.*;
+
+// Cluster com 2 nós — zero configuração de rede
+try (NGridCluster cluster = NGrid.local(2)
+        .queue("orders")
+        .map("users")
+        .start()) {
+
+    DistributedQueue<String> q = cluster.queue("orders", String.class);
+    DistributedMap<String, String> m = cluster.map("users", String.class, String.class);
+
+    q.offer("pedido-1");
+    m.put("u1", "Alice");
+
+    System.out.println(cluster.queue(1, "orders", String.class).peek()); // pedido-1
+    System.out.println(cluster.map(1, "users", String.class, String.class).get("u1")); // Alice
+}
+```
+
+Para nós de produção, use `NGrid.node(host, port)` com seed ou peers explícitos. O protocolo gossip propaga a lista completa de peers automaticamente mesmo que apenas um seed seja fornecido:
+
+```java
+import dev.nishisan.utils.ngrid.structures.*;
+
+import java.nio.file.Path;
+
+// Nó com seed discovery (gossip propaga os demais peers)
+try (NGridNode node = NGrid.node("192.168.1.10", 9011)
+        .seed("192.168.1.11:9011")
+        .queue("orders")
+        .map("users")
+        .dataDir(Path.of("/var/ngrid/data"))
+        .replication(2)
+        .start()) {
+
+    node.getQueue("orders", String.class).offer("pedido-1");
+    node.getMap("users", String.class, String.class).put("u1", "Alice");
+}
+
+// Nó com peers explícitos
+try (NGridNode node = NGrid.node("192.168.1.10", 9011)
+        .peers("192.168.1.11:9011", "192.168.1.12:9011")
+        .queue("orders")
+        .replication(2)
+        .start()) {
+    // ...
+}
+```
+
+| Modo | Sintaxe | Rede | NodeId |
+|---|---|---|---|
+| **Local (dev/test)** | `NGrid.local(n)` | `127.0.0.1`, portas efêmeras | `local-1`, `local-2`, ... |
+| **Node com seed** | `NGrid.node(ip, port).seed(...)` | Explícito + gossip | `host:port` (ou `.id()`) |
+| **Node com peers** | `NGrid.node(ip, port).peers(...)` | Explícitos + gossip | `host:port` (ou `.id()`) |
+
+> **Nota:** A API simplificada coexiste com o builder completo (`NGridConfig.builder()`). Para controle total de timeouts, heartbeat, lease, reeleição etc., continue usando o builder detalhado abaixo.
+
+### Configuração avançada do nó (NGridConfig)
+
 O NGrid funciona com nós descritos por `NodeInfo(nodeId, host, port)` e com uma lista de **peers iniciais**. A descoberta completa tende a convergir via handshake e peer updates. Após o `start()`, você também pode adicionar peers dinamicamente com `node.join(...)`.
 
 ### Configuração do nó (NGridConfig)
