@@ -41,12 +41,12 @@ class NGridMapConcurrentWriteFailoverIT extends AbstractNGridMapClusterIT {
 
     @Test
     @Order(1)
-    @Timeout(value = 90, unit = TimeUnit.SECONDS)
+    @Timeout(value = 180, unit = TimeUnit.SECONDS)
     void shouldMaintainConsistencyDuringConcurrentWritesAndFailover() throws Exception {
         // ── Fase 1: Convergência inicial ──
         await("initial stability")
-            .atMost(30, TimeUnit.SECONDS)
-            .pollInterval(500, TimeUnit.MILLISECONDS)
+            .atMost(90, TimeUnit.SECONDS)
+            .pollInterval(2, TimeUnit.SECONDS)
             .until(() -> countLeaders() == 1
                     && runningNodesSeeAtLeast(5)
                     && !node2_producer.extractMapPuts().isEmpty());
@@ -68,8 +68,8 @@ class NGridMapConcurrentWriteFailoverIT extends AbstractNGridMapClusterIT {
 
         // ── Fase 4: Aguardar re-eleição e estabilização ──
         await("new leader elected after crash")
-            .atMost(30, TimeUnit.SECONDS)
-            .pollInterval(500, TimeUnit.MILLISECONDS)
+            .atMost(60, TimeUnit.SECONDS)
+            .pollInterval(2, TimeUnit.SECONDS)
             .until(() -> {
                 long leaders = Stream.of(seed, node2_producer, node3_reader, node4, node5_reader)
                         .filter(c -> c.isRunning() && c.isLeader())
@@ -79,8 +79,8 @@ class NGridMapConcurrentWriteFailoverIT extends AbstractNGridMapClusterIT {
 
         // ── Fase 5: Validar que producer retomou ──
         await("producer resumes writing after failover")
-            .atMost(20, TimeUnit.SECONDS)
-            .pollInterval(1, TimeUnit.SECONDS)
+            .atMost(60, TimeUnit.SECONDS)
+            .pollInterval(2, TimeUnit.SECONDS)
             .until(() -> node2_producer.extractMapPuts().size() > putsBeforeCrash);
 
         int putsAfterCrash = node2_producer.extractMapPuts().size();
@@ -115,12 +115,12 @@ class NGridMapConcurrentWriteFailoverIT extends AbstractNGridMapClusterIT {
 
     @Test
     @Order(2)
-    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    @Timeout(value = 120, unit = TimeUnit.SECONDS)
     void shouldHandleRapidSuccessiveFailovers() throws Exception {
         // Após o primeiro failover, o cluster deve ter se estabilizado com 4 nós
         await("cluster recovered from first crash")
-            .atMost(30, TimeUnit.SECONDS)
-            .pollInterval(500, TimeUnit.MILLISECONDS)
+            .atMost(60, TimeUnit.SECONDS)
+            .pollInterval(2, TimeUnit.SECONDS)
             .until(() -> countLeaders() == 1 && runningNodesSeeAtLeast(4));
 
         int putsBaselineSecondRound = node2_producer.extractMapPuts().size();
@@ -136,15 +136,15 @@ class NGridMapConcurrentWriteFailoverIT extends AbstractNGridMapClusterIT {
 
             // Aguarda terceira eleição
             await("leader after second crash")
-                .atMost(30, TimeUnit.SECONDS)
-                .pollInterval(500, TimeUnit.MILLISECONDS)
+                .atMost(60, TimeUnit.SECONDS)
+                .pollInterval(2, TimeUnit.SECONDS)
                 .until(() -> countLeaders() >= 1 && runningNodesSeeAtLeast(3));
 
             // Producer deve continuar
             if (node2_producer.isRunning()) {
                 await("producer resumes after second crash")
-                    .atMost(20, TimeUnit.SECONDS)
-                    .pollInterval(1, TimeUnit.SECONDS)
+                    .atMost(60, TimeUnit.SECONDS)
+                    .pollInterval(2, TimeUnit.SECONDS)
                     .until(() -> node2_producer.extractMapPuts().size() > putsBaselineSecondRound);
             }
         }

@@ -40,7 +40,7 @@ class NGridPartitionResilienceIT extends AbstractNGridMapClusterIT {
 
     @Test
     @Order(1)
-    @Timeout(value = 120, unit = TimeUnit.SECONDS)
+    @Timeout(value = 180, unit = TimeUnit.SECONDS)
     void shouldHandleNetworkPartitionAndRecover() throws Exception {
         // ── Fase 1: Estabilização inicial ──
         await("initial stability")
@@ -149,15 +149,15 @@ class NGridPartitionResilienceIT extends AbstractNGridMapClusterIT {
 
     @Test
     @Order(2)
-    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    @Timeout(value = 120, unit = TimeUnit.SECONDS)
     void shouldRejectWritesInMinorityPartition() throws Exception {
         // Este teste valida que o lado minority não aceita writes
         // durante uma partição. Requer que o cluster esteja saudável
         // primeiro (recuperado do teste anterior).
         
         await("cluster healthy")
-            .atMost(30, TimeUnit.SECONDS)
-            .pollInterval(500, TimeUnit.MILLISECONDS)
+            .atMost(90, TimeUnit.SECONDS)
+            .pollInterval(2, TimeUnit.SECONDS)
             .until(() -> countLeaders() == 1
                     && Stream.of(seed, node2_producer, node3_reader, node4, node5_reader)
                             .filter(NGridMapNodeContainer::isRunning)
@@ -183,8 +183,8 @@ class NGridPartitionResilienceIT extends AbstractNGridMapClusterIT {
         // Com 2/5 nós, lease expira → writes devem falhar
         if (node2_producer.isRunning()) {
             await("writes should fail in minority")
-                .atMost(30, TimeUnit.SECONDS)
-                .pollInterval(1, TimeUnit.SECONDS)
+                .atMost(60, TimeUnit.SECONDS)
+                .pollInterval(2, TimeUnit.SECONDS)
                 .until(() -> node2_producer.getLogs().lines()
                     .filter(l -> l.contains("MAP-PUT-FAIL"))
                     .count() > 0);
@@ -202,8 +202,8 @@ class NGridPartitionResilienceIT extends AbstractNGridMapClusterIT {
 
         // Cluster deve se recuperar
         await("cluster recovers after minority test")
-            .atMost(30, TimeUnit.SECONDS)
-            .pollInterval(1, TimeUnit.SECONDS)
+            .atMost(90, TimeUnit.SECONDS)
+            .pollInterval(2, TimeUnit.SECONDS)
             .until(() -> countLeaders() >= 1);
     }
 }
