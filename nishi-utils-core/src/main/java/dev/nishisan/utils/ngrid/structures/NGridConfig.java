@@ -49,6 +49,7 @@ public final class NGridConfig {
     private final Duration leaderReelectionCooldown;
     private final Duration leaderReelectionSuggestionTtl;
     private final double leaderReelectionMinDelta;
+    private final boolean dashboardEnabled;
 
     // New fields for multiple queues and maps
     private final Path dataDirectory;
@@ -89,6 +90,9 @@ public final class NGridConfig {
         this.leaderReelectionCooldown = builder.leaderReelectionCooldown;
         this.leaderReelectionSuggestionTtl = builder.leaderReelectionSuggestionTtl;
         this.leaderReelectionMinDelta = builder.leaderReelectionMinDelta;
+        this.dashboardEnabled = builder.dashboardEnabled != null
+                ? builder.dashboardEnabled
+                : builder.deploymentProfile == DeploymentProfile.PRODUCTION;
 
         // New fields
         this.dataDirectory = builder.dataDirectory != null ? builder.dataDirectory : builder.queueDirectory;
@@ -156,6 +160,18 @@ public final class NGridConfig {
 
     public Duration rttProbeInterval() {
         return rttProbeInterval;
+    }
+
+    /**
+     * Returns whether the dashboard YAML reporter is enabled.
+     * Defaults to {@code true} for {@link DeploymentProfile#PRODUCTION},
+     * {@code false} otherwise.
+     *
+     * @return true if dashboard reporting is enabled
+     * @since 3.3.0
+     */
+    public boolean dashboardEnabled() {
+        return dashboardEnabled;
     }
 
     public Duration heartbeatInterval() {
@@ -296,6 +312,7 @@ public final class NGridConfig {
         private Duration leaderReelectionCooldown = Duration.ofSeconds(60);
         private Duration leaderReelectionSuggestionTtl = Duration.ofSeconds(30);
         private double leaderReelectionMinDelta = 20.0;
+        private Boolean dashboardEnabled;
 
         // New fields
         private Path dataDirectory;
@@ -438,6 +455,20 @@ public final class NGridConfig {
                 throw new IllegalArgumentException("interval must be >= 0");
             }
             this.rttProbeInterval = interval;
+            return this;
+        }
+
+        /**
+         * Enables or disables the dashboard YAML reporter.
+         * Defaults to {@code true} for {@link DeploymentProfile#PRODUCTION},
+         * {@code false} for other profiles.
+         *
+         * @param enabled whether dashboard reporting is enabled
+         * @return this builder
+         * @since 3.3.0
+         */
+        public Builder dashboardEnabled(boolean enabled) {
+            this.dashboardEnabled = enabled;
             return this;
         }
 

@@ -47,7 +47,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -356,6 +356,13 @@ public final class TcpTransport implements Transport {
 
     private void reconnectLoop() {
         if (!running) {
+            return;
+        }
+        // Fast path: skip iteration if all known peers are connected
+        boolean allConnected = knownPeers.values().stream()
+                .filter(p -> !p.nodeId().equals(config.local().nodeId()) && p.port() > 0)
+                .allMatch(p -> isConnected(p.nodeId()));
+        if (allConnected) {
             return;
         }
         List<NodeInfo> peers = new ArrayList<>(knownPeers.values());
@@ -695,7 +702,7 @@ public final class TcpTransport implements Transport {
         private final Socket socket;
         private final ObjectOutputStream outputStream;
         private final ObjectInputStream inputStream;
-        private final ConcurrentLinkedQueue<ClusterMessage> outbound = new ConcurrentLinkedQueue<>();
+        private final LinkedBlockingQueue<ClusterMessage> outbound = new LinkedBlockingQueue<>();
         private final boolean outboundInitiated;
         private volatile NodeInfo remote;
         private volatile boolean open = true;
@@ -732,21 +739,17 @@ public final class TcpTransport implements Transport {
         private void drainOutbound() {
             try {
                 while (isOpen()) {
-                    ClusterMessage message = outbound.poll();
+                    ClusterMessage message = outbound.poll(1, TimeUnit.SECONDS);
                     if (message == null) {
-                        try {
-                            Thread.sleep(5); // Virtual threads sleep efficiently
-                        } catch (InterruptedException e) {
-                             Thread.currentThread().interrupt();
-                             break;
-                        }
-                        continue;
+                        continue; // timeout — recheck isOpen()
                     }
                     synchronized (outputStream) {
                         outputStream.writeObject(message);
                         outputStream.flush();
                     }
                 }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
             } catch (Exception e) {
                 if (open) {
                     LOGGER.log(Level.FINE, "Writer terminating for {0}: {1}", new Object[]{remote, e.getMessage()});

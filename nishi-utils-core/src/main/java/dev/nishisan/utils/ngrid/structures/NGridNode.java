@@ -409,17 +409,19 @@ public final class NGridNode implements Closeable {
                 .build();
         alertEngine.start();
 
-        Path dashboardPath = null;
-        if (config.dataDirectory() != null) {
-            dashboardPath = config.dataDirectory().resolve("dashboard.yaml");
-        } else if (config.queueDirectory() != null) {
-            dashboardPath = config.queueDirectory().getParent().resolve("dashboard.yaml");
-        }
-        if (dashboardPath != null) {
-            dashboardReporter = new NGridDashboardReporter(
-                    this::operationalSnapshot, metricsScheduler,
-                    dashboardPath, Duration.ofSeconds(10));
-            dashboardReporter.start();
+        if (config.dashboardEnabled()) {
+            Path dashboardPath = null;
+            if (config.dataDirectory() != null) {
+                dashboardPath = config.dataDirectory().resolve("dashboard.yaml");
+            } else if (config.queueDirectory() != null) {
+                dashboardPath = config.queueDirectory().getParent().resolve("dashboard.yaml");
+            }
+            if (dashboardPath != null) {
+                dashboardReporter = new NGridDashboardReporter(
+                        this::operationalSnapshot, metricsScheduler,
+                        dashboardPath, Duration.ofSeconds(10));
+                dashboardReporter.start();
+            }
         }
     }
 
