@@ -3,6 +3,12 @@ name: Maven Release
 on:
   release:
     types: [created]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag in format v<major>.<minor>.<patch>
+        required: true
+        type: string
 
 jobs:
   resilience-gate:
@@ -50,12 +56,13 @@ jobs:
 
     - name: Extract version from tag
       run: |
-        TAG="${{ github.event.release.tag_name }}"
+        TAG="${{ github.event.release.tag_name || inputs.release_tag }}"
         if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
           echo "Tag must match v<major>.<minor>.<patch>, got: $TAG"
           exit 1
         fi
         VERSION="${TAG#v}"
+        echo "RELEASE_TAG=$TAG" >> $GITHUB_ENV
         echo "RELEASE_VERSION=$VERSION" >> $GITHUB_ENV
         echo "Releasing version: $VERSION"
 
@@ -63,7 +70,7 @@ jobs:
       run: mvn versions:set -DnewVersion=${{ env.RELEASE_VERSION }} -DgenerateBackupPoms=false -DprocessAllModules=true
 
     - name: Build and publish to GitHub Packages
-      run: mvn -B -DskipTests -pl nishi-utils-core deploy -s $GITHUB_WORKSPACE/settings.xml
+      run: mvn -B -DskipTests -pl nishi-utils-core -am deploy -s $GITHUB_WORKSPACE/settings.xml
       env:
         GITHUB_TOKEN:    ${{ secrets.GITHUB_TOKEN }}
         GITHUB_USERNAME: ${{ github.actor }}
@@ -72,7 +79,7 @@ jobs:
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        gh release upload "${{ github.event.release.tag_name }}" \
+        gh release upload "${{ env.RELEASE_TAG }}" \
           nishi-utils-core/target/nishi-utils-core-${{ env.RELEASE_VERSION }}.jar \
           nishi-utils-core/target/nishi-utils-core-${{ env.RELEASE_VERSION }}-sources.jar \
           nishi-utils-core/target/nishi-utils-core-${{ env.RELEASE_VERSION }}-javadoc.jar \
@@ -92,4 +99,3 @@ jobs:
             gh release delete "$TAG" --yes
           fi
         done
-
