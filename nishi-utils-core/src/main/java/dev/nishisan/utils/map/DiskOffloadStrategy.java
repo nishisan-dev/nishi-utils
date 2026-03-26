@@ -55,10 +55,11 @@ import java.util.logging.Logger;
  * will reclaim cached values under memory pressure.
  * <p>
  * <b>Thread safety:</b> All public operations are protected by a
- * {@link ReentrantReadWriteLock}. Mutating operations ({@code put},
- * {@code remove}, {@code get} when a cache miss triggers a cache update)
- * acquire the write lock; read-only queries ({@code containsKey},
- * {@code size}, {@code isEmpty}, {@code keySet}) acquire the read lock.
+ * striped {@link ReentrantReadWriteLock} scheme. Instead of a single
+ * global lock, the key space is partitioned into {@value #CONCURRENCY_LEVEL}
+ * independent segments (stripes). Each mutating operation acquires only the
+ * lock for its stripe, allowing unrelated keys to be accessed concurrently
+ * without contention.
  * <p>
  * <b>Trade-offs:</b>
  * <ul>
@@ -73,17 +74,22 @@ import java.util.logging.Logger;
  * @param <K> the key type
  * @param <V> the value type
  */
-public final class DiskOffloadStrategy<K extends Serializable, V extends Serializable>
+public final class DiskOffloadStrategy<K, V>
         implements NMapOffloadStrategy<K, V> {
 
     private static final Logger LOGGER = Logger.getLogger(DiskOffloadStrategy.class.getName());
     private static final String OFFLOAD_DIR = "offload";
     private static final String ENTRY_SUFFIX = ".dat";
 
+    /**
+     * Number of lock stripes (must be a power of 2 for fast modular hashing).
+     */
+    private static final int CONCURRENCY_LEVEL = 16;
+
     private final Path offloadDir;
     private final ConcurrentHashMap<K, Path> index = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<K, SoftReference<V>> cache = new ConcurrentHashMap<>();
-    private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
+    private final ReentrantReadWriteLock[] locks;
 
     /**
      * Creates a new disk offload strategy.
@@ -95,6 +101,10 @@ public final class DiskOffloadStrategy<K extends Serializable, V extends Seriali
         Objects.requireNonNull(baseDir, "baseDir");
         Objects.requireNonNull(name, "name");
         this.offloadDir = baseDir.resolve(name).resolve(OFFLOAD_DIR);
+        this.locks = new ReentrantReadWriteLock[CONCURRENCY_LEVEL];
+        for (int i = 0; i < CONCURRENCY_LEVEL; i++) {
+            locks[i] = new ReentrantReadWriteLock();
+        }
         try {
             Files.createDirectories(offloadDir);
             loadIndex();
@@ -103,8 +113,47 @@ public final class DiskOffloadStrategy<K extends Serializable, V extends Seriali
         }
     }
 
+    // ── Stripe helpers ──────────────────────────────────────────────────
+
+    /**
+     * Returns the stripe index for a given key using Fibonacci hashing
+     * for better distribution across power-of-2 buckets.
+     */
+    private int stripeFor(Object key) {
+        int h = key.hashCode();
+        // Spread bits to reduce clustering on low-entropy hashCodes
+        h ^= (h >>> 16);
+        return h & (CONCURRENCY_LEVEL - 1);
+    }
+
+    private ReentrantReadWriteLock stripeLock(Object key) {
+        return locks[stripeFor(key)];
+    }
+
+    /**
+     * Acquires all write locks in index order to prevent deadlocks during
+     * bulk operations such as {@link #clear()}.
+     */
+    private void lockAllWrite() {
+        for (int i = 0; i < CONCURRENCY_LEVEL; i++) {
+            locks[i].writeLock().lock();
+        }
+    }
+
+    /**
+     * Releases all write locks in reverse order.
+     */
+    private void unlockAllWrite() {
+        for (int i = CONCURRENCY_LEVEL - 1; i >= 0; i--) {
+            locks[i].writeLock().unlock();
+        }
+    }
+
+    // ── NMapOffloadStrategy ─────────────────────────────────────────────
+
     @Override
     public V get(K key) {
+        ReentrantReadWriteLock lock = stripeLock(key);
         lock.writeLock().lock();
         try {
             if (!index.containsKey(key)) {
@@ -140,9 +189,10 @@ public final class DiskOffloadStrategy<K extends Serializable, V extends Seriali
 
     @Override
     public V put(K key, V value) {
+        ReentrantReadWriteLock lock = stripeLock(key);
         lock.writeLock().lock();
         try {
-            V previous = get(key);
+            V previous = getUnderLock(key);
             Path path = pathForKey(key);
             try {
                 serialize(path, key, value);
@@ -159,9 +209,10 @@ public final class DiskOffloadStrategy<K extends Serializable, V extends Seriali
 
     @Override
     public V remove(K key) {
+        ReentrantReadWriteLock lock = stripeLock(key);
         lock.writeLock().lock();
         try {
-            V previous = get(key);
+            V previous = getUnderLock(key);
             Path path = index.remove(key);
             cache.remove(key);
             if (path != null) {
@@ -179,6 +230,7 @@ public final class DiskOffloadStrategy<K extends Serializable, V extends Seriali
 
     @Override
     public boolean containsKey(K key) {
+        ReentrantReadWriteLock lock = stripeLock(key);
         lock.readLock().lock();
         try {
             return index.containsKey(key);
@@ -189,32 +241,20 @@ public final class DiskOffloadStrategy<K extends Serializable, V extends Seriali
 
     @Override
     public int size() {
-        lock.readLock().lock();
-        try {
-            return index.size();
-        } finally {
-            lock.readLock().unlock();
-        }
+        // ConcurrentHashMap.size() is already thread-safe; no lock needed
+        return index.size();
     }
 
     @Override
     public boolean isEmpty() {
-        lock.readLock().lock();
-        try {
-            return index.isEmpty();
-        } finally {
-            lock.readLock().unlock();
-        }
+        // ConcurrentHashMap.isEmpty() is already thread-safe; no lock needed
+        return index.isEmpty();
     }
 
     @Override
     public Set<K> keySet() {
-        lock.readLock().lock();
-        try {
-            return Collections.unmodifiableSet(index.keySet());
-        } finally {
-            lock.readLock().unlock();
-        }
+        // Snapshot of the key set — ConcurrentHashMap iteration is thread-safe
+        return Collections.unmodifiableSet(index.keySet());
     }
 
     @Override
@@ -257,15 +297,20 @@ public final class DiskOffloadStrategy<K extends Serializable, V extends Seriali
 
     @Override
     public void clear() {
-        for (Path path : index.values()) {
-            try {
-                Files.deleteIfExists(path);
-            } catch (IOException e) {
-                LOGGER.log(Level.WARNING, "Failed to delete offloaded entry: " + path, e);
+        lockAllWrite();
+        try {
+            for (Path path : index.values()) {
+                try {
+                    Files.deleteIfExists(path);
+                } catch (IOException e) {
+                    LOGGER.log(Level.WARNING, "Failed to delete offloaded entry: " + path, e);
+                }
             }
+            index.clear();
+            cache.clear();
+        } finally {
+            unlockAllWrite();
         }
-        index.clear();
-        cache.clear();
     }
 
     @Override
@@ -330,6 +375,38 @@ public final class DiskOffloadStrategy<K extends Serializable, V extends Seriali
     }
 
     // ── Internal helpers ────────────────────────────────────────────────
+
+    /**
+     * Reads a value from the soft cache or disk <b>without acquiring any
+     * lock</b>. Must only be called when the caller already holds the
+     * write lock for the key's stripe.
+     */
+    private V getUnderLock(K key) {
+        if (!index.containsKey(key)) {
+            return null;
+        }
+        SoftReference<V> ref = cache.get(key);
+        if (ref != null) {
+            V cached = ref.get();
+            if (cached != null) {
+                return cached;
+            }
+        }
+        Path path = index.get(key);
+        if (path == null || !Files.exists(path)) {
+            index.remove(key);
+            cache.remove(key);
+            return null;
+        }
+        try {
+            V value = deserialize(path);
+            cache.put(key, new SoftReference<>(value));
+            return value;
+        } catch (IOException e) {
+            LOGGER.log(Level.WARNING, "Failed to read offloaded entry: " + path, e);
+            return null;
+        }
+    }
 
     /**
      * Generates a collision-free file path for a given key using a SHA-1

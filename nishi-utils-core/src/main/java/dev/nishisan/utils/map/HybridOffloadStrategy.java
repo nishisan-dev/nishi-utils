@@ -51,11 +51,23 @@ import java.util.logging.Logger;
  * Hybrid offloading strategy that keeps hot entries in memory and spills
  * cold entries to disk based on a configurable {@link EvictionPolicy}.
  * <p>
- * When the number of in-memory entries exceeds {@code maxInMemoryEntries},
- * victim entries are selected according to the active policy and serialized
- * to disk. Subsequent {@code get()} calls for evicted entries automatically
- * deserialize from disk and promote them back into memory (warm-up),
- * potentially triggering another eviction.
+ * When the number of in-memory entries in a given stripe exceeds its
+ * per-stripe threshold, victim entries are selected according to the
+ * active policy and serialized to disk. Subsequent {@code get()} calls
+ * for evicted entries automatically deserialize from disk and promote
+ * them back into memory (warm-up), potentially triggering another eviction.
+ *
+ * <h2>Concurrency model</h2>
+ * Instead of a single global lock, the key space is partitioned into
+ * {@value #CONCURRENCY_LEVEL} independent segments (stripes). Each stripe
+ * maintains its own {@link LinkedHashMap} for hot entries and its own
+ * {@link ReentrantReadWriteLock}. This allows multiple threads to operate
+ * on disjoint key ranges without contention — particularly important when
+ * disk I/O (eviction or warm-up) would otherwise block the entire map.
+ * <p>
+ * The LRU policy becomes <em>per-stripe approximate</em> rather than
+ * globally strict — the same trade-off used by production caches like
+ * Caffeine and Guava's {@code ConcurrentLinkedHashMap}.
  *
  * <h2>Usage</h2>
  * 
@@ -74,58 +86,92 @@ import java.util.logging.Logger;
  * }</pre>
  *
  * <h2>Thread safety</h2>
- * All operations are protected by a {@link ReentrantReadWriteLock}, making
- * this strategy safe for concurrent access.
+ * All operations are protected by striped {@link ReentrantReadWriteLock}s,
+ * making this strategy safe for highly concurrent access with significantly
+ * reduced contention compared to a single global lock.
  *
  * @param <K> the key type
  * @param <V> the value type
  */
-public final class HybridOffloadStrategy<K extends Serializable, V extends Serializable>
+public final class HybridOffloadStrategy<K, V>
         implements NMapOffloadStrategy<K, V> {
 
     private static final Logger LOGGER = Logger.getLogger(HybridOffloadStrategy.class.getName());
     private static final String OFFLOAD_DIR = "hybrid-offload";
     private static final String ENTRY_SUFFIX = ".dat";
 
+    /**
+     * Number of lock stripes (must be a power of 2 for fast modular hashing).
+     */
+    private static final int CONCURRENCY_LEVEL = 16;
+
     private final Path offloadDir;
     private final int maxInMemoryEntries;
+    private final int maxPerStripe;
     private final EvictionPolicy evictionPolicy;
     private final StatsUtils stats;
 
     /**
-     * In-memory cache. Depending on the eviction policy:
+     * Per-stripe hot caches. Each stripe has its own {@link LinkedHashMap}
+     * whose ordering depends on the active {@link EvictionPolicy}:
      * <ul>
-     * <li>{@code LRU}: access-ordered {@code LinkedHashMap}</li>
-     * <li>{@code SIZE_THRESHOLD}: insertion-ordered {@code LinkedHashMap}</li>
+     * <li>{@code LRU}: access-ordered</li>
+     * <li>{@code SIZE_THRESHOLD}: insertion-ordered</li>
      * </ul>
-     * The eldest entry is the eviction candidate in both cases.
      */
-    private final LinkedHashMap<K, V> hotCache;
+    @SuppressWarnings("unchecked")
+    private final LinkedHashMap<K, V>[] hotCaches = new LinkedHashMap[CONCURRENCY_LEVEL];
 
     /**
      * Index of entries that have been offloaded to disk.
-     * Key → file path on disk.
+     * Key → file path on disk. Shared across all stripes but inherently
+     * thread-safe ({@link ConcurrentHashMap}).
      */
     private final ConcurrentHashMap<K, Path> coldIndex = new ConcurrentHashMap<>();
 
     /**
-     * Guards {@code hotCache} mutations (not concurrent-safe by itself).
+     * Per-stripe read/write locks.
      */
-    private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
+    private final ReentrantReadWriteLock[] locks = new ReentrantReadWriteLock[CONCURRENCY_LEVEL];
 
     private HybridOffloadStrategy(Builder<K, V> builder) {
         this.offloadDir = builder.baseDir.resolve(builder.name).resolve(OFFLOAD_DIR);
         this.maxInMemoryEntries = builder.maxInMemoryEntries;
+        this.maxPerStripe = Math.max(1, builder.maxInMemoryEntries / CONCURRENCY_LEVEL);
         this.evictionPolicy = builder.evictionPolicy;
         this.stats = builder.stats;
+
         boolean accessOrder = evictionPolicy == EvictionPolicy.LRU;
-        this.hotCache = new LinkedHashMap<>(16, 0.75f, accessOrder);
+        for (int i = 0; i < CONCURRENCY_LEVEL; i++) {
+            hotCaches[i] = new LinkedHashMap<>(16, 0.75f, accessOrder);
+            locks[i] = new ReentrantReadWriteLock();
+        }
 
         try {
             Files.createDirectories(offloadDir);
             loadColdIndex();
         } catch (IOException e) {
             throw new UncheckedIOException("Failed to initialize hybrid offload directory", e);
+        }
+    }
+
+    // ── Stripe helpers ──────────────────────────────────────────────────
+
+    private int stripeFor(Object key) {
+        int h = key.hashCode();
+        h ^= (h >>> 16);
+        return h & (CONCURRENCY_LEVEL - 1);
+    }
+
+    private void lockAllWrite() {
+        for (int i = 0; i < CONCURRENCY_LEVEL; i++) {
+            locks[i].writeLock().lock();
+        }
+    }
+
+    private void unlockAllWrite() {
+        for (int i = CONCURRENCY_LEVEL - 1; i >= 0; i--) {
+            locks[i].writeLock().unlock();
         }
     }
 
@@ -140,7 +186,7 @@ public final class HybridOffloadStrategy<K extends Serializable, V extends Seria
      * @param <V>     the value type
      * @return the builder
      */
-    public static <K extends Serializable, V extends Serializable> Builder<K, V> builder(Path baseDir, String name) {
+    public static <K, V> Builder<K, V> builder(Path baseDir, String name) {
         return new Builder<>(baseDir, name);
     }
 
@@ -149,10 +195,11 @@ public final class HybridOffloadStrategy<K extends Serializable, V extends Seria
     @Override
     public V get(K key) {
         notifyHit(NMapMetrics.GET_HIT);
-        lock.writeLock().lock();
+        int stripe = stripeFor(key);
+        locks[stripe].writeLock().lock();
         try {
             // 1. Check hot cache (also touches for LRU)
-            V value = hotCache.get(key);
+            V value = hotCaches[stripe].get(key);
             if (value != null) {
                 notifyHit(NMapMetrics.CACHE_HIT);
                 return value;
@@ -174,10 +221,10 @@ public final class HybridOffloadStrategy<K extends Serializable, V extends Seria
                 // Promote to hot cache
                 coldIndex.remove(key);
                 deleteFileQuietly(path);
-                hotCache.put(key, value);
+                hotCaches[stripe].put(key, value);
                 notifyHit(NMapMetrics.CACHE_MISS);
                 notifyHit(NMapMetrics.WARM_UP);
-                evictIfNeeded();
+                evictIfNeeded(stripe);
                 publishSizeGauges();
                 return value;
             } catch (IOException e) {
@@ -186,14 +233,15 @@ public final class HybridOffloadStrategy<K extends Serializable, V extends Seria
                 return null;
             }
         } finally {
-            lock.writeLock().unlock();
+            locks[stripe].writeLock().unlock();
         }
     }
 
     @Override
     public V put(K key, V value) {
         notifyHit(NMapMetrics.PUT);
-        lock.writeLock().lock();
+        int stripe = stripeFor(key);
+        locks[stripe].writeLock().lock();
         try {
             // Remove from cold if present
             Path coldPath = coldIndex.remove(key);
@@ -201,22 +249,23 @@ public final class HybridOffloadStrategy<K extends Serializable, V extends Seria
                 deleteFileQuietly(coldPath);
             }
 
-            V prev = hotCache.put(key, value);
-            evictIfNeeded();
+            V prev = hotCaches[stripe].put(key, value);
+            evictIfNeeded(stripe);
             publishSizeGauges();
             return prev;
         } finally {
-            lock.writeLock().unlock();
+            locks[stripe].writeLock().unlock();
         }
     }
 
     @Override
     public V remove(K key) {
         notifyHit(NMapMetrics.REMOVE);
-        lock.writeLock().lock();
+        int stripe = stripeFor(key);
+        locks[stripe].writeLock().lock();
         try {
             // Try hot cache first
-            V prev = hotCache.remove(key);
+            V prev = hotCaches[stripe].remove(key);
             if (prev != null) {
                 publishSizeGauges();
                 return prev;
@@ -237,51 +286,68 @@ public final class HybridOffloadStrategy<K extends Serializable, V extends Seria
             publishSizeGauges();
             return prev;
         } finally {
-            lock.writeLock().unlock();
+            locks[stripe].writeLock().unlock();
         }
     }
 
     @Override
     public boolean containsKey(K key) {
-        lock.readLock().lock();
+        int stripe = stripeFor(key);
+        locks[stripe].readLock().lock();
         try {
-            return hotCache.containsKey(key) || coldIndex.containsKey(key);
+            return hotCaches[stripe].containsKey(key) || coldIndex.containsKey(key);
         } finally {
-            lock.readLock().unlock();
+            locks[stripe].readLock().unlock();
         }
     }
 
     @Override
     public int size() {
-        lock.readLock().lock();
-        try {
-            return hotCache.size() + coldIndex.size();
-        } finally {
-            lock.readLock().unlock();
+        // Aggregate hot sizes across all stripes (dirty read — acceptable for
+        // monitoring/gauges) plus the thread-safe coldIndex size.
+        int hot = 0;
+        for (int i = 0; i < CONCURRENCY_LEVEL; i++) {
+            locks[i].readLock().lock();
+            try {
+                hot += hotCaches[i].size();
+            } finally {
+                locks[i].readLock().unlock();
+            }
         }
+        return hot + coldIndex.size();
     }
 
     @Override
     public boolean isEmpty() {
-        lock.readLock().lock();
-        try {
-            return hotCache.isEmpty() && coldIndex.isEmpty();
-        } finally {
-            lock.readLock().unlock();
+        if (!coldIndex.isEmpty()) {
+            return false;
         }
+        for (int i = 0; i < CONCURRENCY_LEVEL; i++) {
+            locks[i].readLock().lock();
+            try {
+                if (!hotCaches[i].isEmpty()) {
+                    return false;
+                }
+            } finally {
+                locks[i].readLock().unlock();
+            }
+        }
+        return true;
     }
 
     @Override
     public Set<K> keySet() {
-        lock.readLock().lock();
-        try {
-            Set<K> keys = ConcurrentHashMap.newKeySet();
-            keys.addAll(hotCache.keySet());
-            keys.addAll(coldIndex.keySet());
-            return Collections.unmodifiableSet(keys);
-        } finally {
-            lock.readLock().unlock();
+        Set<K> keys = ConcurrentHashMap.newKeySet();
+        for (int i = 0; i < CONCURRENCY_LEVEL; i++) {
+            locks[i].readLock().lock();
+            try {
+                keys.addAll(hotCaches[i].keySet());
+            } finally {
+                locks[i].readLock().unlock();
+            }
         }
+        keys.addAll(coldIndex.keySet());
+        return Collections.unmodifiableSet(keys);
     }
 
     @Override
@@ -327,15 +393,17 @@ public final class HybridOffloadStrategy<K extends Serializable, V extends Seria
 
     @Override
     public void clear() {
-        lock.writeLock().lock();
+        lockAllWrite();
         try {
-            hotCache.clear();
+            for (int i = 0; i < CONCURRENCY_LEVEL; i++) {
+                hotCaches[i].clear();
+            }
             for (Path path : coldIndex.values()) {
                 deleteFileQuietly(path);
             }
             coldIndex.clear();
         } finally {
-            lock.writeLock().unlock();
+            unlockAllWrite();
         }
     }
 
@@ -395,38 +463,44 @@ public final class HybridOffloadStrategy<K extends Serializable, V extends Seria
 
     @Override
     public void close() {
-        lock.writeLock().lock();
+        lockAllWrite();
         try {
-            // Flush all hot entries to disk so state survives restart
-            for (Map.Entry<K, V> entry : hotCache.entrySet()) {
-                try {
-                    Path path = pathForKey(entry.getKey());
-                    serializeEntry(path, entry.getKey(), entry.getValue());
-                    coldIndex.put(entry.getKey(), path);
-                } catch (IOException e) {
-                    LOGGER.log(Level.WARNING, "Failed to flush hot entry on close", e);
+            // Flush all hot entries across all stripes to disk so state survives restart
+            for (int i = 0; i < CONCURRENCY_LEVEL; i++) {
+                for (Map.Entry<K, V> entry : hotCaches[i].entrySet()) {
+                    try {
+                        Path path = pathForKey(entry.getKey());
+                        serializeEntry(path, entry.getKey(), entry.getValue());
+                        coldIndex.put(entry.getKey(), path);
+                    } catch (IOException e) {
+                        LOGGER.log(Level.WARNING, "Failed to flush hot entry on close", e);
+                    }
                 }
+                hotCaches[i].clear();
             }
-            hotCache.clear();
         } finally {
-            lock.writeLock().unlock();
+            unlockAllWrite();
         }
     }
 
     // ── Metrics ─────────────────────────────────────────────────────────
 
     /**
-     * Returns the number of entries currently held in memory.
+     * Returns the number of entries currently held in memory (across all stripes).
      *
      * @return the hot cache size
      */
     public int hotSize() {
-        lock.readLock().lock();
-        try {
-            return hotCache.size();
-        } finally {
-            lock.readLock().unlock();
+        int total = 0;
+        for (int i = 0; i < CONCURRENCY_LEVEL; i++) {
+            locks[i].readLock().lock();
+            try {
+                total += hotCaches[i].size();
+            } finally {
+                locks[i].readLock().unlock();
+            }
         }
+        return total;
     }
 
     /**
@@ -435,12 +509,7 @@ public final class HybridOffloadStrategy<K extends Serializable, V extends Seria
      * @return the cold index size
      */
     public int coldSize() {
-        lock.readLock().lock();
-        try {
-            return coldIndex.size();
-        } finally {
-            lock.readLock().unlock();
-        }
+        return coldIndex.size();
     }
 
     /**
@@ -464,11 +533,15 @@ public final class HybridOffloadStrategy<K extends Serializable, V extends Seria
     // ── Eviction Logic ──────────────────────────────────────────────────
 
     /**
-     * Evicts eldest entries from the hot cache to disk if the threshold is
-     * exceeded. Must be called under write lock.
+     * Evicts eldest entries from the specified stripe's hot cache to disk
+     * if the per-stripe threshold is exceeded. Must be called under the
+     * write lock for the given stripe.
+     *
+     * @param stripe the stripe index
      */
-    private void evictIfNeeded() {
-        while (hotCache.size() > maxInMemoryEntries) {
+    private void evictIfNeeded(int stripe) {
+        LinkedHashMap<K, V> hotCache = hotCaches[stripe];
+        while (hotCache.size() > maxPerStripe) {
             // LinkedHashMap iteration order gives us the eldest entry
             Iterator<Map.Entry<K, V>> it = hotCache.entrySet().iterator();
             if (!it.hasNext()) {
@@ -584,9 +657,13 @@ public final class HybridOffloadStrategy<K extends Serializable, V extends Seria
 
     private void publishSizeGauges() {
         if (stats != null) {
-            stats.notifyCurrentValue(NMapMetrics.HOT_SIZE, (long) hotCache.size());
+            int hot = 0;
+            for (int i = 0; i < CONCURRENCY_LEVEL; i++) {
+                hot += hotCaches[i].size();
+            }
+            stats.notifyCurrentValue(NMapMetrics.HOT_SIZE, (long) hot);
             stats.notifyCurrentValue(NMapMetrics.COLD_SIZE, (long) coldIndex.size());
-            stats.notifyCurrentValue(NMapMetrics.TOTAL_SIZE, (long) (hotCache.size() + coldIndex.size()));
+            stats.notifyCurrentValue(NMapMetrics.TOTAL_SIZE, (long) (hot + coldIndex.size()));
         }
     }
 
@@ -598,7 +675,7 @@ public final class HybridOffloadStrategy<K extends Serializable, V extends Seria
      * @param <K> the key type
      * @param <V> the value type
      */
-    public static final class Builder<K extends Serializable, V extends Serializable> {
+    public static final class Builder<K, V> {
         private final Path baseDir;
         private final String name;
         private EvictionPolicy evictionPolicy = EvictionPolicy.LRU;
@@ -637,6 +714,9 @@ public final class HybridOffloadStrategy<K extends Serializable, V extends Seria
         /**
          * Sets the maximum number of entries to keep in memory before
          * offloading to disk. Default: 10,000.
+         * <p>
+         * The effective per-stripe limit is
+         * {@code Math.max(1, maxInMemoryEntries / CONCURRENCY_LEVEL)}.
          *
          * @param max the threshold
          * @return this builder
