@@ -1,6 +1,6 @@
 # NGrid – Mapa Distribuído (design + implementação atual)
 
-> **Última atualização:** 2026-03-20
+> **Última atualização:** 2026-03-26
 
 Este documento descreve o **mapa distribuído** do NGrid conforme implementado hoje no código.
 
@@ -302,12 +302,47 @@ Quando um follower detecta lag significativo (> 500 ops ou stalled por > 4s):
 
 ---
 
-## Formato do comando replicado
+## Formato do comando replicado e serialização de POJOs
 
-O payload replicado no tópico `map:<mapName>` é `MapReplicationCommand`:
-- `type`: `PUT` ou `REMOVE`
-- `key`: `Serializable` (obrigatório)
-- `value`: `Serializable` (somente em `PUT`)
+O payload replicado no tópico `map:<mapName>` é **serializado como `byte[]`** pelo `MapReplicationCodec` antes de entrar no `ReplicationPayload`. Isso garante que POJOs arbitrários (sem anotações Jackson) sobrevivam ao transporte entre nós.
+
+### Como funciona
+
+```
+map.put("key", new MeuPojo())  — líder
+  → MapReplicationCodec.encode(MapReplicationCommand.put(key, value))
+      ↓ byte[] com @class de cada campo preservado
+  → ReplicationPayload.data = byte[]  (opaco para o JacksonMessageCodec)
+  → rede
+  ↓
+  MapClusterService.apply()
+  → MapReplicationCodec.decode(byte[])  ← tipo original restaurado
+  → data.put((K) command.key(), (V) command.value())  ✅
+```
+
+### `MapReplicationCodec` (interno)
+
+Classe package-private em `dev.nishisan.utils.ngrid.map`. Mantém um `ObjectMapper` dedicado com:
+- `activateDefaultTyping(NON_FINAL, AS_PROPERTY)` — embute `@type` em todos os objetos não-finais
+- Field-access total (suporta classes com campos `final`, sem setters)
+- `FAIL_ON_UNKNOWN_PROPERTIES = false` (compatibilidade futura)
+
+Expõe métodos estáticos:
+- `encode(MapReplicationCommand)` → `byte[]`
+- `decode(byte[])` → `MapReplicationCommand`
+- `encodeSnapshot(Map<?,?>)` → `byte[]`
+- `decodeSnapshot(byte[])` → `Map<Object, Object>`
+
+### Requisitos para o tipo V
+
+| Requisito | Obrigatório? | Observação |
+|-----------|:---:|---|
+| Construtor no-args (pode ser package-private) | ✅ | Necessário para Jackson instanciar |
+| Campos acessíveis (public, package, ou `ANY` visibility) | ✅ | O codec usa field access |
+| Anotações Jackson (`@JsonProperty`, etc.) | ❌ | Não necessário |
+| Implementar `Serializable` | ❌ | Não utilizado |
+
+> **Fix #82 (v3.6.2):** Antes desta versão, POJOs sem anotações Jackson eram deserializados como `LinkedHashMap` nos followers e após snapshot sync, causando `ClassCastException` em runtime.
 
 ---
 
@@ -318,6 +353,7 @@ O payload replicado no tópico `map:<mapName>` é `MapReplicationCommand`:
 | `MapNodeFailoverIntegrationTest` | Integração (3 nós) | Failover do líder, STRONG reads pós-failover, lease expirado, keySet |
 | `NGridMapPersistenceIntegrationTest` | Integração (3 nós) | Full cluster restart, named maps recovery |
 | `MapClusterServiceConcurrencyTest` | Concorrência | 8 threads × 500 ops put/remove sem deadlock |
+| `DistributedMapPojoReplicationTest` | Integração (3 nós) + unitário | Regressão #82: POJO sem anotações Jackson preservado após replication e snapshot sync |
 
 ---
 
