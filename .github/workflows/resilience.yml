@@ -1,4 +1,4 @@
-name: NGrid Resilience Pipeline
+name: PR Validation & Resilience Pipeline
 
 on:
   push:
@@ -25,8 +25,28 @@ on:
         default: 'false'
 
 jobs:
+  unit-tests:
+    name: Standard Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      - name: Run unit tests
+        run: mvn -B test
+
   resilience-tests:
     name: Resilience Tests (In-Process)
+    needs: unit-tests
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -44,8 +64,8 @@ jobs:
       - name: Run NGrid resilience tests
         run: mvn -B test -Presilience -Dsurefire.rerunFailingTestsCount=1
 
-  docker-resilience-tests:
-    name: Docker Resilience Tests (Testcontainers)
+  docker-resilience-gate:
+    name: Docker Resilience Gate
     needs: resilience-tests
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -61,13 +81,23 @@ jobs:
           java-version: '21'
           distribution: 'temurin'
 
-      - name: Run Testcontainers durability tests
-        run: mvn -B verify -Pdocker-resilience -pl ngrid-test
+      - name: Build Docker test image
+        run: docker build -t ngrid-test:latest -f ngrid-test/Dockerfile .
+
+      - name: Install parent and core modules
+        run: mvn -B -DskipTests -Dmaven.javadoc.skip=true -pl nishi-utils-core install -am
+
+      - name: Run resilience integration tests
+        run: |
+          mvn -pl ngrid-test verify \
+            -Dngrid.test.docker=true \
+            -Dtest='NGridLeaderFailoverIT,NGridMapLeaderCrashIT,NGridMapReelectionIT,NGridMapConcurrentWriteFailoverIT,NGridPartitionResilienceIT,NGridQueueConcurrentFailoverIT' \
+            -DfailIfNoTests=false
 
   soak-test:
     name: Soak Test (Long-Running)
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.run_soak == 'true'
-    needs: docker-resilience-tests
+    needs: docker-resilience-gate
     runs-on: ubuntu-latest
     timeout-minutes: 1500
     permissions:
