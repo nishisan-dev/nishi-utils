@@ -55,7 +55,7 @@ public final class NGridCluster implements Closeable {
      * @param <T>  element type
      * @return the distributed queue
      */
-    public <T extends Serializable> DistributedQueue<T> queue(String name, Class<T> type) {
+    public <T> DistributedQueue<T> queue(String name, Class<T> type) {
         return nodes.get(0).getQueue(name, type);
     }
 
@@ -68,7 +68,7 @@ public final class NGridCluster implements Closeable {
      * @param <T>       element type
      * @return the distributed queue
      */
-    public <T extends Serializable> DistributedQueue<T> queue(int nodeIndex, String name, Class<T> type) {
+    public <T> DistributedQueue<T> queue(int nodeIndex, String name, Class<T> type) {
         return nodes.get(nodeIndex).getQueue(name, type);
     }
 
@@ -82,7 +82,7 @@ public final class NGridCluster implements Closeable {
      * @param <V>       value type
      * @return the distributed map
      */
-    public <K extends Serializable, V extends Serializable> DistributedMap<K, V> map(
+    public <K, V> DistributedMap<K, V> map(
             String name, Class<K> keyType, Class<V> valueType) {
         return nodes.get(0).getMap(name, keyType, valueType);
     }
@@ -98,7 +98,7 @@ public final class NGridCluster implements Closeable {
      * @param <V>       value type
      * @return the distributed map
      */
-    public <K extends Serializable, V extends Serializable> DistributedMap<K, V> map(
+    public <K, V> DistributedMap<K, V> map(
             int nodeIndex, String name, Class<K> keyType, Class<V> valueType) {
         return nodes.get(nodeIndex).getMap(name, keyType, valueType);
     }

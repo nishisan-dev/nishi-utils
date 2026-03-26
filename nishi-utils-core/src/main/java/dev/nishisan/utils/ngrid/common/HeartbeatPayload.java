@@ -17,77 +17,46 @@
 
 package dev.nishisan.utils.ngrid.common;
 
-import java.io.Serial;
-import java.io.Serializable;
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+
 import java.time.Instant;
 
 /**
  * Simple heartbeat payload carrying a timestamp from the sender.
  */
-public final class HeartbeatPayload implements Serializable {
-    @Serial
-    private static final long serialVersionUID = 3L;
+public final class HeartbeatPayload {
 
     private final long epochMilli;
     private final long leaderHighWatermark;
     private final long leaderEpoch;
 
-    /**
-     * Creates a heartbeat payload with the given values.
-     *
-     * @param epochMilli          the timestamp in milliseconds since epoch
-     * @param leaderHighWatermark the leader high watermark
-     * @param leaderEpoch         the leader epoch
-     */
-    public HeartbeatPayload(long epochMilli, long leaderHighWatermark, long leaderEpoch) {
+    @JsonCreator
+    public HeartbeatPayload(
+            @JsonProperty("epochMilli") long epochMilli,
+            @JsonProperty("leaderHighWatermark") long leaderHighWatermark,
+            @JsonProperty("leaderEpoch") long leaderEpoch) {
         this.epochMilli = epochMilli;
         this.leaderHighWatermark = leaderHighWatermark;
         this.leaderEpoch = leaderEpoch;
     }
 
-    /**
-     * Creates a heartbeat with the current time and the given watermark and epoch.
-     *
-     * @param leaderHighWatermark the leader high watermark
-     * @param leaderEpoch         the leader epoch
-     * @return a new heartbeat payload
-     */
     public static HeartbeatPayload now(long leaderHighWatermark, long leaderEpoch) {
         return new HeartbeatPayload(Instant.now().toEpochMilli(), leaderHighWatermark, leaderEpoch);
     }
 
-    /**
-     * Legacy factory for backward compatibility or non-leader heartbeats.
-     *
-     * @return a new heartbeat payload with default watermark and epoch
-     */
     public static HeartbeatPayload now() {
         return new HeartbeatPayload(Instant.now().toEpochMilli(), -1L, 0L);
     }
 
-    /**
-     * Returns the timestamp in milliseconds since epoch.
-     *
-     * @return the epoch millis
-     */
     public long epochMilli() {
         return epochMilli;
     }
 
-    /**
-     * Returns the leader high watermark.
-     *
-     * @return the leader high watermark
-     */
     public long leaderHighWatermark() {
         return leaderHighWatermark;
     }
 
-    /**
-     * Returns the leader epoch.
-     *
-     * @return the leader epoch
-     */
     public long leaderEpoch() {
         return leaderEpoch;
     }

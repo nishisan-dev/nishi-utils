@@ -17,7 +17,6 @@
 
 package dev.nishisan.utils.ngrid.replication;
 
-import java.io.Serializable;
 import java.util.UUID;
 
 /**
@@ -29,10 +28,10 @@ public interface ReplicationHandler {
      * Applies a single replicated operation.
      *
      * @param operationId the operation identifier
-     * @param payload     the serialized operation payload
+     * @param payload     the operation payload
      * @throws Exception if the operation cannot be applied
      */
-    void apply(UUID operationId, Serializable payload) throws Exception;
+    void apply(UUID operationId, Object payload) throws Exception;
 
     /**
      * Returns a snapshot chunk.
@@ -41,7 +40,7 @@ public interface ReplicationHandler {
      * @return A SnapshotChunk or null if no handler.
      */
     default SnapshotChunk getSnapshotChunk(int chunkIndex) {
-        Serializable data = (chunkIndex == 0) ? getSnapshot() : null;
+        Object data = (chunkIndex == 0) ? getSnapshot() : null;
         return (data != null) ? new SnapshotChunk(data, false) : null;
     }
 
@@ -52,7 +51,7 @@ public interface ReplicationHandler {
      * @deprecated Use {@link #getSnapshotChunk(int)} for better scalability.
      */
     @Deprecated
-    default Serializable getSnapshot() {
+    default Object getSnapshot() {
         return null;
     }
 
@@ -71,11 +70,11 @@ public interface ReplicationHandler {
      * @param snapshot the snapshot data to install
      * @throws Exception if the snapshot cannot be installed
      */
-    default void installSnapshot(Serializable snapshot) throws Exception {
+    default void installSnapshot(Object snapshot) throws Exception {
         // no-op by default
     }
 
-    record SnapshotChunk(Serializable data, boolean hasMore) implements Serializable {
+    record SnapshotChunk(Object data, boolean hasMore) {
     }
 
     /**

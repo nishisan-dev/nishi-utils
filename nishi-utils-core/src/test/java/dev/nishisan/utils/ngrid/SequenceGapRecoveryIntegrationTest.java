@@ -44,7 +44,7 @@ class SequenceGapRecoveryIntegrationTest {
 
     private static final String QUEUE_NAME = "gap-recovery-queue";
     private static final Duration OP_TIMEOUT = Duration.ofSeconds(10);
-    private static final Duration HEARTBEAT = Duration.ofMillis(200);
+    private static final Duration HEARTBEAT = Duration.ofMillis(500);
 
     private Path baseDir;
     private NodeInfo info1, info2, info3;
@@ -243,17 +243,28 @@ class SequenceGapRecoveryIntegrationTest {
     @Timeout(value = 90, unit = TimeUnit.SECONDS)
     void testFollowerCatchUpAfterBriefOutage() throws Exception {
         Path dirL = Files.createDirectories(baseDir.resolve("leader"));
+        Path dirC = Files.createDirectories(baseDir.resolve("companion"));
         Path dirF = Files.createDirectories(baseDir.resolve("follower"));
 
+        // Use a 3-node cluster so that when the follower disconnects, 2/3 nodes
+        // remain active and the leader preserves its majority for leader election.
         try (NGridNode leader = new NGridNode(NGridConfig.builder(info1)
-                .addPeer(info3)
+                .addPeer(info2).addPeer(info3)
                 .queueDirectory(dirL)
                 .replicationFactor(1) // allow writes with only leader
+                .replicationOperationTimeout(OP_TIMEOUT)
+                .heartbeatInterval(HEARTBEAT)
+                .build());
+             NGridNode companion = new NGridNode(NGridConfig.builder(info2)
+                .addPeer(info1)
+                .queueDirectory(dirC)
+                .replicationFactor(1)
                 .replicationOperationTimeout(OP_TIMEOUT)
                 .heartbeatInterval(HEARTBEAT)
                 .build())) {
 
             leader.start();
+            companion.start();
 
             // Phase 1: Start follower and write 20 items together
             NGridNode follower = new NGridNode(NGridConfig.builder(info3)
@@ -265,11 +276,13 @@ class SequenceGapRecoveryIntegrationTest {
                     .build());
             follower.start();
 
-            // Wait for cluster convergence (2 nodes)
+            // Wait for 3-node cluster convergence
+            awaitBilateralConnection(leader, companion);
             awaitBilateralConnection(leader, follower);
 
-            // Pre-create queue on both nodes
+            // Pre-create queue on all nodes
             leader.getQueue(QUEUE_NAME, String.class);
+            companion.getQueue(QUEUE_NAME, String.class);
             follower.getQueue(QUEUE_NAME, String.class);
 
             DistributedQueue<String> queueL = leader.getQueue(QUEUE_NAME, String.class);
@@ -283,7 +296,9 @@ class SequenceGapRecoveryIntegrationTest {
                     "Follower should have replicated 20 items");
 
             // Phase 2: Stop follower, write 10 more items
+            // With companion still active, leader retains majority (2/3).
             follower.close();
+            Thread.sleep(2000);
 
             for (int i = 20; i < 30; i++) {
                 queueL.offer("item-" + i);

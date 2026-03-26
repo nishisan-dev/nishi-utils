@@ -1,7 +1,6 @@
 package dev.nishisan.utils.ngrid.cluster.transport;
 
 import dev.nishisan.utils.ngrid.common.ClusterMessage;
-import dev.nishisan.utils.ngrid.common.HeartbeatPayload;
 import dev.nishisan.utils.ngrid.common.MessageType;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
@@ -82,7 +81,7 @@ class ProxyRoutingIntegrationTest {
                 }
             });
 
-            ClusterMessage msg = ClusterMessage.request(MessageType.PING, "proxy-test", infoA.nodeId(), infoC.nodeId(), HeartbeatPayload.now());
+            ClusterMessage msg = ClusterMessage.request(MessageType.CLIENT_REQUEST, "proxy-test", infoA.nodeId(), infoC.nodeId(), "proxy-ping");
             waitForProxyRoute(transA, infoC.nodeId(), infoB.nodeId());
             transA.send(msg);
 

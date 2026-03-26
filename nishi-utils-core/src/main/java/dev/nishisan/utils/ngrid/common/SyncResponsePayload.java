@@ -17,29 +17,37 @@
 
 package dev.nishisan.utils.ngrid.common;
 
-import java.io.Serial;
-import java.io.Serializable;
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.annotation.JsonTypeInfo;
+
 import java.util.Objects;
 
 /**
  * Response carrying a state snapshot for synchronization.
  * The sequence refers to the last applied sequence for the specific topic.
  */
-public final class SyncResponsePayload implements Serializable {
-    @Serial
-    private static final long serialVersionUID = 1L;
+public final class SyncResponsePayload {
 
     private final String topic;
     private final long sequence;
     private final int chunkIndex;
     private final boolean hasMore;
-    private final Serializable data;
 
-    public SyncResponsePayload(String topic, long sequence, Serializable data) {
+    @JsonTypeInfo(use = JsonTypeInfo.Id.CLASS)
+    private final Object data;
+
+    public SyncResponsePayload(String topic, long sequence, Object data) {
         this(topic, sequence, 0, false, data);
     }
 
-    public SyncResponsePayload(String topic, long sequence, int chunkIndex, boolean hasMore, Serializable data) {
+    @JsonCreator
+    public SyncResponsePayload(
+            @JsonProperty("topic") String topic,
+            @JsonProperty("sequence") long sequence,
+            @JsonProperty("chunkIndex") int chunkIndex,
+            @JsonProperty("hasMore") boolean hasMore,
+            @JsonProperty("data") Object data) {
         this.topic = Objects.requireNonNull(topic, "topic");
         this.sequence = sequence;
         this.chunkIndex = chunkIndex;
@@ -63,7 +71,7 @@ public final class SyncResponsePayload implements Serializable {
         return hasMore;
     }
 
-    public Serializable data() {
+    public Object data() {
         return data;
     }
 }

@@ -32,7 +32,7 @@ import java.util.function.BiConsumer;
  * @param <K> the key type
  * @param <V> the value type
  */
-public final class InMemoryStrategy<K extends Serializable, V extends Serializable>
+public final class InMemoryStrategy<K, V>
         implements NMapOffloadStrategy<K, V> {
 
     private final ConcurrentHashMap<K, V> data = new ConcurrentHashMap<>();

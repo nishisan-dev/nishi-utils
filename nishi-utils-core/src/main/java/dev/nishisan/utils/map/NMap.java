@@ -68,7 +68,7 @@ import java.util.function.BiConsumer;
  * @param <K> the key type (must be {@link Serializable})
  * @param <V> the value type (must be {@link Serializable})
  */
-public final class NMap<K extends Serializable, V extends Serializable> implements Closeable {
+public final class NMap<K, V> implements Closeable {
 
     private final NMapOffloadStrategy<K, V> storage;
     private final NMapPersistence<K, V> persistence;
@@ -106,7 +106,7 @@ public final class NMap<K extends Serializable, V extends Serializable> implemen
      * @param <V>     the value type
      * @return the opened map
      */
-    public static <K extends Serializable, V extends Serializable> NMap<K, V> open(Path baseDir, String name) {
+    public static <K, V> NMap<K, V> open(Path baseDir, String name) {
         return open(baseDir, name, NMapConfig.defaults(NMapPersistenceMode.ASYNC_WITH_FSYNC));
     }
 
@@ -120,7 +120,7 @@ public final class NMap<K extends Serializable, V extends Serializable> implemen
      * @param <V>     the value type
      * @return the opened map
      */
-    public static <K extends Serializable, V extends Serializable> NMap<K, V> open(
+    public static <K, V> NMap<K, V> open(
             Path baseDir, String name, NMapConfig config) {
         Objects.requireNonNull(baseDir, "baseDir");
         Objects.requireNonNull(name, "name");

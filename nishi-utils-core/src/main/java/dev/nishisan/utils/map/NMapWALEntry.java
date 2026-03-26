@@ -17,8 +17,6 @@
 
 package dev.nishisan.utils.map;
 
-import java.io.Serializable;
-
 /**
  * A single WAL entry representing a mutating operation (PUT/REMOVE).
  *
@@ -30,6 +28,6 @@ import java.io.Serializable;
 public record NMapWALEntry(
         long timestamp,
         NMapOperationType type,
-        Serializable key,
-        Serializable value) {
+        Object key,
+        Object value) {
 }

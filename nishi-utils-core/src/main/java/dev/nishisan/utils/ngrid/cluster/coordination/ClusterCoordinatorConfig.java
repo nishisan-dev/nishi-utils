@@ -47,8 +47,8 @@ public final class ClusterCoordinatorConfig {
      * @return default configuration
      */
     public static ClusterCoordinatorConfig defaults() {
-        Duration defaultTimeout = Duration.ofSeconds(5);
-        return new ClusterCoordinatorConfig(Duration.ofSeconds(1), defaultTimeout,
+        Duration defaultTimeout = Duration.ofSeconds(10);
+        return new ClusterCoordinatorConfig(Duration.ofSeconds(3), defaultTimeout,
                 defaultTimeout.multipliedBy(3), 1, null);
     }
 

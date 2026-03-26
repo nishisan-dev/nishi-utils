@@ -28,7 +28,7 @@ import dev.nishisan.utils.ngrid.replication.ReplicationResult;
 
 import java.io.Closeable;
 import java.io.IOException;
-import java.io.Serializable;
+
 import java.util.Collections;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -54,7 +54,7 @@ import java.util.concurrent.TimeUnit;
  * @param <K> the key type
  * @param <V> the value type
  */
-public final class MapClusterService<K extends Serializable, V extends Serializable>
+public final class MapClusterService<K, V>
         implements Closeable, ReplicationHandler {
     /** Topic prefix for map replication messages. */
     public static final String TOPIC_PREFIX = "map:";
@@ -252,7 +252,7 @@ public final class MapClusterService<K extends Serializable, V extends Serializa
     /** {@inheritDoc} */
     @Override
     @SuppressWarnings("unchecked")
-    public void apply(UUID operationId, Serializable payload) {
+    public void apply(UUID operationId, Object payload) {
         MapReplicationCommand command = (MapReplicationCommand) payload;
         switch (command.type()) {
             case PUT -> {
@@ -302,12 +302,12 @@ public final class MapClusterService<K extends Serializable, V extends Serializa
             Map.Entry<K, V> e = entries.get(i);
             chunk.put(e.getKey(), e.getValue());
         }
-        return new SnapshotChunk((Serializable) chunk, end < entries.size());
+        return new SnapshotChunk(chunk, end < entries.size());
     }
 
     /** {@inheritDoc} */
     @Override
-    public Serializable getSnapshot() {
+    public Object getSnapshot() {
         return new HashMap<>(data);
     }
 
@@ -320,7 +320,7 @@ public final class MapClusterService<K extends Serializable, V extends Serializa
     /** {@inheritDoc} */
     @Override
     @SuppressWarnings("unchecked")
-    public void installSnapshot(Serializable snapshot) {
+    public void installSnapshot(Object snapshot) {
         if (snapshot instanceof Map<?, ?> newMap) {
             // For offset maps, apply monotonic semantics during snapshot install
             if (topic.equals("map:_ngrid-queue-offsets")) {

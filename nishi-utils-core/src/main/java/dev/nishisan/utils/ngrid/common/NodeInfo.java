@@ -17,32 +17,39 @@
 
 package dev.nishisan.utils.ngrid.common;
 
-import java.io.Serial;
-import java.io.Serializable;
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * Describes a node in the cluster including host/port information necessary to establish
  * a TCP connection.
  */
-public final class NodeInfo implements Serializable {
-    @Serial
-    private static final long serialVersionUID = 1L;
+public final class NodeInfo {
 
     private final NodeId nodeId;
     private final String host;
     private final int port;
-    private final java.util.Set<String> roles;
+    private final Set<String> roles;
 
     public NodeInfo(NodeId nodeId, String host, int port) {
-        this(nodeId, host, port, java.util.Collections.emptySet());
+        this(nodeId, host, port, Collections.emptySet());
     }
 
-    public NodeInfo(NodeId nodeId, String host, int port, java.util.Set<String> roles) {
+    @JsonCreator
+    public NodeInfo(
+            @JsonProperty("nodeId") NodeId nodeId,
+            @JsonProperty("host") String host,
+            @JsonProperty("port") int port,
+            @JsonProperty("roles") Set<String> roles) {
         this.nodeId = Objects.requireNonNull(nodeId, "nodeId");
         this.host = Objects.requireNonNull(host, "host");
         this.port = port;
-        this.roles = java.util.Collections.unmodifiableSet(new java.util.HashSet<>(Objects.requireNonNull(roles, "roles")));
+        this.roles = Collections.unmodifiableSet(new HashSet<>(Objects.requireNonNull(roles, "roles")));
     }
 
     public NodeId nodeId() {
@@ -56,8 +63,8 @@ public final class NodeInfo implements Serializable {
     public int port() {
         return port;
     }
-    
-    public java.util.Set<String> roles() {
+
+    public Set<String> roles() {
         return roles;
     }
 

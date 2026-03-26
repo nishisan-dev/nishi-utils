@@ -17,20 +17,27 @@
 
 package dev.nishisan.utils.ngrid.common;
 
-import java.io.Serial;
-import java.io.Serializable;
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.annotation.JsonTypeInfo;
+
 import java.util.Optional;
 import java.util.UUID;
 
 /**
  * Envelope exchanged between nodes. It includes the type, optional qualifier to
- * distinguish
- * operations, an optional destination and a payload that must be
- * {@link Serializable}.
+ * distinguish operations, an optional destination and a payload.
+ * <p>
+ * Payloads use Jackson polymorphic typing so that the concrete type is preserved
+ * across JSON serialization boundaries.
  */
-public final class ClusterMessage implements Serializable {
-    @Serial
-    private static final long serialVersionUID = 2L;
+public final class ClusterMessage {
+
+    /**
+     * Sentinel UUID used for lightweight messages (heartbeats, pings) that
+     * do not require unique identification or correlation.
+     */
+    public static final UUID ZERO_UUID = new UUID(0, 0);
 
     private final UUID messageId;
     private final UUID correlationId;
@@ -38,7 +45,9 @@ public final class ClusterMessage implements Serializable {
     private final String qualifier;
     private final NodeId source;
     private final NodeId destination;
-    private final Serializable payload;
+
+    @JsonTypeInfo(use = JsonTypeInfo.Id.CLASS)
+    private final Object payload;
     private final int ttl;
 
     /**
@@ -51,17 +60,19 @@ public final class ClusterMessage implements Serializable {
      * @param qualifier     additional qualifier for routing
      * @param source        the originating node
      * @param destination   the target node, or {@code null} for broadcast
-     * @param payload       the serializable message payload
+     * @param payload       the message payload
      * @param ttl           time-to-live hop counter
      */
-    public ClusterMessage(UUID messageId,
-            UUID correlationId,
-            MessageType type,
-            String qualifier,
-            NodeId source,
-            NodeId destination,
-            Serializable payload,
-            int ttl) {
+    @JsonCreator
+    public ClusterMessage(
+            @JsonProperty("messageId") UUID messageId,
+            @JsonProperty("correlationId") UUID correlationId,
+            @JsonProperty("type") MessageType type,
+            @JsonProperty("qualifier") String qualifier,
+            @JsonProperty("source") NodeId source,
+            @JsonProperty("destination") NodeId destination,
+            @JsonProperty("payload") Object payload,
+            @JsonProperty("ttl") int ttl) {
         this.messageId = messageId == null ? UUID.randomUUID() : messageId;
         this.correlationId = correlationId;
         this.type = type;
@@ -81,7 +92,7 @@ public final class ClusterMessage implements Serializable {
      * @param qualifier     additional qualifier for routing
      * @param source        the originating node
      * @param destination   the target node
-     * @param payload       the serializable message payload
+     * @param payload       the message payload
      */
     public ClusterMessage(UUID messageId,
             UUID correlationId,
@@ -89,7 +100,7 @@ public final class ClusterMessage implements Serializable {
             String qualifier,
             NodeId source,
             NodeId destination,
-            Serializable payload) {
+            Object payload) {
         this(messageId, correlationId, type, qualifier, source, destination, payload, 5);
     }
 
@@ -104,8 +115,41 @@ public final class ClusterMessage implements Serializable {
      * @return a new request message
      */
     public static ClusterMessage request(MessageType type, String qualifier, NodeId source, NodeId destination,
-            Serializable payload) {
+            Object payload) {
         return new ClusterMessage(UUID.randomUUID(), null, type, qualifier, source, destination, payload, 5);
+    }
+
+    /**
+     * Creates a lightweight message without generating a random UUID.
+     * <p>
+     * Intended for high-frequency fire-and-forget messages (heartbeats)
+     * where {@code messageId} correlation is not needed. Uses {@link #ZERO_UUID}
+     * to avoid the CPU cost of {@link UUID#randomUUID()} and SecureRandom entropy.
+     *
+     * @param type        the message type
+     * @param qualifier   routing qualifier
+     * @param source      the originating node
+     * @param destination the target node, or {@code null} for broadcast
+     * @param payload     the message payload
+     * @return a new lightweight message with {@link #ZERO_UUID} as messageId
+     */
+    public static ClusterMessage lightweight(MessageType type, String qualifier, NodeId source, NodeId destination,
+            Object payload) {
+        return new ClusterMessage(ZERO_UUID, null, type, qualifier, source, destination, payload, 1);
+    }
+
+    /**
+     * Creates a copy of this message with a different destination.
+     * <p>
+     * Useful for broadcast operations where the same message content is sent
+     * to multiple peers without generating a new UUID per peer.
+     *
+     * @param newDestination the new target node
+     * @return a new message with the specified destination
+     */
+    public ClusterMessage withDestination(NodeId newDestination) {
+        return new ClusterMessage(this.messageId, this.correlationId, this.type,
+                this.qualifier, this.source, newDestination, this.payload, this.ttl);
     }
 
     /**
@@ -115,7 +159,7 @@ public final class ClusterMessage implements Serializable {
      * @param payload the response payload
      * @return a new response message
      */
-    public static ClusterMessage response(ClusterMessage request, Serializable payload) {
+    public static ClusterMessage response(ClusterMessage request, Object payload) {
         return new ClusterMessage(UUID.randomUUID(), request.messageId, MessageType.CLIENT_RESPONSE, request.qualifier,
                 request.destination(), request.source(), payload, 5);
     }
@@ -204,7 +248,7 @@ public final class ClusterMessage implements Serializable {
      * @return the typed payload
      */
     @SuppressWarnings("unchecked")
-    public <T extends Serializable> T payload(Class<T> type) {
+    public <T> T payload(Class<T> type) {
         return (T) payload;
     }
 
@@ -213,7 +257,7 @@ public final class ClusterMessage implements Serializable {
      *
      * @return the payload
      */
-    public Serializable payload() {
+    public Object payload() {
         return payload;
     }
 }

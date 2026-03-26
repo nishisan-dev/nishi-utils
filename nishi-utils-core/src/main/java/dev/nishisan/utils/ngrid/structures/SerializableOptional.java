@@ -17,8 +17,12 @@
 
 package dev.nishisan.utils.ngrid.structures;
 
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.annotation.JsonTypeInfo;
+
 import java.io.Serial;
-import java.io.Serializable;
+
 import java.util.Optional;
 
 /**
@@ -26,14 +30,19 @@ import java.util.Optional;
  *
  * @param <T> the value type
  */
-public final class SerializableOptional<T extends Serializable> implements Serializable {
+@JsonTypeInfo(use = JsonTypeInfo.Id.CLASS)
+public final class SerializableOptional<T>  {
     @Serial
     private static final long serialVersionUID = 1L;
 
     private final boolean present;
+    @JsonTypeInfo(use = JsonTypeInfo.Id.CLASS)
     private final T value;
 
-    private SerializableOptional(boolean present, T value) {
+    @JsonCreator
+    private SerializableOptional(
+            @JsonProperty("present") boolean present,
+            @JsonProperty("value") T value) {
         this.present = present;
         this.value = value;
     }
@@ -45,7 +54,7 @@ public final class SerializableOptional<T extends Serializable> implements Seria
      * @param value the value
      * @return a present optional
      */
-    public static <T extends Serializable> SerializableOptional<T> of(T value) {
+    public static <T> SerializableOptional<T> of(T value) {
         return new SerializableOptional<>(true, value);
     }
 
@@ -55,7 +64,7 @@ public final class SerializableOptional<T extends Serializable> implements Seria
      * @param <T> the value type
      * @return an empty optional
      */
-    public static <T extends Serializable> SerializableOptional<T> empty() {
+    public static <T> SerializableOptional<T> empty() {
         return new SerializableOptional<>(false, null);
     }
 

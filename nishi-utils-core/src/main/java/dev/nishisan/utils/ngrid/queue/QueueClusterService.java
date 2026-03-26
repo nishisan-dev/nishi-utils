@@ -48,7 +48,7 @@ import java.util.logging.Logger;
  *
  * @param <T> the queue element type
  */
-public final class QueueClusterService<T extends Serializable> implements Closeable, ReplicationHandler {
+public final class QueueClusterService<T> implements Closeable, ReplicationHandler {
     private static final Logger LOGGER = Logger.getLogger(QueueClusterService.class.getName());
 
     private final NQueue<T> queue;
@@ -244,7 +244,7 @@ public final class QueueClusterService<T extends Serializable> implements Closea
             if (next.isEmpty()) {
                 return Optional.empty();
             }
-            QueueReplicationCommand command = QueueReplicationCommand.poll((Serializable) next.get());
+            QueueReplicationCommand command = QueueReplicationCommand.poll(next.get());
             CompletableFuture<ReplicationResult> future = replicationManager.replicate(topic, command,
                     replicationFactor);
 
@@ -433,7 +433,7 @@ public final class QueueClusterService<T extends Serializable> implements Closea
     /** {@inheritDoc} */
     @Override
     @SuppressWarnings("unchecked")
-    public void apply(UUID operationId, Serializable payload) {
+    public void apply(UUID operationId, Object payload) {
         QueueReplicationCommand command = (QueueReplicationCommand) payload;
         long start = System.nanoTime();
         operationLock.lock();
@@ -474,9 +474,7 @@ public final class QueueClusterService<T extends Serializable> implements Closea
                 return new SnapshotChunk(new java.util.ArrayList<>(), false);
             }
 
-            @SuppressWarnings("unchecked")
-            java.util.ArrayList<Serializable> chunk = new java.util.ArrayList<>(
-                    (java.util.Collection<Serializable>) result.items());
+            java.util.ArrayList<Object> chunk = new java.util.ArrayList<>(result.items());
             return new SnapshotChunk(chunk, result.hasMore());
         } catch (IOException e) {
             LOGGER.log(Level.WARNING, "Failed to get snapshot chunk " + chunkIndex, e);
@@ -528,7 +526,7 @@ public final class QueueClusterService<T extends Serializable> implements Closea
     /** {@inheritDoc} */
     @Override
     @SuppressWarnings("unchecked")
-    public void installSnapshot(Serializable snapshot) throws Exception {
+    public void installSnapshot(Object snapshot) throws Exception {
         if (snapshot instanceof java.util.List<?> items) {
             for (Object item : items) {
                 queue.offer((T) item);
@@ -592,8 +590,10 @@ public final class QueueClusterService<T extends Serializable> implements Closea
      *
      * @param <T> the value type
      */
-    public static class QueueRecord<T> implements Serializable {
+    @com.fasterxml.jackson.annotation.JsonTypeInfo(use = com.fasterxml.jackson.annotation.JsonTypeInfo.Id.CLASS)
+    public static class QueueRecord<T> {
         private final long offset;
+        @com.fasterxml.jackson.annotation.JsonTypeInfo(use = com.fasterxml.jackson.annotation.JsonTypeInfo.Id.CLASS)
         private final T value;
 
         /**
@@ -602,7 +602,10 @@ public final class QueueClusterService<T extends Serializable> implements Closea
          * @param offset the record offset
          * @param value  the record value
          */
-        public QueueRecord(long offset, T value) {
+        @com.fasterxml.jackson.annotation.JsonCreator
+        public QueueRecord(
+                @com.fasterxml.jackson.annotation.JsonProperty("offset") long offset,
+                @com.fasterxml.jackson.annotation.JsonProperty("value") T value) {
             this.offset = offset;
             this.value = value;
         }

@@ -4,6 +4,7 @@ import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.structures.DistributedMap;
 
 import java.util.Objects;
+import java.util.Optional;
 
 /**
  * Offset store backed by a {@link DistributedMap}, ensuring offsets survive
@@ -27,13 +28,31 @@ public final class DistributedOffsetStore implements OffsetStore {
     @Override
     public long getOffset(NodeId nodeId) {
         String key = keyFor(nodeId);
-        return offsets.get(key).orElse(0L);
+        // Jackson may deserialize small numbers as Integer instead of Long.
+        // Using Optional<Long>.map() would trigger an implicit checkcast Long
+        // in bytecode before entering the lambda, causing ClassCastException.
+        // We work with the raw Optional to bypass the generic checkcast.
+        Optional<?> raw = (Optional<?>) offsets.get(key);
+        if (raw.isPresent()) {
+            Object v = raw.get();
+            if (v instanceof Number) {
+                return ((Number) v).longValue();
+            }
+        }
+        return 0L;
     }
 
     @Override
     public void updateOffset(NodeId nodeId, long offset) {
         String key = keyFor(nodeId);
-        Long current = offsets.get(key).orElse(0L);
+        long current = 0L;
+        Optional<?> raw = (Optional<?>) offsets.get(key);
+        if (raw.isPresent()) {
+            Object v = raw.get();
+            if (v instanceof Number) {
+                current = ((Number) v).longValue();
+            }
+        }
         if (offset <= current) {
             // Ignore regression - monotonic offset guarantee
             return;

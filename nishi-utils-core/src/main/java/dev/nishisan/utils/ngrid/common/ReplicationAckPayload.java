@@ -17,22 +17,24 @@
 
 package dev.nishisan.utils.ngrid.common;
 
-import java.io.Serial;
-import java.io.Serializable;
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+
 import java.util.Objects;
 import java.util.UUID;
 
 /**
  * Acknowledgement for a replication operation.
  */
-public final class ReplicationAckPayload implements Serializable {
-    @Serial
-    private static final long serialVersionUID = 1L;
+public final class ReplicationAckPayload {
 
     private final UUID operationId;
     private final boolean accepted;
 
-    public ReplicationAckPayload(UUID operationId, boolean accepted) {
+    @JsonCreator
+    public ReplicationAckPayload(
+            @JsonProperty("operationId") UUID operationId,
+            @JsonProperty("accepted") boolean accepted) {
         this.operationId = Objects.requireNonNull(operationId, "operationId");
         this.accepted = accepted;
     }

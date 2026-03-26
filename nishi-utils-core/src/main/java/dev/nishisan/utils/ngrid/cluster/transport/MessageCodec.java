@@ -15,27 +15,32 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>
  */
 
-package dev.nishisan.utils.map;
+package dev.nishisan.utils.ngrid.cluster.transport;
 
-import java.nio.file.Path;
+import dev.nishisan.utils.ngrid.common.ClusterMessage;
+
+import java.io.IOException;
 
 /**
- * Factory for creating {@link NMapOffloadStrategy} instances.
- * <p>
- * Because strategies often need a base directory and map name (for disk-backed
- * implementations), the factory defers construction to {@link NMap#open} time.
+ * Encodes and decodes {@link ClusterMessage} instances for wire transport.
+ * Implementations must be thread-safe.
  */
-@FunctionalInterface
-public interface NMapOffloadStrategyFactory {
+public interface MessageCodec {
+    /**
+     * Serializes a message to bytes.
+     *
+     * @param message the message to encode
+     * @return the encoded bytes
+     * @throws IOException if encoding fails
+     */
+    byte[] encode(ClusterMessage message) throws IOException;
 
     /**
-     * Creates a new strategy instance.
+     * Deserializes a message from bytes.
      *
-     * @param baseDir the base directory for data storage
-     * @param name    the map name (used as subdirectory)
-     * @param <K>     the key type
-     * @param <V>     the value type
-     * @return the strategy
+     * @param data the encoded bytes
+     * @return the decoded message
+     * @throws IOException if decoding fails
      */
-    <K, V> NMapOffloadStrategy<K, V> create(Path baseDir, String name);
+    ClusterMessage decode(byte[] data) throws IOException;
 }

@@ -24,6 +24,8 @@ import dev.nishisan.utils.ngrid.cluster.transport.TcpTransport;
 import dev.nishisan.utils.ngrid.cluster.transport.TcpTransportConfig;
 import dev.nishisan.utils.ngrid.cluster.transport.Transport;
 import dev.nishisan.utils.ngrid.cluster.transport.TransportListener;
+import dev.nishisan.utils.ngrid.cluster.transport.codec.CompositeMessageCodec;
+import dev.nishisan.utils.ngrid.cluster.transport.codec.MessageCodec;
 import dev.nishisan.utils.ngrid.common.ClientRequestPayload;
 import dev.nishisan.utils.ngrid.common.ClientResponsePayload;
 import dev.nishisan.utils.ngrid.common.ClusterMessage;
@@ -173,19 +175,18 @@ public final class NGridNode implements Closeable {
 
         NodeId localId = config.local().nodeId();
 
+        MessageCodec codec = new CompositeMessageCodec();
+
         try (java.net.Socket socket = new java.net.Socket()) {
 
             socket.connect(new java.net.InetSocketAddress(host, port), 5000);
 
             socket.setTcpNoDelay(true);
 
-            socket.setSoTimeout(15_000); // Evita hang silencioso: seed pode aceitar mas não responder
+            socket.setSoTimeout(15_000);
 
-            java.io.ObjectOutputStream oos = new java.io.ObjectOutputStream(socket.getOutputStream());
-
-            oos.flush();
-
-            java.io.ObjectInputStream ois = new java.io.ObjectInputStream(socket.getInputStream());
+            java.io.DataOutputStream dos = new java.io.DataOutputStream(socket.getOutputStream());
+            java.io.DataInputStream dis = new java.io.DataInputStream(socket.getInputStream());
 
             // 1. Send Handshake (required by TcpTransport on the seed)
 
@@ -200,9 +201,10 @@ public final class NGridNode implements Closeable {
 
             ClusterMessage hsMsg = ClusterMessage.request(MessageType.HANDSHAKE, "hello", localId, null, handshake);
 
-            oos.writeObject(hsMsg);
-
-            oos.flush();
+            byte[] hsData = codec.encode(hsMsg);
+            dos.writeInt(hsData.length);
+            dos.write(hsData);
+            dos.flush();
 
             // 2. Send Config Request
 
@@ -212,9 +214,10 @@ public final class NGridNode implements Closeable {
             ClusterMessage request = ClusterMessage.request(MessageType.CONFIG_FETCH_REQUEST, "config", localId, null,
                     requestPayload);
 
-            oos.writeObject(request);
-
-            oos.flush();
+            byte[] reqData = codec.encode(request);
+            dos.writeInt(reqData.length);
+            dos.write(reqData);
+            dos.flush();
 
             // 3. Await Response
 
@@ -222,52 +225,56 @@ public final class NGridNode implements Closeable {
 
             while (System.currentTimeMillis() < deadline) {
 
-                Object received = ois.readObject();
+                int length = dis.readInt();
+                if (length <= 0 || length > 64 * 1024 * 1024) {
+                    throw new IOException("Invalid frame length: " + length);
+                }
+                byte[] frameData = dis.readNBytes(length);
+                if (frameData.length < length) {
+                    throw new java.io.EOFException("Unexpected end of stream reading frame");
+                }
+                ClusterMessage msg = codec.decode(frameData);
 
-                if (received instanceof ClusterMessage msg) {
+                if (msg.type() == MessageType.CONFIG_FETCH_RESPONSE) {
 
-                    if (msg.type() == MessageType.CONFIG_FETCH_RESPONSE) {
+                    ConfigFetchResponsePayload responsePayload = msg.payload(ConfigFetchResponsePayload.class);
 
-                        ConfigFetchResponsePayload responsePayload = msg.payload(ConfigFetchResponsePayload.class);
+                    // Merge config
 
-                        // Merge config
+                    yamlConfig.setCluster(responsePayload.cluster());
 
-                        yamlConfig.setCluster(responsePayload.cluster());
-
-                        yamlConfig.setQueue(responsePayload.queue());
-                        if (responsePayload.queues() != null && !responsePayload.queues().isEmpty()) {
-                            yamlConfig.setQueues(responsePayload.queues());
-                            if (responsePayload.queue() == null) {
-                                yamlConfig.setQueue(responsePayload.queues().get(0));
-                            }
+                    yamlConfig.setQueue(responsePayload.queue());
+                    if (responsePayload.queues() != null && !responsePayload.queues().isEmpty()) {
+                        yamlConfig.setQueues(responsePayload.queues());
+                        if (responsePayload.queue() == null) {
+                            yamlConfig.setQueue(responsePayload.queues().get(0));
                         }
+                    }
 
-                        yamlConfig.setMaps(responsePayload.maps());
+                    yamlConfig.setMaps(responsePayload.maps());
 
-                        if (responsePayload.seedInfo() != null && yamlConfig.getCluster() != null) {
-                            dev.nishisan.utils.ngrid.config.ClusterPolicyConfig.SeedNodeConfig seedNode = new dev.nishisan.utils.ngrid.config.ClusterPolicyConfig.SeedNodeConfig();
-                            seedNode.setId(responsePayload.seedInfo().nodeId().value());
-                            seedNode.setHost(responsePayload.seedInfo().host());
-                            seedNode.setPort(responsePayload.seedInfo().port());
-                            yamlConfig.getCluster().setSeedNodes(java.util.List.of(seedNode));
-                        }
+                    if (responsePayload.seedInfo() != null && yamlConfig.getCluster() != null) {
+                        dev.nishisan.utils.ngrid.config.ClusterPolicyConfig.SeedNodeConfig seedNode = new dev.nishisan.utils.ngrid.config.ClusterPolicyConfig.SeedNodeConfig();
+                        seedNode.setId(responsePayload.seedInfo().nodeId().value());
+                        seedNode.setHost(responsePayload.seedInfo().host());
+                        seedNode.setPort(responsePayload.seedInfo().port());
+                        yamlConfig.getCluster().setSeedNodes(java.util.List.of(seedNode));
+                    }
 
-                        yamlConfig.getAutodiscover().setEnabled(false);
+                    yamlConfig.getAutodiscover().setEnabled(false);
 
-                        if (configFile != null) {
+                    if (configFile != null) {
 
-                            NGridConfigLoader.save(configFile, yamlConfig);
+                        NGridConfigLoader.save(configFile, yamlConfig);
 
-                            LOGGER.info(
-                                    () -> "Cluster configuration updated via raw socket and saved to " + configFile);
-
-                        }
-
-                        this.config = NGridConfigLoader.convertToDomain(yamlConfig, responsePayload.seedInfo());
-
-                        return; // Success!
+                        LOGGER.info(
+                                () -> "Cluster configuration updated via raw socket and saved to " + configFile);
 
                     }
+
+                    this.config = NGridConfigLoader.convertToDomain(yamlConfig, responsePayload.seedInfo());
+
+                    return; // Success!
 
                 }
 
@@ -311,7 +318,7 @@ public final class NGridNode implements Closeable {
         int minClusterSize = Math.max(1, Math.min(config.replicationQuorum(), config.peers().size() + 1));
         ClusterCoordinatorConfig coordinatorConfig = ClusterCoordinatorConfig.of(
                 config.heartbeatInterval(),
-                Duration.ofSeconds(5),
+                config.heartbeatInterval().multipliedBy(3),
                 config.leaseTimeout(),
                 minClusterSize,
                 null);
@@ -427,7 +434,7 @@ public final class NGridNode implements Closeable {
 
     @Deprecated
     @SuppressWarnings("unchecked")
-    public <T extends Serializable> DistributedQueue<T> queue(Class<T> type) {
+    public <T> DistributedQueue<T> queue(Class<T> type) {
         if (queue == null) {
             throw new IllegalStateException("Multiple queues configured; use getQueue(name, type) instead");
         }
@@ -435,7 +442,7 @@ public final class NGridNode implements Closeable {
     }
 
     @SuppressWarnings("unchecked")
-    public <T extends Serializable> DistributedQueue<T> getQueue(String name, Class<T> type) {
+    public <T> DistributedQueue<T> getQueue(String name, Class<T> type) {
         return (DistributedQueue<T>) getQueue(name, null, type);
     }
 
@@ -448,13 +455,13 @@ public final class NGridNode implements Closeable {
      * @return distributed queue instance
      * @since 2.1.0
      */
-    public <T extends Serializable> DistributedQueue<T> getQueue(TypedQueue<T> typedQueue) {
+    public <T> DistributedQueue<T> getQueue(TypedQueue<T> typedQueue) {
         Objects.requireNonNull(typedQueue, "typedQueue cannot be null");
         return getQueue(typedQueue.name(), typedQueue.type());
     }
 
     @SuppressWarnings("unchecked")
-    public <T extends Serializable> DistributedQueue<T> getQueue(String name, DistributedQueueConfig queueConfig,
+    public <T> DistributedQueue<T> getQueue(String name, DistributedQueueConfig queueConfig,
             Class<T> type) {
         Objects.requireNonNull(name, "queue name cannot be null");
         if (!started.get()) {
@@ -465,13 +472,13 @@ public final class NGridNode implements Closeable {
     }
 
     @SuppressWarnings("unchecked")
-    public <K extends Serializable, V extends Serializable> DistributedMap<K, V> map(Class<K> keyType,
+    public <K, V> DistributedMap<K, V> map(Class<K> keyType,
             Class<V> valueType) {
         return (DistributedMap<K, V>) map;
     }
 
     @SuppressWarnings("unchecked")
-    public <K extends Serializable, V extends Serializable> DistributedMap<K, V> getMap(String name, Class<K> keyType,
+    public <K, V> DistributedMap<K, V> getMap(String name, Class<K> keyType,
             Class<V> valueType) {
         Objects.requireNonNull(name, "map name cannot be null");
         if (!started.get()) {

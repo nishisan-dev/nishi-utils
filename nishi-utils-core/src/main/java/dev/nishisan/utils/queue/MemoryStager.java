@@ -46,7 +46,7 @@ import java.util.concurrent.locks.ReentrantLock;
  *
  * @param <T> the element type handled by the owning queue
  */
-class MemoryStager<T extends Serializable> {
+class MemoryStager<T> {
 
     private static final int MEMORY_DRAIN_BATCH_SIZE = 256;
 
@@ -54,7 +54,7 @@ class MemoryStager<T extends Serializable> {
      * Callback invoked by the drain worker to persist a batch to durable storage.
      */
     @FunctionalInterface
-    interface FlushCallback<T extends Serializable> {
+    interface FlushCallback<T> {
         /**
          * Persists a pre-indexed batch. Called while the queue lock is held.
          *

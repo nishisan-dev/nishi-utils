@@ -3,15 +3,14 @@ package dev.nishisan.utils.ngrid.config;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import java.io.Serial;
-import java.io.Serializable;
+
 
 /**
  * Configuration for a distributed map policy, deserialized from YAML/JSON.
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
-public class MapPolicyConfig implements Serializable {
+public class MapPolicyConfig  {
     @Serial
-    private static final long serialVersionUID = 1L;
 
     private String name;
     @JsonProperty("key-type")

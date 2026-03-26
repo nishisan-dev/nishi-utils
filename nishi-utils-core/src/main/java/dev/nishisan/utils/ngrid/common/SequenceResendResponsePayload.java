@@ -17,7 +17,6 @@
 
 package dev.nishisan.utils.ngrid.common;
 
-import java.io.Serializable;
 import java.util.List;
 
 /**
@@ -31,5 +30,5 @@ import java.util.List;
 public record SequenceResendResponsePayload(
                 String topic,
                 List<ReplicationPayload> operations,
-                List<Long> missingSequences) implements Serializable {
+                List<Long> missingSequences) {
 }

@@ -1,16 +1,16 @@
 package dev.nishisan.utils.ngrid.common;
 
-import java.io.Serial;
-import java.io.Serializable;
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+
 import java.util.Objects;
 
-public final class QueueUnsubscribePayload implements Serializable {
-    @Serial
-    private static final long serialVersionUID = 1L;
+public final class QueueUnsubscribePayload {
 
     private final String queueName;
 
-    public QueueUnsubscribePayload(String queueName) {
+    @JsonCreator
+    public QueueUnsubscribePayload(@JsonProperty("queueName") String queueName) {
         this.queueName = Objects.requireNonNull(queueName, "queueName");
     }
 

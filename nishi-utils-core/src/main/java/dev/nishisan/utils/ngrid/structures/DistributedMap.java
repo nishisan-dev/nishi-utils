@@ -32,7 +32,7 @@ import dev.nishisan.utils.stats.StatsUtils;
 
 import java.io.Closeable;
 import java.io.IOException;
-import java.io.Serializable;
+
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -46,7 +46,7 @@ import java.util.concurrent.CompletableFuture;
  * @param <K> the key type
  * @param <V> the value type
  */
-public final class DistributedMap<K extends Serializable, V extends Serializable>
+public final class DistributedMap<K, V>
         implements TransportListener, Closeable {
     private static final String COMMAND_PREFIX_PUT = "map.put:";
     private static final String COMMAND_PREFIX_REMOVE = "map.remove:";
@@ -156,7 +156,7 @@ public final class DistributedMap<K extends Serializable, V extends Serializable
             recordMapPut();
             return mapService.put(key, value);
         }
-        Serializable body = new MapEntry<>(key, value);
+        Object body = new MapEntry<>(key, value);
         SerializableOptional<V> result = (SerializableOptional<V>) invokeLeader(mapPutCommand, body);
         return result.toOptional();
     }
@@ -304,7 +304,7 @@ public final class DistributedMap<K extends Serializable, V extends Serializable
         return result.toOptional();
     }
 
-    private Serializable invokeLeader(String command, Serializable body) {
+    private Object invokeLeader(String command, Object body) {
         int maxAttempts = 5;
         long backoffMs = 200;
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -360,7 +360,7 @@ public final class DistributedMap<K extends Serializable, V extends Serializable
     }
 
     @SuppressWarnings("unchecked")
-    private Serializable executeLocal(String command, Serializable body) {
+    private Object executeLocal(String command, Object body) {
         if (command.equals(mapPutCommand)) {
             MapEntry<K, V> entry = (MapEntry<K, V>) body;
             recordMapPut();
@@ -409,7 +409,7 @@ public final class DistributedMap<K extends Serializable, V extends Serializable
             responsePayload = new ClientResponsePayload(payload.requestId(), false, null, "Not the leader");
         } else {
             try {
-                Serializable result = executeLocal(payload.command(), payload.body());
+                Object result = executeLocal(payload.command(), payload.body());
                 responsePayload = new ClientResponsePayload(payload.requestId(), true, result, null);
             } catch (RuntimeException e) {
                 String messageText = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
@@ -452,6 +452,6 @@ public final class DistributedMap<K extends Serializable, V extends Serializable
         stats.notifyHitCounter(NGridMetrics.ingressWrite(localNodeId));
     }
 
-    private record MapEntry<K extends Serializable, V extends Serializable>(K key, V value) implements Serializable {
+    private record MapEntry<K, V>(K key, V value) {
     }
 }

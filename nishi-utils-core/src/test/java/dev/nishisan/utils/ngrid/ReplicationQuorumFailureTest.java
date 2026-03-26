@@ -110,7 +110,10 @@ class ReplicationQuorumFailureTest {
 
         IllegalStateException ex = assertThrows(IllegalStateException.class, () -> leaderMap.put("k1", "v1"));
         String msg = ex.getMessage() != null ? ex.getMessage().toLowerCase() : "";
-        assertTrue(msg.contains("timed out"), "Expected timeout failure but got: " + ex.getMessage());
+        // When followers have no handler, the operation may either time out or fail
+        // because the leader loses leadership (failAllPending fires first).
+        assertTrue(msg.contains("timed out") || msg.contains("replication operation failed") || msg.contains("lost leadership"),
+                "Expected timeout or replication failure but got: " + ex.getMessage());
     }
 
     // Note: cluster restart/recovery is already covered by NGridIntegrationTest and map persistence integration tests.

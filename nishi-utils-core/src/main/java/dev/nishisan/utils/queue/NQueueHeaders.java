@@ -17,7 +17,9 @@
 
 package dev.nishisan.utils.queue;
 
-import java.io.Serializable;
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.Collections;
@@ -42,8 +44,7 @@ import java.util.Optional;
  *
  * @since 3.0.0
  */
-public final class NQueueHeaders implements Serializable {
-    private static final long serialVersionUID = 1L;
+public final class NQueueHeaders {
 
     /** Maximum number of headers per record. */
     public static final int MAX_HEADERS = 256;
@@ -58,8 +59,9 @@ public final class NQueueHeaders implements Serializable {
 
     private final Map<String, byte[]> entries;
 
-    private NQueueHeaders(Map<String, byte[]> entries) {
-        this.entries = entries;
+    @JsonCreator
+    private NQueueHeaders(@JsonProperty("entries") Map<String, byte[]> entries) {
+        this.entries = entries != null ? entries : Collections.emptyMap();
     }
 
     // ──────────────────────────── Factory ────────────────────────────────────
@@ -132,6 +134,7 @@ public final class NQueueHeaders implements Serializable {
      * @return header map (values are defensive copies are NOT guaranteed here;
      *         callers must not mutate the returned arrays)
      */
+    @JsonProperty("entries")
     public Map<String, byte[]> asMap() {
         return entries;
     }

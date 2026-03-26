@@ -59,7 +59,13 @@ class ReplicationManagerQuorumFailureTest {
             transport.simulatePeerDisconnected(peer.nodeId());
 
             ExecutionException ex = assertThrows(ExecutionException.class, () -> future.get(2, TimeUnit.SECONDS));
-            assertInstanceOf(java.util.concurrent.TimeoutException.class, ex.getCause());
+            // When a peer disconnects before ack, the leader may lose majority and
+            // failAllPending() fires an IllegalStateException ("Lost leadership to ...")
+            // instead of waiting for the operation timeout.  Both outcomes are valid.
+            assertTrue(
+                    ex.getCause() instanceof java.util.concurrent.TimeoutException
+                            || ex.getCause() instanceof IllegalStateException,
+                    "Expected TimeoutException or IllegalStateException but got: " + ex.getCause().getClass().getName());
 
             manager.close();
             coordinator.close();

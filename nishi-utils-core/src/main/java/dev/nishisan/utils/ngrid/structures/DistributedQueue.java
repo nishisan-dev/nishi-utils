@@ -37,7 +37,7 @@ import dev.nishisan.utils.stats.StatsUtils;
 
 import java.io.Closeable;
 import java.io.IOException;
-import java.io.Serializable;
+
 import java.time.Duration;
 import java.util.Optional;
 import java.util.Set;
@@ -53,7 +53,7 @@ import java.util.logging.Logger;
  *
  * @param <T> the element type
  */
-public final class DistributedQueue<T extends Serializable>
+public final class DistributedQueue<T>
         implements TransportListener, LeadershipListener, Closeable {
     private static final Logger LOGGER = Logger.getLogger(DistributedQueue.class.getName());
     private static final String COMMAND_PREFIX_OFFER = "queue.offer:";
@@ -179,7 +179,7 @@ public final class DistributedQueue<T extends Serializable>
         }
         queueService.syncOffsetsIfNeeded();
         Long offsetHint = queueService.getCurrentOffset(localNodeId);
-        Serializable result = invokeLeader(queuePollCommand, offsetHint);
+        Object result = invokeLeader(queuePollCommand, offsetHint);
         if (result instanceof SerializableOptional) {
             SerializableOptional<?> opt = (SerializableOptional<?>) result;
             if (opt.isPresent()) {
@@ -188,6 +188,16 @@ public final class DistributedQueue<T extends Serializable>
                     QueueClusterService.QueueRecord<T> record = (QueueClusterService.QueueRecord<T>) val;
                     queueService.updateLocalOffset(localNodeId, record.offset() + 1);
                     return Optional.of(record.value());
+                }
+                // Fallback: Jackson may deserialize QueueRecord as Map when type info is lost
+                if (val instanceof java.util.Map<?,?> mapVal) {
+                    Object rawOffset = mapVal.get("offset");
+                    Object rawValue = mapVal.get("value");
+                    if (rawOffset instanceof Number && rawValue != null) {
+                        long offset = ((Number) rawOffset).longValue();
+                        queueService.updateLocalOffset(localNodeId, offset + 1);
+                        return Optional.of((T) rawValue);
+                    }
                 }
                 return Optional.of((T) val);
             }
@@ -206,7 +216,7 @@ public final class DistributedQueue<T extends Serializable>
         if (coordinator.isLeader()) {
             return queueService.peek();
         }
-        SerializableOptional<T> result = (SerializableOptional<T>) invokeLeader(queuePeekCommand, null);
+        SerializableOptional<T> result = (SerializableOptional<T>) invokeLeader(queuePeekCommand, (Object) null);
         return result.toOptional();
     }
 
@@ -267,7 +277,7 @@ public final class DistributedQueue<T extends Serializable>
         subscribedLeader = null;
     }
 
-    private Serializable invokeLeader(String command, Serializable body) {
+    private Object invokeLeader(String command, Object body) {
         int attempts = 0;
         while (attempts < 3) {
             attempts++;
@@ -300,7 +310,7 @@ public final class DistributedQueue<T extends Serializable>
                     }
                     throw new IllegalStateException(responsePayload.error());
                 }
-                return responsePayload.body();
+                return (Object) responsePayload.body();
             } catch (Exception e) {
                 if (attempts >= 3) {
                     throw e;
@@ -317,7 +327,7 @@ public final class DistributedQueue<T extends Serializable>
     }
 
     @SuppressWarnings("unchecked")
-    private Serializable executeLocal(String command, Serializable body, NodeId requestingNode) {
+    private Object executeLocal(String command, Object body, NodeId requestingNode) {
         if (queueOfferCommand.equals(command)) {
             recordQueueOffer();
             if (body instanceof OfferPayload<?>) {
@@ -341,7 +351,7 @@ public final class DistributedQueue<T extends Serializable>
             return SerializableOptional.empty();
         }
         if (queuePeekCommand.equals(command)) {
-            return (Serializable) queueService.peek()
+            return (Object) queueService.peek()
                     .map(SerializableOptional::of)
                     .orElseGet(SerializableOptional::empty);
         }
@@ -414,7 +424,7 @@ public final class DistributedQueue<T extends Serializable>
             responsePayload = new ClientResponsePayload(payload.requestId(), false, null, "Not the leader");
         } else {
             try {
-                Serializable result = executeLocal(payload.command(), payload.body(), message.source());
+                Object result = executeLocal(payload.command(), payload.body(), message.source());
                 if (queuePollCommand.equals(payload.command())) {
                     subscribers.add(message.source());
                 }

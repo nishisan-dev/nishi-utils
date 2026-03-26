@@ -7,7 +7,7 @@ import java.io.Serializable;
  *
  * @param <T> the payload type
  */
-public class PayloadWrapper<T extends Serializable> {
+public class PayloadWrapper<T> {
     private T payload;
     private long seq;
 

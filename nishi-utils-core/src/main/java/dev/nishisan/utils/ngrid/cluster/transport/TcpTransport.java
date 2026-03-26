@@ -23,13 +23,15 @@ import dev.nishisan.utils.ngrid.common.MessageType;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.ngrid.common.PeerUpdatePayload;
+import dev.nishisan.utils.ngrid.cluster.transport.codec.CompositeMessageCodec;
+import dev.nishisan.utils.ngrid.cluster.transport.codec.MessageCodec;
 import dev.nishisan.utils.stats.StatsUtils;
 
 import java.io.Closeable;
 import java.io.EOFException;
 import java.io.IOException;
-import java.io.ObjectInputStream;
-import java.io.ObjectOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -84,6 +86,8 @@ public final class TcpTransport implements Transport {
         return t;
     });
 
+    private final MessageCodec codec = new CompositeMessageCodec();
+
     private volatile boolean running;
     private ServerSocket serverSocket;
 
@@ -124,8 +128,9 @@ public final class TcpTransport implements Transport {
                 config.reconnectInterval().toMillis(),
                 config.reconnectInterval().toMillis(),
                 TimeUnit.MILLISECONDS);
-        // Opportunistic probe for promoted routes (every 3s)
-        scheduler.scheduleAtFixedRate(this::probeLoop, 3_000, 3_000, TimeUnit.MILLISECONDS);
+        // Opportunistic probe for promoted routes
+        long probeMs = config.routeProbeInterval().toMillis();
+        scheduler.scheduleAtFixedRate(this::probeLoop, probeMs, probeMs, TimeUnit.MILLISECONDS);
         // attempt initial outbound connections
         config.initialPeers().forEach(this::ensureConnectionAsync);
     }
@@ -154,19 +159,9 @@ public final class TcpTransport implements Transport {
     public void broadcast(ClusterMessage message) {
         for (NodeId nodeId : knownPeers.keySet()) {
             if (!nodeId.equals(config.local().nodeId())) {
-                send(messageForPeer(message, nodeId));
+                send(message.withDestination(nodeId));
             }
         }
-    }
-
-    private ClusterMessage messageForPeer(ClusterMessage original, NodeId destination) {
-        return new ClusterMessage(UUID.randomUUID(),
-                original.correlationId().orElse(null),
-                original.type(),
-                original.qualifier(),
-                original.source(),
-                destination,
-                original.payload());
     }
 
     @Override
@@ -429,7 +424,7 @@ public final class TcpTransport implements Transport {
 
     private Connection registerConnection(Socket socket, NodeInfo preResolved) throws IOException {
         socket.setTcpNoDelay(true);
-        Connection connection = new Connection(socket, preResolved != null);
+        Connection connection = new Connection(socket, preResolved != null, codec);
         if (preResolved != null) {
             connection.setRemote(preResolved);
             connections.put(preResolved.nodeId(), connection);
@@ -700,19 +695,21 @@ public final class TcpTransport implements Transport {
 
     private final class Connection implements Closeable {
         private final Socket socket;
-        private final ObjectOutputStream outputStream;
-        private final ObjectInputStream inputStream;
+        private final DataOutputStream outputStream;
+        private final DataInputStream inputStream;
+        private final MessageCodec codec;
         private final LinkedBlockingQueue<ClusterMessage> outbound = new LinkedBlockingQueue<>();
         private final boolean outboundInitiated;
         private volatile NodeInfo remote;
         private volatile boolean open = true;
 
-        private Connection(Socket socket, boolean outboundInitiated) throws IOException {
+        private Connection(Socket socket, boolean outboundInitiated, MessageCodec codec) throws IOException {
             this.socket = socket;
             this.outboundInitiated = outboundInitiated;
-            this.outputStream = new ObjectOutputStream(socket.getOutputStream());
+            this.codec = codec;
+            this.outputStream = new DataOutputStream(socket.getOutputStream());
             this.outputStream.flush();
-            this.inputStream = new ObjectInputStream(socket.getInputStream());
+            this.inputStream = new DataInputStream(socket.getInputStream());
             // Use Virtual Thread for writing (one per connection to ensure order)
             Thread.ofVirtual().name("ngrid-transport-writer").start(this::drainOutbound);
         }
@@ -744,7 +741,9 @@ public final class TcpTransport implements Transport {
                         continue; // timeout — recheck isOpen()
                     }
                     synchronized (outputStream) {
-                        outputStream.writeObject(message);
+                        byte[] data = codec.encode(message);
+                        outputStream.writeInt(data.length);
+                        outputStream.write(data);
                         outputStream.flush();
                     }
                 }
@@ -761,7 +760,15 @@ public final class TcpTransport implements Transport {
         void readLoop() {
             try {
                 while (isOpen()) {
-                    ClusterMessage message = (ClusterMessage) inputStream.readObject();
+                    int length = inputStream.readInt();
+                    if (length <= 0 || length > 64 * 1024 * 1024) { // 64 MB sanity limit
+                        throw new IOException("Invalid frame length: " + length);
+                    }
+                    byte[] data = inputStream.readNBytes(length);
+                    if (data.length < length) {
+                        throw new EOFException("Unexpected end of stream reading frame");
+                    }
+                    ClusterMessage message = codec.decode(data);
                     if (message.type() == MessageType.HANDSHAKE) {
                         handleHandshake(this, message);
                     } else {

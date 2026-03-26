@@ -17,8 +17,6 @@
 
 package dev.nishisan.utils.ngrid.common;
 
-import java.io.Serializable;
-
 /**
  * Payload for requesting missing replication sequences from the leader.
  *
@@ -29,5 +27,5 @@ import java.io.Serializable;
 public record SequenceResendRequestPayload(
                 String topic,
                 long fromSequence,
-                long toSequence) implements Serializable {
+                long toSequence) {
 }

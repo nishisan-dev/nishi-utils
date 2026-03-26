@@ -17,25 +17,30 @@
 
 package dev.nishisan.utils.ngrid.map;
 
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.annotation.JsonTypeInfo;
 import dev.nishisan.utils.map.NMapOperationType;
 
-import java.io.Serial;
-import java.io.Serializable;
 import java.util.Objects;
 
 /**
  * Serializable replication command for distributed map operations.
  * Uses {@link NMapOperationType} to indicate the operation type.
  */
-public final class MapReplicationCommand implements Serializable {
-    @Serial
-    private static final long serialVersionUID = 1L;
+public final class MapReplicationCommand  {
 
     private final NMapOperationType type;
-    private final Serializable key;
-    private final Serializable value;
+    @JsonTypeInfo(use = JsonTypeInfo.Id.CLASS)
+    private final Object key;
+    @JsonTypeInfo(use = JsonTypeInfo.Id.CLASS)
+    private final Object value;
 
-    private MapReplicationCommand(NMapOperationType type, Serializable key, Serializable value) {
+    @JsonCreator
+    private MapReplicationCommand(
+            @JsonProperty("type") NMapOperationType type,
+            @JsonProperty("key") Object key,
+            @JsonProperty("value") Object value) {
         this.type = Objects.requireNonNull(type, "type");
         this.key = Objects.requireNonNull(key, "key");
         this.value = value;
@@ -48,7 +53,7 @@ public final class MapReplicationCommand implements Serializable {
      * @param value the value
      * @return the command
      */
-    public static MapReplicationCommand put(Serializable key, Serializable value) {
+    public static MapReplicationCommand put(Object key, Object value) {
         return new MapReplicationCommand(NMapOperationType.PUT, key, value);
     }
 
@@ -58,7 +63,7 @@ public final class MapReplicationCommand implements Serializable {
      * @param key the key
      * @return the command
      */
-    public static MapReplicationCommand remove(Serializable key) {
+    public static MapReplicationCommand remove(Object key) {
         return new MapReplicationCommand(NMapOperationType.REMOVE, key, null);
     }
 
@@ -76,7 +81,7 @@ public final class MapReplicationCommand implements Serializable {
      * 
      * @return the key
      */
-    public Serializable key() {
+    public Object key() {
         return key;
     }
 
@@ -85,7 +90,7 @@ public final class MapReplicationCommand implements Serializable {
      * 
      * @return the value
      */
-    public Serializable value() {
+    public Object value() {
         return value;
     }
 }

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%-5level [%logger{20}] %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- Suppress verbose NGrid cluster/transport logs during tests -->
+    <logger name="dev.nishisan.utils.ngrid" level="WARN"/>
+    <logger name="dev.nishisan.utils.ngrid.cluster" level="WARN"/>
+    <logger name="dev.nishisan.utils.ngrid.replication" level="WARN"/>
+    <logger name="dev.nishisan.utils.ngrid.queue" level="WARN"/>
+    <logger name="dev.nishisan.utils.ngrid.map" level="WARN"/>
+    <logger name="dev.nishisan.utils.ngrid.metrics" level="WARN"/>
+    <logger name="dev.nishisan.utils.ngrid.debug" level="WARN"/>
+
+    <!-- Suppress Spring Boot auto-configuration noise -->
+    <logger name="org.springframework" level="WARN"/>
+
+    <!-- Root: only WARN and above -->
+    <root level="WARN">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+
+</configuration>

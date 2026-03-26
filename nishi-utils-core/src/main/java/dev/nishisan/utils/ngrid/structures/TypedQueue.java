@@ -43,7 +43,7 @@ import java.util.Objects;
  * @param <T> the type of items in the queue
  * @since 2.1.0
  */
-public interface TypedQueue<T extends Serializable> {
+public interface TypedQueue<T> {
     /**
      * Returns the queue name.
      */
@@ -62,7 +62,7 @@ public interface TypedQueue<T extends Serializable> {
      * @param <T>  the item type
      * @return a new typed queue descriptor
      */
-    static <T extends Serializable> TypedQueue<T> of(String name, Class<T> type) {
+    static <T> TypedQueue<T> of(String name, Class<T> type) {
         return new TypedQueueImpl<>(name, type);
     }
 }
@@ -70,7 +70,7 @@ public interface TypedQueue<T extends Serializable> {
 /**
  * Implementation of TypedQueue.
  */
-final class TypedQueueImpl<T extends Serializable> implements TypedQueue<T> {
+final class TypedQueueImpl<T> implements TypedQueue<T> {
     private final String name;
     private final Class<T> type;
 

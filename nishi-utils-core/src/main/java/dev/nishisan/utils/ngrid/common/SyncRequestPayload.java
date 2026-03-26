@@ -17,30 +17,33 @@
 
 package dev.nishisan.utils.ngrid.common;
 
-import java.io.Serial;
-import java.io.Serializable;
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+
 import java.util.Objects;
 
 /**
  * Request for state synchronization.
  */
-public final class SyncRequestPayload implements Serializable {
-    @Serial
-    private static final long serialVersionUID = 1L;
+public final class SyncRequestPayload {
 
     private final String topic;
     private final int chunkIndex;
     private final boolean allowFollowerResponse;
 
     public SyncRequestPayload(String topic) {
-        this(topic, 0);
+        this(topic, 0, false);
     }
 
     public SyncRequestPayload(String topic, int chunkIndex) {
         this(topic, chunkIndex, false);
     }
 
-    public SyncRequestPayload(String topic, int chunkIndex, boolean allowFollowerResponse) {
+    @JsonCreator
+    public SyncRequestPayload(
+            @JsonProperty("topic") String topic,
+            @JsonProperty("chunkIndex") int chunkIndex,
+            @JsonProperty("allowFollowerResponse") boolean allowFollowerResponse) {
         this.topic = Objects.requireNonNull(topic, "topic");
         this.chunkIndex = chunkIndex;
         this.allowFollowerResponse = allowFollowerResponse;

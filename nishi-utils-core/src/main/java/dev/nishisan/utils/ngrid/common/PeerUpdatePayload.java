@@ -17,8 +17,9 @@
 
 package dev.nishisan.utils.ngrid.common;
 
-import java.io.Serial;
-import java.io.Serializable;
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -27,20 +28,17 @@ import java.util.Objects;
 import java.util.Set;
 
 /**
- * Broadcasts the known peers of a node so that a full mesh can be approximated over time.
+ * Payload for broadcasting updated peer lists across the cluster.
  */
-public final class PeerUpdatePayload implements Serializable {
-    @Serial
-    private static final long serialVersionUID = 2L;
+public final class PeerUpdatePayload {
 
     private final Set<NodeInfo> peers;
     private final Map<NodeId, Double> latencies;
 
-    public PeerUpdatePayload(Set<NodeInfo> peers) {
-        this(peers, Collections.emptyMap());
-    }
-
-    public PeerUpdatePayload(Set<NodeInfo> peers, Map<NodeId, Double> latencies) {
+    @JsonCreator
+    public PeerUpdatePayload(
+            @JsonProperty("peers") Set<NodeInfo> peers,
+            @JsonProperty("latencies") Map<NodeId, Double> latencies) {
         this.peers = Collections.unmodifiableSet(new HashSet<>(Objects.requireNonNull(peers, "peers")));
         this.latencies = Collections.unmodifiableMap(new HashMap<>(Objects.requireNonNull(latencies, "latencies")));
     }

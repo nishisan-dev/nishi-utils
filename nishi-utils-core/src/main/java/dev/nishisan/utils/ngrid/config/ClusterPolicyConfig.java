@@ -2,16 +2,15 @@ package dev.nishisan.utils.ngrid.config;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import java.io.Serial;
-import java.io.Serializable;
+
 import java.util.List;
 
 /**
  * Configuration for the cluster policy, deserialized from YAML/JSON.
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
-public class ClusterPolicyConfig implements Serializable {
+public class ClusterPolicyConfig  {
     @Serial
-    private static final long serialVersionUID = 1L;
 
     private String name;
     private ReplicationConfig replication;
@@ -117,9 +116,8 @@ public class ClusterPolicyConfig implements Serializable {
      * Configuration for a seed node.
      */
     @JsonIgnoreProperties(ignoreUnknown = true)
-    public static class SeedNodeConfig implements Serializable {
+    public static class SeedNodeConfig  {
         @Serial
-        private static final long serialVersionUID = 1L;
 
         private String id;
         private String host;
@@ -188,9 +186,8 @@ public class ClusterPolicyConfig implements Serializable {
      * Replication configuration.
      */
     @JsonIgnoreProperties(ignoreUnknown = true)
-    public static class ReplicationConfig implements Serializable {
+    public static class ReplicationConfig  {
         @Serial
-        private static final long serialVersionUID = 1L;
         private int factor = 1;
         private boolean strict = false;
 
@@ -239,9 +236,8 @@ public class ClusterPolicyConfig implements Serializable {
      * Transport configuration.
      */
     @JsonIgnoreProperties(ignoreUnknown = true)
-    public static class TransportConfig implements Serializable {
+    public static class TransportConfig  {
         @Serial
-        private static final long serialVersionUID = 1L;
         private int workers = 2;
 
         /** Creates a default transport config. */

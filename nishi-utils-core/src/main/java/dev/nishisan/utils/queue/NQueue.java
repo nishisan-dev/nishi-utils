@@ -141,7 +141,7 @@ import java.util.concurrent.locks.ReentrantLock;
  *
  * @param <T> Serializable element type stored and retrieved in FIFO order.
  */
-public class NQueue<T extends Serializable> implements Closeable {
+public class NQueue<T> implements Closeable {
     private static final String DATA_FILE = "data.log";
     private static final String META_FILE = "queue.meta";
     /**
@@ -309,7 +309,7 @@ public class NQueue<T extends Serializable> implements Closeable {
      * @throws IOException if the storage cannot be prepared or state cannot be
      *                     recovered
      */
-    public static <T extends Serializable> NQueue<T> open(Path baseDir, String queueName) throws IOException {
+    public static <T> NQueue<T> open(Path baseDir, String queueName) throws IOException {
         return open(baseDir, queueName, Options.defaults());
     }
 
@@ -327,7 +327,7 @@ public class NQueue<T extends Serializable> implements Closeable {
      * @throws IOException if the storage cannot be prepared or state cannot be
      *                     recovered
      */
-    public static <T extends Serializable> NQueue<T> open(Path baseDir, String queueName, Options options)
+    public static <T> NQueue<T> open(Path baseDir, String queueName, Options options)
             throws IOException {
         Objects.requireNonNull(baseDir);
         Objects.requireNonNull(queueName);

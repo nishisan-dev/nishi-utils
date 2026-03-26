@@ -17,57 +17,38 @@
 
 package dev.nishisan.utils.ngrid.common;
 
-import java.io.Serial;
-import java.io.Serializable;
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+
 import java.util.Objects;
 
 /**
  * Payload suggesting a leader change based on observed metrics.
  */
-public final class LeaderSuggestionPayload implements Serializable {
-    @Serial
-    private static final long serialVersionUID = 1L;
+public final class LeaderSuggestionPayload {
 
     private final NodeId leaderId;
     private final double writeRate;
     private final long epochMilli;
 
-    /**
-     * Creates a leader suggestion payload.
-     *
-     * @param leaderId   the suggested leader ID
-     * @param writeRate  the write rate
-     * @param epochMilli the timestamp
-     */
-    public LeaderSuggestionPayload(NodeId leaderId, double writeRate, long epochMilli) {
+    @JsonCreator
+    public LeaderSuggestionPayload(
+            @JsonProperty("leaderId") NodeId leaderId,
+            @JsonProperty("writeRate") double writeRate,
+            @JsonProperty("epochMilli") long epochMilli) {
         this.leaderId = Objects.requireNonNull(leaderId, "leaderId");
         this.writeRate = writeRate;
         this.epochMilli = epochMilli;
     }
 
-    /**
-     * Returns the suggested leader ID.
-     *
-     * @return the leader ID
-     */
     public NodeId leaderId() {
         return leaderId;
     }
 
-    /**
-     * Returns the write rate.
-     *
-     * @return the write rate
-     */
     public double writeRate() {
         return writeRate;
     }
 
-    /**
-     * Returns the timestamp.
-     *
-     * @return the epoch millis
-     */
     public long epochMilli() {
         return epochMilli;
     }

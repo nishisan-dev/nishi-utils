@@ -35,6 +35,7 @@ public final class TcpTransportConfig {
     private final Duration reconnectInterval;
     private final Duration requestTimeout;
     private final int workerThreads;
+    private final Duration routeProbeInterval;
 
     private TcpTransportConfig(Builder builder) {
         this.local = builder.local;
@@ -43,6 +44,7 @@ public final class TcpTransportConfig {
         this.reconnectInterval = builder.reconnectInterval;
         this.requestTimeout = builder.requestTimeout;
         this.workerThreads = builder.workerThreads;
+        this.routeProbeInterval = builder.routeProbeInterval;
     }
 
     public NodeInfo local() {
@@ -76,6 +78,16 @@ public final class TcpTransportConfig {
         return workerThreads;
     }
 
+    /**
+     * Interval for probing proxy routes to check if a direct connection can be
+     * re-established. Defaults to 10 seconds.
+     *
+     * @since 3.6.0
+     */
+    public Duration routeProbeInterval() {
+        return routeProbeInterval;
+    }
+
     public static Builder builder(NodeInfo local) {
         return new Builder(local);
     }
@@ -87,6 +99,7 @@ public final class TcpTransportConfig {
         private Duration reconnectInterval = Duration.ofSeconds(3);
         private Duration requestTimeout = Duration.ofSeconds(20);
         private int workerThreads = Math.max(4, Runtime.getRuntime().availableProcessors());
+        private Duration routeProbeInterval = Duration.ofSeconds(10);
 
         private Builder(NodeInfo local) {
             this.local = Objects.requireNonNull(local, "local");
@@ -111,6 +124,16 @@ public final class TcpTransportConfig {
 
         public Builder requestTimeout(Duration timeout) {
             this.requestTimeout = Objects.requireNonNull(timeout, "timeout");
+            return this;
+        }
+
+        /**
+         * Sets the interval for probing proxy routes.
+         *
+         * @since 3.6.0
+         */
+        public Builder routeProbeInterval(Duration interval) {
+            this.routeProbeInterval = Objects.requireNonNull(interval, "interval");
             return this;
         }
 

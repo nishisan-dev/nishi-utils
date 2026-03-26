@@ -17,14 +17,15 @@
 
 package dev.nishisan.utils.ngrid.structures;
 
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.annotation.JsonTypeInfo;
 import dev.nishisan.utils.queue.NQueueHeaders;
 
-import java.io.Serial;
-import java.io.Serializable;
 import java.util.Objects;
 
 /**
- * Serializable envelope that carries the routing key, headers, and value
+ * Envelope that carries the routing key, headers, and value
  * when a follower forwards an {@code offer} to the cluster leader.
  * <p>
  * Without this wrapper the follower path in {@link DistributedQueue#offer}
@@ -32,22 +33,19 @@ import java.util.Objects;
  *
  * @param <T> the queue element type
  */
-public final class OfferPayload<T extends Serializable> implements Serializable {
-    @Serial
-    private static final long serialVersionUID = 1L;
+public final class OfferPayload<T> {
 
     private final byte[] key;
     private final NQueueHeaders headers;
+
+    @JsonTypeInfo(use = JsonTypeInfo.Id.CLASS)
     private final T value;
 
-    /**
-     * Creates a new offer payload.
-     *
-     * @param key     optional routing/partitioning key ({@code null} = absent)
-     * @param headers record headers; must not be {@code null}
-     * @param value   the element to offer; must not be {@code null}
-     */
-    public OfferPayload(byte[] key, NQueueHeaders headers, T value) {
+    @JsonCreator
+    public OfferPayload(
+            @JsonProperty("key") byte[] key,
+            @JsonProperty("headers") NQueueHeaders headers,
+            @JsonProperty("value") T value) {
         this.key = key;
         this.headers = Objects.requireNonNull(headers, "headers");
         this.value = Objects.requireNonNull(value, "value");

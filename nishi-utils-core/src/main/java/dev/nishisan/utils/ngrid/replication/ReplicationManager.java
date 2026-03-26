@@ -317,11 +317,11 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         return config.operationTimeout();
     }
 
-    public CompletableFuture<ReplicationResult> replicate(String topic, Serializable payload) {
+    public CompletableFuture<ReplicationResult> replicate(String topic, Object payload) {
         return replicate(topic, payload, null);
     }
 
-    public CompletableFuture<ReplicationResult> replicate(String topic, Serializable payload, Integer quorumOverride) {
+    public CompletableFuture<ReplicationResult> replicate(String topic, Object payload, Integer quorumOverride) {
         if (!coordinator.isLeader()) {
             throw new IllegalStateException("Replication can only be initiated by the leader");
         }
@@ -1370,7 +1370,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
     private static final class PendingOperation {
         private final UUID operationId;
         private final String topic;
-        private final Serializable payload;
+        private final Object payload;
         private final long epoch;
         private final int originalQuorum;
         private volatile int quorum;
@@ -1384,7 +1384,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         private final java.util.concurrent.atomic.AtomicBoolean localApplyStarted = new java.util.concurrent.atomic.AtomicBoolean(
                 false);
 
-        private PendingOperation(UUID operationId, String topic, Serializable payload, long epoch, int quorum) {
+        private PendingOperation(UUID operationId, String topic, Object payload, long epoch, int quorum) {
             this.operationId = operationId;
             this.topic = topic;
             this.payload = payload;

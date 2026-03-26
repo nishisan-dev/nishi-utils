@@ -19,20 +19,19 @@ package dev.nishisan.utils.ngrid.replication;
 
 import dev.nishisan.utils.ngrid.common.OperationStatus;
 
-import java.io.Serializable;
 import java.util.UUID;
 
 /**
  * Maintains the replicated history locally so that a node can recover operations after
  * a restart or a temporary disconnection.
  */
-public final class ReplicatedRecord implements Serializable {
+public final class ReplicatedRecord {
     private final UUID operationId;
     private final String topic;
-    private final Serializable payload;
+    private final Object payload;
     private volatile OperationStatus status;
 
-    public ReplicatedRecord(UUID operationId, String topic, Serializable payload, OperationStatus status) {
+    public ReplicatedRecord(UUID operationId, String topic, Object payload, OperationStatus status) {
         this.operationId = operationId;
         this.topic = topic;
         this.payload = payload;
@@ -47,7 +46,7 @@ public final class ReplicatedRecord implements Serializable {
         return topic;
     }
 
-    public Serializable payload() {
+    public Object payload() {
         return payload;
     }
 

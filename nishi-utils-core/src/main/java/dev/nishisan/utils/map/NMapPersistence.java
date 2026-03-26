@@ -59,7 +59,7 @@ import java.util.logging.Logger;
  * @param <K> the key type
  * @param <V> the value type
  */
-public final class NMapPersistence<K extends Serializable, V extends Serializable> implements Closeable {
+public final class NMapPersistence<K, V> implements Closeable {
     private static final Logger LOGGER = Logger.getLogger(NMapPersistence.class.getName());
 
     private static final String WAL_FILE = "wal.log";
@@ -185,7 +185,7 @@ public final class NMapPersistence<K extends Serializable, V extends Serializabl
      * @param key   the key
      * @param value the value (may be null for REMOVE)
      */
-    public void appendAsync(NMapOperationType type, Serializable key, Serializable value) {
+    public void appendAsync(NMapOperationType type, Object key, Object value) {
         if (config.mode() == NMapPersistenceMode.DISABLED) {
             return;
         }
@@ -202,7 +202,7 @@ public final class NMapPersistence<K extends Serializable, V extends Serializabl
      * @param key   the key
      * @param value the value (may be null for REMOVE)
      */
-    public void appendSync(NMapOperationType type, Serializable key, Serializable value) {
+    public void appendSync(NMapOperationType type, Object key, Object value) {
         if (config.mode() == NMapPersistenceMode.DISABLED) {
             return;
         }
@@ -482,9 +482,9 @@ public final class NMapPersistence<K extends Serializable, V extends Serializabl
                 throw new IOException("Invalid key length");
             }
             byte[] keyBytes = in.readNBytes(keyLen);
-            Serializable key = deserialize(keyBytes);
+            Object key = deserialize(keyBytes);
             int valueLen = in.readInt();
-            Serializable value = null;
+            Object value = null;
             if (valueLen > 0) {
                 if (valueLen > (64 * 1024 * 1024)) {
                     throw new IOException("Invalid value length");
@@ -530,7 +530,7 @@ public final class NMapPersistence<K extends Serializable, V extends Serializabl
         return framed;
     }
 
-    private static byte[] serialize(Serializable obj) throws IOException {
+    private static byte[] serialize(Object obj) throws IOException {
         try (ByteArrayOutputStream bos = new ByteArrayOutputStream();
                 ObjectOutputStream oos = new ObjectOutputStream(new BufferedOutputStream(bos))) {
             oos.writeObject(obj);
@@ -539,10 +539,10 @@ public final class NMapPersistence<K extends Serializable, V extends Serializabl
         }
     }
 
-    private static Serializable deserialize(byte[] bytes) throws IOException {
+    private static Object deserialize(byte[] bytes) throws IOException {
         try (ObjectInputStream ois = new ObjectInputStream(
                 new BufferedInputStream(new ByteArrayInputStream(bytes)))) {
-            return (Serializable) ois.readObject();
+            return ois.readObject();
         } catch (ClassNotFoundException e) {
             throw new IOException("Failed to deserialize WAL field", e);
         }

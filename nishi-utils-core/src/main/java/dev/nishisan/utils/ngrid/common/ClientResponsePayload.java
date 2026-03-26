@@ -17,71 +17,49 @@
 
 package dev.nishisan.utils.ngrid.common;
 
-import java.io.Serial;
-import java.io.Serializable;
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.annotation.JsonTypeInfo;
+
 import java.util.Objects;
 import java.util.UUID;
 
 /**
  * Response payload for RPC style commands executed by the leader.
  */
-public final class ClientResponsePayload implements Serializable {
-    @Serial
-    private static final long serialVersionUID = 1L;
+public final class ClientResponsePayload {
 
     private final UUID requestId;
     private final boolean success;
-    private final Serializable body;
+
+    @JsonTypeInfo(use = JsonTypeInfo.Id.CLASS)
+    private final Object body;
     private final String error;
 
-    /**
-     * Creates a new client response payload.
-     *
-     * @param requestId the original request identifier
-     * @param success   whether the command succeeded
-     * @param body      optional response body
-     * @param error     error message when {@code success} is {@code false},
-     *                  may be {@code null}
-     */
-    public ClientResponsePayload(UUID requestId, boolean success, Serializable body, String error) {
+    @JsonCreator
+    public ClientResponsePayload(
+            @JsonProperty("requestId") UUID requestId,
+            @JsonProperty("success") boolean success,
+            @JsonProperty("body") Object body,
+            @JsonProperty("error") String error) {
         this.requestId = Objects.requireNonNull(requestId, "requestId");
         this.success = success;
         this.body = body;
         this.error = error;
     }
 
-    /**
-     * Returns the original request identifier.
-     *
-     * @return the request ID
-     */
     public UUID requestId() {
         return requestId;
     }
 
-    /**
-     * Returns whether the command executed successfully.
-     *
-     * @return {@code true} if successful
-     */
     public boolean success() {
         return success;
     }
 
-    /**
-     * Returns the optional response body payload.
-     *
-     * @return the body, may be {@code null}
-     */
-    public Serializable body() {
+    public Object body() {
         return body;
     }
 
-    /**
-     * Returns the error message, if any.
-     *
-     * @return the error message, or {@code null} if successful
-     */
     public String error() {
         return error;
     }

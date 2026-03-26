@@ -17,25 +17,33 @@
 
 package dev.nishisan.utils.ngrid.common;
 
-import java.io.Serial;
-import java.io.Serializable;
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.annotation.JsonTypeInfo;
+
 import java.util.Objects;
 import java.util.UUID;
 
 /**
  * Encapsulates an operation that must be replicated across cluster members.
  */
-public final class ReplicationPayload implements Serializable {
-    @Serial
-    private static final long serialVersionUID = 3L;
+public final class ReplicationPayload {
 
     private final UUID operationId;
     private final long sequence;
     private final long epoch;
     private final String topic;
-    private final Serializable data;
 
-    public ReplicationPayload(UUID operationId, long sequence, long epoch, String topic, Serializable data) {
+    @JsonTypeInfo(use = JsonTypeInfo.Id.CLASS)
+    private final Object data;
+
+    @JsonCreator
+    public ReplicationPayload(
+            @JsonProperty("operationId") UUID operationId,
+            @JsonProperty("sequence") long sequence,
+            @JsonProperty("epoch") long epoch,
+            @JsonProperty("topic") String topic,
+            @JsonProperty("data") Object data) {
         this.operationId = Objects.requireNonNull(operationId, "operationId");
         this.sequence = sequence;
         this.epoch = epoch;
@@ -59,7 +67,7 @@ public final class ReplicationPayload implements Serializable {
         return topic;
     }
 
-    public Serializable data() {
+    public Object data() {
         return data;
     }
 }

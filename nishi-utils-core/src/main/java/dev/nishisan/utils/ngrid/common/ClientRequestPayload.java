@@ -17,59 +17,43 @@
 
 package dev.nishisan.utils.ngrid.common;
 
-import java.io.Serial;
-import java.io.Serializable;
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.annotation.JsonTypeInfo;
+
 import java.util.Objects;
 import java.util.UUID;
 
 /**
  * Simple RPC style payload for client requests routed to the cluster leader.
  */
-public final class ClientRequestPayload implements Serializable {
-    @Serial
-    private static final long serialVersionUID = 1L;
+public final class ClientRequestPayload {
 
     private final UUID requestId;
     private final String command;
-    private final Serializable body;
 
-    /**
-     * Creates a new client request payload.
-     *
-     * @param requestId unique identifier for this request
-     * @param command   the command to execute on the leader
-     * @param body      optional serializable payload for the command
-     */
-    public ClientRequestPayload(UUID requestId, String command, Serializable body) {
+    @JsonTypeInfo(use = JsonTypeInfo.Id.CLASS)
+    private final Object body;
+
+    @JsonCreator
+    public ClientRequestPayload(
+            @JsonProperty("requestId") UUID requestId,
+            @JsonProperty("command") String command,
+            @JsonProperty("body") Object body) {
         this.requestId = Objects.requireNonNull(requestId, "requestId");
         this.command = Objects.requireNonNull(command, "command");
         this.body = body;
     }
 
-    /**
-     * Returns the unique request identifier.
-     *
-     * @return the request ID
-     */
     public UUID requestId() {
         return requestId;
     }
 
-    /**
-     * Returns the command name to be executed.
-     *
-     * @return the command
-     */
     public String command() {
         return command;
     }
 
-    /**
-     * Returns the optional request body payload.
-     *
-     * @return the body, may be {@code null}
-     */
-    public Serializable body() {
+    public Object body() {
         return body;
     }
 }

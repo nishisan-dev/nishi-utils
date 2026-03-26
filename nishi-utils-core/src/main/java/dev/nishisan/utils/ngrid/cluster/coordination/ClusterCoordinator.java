@@ -211,9 +211,10 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 0,
                 config.heartbeatInterval().toMillis(),
                 TimeUnit.MILLISECONDS);
+        long evictionIntervalMs = config.heartbeatInterval().toMillis() * 2;
         scheduler.scheduleAtFixedRate(this::evictDeadMembers,
-                config.heartbeatInterval().toMillis(),
-                config.heartbeatInterval().toMillis(),
+                evictionIntervalMs,
+                evictionIntervalMs,
                 TimeUnit.MILLISECONDS);
         recomputeLeader();
     }
@@ -459,7 +460,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 return;
             }
             HeartbeatPayload payload = HeartbeatPayload.now(leaderHighWatermarkSupplier.getAsLong(), leaderEpoch.get());
-            ClusterMessage heartbeat = ClusterMessage.request(MessageType.HEARTBEAT,
+            ClusterMessage heartbeat = ClusterMessage.lightweight(MessageType.HEARTBEAT,
                     "hb",
                     transport.local().nodeId(),
                     null,
@@ -593,20 +594,21 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         NodeId previous = leader.getAndSet(newLeaderId);
         if (!Objects.equals(previous, newLeaderId)) {
             // Increment epoch on leader change
-            if (newLeaderId != null && newLeaderId.equals(transport.local().nodeId())) {
+            NodeId localNodeId = transport.local().nodeId();
+            boolean wasLeader = previous != null && previous.equals(localNodeId);
+            boolean isNowLeader = newLeaderId != null && newLeaderId.equals(localNodeId);
+            if (isNowLeader || wasLeader) {
                 long newEpoch = leaderEpoch.incrementAndGet();
                 persistEpoch(newEpoch);
-                LOGGER.info(() -> "New leader epoch: " + newEpoch);
+                LOGGER.info(() -> "Leader epoch changed: " + newEpoch
+                        + (isNowLeader ? " (elected)" : " (stepped down)"));
             }
 
             leadershipListeners.forEach(listener -> listener.onLeaderChanged(newLeaderId));
 
             // Notify LeaderElectionListener if local node's leadership status changed
-            NodeId localNodeId = transport.local().nodeId();
-            boolean wasLeader = previous != null && previous.equals(localNodeId);
-            boolean isLeader = newLeaderId != null && newLeaderId.equals(localNodeId);
-            if (wasLeader != isLeader) {
-                leaderElectionListeners.forEach(listener -> listener.onLeadershipChanged(isLeader, newLeaderId));
+            if (wasLeader != isNowLeader) {
+                leaderElectionListeners.forEach(listener -> listener.onLeadershipChanged(isNowLeader, newLeaderId));
             }
         }
     }
@@ -696,9 +698,19 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 trackedLeaderHighWatermark = payload.leaderHighWatermark();
                 trackedLeaderEpoch = payload.leaderEpoch();
             }
-            members.computeIfAbsent(source,
-                    id -> new ClusterMember(findPeerInfo(source).orElseGet(() -> new NodeInfo(source, "", 0)))).touch();
-            recomputeLeader();
+            boolean[] isNewMember = {false};
+            members.compute(source, (id, existing) -> {
+                if (existing != null) {
+                    existing.touch();
+                    return existing;
+                }
+                isNewMember[0] = true;
+                return new ClusterMember(
+                        findPeerInfo(source).orElseGet(() -> new NodeInfo(source, "", 0)));
+            });
+            if (isNewMember[0]) {
+                recomputeLeader();
+            }
         }
     }
 

@@ -3,12 +3,11 @@ package dev.nishisan.utils.ngrid.config;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import java.io.Serial;
-import java.io.Serializable;
+
 
 @JsonIgnoreProperties(ignoreUnknown = true)
-public class QueuePolicyConfig implements Serializable {
+public class QueuePolicyConfig  {
     @Serial
-    private static final long serialVersionUID = 1L;
     
     private String name; // queue-name in storage section from example, moved here for clarity or keep in root?
                          // The example had storage -> queue-name. Let's assume it's part of policy for now or global.
@@ -51,9 +50,8 @@ public class QueuePolicyConfig implements Serializable {
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
-    public static class RetentionConfig implements Serializable {
+    public static class RetentionConfig  {
         @Serial
-        private static final long serialVersionUID = 1L;
         private String policy; // TIME_BASED
         private String duration; // "24h"
 
@@ -75,9 +73,8 @@ public class QueuePolicyConfig implements Serializable {
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
-    public static class PerformanceConfig implements Serializable {
+    public static class PerformanceConfig  {
         @Serial
-        private static final long serialVersionUID = 1L;
         private boolean fsync;
         @JsonProperty("memory-buffer")
         private MemoryBufferConfig memoryBuffer;
@@ -110,9 +107,8 @@ public class QueuePolicyConfig implements Serializable {
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
-    public static class MemoryBufferConfig implements Serializable {
+    public static class MemoryBufferConfig  {
         @Serial
-        private static final long serialVersionUID = 1L;
         private boolean enabled;
         private int size;
 
@@ -134,9 +130,8 @@ public class QueuePolicyConfig implements Serializable {
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
-    public static class CompactionConfig implements Serializable {
+    public static class CompactionConfig  {
         @Serial
-        private static final long serialVersionUID = 1L;
         private double threshold;
         private String interval;
 

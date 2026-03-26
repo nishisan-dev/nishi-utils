@@ -304,8 +304,8 @@ public final class NGridConfig {
         private int replicationQuorum = 2;
         private Integer replicationFactor;
         private Duration replicationOperationTimeout;
-        private Duration rttProbeInterval = Duration.ofSeconds(2);
-        private Duration heartbeatInterval = Duration.ofSeconds(1);
+        private Duration rttProbeInterval = Duration.ofSeconds(10);
+        private Duration heartbeatInterval = Duration.ofSeconds(3);
         private Duration leaseTimeout;
         private boolean leaderReelectionEnabled = false;
         private Duration leaderReelectionInterval = Duration.ofSeconds(5);

@@ -34,7 +34,7 @@ import java.util.function.BiConsumer;
  * @param <K> the key type (must be {@link Serializable})
  * @param <V> the value type (must be {@link Serializable})
  */
-public interface NMapOffloadStrategy<K extends Serializable, V extends Serializable> extends Closeable {
+public interface NMapOffloadStrategy<K, V> extends Closeable {
 
     /**
      * Returns the value associated with the given key, or {@code null} if absent.

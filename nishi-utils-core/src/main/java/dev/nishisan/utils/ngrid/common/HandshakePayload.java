@@ -17,8 +17,9 @@
 
 package dev.nishisan.utils.ngrid.common;
 
-import java.io.Serial;
-import java.io.Serializable;
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -28,12 +29,9 @@ import java.util.Set;
 
 /**
  * Payload exchanged during the initial handshake containing local node metadata
- * and the
- * peer list currently known by the sender.
+ * and the peer list currently known by the sender.
  */
-public final class HandshakePayload implements Serializable {
-    @Serial
-    private static final long serialVersionUID = 2L;
+public final class HandshakePayload {
 
     private final NodeInfo local;
     private final Set<NodeInfo> peers;
@@ -56,35 +54,24 @@ public final class HandshakePayload implements Serializable {
      * @param peers     the set of known peers
      * @param latencies measured latencies to known peers
      */
-    public HandshakePayload(NodeInfo local, Set<NodeInfo> peers, Map<NodeId, Double> latencies) {
+    @JsonCreator
+    public HandshakePayload(
+            @JsonProperty("local") NodeInfo local,
+            @JsonProperty("peers") Set<NodeInfo> peers,
+            @JsonProperty("latencies") Map<NodeId, Double> latencies) {
         this.local = Objects.requireNonNull(local, "local");
         this.peers = Collections.unmodifiableSet(new HashSet<>(Objects.requireNonNull(peers, "peers")));
         this.latencies = Collections.unmodifiableMap(new HashMap<>(Objects.requireNonNull(latencies, "latencies")));
     }
 
-    /**
-     * Returns the local node information.
-     *
-     * @return the local node info
-     */
     public NodeInfo local() {
         return local;
     }
 
-    /**
-     * Returns the set of known peers.
-     *
-     * @return the peers
-     */
     public Set<NodeInfo> peers() {
         return peers;
     }
 
-    /**
-     * Returns the latency map.
-     *
-     * @return the latencies
-     */
     public Map<NodeId, Double> latencies() {
         return latencies;
     }

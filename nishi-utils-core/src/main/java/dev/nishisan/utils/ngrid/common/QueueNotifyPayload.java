@@ -1,16 +1,16 @@
 package dev.nishisan.utils.ngrid.common;
 
-import java.io.Serial;
-import java.io.Serializable;
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+
 import java.util.Objects;
 
-public final class QueueNotifyPayload implements Serializable {
-    @Serial
-    private static final long serialVersionUID = 1L;
+public final class QueueNotifyPayload {
 
     private final String queueName;
 
-    public QueueNotifyPayload(String queueName) {
+    @JsonCreator
+    public QueueNotifyPayload(@JsonProperty("queueName") String queueName) {
         this.queueName = Objects.requireNonNull(queueName, "queueName");
     }
 

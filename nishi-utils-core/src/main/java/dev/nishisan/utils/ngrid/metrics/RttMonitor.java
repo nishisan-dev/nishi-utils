@@ -30,9 +30,11 @@ import dev.nishisan.utils.stats.StatsUtils;
 import java.io.Closeable;
 import java.time.Duration;
 import java.util.Objects;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Periodically measures round-trip time to peers using lightweight ping messages.
@@ -43,6 +45,7 @@ public final class RttMonitor implements TransportListener, Closeable {
     private final StatsUtils stats;
     private final ScheduledExecutorService scheduler;
     private final Duration interval;
+    private final AtomicLong pingCounter = new AtomicLong();
     private volatile boolean running;
 
     public RttMonitor(Transport transport,
@@ -94,13 +97,28 @@ public final class RttMonitor implements TransportListener, Closeable {
         }
     }
 
+    /**
+     * Generates a deterministic UUID for PING messages using a monotonic counter.
+     * Avoids the CPU cost of {@link UUID#randomUUID()} and SecureRandom entropy
+     * while maintaining uniqueness within this node for request-response correlation.
+     *
+     * @return a new deterministic UUID based on the counter value
+     */
+    private UUID nextPingId() {
+        return new UUID(0, pingCounter.incrementAndGet());
+    }
+
     private void sendPing(NodeId nodeId) {
         long start = System.nanoTime();
-        ClusterMessage request = ClusterMessage.request(MessageType.PING,
+        ClusterMessage request = new ClusterMessage(
+                nextPingId(),
+                null,
+                MessageType.PING,
                 "rtt",
                 transport.local().nodeId(),
                 nodeId,
-                HeartbeatPayload.now());
+                HeartbeatPayload.now(),
+                1);
         CompletableFuture<ClusterMessage> future = transport.sendAndAwait(request);
         future.whenComplete((response, error) -> {
             if (error != null) {
