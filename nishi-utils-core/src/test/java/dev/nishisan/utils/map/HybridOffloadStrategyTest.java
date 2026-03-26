@@ -131,14 +131,11 @@ class HybridOffloadStrategyTest {
         int coldBefore = strategy.coldSize();
         assertTrue(coldBefore > 0, "Should have cold entries");
 
-        // Pick a cold entry and get it → should warm up
-        // Find a key that's actually cold
-        String coldKey = null;
+        // Warm-up: reading a cold entry promotes it back to hot.
+        // Since we can't peek without promoting, we verify the total
+        // invariant holds after reads.
         for (int i = 0; i < 32; i++) {
-            String candidate = "key-" + i;
-            // Reading it promotes it; we need to check if it WAS cold.
-            // Since we can't peek without promoting, we just verify
-            // the total invariant.
+            assertNotNull(strategy.get("key-" + i));
         }
 
         // Total should remain 32 regardless of warm-up/eviction
@@ -309,9 +306,9 @@ class HybridOffloadStrategyTest {
         // Get cold entry → CACHE_MISS + WARM_UP
         // Pick the first inserted key — most likely evicted
         strategy.get("key-0");
-        Long warmUp = stats.getCounterValueOrNull(NMapMetrics.WARM_UP);
         // warm-up may or may not occur depending on stripe distribution,
         // so we just verify no exception is thrown
+        stats.getCounterValueOrNull(NMapMetrics.WARM_UP);
 
         // Remove
         strategy.remove("key-1");
