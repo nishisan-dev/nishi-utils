@@ -130,8 +130,8 @@ public final class MapClusterService<K, V>
         Objects.requireNonNull(key, "key");
         Objects.requireNonNull(value, "value");
         V previous = data.get(key);
-        MapReplicationCommand command = MapReplicationCommand.put(key, value);
-        waitForReplication(replicationManager.replicate(topic, command));
+        byte[] encoded = MapReplicationCodec.encode(MapReplicationCommand.put(key, value));
+        waitForReplication(replicationManager.replicate(topic, encoded));
         return Optional.ofNullable(previous);
     }
 
@@ -144,8 +144,8 @@ public final class MapClusterService<K, V>
     public Optional<V> remove(K key) {
         Objects.requireNonNull(key, "key");
         V previous = data.get(key);
-        MapReplicationCommand command = MapReplicationCommand.remove(key);
-        waitForReplication(replicationManager.replicate(topic, command));
+        byte[] encoded = MapReplicationCodec.encode(MapReplicationCommand.remove(key));
+        waitForReplication(replicationManager.replicate(topic, encoded));
         return Optional.ofNullable(previous);
     }
 
@@ -253,7 +253,9 @@ public final class MapClusterService<K, V>
     @Override
     @SuppressWarnings("unchecked")
     public void apply(UUID operationId, Object payload) {
-        MapReplicationCommand command = (MapReplicationCommand) payload;
+        // The payload is transported as byte[] to preserve concrete POJO types across
+        // the Jackson serialization boundary (see MapReplicationCodec for rationale).
+        MapReplicationCommand command = MapReplicationCodec.decode((byte[]) payload);
         switch (command.type()) {
             case PUT -> {
                 // For offset maps, apply monotonic semantics: only accept higher values
@@ -294,7 +296,7 @@ public final class MapClusterService<K, V>
         List<Map.Entry<K, V>> entries = new ArrayList<>(data.entrySet());
         int start = chunkIndex * chunkSize;
         if (start >= entries.size()) {
-            return new SnapshotChunk(new HashMap<>(), false);
+            return new SnapshotChunk(MapReplicationCodec.encodeSnapshot(new HashMap<>()), false);
         }
         int end = Math.min(start + chunkSize, entries.size());
         Map<K, V> chunk = new HashMap<>();
@@ -302,13 +304,15 @@ public final class MapClusterService<K, V>
             Map.Entry<K, V> e = entries.get(i);
             chunk.put(e.getKey(), e.getValue());
         }
-        return new SnapshotChunk(chunk, end < entries.size());
+        // Encode to byte[] so that the transport layer preserves concrete POJO types
+        // inside the snapshot values (see MapReplicationCodec for rationale).
+        return new SnapshotChunk(MapReplicationCodec.encodeSnapshot(chunk), end < entries.size());
     }
 
     /** {@inheritDoc} */
     @Override
     public Object getSnapshot() {
-        return new HashMap<>(data);
+        return MapReplicationCodec.encodeSnapshot(new HashMap<>(data));
     }
 
     /** {@inheritDoc} */
@@ -321,32 +325,33 @@ public final class MapClusterService<K, V>
     @Override
     @SuppressWarnings("unchecked")
     public void installSnapshot(Object snapshot) {
-        if (snapshot instanceof Map<?, ?> newMap) {
-            // For offset maps, apply monotonic semantics during snapshot install
-            if (topic.equals("map:_ngrid-queue-offsets")) {
-                for (Map.Entry<?, ?> entry : newMap.entrySet()) {
-                    K key = (K) entry.getKey();
-                    V newValue = (V) entry.getValue();
-                    if (newValue instanceof Long newLong) {
-                        data.compute(key, (k, currentValue) -> {
-                            if (currentValue instanceof Long currentLong) {
-                                if (newLong > currentLong) {
-                                    return (V) newLong;
-                                }
-                                return currentValue;
+        // Snapshots are transported as byte[] (produced by MapReplicationCodec.encodeSnapshot)
+        // to preserve the concrete types of POJO values across the Jackson boundary.
+        Map<Object, Object> newMap = MapReplicationCodec.decodeSnapshot((byte[]) snapshot);
+        // For offset maps, apply monotonic semantics during snapshot install
+        if (topic.equals("map:_ngrid-queue-offsets")) {
+            for (Map.Entry<?, ?> entry : newMap.entrySet()) {
+                K key = (K) entry.getKey();
+                V newValue = (V) entry.getValue();
+                if (newValue instanceof Long newLong) {
+                    data.compute(key, (k, currentValue) -> {
+                        if (currentValue instanceof Long currentLong) {
+                            if (newLong > currentLong) {
+                                return (V) newLong;
                             }
-                            return newValue;
-                        });
-                    } else {
-                        data.put(key, newValue);
-                    }
+                            return currentValue;
+                        }
+                        return newValue;
+                    });
+                } else {
+                    data.put(key, newValue);
                 }
-            } else {
-                data.putAll((Map<? extends K, ? extends V>) newMap);
             }
-            if (persistence != null) {
-                persistence.maybeSnapshot();
-            }
+        } else {
+            data.putAll((Map<? extends K, ? extends V>) newMap);
+        }
+        if (persistence != null) {
+            persistence.maybeSnapshot();
         }
     }
 
