@@ -47,10 +47,11 @@ import java.util.Map;
  * always preserved end-to-end without requiring any Jackson annotations on consumer
  * domain classes.
  *
- * <p>This codec is intentionally package-private and should not be used outside the
- * map replication subsystem.
+ * This codec is used within the map replication subsystem and by {@link
+ * dev.nishisan.utils.ngrid.structures.DistributedMap} for the CLIENT_REQUEST
+ * forwarding path (follower → leader).
  */
-final class MapReplicationCodec {
+public final class MapReplicationCodec {
 
     /**
      * Allows any non-final class to carry type metadata.
@@ -76,7 +77,7 @@ final class MapReplicationCodec {
      * @return the JSON bytes
      * @throws MapReplicationCodecException if serialization fails
      */
-    static byte[] encode(MapReplicationCommand command) {
+    public static byte[] encode(MapReplicationCommand command) {
         try {
             return MAPPER.writeValueAsBytes(command);
         } catch (IOException e) {
@@ -92,7 +93,7 @@ final class MapReplicationCodec {
      * @return the deserialized command
      * @throws MapReplicationCodecException if deserialization fails
      */
-    static MapReplicationCommand decode(byte[] bytes) {
+    public static MapReplicationCommand decode(byte[] bytes) {
         try {
             return MAPPER.readValue(bytes, MapReplicationCommand.class);
         } catch (IOException e) {
@@ -112,7 +113,7 @@ final class MapReplicationCodec {
      * @return the JSON bytes
      * @throws MapReplicationCodecException if serialization fails
      */
-    static byte[] encodeSnapshot(Map<?, ?> snapshot) {
+    public static byte[] encodeSnapshot(Map<?, ?> snapshot) {
         try {
             return MAPPER.writeValueAsBytes(snapshot);
         } catch (IOException e) {
@@ -129,7 +130,7 @@ final class MapReplicationCodec {
      * @throws MapReplicationCodecException if deserialization fails
      */
     @SuppressWarnings("unchecked")
-    static Map<Object, Object> decodeSnapshot(byte[] bytes) {
+    public static Map<Object, Object> decodeSnapshot(byte[] bytes) {
         try {
             return MAPPER.readValue(bytes, Map.class);
         } catch (IOException e) {
