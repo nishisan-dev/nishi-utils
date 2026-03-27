@@ -27,6 +27,7 @@ import dev.nishisan.utils.ngrid.common.MessageType;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.ngrid.map.MapClusterService;
+import dev.nishisan.utils.ngrid.map.EncodedCommand;
 import dev.nishisan.utils.ngrid.map.MapReplicationCodec;
 import dev.nishisan.utils.ngrid.map.MapReplicationCommand;
 import dev.nishisan.utils.ngrid.metrics.NGridMetrics;
@@ -158,11 +159,13 @@ public final class DistributedMap<K, V>
             recordMapPut();
             return mapService.put(key, value);
         }
-        // Follower path: encode the command as byte[] using MapReplicationCodec so that
-        // the value's concrete type (e.g. a user POJO) survives the CLIENT_REQUEST
-        // serialization boundary (JacksonMessageCodec has no activateDefaultTyping).
+        // Follower path: encode the command via MapReplicationCodec (preserves concrete
+        // POJO types) and wrap in EncodedCommand so that Jackson does not flatten the
+        // byte[] to a Base64 String. @JsonTypeInfo(CLASS) on ClientRequestPayload.body
+        // writes the @class discriminator, allowing the leader to deserialize the body
+        // back as EncodedCommand instead of String.
         byte[] encoded = MapReplicationCodec.encode(MapReplicationCommand.put(key, value));
-        SerializableOptional<V> result = (SerializableOptional<V>) invokeLeader(mapPutCommand, encoded);
+        SerializableOptional<V> result = (SerializableOptional<V>) invokeLeader(mapPutCommand, new EncodedCommand(encoded));
         return result.toOptional();
     }
 
@@ -182,9 +185,9 @@ public final class DistributedMap<K, V>
             recordMapRemove();
             return mapService.remove(key);
         }
-        // Follower path: encode the remove command as byte[] for the same reason as put().
+        // Follower path: same rationale as put() — wrap encoded bytes in EncodedCommand.
         byte[] encoded = MapReplicationCodec.encode(MapReplicationCommand.remove(key));
-        SerializableOptional<V> result = (SerializableOptional<V>) invokeLeader(mapRemoveCommand, encoded);
+        SerializableOptional<V> result = (SerializableOptional<V>) invokeLeader(mapRemoveCommand, new EncodedCommand(encoded));
         return result.toOptional();
     }
 
@@ -369,13 +372,14 @@ public final class DistributedMap<K, V>
     @SuppressWarnings("unchecked")
     private Object executeLocal(String command, Object body) {
         if (command.equals(mapPutCommand)) {
-            // body is always byte[] when routed through the network (follower → leader),
-            // but may be a raw MapEntry when called directly on the leader node itself.
-            // Decode accordingly to restore the concrete POJO type.
+            // When routed via the network (follower → leader) the body arrives as
+            // EncodedCommand — a POJO wrapper around the MapReplicationCodec bytes.
+            // When the leader calls executeLocal() directly (leader path), the body
+            // is still a raw MapEntry. Decode accordingly.
             K key;
             V value;
-            if (body instanceof byte[] encoded) {
-                MapReplicationCommand cmd = MapReplicationCodec.decode(encoded);
+            if (body instanceof EncodedCommand ec) {
+                MapReplicationCommand cmd = MapReplicationCodec.decode(ec.payload());
                 key   = (K) cmd.key();
                 value = (V) cmd.value();
             } else {
@@ -390,8 +394,8 @@ public final class DistributedMap<K, V>
         }
         if (command.equals(mapRemoveCommand)) {
             K key;
-            if (body instanceof byte[] encoded) {
-                MapReplicationCommand cmd = MapReplicationCodec.decode(encoded);
+            if (body instanceof EncodedCommand ec) {
+                MapReplicationCommand cmd = MapReplicationCodec.decode(ec.payload());
                 key = (K) cmd.key();
             } else {
                 key = (K) body;

@@ -26,6 +26,16 @@ import java.util.UUID;
 
 /**
  * Simple RPC style payload for client requests routed to the cluster leader.
+ *
+ * <p>The {@code body} field carries {@code @JsonTypeInfo(CLASS)} so that the
+ * Jackson transport codec preserves the concrete type across the wire.
+ * This is safe because the only types used as {@code body} belong to the same
+ * {@code LaunchedClassLoader} as {@code nishi-utils} (e.g.
+ * {@link dev.nishisan.utils.ngrid.map.EncodedCommand},
+ * {@link dev.nishisan.utils.ngrid.structures.SerializableOptional},
+ * {@link String}). The previous {@code byte[]} ({@code [B}) body was the root
+ * cause of the LaunchedClassLoader incompatibility; it has been replaced by
+ * {@link dev.nishisan.utils.ngrid.map.EncodedCommand}.
  */
 public final class ClientRequestPayload {
 
