@@ -45,9 +45,9 @@ jobs:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         gh release upload "${{ github.event.release.tag_name }}" \
-          nishi-utils-core/target/nishi-utils-core-${{ env.RELEASE_VERSION }}.jar \
-          nishi-utils-core/target/nishi-utils-core-${{ env.RELEASE_VERSION }}-sources.jar \
-          nishi-utils-core/target/nishi-utils-core-${{ env.RELEASE_VERSION }}-javadoc.jar \
+          nishi-utils-core/target/nishi-utils-${{ env.RELEASE_VERSION }}.jar \
+          nishi-utils-core/target/nishi-utils-${{ env.RELEASE_VERSION }}-sources.jar \
+          nishi-utils-core/target/nishi-utils-${{ env.RELEASE_VERSION }}-javadoc.jar \
           --clobber
 
     - name: Prune old releases (keep last 5)

@@ -17,7 +17,7 @@
     <dependencies>
         <dependency>
             <groupId>dev.nishisan</groupId>
-            <artifactId>nishi-utils-core</artifactId>
+            <artifactId>nishi-utils</artifactId>
             <version>${project.version}</version>
         </dependency>
         <dependency>

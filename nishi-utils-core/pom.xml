@@ -11,7 +11,7 @@
         <relativePath>../pom.xml</relativePath>
     </parent>
 
-    <artifactId>nishi-utils-core</artifactId>
+    <artifactId>nishi-utils</artifactId>
     <packaging>jar</packaging>
 
     <dependencies>
