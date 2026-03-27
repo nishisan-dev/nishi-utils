@@ -27,6 +27,8 @@ import dev.nishisan.utils.ngrid.common.MessageType;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.ngrid.map.MapClusterService;
+import dev.nishisan.utils.ngrid.map.MapReplicationCodec;
+import dev.nishisan.utils.ngrid.map.MapReplicationCommand;
 import dev.nishisan.utils.ngrid.metrics.NGridMetrics;
 import dev.nishisan.utils.stats.StatsUtils;
 
@@ -156,8 +158,11 @@ public final class DistributedMap<K, V>
             recordMapPut();
             return mapService.put(key, value);
         }
-        Object body = new MapEntry<>(key, value);
-        SerializableOptional<V> result = (SerializableOptional<V>) invokeLeader(mapPutCommand, body);
+        // Follower path: encode the command as byte[] using MapReplicationCodec so that
+        // the value's concrete type (e.g. a user POJO) survives the CLIENT_REQUEST
+        // serialization boundary (JacksonMessageCodec has no activateDefaultTyping).
+        byte[] encoded = MapReplicationCodec.encode(MapReplicationCommand.put(key, value));
+        SerializableOptional<V> result = (SerializableOptional<V>) invokeLeader(mapPutCommand, encoded);
         return result.toOptional();
     }
 
@@ -177,7 +182,9 @@ public final class DistributedMap<K, V>
             recordMapRemove();
             return mapService.remove(key);
         }
-        SerializableOptional<V> result = (SerializableOptional<V>) invokeLeader(mapRemoveCommand, key);
+        // Follower path: encode the remove command as byte[] for the same reason as put().
+        byte[] encoded = MapReplicationCodec.encode(MapReplicationCommand.remove(key));
+        SerializableOptional<V> result = (SerializableOptional<V>) invokeLeader(mapRemoveCommand, encoded);
         return result.toOptional();
     }
 
@@ -362,15 +369,35 @@ public final class DistributedMap<K, V>
     @SuppressWarnings("unchecked")
     private Object executeLocal(String command, Object body) {
         if (command.equals(mapPutCommand)) {
-            MapEntry<K, V> entry = (MapEntry<K, V>) body;
+            // body is always byte[] when routed through the network (follower → leader),
+            // but may be a raw MapEntry when called directly on the leader node itself.
+            // Decode accordingly to restore the concrete POJO type.
+            K key;
+            V value;
+            if (body instanceof byte[] encoded) {
+                MapReplicationCommand cmd = MapReplicationCodec.decode(encoded);
+                key   = (K) cmd.key();
+                value = (V) cmd.value();
+            } else {
+                MapEntry<K, V> entry = (MapEntry<K, V>) body;
+                key   = entry.key();
+                value = entry.value();
+            }
             recordMapPut();
-            return mapService.put(entry.key(), entry.value())
+            return mapService.put(key, value)
                     .map(SerializableOptional::of)
                     .orElseGet(SerializableOptional::empty);
         }
         if (command.equals(mapRemoveCommand)) {
+            K key;
+            if (body instanceof byte[] encoded) {
+                MapReplicationCommand cmd = MapReplicationCodec.decode(encoded);
+                key = (K) cmd.key();
+            } else {
+                key = (K) body;
+            }
             recordMapRemove();
-            return mapService.remove((K) body)
+            return mapService.remove(key)
                     .map(SerializableOptional::of)
                     .orElseGet(SerializableOptional::empty);
         }
