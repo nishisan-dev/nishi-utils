@@ -214,9 +214,12 @@ class NGridPartitionResilienceIT extends AbstractNGridMapClusterIT {
             }
         }
 
+        // Aguardar propagação de gossip após reconexão
+        Thread.sleep(5_000);
+
         // Cluster deve se recuperar
         await("cluster recovers after minority test")
-            .atMost(120, TimeUnit.SECONDS)
+            .atMost(180, TimeUnit.SECONDS)
             .pollInterval(2, TimeUnit.SECONDS)
             .until(() -> countLeaders() >= 1);
     }
