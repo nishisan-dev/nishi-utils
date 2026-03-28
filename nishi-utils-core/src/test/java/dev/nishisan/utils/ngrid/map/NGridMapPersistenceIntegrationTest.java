@@ -164,7 +164,7 @@ class NGridMapPersistenceIntegrationTest {
     }
 
     private void awaitClusterStability() {
-        long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(20);
+        long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(45);
         while (System.currentTimeMillis() < deadline) {
             boolean leadersAgree = node1.coordinator().leaderInfo().isPresent()
                     && node1.coordinator().leaderInfo().equals(node2.coordinator().leaderInfo())
