@@ -1,6 +1,5 @@
 package dev.nishisan.utils.ngrid.queue;
 
-import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.structures.DistributedMap;
 
 import java.util.Objects;
@@ -26,8 +25,8 @@ public final class DistributedOffsetStore implements OffsetStore {
     }
 
     @Override
-    public long getOffset(NodeId nodeId) {
-        String key = keyFor(nodeId);
+    public long getOffset(String consumerKey) {
+        String key = keyFor(consumerKey);
         // Jackson may deserialize small numbers as Integer instead of Long.
         // Using Optional<Long>.map() would trigger an implicit checkcast Long
         // in bytecode before entering the lambda, causing ClassCastException.
@@ -43,8 +42,8 @@ public final class DistributedOffsetStore implements OffsetStore {
     }
 
     @Override
-    public void updateOffset(NodeId nodeId, long offset) {
-        String key = keyFor(nodeId);
+    public void updateOffset(String consumerKey, long offset) {
+        String key = keyFor(consumerKey);
         long current = 0L;
         Optional<?> raw = (Optional<?>) offsets.get(key);
         if (raw.isPresent()) {
@@ -61,6 +60,17 @@ public final class DistributedOffsetStore implements OffsetStore {
     }
 
     /**
+     * Overwrites the offset for a logical consumer.
+     * Used by explicit seek/replay operations.
+     *
+     * @param consumerKey the consumer identifier
+     * @param offset the desired offset
+     */
+    public void forceOffset(String consumerKey, long offset) {
+        offsets.put(keyFor(consumerKey), offset);
+    }
+
+    /**
      * Resets all consumer offsets for this queue. Should be called when the queue
      * state is completely replaced (e.g., after a snapshot install) so that
      * stale offsets from the previous epoch do not cause duplicate deliveries.
@@ -74,7 +84,7 @@ public final class DistributedOffsetStore implements OffsetStore {
         offsets.removeByPrefix(queueName + ":");
     }
 
-    private String keyFor(NodeId nodeId) {
-        return queueName + ":" + nodeId.value();
+    private String keyFor(String consumerKey) {
+        return queueName + ":" + consumerKey;
     }
 }

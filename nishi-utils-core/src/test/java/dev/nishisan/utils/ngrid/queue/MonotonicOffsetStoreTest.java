@@ -120,20 +120,20 @@ class MonotonicOffsetStoreTest {
      */
     private static class LocalOffsetStoreTestable implements OffsetStore {
         private final Path storagePath;
-        private final java.util.Map<NodeId, Long> offsets = new java.util.concurrent.ConcurrentHashMap<>();
+        private final java.util.Map<String, Long> offsets = new java.util.concurrent.ConcurrentHashMap<>();
 
         LocalOffsetStoreTestable(Path storagePath) {
             this.storagePath = storagePath;
         }
 
         @Override
-        public long getOffset(NodeId nodeId) {
-            return offsets.getOrDefault(nodeId, 0L);
+        public long getOffset(String consumerKey) {
+            return offsets.getOrDefault(consumerKey, 0L);
         }
 
         @Override
-        public void updateOffset(NodeId nodeId, long offset) {
-            offsets.compute(nodeId, (key, current) -> {
+        public void updateOffset(String consumerKey, long offset) {
+            offsets.compute(consumerKey, (key, current) -> {
                 if (current == null || offset > current) {
                     return offset;
                 }

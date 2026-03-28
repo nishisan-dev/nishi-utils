@@ -32,6 +32,7 @@ import dev.nishisan.utils.ngrid.common.QueueSubscribePayload;
 import dev.nishisan.utils.ngrid.common.QueueUnsubscribePayload;
 import dev.nishisan.utils.ngrid.queue.QueueClusterService;
 import dev.nishisan.utils.ngrid.metrics.NGridMetrics;
+import dev.nishisan.utils.ngrid.queue.QueueConsumerCursor;
 import dev.nishisan.utils.queue.NQueueHeaders;
 import dev.nishisan.utils.stats.StatsUtils;
 
@@ -172,21 +173,25 @@ public final class DistributedQueue<T>
      */
     @SuppressWarnings("unchecked")
     public Optional<T> poll() {
+        return poll(QueueConsumerCursor.legacy(localNodeId));
+    }
+
+    Optional<T> poll(QueueConsumerCursor cursor) {
         recordIngressWrite();
         if (coordinator.isLeader()) {
-            Long hintOffset = queueService.getCurrentOffset(localNodeId);
-            return queueService.poll(localNodeId, hintOffset);
+            Long hintOffset = queueService.getCurrentOffset(cursor.offsetStoreKey());
+            return queueService.poll(cursor, hintOffset);
         }
         queueService.syncOffsetsIfNeeded();
-        Long offsetHint = queueService.getCurrentOffset(localNodeId);
-        Object result = invokeLeader(queuePollCommand, offsetHint);
+        Long offsetHint = queueService.getCurrentOffset(cursor.offsetStoreKey());
+        Object result = invokeLeader(queuePollCommand, new QueueReadRequestPayload(cursor.offsetStoreKey(), offsetHint));
         if (result instanceof SerializableOptional) {
             SerializableOptional<?> opt = (SerializableOptional<?>) result;
             if (opt.isPresent()) {
                 Object val = opt.value();
                 if (val instanceof QueueClusterService.QueueRecord) {
                     QueueClusterService.QueueRecord<T> record = (QueueClusterService.QueueRecord<T>) val;
-                    queueService.updateLocalOffset(localNodeId, record.offset() + 1);
+                    queueService.updateLocalOffset(cursor.offsetStoreKey(), record.offset() + 1);
                     return Optional.of(record.value());
                 }
                 // Fallback: Jackson may deserialize QueueRecord as Map when type info is lost
@@ -195,7 +200,7 @@ public final class DistributedQueue<T>
                     Object rawValue = mapVal.get("value");
                     if (rawOffset instanceof Number && rawValue != null) {
                         long offset = ((Number) rawOffset).longValue();
-                        queueService.updateLocalOffset(localNodeId, offset + 1);
+                        queueService.updateLocalOffset(cursor.offsetStoreKey(), offset + 1);
                         return Optional.of((T) rawValue);
                     }
                 }
@@ -220,6 +225,37 @@ public final class DistributedQueue<T>
         return result.toOptional();
     }
 
+    Optional<T> peek(QueueConsumerCursor cursor) {
+        if (coordinator.isLeader()) {
+            return queueService.peek(cursor);
+        }
+        queueService.syncOffsetsIfNeeded();
+        SerializableOptional<T> result = (SerializableOptional<T>) invokeLeader(queuePeekCommand,
+                new QueueReadRequestPayload(cursor.offsetStoreKey(), null));
+        return result.toOptional();
+    }
+
+    /**
+     * Opens a logical consumer bound to a stable {@code groupId}/{@code consumerId}
+     * pair. This is the recommended stream-style API for TIME_BASED queues.
+     *
+     * @param groupId logical consumer group
+     * @param consumerId stable consumer identity
+     * @return the consumer handle
+     */
+    public DistributedQueueConsumer<T> openConsumer(String groupId, String consumerId) {
+        return new DistributedQueueConsumer<>(this, QueueConsumerCursor.of(groupId, consumerId));
+    }
+
+    long position(QueueConsumerCursor cursor) {
+        queueService.syncOffsetsIfNeeded();
+        return queueService.position(cursor);
+    }
+
+    void seek(QueueConsumerCursor cursor, long offset) {
+        queueService.seek(cursor, offset);
+    }
+
     /**
      * Polls when an element becomes available, blocking up to the given timeout.
      *
@@ -227,13 +263,17 @@ public final class DistributedQueue<T>
      * @return the next element, or empty if the timeout expired
      */
     public Optional<T> pollWhenAvailable(Duration timeout) {
+        return pollWhenAvailable(QueueConsumerCursor.legacy(localNodeId), timeout);
+    }
+
+    Optional<T> pollWhenAvailable(QueueConsumerCursor cursor, Duration timeout) {
         if (timeout == null || timeout.isNegative() || timeout.isZero()) {
-            return poll();
+            return poll(cursor);
         }
         if (coordinator.isLeader()) {
-            return poll();
+            return poll(cursor);
         }
-        Optional<T> immediate = poll();
+        Optional<T> immediate = poll(cursor);
         if (immediate.isPresent()) {
             return immediate;
         }
@@ -241,7 +281,7 @@ public final class DistributedQueue<T>
         long deadline = System.currentTimeMillis() + timeout.toMillis();
         while (System.currentTimeMillis() < deadline) {
             if (consumeNotification()) {
-                return poll();
+                return poll(cursor);
             }
             long remaining = deadline - System.currentTimeMillis();
             if (remaining <= 0) {
@@ -341,9 +381,16 @@ public final class DistributedQueue<T>
             return Boolean.TRUE;
         }
         if (queuePollCommand.equals(command)) {
-            Long hintOffset = body instanceof Long ? (Long) body : null;
-            Optional<QueueClusterService.QueueRecord<T>> recordOpt = queueService.pollRecord(requestingNode,
-                    hintOffset);
+            String consumerKey;
+            Long hintOffset;
+            if (body instanceof QueueReadRequestPayload readPayload) {
+                consumerKey = readPayload.consumerKey();
+                hintOffset = readPayload.hintOffset();
+            } else {
+                consumerKey = QueueConsumerCursor.legacy(requestingNode).offsetStoreKey();
+                hintOffset = body instanceof Long ? (Long) body : null;
+            }
+            Optional<QueueClusterService.QueueRecord<T>> recordOpt = queueService.pollRecord(consumerKey, hintOffset);
             if (recordOpt.isPresent()) {
                 recordQueuePoll();
                 return SerializableOptional.of(recordOpt.get());
@@ -351,6 +398,11 @@ public final class DistributedQueue<T>
             return SerializableOptional.empty();
         }
         if (queuePeekCommand.equals(command)) {
+            if (body instanceof QueueReadRequestPayload readPayload) {
+                return (Object) queueService.peek(QueueConsumerCursor.fromOffsetStoreKey(readPayload.consumerKey()))
+                        .map(SerializableOptional::of)
+                        .orElseGet(SerializableOptional::empty);
+            }
             return (Object) queueService.peek()
                     .map(SerializableOptional::of)
                     .orElseGet(SerializableOptional::empty);
