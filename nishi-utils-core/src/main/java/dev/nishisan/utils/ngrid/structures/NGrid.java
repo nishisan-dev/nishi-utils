@@ -34,6 +34,9 @@ package dev.nishisan.utils.ngrid.structures;
  *         .start()) {
  *
  *     cluster.queue("orders", String.class).offer("pedido-1");
+ *     cluster.queue(1, "orders", String.class)
+ *             .openConsumer("orders-group", "worker-1")
+ *             .poll();
  *     cluster.map("users", String.class, String.class).put("u1", "Alice");
  * }
  * }</pre>

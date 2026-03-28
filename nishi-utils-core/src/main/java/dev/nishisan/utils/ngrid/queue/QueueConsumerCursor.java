@@ -9,9 +9,9 @@ import java.util.Objects;
 /**
  * Logical consumer identity for stream-style queue reads.
  *
- * <p>The legacy node-bound consumer model is still supported through
- * {@link #legacy(NodeId)} so existing {@code DistributedQueue.poll()} callers
- * keep their previous offset keys unchanged.
+ * <p>Public callers should prefer {@code DistributedQueue.openConsumer(...)} so
+ * consumption stays explicit and stable across nodes. The legacy node-bound
+ * cursor is retained only for queue-style helper paths and internal bridging.
  */
 public final class QueueConsumerCursor {
     private static final Base64.Encoder ENCODER = Base64.getUrlEncoder().withoutPadding();
@@ -43,7 +43,7 @@ public final class QueueConsumerCursor {
     }
 
     /**
-     * Creates the legacy node-bound cursor used by {@code DistributedQueue.poll()}.
+     * Creates the legacy node-bound cursor used by queue-style helper paths.
      *
      * @param nodeId the node identifier
      * @return the cursor

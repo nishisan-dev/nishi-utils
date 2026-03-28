@@ -49,8 +49,13 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Logger;
 
 /**
- * Public facing distributed queue API. It routes client calls to the current
- * leader and processes remote requests when the local node is in charge.
+ * Public facing distributed queue API.
+ *
+ * <p>Distributed consumption is consumer-first: callers should prefer
+ * {@link #openConsumer(String, String)} whenever reads may cross nodes or need a
+ * stable cursor. The queue-style {@link #poll()} and {@link #peek()} helpers are
+ * still available as convenience operations, but they are not the primary
+ * replicated-consumption contract.
  *
  * @param <T> the element type
  */
@@ -167,7 +172,10 @@ public final class DistributedQueue<T>
     }
 
     /**
-     * Polls the next element from the distributed queue.
+     * Polls the next element using queue-style semantics.
+     *
+     * <p>For replicated consumption with a stable cursor across nodes, prefer
+     * {@link #openConsumer(String, String)}.
      *
      * @return the next element, or empty if the queue is empty
      */
@@ -214,6 +222,9 @@ public final class DistributedQueue<T>
     /**
      * Peeks at the head of the distributed queue without removing it.
      *
+     * <p>For cursor-aware distributed reads, prefer a logical consumer opened via
+     * {@link #openConsumer(String, String)}.
+     *
      * @return the head element, or empty if the queue is empty
      */
     @SuppressWarnings("unchecked")
@@ -237,7 +248,8 @@ public final class DistributedQueue<T>
 
     /**
      * Opens a logical consumer bound to a stable {@code groupId}/{@code consumerId}
-     * pair. This is the recommended stream-style API for TIME_BASED queues.
+     * pair. This is the primary API for distributed queue consumption on
+     * TIME_BASED queues.
      *
      * @param groupId logical consumer group
      * @param consumerId stable consumer identity
