@@ -12,7 +12,7 @@ Adicione a dependência do projeto (ajuste a versão conforme seu release):
 <dependency>
   <groupId>dev.nishisan</groupId>
   <artifactId>nishi-utils</artifactId>
-  <version>3.6.5</version>
+  <version>3.7.0</version>
 </dependency>
 ```
 

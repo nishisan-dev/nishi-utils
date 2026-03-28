@@ -55,13 +55,13 @@ Coleção de utilitários em Java, com foco em:
 
 ## Instalação (Maven)
 
-Versão do artefato no projeto: **3.6.5** (`pom.xml`).
+Versão do artefato no projeto: **3.7.0** (`pom.xml`).
 
 ```xml
 <dependency>
   <groupId>dev.nishisan</groupId>
   <artifactId>nishi-utils</artifactId>
-  <version>3.6.5</version>
+  <version>3.7.0</version>
 </dependency>
 ```
 

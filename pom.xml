@@ -6,7 +6,7 @@
 
     <groupId>dev.nishisan</groupId>
     <artifactId>nishi-utils-parent</artifactId>
-    <version>3.6.5</version>
+    <version>3.7.0</version>
     <packaging>pom</packaging>
     <modules>
         <module>nishi-utils-core</module>

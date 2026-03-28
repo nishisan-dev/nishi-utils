@@ -19,7 +19,7 @@ Coordenadas atuais neste repositório (`pom.xml`):
 
 - `groupId`: `dev.nishisan`
 - `artifactId`: `nishi-utils`
-- `version`: `3.6.5`
+- `version`: `3.7.0`
 
 Maven:
 
@@ -27,7 +27,7 @@ Maven:
 <dependency>
   <groupId>dev.nishisan</groupId>
   <artifactId>nishi-utils</artifactId>
-  <version>3.6.5</version>
+  <version>3.7.0</version>
 </dependency>
 ```
 
