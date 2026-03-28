@@ -214,6 +214,8 @@ class NGridPartitionResilienceIT extends AbstractNGridMapClusterIT {
             }
         }
 
+        Thread.sleep(2_000); // dar tempo para gossip/log refletirem a reconexão em CI
+
         // Cluster deve se recuperar
         await("cluster recovers after minority test")
             .atMost(120, TimeUnit.SECONDS)
