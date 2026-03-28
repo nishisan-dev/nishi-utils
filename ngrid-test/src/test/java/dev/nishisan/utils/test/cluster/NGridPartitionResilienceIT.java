@@ -214,7 +214,12 @@ class NGridPartitionResilienceIT extends AbstractNGridMapClusterIT {
             }
         }
 
-        Thread.sleep(2_000); // dar tempo para gossip/log refletirem a reconexão em CI
+        await("reconnected nodes observe cluster again")
+            .atMost(30, TimeUnit.SECONDS)
+            .pollInterval(1, TimeUnit.SECONDS)
+            .until(() -> toIsolate.stream()
+                    .filter(NGridMapNodeContainer::isRunning)
+                    .allMatch(node -> node.latestActiveMembersCount() >= 3));
 
         // Cluster deve se recuperar
         await("cluster recovers after minority test")
