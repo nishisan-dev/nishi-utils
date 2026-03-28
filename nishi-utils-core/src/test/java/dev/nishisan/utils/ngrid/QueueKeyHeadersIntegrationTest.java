@@ -80,6 +80,27 @@ class QueueKeyHeadersIntegrationTest {
                 throw new IllegalStateException("Cluster did not stabilize within 20 s");
         }
 
+        /** Waits until one node is leader and no longer in leader sync. */
+        private NGridNode awaitReadyLeader(NGridNode a, NGridNode b) {
+                long deadline = System.currentTimeMillis() + 20_000;
+                while (System.currentTimeMillis() < deadline) {
+                        NGridNode[] candidates = { a, b };
+                        for (NGridNode candidate : candidates) {
+                                if (candidate.coordinator().isLeader()
+                                                && !candidate.replicationManager().isLeaderSyncing()) {
+                                        return candidate;
+                                }
+                        }
+                        try {
+                                Thread.sleep(100);
+                        } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                                throw new IllegalStateException(e);
+                        }
+                }
+                throw new IllegalStateException("Leader did not become ready within 20 s");
+        }
+
         /** Retries an assertion up to 10 s before failing. */
         private void assertEventually(Runnable assertion) {
                 long deadline = System.currentTimeMillis() + 10_000;
@@ -160,8 +181,8 @@ class QueueKeyHeadersIntegrationTest {
                         follower.start();
                         awaitClusterStability(leader, follower, infoL, infoF);
 
-                        NGridNode actualLeader = leader.coordinator().isLeader() ? leader : follower;
-                        NGridNode actualFollower = leader.coordinator().isLeader() ? follower : leader;
+                        NGridNode actualLeader = awaitReadyLeader(leader, follower);
+                        NGridNode actualFollower = actualLeader == leader ? follower : leader;
 
                         DistributedQueue<String> q = actualLeader.getQueue(queueName, String.class);
                         DistributedQueue<String> qFollower = actualFollower.getQueue(queueName, String.class);
@@ -221,8 +242,8 @@ class QueueKeyHeadersIntegrationTest {
                         follower.start();
                         awaitClusterStability(leader, follower, infoL, infoF);
 
-                        NGridNode actualLeader = leader.coordinator().isLeader() ? leader : follower;
-                        NGridNode actualFollower = leader.coordinator().isLeader() ? follower : leader;
+                        NGridNode actualLeader = awaitReadyLeader(leader, follower);
+                        NGridNode actualFollower = actualLeader == leader ? follower : leader;
 
                         DistributedQueue<String> q = actualLeader.getQueue(queueName, String.class);
                         DistributedQueue<String> qFollower = actualFollower.getQueue(queueName, String.class);
@@ -282,8 +303,8 @@ class QueueKeyHeadersIntegrationTest {
                         follower.start();
                         awaitClusterStability(leader, follower, infoL, infoF);
 
-                        NGridNode actualLeader = leader.coordinator().isLeader() ? leader : follower;
-                        NGridNode actualFollower = leader.coordinator().isLeader() ? follower : leader;
+                        NGridNode actualLeader = awaitReadyLeader(leader, follower);
+                        NGridNode actualFollower = actualLeader == leader ? follower : leader;
 
                         DistributedQueue<String> q = actualLeader.getQueue(queueName, String.class);
                         DistributedQueue<String> qFollower = actualFollower.getQueue(queueName, String.class);
@@ -343,8 +364,8 @@ class QueueKeyHeadersIntegrationTest {
                         follower.start();
                         awaitClusterStability(leader, follower, infoL, infoF);
 
-                        NGridNode actualLeader = leader.coordinator().isLeader() ? leader : follower;
-                        NGridNode actualFollower = leader.coordinator().isLeader() ? follower : leader;
+                        NGridNode actualLeader = awaitReadyLeader(leader, follower);
+                        NGridNode actualFollower = actualLeader == leader ? follower : leader;
 
                         DistributedQueue<String> q = actualLeader.getQueue(queueName, String.class);
                         DistributedQueue<String> qFollower = actualFollower.getQueue(queueName, String.class);

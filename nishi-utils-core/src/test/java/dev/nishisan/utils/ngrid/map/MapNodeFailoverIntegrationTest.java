@@ -129,7 +129,7 @@ class MapNodeFailoverIntegrationTest {
     @Timeout(value = 60, unit = TimeUnit.SECONDS)
     void shouldRecoverMapPutAfterLeaderFailover() throws Exception {
         // Leader = node-3 (highest ID by deterministic election)
-        NGridNode leader = findLeader();
+        NGridNode leader = awaitReadyLeader(15_000);
         assertNotNull(leader, "Should have a leader");
 
         DistributedMap<String, String> leaderMap = leader.getMap("failover-map", String.class, String.class);
@@ -184,7 +184,7 @@ class MapNodeFailoverIntegrationTest {
     @Test
     @Timeout(value = 60, unit = TimeUnit.SECONDS)
     void shouldRecoverMapGetStrongAfterLeaderFailover() throws Exception {
-        NGridNode leader = findLeader();
+        NGridNode leader = awaitReadyLeader(15_000);
         assertNotNull(leader, "Should have a leader");
 
         DistributedMap<String, String> leaderMap = leader.getMap("failover-map", String.class, String.class);
@@ -235,7 +235,7 @@ class MapNodeFailoverIntegrationTest {
     @Test
     @Timeout(value = 30, unit = TimeUnit.SECONDS)
     void shouldRejectWriteOnExpiredLease() throws Exception {
-        NGridNode leader = findLeader();
+        NGridNode leader = awaitReadyLeader(15_000);
         assertNotNull(leader, "Should have a leader");
 
         DistributedMap<String, String> leaderMap = leader.getMap("failover-map", String.class, String.class);
@@ -283,7 +283,7 @@ class MapNodeFailoverIntegrationTest {
     @Test
     @Timeout(value = 30, unit = TimeUnit.SECONDS)
     void shouldExposeKeysAcrossCluster() throws Exception {
-        NGridNode leader = findLeader();
+        NGridNode leader = awaitReadyLeader(15_000);
         assertNotNull(leader, "Should have a leader");
 
         DistributedMap<String, String> leaderMap = leader.getMap("failover-map", String.class, String.class);
@@ -315,17 +315,6 @@ class MapNodeFailoverIntegrationTest {
 
     // ==================== Utility Methods ====================
 
-    private NGridNode findLeader() {
-        NGridNode[] candidates = {node1, node2, node3};
-        for (NGridNode n : candidates) {
-            if (n != null && n.coordinator().isLeader()
-                    && !n.replicationManager().isLeaderSyncing()) {
-                return n;
-            }
-        }
-        return null;
-    }
-
     private NGridNode findFollower() {
         NGridNode[] candidates = {node1, node2, node3};
         for (NGridNode n : candidates) {
@@ -334,6 +323,14 @@ class MapNodeFailoverIntegrationTest {
             }
         }
         return null;
+    }
+
+    private NGridNode awaitReadyLeader(long timeoutMs) {
+        NGridNode leader = awaitNewLeader(timeoutMs);
+        if (leader == null) {
+            throw new IllegalStateException("No ready leader elected in time");
+        }
+        return leader;
     }
 
     private NGridNode awaitNewLeader(long timeoutMs) {

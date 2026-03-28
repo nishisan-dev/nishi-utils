@@ -89,8 +89,6 @@ class DistributedQueueConsumerLocalTest {
                 consumer1Again.seek(0L);
                 assertEquals(0L, consumer1Again.position());
                 assertEquals(Optional.of("a"), consumer1Again.poll(), "seek should enable replay from an earlier offset");
-
-                assertEquals(Optional.of("a"), queue.poll(), "Legacy poll path should remain compatible");
             } finally {
                 queue.close();
             }
@@ -131,7 +129,8 @@ class DistributedQueueConsumerLocalTest {
             try {
                 DistributedQueueConsumer<String> consumer = queue.openConsumer("group-a", "worker-1");
                 assertThrows(IllegalStateException.class, consumer::poll);
-                assertEquals(Optional.of("job-1"), queue.poll(), "Legacy destructive semantics must remain available");
+                assertEquals(Optional.of("job-1"), queue.poll(),
+                        "Leader-local queue-style poll remains available for destructive consumption");
             } finally {
                 queue.close();
             }

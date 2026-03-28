@@ -3,6 +3,7 @@ package dev.nishisan.utils.ngrid;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.ngrid.config.*;
 import dev.nishisan.utils.ngrid.structures.DistributedQueue;
+import dev.nishisan.utils.ngrid.structures.DistributedQueueConsumer;
 import dev.nishisan.utils.ngrid.structures.NGridConfig;
 import dev.nishisan.utils.ngrid.structures.NGridNode;
 import org.junit.jupiter.api.AfterEach;
@@ -200,16 +201,17 @@ class NGridSeedWithQueueIntegrationTest {
         // === PHASE 4: Verify messages are in queue and can be consumed ===
         // Get queue reference from consumer
         DistributedQueue<String> consumerQueue = consumerNode.getQueue("message-queue", String.class);
+        DistributedQueueConsumer<String> consumer = consumerQueue.openConsumer("bootstrap-group", "consumer-node");
 
         // Verify we can see the enqueued messages
-        assertEquals(Optional.of("msg-1"), consumerQueue.peek());
+        assertEquals(Optional.of("msg-1"), consumer.peek());
 
-        // Consumer polls all 5 messages (will route to leader automatically)
-        Optional<String> m1 = consumerQueue.poll();
-        Optional<String> m2 = consumerQueue.poll();
-        Optional<String> m3 = consumerQueue.poll();
-        Optional<String> m4 = consumerQueue.poll();
-        Optional<String> m5 = consumerQueue.poll();
+        // Consumer polls all 5 messages using the explicit distributed consumer contract
+        Optional<String> m1 = consumer.poll();
+        Optional<String> m2 = consumer.poll();
+        Optional<String> m3 = consumer.poll();
+        Optional<String> m4 = consumer.poll();
+        Optional<String> m5 = consumer.poll();
 
         // Verify all messages were consumed
         assertTrue(m1.isPresent() && m1.get().equals("msg-1"));
@@ -220,7 +222,7 @@ class NGridSeedWithQueueIntegrationTest {
 
         // === PHASE 5: Verify no more messages ===
         // A 6th poll should return empty
-        Optional<String> noMore = consumerQueue.poll();
+        Optional<String> noMore = consumer.poll();
         assertFalse(noMore.isPresent(), "Queue should have no more messages after consuming all 5");
 
         // === PHASE 6: Verify cluster health ===

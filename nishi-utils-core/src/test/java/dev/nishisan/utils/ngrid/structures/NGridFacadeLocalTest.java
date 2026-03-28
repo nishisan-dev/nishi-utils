@@ -34,15 +34,16 @@ class NGridFacadeLocalTest {
 
             DistributedQueue<String> q0 = cluster.queue("orders", String.class);
             DistributedQueue<String> q1 = cluster.queue(1, "orders", String.class);
+            DistributedQueueConsumer<String> consumer = q1.openConsumer("orders-group", "worker-1");
 
             q0.offer("pedido-1");
             q0.offer("pedido-2");
 
-            Optional<String> peek = q1.peek();
+            Optional<String> peek = consumer.peek();
             assertTrue(peek.isPresent());
             assertEquals("pedido-1", peek.get());
 
-            Optional<String> polled = q1.poll();
+            Optional<String> polled = consumer.poll();
             assertTrue(polled.isPresent());
             assertEquals("pedido-1", polled.get());
         }
@@ -80,7 +81,10 @@ class NGridFacadeLocalTest {
             cluster.queue("events", String.class).offer("evt-1");
             cluster.map("sessions", String.class, String.class).put("s1", "token-abc");
 
-            assertEquals("evt-1", cluster.queue(2, "events", String.class).peek().orElseThrow());
+            assertEquals("evt-1", cluster.queue(2, "events", String.class)
+                    .openConsumer("events-group", "worker-2")
+                    .peek()
+                    .orElseThrow());
             assertEquals("token-abc", cluster.map(1, "sessions", String.class, String.class).get("s1").orElseThrow());
         }
     }

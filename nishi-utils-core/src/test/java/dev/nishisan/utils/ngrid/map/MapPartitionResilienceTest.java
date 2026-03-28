@@ -115,7 +115,7 @@ class MapPartitionResilienceTest {
     @Test
     @Timeout(value = 45, unit = TimeUnit.SECONDS)
     void shouldRejectWritesOnIsolatedLeaderAndConvergeAfterReconnection() throws Exception {
-        NGridNode leader = findLeader();
+        NGridNode leader = awaitReadyLeader(15_000);
         assertNotNull(leader, "Should have a leader");
 
         // Write initial data via leader
@@ -154,7 +154,7 @@ class MapPartitionResilienceTest {
     @Test
     @Timeout(value = 60, unit = TimeUnit.SECONDS)
     void shouldConvergeAfterConcurrentWritesDuringFailover() throws Exception {
-        NGridNode leader = findLeader();
+        NGridNode leader = awaitReadyLeader(15_000);
         assertNotNull(leader, "Should have a leader");
 
         // Write some initial entries
@@ -219,15 +219,12 @@ class MapPartitionResilienceTest {
 
     // ==================== Utility Methods ====================
 
-    private NGridNode findLeader() {
-        NGridNode[] candidates = {node1, node2, node3};
-        for (NGridNode n : candidates) {
-            if (n != null && n.coordinator().isLeader()
-                    && !n.replicationManager().isLeaderSyncing()) {
-                return n;
-            }
+    private NGridNode awaitReadyLeader(long timeoutMs) {
+        NGridNode leader = awaitNewLeader(timeoutMs);
+        if (leader == null) {
+            throw new IllegalStateException("No ready leader elected in time");
         }
-        return null;
+        return leader;
     }
 
     private NGridNode awaitNewLeader(long timeoutMs) {

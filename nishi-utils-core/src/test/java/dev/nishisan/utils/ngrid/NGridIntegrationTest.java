@@ -4,8 +4,10 @@ import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.ngrid.structures.DistributedMap;
 import dev.nishisan.utils.ngrid.structures.DistributedQueue;
+import dev.nishisan.utils.ngrid.structures.DistributedQueueConsumer;
 import dev.nishisan.utils.ngrid.structures.NGridConfig;
 import dev.nishisan.utils.ngrid.structures.NGridNode;
+import dev.nishisan.utils.ngrid.structures.QueueConfig;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -16,6 +18,7 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
@@ -55,33 +58,9 @@ class NGridIntegrationTest {
         dir2 = Files.createDirectories(baseDir.resolve("node2"));
         dir3 = Files.createDirectories(baseDir.resolve("node3"));
 
-        node1 = new NGridNode(NGridConfig.builder(info1)
-                .addPeer(info2)
-                .addPeer(info3)
-                .queueDirectory(dir1)
-                .queueName("queue")
-                .replicationQuorum(1)
-                .transportWorkerThreads(4)
-                .strictConsistency(false)
-                .build());
-        node2 = new NGridNode(NGridConfig.builder(info2)
-                .addPeer(info1)
-                .addPeer(info3)
-                .queueDirectory(dir2)
-                .queueName("queue")
-                .replicationQuorum(1)
-                .transportWorkerThreads(4)
-                .strictConsistency(false)
-                .build());
-        node3 = new NGridNode(NGridConfig.builder(info3)
-                .addPeer(info1)
-                .addPeer(info2)
-                .queueDirectory(dir3)
-                .queueName("queue")
-                .replicationQuorum(1)
-                .transportWorkerThreads(4)
-                .strictConsistency(false)
-                .build());
+        node1 = createNode(info1, dir1, info2, info3);
+        node2 = createNode(info2, dir2, info1, info3);
+        node3 = createNode(info3, dir3, info1, info2);
 
         node1.start();
         node2.start();
@@ -116,6 +95,7 @@ class NGridIntegrationTest {
         DistributedQueue<String> queue1 = node1.queue(String.class);
         DistributedQueue<String> queue2 = node2.queue(String.class);
         DistributedQueue<String> queue3 = node3.queue(String.class);
+        DistributedQueueConsumer<String> followerConsumer = queue2.openConsumer("restart-group", "worker-1");
 
         DistributedMap<String, String> map1 = node1.map(String.class, String.class);
         DistributedMap<String, String> map3 = node3.map(String.class, String.class);
@@ -126,17 +106,13 @@ class NGridIntegrationTest {
         queue3.offer("payload-1");
         queue3.offer("payload-2");
 
-        Optional<String> peekFromFollower = queue1.peek();
-        assertTrue(peekFromFollower.isPresent());
-        assertEquals("payload-1", peekFromFollower.get());
-
-        Optional<String> polledFromFollower = queue2.poll();
-        assertTrue(polledFromFollower.isPresent());
-        assertEquals("payload-1", polledFromFollower.get());
+        assertEventually(() -> assertEquals(Optional.of("payload-1"), followerConsumer.peek()));
+        assertEventually(() -> assertEquals(Optional.of("payload-1"), followerConsumer.poll()));
 
         Optional<String> remaining = queue3.peek();
         assertTrue(remaining.isPresent());
-        assertEquals("payload-2", remaining.get());
+        assertEquals("payload-1", remaining.get(),
+                "Logical consumer progress must not destructively remove the queue head");
 
         map3.put("shared-key", "value-1");
         Optional<String> fetched = map1.get("shared-key");
@@ -146,24 +122,33 @@ class NGridIntegrationTest {
         // Restart node1 using the same storage and ensure queue state is replayed
         closeQuietly(node1);
         waitForPortRelease(info1.port());
-        node1 = new NGridNode(NGridConfig.builder(info1)
-                .addPeer(info2)
-                .addPeer(info3)
-                .queueDirectory(dir1)
-                .queueName("queue")
-                .replicationQuorum(1)
-                .transportWorkerThreads(4)
-                .strictConsistency(false)
-                .build());
+        node1 = createNode(info1, dir1, info2, info3);
         node1.start();
         awaitClusterStability();
 
         assertEventually(() -> {
             DistributedQueue<String> restartedQueue = node1.queue(String.class);
-            Optional<String> afterRestart = restartedQueue.peek();
+            DistributedQueueConsumer<String> restartedConsumer = restartedQueue
+                    .openConsumer("restart-group", "worker-1");
+            Optional<String> afterRestart = restartedConsumer.poll();
             assertTrue(afterRestart.isPresent());
             assertEquals("payload-2", afterRestart.get());
         });
+    }
+
+    private NGridNode createNode(NodeInfo local, Path dataDir, NodeInfo... peers) {
+        NGridConfig.Builder builder = NGridConfig.builder(local)
+                .dataDirectory(dataDir)
+                .addQueue(QueueConfig.builder("queue")
+                        .retention(QueueConfig.RetentionPolicy.timeBased(Duration.ofDays(7)))
+                        .build())
+                .replicationQuorum(1)
+                .transportWorkerThreads(4)
+                .strictConsistency(false);
+        for (NodeInfo peer : peers) {
+            builder.addPeer(peer);
+        }
+        return new NGridNode(builder.build());
     }
 
     @Test
