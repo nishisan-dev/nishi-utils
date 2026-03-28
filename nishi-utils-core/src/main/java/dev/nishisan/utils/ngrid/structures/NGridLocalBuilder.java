@@ -45,7 +45,7 @@ import java.util.Set;
  */
 public final class NGridLocalBuilder {
 
-    private static final Duration DEFAULT_CONSENSUS_TIMEOUT = Duration.ofSeconds(20);
+    private static final Duration DEFAULT_CONSENSUS_TIMEOUT = Duration.ofSeconds(30);
 
     private final int nodeCount;
     private final List<String> queueNames = new ArrayList<>();
@@ -265,6 +265,14 @@ public final class NGridLocalBuilder {
                 if (!nodes.get(i).transport().isConnected(otherId)) {
                     return false;
                 }
+            }
+        }
+
+        // Leader must not be syncing (otherwise writes will fail with
+        // "Leader sync in progress")
+        for (NGridNode node : nodes) {
+            if (node.replicationManager() != null && node.replicationManager().isLeaderSyncing()) {
+                return false;
             }
         }
 
