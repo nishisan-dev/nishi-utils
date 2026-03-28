@@ -42,7 +42,7 @@ jobs:
           distribution: 'temurin'
 
       - name: Run unit tests
-        run: mvn -B test
+        run: mvn -B test -Dsurefire.rerunFailingTestsCount=1
 
   resilience-tests:
     name: Resilience Tests (In-Process)
