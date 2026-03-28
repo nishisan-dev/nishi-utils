@@ -69,6 +69,7 @@ public final class NMapPersistence<K, V> implements Closeable {
     // Entry framing + compatibility
     private static final int ENTRY_MAGIC = 0x4E4D5741; // "NMWA"
     private static final int ENTRY_VERSION = 1;
+    private static final int META_VERSION = 2;
 
     private final NMapConfig config;
     private final Map<K, V> data;
@@ -83,6 +84,7 @@ public final class NMapPersistence<K, V> implements Closeable {
 
     private final LinkedBlockingQueue<NMapWALEntry> queue = new LinkedBlockingQueue<>();
     private final AtomicBoolean running = new AtomicBoolean();
+    private final AtomicLong lastMutationTimeMillis = new AtomicLong();
     private final Object walLock = new Object();
 
     private volatile RandomAccessFile walRaf;
@@ -127,6 +129,16 @@ public final class NMapPersistence<K, V> implements Closeable {
     }
 
     /**
+     * Returns the timestamp of the last mutation known to this persistence
+     * engine, or {@code 0} when no mutation has been observed.
+     *
+     * @return the last mutation timestamp in epoch millis
+     */
+    public long lastMutationTimestamp() {
+        return lastMutationTimeMillis.get();
+    }
+
+    /**
      * Loads state from disk (snapshot + WAL replay). No-op when persistence is
      * disabled.
      */
@@ -142,7 +154,10 @@ public final class NMapPersistence<K, V> implements Closeable {
                 loadWal(oldWalPath);
             }
             loadWal(walPath);
-            readMeta().ifPresent(meta -> lastSnapshotTimeMillis = meta.lastSnapshotTimestamp());
+            readMeta().ifPresent(meta -> {
+                lastSnapshotTimeMillis = meta.lastSnapshotTimestamp();
+                lastMutationTimeMillis.accumulateAndGet(meta.lastMutationTimestamp(), Math::max);
+            });
         } catch (IOException e) {
             LOGGER.log(Level.WARNING, "Failed to load map persistence state", e);
         }
@@ -186,12 +201,25 @@ public final class NMapPersistence<K, V> implements Closeable {
      * @param value the value (may be null for REMOVE)
      */
     public void appendAsync(NMapOperationType type, Object key, Object value) {
+        appendAsync(System.currentTimeMillis(), type, key, value);
+    }
+
+    /**
+     * Appends a WAL entry asynchronously using the provided mutation timestamp.
+     *
+     * @param timestamp the mutation timestamp in epoch millis
+     * @param type      the operation type
+     * @param key       the key
+     * @param value     the value (may be null for REMOVE)
+     */
+    public void appendAsync(long timestamp, NMapOperationType type, Object key, Object value) {
         if (config.mode() == NMapPersistenceMode.DISABLED) {
             return;
         }
         Objects.requireNonNull(type, "type");
         Objects.requireNonNull(key, "key");
-        queue.offer(new NMapWALEntry(System.currentTimeMillis(), type, key, value));
+        lastMutationTimeMillis.accumulateAndGet(timestamp, Math::max);
+        queue.offer(new NMapWALEntry(timestamp, type, key, value));
     }
 
     /**
@@ -203,6 +231,18 @@ public final class NMapPersistence<K, V> implements Closeable {
      * @param value the value (may be null for REMOVE)
      */
     public void appendSync(NMapOperationType type, Object key, Object value) {
+        appendSync(System.currentTimeMillis(), type, key, value);
+    }
+
+    /**
+     * Appends a WAL entry synchronously using the provided mutation timestamp.
+     *
+     * @param timestamp the mutation timestamp in epoch millis
+     * @param type      the operation type
+     * @param key       the key
+     * @param value     the value (may be null for REMOVE)
+     */
+    public void appendSync(long timestamp, NMapOperationType type, Object key, Object value) {
         if (config.mode() == NMapPersistenceMode.DISABLED) {
             return;
         }
@@ -212,7 +252,8 @@ public final class NMapPersistence<K, V> implements Closeable {
         if (ch == null) {
             return;
         }
-        NMapWALEntry entry = new NMapWALEntry(System.currentTimeMillis(), type, key, value);
+        lastMutationTimeMillis.accumulateAndGet(timestamp, Math::max);
+        NMapWALEntry entry = new NMapWALEntry(timestamp, type, key, value);
         synchronized (walLock) {
             try {
                 ByteBuffer buffer = encode(entry);
@@ -378,7 +419,7 @@ public final class NMapPersistence<K, V> implements Closeable {
             LOGGER.log(Level.WARNING, "Failed to delete rotated WAL after snapshot", e);
         }
 
-        writeMeta(new NMapMetadata(0L, System.currentTimeMillis(), ENTRY_VERSION));
+        writeMeta(new NMapMetadata(0L, System.currentTimeMillis(), lastMutationTimeMillis.get(), META_VERSION));
     }
 
     private void writeSnapshot(Map<K, V> snapshot) throws IOException {
@@ -476,7 +517,8 @@ public final class NMapPersistence<K, V> implements Closeable {
                 throw new IOException("Invalid WAL entry type");
             }
             NMapOperationType type = values[typeOrdinal];
-            in.readLong(); // timestamp (reserved for future use)
+            long timestamp = in.readLong();
+            lastMutationTimeMillis.accumulateAndGet(timestamp, Math::max);
             int keyLen = in.readInt();
             if (keyLen <= 0 || keyLen > (16 * 1024 * 1024)) {
                 throw new IOException("Invalid key length");
@@ -598,6 +640,7 @@ public final class NMapPersistence<K, V> implements Closeable {
                 out.writeInt(meta.version());
                 out.writeLong(meta.lastSnapshotOffset());
                 out.writeLong(meta.lastSnapshotTimestamp());
+                out.writeLong(meta.lastMutationTimestamp());
                 out.flush();
             }
         } catch (IOException e) {
@@ -614,7 +657,8 @@ public final class NMapPersistence<K, V> implements Closeable {
             int version = in.readInt();
             long offset = in.readLong();
             long ts = in.readLong();
-            return java.util.Optional.of(new NMapMetadata(offset, ts, version));
+            long lastMutationTs = version >= META_VERSION ? in.readLong() : 0L;
+            return java.util.Optional.of(new NMapMetadata(offset, ts, lastMutationTs, version));
         } catch (IOException e) {
             return java.util.Optional.empty();
         }

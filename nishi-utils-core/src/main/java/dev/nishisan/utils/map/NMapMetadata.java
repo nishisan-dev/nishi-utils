@@ -22,10 +22,12 @@ package dev.nishisan.utils.map;
  *
  * @param lastSnapshotOffset    the offset of the last snapshot
  * @param lastSnapshotTimestamp the timestamp of the last snapshot
+ * @param lastMutationTimestamp the timestamp of the last persisted mutation
  * @param version               the metadata format version
  */
 public record NMapMetadata(
         long lastSnapshotOffset,
         long lastSnapshotTimestamp,
+        long lastMutationTimestamp,
         int version) {
 }

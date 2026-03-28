@@ -55,6 +55,25 @@ class NMapTest {
     }
 
     @Test
+    void lastMutationTimestampShouldTrackMutations() throws Exception {
+        NMapConfig cfg = NMapConfig.inMemory();
+
+        try (NMap<String, String> map = NMap.open(tempDir, "test-last-mutation", cfg)) {
+            assertEquals(0L, map.lastMutationTimestamp());
+
+            map.put("a", "1");
+            long afterPut = map.lastMutationTimestamp();
+            assertTrue(afterPut > 0L);
+
+            map.remove("missing");
+            assertEquals(afterPut, map.lastMutationTimestamp());
+
+            map.remove("a");
+            assertTrue(map.lastMutationTimestamp() >= afterPut);
+        }
+    }
+
+    @Test
     void removeShouldReturnPreviousValue() throws Exception {
         NMapConfig cfg = NMapConfig.builder()
                 .mode(NMapPersistenceMode.ASYNC_WITH_FSYNC)
@@ -108,10 +127,12 @@ class NMapTest {
                 .batchTimeout(Duration.ofMillis(2))
                 .build();
 
+        long lastMutationTimestamp;
         try (NMap<String, String> map = NMap.open(tempDir, "test-snapshot", cfg)) {
             map.put("k1", "v1");
             map.put("k2", "v2");
             map.remove("k1");
+            lastMutationTimestamp = map.lastMutationTimestamp();
             // Give the background writer time to trigger snapshot
             Thread.sleep(100);
         }
@@ -120,6 +141,7 @@ class NMapTest {
         try (NMap<String, String> map = NMap.open(tempDir, "test-snapshot", cfg)) {
             assertFalse(map.containsKey("k1"));
             assertEquals(Optional.of("v2"), map.get("k2"));
+            assertEquals(lastMutationTimestamp, map.lastMutationTimestamp());
         }
     }
 

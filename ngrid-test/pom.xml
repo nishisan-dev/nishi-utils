@@ -165,8 +165,8 @@
     </build>
     <properties>
         <skip.docker.build>false</skip.docker.build>
-        <maven.compiler.source>21</maven.compiler.source>
-        <maven.compiler.target>21</maven.compiler.target>
+        <maven.compiler.source>25</maven.compiler.source>
+        <maven.compiler.target>25</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <testcontainers.version>2.0.3</testcontainers.version>
         <junit.version>5.11.4</junit.version>

@@ -27,6 +27,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiConsumer;
 
 /**
@@ -74,6 +75,7 @@ public final class NMap<K, V> implements Closeable {
     private final NMapPersistence<K, V> persistence;
     private final NMapConfig config;
     private final String name;
+    private final AtomicLong lastMutationTimestamp = new AtomicLong();
 
     private NMap(Path baseDir, String name, NMapConfig config) {
         this.name = Objects.requireNonNull(name, "name");
@@ -129,6 +131,7 @@ public final class NMap<K, V> implements Closeable {
         NMap<K, V> map = new NMap<>(baseDir, name, config);
         if (map.persistence != null) {
             map.persistence.load();
+            map.lastMutationTimestamp.set(map.persistence.lastMutationTimestamp());
             map.persistence.start();
         }
         return map;
@@ -147,8 +150,9 @@ public final class NMap<K, V> implements Closeable {
         Objects.requireNonNull(key, "key");
         Objects.requireNonNull(value, "value");
         V prev = storage.put(key, value);
+        long mutationTimestamp = markMutation();
         if (persistence != null) {
-            persistence.appendAsync(NMapOperationType.PUT, key, value);
+            persistence.appendAsync(mutationTimestamp, NMapOperationType.PUT, key, value);
         }
         return Optional.ofNullable(prev);
     }
@@ -162,8 +166,11 @@ public final class NMap<K, V> implements Closeable {
     public Optional<V> remove(K key) {
         Objects.requireNonNull(key, "key");
         V prev = storage.remove(key);
-        if (prev != null && persistence != null) {
-            persistence.appendAsync(NMapOperationType.REMOVE, key, null);
+        if (prev != null) {
+            long mutationTimestamp = markMutation();
+            if (persistence != null) {
+                persistence.appendAsync(mutationTimestamp, NMapOperationType.REMOVE, key, null);
+            }
         }
         return Optional.ofNullable(prev);
     }
@@ -182,8 +189,12 @@ public final class NMap<K, V> implements Closeable {
      * Removes all entries from this map.
      */
     public void clear() {
+        if (storage.isEmpty()) {
+            return;
+        }
+        long mutationTimestamp = markMutation();
         if (persistence != null) {
-            storage.keySet().forEach(k -> persistence.appendAsync(NMapOperationType.REMOVE, k, null));
+            storage.keySet().forEach(k -> persistence.appendAsync(mutationTimestamp, NMapOperationType.REMOVE, k, null));
         }
         storage.clear();
     }
@@ -291,6 +302,20 @@ public final class NMap<K, V> implements Closeable {
         return persistence != null ? persistence.failureCount() : 0;
     }
 
+    /**
+     * Returns the timestamp of the last successful map mutation.
+     *
+     * <p>
+     * This value is updated by mutating operations such as {@link #put(Object, Object)},
+     * {@link #remove(Object)} and {@link #clear()}. Returns {@code 0} when the map
+     * has not been mutated since it was created or loaded.
+     *
+     * @return the last mutation timestamp in epoch millis, or {@code 0}
+     */
+    public long lastMutationTimestamp() {
+        return lastMutationTimestamp.get();
+    }
+
     // ── Internal Access (for NGrid integration) ─────────────────────────
 
     /**
@@ -315,6 +340,11 @@ public final class NMap<K, V> implements Closeable {
      */
     NMapPersistence<K, V> internalPersistence() {
         return persistence;
+    }
+
+    private long markMutation() {
+        long now = System.currentTimeMillis();
+        return lastMutationTimestamp.accumulateAndGet(now, Math::max);
     }
 
     /**

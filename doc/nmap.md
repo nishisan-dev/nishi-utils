@@ -47,7 +47,7 @@ try (NMap<String, byte[]> blobs = NMap.open(Path.of("/data"), "blobs", config)) 
 | `NMapPersistenceMode` | Modo de persistência: `DISABLED`, `ASYNC_NO_FSYNC`, `ASYNC_WITH_FSYNC` |
 | `NMapOperationType` | Tipo de operação: `PUT`, `REMOVE` |
 | `NMapWALEntry` | Record que representa uma entrada no WAL |
-| `NMapMetadata` | Metadados de versionamento do snapshot |
+| `NMapMetadata` | Metadados persistidos de snapshot e última mutação |
 | `NMapHealthListener` | Callback funcional para falhas de persistência |
 
 ### Fluxo de Persistência
@@ -104,6 +104,7 @@ public interface NMapHealthListener {
 | `snapshot()` | `Map<K,V>` | Cópia imutável do estado atual |
 | `name()` | `String` | Nome do mapa |
 | `persistenceFailureCount()` | `long` | Contagem de falhas de I/O |
+| `lastMutationTimestamp()` | `long` | Epoch millis da última mutação bem-sucedida, ou `0` se nunca houve |
 | `close()` | `void` | Fecha e libera recursos |
 
 ## Configuração (`NMapConfig`)
