@@ -1,6 +1,6 @@
 # NGrid – Mapa Distribuído (design + implementação atual)
 
-> **Última atualização:** 2026-03-26
+> **Última atualização:** 2026-03-28
 
 Este documento descreve o **mapa distribuído** do NGrid conforme implementado hoje no código.
 
@@ -30,9 +30,9 @@ Fornecer um mapa chave→valor replicado entre nós do cluster, com:
 
 - Roteia as chamadas de escrita para o **líder**.
 - Em nó líder: valida **leader lease** antes de aceitar writes, executa localmente no `MapClusterService`.
-- Em nó follower: envia `CLIENT_REQUEST` ao líder via `invokeLeader()` com **retry + backoff exponencial** (5 tentativas, 200ms→2s).
+- Em nó follower: codifica o comando via `MapReplicationCodec` e envelopa em `EncodedCommand` antes de enviar `CLIENT_REQUEST` ao líder via `invokeLeader()` com **retry + backoff exponencial** (5 tentativas, 200ms→2s). Isso garante fidelidade de tipo de POJOs arbitrários.
 - Leituras (`get`) respeitam o nível de consistência configurado (ver seção abaixo).
-- Expõe `keySet()` para leitura eventually-consistent das chaves locais.
+- Expõe `keySet()`, `containsKey()`, `size()`, `isEmpty()`, `putAll()` para leitura eventually-consistent das chaves locais.
 - Expõe `removeByPrefix()` para limpeza local durante snapshot install (sem replicação).
 
 ### `MapClusterService<K,V>` (estado + integração com replicação)
@@ -155,9 +155,11 @@ participant MP as NMapPersistence
 Client->>F: put(k, v)
 F->>DM: put(k, v)
 Note over DM: isLeader()? → invokeLeader()
-DM->>L: CLIENT_REQUEST("map.put:<mapName>", MapEntry(k,v))
+Note over DM: MapReplicationCodec.encode() → EncodedCommand
+DM->>L: CLIENT_REQUEST("map.put:<mapName>", EncodedCommand(bytes))
 L->>DM: onMessage(CLIENT_REQUEST)
 Note over DM: hasValidLease()? ✅
+Note over DM: body instanceof EncodedCommand → decode()
 DM->>MS: put(k, v)
 MS->>RM: replicate("map:<mapName>", PUT(k,v))
 RM->>MS: apply(opId, PUT) (líder aplica local)
@@ -297,6 +299,10 @@ Quando um follower detecta lag significativo (> 500 ops ou stalled por > 4s):
 | `get(key)` | `Optional<V>` | Leitura STRONG (default — roteia ao líder) |
 | `get(key, consistency)` | `Optional<V>` | Leitura com nível de consistência configurável |
 | `keySet()` | `Set<K>` | Visão imutável das chaves (local, eventually-consistent) |
+| `containsKey(key)` | `boolean` | Verifica existência (local, eventually-consistent) |
+| `size()` | `int` | Número de entradas (local, eventually-consistent) |
+| `isEmpty()` | `boolean` | Verifica se vazio (local, eventually-consistent) |
+| `putAll(entries)` | `void` | Insere múltiplas entradas (cada put é replicado individualmente) |
 | `removeByPrefix(prefix)` | `void` | Remove chaves com prefixo (local-only, sem replicação) |
 | `close()` | `void` | Remove listener do transport |
 

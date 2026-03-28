@@ -12,7 +12,7 @@ Adicione a dependência do projeto (ajuste a versão conforme seu release):
 <dependency>
   <groupId>dev.nishisan</groupId>
   <artifactId>nishi-utils</artifactId>
-  <version>3.1.0</version>
+  <version>3.6.5</version>
 </dependency>
 ```
 
@@ -460,6 +460,8 @@ Node->>C: close()
 - `Optional<T> peek()`
 - `Optional<T> poll()`
 - `Optional<T> pollWhenAvailable(Duration timeout)` (long-poll com notificação)
+- `DistributedQueueConsumer<T> openConsumer(String groupId, String consumerId)` — abre consumer lógico com cursor persistente
+- `void subscribe()` / `void unsubscribe()` — gerencia inscrição em notificações do líder
 
 ### Observações importantes
 
@@ -476,19 +478,52 @@ O modo **DELETE_ON_CONSUME** fica restrito ao legado (`queueDirectory`) e nao e 
 - **TIME_BASED (log/stream)**: o item permanece por tempo e cada consumidor avanca seu **offset** individual.
 - **DELETE_ON_CONSUME (legado)**: o item e removido no commit. Todos os consumidores avancam o mesmo ponteiro global.
 
-Exemplo de log distribuido com dois consumidores distintos (NodeId diferentes):
+### Consumer Lógico (`openConsumer`)
+
+O caminho recomendado para consumo distribuído em filas `TIME_BASED` é o consumer lógico, introduzido em 3.6.5:
+
+```java
+DistributedQueue<String> events = node.getQueue("events", String.class);
+DistributedQueueConsumer<String> consumer = events.openConsumer("billing", "worker-1");
+
+consumer.peek();      // lê sem avançar o cursor
+consumer.poll();      // avança o cursor e retorna Optional<T>
+consumer.position();  // retorna o offset atual do cursor
+consumer.seek(0L);    // replay explícito desde o início
+
+// Long-poll (bloqueia até nova mensagem ou timeout)
+Optional<String> msg = consumer.pollWhenAvailable(Duration.ofSeconds(5));
+```
+
+**Vantagens sobre o `poll()` legado:**
+
+| Característica | `poll()` legado | `openConsumer(...)` |
+|---|---|---|
+| Identidade do cursor | Acoplada ao `NodeId` físico | `groupId` + `consumerId` (estável) |
+| Múltiplos consumidores por nó | Não | Sim (cada consumer tem seu cursor) |
+| Seek/replay | Não | Sim (`seek(offset)`) |
+| Posição actual | Não | Sim (`position()`) |
+
+> **API interna:** O cursor é implementado via `QueueConsumerCursor` e persiste offsets no mapa de offsets do cluster (`_ngrid-queue-offsets`) usando uma chave codificada `cg:<base64(groupId)>:<base64(consumerId)>`.
+
+Exemplo de log distribuido com consumidores lógicos independentes:
 
 ```java
 DistributedQueue<String> events = node.getQueue("events", String.class);
 
-// Consumidor A (node-A)
-Optional<String> a1 = events.poll();
+// Consumidor A (logico, estavel)
+DistributedQueueConsumer<String> billingWorker = events.openConsumer("billing", "worker-1");
+Optional<String> a1 = billingWorker.poll();
 
-// Consumidor B (node-B)
-Optional<String> b1 = events.poll();
+// Consumidor B (logico, diferente)
+DistributedQueueConsumer<String> analyticsWorker = events.openConsumer("analytics", "worker-1");
+Optional<String> b1 = analyticsWorker.poll();
+
+// Consumo legado (NodeId-based, compatibilidade)
+Optional<String> legacy = events.poll();
 ```
 
-> Importante: offsets sao persistidos por `NodeId`. Use IDs estaveis e, em log mode, execute consumidores em nos distintos para isolar offsets. Se o retention expirar, o offset pode ser avancado para o item mais antigo disponivel.
+> Importante: consumer lógico (`openConsumer`) persiste offsets por `groupId:consumerId`. O path legado persiste por `NodeId`. Use IDs estáveis para continuidade após restart. Se o retention expirar, o offset pode ser avançado para o item mais antigo disponível.
 
 ### Resiliencia em filas (catch-up e reenvio)
 

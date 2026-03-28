@@ -1,6 +1,74 @@
 # Diário de Bordo — nishi-utils (NGrid / NQueue)
 
-> Registro cronológico das alterações, decisões técnicas e lições aprendidas durante o ciclo de estabilização do NGrid (fev/2026).
+> Registro cronológico das alterações, decisões técnicas e lições aprendidas durante o ciclo de estabilização do NGrid (fev–mar/2026).
+
+---
+
+## 2026-03-28 — 🟢 NMap: `lastMutationTimestamp` persistido + Consumer Lógico
+
+**Commits:** `84722d7`, `b97e214`, `e831d31`
+
+**Alterações:**
+- `NMap.lastMutationTimestamp()` agora persiste o timestamp da última mutação em `meta.json` e restaura no `open()`
+- Documentação ADR: semântica V1 do NQUEUE e NMAP canonizada (`adr-nqueue-nmap-v1.md`)
+- Matriz de gap: `nqueue-nmap-gap-matrix.md` com status de cada capacidade
+- Consumer lógico: `DistributedQueue.openConsumer(groupId, consumerId)` com `QueueConsumerCursor` e `DistributedQueueConsumer`
+  - Cursor independente do `NodeId` físico
+  - Suporte a `peek()`, `poll()`, `pollWhenAvailable()`, `position()` e `seek()`
+  - Offset persistido via `_ngrid-queue-offsets` com chave codificada `cg:<base64(group)>:<base64(consumer)>`
+- `QueueClusterService`: refatoração de `poll`/`peek` para suportar `QueueConsumerCursor`
+
+**Status:** ✅ Commitado
+
+---
+
+## 2026-03-27 — 🟢 Fix: Bug #3 — `byte[]` serializado como Base64 String pelo Jackson (v3.6.5)
+
+**Commit:** `1a1f327`
+
+**Problema:** No path `CLIENT_REQUEST` follower→leader do mapa distribuído, o `byte[]` gerado pelo `MapReplicationCodec.encode()` era serializado pelo Jackson como uma string Base64. O líder recebia `String` ao invés de `byte[]`, causando `ClassCastException`.
+
+**Correção:**
+- Criado `EncodedCommand` como wrapper POJO para transportar `byte[]` via `ClientRequestPayload`
+- `@JsonTypeInfo(CLASS)` no campo `body` de `ClientRequestPayload` escreve o discriminador `@class`, permitindo deserialização correta
+- `DistributedMap.put()` e `remove()` no path follower agora enviam `EncodedCommand` ao invés de `byte[]` raw
+- `executeLocal()` detecta `EncodedCommand` via `instanceof` e extrai o payload original
+
+**Lição aprendida:** O Jackson trata `byte[]` como tipo especial (Base64 String), não preservando a identidade de tipo. Wrappers POJO com `@JsonTypeInfo` resolvem o problema de forma transparente.
+
+**Status:** ✅ Commitado
+
+---
+
+## 2026-03-27 — 🟢 Fix: POJO type fidelity no `CLIENT_REQUEST` follower→leader (#83, v3.6.4)
+
+**Commits:** `c85298b`, `2407bc3`, `1bcd936`
+
+**Problema:** POJOs personalizados (sem anotações Jackson) enviados de followers para o líder via `CLIENT_REQUEST` eram deserializados como `LinkedHashMap`, causando `ClassCastException` no `MapClusterService.put()`.
+
+**Correção:**
+- `DistributedMap.put()` no follower agora codifica o comando via `MapReplicationCodec.encode()` (preserva tipos concretos via `activateDefaultTyping`)
+- `MapReplicationCodec` tornado `public` para uso cross-package
+- `executeLocal()` decodifica via `MapReplicationCodec.decode()` quando recebe `byte[]`
+
+**Status:** ✅ Commitado
+
+---
+
+## 2026-03-26 — 🟢 Fix: POJO type na replicação do mapa (#82, v3.6.2)
+
+**Commits:** `ad91643`, `588c6b1`, `f5b44a6`, `643a2f0`
+
+**Problema:** No path de replicação líder→follower, POJOs arbitrários eram serializados pelo `JacksonMessageCodec` sem informação de tipo, resultando em `LinkedHashMap` nos followers.
+
+**Correção:**
+- Criado `MapReplicationCodec` com `ObjectMapper` dedicado + `activateDefaultTyping`
+- `MapClusterService` passa a usar `MapReplicationCodec.encode/decode` para transportar comandos e snapshots como `byte[]` opaco
+- Testes de regressão adicionados para validar preservação de POJO
+
+**Lição aprendida:** O `JacksonMessageCodec` padrão não preserva tipos concretos. Para POJOs arbitrários no payload de replicação, um codec dedicado com `activateDefaultTyping` é necessário.
+
+**Status:** ✅ Commitado
 
 ---
 

@@ -4,7 +4,7 @@ Coleção de utilitários em Java, com foco em:
 
 - **NMap**: mapa **persistente** standalone (WAL + snapshot), com **offloading plugável** (in-memory, disco, híbrido com LRU).
 - **NQueue**: fila **persistente** (FIFO) baseada em arquivos, segura para múltiplas threads.
-- **NGrid**: infraestrutura **distribuída** via TCP com **fila** e **mapa** (replicação por líder + quorum).
+- **NGrid**: infraestrutura **distribuída** via TCP com **fila** (stream/log distribuído) e **mapa** (KV distribuído) — replicação por líder + quorum, consumer lógico com cursor persistente e serialização type-safe de POJOs.
 - **Stats**: utilitários para **métricas/estatísticas** simples (contadores, médias, valores, memória).
 
 ### NMap (mapa persistente standalone)
@@ -38,28 +38,30 @@ Coleção de utilitários em Java, com foco em:
 - **Replicação com quorum** configurável (modos: disponibilidade ou consistência estrita)
 - API cliente transparente: qualquer nó pode encaminhar a operação ao líder
 - **Log Distribuído & Streaming**: retenção por tempo + consumo persistente por NodeId (offset)
+- **Consumer Lógico (3.6.5+)**: `openConsumer(groupId, consumerId)` com cursor independente, seek explícito e identidade desacoplada do NodeId físico
 - **Consistência de leitura** para mapas: forte, eventual ou limitada por lag
 - **Sincronização de estado (catch-up)** por snapshot em chunks para mapas **e filas**
 - **Reenvio de sequência** quando gaps são detectados (com fallback para snapshot)
 - **Persistência opcional de mapa** com WAL + snapshot (recuperação robusta em crash/rotação)
+- **Serialização type-safe de POJOs (3.6.2+)**: `MapReplicationCodec` + `EncodedCommand` preservam tipos concretos na replicação e no path follower→leader
 - Estruturas:
-  - `DistributedQueue`: `offer`, `poll`, `peek`
-  - `DistributedMap`: `put`, `get`, `remove`
+  - `DistributedQueue`: `offer`, `poll`, `peek`, `openConsumer`
+  - `DistributedMap`: `put`, `get`, `remove`, `containsKey`, `keySet`, `size`, `putAll`
 
 ## Requisitos
 
-- Java **21**
+- Java **21+**
 - Maven
 
 ## Instalação (Maven)
 
-Versão do artefato no projeto: **3.1.0** (`pom.xml`).
+Versão do artefato no projeto: **3.6.5** (`pom.xml`).
 
 ```xml
 <dependency>
   <groupId>dev.nishisan</groupId>
   <artifactId>nishi-utils</artifactId>
-  <version>3.1.0</version>
+  <version>3.6.5</version>
 </dependency>
 ```
 
@@ -295,6 +297,7 @@ import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.ngrid.structures.DistributedMap;
 import dev.nishisan.utils.ngrid.structures.DistributedQueue;
+import dev.nishisan.utils.ngrid.structures.DistributedQueueConsumer;
 import dev.nishisan.utils.ngrid.structures.NGridConfig;
 import dev.nishisan.utils.ngrid.structures.NGridNode;
 import dev.nishisan.utils.ngrid.structures.QueueConfig;
@@ -339,6 +342,13 @@ public class NGridClusterExample {
       queue.offer("job-1");
       Optional<String> job = queue.poll();
       System.out.println("job=" + job.orElse("<vazio>"));
+
+      // Consumer lógico (recomendado para TIME_BASED)
+      DistributedQueueConsumer<String> consumer = queue.openConsumer("billing", "worker-1");
+      consumer.peek();      // lê sem avançar
+      consumer.poll();      // avança o cursor
+      consumer.position();  // offset atual
+      consumer.seek(0L);    // replay explícito
 
       DistributedMap<String, String> map = node2.map(String.class, String.class);
       map.put("k1", "v1");
@@ -424,14 +434,31 @@ Optional<Event> event = events.poll();
 
 Para mais detalhes, consulte a [documentação completa de configuração YAML](doc/ngrid/ngrid_yaml_config_guide.md).
 
+### Consumer lógico (recomendado para TIME_BASED)
+
+A partir da versão 3.6.5, use `openConsumer(groupId, consumerId)` para consumo distribuído com cursor explícito. O cursor é identificado por `groupId` + `consumerId` e persiste offsets de forma independente do `NodeId` físico.
+
+```java
+DistributedQueue<String> queue = node.getQueue("orders", String.class);
+DistributedQueueConsumer<String> consumer = queue.openConsumer("billing", "worker-1");
+
+consumer.peek();      // lê sem avançar o cursor
+consumer.poll();      // avança o cursor
+consumer.position();  // retorna offset atual
+consumer.seek(0L);    // replay explícito do início
+```
+
+> O `poll()` legado via `DistributedQueue.poll()` continua existindo com semântica baseada no `NodeId` para compatibilidade.
+
 ### Observações/limitações atuais
 
 - Operações são **roteadas ao líder** para consistência.
 - O mapa é mantido em memória (e replicado); persistência em disco é **durabilidade**, não expansão de capacidade.
 - O `replicationQuorum` define quantos nós (incluindo o líder) precisam confirmar para a operação ser considerada commitada.
 - **Catch-up de filas e mapas** usa snapshot em chunks quando há atraso relevante.
-- Offsets de consumo em modo `TIME_BASED` são persistidos por `NodeId`; se o retention expirar, o consumidor pode ser avançado para o item mais antigo disponível.
+- Offsets de consumo: consumer lógico (`openConsumer`) persiste por `groupId:consumerId`; path legado persiste por `NodeId`. Se o retention expirar, o consumidor pode ser avançado para o item mais antigo disponível.
 - `queueDirectory` (legado) mantém semântica destrutiva; no NGrid moderno o padrão é `TIME_BASED`.
+- **Serialização de POJOs (3.6.2+)**: POJOs sem anotações Jackson são transportados com tipo preservado via `MapReplicationCodec`. Não é necessário implementar `Serializable`.
 
 ## Arquitetura (resumo)
 
@@ -501,7 +528,12 @@ Para detalhes (docs em pt-BR):
 - `doc/ngrid/map-design.md`
 - `doc/ngrid/nqueue-integration.md`
 - `doc/ngrid/playbook-resiliencia.md`
+- `doc/ngrid/adr-nqueue-nmap-v1.md` — ADR: semântica V1 do NQUEUE e NMAP
+- `doc/ngrid/nqueue-nmap-gap-matrix.md` — matriz de gap e maturidade
+- `doc/nmap.md`
 - `doc/nqueue-readme.md`
+- `doc/nqueue-examples.md`
+- `doc/nqueue-agent-guide.md`
 
 ## Stats (métricas)
 
