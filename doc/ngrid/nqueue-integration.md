@@ -97,6 +97,25 @@ No NGrid moderno, o padrao e **TIME_BASED**; **DELETE_ON_CONSUME** fica restrito
 - **TIME_BASED**: poll por offset (log mode) associado ao `NodeId` do consumidor.
 - **DELETE_ON_CONSUME (legado)**: poll destrutivo replicado para todos os nos.
 
+### `openConsumer(groupId, consumerId)`
+
+O caminho recomendado para consumo no modelo atual e abrir um consumidor logico explicito:
+
+```java
+DistributedQueue<String> queue = node.getQueue("orders", String.class);
+DistributedQueueConsumer<String> consumer = queue.openConsumer("billing", "worker-1");
+
+consumer.peek();      // le sem avancar
+consumer.poll();      // avanca o cursor
+consumer.position();  // offset atual
+consumer.seek(0L);    // replay explicito
+```
+
+- `groupId` + `consumerId` identificam o cursor de leitura.
+- O offset e persistido de forma independente do `NodeId` fisico.
+- `DistributedQueue.poll()` continua existindo como compatibilidade do modelo legado baseado no no local.
+- `openConsumer(...)` exige `TIME_BASED`; em `DELETE_ON_CONSUME` o comportamento recomendado continua sendo o caminho legado.
+
 ```mermaid
 sequenceDiagram
 participant Client as Client
