@@ -141,11 +141,16 @@ class NMapDestroyTest {
     void destroyShouldRemoveHybridOffloadDirectory() throws Exception {
         NMapConfig cfg = NMapConfig.builder()
                 .mode(NMapPersistenceMode.DISABLED)
-                .offloadStrategyFactory((baseDir, name) ->
-                        HybridOffloadStrategy.<String, String>builder(baseDir, name)
+                .offloadStrategyFactory(new NMapOffloadStrategyFactory() {
+                    @Override
+                    @SuppressWarnings("unchecked")
+                    public <K, V> NMapOffloadStrategy<K, V> create(Path baseDir, String name) {
+                        return (NMapOffloadStrategy<K, V>) HybridOffloadStrategy.<String, String>builder(baseDir, name)
                                 .evictionPolicy(EvictionPolicy.LRU)
                                 .maxInMemoryEntries(2)
-                                .build())
+                                .build();
+                    }
+                })
                 .build();
 
         Path mapDir = tempDir.resolve("destroy-hybrid");
