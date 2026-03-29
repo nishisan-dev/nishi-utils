@@ -24,5 +24,7 @@ public enum NMapOperationType {
     /** Insert or update an entry. */
     PUT,
     /** Remove an entry by key. */
-    REMOVE
+    REMOVE,
+    /** Destroy the map — clear all data and delete persistence files. */
+    DESTROY
 }

@@ -34,6 +34,7 @@ import java.security.NoSuchAlgorithmException;
 import java.util.AbstractMap;
 import java.util.AbstractSet;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HexFormat;
 import java.util.Iterator;
 import java.util.Map;
@@ -374,6 +375,19 @@ public final class DiskOffloadStrategy<K, V>
         // Index and files remain on disk for future reopens
     }
 
+    /**
+     * Remove todas as entradas do disco e da memória, libera recursos e apaga
+     * recursivamente o diretório de offload ({@code offloadDir}).
+     *
+     * @throws IOException se ocorrer erro de I/O durante a remoção
+     */
+    @Override
+    public void destroy() throws IOException {
+        clear();
+        close();
+        deleteDirectoryRecursively(offloadDir);
+    }
+
     // ── Internal helpers ────────────────────────────────────────────────
 
     /**
@@ -497,5 +511,21 @@ public final class DiskOffloadStrategy<K, V>
      * Internal record for holding a deserialized key-value pair.
      */
     private record OffloadEntry<K, V>(K key, V value) {
+    }
+
+    static void deleteDirectoryRecursively(Path dir) throws IOException {
+        if (!Files.exists(dir)) {
+            return;
+        }
+        try (var stream = Files.walk(dir)) {
+            stream.sorted(Comparator.reverseOrder())
+                    .forEach(p -> {
+                        try {
+                            Files.deleteIfExists(p);
+                        } catch (IOException e) {
+                            LOGGER.log(Level.WARNING, "Failed to delete: " + p, e);
+                        }
+                    });
+        }
     }
 }

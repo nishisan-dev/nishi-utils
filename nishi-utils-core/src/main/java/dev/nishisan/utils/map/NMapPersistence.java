@@ -630,6 +630,38 @@ public final class NMapPersistence<K, V> implements Closeable {
         }
     }
 
+    // ── Destroy ─────────────────────────────────────────────────────────
+
+    /**
+     * Encerra a engine de persistência e remove todos os arquivos associados ao mapa
+     * (WAL, snapshot, metadados e arquivos temporários), além do diretório do mapa
+     * caso esteja vazio após a exclusão.
+     *
+     * Fluxo Negocial
+     * 1. Invoca {@link #close()} para encerrar a writer thread e liberar o canal WAL.
+     * 2. Remove os arquivos: {@code wal.log}, {@code wal.log.old}, {@code snapshot.dat},
+     *    {@code snapshot.dat.tmp} e {@code map.meta}.
+     * 3. Tenta remover o diretório do mapa ({@code mapDir}). A remoção só ocorre se o
+     *    diretório estiver vazio; caso contrário, é silenciosamente ignorada.
+     *
+     * @throws IOException se ocorrer erro de I/O ao fechar ou remover arquivos
+     */
+    public void destroy() throws IOException {
+        close();
+        Files.deleteIfExists(walPath);
+        Files.deleteIfExists(oldWalPath);
+        Files.deleteIfExists(snapshotPath);
+        Files.deleteIfExists(tempSnapshotPath);
+        Files.deleteIfExists(metaPath);
+        // Remove directory only if empty (offload files may still live there)
+        try {
+            Files.deleteIfExists(mapDir);
+        } catch (java.nio.file.DirectoryNotEmptyException ignored) {
+            // Expected when DiskOffload/HybridOffload subdirectories exist;
+            // the strategy's own destroy() will handle those.
+        }
+    }
+
     // ── Metadata ────────────────────────────────────────────────────────
 
     private void writeMeta(NMapMetadata meta) {

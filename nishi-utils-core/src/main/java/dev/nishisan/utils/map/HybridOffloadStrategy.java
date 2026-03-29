@@ -483,6 +483,28 @@ public final class HybridOffloadStrategy<K, V>
         }
     }
 
+    /**
+     * Remove todas as entradas (hot e cold), libera recursos e apaga
+     * recursivamente o diretório de offload híbrido ({@code offloadDir}).
+     *
+     * @throws IOException se ocorrer erro de I/O durante a remoção
+     */
+    @Override
+    public void destroy() throws IOException {
+        clear();
+        // close() without flushing — data is already cleared
+        lockAllWrite();
+        try {
+            for (int i = 0; i < CONCURRENCY_LEVEL; i++) {
+                hotCaches[i].clear();
+            }
+            coldIndex.clear();
+        } finally {
+            unlockAllWrite();
+        }
+        DiskOffloadStrategy.deleteDirectoryRecursively(offloadDir);
+    }
+
     // ── Metrics ─────────────────────────────────────────────────────────
 
     /**

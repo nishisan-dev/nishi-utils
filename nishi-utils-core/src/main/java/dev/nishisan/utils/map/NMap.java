@@ -358,6 +358,29 @@ public final class NMap<K, V> implements Closeable {
 
     // ── Lifecycle ───────────────────────────────────────────────────────
 
+    /**
+     * Encerra o mapa, limpa todos os dados em memória e remove os arquivos de
+     * persistência associados (WAL, snapshot, metadados e diretórios de offload).
+     *
+     * Após a chamada, o mapa fica em estado inutilizável — comportamento análogo
+     * ao {@link #close()}, porém com destruição irreversível dos dados persistidos.
+     *
+     * Fluxo Negocial
+     * 1. Invoca {@code destroy()} na estratégia de storage, limpando entradas em
+     *    memória e removendo arquivos de offload (quando aplicável).
+     * 2. Se a persistência WAL/snapshot estiver habilitada, invoca
+     *    {@code destroy()} na engine de persistência para remover WAL, snapshot,
+     *    metadados e o diretório do mapa.
+     *
+     * @throws IOException se ocorrer erro de I/O durante a destruição
+     */
+    public void destroy() throws IOException {
+        storage.destroy();
+        if (persistence != null) {
+            persistence.destroy();
+        }
+    }
+
     @Override
     public void close() throws IOException {
         if (persistence != null) {

@@ -18,6 +18,7 @@
 package dev.nishisan.utils.map;
 
 import java.io.Closeable;
+import java.io.IOException;
 import java.io.Serializable;
 import java.util.Map;
 import java.util.Set;
@@ -134,4 +135,20 @@ public interface NMapOffloadStrategy<K, V> extends Closeable {
      * @return {@code true} if data is inherently persisted by the strategy
      */
     boolean isInherentlyPersistent();
+
+    /**
+     * Remove todas as entradas em memória e em disco, libera recursos e apaga
+     * quaisquer diretórios de offload pertencentes a esta estratégia.
+     *
+     * A implementação padrão invoca {@link #clear()} seguido de {@link #close()},
+     * o que é suficiente para estratégias puramente em memória. Estratégias com
+     * persistência em disco devem sobrescrever este método para remover seus
+     * diretórios de dados.
+     *
+     * @throws IOException se ocorrer erro de I/O durante a destruição
+     */
+    default void destroy() throws IOException {
+        clear();
+        close();
+    }
 }
