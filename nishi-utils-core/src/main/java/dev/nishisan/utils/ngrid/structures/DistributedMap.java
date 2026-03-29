@@ -54,6 +54,7 @@ public final class DistributedMap<K, V>
     private static final String COMMAND_PREFIX_PUT = "map.put:";
     private static final String COMMAND_PREFIX_REMOVE = "map.remove:";
     private static final String COMMAND_PREFIX_GET = "map.get:";
+    private static final String COMMAND_PREFIX_DESTROY = "map.destroy:";
 
     private final Transport transport;
     private final ClusterCoordinator coordinator;
@@ -62,6 +63,7 @@ public final class DistributedMap<K, V>
     private final String mapPutCommand;
     private final String mapRemoveCommand;
     private final String mapGetCommand;
+    private final String mapDestroyCommand;
     private final StatsUtils stats;
     private final dev.nishisan.utils.ngrid.replication.ReplicationManager replicationManager;
     private final NodeId localNodeId;
@@ -139,6 +141,7 @@ public final class DistributedMap<K, V>
         this.mapPutCommand = COMMAND_PREFIX_PUT + this.mapName;
         this.mapRemoveCommand = COMMAND_PREFIX_REMOVE + this.mapName;
         this.mapGetCommand = COMMAND_PREFIX_GET + this.mapName;
+        this.mapDestroyCommand = COMMAND_PREFIX_DESTROY + this.mapName;
         transport.addListener(this);
     }
 
@@ -410,6 +413,10 @@ public final class DistributedMap<K, V>
                     .map(SerializableOptional::of)
                     .orElseGet(SerializableOptional::empty);
         }
+        if (command.equals(mapDestroyCommand)) {
+            mapService.destroyReplicated();
+            return Boolean.TRUE;
+        }
         throw new IllegalArgumentException("Unknown command: " + command);
     }
 
@@ -432,7 +439,7 @@ public final class DistributedMap<K, V>
             return;
         }
         ClientRequestPayload payload = message.payload(ClientRequestPayload.class);
-        if (!Set.of(mapPutCommand, mapRemoveCommand, mapGetCommand).contains(payload.command())) {
+        if (!Set.of(mapPutCommand, mapRemoveCommand, mapGetCommand, mapDestroyCommand).contains(payload.command())) {
             return;
         }
         ClientResponsePayload responsePayload;
@@ -458,6 +465,48 @@ public final class DistributedMap<K, V>
         // Note: mapService is NOT closed here because it may be shared by multiple
         // DistributedMap instances.
         // The owner (NGridNode) is responsible for closing MapClusterService instances.
+    }
+
+    /**
+     * Destrói o mapa distribuído replicando o comando DESTROY para todos os nós
+     * do cluster via pipeline de replicação leader-based.
+     *
+     * Fluxo Negocial
+     * 1. Se o nó local é o líder com lease válido, invoca
+     *    {@link MapClusterService#destroyReplicated()} diretamente.
+     * 2. Se o nó local é follower, encaminha a requisição ao líder via
+     *    {@code CLIENT_REQUEST} (mesmo mecanismo de {@code put}/{@code remove}).
+     * 3. O líder replica o comando DESTROY para todos os nós — cada nó, ao
+     *    aplicar, limpa os dados em memória e apaga os arquivos de persistência.
+     * 4. Após a confirmação, remove o listener de transporte via {@link #close()}.
+     *
+     * @throws IOException se ocorrer erro de I/O ao remover o listener de transporte
+     */
+    public void destroy() throws IOException {
+        if (coordinator.isLeader()) {
+            if (!coordinator.hasValidLease()) {
+                throw new IllegalStateException("Leader lease expired, cannot accept writes");
+            }
+            mapService.destroyReplicated();
+        } else {
+            byte[] encoded = MapReplicationCodec.encode(MapReplicationCommand.destroy());
+            invokeLeader(mapDestroyCommand, new EncodedCommand(encoded));
+        }
+        close();
+    }
+
+    /**
+     * Destrói o mapa apenas no nó local, sem replicação para o cluster.
+     *
+     * Remove todos os dados em memória e apaga os arquivos de persistência
+     * do nó local. Útil em cenários de shutdown ou cleanup onde a replicação
+     * não é possível ou desejada.
+     *
+     * @throws IOException se ocorrer erro de I/O ao remover arquivos de persistência
+     */
+    public void destroyLocal() throws IOException {
+        mapService.destroy();
+        close();
     }
 
     private void recordMapPut() {

@@ -45,6 +45,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.TimeUnit;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 /**
  * Simple distributed map that relies on the replication layer to keep replicas
@@ -147,6 +149,21 @@ public final class MapClusterService<K, V>
         byte[] encoded = MapReplicationCodec.encode(MapReplicationCommand.remove(key));
         waitForReplication(replicationManager.replicate(topic, encoded));
         return Optional.ofNullable(previous);
+    }
+
+    /**
+     * Replica um comando DESTROY para todos os nós do cluster, limpando os dados
+     * em memória e removendo os arquivos de persistência em cada réplica.
+     *
+     * Fluxo Negocial
+     * 1. Codifica um {@link MapReplicationCommand} do tipo {@code DESTROY}.
+     * 2. Envia o comando pelo pipeline de replicação e aguarda quorum.
+     * 3. Cada nó, ao aplicar o comando em {@link #apply}, limpa o
+     *    {@code ConcurrentMap} e invoca {@code persistence.destroy()}.
+     */
+    public void destroyReplicated() {
+        byte[] encoded = MapReplicationCodec.encode(MapReplicationCommand.destroy());
+        waitForReplication(replicationManager.replicate(topic, encoded));
     }
 
     /**
@@ -275,6 +292,17 @@ public final class MapClusterService<K, V>
                 }
             }
             case REMOVE -> data.remove((K) command.key());
+            case DESTROY -> {
+                data.clear();
+                if (persistence != null) {
+                    try {
+                        persistence.destroy();
+                    } catch (IOException e) {
+                        LOGGER.log(Level.WARNING, "Failed to destroy persistence files for topic: " + topic, e);
+                    }
+                }
+                return; // skip normal persistence append below
+            }
         }
         if (persistence != null) {
             NMapOperationType opType = command.type();
@@ -360,6 +388,28 @@ public final class MapClusterService<K, V>
     public void close() throws IOException {
         if (persistence != null) {
             persistence.close();
+        }
+    }
+
+    /**
+     * Limpa todos os dados em memória e remove os arquivos de persistência
+     * associados a este serviço de mapa no nó local.
+     *
+     * Operação exclusivamente local — não dispara replicação para o cluster.
+     * Cada nó participante deve invocar este método individualmente para
+     * destruir seus próprios arquivos.
+     *
+     * Fluxo Negocial
+     * 1. Limpa o {@code ConcurrentMap} local com todos os dados do mapa.
+     * 2. Se a persistência estiver habilitada, invoca {@code destroy()} na
+     *    engine {@link NMapPersistence}, removendo WAL, snapshot e metadados.
+     *
+     * @throws IOException se ocorrer erro de I/O ao remover arquivos de persistência
+     */
+    public void destroy() throws IOException {
+        data.clear();
+        if (persistence != null) {
+            persistence.destroy();
         }
     }
 

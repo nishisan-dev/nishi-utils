@@ -42,7 +42,10 @@ public final class MapReplicationCommand  {
             @JsonProperty("key") Object key,
             @JsonProperty("value") Object value) {
         this.type = Objects.requireNonNull(type, "type");
-        this.key = Objects.requireNonNull(key, "key");
+        if (type != NMapOperationType.DESTROY) {
+            Objects.requireNonNull(key, "key");
+        }
+        this.key = key;
         this.value = value;
     }
 
@@ -65,6 +68,15 @@ public final class MapReplicationCommand  {
      */
     public static MapReplicationCommand remove(Object key) {
         return new MapReplicationCommand(NMapOperationType.REMOVE, key, null);
+    }
+
+    /**
+     * Cria um comando de replicação DESTROY para destruir o mapa em todos os nós.
+     *
+     * @return o comando
+     */
+    public static MapReplicationCommand destroy() {
+        return new MapReplicationCommand(NMapOperationType.DESTROY, null, null);
     }
 
     /**
