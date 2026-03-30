@@ -67,6 +67,8 @@ public final class DistributedMap<K, V>
     private final StatsUtils stats;
     private final dev.nishisan.utils.ngrid.replication.ReplicationManager replicationManager;
     private final NodeId localNodeId;
+    private volatile boolean closed;
+    private volatile Runnable onDestroyCallback;
 
     /**
      * Creates a distributed map with default name and no stats or replication
@@ -143,6 +145,25 @@ public final class DistributedMap<K, V>
         this.mapGetCommand = COMMAND_PREFIX_GET + this.mapName;
         this.mapDestroyCommand = COMMAND_PREFIX_DESTROY + this.mapName;
         transport.addListener(this);
+    }
+
+    /**
+     * Sets a callback invoked when this map is destroyed or closed.
+     * Used by {@link NGridNode} to remove the map from its internal registry.
+     *
+     * @param callback the callback to invoke on destroy
+     */
+    void setOnDestroyCallback(Runnable callback) {
+        this.onDestroyCallback = callback;
+    }
+
+    /**
+     * Returns {@code true} if this map has been closed or destroyed.
+     *
+     * @return whether the map is closed
+     */
+    public boolean isClosed() {
+        return closed;
     }
 
     /**
@@ -313,8 +334,17 @@ public final class DistributedMap<K, V>
             return mapService.get(key);
         }
 
-        SerializableOptional<V> result = (SerializableOptional<V>) invokeLeader(mapGetCommand, key);
-        return result.toOptional();
+        try {
+            SerializableOptional<V> result = (SerializableOptional<V>) invokeLeader(mapGetCommand, key);
+            return result.toOptional();
+        } catch (IllegalStateException e) {
+            // If the leader's map was destroyed locally, fall back to local read
+            // rather than propagating the error — the local replica may still have data.
+            if (e.getMessage() != null && e.getMessage().startsWith("Map not found:")) {
+                return mapService.get(key);
+            }
+            throw e;
+        }
     }
 
     private Object invokeLeader(String command, Object body) {
@@ -435,6 +465,9 @@ public final class DistributedMap<K, V>
     /** {@inheritDoc} */
     @Override
     public void onMessage(ClusterMessage message) {
+        if (closed) {
+            return;
+        }
         if (message.type() != MessageType.CLIENT_REQUEST) {
             return;
         }
@@ -461,6 +494,11 @@ public final class DistributedMap<K, V>
     /** {@inheritDoc} */
     @Override
     public void close() throws IOException {
+        closed = true;
+        Runnable cb = onDestroyCallback;
+        if (cb != null) {
+            cb.run();
+        }
         transport.removeListener(this);
         // Note: mapService is NOT closed here because it may be shared by multiple
         // DistributedMap instances.
