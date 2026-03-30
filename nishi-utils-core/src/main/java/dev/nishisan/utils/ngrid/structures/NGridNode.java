@@ -878,6 +878,10 @@ public final class NGridNode implements Closeable {
                 this::createMapService);
         DistributedMap<Serializable, Serializable> m = new DistributedMap<>(transport, coordinator, service, mapName,
                 stats, replicationManager);
+        m.setOnDestroyCallback(() -> {
+            maps.remove(mapName);
+            mapServices.remove(mapName);
+        });
         notifyResourceListeners();
         return m;
     }
@@ -917,6 +921,7 @@ public final class NGridNode implements Closeable {
         private static final String MAP_PUT_PREFIX = "map.put:";
         private static final String MAP_REMOVE_PREFIX = "map.remove:";
         private static final String MAP_GET_PREFIX = "map.get:";
+        private static final String MAP_DESTROY_PREFIX = "map.destroy:";
 
         @Override
         public void onMessage(ClusterMessage message) {
@@ -935,9 +940,11 @@ public final class NGridNode implements Closeable {
                 return; // Not a map command
             }
 
-            // If a DistributedMap is registered for this name, it will handle the
-            // request. Only respond if no map is known.
-            if (maps.containsKey(targetMapName)) {
+            // If a DistributedMap is registered for this name and still active,
+            // it will handle the request. Respond with error if no map is known
+            // or the map has been locally destroyed (closed).
+            DistributedMap<?, ?> existing = maps.get(targetMapName);
+            if (existing != null && !existing.isClosed()) {
                 return;
             }
 
@@ -960,6 +967,9 @@ public final class NGridNode implements Closeable {
             }
             if (command.startsWith(MAP_GET_PREFIX)) {
                 return command.substring(MAP_GET_PREFIX.length());
+            }
+            if (command.startsWith(MAP_DESTROY_PREFIX)) {
+                return command.substring(MAP_DESTROY_PREFIX.length());
             }
             return null;
         }
