@@ -63,6 +63,8 @@ public final class MapClusterService<K, V>
     /** Default map name when none is specified. */
     public static final String DEFAULT_MAP_NAME = "default-map";
 
+    private static final Logger LOGGER = Logger.getLogger(MapClusterService.class.getName());
+
     private final ConcurrentMap<K, V> data = new ConcurrentHashMap<>();
     private final ReplicationManager replicationManager;
     private final NMapPersistence<K, V> persistence;

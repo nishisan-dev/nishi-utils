@@ -6,7 +6,7 @@
 
     <groupId>dev.nishisan</groupId>
     <artifactId>nishi-utils-parent</artifactId>
-    <version>3.7.0</version>
+    <version>3.7.1</version>
     <packaging>pom</packaging>
     <modules>
         <module>nishi-utils-core</module>
@@ -265,6 +265,7 @@
                         <version>12.1.1</version>
                         <configuration>
                             <failBuildOnCVSS>7</failBuildOnCVSS>
+                            <nvdApiDelay>2000</nvdApiDelay>
                             <formats>
                                 <format>HTML</format>
                                 <format>JSON</format>

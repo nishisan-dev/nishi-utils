@@ -3,12 +3,6 @@ name: Maven Release
 on:
   release:
     types: [created]
-  workflow_dispatch:
-    inputs:
-      release_tag:
-        description: Release tag in format v<major>.<minor>.<patch>
-        required: true
-        type: string
 
 jobs:
   release:
@@ -28,7 +22,7 @@ jobs:
 
     - name: Extract version from tag
       run: |
-        TAG="${{ github.event.release.tag_name || inputs.release_tag }}"
+        TAG="${{ github.event.release.tag_name }}"
         if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
           echo "Tag must match v<major>.<minor>.<patch>, got: $TAG"
           exit 1
