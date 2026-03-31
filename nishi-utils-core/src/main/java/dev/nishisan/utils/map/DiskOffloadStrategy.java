@@ -19,23 +19,18 @@ package dev.nishisan.utils.map;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.io.Serializable;
 import java.io.UncheckedIOException;
 import java.lang.ref.SoftReference;
-import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.AbstractMap;
 import java.util.AbstractSet;
 import java.util.Collections;
 import java.util.Comparator;
-import java.util.HexFormat;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.Objects;
@@ -169,10 +164,8 @@ public final class DiskOffloadStrategy<K, V>
                 }
             }
             // Cache miss — read from disk
-            Path path = index.get(key);
-            if (path == null || !Files.exists(path)) {
-                index.remove(key);
-                cache.remove(key);
+            Path path = resolvePathForRead(key, index.get(key));
+            if (path == null) {
                 return null;
             }
             try {
@@ -194,11 +187,16 @@ public final class DiskOffloadStrategy<K, V>
         lock.writeLock().lock();
         try {
             V previous = getUnderLock(key);
-            Path path = pathForKey(key);
+            String keyHash = keyHash(key);
+            Path path = pathForKey(keyHash);
+            Path legacyPath = legacyPathForKey(keyHash);
             try {
                 serialize(path, key, value);
                 index.put(key, path);
                 cache.put(key, new SoftReference<>(value));
+                if (!path.equals(legacyPath)) {
+                    OffloadLayout.deleteFileQuietly(offloadDir, legacyPath, LOGGER);
+                }
             } catch (IOException e) {
                 LOGGER.log(Level.WARNING, "Failed to write offloaded entry", e);
             }
@@ -214,15 +212,11 @@ public final class DiskOffloadStrategy<K, V>
         lock.writeLock().lock();
         try {
             V previous = getUnderLock(key);
-            Path path = index.remove(key);
+            index.remove(key);
             cache.remove(key);
-            if (path != null) {
-                try {
-                    Files.deleteIfExists(path);
-                } catch (IOException e) {
-                    LOGGER.log(Level.WARNING, "Failed to delete offloaded entry: " + path, e);
-                }
-            }
+            String keyHash = keyHash(key);
+            OffloadLayout.deleteFileQuietly(offloadDir, pathForKey(keyHash), LOGGER);
+            OffloadLayout.deleteFileQuietly(offloadDir, legacyPathForKey(keyHash), LOGGER);
             return previous;
         } finally {
             lock.writeLock().unlock();
@@ -300,15 +294,9 @@ public final class DiskOffloadStrategy<K, V>
     public void clear() {
         lockAllWrite();
         try {
-            for (Path path : index.values()) {
-                try {
-                    Files.deleteIfExists(path);
-                } catch (IOException e) {
-                    LOGGER.log(Level.WARNING, "Failed to delete offloaded entry: " + path, e);
-                }
-            }
             index.clear();
             cache.clear();
+            OffloadLayout.clearDirectoryContentsRecursively(offloadDir, LOGGER);
         } finally {
             unlockAllWrite();
         }
@@ -406,10 +394,8 @@ public final class DiskOffloadStrategy<K, V>
                 return cached;
             }
         }
-        Path path = index.get(key);
-        if (path == null || !Files.exists(path)) {
-            index.remove(key);
-            cache.remove(key);
+        Path path = resolvePathForRead(key, index.get(key));
+        if (path == null) {
             return null;
         }
         try {
@@ -429,24 +415,22 @@ public final class DiskOffloadStrategy<K, V>
      * two distinct keys always map to different files.
      */
     private Path pathForKey(K key) {
-        return offloadDir.resolve(keyHash(key) + ENTRY_SUFFIX);
+        return pathForKey(keyHash(key));
+    }
+
+    private Path pathForKey(String keyHash) {
+        return OffloadLayout.shardedPath(offloadDir, keyHash, ENTRY_SUFFIX);
+    }
+
+    private Path legacyPathForKey(String keyHash) {
+        return OffloadLayout.legacyPath(offloadDir, keyHash, ENTRY_SUFFIX);
     }
 
     /**
      * Computes the SHA-1 hex digest of the serialized key.
      */
     private String keyHash(K key) {
-        try {
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            try (ObjectOutputStream oos = new ObjectOutputStream(baos)) {
-                oos.writeObject(key);
-            }
-            byte[] digest = MessageDigest.getInstance("SHA-1").digest(baos.toByteArray());
-            return HexFormat.of().formatHex(digest);
-        } catch (IOException | NoSuchAlgorithmException e) {
-            // SHA-1 is always available per JDK spec; IO on byte array never fails
-            throw new UncheckedIOException(new IOException("Failed to compute key hash", e));
-        }
+        return OffloadLayout.keyHash(key);
     }
 
     /**
@@ -458,16 +442,35 @@ public final class DiskOffloadStrategy<K, V>
         if (!Files.isDirectory(offloadDir)) {
             return;
         }
-        try (DirectoryStream<Path> stream = Files.newDirectoryStream(offloadDir, "*" + ENTRY_SUFFIX)) {
-            for (Path path : stream) {
+        try (var stream = Files.walk(offloadDir)) {
+            for (Path path : stream.filter(Files::isRegularFile)
+                    .filter(path -> path.getFileName().toString().endsWith(ENTRY_SUFFIX))
+                    .toList()) {
                 try {
                     OffloadEntry<K, V> entry = deserializeEntry(path);
-                    index.put(entry.key(), path);
+                    index.compute(entry.key(), (k, current) ->
+                            OffloadLayout.shouldPrefer(offloadDir, current, path) ? path : current);
                 } catch (IOException e) {
                     LOGGER.log(Level.WARNING, "Failed to load offloaded entry: " + path, e);
                 }
             }
         }
+    }
+
+    private Path resolvePathForRead(K key, Path indexedPath) {
+        if (indexedPath != null && Files.exists(indexedPath)) {
+            return indexedPath;
+        }
+        Path resolved = OffloadLayout.preferredExistingPath(offloadDir, keyHash(key), ENTRY_SUFFIX);
+        if (resolved != null) {
+            index.put(key, resolved);
+            return resolved;
+        }
+        if (indexedPath != null) {
+            index.remove(key, indexedPath);
+        }
+        cache.remove(key);
+        return null;
     }
 
     /**

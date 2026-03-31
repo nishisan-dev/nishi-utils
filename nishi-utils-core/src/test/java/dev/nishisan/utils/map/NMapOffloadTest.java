@@ -20,6 +20,9 @@ package dev.nishisan.utils.map;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.BufferedOutputStream;
+import java.io.ObjectOutputStream;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -48,6 +51,29 @@ class NMapOffloadTest {
                 .build();
     }
 
+    private Path offloadDir(String mapName) {
+        return tempDir.resolve(mapName).resolve("offload");
+    }
+
+    private Path shardedPath(String mapName, String key) {
+        String keyHash = OffloadLayout.keyHash(key);
+        return OffloadLayout.shardedPath(offloadDir(mapName), keyHash, ".dat");
+    }
+
+    private Path legacyPath(String mapName, String key) {
+        String keyHash = OffloadLayout.keyHash(key);
+        return OffloadLayout.legacyPath(offloadDir(mapName), keyHash, ".dat");
+    }
+
+    private void writeOffloadEntry(Path path, String key, String value) throws Exception {
+        Files.createDirectories(path.getParent());
+        try (ObjectOutputStream oos = new ObjectOutputStream(
+                new BufferedOutputStream(Files.newOutputStream(path)))) {
+            oos.writeObject(key);
+            oos.writeObject(value);
+        }
+    }
+
     @Test
     void diskOffloadPutAndGet() throws Exception {
         try (NMap<String, String> map = NMap.open(tempDir, "offload-put", diskConfig())) {
@@ -74,17 +100,32 @@ class NMapOffloadTest {
     }
 
     @Test
+    void diskOffloadShouldUseTwoLevelShardedLayout() throws Exception {
+        String mapName = "offload-sharded-layout";
+        try (NMap<String, String> map = NMap.open(tempDir, mapName, diskConfig())) {
+            map.put("sharded-key", "value");
+        }
+
+        assertTrue(Files.exists(shardedPath(mapName, "sharded-key")));
+        assertFalse(Files.exists(legacyPath(mapName, "sharded-key")));
+    }
+
+    @Test
     void diskOffloadSurvivesRestart() throws Exception {
+        String mapName = "offload-restart";
         NMapConfig cfg = diskConfig();
 
-        try (NMap<String, String> map = NMap.open(tempDir, "offload-restart", cfg)) {
+        try (NMap<String, String> map = NMap.open(tempDir, mapName, cfg)) {
             map.put("persistent-key", "persistent-value");
             map.put("another-key", "another-value");
         }
 
+        assertTrue(Files.exists(shardedPath(mapName, "persistent-key")));
+        assertTrue(Files.exists(shardedPath(mapName, "another-key")));
+
         // Reopen — data should survive because DiskOffloadStrategy is inherently
         // persistent
-        try (NMap<String, String> map = NMap.open(tempDir, "offload-restart", cfg)) {
+        try (NMap<String, String> map = NMap.open(tempDir, mapName, cfg)) {
             assertEquals(Optional.of("persistent-value"), map.get("persistent-key"));
             assertEquals(Optional.of("another-value"), map.get("another-key"));
             assertEquals(2, map.size());
@@ -92,8 +133,67 @@ class NMapOffloadTest {
     }
 
     @Test
+    void diskOffloadShouldReadLegacyFlatLayoutOnRestart() throws Exception {
+        String mapName = "offload-legacy-restart";
+        writeOffloadEntry(legacyPath(mapName, "legacy-key"), "legacy-key", "legacy-value");
+
+        try (NMap<String, String> map = NMap.open(tempDir, mapName, diskConfig())) {
+            assertEquals(Optional.of("legacy-value"), map.get("legacy-key"));
+            assertEquals(1, map.size());
+        }
+    }
+
+    @Test
+    void diskOffloadShouldPreferShardedEntryWhenLegacyAndShardedCoexist() throws Exception {
+        String mapName = "offload-prefer-sharded";
+        writeOffloadEntry(legacyPath(mapName, "coexist-key"), "coexist-key", "legacy-value");
+        writeOffloadEntry(shardedPath(mapName, "coexist-key"), "coexist-key", "new-value");
+
+        try (NMap<String, String> map = NMap.open(tempDir, mapName, diskConfig())) {
+            assertEquals(Optional.of("new-value"), map.get("coexist-key"));
+            assertEquals(1, map.size());
+        }
+    }
+
+    @Test
+    void diskOffloadPutShouldMigrateLegacyEntryToShardedLayout() throws Exception {
+        String mapName = "offload-migrate-put";
+        Path legacyPath = legacyPath(mapName, "migrate-key");
+        Path shardedPath = shardedPath(mapName, "migrate-key");
+        writeOffloadEntry(legacyPath, "migrate-key", "legacy-value");
+
+        try (NMap<String, String> map = NMap.open(tempDir, mapName, diskConfig())) {
+            assertEquals(Optional.of("legacy-value"), map.get("migrate-key"));
+            map.put("migrate-key", "updated-value");
+            assertEquals(Optional.of("updated-value"), map.get("migrate-key"));
+        }
+
+        assertFalse(Files.exists(legacyPath));
+        assertTrue(Files.exists(shardedPath));
+    }
+
+    @Test
+    void diskOffloadRemoveShouldDeleteLegacyAndShardedFiles() throws Exception {
+        String mapName = "offload-remove-both-layouts";
+        Path legacyPath = legacyPath(mapName, "remove-key");
+        Path shardedPath = shardedPath(mapName, "remove-key");
+        writeOffloadEntry(legacyPath, "remove-key", "legacy-value");
+        writeOffloadEntry(shardedPath, "remove-key", "new-value");
+
+        try (NMap<String, String> map = NMap.open(tempDir, mapName, diskConfig())) {
+            assertEquals(Optional.of("new-value"), map.get("remove-key"));
+            assertEquals(Optional.of("new-value"), map.remove("remove-key"));
+            assertTrue(map.isEmpty());
+        }
+
+        assertFalse(Files.exists(legacyPath));
+        assertFalse(Files.exists(shardedPath));
+    }
+
+    @Test
     void diskOffloadClear() throws Exception {
-        try (NMap<String, String> map = NMap.open(tempDir, "offload-clear", diskConfig())) {
+        String mapName = "offload-clear";
+        try (NMap<String, String> map = NMap.open(tempDir, mapName, diskConfig())) {
             map.put("a", "1");
             map.put("b", "2");
             map.put("c", "3");
@@ -103,6 +203,10 @@ class NMapOffloadTest {
             assertTrue(map.isEmpty());
             assertEquals(0, map.size());
             assertFalse(map.containsKey("a"));
+        }
+        assertTrue(Files.isDirectory(offloadDir(mapName)));
+        try (var stream = Files.walk(offloadDir(mapName))) {
+            assertEquals(1L, stream.count(), "Offload root should remain empty after clear");
         }
     }
 

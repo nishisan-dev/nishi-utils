@@ -21,21 +21,16 @@ import dev.nishisan.utils.stats.StatsUtils;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.io.Serializable;
 import java.io.UncheckedIOException;
-import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.util.AbstractMap;
 import java.util.AbstractSet;
 import java.util.Collections;
-import java.util.HexFormat;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -206,11 +201,8 @@ public final class HybridOffloadStrategy<K, V>
             }
 
             // 2. Check cold index → warm-up
-            Path path = coldIndex.get(key);
-            if (path == null || !Files.exists(path)) {
-                if (path != null) {
-                    coldIndex.remove(key);
-                }
+            Path path = resolveColdPathForRead(key, coldIndex.get(key));
+            if (path == null) {
                 notifyHit(NMapMetrics.CACHE_MISS);
                 return null;
             }
@@ -243,11 +235,10 @@ public final class HybridOffloadStrategy<K, V>
         int stripe = stripeFor(key);
         locks[stripe].writeLock().lock();
         try {
-            // Remove from cold if present
-            Path coldPath = coldIndex.remove(key);
-            if (coldPath != null) {
-                deleteFileQuietly(coldPath);
-            }
+            String keyHash = keyHash(key);
+            coldIndex.remove(key);
+            deleteFileQuietly(pathForKey(keyHash));
+            deleteFileQuietly(legacyPathForKey(keyHash));
 
             V prev = hotCaches[stripe].put(key, value);
             evictIfNeeded(stripe);
@@ -272,7 +263,7 @@ public final class HybridOffloadStrategy<K, V>
             }
 
             // Try cold index
-            Path path = coldIndex.remove(key);
+            Path path = resolveColdPathForRead(key, coldIndex.remove(key));
             if (path != null) {
                 try {
                     prev = deserializeValue(path);
@@ -283,6 +274,9 @@ public final class HybridOffloadStrategy<K, V>
                     deleteFileQuietly(path);
                 }
             }
+            String keyHash = keyHash(key);
+            deleteFileQuietly(pathForKey(keyHash));
+            deleteFileQuietly(legacyPathForKey(keyHash));
             publishSizeGauges();
             return prev;
         } finally {
@@ -398,10 +392,8 @@ public final class HybridOffloadStrategy<K, V>
             for (int i = 0; i < CONCURRENCY_LEVEL; i++) {
                 hotCaches[i].clear();
             }
-            for (Path path : coldIndex.values()) {
-                deleteFileQuietly(path);
-            }
             coldIndex.clear();
+            OffloadLayout.clearDirectoryContentsRecursively(offloadDir, LOGGER);
         } finally {
             unlockAllWrite();
         }
@@ -469,9 +461,11 @@ public final class HybridOffloadStrategy<K, V>
             for (int i = 0; i < CONCURRENCY_LEVEL; i++) {
                 for (Map.Entry<K, V> entry : hotCaches[i].entrySet()) {
                     try {
-                        Path path = pathForKey(entry.getKey());
+                        String keyHash = keyHash(entry.getKey());
+                        Path path = pathForKey(keyHash);
                         serializeEntry(path, entry.getKey(), entry.getValue());
                         coldIndex.put(entry.getKey(), path);
+                        deleteFileQuietly(legacyPathForKey(keyHash));
                     } catch (IOException e) {
                         LOGGER.log(Level.WARNING, "Failed to flush hot entry on close", e);
                     }
@@ -573,12 +567,14 @@ public final class HybridOffloadStrategy<K, V>
             it.remove();
 
             // Serialize to disk
-            Path path = pathForKey(eldest.getKey());
+            String keyHash = keyHash(eldest.getKey());
+            Path path = pathForKey(keyHash);
             try {
                 long t0 = System.currentTimeMillis();
                 serializeEntry(path, eldest.getKey(), eldest.getValue());
                 notifyLatency(NMapMetrics.DISK_WRITE_LATENCY, System.currentTimeMillis() - t0);
                 coldIndex.put(eldest.getKey(), path);
+                deleteFileQuietly(legacyPathForKey(keyHash));
                 notifyHit(NMapMetrics.EVICTION);
             } catch (IOException e) {
                 LOGGER.log(Level.WARNING, "Failed to offload entry to disk: " + eldest.getKey(), e);
@@ -596,24 +592,22 @@ public final class HybridOffloadStrategy<K, V>
      * two distinct keys always map to different files.
      */
     private Path pathForKey(K key) {
-        return offloadDir.resolve(keyHash(key) + ENTRY_SUFFIX);
+        return pathForKey(keyHash(key));
+    }
+
+    private Path pathForKey(String keyHash) {
+        return OffloadLayout.shardedPath(offloadDir, keyHash, ENTRY_SUFFIX);
+    }
+
+    private Path legacyPathForKey(String keyHash) {
+        return OffloadLayout.legacyPath(offloadDir, keyHash, ENTRY_SUFFIX);
     }
 
     /**
      * Computes the SHA-1 hex digest of the serialized key.
      */
     private String keyHash(K key) {
-        try {
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            try (ObjectOutputStream oos = new ObjectOutputStream(baos)) {
-                oos.writeObject(key);
-            }
-            byte[] digest = MessageDigest.getInstance("SHA-1").digest(baos.toByteArray());
-            return HexFormat.of().formatHex(digest);
-        } catch (IOException | NoSuchAlgorithmException e) {
-            // SHA-1 is always available per JDK spec; IO on byte array never fails
-            throw new UncheckedIOException(new IOException("Failed to compute key hash", e));
-        }
+        return OffloadLayout.keyHash(key);
     }
 
     private void serializeEntry(Path path, K key, V value) throws IOException {
@@ -642,12 +636,15 @@ public final class HybridOffloadStrategy<K, V>
         if (!Files.isDirectory(offloadDir)) {
             return;
         }
-        try (DirectoryStream<Path> stream = Files.newDirectoryStream(offloadDir, "*" + ENTRY_SUFFIX)) {
-            for (Path path : stream) {
+        try (var stream = Files.walk(offloadDir)) {
+            for (Path path : stream.filter(Files::isRegularFile)
+                    .filter(path -> path.getFileName().toString().endsWith(ENTRY_SUFFIX))
+                    .toList()) {
                 try (ObjectInputStream ois = new ObjectInputStream(
                         new BufferedInputStream(Files.newInputStream(path)))) {
                     K key = (K) ois.readObject();
-                    coldIndex.put(key, path);
+                    coldIndex.compute(key, (k, current) ->
+                            OffloadLayout.shouldPrefer(offloadDir, current, path) ? path : current);
                 } catch (ClassNotFoundException | IOException e) {
                     LOGGER.log(Level.WARNING, "Failed to load cold entry key: " + path, e);
                 }
@@ -655,12 +652,23 @@ public final class HybridOffloadStrategy<K, V>
         }
     }
 
-    private void deleteFileQuietly(Path path) {
-        try {
-            Files.deleteIfExists(path);
-        } catch (IOException e) {
-            LOGGER.log(Level.WARNING, "Failed to delete offloaded file: " + path, e);
+    private Path resolveColdPathForRead(K key, Path indexedPath) {
+        if (indexedPath != null && Files.exists(indexedPath)) {
+            return indexedPath;
         }
+        Path resolved = OffloadLayout.preferredExistingPath(offloadDir, keyHash(key), ENTRY_SUFFIX);
+        if (resolved != null) {
+            coldIndex.put(key, resolved);
+            return resolved;
+        }
+        if (indexedPath != null) {
+            coldIndex.remove(key, indexedPath);
+        }
+        return null;
+    }
+
+    private void deleteFileQuietly(Path path) {
+        OffloadLayout.deleteFileQuietly(offloadDir, path, LOGGER);
     }
 
     // ── Stats helpers ───────────────────────────────────────────────────

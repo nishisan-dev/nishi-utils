@@ -23,6 +23,9 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.BufferedOutputStream;
+import java.io.ObjectOutputStream;
+import java.nio.file.Files;
 import java.nio.file.Path;
 
 import java.util.Set;
@@ -53,6 +56,29 @@ class HybridOffloadStrategyTest {
     @BeforeEach
     void setUp() {
         stats = new StatsUtils();
+    }
+
+    private Path offloadDir(String name) {
+        return tempDir.resolve(name).resolve("hybrid-offload");
+    }
+
+    private Path shardedPath(String name, String key) {
+        String keyHash = OffloadLayout.keyHash(key);
+        return OffloadLayout.shardedPath(offloadDir(name), keyHash, ".dat");
+    }
+
+    private Path legacyPath(String name, String key) {
+        String keyHash = OffloadLayout.keyHash(key);
+        return OffloadLayout.legacyPath(offloadDir(name), keyHash, ".dat");
+    }
+
+    private void writeOffloadEntry(Path path, String key, String value) throws Exception {
+        Files.createDirectories(path.getParent());
+        try (ObjectOutputStream oos = new ObjectOutputStream(
+                new BufferedOutputStream(Files.newOutputStream(path)))) {
+            oos.writeObject(key);
+            oos.writeObject(value);
+        }
     }
 
     @AfterEach
@@ -146,7 +172,8 @@ class HybridOffloadStrategyTest {
 
     @Test
     void dataShouldSurviveCloseAndReopen() {
-        strategy = HybridOffloadStrategy.<String, String>builder(tempDir, "persist-test")
+        String mapName = "persist-test";
+        strategy = HybridOffloadStrategy.<String, String>builder(tempDir, mapName)
                 .evictionPolicy(EvictionPolicy.LRU)
                 .maxInMemoryEntries(32)
                 .build();
@@ -157,9 +184,12 @@ class HybridOffloadStrategyTest {
 
         // Close flushes hot to cold
         strategy.close();
+        assertTrue(Files.exists(shardedPath(mapName, "x")));
+        assertTrue(Files.exists(shardedPath(mapName, "y")));
+        assertTrue(Files.exists(shardedPath(mapName, "z")));
 
         // Reopen
-        strategy = HybridOffloadStrategy.<String, String>builder(tempDir, "persist-test")
+        strategy = HybridOffloadStrategy.<String, String>builder(tempDir, mapName)
                 .evictionPolicy(EvictionPolicy.LRU)
                 .maxInMemoryEntries(32)
                 .build();
@@ -199,7 +229,8 @@ class HybridOffloadStrategyTest {
 
     @Test
     void clearShouldRemoveAllHotAndColdEntries() {
-        strategy = HybridOffloadStrategy.<String, String>builder(tempDir, "clear-test")
+        String mapName = "clear-test";
+        strategy = HybridOffloadStrategy.<String, String>builder(tempDir, mapName)
                 .evictionPolicy(EvictionPolicy.LRU)
                 .maxInMemoryEntries(16)
                 .build();
@@ -213,6 +244,12 @@ class HybridOffloadStrategyTest {
         assertEquals(0, strategy.hotSize());
         assertEquals(0, strategy.coldSize());
         assertTrue(strategy.isEmpty());
+        assertTrue(Files.isDirectory(offloadDir(mapName)));
+        try (var stream = Files.walk(offloadDir(mapName))) {
+            assertEquals(1L, stream.count(), "Hybrid offload root should remain empty after clear");
+        } catch (Exception e) {
+            fail(e);
+        }
     }
 
     @Test
@@ -431,5 +468,74 @@ class HybridOffloadStrategyTest {
         assertThrows(IllegalArgumentException.class,
                 () -> HybridOffloadStrategy.<String, String>builder(tempDir, "invalid")
                         .maxInMemoryEntries(-1));
+    }
+
+    @Test
+    void shouldReadLegacyFlatLayoutOnReopen() throws Exception {
+        String mapName = "legacy-reopen";
+        writeOffloadEntry(legacyPath(mapName, "legacy-key"), "legacy-key", "legacy-value");
+
+        strategy = HybridOffloadStrategy.<String, String>builder(tempDir, mapName)
+                .evictionPolicy(EvictionPolicy.LRU)
+                .maxInMemoryEntries(32)
+                .build();
+
+        assertEquals("legacy-value", strategy.get("legacy-key"));
+        assertEquals(1, strategy.size());
+    }
+
+    @Test
+    void shouldPreferShardedEntryWhenLegacyAndShardedCoexist() throws Exception {
+        String mapName = "prefer-sharded";
+        writeOffloadEntry(legacyPath(mapName, "coexist-key"), "coexist-key", "legacy-value");
+        writeOffloadEntry(shardedPath(mapName, "coexist-key"), "coexist-key", "new-value");
+
+        strategy = HybridOffloadStrategy.<String, String>builder(tempDir, mapName)
+                .evictionPolicy(EvictionPolicy.LRU)
+                .maxInMemoryEntries(32)
+                .build();
+
+        assertEquals("new-value", strategy.get("coexist-key"));
+        assertEquals(1, strategy.size());
+    }
+
+    @Test
+    void warmUpFromLegacyLayoutShouldReoffloadIntoShardedLayout() throws Exception {
+        String mapName = "legacy-warmup";
+        Path legacyPath = legacyPath(mapName, "legacy-key");
+        Path shardedPath = shardedPath(mapName, "legacy-key");
+        writeOffloadEntry(legacyPath, "legacy-key", "legacy-value");
+
+        strategy = HybridOffloadStrategy.<String, String>builder(tempDir, mapName)
+                .evictionPolicy(EvictionPolicy.LRU)
+                .maxInMemoryEntries(32)
+                .build();
+
+        assertEquals("legacy-value", strategy.get("legacy-key"));
+        assertFalse(Files.exists(legacyPath), "Warm-up should consume the legacy cold file");
+
+        strategy.close();
+
+        assertTrue(Files.exists(shardedPath), "Close should flush the warmed entry into the sharded layout");
+        assertFalse(Files.exists(legacyPath));
+    }
+
+    @Test
+    void removeShouldDeleteLegacyAndShardedPaths() throws Exception {
+        String mapName = "remove-both-layouts";
+        Path legacyPath = legacyPath(mapName, "remove-key");
+        Path shardedPath = shardedPath(mapName, "remove-key");
+        writeOffloadEntry(legacyPath, "remove-key", "legacy-value");
+        writeOffloadEntry(shardedPath, "remove-key", "new-value");
+
+        strategy = HybridOffloadStrategy.<String, String>builder(tempDir, mapName)
+                .evictionPolicy(EvictionPolicy.LRU)
+                .maxInMemoryEntries(32)
+                .build();
+
+        assertEquals("new-value", strategy.remove("remove-key"));
+        assertNull(strategy.get("remove-key"));
+        assertFalse(Files.exists(legacyPath));
+        assertFalse(Files.exists(shardedPath));
     }
 }
