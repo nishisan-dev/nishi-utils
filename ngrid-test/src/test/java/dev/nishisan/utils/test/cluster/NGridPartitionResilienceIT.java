@@ -214,8 +214,12 @@ class NGridPartitionResilienceIT extends AbstractNGridMapClusterIT {
             }
         }
 
-        // Aguardar propagação de gossip após reconexão
-        Thread.sleep(5_000);
+        await("reconnected nodes observe cluster again")
+            .atMost(30, TimeUnit.SECONDS)
+            .pollInterval(1, TimeUnit.SECONDS)
+            .until(() -> toIsolate.stream()
+                    .filter(NGridMapNodeContainer::isRunning)
+                    .allMatch(node -> node.latestActiveMembersCount() >= 3));
 
         // Cluster deve mostrar sinais de recuperação (rede reconectada).
         // Em ambiente Docker do CI, a re-eleição completa pode demorar
