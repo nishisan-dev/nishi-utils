@@ -159,6 +159,7 @@
                             </includes>
                             <environmentVariables>
                                 <TESTCONTAINERS_RYUK_DISABLED>true</TESTCONTAINERS_RYUK_DISABLED>
+                                <DOCKER_API_VERSION>1.43</DOCKER_API_VERSION>
                             </environmentVariables>
                         </configuration>
                         <executions>
