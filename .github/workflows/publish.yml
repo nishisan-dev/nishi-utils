@@ -39,7 +39,7 @@ jobs:
         GITHUB_USERNAME: ${{ github.actor }}
 
     - name: Build and publish to GitHub Packages
-      run: mvn -B -DskipTests -pl nishi-utils-core -am deploy -s $GITHUB_WORKSPACE/settings.xml
+      run: mvn -B -DskipTests -pl nishi-utils-core,nishi-utils-oss -am deploy -s $GITHUB_WORKSPACE/settings.xml
       env:
         GITHUB_TOKEN:    ${{ secrets.GITHUB_TOKEN }}
         GITHUB_USERNAME: ${{ github.actor }}
@@ -52,6 +52,9 @@ jobs:
           nishi-utils-core/target/nishi-utils-core-${{ env.RELEASE_VERSION }}.jar \
           nishi-utils-core/target/nishi-utils-core-${{ env.RELEASE_VERSION }}-sources.jar \
           nishi-utils-core/target/nishi-utils-core-${{ env.RELEASE_VERSION }}-javadoc.jar \
+          nishi-utils-oss/target/nishi-utils-oss-${{ env.RELEASE_VERSION }}.jar \
+          nishi-utils-oss/target/nishi-utils-oss-${{ env.RELEASE_VERSION }}-sources.jar \
+          nishi-utils-oss/target/nishi-utils-oss-${{ env.RELEASE_VERSION }}-javadoc.jar \
           --clobber
 
     - name: Prune old releases (keep last 5)

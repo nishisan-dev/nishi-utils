@@ -9,7 +9,7 @@ import java.util.Map;
 /**
  * Contrato público de operação de um pipeline ngrrd já configurado. Devolvido
  * por {@link Ngrrd#fromYaml(java.nio.file.Path,
- * dev.nishisan.utils.oss.storage.StorageFactory.StorageBindings)}.
+ * dev.nishisan.utils.oss.storage.StorageFactory.StorageBindings, java.util.Map)}.
  *
  * <p>O escopo é o da série identificada pelas {@code tags} fornecidas — o
  * handle resolve {@code seriesKey} via {@code IdentitySpec.seriesKeyTemplate}.</p>
