@@ -295,6 +295,54 @@ public final class NgrrdWriter implements AutoCloseable {
                 }
             }
         }
+        // Após gravar blocos novos, expira blocos que caíram fora da janela
+        // rows × stepSec de cada RRA (semântica de retenção finita do RRD).
+        for (RraDef rra : archives.rras()) {
+            expireOutOfWindowBlocks(rra);
+        }
+    }
+
+    /**
+     * Remove do Storage e do registro interno blocos cujo final em segundos
+     * caiu fora da janela {@code rows × stepSec} mais recente do RRA.
+     *
+     * <p>Sem esta lógica, o ngrrd cresceria indefinidamente e perderia a
+     * paridade com a semântica RRD clássica (ring buffer com janela fixa).</p>
+     */
+    private void expireOutOfWindowBlocks(RraDef rra) {
+        long retentionSec = (long) rra.rows() * rra.stepSec();
+        long latestBlockEnd = 0L;
+        for (PersistedBlock b : persistedBlocks) {
+            if (!b.rraName().equals(rra.name())) {
+                continue;
+            }
+            long blockEnd = b.blockStartEpoch() + (long) b.rows() * b.stepSec();
+            if (blockEnd > latestBlockEnd) {
+                latestBlockEnd = blockEnd;
+            }
+        }
+        if (latestBlockEnd == 0L) {
+            return;
+        }
+        long horizonStart = latestBlockEnd - retentionSec;
+        List<PersistedBlock> toRemove = new ArrayList<>();
+        for (PersistedBlock b : persistedBlocks) {
+            if (!b.rraName().equals(rra.name())) {
+                continue;
+            }
+            long blockEnd = b.blockStartEpoch() + (long) b.rows() * b.stepSec();
+            if (blockEnd <= horizonStart) {
+                toRemove.add(b);
+            }
+        }
+        for (PersistedBlock b : toRemove) {
+            try {
+                storage.delete(b.storageKey());
+            } catch (RuntimeException e) {
+                System.err.println("ngrrd-writer: falha ao expirar bloco " + b.storageKey() + ": " + e);
+            }
+        }
+        persistedBlocks.removeAll(toRemove);
     }
 
     private void persistRraBlock(BlockWindow window, String derivedDsName, RraDef rra,
