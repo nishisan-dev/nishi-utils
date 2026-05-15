@@ -3,9 +3,10 @@ WORKDIR /workspace
 
 COPY pom.xml /workspace/pom.xml
 COPY nishi-utils-core /workspace/nishi-utils-core
+COPY nishi-utils-oss /workspace/nishi-utils-oss
 COPY ngrid-test /workspace/ngrid-test
 
-RUN mvn -DskipTests -Dmaven.javadoc.skip=true -Dskip.docker.build=true install
+RUN mvn -pl nishi-utils-core -am -DskipTests -Dmaven.javadoc.skip=true -Dskip.docker.build=true install
 RUN mvn -f ngrid-test/pom.xml -DskipTests -Dskip.docker.build=true package
 
 FROM eclipse-temurin:25-jre

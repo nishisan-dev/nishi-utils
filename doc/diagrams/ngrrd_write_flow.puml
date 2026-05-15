@@ -1,0 +1,43 @@
+@startuml
+title ngrrd — Fluxo de escrita (ingestão)
+
+actor Cliente
+participant "Ngrrd.fromYaml" as Facade
+participant "NgrrdWriter\n(worker thread)" as Writer
+participant "CounterDeriver" as Deriv
+participant "PrimaryDataPoint[]" as PDP
+participant "RraConsolidator" as RRA
+participant "BlockCodec" as Codec
+participant "NgrrdStorage" as Storage
+participant "ManifestUpdater\n(scheduler)" as Manifest
+
+Cliente -> Facade : fromYaml(yaml, bindings, tags)
+Facade -> Writer : start (worker + queue)
+Facade -> Manifest : start (periodic)
+loop por sample
+  Cliente -> Writer : write("in_octets", Sample(ts, v))
+  Writer -> Deriv : derive(prev, curr)
+  Deriv --> Writer : derivedValue + flag
+  alt flag = RESET
+    Writer -> Writer : metrics.onCounterReset
+  else flag = WRAP
+    Writer -> Writer : metrics.onWrapDetected
+  end
+  Writer -> PDP : add(derivedValue)
+  alt ts >= blockEndEpoch
+    loop por RRA × CF
+      Writer -> RRA : consolidate(pdps, cf, xff)
+      RRA --> Writer : cdpValue[]
+      Writer -> Codec : encode(header, cdpValue[])
+      Writer -> Storage : atomicReplace(key, bytes)
+    end
+    Writer -> Writer : roll para novo BlockWindow
+  end
+end
+loop a cada intervalSec
+  Manifest -> Storage : list(manifest/<seriesKey>/)
+  Manifest -> Codec : writeYaml(NgrrdManifest)
+  Manifest -> Storage : atomicReplace(v{N}.yaml)
+end
+
+@enduml

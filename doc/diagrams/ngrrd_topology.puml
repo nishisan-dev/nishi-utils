@@ -1,0 +1,46 @@
+@startuml
+!define RECTANGLE class
+
+skinparam componentStyle rectangle
+skinparam linetype ortho
+
+title ngrrd — Visão de Contêiner (C4)
+
+actor "Aplicação cliente" as App
+
+package "nishi-utils-oss" {
+  component "Ngrrd\n(façade)" as Facade
+  component "NgrrdYamlLoader\n+ Validator" as Loader
+  component "Engine pura\n(CounterDeriver, PDP,\nRraConsolidator, BestFit)" as Engine
+  component "NgrrdWriter\n(thread única)" as Writer
+  component "ManifestUpdater\n(ScheduledExecutor)" as Manifest
+  component "NgrrdReader\n+ ViewExecutor" as Reader
+  component "BlockCodec\n+ ManifestCodec" as Format
+  component "NgrrdMetrics" as Metrics
+}
+
+interface "NgrrdStorage" as Storage
+component "LocalDiskStorage" as Local
+component "S3Storage\n(AWS SDK v2)" as S3
+
+database "Disco local" as Disk
+cloud "S3 / MinIO / Ceph" as Cloud
+
+App --> Facade : write(ds, Sample)\nread(preset|query)
+Facade --> Loader : carrega YAML
+Loader --> Engine : valida + monta\ndefinição imutável
+Facade --> Writer : ingestão assíncrona
+Facade --> Reader : leitura síncrona
+Writer --> Engine : pipeline\nCounterDeriver → PDP → RRA
+Writer --> Format : encode bloco
+Writer --> Storage : atomicReplace(block)
+Writer --> Metrics : eventos quality
+Manifest --> Storage : atomicReplace(manifest)
+Reader --> Storage : list(prefix) + get(block)
+Reader --> Format : decode bloco + manifest
+Storage <|-- Local
+Storage <|-- S3
+Local --> Disk
+S3 --> Cloud
+
+@enduml
