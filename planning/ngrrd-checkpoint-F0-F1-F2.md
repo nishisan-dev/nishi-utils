@@ -65,17 +65,95 @@ nishi-utils-oss/
 
 ---
 
-## 4. Pendências Abertas (F3 → F9)
+## 4. Pendências Abertas (F3 → F9) — Checklist Detalhado
 
-| Fase | O que entrega | Esforço estimado |
-|------|---------------|------------------|
-| **F3** — Formato binário + manifest | `format/BlockHeader`, `BlockCodec` (magic `NGRD` + version + flags + stepSec + cf + ds + blockStartEpoch + rows + crc32 + payload), `ManifestCodec` (Jackson YAML, definitionHash SHA-256) | 1 dia |
-| **F4** — Storage backends | `storage/NgrrdStorage` interface, `StorageKey`, `LocalDiskStorage` (atomic move), `S3Storage` (AWS SDK v2), `StorageFactory`. IT com LocalStack via Testcontainers no profile `ngrrd-integration`. | 1.5 dias |
-| **F5** — Writer + Reader e2e | `writer/NgrrdWriter` (thread única + LinkedBlockingQueue), `BlockRotator`, `ManifestUpdater`, `reader/NgrrdReader`, `ViewExecutor`. Testes e2e em disco + S3 + recovery. | 2 dias |
-| **F6** — Métricas/Quality | `metrics/NgrrdMetrics` com `missing_ratio`, `ingest_lag_sec`, `late_sample_count`, `counter_reset_count`, `wrap_detected_count`. | 0.5 dia |
-| **F7** — Façade Ngrrd | `Ngrrd.fromYaml(Path)` + `Ngrrd.builder()`. `NgrrdHandle` com `write/read/close`, shutdown ordenado. | 0.5 dia |
-| **F8** — Documentação | `docs/oss/ngrrd.md`, diagramas PlantUML em `docs/diagrams/`, README do módulo. | 1 dia |
-| **F9** — Smoke completo | `IfaceTrafficSmokeIT` carregando o YAML do enunciado, ingestão de 30 dias sintéticos, valida os 5 presets em disco e S3. Atualiza `CLAUDE.md` raiz. | 1 dia |
+### F3 — Formato binário e manifesto (~1 dia)
+**Branch:** `feature/ngrrd-format` (criar a partir de `feature/ngrrd-engine`).
+**Subpacote alvo:** `dev.nishisan.utils.oss.format`.
+
+- [ ] `BlockHeader` record com layout: `MAGIC(4) "NGRD" | VER(2) | FLAGS(2) | STEP(4) | CF(1) | DS(1) | BLOCK_START_EPOCH(8) | ROWS(4) | CRC32(4)`.
+- [ ] `BlockCodec.encode(BlockHeader, double[] payload) -> byte[]` e `decode(byte[]) -> {header, payload}`. Sem timestamps no payload — derivam de `blockStartEpoch + i*stepSec`. NaN = missing.
+- [ ] FLAGS reserva bits: `compressed`, `partial` (bloco ainda não fechado), `agg` (RRA vs raw). Implementar accessors mas deixar `compressed` sempre falso no MVP.
+- [ ] CRC32 (`java.util.zip.CRC32`) sobre header (excluindo o próprio campo CRC) + payload.
+- [ ] `ManifestCodec` (Jackson YAML) com modelo: `version`, `seriesKey`, `definitionHash` (SHA-256 do YAML original), `rras[].blocks[]` (cada com `blockStartEpoch`, `rows`, `crc32`, `storageKey`).
+- [ ] Testes: round-trip block (encode→decode), round-trip manifest, detecção de CRC corrompido (mutação de 1 byte deve falhar), manifest com múltiplas versões.
+- [ ] Commit atômico: `feat(oss): formato binário NGRD e manifesto versionado`.
+
+### F4 — Storage backends LocalDisk + S3 (~1.5 dias)
+**Branch:** `feature/ngrrd-storage`.
+**Subpacote alvo:** `dev.nishisan.utils.oss.storage`.
+
+- [ ] `NgrrdStorage` interface: `put(key, bytes)`, `get(key)`, `list(prefix)`, `exists(key)`, `delete(key)`, `atomicReplace(key, bytes)`.
+- [ ] `StorageKey` builder com prefixos do YAML (`rawPrefix`, `aggPrefix`, `manifestPrefix`, `schemaPrefix`) e template `{seriesKey}/{ds}/{stepSec}/{blockStartEpoch}`.
+- [ ] `LocalDiskStorage`: `java.nio.Files`, escrita via tmp + `Files.move(ATOMIC_MOVE, REPLACE_EXISTING)`. Cria diretórios pais on demand.
+- [ ] `S3Storage`: AWS SDK v2 (`S3Client` síncrono com `UrlConnectionHttpClient`). Suporta `endpointOverride(URI)` + `S3Configuration.pathStyleAccessEnabled(true)` (MinIO/Ceph). `atomicReplace` via PUT direto (S3 não suporta atomic rename; key determinística cobre).
+- [ ] `StorageFactory.from(StorageSpec)` — instancia conforme `backend` (LOCAL_DISK ou OBJECT_STORAGE).
+- [ ] Implementação de `verify_or_replace_if_identical`: lê existente, compara SHA-256/CRC32, decide. Pode viver dentro do `NgrrdStorage` ou em wrapper.
+- [ ] Testes unitários `LocalDiskStorageTest` com `@TempDir`.
+- [ ] **IT `S3StorageIT`** em `*IT.java` para Failsafe; usa `org.testcontainers:localstack:1.21.3` (já declarado). Profile `ngrrd-integration` no `pom.xml` já configurado. Validar: `mvn -pl nishi-utils-oss verify -Pngrrd-integration`.
+- [ ] Commit atômico: `feat(oss): storage backend local + S3 com IT LocalStack`.
+
+### F5 — Writer + Reader e2e (~2 dias)
+**Branch:** `feature/ngrrd-writer-reader`.
+**Subpacotes alvo:** `dev.nishisan.utils.oss.writer` e `dev.nishisan.utils.oss.reader`.
+
+- [ ] `NgrrdWriter`: thread única dedicada (`LinkedBlockingQueue<Sample> + worker`), recebe `Sample`, atravessa engine (`CounterDeriver` → `PrimaryDataPoint` → `RraConsolidator`), mantém `RingBuffer` por RRA por DS.
+- [ ] Mapeamento por DS: cada DS COUNTER (raw, ex.: `in_octets`) gera o DS derivado (ex.: `in_bps`). PDPs/CDPs são computados sobre o DERIVADO; os RRAs do YAML referenciam o DS derivado por nome em `archives.appliesTo.include`.
+- [ ] `BlockRotator`: detecta cruzamento de `blockSizeSec` e dispara `BlockCodec.encode(...)` + `NgrrdStorage.put(...)`.
+- [ ] Idempotência: aplicada no Storage (não no Writer). Usa `verify_or_replace_if_identical` (F4).
+- [ ] `ManifestUpdater`: `ScheduledExecutorService` que grava `manifest/<seriesKey>/v{N}.yaml` a cada `manifestPolicy.intervalSec`. Lê última versão para detectar `N`. Reuso do `ManifestCodec` (F3).
+- [ ] `NgrrdReader`: resolve RRA via `BestFitSelector` (F2) e lista blocos pelo MANIFESTO (fonte de verdade — não usar `Storage.list`). Lê blocos em paralelo, decodifica, recorta para `window`, aplica `maxPoints` (downsample uniforme).
+- [ ] `ViewExecutor.run(presetName, tags)`: resolve seriesKey via `IdentitySpec.seriesKeyTemplate`, traduz `PresetDef` → `ViewQuery`, delega ao `NgrrdReader`.
+- [ ] Testes e2e:
+    - [ ] **Disco**: ingest sintético 1h de samples 5min em DS COUNTER (com 1 reset proposital), valida `daily` preset com ~12 pontos.
+    - [ ] **S3 (LocalStack IT)**: mesma ingestão, valida persistência + leitura.
+    - [ ] **Recovery**: restart do writer após 2 blocos; valida que `ManifestUpdater` reconstroi via último `v{N}.yaml` válido.
+- [ ] Commit: separar `feat(oss): writer ngrrd` e `feat(oss): reader ngrrd` se útil.
+
+### F6 — Métricas e Quality (~0.5 dia)
+**Branch:** `feature/ngrrd-metrics`.
+**Subpacote alvo:** `dev.nishisan.utils.oss.metrics`.
+
+- [ ] `NgrrdMetrics` com counters/gauges para os 5 nomes em `quality.emitMetrics`: `missing_ratio`, `ingest_lag_sec`, `late_sample_count`, `counter_reset_count`, `wrap_detected_count`.
+- [ ] Injeção: o `NgrrdWriter` aceita um `NgrrdMetrics` opcional via construtor; engine emite via callbacks (não polui as funções puras).
+- [ ] `NgrrdMetricsListener` interface — integração externa (Micrometer, logs, JMX).
+- [ ] Testes: induz cada cenário (sample atrasado → `late_sample_count`++; counter reset → `counter_reset_count`++; wrap → `wrap_detected_count`++).
+- [ ] Commit atômico: `feat(oss): métricas de quality ngrrd`.
+
+### F7 — Façade Ngrrd e API pública (~0.5 dia)
+**Branch:** `feature/ngrrd-facade`.
+**Arquivo principal:** `dev.nishisan.utils.oss.Ngrrd` (expandir o stub atual).
+
+- [ ] `Ngrrd.fromYaml(Path)` → carrega definição (F1) + valida + monta storage (F4) + writer (F5) + reader (F5) + métricas (F6). Retorna `NgrrdHandle`.
+- [ ] `Ngrrd.builder()` para casos programáticos sem YAML.
+- [ ] `NgrrdHandle` interface pública: `write(SeriesKey, dsName, Sample)`, `read(presetName, Map<String,String> tags)`, `read(ViewQuery)`, `close()`.
+- [ ] `close()` garante shutdown ordenado: flush do bloco aberto + última gravação do manifest snapshot + finalização do thread do writer.
+- [ ] Testes: lifecycle (start → write → read → close) sem leaks de thread/file handle (use `Thread.getAllStackTraces()` ou Awaitility).
+- [ ] Commit atômico: `feat(oss): façade Ngrrd com fromYaml e shutdown ordenado`.
+
+### F8 — Documentação e diagramas (~1 dia)
+**Branch:** `docs/ngrrd`.
+
+- [ ] `docs/oss/ngrrd.md` — visão geral, conceitos RRD (DS/RRA/CF/XFF), exemplos YAML, fluxo de escrita/leitura, exemplos de código.
+- [ ] `docs/diagrams/ngrrd_topology.puml` — C4 Container do pacote `oss`.
+- [ ] `docs/diagrams/ngrrd_write_flow.puml` — sequência ingest → engine → bloco → storage.
+- [ ] `docs/diagrams/ngrrd_read_flow.puml` — sequência view → bestFit → manifest → blocos → series.
+- [ ] Markdown embeda diagramas via `https://uml.nishisan.dev/proxy?src=<URL_RAW>`.
+- [ ] `nishi-utils-oss/README.md` com quickstart (Maven, exemplo `Ngrrd.fromYaml`).
+- [ ] Commit atômico: `docs(oss): documentação e diagramas do ngrrd`.
+
+### F9 — Smoke completo e integração final (~1 dia)
+**Branch:** `feature/ngrrd-smoke`.
+
+- [ ] `IfaceTrafficSmokeIT` (em `nishi-utils-oss/src/test/java/.../IfaceTrafficSmokeIT.java`):
+    - [ ] Carrega `iface-traffic-errors-v1.yaml` via `Ngrrd.fromYaml(...)`.
+    - [ ] Ingere 30 dias × 288 amostras/dia para `in_octets`/`out_octets`/`in_errors`/`out_errors`.
+    - [ ] Valida os 5 presets do YAML: `daily` (~288 pontos), `weekly` (168), `monthly` (720), `yearly` (~4380 limitado a 5000), `errors_daily`.
+    - [ ] Roda em ambos backends: disco (`@TempDir`) e S3 (LocalStack via Testcontainers).
+    - [ ] Cenário de reset injetado: valida `counter_reset_count == 1` e `in_bps` no ponto = NaN.
+- [ ] Atualiza `/CLAUDE.md` raiz: adicionar `nishi-utils-oss` em "Repository Structure".
+- [ ] Tag de release alinhada com convenção do projeto (`gh release create` se disponível).
+- [ ] Commit atômico: `feat(oss): smoke completo IfaceTraffic + integração final`.
 
 ---
 
