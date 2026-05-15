@@ -15,6 +15,7 @@ import dev.nishisan.utils.oss.engine.RraConsolidator;
 import dev.nishisan.utils.oss.engine.TimeBucket;
 import dev.nishisan.utils.oss.format.BlockCodec;
 import dev.nishisan.utils.oss.format.BlockHeader;
+import dev.nishisan.utils.oss.metrics.NgrrdMetricsListener;
 import dev.nishisan.utils.oss.storage.NgrrdStorage;
 import dev.nishisan.utils.oss.storage.StorageKey;
 
@@ -67,14 +68,21 @@ public final class NgrrdWriter implements AutoCloseable {
     private final LinkedBlockingQueue<Command> queue = new LinkedBlockingQueue<>();
 
     private final List<PersistedBlock> persistedBlocks = new CopyOnWriteArrayList<>();
+    private final NgrrdMetricsListener metrics;
     private volatile boolean closed;
 
     private BlockWindow current;
 
     public NgrrdWriter(NgrrdDefinition definition, NgrrdStorage storage, String seriesKey) {
+        this(definition, storage, seriesKey, null);
+    }
+
+    public NgrrdWriter(NgrrdDefinition definition, NgrrdStorage storage, String seriesKey,
+                       NgrrdMetricsListener metrics) {
         this.definition = Objects.requireNonNull(definition, "definition é obrigatório");
         this.storage = Objects.requireNonNull(storage, "storage é obrigatório");
         this.seriesKey = Objects.requireNonNull(seriesKey, "seriesKey é obrigatório");
+        this.metrics = metrics;
 
         this.baseStepSec = definition.spec().time().baseStepSec();
         this.blockSizeSec = definition.spec().time().blockSizeSec();
@@ -200,13 +208,16 @@ public final class NgrrdWriter implements AutoCloseable {
 
         rolloverIfNeeded(alignedSec);
         if (!current.contains(alignedSec)) {
-            // amostra anterior ao bloco corrente — drop silencioso no MVP.
+            // amostra anterior ao bloco corrente — drop com métrica de late.
+            if (metrics != null) {
+                long latenessSec = current.blockStartEpochSec() - alignedSec;
+                metrics.onLateSample(w.dsName(), latenessSec);
+            }
             return;
         }
 
         double derivedValue = deriveValue(rawDs, w.sample());
         if (Double.isNaN(derivedValue)) {
-            // sem valor derivado válido — mas ainda atualiza counterPrev acima.
             return;
         }
         String derivedDsName = rawDs.derive().output().name();
@@ -229,6 +240,14 @@ public final class NgrrdWriter implements AutoCloseable {
         CounterDeriver.CounterDeriverResult result = CounterDeriver.derive(
                 rawDs, prevValue, prevTsMs, sample.value(), sample.tsEpochMs());
         current.setCounterPrev(rawDs.name(), new BlockWindow.CounterPrev(sample.value(), sample.tsEpochMs()));
+        if (metrics != null) {
+            switch (result.flag()) {
+                case RESET -> metrics.onCounterReset(rawDs.name());
+                case WRAP -> metrics.onWrapDetected(rawDs.name());
+                default -> {
+                }
+            }
+        }
         return result.value();
     }
 
@@ -290,6 +309,8 @@ public final class NgrrdWriter implements AutoCloseable {
         }
         double[] payload = new double[cdpCount];
         boolean anyValue = false;
+        int totalMissing = 0;
+        int totalPdps = 0;
         for (int i = 0; i < cdpCount; i++) {
             List<Double> consolidated = new ArrayList<>(groupSize);
             int missing = 0;
@@ -301,6 +322,8 @@ public final class NgrrdWriter implements AutoCloseable {
                     consolidated.add(pdp.consolidate(cf));
                 }
             }
+            totalMissing += missing;
+            totalPdps += groupSize;
             double cdp = RraConsolidator.consolidate(rra, cf, consolidated, missing);
             payload[i] = cdp;
             if (!Double.isNaN(cdp)) {
@@ -309,6 +332,10 @@ public final class NgrrdWriter implements AutoCloseable {
         }
         if (!anyValue) {
             return;
+        }
+        if (metrics != null && totalPdps > 0) {
+            double ratio = (double) totalMissing / totalPdps;
+            metrics.onBlockClosed(rra.name(), derivedDsName, ratio);
         }
 
         String storageKeyStr = StorageKey.aggBlock(naming,
