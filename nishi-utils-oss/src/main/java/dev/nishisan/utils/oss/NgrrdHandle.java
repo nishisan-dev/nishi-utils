@@ -34,6 +34,19 @@ public interface NgrrdHandle extends AutoCloseable {
     /** Executa um preset declarativo, retornando uma série por DS listado. */
     Map<String, SeriesResult> read(String presetName);
 
+    /**
+     * Variante de {@link #read(String)} com {@code endExclusiveEpochMs}
+     * explícito — útil para testes/replays determinísticos onde
+     * {@link System#currentTimeMillis()} não reflete o range desejado.
+     */
+    Map<String, SeriesResult> read(String presetName, long endExclusiveEpochMs);
+
+    /**
+     * Variante de {@link #read(String, ViewQuery)} com {@code endExclusiveEpochMs}
+     * explícito.
+     */
+    SeriesResult read(String dsName, ViewQuery query, long endExclusiveEpochMs);
+
     @Override
     void close();
 }

@@ -186,8 +186,18 @@ public final class Ngrrd {
         }
 
         @Override
+        public SeriesResult read(String dsName, ViewQuery query, long endExclusiveEpochMs) {
+            return reader.read(dsName, query, endExclusiveEpochMs);
+        }
+
+        @Override
         public Map<String, SeriesResult> read(String presetName) {
             return viewExecutor.run(presetName, tags);
+        }
+
+        @Override
+        public Map<String, SeriesResult> read(String presetName, long endExclusiveEpochMs) {
+            return viewExecutor.run(presetName, tags, endExclusiveEpochMs);
         }
 
         @Override

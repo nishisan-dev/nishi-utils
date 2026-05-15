@@ -43,11 +43,18 @@ mvn verify -Psecurity-scan -DskipTests
 
 Multi-module Maven monorepo:
 - **nishi-utils-core** — the library (production code + tests). Only this module is published.
+- **nishi-utils-oss** — independent module implementing the **ngrrd** time-series format (RRD-like, YAML-defined, with local-disk and S3-compatible storage backends). Published separately. See `docs/oss/ngrrd.md`. IT profile: `mvn verify -Pngrrd-integration` (LocalStack via Testcontainers).
 - **ngrid-test** — support module for Docker-based integration tests and manual scenarios. Not a release artifact.
 
 ## Architecture Overview
 
-Four main components in `dev.nishisan.utils`:
+**nishi-utils-oss** lives at `dev.nishisan.utils.oss` and implements the
+ngrrd format (separate publishable artifact). It is independent of `core`
+and brings its own engine (CounterDeriver, RraConsolidator, BestFitSelector),
+binary block codec, storage backends, writer/reader pipeline, manifest and
+metrics. Public façade: `dev.nishisan.utils.oss.Ngrrd`.
+
+Four main components in `dev.nishisan.utils` (the `core` module):
 
 1. **NMap** (`map/`) — Thread-safe persistent map with WAL+snapshot and pluggable offload strategies (in-memory, disk, hybrid LRU). Standalone, no cluster dependency.
 
