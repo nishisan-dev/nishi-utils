@@ -19,12 +19,15 @@ class ManifestCodecTest {
                 List.of(
                         new RraManifest("raw", 300, List.of(
                                 new ManifestBlock(1_747_339_200L, 288, 0x12345678L,
-                                        "raw/device:r1/iface:eth0/in_octets/300/1747339200.ngrrd"),
+                                        "raw/device:r1/iface:eth0/in_octets/300/1747339200.ngrrd",
+                                        "in_bps", dev.nishisan.utils.oss.api.ConsolidationFunction.AVERAGE),
                                 new ManifestBlock(1_747_425_600L, 288, 0xAABBCCDDL,
-                                        "raw/device:r1/iface:eth0/in_octets/300/1747425600.ngrrd"))),
+                                        "raw/device:r1/iface:eth0/in_octets/300/1747425600.ngrrd",
+                                        "in_bps", dev.nishisan.utils.oss.api.ConsolidationFunction.AVERAGE))),
                         new RraManifest("rra_5m_30d", 300, List.of(
                                 new ManifestBlock(1_747_339_200L, 8640, 0xFEEDFACEL,
-                                        "agg/device:r1/iface:eth0/rra_5m_30d/300/1747339200.ngrrd")))));
+                                        "agg/device:r1/iface:eth0/rra_5m_30d/300/1747339200.ngrrd",
+                                        "in_bps", dev.nishisan.utils.oss.api.ConsolidationFunction.AVERAGE)))));
     }
 
     @Test
