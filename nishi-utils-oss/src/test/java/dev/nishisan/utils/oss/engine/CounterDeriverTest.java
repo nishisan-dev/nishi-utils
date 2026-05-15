@@ -60,6 +60,41 @@ class CounterDeriverTest {
     }
 
     @Test
+    void quedaPequenaAbaixoDoThresholdClassificaComoSpikeDownNaoReset() {
+        // ds64 tem maxResetDeltaRatio=0.90 → quedas < 90% não são reset.
+        long prevMs = 1_000_000L;
+        long currMs = prevMs + 300_000L;
+        double prev = 1_000_000.0;
+        double curr = 950_000.0; // queda de 5% — bem abaixo do threshold 90%
+        CounterDeriver.CounterDeriverResult r = CounterDeriver.derive(
+                ds64(), prev, prevMs, curr, currMs);
+        assertEquals(CounterDeriver.Flag.SPIKE_DOWN, r.flag());
+        assertTrue(Double.isNaN(r.value()));
+    }
+
+    @Test
+    void quedaNoLimiteDoThresholdAindaContaComoReset() {
+        long prevMs = 1_000_000L;
+        long currMs = prevMs + 300_000L;
+        double prev = 1_000_000.0;
+        double curr = 100_000.0; // queda exatamente de 90%
+        CounterDeriver.CounterDeriverResult r = CounterDeriver.derive(
+                ds64(), prev, prevMs, curr, currMs);
+        assertEquals(CounterDeriver.Flag.RESET, r.flag());
+    }
+
+    @Test
+    void prevValueZeroForcaQualquerNegativoAReset() {
+        // Sem base para calcular ratio; tratamos como reset por convenção.
+        DataSourceDef ds = ds64();
+        long prevMs = 1_000_000L;
+        long currMs = prevMs + 300_000L;
+        CounterDeriver.CounterDeriverResult r = CounterDeriver.derive(
+                ds, 0.0, prevMs, -1.0, currMs);
+        assertEquals(CounterDeriver.Flag.RESET, r.flag());
+    }
+
+    @Test
     void clampNegativeToZeroForcaResultadoNaoNegativo() {
         // Constrói DS com formula que poderia ser negativa
         DataSourceDef ds = new DataSourceDef(

@@ -85,10 +85,20 @@ public final class CounterDeriver {
                 return finalize(ds, wrappedDelta, deltaT, Flag.WRAP);
             }
         }
-        // Não é wrap plausível: tratar como reset.
+        // Não é wrap plausível: avalia maxResetDeltaRatio antes de classificar como reset.
         if (!detectReset) {
             // Sem política, delta negativo é apenas NaN.
             return new CounterDeriverResult(Double.NaN, Flag.RESET);
+        }
+        // dropRatio em [0, +inf): fração do valor anterior que foi "perdida".
+        // Ex.: prev=100, curr=10 → dropRatio = 0.90 (queda de 90%).
+        // prevValue<=0 não permite cálculo significativo da razão; assumimos queda total.
+        double maxResetRatio = ds.resetPolicy().maxResetDeltaRatio();
+        double dropRatio = prevValue > 0 ? (-delta / prevValue) : Double.POSITIVE_INFINITY;
+        if (dropRatio < maxResetRatio) {
+            // Queda menor que o threshold — provavelmente ruído ou amostra fora
+            // de ordem, não um reset legítimo. Devolve NaN sem contar como reset.
+            return new CounterDeriverResult(Double.NaN, Flag.SPIKE_DOWN);
         }
         double resetValue = switch (onReset == null ? ResetBehavior.UNKNOWN : onReset) {
             case UNKNOWN, CARRY -> Double.NaN;
@@ -115,7 +125,13 @@ public final class CounterDeriver {
         FIRST_SAMPLE,
         NON_MONOTONIC_TIME,
         RESET,
-        WRAP
+        WRAP,
+        /**
+         * Queda negativa cujo magnitude é menor que
+         * {@link dev.nishisan.utils.oss.definition.ResetPolicyDef#maxResetDeltaRatio()}.
+         * Tratada como amostra inválida (NaN), <strong>não</strong> como reset.
+         */
+        SPIKE_DOWN
     }
 
     /**
