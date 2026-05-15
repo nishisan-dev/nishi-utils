@@ -27,7 +27,7 @@ import java.util.Objects;
  * Façade pública do formato <strong>ngrrd</strong>.
  *
  * <p>Compila um pipeline pronto para uso a partir de uma definição YAML +
- * vínculos de storage. {@link #fromYaml(Path, StorageFactory.StorageBindings)}
+ * vínculos de storage. {@link #fromYaml(Path, StorageFactory.StorageBindings, Map)}
  * carrega+valida o YAML, instancia o backend, sobe o writer e o manifest
  * updater em background, e devolve um {@link NgrrdHandle} para escrita/leitura
  * por série.</p>
