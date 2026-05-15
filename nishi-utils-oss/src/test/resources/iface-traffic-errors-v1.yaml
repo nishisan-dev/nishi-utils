@@ -1,0 +1,210 @@
+apiVersion: ngrrd/v1
+kind: MetricSeriesDefinition
+metadata:
+  name: iface-traffic-errors-v1
+  description: >
+    Série ngrrd para tráfego e erros de uma interface SNMP.
+    Coleta a cada 5min. Retenções modeladas para gráficos diário/semanal/mensal/anual.
+
+spec:
+  time:
+    baseStepSec: 300
+    blockSizeSec: 21600
+    timestampAlignment: epoch
+    lateSamplePolicy:
+      maxLatenessSec: 600
+      onLate: "bucket_if_possible"
+    missingValue: "NaN"
+
+  identity:
+    seriesKeyTemplate: "device:{deviceId}/iface:{interfaceId}"
+    tags:
+      - name: deviceId
+      - name: interfaceId
+      - name: region
+      - name: vendor
+      - name: role
+
+  dataSources:
+    - name: in_octets
+      type: COUNTER
+      counterBits: 64
+      heartbeatSec: 900
+      min: 0
+      max: null
+      resetPolicy:
+        detectCounterReset: true
+        maxResetDeltaRatio: 0.90
+      derive:
+        output:
+          name: in_bps
+          unit: "bit/s"
+          formula: "delta * 8 / deltaT"
+          clampNegativeToZero: true
+          onReset: "unknown"
+          onWrap: "auto"
+
+    - name: out_octets
+      type: COUNTER
+      counterBits: 64
+      heartbeatSec: 900
+      min: 0
+      max: null
+      resetPolicy:
+        detectCounterReset: true
+        maxResetDeltaRatio: 0.90
+      derive:
+        output:
+          name: out_bps
+          unit: "bit/s"
+          formula: "delta * 8 / deltaT"
+          clampNegativeToZero: true
+          onReset: "unknown"
+          onWrap: "auto"
+
+    - name: in_errors
+      type: COUNTER
+      counterBits: 32
+      heartbeatSec: 900
+      min: 0
+      max: null
+      resetPolicy:
+        detectCounterReset: true
+        maxResetDeltaRatio: 0.90
+      derive:
+        output:
+          name: in_eps
+          unit: "errors/s"
+          formula: "delta / deltaT"
+          clampNegativeToZero: true
+          onReset: "unknown"
+          onWrap: "auto"
+
+    - name: out_errors
+      type: COUNTER
+      counterBits: 32
+      heartbeatSec: 900
+      min: 0
+      max: null
+      resetPolicy:
+        detectCounterReset: true
+        maxResetDeltaRatio: 0.90
+      derive:
+        output:
+          name: out_eps
+          unit: "errors/s"
+          formula: "delta / deltaT"
+          clampNegativeToZero: true
+          onReset: "unknown"
+          onWrap: "auto"
+
+  archives:
+    appliesTo:
+      include:
+        - in_bps
+        - out_bps
+        - in_eps
+        - out_eps
+      exclude: []
+
+    rras:
+      - name: rra_5m_30d
+        stepSec: 300
+        rows: 8640
+        cf:
+          - AVERAGE
+          - MAX
+        xff: 0.50
+
+      - name: rra_1h_6mo
+        stepSec: 3600
+        rows: 4320
+        cf:
+          - AVERAGE
+          - MAX
+        xff: 0.50
+
+      - name: rra_2h_1y
+        stepSec: 7200
+        rows: 4380
+        cf:
+          - AVERAGE
+          - MAX
+        xff: 0.50
+
+  views:
+    selection:
+      strategy: best_fit
+      maxPointsDefault: 2000
+      fallbackOrder: [raw, agg]
+
+    presets:
+      - name: daily
+        window: "P1D"
+        targetStepSec: 300
+        cf: AVERAGE
+        maxPoints: 400
+        series:
+          - in_bps
+          - out_bps
+
+      - name: weekly
+        window: "P7D"
+        targetStepSec: 3600
+        cf: AVERAGE
+        maxPoints: 500
+        series:
+          - in_bps
+          - out_bps
+
+      - name: monthly
+        window: "P30D"
+        targetStepSec: 3600
+        cf: AVERAGE
+        maxPoints: 1200
+        series:
+          - in_bps
+          - out_bps
+
+      - name: yearly
+        window: "P365D"
+        targetStepSec: 7200
+        cf: AVERAGE
+        maxPoints: 5000
+        series:
+          - in_bps
+          - out_bps
+
+      - name: errors_daily
+        window: "P1D"
+        targetStepSec: 300
+        cf: MAX
+        maxPoints: 400
+        series:
+          - in_eps
+          - out_eps
+
+  storage:
+    backend: objectStorage
+    objectNaming:
+      scheme: deterministic
+      rawPrefix: "raw"
+      aggPrefix: "agg"
+      manifestPrefix: "manifest"
+      schemaPrefix: "schema"
+    writePolicy:
+      mode: append_only
+      idempotency:
+        key: "{seriesKey}/{ds}/{stepSec}/{blockStartEpoch}"
+        onConflict: "verify_or_replace_if_identical"
+    manifestPolicy:
+      updateMode: periodic_snapshot
+      intervalSec: 900
+
+  quality:
+    emitMetrics:
+      - missing_ratio
+      - ingest_lag_sec
+      - late_sample_count
+      - counter_reset_count
+      - wrap_detected_count

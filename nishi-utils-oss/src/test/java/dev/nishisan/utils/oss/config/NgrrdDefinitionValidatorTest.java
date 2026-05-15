@@ -1,0 +1,201 @@
+package dev.nishisan.utils.oss.config;
+
+import dev.nishisan.utils.oss.definition.NgrrdDefinition;
+import org.junit.jupiter.api.Test;
+
+import java.io.InputStream;
+
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+class NgrrdDefinitionValidatorTest {
+
+    @Test
+    void aceitaDefinicaoDoEnunciado() {
+        NgrrdDefinition def = loadResource("/iface-traffic-errors-v1.yaml");
+        assertDoesNotThrow(() -> NgrrdDefinitionValidator.validate(def));
+    }
+
+    @Test
+    void rejeitaApiVersionDesconhecida() {
+        NgrrdDefinition def = parse(baseYaml().replace("apiVersion: ngrrd/v1", "apiVersion: foo/v1"));
+        NgrrdDefinitionException ex = assertThrows(NgrrdDefinitionException.class,
+                () -> NgrrdDefinitionValidator.validate(def));
+        assertTrue(ex.getMessage().contains("apiVersion"));
+    }
+
+    @Test
+    void rejeitaBlockSizeNaoMultiplo() {
+        NgrrdDefinition def = parse(baseYaml()
+                .replace("blockSizeSec: 3600", "blockSizeSec: 3650"));
+        NgrrdDefinitionException ex = assertThrows(NgrrdDefinitionException.class,
+                () -> NgrrdDefinitionValidator.validate(def));
+        assertTrue(ex.getMessage().contains("blockSizeSec"));
+    }
+
+    @Test
+    void rejeitaRraStepNaoMultiplo() {
+        NgrrdDefinition def = parse(baseYaml()
+                .replace("stepSec: 60\n", "stepSec: 75\n"));
+        NgrrdDefinitionException ex = assertThrows(NgrrdDefinitionException.class,
+                () -> NgrrdDefinitionValidator.validate(def));
+        assertTrue(ex.getMessage().contains("stepSec"));
+    }
+
+    @Test
+    void rejeitaXffForaDoIntervalo() {
+        NgrrdDefinition def = parse(baseYaml()
+                .replace("xff: 0.5", "xff: 1.2"));
+        NgrrdDefinitionException ex = assertThrows(NgrrdDefinitionException.class,
+                () -> NgrrdDefinitionValidator.validate(def));
+        assertTrue(ex.getMessage().contains("xff"));
+    }
+
+    @Test
+    void rejeitaIncludeReferenciandoDsInexistente() {
+        NgrrdDefinition def = parse(baseYaml()
+                .replace("include: [cpu]", "include: [cpu, foo]"));
+        NgrrdDefinitionException ex = assertThrows(NgrrdDefinitionException.class,
+                () -> NgrrdDefinitionValidator.validate(def));
+        assertTrue(ex.getMessage().contains("foo"));
+    }
+
+    @Test
+    void rejeitaPresetSemRraResolvivel() {
+        String yamlWithPreset = baseYaml().replace(
+                "    presets: []",
+                "    presets:\n"
+                        + "      - name: tiny\n"
+                        + "        window: PT1H\n"
+                        + "        targetStepSec: 30\n"
+                        + "        cf: AVERAGE\n"
+                        + "        maxPoints: 50\n"
+                        + "        series: [cpu]");
+        NgrrdDefinition def = parse(yamlWithPreset);
+        NgrrdDefinitionException ex = assertThrows(NgrrdDefinitionException.class,
+                () -> NgrrdDefinitionValidator.validate(def));
+        assertTrue(ex.getMessage().contains("tiny"));
+    }
+
+    @Test
+    void rejeitaFormulaInvalida() {
+        String yaml = """
+                apiVersion: ngrrd/v1
+                kind: MetricSeriesDefinition
+                metadata:
+                  name: bad-formula
+                spec:
+                  time:
+                    baseStepSec: 60
+                    blockSizeSec: 3600
+                  dataSources:
+                    - name: bytes
+                      type: COUNTER
+                      counterBits: 64
+                      heartbeatSec: 120
+                      resetPolicy:
+                        detectCounterReset: true
+                        maxResetDeltaRatio: 0.9
+                      derive:
+                        output:
+                          name: rate
+                          unit: "B/s"
+                          formula: "delta * 8 ; rm -rf /"
+                          clampNegativeToZero: true
+                          onReset: unknown
+                          onWrap: auto
+                  archives:
+                    rras:
+                      - name: r
+                        stepSec: 60
+                        rows: 60
+                        cf: [AVERAGE]
+                        xff: 0.5
+                """;
+        NgrrdDefinition def = NgrrdYamlLoader.parse(yaml, n -> null);
+        NgrrdDefinitionException ex = assertThrows(NgrrdDefinitionException.class,
+                () -> NgrrdDefinitionValidator.validate(def));
+        assertTrue(ex.getMessage().contains("formula"));
+    }
+
+    @Test
+    void rejeitaTemplateComTagNaoDeclarada() {
+        String yamlWithIdentity = baseYaml().replace(
+                "  dataSources:",
+                "  identity:\n"
+                        + "    seriesKeyTemplate: \"host:{hostName}\"\n"
+                        + "    tags:\n"
+                        + "      - name: deviceId\n"
+                        + "  dataSources:");
+        NgrrdDefinition def = parse(yamlWithIdentity);
+        NgrrdDefinitionException ex = assertThrows(NgrrdDefinitionException.class,
+                () -> NgrrdDefinitionValidator.validate(def));
+        assertTrue(ex.getMessage().contains("hostName"));
+    }
+
+    private static String baseYaml() {
+        return """
+                apiVersion: ngrrd/v1
+                kind: MetricSeriesDefinition
+                metadata:
+                  name: minimal
+                spec:
+                  time:
+                    baseStepSec: 60
+                    blockSizeSec: 3600
+                  dataSources:
+                    - name: cpu
+                      type: GAUGE
+                      heartbeatSec: 120
+                  archives:
+                    appliesTo:
+                      include: [cpu]
+                    rras:
+                      - name: rra_1m
+                        stepSec: 60
+                        rows: 60
+                        cf: [AVERAGE]
+                        xff: 0.5
+                  views:
+                    selection:
+                      strategy: best_fit
+                      maxPointsDefault: 1000
+                      fallbackOrder: [raw, agg]
+                    presets: []
+                  storage:
+                    backend: localDisk
+                    objectNaming:
+                      scheme: deterministic
+                      rawPrefix: raw
+                      aggPrefix: agg
+                      manifestPrefix: manifest
+                      schemaPrefix: schema
+                    writePolicy:
+                      mode: append_only
+                      idempotency:
+                        key: ""
+                        onConflict: verify_or_replace_if_identical
+                    manifestPolicy:
+                      updateMode: periodic_snapshot
+                      intervalSec: 60
+                  quality:
+                    emitMetrics: []
+                """;
+    }
+
+    private static NgrrdDefinition parse(String yaml) {
+        return NgrrdYamlLoader.parse(yaml, n -> null);
+    }
+
+    private static NgrrdDefinition loadResource(String path) {
+        try (InputStream is = NgrrdDefinitionValidatorTest.class.getResourceAsStream(path)) {
+            if (is == null) {
+                throw new IllegalStateException("resource não encontrado: " + path);
+            }
+            return NgrrdYamlLoader.load(is, n -> null);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+}
