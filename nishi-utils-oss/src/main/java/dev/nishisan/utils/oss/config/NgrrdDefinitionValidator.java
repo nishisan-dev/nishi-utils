@@ -11,7 +11,6 @@ import dev.nishisan.utils.oss.definition.TimeSpec;
 import dev.nishisan.utils.oss.definition.ViewSpec;
 
 import java.time.Duration;
-import java.time.Period;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -248,16 +247,22 @@ public final class NgrrdDefinitionValidator {
         }
     }
 
+    /**
+     * Janelas de preset são interpretadas pelo mesmo caminho que o
+     * {@code ViewExecutor} usa em runtime ({@link Duration#parse(CharSequence)}).
+     * Formatos baseados em meses/anos ({@code P1M}, {@code P1Y}) <strong>não</strong>
+     * são aceitos — use {@code P30D}, {@code P365D} ou equivalentes em dias/horas
+     * para que o validator e o executor concordem sobre o número de segundos
+     * representado.
+     */
     private static long parseWindow(String window, String presetName) {
         try {
             return Duration.parse(window).getSeconds();
-        } catch (Exception eDuration) {
-            try {
-                return Period.parse(window).getDays() * 86400L;
-            } catch (Exception ePeriod) {
-                throw new NgrrdDefinitionException(
-                        "preset.window inválido em " + presetName + " (esperado ISO-8601 P1D/PT1H/...): " + window);
-            }
+        } catch (Exception e) {
+            throw new NgrrdDefinitionException(
+                    "preset.window inválido em " + presetName
+                            + " (esperado ISO-8601 com dias/horas: P1D, P7D, PT1H, ... — meses/anos não suportados): "
+                            + window, e);
         }
     }
 

@@ -79,6 +79,59 @@ class NgrrdDefinitionValidatorTest {
     }
 
     @Test
+    void rejeitaWindowComMesOuAno() {
+        // P1M e P1Y são Period (meses/anos), não Duration — não conseguem ser
+        // interpretados consistentemente em segundos pelo ViewExecutor em runtime.
+        String yamlWithMonthlyWindow = baseYaml().replace(
+                "    presets: []",
+                "    presets:\n"
+                        + "      - name: monthly\n"
+                        + "        window: P1M\n"
+                        + "        targetStepSec: 60\n"
+                        + "        cf: AVERAGE\n"
+                        + "        maxPoints: 50\n"
+                        + "        series: [cpu]");
+        NgrrdDefinition def = parse(yamlWithMonthlyWindow);
+        NgrrdDefinitionException ex = assertThrows(NgrrdDefinitionException.class,
+                () -> NgrrdDefinitionValidator.validate(def));
+        assertTrue(ex.getMessage().contains("preset.window inválido"),
+                "mensagem esperada mencionando preset.window, obteve: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("P1M"));
+    }
+
+    @Test
+    void rejeitaWindowDeAno() {
+        String yaml = baseYaml().replace(
+                "    presets: []",
+                "    presets:\n"
+                        + "      - name: yearly\n"
+                        + "        window: P1Y\n"
+                        + "        targetStepSec: 60\n"
+                        + "        cf: AVERAGE\n"
+                        + "        maxPoints: 50\n"
+                        + "        series: [cpu]");
+        NgrrdDefinition def = parse(yaml);
+        assertThrows(NgrrdDefinitionException.class,
+                () -> NgrrdDefinitionValidator.validate(def));
+    }
+
+    @Test
+    void aceitaWindowEmDiasMesmoQueLonga() {
+        // P365D é Duration válida (365 dias em segundos), diferente de P1Y.
+        String yaml = baseYaml().replace(
+                "    presets: []",
+                "    presets:\n"
+                        + "      - name: yearly\n"
+                        + "        window: P365D\n"
+                        + "        targetStepSec: 60\n"
+                        + "        cf: AVERAGE\n"
+                        + "        maxPoints: 50\n"
+                        + "        series: [cpu]");
+        NgrrdDefinition def = parse(yaml);
+        assertDoesNotThrow(() -> NgrrdDefinitionValidator.validate(def));
+    }
+
+    @Test
     void rejeitaFormulaInvalida() {
         String yaml = """
                 apiVersion: ngrrd/v1
