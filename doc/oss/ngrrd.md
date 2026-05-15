@@ -29,7 +29,7 @@ declarativa em YAML.
 
 ## Arquitetura
 
-![Topologia C4](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan/nishi-utils/main/docs/diagrams/ngrrd_topology.puml)
+![Topologia C4](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan-dev/nishi-utils/main/doc/diagrams/ngrrd_topology.puml)
 
 - **Engine pura** (`engine/`): determinística e sem IO — `CounterDeriver`,
   `PrimaryDataPoint`, `RraConsolidator`, `BestFitSelector`, `TimeBucket`,
@@ -47,7 +47,7 @@ declarativa em YAML.
 
 ## Fluxo de escrita
 
-![Fluxo de escrita](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan/nishi-utils/main/docs/diagrams/ngrrd_write_flow.puml)
+![Fluxo de escrita](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan-dev/nishi-utils/main/doc/diagrams/ngrrd_write_flow.puml)
 
 1. Cliente enfileira `Sample` por DS raw.
 2. Worker aplica `CounterDeriver` em DS COUNTER com `derive.output`, gerando o
@@ -63,7 +63,7 @@ declarativa em YAML.
 
 ## Fluxo de leitura
 
-![Fluxo de leitura](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan/nishi-utils/main/docs/diagrams/ngrrd_read_flow.puml)
+![Fluxo de leitura](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan-dev/nishi-utils/main/doc/diagrams/ngrrd_read_flow.puml)
 
 1. `ViewExecutor` traduz `PresetDef` → `ViewQuery` e resolve `seriesKey` via
    `IdentitySpec.seriesKeyTemplate`.

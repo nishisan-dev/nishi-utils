@@ -29,7 +29,7 @@ try (NgrrdHandle handle = Ngrrd.fromYaml(
 }
 ```
 
-Documentação completa em [`docs/oss/ngrrd.md`](../docs/oss/ngrrd.md).
+Documentação completa em [`doc/oss/ngrrd.md`](../doc/oss/ngrrd.md).
 
 ## Testes
 
