@@ -68,18 +68,18 @@ class ConsistencyIntegrationTest {
             mapL.put("key1", "value1");
 
             // Verify Leader has it
-            assertEquals("value1", mapL.get("key1").orElse(null), "Leader should have the value locally");
+            assertEquals("value1", mapL.getOptional("key1").orElse(null), "Leader should have the value locally");
 
             // Verify STRONG consistency (always correct)
             // Retry a few times if connection is flaky?
-            Optional<String> res = mapF.get("key1");
+            Optional<String> res = mapF.getOptional("key1");
             assertEquals("value1", res.orElse(null));
 
             // Wait for replication to settle locally on Follower
             // We can poll EVENTUAL until it sees it
             start = System.currentTimeMillis();
             while (true) {
-                Optional<String> val = mapF.get("key1", Consistency.EVENTUAL);
+                Optional<String> val = mapF.getOptional("key1", Consistency.EVENTUAL);
                 if (val.isPresent() && "value1".equals(val.get())) {
                     break;
                 }
@@ -91,10 +91,10 @@ class ConsistencyIntegrationTest {
 
             // Now test BOUNDED consistency
             // Since we waited, lag should be 0.
-            assertEquals("value1", mapF.get("key1", Consistency.bounded(5)).orElse(null));
+            assertEquals("value1", mapF.getOptional("key1", Consistency.bounded(5)).orElse(null));
 
             // Should also work with strict 0 lag
-            assertEquals("value1", mapF.get("key1", Consistency.bounded(0)).orElse(null));
+            assertEquals("value1", mapF.getOptional("key1", Consistency.bounded(0)).orElse(null));
         }
     }
 }

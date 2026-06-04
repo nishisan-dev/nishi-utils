@@ -314,7 +314,7 @@ public class NGridClusterExample {
 
       // Mapa distribuído
       m3.put("shared-key", "value-1");
-      System.out.println("m1.get=" + m1.get("shared-key").orElse("<vazio>"));
+      System.out.println("m1.get=" + m1.getOrDefault("shared-key", "<vazio>"));
     }
   }
 }
@@ -549,18 +549,27 @@ follower.start();
 
 ## 4) DistributedMap (mapa distribuído)
 
-### API principal
+> **`DistributedMap<K,V>` implementa `java.util.Map<K,V>`** — é um drop-in de `ConcurrentHashMap`.
+> Os métodos do contrato `Map` (`get`/`put`/`remove`) retornam `V` (ou `null`); use as variantes
+> `*Optional` quando preferir `Optional<V>`.
 
-- `Optional<V> put(K key, V value)`
-- `Optional<V> get(K key)` — consistência `STRONG` (padrão, roteia ao líder)
-- `Optional<V> get(K key, Consistency consistency)` — com nível de consistência configurável
-- `Optional<V> remove(K key)`
-- `Set<K> keySet()` — leitura local (eventual consistency)
-- `boolean containsKey(K key)` — leitura local (eventual consistency)
-- `int size()` — contagem local (eventual consistency)
-- `boolean isEmpty()` — verifica se vazio (local)
-- `void putAll(Map<K, V> entries)` — insere múltiplos entries (cada put é replicado individualmente)
+### API principal (contrato `java.util.Map`)
+
+- `V put(K key, V value)` — retorna o valor anterior ou `null` (replicado)
+- `V get(Object key)` — consistência `STRONG` (padrão, roteia ao líder), `null` se ausente
+- `V remove(Object key)` — retorna o valor anterior ou `null` (replicado)
+- `boolean containsKey(Object key)` / `boolean containsValue(Object value)` — leitura local (eventual consistency)
+- `Set<K> keySet()` / `Collection<V> values()` / `Set<Map.Entry<K,V>> entrySet()` — snapshots locais imutáveis
+- `int size()` / `boolean isEmpty()` — contagem local (eventual consistency)
+- `void putAll(Map<? extends K, ? extends V> entries)` — insere múltiplos entries (cada put é replicado individualmente)
+- `void clear()` — **esvazia todas as réplicas** mantendo o mapa reutilizável (replicado)
+
+### Extensões (variantes `Optional` e ciclo de vida)
+
+- `Optional<V> getOptional(K key)` / `getOptional(K key, Consistency consistency)` — leitura com `Optional` e/ou nível de consistência
+- `Optional<V> putOptional(K key, V value)` / `Optional<V> removeOptional(K key)`
 - `void removeByPrefix(String prefix)` — remove entries por prefixo (operação local, sem replicação)
+- `void destroy()` / `void destroyLocal()` — destrói o mapa (replicado / apenas local), apagando a persistência
 
 ### Níveis de consistência para leitura
 

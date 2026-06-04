@@ -34,7 +34,7 @@
 - Validação de Javadoc: `mvn verify -Pvalidate-javadoc`.
 - Script pronto para o subconjunto mínimo de resiliência: `bash doc/ngrid/playbook-automation/run-ci-resilience.sh`; ele também configura logging JUL em `doc/ngrid/playbook-automation/logs/`.
 - O módulo `ngrid-test` gera um jar executável com cenários manuais (`server`, `client`, `client-auto`, `scenario-1`) e usa configs em `ngrid-test/config/*.yml`.
-- Há um detalhe importante de toolchain: README/workflows falam em Java 21+, mas os POMs e `ngrid-test/Dockerfile` compilam com Java 25. Se aparecer erro de compilação/toolchain, confira isso antes de depurar o código.
+- Toolchain: os POMs e o `ngrid-test/Dockerfile` têm baseline Java 21 (`maven.compiler.release=21`), alinhado ao README e aos workflows do GitHub Actions. O artefato roda em JDK 21+ e continua compilável em JDKs mais novos. Se aparecer erro de compilação/toolchain, confira a versão do Java antes de depurar o código.
 
 ## Convenções específicas do projeto
 - Nem todo teste de integração usa sufixo `IT`: no core, muitos cenários de cluster ficam em `src/test/java/dev/nishisan/utils/ngrid/**` com nome `*Test.java`; o profile `resilience` inclui esses testes e exclui `testcontainers`/`soak`.

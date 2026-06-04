@@ -60,7 +60,7 @@ class NGridFacadeLocalTest {
             DistributedMap<String, String> m1 = cluster.map(1, "users", String.class, String.class);
 
             m0.put("u1", "Alice");
-            Optional<String> fetched = m1.get("u1");
+            Optional<String> fetched = m1.getOptional("u1");
             assertTrue(fetched.isPresent());
             assertEquals("Alice", fetched.get());
         }
@@ -85,7 +85,7 @@ class NGridFacadeLocalTest {
                     .openConsumer("events-group", "worker-2")
                     .peek()
                     .orElseThrow());
-            assertEquals("token-abc", cluster.map(1, "sessions", String.class, String.class).get("s1").orElseThrow());
+            assertEquals("token-abc", cluster.map(1, "sessions", String.class, String.class).getOptional("s1").orElseThrow());
         }
     }
 

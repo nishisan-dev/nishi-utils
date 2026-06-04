@@ -42,7 +42,7 @@ public final class MapReplicationCommand  {
             @JsonProperty("key") Object key,
             @JsonProperty("value") Object value) {
         this.type = Objects.requireNonNull(type, "type");
-        if (type != NMapOperationType.DESTROY) {
+        if (type != NMapOperationType.DESTROY && type != NMapOperationType.CLEAR) {
             Objects.requireNonNull(key, "key");
         }
         this.key = key;
@@ -77,6 +77,16 @@ public final class MapReplicationCommand  {
      */
     public static MapReplicationCommand destroy() {
         return new MapReplicationCommand(NMapOperationType.DESTROY, null, null);
+    }
+
+    /**
+     * Cria um comando de replicação CLEAR para esvaziar o mapa em todos os nós,
+     * mantendo-o reutilizável (sem apagar os arquivos de persistência).
+     *
+     * @return o comando
+     */
+    public static MapReplicationCommand clear() {
+        return new MapReplicationCommand(NMapOperationType.CLEAR, null, null);
     }
 
     /**

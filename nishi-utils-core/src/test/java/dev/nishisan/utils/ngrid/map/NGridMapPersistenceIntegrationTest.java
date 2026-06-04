@@ -76,7 +76,7 @@ class NGridMapPersistenceIntegrationTest {
         assertEquals("node-3", node1.coordinator().leaderInfo().map(info -> info.nodeId().value()).orElseThrow());
 
         map.put("shared-key", "value-1");
-        assertEquals(Optional.of("value-1"), map.get("shared-key"));
+        assertEquals(Optional.of("value-1"), map.getOptional("shared-key"));
 
         closeQuietly(node1);
         closeQuietly(node2);
@@ -93,7 +93,7 @@ class NGridMapPersistenceIntegrationTest {
         awaitClusterStability();
 
         DistributedMap<String, String> mapAfterRestart = node2.map(String.class, String.class);
-        Optional<String> recovered = mapAfterRestart.get("shared-key");
+        Optional<String> recovered = mapAfterRestart.getOptional("shared-key");
         assertTrue(recovered.isPresent());
         assertEquals("value-1", recovered.get());
     }
@@ -114,8 +114,8 @@ class NGridMapPersistenceIntegrationTest {
         users2.put("u1", "alice");
         sessions3.put("s1", "token-123");
 
-        assertEquals(Optional.of("alice"), users1.get("u1"));
-        assertEquals(Optional.of("token-123"), sessions1.get("s1"));
+        assertEquals(Optional.of("alice"), users1.getOptional("u1"));
+        assertEquals(Optional.of("token-123"), sessions1.getOptional("s1"));
 
         closeQuietly(node1);
         closeQuietly(node2);
@@ -140,13 +140,13 @@ class NGridMapPersistenceIntegrationTest {
         DistributedMap<String, String> sessionsAfter2 = node2.getMap("sessions", String.class, String.class);
         DistributedMap<String, String> sessionsAfter3 = node3.getMap("sessions", String.class, String.class);
 
-        assertEquals(Optional.of("alice"), usersAfter1.get("u1"));
-        assertEquals(Optional.of("alice"), usersAfter2.get("u1"));
-        assertEquals(Optional.of("alice"), usersAfter3.get("u1"));
+        assertEquals(Optional.of("alice"), usersAfter1.getOptional("u1"));
+        assertEquals(Optional.of("alice"), usersAfter2.getOptional("u1"));
+        assertEquals(Optional.of("alice"), usersAfter3.getOptional("u1"));
 
-        assertEquals(Optional.of("token-123"), sessionsAfter1.get("s1"));
-        assertEquals(Optional.of("token-123"), sessionsAfter2.get("s1"));
-        assertEquals(Optional.of("token-123"), sessionsAfter3.get("s1"));
+        assertEquals(Optional.of("token-123"), sessionsAfter1.getOptional("s1"));
+        assertEquals(Optional.of("token-123"), sessionsAfter2.getOptional("s1"));
+        assertEquals(Optional.of("token-123"), sessionsAfter3.getOptional("s1"));
     }
 
     private static NGridConfig configFor(NodeInfo local, Path dir, NodeInfo... peers) {

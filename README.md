@@ -46,7 +46,7 @@ Coleção de utilitários em Java, com foco em:
 - **Serialização type-safe de POJOs (3.6.2+)**: `MapReplicationCodec` + `EncodedCommand` preservam tipos concretos na replicação e no path follower→leader
 - Estruturas:
   - `DistributedQueue`: `offer`, `poll`, `peek`, `openConsumer`
-  - `DistributedMap`: `put`, `get`, `remove`, `containsKey`, `keySet`, `size`, `putAll`
+  - `DistributedMap` (**implementa `java.util.Map<K,V>`**): `put`, `get`, `remove`, `containsKey`, `containsValue`, `keySet`, `values`, `entrySet`, `size`, `putAll`, `clear` (replicado) — além das variantes `getOptional`/`putOptional`/`removeOptional`
 
 ## Requisitos
 
@@ -352,7 +352,7 @@ public class NGridClusterExample {
 
       DistributedMap<String, String> map = node2.map(String.class, String.class);
       map.put("k1", "v1");
-      System.out.println("get(k1)=" + map.get("k1").orElse("<vazio>"));
+      System.out.println("get(k1)=" + map.getOrDefault("k1", "<vazio>"));
 
       // Múltiplos mapas (nomeados) no mesmo cluster:
       DistributedMap<String, String> users = node1.getMap("users", String.class, String.class);

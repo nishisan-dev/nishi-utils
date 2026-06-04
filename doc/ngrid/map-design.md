@@ -1,6 +1,6 @@
 # NGrid – Mapa Distribuído (design + implementação atual)
 
-> **Última atualização:** 2026-03-28
+> **Última atualização:** 2026-06-04
 
 Este documento descreve o **mapa distribuído** do NGrid conforme implementado hoje no código.
 
@@ -16,9 +16,12 @@ Principais classes envolvidas:
 ## Objetivo
 
 Fornecer um mapa chave→valor replicado entre nós do cluster, com:
+- **Drop-in de `java.util.Map<K,V>`** — `DistributedMap` implementa a interface, permitindo
+  trocar um `ConcurrentHashMap` por ele sem refatorar o código consumidor (inclusive regras
+  Groovy: `map[key]`, `map.each`, `map.containsKey`, `map.clear`).
 - **Escritas serializadas por líder** com validação de lease
 - **Commit por quorum** (estrito ou dinâmico)
-- **Replicação de comandos** (`PUT`/`REMOVE`) para manter as réplicas alinhadas
+- **Replicação de comandos** (`PUT`/`REMOVE`/`CLEAR`) para manter as réplicas alinhadas
 - **Persistência local opcional** (WAL + Snapshot) para acelerar restart e melhorar durabilidade local
 - **Leituras com 3 níveis de consistência** (STRONG, BOUNDED, EVENTUAL)
 
@@ -28,11 +31,18 @@ Fornecer um mapa chave→valor replicado entre nós do cluster, com:
 
 ### `DistributedMap<K,V>` (fachada "cliente")
 
+- **Implementa `java.util.Map<K,V>`** — os métodos do contrato (`get`/`put`/`remove`)
+  retornam `V` (ou `null`). As variantes `getOptional`/`putOptional`/`removeOptional`
+  preservam o retorno `Optional<V>` (e o overload com `Consistency`), já que o *erasure*
+  impede dois retornos na mesma assinatura.
 - Roteia as chamadas de escrita para o **líder**.
 - Em nó líder: valida **leader lease** antes de aceitar writes, executa localmente no `MapClusterService`.
 - Em nó follower: codifica o comando via `MapReplicationCodec` e envelopa em `EncodedCommand` antes de enviar `CLIENT_REQUEST` ao líder via `invokeLeader()` com **retry + backoff exponencial** (5 tentativas, 200ms→2s). Isso garante fidelidade de tipo de POJOs arbitrários.
-- Leituras (`get`) respeitam o nível de consistência configurado (ver seção abaixo).
-- Expõe `keySet()`, `containsKey()`, `size()`, `isEmpty()`, `putAll()` para leitura eventually-consistent das chaves locais.
+- Leituras (`get`/`getOptional`) respeitam o nível de consistência configurado (ver seção abaixo).
+- Expõe `keySet()`, `containsKey()`, `containsValue()`, `size()`, `isEmpty()`, `putAll()` e as
+  views locais `values()`/`entrySet()` (snapshots imutáveis, eventually-consistent e imunes a
+  `ConcurrentModificationException` sob escrita concorrente).
+- Expõe `clear()` **replicado** (esvazia todas as réplicas mantendo o mapa reutilizável).
 - Expõe `removeByPrefix()` para limpeza local durante snapshot install (sem replicação).
 
 ### `MapClusterService<K,V>` (estado + integração com replicação)
@@ -44,7 +54,8 @@ Fornecer um mapa chave→valor replicado entre nós do cluster, com:
 - Para `get`:
   - lê do mapa local diretamente
 - Implementa `ReplicationHandler`:
-  - `apply()` — aplica PUT/REMOVE localmente. Para offset maps (`_ngrid-queue-offsets`), usa semântica monotônica: `max(stored, new)`.
+  - `apply()` — aplica PUT/REMOVE/CLEAR/DESTROY localmente. Para offset maps (`_ngrid-queue-offsets`), usa semântica monotônica: `max(stored, new)`. **CLEAR** esvazia o `ConcurrentHashMap` e registra um marcador no WAL mantendo a persistência viva (reutilizável); **DESTROY** esvazia e apaga os arquivos de persistência.
+  - `clearReplicated()` — replica um comando `CLEAR` (esvazia mantendo o mapa reutilizável).
   - `getSnapshotChunk()` — retorna snapshot paginado (1000 itens/chunk) para catch-up de followers.
   - `installSnapshot()` — instala snapshot recebido. Para offset maps, respeita semântica monotônica.
   - `resetState()` — limpa estado antes de snapshot install.
@@ -83,14 +94,17 @@ O `DistributedMap.get()` suporta 3 níveis de consistência configuráveis:
 | `EVENTUAL` | Sempre local | Mínima | Dashboards, métricas, dados não-críticos |
 
 ```java
-// Leitura forte (default)
-Optional<V> value = map.get("key");
+// Contrato java.util.Map: retorna V (ou null), leitura STRONG (default)
+V value = map.get("key");
+
+// Variante Optional (leitura forte)
+Optional<V> value = map.getOptional("key");
 
 // Leitura eventual (local, sem RPC)
-Optional<V> value = map.get("key", Consistency.EVENTUAL);
+Optional<V> value = map.getOptional("key", Consistency.EVENTUAL);
 
 // Leitura bounded (local se lag <= 10 operações)
-Optional<V> value = map.get("key", Consistency.bounded(10));
+Optional<V> value = map.getOptional("key", Consistency.bounded(10));
 ```
 
 ---
@@ -290,21 +304,43 @@ Quando um follower detecta lag significativo (> 500 ops ou stalled por > 4s):
 
 ---
 
-## API Pública (`DistributedMap<K,V>`)
+## API Pública (`DistributedMap<K,V> implements java.util.Map<K,V>`)
+
+### Contrato `java.util.Map` (retornam `V`/`null`)
 
 | Método | Retorno | Descrição |
 |---|---|---|
-| `put(key, value)` | `Optional<V>` | Insere/atualiza, retorna valor anterior (replicado) |
-| `remove(key)` | `Optional<V>` | Remove e retorna valor anterior (replicado) |
-| `get(key)` | `Optional<V>` | Leitura STRONG (default — roteia ao líder) |
-| `get(key, consistency)` | `Optional<V>` | Leitura com nível de consistência configurável |
-| `keySet()` | `Set<K>` | Visão imutável das chaves (local, eventually-consistent) |
-| `containsKey(key)` | `boolean` | Verifica existência (local, eventually-consistent) |
+| `put(key, value)` | `V` | Insere/atualiza, retorna valor anterior ou `null` (replicado) |
+| `remove(Object key)` | `V` | Remove e retorna valor anterior ou `null` (replicado) |
+| `get(Object key)` | `V` | Leitura STRONG (default — roteia ao líder), `null` se ausente |
+| `containsKey(Object key)` | `boolean` | Verifica existência (local, eventually-consistent) |
+| `containsValue(Object value)` | `boolean` | Scan linear local (eventually-consistent) |
+| `keySet()` | `Set<K>` | Snapshot imutável das chaves (local, eventually-consistent) |
+| `values()` | `Collection<V>` | Snapshot imutável dos valores (local; imune a `CME`) |
+| `entrySet()` | `Set<Map.Entry<K,V>>` | Snapshot imutável das entradas (local; imune a `CME`) |
 | `size()` | `int` | Número de entradas (local, eventually-consistent) |
 | `isEmpty()` | `boolean` | Verifica se vazio (local, eventually-consistent) |
 | `putAll(entries)` | `void` | Insere múltiplas entradas (cada put é replicado individualmente) |
+| `clear()` | `void` | **Esvazia todas as réplicas** mantendo o mapa reutilizável (replicado) |
+
+### Extensões (variantes `Optional` e ciclo de vida)
+
+| Método | Retorno | Descrição |
+|---|---|---|
+| `getOptional(key)` | `Optional<V>` | Leitura STRONG, valor anterior embrulhado em `Optional` |
+| `getOptional(key, consistency)` | `Optional<V>` | Leitura com nível de consistência configurável |
+| `putOptional(key, value)` | `Optional<V>` | `put` com retorno `Optional` |
+| `removeOptional(key)` | `Optional<V>` | `remove` com retorno `Optional` |
 | `removeByPrefix(prefix)` | `void` | Remove chaves com prefixo (local-only, sem replicação) |
+| `destroy()` / `destroyLocal()` | `void` | Destrói o mapa (replicado / apenas local) — apaga persistência |
 | `close()` | `void` | Remove listener do transport |
+
+> **`clear()` (CLEAR) × `destroy()` (DESTROY):** ambos esvaziam o estado, mas o `clear()`
+> **preserva** a engine de persistência (o mapa continua usável e aceita novas escritas — caso
+> de uso típico: `identifierCache.clear()` seguido de novos `put`), enquanto o `destroy()`
+> **apaga** WAL/snapshot/diretório e encerra o mapa. No WAL, `CLEAR` é um marcador sem
+> chave/valor (opcode adicionado ao final de `NMapOperationType` para preservar a compatibilidade
+> de ordinais com logs já gravados).
 
 ---
 
@@ -326,9 +362,9 @@ map.put("key", new MeuPojo())  — líder
   → data.put((K) command.key(), (V) command.value())  ✅
 ```
 
-### `MapReplicationCodec` (interno)
+### `MapReplicationCodec`
 
-Classe package-private em `dev.nishisan.utils.ngrid.map`. Mantém um `ObjectMapper` dedicado com:
+Classe em `dev.nishisan.utils.ngrid.map`. Mantém um `ObjectMapper` dedicado com:
 - `activateDefaultTyping(NON_FINAL, AS_PROPERTY)` — embute `@type` em todos os objetos não-finais
 - Field-access total (suporta classes com campos `final`, sem setters)
 - `FAIL_ON_UNKNOWN_PROPERTIES = false` (compatibilidade futura)
@@ -338,6 +374,27 @@ Expõe métodos estáticos:
 - `decode(byte[])` → `MapReplicationCommand`
 - `encodeSnapshot(Map<?,?>)` → `byte[]`
 - `decodeSnapshot(byte[])` → `Map<Object, Object>`
+
+### Ponto de extensão do `ObjectMapper` (#110)
+
+O `ObjectMapper` do codec pode ser customizado **no bootstrap**, compondo com (sem
+substituir) a configuração de default typing:
+
+- `MapReplicationCodec.registerModule(Module)` — registra um Jackson `Module`.
+- `MapReplicationCodec.addMixIn(Class<?> target, Class<?> mixin)` — aplica um mixin a um tipo
+  **apenas no codec de replicação**, sem anotar o POJO globalmente.
+- `MapReplicationCodec.registerCustomizer(Consumer<ObjectMapper>)` — escape hatch genérico.
+
+Escopo **global ao codec** (process-wide), aplicado de forma **simétrica** em serialização
+(put/snapshot) e desserialização. Sem nenhuma customização, o comportamento é idêntico ao
+anterior (backward-compat).
+
+**Caso de uso — grafos auto-referenciais:** um DTO com relação recíproca
+(`impacts`/`impactedBy`) forma ciclo e, sem proteção, estoura a serialização. Registrar um
+mixin com `@JsonIdentityInfo(generator = PropertyGenerator.class, property = "identifier")`
+quebra o ciclo e deduplica por id, resolvendo referências repetidas para a mesma instância —
+tudo isolado no codec. Observação: o snapshot é serializado a partir de um `HashMap`
+(não-final), de modo que o default typing emite `@class` no contêiner.
 
 ### Requisitos para o tipo V
 

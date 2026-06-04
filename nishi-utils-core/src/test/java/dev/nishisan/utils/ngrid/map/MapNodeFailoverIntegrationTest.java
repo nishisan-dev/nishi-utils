@@ -156,12 +156,12 @@ class MapNodeFailoverIntegrationTest {
 
         // Validate entries are accessible from the new leader
         DistributedMap<String, String> survivorMap = newLeader.getMap("failover-map", String.class, String.class);
-        Optional<String> recovered = survivorMap.get("key-0");
+        Optional<String> recovered = survivorMap.getOptional("key-0");
         assertTrue(recovered.isPresent(), "Map entry should survive leader failover");
         assertEquals("value-0", recovered.get());
 
         // Spot-check another entry
-        Optional<String> recovered25 = survivorMap.get("key-25");
+        Optional<String> recovered25 = survivorMap.getOptional("key-25");
         assertTrue(recovered25.isPresent(), "Map entry key-25 should survive failover");
         assertEquals("value-25", recovered25.get());
     }
@@ -212,7 +212,7 @@ class MapNodeFailoverIntegrationTest {
 
         // This should NOT throw; it should route to the new leader
         Optional<String> result = assertDoesNotThrow(
-                () -> followerMap.get("strong-key", Consistency.STRONG),
+                () -> followerMap.getOptional("strong-key", Consistency.STRONG),
                 "STRONG read should succeed after leader failover, not throw IllegalStateException");
         assertTrue(result.isPresent(), "STRONG read should return the value");
         assertEquals("strong-value", result.get());

@@ -169,6 +169,23 @@ public final class MapClusterService<K, V>
     }
 
     /**
+     * Replica um comando CLEAR para todos os nós do cluster, esvaziando os dados
+     * em memória de cada réplica e mantendo a engine de persistência viva para
+     * escritas subsequentes (diferente de {@link #destroyReplicated()}, que apaga
+     * os arquivos).
+     *
+     * Fluxo Negocial
+     * 1. Codifica um {@link MapReplicationCommand} do tipo {@code CLEAR}.
+     * 2. Envia o comando pelo pipeline de replicação e aguarda quorum.
+     * 3. Cada nó, ao aplicar o comando em {@link #apply}, limpa o
+     *    {@code ConcurrentMap} e registra um marcador {@code CLEAR} no WAL.
+     */
+    public void clearReplicated() {
+        byte[] encoded = MapReplicationCodec.encode(MapReplicationCommand.clear());
+        waitForReplication(replicationManager.replicate(topic, encoded));
+    }
+
+    /**
      * Removes all entries whose string key starts with {@code prefix} from the
      * <em>local</em> in-memory state only, writing tombstone entries to the
      * persistence layer if enabled. No Raft replication is triggered.
@@ -212,6 +229,42 @@ public final class MapClusterService<K, V>
      */
     public java.util.Set<K> keySet() {
         return Collections.unmodifiableSet(data.keySet());
+    }
+
+    /**
+     * Returns an unmodifiable snapshot of the values in the local replica.
+     * The snapshot is a defensive copy, so iteration is immune to concurrent
+     * writes (no {@link java.util.ConcurrentModificationException}).
+     * This is an eventually-consistent view — no replication or leader routing.
+     *
+     * @return an unmodifiable collection of values
+     */
+    public java.util.Collection<V> values() {
+        return Collections.unmodifiableList(new ArrayList<>(data.values()));
+    }
+
+    /**
+     * Returns an unmodifiable snapshot of the entries in the local replica.
+     * The snapshot is a defensive copy, so iteration is immune to concurrent
+     * writes (no {@link java.util.ConcurrentModificationException}).
+     * This is an eventually-consistent view — no replication or leader routing.
+     *
+     * @return an unmodifiable set of entries
+     */
+    public java.util.Set<Map.Entry<K, V>> entrySet() {
+        return Collections.unmodifiableSet(new java.util.LinkedHashMap<>(data).entrySet());
+    }
+
+    /**
+     * Returns {@code true} if the local replica maps one or more keys to the
+     * specified value (linear scan). Eventually-consistent — no replication or
+     * leader routing is involved.
+     *
+     * @param value the value to search for
+     * @return {@code true} if the value is present in the local replica
+     */
+    public boolean containsValue(Object value) {
+        return data.containsValue(value);
     }
 
     /**
@@ -302,6 +355,15 @@ public final class MapClusterService<K, V>
                     } catch (IOException e) {
                         LOGGER.log(Level.WARNING, "Failed to destroy persistence files for topic: " + topic, e);
                     }
+                }
+                return; // skip normal persistence append below
+            }
+            case CLEAR -> {
+                // Empty the map but keep the persistence engine alive (reusable):
+                // record a CLEAR marker in the WAL so the empty state survives restart.
+                data.clear();
+                if (persistence != null) {
+                    persistence.appendAsync(NMapOperationType.CLEAR, null, null);
                 }
                 return; // skip normal persistence append below
             }

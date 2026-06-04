@@ -18,15 +18,23 @@ import java.net.ServerSocket;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Integration tests for new DistributedMap API operations:
- * containsKey, size, isEmpty, putAll.
+ * Integration tests for the DistributedMap API: containsKey, size, isEmpty,
+ * putAll and the full {@link java.util.Map} contract (RF1–RF12) — value-returning
+ * get/put/remove, replicated reusable clear, values/entrySet snapshots and
+ * Map recognition for drop-in usage.
  */
 class DistributedMapApiTest {
 
@@ -180,7 +188,7 @@ class DistributedMapApiTest {
 
         // Verify all entries are accessible on leader
         for (Map.Entry<String, String> entry : entries.entrySet()) {
-            assertEquals(entry.getValue(), map.get(entry.getKey()).orElse(null),
+            assertEquals(entry.getValue(), map.getOptional(entry.getKey()).orElse(null),
                     "Entry " + entry.getKey() + " should be accessible");
         }
 
@@ -194,6 +202,248 @@ class DistributedMapApiTest {
             assertTrue(followerMap.containsKey(entry.getKey()),
                     "Follower should have key " + entry.getKey());
         }
+    }
+
+    // ==================== java.util.Map contract (RF1–RF12) ====================
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void mapContractReturnsValuesAndNullsRF1toRF5() {
+        NGridNode leader = findLeader();
+        assertNotNull(leader, "Should have a leader");
+        DistributedMap<String, String> map = leader.getMap("api-test", String.class, String.class);
+
+        // RF1: get returns the value or null
+        assertNull(map.get("rf-1"), "get on absent key returns null");
+        // RF2: put returns the previous value (or null)
+        assertNull(map.put("rf-1", "v1"), "put returns null when no previous value");
+        assertEquals("v1", map.put("rf-1", "v2"), "put returns the previous value");
+        assertEquals("v2", map.get("rf-1"), "get returns the current value");
+        // RF4: containsKey(Object)
+        assertTrue(map.containsKey("rf-1"));
+        // RF3: remove returns the previous value
+        assertEquals("v2", map.remove("rf-1"), "remove returns the previous value");
+        assertNull(map.get("rf-1"));
+        assertFalse(map.containsKey("rf-1"));
+        // RF5: size
+        map.put("rf-a", "1");
+        map.put("rf-b", "2");
+        assertEquals(2, map.size());
+        // Optional-based variants remain available
+        assertEquals(Optional.of("1"), map.getOptional("rf-a"));
+        assertEquals(Optional.empty(), map.getOptional("rf-missing"));
+    }
+
+    @Test
+    @Timeout(value = 45, unit = TimeUnit.SECONDS)
+    void clearShouldBeReplicatedAndReusableRF6() throws Exception {
+        NGridNode leader = findLeader();
+        assertNotNull(leader, "Should have a leader");
+        DistributedMap<String, String> map = leader.getMap("api-test", String.class, String.class);
+
+        map.put("c-1", "v1");
+        map.put("c-2", "v2");
+        assertEquals(2, map.size());
+
+        map.clear();
+        assertEquals(0, map.size(), "size must be 0 after clear");
+        assertTrue(map.isEmpty(), "map must be empty after clear");
+
+        // RF6: the map stays reusable after clear (persistence engine alive)
+        map.put("c-3", "v3");
+        assertEquals("v3", map.get("c-3"));
+        assertEquals(1, map.size());
+
+        // clear is replicated: followers reflect the empty-then-reuse state
+        NGridNode follower = findFollower();
+        assertNotNull(follower, "Should have a follower");
+        DistributedMap<String, String> followerMap = follower.getMap("api-test", String.class, String.class);
+        long deadline = System.currentTimeMillis() + 10_000;
+        while (System.currentTimeMillis() < deadline
+                && !(followerMap.size() == 1 && followerMap.containsKey("c-3"))) {
+            Thread.sleep(100);
+        }
+        assertFalse(followerMap.containsKey("c-1"), "follower must not retain pre-clear keys");
+        assertFalse(followerMap.containsKey("c-2"), "follower must not retain pre-clear keys");
+        assertTrue(followerMap.containsKey("c-3"), "follower must see the post-clear write");
+        assertEquals(1, followerMap.size(), "follower size reflects clear + reuse");
+    }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void valuesAndEntrySetReflectLocalReplicaRF7RF8() {
+        NGridNode leader = findLeader();
+        assertNotNull(leader, "Should have a leader");
+        DistributedMap<String, String> map = leader.getMap("api-test", String.class, String.class);
+
+        map.put("k1", "v1");
+        map.put("k2", "v2");
+        map.put("k3", "v3");
+
+        // RF7: values()
+        Collection<String> values = map.values();
+        assertEquals(3, values.size());
+        assertTrue(values.contains("v1") && values.contains("v2") && values.contains("v3"));
+
+        // RF8: entrySet() + Groovy-style ".each { k, v -> }" iteration
+        Map<String, String> collected = new ConcurrentHashMap<>();
+        for (Map.Entry<String, String> e : map.entrySet()) {
+            collected.put(e.getKey(), e.getValue());
+        }
+        assertEquals(Map.of("k1", "v1", "k2", "v2", "k3", "v3"), collected);
+
+        // RF: containsValue
+        assertTrue(map.containsValue("v2"));
+        assertFalse(map.containsValue("nope"));
+    }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void readAfterWriteLocalOnLeaderRF10() {
+        NGridNode leader = findLeader();
+        assertNotNull(leader, "Should have a leader");
+        DistributedMap<String, String> map = leader.getMap("api-test", String.class, String.class);
+
+        // RF10: after put(k,v), get(k)/iteration on the same node sees v without
+        // waiting for replication.
+        for (int i = 0; i < 50; i++) {
+            map.put("raw-" + i, "val-" + i);
+            assertEquals("val-" + i, map.get("raw-" + i), "read-after-write must be visible locally");
+        }
+        // iteration on the same pass also sees the writes
+        int seen = 0;
+        for (Map.Entry<String, String> e : map.entrySet()) {
+            if (e.getKey().startsWith("raw-")) {
+                seen++;
+            }
+        }
+        assertEquals(50, seen);
+    }
+
+    @Test
+    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    void iterationOverSnapshotIsSafeUnderConcurrentWriteRF11() throws Exception {
+        NGridNode leader = findLeader();
+        assertNotNull(leader, "Should have a leader");
+        DistributedMap<String, String> map = leader.getMap("api-test", String.class, String.class);
+
+        for (int i = 0; i < 200; i++) {
+            map.put("base-" + i, "v" + i);
+        }
+
+        AtomicBoolean failed = new AtomicBoolean(false);
+        Thread writer = new Thread(() -> {
+            for (int i = 0; i < 200; i++) {
+                map.put("hot-" + i, "v" + i);
+            }
+        });
+        writer.start();
+
+        // RF11: iterating the local snapshot must not throw ConcurrentModificationException
+        try {
+            for (int round = 0; round < 5; round++) {
+                int count = 0;
+                for (Map.Entry<String, String> e : map.entrySet()) {
+                    assertNotNull(e.getKey());
+                    count++;
+                }
+                assertTrue(count > 0);
+                for (String v : map.values()) {
+                    assertNotNull(v);
+                }
+            }
+        } catch (RuntimeException ex) {
+            failed.set(true);
+            throw ex;
+        } finally {
+            writer.join();
+        }
+        assertFalse(failed.get(), "snapshot iteration must be immune to concurrent writes");
+    }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void recognizedAsJavaUtilMapRF12() {
+        NGridNode leader = findLeader();
+        assertNotNull(leader, "Should have a leader");
+        DistributedMap<String, String> distributed = leader.getMap("api-test", String.class, String.class);
+
+        // RF12: must be a java.util.Map so Groovy treats it natively (map[key],
+        // map.each, map.containsKey).
+        assertInstanceOf(Map.class, distributed, "DistributedMap must be a java.util.Map");
+
+        // Use it purely through the Map<K,V> reference — the "drop-in" contract.
+        Map<String, String> map = distributed;
+        assertNull(map.put("rf12", "x"));
+        assertEquals("x", map.get("rf12"));
+        assertTrue(map.containsKey("rf12"));
+        assertEquals(1, map.size());
+        map.putAll(Map.of("a", "1", "b", "2"));
+        assertEquals(3, map.size());
+        assertTrue(map.keySet().containsAll(Set.of("rf12", "a", "b")));
+        map.clear();
+        assertTrue(map.isEmpty());
+    }
+
+    @Test
+    @Timeout(value = 45, unit = TimeUnit.SECONDS)
+    void dropInReplacementForConcurrentHashMapRF1toRF12() {
+        NGridNode leader = findLeader();
+        assertNotNull(leader, "Should have a leader");
+
+        // The Cardinal use case: swap ConcurrentHashMap for DistributedMap behind a
+        // java.util.Map reference and exercise the same operations the Groovy rules use.
+        Map<String, String> reference = new ConcurrentHashMap<>();
+        Map<String, String> distributed = leader.getMap("api-test", String.class, String.class);
+
+        for (Map<String, String> m : List.of(reference, distributed)) {
+            m.put("id-1", "alpha");
+            m.put("id-2", "beta");
+            assertEquals("alpha", m.get("id-1"));
+            assertTrue(m.containsKey("id-2"));
+            assertEquals(2, m.size());
+
+            List<String> vals = new ArrayList<>(m.values());
+            assertTrue(vals.contains("alpha") && vals.contains("beta"));
+
+            int each = 0;
+            for (Map.Entry<String, String> e : m.entrySet()) {
+                assertNotNull(e.getValue());
+                each++;
+            }
+            assertEquals(2, each);
+
+            assertEquals("alpha", m.remove("id-1"));
+            assertFalse(m.containsKey("id-1"));
+
+            m.clear();
+            assertTrue(m.isEmpty());
+            assertEquals(0, m.size());
+        }
+    }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void replaceAllReplicatesAndMapUsesIdentityEquality() {
+        NGridNode leader = findLeader();
+        assertNotNull(leader, "Should have a leader");
+        DistributedMap<String, String> map = leader.getMap("api-test", String.class, String.class);
+
+        map.put("a", "1");
+        map.put("b", "2");
+
+        // Identity equality (NOT content-based) is required: DistributedMap registers
+        // itself as a TransportListener kept in a CopyOnWriteArraySet (dedup by equals).
+        // Content-based equality would make distinct (e.g. empty) maps collide and silently
+        // drop listener registration, hanging routed reads/writes. Guard against regression.
+        assertEquals(map, map, "a map must equal itself (identity)");
+        assertNotEquals(map, Map.of("a", "1", "b", "2"),
+                "DistributedMap must NOT be content-equal to a plain Map");
+
+        // replaceAll must perform replicated puts, not mutate a throwaway snapshot
+        map.replaceAll((k, v) -> v + "-x");
+        assertEquals("1-x", map.get("a"), "replaceAll must update the distributed map");
+        assertEquals("2-x", map.get("b"), "replaceAll must update the distributed map");
     }
 
     // ==================== Utility Methods ====================

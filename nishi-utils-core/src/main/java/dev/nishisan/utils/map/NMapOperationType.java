@@ -26,5 +26,14 @@ public enum NMapOperationType {
     /** Remove an entry by key. */
     REMOVE,
     /** Destroy the map — clear all data and delete persistence files. */
-    DESTROY
+    DESTROY,
+    /**
+     * Clear all entries while keeping the map reusable — empties the in-memory
+     * state and records the operation in the WAL, leaving the persistence engine
+     * alive for subsequent writes (unlike {@link #DESTROY}, which deletes files).
+     *
+     * <p>Must remain the last constant: the WAL serializes the operation by its
+     * enum ordinal, so reordering would break replay of already-written logs.
+     */
+    CLEAR
 }

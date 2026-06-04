@@ -4,6 +4,45 @@
 
 ---
 
+## 2026-06-04 — 🟢 `DistributedMap implements java.util.Map<K,V>` (#106) + baseline JDK 21 (#107)
+
+**Alterações:**
+- **#106 — `DistributedMap<K,V>` agora implementa `java.util.Map<K,V>`** (drop-in de
+  `ConcurrentHashMap`, sem refatorar o código consumidor — inclusive regras Groovy).
+  - `get`/`put`/`remove` passam a retornar `V` (contrato `Map`); variantes `getOptional`/
+    `putOptional`/`removeOptional` preservam o retorno `Optional<V>` (e o overload com
+    `Consistency`).
+  - Novos: `values()`, `entrySet()` (snapshots imutáveis locais, imunes a
+    `ConcurrentModificationException`), `containsValue()` e `clear()` **replicado**.
+  - `replaceAll` sobrescrito para emitir `put` **replicado** (o default da interface
+    mutaria apenas o snapshot descartável de `entrySet()`).
+  - `equals`/`hashCode` mantidos por **identidade** (`Object`), intencionalmente — o
+    `DistributedMap` é registrado como `TransportListener` num `CopyOnWriteArraySet` (dedup
+    por `equals`); igualdade por conteúdo faria mapas distintos colidirem e dropar o registro
+    do listener. Mesma escolha de implementações como o Hazelcast `IMap`.
+  - Novo opcode **`CLEAR`** (`NMapOperationType`, adicionado ao final do enum para preservar a
+    compatibilidade de ordinais do WAL): esvazia a réplica mantendo a engine de persistência
+    viva (reutilizável), distinto do `DESTROY` que apaga os arquivos. Propagado via
+    `MapClusterService.clearReplicated()` e registrado no WAL como marcador sem chave/valor.
+  - `DistributedOffsetStore` migrado para `getOptional`.
+  - `DistributedMapApiTest` cobre o contrato `Map` ponta a ponta (RF1–RF12, incl. clear
+    replicado + reuso, iteração sob escrita concorrente e uso como `java.util.Map`).
+- **#110 — Ponto de extensão do `ObjectMapper` no `MapReplicationCodec`**: `registerModule`,
+  `addMixIn` e `registerCustomizer` (estáticos, escopo global ao codec) permitem registrar
+  Jackson `Module`s/Mixins que **compõem** com o default typing, aplicados simetricamente em
+  serialização e desserialização. Sem customização, comportamento idêntico (backward-compat).
+  Caso de uso: mixin `@JsonIdentityInfo` para quebrar ciclos `impacts`/`impactedBy` do
+  `EventDto` (dedup por id) **sem anotar o POJO global**.
+- **#107 — Baseline JDK 21** para a linha 4.x: `maven.compiler.release=21` (declarado o
+  `maven-compiler-plugin` 3.13.0, pois o default 3.1 não suporta a property `release`),
+  `Dockerfile` e workflows do GitHub Actions em JDK 21. Nenhuma API exclusiva de JDK > 21 é
+  usada (virtual threads são GA desde 21). Suíte verde sob JVM 21 (293 unitários + 31 do
+  profile resilience).
+
+**Status:** ✅ Commitado
+
+---
+
 ## 2026-03-28 — 🟢 NMap: `lastMutationTimestamp` persistido + Consumer Lógico
 
 **Commits:** `84722d7`, `b97e214`, `e831d31`

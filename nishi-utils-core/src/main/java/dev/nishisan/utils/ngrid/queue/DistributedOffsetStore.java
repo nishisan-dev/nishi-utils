@@ -31,7 +31,7 @@ public final class DistributedOffsetStore implements OffsetStore {
         // Using Optional<Long>.map() would trigger an implicit checkcast Long
         // in bytecode before entering the lambda, causing ClassCastException.
         // We work with the raw Optional to bypass the generic checkcast.
-        Optional<?> raw = (Optional<?>) offsets.get(key);
+        Optional<?> raw = offsets.getOptional(key);
         if (raw.isPresent()) {
             Object v = raw.get();
             if (v instanceof Number) {
@@ -45,7 +45,7 @@ public final class DistributedOffsetStore implements OffsetStore {
     public void updateOffset(String consumerKey, long offset) {
         String key = keyFor(consumerKey);
         long current = 0L;
-        Optional<?> raw = (Optional<?>) offsets.get(key);
+        Optional<?> raw = offsets.getOptional(key);
         if (raw.isPresent()) {
             Object v = raw.get();
             if (v instanceof Number) {

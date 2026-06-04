@@ -237,7 +237,7 @@ class NGridAutodiscoverIntegrationTest {
     private void awaitMapReplication(DistributedMap<String, String> map, String key, String expectedValue) {
         long deadline = System.currentTimeMillis() + 5000; // 5 seconds timeout
         while (System.currentTimeMillis() < deadline) {
-            Optional<String> value = map.get(key);
+            Optional<String> value = map.getOptional(key);
             if (value.isPresent() && expectedValue.equals(value.get())) {
                 return;
             }

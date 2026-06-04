@@ -115,7 +115,7 @@ class NGridIntegrationTest {
                 "Logical consumer progress must not destructively remove the queue head");
 
         map3.put("shared-key", "value-1");
-        Optional<String> fetched = map1.get("shared-key");
+        Optional<String> fetched = map1.getOptional("shared-key");
         assertTrue(fetched.isPresent());
         assertEquals("value-1", fetched.get());
 
@@ -167,16 +167,16 @@ class NGridIntegrationTest {
         assertEquals("node-3", node1.coordinator().leaderInfo().map(info -> info.nodeId().value()).orElseThrow());
 
         users2.put("u1", "alice");
-        assertEquals(Optional.of("alice"), users1.get("u1"));
-        assertEquals(Optional.of("alice"), users3.get("u1"));
+        assertEquals(Optional.of("alice"), users1.getOptional("u1"));
+        assertEquals(Optional.of("alice"), users3.getOptional("u1"));
 
         sessions1.put("s1", "token-123");
-        assertEventually(() -> assertEquals(Optional.of("token-123"), sessions2.get("s1")));
-        assertEventually(() -> assertEquals(Optional.of("token-123"), sessions3.get("s1")));
+        assertEventually(() -> assertEquals(Optional.of("token-123"), sessions2.getOptional("s1")));
+        assertEventually(() -> assertEquals(Optional.of("token-123"), sessions3.getOptional("s1")));
 
         // Independence: keys from one map must not leak into the other
-        assertFalse(users1.get("s1").isPresent());
-        assertFalse(sessions1.get("u1").isPresent());
+        assertFalse(users1.getOptional("s1").isPresent());
+        assertFalse(sessions1.getOptional("u1").isPresent());
     }
 
     private void assertEventually(Runnable assertion) {

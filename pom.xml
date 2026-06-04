@@ -6,7 +6,7 @@
 
     <groupId>dev.nishisan</groupId>
     <artifactId>nishi-utils-parent</artifactId>
-    <version>4.0.0</version>
+    <version>4.1.0</version>
     <packaging>pom</packaging>
     <modules>
         <module>nishi-utils-core</module>
@@ -84,8 +84,7 @@
         <spring-boot.version>3.5.6</spring-boot.version>
         <aws.sdk.version>2.28.0</aws.sdk.version>
         <testcontainers.localstack.version>1.21.3</testcontainers.localstack.version>
-        <maven.compiler.source>25</maven.compiler.source>
-        <maven.compiler.target>25</maven.compiler.target>
+        <maven.compiler.release>21</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <jacoco.version>0.8.13</jacoco.version>
         <!-- Minimum line coverage for non-ngrid packages (ngrid is covered by resilience profile) -->
@@ -95,6 +94,14 @@
 
     <build>
         <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+                <configuration>
+                    <release>${maven.compiler.release}</release>
+                </configuration>
+            </plugin>
             <plugin>
                 <groupId>org.codehaus.mojo</groupId>
                 <artifactId>build-helper-maven-plugin</artifactId>

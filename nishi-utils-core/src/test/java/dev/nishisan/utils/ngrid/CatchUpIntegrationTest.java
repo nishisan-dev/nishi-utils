@@ -69,7 +69,7 @@ class CatchUpIntegrationTest {
                 DistributedMap<String, String> mapF = follower.getMap("sync-map", String.class, String.class);
                 
                 while (true) {
-                    Optional<String> lastVal = mapF.get("key599", Consistency.EVENTUAL);
+                    Optional<String> lastVal = mapF.getOptional("key599", Consistency.EVENTUAL);
                     if (lastVal.isPresent() && "val599".equals(lastVal.get())) {
                         break;
                     }
@@ -81,7 +81,7 @@ class CatchUpIntegrationTest {
 
                 // 5. Verify all data is present
                 for (int i = 0; i < 600; i++) {
-                    assertEquals("val" + i, mapF.get("key" + i, Consistency.EVENTUAL).orElse(null), "Missing key" + i);
+                    assertEquals("val" + i, mapF.getOptional("key" + i, Consistency.EVENTUAL).orElse(null), "Missing key" + i);
                 }
                 
                 assertTrue(follower.replicationManager().getLastAppliedSequence() >= 600);
@@ -126,7 +126,7 @@ class CatchUpIntegrationTest {
                 
                 while (true) {
                     // Check last key
-                    Optional<String> lastVal = mapF.get("key2499", Consistency.EVENTUAL);
+                    Optional<String> lastVal = mapF.getOptional("key2499", Consistency.EVENTUAL);
                     if (lastVal.isPresent() && "val2499".equals(lastVal.get())) {
                         break;
                     }
@@ -137,9 +137,9 @@ class CatchUpIntegrationTest {
                 }
 
                 // Verify samples
-                assertEquals("val0", mapF.get("key0", Consistency.EVENTUAL).orElse(null));
-                assertEquals("val1234", mapF.get("key1234", Consistency.EVENTUAL).orElse(null));
-                assertEquals("val2499", mapF.get("key2499", Consistency.EVENTUAL).orElse(null));
+                assertEquals("val0", mapF.getOptional("key0", Consistency.EVENTUAL).orElse(null));
+                assertEquals("val1234", mapF.getOptional("key1234", Consistency.EVENTUAL).orElse(null));
+                assertEquals("val2499", mapF.getOptional("key2499", Consistency.EVENTUAL).orElse(null));
             }
         }
     }
