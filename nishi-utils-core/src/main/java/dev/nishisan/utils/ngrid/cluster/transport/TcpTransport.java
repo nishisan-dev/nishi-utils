@@ -49,7 +49,6 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -698,7 +697,7 @@ public final class TcpTransport implements Transport {
         private final DataOutputStream outputStream;
         private final DataInputStream inputStream;
         private final MessageCodec codec;
-        private final LinkedBlockingQueue<ClusterMessage> outbound = new LinkedBlockingQueue<>();
+        private final OutboundChannel outbound = new OutboundChannel(0);
         private final boolean outboundInitiated;
         private volatile NodeInfo remote;
         private volatile boolean open = true;
@@ -730,7 +729,7 @@ public final class TcpTransport implements Transport {
             if (!isOpen()) {
                 return;
             }
-            outbound.offer(message);
+            outbound.enqueue(message);
         }
 
         private void drainOutbound() {
