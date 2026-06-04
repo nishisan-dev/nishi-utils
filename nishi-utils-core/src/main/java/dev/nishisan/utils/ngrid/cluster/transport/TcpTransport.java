@@ -697,7 +697,7 @@ public final class TcpTransport implements Transport {
         private final DataOutputStream outputStream;
         private final DataInputStream inputStream;
         private final MessageCodec codec;
-        private final OutboundChannel outbound = new OutboundChannel(0);
+        private final OutboundChannel outbound = new OutboundChannel(config.outboundQueueCapacity());
         private final boolean outboundInitiated;
         private volatile NodeInfo remote;
         private volatile boolean open = true;
