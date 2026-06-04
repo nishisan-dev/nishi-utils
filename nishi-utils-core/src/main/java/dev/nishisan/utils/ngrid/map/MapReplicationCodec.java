@@ -21,12 +21,17 @@ import com.fasterxml.jackson.annotation.JsonAutoDetect;
 import com.fasterxml.jackson.annotation.JsonTypeInfo;
 import com.fasterxml.jackson.annotation.PropertyAccessor;
 import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.Module;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.databind.jsontype.BasicPolymorphicTypeValidator;
 
 import java.io.IOException;
+import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.function.Consumer;
 
 /**
  * Dedicated codec for serializing and deserializing {@link MapReplicationCommand}
@@ -50,19 +55,91 @@ import java.util.Map;
  * This codec is used within the map replication subsystem and by {@link
  * dev.nishisan.utils.ngrid.structures.DistributedMap} for the CLIENT_REQUEST
  * forwarding path (follower → leader).
+ *
+ * <p><strong>Extension point (#110):</strong> the underlying {@link ObjectMapper} can be
+ * customized at bootstrap via {@link #registerModule}, {@link #addMixIn} or
+ * {@link #registerCustomizer}, composing with (not replacing) the default typing. This is
+ * <em>global to the codec</em> (process-wide) and applies symmetrically to serialization
+ * and deserialization — e.g. attaching {@code @JsonIdentityInfo} to a self-referential DTO
+ * via a mixin to break cycles without annotating the POJO globally.
  */
 public final class MapReplicationCodec {
 
     /**
-     * Allows any non-final class to carry type metadata.
-     * We scope to {@code NON_FINAL} (instead of {@code EVERYTHING}) to avoid
-     * interfering with JDK primitives and standard collections subclasses while
-     * still covering arbitrary user-defined POJOs.
+     * Customizers applied to the codec's {@link ObjectMapper} <em>after</em> the base
+     * configuration (visibility + default typing), in registration order. Used to add
+     * Jackson {@link Module}s or Mixins without touching the base default-typing setup.
+     *
+     * <p><strong>Scope:</strong> global to the codec (process-wide), since the codec is
+     * stateless and shared by all distributed maps. Register at bootstrap, before any
+     * replication traffic. The same configured mapper is used for serialization
+     * (put/snapshot) and deserialization, so customizations apply symmetrically.
      */
-    private static final ObjectMapper MAPPER = buildMapper();
+    private static final List<Consumer<ObjectMapper>> CUSTOMIZERS = new CopyOnWriteArrayList<>();
+
+    private static volatile ObjectMapper MAPPER = buildMapper();
 
     private MapReplicationCodec() {
         // utility class
+    }
+
+    // -------------------------------------------------------------------------
+    // Extension point — customizing the codec's ObjectMapper (#110)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Registers a Jackson {@link Module} on the codec's {@link ObjectMapper}. The module
+     * <em>composes</em> with the existing default-typing configuration (it is not
+     * replaced) and is applied symmetrically to serialization and deserialization.
+     *
+     * <p>Global to the codec; call at bootstrap before any replication traffic.
+     *
+     * @param module the Jackson module to register (must not be {@code null})
+     */
+    public static void registerModule(Module module) {
+        Objects.requireNonNull(module, "module");
+        registerCustomizer(m -> m.registerModule(module));
+    }
+
+    /**
+     * Registers a Jackson <em>mixin</em> on the codec's {@link ObjectMapper}, associating
+     * {@code mixinSource}'s annotations with {@code target} <em>only</em> within the
+     * replication codec — without annotating the target POJO globally. Useful, e.g., to
+     * attach {@code @JsonIdentityInfo} to a self-referential DTO to break cycles and
+     * deduplicate by id during the round-trip.
+     *
+     * <p>Composes with default typing and applies symmetrically. Global to the codec;
+     * call at bootstrap before any replication traffic.
+     *
+     * @param target      the class whose serialization to customize (must not be {@code null})
+     * @param mixinSource the class carrying the Jackson annotations (must not be {@code null})
+     */
+    public static void addMixIn(Class<?> target, Class<?> mixinSource) {
+        Objects.requireNonNull(target, "target");
+        Objects.requireNonNull(mixinSource, "mixinSource");
+        registerCustomizer(m -> m.addMixIn(target, mixinSource));
+    }
+
+    /**
+     * Registers an arbitrary customizer applied to the codec's {@link ObjectMapper} after
+     * the base configuration. Escape hatch for customizations not covered by
+     * {@link #registerModule} / {@link #addMixIn}.
+     *
+     * @param customizer the customizer to apply (must not be {@code null})
+     */
+    public static synchronized void registerCustomizer(Consumer<ObjectMapper> customizer) {
+        Objects.requireNonNull(customizer, "customizer");
+        CUSTOMIZERS.add(customizer);
+        MAPPER = buildMapper();
+    }
+
+    /**
+     * Clears all registered customizers and rebuilds the base mapper, restoring the
+     * default behavior. Intended for test isolation.
+     */
+    static synchronized void resetCustomizers() {
+        CUSTOMIZERS.clear();
+        MAPPER = buildMapper();
     }
 
     // -------------------------------------------------------------------------
@@ -165,6 +242,12 @@ public final class MapReplicationCodec {
                 ObjectMapper.DefaultTyping.NON_FINAL,
                 JsonTypeInfo.As.PROPERTY
         );
+
+        // Apply registered customizers last so they compose with (and can refine) the
+        // base configuration above (#110). With no customizers this is a no-op (RF6).
+        for (Consumer<ObjectMapper> customizer : CUSTOMIZERS) {
+            customizer.accept(mapper);
+        }
 
         return mapper;
     }

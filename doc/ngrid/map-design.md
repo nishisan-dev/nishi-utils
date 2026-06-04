@@ -362,9 +362,9 @@ map.put("key", new MeuPojo())  — líder
   → data.put((K) command.key(), (V) command.value())  ✅
 ```
 
-### `MapReplicationCodec` (interno)
+### `MapReplicationCodec`
 
-Classe package-private em `dev.nishisan.utils.ngrid.map`. Mantém um `ObjectMapper` dedicado com:
+Classe em `dev.nishisan.utils.ngrid.map`. Mantém um `ObjectMapper` dedicado com:
 - `activateDefaultTyping(NON_FINAL, AS_PROPERTY)` — embute `@type` em todos os objetos não-finais
 - Field-access total (suporta classes com campos `final`, sem setters)
 - `FAIL_ON_UNKNOWN_PROPERTIES = false` (compatibilidade futura)
@@ -374,6 +374,27 @@ Expõe métodos estáticos:
 - `decode(byte[])` → `MapReplicationCommand`
 - `encodeSnapshot(Map<?,?>)` → `byte[]`
 - `decodeSnapshot(byte[])` → `Map<Object, Object>`
+
+### Ponto de extensão do `ObjectMapper` (#110)
+
+O `ObjectMapper` do codec pode ser customizado **no bootstrap**, compondo com (sem
+substituir) a configuração de default typing:
+
+- `MapReplicationCodec.registerModule(Module)` — registra um Jackson `Module`.
+- `MapReplicationCodec.addMixIn(Class<?> target, Class<?> mixin)` — aplica um mixin a um tipo
+  **apenas no codec de replicação**, sem anotar o POJO globalmente.
+- `MapReplicationCodec.registerCustomizer(Consumer<ObjectMapper>)` — escape hatch genérico.
+
+Escopo **global ao codec** (process-wide), aplicado de forma **simétrica** em serialização
+(put/snapshot) e desserialização. Sem nenhuma customização, o comportamento é idêntico ao
+anterior (backward-compat).
+
+**Caso de uso — grafos auto-referenciais:** um DTO com relação recíproca
+(`impacts`/`impactedBy`) forma ciclo e, sem proteção, estoura a serialização. Registrar um
+mixin com `@JsonIdentityInfo(generator = PropertyGenerator.class, property = "identifier")`
+quebra o ciclo e deduplica por id, resolvendo referências repetidas para a mesma instância —
+tudo isolado no codec. Observação: o snapshot é serializado a partir de um `HashMap`
+(não-final), de modo que o default typing emite `@class` no contêiner.
 
 ### Requisitos para o tipo V
 
