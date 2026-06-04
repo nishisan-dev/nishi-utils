@@ -430,60 +430,18 @@ public final class DistributedMap<K, V>
         }
     }
 
-    /**
-     * Compares the specified object with this map for equality per the
-     * {@link java.util.Map#equals(Object)} contract — {@code true} when the other
-     * object is a {@code Map} with the same mappings. The comparison is made
-     * against the <em>local replica snapshot</em> (eventually-consistent), the
-     * same view exposed by {@link #entrySet()}/{@link #size()}.
-     *
-     * @param o the object to compare
-     * @return {@code true} if the maps have equal mappings
-     */
-    @Override
-    public boolean equals(Object o) {
-        if (o == this) {
-            return true;
-        }
-        if (!(o instanceof java.util.Map<?, ?> other)) {
-            return false;
-        }
-        if (other.size() != size()) {
-            return false;
-        }
-        try {
-            for (java.util.Map.Entry<K, V> e : entrySet()) {
-                K key = e.getKey();
-                V value = e.getValue();
-                if (value == null) {
-                    if (!(other.get(key) == null && other.containsKey(key))) {
-                        return false;
-                    }
-                } else if (!value.equals(other.get(key))) {
-                    return false;
-                }
-            }
-        } catch (ClassCastException | NullPointerException unused) {
-            return false;
-        }
-        return true;
-    }
-
-    /**
-     * Returns the hash code for this map per the {@link java.util.Map#hashCode()}
-     * contract (sum of the entries' hash codes), computed over the local replica
-     * snapshot.
-     *
-     * @return the map hash code
-     */
-    @Override
-    public int hashCode() {
-        int h = 0;
-        for (java.util.Map.Entry<K, V> e : entrySet()) {
-            h += e.hashCode();
-        }
-        return h;
-    }
+    // equals()/hashCode() are intentionally NOT overridden — identity semantics
+    // (inherited from Object) are required and content-based equality is unsafe here:
+    //   1. DistributedMap registers itself as a TransportListener, which the transport
+    //      keeps in a CopyOnWriteArraySet (dedup by equals). Content-based equality would
+    //      make two empty maps "equal", so registering a second empty map on a node would
+    //      be silently dropped — that map would never receive onMessage and its routed
+    //      reads/writes would hang. Identity keeps every map a distinct listener.
+    //   2. The content is mutable and may hold hundreds of thousands of entries, so a
+    //      Map-contract equals/hashCode would be O(n) and change as the map mutates —
+    //      breaking any hash-based container the map is placed in.
+    // This matches distributed-map implementations like Hazelcast IMap, which also use
+    // identity rather than content equality.
 
     /**
      * Retrieves the value for a key with the specified consistency level,

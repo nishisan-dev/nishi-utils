@@ -424,7 +424,7 @@ class DistributedMapApiTest {
 
     @Test
     @Timeout(value = 30, unit = TimeUnit.SECONDS)
-    void equalsHashCodeAndReplaceAllHonorMapContract() {
+    void replaceAllReplicatesAndMapUsesIdentityEquality() {
         NGridNode leader = findLeader();
         assertNotNull(leader, "Should have a leader");
         DistributedMap<String, String> map = leader.getMap("api-test", String.class, String.class);
@@ -432,12 +432,13 @@ class DistributedMapApiTest {
         map.put("a", "1");
         map.put("b", "2");
 
-        // equals/hashCode are content-based (Map contract), comparable to a plain Map
-        Map<String, String> expected = Map.of("a", "1", "b", "2");
-        assertEquals(expected, map, "DistributedMap must equal a Map with the same mappings");
-        assertEquals(map, expected, "equality must be symmetric with a plain Map");
-        assertEquals(expected.hashCode(), map.hashCode(), "hashCode must match a content-equal Map");
-        assertNotEquals(Map.of("a", "1"), map, "maps with different sizes must not be equal");
+        // Identity equality (NOT content-based) is required: DistributedMap registers
+        // itself as a TransportListener kept in a CopyOnWriteArraySet (dedup by equals).
+        // Content-based equality would make distinct (e.g. empty) maps collide and silently
+        // drop listener registration, hanging routed reads/writes. Guard against regression.
+        assertEquals(map, map, "a map must equal itself (identity)");
+        assertNotEquals(map, Map.of("a", "1", "b", "2"),
+                "DistributedMap must NOT be content-equal to a plain Map");
 
         // replaceAll must perform replicated puts, not mutate a throwaway snapshot
         map.replaceAll((k, v) -> v + "-x");
