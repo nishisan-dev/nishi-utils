@@ -146,6 +146,7 @@ public class NGridConfigLoader {
             }
             if (clusterConfig.getTransport() != null) {
                 builder.transportWorkerThreads(clusterConfig.getTransport().getWorkers());
+                builder.outboundQueueCapacity(clusterConfig.getTransport().getOutboundQueueCapacity());
             }
             if (clusterConfig.getSeedNodes() != null && !clusterConfig.getSeedNodes().isEmpty()) {
                 for (ClusterPolicyConfig.SeedNodeConfig seedNode : clusterConfig.getSeedNodes()) {

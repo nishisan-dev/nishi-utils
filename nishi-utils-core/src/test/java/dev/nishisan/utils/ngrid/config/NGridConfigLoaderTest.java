@@ -121,6 +121,52 @@ class NGridConfigLoaderTest {
     }
 
     @Test
+    void shouldBindOutboundQueueCapacityFromTransportYaml() throws IOException {
+        Path yamlFile = tempDir.resolve("outbound-capacity.yaml");
+        NGridYamlConfig config = new NGridYamlConfig();
+
+        NodeIdentityConfig node = new NodeIdentityConfig();
+        node.setId("node-1");
+        node.setHost("127.0.0.1");
+        node.setPort(9000);
+        NodeIdentityConfig.DirsConfig dirs = new NodeIdentityConfig.DirsConfig();
+        dirs.setBase("/tmp/ngrid-outbound-test");
+        node.setDirs(dirs);
+        config.setNode(node);
+
+        ClusterPolicyConfig cluster = new ClusterPolicyConfig();
+        ClusterPolicyConfig.TransportConfig transport = new ClusterPolicyConfig.TransportConfig();
+        transport.setWorkers(4);
+        transport.setOutboundQueueCapacity(10_000);
+        cluster.setTransport(transport);
+        config.setCluster(cluster);
+
+        // Round-trip through YAML to exercise Jackson (de)serialization.
+        NGridConfigLoader.save(yamlFile, config);
+        NGridConfig domain = NGridConfigLoader.convertToDomain(NGridConfigLoader.load(yamlFile));
+
+        assertEquals(10_000, domain.outboundQueueCapacity());
+        assertEquals(4, domain.transportWorkerThreads());
+    }
+
+    @Test
+    void shouldDefaultOutboundQueueCapacityToUnboundedWhenAbsent() {
+        NGridYamlConfig config = new NGridYamlConfig();
+        NodeIdentityConfig node = new NodeIdentityConfig();
+        node.setId("node-1");
+        node.setHost("127.0.0.1");
+        node.setPort(9000);
+        NodeIdentityConfig.DirsConfig dirs = new NodeIdentityConfig.DirsConfig();
+        dirs.setBase("/tmp/ngrid-outbound-test");
+        node.setDirs(dirs);
+        config.setNode(node);
+
+        NGridConfig domain = NGridConfigLoader.convertToDomain(config);
+
+        assertEquals(0, domain.outboundQueueCapacity());
+    }
+
+    @Test
     void shouldNotDuplicateSeedPrefixWhenSeedHostAlreadyHasPrefix() {
         NGridYamlConfig config = new NGridYamlConfig();
 

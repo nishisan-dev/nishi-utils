@@ -239,6 +239,7 @@ public class ClusterPolicyConfig  {
     public static class TransportConfig  {
         @Serial
         private int workers = 2;
+        private int outboundQueueCapacity = 0;
 
         /** Creates a default transport config. */
         public TransportConfig() {
@@ -260,6 +261,27 @@ public class ClusterPolicyConfig  {
          */
         public void setWorkers(int workers) {
             this.workers = workers;
+        }
+
+        /**
+         * Returns the per-connection outbound replication capacity
+         * ({@code 0} = unbounded, the default).
+         *
+         * @return the outbound replication capacity
+         */
+        public int getOutboundQueueCapacity() {
+            return outboundQueueCapacity;
+        }
+
+        /**
+         * Sets the per-connection outbound replication capacity. When reached,
+         * excess replication is dropped and the lagging follower recovers via the
+         * gap/snapshot catch-up. Control traffic is never bounded.
+         *
+         * @param outboundQueueCapacity the capacity, {@code 0} = unbounded
+         */
+        public void setOutboundQueueCapacity(int outboundQueueCapacity) {
+            this.outboundQueueCapacity = outboundQueueCapacity;
         }
     }
 }
