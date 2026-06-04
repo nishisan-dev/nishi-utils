@@ -217,7 +217,9 @@ public final class NMapPersistence<K, V> implements Closeable {
             return;
         }
         Objects.requireNonNull(type, "type");
-        Objects.requireNonNull(key, "key");
+        if (type != NMapOperationType.CLEAR) {
+            Objects.requireNonNull(key, "key");
+        }
         lastMutationTimeMillis.accumulateAndGet(timestamp, Math::max);
         queue.offer(new NMapWALEntry(timestamp, type, key, value));
     }
@@ -247,7 +249,9 @@ public final class NMapPersistence<K, V> implements Closeable {
             return;
         }
         Objects.requireNonNull(type, "type");
-        Objects.requireNonNull(key, "key");
+        if (type != NMapOperationType.CLEAR) {
+            Objects.requireNonNull(key, "key");
+        }
         FileChannel ch = walChannel;
         if (ch == null) {
             return;
@@ -519,6 +523,13 @@ public final class NMapPersistence<K, V> implements Closeable {
             NMapOperationType type = values[typeOrdinal];
             long timestamp = in.readLong();
             lastMutationTimeMillis.accumulateAndGet(timestamp, Math::max);
+            if (type == NMapOperationType.CLEAR) {
+                // CLEAR carries no key/value — empty the map and stop. The WAL
+                // framing (entry length) lets the replay loop skip the trailing
+                // zero-length key/value fields written by encode().
+                data.clear();
+                return;
+            }
             int keyLen = in.readInt();
             if (keyLen <= 0 || keyLen > (16 * 1024 * 1024)) {
                 throw new IOException("Invalid key length");
@@ -546,7 +557,7 @@ public final class NMapPersistence<K, V> implements Closeable {
     // ── Encoding / Decoding ─────────────────────────────────────────────
 
     private ByteBuffer encode(NMapWALEntry entry) throws IOException {
-        byte[] keyBytes = serialize(entry.key());
+        byte[] keyBytes = entry.key() != null ? serialize(entry.key()) : new byte[0];
         byte[] valueBytes = entry.value() != null ? serialize(entry.value()) : new byte[0];
 
         ByteArrayOutputStream bos = new ByteArrayOutputStream();

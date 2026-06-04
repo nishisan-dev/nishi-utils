@@ -143,7 +143,7 @@ class MapPartitionResilienceTest {
                 "Put on isolated leader with expired lease should throw");
 
         // Pre-partition data should still be accessible locally (eventual read)
-        Optional<String> localRead = leaderMap.get("pre-partition", Consistency.EVENTUAL);
+        Optional<String> localRead = leaderMap.getOptional("pre-partition", Consistency.EVENTUAL);
         assertTrue(localRead.isPresent(), "Pre-partition data should survive locally");
     }
 
@@ -203,13 +203,13 @@ class MapPartitionResilienceTest {
         assertTrue(successCount.get() > 0, "Some concurrent writes should succeed");
 
         // Verify pre-failover data survived
-        Optional<String> recovered = survivorMap.get("init-0");
+        Optional<String> recovered = survivorMap.getOptional("init-0");
         assertTrue(recovered.isPresent(), "Pre-failover data should survive");
         assertEquals("value-0", recovered.get());
 
         // Verify post-failover data is consistent
         for (int i = 0; i < concurrentWrites; i++) {
-            Optional<String> val = survivorMap.get("post-failover-" + i);
+            Optional<String> val = survivorMap.getOptional("post-failover-" + i);
             if (val.isPresent()) {
                 assertEquals("value-" + i, val.get(),
                         "Post-failover entry should have correct value");

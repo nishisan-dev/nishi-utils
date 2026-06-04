@@ -182,7 +182,7 @@ class DistributedMapPojoReplicationTest {
         DistributedMap<String, TunnelEntryStub> followerMap =
                 follower.getMap("pojo-map", String.class, TunnelEntryStub.class);
 
-        TunnelEntryStub actual = followerMap.get("tunnel-1")
+        TunnelEntryStub actual = followerMap.getOptional("tunnel-1")
                 .orElseThrow(() -> new AssertionError("Key not found on follower after replication"));
 
         // Before the fix this would throw ClassCastException because 'actual' was LinkedHashMap
@@ -215,14 +215,14 @@ class DistributedMapPojoReplicationTest {
                 follower.getMap("pojo-map", String.class, TunnelEntryStub.class);
 
         for (String key : new String[]{"t-1", "t-2", "t-3"}) {
-            TunnelEntryStub v = followerMap.get(key)
+            TunnelEntryStub v = followerMap.getOptional(key)
                     .orElseThrow(() -> new AssertionError("Key " + key + " not found on follower"));
             assertInstanceOf(TunnelEntryStub.class, v,
                     "Value for key '" + key + "' on follower must be TunnelEntryStub, not " + v.getClass().getName());
         }
 
         // Spot-check values
-        TunnelEntryStub t2 = followerMap.get("t-2").orElseThrow();
+        TunnelEntryStub t2 = followerMap.getOptional("t-2").orElseThrow();
         assertEquals("10.0.0.2", t2.host());
         assertEquals(8081, t2.port());
         assertFalse(t2.active());

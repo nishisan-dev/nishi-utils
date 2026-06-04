@@ -50,11 +50,12 @@ import java.util.concurrent.CompletableFuture;
  * @param <V> the value type
  */
 public final class DistributedMap<K, V>
-        implements TransportListener, Closeable {
+        implements java.util.Map<K, V>, TransportListener, Closeable {
     private static final String COMMAND_PREFIX_PUT = "map.put:";
     private static final String COMMAND_PREFIX_REMOVE = "map.remove:";
     private static final String COMMAND_PREFIX_GET = "map.get:";
     private static final String COMMAND_PREFIX_DESTROY = "map.destroy:";
+    private static final String COMMAND_PREFIX_CLEAR = "map.clear:";
 
     private final Transport transport;
     private final ClusterCoordinator coordinator;
@@ -64,6 +65,7 @@ public final class DistributedMap<K, V>
     private final String mapRemoveCommand;
     private final String mapGetCommand;
     private final String mapDestroyCommand;
+    private final String mapClearCommand;
     private final StatsUtils stats;
     private final dev.nishisan.utils.ngrid.replication.ReplicationManager replicationManager;
     private final NodeId localNodeId;
@@ -144,6 +146,7 @@ public final class DistributedMap<K, V>
         this.mapRemoveCommand = COMMAND_PREFIX_REMOVE + this.mapName;
         this.mapGetCommand = COMMAND_PREFIX_GET + this.mapName;
         this.mapDestroyCommand = COMMAND_PREFIX_DESTROY + this.mapName;
+        this.mapClearCommand = COMMAND_PREFIX_CLEAR + this.mapName;
         transport.addListener(this);
     }
 
@@ -167,6 +170,21 @@ public final class DistributedMap<K, V>
     }
 
     /**
+     * Puts a key-value pair into the distributed map, returning the previous
+     * value associated with the key, or {@code null} if there was none.
+     * This is the {@link java.util.Map} contract method; use {@link #putOptional}
+     * for the {@link Optional}-based variant.
+     *
+     * @param key   the key
+     * @param value the value
+     * @return the previous value, or {@code null}
+     */
+    @Override
+    public V put(K key, V value) {
+        return putOptional(key, value).orElse(null);
+    }
+
+    /**
      * Puts a key-value pair into the distributed map.
      *
      * @param key   the key
@@ -174,7 +192,7 @@ public final class DistributedMap<K, V>
      * @return the previous value, or empty
      */
     @SuppressWarnings("unchecked")
-    public Optional<V> put(K key, V value) {
+    public Optional<V> putOptional(K key, V value) {
         recordIngressWrite();
         if (coordinator.isLeader()) {
             if (!coordinator.hasValidLease()) {
@@ -194,13 +212,28 @@ public final class DistributedMap<K, V>
     }
 
     /**
+     * Removes the entry for a key from the distributed map, returning the
+     * previous value, or {@code null} if there was none.
+     * This is the {@link java.util.Map} contract method; use {@link #removeOptional}
+     * for the {@link Optional}-based variant.
+     *
+     * @param key the key to remove
+     * @return the previous value, or {@code null}
+     */
+    @Override
+    @SuppressWarnings("unchecked")
+    public V remove(Object key) {
+        return removeOptional((K) key).orElse(null);
+    }
+
+    /**
      * Removes the entry for a key from the distributed map.
      *
      * @param key the key to remove
      * @return the previous value, or empty
      */
     @SuppressWarnings("unchecked")
-    public Optional<V> remove(K key) {
+    public Optional<V> removeOptional(K key) {
         recordIngressWrite();
         if (coordinator.isLeader()) {
             if (!coordinator.hasValidLease()) {
@@ -231,14 +264,30 @@ public final class DistributedMap<K, V>
     }
 
     /**
-     * Retrieves the value for a key using {@link Consistency#STRONG}.
+     * Retrieves the value for a key using {@link Consistency#STRONG}, returning
+     * the value or {@code null} if absent. This is the {@link java.util.Map}
+     * contract method; use {@link #getOptional} for the {@link Optional}-based
+     * variant or {@link #getOptional(Object, Consistency)} to pick a consistency
+     * level.
+     *
+     * @param key the key
+     * @return the value, or {@code null}
+     */
+    @Override
+    @SuppressWarnings("unchecked")
+    public V get(Object key) {
+        return getOptional((K) key, Consistency.STRONG).orElse(null);
+    }
+
+    /**
+     * Retrieves the value for a key using {@link Consistency#STRONG}, wrapped in
+     * an {@link Optional}.
      *
      * @param key the key
      * @return the value, or empty
      */
-    @SuppressWarnings("unchecked")
-    public Optional<V> get(K key) {
-        return get(key, Consistency.STRONG);
+    public Optional<V> getOptional(K key) {
+        return getOptional(key, Consistency.STRONG);
     }
 
     /**
@@ -248,6 +297,7 @@ public final class DistributedMap<K, V>
      *
      * @return an unmodifiable set of keys
      */
+    @Override
     public Set<K> keySet() {
         return mapService.keySet();
     }
@@ -260,8 +310,47 @@ public final class DistributedMap<K, V>
      * @param key the key to check
      * @return {@code true} if the key is present in the local replica
      */
-    public boolean containsKey(K key) {
-        return mapService.get(key).isPresent();
+    @Override
+    @SuppressWarnings("unchecked")
+    public boolean containsKey(Object key) {
+        return mapService.get((K) key).isPresent();
+    }
+
+    /**
+     * Returns {@code true} if the local replica maps one or more keys to the
+     * specified value. This is an eventually-consistent linear scan — no
+     * replication or leader routing is involved.
+     *
+     * @param value the value to search for
+     * @return {@code true} if the value is present in the local replica
+     */
+    @Override
+    public boolean containsValue(Object value) {
+        return mapService.containsValue(value);
+    }
+
+    /**
+     * Returns an unmodifiable snapshot of the values in the local replica.
+     * Eventually-consistent and safe to iterate under concurrent writes
+     * (no {@link java.util.ConcurrentModificationException}).
+     *
+     * @return an unmodifiable collection of values
+     */
+    @Override
+    public java.util.Collection<V> values() {
+        return mapService.values();
+    }
+
+    /**
+     * Returns an unmodifiable snapshot of the entries in the local replica.
+     * Eventually-consistent and safe to iterate under concurrent writes
+     * (no {@link java.util.ConcurrentModificationException}).
+     *
+     * @return an unmodifiable set of entries
+     */
+    @Override
+    public Set<java.util.Map.Entry<K, V>> entrySet() {
+        return mapService.entrySet();
     }
 
     /**
@@ -271,6 +360,7 @@ public final class DistributedMap<K, V>
      *
      * @return the number of entries
      */
+    @Override
     public int size() {
         return mapService.size();
     }
@@ -282,6 +372,7 @@ public final class DistributedMap<K, V>
      *
      * @return {@code true} if empty
      */
+    @Override
     public boolean isEmpty() {
         return mapService.size() == 0;
     }
@@ -293,21 +384,44 @@ public final class DistributedMap<K, V>
      *
      * @param entries the entries to put
      */
-    public void putAll(java.util.Map<K, V> entries) {
+    @Override
+    public void putAll(java.util.Map<? extends K, ? extends V> entries) {
         java.util.Objects.requireNonNull(entries, "entries");
-        for (java.util.Map.Entry<K, V> entry : entries.entrySet()) {
+        for (java.util.Map.Entry<? extends K, ? extends V> entry : entries.entrySet()) {
             put(entry.getKey(), entry.getValue());
         }
     }
 
     /**
-     * Retrieves the value for a key with the specified consistency level.
+     * Removes all entries from the distributed map, keeping it reusable.
+     * The CLEAR is replicated across the cluster (leader-based): the leader
+     * applies it locally and replicates to followers, which empty their local
+     * replica while keeping persistence alive. Followers route the request to
+     * the leader (same path as {@link #put}/{@link #remove}).
+     */
+    @Override
+    public void clear() {
+        recordIngressWrite();
+        if (coordinator.isLeader()) {
+            if (!coordinator.hasValidLease()) {
+                throw new IllegalStateException("Leader lease expired, cannot accept writes");
+            }
+            mapService.clearReplicated();
+            return;
+        }
+        byte[] encoded = MapReplicationCodec.encode(MapReplicationCommand.clear());
+        invokeLeader(mapClearCommand, new EncodedCommand(encoded));
+    }
+
+    /**
+     * Retrieves the value for a key with the specified consistency level,
+     * wrapped in an {@link Optional}.
      *
      * @param key         the key
      * @param consistency the desired consistency
      * @return the value, or empty
      */
-    public Optional<V> get(K key, Consistency consistency) {
+    public Optional<V> getOptional(K key, Consistency consistency) {
         if (coordinator.isLeader()) {
             return mapService.get(key);
         }
@@ -447,6 +561,10 @@ public final class DistributedMap<K, V>
             mapService.destroyReplicated();
             return Boolean.TRUE;
         }
+        if (command.equals(mapClearCommand)) {
+            mapService.clearReplicated();
+            return Boolean.TRUE;
+        }
         throw new IllegalArgumentException("Unknown command: " + command);
     }
 
@@ -472,7 +590,7 @@ public final class DistributedMap<K, V>
             return;
         }
         ClientRequestPayload payload = message.payload(ClientRequestPayload.class);
-        if (!Set.of(mapPutCommand, mapRemoveCommand, mapGetCommand, mapDestroyCommand).contains(payload.command())) {
+        if (!Set.of(mapPutCommand, mapRemoveCommand, mapGetCommand, mapDestroyCommand, mapClearCommand).contains(payload.command())) {
             return;
         }
         ClientResponsePayload responsePayload;

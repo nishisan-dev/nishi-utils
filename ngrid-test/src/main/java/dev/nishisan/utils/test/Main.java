@@ -459,7 +459,7 @@ public class Main {
                                 dev.nishisan.utils.ngrid.structures.Consistency.STRONG : 
                                 dev.nishisan.utils.ngrid.structures.Consistency.EVENTUAL;
                                 
-                        java.util.Optional<String> result = map.get(key, consistency);
+                        java.util.Optional<String> result = map.getOptional(key, consistency);
                         String consistencyLabel = useStrong ? "STRONG" : "EVENTUAL";
                         
                         if (result.isPresent()) {
