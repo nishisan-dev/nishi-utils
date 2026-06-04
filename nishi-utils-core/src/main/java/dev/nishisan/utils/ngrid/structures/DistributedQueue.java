@@ -479,11 +479,11 @@ public final class DistributedQueue<T>
         if (!Set.of(queueOfferCommand, queuePollCommand, queuePeekCommand).contains(payload.command())) {
             return;
         }
-        LOGGER.info(() -> "Received client request " + payload.command() + " for queue " + queueName + " from "
+        LOGGER.fine(() -> "Received client request " + payload.command() + " for queue " + queueName + " from "
                 + message.source() + " (leader=" + coordinator.isLeader() + ")");
         ClientResponsePayload responsePayload;
         if (!coordinator.isLeader()) {
-            LOGGER.info(() -> "Rejecting client request (not leader) for " + payload.command() + " from "
+            LOGGER.fine(() -> "Rejecting client request (not leader) for " + payload.command() + " from "
                     + message.source());
             responsePayload = new ClientResponsePayload(payload.requestId(), false, null, "Not the leader");
         } else {

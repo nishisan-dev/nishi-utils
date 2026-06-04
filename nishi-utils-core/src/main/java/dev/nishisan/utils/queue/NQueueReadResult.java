@@ -23,16 +23,26 @@ package dev.nishisan.utils.queue;
  */
 public class NQueueReadResult {
     public final NQueueRecord record;
+    public final long offset;
     public final long nextOffset;
 
     public NQueueReadResult(NQueueRecord record, long nextOffset) {
+        this(record, -1L, nextOffset);
+    }
+
+    public NQueueReadResult(NQueueRecord record, long offset, long nextOffset) {
         this.record = record;
+        this.offset = offset;
         this.nextOffset = nextOffset;
     }
 
 
     public NQueueRecord getRecord() {
         return record;
+    }
+
+    public long getOffset() {
+        return offset;
     }
 
     public long getNextOffset() {

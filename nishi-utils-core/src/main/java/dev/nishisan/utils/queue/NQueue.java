@@ -892,7 +892,7 @@ public class NQueue<T> implements Closeable {
                         if (dataChannel.read(pb, hEnd + (long) pb.position()) < 0)
                             throw new EOFException();
                     }
-                    return Optional.of(new NQueueReadResult(new NQueueRecord(meta, payload), pEnd));
+                    return Optional.of(new NQueueReadResult(new NQueueRecord(meta, payload), offset, pEnd));
                 } else if (meta.getIndex() > index) {
                     return Optional.empty();
                 }
@@ -996,7 +996,7 @@ public class NQueue<T> implements Closeable {
             if (dataChannel.read(pb, hEnd + (long) pb.position()) < 0)
                 throw new EOFException();
         }
-        return Optional.of(new NQueueReadResult(new NQueueRecord(meta, payload), pEnd));
+        return Optional.of(new NQueueReadResult(new NQueueRecord(meta, payload), offset, pEnd));
     }
 
     private Optional<NQueueRecord> consumeNextRecordLocked() throws IOException {

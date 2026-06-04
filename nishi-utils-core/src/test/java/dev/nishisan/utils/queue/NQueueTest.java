@@ -225,6 +225,7 @@ class NQueueTest {
             NQueueReadResult firstRead = queue.readRecordAt(firstOffset).orElseThrow();
             NQueueQueueMeta metaAfterFirst = NQueueQueueMeta.read(queueDir.resolve("queue.meta"));
 
+            assertEquals(firstOffset, firstRead.getOffset());
             assertEquals(firstOffset, metaAfterFirst.getConsumerOffset());
             assertEquals(firstRead.getNextOffset(), metaAfterFirst.getProducerOffset());
             assertEquals(1L, metaAfterFirst.getRecordCount());
@@ -237,6 +238,7 @@ class NQueueTest {
             NQueueReadResult secondRead = queue.readRecordAt(secondOffset).orElseThrow();
             NQueueQueueMeta metaAfterSecond = NQueueQueueMeta.read(queueDir.resolve("queue.meta"));
 
+            assertEquals(secondOffset, secondRead.getOffset());
             assertEquals(firstOffset, metaAfterSecond.getConsumerOffset());
             assertEquals(secondRead.getNextOffset(), metaAfterSecond.getProducerOffset());
             assertEquals(2L, metaAfterSecond.getRecordCount());

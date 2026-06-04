@@ -60,6 +60,8 @@ public final class QueueClusterService<T> implements Closeable, ReplicationHandl
     private final Integer replicationFactor;
     private final java.util.concurrent.atomic.AtomicBoolean pendingOffsetSync = new java.util.concurrent.atomic.AtomicBoolean(
             false);
+    private final java.util.concurrent.ConcurrentMap<String, CachedReadPosition> readPositionCache =
+            new java.util.concurrent.ConcurrentHashMap<>();
 
     /**
      * Creates a queue cluster service with default options.
@@ -190,7 +192,7 @@ public final class QueueClusterService<T> implements Closeable, ReplicationHandl
             // If it is DELETE_ON_CONSUME, we ignore the consumerId and perform a
             // destructive poll
             // to maintain backward compatibility and expected Queue semantics.
-            LOGGER.info(() -> String.format("poll: consumer=%s, retentionPolicy=%s, queueName=%s",
+            LOGGER.fine(() -> String.format("poll: consumer=%s, retentionPolicy=%s, queueName=%s",
                     cursor != null ? cursor.offsetStoreKey() : null, queue.getRetentionPolicy(), queueName));
             ensureLogicalCursorSupported(cursor);
             if (cursor != null && queue.getRetentionPolicy() == NQueue.Options.RetentionPolicy.TIME_BASED) {
@@ -206,12 +208,15 @@ public final class QueueClusterService<T> implements Closeable, ReplicationHandl
                         // Advance offset to next record
                         long newOffset = record.meta().getIndex() + 1;
                         safeUpdateOffset(cursor.offsetStoreKey(), newOffset);
+                        cacheReadPosition(cursor.offsetStoreKey(), newOffset, result.get().getNextOffset());
 
                         return Optional.of(item);
                     } catch (Exception e) {
                         LOGGER.log(Level.SEVERE, "Failed to deserialize record", e);
                         // Skip poison pill
-                        safeUpdateOffset(cursor.offsetStoreKey(), result.get().getRecord().meta().getIndex() + 1);
+                        long newOffset = result.get().getRecord().meta().getIndex() + 1;
+                        safeUpdateOffset(cursor.offsetStoreKey(), newOffset);
+                        cacheReadPosition(cursor.offsetStoreKey(), newOffset, result.get().getNextOffset());
                         return Optional.empty();
                     }
                 } else {
@@ -298,6 +303,7 @@ public final class QueueClusterService<T> implements Closeable, ReplicationHandl
             throw new IllegalArgumentException("offset must be >= 0");
         }
         ensureTimeBasedRetention();
+        readPositionCache.remove(cursor.offsetStoreKey());
         forceOffset(cursor.offsetStoreKey(), offset);
     }
 
@@ -390,6 +396,7 @@ public final class QueueClusterService<T> implements Closeable, ReplicationHandl
     }
 
     private void forceOffset(String consumerKey, long offset) {
+        readPositionCache.remove(consumerKey);
         if (distributedOffsetStore != null) {
             distributedOffsetStore.forceOffset(consumerKey, offset);
             pendingOffsetSync.set(false);
@@ -478,7 +485,7 @@ public final class QueueClusterService<T> implements Closeable, ReplicationHandl
         } finally {
             operationLock.unlock();
             long elapsedMs = (System.nanoTime() - start) / 1_000_000;
-            LOGGER.info(
+            LOGGER.fine(
                     () -> "Applied replication command " + command.type() + " in " + elapsedMs + "ms on " + queueName);
         }
     }
@@ -525,6 +532,7 @@ public final class QueueClusterService<T> implements Closeable, ReplicationHandl
         if (distributedOffsetStore != null) {
             distributedOffsetStore.reset();
         }
+        readPositionCache.clear();
     }
 
     @Override
@@ -538,6 +546,7 @@ public final class QueueClusterService<T> implements Closeable, ReplicationHandl
         queue.truncateAndReopen();
         // Reset local consumer offsets so they align with the new snapshot indices.
         localOffsetStore.reset();
+        readPositionCache.clear();
         // Also clear the distributed offset store. After a snapshot install the
         // queue index counter restarts from 0 (or 1). Any stale per-consumer
         // offset that survives in the distributed map would cause the leader to
@@ -616,6 +625,7 @@ public final class QueueClusterService<T> implements Closeable, ReplicationHandl
     }
 
     public void updateLocalOffset(String consumerKey, long offset) {
+        readPositionCache.remove(consumerKey);
         localOffsetStore.updateOffset(consumerKey, offset);
     }
 
@@ -696,12 +706,18 @@ public final class QueueClusterService<T> implements Closeable, ReplicationHandl
         long storedOffset = getCurrentOffset(consumerKey);
         long nextIndex = storedOffset;
         if (hintOffset != null && hintOffset > storedOffset) {
-            LOGGER.info(() -> "Forwarding offset for " + consumerKey + " from " + storedOffset + " to hint "
+            LOGGER.fine(() -> "Forwarding offset for " + consumerKey + " from " + storedOffset + " to hint "
                     + hintOffset);
             nextIndex = hintOffset;
         }
 
-        Optional<dev.nishisan.utils.queue.NQueueReadResult> result = queue.readRecordAtIndex(nextIndex);
+        long requestedIndex = nextIndex;
+        Optional<dev.nishisan.utils.queue.NQueueReadResult> result =
+                readRecordAtCachedPosition(consumerKey, requestedIndex);
+        if (result.isEmpty()) {
+            result = queue.readRecordAtIndex(requestedIndex);
+            result.ifPresent(read -> cacheReadPosition(consumerKey, requestedIndex, read.getOffset()));
+        }
         if (result.isPresent() || !allowFastForward) {
             return result;
         }
@@ -711,13 +727,41 @@ public final class QueueClusterService<T> implements Closeable, ReplicationHandl
             long oldestIndex = oldest.get().meta().getIndex();
             if (oldestIndex > nextIndex) {
                 long requestedOffset = nextIndex;
-                LOGGER.info(() -> "Consumer " + consumerKey + " offset " + requestedOffset
+                LOGGER.fine(() -> "Consumer " + consumerKey + " offset " + requestedOffset
                         + " is behind/invalid. Fast-forwarding to " + oldestIndex);
                 safeUpdateOffset(consumerKey, oldestIndex);
-                return queue.readRecordAtIndex(oldestIndex);
+                Optional<dev.nishisan.utils.queue.NQueueReadResult> fastForwarded = queue.readRecordAtIndex(oldestIndex);
+                fastForwarded.ifPresent(read -> cacheReadPosition(consumerKey, oldestIndex, read.getOffset()));
+                return fastForwarded;
             }
         }
         return Optional.empty();
+    }
+
+    private Optional<dev.nishisan.utils.queue.NQueueReadResult> readRecordAtCachedPosition(
+            String consumerKey,
+            long index) throws IOException {
+        CachedReadPosition cached = readPositionCache.get(consumerKey);
+        if (cached == null || cached.index() != index || cached.offset() < 0) {
+            return Optional.empty();
+        }
+        Optional<dev.nishisan.utils.queue.NQueueReadResult> result = queue.readRecordAt(cached.offset());
+        if (result.isPresent() && result.get().getRecord().meta().getIndex() == index) {
+            return result;
+        }
+        readPositionCache.remove(consumerKey, cached);
+        return Optional.empty();
+    }
+
+    private void cacheReadPosition(String consumerKey, long index, long offset) {
+        if (offset >= 0) {
+            readPositionCache.put(consumerKey, new CachedReadPosition(index, offset));
+        } else {
+            readPositionCache.remove(consumerKey);
+        }
+    }
+
+    private record CachedReadPosition(long index, long offset) {
     }
 
     private Optional<T> deserialize(dev.nishisan.utils.queue.NQueueRecord record) {
