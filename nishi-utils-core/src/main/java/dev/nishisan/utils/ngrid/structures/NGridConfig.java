@@ -71,6 +71,7 @@ public final class NGridConfig {
     private final Duration reconnectInterval;
     private final Duration requestTimeout;
     private final int transportWorkerThreads;
+    private final int outboundQueueCapacity;
 
     private NGridConfig(Builder builder) {
         this.clusterName = builder.clusterName;
@@ -113,6 +114,7 @@ public final class NGridConfig {
         this.reconnectInterval = builder.reconnectInterval;
         this.requestTimeout = builder.requestTimeout;
         this.transportWorkerThreads = builder.transportWorkerThreads;
+        this.outboundQueueCapacity = builder.outboundQueueCapacity;
     }
 
     public String clusterName() {
@@ -204,6 +206,19 @@ public final class NGridConfig {
 
     public int transportWorkerThreads() {
         return transportWorkerThreads;
+    }
+
+    /**
+     * Per-connection outbound replication capacity. When the number of pending
+     * replication messages on a connection reaches this value, excess replication
+     * is dropped and the lagging follower recovers via the gap/snapshot catch-up.
+     * Control traffic is never bounded. {@code 0} means unbounded (default).
+     *
+     * @return the outbound replication capacity
+     * @since 2.2.0
+     */
+    public int outboundQueueCapacity() {
+        return outboundQueueCapacity;
     }
 
     public boolean leaderReelectionEnabled() {
@@ -334,6 +349,7 @@ public final class NGridConfig {
         private Duration reconnectInterval = Duration.ofMillis(500);
         private Duration requestTimeout = Duration.ofSeconds(20);
         private int transportWorkerThreads = 2;
+        private int outboundQueueCapacity = 0;
 
         private Builder(NodeInfo local) {
             this.local = Objects.requireNonNull(local, "local");
@@ -382,6 +398,24 @@ public final class NGridConfig {
                 throw new IllegalArgumentException("transportWorkerThreads must be >= 1");
             }
             this.transportWorkerThreads = threads;
+            return this;
+        }
+
+        /**
+         * Sets the per-connection outbound replication capacity. When the number
+         * of pending replication messages on a connection reaches this value,
+         * excess replication is dropped and the lagging follower recovers via the
+         * gap/snapshot catch-up. Control traffic is never bounded.
+         *
+         * @param capacity the capacity, {@code 0} = unbounded (default), must be {@code >= 0}
+         * @return this builder
+         * @since 2.2.0
+         */
+        public Builder outboundQueueCapacity(int capacity) {
+            if (capacity < 0) {
+                throw new IllegalArgumentException("outboundQueueCapacity must be >= 0");
+            }
+            this.outboundQueueCapacity = capacity;
             return this;
         }
 
