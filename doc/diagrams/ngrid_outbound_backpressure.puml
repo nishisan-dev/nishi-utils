@@ -1,0 +1,40 @@
+@startuml
+title NGrid - Backpressure outbound (drop + catch-up) sob quorum=1
+
+actor "Produtor" as P
+participant "Lider\n(ReplicationManager)" as L
+participant "OutboundChannel\n(por conexao)" as Q
+participant "Follower" as F
+
+== Rajada (trap storm) sob quorum=1 / best-effort ==
+P -> L : put(k, v)  (rajada rapida)
+activate L
+L -> L : aplica local + ack local\n(quorum=1: completa sem RTT)
+L -> Q : enqueue(REPLICATION_REQUEST)
+alt fila de dados cheia (>= capacity)
+  Q -->> L : DROP (descarta dados)\npendingReplication mantido\ndroppedReplication++
+  note right of Q : Heartbeat/controle\nNUNCA e descartado
+else ha espaco
+  Q -> F : REPLICATION_REQUEST (seq n)
+  F -> F : aplica em ordem
+end
+deactivate L
+
+== Deteccao de atraso (independe de nova operacao) ==
+L -> F : HEARTBEAT (leaderHighWatermark)
+F -> F : checkLagAndSync()\nlag = watermark - lastApplied
+note over F : a cada 2s; controle sempre passa
+
+== Catch-up (mecanismo existente) ==
+F -> L : SYNC_REQUEST (snapshot)
+activate L
+L -> F : SYNC_RESPONSE (chunks do estado)
+deactivate L
+F -> F : instala snapshot\nlastApplied avanca -> convergencia
+
+note over P, F
+  Memoria do lider permanece estavel:
+  somente REPLICATION_REQUEST e limitado/descartado;
+  o follower atrasado reconcilia via gap/snapshot.
+end note
+@enduml

@@ -67,6 +67,13 @@ cluster:
     strict: false
   transport:
     workers: 4
+    # Capacidade da fila outbound de replicacao por conexao (backpressure).
+    # 0 = ilimitada (default, compativel). Sob quorum=1 (escrita best-effort),
+    # limita as mensagens de replicacao pendentes por conexao: ao encher, a
+    # replicacao excedente e descartada e o follower atrasado se recupera pelo
+    # catch-up (gap/snapshot). Trafego de controle (heartbeat) nunca e limitado.
+    # Ver doc/ngrid/outbound-backpressure.md.
+    outboundQueueCapacity: 0
   # Lista de nos sementes para descoberta inicial (formato host:port)
   seeds:
     - 127.0.0.1:9001
