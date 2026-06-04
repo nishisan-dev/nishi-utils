@@ -414,6 +414,78 @@ public final class DistributedMap<K, V>
     }
 
     /**
+     * Replaces each entry's value with the result of the given function,
+     * issuing a <em>replicated</em> {@code put} per entry. Overrides the
+     * {@link java.util.Map} default, whose {@code entry.setValue} would mutate
+     * only the throwaway local snapshot returned by {@link #entrySet()} without
+     * replicating. Iterates over the local replica snapshot.
+     *
+     * @param function the function computing the new value for each entry
+     */
+    @Override
+    public void replaceAll(java.util.function.BiFunction<? super K, ? super V, ? extends V> function) {
+        java.util.Objects.requireNonNull(function, "function");
+        for (java.util.Map.Entry<K, V> entry : entrySet()) {
+            put(entry.getKey(), function.apply(entry.getKey(), entry.getValue()));
+        }
+    }
+
+    /**
+     * Compares the specified object with this map for equality per the
+     * {@link java.util.Map#equals(Object)} contract — {@code true} when the other
+     * object is a {@code Map} with the same mappings. The comparison is made
+     * against the <em>local replica snapshot</em> (eventually-consistent), the
+     * same view exposed by {@link #entrySet()}/{@link #size()}.
+     *
+     * @param o the object to compare
+     * @return {@code true} if the maps have equal mappings
+     */
+    @Override
+    public boolean equals(Object o) {
+        if (o == this) {
+            return true;
+        }
+        if (!(o instanceof java.util.Map<?, ?> other)) {
+            return false;
+        }
+        if (other.size() != size()) {
+            return false;
+        }
+        try {
+            for (java.util.Map.Entry<K, V> e : entrySet()) {
+                K key = e.getKey();
+                V value = e.getValue();
+                if (value == null) {
+                    if (!(other.get(key) == null && other.containsKey(key))) {
+                        return false;
+                    }
+                } else if (!value.equals(other.get(key))) {
+                    return false;
+                }
+            }
+        } catch (ClassCastException | NullPointerException unused) {
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Returns the hash code for this map per the {@link java.util.Map#hashCode()}
+     * contract (sum of the entries' hash codes), computed over the local replica
+     * snapshot.
+     *
+     * @return the map hash code
+     */
+    @Override
+    public int hashCode() {
+        int h = 0;
+        for (java.util.Map.Entry<K, V> e : entrySet()) {
+            h += e.hashCode();
+        }
+        return h;
+    }
+
+    /**
      * Retrieves the value for a key with the specified consistency level,
      * wrapped in an {@link Optional}.
      *

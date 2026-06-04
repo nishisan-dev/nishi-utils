@@ -422,6 +422,29 @@ class DistributedMapApiTest {
         }
     }
 
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void equalsHashCodeAndReplaceAllHonorMapContract() {
+        NGridNode leader = findLeader();
+        assertNotNull(leader, "Should have a leader");
+        DistributedMap<String, String> map = leader.getMap("api-test", String.class, String.class);
+
+        map.put("a", "1");
+        map.put("b", "2");
+
+        // equals/hashCode are content-based (Map contract), comparable to a plain Map
+        Map<String, String> expected = Map.of("a", "1", "b", "2");
+        assertEquals(expected, map, "DistributedMap must equal a Map with the same mappings");
+        assertEquals(map, expected, "equality must be symmetric with a plain Map");
+        assertEquals(expected.hashCode(), map.hashCode(), "hashCode must match a content-equal Map");
+        assertNotEquals(Map.of("a", "1"), map, "maps with different sizes must not be equal");
+
+        // replaceAll must perform replicated puts, not mutate a throwaway snapshot
+        map.replaceAll((k, v) -> v + "-x");
+        assertEquals("1-x", map.get("a"), "replaceAll must update the distributed map");
+        assertEquals("2-x", map.get("b"), "replaceAll must update the distributed map");
+    }
+
     // ==================== Utility Methods ====================
 
     private NGridNode findLeader() {

@@ -14,6 +14,9 @@
     `Consistency`).
   - Novos: `values()`, `entrySet()` (snapshots imutáveis locais, imunes a
     `ConcurrentModificationException`), `containsValue()` e `clear()` **replicado**.
+  - `equals`/`hashCode` por conteúdo (contrato `Map`, sobre o replica local) e
+    `replaceAll` sobrescrito para emitir `put` **replicado** (o default da interface
+    mutaria apenas o snapshot descartável).
   - Novo opcode **`CLEAR`** (`NMapOperationType`, adicionado ao final do enum para preservar a
     compatibilidade de ordinais do WAL): esvazia a réplica mantendo a engine de persistência
     viva (reutilizável), distinto do `DESTROY` que apaga os arquivos. Propagado via
