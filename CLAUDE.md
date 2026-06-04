@@ -37,7 +37,7 @@ mvn verify -pl nishi-utils-core
 mvn verify -Psecurity-scan -DskipTests
 ```
 
-**Toolchain note:** POMs and Dockerfile compile with Java 25, though README says Java 21+. If you see compilation errors, check Java version first.
+**Toolchain note:** POMs and Dockerfile target Java 21 (`maven.compiler.release=21`), matching the README and the GitHub Actions workflows. The artifact runs on JDK 21+ and remains buildable on newer JDKs. If you see compilation errors, check Java version first.
 
 ## Repository Structure
 
