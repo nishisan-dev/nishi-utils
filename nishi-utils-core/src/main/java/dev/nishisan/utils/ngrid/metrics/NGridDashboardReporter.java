@@ -172,6 +172,12 @@ public final class NGridDashboardReporter implements Closeable {
         health.put("quorumRatio", Math.round(quorumRatio * 100.0) / 100.0);
         root.put("health", health);
 
+        // Transport section (outbound backpressure, issue #113)
+        Map<String, Object> transport = new LinkedHashMap<>();
+        transport.put("outboundQueueDepthByNode", snapshot.outboundQueueDepthByNode());
+        transport.put("outboundDroppedByNode", snapshot.outboundDroppedByNode());
+        root.put("transport", transport);
+
         // I/O section (summarized)
         NGridStatsSnapshot io = snapshot.ioStats();
         if (io != null) {

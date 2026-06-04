@@ -300,6 +300,20 @@ public final class TcpTransport implements Transport {
     }
 
     @Override
+    public Map<NodeId, Integer> outboundQueueDepths() {
+        Map<NodeId, Integer> depths = new HashMap<>();
+        connections.forEach((nodeId, conn) -> depths.put(nodeId, conn.outboundDepth()));
+        return depths;
+    }
+
+    @Override
+    public Map<NodeId, Long> outboundDropped() {
+        Map<NodeId, Long> dropped = new HashMap<>();
+        connections.forEach((nodeId, conn) -> dropped.put(nodeId, conn.outboundDropped()));
+        return dropped;
+    }
+
+    @Override
     public void addPeer(NodeInfo peer) {
         if (peer == null || peer.nodeId().equals(config.local().nodeId())) {
             return;
@@ -723,6 +737,14 @@ public final class TcpTransport implements Transport {
 
         boolean isOpen() {
             return open && !socket.isClosed();
+        }
+
+        int outboundDepth() {
+            return outbound.dataDepth();
+        }
+
+        long outboundDropped() {
+            return outbound.droppedCount();
         }
 
         void send(ClusterMessage message) {

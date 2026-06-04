@@ -39,7 +39,9 @@ class NGridDashboardReporterTest {
                 true, true, 1000L,
                 1000L, 1000L - lag, lag,
                 3L, 1L, 0L, 8.5, 2,
-                reachable, total, ioStats, Instant.now());
+                reachable, total,
+                Map.of("node-2", 7), Map.of("node-2", 3L),
+                ioStats, Instant.now());
     }
 
     @Test
@@ -62,6 +64,8 @@ class NGridDashboardReporterTest {
             assertTrue(content.contains("cluster:"));
             assertTrue(content.contains("replication:"));
             assertTrue(content.contains("health:"));
+            assertTrue(content.contains("transport:"));
+            assertTrue(content.contains("outboundQueueDepthByNode:"));
             assertTrue(content.contains("io:"));
             assertTrue(content.contains("localNodeId: \"node-1\""));
             assertTrue(content.contains("leaderId: \"node-1\""));

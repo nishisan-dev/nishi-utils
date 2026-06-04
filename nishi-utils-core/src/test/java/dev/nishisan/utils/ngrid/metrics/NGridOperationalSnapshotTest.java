@@ -45,6 +45,8 @@ class NGridOperationalSnapshotTest {
                 0,
                 3,
                 3,
+                Map.of(),
+                Map.of(),
                 ioStats,
                 now);
 
@@ -84,7 +86,7 @@ class NGridOperationalSnapshotTest {
         // whatever was passed.
         NGridOperationalSnapshot snapshot = new NGridOperationalSnapshot(
                 "node-1", "node-1", 1L, 1L, 1, true, true, 100L,
-                200L, 200L, 0L, 0L, 0L, 0L, 0.0, 0, 1, 1, ioStats, now);
+                200L, 200L, 0L, 0L, 0L, 0L, 0.0, 0, 1, 1, Map.of(), Map.of(), ioStats, now);
 
         assertEquals(0L, snapshot.replicationLag());
     }
@@ -100,7 +102,7 @@ class NGridOperationalSnapshotTest {
         long lag = 200L;
         NGridOperationalSnapshot snapshot = new NGridOperationalSnapshot(
                 "follower-1", "leader-1", 2L, 2L, 3, false, false, 500L,
-                0L, 300L, lag, 5L, 3L, 1L, 25.0, 2, 2, 3, ioStats, now);
+                0L, 300L, lag, 5L, 3L, 1L, 25.0, 2, 2, 3, Map.of(), Map.of(), ioStats, now);
 
         assertEquals(200L, snapshot.replicationLag());
         assertFalse(snapshot.isLeader());
@@ -118,7 +120,7 @@ class NGridOperationalSnapshotTest {
         // Only 1 of 3 nodes reachable
         NGridOperationalSnapshot snapshot = new NGridOperationalSnapshot(
                 "node-1", "node-1", 5L, 5L, 3, true, false, 1000L,
-                1000L, 1000L, 0L, 0L, 0L, 0L, 0.0, 5, 1, 3, ioStats, now);
+                1000L, 1000L, 0L, 0L, 0L, 0L, 0.0, 5, 1, 3, Map.of(), Map.of(), ioStats, now);
 
         assertEquals(1, snapshot.reachableNodesCount());
         assertEquals(3, snapshot.totalNodesCount());
