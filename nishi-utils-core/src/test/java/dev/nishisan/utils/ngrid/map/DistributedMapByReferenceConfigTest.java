@@ -92,6 +92,54 @@ class DistributedMapByReferenceConfigTest {
         assertEquals(v2, stored);
     }
 
+    @Test
+    void configuredMapWithoutExplicitSettingInheritsGlobalDefault() throws Exception {
+        int port = allocateFreeLocalPort();
+        NodeInfo info = new NodeInfo(NodeId.of("cfg-2"), "127.0.0.1", port);
+        Path dir = Files.createTempDirectory("byref-config-inherit");
+
+        node = new NGridNode(NGridConfig.builder(info)
+                .dataDirectory(dir)
+                .replicationFactor(1)
+                .mapLeaderLocalByReference(true) // global default ON
+                .addMap(MapConfig.builder("configured-no-flag").build()) // no explicit setting
+                .build());
+        node.start();
+        awaitLeadership(node);
+
+        // A configured map that does not set the flag must inherit the global default.
+        DistributedMap<String, Box> m = node.getMap("configured-no-flag", String.class, Box.class);
+        Box v = new Box(5);
+        m.put("k", v);
+        assertSame(v, m.getOptional("k").orElseThrow(),
+                "configured map without explicit setting must inherit the global default (ON)");
+    }
+
+    @Test
+    void defaultMapConfiguredByReferenceApplies() throws Exception {
+        int port = allocateFreeLocalPort();
+        NodeInfo info = new NodeInfo(NodeId.of("cfg-3"), "127.0.0.1", port);
+        Path dir = Files.createTempDirectory("byref-config-default");
+
+        // Global default OFF; the *default map* itself sets by-reference explicitly.
+        // Regression guard: the override must be registered before the default map is
+        // eagerly created, otherwise it would be silently ignored.
+        node = new NGridNode(NGridConfig.builder(info)
+                .dataDirectory(dir)
+                .replicationFactor(1)
+                .mapName("default-map")
+                .addMap(MapConfig.builder("default-map").leaderLocalByReference(true).build())
+                .build());
+        node.start();
+        awaitLeadership(node);
+
+        DistributedMap<String, Box> m = node.getMap("default-map", String.class, Box.class);
+        Box v = new Box(9);
+        m.put("k", v);
+        assertSame(v, m.getOptional("k").orElseThrow(),
+                "default map configured with by-reference must apply (override registered before creation)");
+    }
+
     private static void awaitLeadership(NGridNode node) throws InterruptedException {
         long deadline = System.currentTimeMillis() + 15_000;
         while (System.currentTimeMillis() < deadline) {

@@ -32,7 +32,7 @@ import java.util.Objects;
 public final class MapConfig {
     private final String name;
     private final NMapPersistenceMode persistenceMode;
-    private final boolean leaderLocalByReference;
+    private final Boolean leaderLocalByReference;
 
     private MapConfig(Builder builder) {
         this.name = builder.name;
@@ -59,16 +59,20 @@ public final class MapConfig {
     }
 
     /**
-     * Returns whether this map runs in leader-local by-reference mode.
+     * Returns the per-map leader-local by-reference override, or {@code null} when
+     * unset.
      * <p>
      * When {@code true}, the leader keeps the original value instance in its local
      * state (ConcurrentHashMap reference semantics) instead of a deserialized copy;
-     * followers still receive the serialized, type-faithful copy. Opt-in, defaults
-     * to {@code false}.
+     * followers still receive the serialized, type-faithful copy. When {@code false},
+     * by-reference is explicitly disabled for this map. When {@code null} (the
+     * default), the map inherits the global default
+     * ({@link NGridConfig#mapLeaderLocalByReference()}).
      *
-     * @return {@code true} if leader-local by-reference is enabled
+     * @return {@link Boolean#TRUE}/{@link Boolean#FALSE} for an explicit override, or
+     *         {@code null} to inherit the global default
      */
-    public boolean leaderLocalByReference() {
+    public Boolean leaderLocalByReference() {
         return leaderLocalByReference;
     }
 
@@ -91,7 +95,7 @@ public final class MapConfig {
     public static final class Builder {
         private final String name;
         private NMapPersistenceMode persistenceMode = NMapPersistenceMode.DISABLED;
-        private boolean leaderLocalByReference = false;
+        private Boolean leaderLocalByReference = null;
 
         private Builder(String name) {
             this.name = Objects.requireNonNull(name, "map name cannot be null");
@@ -118,6 +122,9 @@ public final class MapConfig {
          * state instead of a deserialized copy, preserving {@code ConcurrentHashMap}
          * reference semantics ({@code put(k, v)} then {@code get(k) == v}) on the
          * leader. Followers still receive the serialized copy.
+         *
+         * Not setting this leaves the value unset ({@code null}), so the map inherits
+         * the global default ({@link NGridConfig.Builder#mapLeaderLocalByReference(boolean)}).
          *
          * @param leaderLocalByReference whether to enable by-reference mode
          * @return this builder

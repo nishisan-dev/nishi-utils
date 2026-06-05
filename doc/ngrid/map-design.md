@@ -457,6 +457,12 @@ necessário um modo de apply síncrono adicional. Aplicar antes do quorum quebra
 | Default global | `NGridConfig.Builder.mapLeaderLocalByReference(true)` |
 | Facade local/produção | `NGrid.local(n).map("hot", true)` / `NGrid.node(...).map("hot", true)` |
 
+O override por-mapa é **tri-state**: `MapConfig.leaderLocalByReference` é `null` quando não
+definido — nesse caso o mapa **herda o default global**; só um `true`/`false` explícito sobrepõe
+o global. Os overrides por-mapa são registrados **antes** da criação dos mapas (inclusive o mapa
+default), garantindo que `MapConfig.builder("default-map").leaderLocalByReference(true)` seja
+aplicado.
+
 > O mapa interno `_ngrid-queue-offsets` **nunca** usa by-reference (guard em
 > `NGridNode.createMapService`); seus valores são `Long` imutáveis, onde referência × cópia é
 > indistinguível.

@@ -396,6 +396,21 @@ public final class NGridNode implements Closeable {
             }
         }
 
+        // Register per-map overrides BEFORE creating any map. createMapService reads
+        // these overrides, and computeIfAbsent will not rebuild an already-created
+        // map — so the default map (config.mapName()) must see its override too.
+        if (config.configuredMaps() != null) {
+            for (MapConfig mapConfig : config.configuredMaps()) {
+                mapPersistenceOverrides.put(mapConfig.name(), mapConfig.persistenceMode());
+                // Tri-state: only record an override when the map sets it explicitly;
+                // otherwise the map inherits the global mapLeaderLocalByReference default.
+                Boolean byRefOverride = mapConfig.leaderLocalByReference();
+                if (byRefOverride != null) {
+                    mapByReferenceOverrides.put(mapConfig.name(), byRefOverride);
+                }
+            }
+        }
+
         String defaultMapName = config.mapName();
         map = maps.computeIfAbsent(defaultMapName, this::createDistributedMap);
 
@@ -404,8 +419,6 @@ public final class NGridNode implements Closeable {
         // This is analogous to the queue eager-registration loop above.
         if (config.configuredMaps() != null && !config.configuredMaps().isEmpty()) {
             for (MapConfig mapConfig : config.configuredMaps()) {
-                mapPersistenceOverrides.put(mapConfig.name(), mapConfig.persistenceMode());
-                mapByReferenceOverrides.put(mapConfig.name(), mapConfig.leaderLocalByReference());
                 maps.computeIfAbsent(mapConfig.name(), this::createDistributedMap);
             }
         }
