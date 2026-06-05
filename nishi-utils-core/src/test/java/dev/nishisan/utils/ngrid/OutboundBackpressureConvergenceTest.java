@@ -24,8 +24,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * This test exercises the feature end-to-end: a per-connection
  * {@code outboundQueueCapacity} is configured via {@link NGridConfig}, a leader
  * writes a burst under {@code quorum=1} (best-effort, no RTT), and the test
- * verifies that (a) the cluster still converges — every key replicates/catches
- * up to the follower despite the bounded outbound queue — and (b) the per-node
+ * verifies that (a) the cluster still converges — a representative sample of
+ * keys (every {@code SAMPLE_STEP}) replicates/catches up to the follower despite
+ * the bounded outbound queue — and (b) the per-node
  * outbound occupancy/drop metric (RF3) is exposed in
  * {@link NGridNode#operationalSnapshot()} for the leader→follower link.
  * </p>
