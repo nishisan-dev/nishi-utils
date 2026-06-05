@@ -48,7 +48,7 @@ public final class NGridNodeBuilder {
     private String seedAddress;
     private final List<String> peerAddresses = new ArrayList<>();
     private final List<String> queueNames = new ArrayList<>();
-    private final List<String> mapNames = new ArrayList<>();
+    private final List<MapConfig> mapConfigs = new ArrayList<>();
     private Integer replicationFactor;
     private Path dataDir;
     private boolean strictConsistency = true;
@@ -119,7 +119,25 @@ public final class NGridNodeBuilder {
      * @return this builder
      */
     public NGridNodeBuilder map(String name) {
-        mapNames.add(Objects.requireNonNull(name, "map name"));
+        mapConfigs.add(MapConfig.builder(Objects.requireNonNull(name, "map name")).build());
+        return this;
+    }
+
+    /**
+     * Adds a distributed map with leader-local by-reference mode set.
+     * <p>
+     * When {@code leaderLocalByReference} is {@code true}, the leader keeps the
+     * original value instance in its local state ({@code put(k, v)} then
+     * {@code get(k) == v}); followers still receive the serialized copy.
+     *
+     * @param name                   the map name
+     * @param leaderLocalByReference whether to enable by-reference mode
+     * @return this builder
+     */
+    public NGridNodeBuilder map(String name, boolean leaderLocalByReference) {
+        mapConfigs.add(MapConfig.builder(Objects.requireNonNull(name, "map name"))
+                .leaderLocalByReference(leaderLocalByReference)
+                .build());
         return this;
     }
 
@@ -208,8 +226,8 @@ public final class NGridNodeBuilder {
         }
 
         // Add maps
-        for (String name : mapNames) {
-            builder.addMap(MapConfig.builder(name).build());
+        for (MapConfig mc : mapConfigs) {
+            builder.addMap(mc);
         }
 
         // Ensure at least one queue exists (required by NGridNode)
