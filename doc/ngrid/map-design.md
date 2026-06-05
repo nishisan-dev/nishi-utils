@@ -24,6 +24,9 @@ Fornecer um mapa chave→valor replicado entre nós do cluster, com:
 - **Replicação de comandos** (`PUT`/`REMOVE`/`CLEAR`) para manter as réplicas alinhadas
 - **Persistência local opcional** (WAL + Snapshot) para acelerar restart e melhorar durabilidade local
 - **Leituras com 3 níveis de consistência** (STRONG, BOUNDED, EVENTUAL)
+- **Modo opcional _leader-local by-reference_** (#115) — no líder, `put(k, v)` seguido de
+  `get(k)` devolve **a mesma instância** (semântica de referência do `ConcurrentHashMap`),
+  preservando a serialização apenas para replicar aos followers
 
 ---
 
@@ -409,6 +412,84 @@ tudo isolado no codec. Observação: o snapshot é serializado a partir de um `H
 
 ---
 
+## Modo leader-local by-reference (#115)
+
+Por padrão, mesmo no líder, um `put(k, v)` **serializa** o valor e o estado local guarda a
+**cópia desserializada** — `get(k) == v` é `false`. Para estado quente mutável migrado de
+`ConcurrentHashMap` (ex.: motor de correlação em cenário **active-standby**, onde só o líder
+escreve/processa), isso quebra a expectativa de **referência compartilhada**: o código que
+faz `cache.put(id, dto)` e depois **muta `dto` in-place** (sem novo `put`) perde as mutações,
+porque o cache guarda a cópia, não `dto`.
+
+O modo **opcional** `leaderLocalByReference` resolve isso no líder, mantendo a fidelidade de
+tipos nos followers.
+
+### Como funciona (dual-payload)
+
+A escrita passa a carregar **dois payloads** distintos (espelhando o que o `QueueClusterService`
+já faz com objetos vivos):
+
+- **wire** (`byte[]` do `MapReplicationCodec`): vai aos followers, ao log de resend e ao snapshot;
+- **localApply** (o `MapReplicationCommand` **vivo**, com a referência original): usado **apenas**
+  no apply local do líder.
+
+No líder, `MapClusterService.apply` recebe o comando vivo (`payload instanceof MapReplicationCommand`)
+e faz `data.put(k, referênciaOriginal)` **sem decodar**. Nos followers, chega o `byte[]` do wire,
+que é decodado normalmente (`data.put(k, cópia)`). O `ReplicationManager` adiciona o campo
+`localApplyPayload` em `PendingOperation` e um overload
+`replicate(topic, wirePayload, localApplyPayload, quorumOverride)`; somente o apply local do líder
+(`checkCompletion`) usa o `localApplyPayload` — wire/resend/snapshot continuam usando os bytes.
+
+![NGrid Map — leader-local by-reference](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan-dev/nishi-utils/main/doc/diagrams/ngrid_map_byreference.puml)
+
+### Read-after-write
+
+`put()` bloqueia em `waitForReplication(future.get())`, e a *future* só completa **após** o apply
+local (em `completeOperation`). Logo, **read-after-write já é garantido por design** — não é
+necessário um modo de apply síncrono adicional. Aplicar antes do quorum quebraria o invariante
+*commit-após-quorum*, e por isso **não** é feito.
+
+### Configuração
+
+| Onde | Como |
+|---|---|
+| Por mapa | `MapConfig.builder("hot").leaderLocalByReference(true)` (vence o default global) |
+| Default global | `NGridConfig.Builder.mapLeaderLocalByReference(true)` |
+| Facade local/produção | `NGrid.local(n).map("hot", true)` / `NGrid.node(...).map("hot", true)` |
+
+O override por-mapa é **tri-state**: `MapConfig.leaderLocalByReference` é `null` quando não
+definido — nesse caso o mapa **herda o default global**; só um `true`/`false` explícito sobrepõe
+o global. Os overrides por-mapa são registrados **antes** da criação dos mapas (inclusive o mapa
+default), garantindo que `MapConfig.builder("default-map").leaderLocalByReference(true)` seja
+aplicado.
+
+> O mapa interno `_ngrid-queue-offsets` **nunca** usa by-reference (guard em
+> `NGridNode.createMapService`); seus valores são `Long` imutáveis, onde referência × cópia é
+> indistinguível.
+
+### Persistência
+
+Para mapas by-reference com WAL habilitado, o ramo PUT do `apply` usa **`appendSync`** (e não
+`appendAsync`): assim o WAL captura o **estado-no-apply**, idêntico ao replicado aos followers,
+antes de qualquer mutação in-place posterior da instância viva.
+
+### Semântica e limitações
+
+- **Identidade só no líder corrente.** Após failover, o novo líder tem cópias decodificadas; a
+  identidade de referência **não** sobrevive à eleição (aceitável no active-standby colocalizado
+  com o líder).
+- **Mutação in-place não replica.** Mutar o objeto obtido (via `get`) ou o objeto passado (após o
+  `put`) altera o estado **local** do líder, mas **não** dispara replicação nem persistência — só
+  um novo `put(k, v)` propaga. Followers seguem com a cópia congelada no momento do último `put`.
+- **Não mutar durante o `put`.** O encode dos bytes ocorre antes do apply local; o contrato
+  single-writer do active-standby pressupõe que o valor não é mutado por outra thread enquanto o
+  `put` não retornou.
+- **Escrita roteada de follower→líder.** Quando um follower roteia o `put` ao líder, o líder
+  recebe o valor **decodado** e guarda essa cópia como "referência" — inócuo, pois o escritor está
+  em outra JVM. O ganho de identidade só vale para `put` originado **no próprio líder**.
+
+---
+
 ## Testes de cobertura
 
 | Teste | Tipo | Cobertura |
@@ -417,6 +498,9 @@ tudo isolado no codec. Observação: o snapshot é serializado a partir de um `H
 | `NGridMapPersistenceIntegrationTest` | Integração (3 nós) | Full cluster restart, named maps recovery |
 | `MapClusterServiceConcurrencyTest` | Concorrência | 8 threads × 500 ops put/remove sem deadlock |
 | `DistributedMapPojoReplicationTest` | Integração (3 nós) + unitário | Regressão #82: POJO sem anotações Jackson preservado após replication e snapshot sync |
+| `MapClusterServiceByReferenceTest` | Unitário (1 nó, quorum=1) | #115: identidade de referência, mutação in-place, apply dual (vivo×bytes), persistência+reload |
+| `DistributedMapByReferenceClusterTest` | Integração (3 nós) | #115: líder mantém referência, follower recebe cópia type-faithful |
+| `DistributedMapByReferenceConfigTest` | Integração (1 nó) | #115: override por-mapa vence o default global |
 
 ---
 
@@ -427,5 +511,6 @@ tudo isolado no codec. Observação: o snapshot é serializado a partir de um `H
 | `mapDirectory` | `{dataDirectory}/maps` | Diretório base para persistência de mapas |
 | `mapName` | `"default-map"` | Nome do mapa padrão |
 | `mapPersistenceMode` | `DISABLED` | Modo de persistência para mapas do usuário |
+| `mapLeaderLocalByReference` | `false` | Default global do modo by-reference (#115); sobreposto por `MapConfig.leaderLocalByReference` |
 
-> **Nota:** O mapa de offsets (`_ngrid-queue-offsets`) sempre usa `ASYNC_WITH_FSYNC` independente da configuração do usuário.
+> **Nota:** O mapa de offsets (`_ngrid-queue-offsets`) sempre usa `ASYNC_WITH_FSYNC` independente da configuração do usuário, e **nunca** usa by-reference.

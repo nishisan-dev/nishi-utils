@@ -1,0 +1,57 @@
+@startuml ngrid_map_byreference
+!theme plain
+
+title NGrid Map — Leader-local by-reference (PUT) #115
+
+skinparam backgroundColor white
+skinparam defaultFontName Inter
+skinparam sequenceMessageAlign center
+
+participant "App\n(no líder)" as App
+participant "DistributedMap" as DM
+participant "MapClusterService\n(LÍDER)" as MS
+participant "ReplicationManager" as RM
+participant "Follower\nMapClusterService" as F
+
+App -> DM : put(k, v)
+DM -> MS : put(k, v)   (isLeader)
+
+note over MS
+  command = MapReplicationCommand.put(k, v)   (objeto VIVO)
+  encoded = MapReplicationCodec.encode(command)   (bytes p/ wire)
+end note
+
+MS -> RM : replicate(topic, **encoded** /*wire*/, **command** /*localApply*/)
+
+RM ->> F : REPLICATION_REQUEST(encoded)
+note right of F
+  apply(byte[]) → decode()
+  data.put(k, **cópia**)   (fidelidade de tipos)
+end note
+F -->> RM : REPLICATION_ACK
+
+note over RM
+  acks >= quorum → apply LOCAL do líder
+  handler.apply(opId, **command vivo**)
+end note
+RM -> MS : apply(opId, command)
+
+note over MS
+  payload instanceof MapReplicationCommand →
+    data.put(k, **referência original v**)
+  (sem decode; identidade preservada)
+  persistência: appendSync (estado-no-apply)
+end note
+
+RM --> MS : commit (future completa após apply)
+MS --> DM : Optional(prev)
+DM --> App : Optional(prev)
+
+note over App, MS #FFF3CD
+  No líder: get(k) == v (mesma instância).
+  Mutação in-place em v é visível em get(k) — mas
+  NÃO é replicada (sem novo put). Followers seguem
+  com a cópia congelada no momento do put.
+end note
+
+@enduml

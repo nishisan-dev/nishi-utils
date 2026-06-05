@@ -100,6 +100,8 @@ public final class NGridNode implements Closeable {
     private final Map<String, DistributedMap<Serializable, Serializable>> maps = new ConcurrentHashMap<>();
     /** Maps map names to their per-map persistence mode override (from YAML config). */
     private final Map<String, NMapPersistenceMode> mapPersistenceOverrides = new ConcurrentHashMap<>();
+    /** Maps map names to their per-map leader-local by-reference override. */
+    private final Map<String, Boolean> mapByReferenceOverrides = new ConcurrentHashMap<>();
     private DistributedMap<Serializable, Serializable> map;
     private ScheduledExecutorService coordinatorScheduler;
     private ScheduledExecutorService metricsScheduler;
@@ -394,6 +396,21 @@ public final class NGridNode implements Closeable {
             }
         }
 
+        // Register per-map overrides BEFORE creating any map. createMapService reads
+        // these overrides, and computeIfAbsent will not rebuild an already-created
+        // map — so the default map (config.mapName()) must see its override too.
+        if (config.configuredMaps() != null) {
+            for (MapConfig mapConfig : config.configuredMaps()) {
+                mapPersistenceOverrides.put(mapConfig.name(), mapConfig.persistenceMode());
+                // Tri-state: only record an override when the map sets it explicitly;
+                // otherwise the map inherits the global mapLeaderLocalByReference default.
+                Boolean byRefOverride = mapConfig.leaderLocalByReference();
+                if (byRefOverride != null) {
+                    mapByReferenceOverrides.put(mapConfig.name(), byRefOverride);
+                }
+            }
+        }
+
         String defaultMapName = config.mapName();
         map = maps.computeIfAbsent(defaultMapName, this::createDistributedMap);
 
@@ -402,7 +419,6 @@ public final class NGridNode implements Closeable {
         // This is analogous to the queue eager-registration loop above.
         if (config.configuredMaps() != null && !config.configuredMaps().isEmpty()) {
             for (MapConfig mapConfig : config.configuredMaps()) {
-                mapPersistenceOverrides.put(mapConfig.name(), mapConfig.persistenceMode());
                 maps.computeIfAbsent(mapConfig.name(), this::createDistributedMap);
             }
         }
@@ -902,6 +918,11 @@ public final class NGridNode implements Closeable {
                 && (effectiveMode == null || effectiveMode == NMapPersistenceMode.DISABLED)) {
             effectiveMode = NMapPersistenceMode.ASYNC_WITH_FSYNC;
         }
+        // Resolve leader-local by-reference: per-map override else global default.
+        // Internal maps must never use by-reference (e.g. offsets rely on the
+        // monotonic-Long apply path; Long is immutable, so by-reference is moot anyway).
+        boolean byReference = !"_ngrid-queue-offsets".equals(mapName)
+                && mapByReferenceOverrides.getOrDefault(mapName, config.mapLeaderLocalByReference());
         if (effectiveMode != null && effectiveMode != NMapPersistenceMode.DISABLED) {
             NMapConfig nmapConfig = NMapConfig.builder()
                     .mode(effectiveMode)
@@ -911,11 +932,12 @@ public final class NGridNode implements Closeable {
                     MapClusterService.topicFor(mapName),
                     config.mapDirectory(),
                     mapName,
-                    nmapConfig);
+                    nmapConfig,
+                    byReference);
             service.loadFromDisk();
             return service;
         }
-        return new MapClusterService<>(replicationManager, MapClusterService.topicFor(mapName), null);
+        return new MapClusterService<>(replicationManager, MapClusterService.topicFor(mapName), null, byReference);
     }
 
     /**

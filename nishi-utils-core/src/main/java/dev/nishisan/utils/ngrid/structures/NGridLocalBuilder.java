@@ -49,7 +49,7 @@ public final class NGridLocalBuilder {
 
     private final int nodeCount;
     private final List<String> queueNames = new ArrayList<>();
-    private final List<String> mapNames = new ArrayList<>();
+    private final List<MapConfig> mapConfigs = new ArrayList<>();
     private Integer replicationFactor;
     private Path dataDir;
     private boolean strictConsistency = false;
@@ -76,7 +76,25 @@ public final class NGridLocalBuilder {
      * @return this builder
      */
     public NGridLocalBuilder map(String name) {
-        mapNames.add(Objects.requireNonNull(name, "map name"));
+        mapConfigs.add(MapConfig.builder(Objects.requireNonNull(name, "map name")).build());
+        return this;
+    }
+
+    /**
+     * Adds a distributed map to all nodes, with leader-local by-reference mode set.
+     * <p>
+     * When {@code leaderLocalByReference} is {@code true}, the leader keeps the
+     * original value instance in its local state ({@code put(k, v)} then
+     * {@code get(k) == v}); followers still receive the serialized copy.
+     *
+     * @param name                   the map name
+     * @param leaderLocalByReference whether to enable by-reference mode
+     * @return this builder
+     */
+    public NGridLocalBuilder map(String name, boolean leaderLocalByReference) {
+        mapConfigs.add(MapConfig.builder(Objects.requireNonNull(name, "map name"))
+                .leaderLocalByReference(leaderLocalByReference)
+                .build());
         return this;
     }
 
@@ -158,11 +176,6 @@ public final class NGridLocalBuilder {
         for (String name : queueNames) {
             queueConfigs.add(QueueConfig.builder(name).build());
         }
-        List<MapConfig> mapConfigs = new ArrayList<>();
-        for (String name : mapNames) {
-            mapConfigs.add(MapConfig.builder(name).build());
-        }
-
         // Ensure at least one queue exists (required by NGridNode)
         if (queueConfigs.isEmpty()) {
             queueConfigs.add(QueueConfig.builder("default").build());

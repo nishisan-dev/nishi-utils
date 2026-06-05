@@ -32,10 +32,12 @@ import java.util.Objects;
 public final class MapConfig {
     private final String name;
     private final NMapPersistenceMode persistenceMode;
+    private final Boolean leaderLocalByReference;
 
     private MapConfig(Builder builder) {
         this.name = builder.name;
         this.persistenceMode = builder.persistenceMode;
+        this.leaderLocalByReference = builder.leaderLocalByReference;
     }
 
     /**
@@ -57,6 +59,24 @@ public final class MapConfig {
     }
 
     /**
+     * Returns the per-map leader-local by-reference override, or {@code null} when
+     * unset.
+     * <p>
+     * When {@code true}, the leader keeps the original value instance in its local
+     * state (ConcurrentHashMap reference semantics) instead of a deserialized copy;
+     * followers still receive the serialized, type-faithful copy. When {@code false},
+     * by-reference is explicitly disabled for this map. When {@code null} (the
+     * default), the map inherits the global default
+     * ({@link NGridConfig#mapLeaderLocalByReference()}).
+     *
+     * @return {@link Boolean#TRUE}/{@link Boolean#FALSE} for an explicit override, or
+     *         {@code null} to inherit the global default
+     */
+    public Boolean leaderLocalByReference() {
+        return leaderLocalByReference;
+    }
+
+    /**
      * Creates a builder for a map config with the given name.
      *
      * @param name the map name
@@ -68,12 +88,14 @@ public final class MapConfig {
 
     @Override
     public String toString() {
-        return "MapConfig{name='" + name + "', persistenceMode=" + persistenceMode + "}";
+        return "MapConfig{name='" + name + "', persistenceMode=" + persistenceMode
+                + ", leaderLocalByReference=" + leaderLocalByReference + "}";
     }
 
     public static final class Builder {
         private final String name;
         private NMapPersistenceMode persistenceMode = NMapPersistenceMode.DISABLED;
+        private Boolean leaderLocalByReference = null;
 
         private Builder(String name) {
             this.name = Objects.requireNonNull(name, "map name cannot be null");
@@ -90,6 +112,25 @@ public final class MapConfig {
          */
         public Builder persistenceMode(NMapPersistenceMode mode) {
             this.persistenceMode = Objects.requireNonNull(mode, "persistenceMode cannot be null");
+            return this;
+        }
+
+        /**
+         * Enables or disables leader-local by-reference mode for this map.
+         * <p>
+         * When enabled, the leader stores the original value instance in its local
+         * state instead of a deserialized copy, preserving {@code ConcurrentHashMap}
+         * reference semantics ({@code put(k, v)} then {@code get(k) == v}) on the
+         * leader. Followers still receive the serialized copy.
+         *
+         * Not setting this leaves the value unset ({@code null}), so the map inherits
+         * the global default ({@link NGridConfig.Builder#mapLeaderLocalByReference(boolean)}).
+         *
+         * @param leaderLocalByReference whether to enable by-reference mode
+         * @return this builder
+         */
+        public Builder leaderLocalByReference(boolean leaderLocalByReference) {
+            this.leaderLocalByReference = leaderLocalByReference;
             return this;
         }
 
