@@ -322,6 +322,27 @@ public class ReplicationManager implements TransportListener, LeadershipListener
     }
 
     public CompletableFuture<ReplicationResult> replicate(String topic, Object payload, Integer quorumOverride) {
+        return replicate(topic, payload, payload, quorumOverride);
+    }
+
+    /**
+     * Replicates an operation, allowing the leader's local apply to use a payload
+     * distinct from the one shipped to followers.
+     *
+     * <p>The {@code wirePayload} is what travels to followers and is recorded in the
+     * resend log (it must be serialization-stable across the transport, e.g. the
+     * {@code byte[]} produced by {@code MapReplicationCodec}). The
+     * {@code localApplyPayload} is handed to the local {@link ReplicationHandler#apply}
+     * on this (leader) node only. Passing the live command object as
+     * {@code localApplyPayload} lets the leader keep the original value instance in
+     * its local state (leader-local by-reference), while followers still receive the
+     * serialized, type-faithful copy.
+     *
+     * <p>When {@code wirePayload == localApplyPayload} this behaves exactly like the
+     * single-payload overload.
+     */
+    public CompletableFuture<ReplicationResult> replicate(String topic, Object wirePayload,
+            Object localApplyPayload, Integer quorumOverride) {
         if (!coordinator.isLeader()) {
             throw new IllegalStateException("Replication can only be initiated by the leader");
         }
@@ -333,10 +354,10 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             throw new IllegalArgumentException("No replication handler registered for topic: " + topic);
         }
         UUID operationId = UUID.randomUUID();
-        PendingOperation operation = new PendingOperation(operationId, topic, payload,
+        PendingOperation operation = new PendingOperation(operationId, topic, wirePayload, localApplyPayload,
                 coordinator.getLeaderEpoch(), requiredQuorum(quorumOverride));
         pending.put(operationId, operation);
-        log.put(operationId, new ReplicatedRecord(operationId, topic, payload, OperationStatus.PENDING));
+        log.put(operationId, new ReplicatedRecord(operationId, topic, wirePayload, OperationStatus.PENDING));
 
         // Local node acknowledges receipt, but defers application until quorum
         operation.ack(transport.local().nodeId());
@@ -432,10 +453,12 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             ReplicationHandler handler = handlers.get(operation.topic);
             if (handler != null) {
                 if (operation.markLocalApplyStarted()) {
-                    // LEADER PATH: Execute apply ASYNCHRONOUSLY to avoid deadlock
+                    // LEADER PATH: Execute apply ASYNCHRONOUSLY to avoid deadlock.
+                    // Uses localApplyPayload so leader-local by-reference maps keep the
+                    // original value instance locally (defaults to the wire payload).
                     executor.submit(() -> {
                         try {
-                            handler.apply(operation.operationId, operation.payload);
+                            handler.apply(operation.operationId, operation.localApplyPayload);
                             recordApplied();
                             sequenceBufferLock.lock();
                             try {
@@ -1371,6 +1394,15 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         private final UUID operationId;
         private final String topic;
         private final Object payload;
+        /**
+         * Payload used for the leader's own local apply. Defaults to {@link #payload}
+         * (the wire payload). When a caller provides a distinct value — e.g. a
+         * {@code DistributedMap} in leader-local by-reference mode passing the live
+         * command object — the leader applies that instance locally while still
+         * shipping {@link #payload} (the serialized form) to followers and the resend
+         * log. See {@link ReplicationManager#replicate(String, Object, Object, Integer)}.
+         */
+        private final Object localApplyPayload;
         private final long epoch;
         private final int originalQuorum;
         private volatile int quorum;
@@ -1385,9 +1417,15 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                 false);
 
         private PendingOperation(UUID operationId, String topic, Object payload, long epoch, int quorum) {
+            this(operationId, topic, payload, payload, epoch, quorum);
+        }
+
+        private PendingOperation(UUID operationId, String topic, Object payload, Object localApplyPayload,
+                long epoch, int quorum) {
             this.operationId = operationId;
             this.topic = topic;
             this.payload = payload;
+            this.localApplyPayload = localApplyPayload;
             this.epoch = epoch;
             this.originalQuorum = quorum;
             this.quorum = quorum;
