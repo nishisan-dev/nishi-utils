@@ -32,10 +32,12 @@ import java.util.Objects;
 public final class MapConfig {
     private final String name;
     private final NMapPersistenceMode persistenceMode;
+    private final boolean leaderLocalByReference;
 
     private MapConfig(Builder builder) {
         this.name = builder.name;
         this.persistenceMode = builder.persistenceMode;
+        this.leaderLocalByReference = builder.leaderLocalByReference;
     }
 
     /**
@@ -57,6 +59,20 @@ public final class MapConfig {
     }
 
     /**
+     * Returns whether this map runs in leader-local by-reference mode.
+     * <p>
+     * When {@code true}, the leader keeps the original value instance in its local
+     * state (ConcurrentHashMap reference semantics) instead of a deserialized copy;
+     * followers still receive the serialized, type-faithful copy. Opt-in, defaults
+     * to {@code false}.
+     *
+     * @return {@code true} if leader-local by-reference is enabled
+     */
+    public boolean leaderLocalByReference() {
+        return leaderLocalByReference;
+    }
+
+    /**
      * Creates a builder for a map config with the given name.
      *
      * @param name the map name
@@ -68,12 +84,14 @@ public final class MapConfig {
 
     @Override
     public String toString() {
-        return "MapConfig{name='" + name + "', persistenceMode=" + persistenceMode + "}";
+        return "MapConfig{name='" + name + "', persistenceMode=" + persistenceMode
+                + ", leaderLocalByReference=" + leaderLocalByReference + "}";
     }
 
     public static final class Builder {
         private final String name;
         private NMapPersistenceMode persistenceMode = NMapPersistenceMode.DISABLED;
+        private boolean leaderLocalByReference = false;
 
         private Builder(String name) {
             this.name = Objects.requireNonNull(name, "map name cannot be null");
@@ -90,6 +108,22 @@ public final class MapConfig {
          */
         public Builder persistenceMode(NMapPersistenceMode mode) {
             this.persistenceMode = Objects.requireNonNull(mode, "persistenceMode cannot be null");
+            return this;
+        }
+
+        /**
+         * Enables or disables leader-local by-reference mode for this map.
+         * <p>
+         * When enabled, the leader stores the original value instance in its local
+         * state instead of a deserialized copy, preserving {@code ConcurrentHashMap}
+         * reference semantics ({@code put(k, v)} then {@code get(k) == v}) on the
+         * leader. Followers still receive the serialized copy.
+         *
+         * @param leaderLocalByReference whether to enable by-reference mode
+         * @return this builder
+         */
+        public Builder leaderLocalByReference(boolean leaderLocalByReference) {
+            this.leaderLocalByReference = leaderLocalByReference;
             return this;
         }
 

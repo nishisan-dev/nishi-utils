@@ -66,6 +66,7 @@ public final class NGridConfig {
     private final Path mapDirectory;
     private final String mapName;
     private final NMapPersistenceMode mapPersistenceMode;
+    private final boolean mapLeaderLocalByReference;
     private final boolean strictConsistency;
     private final Duration connectTimeout;
     private final Duration reconnectInterval;
@@ -109,6 +110,7 @@ public final class NGridConfig {
                 : (dataDirectory != null ? dataDirectory.resolve("maps") : builder.queueDirectory.resolve("maps"));
         this.mapName = builder.mapName;
         this.mapPersistenceMode = builder.mapPersistenceMode;
+        this.mapLeaderLocalByReference = builder.mapLeaderLocalByReference;
         this.strictConsistency = builder.strictConsistency;
         this.connectTimeout = builder.connectTimeout;
         this.reconnectInterval = builder.reconnectInterval;
@@ -302,6 +304,18 @@ public final class NGridConfig {
     }
 
     /**
+     * Global default for leader-local by-reference mode applied to maps that do not
+     * override it via {@link MapConfig#leaderLocalByReference()}. Defaults to
+     * {@code false}. Internal maps (e.g. {@code _ngrid-queue-offsets}) are never
+     * affected.
+     *
+     * @return the global default for leader-local by-reference
+     */
+    public boolean mapLeaderLocalByReference() {
+        return mapLeaderLocalByReference;
+    }
+
+    /**
      * Creates a builder for the given local node.
      * 
      * @param local the local node info
@@ -344,6 +358,7 @@ public final class NGridConfig {
         private Path mapDirectory;
         private String mapName = "default-map";
         private NMapPersistenceMode mapPersistenceMode = NMapPersistenceMode.DISABLED;
+        private boolean mapLeaderLocalByReference = false;
         private boolean strictConsistency = true;
         private Duration connectTimeout = Duration.ofSeconds(5);
         private Duration reconnectInterval = Duration.ofMillis(500);
@@ -614,6 +629,19 @@ public final class NGridConfig {
 
         public Builder mapPersistenceMode(NMapPersistenceMode mode) {
             this.mapPersistenceMode = Objects.requireNonNull(mode, "mode");
+            return this;
+        }
+
+        /**
+         * Sets the global default for leader-local by-reference mode. Maps that do
+         * not override it via {@link MapConfig.Builder#leaderLocalByReference(boolean)}
+         * inherit this value. Internal maps are never affected.
+         *
+         * @param leaderLocalByReference the global default
+         * @return this builder
+         */
+        public Builder mapLeaderLocalByReference(boolean leaderLocalByReference) {
+            this.mapLeaderLocalByReference = leaderLocalByReference;
             return this;
         }
 
