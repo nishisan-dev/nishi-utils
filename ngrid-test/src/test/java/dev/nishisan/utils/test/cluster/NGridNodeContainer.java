@@ -107,6 +107,14 @@ public class NGridNodeContainer extends GenericContainer<NGridNodeContainer> {
         return parseLatestInt("REACHABLE_NODES_COUNT:");
     }
 
+    /**
+     * Número de peers com conexão <b>direta</b> aberta reportado por último.
+     * Numa malha full-mesh saudável de N nós, cada nó reporta {@code N-1}.
+     */
+    public int latestDirectPeersCount() {
+        return parseLatestInt("DIRECT_PEERS_COUNT:");
+    }
+
     private Boolean parseLeaderValue(String line, String marker) {
         int idx = line.indexOf(marker);
         if (idx < 0) {

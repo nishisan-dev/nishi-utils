@@ -500,5 +500,15 @@ public class Main {
         System.out.println("CURRENT_LEADER_ID:" + snapshot.leaderId());
         System.out.println("ACTIVE_MEMBERS_COUNT:" + snapshot.activeMembersCount());
         System.out.println("REACHABLE_NODES_COUNT:" + snapshot.reachableNodesCount());
+        // Numero de peers com conexao DIRETA aberta (exclui alcance via proxy).
+        // Numa malha full-mesh saudavel de N nos, cada no reporta N-1. Um valor
+        // menor indica que algum par ficou proxy-only (sintoma da issue #117).
+        var transport = node.transport();
+        var self = transport.local().nodeId();
+        long directPeers = transport.peers().stream()
+                .filter(p -> !p.nodeId().equals(self))
+                .filter(p -> transport.isConnected(p.nodeId()))
+                .count();
+        System.out.println("DIRECT_PEERS_COUNT:" + directPeers);
     }
 }
