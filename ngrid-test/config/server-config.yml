@@ -27,7 +27,12 @@ cluster:
   transport:
     workers: 4            # Threads de IO
   seeds:                  # Lista de seeds para failover
-    - ${SEED_HOST:seed-1:9000}
+    - "${SEED_HOST:seed-1:9000}"
+    # Peers adicionais opcionais (full-mesh). Quando nao definidos resolvem para
+    # string vazia e sao ignorados pelo loader — preservando a topologia de seed
+    # unico dos ITs existentes. Usados pelo IT de mesh concorrente (issue #117).
+    - "${NG_PEER_2:}"
+    - "${NG_PEER_3:}"
 
 # Configuracao de Filas (multi-queue)
 queues:

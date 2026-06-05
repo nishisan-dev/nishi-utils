@@ -1,0 +1,45 @@
+@startuml ngrid_simultaneous_open
+!theme plain
+
+title NGrid Transport — Reconciliação determinística de simultaneous-open #117
+
+skinparam backgroundColor white
+skinparam defaultFontName Inter
+skinparam sequenceMessageAlign center
+
+participant "Lo\n(NodeId menor)" as Lo
+participant "Hi\n(NodeId maior)" as Hi
+
+note over Lo, Hi
+  Start concorrente em full-mesh: ambos discam (bootstrap de seed é
+  incondicional). Resultado: DOIS sockets para o mesmo par.
+end note
+
+Lo -> Hi : connect()  // socket S1 (outbound de Lo)
+Hi -> Lo : connect()  // socket S2 (outbound de Hi)
+
+Lo -> Hi : HANDSHAKE (em S1)
+Hi -> Lo : HANDSHAKE (em S2)
+
+note over Lo
+  registerLiveConnection(Hi, conn) — sob lock por-peer
+  Regra: vence a conexão iniciada por min(NodeId) = Lo
+  keepCandidate = (local<remote) == conn.outboundInitiated
+end note
+
+note over Hi
+  registerLiveConnection(Lo, conn) — mesma regra, mesmo resultado
+  Hi descarta o próprio outbound (S2) e mantém o inbound (S1)
+end note
+
+Lo -> Lo : mantém S1 (outbound), descarta inbound de S2
+Hi -> Hi : mantém S1 (inbound), fecha S2 (outbound)
+
+note over Lo, Hi #DDFFDD
+  Ambos os lados convergem para a MESMA conexão física (S1).
+  Sem blind-replace, sem flapping. Rota promovida a DIRECT no
+  handshake (self-heal). Probe reconecta de verdade (com handshake)
+  antes de promover — nunca prende o par em proxy via hub.
+end note
+
+@enduml

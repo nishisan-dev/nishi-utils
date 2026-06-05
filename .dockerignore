@@ -1,0 +1,7 @@
+# Mantém o contexto do build da imagem reprodutível e independente do estado
+# local: artefatos de build (target/) são recompilados dentro do container.
+**/target
+.git
+.idea
+*.iml
+planning

@@ -130,7 +130,11 @@ public final class TcpTransport implements Transport {
         // Opportunistic probe for promoted routes
         long probeMs = config.routeProbeInterval().toMillis();
         scheduler.scheduleAtFixedRate(this::probeLoop, probeMs, probeMs, TimeUnit.MILLISECONDS);
-        // attempt initial outbound connections
+        // Attempt initial outbound connections. Initial peers are bootstrap seeds and must
+        // be dialed unconditionally (a seed does not yet know the joining node, so it cannot
+        // dial back). The simultaneous-open collision this may cause is reconciled
+        // deterministically in registerLiveConnection, so both endpoints converge on a single
+        // shared connection instead of flapping.
         config.initialPeers().forEach(this::ensureConnectionAsync);
     }
 
@@ -300,6 +304,11 @@ public final class TcpTransport implements Transport {
     }
 
     @Override
+    public boolean isProxied(NodeId nodeId) {
+        return router.isProxy(nodeId);
+    }
+
+    @Override
     public Map<NodeId, Integer> outboundQueueDepths() {
         Map<NodeId, Integer> depths = new HashMap<>();
         connections.forEach((nodeId, conn) -> depths.put(nodeId, conn.outboundDepth()));
@@ -408,6 +417,11 @@ public final class TcpTransport implements Transport {
         if (nodeInfo == null) {
             return null;
         }
+        // Skip non-listening placeholders (discovery clients / gossip entries carry port 0):
+        // dialing them would just fail and add noise to the scheduler/probe loops.
+        if (nodeInfo.port() <= 0) {
+            return null;
+        }
         synchronized (getLockFor(nodeId)) {
             current = connections.get(nodeId);
             if (current != null && current.isOpen()) {
@@ -419,9 +433,16 @@ public final class TcpTransport implements Transport {
                 socket.connect(new InetSocketAddress(nodeInfo.host(), nodeInfo.port()),
                         (int) config.connectTimeout().toMillis());
                 Connection connection = registerConnection(socket, nodeInfo);
-                sendHandshake(connection);
+                // Register through the single reconciliation point. If a connection to this
+                // peer already won (e.g. an inbound one that arrived concurrently), we adopt
+                // it and let our just-opened socket be closed, so both endpoints converge on
+                // the same physical link instead of clobbering each other.
+                Connection live = registerLiveConnection(nodeId, connection);
+                if (live == connection) {
+                    sendHandshake(connection);
+                }
                 LOGGER.fine(() -> "Connected to " + nodeInfo);
-                return connection;
+                return live;
             } catch (IOException e) {
                 LOGGER.log(Level.FINE, "Unable to connect to {0}: {1}", new Object[]{nodeInfo, e.getMessage()});
                 return null;
@@ -440,12 +461,47 @@ public final class TcpTransport implements Transport {
         Connection connection = new Connection(socket, preResolved != null, codec);
         if (preResolved != null) {
             connection.setRemote(preResolved);
-            connections.put(preResolved.nodeId(), connection);
+            // NOTE: do not publish into `connections` here. Both the outbound path and the
+            // inbound handshake go through registerLiveConnection (under the per-peer lock),
+            // the single place that decides which connection is live — preventing an outbound
+            // dial from clobbering a canonical inbound connection (or vice-versa).
         }
         // Use Virtual Thread for reading
         Thread.ofVirtual().name("ngrid-transport-reader").start(connection::readLoop);
         LOGGER.fine(() -> "Registered connection: " + socket.getRemoteSocketAddress());
         return connection;
+    }
+
+    /**
+     * Publishes {@code candidate} as the live connection for {@code remoteId}, reconciling
+     * concurrent (simultaneous-open) connections deterministically: when two live sockets
+     * exist for the same peer, the one initiated by the lower {@link NodeId} wins. Both
+     * endpoints compute the same winner, so they converge on a single physical connection.
+     *
+     * @return the connection that is now live for the peer (may be a pre-existing one if the
+     *         candidate lost the tie-break; the candidate is closed in that case)
+     */
+    private Connection registerLiveConnection(NodeId remoteId, Connection candidate) {
+        synchronized (getLockFor(remoteId)) {
+            Connection existing = connections.get(remoteId);
+            if (existing == candidate) {
+                return candidate;
+            }
+            if (existing == null || !existing.isOpen()) {
+                connections.put(remoteId, candidate);
+                return candidate;
+            }
+            // Simultaneous open: keep the connection initiated by the lower NodeId.
+            boolean keepCandidate =
+                    (config.local().nodeId().compareTo(remoteId) < 0) == candidate.outboundInitiated;
+            if (keepCandidate) {
+                connections.put(remoteId, candidate);
+                existing.closeQuietly();
+                return candidate;
+            }
+            candidate.closeQuietly();
+            return existing;
+        }
     }
 
     private void probeLoop() {
@@ -462,16 +518,20 @@ public final class TcpTransport implements Transport {
 
     private void tryPromoteRoute(NodeId target) {
         NodeInfo info = knownPeers.get(target);
-        if (info == null) {
+        if (info == null || info.port() <= 0) {
+            // Non-listening placeholder (port 0): never promotable to a direct link, and
+            // probing it would loop forever calling ensureConnection() that always fails.
             return;
         }
-        try (Socket socket = new Socket()) {
-            socket.connect(new InetSocketAddress(info.host(), info.port()), 2000);
-            // If connected successfully, promote route.
+        // Re-establish a REAL handshaked connection (not a throwaway probe socket) before
+        // promoting: a bare socket test would flip the route to DIRECT while no usable
+        // connection exists, so the very next send collapses it back to PROXY (flapping).
+        // Any simultaneous-open caused by both ends probing is reconciled deterministically
+        // in registerLiveConnection, so this is safe regardless of NodeId ordering.
+        Connection connection = ensureConnection(target);
+        if (connection != null && connection.isOpen()) {
             router.promoteToDirect(target);
-            LOGGER.info("Route promoted to DIRECT for " + target);
-        } catch (IOException e) {
-            // Still unreachable directly, stay on proxy.
+            LOGGER.fine(() -> "Route promoted to DIRECT for " + target);
         }
     }
 
@@ -509,12 +569,21 @@ public final class TcpTransport implements Transport {
             }
         }
         knownPeers.put(remoteInfo.nodeId(), remoteInfo);
-        
-        Connection previous = connections.put(remoteInfo.nodeId(), connection);
-        if (previous != null && previous != connection) {
-            previous.closeQuietly();
+
+        // Publish this connection through the single reconciliation point. If a concurrent
+        // (simultaneous-open) connection already won the deterministic tie-break, we lost:
+        // record reachability and bail out without responding — the winning connection
+        // already drives this peer.
+        NodeId remoteNodeId = remoteInfo.nodeId();
+        Connection live = registerLiveConnection(remoteNodeId, connection);
+        if (live != connection) {
+            router.updateReachability(remoteNodeId, payload.peers(), payload.latencies());
+            return;
         }
-        
+
+        // A direct connection now exists: self-heal any stale PROXY route to this peer.
+        router.promoteToDirect(remoteNodeId);
+
         // Feed router with reachability info
         router.updateReachability(remoteInfo.nodeId(), payload.peers(), payload.latencies());
 

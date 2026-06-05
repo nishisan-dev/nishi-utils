@@ -57,6 +57,16 @@ import java.util.logging.Logger;
 public final class ClusterCoordinator implements TransportListener, Closeable {
     private static final Logger LOGGER = Logger.getLogger(ClusterCoordinator.class.getName());
 
+    /**
+     * Multiplier applied to {@code heartbeatTimeout} that bounds how long a member whose
+     * heartbeat is overdue but which is still transport-reachable (possibly only via a
+     * proxy) is kept active before eviction. This grace window avoids spurious quorum loss
+     * during a brief direct-link flap. Trade-off: counting proxy-only reachability keeps the
+     * relaying hub as a partial SPOF, so the window is intentionally bounded — a genuinely
+     * dead peer (no route at all, or overdue beyond the window) is still evicted.
+     */
+    private static final long PROXY_REACHABLE_GRACE_FACTOR = 2;
+
     private final Transport transport;
     private final ClusterCoordinatorConfig config;
     private final Map<NodeId, ClusterMember> members = new ConcurrentHashMap<>();
@@ -507,6 +517,22 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                     continue;
                 }
                 if (member.isActive() && now - member.lastHeartbeat() > config.heartbeatTimeout().toMillis()) {
+                    long overdueMs = now - member.lastHeartbeat();
+                    long graceMs = config.heartbeatTimeout().toMillis() * PROXY_REACHABLE_GRACE_FACTOR;
+                    // Genuine reachability only: an open direct connection OR an active proxy
+                    // route. We must NOT use transport.isReachable() here — it returns true for
+                    // any known peer (the optimistic default-direct route), which would grant
+                    // grace to dead members and let an isolated leader keep refreshing its lease
+                    // instead of stepping down.
+                    boolean genuinelyReachable =
+                            transport.isConnected(member.id()) || transport.isProxied(member.id());
+                    if (overdueMs <= graceMs && genuinelyReachable) {
+                        // Heartbeat overdue but the peer is still reachable (possibly only via a
+                        // proxy). Keep it active within the bounded grace window to avoid spurious
+                        // quorum loss during a transient direct-link flap.
+                        LOGGER.fine(() -> "Granting proxy-reachable grace to overdue member: " + member.info());
+                        continue;
+                    }
                     LOGGER.fine(() -> "Marking member inactive due to missed heartbeat: " + member.info());
                     member.markInactive();
                     changed = true;
@@ -571,7 +597,11 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
 
     private int requiredActiveMembersForLeadership() {
         // transport.peers() is backed by knownPeers and already includes the local node.
-        int totalExpected = Math.max(1, transport.peers().size());
+        // Count only eligible peers (those with a real listen port): discovery clients and
+        // gossip placeholders carry port 0 and must not inflate the required majority — an
+        // inflated denominator can make a healthy quorum fall short and stall the election.
+        long eligible = transport.peers().stream().filter(p -> p.port() > 0).count();
+        int totalExpected = (int) Math.max(1, eligible);
         int dynamicMajority = (totalExpected / 2) + 1;
         return Math.max(config.minClusterSize(), dynamicMajority);
     }
