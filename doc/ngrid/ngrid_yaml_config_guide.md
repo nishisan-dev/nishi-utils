@@ -208,6 +208,7 @@ NGridNode producerNode = new NGridNode(
         .addQueue(QueueConfig.builder("events").build())
         .replicationQuorum(1)                        // Quorum = factor/2 + 1
         .transportWorkerThreads(4)
+        .outboundQueueCapacity(10_000)               // backpressure: 0 = ilimitada (default)
         .strictConsistency(false)
         .build()
 );

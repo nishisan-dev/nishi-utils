@@ -36,6 +36,7 @@ public final class TcpTransportConfig {
     private final Duration requestTimeout;
     private final int workerThreads;
     private final Duration routeProbeInterval;
+    private final int outboundQueueCapacity;
 
     private TcpTransportConfig(Builder builder) {
         this.local = builder.local;
@@ -45,6 +46,7 @@ public final class TcpTransportConfig {
         this.requestTimeout = builder.requestTimeout;
         this.workerThreads = builder.workerThreads;
         this.routeProbeInterval = builder.routeProbeInterval;
+        this.outboundQueueCapacity = builder.outboundQueueCapacity;
     }
 
     public NodeInfo local() {
@@ -88,6 +90,19 @@ public final class TcpTransportConfig {
         return routeProbeInterval;
     }
 
+    /**
+     * Maximum number of pending replication messages buffered per connection
+     * before excess replication is dropped (the lagging follower then recovers
+     * via the gap/snapshot catch-up). Control traffic is never bounded. A value
+     * of {@code 0} means unbounded (default, legacy behaviour).
+     *
+     * @return the per-connection outbound replication capacity
+     * @since 2.2.0
+     */
+    public int outboundQueueCapacity() {
+        return outboundQueueCapacity;
+    }
+
     public static Builder builder(NodeInfo local) {
         return new Builder(local);
     }
@@ -100,6 +115,7 @@ public final class TcpTransportConfig {
         private Duration requestTimeout = Duration.ofSeconds(20);
         private int workerThreads = Math.max(4, Runtime.getRuntime().availableProcessors());
         private Duration routeProbeInterval = Duration.ofSeconds(10);
+        private int outboundQueueCapacity = 0;
 
         private Builder(NodeInfo local) {
             this.local = Objects.requireNonNull(local, "local");
@@ -142,6 +158,22 @@ public final class TcpTransportConfig {
                 throw new IllegalArgumentException("workerThreads must be >= 1");
             }
             this.workerThreads = workerThreads;
+            return this;
+        }
+
+        /**
+         * Sets the per-connection outbound replication capacity ({@code 0} =
+         * unbounded, the default).
+         *
+         * @param capacity the capacity, must be {@code >= 0}
+         * @return this builder
+         * @since 2.2.0
+         */
+        public Builder outboundQueueCapacity(int capacity) {
+            if (capacity < 0) {
+                throw new IllegalArgumentException("outboundQueueCapacity must be >= 0");
+            }
+            this.outboundQueueCapacity = capacity;
             return this;
         }
 

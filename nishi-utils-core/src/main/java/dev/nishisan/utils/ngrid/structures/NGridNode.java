@@ -299,7 +299,8 @@ public final class NGridNode implements Closeable {
                 .connectTimeout(config.connectTimeout())
                 .reconnectInterval(config.reconnectInterval())
                 .requestTimeout(requestTimeout)
-                .workerThreads(config.transportWorkerThreads());
+                .workerThreads(config.transportWorkerThreads())
+                .outboundQueueCapacity(config.outboundQueueCapacity());
         config.peers().forEach(transportBuilder::addPeer);
         transport = new TcpTransport(transportBuilder.build(), stats);
 
@@ -660,6 +661,11 @@ public final class NGridNode implements Closeable {
 
         NGridStatsSnapshot ioStats = metricsSnapshot();
 
+        Map<String, Integer> outboundDepthByNode = new HashMap<>();
+        transport.outboundQueueDepths().forEach((nodeId, depth) -> outboundDepthByNode.put(nodeId.value(), depth));
+        Map<String, Long> outboundDroppedByNode = new HashMap<>();
+        transport.outboundDropped().forEach((nodeId, count) -> outboundDroppedByNode.put(nodeId.value(), count));
+
         return new NGridOperationalSnapshot(
                 localId,
                 leaderId,
@@ -679,6 +685,8 @@ public final class NGridNode implements Closeable {
                 pendingOps,
                 reachable,
                 totalNodes,
+                outboundDepthByNode,
+                outboundDroppedByNode,
                 ioStats,
                 Instant.now());
     }

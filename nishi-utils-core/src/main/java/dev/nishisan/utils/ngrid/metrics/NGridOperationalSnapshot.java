@@ -18,6 +18,7 @@
 package dev.nishisan.utils.ngrid.metrics;
 
 import java.time.Instant;
+import java.util.Map;
 
 /**
  * Immutable operational snapshot of an NGrid node, aggregating cluster state,
@@ -49,6 +50,10 @@ import java.time.Instant;
  * @param pendingOperationsCount     the pending operations count
  * @param reachableNodesCount        the number of reachable nodes
  * @param totalNodesCount            the total number of nodes
+ * @param outboundQueueDepthByNode   pending replication messages per node in the
+ *                                   outbound queue (backpressure occupancy)
+ * @param outboundDroppedByNode      replication messages dropped by outbound
+ *                                   backpressure per node (cumulative)
  * @param ioStats                    the I/O statistics snapshot
  * @param capturedAt                 the timestamp when the snapshot was taken
  */
@@ -76,6 +81,10 @@ public record NGridOperationalSnapshot(
                 // ── Health ──
                 int reachableNodesCount,
                 int totalNodesCount,
+
+                // ── Transport (outbound backpressure, issue #113) ──
+                Map<String, Integer> outboundQueueDepthByNode,
+                Map<String, Long> outboundDroppedByNode,
 
                 // ── I/O Stats ──
                 NGridStatsSnapshot ioStats,

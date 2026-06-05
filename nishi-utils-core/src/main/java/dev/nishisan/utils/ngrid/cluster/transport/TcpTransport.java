@@ -49,7 +49,6 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -298,6 +297,20 @@ public final class TcpTransport implements Transport {
             return true;
         }
         return router.nextHop(nodeId).isPresent();
+    }
+
+    @Override
+    public Map<NodeId, Integer> outboundQueueDepths() {
+        Map<NodeId, Integer> depths = new HashMap<>();
+        connections.forEach((nodeId, conn) -> depths.put(nodeId, conn.outboundDepth()));
+        return depths;
+    }
+
+    @Override
+    public Map<NodeId, Long> outboundDropped() {
+        Map<NodeId, Long> dropped = new HashMap<>();
+        connections.forEach((nodeId, conn) -> dropped.put(nodeId, conn.outboundDropped()));
+        return dropped;
     }
 
     @Override
@@ -698,7 +711,7 @@ public final class TcpTransport implements Transport {
         private final DataOutputStream outputStream;
         private final DataInputStream inputStream;
         private final MessageCodec codec;
-        private final LinkedBlockingQueue<ClusterMessage> outbound = new LinkedBlockingQueue<>();
+        private final OutboundChannel outbound = new OutboundChannel(config.outboundQueueCapacity());
         private final boolean outboundInitiated;
         private volatile NodeInfo remote;
         private volatile boolean open = true;
@@ -726,11 +739,19 @@ public final class TcpTransport implements Transport {
             return open && !socket.isClosed();
         }
 
+        int outboundDepth() {
+            return outbound.dataDepth();
+        }
+
+        long outboundDropped() {
+            return outbound.droppedCount();
+        }
+
         void send(ClusterMessage message) {
             if (!isOpen()) {
                 return;
             }
-            outbound.offer(message);
+            outbound.enqueue(message);
         }
 
         private void drainOutbound() {

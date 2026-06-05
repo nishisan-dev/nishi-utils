@@ -53,7 +53,7 @@ class NGridAlertEngineTest {
                 isLeader, hasLease, 1000L,
                 1000L, 1000L - lag, lag,
                 gaps, 0L, fallbacks, 0.0, 0,
-                reachable, total, ioStats, Instant.now());
+                reachable, total, Map.of(), Map.of(), ioStats, Instant.now());
     }
 
     @Test
@@ -234,7 +234,7 @@ class NGridAlertEngineTest {
                 true, false, 1000L,
                 1000L, 400L, 600L,
                 0L, 0L, 0L, 0.0, 0,
-                1, 3, ioStats, Instant.now());
+                1, 3, Map.of(), Map.of(), ioStats, Instant.now());
         currentSnapshot.set(bad);
         engine.evaluate();
 

@@ -23,6 +23,8 @@ import dev.nishisan.utils.ngrid.common.NodeInfo;
 
 import java.io.Closeable;
 import java.util.Collection;
+import java.util.Collections;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -50,4 +52,26 @@ public interface Transport extends Closeable {
     boolean isReachable(NodeId nodeId);
 
     void addPeer(NodeInfo peer);
+
+    /**
+     * Current outbound replication queue depth per node (RF3, issue #113).
+     * Implementations without per-connection buffering return an empty map.
+     *
+     * @return a snapshot of pending replication messages by node
+     * @since 2.2.0
+     */
+    default Map<NodeId, Integer> outboundQueueDepths() {
+        return Collections.emptyMap();
+    }
+
+    /**
+     * Cumulative replication messages dropped by outbound backpressure per node
+     * (issue #113). Implementations without backpressure return an empty map.
+     *
+     * @return a snapshot of dropped replication counts by node
+     * @since 2.2.0
+     */
+    default Map<NodeId, Long> outboundDropped() {
+        return Collections.emptyMap();
+    }
 }

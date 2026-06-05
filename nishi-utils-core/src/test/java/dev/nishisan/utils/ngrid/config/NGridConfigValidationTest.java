@@ -151,4 +151,31 @@ class NGridConfigValidationTest {
 
         assertEquals(DeploymentProfile.DEV, config.deploymentProfile());
     }
+
+    // ── outboundQueueCapacity (issue #113) ──
+
+    @Test
+    void outboundQueueCapacityDefaultsToUnbounded() {
+        NGridConfig config = NGridConfig.builder(LOCAL)
+                .dataDirectory(tempDir)
+                .build();
+
+        assertEquals(0, config.outboundQueueCapacity());
+    }
+
+    @Test
+    void outboundQueueCapacityRejectsNegative() {
+        assertThrows(IllegalArgumentException.class,
+                () -> NGridConfig.builder(LOCAL).outboundQueueCapacity(-1));
+    }
+
+    @Test
+    void outboundQueueCapacityAcceptsConfiguredValue() {
+        NGridConfig config = NGridConfig.builder(LOCAL)
+                .dataDirectory(tempDir)
+                .outboundQueueCapacity(10_000)
+                .build();
+
+        assertEquals(10_000, config.outboundQueueCapacity());
+    }
 }
