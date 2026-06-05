@@ -634,6 +634,16 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                         + (isNowLeader ? " (elected)" : " (stepped down)"));
             }
 
+            // Re-arm the lease the moment this node becomes leader. While it was a follower the
+            // lease was never renewed (renewal only runs for the active leader, in
+            // evictDeadMembers), so a node elected after a long follower period would otherwise
+            // inherit a stale, already-expired lease and be stepped down on the very next eviction
+            // cycle — that cycle checks lease expiry BEFORE renewing — leaving the cluster
+            // leaderless immediately after a failover. Arm a fresh lease window at election time.
+            if (isNowLeader && !wasLeader) {
+                this.leaseExpiresAt = Instant.now().plus(config.leaseTimeout());
+            }
+
             leadershipListeners.forEach(listener -> listener.onLeaderChanged(newLeaderId));
 
             // Notify LeaderElectionListener if local node's leadership status changed

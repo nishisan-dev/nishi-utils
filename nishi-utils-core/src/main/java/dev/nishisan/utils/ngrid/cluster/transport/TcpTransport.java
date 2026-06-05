@@ -52,6 +52,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -87,6 +88,11 @@ public final class TcpTransport implements Transport {
 
     private final MessageCodec codec = new CompositeMessageCodec();
 
+    // Test seam: runs just before an outbound dial. Lets a test deterministically simulate a slow
+    // or stuck connect for a given peer (e.g. a node that just died) without relying on real
+    // network timeouts. No-op in production.
+    private volatile java.util.function.Consumer<NodeId> beforeDialHook = id -> { };
+
     private volatile boolean running;
     private ServerSocket serverSocket;
 
@@ -104,6 +110,11 @@ public final class TcpTransport implements Transport {
     // For testing purposes
     NetworkRouter getRouter() {
         return router;
+    }
+
+    // Visible for tests in this package: hook invoked right before each outbound dial.
+    void setBeforeDialHook(java.util.function.Consumer<NodeId> hook) {
+        this.beforeDialHook = Objects.requireNonNull(hook, "hook");
     }
 
     @Override
@@ -160,9 +171,28 @@ public final class TcpTransport implements Transport {
 
     @Override
     public void broadcast(ClusterMessage message) {
+        // Fan out per-peer sends on the worker pool (virtual threads) instead of inline in this
+        // loop. send() does a BLOCKING connect (up to connectTimeout, twice when it also tries a
+        // proxy fallback) for any peer without a live connection — e.g. a peer that just died.
+        // Done inline, that blocks the caller (the heartbeat scheduler thread) for ~10s, delaying
+        // the heartbeat to every *live* peer iterated after the dead one. Under a failover that
+        // starves the survivors' heartbeats past the eviction window, collapsing quorum. Dispatching
+        // each send independently means a dead peer's slow dial never delays a live peer's heartbeat.
+        if (!running) {
+            return; // best-effort: the transport is stopped/closing
+        }
         for (NodeId nodeId : knownPeers.keySet()) {
             if (!nodeId.equals(config.local().nodeId())) {
-                send(message.withDestination(nodeId));
+                ClusterMessage perPeer = message.withDestination(nodeId);
+                try {
+                    workerPool.submit(() -> send(perPeer));
+                } catch (RejectedExecutionException e) {
+                    // close() raced this broadcast and already shut the pool down. Broadcast is
+                    // fire-and-forget, so drop the remaining sends instead of propagating — otherwise
+                    // the exception would bubble to schedulers like LeaderReelectionService.tick()
+                    // (no try/catch) and cancel their recurring task.
+                    return;
+                }
             }
         }
     }
@@ -428,6 +458,7 @@ public final class TcpTransport implements Transport {
                 return current;
             }
             try {
+                beforeDialHook.accept(nodeId);
                 LOGGER.fine(() -> "Initiating connection to " + nodeInfo);
                 Socket socket = new Socket();
                 socket.connect(new InetSocketAddress(nodeInfo.host(), nodeInfo.port()),
