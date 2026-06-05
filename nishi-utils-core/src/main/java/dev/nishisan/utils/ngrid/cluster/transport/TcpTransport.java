@@ -52,6 +52,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -177,10 +178,21 @@ public final class TcpTransport implements Transport {
         // the heartbeat to every *live* peer iterated after the dead one. Under a failover that
         // starves the survivors' heartbeats past the eviction window, collapsing quorum. Dispatching
         // each send independently means a dead peer's slow dial never delays a live peer's heartbeat.
+        if (!running) {
+            return; // best-effort: the transport is stopped/closing
+        }
         for (NodeId nodeId : knownPeers.keySet()) {
             if (!nodeId.equals(config.local().nodeId())) {
                 ClusterMessage perPeer = message.withDestination(nodeId);
-                workerPool.submit(() -> send(perPeer));
+                try {
+                    workerPool.submit(() -> send(perPeer));
+                } catch (RejectedExecutionException e) {
+                    // close() raced this broadcast and already shut the pool down. Broadcast is
+                    // fire-and-forget, so drop the remaining sends instead of propagating — otherwise
+                    // the exception would bubble to schedulers like LeaderReelectionService.tick()
+                    // (no try/catch) and cancel their recurring task.
+                    return;
+                }
             }
         }
     }

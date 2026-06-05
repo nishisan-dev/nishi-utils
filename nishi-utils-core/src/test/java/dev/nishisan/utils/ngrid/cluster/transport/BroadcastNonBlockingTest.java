@@ -29,6 +29,7 @@ import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -90,6 +91,26 @@ class BroadcastNonBlockingTest {
             release.countDown();
             transport.close();
         }
+    }
+
+    @Test
+    void broadcastIsBestEffortAfterClose() throws Exception {
+        int localPort = freePort(Set.of());
+        int peerPort = freePort(Set.of(localPort));
+        NodeInfo local = new NodeInfo(NodeId.of("local-node"), "127.0.0.1", localPort);
+        NodeInfo peer = new NodeInfo(NodeId.of("peer-node"), "127.0.0.1", peerPort);
+
+        TcpTransport transport = new TcpTransport(config(local, peer));
+        transport.start();
+        transport.close();
+
+        ClusterMessage heartbeat = ClusterMessage.lightweight(
+                MessageType.HEARTBEAT, "hb", local.nodeId(), null, HeartbeatPayload.now());
+
+        // Após close(), o workerPool está encerrado; o broadcast deve ser best-effort e NÃO lançar
+        // RejectedExecutionException (que cancelaria a task agendada de um caller como o
+        // LeaderReelectionService.tick()).
+        assertDoesNotThrow(() -> transport.broadcast(heartbeat));
     }
 
     private static TcpTransportConfig config(NodeInfo local, NodeInfo... peers) {
