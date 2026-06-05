@@ -427,11 +427,14 @@ public final class MapClusterService<K, V>
             NMapOperationType opType = command.type();
             // Persist locally on every node (leader and followers) when applying the
             // replicated command.
-            if (topic.equals("map:_ngrid-queue-offsets") || leaderLocalByReference) {
-                // Offsets must survive hard crashes to avoid duplicate delivery.
-                // By-reference maps serialize the value now (at apply), so the WAL
-                // captures the same state replicated to followers — before any later
-                // in-place mutation of the live instance the leader still holds.
+            //  - Offsets must survive hard crashes to avoid duplicate delivery → sync.
+            //  - By-reference maps serialize the value now (at apply) on PUT, so the WAL
+            //    captures the same state replicated to followers, before any later
+            //    in-place mutation of the live instance. REMOVE carries no value, so it
+            //    stays async (no fsync-per-mutation penalty).
+            boolean syncWal = topic.equals("map:_ngrid-queue-offsets")
+                    || (leaderLocalByReference && opType == NMapOperationType.PUT);
+            if (syncWal) {
                 persistence.appendSync(opType, command.key(), command.value());
             } else {
                 persistence.appendAsync(opType, command.key(), command.value());
