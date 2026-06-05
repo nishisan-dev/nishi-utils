@@ -304,6 +304,11 @@ public final class TcpTransport implements Transport {
     }
 
     @Override
+    public boolean isProxied(NodeId nodeId) {
+        return router.isProxy(nodeId);
+    }
+
+    @Override
     public Map<NodeId, Integer> outboundQueueDepths() {
         Map<NodeId, Integer> depths = new HashMap<>();
         connections.forEach((nodeId, conn) -> depths.put(nodeId, conn.outboundDepth()));
@@ -412,6 +417,11 @@ public final class TcpTransport implements Transport {
         if (nodeInfo == null) {
             return null;
         }
+        // Skip non-listening placeholders (discovery clients / gossip entries carry port 0):
+        // dialing them would just fail and add noise to the scheduler/probe loops.
+        if (nodeInfo.port() <= 0) {
+            return null;
+        }
         synchronized (getLockFor(nodeId)) {
             current = connections.get(nodeId);
             if (current != null && current.isOpen()) {
@@ -508,7 +518,9 @@ public final class TcpTransport implements Transport {
 
     private void tryPromoteRoute(NodeId target) {
         NodeInfo info = knownPeers.get(target);
-        if (info == null) {
+        if (info == null || info.port() <= 0) {
+            // Non-listening placeholder (port 0): never promotable to a direct link, and
+            // probing it would loop forever calling ensureConnection() that always fails.
             return;
         }
         // Re-establish a REAL handshaked connection (not a throwaway probe socket) before

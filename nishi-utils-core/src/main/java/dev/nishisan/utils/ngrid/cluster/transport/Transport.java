@@ -51,6 +51,18 @@ public interface Transport extends Closeable {
 
     boolean isReachable(NodeId nodeId);
 
+    /**
+     * Whether there is an <b>established proxy route</b> to the node (i.e. a direct link
+     * failed and a relay was selected), as opposed to the optimistic default-direct route
+     * that {@link #isReachable(NodeId)} reports for any known peer. Used to distinguish
+     * genuine reachability (open connection or active proxy) from a merely-known peer.
+     *
+     * @return {@code true} only if a proxy route is currently in effect for the node
+     */
+    default boolean isProxied(NodeId nodeId) {
+        return false;
+    }
+
     void addPeer(NodeInfo peer);
 
     /**

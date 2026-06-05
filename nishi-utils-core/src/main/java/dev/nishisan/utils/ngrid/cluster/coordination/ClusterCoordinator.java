@@ -519,7 +519,14 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 if (member.isActive() && now - member.lastHeartbeat() > config.heartbeatTimeout().toMillis()) {
                     long overdueMs = now - member.lastHeartbeat();
                     long graceMs = config.heartbeatTimeout().toMillis() * PROXY_REACHABLE_GRACE_FACTOR;
-                    if (overdueMs <= graceMs && transport.isReachable(member.id())) {
+                    // Genuine reachability only: an open direct connection OR an active proxy
+                    // route. We must NOT use transport.isReachable() here — it returns true for
+                    // any known peer (the optimistic default-direct route), which would grant
+                    // grace to dead members and let an isolated leader keep refreshing its lease
+                    // instead of stepping down.
+                    boolean genuinelyReachable =
+                            transport.isConnected(member.id()) || transport.isProxied(member.id());
+                    if (overdueMs <= graceMs && genuinelyReachable) {
                         // Heartbeat overdue but the peer is still reachable (possibly only via a
                         // proxy). Keep it active within the bounded grace window to avoid spurious
                         // quorum loss during a transient direct-link flap.
