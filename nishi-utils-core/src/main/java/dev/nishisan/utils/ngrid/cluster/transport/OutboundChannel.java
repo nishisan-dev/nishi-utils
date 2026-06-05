@@ -106,8 +106,10 @@ final class OutboundChannel {
         }
         pendingReplication.incrementAndGet();
         if (!queue.offer(message)) {
-            // The backing queue is unbounded, so offer never fails; undo defensively.
+            // The backing queue is unbounded, so offer never fails; account
+            // defensively as a drop to keep the metric consistent.
             pendingReplication.decrementAndGet();
+            droppedReplication.incrementAndGet();
             return false;
         }
         return true;
