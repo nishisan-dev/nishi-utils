@@ -69,6 +69,14 @@ public final class MapClusterService<K, V>
     private final ReplicationManager replicationManager;
     private final NMapPersistence<K, V> persistence;
     private final String topic;
+    /**
+     * When {@code true}, the leader stores the original value instance in its local
+     * {@code data} (ConcurrentHashMap reference semantics) instead of a deserialized
+     * copy. Followers still receive the serialized, type-faithful copy. Opt-in,
+     * resolved per-map / globally by {@code NGridNode}; never enabled for internal
+     * maps such as {@code _ngrid-queue-offsets}.
+     */
+    private final boolean leaderLocalByReference;
 
     /**
      * Creates a map cluster service backed by the given replication manager
@@ -89,6 +97,21 @@ public final class MapClusterService<K, V>
      */
     public MapClusterService(ReplicationManager replicationManager, String topic,
             @SuppressWarnings("unused") Void unused) {
+        this(replicationManager, topic, unused, false);
+    }
+
+    /**
+     * Creates a map cluster service with explicit topic, no persistence and an
+     * explicit leader-local by-reference mode.
+     *
+     * @param replicationManager      the replication manager
+     * @param topic                   the replication topic
+     * @param unused                  kept for backward compatibility (pass {@code null})
+     * @param leaderLocalByReference  whether the leader keeps the original value
+     *                                instance locally instead of a deserialized copy
+     */
+    public MapClusterService(ReplicationManager replicationManager, String topic,
+            @SuppressWarnings("unused") Void unused, boolean leaderLocalByReference) {
         this.replicationManager = Objects.requireNonNull(replicationManager, "replicationManager");
         this.topic = Objects.requireNonNull(topic, "topic");
         if (this.topic.isBlank()) {
@@ -96,6 +119,7 @@ public final class MapClusterService<K, V>
         }
         this.replicationManager.registerHandler(this.topic, this);
         this.persistence = null;
+        this.leaderLocalByReference = leaderLocalByReference;
     }
 
     /**
@@ -110,6 +134,23 @@ public final class MapClusterService<K, V>
      */
     public MapClusterService(ReplicationManager replicationManager, String topic,
             Path baseDir, String mapName, NMapConfig nmapConfig) {
+        this(replicationManager, topic, baseDir, mapName, nmapConfig, false);
+    }
+
+    /**
+     * Creates a map cluster service with persistence and an explicit leader-local
+     * by-reference mode.
+     *
+     * @param replicationManager      the replication manager
+     * @param topic                   the replication topic
+     * @param baseDir                 base directory for map persistence files
+     * @param mapName                 logical map name (used for subdirectory)
+     * @param nmapConfig              persistence configuration
+     * @param leaderLocalByReference  whether the leader keeps the original value
+     *                                instance locally instead of a deserialized copy
+     */
+    public MapClusterService(ReplicationManager replicationManager, String topic,
+            Path baseDir, String mapName, NMapConfig nmapConfig, boolean leaderLocalByReference) {
         this.replicationManager = Objects.requireNonNull(replicationManager, "replicationManager");
         this.topic = Objects.requireNonNull(topic, "topic");
         if (this.topic.isBlank()) {
@@ -121,6 +162,7 @@ public final class MapClusterService<K, V>
         } else {
             this.persistence = null;
         }
+        this.leaderLocalByReference = leaderLocalByReference;
     }
 
     /**
@@ -134,8 +176,15 @@ public final class MapClusterService<K, V>
         Objects.requireNonNull(key, "key");
         Objects.requireNonNull(value, "value");
         V previous = data.get(key);
-        byte[] encoded = MapReplicationCodec.encode(MapReplicationCommand.put(key, value));
-        waitForReplication(replicationManager.replicate(topic, encoded));
+        MapReplicationCommand command = MapReplicationCommand.put(key, value);
+        byte[] encoded = MapReplicationCodec.encode(command);
+        if (leaderLocalByReference) {
+            // Followers receive the serialized copy (encoded); the leader applies the
+            // live command locally, keeping the original value instance in `data`.
+            waitForReplication(replicationManager.replicate(topic, encoded, command, null));
+        } else {
+            waitForReplication(replicationManager.replicate(topic, encoded));
+        }
         return Optional.ofNullable(previous);
     }
 
@@ -325,9 +374,15 @@ public final class MapClusterService<K, V>
     @Override
     @SuppressWarnings("unchecked")
     public void apply(UUID operationId, Object payload) {
-        // The payload is transported as byte[] to preserve concrete POJO types across
-        // the Jackson serialization boundary (see MapReplicationCodec for rationale).
-        MapReplicationCommand command = MapReplicationCodec.decode((byte[]) payload);
+        // Two payload shapes reach apply():
+        //  - byte[]: the wire form (followers, resend, and the default leader path).
+        //    Decoded here to preserve concrete POJO types across the Jackson boundary
+        //    (see MapReplicationCodec for rationale).
+        //  - MapReplicationCommand: the live command, used only by the leader when
+        //    leaderLocalByReference is on, so `data` keeps the original value instance.
+        MapReplicationCommand command = (payload instanceof MapReplicationCommand mrc)
+                ? mrc
+                : MapReplicationCodec.decode((byte[]) payload);
         switch (command.type()) {
             case PUT -> {
                 // For offset maps, apply monotonic semantics: only accept higher values
@@ -372,8 +427,11 @@ public final class MapClusterService<K, V>
             NMapOperationType opType = command.type();
             // Persist locally on every node (leader and followers) when applying the
             // replicated command.
-            if (topic.equals("map:_ngrid-queue-offsets")) {
+            if (topic.equals("map:_ngrid-queue-offsets") || leaderLocalByReference) {
                 // Offsets must survive hard crashes to avoid duplicate delivery.
+                // By-reference maps serialize the value now (at apply), so the WAL
+                // captures the same state replicated to followers — before any later
+                // in-place mutation of the live instance the leader still holds.
                 persistence.appendSync(opType, command.key(), command.value());
             } else {
                 persistence.appendAsync(opType, command.key(), command.value());
