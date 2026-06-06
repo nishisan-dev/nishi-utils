@@ -130,6 +130,11 @@ public class ReplicationManager implements TransportListener, LeadershipListener
     // recoverable timeout (the operation aborts and is retried / re-synced) instead of parking the
     // whole replication pool forever and freezing the node (which then drops the cluster's leader).
     private static final long LOCK_ACQUIRE_TIMEOUT_MS = 15_000L;
+    // Hard cap on the per-topic out-of-order sequence buffer. Unbounded growth (a follower stuck on a
+    // gap while the live stream keeps arriving) is what drove the node to OOM — the Error that
+    // orphaned the lock and froze it. At the cap we drop to a fresh snapshot instead of buffering
+    // without limit.
+    private static final int MAX_SEQUENCE_BUFFER = 250_000;
 
     // Leader-side replication log indexed by sequence (per topic) for resend
     // support
@@ -141,6 +146,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
     // Metrics
     private final java.util.concurrent.atomic.AtomicLong gapsDetected = new java.util.concurrent.atomic.AtomicLong(0);
+    private final java.util.concurrent.atomic.AtomicLong evictedSkipCount = new java.util.concurrent.atomic.AtomicLong(0);
     private final java.util.concurrent.atomic.AtomicLong resendSuccessCount = new java.util.concurrent.atomic.AtomicLong(
             0);
     private final java.util.concurrent.atomic.AtomicLong snapshotFallbackCount = new java.util.concurrent.atomic.AtomicLong(
@@ -862,6 +868,19 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                     return;
                 }
 
+                if (buffer.size() >= MAX_SEQUENCE_BUFFER) {
+                    // Hopelessly behind with a persistent gap: buffering without limit would OOM.
+                    // Drop to a fresh snapshot (tail-replayed at the new watermark discards the stale
+                    // buffer) instead of growing the buffer until the heap is exhausted.
+                    LOGGER.warning(() -> String.format(
+                            "[%s] Sequence buffer for topic=%s hit cap (%d); requesting snapshot to recover.",
+                            localNodeId, topic, MAX_SEQUENCE_BUFFER));
+                    snapshotFallbackCount.incrementAndGet();
+                    if (syncingTopics.add(topic)) {
+                        requestSync(topic);
+                    }
+                    return;
+                }
                 BufferedReplication buffered = new BufferedReplication(
                         payload, message, Instant.now());
                 buffer.add(buffered);
@@ -1007,6 +1026,12 @@ public class ReplicationManager implements TransportListener, LeadershipListener
      * (must be called with sequenceBufferLock held).
      */
     private void checkForMissingSequences(String topic) {
+        // A snapshot sync already in progress will recover this topic at its new watermark; firing
+        // resends underneath it only hammers the leader (the hot-loop that starved its lease) and
+        // races the tail-replay. Let the sync settle first.
+        if (syncingTopics.contains(topic)) {
+            return;
+        }
         PriorityQueue<BufferedReplication> buffer = sequenceBufferByTopic.get(topic);
         Map<Long, Instant> waitStart = sequenceWaitStartByTopic.get(topic);
 
@@ -1155,7 +1180,12 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             synchronized (topicLog) {
                 for (long seq = from; seq <= to; seq++) {
                     ReplicationPayload payload = topicLog.get(seq);
-                    if (payload != null && isOperationCommitted(payload.operationId())) {
+                    // A payload only enters replicationLogBySequence via indexReplicationPayload, which
+                    // is called exclusively from completeOperation (commit). So its mere presence here
+                    // already implies it is committed — re-checking the bounded audit log (capped at
+                    // operationLogMaxSize, far smaller than replicationLogRetention) only produced
+                    // false "missing" for ops beyond that cap, forcing needless snapshot fallback.
+                    if (payload != null) {
                         operations.add(payload);
                     } else {
                         missingSequences.add(seq);
@@ -1189,9 +1219,59 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         transport.send(responseMessage);
     }
 
-    private boolean isOperationCommitted(UUID operationId) {
-        ReplicatedRecord record = log.get(operationId);
-        return record != null && record.status() == OperationStatus.COMMITTED;
+    /**
+     * Recovers from an UNFILLABLE head-of-line gap: when the leader reports the requested
+     * sequence(s) as missing (evicted from its resend log) and the follower already holds higher
+     * sequences in the buffer, the missing range was produced-then-evicted and will never arrive.
+     * Advancing {@code nextExpected} past the hole to the buffer head and draining the contiguous
+     * tail lets the follower converge in bulk and go live, instead of re-requesting the same
+     * sequence forever (the hot-loop that saturated the leader and starved its lease).
+     *
+     * <p>This trades strong consistency for liveness (eventual LWW): keys touched ONLY in the
+     * skipped range keep their last-known value until the next update or a fresh snapshot. It only
+     * fires on a confirmed-evicted gap (the leader said "missing"), never during normal small gaps
+     * whose sequences are still resendable.
+     *
+     * @return {@code true} if a gap was skipped and the buffer drain was kicked off
+     */
+    private boolean skipEvictedGapAndDrain(String topic, java.util.List<Long> missingSequences) {
+        acquireSequenceLock();
+        try {
+            PriorityQueue<BufferedReplication> buffer = sequenceBufferByTopic.get(topic);
+            if (buffer == null || buffer.isEmpty()) {
+                return false; // nothing buffered above the hole to jump to
+            }
+            long nextExpected = nextExpectedSequenceByTopic.getOrDefault(topic, 1L);
+            long bufferHead = buffer.peek().sequence();
+            if (bufferHead <= nextExpected) {
+                return false; // buffer head is not above the hole; ordinary processing applies
+            }
+            long maxMissing = Long.MIN_VALUE;
+            for (long m : missingSequences) {
+                maxMissing = Math.max(maxMissing, m);
+            }
+            if (maxMissing < nextExpected) {
+                return false; // stale response for an already-advanced position
+            }
+            long skipFrom = nextExpected;
+            long skipTo = bufferHead - 1;
+            long skipped = skipTo - skipFrom + 1;
+            nextExpectedSequenceByTopic.put(topic, bufferHead);
+            evictedSkipCount.addAndGet(skipped);
+            LOGGER.warning(() -> String.format(
+                    "Skipping %d evicted sequence(s) [%d..%d] for topic=%s (gone from the leader's "
+                            + "resend log); advancing to buffered %d and draining the tail.",
+                    skipped, skipFrom, skipTo, topic, bufferHead));
+            Map<Long, Instant> waitStart = sequenceWaitStartByTopic.get(topic);
+            if (waitStart != null) {
+                waitStart.entrySet().removeIf(e -> e.getKey() < bufferHead);
+            }
+            sequenceStateDirty = true;
+            processSequenceBuffer(topic);
+            return true;
+        } finally {
+            sequenceBufferLock.unlock();
+        }
     }
 
     /**
@@ -1207,10 +1287,19 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         Instant startTime = resendStartByTopic.remove(topic);
 
         if (!response.missingSequences().isEmpty()) {
-            // Leader couldn't provide all sequences — fallback to snapshot
+            // The leader cannot resend these sequences. With synchronous indexing on commit, an op is
+            // resendable the instant it is produced, so a "missing" sequence was produced earlier and
+            // then EVICTED from the bounded resend log (the follower fell more than the retention
+            // window behind). It will never come. If we already hold higher sequences in the buffer,
+            // skip the evicted hole and drain the buffered tail to converge IN BULK — instead of
+            // head-of-line blocking on one unfillable sequence and re-requesting it forever.
+            if (skipEvictedGapAndDrain(topic, response.missingSequences())) {
+                return;
+            }
+            // No buffered tail above the hole to jump to: a full snapshot is the only recovery.
             LOGGER.warning(() -> String.format(
-                    "Leader reported %d missing sequences for topic=%s. Falling back to snapshot sync.",
-                    response.missingSequences().size(), topic));
+                    "Leader reported %d missing sequences for topic=%s and no buffered tail to skip. "
+                            + "Falling back to snapshot sync.", response.missingSequences().size(), topic));
             snapshotFallbackCount.incrementAndGet();
             if (syncingTopics.add(topic)) {
                 requestSync(topic);
@@ -1324,6 +1413,17 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
     public long getSnapshotFallbackCount() {
         return snapshotFallbackCount.get();
+    }
+
+    /**
+     * Number of operations the follower has skipped past because they were evicted from the leader's
+     * resend log (unfillable head-of-line gaps). A non-zero, growing value signals the follower fell
+     * far enough behind to lose strong ordering for those ops (recovered to eventual LWW).
+     *
+     * @return total evicted sequences skipped
+     */
+    public long getEvictedSkipCount() {
+        return evictedSkipCount.get();
     }
 
     public double getAverageConvergenceTimeMs() {
