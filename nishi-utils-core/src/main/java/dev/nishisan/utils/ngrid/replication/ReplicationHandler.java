@@ -74,6 +74,19 @@ public interface ReplicationHandler {
         // no-op by default
     }
 
+    /**
+     * Invoked once after the LAST chunk of a multi-chunk snapshot has been installed
+     * ({@code installSnapshot} was called for every chunk, in order). Handlers that transport a
+     * single large snapshot as byte-slices (because it exceeds the transport frame limit) should
+     * reassemble and decode the accumulated bytes here, then repopulate their state. Single-chunk
+     * handlers can ignore this (the default is a no-op).
+     *
+     * @throws Exception if the assembled snapshot cannot be applied
+     */
+    default void onSnapshotInstalled() throws Exception {
+        // no-op by default
+    }
+
     record SnapshotChunk(Object data, boolean hasMore) {
     }
 

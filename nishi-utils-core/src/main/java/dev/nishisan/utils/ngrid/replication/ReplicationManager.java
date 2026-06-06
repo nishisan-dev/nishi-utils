@@ -73,11 +73,19 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             0);
     private volatile long lastAppliedSequence = 0;
     private final Set<String> syncingTopics = ConcurrentHashMap.newKeySet();
-    // Janitor state: per-topic [lastObservedNextExpected, lastProgressMillis]. Lets us release a
-    // sync guard that has been held without any progress for too long (lost SYNC_RESPONSE, dropped
-    // chunk, etc.), so gap detection can request a fresh sync instead of looping forever.
-    private final Map<String, long[]> syncProgressByTopic = new ConcurrentHashMap<>();
+    // Janitor state: timestamp (millis) of the LAST sync activity per topic — updated on every
+    // SYNC_RESPONSE chunk received. The janitor releases a sync guard only when NO chunk has arrived
+    // for SYNC_STUCK_TIMEOUT_MS (a genuinely lost/hung sync), NOT merely because nextExpected has
+    // not advanced yet. A large multi-chunk (byte-sliced) snapshot legitimately takes many seconds
+    // and only advances nextExpected on the FINAL chunk; keying the janitor on chunk arrival keeps
+    // it from killing a healthy in-flight transfer mid-way (which would resetState the follower and
+    // never converge).
+    private final Map<String, Long> lastSyncActivityByTopic = new ConcurrentHashMap<>();
     private static final long SYNC_STUCK_TIMEOUT_MS = 15_000L;
+    // Watermark captured at chunk 0 of an in-flight snapshot, reused for all chunks of that snapshot
+    // so a multi-chunk (byte-sliced) snapshot lands a consistent nextExpected on the follower.
+    // Keyed by "<followerNodeId>::<topic>".
+    private final Map<String, Long> activeSyncWatermark = new ConcurrentHashMap<>();
     private final Set<String> leaderSyncTopics = ConcurrentHashMap.newKeySet();
     private final java.util.concurrent.atomic.AtomicBoolean leaderSyncing = new java.util.concurrent.atomic.AtomicBoolean(
             false);
@@ -456,6 +464,21 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             return;
         }
         if (operation.ackCount() >= operation.quorum) {
+            if (!config.leaderLocalApply()) {
+                // External engine owns the authoritative state (delta-shipping op-log): skip the
+                // redundant leader-local apply and commit + INDEX the operation SYNCHRONOUSLY now
+                // that quorum is met, so it is immediately resendable to a catching-up follower.
+                // Indexing at the end of the async apply (the leaderLocalApply=true path below) let
+                // the resend index lag the send frontier by the whole apply backlog under high
+                // throughput, which made frontier resends impossible → perpetual snapshot fallback.
+                if (operation.markCommitStarted()) {
+                    long appliedSeq = appliedSequence.updateAndGet(c -> Math.max(c, operation.sequence));
+                    lastAppliedSequence = appliedSeq;
+                    operation.markLocalApplied();
+                    completeOperation(operation);
+                }
+                return;
+            }
             ReplicationHandler handler = handlers.get(operation.topic);
             if (handler != null) {
                 if (operation.markLocalApplyStarted()) {
@@ -556,17 +579,32 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         if (handler == null)
             return;
 
-        // Read the watermark BEFORE capturing the snapshot so it is a safe LOWER BOUND for the
-        // snapshot content. On the leader the state mutation happens before replicateToFollowers()
-        // assigns the sequence, so any sequence read before the capture is guaranteed to be
-        // reflected by a snapshot taken afterwards. Reading it AFTER the capture (the previous
-        // behavior) could label the snapshot with a sequence ABOVE its actual content, making the
-        // follower advance nextExpected past entries that were never in the snapshot and are never
-        // resent — a permanent phantom gap (the production freeze on topic=cardinal-state).
-        long seq = getSyncSequenceForTopic(payload.topic());
+        // Watermark capture for a (possibly multi-chunk) snapshot:
+        // - Read it BEFORE capturing chunk 0 so it is a safe LOWER BOUND for the snapshot content
+        //   (on the leader the state mutation precedes the sequence assignment in
+        //   replicateToFollowers(), so a sequence read before the capture is reflected by a snapshot
+        //   taken afterwards). Reading it AFTER the capture could label the snapshot with a sequence
+        //   ABOVE its content → the follower skips entries never in the snapshot and never resent
+        //   (the permanent phantom gap on topic=cardinal-state).
+        // - REUSE the chunk-0 watermark for every subsequent chunk, so a large snapshot transferred
+        //   over many chunks still lands the follower's nextExpected on a value consistent with the
+        //   captured content, even though the leader keeps producing during the transfer.
+        String syncKey = message.source() + "::" + payload.topic();
+        long seq;
+        if (payload.chunkIndex() == 0) {
+            seq = getSyncSequenceForTopic(payload.topic());
+            activeSyncWatermark.put(syncKey, seq);
+        } else {
+            seq = activeSyncWatermark.getOrDefault(syncKey, getSyncSequenceForTopic(payload.topic()));
+        }
         ReplicationHandler.SnapshotChunk chunk = handler.getSnapshotChunk(payload.chunkIndex());
-        if (chunk == null)
+        if (chunk == null) {
+            activeSyncWatermark.remove(syncKey);
             return;
+        }
+        if (!chunk.hasMore()) {
+            activeSyncWatermark.remove(syncKey);
+        }
 
         SyncResponsePayload responsePayload = new SyncResponsePayload(payload.topic(), seq, payload.chunkIndex(),
                 chunk.hasMore(), chunk.data());
@@ -589,6 +627,11 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
         executor.submit(() -> {
             try {
+                // Mark sync activity so the stuck-sync janitor does not kill a healthy in-flight
+                // multi-chunk transfer — nextExpected only advances on the final chunk, so without
+                // this a large byte-sliced snapshot would be torn down mid-way (resetState) and the
+                // follower would never converge.
+                lastSyncActivityByTopic.put(payload.topic(), System.currentTimeMillis());
                 long currentNext;
                 sequenceBufferLock.lock();
                 try {
@@ -612,6 +655,9 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                 if (payload.hasMore()) {
                     requestSync(payload.topic(), payload.chunkIndex() + 1);
                 } else {
+                    // Last chunk installed: let the handler reassemble/decode a multi-chunk
+                    // (byte-sliced) snapshot before the follower is considered caught up.
+                    handler.onSnapshotInstalled();
                     LOGGER.info(
                             () -> "Sync completed for " + payload.topic() + ". Final sequence: " + payload.sequence());
                     appliedSequence.updateAndGet(current -> Math.max(current, payload.sequence()));
@@ -1207,22 +1253,21 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         }
         long now = System.currentTimeMillis();
         for (String topic : syncingTopics) {
-            long nextExpected = nextExpectedSequenceByTopic.getOrDefault(topic, 1L);
-            long[] prog = syncProgressByTopic.computeIfAbsent(topic, k -> new long[] { nextExpected, now });
-            if (prog[0] != nextExpected) {
-                prog[0] = nextExpected;
-                prog[1] = now;
-            } else if (now - prog[1] > SYNC_STUCK_TIMEOUT_MS) {
-                long stuckMs = now - prog[1];
+            // A sync stays "alive" as long as chunks keep arriving. Seed the stamp the first time a
+            // guard is observed so a sync that never receives a single chunk (lost SYNC_REQUEST) is
+            // still eventually released; healthy multi-chunk transfers refresh it on every chunk.
+            long lastActivity = lastSyncActivityByTopic.computeIfAbsent(topic, k -> now);
+            if (now - lastActivity > SYNC_STUCK_TIMEOUT_MS) {
+                long stuckMs = now - lastActivity;
                 LOGGER.warning(() -> String.format(
-                        "Sync for topic=%s stuck without progress for %dms; releasing sync guard to allow a fresh sync.",
+                        "Sync for topic=%s stuck without a chunk for %dms; releasing sync guard to allow a fresh sync.",
                         topic, stuckMs));
                 syncingTopics.remove(topic);
-                syncProgressByTopic.remove(topic);
+                lastSyncActivityByTopic.remove(topic);
             }
         }
-        // Drop progress entries for topics that are no longer syncing.
-        syncProgressByTopic.keySet().removeIf(t -> !syncingTopics.contains(t));
+        // Drop activity entries for topics that are no longer syncing.
+        lastSyncActivityByTopic.keySet().removeIf(t -> !syncingTopics.contains(t));
     }
 
     // ──────────────────────────────────────────────────────────
@@ -1470,6 +1515,8 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                 false);
         private final java.util.concurrent.atomic.AtomicBoolean localApplyStarted = new java.util.concurrent.atomic.AtomicBoolean(
                 false);
+        private final java.util.concurrent.atomic.AtomicBoolean commitStarted = new java.util.concurrent.atomic.AtomicBoolean(
+                false);
 
         private PendingOperation(UUID operationId, String topic, Object payload, long epoch, int quorum) {
             this(operationId, topic, payload, payload, epoch, quorum);
@@ -1520,6 +1567,10 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
         boolean markLocalApplyStarted() {
             return localApplyStarted.compareAndSet(false, true);
+        }
+
+        boolean markCommitStarted() {
+            return commitStarted.compareAndSet(false, true);
         }
 
         void markLocalApplied() {
