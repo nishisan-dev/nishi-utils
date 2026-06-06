@@ -708,16 +708,11 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                     try {
                         long watermark = payload.sequence();
                         nextExpectedSequenceByTopic.put(payload.topic(), watermark + 1);
-                        PriorityQueue<BufferedReplication> buffer = sequenceBufferByTopic.get(payload.topic());
-                        if (buffer != null) {
-                            // Tail-replay instead of discard: drop only the entries already covered
-                            // by the snapshot (seq <= watermark) and KEEP the rest, so the contiguous
-                            // tail (watermark+1, +2, ...) buffered during the round-trip can still be
-                            // applied. Clearing the whole buffer (the previous behavior) left a
-                            // permanent hole between the watermark and the buffer head that the
-                            // leader never resends.
-                            buffer.removeIf(b -> b.sequence() <= watermark);
-                        }
+                        // Tail-replay: keep the buffered tail above the watermark so the contiguous
+                        // run (watermark+1, +2, ...) buffered during the round-trip is still applied.
+                        // The entries already covered (seq <= watermark) are discarded cheaply by
+                        // processSequenceBuffer's stale-discard loop below (O(log n) each), not by an
+                        // O(n^2) PriorityQueue.removeIf here.
                         Map<Long, Instant> waitStart = sequenceWaitStartByTopic.get(payload.topic());
                         if (waitStart != null) {
                             waitStart.entrySet().removeIf(e -> e.getKey() <= watermark);
@@ -858,16 +853,10 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                 // Apply asynchronously with callback
                 applyReplication(payload, message, onSuccess);
             } else if (seq > nextExpected) {
-                // Future sequence - check for duplicates before buffering
-                boolean alreadyBuffered = buffer.stream()
-                        .anyMatch(b -> b.payload().operationId().equals(opId));
-                if (alreadyBuffered) {
-                    LOGGER.fine(() -> String.format(
-                            "[%s] Ignoring duplicate buffered opId=%s seq=%d topic=%s",
-                            localNodeId, opId, seq, topic));
-                    return;
-                }
-
+                // Future sequence: buffer it. We do NOT scan the buffer for duplicates here (that was
+                // O(n) per op and, with a large buffer under load, monopolized the lock). A duplicate
+                // future seq is harmless — it stays until processSequenceBuffer reaches that sequence,
+                // applies one copy, and discards the rest as stale (seq < nextExpected) in O(log n).
                 if (buffer.size() >= MAX_SEQUENCE_BUFFER) {
                     // Hopelessly behind with a persistent gap: buffering without limit would OOM.
                     // Drop to a fresh snapshot (tail-replayed at the new watermark discards the stale
@@ -967,8 +956,22 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             return;
         }
 
-        BufferedReplication next = buffer.peek();
         long nextExpected = nextExpectedSequenceByTopic.get(topic);
+        // Discard buffered entries already covered (seq < nextExpected): duplicates, or the part of
+        // the buffer below a snapshot watermark. Each poll is O(log n) — this replaces the O(n)
+        // per-insert duplicate scan and the O(n^2) PriorityQueue.removeIf on tail-replay, both of
+        // which monopolized the lock under a large buffer and starved the apply callbacks (lock
+        // acquire timeouts), stalling convergence.
+        while (!buffer.isEmpty() && buffer.peek().sequence() < nextExpected) {
+            BufferedReplication stale = buffer.poll();
+            if (waitStart != null) {
+                waitStart.remove(stale.sequence());
+            }
+        }
+        if (buffer.isEmpty()) {
+            return;
+        }
+        BufferedReplication next = buffer.peek();
 
         if (next.sequence() != nextExpected) {
             // Next in buffer is not the expected one, stop
