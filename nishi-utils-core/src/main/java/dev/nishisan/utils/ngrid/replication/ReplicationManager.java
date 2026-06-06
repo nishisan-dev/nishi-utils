@@ -117,7 +117,19 @@ public class ReplicationManager implements TransportListener, LeadershipListener
     private final Map<String, Map<Long, Instant>> sequenceWaitStartByTopic = new ConcurrentHashMap<>();
     private static final Duration SEQUENCE_WAIT_TIMEOUT = Duration.ofSeconds(1);
     private final Path sequenceStatePath;
+    // Sequence-state persistence is a recovery HINT (lost state just triggers a re-sync), so it is
+    // coalesced: the hot path marks it dirty (no I/O, no lock cost) and a scheduled flush writes it
+    // at most once per interval, OFF the lock. Writing the whole file on every applied op (2k+/s)
+    // under sequenceBufferLock made the lock hold time bounded by disk latency — a throughput
+    // bottleneck and a freeze hazard on any I/O stall.
+    private volatile boolean sequenceStateDirty = false;
     private final ReentrantLock sequenceBufferLock = new ReentrantLock();
+    // Max time to wait when acquiring sequenceBufferLock on the replication path. A bounded tryLock
+    // (instead of an unbounded lock()) means that if the lock is ever orphaned — e.g. a worker dies
+    // leaving the ReentrantLock held with no live owner — the replication path degrades to a
+    // recoverable timeout (the operation aborts and is retried / re-synced) instead of parking the
+    // whole replication pool forever and freezing the node (which then drops the cluster's leader).
+    private static final long LOCK_ACQUIRE_TIMEOUT_MS = 15_000L;
 
     // Leader-side replication log indexed by sequence (per topic) for resend
     // support
@@ -193,6 +205,8 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         timeoutScheduler.scheduleAtFixedRate(this::retryLeaderSync, 500, 500, TimeUnit.MILLISECONDS);
         timeoutScheduler.scheduleAtFixedRate(this::checkResendTimeouts, 500, 500, TimeUnit.MILLISECONDS);
         timeoutScheduler.scheduleAtFixedRate(this::checkStuckSyncs, 1000, 1000, TimeUnit.MILLISECONDS);
+        // Coalesced off-lock persistence of the sequence state (dirty-flag flush)
+        timeoutScheduler.scheduleAtFixedRate(this::flushSequenceStateIfDirty, 1000, 1000, TimeUnit.MILLISECONDS);
         // Periodic memory eviction for the operation audit log
         long cleanupPeriodMs = Math.max(5000L, timeout.toMillis() * 5);
         timeoutScheduler.scheduleAtFixedRate(this::trimLog, cleanupPeriodMs, cleanupPeriodMs, TimeUnit.MILLISECONDS);
@@ -203,6 +217,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             return;
         }
         running = false;
+        flushSequenceStateIfDirty(); // persist the latest coalesced sequence state on shutdown
         transport.removeListener(this);
         coordinator.removeLeadershipListener(this);
         failAllPending("ReplicationManager stopped");
@@ -225,7 +240,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
      * Intended for testing and observability.
      */
     public int getAppliedSetSize() {
-        sequenceBufferLock.lock();
+        acquireSequenceLock();
         try {
             return applied.size();
         } finally {
@@ -400,8 +415,8 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         long seq = nextSequenceForTopic(operation.topic);
         operation.sequence = seq;
 
-        // Persist sequence state for leader recovery
-        saveSequenceState();
+        // Persist sequence state for leader recovery (coalesced; flushed off the hot path)
+        sequenceStateDirty = true;
 
         ReplicationPayload payload = new ReplicationPayload(operation.operationId, seq,
                 coordinator.getLeaderEpoch(), operation.topic, operation.payload);
@@ -459,6 +474,25 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         }
     }
 
+    /**
+     * Acquires {@link #sequenceBufferLock} with a bounded wait. Callers MUST follow the
+     * {@code acquireSequenceLock(); try { ... } finally { sequenceBufferLock.unlock(); }} idiom: on a
+     * timeout this throws BEFORE the {@code try}, so the {@code finally} never runs and no spurious
+     * unlock happens. A timeout indicates a stuck/orphaned lock; the caller aborts and the operation
+     * is retried or recovered via re-sync — far better than parking forever and freezing the node.
+     */
+    private void acquireSequenceLock() {
+        try {
+            if (!sequenceBufferLock.tryLock(LOCK_ACQUIRE_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                throw new IllegalStateException("Timed out after " + LOCK_ACQUIRE_TIMEOUT_MS
+                        + "ms acquiring sequenceBufferLock (possible orphaned lock); aborting to recover");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while acquiring sequenceBufferLock", e);
+        }
+    }
+
     private void checkCompletion(PendingOperation operation) {
         if (operation.isCommitted()) {
             return;
@@ -489,7 +523,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                         try {
                             handler.apply(operation.operationId, operation.localApplyPayload);
                             recordApplied();
-                            sequenceBufferLock.lock();
+                            acquireSequenceLock();
                             try {
                                 applied.add(operation.operationId);
                                 trimApplied();
@@ -500,7 +534,9 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
                             // Complete operation after successful apply
                             completeOperation(operation);
-                        } catch (Exception e) {
+                        } catch (Throwable e) {
+                            // Throwable (not Exception): an Error (OOM/StackOverflow) must not kill
+                            // the pool worker silently nor skip cleanup — log it and fail the op.
                             LOGGER.log(Level.SEVERE, "Failed to apply committed operation locally", e);
                             failOperation(operation, e);
                         }
@@ -633,7 +669,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                 // follower would never converge.
                 lastSyncActivityByTopic.put(payload.topic(), System.currentTimeMillis());
                 long currentNext;
-                sequenceBufferLock.lock();
+                acquireSequenceLock();
                 try {
                     currentNext = nextExpectedSequenceByTopic.getOrDefault(payload.topic(), 1L);
                 } finally {
@@ -662,7 +698,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                             () -> "Sync completed for " + payload.topic() + ". Final sequence: " + payload.sequence());
                     appliedSequence.updateAndGet(current -> Math.max(current, payload.sequence()));
                     lastAppliedSequence = appliedSequence.get();
-                    sequenceBufferLock.lock();
+                    acquireSequenceLock();
                     try {
                         long watermark = payload.sequence();
                         nextExpectedSequenceByTopic.put(payload.topic(), watermark + 1);
@@ -680,7 +716,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                         if (waitStart != null) {
                             waitStart.entrySet().removeIf(e -> e.getKey() <= watermark);
                         }
-                        saveSequenceState();
+                        sequenceStateDirty = true;
                         // Apply the contiguous tail the snapshot did not cover (called under the
                         // lock, per processSequenceBuffer's contract).
                         processSequenceBuffer(payload.topic());
@@ -692,7 +728,9 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                         leaderSyncing.set(false);
                     }
                 }
-            } catch (Exception e) {
+            } catch (Throwable e) {
+                // Throwable (not Exception): an Error here (e.g. OOM decoding a large snapshot) must
+                // not kill the pool worker silently; log it and release the sync guard to allow retry.
                 LOGGER.log(Level.SEVERE, "Failed to install snapshot chunk", e);
                 syncingTopics.remove(payload.topic()); // allow retry
             }
@@ -765,7 +803,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
         // Lock to manipulate buffer and sequence
         String topic = payload.topic();
-        sequenceBufferLock.lock();
+        acquireSequenceLock();
         try {
             // Already applied previously - send ACK and skip (safe check under lock)
             if (applied.contains(opId)) {
@@ -785,7 +823,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             if (seq == nextExpected) {
                 // Create callback to execute AFTER successful apply
                 Runnable onSuccess = () -> {
-                    sequenceBufferLock.lock();
+                    acquireSequenceLock();
                     try {
                         // Update state ONLY if still the expected sequence (idempotency check)
                         long current = nextExpectedSequenceByTopic.get(topic);
@@ -801,7 +839,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
                             // Advance sequence
                             nextExpectedSequenceByTopic.put(topic, nextExpected + 1);
-                            saveSequenceState();
+                            sequenceStateDirty = true;
 
                             // Process buffer recursively
                             processSequenceBuffer(topic);
@@ -883,7 +921,9 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                 LOGGER.fine(() -> String.format(
                         "[%s] Applied replication opId=%s seq=%d topic=%s",
                         localNodeId, opId, payload.sequence(), payload.topic()));
-            } catch (Exception e) {
+            } catch (Throwable e) {
+                // Throwable (not Exception): an Error must not kill the pool worker silently nor skip
+                // the processing-set cleanup in the finally below; log it and recover via re-sync.
                 LOGGER.log(Level.SEVERE, "Failed to apply replicated operation", e);
                 if (syncingTopics.add(payload.topic())) {
                     LOGGER.warning(() -> "Apply failed for topic " + payload.topic()
@@ -924,7 +964,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
         // Create callback for recursive processing
         Runnable onSuccess = () -> {
-            sequenceBufferLock.lock();
+            acquireSequenceLock();
             try {
                 // Update state ONLY if still the expected sequence (idempotency check)
                 long current = nextExpectedSequenceByTopic.get(topic);
@@ -942,7 +982,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
                     // Advance sequence
                     nextExpectedSequenceByTopic.put(topic, nextExpected + 1);
-                    saveSequenceState();
+                    sequenceStateDirty = true;
 
                     LOGGER.fine(() -> String.format(
                             "Processed buffered sequence seq=%d for topic=%s", next.sequence(), topic));
@@ -1659,7 +1699,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             java.util.concurrent.atomic.AtomicLong counter = sequenceByTopic.get(topic);
             return counter != null ? counter.get() : 0L;
         }
-        sequenceBufferLock.lock();
+        acquireSequenceLock();
         try {
             long next = nextExpectedSequenceByTopic.getOrDefault(topic, 1L);
             return Math.max(0L, next - 1L);
@@ -1704,6 +1744,19 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         } catch (Exception e) {
             LOGGER.log(Level.WARNING, "Failed to load sequence state, starting from 1", e);
         }
+    }
+
+    /**
+     * Scheduled flush of the coalesced sequence state. Runs OFF the replication lock; reads only
+     * thread-safe concurrent structures. Clears the dirty flag before writing so a concurrent
+     * dirty-mark during the write re-arms it for the next flush (no lost update).
+     */
+    private void flushSequenceStateIfDirty() {
+        if (!sequenceStateDirty) {
+            return;
+        }
+        sequenceStateDirty = false;
+        saveSequenceState();
     }
 
     /**
