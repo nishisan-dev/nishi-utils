@@ -73,6 +73,11 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             0);
     private volatile long lastAppliedSequence = 0;
     private final Set<String> syncingTopics = ConcurrentHashMap.newKeySet();
+    // Janitor state: per-topic [lastObservedNextExpected, lastProgressMillis]. Lets us release a
+    // sync guard that has been held without any progress for too long (lost SYNC_RESPONSE, dropped
+    // chunk, etc.), so gap detection can request a fresh sync instead of looping forever.
+    private final Map<String, long[]> syncProgressByTopic = new ConcurrentHashMap<>();
+    private static final long SYNC_STUCK_TIMEOUT_MS = 15_000L;
     private final Set<String> leaderSyncTopics = ConcurrentHashMap.newKeySet();
     private final java.util.concurrent.atomic.AtomicBoolean leaderSyncing = new java.util.concurrent.atomic.AtomicBoolean(
             false);
@@ -179,6 +184,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         timeoutScheduler.scheduleAtFixedRate(this::checkLagAndSync, 2000, 2000, TimeUnit.MILLISECONDS);
         timeoutScheduler.scheduleAtFixedRate(this::retryLeaderSync, 500, 500, TimeUnit.MILLISECONDS);
         timeoutScheduler.scheduleAtFixedRate(this::checkResendTimeouts, 500, 500, TimeUnit.MILLISECONDS);
+        timeoutScheduler.scheduleAtFixedRate(this::checkStuckSyncs, 1000, 1000, TimeUnit.MILLISECONDS);
         // Periodic memory eviction for the operation audit log
         long cleanupPeriodMs = Math.max(5000L, timeout.toMillis() * 5);
         timeoutScheduler.scheduleAtFixedRate(this::trimLog, cleanupPeriodMs, cleanupPeriodMs, TimeUnit.MILLISECONDS);
@@ -550,11 +556,18 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         if (handler == null)
             return;
 
+        // Read the watermark BEFORE capturing the snapshot so it is a safe LOWER BOUND for the
+        // snapshot content. On the leader the state mutation happens before replicateToFollowers()
+        // assigns the sequence, so any sequence read before the capture is guaranteed to be
+        // reflected by a snapshot taken afterwards. Reading it AFTER the capture (the previous
+        // behavior) could label the snapshot with a sequence ABOVE its actual content, making the
+        // follower advance nextExpected past entries that were never in the snapshot and are never
+        // resent — a permanent phantom gap (the production freeze on topic=cardinal-state).
+        long seq = getSyncSequenceForTopic(payload.topic());
         ReplicationHandler.SnapshotChunk chunk = handler.getSnapshotChunk(payload.chunkIndex());
         if (chunk == null)
             return;
 
-        long seq = getSyncSequenceForTopic(payload.topic());
         SyncResponsePayload responsePayload = new SyncResponsePayload(payload.topic(), seq, payload.chunkIndex(),
                 chunk.hasMore(), chunk.data());
         ClusterMessage response = new ClusterMessage(UUID.randomUUID(),
@@ -605,16 +618,26 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                     lastAppliedSequence = appliedSequence.get();
                     sequenceBufferLock.lock();
                     try {
-                        nextExpectedSequenceByTopic.put(payload.topic(), payload.sequence() + 1);
+                        long watermark = payload.sequence();
+                        nextExpectedSequenceByTopic.put(payload.topic(), watermark + 1);
                         PriorityQueue<BufferedReplication> buffer = sequenceBufferByTopic.get(payload.topic());
                         if (buffer != null) {
-                            buffer.clear();
+                            // Tail-replay instead of discard: drop only the entries already covered
+                            // by the snapshot (seq <= watermark) and KEEP the rest, so the contiguous
+                            // tail (watermark+1, +2, ...) buffered during the round-trip can still be
+                            // applied. Clearing the whole buffer (the previous behavior) left a
+                            // permanent hole between the watermark and the buffer head that the
+                            // leader never resends.
+                            buffer.removeIf(b -> b.sequence() <= watermark);
                         }
                         Map<Long, Instant> waitStart = sequenceWaitStartByTopic.get(payload.topic());
                         if (waitStart != null) {
-                            waitStart.clear();
+                            waitStart.entrySet().removeIf(e -> e.getKey() <= watermark);
                         }
                         saveSequenceState();
+                        // Apply the contiguous tail the snapshot did not cover (called under the
+                        // lock, per processSequenceBuffer's contract).
+                        processSequenceBuffer(payload.topic());
                     } finally {
                         sequenceBufferLock.unlock();
                     }
@@ -1168,6 +1191,38 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                 }
             }
         }
+    }
+
+    /**
+     * Janitor that releases a sync guard ({@link #syncingTopics}) that has been held without any
+     * progress (no advance in {@code nextExpected}) for {@link #SYNC_STUCK_TIMEOUT_MS}. Without this,
+     * a sync that never completes — a lost {@code SYNC_RESPONSE}, a silently dropped chunk, or a
+     * stale-sync that keeps being ignored — would keep {@code syncingTopics.add(topic)} returning
+     * {@code false} forever, so gap detection could never request a fresh sync and the follower
+     * would loop logging "Large gap" without ever recovering.
+     */
+    private void checkStuckSyncs() {
+        if (!running || coordinator.isLeader()) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        for (String topic : syncingTopics) {
+            long nextExpected = nextExpectedSequenceByTopic.getOrDefault(topic, 1L);
+            long[] prog = syncProgressByTopic.computeIfAbsent(topic, k -> new long[] { nextExpected, now });
+            if (prog[0] != nextExpected) {
+                prog[0] = nextExpected;
+                prog[1] = now;
+            } else if (now - prog[1] > SYNC_STUCK_TIMEOUT_MS) {
+                long stuckMs = now - prog[1];
+                LOGGER.warning(() -> String.format(
+                        "Sync for topic=%s stuck without progress for %dms; releasing sync guard to allow a fresh sync.",
+                        topic, stuckMs));
+                syncingTopics.remove(topic);
+                syncProgressByTopic.remove(topic);
+            }
+        }
+        // Drop progress entries for topics that are no longer syncing.
+        syncProgressByTopic.keySet().removeIf(t -> !syncingTopics.contains(t));
     }
 
     // ──────────────────────────────────────────────────────────
