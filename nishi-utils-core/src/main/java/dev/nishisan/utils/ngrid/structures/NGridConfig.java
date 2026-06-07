@@ -48,6 +48,10 @@ public final class NGridConfig {
     private final FollowerIngestMode followerIngestMode;
     private final RelayDurability relayDurability;
     private final Duration relayGroupCommitInterval;
+    private final boolean persistentResendLog;
+    private final int relayApplyBatchSize;
+    private final boolean leaderPauseOnJoin;
+    private final Duration joinQuiesceMaxDuration;
     private final Duration rttProbeInterval;
     private final Duration heartbeatInterval;
     private final Duration leaseTimeout;
@@ -96,6 +100,10 @@ public final class NGridConfig {
         this.followerIngestMode = builder.followerIngestMode;
         this.relayDurability = builder.relayDurability;
         this.relayGroupCommitInterval = builder.relayGroupCommitInterval;
+        this.persistentResendLog = builder.persistentResendLog;
+        this.relayApplyBatchSize = builder.relayApplyBatchSize;
+        this.leaderPauseOnJoin = builder.leaderPauseOnJoin;
+        this.joinQuiesceMaxDuration = builder.joinQuiesceMaxDuration;
         this.rttProbeInterval = builder.rttProbeInterval;
         this.heartbeatInterval = builder.heartbeatInterval;
         this.leaseTimeout = builder.leaseTimeout;
@@ -214,6 +222,48 @@ public final class NGridConfig {
      */
     public RelayDurability relayDurability() {
         return relayDurability;
+    }
+
+    /**
+     * Whether the leader-side resend op-log is backed by a durable, segmented on-disk store (#127),
+     * keeping the deep backlog window off-heap. Defaults to {@code false}. Pair with
+     * {@link #replicationLogRetentionTime()} to size the temporal window.
+     *
+     * @return {@code true} when the disk-backed resend op-log is enabled
+     */
+    public boolean persistentResendLog() {
+        return persistentResendLog;
+    }
+
+    /**
+     * Number of relay-log entries a follower's apply consumer drains per batch (#128). Higher values
+     * raise apply throughput under burst by amortizing per-operation overhead; the consumer stays
+     * single-threaded and in strict sequence order. Defaults to 256.
+     *
+     * @return the relay apply batch size
+     */
+    public int relayApplyBatchSize() {
+        return relayApplyBatchSize;
+    }
+
+    /**
+     * Whether the leader pauses production while a not-caught-up follower joins (#129). Defaults to
+     * {@code false}. Relevant in RELAY_LOG deployments needing deterministic bootstrap convergence.
+     *
+     * @return {@code true} when leader-pause-on-join is enabled
+     */
+    public boolean leaderPauseOnJoin() {
+        return leaderPauseOnJoin;
+    }
+
+    /**
+     * Hard cap on a leader-pause-on-join pause (#129), so a follower that dies mid-join cannot freeze
+     * the leader. Defaults to 10s.
+     *
+     * @return the maximum join-quiesce duration
+     */
+    public Duration joinQuiesceMaxDuration() {
+        return joinQuiesceMaxDuration;
     }
 
     /**
@@ -401,6 +451,10 @@ public final class NGridConfig {
         private FollowerIngestMode followerIngestMode = FollowerIngestMode.INLINE;
         private RelayDurability relayDurability = RelayDurability.OS_MANAGED;
         private Duration relayGroupCommitInterval = Duration.ofSeconds(1);
+        private boolean persistentResendLog = false;
+        private int relayApplyBatchSize = 256;
+        private boolean leaderPauseOnJoin = false;
+        private Duration joinQuiesceMaxDuration = Duration.ofSeconds(10);
         private Duration rttProbeInterval = Duration.ofSeconds(10);
         private Duration heartbeatInterval = Duration.ofSeconds(3);
         private Duration leaseTimeout;
@@ -620,6 +674,60 @@ public final class NGridConfig {
          */
         public Builder relayDurability(RelayDurability relayDurability) {
             this.relayDurability = Objects.requireNonNull(relayDurability, "relayDurability");
+            return this;
+        }
+
+        /**
+         * Enables the disk-backed resend op-log (#127), keeping the deep backlog window off-heap.
+         * Pair with {@link #replicationLogRetentionTime(Duration)} to size the temporal window.
+         * Defaults to {@code false}.
+         *
+         * @param persistentResendLog {@code true} to enable the on-disk resend op-log
+         * @return this builder
+         */
+        public Builder persistentResendLog(boolean persistentResendLog) {
+            this.persistentResendLog = persistentResendLog;
+            return this;
+        }
+
+        /**
+         * Sets how many relay-log entries a follower's apply consumer drains per batch (#128).
+         * Defaults to 256.
+         *
+         * @param batchSize the relay apply batch size (must be >= 1)
+         * @return this builder
+         */
+        public Builder relayApplyBatchSize(int batchSize) {
+            if (batchSize < 1) {
+                throw new IllegalArgumentException("relayApplyBatchSize must be >= 1");
+            }
+            this.relayApplyBatchSize = batchSize;
+            return this;
+        }
+
+        /**
+         * Enables leader-pause-on-join (#129). Defaults to {@code false}.
+         *
+         * @param leaderPauseOnJoin {@code true} to pause production while a behind follower joins
+         * @return this builder
+         */
+        public Builder leaderPauseOnJoin(boolean leaderPauseOnJoin) {
+            this.leaderPauseOnJoin = leaderPauseOnJoin;
+            return this;
+        }
+
+        /**
+         * Sets the hard cap on a leader-pause-on-join pause (#129).
+         *
+         * @param duration the maximum join-quiesce duration (must be positive)
+         * @return this builder
+         */
+        public Builder joinQuiesceMaxDuration(Duration duration) {
+            Objects.requireNonNull(duration, "joinQuiesceMaxDuration");
+            if (duration.isNegative() || duration.isZero()) {
+                throw new IllegalArgumentException("joinQuiesceMaxDuration must be positive");
+            }
+            this.joinQuiesceMaxDuration = duration;
             return this;
         }
 

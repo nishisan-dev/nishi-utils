@@ -1,0 +1,26 @@
+@startuml
+title Convergencia no join (#129) — sync proativo (3a) + leader-pause-on-join (3b)
+
+participant "Lider (quiescente)" as LDR
+participant "Follower novo\n(estado vazio)" as FOL
+
+== 3a: sync proativo no join (sempre ativo em RELAY_LOG) ==
+LDR -> FOL : HEARTBEAT (leaderHighWatermark = N)
+note over FOL : checkProactiveJoinSync:\nnada aplicado + relay vazio +\nwatermark N > applied
+FOL -> LDR : SYNC_REQUEST (1x por termo)
+LDR --> FOL : SNAPSHOT (estado em N)
+note over FOL : converge SEM depender de\ntrafego de op-log
+
+== 3b: leader-pause-on-join (opt-in: leaderPauseOnJoin) ==
+note over LDR : onMembershipChanged: follower\natrasado entrando -> joinQuiescing
+LDR -> LDR : replicate() rejeita\n(LeaderSyncingException)
+FOL -> LDR : FOLLOWER_PROGRESS (applied)
+alt applied >= leaderSeq - joinSyncLagThreshold
+  LDR -> LDR : release (resume producao)
+else timeout joinQuiesceMaxDuration OU follower desconecta
+  LDR -> LDR : release (nao congela o lider)
+end
+
+== 3c: sem caught-up transitorio no boot ==
+note over LDR : auto-eleicao sozinho dentro da\njoinPeerDiscoveryWindow NAO libera o\ndrain-gate por relay vazio (nao se marca\nsincronizado no vazio); ao ver o peer,\nstepa para follower e 3a converge
+@enduml

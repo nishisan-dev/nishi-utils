@@ -40,12 +40,26 @@ public final class ReplicationConfig {
     private final FollowerIngestMode followerIngestMode;
     private final RelayDurability relayDurability;
     private final Duration relayGroupCommitInterval;
+    private final boolean persistentResendLog;
+    private final int resendLogSegmentMaxEntries;
+    private final Duration resendLogSegmentMaxAge;
+    private final long resendLogMaxEntries;
+    private final int resendLogReadBatchMax;
+    private final int relayApplyBatchSize;
+    private final boolean leaderPauseOnJoin;
+    private final Duration joinQuiesceMaxDuration;
+    private final Duration followerProgressInterval;
+    private final Duration joinPeerDiscoveryWindow;
+    private final long joinSyncLagThreshold;
 
     private ReplicationConfig(int quorum, Duration operationTimeout, Duration retryInterval, boolean strictConsistency,
             Path dataDirectory, int resendGapThreshold, Duration resendTimeout, int replicationLogRetention,
             Duration replicationLogRetentionTime, int appliedSetMaxSize, int operationLogMaxSize,
             boolean leaderLocalApply, FollowerIngestMode followerIngestMode, RelayDurability relayDurability,
-            Duration relayGroupCommitInterval) {
+            Duration relayGroupCommitInterval, boolean persistentResendLog, int resendLogSegmentMaxEntries,
+            Duration resendLogSegmentMaxAge, long resendLogMaxEntries, int resendLogReadBatchMax,
+            int relayApplyBatchSize, boolean leaderPauseOnJoin, Duration joinQuiesceMaxDuration,
+            Duration followerProgressInterval, Duration joinPeerDiscoveryWindow, long joinSyncLagThreshold) {
         this.quorum = quorum;
         this.operationTimeout = Objects.requireNonNull(operationTimeout, "operationTimeout");
         this.retryInterval = Objects.requireNonNull(retryInterval, "retryInterval");
@@ -62,6 +76,17 @@ public final class ReplicationConfig {
         this.followerIngestMode = Objects.requireNonNull(followerIngestMode, "followerIngestMode");
         this.relayDurability = Objects.requireNonNull(relayDurability, "relayDurability");
         this.relayGroupCommitInterval = Objects.requireNonNull(relayGroupCommitInterval, "relayGroupCommitInterval");
+        this.persistentResendLog = persistentResendLog;
+        this.resendLogSegmentMaxEntries = resendLogSegmentMaxEntries;
+        this.resendLogSegmentMaxAge = Objects.requireNonNull(resendLogSegmentMaxAge, "resendLogSegmentMaxAge");
+        this.resendLogMaxEntries = resendLogMaxEntries;
+        this.resendLogReadBatchMax = resendLogReadBatchMax;
+        this.relayApplyBatchSize = relayApplyBatchSize;
+        this.leaderPauseOnJoin = leaderPauseOnJoin;
+        this.joinQuiesceMaxDuration = Objects.requireNonNull(joinQuiesceMaxDuration, "joinQuiesceMaxDuration");
+        this.followerProgressInterval = Objects.requireNonNull(followerProgressInterval, "followerProgressInterval");
+        this.joinPeerDiscoveryWindow = Objects.requireNonNull(joinPeerDiscoveryWindow, "joinPeerDiscoveryWindow");
+        this.joinSyncLagThreshold = joinSyncLagThreshold;
     }
 
     public static ReplicationConfig of(int quorum) {
@@ -195,6 +220,127 @@ public final class ReplicationConfig {
         return relayGroupCommitInterval;
     }
 
+    /**
+     * Whether the leader-side resend op-log is backed by a durable, segmented on-disk store (#127)
+     * in addition to the in-heap hot cache. Defaults to {@code false} (heap-only, the previous
+     * behavior). When {@code true}, the heap cache holds only the freshest window (bounded by
+     * {@link #replicationLogRetention()}) and the deep, time-governed backlog window
+     * ({@link #replicationLogRetentionTime()}) lives on disk — so a large window costs disk, not
+     * heap, eliminating the count-vs-time eviction that collapsed the window under load.
+     *
+     * @return {@code true} to enable the disk-backed resend op-log
+     */
+    public boolean persistentResendLog() {
+        return persistentResendLog;
+    }
+
+    /**
+     * Maximum number of entries per on-disk resend-log segment before a new segment is rolled.
+     * Retention drops whole sealed segments, so this also sets the granularity of eviction.
+     *
+     * @return the per-segment entry cap
+     */
+    public int resendLogSegmentMaxEntries() {
+        return resendLogSegmentMaxEntries;
+    }
+
+    /**
+     * Maximum age of an on-disk resend-log segment before a new one is rolled, bounding how long an
+     * entry waits before its segment can age out of the temporal window. {@link Duration#ZERO}
+     * disables age-based rolling (count-based rolling still applies).
+     *
+     * @return the per-segment max age
+     */
+    public Duration resendLogSegmentMaxAge() {
+        return resendLogSegmentMaxAge;
+    }
+
+    /**
+     * Hard count backstop for the on-disk resend op-log across all segments of a topic, guarding
+     * against unbounded disk growth. The temporal window ({@link #replicationLogRetentionTime()}) is
+     * the intended governor; this is a safety cap.
+     *
+     * @return the disk-side entry cap per topic
+     */
+    public long resendLogMaxEntries() {
+        return resendLogMaxEntries;
+    }
+
+    /**
+     * Maximum number of sequences served from the disk resend op-log in a single resend response,
+     * bounding one read. Larger gaps fall into the snapshot-fallback path.
+     *
+     * @return the per-response read cap
+     */
+    public int resendLogReadBatchMax() {
+        return resendLogReadBatchMax;
+    }
+
+    /**
+     * Maximum number of relay-log entries a follower's apply consumer drains per batch (#128). The
+     * consumer stays single-threaded and applies in strict sequence order; batching amortizes the
+     * per-operation lock/flush/peek-poll overhead across the batch, raising apply throughput above
+     * the leader's production without any ordering or fencing risk.
+     *
+     * @return the relay apply batch size
+     */
+    public int relayApplyBatchSize() {
+        return relayApplyBatchSize;
+    }
+
+    /**
+     * Whether the leader pauses production while a not-caught-up follower joins (#129), generalizing
+     * the failover drain-gate to the join path so convergence is deterministic (no firehose during
+     * bootstrap). Bounded by {@link #joinQuiesceMaxDuration()} and released on the follower catching
+     * up or disconnecting. Defaults to {@code false} (opt-in; preserves current write availability).
+     *
+     * @return {@code true} when leader-pause-on-join is enabled
+     */
+    public boolean leaderPauseOnJoin() {
+        return leaderPauseOnJoin;
+    }
+
+    /**
+     * Hard cap on how long the leader pauses production for a joining follower (#129), so a follower
+     * that dies mid-join cannot freeze the leader. Defaults to 10s.
+     *
+     * @return the maximum join-quiesce duration
+     */
+    public Duration joinQuiesceMaxDuration() {
+        return joinQuiesceMaxDuration;
+    }
+
+    /**
+     * How often a follower reports its apply progress to the leader (#129), driving the
+     * leader-pause-on-join release. Defaults to 500ms.
+     *
+     * @return the follower progress-report interval
+     */
+    public Duration followerProgressInterval() {
+        return followerProgressInterval;
+    }
+
+    /**
+     * Grace window after start during which a node that self-elects leader alone (pair mode) is not
+     * treated as a ready, caught-up leader (#129) — preventing a transient boot self-election from
+     * marking empty state as synced. Defaults to 2s.
+     *
+     * @return the peer-discovery grace window
+     */
+    public Duration joinPeerDiscoveryWindow() {
+        return joinPeerDiscoveryWindow;
+    }
+
+    /**
+     * How close (in sequences) a joining follower must be to the leader's current sequence to count as
+     * caught up and release the leader-pause-on-join gate (#129). Defaults to 0 (fully caught up).
+     *
+     * @return the join-sync lag threshold
+     */
+    public long joinSyncLagThreshold() {
+        return joinSyncLagThreshold;
+    }
+
     public static final class Builder {
         private final int quorum;
         private Duration operationTimeout = Duration.ofSeconds(30);
@@ -211,6 +357,17 @@ public final class ReplicationConfig {
         private FollowerIngestMode followerIngestMode = FollowerIngestMode.INLINE;
         private RelayDurability relayDurability = RelayDurability.OS_MANAGED;
         private Duration relayGroupCommitInterval = Duration.ofSeconds(1);
+        private boolean persistentResendLog = false;
+        private int resendLogSegmentMaxEntries = 65_536;
+        private Duration resendLogSegmentMaxAge = Duration.ofMinutes(5);
+        private long resendLogMaxEntries = 10_000_000L;
+        private int resendLogReadBatchMax = 5_000;
+        private int relayApplyBatchSize = 256;
+        private boolean leaderPauseOnJoin = false;
+        private Duration joinQuiesceMaxDuration = Duration.ofSeconds(10);
+        private Duration followerProgressInterval = Duration.ofMillis(500);
+        private Duration joinPeerDiscoveryWindow = Duration.ofSeconds(2);
+        private long joinSyncLagThreshold = 0L;
 
         private Builder(int quorum) {
             if (quorum < 1) {
@@ -369,6 +526,161 @@ public final class ReplicationConfig {
             return this;
         }
 
+        /**
+         * Enables the disk-backed resend op-log (#127). See {@link #persistentResendLog()}. Pair with
+         * {@link #replicationLogRetentionTime(Duration)} to set the temporal backlog window.
+         *
+         * @param persistentResendLog {@code true} to back the resend op-log with the on-disk store
+         * @return this builder
+         */
+        public Builder persistentResendLog(boolean persistentResendLog) {
+            this.persistentResendLog = persistentResendLog;
+            return this;
+        }
+
+        /**
+         * Sets the per-segment entry cap for the on-disk resend op-log.
+         *
+         * @param maxEntries entries per segment (must be >= 1)
+         * @return this builder
+         */
+        public Builder resendLogSegmentMaxEntries(int maxEntries) {
+            if (maxEntries < 1) {
+                throw new IllegalArgumentException("resendLogSegmentMaxEntries must be >= 1");
+            }
+            this.resendLogSegmentMaxEntries = maxEntries;
+            return this;
+        }
+
+        /**
+         * Sets the per-segment max age for the on-disk resend op-log. {@link Duration#ZERO} disables
+         * age-based segment rolling.
+         *
+         * @param maxAge the per-segment max age (must not be negative)
+         * @return this builder
+         */
+        public Builder resendLogSegmentMaxAge(Duration maxAge) {
+            Objects.requireNonNull(maxAge, "resendLogSegmentMaxAge");
+            if (maxAge.isNegative()) {
+                throw new IllegalArgumentException("resendLogSegmentMaxAge must not be negative");
+            }
+            this.resendLogSegmentMaxAge = maxAge;
+            return this;
+        }
+
+        /**
+         * Sets the hard disk-side count backstop per topic for the on-disk resend op-log.
+         *
+         * @param maxEntries the disk entry cap (must be >= 1)
+         * @return this builder
+         */
+        public Builder resendLogMaxEntries(long maxEntries) {
+            if (maxEntries < 1) {
+                throw new IllegalArgumentException("resendLogMaxEntries must be >= 1");
+            }
+            this.resendLogMaxEntries = maxEntries;
+            return this;
+        }
+
+        /**
+         * Sets the maximum number of sequences served from the disk resend op-log in one response.
+         *
+         * @param maxBatch the per-response read cap (must be >= 1)
+         * @return this builder
+         */
+        public Builder resendLogReadBatchMax(int maxBatch) {
+            if (maxBatch < 1) {
+                throw new IllegalArgumentException("resendLogReadBatchMax must be >= 1");
+            }
+            this.resendLogReadBatchMax = maxBatch;
+            return this;
+        }
+
+        /**
+         * Sets how many relay-log entries a follower's apply consumer drains per batch (#128).
+         *
+         * @param batchSize the relay apply batch size (must be >= 1)
+         * @return this builder
+         */
+        public Builder relayApplyBatchSize(int batchSize) {
+            if (batchSize < 1) {
+                throw new IllegalArgumentException("relayApplyBatchSize must be >= 1");
+            }
+            this.relayApplyBatchSize = batchSize;
+            return this;
+        }
+
+        /**
+         * Enables leader-pause-on-join (#129). See {@link #leaderPauseOnJoin()}. Defaults to
+         * {@code false}.
+         *
+         * @param leaderPauseOnJoin {@code true} to pause production while a behind follower joins
+         * @return this builder
+         */
+        public Builder leaderPauseOnJoin(boolean leaderPauseOnJoin) {
+            this.leaderPauseOnJoin = leaderPauseOnJoin;
+            return this;
+        }
+
+        /**
+         * Sets the hard cap on a join-quiesce pause (#129).
+         *
+         * @param duration the maximum join-quiesce duration (must be positive)
+         * @return this builder
+         */
+        public Builder joinQuiesceMaxDuration(Duration duration) {
+            Objects.requireNonNull(duration, "joinQuiesceMaxDuration");
+            if (duration.isNegative() || duration.isZero()) {
+                throw new IllegalArgumentException("joinQuiesceMaxDuration must be positive");
+            }
+            this.joinQuiesceMaxDuration = duration;
+            return this;
+        }
+
+        /**
+         * Sets how often a follower reports apply progress to the leader (#129).
+         *
+         * @param interval the progress-report interval (must be positive)
+         * @return this builder
+         */
+        public Builder followerProgressInterval(Duration interval) {
+            Objects.requireNonNull(interval, "followerProgressInterval");
+            if (interval.isNegative() || interval.isZero()) {
+                throw new IllegalArgumentException("followerProgressInterval must be positive");
+            }
+            this.followerProgressInterval = interval;
+            return this;
+        }
+
+        /**
+         * Sets the peer-discovery grace window for the boot self-election guard (#129).
+         *
+         * @param window the grace window (must not be negative)
+         * @return this builder
+         */
+        public Builder joinPeerDiscoveryWindow(Duration window) {
+            Objects.requireNonNull(window, "joinPeerDiscoveryWindow");
+            if (window.isNegative()) {
+                throw new IllegalArgumentException("joinPeerDiscoveryWindow must not be negative");
+            }
+            this.joinPeerDiscoveryWindow = window;
+            return this;
+        }
+
+        /**
+         * Sets how close a joining follower must be to release the leader-pause-on-join gate (#129).
+         *
+         * @param threshold the lag threshold in sequences (must be >= 0)
+         * @return this builder
+         */
+        public Builder joinSyncLagThreshold(long threshold) {
+            if (threshold < 0) {
+                throw new IllegalArgumentException("joinSyncLagThreshold must be >= 0");
+            }
+            this.joinSyncLagThreshold = threshold;
+            return this;
+        }
+
         public ReplicationConfig build() {
             if (dataDirectory == null) {
                 throw new IllegalStateException("dataDirectory must be set");
@@ -376,7 +688,9 @@ public final class ReplicationConfig {
             return new ReplicationConfig(quorum, operationTimeout, retryInterval, strictConsistency, dataDirectory,
                     resendGapThreshold, resendTimeout, replicationLogRetention, replicationLogRetentionTime,
                     appliedSetMaxSize, operationLogMaxSize, leaderLocalApply, followerIngestMode, relayDurability,
-                    relayGroupCommitInterval);
+                    relayGroupCommitInterval, persistentResendLog, resendLogSegmentMaxEntries, resendLogSegmentMaxAge,
+                    resendLogMaxEntries, resendLogReadBatchMax, relayApplyBatchSize, leaderPauseOnJoin,
+                    joinQuiesceMaxDuration, followerProgressInterval, joinPeerDiscoveryWindow, joinSyncLagThreshold);
         }
     }
 }

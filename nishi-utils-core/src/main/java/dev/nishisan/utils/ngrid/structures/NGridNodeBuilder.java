@@ -56,6 +56,9 @@ public final class NGridNodeBuilder {
     private boolean strictConsistency = true;
     private FollowerIngestMode followerIngestMode = FollowerIngestMode.INLINE;
     private RelayDurability relayDurability = RelayDurability.OS_MANAGED;
+    private boolean persistentResendLog = false;
+    private int relayApplyBatchSize = 256;
+    private boolean leaderPauseOnJoin = false;
 
     NGridNodeBuilder(String host, int port) {
         this.host = Objects.requireNonNull(host, "host");
@@ -208,6 +211,47 @@ public final class NGridNodeBuilder {
     }
 
     /**
+     * Enables the disk-backed resend op-log (#127), keeping the deep backlog window off-heap so a
+     * large {@link NGridConfig.Builder#replicationLogRetentionTime(java.time.Duration) temporal
+     * window} does not pressure the JVM heap. Defaults to {@code false}.
+     *
+     * @param persistentResendLog {@code true} to enable the on-disk resend op-log
+     * @return this builder
+     */
+    public NGridNodeBuilder persistentResendLog(boolean persistentResendLog) {
+        this.persistentResendLog = persistentResendLog;
+        return this;
+    }
+
+    /**
+     * Sets how many relay-log entries the follower apply consumer drains per batch (#128), raising
+     * apply throughput under burst while keeping strict in-order application. Defaults to 256.
+     *
+     * @param batchSize the relay apply batch size (must be >= 1)
+     * @return this builder
+     */
+    public NGridNodeBuilder relayApplyBatchSize(int batchSize) {
+        if (batchSize < 1) {
+            throw new IllegalArgumentException("relayApplyBatchSize must be >= 1");
+        }
+        this.relayApplyBatchSize = batchSize;
+        return this;
+    }
+
+    /**
+     * Enables leader-pause-on-join (#129): the leader pauses production while a not-caught-up follower
+     * joins, generalizing the failover drain-gate to the join path for deterministic bootstrap
+     * convergence. Bounded and released on catch-up/disconnect/timeout. Defaults to {@code false}.
+     *
+     * @param leaderPauseOnJoin {@code true} to pause production while a behind follower joins
+     * @return this builder
+     */
+    public NGridNodeBuilder leaderPauseOnJoin(boolean leaderPauseOnJoin) {
+        this.leaderPauseOnJoin = leaderPauseOnJoin;
+        return this;
+    }
+
+    /**
      * Builds and starts the node.
      * <p>
      * If no data directory is specified, the build will fail for
@@ -228,7 +272,10 @@ public final class NGridNodeBuilder {
         NGridConfig.Builder builder = NGridConfig.builder(localInfo)
                 .strictConsistency(strictConsistency)
                 .followerIngestMode(followerIngestMode)
-                .relayDurability(relayDurability);
+                .relayDurability(relayDurability)
+                .persistentResendLog(persistentResendLog)
+                .relayApplyBatchSize(relayApplyBatchSize)
+                .leaderPauseOnJoin(leaderPauseOnJoin);
 
         if (dataDir != null) {
             builder.dataDirectory(dataDir);

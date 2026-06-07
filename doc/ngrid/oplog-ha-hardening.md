@@ -264,3 +264,150 @@ NGridConfig.builder(local)
 - **Failover 3-nós:** o novo líder só fica *ready* (`isLeaderSyncing()==false`) após drenar o relay;
   escrita volta; sem divergência.
 - Suíte de resiliência completa verde; **INLINE inalterado** (default, compat 4.3.0).
+
+---
+
+## 10. Op-log de resend do líder em disco (#127, 4.5.0)
+
+### Problema
+
+O op-log de resend do líder vivia em **heap** (`Map<String, NavigableMap<Long, TimedPayload>>`,
+TreeMap sincronizado). Era capado por **contagem** (`replicationLogRetention`, teto de memória) **e**
+por **tempo** (`replicationLogRetentionTime`, janela de backlog) — o que evictar primeiro vence. Sob
+**alta produção** (replay de ~24h a ~5x tempo-real), cobrir uma janela de 30 min em heap estouraria a
+memória, então o teto por **contagem** vence e a janela temporal vira segundos. Quando o follower
+instala o snapshot no ponto `S` e pede `S+1..`, o líder **já evictou** essas sequências →
+`missing sequences → snapshot fallback` em loop, e o relay do follower cresce sem limite (18 GB
+observados em minutos).
+
+### Solução — `ResendLog` (store próprio, híbrido)
+
+Backear o op-log de resend por um **store sequencial próprio em disco**, mantendo um **cache quente em
+heap** para os deltas recentes:
+
+- **`ResendLog`** (um por tópico): log **append-only segmentado**, indexado por sequência. Cada
+  segmento é um arquivo (`seg-NNN.dat`) com registros `[len][timestamp][frame]`, onde `frame` reusa o
+  `RelayEntryCodec` (mesma tupla do relay). O índice em memória por segmento é um par de arrays
+  primitivos `sequences[]`/`offsets[]` **ordenado por inserção binária** — compacto (sem boxing) e
+  **tolerante a commits fora de ordem** (o commit por quórum não respeita a ordem de sequência, então
+  o índice precisa ordenar como o `TreeMap` do heap ordenava).
+- **Auto-compactação barata:** a retenção descarta **segmentos inteiros** (deleta o arquivo, sem
+  reescrita), governada pela **janela temporal** (`replicationLogRetentionTime`) e por um backstop de
+  contagem em disco (`resendLogMaxEntries`).
+- **Híbrido:** `indexReplicationPayload` faz *dual-write* — heap (cache quente, capado por
+  `replicationLogRetention`) **e** disco. `handleSequenceResendRequest` lê heap primeiro e cai no disco
+  para o restante; uma sequência ausente em ambos vira `missingSequences` (caminho de snapshot
+  existente, sem divergência). Falha de I/O do op-log **não** falha o commit.
+- **Por que não NQueue/NMap:** o padrão de acesso é *append* + **leitura aleatória por sequência**
+  (`get(seq)`/range), que NQueue (FIFO) não serve e NMap só com eviction composta manual. O log
+  segmentado dá os dois com índice compacto e compactação por segmento.
+
+### Configuração
+
+```java
+.persistentResendLog(true)                       // liga o tier de disco (default false)
+.replicationLogRetentionTime(Duration.ofMinutes(30)) // janela temporal (governa o disco)
+// avançado (ReplicationConfig): resendLogSegmentMaxEntries, resendLogSegmentMaxAge,
+//                               resendLogMaxEntries, resendLogReadBatchMax
+```
+
+### Diagrama
+
+![Op-log de resend segmentado em disco](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan-dev/nishi-utils/main/doc/diagrams/ngrid_resend_oplog_segmented.puml)
+
+### Validação
+
+- `ResendLogTest` (9): get/range/gaps, **chegada fora de ordem**, eviction por contagem e por tempo,
+  reopen limpo e recuperação de registro rasgado.
+- `PersistentResendLogRegressionTest` (2): com cap por contagem baixo + janela temporal grande, o
+  op-log só-heap reporta o gap de bootstrap como *missing* (espiral), enquanto o op-log em disco serve
+  o gap da janela temporal (sem fallback).
+
+---
+
+## 11. Throughput de apply em lote + métricas de relay (#128, 4.5.0)
+
+### Problema
+
+O consumidor de apply do relay drenava **1-a-1** (`peek → apply → poll`). Sob burst, o apply do
+follower (~1.850 ops/s) não acompanhava a produção do líder (~2.600+ ops/s) e o lag crescia
+monotonicamente. Faltava também **métrica pública** de tamanho/idade do relay (o cardinal só inferia
+lag por `getGlobalSequence() − getLastAppliedSequence()`).
+
+### Solução — apply em lote (ordem estrita preservada)
+
+- `drainRelayOnce` passa a fazer **batch-peek** (`NQueue.readRange(0, batchSize)`, leitura
+  não-consumidora), aplica o prefixo contíguo em ordem e faz **um único commit de frontier por lote**
+  (`commitRelayBatch`), polando o prefixo consumido **só após** apply+commit. O consumidor continua
+  **single-thread por tópico** e a ordem por sequência é estrita — paralelismo por chave foi
+  **descartado** (risco de ordem/fencing, a classe de bug #124). Falha de apply no meio do lote commita
+  o prefixo bem-sucedido e re-lança para o backoff do loop.
+- Knob **`relayApplyBatchSize`** (default 256). O ganho vem de amortizar o overhead por-op
+  (lock/flush/contadores/round-trips de peek-poll) ao longo do lote.
+
+### Métricas públicas de lag
+
+`ReplicationManager` (alcançável via `NGridNode.replicationManager()`):
+
+- **`getRelaySize(topic)`** — backlog durável de apply do tópico (cresce com o lag, drena com o apply).
+- **`getRelayHeadAgeMillis(topic)`** — há quanto tempo a cabeça do relay espera (idade do lag).
+- **`getRelaySizes()`** — mapa tópico → backlog para dashboards.
+
+### Diagrama
+
+![Apply do relay em lote](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan-dev/nishi-utils/main/doc/diagrams/ngrid_relay_batch_apply.puml)
+
+### Validação
+
+- `RelayLogReplicationTest#relayBacklogMetricsReflectLagAndDrain`: o backlog é observável via a métrica
+  enquanto drena, drena a zero na convergência, e o apply em lote converge em ordem (cabeça = 1º item).
+
+---
+
+## 12. Convergência determinística no join (#129, 4.5.0)
+
+### Problemas
+
+1. **Bootstrap reativo:** em RELAY_LOG o follower só dispara sync ao ver gap no tráfego de op-log. Um
+   follower **novo** (estado vazio) contra um líder **quiescente** (sem tráfego) **nunca sincroniza** —
+   fica inerte mesmo conectado.
+2. **Auto-eleição transitória no boot:** com pair mode/`minClusterSize=1`, o nó se auto-elege líder no
+   boot antes de enxergar o peer e stepa para follower em ~0,4s; ao se eleger no vazio, marca-se como
+   *caught-up* e carrega essa crença falsa para o papel de follower.
+
+### Solução
+
+- **(3a) Sync proativo no join:** `checkProactiveJoinSync` — um follower que nada aplicou para um
+  tópico, com relay vazio, e que vê (pelo **watermark do heartbeat**) que o líder tem dados, dispara
+  **um** snapshot por termo. Não depende de tráfego de op-log; distingue o cold-join genuíno do lag
+  em-regime (que o relay absorve).
+- **(3b) Leader-pause-on-join (opt-in):** espelho do drain-gate de failover no caminho de join. O
+  líder rastreia o progresso dos followers (novo `FOLLOWER_PROGRESS`) e, ao detectar um follower
+  atrasado entrando (`onMembershipChanged`), **pausa a produção** (`replicate` rejeita com
+  `LeaderSyncingException`) até ele alcançar / desconectar / estourar `joinQuiesceMaxDuration`. Bounded:
+  um follower que morre no join **não** congela o líder.
+- **(3c) Sem caught-up transitório:** um nó que se auto-elege sozinho dentro da
+  `joinPeerDiscoveryWindow` **não** libera o drain-gate por relay vazio (não se anuncia como líder
+  sincronizado no vazio); ao ver o peer, stepa para follower e o (3a) converge.
+
+> **(3a) e (3b) andam juntas:** pausar o líder sem o follower sincronizar proativamente pioraria o
+> quadro. Por isso o (3a) é sempre ativo em RELAY_LOG e o (3b) é opt-in sobre ele.
+
+### Configuração
+
+```java
+.leaderPauseOnJoin(true)                       // opt-in (default false)
+.joinQuiesceMaxDuration(Duration.ofSeconds(10))
+// avançado (ReplicationConfig): followerProgressInterval, joinPeerDiscoveryWindow, joinSyncLagThreshold
+```
+
+### Diagrama
+
+![Sync proativo no join + leader-pause-on-join](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan-dev/nishi-utils/main/doc/diagrams/ngrid_join_quiesce_proactive_sync.puml)
+
+### Validação
+
+- `RelayLogReplicationTest#proactiveSyncConvergesFreshFollowerAgainstQuiescentLeader`: follower limpo
+  reinicia contra um líder que não produz mais nada e converge **só** via sync proativo.
+- `LeaderPauseOnJoinTest`: o líder rejeita escritas enquanto um follower atrasado entra e retoma quando
+  ele reporta *caught-up*.

@@ -17,6 +17,7 @@
 
 package dev.nishisan.utils.ngrid.structures;
 
+import dev.nishisan.utils.ngrid.BroadcastListener;
 import dev.nishisan.utils.ngrid.cluster.coordination.ClusterCoordinator;
 import dev.nishisan.utils.ngrid.cluster.coordination.ClusterCoordinatorConfig;
 
@@ -362,6 +363,10 @@ public final class NGridNode implements Closeable {
         replicationBuilder.followerIngestMode(config.followerIngestMode());
         replicationBuilder.relayDurability(config.relayDurability());
         replicationBuilder.relayGroupCommitInterval(config.relayGroupCommitInterval());
+        replicationBuilder.persistentResendLog(config.persistentResendLog());
+        replicationBuilder.relayApplyBatchSize(config.relayApplyBatchSize());
+        replicationBuilder.leaderPauseOnJoin(config.leaderPauseOnJoin());
+        replicationBuilder.joinQuiesceMaxDuration(config.joinQuiesceMaxDuration());
 
         // Determine replication data directory
         Path replicationDataDir;
@@ -543,6 +548,36 @@ public final class NGridNode implements Closeable {
 
     public ReplicationManager replicationManager() {
         return replicationManager;
+    }
+
+    /**
+     * Broadcasts a small, best-effort message to every node in the cluster, including this one
+     * (loopback). Delivered to listeners registered via {@link #addBroadcastListener(BroadcastListener)}
+     * with the producer's node id. Fire-and-forget: not ordered, not durable — for guaranteed delivery
+     * use a distributed queue. Lets code coordinating over the cluster exchange lightweight signals.
+     *
+     * @param message the message body (must not be {@code null})
+     */
+    public void broadcastMessage(String message) {
+        replicationManager.broadcastMessage(message);
+    }
+
+    /**
+     * Registers a listener for user-level broadcast messages (see {@link #broadcastMessage(String)}).
+     *
+     * @param listener the listener (must not be {@code null})
+     */
+    public void addBroadcastListener(BroadcastListener listener) {
+        replicationManager.addBroadcastListener(listener);
+    }
+
+    /**
+     * Removes a previously registered broadcast listener.
+     *
+     * @param listener the listener to remove
+     */
+    public void removeBroadcastListener(BroadcastListener listener) {
+        replicationManager.removeBroadcastListener(listener);
     }
 
     /**

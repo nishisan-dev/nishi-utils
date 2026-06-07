@@ -1,0 +1,28 @@
+@startuml
+title Apply do relay em lote (#128) — throughput sem perder ordem/fencing
+
+participant "Apply consumer\n(single-thread por topico)" as APPLY
+database "Relay (NQueue<byte[]>)" as RELAY
+participant "Handler\n(queue/map)" as H
+
+== Batch drain (1 lote por iteracao) ==
+APPLY -> RELAY : readRange(0, relayApplyBatchSize)\n(peek NAO consumidor)
+note over APPLY : caminha o lote em ORDEM,\nnextExpected local
+loop para cada frame do lote
+  alt epoch < lastSeen OU seq < nextExpected
+    APPLY -> APPLY : consumed++ (stale/dup, descarta)
+  else seq == nextExpected
+    APPLY -> H : apply(opId, decode(payload))
+    APPLY -> APPLY : nextExpected++ ; consumed++
+  else seq > nextExpected (gap)
+    APPLY -> APPLY : para o lote (gap entry)
+  end
+end
+
+== Commit unico do lote ==
+APPLY -> APPLY : commitRelayBatch()\n(1 lock: avanca frontier,\napplied set, recordApplied(n))
+APPLY -> RELAY : poll() x consumed\n(so APOS apply + commit)
+note over APPLY : effectively-once preservado\n(fencing por epoch,seq);\nfalha no meio: commita prefixo, re-lanca p/ backoff
+
+note over APPLY : metricas: getRelaySize(topic),\ngetRelayHeadAgeMillis(topic), getRelaySizes()
+@enduml

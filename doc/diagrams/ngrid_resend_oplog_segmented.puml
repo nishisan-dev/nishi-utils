@@ -1,0 +1,28 @@
+@startuml
+title Op-log de resend do lider em disco (#127) — hibrido (cache heap + ResendLog segmentado)
+
+participant "completeOperation\n(commit)" as COMMIT
+participant "indexReplicationPayload" as IDX
+collections "Heap hot cache\nTreeMap (recente)\ncap: replicationLogRetention" as HEAP
+database "ResendLog (1 por topico)\nsegmentos append-only\nindex seq->offset ordenado" as DISK
+participant "handleSequenceResendRequest" as RESEND
+participant "Follower\n(catching up)" as FOL
+
+== Commit (dual-write) ==
+COMMIT -> IDX : (topico, seq, payload)
+IDX -> HEAP : put(seq) ; evict por contagem
+IDX -> DISK : append(seq, ts, frame)
+note over DISK : auto-compactacao por\nDESCARTE DE SEGMENTO\n(janela temporal\nreplicationLogRetentionTime)
+
+== Resend (merge heap + disco) ==
+FOL -> RESEND : SEQUENCE_RESEND_REQUEST [from..to]
+RESEND -> HEAP : get(seq) (recente)
+RESEND -> DISK : read(from..to) (janela profunda, off-heap)
+alt presente em heap OU disco
+  RESEND --> FOL : operations[]
+else ausente (nunca indexado / evictado por tempo)
+  RESEND --> FOL : missingSequences -> snapshot fallback
+end
+
+note over HEAP, DISK : antes (so-heap): contagem vencia o tempo sob carga\n=> gap de bootstrap evictado => snapshot em loop (espiral #124)\nagora: janela governada por TEMPO em disco, sem pressao de heap
+@enduml
