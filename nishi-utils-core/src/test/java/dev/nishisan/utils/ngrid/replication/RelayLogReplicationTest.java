@@ -70,6 +70,10 @@ class RelayLogReplicationTest {
             // Converged via the relay, NOT via a snapshot reset (the failure mode #124 removes).
             assertEquals(0L, follower.replicationManager().getSnapshotFallbackCount(),
                     "relay regime must converge without snapshot fallback");
+            // Cutover (decision A): the relay-log fully replaces the in-memory sequence buffer — it is
+            // never touched in RELAY_LOG, no fallback to the legacy path.
+            assertEquals(0L, follower.replicationManager().getInlineSequenceBufferSize(),
+                    "RELAY_LOG must not use the legacy in-memory sequence buffer");
 
             // Concrete local-replica checks on the follower.
             DistributedQueue<String> followerQueue = follower.getQueue("relay-queue", String.class);

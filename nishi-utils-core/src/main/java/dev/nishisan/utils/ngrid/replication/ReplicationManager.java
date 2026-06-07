@@ -1812,6 +1812,26 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         return gapsDetected.get();
     }
 
+    /**
+     * Total entries held in the legacy in-memory sequence buffer (the INLINE ingestion path). In
+     * {@link FollowerIngestMode#RELAY_LOG} this must stay {@code 0}: the durable relay-log fully
+     * replaces the in-memory buffer (cutover, decision A) — there is no fallback to it.
+     *
+     * @return the total number of buffered entries across all topics
+     */
+    public long getInlineSequenceBufferSize() {
+        acquireSequenceLock();
+        try {
+            long total = 0;
+            for (PriorityQueue<BufferedReplication> buffer : sequenceBufferByTopic.values()) {
+                total += buffer.size();
+            }
+            return total;
+        } finally {
+            sequenceBufferLock.unlock();
+        }
+    }
+
     public long getResendSuccessCount() {
         return resendSuccessCount.get();
     }
