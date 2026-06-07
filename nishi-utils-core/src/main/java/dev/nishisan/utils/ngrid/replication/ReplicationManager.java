@@ -272,6 +272,12 @@ public class ReplicationManager
             return;
         }
         running = true;
+        // Wire the leader high-watermark supplier so heartbeats carry a real watermark even when the
+        // ReplicationManager is assembled manually (without NGridNode). The follower reads this
+        // watermark to drive the proactive cold-join sync (#129); the coordinator default (-1) starved
+        // it, so a fresh follower never converged against a quiescent leader in manual assemblies (#131).
+        coordinator.setLeaderHighWatermarkSupplier(
+                () -> coordinator.isLeader() ? getGlobalSequence() : getLastAppliedSequence());
         if (isRelayMode()) {
             detectUncleanRestartAndMarkBootstrap();
             // Relay retention mirrors the leader op-log window (#122): an over-retention
@@ -2440,12 +2446,16 @@ public class ReplicationManager
         if (!running || coordinator.isLeader()) {
             return;
         }
-        long leaderWatermark = coordinator.getTrackedLeaderHighWatermark();
-        if (leaderWatermark <= 0 || leaderWatermark <= lastAppliedSequence) {
-            return; // leader has no data, or we are already at/above its watermark
-        }
         if (coordinator.leaderInfo().isEmpty()) {
             return; // no leader to sync from yet
+        }
+        long leaderWatermark = coordinator.getTrackedLeaderHighWatermark();
+        // Skip ONLY when the leader watermark is KNOWN (>0) and we have already caught up to it. An
+        // unknown watermark (<=0: supplier not wired, or no heartbeat seen yet) must NOT block a cold
+        // follower — treat it as "the leader may hold data, sync to be safe" (#131). Worst case is an
+        // empty snapshot, fired once per term (proactiveSyncRequested), which is harmless.
+        if (leaderWatermark > 0 && lastAppliedSequence >= leaderWatermark) {
+            return;
         }
         for (String topic : handlers.keySet()) {
             if (syncingTopics.contains(topic) || proactiveSyncRequested.contains(topic)) {
