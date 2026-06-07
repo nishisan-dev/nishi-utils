@@ -1,0 +1,31 @@
+@startuml
+title Relay-log no follower (#124) — recepcao desacoplada do apply
+
+participant "Lider" as LDR
+participant "Follower\nhandleReplicationRequest" as IO
+database "Relay (NQueue<byte[]>)\n1 por topico" as RELAY
+participant "Apply consumer\n(por topico)" as APPLY
+participant "Handler\n(queue/map)" as H
+
+== IO path (barato, acompanha o lider) ==
+LDR -> IO : REPLICATION_REQUEST (epoch, seq, payload)
+note over IO : fencing por epoch\n(descarta epoch obsoleto)
+IO -> RELAY : offer(RelayEntry<epoch-seq, payloadBytes>)
+note over RELAY : duravel; nunca dropa nao-aplicado\n(clamp-to-consumer)
+IO --> LDR : REPLICATION_ACK\n(recepcao duravel = quorum)
+
+== Apply path (proprio ritmo, pode ficar atras) ==
+APPLY -> RELAY : peek() (cabeca)
+alt seq < nextExpected (duplicata/stale)
+  APPLY -> RELAY : poll() (descarta — fencing)
+else seq == nextExpected
+  APPLY -> H : apply(opId, decode(payload))
+  APPLY -> APPLY : nextExpected++
+  APPLY -> RELAY : poll()
+else seq > nextExpected (gap de transporte)
+  APPLY -> APPLY : buffer fino + requestResend(nextExpected..seq-1)
+  note over APPLY : backlog grande mora no disco (sem OOM)
+end
+
+note over APPLY : lag NAO dispara snapshot (relay absorve);\nbootstrap so para o irrecuperavel
+@enduml

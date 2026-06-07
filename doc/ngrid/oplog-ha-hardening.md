@@ -175,3 +175,92 @@ Pela facade `NGridConfig.Builder` os dois knobs de retenção também estão exp
 - Resiliência: follower vivo no soak, **0** timeouts de lock, **0** "missing", sem freeze.
 - Failover (pair mode): matar o líder → sobrevivente assume sozinho e retoma o consumo.
 - Reconciliação: religar o nó de maior NodeId → ele retoma a liderança, o outro faz step-down.
+
+## Relay-log no follower (#124)
+
+> Evolução do modelo de ingestão do follower, **opt-in** atrás de `FollowerIngestMode.RELAY_LOG`
+> (default `INLINE` preserva o comportamento 4.3.0). Elimina a **espiral de morte** do follower sob
+> volume real.
+
+### Problema (espiral de morte)
+
+Sob ~2.8k ops/s o follower INLINE colapsava: quando o gap passava de `MAX_SEQUENCE_BUFFER` (250k) — ou o
+lag passava de `SYNC_THRESHOLD` (500) — a lib pedia snapshot; `resetState()` zerava o estado em memória
+e reinstalava um **full-snapshot que cresce com o estado** (379 → 716 MB). O líder ficava em starvation
+servindo snapshots gigantes e o follower nunca convergia. A reação ao atraso (`apply < produção`) era
+**destruir o estado e recarregar tudo** — o oposto do desejável.
+
+### Modelo-alvo (estilo MySQL relay log)
+
+Desacopla **recepção** de **aplicação**:
+
+1. **IO path (barato):** cada `REPLICATION_REQUEST` é persistido num **relay-log em disco (NQueue), um
+   por tópico**, em ordem de chegada, com frame `<epoch>-<seq>` + payload. O ACK sai na **recepção
+   durável** (quórum = "durável em N relays"), não no apply.
+2. **Apply path (próprio ritmo):** um consumer por tópico drena o relay: `peek` → **fencing por
+   (epoch, seq)** → `apply` → `poll`. O fencing por sequência é o que garante *effectively-once* mesmo
+   com o `OFFER` da queue (não-idempotente). Gaps de transporte usam um buffer fino de reordenação +
+   resend; o backlog grande mora no disco (fim do OOM do buffer de 250k).
+3. **Sem snapshot em regime:** o lag é absorvido pelo relay; `checkLagAndSync` não pede mais snapshot no
+   modo relay. Snapshot fica só para o irrecuperável (bootstrap).
+4. **Failover drain-gate:** ao ser promovido, o nó segura escrita (`LeaderSyncingException`) até
+   **drenar o relay** (não até "snapshot instalado"); release por relay vazio, **sem depender de peer**.
+
+### Extensão NQueue (fundação)
+
+- **`withRetentionClampToConsumer(true)`** — a retenção `TIME_BASED` **nunca descarta registros
+  não-aplicados**; só recupera o prefixo já consumido. Sem isso, a compaction por tempo apagava ops
+  ainda não aplicadas (perda silenciosa) — era o ponto make-or-break.
+- **Fix do `recordCount`** — recontagem do segmento vivo após compaction `TIME_BASED` (o contador ficava
+  defasado, corrompendo `size()`/métricas/drain-gate).
+
+### Durabilidade configurável (análogo ao `sync_relay_log` do MySQL)
+
+`RelayDurability` controla o fsync do tail do relay — trade-off **taxa × janela de perda**, não de
+correção (o tail perdido é re-buscado pelo resend do líder, #122):
+
+- `OS_MANAGED` (default) — sem fsync explícito (~213k ops/s no spike); janela coberta pelo resend.
+- `GROUP_COMMIT` — fsync periódico (group commit) via `NQueue.sync()`.
+- `ALWAYS` — fsync por op (mais durável, ~481 ops/s no spike).
+
+A **crash-safety contra duplicação** (o `OFFER` não-idempotente) é estrutural, não por frequência de
+fsync (análogo ao `relay_log_info_repository=TABLE` do MySQL): um **clean-shutdown marker** distingue
+parada limpa (resume do frontier) de crash (bootstrap que substitui o estado).
+
+### Acumulação ilimitada / relay-only (comportamento tipo MySQL)
+
+Com `replicationLogRetentionTime=0` (default), o relay **acumula indefinidamente** os ops não-aplicados
+(até encher o disco, como o relay log do MySQL sem purge): se o apply travar por erro crítico, os ops
+ficam duráveis e são aplicados depois — **lag ≠ perda**. Setar `retentionTime > 0` ativa o **cap opt-in**
+(decisão E): cabeça mais velha que a janela → bootstrap.
+
+Para o lag puro (em ordem), o follower **já usa só relay-log** — não pede snapshot por mais atrás que
+fique. Os únicos snapshots remanescentes são para o que o relay/resend **não conseguem reconstruir**: gap
+cuja op foi evictada do op-log do líder, estouro do reorder-buffer e restart sujo. Para um "relay-only
+absoluto", basta reter o op-log do líder o suficiente (resend sempre preenche) — evolução futura: um flag
+explícito (`relayOnlyNoBootstrap`) + co-location atômica do cursor.
+
+### Configuração
+
+```java
+NGridConfig.builder(local)
+    .followerIngestMode(FollowerIngestMode.RELAY_LOG)    // opt-in; default INLINE
+    .relayDurability(RelayDurability.OS_MANAGED)          // OS_MANAGED | GROUP_COMMIT | ALWAYS
+    .replicationLogRetentionTime(Duration.ZERO)          // 0 = relay ilimitado (acumula e aplica depois)
+    .build();
+```
+
+### Diagramas
+
+![Relay-log — recepção desacoplada do apply](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan-dev/nishi-utils/main/doc/diagrams/ngrid_relay_log_apply.puml)
+
+![Failover drain-gate (relay drenado antes de liderar)](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan-dev/nishi-utils/main/doc/diagrams/ngrid_relay_failover_drain_gate.puml)
+
+### Validação
+
+- **E2E:** follower converge via relay (queue + map), sem snapshot fallback, buffer inline em 0.
+- **Aceite central:** carga sustentada de 10k ops, lag muito além dos limiares → converge com **0**
+  snapshot/sync e sem reset (head ainda na 1ª op) — espiral eliminada.
+- **Failover 3-nós:** o novo líder só fica *ready* (`isLeaderSyncing()==false`) após drenar o relay;
+  escrita volta; sem divergência.
+- Suíte de resiliência completa verde; **INLINE inalterado** (default, compat 4.3.0).
