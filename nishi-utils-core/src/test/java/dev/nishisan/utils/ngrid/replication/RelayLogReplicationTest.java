@@ -132,6 +132,53 @@ class RelayLogReplicationTest {
     }
 
     /**
+     * ACEITE CENTRAL (#124): the death spiral reproduced and proven gone. Under sustained load the
+     * follower lags far past every legacy snapshot trigger (SYNC_THRESHOLD=500, MAX_SEQUENCE_BUFFER),
+     * which in INLINE drives the reset + growing-snapshot + leader-starvation spiral. In RELAY_LOG the
+     * lag is absorbed by the durable relay and worked off by the apply consumer: the follower converges
+     * with ZERO snapshot/sync requests, no reset, and bounded (not catastrophic) replica lag.
+     */
+    @Test
+    @Timeout(value = 120, unit = TimeUnit.SECONDS)
+    void deathSpiralEliminated_sustainedLagConvergesWithoutSnapshot() throws Exception {
+        NodeInfo infoA = new NodeInfo(NodeId.of("relay-soak-a"), "localhost", 9848);
+        NodeInfo infoB = new NodeInfo(NodeId.of("relay-soak-b"), "localhost", 9849);
+        Path base = Files.createTempDirectory("ngrid-relay-soak");
+
+        try (NGridNode a = relayNode(infoA, infoB, base.resolve("a"), 1);
+                NGridNode b = relayNode(infoB, infoA, base.resolve("b"), 1)) {
+            a.start();
+            b.start();
+            ClusterTestUtils.awaitClusterConsensus(a, b);
+            a.getQueue("soak-queue", String.class);
+            b.getQueue("soak-queue", String.class);
+
+            NGridNode leader = a.coordinator().isLeader() ? a : b;
+            NGridNode follower = (leader == a) ? b : a;
+
+            int totalOps = 10_000; // sustained load — lag builds far beyond every snapshot threshold
+            DistributedQueue<String> queue = leader.getQueue("soak-queue", String.class);
+            for (int i = 0; i < totalOps; i++) {
+                queue.offer("op-" + i);
+            }
+
+            long produced = leader.replicationManager().getGlobalSequence();
+            awaitApplied(follower, produced, 80_000);
+
+            // The acceptance: NO snapshot/sync ever fired despite a huge sustained lag (spiral gone),
+            // and the follower kept its state from the start (no reset/loss).
+            assertEquals(0L, follower.replicationManager().getSyncRequestCount(),
+                    "sustained lag must NOT trigger any snapshot/sync (death spiral eliminated)");
+            assertEquals(0L, follower.replicationManager().getSnapshotFallbackCount(),
+                    "no snapshot fallback under sustained load");
+            assertEquals(0L, follower.replicationManager().getInlineSequenceBufferSize(),
+                    "relay path only — the in-memory buffer that drove the OOM/spiral is unused");
+            assertEquals("op-0", follower.getQueue("soak-queue", String.class).peek().orElse(null),
+                    "the follower never reset its state — head is still the first op");
+        }
+    }
+
+    /**
      * Fase 5: after killing the leader, a surviving relay node may only become a <em>ready</em> leader
      * once its relay backlog has fully drained ({@code isLeaderSyncing()} stays true until then — the
      * failover drain-gate). Then writes succeed and the cluster stays consistent (no divergence).
