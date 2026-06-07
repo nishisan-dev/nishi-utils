@@ -193,7 +193,15 @@ class CompactionEngine {
                     FileChannel srcCh = srcRaf.getChannel()) {
 
                 if (options.retentionPolicy == NQueue.Options.RetentionPolicy.TIME_BASED) {
-                    copyStartOffset = findTimeBasedCutoff(srcCh, copyEndOffset);
+                    long timeCutoff = findTimeBasedCutoff(srcCh, copyEndOffset);
+                    // When clamping is enabled, never let the temporal cutoff advance past the
+                    // consumer: retention then reclaims only the already-consumed prefix and never
+                    // discards records the consumer has not yet read. A replay-log consumer relies
+                    // on this guarantee — an over-retention backlog must be surfaced via head age
+                    // and resolved by an explicit bootstrap, not silently truncated here.
+                    copyStartOffset = options.retentionClampToConsumer
+                            ? Math.min(timeCutoff, snap.consumerOffset)
+                            : timeCutoff;
                 }
 
                 if (copyEndOffset > copyStartOffset) {

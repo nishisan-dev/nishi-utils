@@ -78,4 +78,58 @@ class NQueueTimeBasedRetentionTest {
                     "a retencao TIME_BASED deve ter descartado o backlog expirado, restando so os jovens (drained=" + drained + ")");
         }
     }
+
+    /**
+     * With {@code withRetentionClampToConsumer(true)}, a TIME_BASED compaction must
+     * NOT discard records the consumer has not read yet, even when they are older
+     * than the retention window. The clamp anchors the cutoff at the consumer
+     * offset, so every unconsumed record survives — the guarantee the relay-log
+     * depends on (vs. the silent loss proven, without the clamp, by the spike).
+     */
+    @Test
+    void clampNeverDiscardsUnconsumed() throws Exception {
+        final Duration retention = Duration.ofMillis(200);
+        final String name = "clamp-timebased";
+        final int total = 200;
+        final int consumed = 5;
+        final NQueue.Options writeOpts = NQueue.Options.defaults()
+                .withFsync(false)
+                .withRetentionPolicy(NQueue.Options.RetentionPolicy.TIME_BASED)
+                .withRetentionTime(retention)
+                .withRetentionClampToConsumer(true) // the extension under test
+                .withCompactionInterval(Duration.ofMillis(50));
+
+        try (NQueue<Integer> q = NQueue.open(tempDir, name, writeOpts)) {
+            for (int i = 0; i < total; i++) {
+                q.offer(i);
+            }
+            for (int i = 0; i < consumed; i++) {
+                q.poll();
+            }
+            // All remaining records are now older than the retention window. Without
+            // the clamp they would be discarded; with it they must all survive.
+            Thread.sleep(retention.toMillis() + 250);
+        } // close() -> shutdown compaction (TIME_BASED + clamp): reclaims only the consumed prefix
+
+        NQueue.Options readOpts = NQueue.Options.defaults().withFsync(false);
+        try (NQueue<Integer> q = NQueue.open(tempDir, name, readOpts)) {
+            long reported = q.getRecordCount();
+            assertEquals(total - consumed, reported,
+                    "recordCount deve refletir o segmento vivo preservado pelo clamp");
+
+            int drained = 0;
+            Integer first = null;
+            java.util.Optional<Integer> v;
+            while ((v = q.poll(50, TimeUnit.MILLISECONDS)).isPresent()) {
+                if (first == null) {
+                    first = v.get();
+                }
+                drained++;
+            }
+            assertEquals(total - consumed, drained,
+                    "o clamp deve preservar TODOS os nao-consumidos expirados (sem perda silenciosa)");
+            assertEquals(Integer.valueOf(consumed), first,
+                    "a cabeca apos o clamp deve ser o primeiro nao-consumido (idx=" + consumed + ")");
+        }
+    }
 }
