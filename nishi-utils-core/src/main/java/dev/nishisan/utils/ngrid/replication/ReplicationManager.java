@@ -705,6 +705,14 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                     LOGGER.warning(() -> "Ignoring stale sync for " + payload.topic()
                             + " (sequence=" + payload.sequence() + ", current=" + currentApplied + ")");
                     syncingTopics.remove(payload.topic());
+                    // The local (newly promoted) leader already holds newer state than the peer's
+                    // snapshot, so this topic is effectively caught up. Release its leader-sync guard
+                    // too — otherwise leaderSyncing stays true forever (retryLeaderSync keeps pulling
+                    // the same older snapshot) and the write gate in replicate() rejects every write
+                    // even though the leader has the latest state.
+                    if (leaderSyncTopics.remove(payload.topic()) && leaderSyncTopics.isEmpty()) {
+                        leaderSyncing.set(false);
+                    }
                     return;
                 }
                 if (payload.chunkIndex() == 0) {

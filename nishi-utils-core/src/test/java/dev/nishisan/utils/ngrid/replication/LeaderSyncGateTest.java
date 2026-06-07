@@ -5,8 +5,10 @@ import dev.nishisan.utils.ngrid.cluster.coordination.ClusterCoordinatorConfig;
 import dev.nishisan.utils.ngrid.cluster.transport.Transport;
 import dev.nishisan.utils.ngrid.cluster.transport.TransportListener;
 import dev.nishisan.utils.ngrid.common.ClusterMessage;
+import dev.nishisan.utils.ngrid.common.MessageType;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
+import dev.nishisan.utils.ngrid.common.SyncResponsePayload;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -117,6 +119,51 @@ class LeaderSyncGateTest {
                 "with no reachable sync source the leaderSyncing flag must be cleared, not stuck");
         assertDoesNotThrow(() -> manager.replicate(TOPIC, "x"),
                 "a leader with nothing to sync should accept writes immediately");
+    }
+
+    @Test
+    @Timeout(30)
+    void staleSyncFromBehindPeerClearsLeaderSyncing() throws Exception {
+        // Local is a follower (lower NodeId); the peer is the active elected leader, so when we later
+        // simulate promotion, resolveSyncSource finds the peer and leaderSyncing stays true.
+        NodeInfo local = new NodeInfo(NodeId.of("aaa-node"), "127.0.0.1", 0);
+        NodeInfo peer = new NodeInfo(NodeId.of("zzz-leader"), "127.0.0.1", 0);
+        transport = new FakeTransport(local, List.of(peer));
+        coordinator = new ClusterCoordinator(transport, ClusterCoordinatorConfig.defaults(), scheduler);
+        coordinator.start();
+        transport.simulatePeerConnected(peer); // synchronously marks the peer active
+
+        manager = newManager();
+        manager.registerHandler(TOPIC, (opId, payload) -> {
+        });
+        manager.start();
+
+        // Advance local applied state to sequence 5 via a normal (non-stale) snapshot.
+        manager.onMessage(ClusterMessage.request(MessageType.SYNC_RESPONSE, TOPIC,
+                peer.nodeId(), local.nodeId(), new SyncResponsePayload(TOPIC, 5L, 0, false, "snap")));
+        long deadline = System.currentTimeMillis() + 5000;
+        while (System.currentTimeMillis() < deadline && manager.getLastAppliedSequence() < 5L) {
+            Thread.sleep(20);
+        }
+        assertEquals(5L, manager.getLastAppliedSequence(), "initial snapshot should advance applied sequence");
+        Thread.sleep(200); // nextExpected is set just after lastAppliedSequence under the lock
+
+        // Simulate promotion: leaderSyncing becomes true with the active peer as sync source.
+        manager.onLeaderChanged(local.nodeId());
+        assertTrue(manager.isLeaderSyncing(), "promoted leader with an active peer should be syncing");
+
+        // A behind peer answers with an OLDER snapshot (seq 3 < applied 5): the stale-sync path must
+        // release the leader-sync guard, otherwise the write gate would reject writes forever even
+        // though this leader already holds the newer state.
+        manager.onMessage(ClusterMessage.request(MessageType.SYNC_RESPONSE, TOPIC,
+                peer.nodeId(), local.nodeId(), new SyncResponsePayload(TOPIC, 3L, 0, false, "old")));
+
+        long clearDeadline = System.currentTimeMillis() + 5000;
+        while (System.currentTimeMillis() < clearDeadline && manager.isLeaderSyncing()) {
+            Thread.sleep(20);
+        }
+        assertFalse(manager.isLeaderSyncing(),
+                "stale sync from a behind peer must clear leaderSyncing, not block writes forever");
     }
 
     // ── Helpers ──
