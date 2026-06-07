@@ -381,10 +381,9 @@ public final class NGridNode implements Closeable {
         replicationBuilder.dataDirectory(replicationDataDir);
 
         replicationManager = new ReplicationManager(transport, coordinator, replicationBuilder.build());
+        // The leader high-watermark supplier is wired by ReplicationManager.start() itself (#131), so
+        // it is correct for manual assemblies too — no external wiring needed here.
         replicationManager.start();
-
-        coordinator.setLeaderHighWatermarkSupplier(() -> coordinator.isLeader() ? replicationManager.getGlobalSequence()
-                : replicationManager.getLastAppliedSequence());
 
         NQueue.Options queueOptions = config.queueOptions() != null ? config.queueOptions() : NQueue.Options.defaults();
         defaultQueueConfig = DistributedQueueConfig.builder(config.queueName())
