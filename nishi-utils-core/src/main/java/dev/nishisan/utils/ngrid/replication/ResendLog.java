@@ -29,43 +29,45 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
-import java.util.Map;
-import java.util.NavigableMap;
-import java.util.TreeMap;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * Leader-side resend op-log for a single topic (#127): a purpose-built, segmented,
- * append-only log indexed by sequence. It backs the resend of committed operations to a
- * catching-up follower without keeping the (potentially large) payloads on the JVM heap.
+ * Leader-side resend op-log for a single topic (#127): a purpose-built, segmented, append-only log
+ * indexed by sequence. It backs the resend of committed operations to a catching-up follower without
+ * keeping the (potentially large) payloads on the JVM heap.
  *
  * <p>Why a bespoke store instead of {@code NQueue}/{@code NMap}: the access pattern is exactly
  * <ul>
- *   <li><b>append</b> by ascending sequence (commit order; sequences are monotonic but may have
- *       gaps when an operation fails before commit), and</li>
+ *   <li><b>append</b> of committed operations, and</li>
  *   <li><b>random read</b> by sequence — {@link #get(long)} and {@link #read(long, long)} — which
  *       {@code NQueue} (FIFO, no random access) cannot serve and {@code NMap} would serve only with
  *       hand-rolled compound (count + time) eviction.</li>
  * </ul>
- * A segmented log gives O(log n) random read via a compact primitive index and <b>auto-compaction
- * by whole-segment drop</b> (no rewrite): old segments are deleted when the total count exceeds the
+ * A segmented log gives random read via a compact primitive index and <b>auto-compaction by
+ * whole-segment drop</b> (no rewrite): the oldest segment is deleted when the total count exceeds the
  * cap or when the segment's newest record is older than the temporal retention window.
  *
- * <p>On-disk record layout (big-endian), within a {@code seg-<baseSequence>.dat} file:
+ * <p><b>Arrival order:</b> committed operations are indexed in commit order, which is NOT necessarily
+ * sequence order (quorum can complete operation N+1 before N). The log therefore records data in the
+ * file in arrival order but keeps each segment's in-memory {@code (sequence → offset)} index <b>sorted
+ * by sequence</b> (binary insertion), and lookups scan the few segments whose {@code [minSeq, maxSeq]}
+ * overlaps the query. With near-sorted arrival the per-segment insertions land at/near the tail, so the
+ * cost stays close to a plain append.
+ *
+ * <p>On-disk record layout (big-endian), within a {@code seg-NNNNNNNNNN.dat} file (NNNN… = creation
+ * order):
  * <pre>
  *   recordLen(4) · timestamp(8) · frame(recordLen-8)
  * </pre>
- * where {@code frame} is a {@link RelayEntryCodec}-encoded {@link RelayEntry} (the same compact
- * frame the follower relay uses — reused, not reinvented). The per-record timestamp drives temporal
+ * where {@code frame} is a {@link RelayEntryCodec}-encoded {@link RelayEntry} (the same compact frame
+ * the follower relay uses — reused, not reinvented). The per-record timestamp drives temporal
  * retention and survives a restart (the in-memory index is rebuilt by scanning on {@link #open}).
  *
  * <p>Durability mirrors the relay: {@code fsync} is off by default — the small not-yet-flushed tail
  * is recovered by the follower falling into the existing snapshot path, never silent divergence.
  *
- * <p>Thread-safety: all public methods are synchronized on the instance. Appends run on the
- * commit path (sub-millisecond: a buffered positional write plus two primitive-array appends) and
- * reads run on the rare resend path, so a single monitor is both correct and cheap.
+ * <p>Thread-safety: all public methods are synchronized on the instance.
  */
 final class ResendLog implements Closeable {
 
@@ -84,10 +86,11 @@ final class ResendLog implements Closeable {
     private final long maxEntries;
     private final boolean fsync;
 
-    /** Sealed + active segments keyed by their base (lowest) sequence. */
-    private final NavigableMap<Long, Segment> segments = new TreeMap<>();
+    /** Segments in creation (arrival) order; head is the oldest, tail is the active one. */
+    private final List<Segment> segments = new ArrayList<>();
     private Segment active;
     private long totalEntries;
+    private long nextSegmentId;
     private boolean closed;
 
     ResendLog(Path dir, int segmentMaxEntries, Duration segmentMaxAge, Duration retentionTime,
@@ -108,25 +111,27 @@ final class ResendLog implements Closeable {
             try (var stream = Files.newDirectoryStream(dir, SEGMENT_PREFIX + "*" + SEGMENT_SUFFIX)) {
                 List<Path> files = new ArrayList<>();
                 stream.forEach(files::add);
-                files.sort((a, b) -> Long.compare(baseSequenceOf(a), baseSequenceOf(b)));
+                files.sort((a, b) -> Long.compare(segmentIdOf(a), segmentIdOf(b)));
                 for (Path file : files) {
+                    long id = segmentIdOf(file);
                     Segment segment = Segment.recover(file, fsync);
                     if (segment.count == 0) {
                         segment.close();
                         Files.deleteIfExists(file);
                         continue;
                     }
-                    segments.put(segment.baseSequence(), segment);
+                    segments.add(segment);
                     totalEntries += segment.count;
+                    nextSegmentId = Math.max(nextSegmentId, id + 1);
                 }
             }
-            active = segments.isEmpty() ? null : segments.lastEntry().getValue();
+            active = segments.isEmpty() ? null : segments.get(segments.size() - 1);
         } catch (IOException e) {
             throw new UncheckedIOException("Failed to open resend log at " + dir, e);
         }
     }
 
-    private static long baseSequenceOf(Path file) {
+    private static long segmentIdOf(Path file) {
         String name = file.getFileName().toString();
         String digits = name.substring(SEGMENT_PREFIX.length(), name.length() - SEGMENT_SUFFIX.length());
         try {
@@ -137,8 +142,8 @@ final class ResendLog implements Closeable {
     }
 
     /**
-     * Appends a committed operation. Sequences must arrive non-decreasing (commit order); gaps are
-     * permitted (an aborted operation consumes a sequence it never commits).
+     * Appends a committed operation. Sequences may arrive in any order (commit order, not necessarily
+     * sequence order); the in-memory index keeps them sorted.
      *
      * @param sequence  the per-topic sequence number
      * @param timestamp the leader-local commit timestamp (epoch millis) driving temporal retention
@@ -150,7 +155,7 @@ final class ResendLog implements Closeable {
         }
         try {
             if (active == null || active.count >= segmentMaxEntries || active.shouldRollByAge(segmentMaxAgeMillis)) {
-                rollSegment(sequence);
+                rollSegment();
             }
             active.append(sequence, timestamp, frame);
             totalEntries++;
@@ -162,29 +167,26 @@ final class ResendLog implements Closeable {
         }
     }
 
-    private void rollSegment(long baseSequence) throws IOException {
-        Path file = dir.resolve(SEGMENT_PREFIX + baseSequence + SEGMENT_SUFFIX);
+    private void rollSegment() throws IOException {
+        long id = nextSegmentId++;
+        Path file = dir.resolve(SEGMENT_PREFIX + String.format("%010d", id) + SEGMENT_SUFFIX);
         Segment segment = Segment.create(file, fsync);
-        segments.put(baseSequence, segment);
+        segments.add(segment);
         active = segment;
     }
 
-    /** Drops whole sealed segments that exceed the count cap or fall entirely outside the time window. */
+    /** Drops the whole oldest segment when it exceeds the count cap or falls outside the time window. */
     private void enforceRetention() {
         long now = System.currentTimeMillis();
         // Never drop the active (tail) segment: it is still receiving appends.
         while (segments.size() > 1) {
-            Map.Entry<Long, Segment> oldestEntry = segments.firstEntry();
-            Segment oldest = oldestEntry.getValue();
-            if (oldest == active) {
-                break;
-            }
+            Segment oldest = segments.get(0);
             boolean overCount = totalEntries > maxEntries;
             boolean expired = retentionMillis > 0 && (now - oldest.maxTimestamp) > retentionMillis;
             if (!overCount && !expired) {
                 break;
             }
-            segments.pollFirstEntry();
+            segments.remove(0);
             totalEntries -= oldest.count;
             oldest.delete();
         }
@@ -195,13 +197,16 @@ final class ResendLog implements Closeable {
         if (closed) {
             return null;
         }
-        Map.Entry<Long, Segment> floor = segments.floorEntry(sequence);
-        if (floor == null) {
-            return null;
+        for (Segment segment : segments) {
+            if (segment.count == 0 || sequence < segment.minSequence || sequence > segment.maxSequence) {
+                continue;
+            }
+            byte[] frame = segment.readFrame(sequence);
+            if (frame != null) {
+                return RelayEntryCodec.decode(frame);
+            }
         }
-        Segment segment = floor.getValue();
-        byte[] frame = segment.readFrame(sequence);
-        return frame == null ? null : RelayEntryCodec.decode(frame);
+        return null;
     }
 
     /**
@@ -214,14 +219,14 @@ final class ResendLog implements Closeable {
         if (closed || toSequence < fromSequence) {
             return out;
         }
-        Long startKey = segments.floorKey(fromSequence);
-        NavigableMap<Long, Segment> tail = segments.tailMap(startKey == null ? fromSequence : startKey, true);
-        for (Segment segment : tail.values()) {
-            if (segment.baseSequence() > toSequence) {
-                break;
+        for (Segment segment : segments) {
+            if (segment.count == 0 || segment.maxSequence < fromSequence || segment.minSequence > toSequence) {
+                continue;
             }
             segment.readRange(fromSequence, toSequence, out);
         }
+        // Segments are arrival-ordered and may overlap slightly; sort the (small) result by sequence.
+        out.sort((a, b) -> Long.compare(a.sequence(), b.sequence()));
         return out;
     }
 
@@ -232,7 +237,13 @@ final class ResendLog implements Closeable {
 
     /** Lowest sequence still retained, or {@code -1} when empty. */
     synchronized long oldestSequence() {
-        return segments.isEmpty() ? -1L : segments.firstEntry().getValue().baseSequence();
+        long min = Long.MAX_VALUE;
+        for (Segment segment : segments) {
+            if (segment.count > 0) {
+                min = Math.min(min, segment.minSequence);
+            }
+        }
+        return min == Long.MAX_VALUE ? -1L : min;
     }
 
     @Override
@@ -241,27 +252,29 @@ final class ResendLog implements Closeable {
             return;
         }
         closed = true;
-        for (Segment segment : segments.values()) {
+        for (Segment segment : segments) {
             segment.close();
         }
         segments.clear();
         active = null;
     }
 
-    /** One append-only segment file plus its compact, gap-tolerant in-memory index. */
+    /** One append-only segment file plus its compact, sequence-sorted in-memory index. */
     private static final class Segment {
 
         private final Path file;
         private final FileChannel channel;
         private final boolean fsync;
-        /** Sorted ascending (append order); supports binary search to tolerate sequence gaps. */
+        /** Sorted ascending by sequence (binary insertion on append). */
         private long[] sequences;
         /** Byte offset of each record's length prefix, parallel to {@link #sequences}. */
         private long[] offsets;
         private int count;
         private long writePosition;
+        private long minSequence = Long.MAX_VALUE;
+        private long maxSequence = Long.MIN_VALUE;
         private long maxTimestamp;
-        private long firstAppendMillis;
+        private final long firstAppendMillis;
 
         private Segment(Path file, FileChannel channel, boolean fsync) {
             this.file = file;
@@ -314,10 +327,6 @@ final class ResendLog implements Closeable {
             return segment;
         }
 
-        long baseSequence() {
-            return count == 0 ? Long.MAX_VALUE : sequences[0];
-        }
-
         boolean shouldRollByAge(long maxAgeMillis) {
             return maxAgeMillis > 0 && (System.currentTimeMillis() - firstAppendMillis) > maxAgeMillis;
         }
@@ -339,14 +348,27 @@ final class ResendLog implements Closeable {
             indexRecord(sequence, timestamp, startOffset);
         }
 
+        /** Inserts (sequence, offset) keeping {@link #sequences} sorted ascending. */
         private void indexRecord(long sequence, long timestamp, long offset) {
             if (count == sequences.length) {
                 sequences = Arrays.copyOf(sequences, sequences.length * 2);
                 offsets = Arrays.copyOf(offsets, offsets.length * 2);
             }
-            sequences[count] = sequence;
-            offsets[count] = offset;
+            int pos = Arrays.binarySearch(sequences, 0, count, sequence);
+            int insertAt = pos >= 0 ? pos : -(pos + 1);
+            if (insertAt < count) {
+                System.arraycopy(sequences, insertAt, sequences, insertAt + 1, count - insertAt);
+                System.arraycopy(offsets, insertAt, offsets, insertAt + 1, count - insertAt);
+            }
+            sequences[insertAt] = sequence;
+            offsets[insertAt] = offset;
             count++;
+            if (sequence < minSequence) {
+                minSequence = sequence;
+            }
+            if (sequence > maxSequence) {
+                maxSequence = sequence;
+            }
             if (timestamp > maxTimestamp) {
                 maxTimestamp = timestamp;
             }
