@@ -23,6 +23,7 @@ import dev.nishisan.utils.ngrid.cluster.coordination.LeadershipListener;
 import dev.nishisan.utils.ngrid.cluster.transport.Transport;
 import dev.nishisan.utils.ngrid.cluster.transport.TransportListener;
 import dev.nishisan.utils.ngrid.common.ClusterMessage;
+import dev.nishisan.utils.ngrid.common.FollowerProgressPayload;
 import dev.nishisan.utils.ngrid.common.MessageType;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
@@ -53,7 +54,8 @@ import java.util.logging.Logger;
  * handles both
  * leader initiated operations and replication requests coming from other nodes.
  */
-public class ReplicationManager implements TransportListener, LeadershipListener, Closeable {
+public class ReplicationManager
+        implements TransportListener, LeadershipListener, ClusterCoordinator.MembershipListener, Closeable {
     private static final Logger LOGGER = Logger.getLogger(ReplicationManager.class.getName());
     private static final long SYNC_THRESHOLD = 500; // Trigger sync if lag > 500 ops
     // For small lag (<= SYNC_THRESHOLD), only trigger snapshot sync if lag is
@@ -151,6 +153,23 @@ public class ReplicationManager implements TransportListener, LeadershipListener
     // Resend tracking (follower-side)
     private final Set<String> resendPendingTopics = ConcurrentHashMap.newKeySet();
     private final Map<String, Instant> resendStartByTopic = new ConcurrentHashMap<>();
+
+    // ── Join convergence (#129) ──────────────────────────────────────────────────
+    // Wall-clock of construction, used by the boot-window guard that stops a transient lone
+    // self-election from advertising empty state as a ready, caught-up leadership (3c).
+    private final long startedAtMillis = System.currentTimeMillis();
+    // Topics for which a proactive cold-join sync has already been requested since the last leader
+    // change (3a) — fire-once so a quiescent leader does not get a sync request every tick.
+    private final Set<String> proactiveSyncRequested = ConcurrentHashMap.newKeySet();
+    // Leader-side join-quiesce gate (3b, opt-in via config.leaderPauseOnJoin): the leader pauses
+    // production while a not-caught-up follower joins, until it catches up / disconnects / times out.
+    private final java.util.concurrent.atomic.AtomicBoolean joinQuiescing = new java.util.concurrent.atomic.AtomicBoolean(
+            false);
+    private final Map<NodeId, Long> followerAppliedByNode = new ConcurrentHashMap<>();
+    private final Set<NodeId> quiescingFor = ConcurrentHashMap.newKeySet();
+    private volatile long joinQuiesceStartedMs;
+    // Active members observed on the previous membership change, to detect newly-joined nodes.
+    private final Set<NodeId> knownActiveMembers = ConcurrentHashMap.newKeySet();
 
     // ── Relay-log ingestion (#124, FollowerIngestMode.RELAY_LOG) ─────────────────
     // The follower persists each REPLICATION_REQUEST to a durable relay (one NQueue per
@@ -270,6 +289,15 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         }
         transport.addListener(this);
         coordinator.addLeadershipListener(this);
+        if (config.leaderPauseOnJoin()) {
+            // Leader-pause-on-join (#129): detect joins (membership), have followers report progress, and
+            // periodically re-evaluate the quiesce gate (release on catch-up / disconnect / timeout).
+            coordinator.addMembershipListener(this);
+            long progressMs = Math.max(50L, config.followerProgressInterval().toMillis());
+            timeoutScheduler.scheduleAtFixedRate(this::sendFollowerProgress, progressMs, progressMs,
+                    TimeUnit.MILLISECONDS);
+            timeoutScheduler.scheduleAtFixedRate(this::checkJoinQuiesce, 200, 200, TimeUnit.MILLISECONDS);
+        }
         Duration timeout = config.operationTimeout();
         long periodMs = Math.max(100L, timeout.toMillis() / 2);
         timeoutScheduler.scheduleAtFixedRate(this::checkTimeouts, periodMs, periodMs, TimeUnit.MILLISECONDS);
@@ -440,6 +468,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             // (registerHandler), an unfillable gap (resend → missing), the reorder-cap, and a relay
             // head older than the retention window (below).
             checkRelayHeadAgeAndBootstrap();
+            checkProactiveJoinSync();
             return;
         }
         long leaderWatermark = coordinator.getTrackedLeaderHighWatermark();
@@ -593,6 +622,13 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         if (isLeaderSyncing()) {
             throw new LeaderSyncingException(
                     "Leader is syncing (catch-up in progress), write rejected to prevent stale-state divergence");
+        }
+        if (config.leaderPauseOnJoin() && isJoinQuiescing()) {
+            // Leader-pause-on-join (#129): a not-caught-up follower is joining; pause production until it
+            // drains so convergence is deterministic (no firehose during bootstrap). Bounded + released
+            // on catch-up/disconnect/timeout. Mirror of the failover drain-gate, on the join path.
+            throw new LeaderSyncingException(
+                    "Leader is quiescing for a joining follower (catch-up in progress), write rejected");
         }
         if (!coordinator.hasValidLease()) {
             throw new LeaseExpiredException("Leader lease expired, write rejected to prevent data divergence");
@@ -792,6 +828,13 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
     @Override
     public void onPeerDisconnected(NodeId peerId) {
+        // Join-quiesce (#129): a follower that vanishes mid-join must not freeze the leader — drop it
+        // from the wait set and release the gate if it was the last one we were waiting on.
+        knownActiveMembers.remove(peerId);
+        followerAppliedByNode.remove(peerId);
+        if (quiescingFor.remove(peerId)) {
+            maybeReleaseJoinQuiesce();
+        }
         for (PendingOperation operation : pending.values()) {
             if (operation.isDone()) {
                 continue;
@@ -822,6 +865,8 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             handleSequenceResendRequest(message);
         } else if (message.type() == MessageType.SEQUENCE_RESEND_RESPONSE) {
             handleSequenceResendResponse(message);
+        } else if (message.type() == MessageType.FOLLOWER_PROGRESS) {
+            handleFollowerProgress(message);
         }
     }
 
@@ -2252,10 +2297,14 @@ public class ReplicationManager implements TransportListener, LeadershipListener
     public void onLeaderChanged(NodeId newLeader) {
         NodeId localId = transport.local().nodeId();
         NodeId previousLeader = lastLeader.getAndSet(newLeader);
+        // A leadership transition resets the join-convergence state (#129): the proactive cold-join
+        // sync is re-armed for the new term, and any join-quiesce held as leader is released.
+        proactiveSyncRequested.clear();
         if (!localId.equals(newLeader)) {
             if (previousLeader != null && previousLeader.equals(localId)) {
                 leaderSyncing.set(false);
                 leaderSyncTopics.clear();
+                clearJoinQuiesce();
             }
             failAllPending("Lost leadership to " + newLeader);
             return;
@@ -2343,10 +2392,167 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         if (!leaderSyncing.get()) {
             return;
         }
+        if (isLoneBootLeadership()) {
+            // Boot self-election guard (#129 3c): a node that self-elects alone in pair mode must not
+            // advertise empty state as a ready, caught-up leadership by releasing the gate on an empty
+            // relay. Hold the gate through the peer-discovery window; if a peer appears it will step this
+            // node down to follower (clearing the gate) and the proactive cold-join sync (3a) converges
+            // it — otherwise the window lapses and the gate releases below on the next drained tick.
+            return;
+        }
         if (leaderSyncTopics.remove(topic) && leaderSyncTopics.isEmpty()) {
             leaderSyncing.set(false);
             LOGGER.info(() -> "Relay drained on promotion; releasing write gate for leadership.");
         }
+    }
+
+    /**
+     * True while a fresh relay-mode node that self-elected alone is still within the peer-discovery
+     * window (#129 3c) — used to defer the empty-relay drain-gate release so a transient boot
+     * self-election does not mark empty state as synced.
+     */
+    private boolean isLoneBootLeadership() {
+        long window = config.joinPeerDiscoveryWindow().toMillis();
+        return isRelayMode() && window > 0
+                && (System.currentTimeMillis() - startedAtMillis) < window
+                && coordinator.getActiveMembersCount() <= 1;
+    }
+
+    // ── Join convergence (#129) ──────────────────────────────────────────────────
+
+    /**
+     * Proactive cold-join sync (#129 3a): in RELAY_LOG the follower only syncs reactively (on op-log
+     * traffic revealing a gap), so a brand-new follower with an empty relay against a quiescent leader
+     * never converges. Here a follower that has applied nothing for a topic, has no relay traffic, and
+     * sees (via the heartbeat watermark) that the leader holds data, requests one snapshot/stream —
+     * fire-once per term so it does not loop. This is the genuine cold-join case, distinct from the
+     * in-regime lag the relay is designed to absorb.
+     */
+    private void checkProactiveJoinSync() {
+        if (!running || coordinator.isLeader()) {
+            return;
+        }
+        long leaderWatermark = coordinator.getTrackedLeaderHighWatermark();
+        if (leaderWatermark <= 0 || leaderWatermark <= lastAppliedSequence) {
+            return; // leader has no data, or we are already at/above its watermark
+        }
+        if (coordinator.leaderInfo().isEmpty()) {
+            return; // no leader to sync from yet
+        }
+        for (String topic : handlers.keySet()) {
+            if (syncingTopics.contains(topic) || proactiveSyncRequested.contains(topic)) {
+                continue;
+            }
+            boolean coldForTopic = nextExpectedSequenceByTopic.getOrDefault(topic, 1L) <= 1L;
+            boolean noRelayTraffic = getRelaySize(topic) == 0L;
+            if (coldForTopic && noRelayTraffic) {
+                proactiveSyncRequested.add(topic);
+                LOGGER.info(() -> "Proactive cold-join sync for topic " + topic
+                        + " (empty state + quiescent leader at watermark " + leaderWatermark + ")");
+                if (syncingTopics.add(topic)) {
+                    requestSync(topic);
+                }
+            }
+        }
+    }
+
+    /** True while the leader is pausing production for a joining, not-caught-up follower (#129 3b). */
+    public boolean isJoinQuiescing() {
+        return joinQuiescing.get();
+    }
+
+    @Override
+    public void onMembershipChanged() {
+        if (!running || !config.leaderPauseOnJoin()) {
+            return;
+        }
+        Set<NodeId> current = new HashSet<>();
+        for (NodeInfo member : coordinator.activeMembers()) {
+            current.add(member.nodeId());
+        }
+        NodeId localId = transport.local().nodeId();
+        if (coordinator.isLeader()) {
+            long leaderSeq = globalSequence.get();
+            long threshold = config.joinSyncLagThreshold();
+            for (NodeId member : current) {
+                if (member.equals(localId) || knownActiveMembers.contains(member)) {
+                    continue; // only newly-joined members
+                }
+                long applied = followerAppliedByNode.getOrDefault(member, -1L);
+                if (applied < 0 || applied < leaderSeq - threshold) {
+                    // Behind (or unknown): pause production until it catches up / disconnects / times out.
+                    quiescingFor.add(member);
+                }
+            }
+            if (!quiescingFor.isEmpty() && joinQuiescing.compareAndSet(false, true)) {
+                joinQuiesceStartedMs = System.currentTimeMillis();
+                LOGGER.info(() -> "Leader pausing production for joining follower(s) " + quiescingFor);
+            }
+        }
+        // Drop wait-set entries for members that left, then re-evaluate the gate.
+        quiescingFor.retainAll(current);
+        knownActiveMembers.clear();
+        knownActiveMembers.addAll(current);
+        maybeReleaseJoinQuiesce();
+    }
+
+    private void handleFollowerProgress(ClusterMessage message) {
+        if (!coordinator.isLeader()) {
+            return; // only the leader tracks follower progress
+        }
+        FollowerProgressPayload payload = message.payload(FollowerProgressPayload.class);
+        NodeId source = message.source();
+        followerAppliedByNode.put(source, payload.appliedSequence());
+        if (quiescingFor.contains(source)) {
+            long leaderSeq = globalSequence.get();
+            if (payload.appliedSequence() >= leaderSeq - config.joinSyncLagThreshold()) {
+                quiescingFor.remove(source);
+                maybeReleaseJoinQuiesce();
+            }
+        }
+    }
+
+    /** Follower-side: periodically report apply progress so the leader can release its join-quiesce. */
+    private void sendFollowerProgress() {
+        if (!running || coordinator.isLeader()) {
+            return;
+        }
+        coordinator.leaderInfo().ifPresent(leader -> {
+            FollowerProgressPayload payload = new FollowerProgressPayload(lastAppliedSequence,
+                    coordinator.getTrackedLeaderEpoch());
+            transport.send(ClusterMessage.request(MessageType.FOLLOWER_PROGRESS, "follower-progress",
+                    transport.local().nodeId(), leader.nodeId(), payload));
+        });
+    }
+
+    /** Periodically bounds the join-quiesce: release on timeout (a joiner that died cannot freeze us). */
+    private void checkJoinQuiesce() {
+        if (!running || !joinQuiescing.get()) {
+            return;
+        }
+        if (System.currentTimeMillis() - joinQuiesceStartedMs > config.joinQuiesceMaxDuration().toMillis()) {
+            LOGGER.warning(() -> "Join-quiesce exceeded max duration; releasing write gate (joiner(s) "
+                    + quiescingFor + " did not catch up in time)");
+            clearJoinQuiesce();
+            return;
+        }
+        // Drop joiners that are no longer active or have since caught up.
+        long leaderSeq = globalSequence.get();
+        long threshold = config.joinSyncLagThreshold();
+        quiescingFor.removeIf(node -> followerAppliedByNode.getOrDefault(node, -1L) >= leaderSeq - threshold);
+        maybeReleaseJoinQuiesce();
+    }
+
+    private void maybeReleaseJoinQuiesce() {
+        if (joinQuiescing.get() && quiescingFor.isEmpty()) {
+            joinQuiescing.set(false);
+            LOGGER.info(() -> "Join-quiesce released; resuming production.");
+        }
+    }
+
+    private void clearJoinQuiesce() {
+        quiescingFor.clear();
+        joinQuiescing.set(false);
     }
 
     private void failAllPending(String reason) {
