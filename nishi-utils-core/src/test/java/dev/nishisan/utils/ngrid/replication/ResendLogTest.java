@@ -64,6 +64,25 @@ class ResendLogTest {
     }
 
     @Test
+    void toleratesOutOfOrderArrival() {
+        // Commits complete in quorum order, not sequence order: index 1..8 in a shuffled order and
+        // assert get()/read() still return them sorted (the heap TreeMap is order-independent; so is this).
+        try (ResendLog log = open(tempDir, 4, Duration.ZERO, 1_000)) {
+            long now = System.currentTimeMillis();
+            for (long seq : new long[] { 3, 1, 2, 6, 4, 8, 5, 7 }) {
+                log.append(seq, now, frame(seq));
+            }
+            assertEquals(8L, log.size());
+            assertEquals(1L, log.get(1L).sequence());
+            assertEquals(7L, log.get(7L).sequence());
+            assertEquals(List.of(1L, 2L, 3L, 4L, 5L),
+                    log.read(1L, 5L).stream().map(RelayEntry::sequence).toList());
+            assertEquals(List.of(2L, 3L, 4L),
+                    log.read(2L, 4L).stream().map(RelayEntry::sequence).toList());
+        }
+    }
+
+    @Test
     void rangeReadSpansSegments() {
         try (ResendLog log = open(tempDir, 3, Duration.ZERO, 1_000)) {
             long now = System.currentTimeMillis();
