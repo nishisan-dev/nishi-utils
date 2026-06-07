@@ -142,6 +142,12 @@ public class ReplicationManager implements TransportListener, LeadershipListener
     // evicted both by count (memory cap) and by time (backlog window) — see indexReplicationPayload.
     private final Map<String, java.util.NavigableMap<Long, TimedPayload>> replicationLogBySequence = new ConcurrentHashMap<>();
 
+    // Disk tier of the hybrid resend op-log (#127): when persistentResendLog is enabled, the heap map
+    // above keeps only the freshest window (count-capped) and this durable, segmented, time-governed
+    // store holds the deep backlog window off-heap — so a large window costs disk, not heap (the cause
+    // of the re-snapshot death spiral under high production). Null when persistence is disabled.
+    private volatile ResendLogStore resendLogStore;
+
     // Resend tracking (follower-side)
     private final Set<String> resendPendingTopics = ConcurrentHashMap.newKeySet();
     private final Map<String, Instant> resendStartByTopic = new ConcurrentHashMap<>();
@@ -253,6 +259,14 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             for (String topic : handlers.keySet()) {
                 ensureRelayApplyLoop(topic);
             }
+        }
+        if (config.persistentResendLog()) {
+            // Disk-backed resend op-log (#127). Initialized regardless of role — a follower may be
+            // promoted to leader later and must already be serving resends from a durable window.
+            this.resendLogStore = new ResendLogStore(config.dataDirectory().resolve("resend-log"),
+                    config.resendLogSegmentMaxEntries(), config.resendLogSegmentMaxAge(),
+                    config.replicationLogRetentionTime(), config.resendLogMaxEntries(),
+                    config.relayDurability() == RelayDurability.ALWAYS);
         }
         transport.addListener(this);
         coordinator.addLeadershipListener(this);
@@ -1507,11 +1521,13 @@ public class ReplicationManager implements TransportListener, LeadershipListener
      * Enforces retention by evicting oldest entries beyond the configured limit.
      */
     private void indexReplicationPayload(String topic, long sequence, ReplicationPayload payload) {
+        long now = System.currentTimeMillis();
         java.util.NavigableMap<Long, TimedPayload> topicLog = replicationLogBySequence
                 .computeIfAbsent(topic, k -> java.util.Collections.synchronizedNavigableMap(new java.util.TreeMap<>()));
-        topicLog.put(sequence, new TimedPayload(payload, System.currentTimeMillis()));
+        topicLog.put(sequence, new TimedPayload(payload, now));
 
-        // Count-based retention (memory cap): evict oldest beyond the configured limit.
+        // Count-based retention (memory cap): evict oldest beyond the configured limit. In hybrid mode
+        // (#127) this cap governs ONLY the heap hot cache — the deep window lives on disk below.
         int retention = config.replicationLogRetention();
         while (topicLog.size() > retention) {
             topicLog.pollFirstEntry();
@@ -1519,6 +1535,25 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         // Time-based retention (backlog window): opportunistic head eviction on each commit.
         // Complementary to the count cap — whichever limit is reached first evicts.
         evictExpiredFromTopicLog(topicLog);
+
+        // Disk tier (#127): mirror the entry to the durable, time-governed resend op-log so the backlog
+        // window survives off-heap. A disk failure here must NOT fail the commit — it only degrades a
+        // future resend into the existing snapshot-fallback path.
+        ResendLogStore diskStore = resendLogStore;
+        if (diskStore != null) {
+            ReplicationHandler handler = handlers.get(topic);
+            if (handler != null) {
+                try {
+                    byte[] payloadBytes = handler.encodePayload(payload.data());
+                    RelayEntry entry = new RelayEntry(payload.epoch(), sequence, topic, payload.operationId(),
+                            payloadBytes);
+                    diskStore.append(topic, sequence, now, RelayEntryCodec.encode(entry));
+                } catch (Exception e) {
+                    LOGGER.log(Level.WARNING,
+                            "Resend op-log disk append failed for seq " + sequence + " (topic " + topic + ")", e);
+                }
+            }
+        }
     }
 
     /**
@@ -1609,7 +1644,11 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             return;
         }
 
-        long maxRange = Math.max(1000L, (long) config.replicationLogRetention());
+        long baseMaxRange = Math.max(1000L, (long) config.replicationLogRetention());
+        // The disk window (#127) can be far larger than the heap cap; allow a bigger single response.
+        final long maxRange = config.persistentResendLog()
+                ? Math.max(baseMaxRange, config.resendLogReadBatchMax())
+                : baseMaxRange;
         long rangeSize = (to - from) + 1L;
         if (rangeSize > maxRange) {
             LOGGER.warning(() -> String.format(
@@ -1621,32 +1660,49 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
         java.util.NavigableMap<Long, TimedPayload> topicLog = replicationLogBySequence.get(topic);
 
+        // Disk tier (#127): materialize the requested range from the durable op-log once and index it
+        // by sequence, so a heap miss can be served from disk before being reported missing.
+        java.util.Map<Long, RelayEntry> diskBySeq = java.util.Collections.emptyMap();
+        ResendLogStore diskStore = resendLogStore;
+        if (diskStore != null) {
+            List<RelayEntry> diskEntries = diskStore.read(topic, from, to);
+            if (!diskEntries.isEmpty()) {
+                diskBySeq = new java.util.HashMap<>(diskEntries.size() * 2);
+                for (RelayEntry e : diskEntries) {
+                    diskBySeq.put(e.sequence(), e);
+                }
+            }
+        }
+        ReplicationHandler diskHandler = diskBySeq.isEmpty() ? null : handlers.get(topic);
+
         List<ReplicationPayload> operations = new ArrayList<>();
         List<Long> missingSequences = new ArrayList<>();
 
-        if (topicLog != null) {
-            synchronized (topicLog) {
-                for (long seq = from; seq <= to; seq++) {
-                    TimedPayload entry = topicLog.get(seq);
-                    // A payload only enters replicationLogBySequence via indexReplicationPayload, which
-                    // is called exclusively from completeOperation (commit). So its mere presence here
-                    // already implies it is committed — re-checking the bounded audit log (capped at
-                    // operationLogMaxSize, far smaller than replicationLogRetention) only produced
-                    // false "missing" for ops beyond that cap, forcing needless snapshot fallback.
-                    // A null here also covers entries evicted by the temporal retention window: the
-                    // follower receives them as missingSequences → gap-detection → snapshot fallback.
-                    if (entry != null) {
-                        operations.add(entry.payload());
-                    } else {
-                        missingSequences.add(seq);
-                    }
+        for (long seq = from; seq <= to; seq++) {
+            // A payload only enters replicationLogBySequence via indexReplicationPayload, which is
+            // called exclusively from completeOperation (commit). So its mere presence here already
+            // implies it is committed. The synchronizedNavigableMap serves each get() atomically.
+            TimedPayload entry = topicLog != null ? topicLog.get(seq) : null;
+            if (entry != null) {
+                operations.add(entry.payload());
+                continue;
+            }
+            // Heap miss: try the disk tier before declaring the sequence missing. A reconstructed
+            // payload re-encodes the stored bytes through the handler, matching the heap path's shape.
+            RelayEntry diskEntry = diskBySeq.get(seq);
+            if (diskEntry != null && diskHandler != null) {
+                try {
+                    operations.add(new ReplicationPayload(diskEntry.operationId(), diskEntry.sequence(),
+                            diskEntry.epoch(), topic, diskHandler.decodePayload(diskEntry.payloadBytes())));
+                    continue;
+                } catch (Exception e) {
+                    LOGGER.log(Level.WARNING,
+                            "Resend disk decode failed for seq " + seq + " (topic " + topic + ")", e);
                 }
             }
-        } else {
-            // No log at all for this topic
-            for (long seq = from; seq <= to; seq++) {
-                missingSequences.add(seq);
-            }
+            // Absent from heap AND disk: never indexed, or evicted by the temporal window. The follower
+            // receives it as a missing sequence → gap-detection → snapshot fallback.
+            missingSequences.add(seq);
         }
 
         sendSequenceResendResponse(topic, message.source(), operations, missingSequences);
@@ -1926,7 +1982,14 @@ public class ReplicationManager implements TransportListener, LeadershipListener
      */
     public int getReplicationLogSize(String topic) {
         java.util.NavigableMap<Long, TimedPayload> topicLog = replicationLogBySequence.get(topic);
-        return topicLog == null ? 0 : topicLog.size();
+        int heap = topicLog == null ? 0 : topicLog.size();
+        ResendLogStore diskStore = resendLogStore;
+        if (diskStore == null) {
+            return heap;
+        }
+        // Hybrid (#127): disk holds the deep window; the heap cache is a (possibly overlapping) recent
+        // subset. The disk size is the authoritative retained count, so report it when larger.
+        return (int) Math.max(heap, Math.min(Integer.MAX_VALUE, diskStore.size(topic)));
     }
 
     public double getAverageConvergenceTimeMs() {
@@ -1988,6 +2051,11 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         if (store != null) {
             store.close();
             relayStore = null;
+        }
+        ResendLogStore resendStore = resendLogStore;
+        if (resendStore != null) {
+            resendStore.close();
+            resendLogStore = null;
         }
     }
 
