@@ -172,6 +172,10 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             0);
     private final java.util.concurrent.atomic.AtomicLong snapshotFallbackCount = new java.util.concurrent.atomic.AtomicLong(
             0);
+    // Total snapshot/sync requests this node has initiated (chunk 0). In RELAY_LOG regime this must
+    // stay flat — lag is absorbed by the relay, not by a snapshot.
+    private final java.util.concurrent.atomic.AtomicLong syncRequestCount = new java.util.concurrent.atomic.AtomicLong(
+            0);
     private final java.util.concurrent.atomic.AtomicLong totalConvergenceTimeMs = new java.util.concurrent.atomic.AtomicLong(
             0);
     private final java.util.concurrent.atomic.AtomicLong convergenceCount = new java.util.concurrent.atomic.AtomicLong(
@@ -390,6 +394,15 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         if (!running || coordinator.isLeader()) {
             return;
         }
+        if (isRelayMode()) {
+            // RELAY_LOG: a mere lag is absorbed by the durable relay and worked off by the apply
+            // consumer — it NEVER triggers a snapshot in regime (the reset+grow-snapshot death spiral
+            // #124 removes). Bootstrap is reserved for the unrecoverable cases: unclean restart
+            // (registerHandler), an unfillable gap (resend → missing), the reorder-cap, and a relay
+            // head older than the retention window (below).
+            checkRelayHeadAgeAndBootstrap();
+            return;
+        }
         long leaderWatermark = coordinator.getTrackedLeaderHighWatermark();
         if (leaderWatermark < 0) {
             return;
@@ -415,6 +428,46 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         for (String topic : handlers.keySet()) {
             if (syncingTopics.add(topic)) {
                 requestSync(topic);
+            }
+        }
+    }
+
+    /**
+     * RELAY_LOG bootstrap safety valve (decision E): if a topic's relay head is older than the
+     * retention window, the follower has fallen so far behind that the relay can no longer carry it
+     * to convergence — declare it obsolete and bootstrap from a fresh snapshot, rather than letting
+     * the relay grow without bound. Relies on {@code expireAfterWrite} being OFF on the relay (it is),
+     * so {@code peekRecord()} returns the true oldest unapplied entry.
+     */
+    private void checkRelayHeadAgeAndBootstrap() {
+        Duration retention = config.replicationLogRetentionTime();
+        RelayStore store = relayStore;
+        if (store == null || retention == null || retention.isZero()) {
+            return; // no temporal bound configured
+        }
+        long retentionMs = retention.toMillis();
+        long marginMs = Math.max(1000L, retentionMs / 10); // bootstrap slightly before the window lapses
+        for (String topic : handlers.keySet()) {
+            if (syncingTopics.contains(topic)) {
+                continue;
+            }
+            try {
+                long headTimestamp = store.relayFor(topic).peekRecord()
+                        .map(record -> record.meta().getTimestamp())
+                        .orElse(Long.MAX_VALUE);
+                if (headTimestamp == Long.MAX_VALUE) {
+                    continue; // empty relay
+                }
+                if (System.currentTimeMillis() - headTimestamp > retentionMs - marginMs) {
+                    LOGGER.warning(() -> "Relay head for topic " + topic
+                            + " is older than the retention window; bootstrapping (lag exceeded retention)");
+                    if (syncingTopics.add(topic)) {
+                        snapshotFallbackCount.incrementAndGet();
+                        requestSync(topic);
+                    }
+                }
+            } catch (Exception e) {
+                LOGGER.log(Level.FINE, "Relay head-age check failed for topic " + topic, e);
             }
         }
     }
@@ -860,6 +913,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
     private void requestSync(String topic, int chunkIndex) {
         coordinator.leaderInfo().ifPresent(leader -> {
             if (chunkIndex == 0) {
+                syncRequestCount.incrementAndGet();
                 LOGGER.info(() -> "Lag detected (" + (coordinator.getTrackedLeaderHighWatermark() - lastAppliedSequence)
                         + "). Requesting sync for " + topic);
             }
@@ -1759,6 +1813,16 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
     public long getSnapshotFallbackCount() {
         return snapshotFallbackCount.get();
+    }
+
+    /**
+     * Number of snapshot/sync requests this node has initiated. In RELAY_LOG regime this stays flat
+     * under lag (the relay absorbs it); a snapshot is only requested for unrecoverable cases.
+     *
+     * @return the count of initiated sync requests
+     */
+    public long getSyncRequestCount() {
+        return syncRequestCount.get();
     }
 
     /**
