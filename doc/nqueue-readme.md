@@ -82,6 +82,7 @@ flowchart TD
 - `long size(boolean optimistic)`
 - `long getRecordCount()`
 - `boolean isEmpty()`
+- `long flushExpired()`
 - `StatsUtils getStats()`
 - `void close()`
 
@@ -104,6 +105,41 @@ try (NQueue<String> queue = NQueue.open(baseDir, "stream-topic", options)) {
     queue.offer("evento-1");
 }
 ```
+
+### Expiracao por tempo de escrita (`expireAfterWrite`)
+
+Ortogonal a `RetentionPolicy`, o `expireAfterWrite` descarta itens cuja idade
+(desde o `offer`) ultrapasse a duracao configurada, **independentemente de serem
+consumidos**. O descarte e **oportunista**: a cada `poll`/`peek` o prefixo de
+itens expirados na cabeca da fila e descartado silenciosamente (sem ser entregue)
+e o primeiro item ainda valido e retornado. Como os timestamps sao monotonicos
+(FIFO), os itens expirados sempre formam um prefixo contiguo na cabeca.
+
+```java
+NQueue.Options options = NQueue.Options.defaults()
+    .withExpireAfterWrite(Duration.ofMinutes(10)); // descarta itens com mais de 10 min
+
+try (NQueue<String> queue = NQueue.open(baseDir, "fila-com-expiracao", options)) {
+    queue.offer("evento");
+    // ... 11 minutos depois ...
+    Optional<String> next = queue.poll(); // "evento" foi descartado; retorna o proximo valido (ou vazio)
+
+    // Disparo manual: descarta o prefixo expirado e retorna quantos foram removidos.
+    long removidos = queue.flushExpired();
+}
+```
+
+Caracteristicas e limites:
+
+- Funciona em conjunto com `DELETE_ON_CONSUME` e `TIME_BASED` (duracao `0` desabilita; padrao).
+- O descarte apenas **avanca o cursor de consumo** (O(1) por item); o espaco fisico
+  e recuperado depois pela compactacao automatica.
+- Aplica-se somente ao **segmento duravel** (`data.log`). Itens em `MemoryBuffer`
+  e entregas por **short-circuit** (handoff) nao sao expirados — passam a estar
+  sujeitos a expiracao apenas quando se tornam duraveis.
+- `size()`/`getRecordCount()` **nao** disparam varredura: itens expirados ainda nao
+  varridos continuam contabilizados ate que um `poll`/`peek`/`flushExpired` os
+  descarte. Para uma contagem exata pos-expiracao, chame `flushExpired()` antes.
 
 ## Offsets e retorno do offer
 
