@@ -4,6 +4,31 @@
 
 ---
 
+## 2026-06-06 — 🟢 4.1.3 — Endurecimento do op-log de HA sob volume real
+
+Convergência e estabilidade do HA active/standby (op-log) sob a volumetria real do Kafka
+(~milhares de ops/s). Diagnóstico por logs + thread dumps de pré-prod; validado E2E. Detalhes e
+diagramas em [`doc/ngrid/oplog-ha-hardening.md`](ngrid/oplog-ha-hardening.md).
+
+**Correções:**
+- **`leaderLocalApply`** — quando um engine externo é a fonte da verdade, o líder pula o apply-local
+  redundante e commita+indexa de forma síncrona ao atingir o quórum, mantendo o índice de resend no
+  frontier (elimina o falso-"missing" que causava snapshot infinito).
+- **Snapshot multi-chunk byte-sliced** (`onSnapshotInstalled`) — contorna o limite de frame de 64 MB.
+- **Resiliência do `sequenceBufferLock`** — `tryLock(timeout)` (lock órfão degrada para recuperação,
+  não freeze), `catch(Throwable)` nas tasks, cap do buffer (remove o gatilho de OOM) e persistência
+  da sequência coalescida/off-lock.
+- **Operações O(log n) sob o lock** — removidos o scan de duplicata O(n) e o `removeIf` O(n²) que
+  monopolizavam o lock e travavam a convergência.
+- **skip-and-drain** — gap evictado é pulado e a cauda drenada em massa (quebra head-of-line),
+  trocando consistência forte por liveness (LWW eventual; métrica `getEvictedSkipCount()`).
+- **Pair mode** (`ClusterCoordinatorConfig.withPairMode`) — cluster de 2 nós: o sobrevivente assume
+  ao perder o peer (bypassa a maioria dinâmica); split-brain reconciliado pelo maior NodeId.
+
+**Testes:** `PairModeFailoverTest` (RED→GREEN). Suíte completa verde (329).
+
+---
+
 ## 2026-06-04 — 🟢 `DistributedMap implements java.util.Map<K,V>` (#106) + baseline JDK 21 (#107)
 
 **Alterações:**

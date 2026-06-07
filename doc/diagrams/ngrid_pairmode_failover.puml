@@ -1,0 +1,22 @@
+@startuml
+title Pair mode — failover de 2 nós e reconciliação por NodeId
+
+participant "node-1\n(00100, maior)" as N1
+participant "node-2\n(00050)" as N2
+
+== Operação normal ==
+N1 -> N2 : heartbeat (líder=00100)
+note over N1, N2 : Active 2/2; maior NodeId (00100) é líder
+
+== Falha do líder ==
+N1 -x N2 : (node-1 cai)
+N2 -> N2 : evict node-1; recomputeLeader\nrequired = minClusterSize (pairMode)\nActive 1/2 >= 1 → ASSUME
+note over N2 : 00050 vira líder sozinho\n(sem pairMode: required=2 → SEM líder)
+N2 -> N2 : onBecameLeader → retoma consumo Kafka
+
+== Retorno do node-1 (partição cura) ==
+N1 -> N2 : heartbeat / membership
+N2 -> N2 : recomputeLeader = max(NodeId) = 00100\n→ step-down (epoch++)
+N1 -> N1 : assume liderança (00100)
+note over N1, N2 : Reconciliação: maior NodeId vence;\nfencing por epoch rejeita escritas do líder obsoleto.\nnode-2 volta a aplicar como follower.
+@enduml
