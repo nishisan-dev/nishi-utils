@@ -58,6 +58,7 @@ public final class NGridNodeBuilder {
     private RelayDurability relayDurability = RelayDurability.OS_MANAGED;
     private boolean persistentResendLog = false;
     private int relayApplyBatchSize = 256;
+    private boolean leaderPauseOnJoin = false;
 
     NGridNodeBuilder(String host, int port) {
         this.host = Objects.requireNonNull(host, "host");
@@ -238,6 +239,19 @@ public final class NGridNodeBuilder {
     }
 
     /**
+     * Enables leader-pause-on-join (#129): the leader pauses production while a not-caught-up follower
+     * joins, generalizing the failover drain-gate to the join path for deterministic bootstrap
+     * convergence. Bounded and released on catch-up/disconnect/timeout. Defaults to {@code false}.
+     *
+     * @param leaderPauseOnJoin {@code true} to pause production while a behind follower joins
+     * @return this builder
+     */
+    public NGridNodeBuilder leaderPauseOnJoin(boolean leaderPauseOnJoin) {
+        this.leaderPauseOnJoin = leaderPauseOnJoin;
+        return this;
+    }
+
+    /**
      * Builds and starts the node.
      * <p>
      * If no data directory is specified, the build will fail for
@@ -260,7 +274,8 @@ public final class NGridNodeBuilder {
                 .followerIngestMode(followerIngestMode)
                 .relayDurability(relayDurability)
                 .persistentResendLog(persistentResendLog)
-                .relayApplyBatchSize(relayApplyBatchSize);
+                .relayApplyBatchSize(relayApplyBatchSize)
+                .leaderPauseOnJoin(leaderPauseOnJoin);
 
         if (dataDir != null) {
             builder.dataDirectory(dataDir);

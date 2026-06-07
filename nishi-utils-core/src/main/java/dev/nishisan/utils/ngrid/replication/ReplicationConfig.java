@@ -46,6 +46,11 @@ public final class ReplicationConfig {
     private final long resendLogMaxEntries;
     private final int resendLogReadBatchMax;
     private final int relayApplyBatchSize;
+    private final boolean leaderPauseOnJoin;
+    private final Duration joinQuiesceMaxDuration;
+    private final Duration followerProgressInterval;
+    private final Duration joinPeerDiscoveryWindow;
+    private final long joinSyncLagThreshold;
 
     private ReplicationConfig(int quorum, Duration operationTimeout, Duration retryInterval, boolean strictConsistency,
             Path dataDirectory, int resendGapThreshold, Duration resendTimeout, int replicationLogRetention,
@@ -53,7 +58,8 @@ public final class ReplicationConfig {
             boolean leaderLocalApply, FollowerIngestMode followerIngestMode, RelayDurability relayDurability,
             Duration relayGroupCommitInterval, boolean persistentResendLog, int resendLogSegmentMaxEntries,
             Duration resendLogSegmentMaxAge, long resendLogMaxEntries, int resendLogReadBatchMax,
-            int relayApplyBatchSize) {
+            int relayApplyBatchSize, boolean leaderPauseOnJoin, Duration joinQuiesceMaxDuration,
+            Duration followerProgressInterval, Duration joinPeerDiscoveryWindow, long joinSyncLagThreshold) {
         this.quorum = quorum;
         this.operationTimeout = Objects.requireNonNull(operationTimeout, "operationTimeout");
         this.retryInterval = Objects.requireNonNull(retryInterval, "retryInterval");
@@ -76,6 +82,11 @@ public final class ReplicationConfig {
         this.resendLogMaxEntries = resendLogMaxEntries;
         this.resendLogReadBatchMax = resendLogReadBatchMax;
         this.relayApplyBatchSize = relayApplyBatchSize;
+        this.leaderPauseOnJoin = leaderPauseOnJoin;
+        this.joinQuiesceMaxDuration = Objects.requireNonNull(joinQuiesceMaxDuration, "joinQuiesceMaxDuration");
+        this.followerProgressInterval = Objects.requireNonNull(followerProgressInterval, "followerProgressInterval");
+        this.joinPeerDiscoveryWindow = Objects.requireNonNull(joinPeerDiscoveryWindow, "joinPeerDiscoveryWindow");
+        this.joinSyncLagThreshold = joinSyncLagThreshold;
     }
 
     public static ReplicationConfig of(int quorum) {
@@ -277,6 +288,59 @@ public final class ReplicationConfig {
         return relayApplyBatchSize;
     }
 
+    /**
+     * Whether the leader pauses production while a not-caught-up follower joins (#129), generalizing
+     * the failover drain-gate to the join path so convergence is deterministic (no firehose during
+     * bootstrap). Bounded by {@link #joinQuiesceMaxDuration()} and released on the follower catching
+     * up or disconnecting. Defaults to {@code false} (opt-in; preserves current write availability).
+     *
+     * @return {@code true} when leader-pause-on-join is enabled
+     */
+    public boolean leaderPauseOnJoin() {
+        return leaderPauseOnJoin;
+    }
+
+    /**
+     * Hard cap on how long the leader pauses production for a joining follower (#129), so a follower
+     * that dies mid-join cannot freeze the leader. Defaults to 10s.
+     *
+     * @return the maximum join-quiesce duration
+     */
+    public Duration joinQuiesceMaxDuration() {
+        return joinQuiesceMaxDuration;
+    }
+
+    /**
+     * How often a follower reports its apply progress to the leader (#129), driving the
+     * leader-pause-on-join release. Defaults to 500ms.
+     *
+     * @return the follower progress-report interval
+     */
+    public Duration followerProgressInterval() {
+        return followerProgressInterval;
+    }
+
+    /**
+     * Grace window after start during which a node that self-elects leader alone (pair mode) is not
+     * treated as a ready, caught-up leader (#129) — preventing a transient boot self-election from
+     * marking empty state as synced. Defaults to 2s.
+     *
+     * @return the peer-discovery grace window
+     */
+    public Duration joinPeerDiscoveryWindow() {
+        return joinPeerDiscoveryWindow;
+    }
+
+    /**
+     * How close (in sequences) a joining follower must be to the leader's current sequence to count as
+     * caught up and release the leader-pause-on-join gate (#129). Defaults to 0 (fully caught up).
+     *
+     * @return the join-sync lag threshold
+     */
+    public long joinSyncLagThreshold() {
+        return joinSyncLagThreshold;
+    }
+
     public static final class Builder {
         private final int quorum;
         private Duration operationTimeout = Duration.ofSeconds(30);
@@ -299,6 +363,11 @@ public final class ReplicationConfig {
         private long resendLogMaxEntries = 10_000_000L;
         private int resendLogReadBatchMax = 5_000;
         private int relayApplyBatchSize = 256;
+        private boolean leaderPauseOnJoin = false;
+        private Duration joinQuiesceMaxDuration = Duration.ofSeconds(10);
+        private Duration followerProgressInterval = Duration.ofMillis(500);
+        private Duration joinPeerDiscoveryWindow = Duration.ofSeconds(2);
+        private long joinSyncLagThreshold = 0L;
 
         private Builder(int quorum) {
             if (quorum < 1) {
@@ -541,6 +610,77 @@ public final class ReplicationConfig {
             return this;
         }
 
+        /**
+         * Enables leader-pause-on-join (#129). See {@link #leaderPauseOnJoin()}. Defaults to
+         * {@code false}.
+         *
+         * @param leaderPauseOnJoin {@code true} to pause production while a behind follower joins
+         * @return this builder
+         */
+        public Builder leaderPauseOnJoin(boolean leaderPauseOnJoin) {
+            this.leaderPauseOnJoin = leaderPauseOnJoin;
+            return this;
+        }
+
+        /**
+         * Sets the hard cap on a join-quiesce pause (#129).
+         *
+         * @param duration the maximum join-quiesce duration (must be positive)
+         * @return this builder
+         */
+        public Builder joinQuiesceMaxDuration(Duration duration) {
+            Objects.requireNonNull(duration, "joinQuiesceMaxDuration");
+            if (duration.isNegative() || duration.isZero()) {
+                throw new IllegalArgumentException("joinQuiesceMaxDuration must be positive");
+            }
+            this.joinQuiesceMaxDuration = duration;
+            return this;
+        }
+
+        /**
+         * Sets how often a follower reports apply progress to the leader (#129).
+         *
+         * @param interval the progress-report interval (must be positive)
+         * @return this builder
+         */
+        public Builder followerProgressInterval(Duration interval) {
+            Objects.requireNonNull(interval, "followerProgressInterval");
+            if (interval.isNegative() || interval.isZero()) {
+                throw new IllegalArgumentException("followerProgressInterval must be positive");
+            }
+            this.followerProgressInterval = interval;
+            return this;
+        }
+
+        /**
+         * Sets the peer-discovery grace window for the boot self-election guard (#129).
+         *
+         * @param window the grace window (must not be negative)
+         * @return this builder
+         */
+        public Builder joinPeerDiscoveryWindow(Duration window) {
+            Objects.requireNonNull(window, "joinPeerDiscoveryWindow");
+            if (window.isNegative()) {
+                throw new IllegalArgumentException("joinPeerDiscoveryWindow must not be negative");
+            }
+            this.joinPeerDiscoveryWindow = window;
+            return this;
+        }
+
+        /**
+         * Sets how close a joining follower must be to release the leader-pause-on-join gate (#129).
+         *
+         * @param threshold the lag threshold in sequences (must be >= 0)
+         * @return this builder
+         */
+        public Builder joinSyncLagThreshold(long threshold) {
+            if (threshold < 0) {
+                throw new IllegalArgumentException("joinSyncLagThreshold must be >= 0");
+            }
+            this.joinSyncLagThreshold = threshold;
+            return this;
+        }
+
         public ReplicationConfig build() {
             if (dataDirectory == null) {
                 throw new IllegalStateException("dataDirectory must be set");
@@ -549,7 +689,8 @@ public final class ReplicationConfig {
                     resendGapThreshold, resendTimeout, replicationLogRetention, replicationLogRetentionTime,
                     appliedSetMaxSize, operationLogMaxSize, leaderLocalApply, followerIngestMode, relayDurability,
                     relayGroupCommitInterval, persistentResendLog, resendLogSegmentMaxEntries, resendLogSegmentMaxAge,
-                    resendLogMaxEntries, resendLogReadBatchMax, relayApplyBatchSize);
+                    resendLogMaxEntries, resendLogReadBatchMax, relayApplyBatchSize, leaderPauseOnJoin,
+                    joinQuiesceMaxDuration, followerProgressInterval, joinPeerDiscoveryWindow, joinSyncLagThreshold);
         }
     }
 }
