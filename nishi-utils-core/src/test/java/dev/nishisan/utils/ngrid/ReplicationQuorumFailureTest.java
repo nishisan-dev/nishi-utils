@@ -133,7 +133,10 @@ class ReplicationQuorumFailureTest {
                     && node2.transport().isConnected(info3.nodeId())
                     && node3.transport().isConnected(info1.nodeId())
                     && node3.transport().isConnected(info2.nodeId());
-            if (leadersAgree && allMembers && connected) {
+            // The leader must have finished its initial sync before we write: replicate() now
+            // rejects writes while the leader is catching up (LeaderSyncingException).
+            boolean leaderReady = leaderNotSyncing(node1) && leaderNotSyncing(node2) && leaderNotSyncing(node3);
+            if (leadersAgree && allMembers && connected && leaderReady) {
                 return;
             }
             try {
@@ -144,6 +147,10 @@ class ReplicationQuorumFailureTest {
             }
         }
         throw new IllegalStateException("Cluster did not stabilize in time");
+    }
+
+    private static boolean leaderNotSyncing(NGridNode node) {
+        return node.replicationManager() == null || !node.replicationManager().isLeaderSyncing();
     }
 
     private void closeQuietly(NGridNode node) {
