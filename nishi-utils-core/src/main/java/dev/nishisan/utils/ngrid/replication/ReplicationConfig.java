@@ -45,13 +45,15 @@ public final class ReplicationConfig {
     private final Duration resendLogSegmentMaxAge;
     private final long resendLogMaxEntries;
     private final int resendLogReadBatchMax;
+    private final int relayApplyBatchSize;
 
     private ReplicationConfig(int quorum, Duration operationTimeout, Duration retryInterval, boolean strictConsistency,
             Path dataDirectory, int resendGapThreshold, Duration resendTimeout, int replicationLogRetention,
             Duration replicationLogRetentionTime, int appliedSetMaxSize, int operationLogMaxSize,
             boolean leaderLocalApply, FollowerIngestMode followerIngestMode, RelayDurability relayDurability,
             Duration relayGroupCommitInterval, boolean persistentResendLog, int resendLogSegmentMaxEntries,
-            Duration resendLogSegmentMaxAge, long resendLogMaxEntries, int resendLogReadBatchMax) {
+            Duration resendLogSegmentMaxAge, long resendLogMaxEntries, int resendLogReadBatchMax,
+            int relayApplyBatchSize) {
         this.quorum = quorum;
         this.operationTimeout = Objects.requireNonNull(operationTimeout, "operationTimeout");
         this.retryInterval = Objects.requireNonNull(retryInterval, "retryInterval");
@@ -73,6 +75,7 @@ public final class ReplicationConfig {
         this.resendLogSegmentMaxAge = Objects.requireNonNull(resendLogSegmentMaxAge, "resendLogSegmentMaxAge");
         this.resendLogMaxEntries = resendLogMaxEntries;
         this.resendLogReadBatchMax = resendLogReadBatchMax;
+        this.relayApplyBatchSize = relayApplyBatchSize;
     }
 
     public static ReplicationConfig of(int quorum) {
@@ -262,6 +265,18 @@ public final class ReplicationConfig {
         return resendLogReadBatchMax;
     }
 
+    /**
+     * Maximum number of relay-log entries a follower's apply consumer drains per batch (#128). The
+     * consumer stays single-threaded and applies in strict sequence order; batching amortizes the
+     * per-operation lock/flush/peek-poll overhead across the batch, raising apply throughput above
+     * the leader's production without any ordering or fencing risk.
+     *
+     * @return the relay apply batch size
+     */
+    public int relayApplyBatchSize() {
+        return relayApplyBatchSize;
+    }
+
     public static final class Builder {
         private final int quorum;
         private Duration operationTimeout = Duration.ofSeconds(30);
@@ -283,6 +298,7 @@ public final class ReplicationConfig {
         private Duration resendLogSegmentMaxAge = Duration.ofMinutes(5);
         private long resendLogMaxEntries = 10_000_000L;
         private int resendLogReadBatchMax = 5_000;
+        private int relayApplyBatchSize = 256;
 
         private Builder(int quorum) {
             if (quorum < 1) {
@@ -511,6 +527,20 @@ public final class ReplicationConfig {
             return this;
         }
 
+        /**
+         * Sets how many relay-log entries a follower's apply consumer drains per batch (#128).
+         *
+         * @param batchSize the relay apply batch size (must be >= 1)
+         * @return this builder
+         */
+        public Builder relayApplyBatchSize(int batchSize) {
+            if (batchSize < 1) {
+                throw new IllegalArgumentException("relayApplyBatchSize must be >= 1");
+            }
+            this.relayApplyBatchSize = batchSize;
+            return this;
+        }
+
         public ReplicationConfig build() {
             if (dataDirectory == null) {
                 throw new IllegalStateException("dataDirectory must be set");
@@ -519,7 +549,7 @@ public final class ReplicationConfig {
                     resendGapThreshold, resendTimeout, replicationLogRetention, replicationLogRetentionTime,
                     appliedSetMaxSize, operationLogMaxSize, leaderLocalApply, followerIngestMode, relayDurability,
                     relayGroupCommitInterval, persistentResendLog, resendLogSegmentMaxEntries, resendLogSegmentMaxAge,
-                    resendLogMaxEntries, resendLogReadBatchMax);
+                    resendLogMaxEntries, resendLogReadBatchMax, relayApplyBatchSize);
         }
     }
 }

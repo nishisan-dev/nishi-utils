@@ -49,6 +49,7 @@ public final class NGridConfig {
     private final RelayDurability relayDurability;
     private final Duration relayGroupCommitInterval;
     private final boolean persistentResendLog;
+    private final int relayApplyBatchSize;
     private final Duration rttProbeInterval;
     private final Duration heartbeatInterval;
     private final Duration leaseTimeout;
@@ -98,6 +99,7 @@ public final class NGridConfig {
         this.relayDurability = builder.relayDurability;
         this.relayGroupCommitInterval = builder.relayGroupCommitInterval;
         this.persistentResendLog = builder.persistentResendLog;
+        this.relayApplyBatchSize = builder.relayApplyBatchSize;
         this.rttProbeInterval = builder.rttProbeInterval;
         this.heartbeatInterval = builder.heartbeatInterval;
         this.leaseTimeout = builder.leaseTimeout;
@@ -227,6 +229,17 @@ public final class NGridConfig {
      */
     public boolean persistentResendLog() {
         return persistentResendLog;
+    }
+
+    /**
+     * Number of relay-log entries a follower's apply consumer drains per batch (#128). Higher values
+     * raise apply throughput under burst by amortizing per-operation overhead; the consumer stays
+     * single-threaded and in strict sequence order. Defaults to 256.
+     *
+     * @return the relay apply batch size
+     */
+    public int relayApplyBatchSize() {
+        return relayApplyBatchSize;
     }
 
     /**
@@ -415,6 +428,7 @@ public final class NGridConfig {
         private RelayDurability relayDurability = RelayDurability.OS_MANAGED;
         private Duration relayGroupCommitInterval = Duration.ofSeconds(1);
         private boolean persistentResendLog = false;
+        private int relayApplyBatchSize = 256;
         private Duration rttProbeInterval = Duration.ofSeconds(10);
         private Duration heartbeatInterval = Duration.ofSeconds(3);
         private Duration leaseTimeout;
@@ -647,6 +661,21 @@ public final class NGridConfig {
          */
         public Builder persistentResendLog(boolean persistentResendLog) {
             this.persistentResendLog = persistentResendLog;
+            return this;
+        }
+
+        /**
+         * Sets how many relay-log entries a follower's apply consumer drains per batch (#128).
+         * Defaults to 256.
+         *
+         * @param batchSize the relay apply batch size (must be >= 1)
+         * @return this builder
+         */
+        public Builder relayApplyBatchSize(int batchSize) {
+            if (batchSize < 1) {
+                throw new IllegalArgumentException("relayApplyBatchSize must be >= 1");
+            }
+            this.relayApplyBatchSize = batchSize;
             return this;
         }
 

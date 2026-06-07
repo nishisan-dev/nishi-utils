@@ -57,6 +57,7 @@ public final class NGridNodeBuilder {
     private FollowerIngestMode followerIngestMode = FollowerIngestMode.INLINE;
     private RelayDurability relayDurability = RelayDurability.OS_MANAGED;
     private boolean persistentResendLog = false;
+    private int relayApplyBatchSize = 256;
 
     NGridNodeBuilder(String host, int port) {
         this.host = Objects.requireNonNull(host, "host");
@@ -222,6 +223,21 @@ public final class NGridNodeBuilder {
     }
 
     /**
+     * Sets how many relay-log entries the follower apply consumer drains per batch (#128), raising
+     * apply throughput under burst while keeping strict in-order application. Defaults to 256.
+     *
+     * @param batchSize the relay apply batch size (must be >= 1)
+     * @return this builder
+     */
+    public NGridNodeBuilder relayApplyBatchSize(int batchSize) {
+        if (batchSize < 1) {
+            throw new IllegalArgumentException("relayApplyBatchSize must be >= 1");
+        }
+        this.relayApplyBatchSize = batchSize;
+        return this;
+    }
+
+    /**
      * Builds and starts the node.
      * <p>
      * If no data directory is specified, the build will fail for
@@ -243,7 +259,8 @@ public final class NGridNodeBuilder {
                 .strictConsistency(strictConsistency)
                 .followerIngestMode(followerIngestMode)
                 .relayDurability(relayDurability)
-                .persistentResendLog(persistentResendLog);
+                .persistentResendLog(persistentResendLog)
+                .relayApplyBatchSize(relayApplyBatchSize);
 
         if (dataDir != null) {
             builder.dataDirectory(dataDir);
