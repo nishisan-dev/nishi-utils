@@ -73,6 +73,19 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             0);
     private volatile long lastAppliedSequence = 0;
     private final Set<String> syncingTopics = ConcurrentHashMap.newKeySet();
+    // Janitor state: timestamp (millis) of the LAST sync activity per topic — updated on every
+    // SYNC_RESPONSE chunk received. The janitor releases a sync guard only when NO chunk has arrived
+    // for SYNC_STUCK_TIMEOUT_MS (a genuinely lost/hung sync), NOT merely because nextExpected has
+    // not advanced yet. A large multi-chunk (byte-sliced) snapshot legitimately takes many seconds
+    // and only advances nextExpected on the FINAL chunk; keying the janitor on chunk arrival keeps
+    // it from killing a healthy in-flight transfer mid-way (which would resetState the follower and
+    // never converge).
+    private final Map<String, Long> lastSyncActivityByTopic = new ConcurrentHashMap<>();
+    private static final long SYNC_STUCK_TIMEOUT_MS = 15_000L;
+    // Watermark captured at chunk 0 of an in-flight snapshot, reused for all chunks of that snapshot
+    // so a multi-chunk (byte-sliced) snapshot lands a consistent nextExpected on the follower.
+    // Keyed by "<followerNodeId>::<topic>".
+    private final Map<String, Long> activeSyncWatermark = new ConcurrentHashMap<>();
     private final Set<String> leaderSyncTopics = ConcurrentHashMap.newKeySet();
     private final java.util.concurrent.atomic.AtomicBoolean leaderSyncing = new java.util.concurrent.atomic.AtomicBoolean(
             false);
@@ -104,7 +117,24 @@ public class ReplicationManager implements TransportListener, LeadershipListener
     private final Map<String, Map<Long, Instant>> sequenceWaitStartByTopic = new ConcurrentHashMap<>();
     private static final Duration SEQUENCE_WAIT_TIMEOUT = Duration.ofSeconds(1);
     private final Path sequenceStatePath;
+    // Sequence-state persistence is a recovery HINT (lost state just triggers a re-sync), so it is
+    // coalesced: the hot path marks it dirty (no I/O, no lock cost) and a scheduled flush writes it
+    // at most once per interval, OFF the lock. Writing the whole file on every applied op (2k+/s)
+    // under sequenceBufferLock made the lock hold time bounded by disk latency — a throughput
+    // bottleneck and a freeze hazard on any I/O stall.
+    private volatile boolean sequenceStateDirty = false;
     private final ReentrantLock sequenceBufferLock = new ReentrantLock();
+    // Max time to wait when acquiring sequenceBufferLock on the replication path. A bounded tryLock
+    // (instead of an unbounded lock()) means that if the lock is ever orphaned — e.g. a worker dies
+    // leaving the ReentrantLock held with no live owner — the replication path degrades to a
+    // recoverable timeout (the operation aborts and is retried / re-synced) instead of parking the
+    // whole replication pool forever and freezing the node (which then drops the cluster's leader).
+    private static final long LOCK_ACQUIRE_TIMEOUT_MS = 15_000L;
+    // Hard cap on the per-topic out-of-order sequence buffer. Unbounded growth (a follower stuck on a
+    // gap while the live stream keeps arriving) is what drove the node to OOM — the Error that
+    // orphaned the lock and froze it. At the cap we drop to a fresh snapshot instead of buffering
+    // without limit.
+    private static final int MAX_SEQUENCE_BUFFER = 250_000;
 
     // Leader-side replication log indexed by sequence (per topic) for resend
     // support
@@ -116,6 +146,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
     // Metrics
     private final java.util.concurrent.atomic.AtomicLong gapsDetected = new java.util.concurrent.atomic.AtomicLong(0);
+    private final java.util.concurrent.atomic.AtomicLong evictedSkipCount = new java.util.concurrent.atomic.AtomicLong(0);
     private final java.util.concurrent.atomic.AtomicLong resendSuccessCount = new java.util.concurrent.atomic.AtomicLong(
             0);
     private final java.util.concurrent.atomic.AtomicLong snapshotFallbackCount = new java.util.concurrent.atomic.AtomicLong(
@@ -179,6 +210,9 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         timeoutScheduler.scheduleAtFixedRate(this::checkLagAndSync, 2000, 2000, TimeUnit.MILLISECONDS);
         timeoutScheduler.scheduleAtFixedRate(this::retryLeaderSync, 500, 500, TimeUnit.MILLISECONDS);
         timeoutScheduler.scheduleAtFixedRate(this::checkResendTimeouts, 500, 500, TimeUnit.MILLISECONDS);
+        timeoutScheduler.scheduleAtFixedRate(this::checkStuckSyncs, 1000, 1000, TimeUnit.MILLISECONDS);
+        // Coalesced off-lock persistence of the sequence state (dirty-flag flush)
+        timeoutScheduler.scheduleAtFixedRate(this::flushSequenceStateIfDirty, 1000, 1000, TimeUnit.MILLISECONDS);
         // Periodic memory eviction for the operation audit log
         long cleanupPeriodMs = Math.max(5000L, timeout.toMillis() * 5);
         timeoutScheduler.scheduleAtFixedRate(this::trimLog, cleanupPeriodMs, cleanupPeriodMs, TimeUnit.MILLISECONDS);
@@ -189,6 +223,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             return;
         }
         running = false;
+        flushSequenceStateIfDirty(); // persist the latest coalesced sequence state on shutdown
         transport.removeListener(this);
         coordinator.removeLeadershipListener(this);
         failAllPending("ReplicationManager stopped");
@@ -211,7 +246,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
      * Intended for testing and observability.
      */
     public int getAppliedSetSize() {
-        sequenceBufferLock.lock();
+        acquireSequenceLock();
         try {
             return applied.size();
         } finally {
@@ -386,8 +421,8 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         long seq = nextSequenceForTopic(operation.topic);
         operation.sequence = seq;
 
-        // Persist sequence state for leader recovery
-        saveSequenceState();
+        // Persist sequence state for leader recovery (coalesced; flushed off the hot path)
+        sequenceStateDirty = true;
 
         ReplicationPayload payload = new ReplicationPayload(operation.operationId, seq,
                 coordinator.getLeaderEpoch(), operation.topic, operation.payload);
@@ -445,11 +480,45 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         }
     }
 
+    /**
+     * Acquires {@link #sequenceBufferLock} with a bounded wait. Callers MUST follow the
+     * {@code acquireSequenceLock(); try { ... } finally { sequenceBufferLock.unlock(); }} idiom: on a
+     * timeout this throws BEFORE the {@code try}, so the {@code finally} never runs and no spurious
+     * unlock happens. A timeout indicates a stuck/orphaned lock; the caller aborts and the operation
+     * is retried or recovered via re-sync — far better than parking forever and freezing the node.
+     */
+    private void acquireSequenceLock() {
+        try {
+            if (!sequenceBufferLock.tryLock(LOCK_ACQUIRE_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                throw new IllegalStateException("Timed out after " + LOCK_ACQUIRE_TIMEOUT_MS
+                        + "ms acquiring sequenceBufferLock (possible orphaned lock); aborting to recover");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while acquiring sequenceBufferLock", e);
+        }
+    }
+
     private void checkCompletion(PendingOperation operation) {
         if (operation.isCommitted()) {
             return;
         }
         if (operation.ackCount() >= operation.quorum) {
+            if (!config.leaderLocalApply()) {
+                // External engine owns the authoritative state (delta-shipping op-log): skip the
+                // redundant leader-local apply and commit + INDEX the operation SYNCHRONOUSLY now
+                // that quorum is met, so it is immediately resendable to a catching-up follower.
+                // Indexing at the end of the async apply (the leaderLocalApply=true path below) let
+                // the resend index lag the send frontier by the whole apply backlog under high
+                // throughput, which made frontier resends impossible → perpetual snapshot fallback.
+                if (operation.markCommitStarted()) {
+                    long appliedSeq = appliedSequence.updateAndGet(c -> Math.max(c, operation.sequence));
+                    lastAppliedSequence = appliedSeq;
+                    operation.markLocalApplied();
+                    completeOperation(operation);
+                }
+                return;
+            }
             ReplicationHandler handler = handlers.get(operation.topic);
             if (handler != null) {
                 if (operation.markLocalApplyStarted()) {
@@ -460,7 +529,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                         try {
                             handler.apply(operation.operationId, operation.localApplyPayload);
                             recordApplied();
-                            sequenceBufferLock.lock();
+                            acquireSequenceLock();
                             try {
                                 applied.add(operation.operationId);
                                 trimApplied();
@@ -471,7 +540,9 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
                             // Complete operation after successful apply
                             completeOperation(operation);
-                        } catch (Exception e) {
+                        } catch (Throwable e) {
+                            // Throwable (not Exception): an Error (OOM/StackOverflow) must not kill
+                            // the pool worker silently nor skip cleanup — log it and fail the op.
                             LOGGER.log(Level.SEVERE, "Failed to apply committed operation locally", e);
                             failOperation(operation, e);
                         }
@@ -550,11 +621,33 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         if (handler == null)
             return;
 
+        // Watermark capture for a (possibly multi-chunk) snapshot:
+        // - Read it BEFORE capturing chunk 0 so it is a safe LOWER BOUND for the snapshot content
+        //   (on the leader the state mutation precedes the sequence assignment in
+        //   replicateToFollowers(), so a sequence read before the capture is reflected by a snapshot
+        //   taken afterwards). Reading it AFTER the capture could label the snapshot with a sequence
+        //   ABOVE its content → the follower skips entries never in the snapshot and never resent
+        //   (the permanent phantom gap on topic=cardinal-state).
+        // - REUSE the chunk-0 watermark for every subsequent chunk, so a large snapshot transferred
+        //   over many chunks still lands the follower's nextExpected on a value consistent with the
+        //   captured content, even though the leader keeps producing during the transfer.
+        String syncKey = message.source() + "::" + payload.topic();
+        long seq;
+        if (payload.chunkIndex() == 0) {
+            seq = getSyncSequenceForTopic(payload.topic());
+            activeSyncWatermark.put(syncKey, seq);
+        } else {
+            seq = activeSyncWatermark.getOrDefault(syncKey, getSyncSequenceForTopic(payload.topic()));
+        }
         ReplicationHandler.SnapshotChunk chunk = handler.getSnapshotChunk(payload.chunkIndex());
-        if (chunk == null)
+        if (chunk == null) {
+            activeSyncWatermark.remove(syncKey);
             return;
+        }
+        if (!chunk.hasMore()) {
+            activeSyncWatermark.remove(syncKey);
+        }
 
-        long seq = getSyncSequenceForTopic(payload.topic());
         SyncResponsePayload responsePayload = new SyncResponsePayload(payload.topic(), seq, payload.chunkIndex(),
                 chunk.hasMore(), chunk.data());
         ClusterMessage response = new ClusterMessage(UUID.randomUUID(),
@@ -576,8 +669,13 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
         executor.submit(() -> {
             try {
+                // Mark sync activity so the stuck-sync janitor does not kill a healthy in-flight
+                // multi-chunk transfer — nextExpected only advances on the final chunk, so without
+                // this a large byte-sliced snapshot would be torn down mid-way (resetState) and the
+                // follower would never converge.
+                lastSyncActivityByTopic.put(payload.topic(), System.currentTimeMillis());
                 long currentNext;
-                sequenceBufferLock.lock();
+                acquireSequenceLock();
                 try {
                     currentNext = nextExpectedSequenceByTopic.getOrDefault(payload.topic(), 1L);
                 } finally {
@@ -599,22 +697,30 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                 if (payload.hasMore()) {
                     requestSync(payload.topic(), payload.chunkIndex() + 1);
                 } else {
+                    // Last chunk installed: let the handler reassemble/decode a multi-chunk
+                    // (byte-sliced) snapshot before the follower is considered caught up.
+                    handler.onSnapshotInstalled();
                     LOGGER.info(
                             () -> "Sync completed for " + payload.topic() + ". Final sequence: " + payload.sequence());
                     appliedSequence.updateAndGet(current -> Math.max(current, payload.sequence()));
                     lastAppliedSequence = appliedSequence.get();
-                    sequenceBufferLock.lock();
+                    acquireSequenceLock();
                     try {
-                        nextExpectedSequenceByTopic.put(payload.topic(), payload.sequence() + 1);
-                        PriorityQueue<BufferedReplication> buffer = sequenceBufferByTopic.get(payload.topic());
-                        if (buffer != null) {
-                            buffer.clear();
-                        }
+                        long watermark = payload.sequence();
+                        nextExpectedSequenceByTopic.put(payload.topic(), watermark + 1);
+                        // Tail-replay: keep the buffered tail above the watermark so the contiguous
+                        // run (watermark+1, +2, ...) buffered during the round-trip is still applied.
+                        // The entries already covered (seq <= watermark) are discarded cheaply by
+                        // processSequenceBuffer's stale-discard loop below (O(log n) each), not by an
+                        // O(n^2) PriorityQueue.removeIf here.
                         Map<Long, Instant> waitStart = sequenceWaitStartByTopic.get(payload.topic());
                         if (waitStart != null) {
-                            waitStart.clear();
+                            waitStart.entrySet().removeIf(e -> e.getKey() <= watermark);
                         }
-                        saveSequenceState();
+                        sequenceStateDirty = true;
+                        // Apply the contiguous tail the snapshot did not cover (called under the
+                        // lock, per processSequenceBuffer's contract).
+                        processSequenceBuffer(payload.topic());
                     } finally {
                         sequenceBufferLock.unlock();
                     }
@@ -623,7 +729,9 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                         leaderSyncing.set(false);
                     }
                 }
-            } catch (Exception e) {
+            } catch (Throwable e) {
+                // Throwable (not Exception): an Error here (e.g. OOM decoding a large snapshot) must
+                // not kill the pool worker silently; log it and release the sync guard to allow retry.
                 LOGGER.log(Level.SEVERE, "Failed to install snapshot chunk", e);
                 syncingTopics.remove(payload.topic()); // allow retry
             }
@@ -696,7 +804,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
         // Lock to manipulate buffer and sequence
         String topic = payload.topic();
-        sequenceBufferLock.lock();
+        acquireSequenceLock();
         try {
             // Already applied previously - send ACK and skip (safe check under lock)
             if (applied.contains(opId)) {
@@ -716,7 +824,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             if (seq == nextExpected) {
                 // Create callback to execute AFTER successful apply
                 Runnable onSuccess = () -> {
-                    sequenceBufferLock.lock();
+                    acquireSequenceLock();
                     try {
                         // Update state ONLY if still the expected sequence (idempotency check)
                         long current = nextExpectedSequenceByTopic.get(topic);
@@ -732,7 +840,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
                             // Advance sequence
                             nextExpectedSequenceByTopic.put(topic, nextExpected + 1);
-                            saveSequenceState();
+                            sequenceStateDirty = true;
 
                             // Process buffer recursively
                             processSequenceBuffer(topic);
@@ -745,16 +853,23 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                 // Apply asynchronously with callback
                 applyReplication(payload, message, onSuccess);
             } else if (seq > nextExpected) {
-                // Future sequence - check for duplicates before buffering
-                boolean alreadyBuffered = buffer.stream()
-                        .anyMatch(b -> b.payload().operationId().equals(opId));
-                if (alreadyBuffered) {
-                    LOGGER.fine(() -> String.format(
-                            "[%s] Ignoring duplicate buffered opId=%s seq=%d topic=%s",
-                            localNodeId, opId, seq, topic));
+                // Future sequence: buffer it. We do NOT scan the buffer for duplicates here (that was
+                // O(n) per op and, with a large buffer under load, monopolized the lock). A duplicate
+                // future seq is harmless — it stays until processSequenceBuffer reaches that sequence,
+                // applies one copy, and discards the rest as stale (seq < nextExpected) in O(log n).
+                if (buffer.size() >= MAX_SEQUENCE_BUFFER) {
+                    // Hopelessly behind with a persistent gap: buffering without limit would OOM.
+                    // Drop to a fresh snapshot (tail-replayed at the new watermark discards the stale
+                    // buffer) instead of growing the buffer until the heap is exhausted.
+                    LOGGER.warning(() -> String.format(
+                            "[%s] Sequence buffer for topic=%s hit cap (%d); requesting snapshot to recover.",
+                            localNodeId, topic, MAX_SEQUENCE_BUFFER));
+                    snapshotFallbackCount.incrementAndGet();
+                    if (syncingTopics.add(topic)) {
+                        requestSync(topic);
+                    }
                     return;
                 }
-
                 BufferedReplication buffered = new BufferedReplication(
                         payload, message, Instant.now());
                 buffer.add(buffered);
@@ -814,7 +929,9 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                 LOGGER.fine(() -> String.format(
                         "[%s] Applied replication opId=%s seq=%d topic=%s",
                         localNodeId, opId, payload.sequence(), payload.topic()));
-            } catch (Exception e) {
+            } catch (Throwable e) {
+                // Throwable (not Exception): an Error must not kill the pool worker silently nor skip
+                // the processing-set cleanup in the finally below; log it and recover via re-sync.
                 LOGGER.log(Level.SEVERE, "Failed to apply replicated operation", e);
                 if (syncingTopics.add(payload.topic())) {
                     LOGGER.warning(() -> "Apply failed for topic " + payload.topic()
@@ -839,8 +956,22 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             return;
         }
 
-        BufferedReplication next = buffer.peek();
         long nextExpected = nextExpectedSequenceByTopic.get(topic);
+        // Discard buffered entries already covered (seq < nextExpected): duplicates, or the part of
+        // the buffer below a snapshot watermark. Each poll is O(log n) — this replaces the O(n)
+        // per-insert duplicate scan and the O(n^2) PriorityQueue.removeIf on tail-replay, both of
+        // which monopolized the lock under a large buffer and starved the apply callbacks (lock
+        // acquire timeouts), stalling convergence.
+        while (!buffer.isEmpty() && buffer.peek().sequence() < nextExpected) {
+            BufferedReplication stale = buffer.poll();
+            if (waitStart != null) {
+                waitStart.remove(stale.sequence());
+            }
+        }
+        if (buffer.isEmpty()) {
+            return;
+        }
+        BufferedReplication next = buffer.peek();
 
         if (next.sequence() != nextExpected) {
             // Next in buffer is not the expected one, stop
@@ -855,7 +986,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
         // Create callback for recursive processing
         Runnable onSuccess = () -> {
-            sequenceBufferLock.lock();
+            acquireSequenceLock();
             try {
                 // Update state ONLY if still the expected sequence (idempotency check)
                 long current = nextExpectedSequenceByTopic.get(topic);
@@ -873,7 +1004,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
                     // Advance sequence
                     nextExpectedSequenceByTopic.put(topic, nextExpected + 1);
-                    saveSequenceState();
+                    sequenceStateDirty = true;
 
                     LOGGER.fine(() -> String.format(
                             "Processed buffered sequence seq=%d for topic=%s", next.sequence(), topic));
@@ -898,6 +1029,12 @@ public class ReplicationManager implements TransportListener, LeadershipListener
      * (must be called with sequenceBufferLock held).
      */
     private void checkForMissingSequences(String topic) {
+        // A snapshot sync already in progress will recover this topic at its new watermark; firing
+        // resends underneath it only hammers the leader (the hot-loop that starved its lease) and
+        // races the tail-replay. Let the sync settle first.
+        if (syncingTopics.contains(topic)) {
+            return;
+        }
         PriorityQueue<BufferedReplication> buffer = sequenceBufferByTopic.get(topic);
         Map<Long, Instant> waitStart = sequenceWaitStartByTopic.get(topic);
 
@@ -1046,7 +1183,12 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             synchronized (topicLog) {
                 for (long seq = from; seq <= to; seq++) {
                     ReplicationPayload payload = topicLog.get(seq);
-                    if (payload != null && isOperationCommitted(payload.operationId())) {
+                    // A payload only enters replicationLogBySequence via indexReplicationPayload, which
+                    // is called exclusively from completeOperation (commit). So its mere presence here
+                    // already implies it is committed — re-checking the bounded audit log (capped at
+                    // operationLogMaxSize, far smaller than replicationLogRetention) only produced
+                    // false "missing" for ops beyond that cap, forcing needless snapshot fallback.
+                    if (payload != null) {
                         operations.add(payload);
                     } else {
                         missingSequences.add(seq);
@@ -1080,9 +1222,59 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         transport.send(responseMessage);
     }
 
-    private boolean isOperationCommitted(UUID operationId) {
-        ReplicatedRecord record = log.get(operationId);
-        return record != null && record.status() == OperationStatus.COMMITTED;
+    /**
+     * Recovers from an UNFILLABLE head-of-line gap: when the leader reports the requested
+     * sequence(s) as missing (evicted from its resend log) and the follower already holds higher
+     * sequences in the buffer, the missing range was produced-then-evicted and will never arrive.
+     * Advancing {@code nextExpected} past the hole to the buffer head and draining the contiguous
+     * tail lets the follower converge in bulk and go live, instead of re-requesting the same
+     * sequence forever (the hot-loop that saturated the leader and starved its lease).
+     *
+     * <p>This trades strong consistency for liveness (eventual LWW): keys touched ONLY in the
+     * skipped range keep their last-known value until the next update or a fresh snapshot. It only
+     * fires on a confirmed-evicted gap (the leader said "missing"), never during normal small gaps
+     * whose sequences are still resendable.
+     *
+     * @return {@code true} if a gap was skipped and the buffer drain was kicked off
+     */
+    private boolean skipEvictedGapAndDrain(String topic, java.util.List<Long> missingSequences) {
+        acquireSequenceLock();
+        try {
+            PriorityQueue<BufferedReplication> buffer = sequenceBufferByTopic.get(topic);
+            if (buffer == null || buffer.isEmpty()) {
+                return false; // nothing buffered above the hole to jump to
+            }
+            long nextExpected = nextExpectedSequenceByTopic.getOrDefault(topic, 1L);
+            long bufferHead = buffer.peek().sequence();
+            if (bufferHead <= nextExpected) {
+                return false; // buffer head is not above the hole; ordinary processing applies
+            }
+            long maxMissing = Long.MIN_VALUE;
+            for (long m : missingSequences) {
+                maxMissing = Math.max(maxMissing, m);
+            }
+            if (maxMissing < nextExpected) {
+                return false; // stale response for an already-advanced position
+            }
+            long skipFrom = nextExpected;
+            long skipTo = bufferHead - 1;
+            long skipped = skipTo - skipFrom + 1;
+            nextExpectedSequenceByTopic.put(topic, bufferHead);
+            evictedSkipCount.addAndGet(skipped);
+            LOGGER.warning(() -> String.format(
+                    "Skipping %d evicted sequence(s) [%d..%d] for topic=%s (gone from the leader's "
+                            + "resend log); advancing to buffered %d and draining the tail.",
+                    skipped, skipFrom, skipTo, topic, bufferHead));
+            Map<Long, Instant> waitStart = sequenceWaitStartByTopic.get(topic);
+            if (waitStart != null) {
+                waitStart.entrySet().removeIf(e -> e.getKey() < bufferHead);
+            }
+            sequenceStateDirty = true;
+            processSequenceBuffer(topic);
+            return true;
+        } finally {
+            sequenceBufferLock.unlock();
+        }
     }
 
     /**
@@ -1098,10 +1290,19 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         Instant startTime = resendStartByTopic.remove(topic);
 
         if (!response.missingSequences().isEmpty()) {
-            // Leader couldn't provide all sequences — fallback to snapshot
+            // The leader cannot resend these sequences. With synchronous indexing on commit, an op is
+            // resendable the instant it is produced, so a "missing" sequence was produced earlier and
+            // then EVICTED from the bounded resend log (the follower fell more than the retention
+            // window behind). It will never come. If we already hold higher sequences in the buffer,
+            // skip the evicted hole and drain the buffered tail to converge IN BULK — instead of
+            // head-of-line blocking on one unfillable sequence and re-requesting it forever.
+            if (skipEvictedGapAndDrain(topic, response.missingSequences())) {
+                return;
+            }
+            // No buffered tail above the hole to jump to: a full snapshot is the only recovery.
             LOGGER.warning(() -> String.format(
-                    "Leader reported %d missing sequences for topic=%s. Falling back to snapshot sync.",
-                    response.missingSequences().size(), topic));
+                    "Leader reported %d missing sequences for topic=%s and no buffered tail to skip. "
+                            + "Falling back to snapshot sync.", response.missingSequences().size(), topic));
             snapshotFallbackCount.incrementAndGet();
             if (syncingTopics.add(topic)) {
                 requestSync(topic);
@@ -1170,6 +1371,37 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         }
     }
 
+    /**
+     * Janitor that releases a sync guard ({@link #syncingTopics}) that has been held without any
+     * progress (no advance in {@code nextExpected}) for {@link #SYNC_STUCK_TIMEOUT_MS}. Without this,
+     * a sync that never completes — a lost {@code SYNC_RESPONSE}, a silently dropped chunk, or a
+     * stale-sync that keeps being ignored — would keep {@code syncingTopics.add(topic)} returning
+     * {@code false} forever, so gap detection could never request a fresh sync and the follower
+     * would loop logging "Large gap" without ever recovering.
+     */
+    private void checkStuckSyncs() {
+        if (!running || coordinator.isLeader()) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        for (String topic : syncingTopics) {
+            // A sync stays "alive" as long as chunks keep arriving. Seed the stamp the first time a
+            // guard is observed so a sync that never receives a single chunk (lost SYNC_REQUEST) is
+            // still eventually released; healthy multi-chunk transfers refresh it on every chunk.
+            long lastActivity = lastSyncActivityByTopic.computeIfAbsent(topic, k -> now);
+            if (now - lastActivity > SYNC_STUCK_TIMEOUT_MS) {
+                long stuckMs = now - lastActivity;
+                LOGGER.warning(() -> String.format(
+                        "Sync for topic=%s stuck without a chunk for %dms; releasing sync guard to allow a fresh sync.",
+                        topic, stuckMs));
+                syncingTopics.remove(topic);
+                lastSyncActivityByTopic.remove(topic);
+            }
+        }
+        // Drop activity entries for topics that are no longer syncing.
+        lastSyncActivityByTopic.keySet().removeIf(t -> !syncingTopics.contains(t));
+    }
+
     // ──────────────────────────────────────────────────────────
     // Metrics API
     // ──────────────────────────────────────────────────────────
@@ -1184,6 +1416,17 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
     public long getSnapshotFallbackCount() {
         return snapshotFallbackCount.get();
+    }
+
+    /**
+     * Number of operations the follower has skipped past because they were evicted from the leader's
+     * resend log (unfillable head-of-line gaps). A non-zero, growing value signals the follower fell
+     * far enough behind to lose strong ordering for those ops (recovered to eventual LWW).
+     *
+     * @return total evicted sequences skipped
+     */
+    public long getEvictedSkipCount() {
+        return evictedSkipCount.get();
     }
 
     public double getAverageConvergenceTimeMs() {
@@ -1415,6 +1658,8 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                 false);
         private final java.util.concurrent.atomic.AtomicBoolean localApplyStarted = new java.util.concurrent.atomic.AtomicBoolean(
                 false);
+        private final java.util.concurrent.atomic.AtomicBoolean commitStarted = new java.util.concurrent.atomic.AtomicBoolean(
+                false);
 
         private PendingOperation(UUID operationId, String topic, Object payload, long epoch, int quorum) {
             this(operationId, topic, payload, payload, epoch, quorum);
@@ -1465,6 +1710,10 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
         boolean markLocalApplyStarted() {
             return localApplyStarted.compareAndSet(false, true);
+        }
+
+        boolean markCommitStarted() {
+            return commitStarted.compareAndSet(false, true);
         }
 
         void markLocalApplied() {
@@ -1553,7 +1802,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             java.util.concurrent.atomic.AtomicLong counter = sequenceByTopic.get(topic);
             return counter != null ? counter.get() : 0L;
         }
-        sequenceBufferLock.lock();
+        acquireSequenceLock();
         try {
             long next = nextExpectedSequenceByTopic.getOrDefault(topic, 1L);
             return Math.max(0L, next - 1L);
@@ -1598,6 +1847,19 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         } catch (Exception e) {
             LOGGER.log(Level.WARNING, "Failed to load sequence state, starting from 1", e);
         }
+    }
+
+    /**
+     * Scheduled flush of the coalesced sequence state. Runs OFF the replication lock; reads only
+     * thread-safe concurrent structures. Clears the dirty flag before writing so a concurrent
+     * dirty-mark during the write re-arms it for the next flush (no lost update).
+     */
+    private void flushSequenceStateIfDirty() {
+        if (!sequenceStateDirty) {
+            return;
+        }
+        sequenceStateDirty = false;
+        saveSequenceState();
     }
 
     /**

@@ -596,6 +596,13 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     }
 
     private int requiredActiveMembersForLeadership() {
+        // Pair mode: bypass the dynamic majority — leadership requires only minClusterSize active
+        // members (typically 1), so a node that loses its peer still leads. Split-brain during a
+        // partition is accepted and reconciled on reconnect by electing the highest NodeId
+        // (recomputeLeader already picks max(NodeId); epoch fencing rejects the stale leader's writes).
+        if (config.pairMode()) {
+            return config.minClusterSize();
+        }
         // transport.peers() is backed by knownPeers and already includes the local node.
         // Count only eligible peers (those with a real listen port): discovery clients and
         // gossip placeholders carry port 0 and must not inflate the required majority — an

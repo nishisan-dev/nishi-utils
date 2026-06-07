@@ -30,14 +30,16 @@ public final class ClusterCoordinatorConfig {
     private final Duration leaseTimeout;
     private final int minClusterSize;
     private final Path dataDirectory;
+    private final boolean pairMode;
 
     private ClusterCoordinatorConfig(Duration heartbeatInterval, Duration heartbeatTimeout,
-            Duration leaseTimeout, int minClusterSize, Path dataDirectory) {
+            Duration leaseTimeout, int minClusterSize, Path dataDirectory, boolean pairMode) {
         this.heartbeatInterval = heartbeatInterval;
         this.heartbeatTimeout = heartbeatTimeout;
         this.leaseTimeout = leaseTimeout;
         this.minClusterSize = minClusterSize;
         this.dataDirectory = dataDirectory;
+        this.pairMode = pairMode;
     }
 
     /**
@@ -49,7 +51,7 @@ public final class ClusterCoordinatorConfig {
     public static ClusterCoordinatorConfig defaults() {
         Duration defaultTimeout = Duration.ofSeconds(10);
         return new ClusterCoordinatorConfig(Duration.ofSeconds(3), defaultTimeout,
-                defaultTimeout.multipliedBy(3), 1, null);
+                defaultTimeout.multipliedBy(3), 1, null, false);
     }
 
     /**
@@ -111,7 +113,25 @@ public final class ClusterCoordinatorConfig {
             throw new IllegalArgumentException("minClusterSize must be >= 1");
         }
         Duration effectiveLease = leaseTimeout != null ? leaseTimeout : timeout.multipliedBy(3);
-        return new ClusterCoordinatorConfig(interval, timeout, effectiveLease, minClusterSize, dataDirectory);
+        return new ClusterCoordinatorConfig(interval, timeout, effectiveLease, minClusterSize, dataDirectory, false);
+    }
+
+    /**
+     * Returns a copy of this configuration with pair-mode enabled or disabled.
+     *
+     * <p>In pair mode the dynamic-majority guard is bypassed: leadership requires only
+     * {@link #minClusterSize()} active members (set it to 1 for a two-node active/standby pair), so a
+     * node that loses contact with its peer still becomes/stays leader instead of stepping down.
+     * This INTENTIONALLY allows split-brain during a partition; on reconnect the coordinator
+     * reconciles deterministically by electing the highest {@code NodeId} (the lower one steps down,
+     * and epoch fencing rejects its stale writes). Use only when this trade-off is acceptable.</p>
+     *
+     * @param pairMode {@code true} to allow minority/solo leadership
+     * @return a new configuration with the flag applied
+     */
+    public ClusterCoordinatorConfig withPairMode(boolean pairMode) {
+        return new ClusterCoordinatorConfig(heartbeatInterval, heartbeatTimeout, leaseTimeout,
+                minClusterSize, dataDirectory, pairMode);
     }
 
     /**
@@ -150,6 +170,16 @@ public final class ClusterCoordinatorConfig {
      */
     public int minClusterSize() {
         return minClusterSize;
+    }
+
+    /**
+     * Whether pair mode is enabled (minority/solo leadership allowed, bypassing the dynamic
+     * majority). See {@link #withPairMode(boolean)}.
+     *
+     * @return {@code true} if pair mode is enabled
+     */
+    public boolean pairMode() {
+        return pairMode;
     }
 
     /**

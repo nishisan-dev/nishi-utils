@@ -1,0 +1,33 @@
+@startuml
+title Op-log — Recuperação de gap (resend, skip-and-drain, snapshot)
+
+actor "Stream vivo" as Stream
+participant "Follower\nReplicationManager" as F
+participant "Leader\nReplicationManager" as L
+
+Stream -> F : REPLICATION_REQUEST seq=N+1..\n(N faltando)
+F -> F : bufferiza futuras (O(log n));\ngap detectado em N
+
+group Gap pequeno e recente (N na retention)
+  F -> L : SEQUENCE_RESEND_REQUEST [N]
+  L -> F : SEQUENCE_RESEND_RESPONSE (op N)
+  F -> F : aplica N → drena buffer → ao vivo
+end
+
+group Gap evictado (N abaixo do floor de retention)
+  F -> L : SEQUENCE_RESEND_REQUEST [N]
+  L -> F : "0 operations, 1 missing"
+  alt follower tem seq > N no buffer
+    F -> F : skipEvictedGapAndDrain\nnextExpected = bufferHead\n drena em massa → ao vivo
+    note right of F
+      Pula a op evictada (LWW eventual);
+      evictedSkipCount++. Quebra o
+      head-of-line block sem martelar.
+    end note
+  else sem cauda bufferizada acima
+    F -> L : SYNC_REQUEST (snapshot)
+    L -> F : SnapshotChunk (multi-chunk 16MB)
+    F -> F : onSnapshotInstalled → tail-replay\n→ ao vivo
+  end
+end
+@enduml

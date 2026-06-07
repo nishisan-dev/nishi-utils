@@ -35,10 +35,11 @@ public final class ReplicationConfig {
     private final int replicationLogRetention;
     private final int appliedSetMaxSize;
     private final int operationLogMaxSize;
+    private final boolean leaderLocalApply;
 
     private ReplicationConfig(int quorum, Duration operationTimeout, Duration retryInterval, boolean strictConsistency,
             Path dataDirectory, int resendGapThreshold, Duration resendTimeout, int replicationLogRetention,
-            int appliedSetMaxSize, int operationLogMaxSize) {
+            int appliedSetMaxSize, int operationLogMaxSize, boolean leaderLocalApply) {
         this.quorum = quorum;
         this.operationTimeout = Objects.requireNonNull(operationTimeout, "operationTimeout");
         this.retryInterval = Objects.requireNonNull(retryInterval, "retryInterval");
@@ -49,6 +50,7 @@ public final class ReplicationConfig {
         this.replicationLogRetention = replicationLogRetention;
         this.appliedSetMaxSize = appliedSetMaxSize;
         this.operationLogMaxSize = operationLogMaxSize;
+        this.leaderLocalApply = leaderLocalApply;
     }
 
     public static ReplicationConfig of(int quorum) {
@@ -117,6 +119,23 @@ public final class ReplicationConfig {
         return operationLogMaxSize;
     }
 
+    /**
+     * Whether the leader applies committed operations to its OWN local state via the registered
+     * {@link ReplicationHandler}. Defaults to {@code true} (correct for backends where the leader is
+     * the source of truth, e.g. DistributedMap).
+     *
+     * <p>Set to {@code false} when an external engine already owns the authoritative state and only
+     * uses the op-log to ship deltas to followers (e.g. Cardinal's correlation engine). In that mode
+     * the leader-local apply would be redundant work that builds an unbounded backlog at scale; the
+     * manager instead commits and indexes each operation synchronously when quorum is met, so every
+     * sent operation is immediately resendable to a catching-up follower.</p>
+     *
+     * @return {@code true} to apply on the leader, {@code false} to skip the redundant apply
+     */
+    public boolean leaderLocalApply() {
+        return leaderLocalApply;
+    }
+
     public static final class Builder {
         private final int quorum;
         private Duration operationTimeout = Duration.ofSeconds(30);
@@ -128,6 +147,7 @@ public final class ReplicationConfig {
         private int replicationLogRetention = 1000;
         private int appliedSetMaxSize = 5000;
         private int operationLogMaxSize = 2000;
+        private boolean leaderLocalApply = true;
 
         private Builder(int quorum) {
             if (quorum < 1) {
@@ -215,13 +235,26 @@ public final class ReplicationConfig {
             return this;
         }
 
+        /**
+         * Controls whether the leader applies committed operations to its own local state through
+         * the registered handler. Leave {@code true} for source-of-truth backends; set {@code false}
+         * when an external engine owns the state and the op-log is delta-shipping only.
+         *
+         * @param leaderLocalApply {@code true} to apply on the leader, {@code false} to skip it
+         * @return this builder
+         */
+        public Builder leaderLocalApply(boolean leaderLocalApply) {
+            this.leaderLocalApply = leaderLocalApply;
+            return this;
+        }
+
         public ReplicationConfig build() {
             if (dataDirectory == null) {
                 throw new IllegalStateException("dataDirectory must be set");
             }
             return new ReplicationConfig(quorum, operationTimeout, retryInterval, strictConsistency, dataDirectory,
                     resendGapThreshold, resendTimeout, replicationLogRetention,
-                    appliedSetMaxSize, operationLogMaxSize);
+                    appliedSetMaxSize, operationLogMaxSize, leaderLocalApply);
         }
     }
 }

@@ -1,0 +1,36 @@
+@startuml
+title Op-log — Resiliência do sequenceBufferLock (tryLock + recuperação)
+
+start
+:Task do pool ngrid-replication
+precisa da seção crítica;
+
+partition "acquireSequenceLock()" {
+  if (tryLock(15s) adquiriu?) then (sim)
+    :secção crítica
+    (apenas operações O(log n):
+    poll/peek/add + submit assíncrono);
+    note right
+      I/O (saveSequenceState, disco) é
+      coalescido e roda FORA do lock;
+      sendAck é não-bloqueante (enqueue).
+    end note
+    :unlock() no finally;
+    stop
+  else (não — timeout)
+    :IllegalStateException
+    "possible orphaned lock";
+    note right
+      ReentrantLock órfão (held sem dono vivo)
+      NÃO congela o pool: o waiter desiste e
+      recupera, mantendo o nó vivo e o cluster
+      com líder. O cap do buffer remove o
+      gatilho de OOM que originava o órfão.
+    end note
+    :catch(Throwable) na task
+    → log SEVERE + cleanup
+    → re-sync / re-tentativa;
+    stop
+  endif
+}
+@enduml
