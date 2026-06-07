@@ -1,11 +1,15 @@
 package dev.nishisan.utils.ngrid.replication;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.fail;
 
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 import org.junit.jupiter.api.Test;
@@ -120,6 +124,128 @@ class RelayLogReplicationTest {
                     "relay must converge without snapshot fallback");
             assertEquals("item-0", follower.getQueue("burst-queue", String.class).peek().orElse(null),
                     "follower must converge via the relay");
+        }
+    }
+
+    /**
+     * Fase 5: after killing the leader, a surviving relay node may only become a <em>ready</em> leader
+     * once its relay backlog has fully drained ({@code isLeaderSyncing()} stays true until then — the
+     * failover drain-gate). Then writes succeed and the cluster stays consistent (no divergence).
+     */
+    @Test
+    @Timeout(value = 120, unit = TimeUnit.SECONDS)
+    void leaderFailoverIsGatedOnRelayDrainAndStaysConsistent() throws Exception {
+        NodeInfo i1 = new NodeInfo(NodeId.of("relay-fo-1"), "localhost", 9845);
+        NodeInfo i2 = new NodeInfo(NodeId.of("relay-fo-2"), "localhost", 9846);
+        NodeInfo i3 = new NodeInfo(NodeId.of("relay-fo-3"), "localhost", 9847);
+        Path base = Files.createTempDirectory("ngrid-relay-failover");
+
+        List<NGridNode> nodes = new ArrayList<>();
+        nodes.add(failoverNode(i1, base.resolve("1"), i2, i3));
+        nodes.add(failoverNode(i2, base.resolve("2"), i1, i3));
+        nodes.add(failoverNode(i3, base.resolve("3"), i1, i2));
+        try {
+            for (NGridNode n : nodes) {
+                n.start();
+            }
+            ClusterTestUtils.awaitClusterConsensus(nodes.get(0), nodes.get(1), nodes.get(2));
+            for (NGridNode n : nodes) {
+                n.getQueue("fo-queue", String.class);
+            }
+
+            NGridNode leader = findLeader(nodes);
+            DistributedQueue<String> queue = leader.getQueue("fo-queue", String.class);
+            for (int i = 0; i < 200; i++) {
+                queue.offer("a-" + i);
+            }
+            Thread.sleep(150); // partial drain: a promoted follower may still hold a relay backlog
+
+            // Kill the leader.
+            leader.close();
+            nodes.remove(leader);
+
+            // A new leader is "ready" only after its relay drains (gate released).
+            NGridNode newLeader = awaitNewLeader(nodes, 40_000);
+            assertNotNull(newLeader, "a new leader must be elected and drain its relay before leading");
+
+            // The gate is released -> writes succeed (retry briefly to absorb election settling).
+            DistributedQueue<String> newQueue = newLeader.getQueue("fo-queue", String.class);
+            for (int i = 0; i < 50; i++) {
+                offerWithRetry(newQueue, "b-" + i, 15_000);
+            }
+
+            // The surviving follower stays consistent: original data present, new writes applied.
+            NGridNode survivor = nodes.stream().filter(n -> n != newLeader).findFirst().orElseThrow();
+            long target = newLeader.replicationManager().getLastAppliedSequence();
+            awaitApplied(survivor, target, 30_000);
+            assertEquals("a-0", survivor.getQueue("fo-queue", String.class).peek().orElse(null),
+                    "original data must survive the failover (no loss, no divergence)");
+        } finally {
+            for (NGridNode n : nodes) {
+                closeQuietly(n);
+            }
+        }
+    }
+
+    private static NGridNode failoverNode(NodeInfo self, Path dir, NodeInfo peerA, NodeInfo peerB) {
+        return new NGridNode(NGridConfig.builder(self)
+                .addPeer(peerA)
+                .addPeer(peerB)
+                .dataDirectory(dir)
+                .replicationFactor(2)
+                .followerIngestMode(FollowerIngestMode.RELAY_LOG)
+                .replicationOperationTimeout(Duration.ofSeconds(10))
+                .heartbeatInterval(Duration.ofMillis(200))
+                .build());
+    }
+
+    private static NGridNode findLeader(List<NGridNode> nodes) {
+        for (NGridNode n : nodes) {
+            if (n.coordinator().isLeader()) {
+                return n;
+            }
+        }
+        throw new IllegalStateException("no leader elected");
+    }
+
+    private static NGridNode awaitNewLeader(List<NGridNode> nodes, long timeoutMs) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < deadline) {
+            for (NGridNode n : nodes) {
+                if (n.coordinator().isLeader() && !n.replicationManager().isLeaderSyncing()) {
+                    return n;
+                }
+            }
+            Thread.sleep(200);
+        }
+        return null;
+    }
+
+    private static void offerWithRetry(DistributedQueue<String> queue, String value, long timeoutMs) {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        RuntimeException last = null;
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                queue.offer(value);
+                return;
+            } catch (RuntimeException e) {
+                last = e; // gate held / election settling -> retry
+                try {
+                    Thread.sleep(100);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException(ie);
+                }
+            }
+        }
+        throw new IllegalStateException("offer never succeeded after failover", last);
+    }
+
+    private static void closeQuietly(NGridNode node) {
+        try {
+            node.close();
+        } catch (IOException ignored) {
+            // best-effort cleanup
         }
     }
 

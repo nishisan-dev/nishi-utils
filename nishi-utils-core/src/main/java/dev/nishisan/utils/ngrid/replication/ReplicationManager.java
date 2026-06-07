@@ -1174,6 +1174,11 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
         Optional<byte[]> head = relay.peek();
         if (head.isEmpty()) {
+            if (reorder.isEmpty()) {
+                // Relay + reorder buffer fully drained for this topic — release the failover drain-gate
+                // if one is held (no-op otherwise). Safe to read reorder here: this is its owner thread.
+                maybeReleaseRelayDrainGate(topic);
+            }
             return progressed;
         }
         RelayEntry entry = RelayEntryCodec.decode(head.get());
@@ -2017,6 +2022,14 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                 LOGGER.log(Level.SEVERE, "Handler onBecameLeader failed", e);
             }
         }
+        if (isRelayMode()) {
+            // RELAY_LOG failover drain-gate (generalizes the #123 sync-before-lead): the promoted node
+            // holds writes (leaderSyncing) until its relay backlog is fully applied. The per-topic apply
+            // consumers drain and release the gate (maybeReleaseRelayDrainGate) — release depends on
+            // "relay drained", not on a peer snapshot, so a node promoted without a reachable peer (and
+            // with a full relay) stays gated until it drains rather than leading with a stale state.
+            return;
+        }
         attemptLeaderSync(previousLeader, localId);
     }
 
@@ -2062,8 +2075,28 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         if (!leaderSyncing.get()) {
             return;
         }
+        if (isRelayMode()) {
+            // The drain-gate is released by the apply consumers (maybeReleaseRelayDrainGate). No snapshot
+            // retry here: a promoted node drains its own relay, it does not pull a snapshot to lead.
+            return;
+        }
         NodeId localId = transport.local().nodeId();
         attemptLeaderSync(lastLeader.get(), localId);
+    }
+
+    /**
+     * Called by a topic's apply consumer when its relay (and in-memory reorder buffer) have fully
+     * drained. While a failover drain-gate is held (leaderSyncing), this releases the topic; once all
+     * gated topics have drained, the write gate opens and the promoted node may lead.
+     */
+    private void maybeReleaseRelayDrainGate(String topic) {
+        if (!leaderSyncing.get()) {
+            return;
+        }
+        if (leaderSyncTopics.remove(topic) && leaderSyncTopics.isEmpty()) {
+            leaderSyncing.set(false);
+            LOGGER.info(() -> "Relay drained on promotion; releasing write gate for leadership.");
+        }
     }
 
     private void failAllPending(String reason) {
