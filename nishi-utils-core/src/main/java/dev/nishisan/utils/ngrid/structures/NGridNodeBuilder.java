@@ -19,6 +19,7 @@ package dev.nishisan.utils.ngrid.structures;
 
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
+import dev.nishisan.utils.ngrid.replication.FollowerIngestMode;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -52,6 +53,7 @@ public final class NGridNodeBuilder {
     private Integer replicationFactor;
     private Path dataDir;
     private boolean strictConsistency = true;
+    private FollowerIngestMode followerIngestMode = FollowerIngestMode.INLINE;
 
     NGridNodeBuilder(String host, int port) {
         this.host = Objects.requireNonNull(host, "host");
@@ -179,6 +181,19 @@ public final class NGridNodeBuilder {
     }
 
     /**
+     * Sets how this node ingests replication when acting as a follower. Defaults to
+     * {@link FollowerIngestMode#INLINE}; {@link FollowerIngestMode#RELAY_LOG} enables
+     * the on-disk relay-log ingestion path (#124).
+     *
+     * @param mode the follower ingest mode (must not be {@code null})
+     * @return this builder
+     */
+    public NGridNodeBuilder followerIngestMode(FollowerIngestMode mode) {
+        this.followerIngestMode = Objects.requireNonNull(mode, "followerIngestMode");
+        return this;
+    }
+
+    /**
      * Builds and starts the node.
      * <p>
      * If no data directory is specified, the build will fail for
@@ -197,7 +212,8 @@ public final class NGridNodeBuilder {
         NodeInfo localInfo = new NodeInfo(NodeId.of(effectiveNodeId), host, effectivePort);
 
         NGridConfig.Builder builder = NGridConfig.builder(localInfo)
-                .strictConsistency(strictConsistency);
+                .strictConsistency(strictConsistency)
+                .followerIngestMode(followerIngestMode);
 
         if (dataDir != null) {
             builder.dataDirectory(dataDir);

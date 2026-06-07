@@ -143,6 +143,15 @@ public class NGridConfigLoader {
             if (clusterConfig.getReplication() != null) {
                 builder.replicationFactor(clusterConfig.getReplication().getFactor());
                 builder.strictConsistency(clusterConfig.getReplication().isStrict());
+                String ingest = clusterConfig.getReplication().getFollowerIngestMode();
+                if (ingest != null && !ingest.isBlank()) {
+                    try {
+                        builder.followerIngestMode(dev.nishisan.utils.ngrid.replication.FollowerIngestMode
+                                .valueOf(ingest.trim().toUpperCase()));
+                    } catch (IllegalArgumentException ignored) {
+                        // Keep INLINE default for invalid values
+                    }
+                }
             }
             if (clusterConfig.getTransport() != null) {
                 builder.transportWorkerThreads(clusterConfig.getTransport().getWorkers());

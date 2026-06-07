@@ -1,5 +1,6 @@
 package dev.nishisan.utils.ngrid.config;
 
+import dev.nishisan.utils.ngrid.replication.FollowerIngestMode;
 import dev.nishisan.utils.ngrid.structures.NGridConfig;
 import dev.nishisan.utils.queue.NQueue;
 import org.junit.jupiter.api.Test;
@@ -91,6 +92,39 @@ class NGridConfigLoaderTest {
 
         // Let's verify paths
         assertEquals(Path.of("/tmp/ngrid-data"), domainConfig.dataDirectory());
+    }
+
+    @Test
+    void followerIngestModeFromYaml() throws IOException {
+        // unset -> INLINE (default preserved)
+        assertEquals(FollowerIngestMode.INLINE, loadWithIngestMode(null).followerIngestMode());
+        // explicit, case-insensitive -> RELAY_LOG
+        assertEquals(FollowerIngestMode.RELAY_LOG, loadWithIngestMode("relay_log").followerIngestMode());
+        // invalid -> falls back to INLINE (tolerant parse)
+        assertEquals(FollowerIngestMode.INLINE, loadWithIngestMode("bogus").followerIngestMode());
+    }
+
+    private NGridConfig loadWithIngestMode(String ingest) throws IOException {
+        NGridYamlConfig config = new NGridYamlConfig();
+        NodeIdentityConfig node = new NodeIdentityConfig();
+        node.setHost("127.0.0.1");
+        node.setDirs(new NodeIdentityConfig.DirsConfig());
+        node.getDirs().setBase("/tmp");
+        config.setNode(node);
+
+        ClusterPolicyConfig cluster = new ClusterPolicyConfig();
+        ClusterPolicyConfig.ReplicationConfig replication = new ClusterPolicyConfig.ReplicationConfig();
+        replication.setFollowerIngestMode(ingest);
+        cluster.setReplication(replication);
+        config.setCluster(cluster);
+
+        QueuePolicyConfig queue = new QueuePolicyConfig();
+        queue.setName("ingest-queue");
+        config.setQueue(queue);
+
+        Path yamlFile = tempDir.resolve("ingest-" + (ingest == null ? "default" : ingest) + ".yaml");
+        NGridConfigLoader.save(yamlFile, config);
+        return NGridConfigLoader.convertToDomain(NGridConfigLoader.load(yamlFile));
     }
 
     @Test

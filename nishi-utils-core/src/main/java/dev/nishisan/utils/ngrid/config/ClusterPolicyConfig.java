@@ -190,6 +190,7 @@ public class ClusterPolicyConfig  {
         @Serial
         private int factor = 1;
         private boolean strict = false;
+        private String followerIngestMode;
 
         /** Creates a default replication config. */
         public ReplicationConfig() {
@@ -229,6 +230,26 @@ public class ClusterPolicyConfig  {
          */
         public void setStrict(boolean strict) {
             this.strict = strict;
+        }
+
+        /**
+         * Returns the follower ingest mode name ({@code INLINE} / {@code RELAY_LOG}),
+         * or {@code null} when unset (defaults to {@code INLINE}).
+         *
+         * @return the configured follower ingest mode name, or {@code null}
+         */
+        public String getFollowerIngestMode() {
+            return followerIngestMode;
+        }
+
+        /**
+         * Sets the follower ingest mode name. Case-insensitive; invalid values fall
+         * back to {@code INLINE} at load time.
+         *
+         * @param followerIngestMode the mode name ({@code INLINE} or {@code RELAY_LOG})
+         */
+        public void setFollowerIngestMode(String followerIngestMode) {
+            this.followerIngestMode = followerIngestMode;
         }
     }
 
