@@ -90,6 +90,14 @@ class OutboundBackpressureConvergenceTest {
             DistributedMap<String, String> mapL = leader.getMap(MAP, String.class, String.class);
             DistributedMap<String, String> mapF = follower.getMap(MAP, String.class, String.class);
 
+            // Wait until the leader has finished its initial sync before writing: replicate() now
+            // rejects writes while the leader is catching up (LeaderSyncingException).
+            long readyDeadline = System.currentTimeMillis() + 20000;
+            while (leader.replicationManager().isLeaderSyncing()
+                    && System.currentTimeMillis() < readyDeadline) {
+                Thread.sleep(50);
+            }
+
             // Fast burst under the bounded outbound queue. With quorum=1 the put does
             // not wait for the follower.
             for (int i = 0; i < WRITES; i++) {

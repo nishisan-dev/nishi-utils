@@ -137,8 +137,9 @@ public class ReplicationManager implements TransportListener, LeadershipListener
     private static final int MAX_SEQUENCE_BUFFER = 250_000;
 
     // Leader-side replication log indexed by sequence (per topic) for resend
-    // support
-    private final Map<String, java.util.NavigableMap<Long, ReplicationPayload>> replicationLogBySequence = new ConcurrentHashMap<>();
+    // support. Values carry a leader-local index timestamp (TimedPayload) so the log can be
+    // evicted both by count (memory cap) and by time (backlog window) — see indexReplicationPayload.
+    private final Map<String, java.util.NavigableMap<Long, TimedPayload>> replicationLogBySequence = new ConcurrentHashMap<>();
 
     // Resend tracking (follower-side)
     private final Set<String> resendPendingTopics = ConcurrentHashMap.newKeySet();
@@ -155,8 +156,19 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             0);
     private final java.util.concurrent.atomic.AtomicLong convergenceCount = new java.util.concurrent.atomic.AtomicLong(
             0);
+    private final java.util.concurrent.atomic.AtomicLong replicationLogTimeEvictedCount = new java.util.concurrent.atomic.AtomicLong(
+            0);
 
     private static record Failure(PendingOperation operation, Throwable error) {
+    }
+
+    /**
+     * Resend-log entry: the wire {@link ReplicationPayload} plus the leader-local epoch-millis
+     * timestamp captured when the operation was committed and indexed. The timestamp drives the
+     * temporal retention window ({@link ReplicationConfig#replicationLogRetentionTime()}); it never
+     * travels on the wire (the payload is unwrapped before being sent to followers).
+     */
+    private static record TimedPayload(ReplicationPayload payload, long indexedAtMillis) {
     }
 
     /**
@@ -380,6 +392,13 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             Object localApplyPayload, Integer quorumOverride) {
         if (!coordinator.isLeader()) {
             throw new IllegalStateException("Replication can only be initiated by the leader");
+        }
+        // Gate writes while this node, although leader, is still catching up from a peer. Accepting
+        // a write now would advance from stale state and overwrite the previous leader's progress —
+        // defense in depth that closes the divergence window for ALL backends (queue and map).
+        if (isLeaderSyncing()) {
+            throw new LeaderSyncingException(
+                    "Leader is syncing (catch-up in progress), write rejected to prevent stale-state divergence");
         }
         if (!coordinator.hasValidLease()) {
             throw new LeaseExpiredException("Leader lease expired, write rejected to prevent data divergence");
@@ -686,6 +705,14 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                     LOGGER.warning(() -> "Ignoring stale sync for " + payload.topic()
                             + " (sequence=" + payload.sequence() + ", current=" + currentApplied + ")");
                     syncingTopics.remove(payload.topic());
+                    // The local (newly promoted) leader already holds newer state than the peer's
+                    // snapshot, so this topic is effectively caught up. Release its leader-sync guard
+                    // too — otherwise leaderSyncing stays true forever (retryLeaderSync keeps pulling
+                    // the same older snapshot) and the write gate in replicate() rejects every write
+                    // even though the leader has the latest state.
+                    if (leaderSyncTopics.remove(payload.topic()) && leaderSyncTopics.isEmpty()) {
+                        leaderSyncing.set(false);
+                    }
                     return;
                 }
                 if (payload.chunkIndex() == 0) {
@@ -1095,15 +1122,48 @@ public class ReplicationManager implements TransportListener, LeadershipListener
      * Enforces retention by evicting oldest entries beyond the configured limit.
      */
     private void indexReplicationPayload(String topic, long sequence, ReplicationPayload payload) {
-        java.util.NavigableMap<Long, ReplicationPayload> topicLog = replicationLogBySequence
+        java.util.NavigableMap<Long, TimedPayload> topicLog = replicationLogBySequence
                 .computeIfAbsent(topic, k -> java.util.Collections.synchronizedNavigableMap(new java.util.TreeMap<>()));
-        topicLog.put(sequence, payload);
+        topicLog.put(sequence, new TimedPayload(payload, System.currentTimeMillis()));
 
-        // Enforce retention limit
+        // Count-based retention (memory cap): evict oldest beyond the configured limit.
         int retention = config.replicationLogRetention();
         while (topicLog.size() > retention) {
             topicLog.pollFirstEntry();
         }
+        // Time-based retention (backlog window): opportunistic head eviction on each commit.
+        // Complementary to the count cap — whichever limit is reached first evicts.
+        evictExpiredFromTopicLog(topicLog);
+    }
+
+    /**
+     * Evicts the contiguous prefix of resend-log entries older than the configured temporal
+     * retention window. Entries are inserted in (sequence, time)-monotonic order, so the head
+     * (lowest sequence) is always the oldest — mirrors {@code NQueue.skipExpiredRecordsLocked}.
+     * No-op when temporal retention is disabled ({@link Duration#ZERO}).
+     *
+     * @param topicLog the per-topic synchronized resend log
+     * @return the number of entries evicted
+     */
+    private int evictExpiredFromTopicLog(java.util.NavigableMap<Long, TimedPayload> topicLog) {
+        long retentionMillis = config.replicationLogRetentionTime().toMillis();
+        if (retentionMillis <= 0) {
+            return 0; // temporal eviction disabled
+        }
+        long now = System.currentTimeMillis();
+        int evicted = 0;
+        synchronized (topicLog) {
+            java.util.Map.Entry<Long, TimedPayload> head;
+            while ((head = topicLog.firstEntry()) != null
+                    && now - head.getValue().indexedAtMillis() > retentionMillis) {
+                topicLog.pollFirstEntry();
+                evicted++;
+            }
+        }
+        if (evicted > 0) {
+            replicationLogTimeEvictedCount.addAndGet(evicted);
+        }
+        return evicted;
     }
 
     /**
@@ -1174,7 +1234,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             return;
         }
 
-        java.util.NavigableMap<Long, ReplicationPayload> topicLog = replicationLogBySequence.get(topic);
+        java.util.NavigableMap<Long, TimedPayload> topicLog = replicationLogBySequence.get(topic);
 
         List<ReplicationPayload> operations = new ArrayList<>();
         List<Long> missingSequences = new ArrayList<>();
@@ -1182,14 +1242,16 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         if (topicLog != null) {
             synchronized (topicLog) {
                 for (long seq = from; seq <= to; seq++) {
-                    ReplicationPayload payload = topicLog.get(seq);
+                    TimedPayload entry = topicLog.get(seq);
                     // A payload only enters replicationLogBySequence via indexReplicationPayload, which
                     // is called exclusively from completeOperation (commit). So its mere presence here
                     // already implies it is committed — re-checking the bounded audit log (capped at
                     // operationLogMaxSize, far smaller than replicationLogRetention) only produced
                     // false "missing" for ops beyond that cap, forcing needless snapshot fallback.
-                    if (payload != null) {
-                        operations.add(payload);
+                    // A null here also covers entries evicted by the temporal retention window: the
+                    // follower receives them as missingSequences → gap-detection → snapshot fallback.
+                    if (entry != null) {
+                        operations.add(entry.payload());
                     } else {
                         missingSequences.add(seq);
                     }
@@ -1429,6 +1491,29 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         return evictedSkipCount.get();
     }
 
+    /**
+     * Number of resend-log entries evicted by the temporal retention window
+     * ({@link ReplicationConfig#replicationLogRetentionTime()}). Complements the count-based
+     * retention; zero when temporal retention is disabled.
+     *
+     * @return total entries evicted by time across all topics
+     */
+    public long getReplicationLogTimeEvictedCount() {
+        return replicationLogTimeEvictedCount.get();
+    }
+
+    /**
+     * Current number of entries in the leader-side resend log for the given topic. Intended for
+     * testing and observability.
+     *
+     * @param topic the topic
+     * @return the resend-log size for the topic (0 if none)
+     */
+    public int getReplicationLogSize(String topic) {
+        java.util.NavigableMap<Long, TimedPayload> topicLog = replicationLogBySequence.get(topic);
+        return topicLog == null ? 0 : topicLog.size();
+    }
+
     public double getAverageConvergenceTimeMs() {
         long count = convergenceCount.get();
         return count > 0 ? (double) totalConvergenceTimeMs.get() / count : 0.0;
@@ -1604,6 +1689,15 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         }
         NodeId syncSource = resolveSyncSource(previousLeader, localId);
         if (syncSource == null) {
+            // No reachable peer to sync from (single-node cluster, first leader of a brand-new
+            // cluster, or the previous leader is gone). resolveSyncSource returns null ONLY when no
+            // other active member is reachable, so this node is by definition the most-advanced
+            // reachable replica — there is nothing newer to catch up to and it may lead immediately.
+            // Clearing the flag here is required so consumers gating on isLeaderSyncing() (and the
+            // write gate in replicate()) are not blocked indefinitely.
+            leaderSyncTopics.clear();
+            leaderSyncing.set(false);
+            LOGGER.info("Leader sync skipped: no reachable sync source; clearing leaderSyncing flag.");
             return;
         }
         for (String topic : leaderSyncTopics) {
@@ -1784,16 +1878,36 @@ public class ReplicationManager implements TransportListener, LeadershipListener
      */
     private void trimLog() {
         try {
-            int maxSize = config.operationLogMaxSize();
-            if (log.size() <= maxSize) {
-                return;
-            }
-            // Remove only COMMITTED entries — PENDING entries must not be evicted
-            log.entrySet().removeIf(e -> e.getValue().status() == OperationStatus.COMMITTED
-                    && log.size() > maxSize);
-            LOGGER.fine(() -> "Operation log trimmed to " + log.size() + " entries");
+            trimOperationAuditLog();
+            trimReplicationLogByTime();
         } catch (Throwable t) {
             LOGGER.log(Level.WARNING, "Unexpected error during trimLog", t);
+        }
+    }
+
+    private void trimOperationAuditLog() {
+        int maxSize = config.operationLogMaxSize();
+        if (log.size() <= maxSize) {
+            return;
+        }
+        // Remove only COMMITTED entries — PENDING entries must not be evicted
+        log.entrySet().removeIf(e -> e.getValue().status() == OperationStatus.COMMITTED
+                && log.size() > maxSize);
+        LOGGER.fine(() -> "Operation log trimmed to " + log.size() + " entries");
+    }
+
+    /**
+     * Sweeps every per-topic resend log for entries past the temporal retention window. This is the
+     * eviction path for IDLE topics (no new commits to trigger the opportunistic eviction in
+     * {@link #indexReplicationPayload}); without it a topic that stopped writing would never release
+     * its backlog within the configured window. No-op when temporal retention is disabled.
+     */
+    private void trimReplicationLogByTime() {
+        if (config.replicationLogRetentionTime().toMillis() <= 0) {
+            return;
+        }
+        for (java.util.NavigableMap<Long, TimedPayload> topicLog : replicationLogBySequence.values()) {
+            evictExpiredFromTopicLog(topicLog);
         }
     }
 

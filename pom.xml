@@ -203,6 +203,35 @@
             </build>
         </profile>
 
+        <!--
+            CI-only: exclude the NGrid in-process resilience tests from the surefire run.
+            Activated with -DexcludeNgrid (any value). The GitHub Actions PR pipeline uses it so the
+            cluster resilience suite (timing/resource sensitive, slow) does not run on the hosted
+            runners; those tests remain available locally via `mvn test` and via the `resilience`
+            profile. JaCoCo already excludes the ngrid packages from the coverage gate.
+        -->
+        <profile>
+            <id>exclude-ngrid</id>
+            <activation>
+                <property>
+                    <name>excludeNgrid</name>
+                </property>
+            </activation>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-surefire-plugin</artifactId>
+                        <configuration>
+                            <excludes>
+                                <exclude>**/ngrid/**</exclude>
+                            </excludes>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
         <!-- Resilience: NGrid integration tests (in-process, no Docker) -->
         <profile>
             <id>resilience</id>

@@ -1,0 +1,47 @@
+name: PR Validation Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - feature/queue-consumer
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  workflow_dispatch:
+
+jobs:
+  unit-tests:
+    name: Standard Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+
+      # The NGrid cluster resilience suite (in-process + Docker) is excluded here: it is timing and
+      # resource sensitive and does not pass reliably on hosted runners. Run it locally with
+      # `mvn test -Presilience` / `mvn verify -Pdocker-resilience`.
+      - name: Run unit tests with coverage (NGrid resilience suite excluded)
+        run: mvn -B verify -pl nishi-utils-core -DexcludeNgrid=true -Dsurefire.rerunFailingTestsCount=1
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jacoco-report
+          path: nishi-utils-core/target/site/jacoco/
+          retention-days: 14

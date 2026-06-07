@@ -4,6 +4,31 @@
 
 ---
 
+## 2026-06-07 — 🟢 4.3.0 — Retenção temporal do op-log e gate de leader-sync
+
+Fecha duas lacunas do HA active/standby (op-log) levantadas pelo `tevent-cardinal` (issues #122 e
+#123). Detalhes e diagramas em [`doc/ngrid/oplog-ha-hardening.md`](ngrid/oplog-ha-hardening.md)
+(seções 7 e 8).
+
+**Novidades:**
+- **`replicationLogRetentionTime(Duration)`** (#122) — retenção **temporal** do resend log do op-log,
+  complementar ao teto de contagem (`replicationLogRetention`): *o que evictar primeiro vence*
+  (contagem = memória; tempo = janela de backlog). Eviction oportunística no commit + agendada para
+  tópicos ociosos. Default `Duration.ZERO` (desabilitado). Exposto em `ReplicationConfig.Builder` e na
+  facade `NGridConfig.Builder`. Métricas `getReplicationLogTimeEvictedCount()` /
+  `getReplicationLogSize(topic)`. Sequência fora da janela → `missingSequences` → snapshot fallback
+  (caminho existente, sem divergência silenciosa).
+- **Gate de escrita durante leader-sync** (#123) — `replicate()` agora rejeita escritas com
+  **`LeaderSyncingException`** (subtipo de `IllegalStateException`) enquanto `isLeaderSyncing()` for
+  `true`, fechando a janela de divergência para queue **e** map. Além disso, `attemptLeaderSync`
+  **limpa** `leaderSyncing` quando não há `syncSource` alcançável (nó sozinho / cluster novo), em vez
+  de travar o consumidor — elimina a necessidade do *grace* do lado do cardinal.
+
+**Testes:** `ReplicationLogTimeRetentionTest` (4) e `LeaderSyncGateTest` (2). Testes de failover que
+escreviam durante a janela de sync foram alinhados à convenção `!isLeaderSyncing()`.
+
+---
+
 ## 2026-06-06 — 🟢 4.1.3 — Endurecimento do op-log de HA sob volume real
 
 Convergência e estabilidade do HA active/standby (op-log) sob a volumetria real do Kafka

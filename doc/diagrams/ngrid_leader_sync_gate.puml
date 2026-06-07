@@ -1,0 +1,30 @@
+@startuml
+title Gate de escrita durante leader-sync (failover sem divergência)
+
+participant "Cliente / engine" as C
+participant "L1 (maior NodeId)\nReplicationManager" as L1
+participant "L2 (assumiu)\nReplicationManager" as L2
+
+== L1 líder, avança até N ==
+C -> L1 : replicate() (seq <= N)
+note over L1 : isLeaderSyncing()=false → aceita
+
+== L1 cai; L2 assume e avança até N+k ==
+L1 -x L2 : (L1 cai)
+L2 -> L2 : onLeaderChanged → líder\navança estado até N+k
+
+== L1 reingressa e é reeleito (maior NodeId) ==
+L1 -> L1 : onLeaderChanged → leaderSyncing=true\nattemptLeaderSync(syncSource=L2)
+C -> L1 : replicate() (durante o catch-up)
+L1 --> C : **LeaderSyncingException** (rejeitado)\nfecha a janela de divergência
+L1 -> L2 : SYNC_REQUEST (recupera N..N+k)
+L2 --> L1 : SYNC_RESPONSE (snapshot/deltas)
+L1 -> L1 : handleSyncResponse → leaderSyncTopics vazio\n→ leaderSyncing=false
+C -> L1 : replicate() (pós-catch-up)
+note over L1 : isLeaderSyncing()=false → aceita, sem sobrescrever N+k
+
+== Caso sem syncSource (nó sozinho / cluster novo) ==
+L1 -> L1 : onLeaderChanged → leaderSyncing=true\nresolveSyncSource()=null
+L1 -> L1 : **clear**: leaderSyncing=false\n(é a réplica mais avançada alcançável)
+note over L1 : consumidor que gateia em isLeaderSyncing() não trava
+@enduml

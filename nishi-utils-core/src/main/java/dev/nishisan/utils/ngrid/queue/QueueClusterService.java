@@ -18,6 +18,7 @@
 package dev.nishisan.utils.ngrid.queue;
 
 import dev.nishisan.utils.ngrid.common.NodeId;
+import dev.nishisan.utils.ngrid.replication.LeaderSyncingException;
 import dev.nishisan.utils.ngrid.replication.QuorumUnreachableException;
 import dev.nishisan.utils.ngrid.replication.ReplicationHandler;
 import dev.nishisan.utils.ngrid.replication.ReplicationManager;
@@ -594,7 +595,7 @@ public final class QueueClusterService<T> implements Closeable, ReplicationHandl
 
     private void ensureLeaderReady() {
         if (replicationManager.isLeaderSyncing()) {
-            throw new IllegalStateException("Leader sync in progress");
+            throw new LeaderSyncingException("Leader sync in progress");
         }
     }
 

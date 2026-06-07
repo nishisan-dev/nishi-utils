@@ -91,17 +91,73 @@ Em cluster de 2 nós, ao perder o peer o sobrevivente não alcançava o quórum:
 reconexão pelo **maior NodeId** (`recomputeLeader` já elege `max(NodeId)`; o fencing por epoch
 rejeita escritas do líder obsoleto). A Cardinal habilita pair mode quando `minClusterSize <= 1`.
 
+### 7. Janela de backlog do op-log por tempo (`replicationLogRetentionTime`)
+
+O log de resend (`replicationLogBySequence`) era trimado **apenas por contagem**
+(`replicationLogRetention`, default 1000): não havia como dizer **por quanto tempo** o backlog fica
+disponível para um follower que reingressa antes de cair em snapshot. Em volumetria alta, 1000 ops
+podem representar uma fração de segundo de janela; em volumetria baixa, retêm memória por horas sem
+necessidade.
+
+**Fix:** retenção **temporal** complementar — `ReplicationConfig.replicationLogRetentionTime(Duration)`.
+Cada entrada do resend log carrega o instante de indexação (no commit) e o `ReplicationManager`
+evicta o prefixo contíguo de entradas mais velhas que a janela:
+
+- **oportunística** a cada commit (`indexReplicationPayload`), espelhando o
+  `NQueue.skipExpiredRecordsLocked`;
+- **agendada** para tópicos ociosos (estende o passe periódico `trimLog`), garantindo que um tópico
+  que parou de escrever ainda libere o backlog dentro da janela.
+
+Tempo e contagem são **complementares — o que evictar primeiro vence**: contagem limita memória,
+tempo limita a janela. Default `Duration.ZERO` = desabilitado (comportamento count-only inalterado).
+Quando o follower pede deltas além da janela já expirada, o líder responde `missingSequences` e o
+follower cai no caminho **gap-detection → snapshot fallback** já existente — nunca divergência
+silenciosa. Métrica: `getReplicationLogTimeEvictedCount()`; tamanho por tópico:
+`getReplicationLogSize(topic)`.
+
+> Caso de uso (Cardinal): `ha.replication.logRetention` (ISO-8601) passa a janela temporal de
+> backlog, de modo que um nó que reingressa **dentro** da janela recebe deltas e, **fora** dela,
+> snapshot.
+
+### 8. Gate de escrita durante o leader-sync (`LeaderSyncingException`)
+
+No failover, ao reassumir liderança o novo líder marca `leaderSyncing=true` e dispara
+`attemptLeaderSync` de forma assíncrona para recuperar o que o líder anterior avançou. Porém
+`replicate()` checava apenas `isLeader()` + lease — **não** `isLeaderSyncing()` — então o novo líder
+**aceitava escritas imediatamente**, antes de concluir o catch-up, podendo avançar com **estado
+velho** e sobrescrever o progresso do líder anterior (divergência). Além disso, `attemptLeaderSync`
+deixava `leaderSyncing=true` **preso** quando não havia `syncSource` (nó sozinho / primeiro líder de
+cluster novo), travando consumidores que gateiam em `isLeaderSyncing()`.
+
+**Fix:**
+- **Gate fail-fast:** `replicate()` rejeita escritas com `LeaderSyncingException` (subtipo de
+  `IllegalStateException`) enquanto `isLeaderSyncing()` for `true`. Defesa em profundidade que fecha a
+  janela de divergência para **todos** os backends (queue e map).
+- **Clear sem `syncSource`:** quando `resolveSyncSource()` retorna `null` (nenhum peer alcançável),
+  `attemptLeaderSync` limpa `leaderSyncing=false` — o nó é, por definição, a réplica mais avançada
+  alcançável e pode liderar imediatamente, sem prender o consumidor.
+
+> Caso de uso (Cardinal): o HA faz **sync-before-lead** (só ativa o consumo do Kafka após
+> `isLeaderSyncing()==false`). O gate fecha a janela na própria lib e o clear correto elimina a
+> necessidade do *grace* que antes era usado como salvaguarda. Quem escreve deve aguardar
+> `!isLeaderSyncing()` antes da primeira escrita pós-promoção (a lib agora rejeita explicitamente).
+
 ## Configuração (Cardinal)
 
 ```java
 ReplicationConfig.builder(1)
     .strictConsistency(false)
-    .leaderLocalApply(false)        // engine é a fonte da verdade
-    .replicationLogRetention(100_000) // cobre a janela de transferência do snapshot
+    .leaderLocalApply(false)                       // engine é a fonte da verdade
+    .replicationLogRetention(100_000)              // teto de contagem (cobre a transferência do snapshot)
+    .replicationLogRetentionTime(Duration.ofMinutes(30)) // janela de backlog por tempo (o que evictar primeiro vence)
     .build();
 
 // coordinator: minClusterSize=1 → pairMode habilitado (liderança solo + reconciliação por NodeId)
 ```
+
+Pela facade `NGridConfig.Builder` os dois knobs de retenção também estão expostos
+(`replicationLogRetention(int)` e `replicationLogRetentionTime(Duration)`), repassados ao
+`ReplicationManager` no `NGridNode`.
 
 ## Diagramas
 
@@ -110,6 +166,8 @@ ReplicationConfig.builder(1)
 ![Recuperação de gap / skip-and-drain](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan-dev/nishi-utils/main/doc/diagrams/ngrid_oplog_gap_recovery.puml)
 
 ![Pair mode — failover e reconciliação](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan-dev/nishi-utils/main/doc/diagrams/ngrid_pairmode_failover.puml)
+
+![Gate de escrita durante leader-sync](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan-dev/nishi-utils/main/doc/diagrams/ngrid_leader_sync_gate.puml)
 
 ## Validação E2E (pré-prod)
 
