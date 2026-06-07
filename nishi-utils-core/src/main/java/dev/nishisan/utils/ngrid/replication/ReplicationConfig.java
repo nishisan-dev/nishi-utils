@@ -37,11 +37,12 @@ public final class ReplicationConfig {
     private final int appliedSetMaxSize;
     private final int operationLogMaxSize;
     private final boolean leaderLocalApply;
+    private final FollowerIngestMode followerIngestMode;
 
     private ReplicationConfig(int quorum, Duration operationTimeout, Duration retryInterval, boolean strictConsistency,
             Path dataDirectory, int resendGapThreshold, Duration resendTimeout, int replicationLogRetention,
             Duration replicationLogRetentionTime, int appliedSetMaxSize, int operationLogMaxSize,
-            boolean leaderLocalApply) {
+            boolean leaderLocalApply, FollowerIngestMode followerIngestMode) {
         this.quorum = quorum;
         this.operationTimeout = Objects.requireNonNull(operationTimeout, "operationTimeout");
         this.retryInterval = Objects.requireNonNull(retryInterval, "retryInterval");
@@ -55,6 +56,7 @@ public final class ReplicationConfig {
         this.appliedSetMaxSize = appliedSetMaxSize;
         this.operationLogMaxSize = operationLogMaxSize;
         this.leaderLocalApply = leaderLocalApply;
+        this.followerIngestMode = Objects.requireNonNull(followerIngestMode, "followerIngestMode");
     }
 
     public static ReplicationConfig of(int quorum) {
@@ -156,6 +158,18 @@ public final class ReplicationConfig {
         return leaderLocalApply;
     }
 
+    /**
+     * How this node, when acting as a follower, ingests replicated operations.
+     * {@link FollowerIngestMode#INLINE} (the default) preserves the legacy in-memory
+     * buffer + apply path; {@link FollowerIngestMode#RELAY_LOG} persists each request
+     * to an on-disk relay and applies it from a separate consumer (#124).
+     *
+     * @return the follower ingest mode (never {@code null})
+     */
+    public FollowerIngestMode followerIngestMode() {
+        return followerIngestMode;
+    }
+
     public static final class Builder {
         private final int quorum;
         private Duration operationTimeout = Duration.ofSeconds(30);
@@ -169,6 +183,7 @@ public final class ReplicationConfig {
         private int appliedSetMaxSize = 5000;
         private int operationLogMaxSize = 2000;
         private boolean leaderLocalApply = true;
+        private FollowerIngestMode followerIngestMode = FollowerIngestMode.INLINE;
 
         private Builder(int quorum) {
             if (quorum < 1) {
@@ -287,13 +302,26 @@ public final class ReplicationConfig {
             return this;
         }
 
+        /**
+         * Sets how this node ingests replication when acting as a follower. Defaults to
+         * {@link FollowerIngestMode#INLINE} (legacy behavior); {@link FollowerIngestMode#RELAY_LOG}
+         * enables the on-disk relay-log ingestion path (#124).
+         *
+         * @param followerIngestMode the follower ingest mode (must not be {@code null})
+         * @return this builder
+         */
+        public Builder followerIngestMode(FollowerIngestMode followerIngestMode) {
+            this.followerIngestMode = Objects.requireNonNull(followerIngestMode, "followerIngestMode");
+            return this;
+        }
+
         public ReplicationConfig build() {
             if (dataDirectory == null) {
                 throw new IllegalStateException("dataDirectory must be set");
             }
             return new ReplicationConfig(quorum, operationTimeout, retryInterval, strictConsistency, dataDirectory,
                     resendGapThreshold, resendTimeout, replicationLogRetention, replicationLogRetentionTime,
-                    appliedSetMaxSize, operationLogMaxSize, leaderLocalApply);
+                    appliedSetMaxSize, operationLogMaxSize, leaderLocalApply, followerIngestMode);
         }
     }
 }
