@@ -34,6 +34,40 @@ public interface ReplicationHandler {
     void apply(UUID operationId, Object payload) throws Exception;
 
     /**
+     * Encodes a live operation payload (as delivered to {@link #apply}) into the durable
+     * bytes persisted in a follower's relay-log (#124). The default treats the payload as
+     * the wire form — already a {@code byte[]} — and returns it unchanged, which is correct
+     * for handlers whose replicated data is byte-encoded (e.g. the map). Handlers whose data
+     * is a live typed command (e.g. the queue) override this to serialize it with type
+     * fidelity.
+     *
+     * @param payload the operation payload as passed to {@link #apply}
+     * @return the encoded payload bytes (never {@code null})
+     */
+    default byte[] encodePayload(Object payload) {
+        if (payload instanceof byte[] bytes) {
+            return bytes;
+        }
+        throw new IllegalArgumentException(
+                "Default encodePayload expects a byte[] wire payload but got "
+                        + (payload == null ? "null" : payload.getClass().getName())
+                        + "; override encodePayload for typed commands");
+    }
+
+    /**
+     * Decodes the durable relay bytes produced by {@link #encodePayload(Object)} back into
+     * the payload object handed to {@link #apply}. The default returns the bytes unchanged
+     * (the wire form that {@link #apply} decodes itself). Handlers that override
+     * {@link #encodePayload} override this symmetrically.
+     *
+     * @param payloadBytes the encoded payload bytes
+     * @return the payload object to pass to {@link #apply}
+     */
+    default Object decodePayload(byte[] payloadBytes) {
+        return payloadBytes;
+    }
+
+    /**
      * Returns a snapshot chunk.
      * 
      * @param chunkIndex Index of the chunk requested.

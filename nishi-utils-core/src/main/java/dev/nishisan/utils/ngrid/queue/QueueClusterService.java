@@ -491,6 +491,23 @@ public final class QueueClusterService<T> implements Closeable, ReplicationHandl
         }
     }
 
+    /**
+     * Encodes the live {@link QueueReplicationCommand} into durable relay bytes with full
+     * type fidelity for {@code value} (#124).
+     */
+    @Override
+    public byte[] encodePayload(Object payload) {
+        return QueueReplicationCodec.encode((QueueReplicationCommand) payload);
+    }
+
+    /**
+     * Decodes relay bytes back into a {@link QueueReplicationCommand} for {@link #apply}.
+     */
+    @Override
+    public Object decodePayload(byte[] payloadBytes) {
+        return QueueReplicationCodec.decode(payloadBytes);
+    }
+
     private static final int SNAPSHOT_CHUNK_SIZE = 1000;
 
     /** {@inheritDoc} */
