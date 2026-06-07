@@ -61,5 +61,7 @@ public enum MessageType {
     /** Unsubscribe from a distributed queue topic. */
     QUEUE_UNSUBSCRIBE,
     /** Notification of new items in a queue. */
-    QUEUE_NOTIFY
+    QUEUE_NOTIFY,
+    /** Follower → leader report of its applied-sequence progress (#129, join quiesce gate). */
+    FOLLOWER_PROGRESS
 }
