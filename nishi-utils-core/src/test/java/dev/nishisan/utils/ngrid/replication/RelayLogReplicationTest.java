@@ -238,6 +238,93 @@ class RelayLogReplicationTest {
         }
     }
 
+    /**
+     * P1 (review Codex): an unclean restart whose coalesced frontier was LOST (e.g. crash before the
+     * flush) must bootstrap from a fresh snapshot instead of silently resuming at sequence 1 and letting
+     * a leader resend re-apply (duplicate) the non-idempotent queue OFFER. Simulated by deleting the
+     * clean marker AND {@code sequence-state.dat} of a follower before restarting it.
+     */
+    @Test
+    @Timeout(value = 120, unit = TimeUnit.SECONDS)
+    void uncleanRestartWithLostFrontierBootstrapsInsteadOfReapplying() throws Exception {
+        NodeInfo[] infos = {
+                new NodeInfo(NodeId.of("relay-uc-1"), "localhost", 9851),
+                new NodeInfo(NodeId.of("relay-uc-2"), "localhost", 9852),
+                new NodeInfo(NodeId.of("relay-uc-3"), "localhost", 9853)
+        };
+        Path base = Files.createTempDirectory("ngrid-relay-unclean");
+        Path[] dirs = { base.resolve("1"), base.resolve("2"), base.resolve("3") };
+
+        NGridNode[] nodes = new NGridNode[3];
+        for (int i = 0; i < 3; i++) {
+            nodes[i] = failoverNode(infos[i], dirs[i], infos[(i + 1) % 3], infos[(i + 2) % 3]);
+        }
+        List<NGridNode> live = new ArrayList<>(List.of(nodes));
+        try {
+            for (NGridNode n : live) {
+                n.start();
+            }
+            ClusterTestUtils.awaitClusterConsensus(nodes[0], nodes[1], nodes[2]);
+            for (NGridNode n : live) {
+                n.getQueue("uc-queue", String.class);
+            }
+
+            int leaderIdx = leaderIndex(nodes);
+            int victimIdx = (leaderIdx + 1) % 3; // a follower
+
+            DistributedQueue<String> queue = nodes[leaderIdx].getQueue("uc-queue", String.class);
+            for (int i = 0; i < 60; i++) {
+                queue.offer("x-" + i);
+            }
+            long total = nodes[leaderIdx].replicationManager().getGlobalSequence();
+            awaitApplied(nodes[victimIdx], total, 25_000);
+
+            // Simulate an UNCLEAN crash with a LOST frontier on the victim follower.
+            nodes[victimIdx].close();
+            live.remove(nodes[victimIdx]);
+            Path repl = dirs[victimIdx].resolve("replication");
+            Files.deleteIfExists(repl.resolve("relay").resolve(".clean-shutdown"));
+            Files.deleteIfExists(repl.resolve("sequence-state.dat"));
+
+            // Restart the victim from the tampered (crashed) state.
+            NGridNode restarted = failoverNode(infos[victimIdx], dirs[victimIdx],
+                    infos[(victimIdx + 1) % 3], infos[(victimIdx + 2) % 3]);
+            nodes[victimIdx] = restarted;
+            live.add(restarted);
+            restarted.start();
+            ClusterTestUtils.awaitClusterConsensus(nodes[0], nodes[1], nodes[2]);
+            restarted.getQueue("uc-queue", String.class);
+
+            // The fix: it bootstraps (requests a snapshot) rather than replaying the relay from seq 1.
+            long deadline = System.currentTimeMillis() + 30_000;
+            while (restarted.replicationManager().getSyncRequestCount() == 0
+                    && System.currentTimeMillis() < deadline) {
+                Thread.sleep(150);
+            }
+            assertEquals(true, restarted.replicationManager().getSyncRequestCount() > 0,
+                    "unclean restart with a lost frontier must bootstrap (snapshot), not silently re-apply");
+
+            // ...and converge consistently (no divergence/duplication).
+            NGridNode leaderNow = nodes[leaderIndex(nodes)];
+            awaitApplied(restarted, leaderNow.replicationManager().getLastAppliedSequence(), 30_000);
+            assertEquals("x-0", restarted.getQueue("uc-queue", String.class).peek().orElse(null),
+                    "bootstrapped follower must hold the leader's state (no divergence)");
+        } finally {
+            for (NGridNode n : live) {
+                closeQuietly(n);
+            }
+        }
+    }
+
+    private static int leaderIndex(NGridNode[] nodes) {
+        for (int i = 0; i < nodes.length; i++) {
+            if (nodes[i] != null && nodes[i].coordinator().isLeader()) {
+                return i;
+            }
+        }
+        throw new IllegalStateException("no leader elected");
+    }
+
     private static NGridNode failoverNode(NodeInfo self, Path dir, NodeInfo peerA, NodeInfo peerB) {
         return new NGridNode(NGridConfig.builder(self)
                 .addPeer(peerA)

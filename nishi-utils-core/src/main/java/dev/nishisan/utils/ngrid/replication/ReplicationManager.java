@@ -163,7 +163,13 @@ public class ReplicationManager implements TransportListener, LeadershipListener
     // unclean — the coalesced apply frontier may be behind the durable handler state, which would
     // re-apply (duplicating the non-idempotent queue OFFER). A clean shutdown writes a marker that
     // makes a clean restart resume without bootstrap.
-    private final Set<String> relayBootstrapTopics = ConcurrentHashMap.newKeySet();
+    // Set on an unclean restart (crash): the coalesced apply frontier may be behind — or entirely lost
+    // — vs. the durable handler state, so every relay topic with prior data must bootstrap (a fresh
+    // snapshot replaces local state) instead of risking a stale/lost-frontier re-apply that duplicates
+    // the non-idempotent queue OFFER. relayPendingBootstrap holds those topics until the apply loop
+    // requests the snapshot (deferred so a follower syncs from the leader, never from itself).
+    private volatile boolean relayUncleanRestart = false;
+    private final Set<String> relayPendingBootstrap = ConcurrentHashMap.newKeySet();
 
     // Metrics
     private final java.util.concurrent.atomic.AtomicLong gapsDetected = new java.util.concurrent.atomic.AtomicLong(0);
@@ -272,8 +278,11 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             return;
         }
         running = false;
-        flushSequenceStateIfDirty(); // persist the latest coalesced sequence state on shutdown
-        // Wake and stop the per-topic relay apply consumers.
+        // Interrupt + wake the per-topic relay apply consumers, then JOIN them: no apply may be in
+        // flight when we flush the final frontier and mark the shutdown clean — otherwise a thread still
+        // inside handler.apply() could advance/poll the relay AFTER the flush, leaving durable state
+        // ahead of the saved frontier under a clean marker (gaps/duplicates on the next start).
+        List<Thread> relayThreads = new ArrayList<>(relayApplyThreads.values());
         for (Map.Entry<String, Thread> e : relayApplyThreads.entrySet()) {
             e.getValue().interrupt();
             Object sig = relaySignals.get(e.getKey());
@@ -283,35 +292,48 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                 }
             }
         }
+        boolean allAppliersTerminated = true;
+        for (Thread t : relayThreads) {
+            try {
+                t.join(5000);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+            if (t.isAlive()) {
+                allAppliersTerminated = false;
+            }
+        }
         relayApplyThreads.clear();
-        // Apply consumers are quiesced; flush the final frontier and mark this as a clean shutdown so
-        // the next start resumes without a bootstrap (a crash leaves no marker -> bootstrap on restart).
+        // Frontier is now consistent (no in-flight apply). Persist it, then mark the shutdown clean ONLY
+        // if every applier actually terminated; otherwise leave no marker so the next start bootstraps
+        // (the safe side).
         flushSequenceStateIfDirty();
-        writeCleanShutdownMarker();
+        if (allAppliersTerminated) {
+            writeCleanShutdownMarker();
+        } else {
+            LOGGER.warning("Relay apply consumers did not all terminate on stop; skipping clean-shutdown "
+                    + "marker so the next start bootstraps as a safety measure.");
+        }
         transport.removeListener(this);
         coordinator.removeLeadershipListener(this);
         failAllPending("ReplicationManager stopped");
     }
 
     /**
-     * Detects whether the previous shutdown was unclean (no clean-shutdown marker) while prior state
-     * exists, and if so marks the topics with prior applied state for a bootstrap snapshot — the
-     * crash-safe recovery for the relay model (the snapshot replaces local state, so the
-     * non-idempotent queue OFFER cannot be duplicated by re-applying a stale frontier).
+     * Detects whether the previous shutdown was unclean (no clean-shutdown marker). On a crash the
+     * coalesced apply frontier may be behind — or lost entirely — so every relay topic with prior data
+     * must bootstrap (the snapshot replaces local state, so a stale/lost frontier cannot duplicate the
+     * non-idempotent queue OFFER by re-applying). The per-topic decision is made in {@link
+     * #registerHandler} (which knows the topic) and the snapshot request is deferred to the apply loop
+     * (so a follower syncs from the leader, never from itself).
      */
     private void detectUncleanRestartAndMarkBootstrap() {
         Path relayDir = config.dataDirectory().resolve("relay");
-        boolean unclean = RelayStore.isUncleanRestart(relayDir);
+        relayUncleanRestart = RelayStore.isUncleanRestart(relayDir);
         RelayStore.consumeCleanMarker(relayDir);
-        if (unclean) {
-            for (Map.Entry<String, Long> entry : nextExpectedSequenceByTopic.entrySet()) {
-                if (entry.getValue() != null && entry.getValue() > 1L) {
-                    relayBootstrapTopics.add(entry.getKey());
-                }
-            }
-            if (!relayBootstrapTopics.isEmpty()) {
-                LOGGER.warning(() -> "Unclean relay restart detected; bootstrapping topics " + relayBootstrapTopics);
-            }
+        if (relayUncleanRestart) {
+            LOGGER.warning("Unclean relay restart detected; topics with prior data will bootstrap from a "
+                    + "fresh snapshot before applying (frontier may be stale or lost).");
         }
     }
 
@@ -325,10 +347,13 @@ public class ReplicationManager implements TransportListener, LeadershipListener
     public void registerHandler(String topic, ReplicationHandler handler) {
         handlers.put(topic, handler);
         if (isRelayMode()) {
-            if (relayBootstrapTopics.remove(topic) && syncingTopics.add(topic)) {
-                // Unclean restart: gate apply (syncingTopics) and pull a fresh snapshot before draining
-                // the relay. handleSyncResponse clears the gate and sets the frontier on completion.
-                requestSync(topic);
+            if (relayUncleanRestart
+                    && RelayStore.hasTopicData(config.dataDirectory().resolve("relay"), topic)) {
+                // Unclean restart and this topic had prior relay data: it must bootstrap before applying
+                // (regardless of any saved frontier, which may be lost). The snapshot is actually
+                // requested by the apply loop once a leader is known and this node is a follower
+                // (drainRelayOnce), avoiding a leader-syncs-from-itself loop.
+                relayPendingBootstrap.add(topic);
             }
             // Tie the apply consumer to handler registration, not to start(): an op may reach
             // the relay before the handler exists (it is durably parked on disk until then),
@@ -1167,6 +1192,26 @@ public class ReplicationManager implements TransportListener, LeadershipListener
      */
     private boolean drainRelayOnce(String topic, NQueue<byte[]> relay, PriorityQueue<RelayEntry> reorder)
             throws Exception {
+        if (relayPendingBootstrap.contains(topic)) {
+            // Unclean restart: do not apply this topic's relay until it is bootstrapped, or the decision
+            // is made that no bootstrap is needed.
+            if (coordinator.isLeader()) {
+                // Promoted/leader: there is no peer to bootstrap from; the failover drain-gate + sequence
+                // fencing recover the backlog. (A lost frontier on a promoted-with-backlog node is the
+                // residual edge case that needs crash-safe frontier co-location — out of scope here.)
+                relayPendingBootstrap.remove(topic);
+            } else if (coordinator.leaderInfo().isPresent()) {
+                // Follower with a known leader: pull a fresh snapshot first (replaces local state, so a
+                // stale/lost frontier cannot duplicate the non-idempotent queue OFFER).
+                relayPendingBootstrap.remove(topic);
+                if (syncingTopics.add(topic)) {
+                    requestSync(topic);
+                }
+                return false;
+            } else {
+                return false; // no leader known yet — wait before replaying anything
+            }
+        }
         if (syncingTopics.contains(topic)) {
             return false; // a sync/bootstrap is installing a snapshot for this topic; pause apply
         }

@@ -75,6 +75,11 @@ final class RelayStore implements Closeable {
         }
     }
 
+    /** True if {@code topic} already has a relay directory under {@code relayDir} from a prior run. */
+    static boolean hasTopicData(Path relayDir, String topic) {
+        return Files.exists(relayDir.resolve(dirName(topic)));
+    }
+
     /** Writes the clean-shutdown marker on graceful stop, after the apply frontier is flushed. */
     static void writeCleanMarker(Path relayDir) {
         try {
