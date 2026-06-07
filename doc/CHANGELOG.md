@@ -4,6 +4,44 @@
 
 ---
 
+## 2026-06-07 — 🟢 4.4.0 — Relay-log no follower (elimina a espiral de morte)
+
+Implementa o **modelo relay-log** no follower do `ReplicationManager` (#124), sobre as fundações da
+4.3.0 (#122/#123). Substitui o buffer em memória por um **relay-log persistente em disco** que
+desacopla recepção de aplicação, eliminando a espiral de morte (reset + full-snapshot crescente +
+starvation do líder) sob volume real (~2.8k ops/s). **Opt-in e aditivo**: default `INLINE` preserva o
+comportamento 4.3.0. Detalhes e diagramas em
+[`doc/ngrid/oplog-ha-hardening.md`](ngrid/oplog-ha-hardening.md) (seção *Relay-log no follower*).
+
+**Novidades:**
+- **`FollowerIngestMode { INLINE, RELAY_LOG }`** — knob do follower (default `INLINE`). No modo
+  `RELAY_LOG`, cada `REPLICATION_REQUEST` é persistido num relay-log NQueue por tópico (ACK na recepção
+  durável) e aplicado por um consumer próprio: `peek → fencing(epoch,seq) → apply → poll`. Exposto em
+  `ReplicationConfig.Builder`, `NGridConfig.Builder`, facade `NGridNodeBuilder` e YAML
+  (`cluster.replication.followerIngestMode`).
+- **`RelayDurability { OS_MANAGED, GROUP_COMMIT, ALWAYS }`** — durabilidade configurável do tail do
+  relay, análoga ao `sync_relay_log` do MySQL (trade-off taxa × janela de perda; o tail perdido é
+  re-buscado pelo resend do líder). Default `OS_MANAGED`. Novo `NQueue.sync()` para o group commit.
+- **Extensão NQueue** — `Options.withRetentionClampToConsumer(boolean)`: a retenção `TIME_BASED` nunca
+  descarta registros **não-aplicados** (só recupera o prefixo consumido); e fix do `recordCount`
+  defasado após compaction `TIME_BASED`.
+- **Snapshot bootstrap-only** — no modo relay, lag **não** dispara snapshot (o relay absorve);
+  snapshot fica só para o irrecuperável (restart sujo, gap evictado, head > retenção). Com
+  `replicationLogRetentionTime=0` (default), o relay **acumula indefinidamente** os não-aplicados e
+  aplica depois (lag ≠ perda — comportamento tipo relay log do MySQL sem purge).
+- **Failover drain-gate** — generaliza o gate de leader-sync de "snapshot instalado" para "relay
+  drenado": o nó promovido segura escrita (`LeaderSyncingException`) até drenar o relay; release por
+  relay vazio, **sem depender de peer**.
+- **Crash-safety do cursor** — clean-shutdown marker distingue parada limpa (resume) de crash
+  (bootstrap), evitando duplicação do `OFFER` não-idempotente.
+- Métricas `getSyncRequestCount()` e `getInlineSequenceBufferSize()` (observabilidade do regime relay).
+
+**Aceite:** carga sustentada de 10k ops com lag muito além dos limiares → converge com **0**
+snapshot/sync, sem reset (espiral eliminada). Failover 3-nós sem divergência. Suíte de resiliência
+completa verde; INLINE inalterado.
+
+---
+
 ## 2026-06-07 — 🟢 4.3.0 — Retenção temporal do op-log e gate de leader-sync
 
 Fecha duas lacunas do HA active/standby (op-log) levantadas pelo `tevent-cardinal` (issues #122 e

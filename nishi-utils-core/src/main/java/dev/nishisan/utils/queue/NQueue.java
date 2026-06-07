@@ -253,6 +253,15 @@ public class NQueue<T> implements Closeable {
         this.dataChannel = result.newChannel();
         this.consumerOffset = result.newConsumerOffset();
         this.producerOffset = result.newProducerOffset();
+        // Recompute recordCount from the surviving live segment. TIME_BASED compaction
+        // may physically discard head records (those older than the retention window),
+        // which the cursor-delta arithmetic alone cannot account for — leaving recordCount
+        // overcounted (stale). Recounting [consumerOffset, producerOffset) keeps size(),
+        // getRecordCount() and the persisted meta honest. Cheap: only the post-compaction
+        // live records are scanned (headers only). Benign for DELETE_ON_CONSUME (it only
+        // reclaims the already-consumed prefix, so the count is unchanged).
+        this.recordCount = countRecordsInRange(this.dataChannel, this.consumerOffset, this.producerOffset);
+        this.approximateSize.set(this.recordCount);
         persistCurrentStateLocked();
         if (stager != null) {
             stager.triggerDrainIfNeeded();
@@ -720,6 +729,31 @@ public class NQueue<T> implements Closeable {
     }
 
     /**
+     * Forces the durable log and metadata to disk on demand, independent of the
+     * per-operation {@link Options#withFsync(boolean)} setting. This enables a
+     * group-commit durability policy — run with {@code withFsync(false)} for speed and
+     * call {@code sync()} periodically — bounding the crash loss window without paying an
+     * fsync on every {@code offer}.
+     *
+     * @throws IOException if forcing the channels fails
+     */
+    public void sync() throws IOException {
+        lock.lock();
+        try {
+            if (dataChannel != null && dataChannel.isOpen()) {
+                dataChannel.force(true);
+            }
+        } finally {
+            lock.unlock();
+        }
+        synchronized (metaWriteLock) {
+            if (metaChannel != null && metaChannel.isOpen()) {
+                metaChannel.force(true);
+            }
+        }
+    }
+
+    /**
      * Forces an immediate, on-demand expiration pass, discarding the contiguous
      * prefix of records whose age (since {@code offer}) exceeds the configured
      * {@link Options#withExpireAfterWrite(Duration) expireAfterWrite} duration.
@@ -1151,6 +1185,26 @@ public class NQueue<T> implements Closeable {
         return new QueueState(count > 0 ? 0 : size, size, count, lastIdx);
     }
 
+    /**
+     * Counts the complete records contained in {@code [start, end)} of the given
+     * channel by scanning record headers only. Used to recompute {@code recordCount}
+     * after a compaction that may have physically discarded records from the head
+     * (TIME_BASED retention), where cursor-delta arithmetic cannot tell how many
+     * records survived. A torn/partial trailing record stops the scan.
+     */
+    private static long countRecordsInRange(FileChannel ch, long start, long end) throws IOException {
+        long offset = start, count = 0;
+        while (offset < end) {
+            NQueueRecordMetaData.HeaderPrefix pref = NQueueRecordMetaData.readPrefix(ch, offset);
+            NQueueRecordMetaData meta = NQueueRecordMetaData.fromBuffer(ch, offset, pref.headerLen);
+            offset = offset + NQueueRecordMetaData.fixedPrefixSize() + pref.headerLen + meta.getPayloadLen();
+            if (offset > end)
+                break;
+            count++;
+        }
+        return count;
+    }
+
     // ── Serialization Helpers ─────────────────────────────────────────────────
 
     private byte[] toBytes(T obj) throws IOException {
@@ -1355,6 +1409,7 @@ public class NQueue<T> implements Closeable {
         RetentionPolicy retentionPolicy = RetentionPolicy.DELETE_ON_CONSUME;
         long retentionTimeNanos = 0;
         long expireAfterWriteNanos = 0; // 0 = desabilitado
+        boolean retentionClampToConsumer = false;
 
         private Options() {
         }
@@ -1404,6 +1459,30 @@ public class NQueue<T> implements Closeable {
             return this;
         }
 
+        /**
+         * When {@link RetentionPolicy#TIME_BASED} is active, clamps the temporal
+         * compaction cutoff to the current consumer offset so retention reclaims
+         * only the already-consumed prefix and <b>never</b> discards records the
+         * consumer has not yet read.
+         * <p>
+         * Without this flag (the default), time-based compaction removes every
+         * record older than the retention window regardless of whether it was
+         * consumed — silently dropping unread records when the consumer lags. A
+         * replay-log consumer (e.g. the ngrid relay-log) requires this guarantee:
+         * an over-retention backlog must be surfaced to the consumer (via head age)
+         * and resolved by an explicit bootstrap, not by silent truncation.
+         * <p>
+         * Has no effect under {@link RetentionPolicy#DELETE_ON_CONSUME}, which
+         * already anchors the cutoff at the consumer offset. Default {@code false}.
+         *
+         * @param clamp {@code true} to forbid discarding unconsumed records during time-based compaction
+         * @return this options instance for chaining
+         */
+        public Options withRetentionClampToConsumer(boolean clamp) {
+            this.retentionClampToConsumer = clamp;
+            return this;
+        }
+
         public Options copy() {
             Options copy = new Options();
             copy.compactionWasteThreshold = this.compactionWasteThreshold;
@@ -1422,6 +1501,7 @@ public class NQueue<T> implements Closeable {
             copy.retentionPolicy = this.retentionPolicy;
             copy.retentionTimeNanos = this.retentionTimeNanos;
             copy.expireAfterWriteNanos = this.expireAfterWriteNanos;
+            copy.retentionClampToConsumer = this.retentionClampToConsumer;
             return copy;
         }
 
@@ -1533,6 +1613,7 @@ public class NQueue<T> implements Closeable {
             final RetentionPolicy retentionPolicy;
             final long retentionTimeNanos;
             final long expireAfterWriteNanos;
+            final boolean retentionClampToConsumer;
 
             Snapshot(Options o) {
                 this.compactionWasteThreshold = o.compactionWasteThreshold;
@@ -1549,6 +1630,7 @@ public class NQueue<T> implements Closeable {
                 this.retentionPolicy = o.retentionPolicy;
                 this.retentionTimeNanos = o.retentionTimeNanos;
                 this.expireAfterWriteNanos = o.expireAfterWriteNanos;
+                this.retentionClampToConsumer = o.retentionClampToConsumer;
             }
         }
     }

@@ -1,0 +1,23 @@
+@startuml
+title Failover drain-gate (#124) — promover so apos drenar o relay
+
+participant "Cliente" as C
+participant "Novo lider\n(ex-follower)" as N
+database "Relay\n(backlog pendente)" as RELAY
+participant "Apply consumer" as APPLY
+
+== Promocao com relay cheio ==
+N -> N : onLeaderChanged → leaderSyncing=true\nleaderSyncTopics = topicos
+note over N : NAO chama attemptLeaderSync\n(sem snapshot; sem clear-on-null sem peer)
+C -> N : replicate() (escrita)
+N --> C : **LeaderSyncingException**\n(gate: relay nao drenado)
+
+== Drain (proprio relay; sem depender de peer) ==
+APPLY -> RELAY : peek → apply → poll (drena backlog)
+APPLY -> N : relay+reorder vazios →\nmaybeReleaseRelayDrainGate(topico)
+note over N : todos os topicos drenaram →\nleaderSyncing=false
+
+== Pos-drain ==
+C -> N : replicate() (retry)
+note over N : isLeaderSyncing()=false → aceita\n(estado ja aplicado; sem divergencia)
+@enduml

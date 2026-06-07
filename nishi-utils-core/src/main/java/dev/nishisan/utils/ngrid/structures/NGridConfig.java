@@ -18,6 +18,8 @@
 package dev.nishisan.utils.ngrid.structures;
 
 import dev.nishisan.utils.ngrid.common.NodeInfo;
+import dev.nishisan.utils.ngrid.replication.FollowerIngestMode;
+import dev.nishisan.utils.ngrid.replication.RelayDurability;
 import dev.nishisan.utils.map.NMapPersistenceMode;
 import dev.nishisan.utils.queue.NQueue;
 
@@ -43,6 +45,9 @@ public final class NGridConfig {
     private final Duration replicationOperationTimeout;
     private final Integer replicationLogRetention;
     private final Duration replicationLogRetentionTime;
+    private final FollowerIngestMode followerIngestMode;
+    private final RelayDurability relayDurability;
+    private final Duration relayGroupCommitInterval;
     private final Duration rttProbeInterval;
     private final Duration heartbeatInterval;
     private final Duration leaseTimeout;
@@ -88,6 +93,9 @@ public final class NGridConfig {
         this.replicationOperationTimeout = builder.replicationOperationTimeout;
         this.replicationLogRetention = builder.replicationLogRetention;
         this.replicationLogRetentionTime = builder.replicationLogRetentionTime;
+        this.followerIngestMode = builder.followerIngestMode;
+        this.relayDurability = builder.relayDurability;
+        this.relayGroupCommitInterval = builder.relayGroupCommitInterval;
         this.rttProbeInterval = builder.rttProbeInterval;
         this.heartbeatInterval = builder.heartbeatInterval;
         this.leaseTimeout = builder.leaseTimeout;
@@ -185,6 +193,36 @@ public final class NGridConfig {
      */
     public Duration replicationLogRetentionTime() {
         return replicationLogRetentionTime;
+    }
+
+    /**
+     * How a follower ingests replicated operations. Defaults to
+     * {@link FollowerIngestMode#INLINE}; {@link FollowerIngestMode#RELAY_LOG} enables
+     * the on-disk relay-log ingestion path (#124).
+     *
+     * @return the follower ingest mode (never {@code null})
+     */
+    public FollowerIngestMode followerIngestMode() {
+        return followerIngestMode;
+    }
+
+    /**
+     * Relay-log tail durability policy (#124), analogous to MySQL's {@code sync_relay_log}.
+     * Defaults to {@link RelayDurability#OS_MANAGED}.
+     *
+     * @return the relay durability policy (never {@code null})
+     */
+    public RelayDurability relayDurability() {
+        return relayDurability;
+    }
+
+    /**
+     * Interval between forced relay syncs when {@link RelayDurability#GROUP_COMMIT} is active.
+     *
+     * @return the group-commit interval (never {@code null})
+     */
+    public Duration relayGroupCommitInterval() {
+        return relayGroupCommitInterval;
     }
 
     public Duration rttProbeInterval() {
@@ -360,6 +398,9 @@ public final class NGridConfig {
         private Duration replicationOperationTimeout;
         private Integer replicationLogRetention;
         private Duration replicationLogRetentionTime;
+        private FollowerIngestMode followerIngestMode = FollowerIngestMode.INLINE;
+        private RelayDurability relayDurability = RelayDurability.OS_MANAGED;
+        private Duration relayGroupCommitInterval = Duration.ofSeconds(1);
         private Duration rttProbeInterval = Duration.ofSeconds(10);
         private Duration heartbeatInterval = Duration.ofSeconds(3);
         private Duration leaseTimeout;
@@ -554,6 +595,46 @@ public final class NGridConfig {
                 throw new IllegalArgumentException("replicationLogRetentionTime must not be negative");
             }
             this.replicationLogRetentionTime = retentionTime;
+            return this;
+        }
+
+        /**
+         * Sets how a follower ingests replicated operations. Defaults to
+         * {@link FollowerIngestMode#INLINE} (legacy behavior); {@link FollowerIngestMode#RELAY_LOG}
+         * enables the on-disk relay-log ingestion path (#124).
+         *
+         * @param followerIngestMode the follower ingest mode (must not be {@code null})
+         * @return this builder
+         */
+        public Builder followerIngestMode(FollowerIngestMode followerIngestMode) {
+            this.followerIngestMode = Objects.requireNonNull(followerIngestMode, "followerIngestMode");
+            return this;
+        }
+
+        /**
+         * Sets the relay-log tail durability policy (#124), analogous to MySQL's
+         * {@code sync_relay_log}. Defaults to {@link RelayDurability#OS_MANAGED}.
+         *
+         * @param relayDurability the durability policy (must not be {@code null})
+         * @return this builder
+         */
+        public Builder relayDurability(RelayDurability relayDurability) {
+            this.relayDurability = Objects.requireNonNull(relayDurability, "relayDurability");
+            return this;
+        }
+
+        /**
+         * Sets the forced-sync interval used when {@link RelayDurability#GROUP_COMMIT} is active.
+         *
+         * @param interval the group-commit interval (must be positive)
+         * @return this builder
+         */
+        public Builder relayGroupCommitInterval(Duration interval) {
+            Objects.requireNonNull(interval, "relayGroupCommitInterval");
+            if (interval.isNegative() || interval.isZero()) {
+                throw new IllegalArgumentException("relayGroupCommitInterval must be positive");
+            }
+            this.relayGroupCommitInterval = interval;
             return this;
         }
 
