@@ -242,6 +242,80 @@ class RelayLogReplicationTest {
     }
 
     /**
+     * #129 (3a): a brand-new follower must converge against a QUIESCENT leader — without waiting for
+     * op-log traffic. In RELAY_LOG the follower previously only synced reactively (on a gap in arriving
+     * traffic), so a fresh follower joining an idle leader stayed empty forever. The proactive cold-join
+     * sync reads the leader's watermark from the heartbeat and pulls a snapshot on its own.
+     *
+     * <p>Reproduced by wiping a follower's state and restarting it while the leader produces NOTHING
+     * after the restart — convergence can only come from the proactive sync.
+     */
+    @Test
+    @Timeout(value = 120, unit = TimeUnit.SECONDS)
+    void proactiveSyncConvergesFreshFollowerAgainstQuiescentLeader() throws Exception {
+        // Higher NodeId ("z") always wins election, so the wiped node never leads with empty state.
+        NodeInfo leaderInfo = new NodeInfo(NodeId.of("relay-join-z"), "localhost", 9856);
+        NodeInfo followerInfo = new NodeInfo(NodeId.of("relay-join-a"), "localhost", 9857);
+        Path base = Files.createTempDirectory("ngrid-relay-join");
+        Path followerDir = base.resolve("a");
+
+        NGridNode leader = relayNode(leaderInfo, followerInfo, base.resolve("z"), 1);
+        NGridNode follower = relayNode(followerInfo, leaderInfo, followerDir, 1);
+        try {
+            leader.start();
+            follower.start();
+            ClusterTestUtils.awaitClusterConsensus(leader, follower);
+            leader.getQueue("join-queue", String.class);
+            follower.getQueue("join-queue", String.class);
+
+            // Produce a backlog, let the follower converge the normal (reactive) way.
+            DistributedQueue<String> queue = leader.getQueue("join-queue", String.class);
+            int n = 100;
+            for (int i = 0; i < n; i++) {
+                queue.offer("item-" + i);
+            }
+            long produced = leader.replicationManager().getGlobalSequence();
+            awaitApplied(follower, produced, 30_000);
+
+            // Wipe the follower entirely and restart it FRESH while the leader stays quiescent.
+            follower.close();
+            deleteRecursively(followerDir);
+            NGridNode freshFollower = relayNode(followerInfo, leaderInfo, followerDir, 1);
+            freshFollower.start();
+            try {
+                ClusterTestUtils.awaitClusterConsensus(leader, freshFollower);
+                freshFollower.getQueue("join-queue", String.class);
+
+                // No more writes on the leader — convergence can ONLY come from the proactive cold-join
+                // sync (3a). Without it, a fresh follower + quiescent leader never syncs.
+                awaitApplied(freshFollower, produced, 40_000);
+                assertEquals("item-0", freshFollower.getQueue("join-queue", String.class).peek().orElse(null),
+                        "fresh follower must converge against a quiescent leader via proactive sync");
+            } finally {
+                closeQuietly(freshFollower);
+            }
+        } finally {
+            closeQuietly(leader);
+            closeQuietly(follower);
+        }
+    }
+
+    private static void deleteRecursively(Path root) throws IOException {
+        if (!Files.exists(root)) {
+            return;
+        }
+        try (java.util.stream.Stream<Path> walk = Files.walk(root)) {
+            walk.sorted(java.util.Comparator.reverseOrder()).forEach(p -> {
+                try {
+                    Files.deleteIfExists(p);
+                } catch (IOException ignored) {
+                    // best-effort cleanup
+                }
+            });
+        }
+    }
+
+    /**
      * Fase 5: after killing the leader, a surviving relay node may only become a <em>ready</em> leader
      * once its relay backlog has fully drained ({@code isLeaderSyncing()} stays true until then — the
      * failover drain-gate). Then writes succeed and the cluster stays consistent (no divergence).
