@@ -40,12 +40,18 @@ public final class ReplicationConfig {
     private final FollowerIngestMode followerIngestMode;
     private final RelayDurability relayDurability;
     private final Duration relayGroupCommitInterval;
+    private final boolean persistentResendLog;
+    private final int resendLogSegmentMaxEntries;
+    private final Duration resendLogSegmentMaxAge;
+    private final long resendLogMaxEntries;
+    private final int resendLogReadBatchMax;
 
     private ReplicationConfig(int quorum, Duration operationTimeout, Duration retryInterval, boolean strictConsistency,
             Path dataDirectory, int resendGapThreshold, Duration resendTimeout, int replicationLogRetention,
             Duration replicationLogRetentionTime, int appliedSetMaxSize, int operationLogMaxSize,
             boolean leaderLocalApply, FollowerIngestMode followerIngestMode, RelayDurability relayDurability,
-            Duration relayGroupCommitInterval) {
+            Duration relayGroupCommitInterval, boolean persistentResendLog, int resendLogSegmentMaxEntries,
+            Duration resendLogSegmentMaxAge, long resendLogMaxEntries, int resendLogReadBatchMax) {
         this.quorum = quorum;
         this.operationTimeout = Objects.requireNonNull(operationTimeout, "operationTimeout");
         this.retryInterval = Objects.requireNonNull(retryInterval, "retryInterval");
@@ -62,6 +68,11 @@ public final class ReplicationConfig {
         this.followerIngestMode = Objects.requireNonNull(followerIngestMode, "followerIngestMode");
         this.relayDurability = Objects.requireNonNull(relayDurability, "relayDurability");
         this.relayGroupCommitInterval = Objects.requireNonNull(relayGroupCommitInterval, "relayGroupCommitInterval");
+        this.persistentResendLog = persistentResendLog;
+        this.resendLogSegmentMaxEntries = resendLogSegmentMaxEntries;
+        this.resendLogSegmentMaxAge = Objects.requireNonNull(resendLogSegmentMaxAge, "resendLogSegmentMaxAge");
+        this.resendLogMaxEntries = resendLogMaxEntries;
+        this.resendLogReadBatchMax = resendLogReadBatchMax;
     }
 
     public static ReplicationConfig of(int quorum) {
@@ -195,6 +206,62 @@ public final class ReplicationConfig {
         return relayGroupCommitInterval;
     }
 
+    /**
+     * Whether the leader-side resend op-log is backed by a durable, segmented on-disk store (#127)
+     * in addition to the in-heap hot cache. Defaults to {@code false} (heap-only, the previous
+     * behavior). When {@code true}, the heap cache holds only the freshest window (bounded by
+     * {@link #replicationLogRetention()}) and the deep, time-governed backlog window
+     * ({@link #replicationLogRetentionTime()}) lives on disk — so a large window costs disk, not
+     * heap, eliminating the count-vs-time eviction that collapsed the window under load.
+     *
+     * @return {@code true} to enable the disk-backed resend op-log
+     */
+    public boolean persistentResendLog() {
+        return persistentResendLog;
+    }
+
+    /**
+     * Maximum number of entries per on-disk resend-log segment before a new segment is rolled.
+     * Retention drops whole sealed segments, so this also sets the granularity of eviction.
+     *
+     * @return the per-segment entry cap
+     */
+    public int resendLogSegmentMaxEntries() {
+        return resendLogSegmentMaxEntries;
+    }
+
+    /**
+     * Maximum age of an on-disk resend-log segment before a new one is rolled, bounding how long an
+     * entry waits before its segment can age out of the temporal window. {@link Duration#ZERO}
+     * disables age-based rolling (count-based rolling still applies).
+     *
+     * @return the per-segment max age
+     */
+    public Duration resendLogSegmentMaxAge() {
+        return resendLogSegmentMaxAge;
+    }
+
+    /**
+     * Hard count backstop for the on-disk resend op-log across all segments of a topic, guarding
+     * against unbounded disk growth. The temporal window ({@link #replicationLogRetentionTime()}) is
+     * the intended governor; this is a safety cap.
+     *
+     * @return the disk-side entry cap per topic
+     */
+    public long resendLogMaxEntries() {
+        return resendLogMaxEntries;
+    }
+
+    /**
+     * Maximum number of sequences served from the disk resend op-log in a single resend response,
+     * bounding one read. Larger gaps fall into the snapshot-fallback path.
+     *
+     * @return the per-response read cap
+     */
+    public int resendLogReadBatchMax() {
+        return resendLogReadBatchMax;
+    }
+
     public static final class Builder {
         private final int quorum;
         private Duration operationTimeout = Duration.ofSeconds(30);
@@ -211,6 +278,11 @@ public final class ReplicationConfig {
         private FollowerIngestMode followerIngestMode = FollowerIngestMode.INLINE;
         private RelayDurability relayDurability = RelayDurability.OS_MANAGED;
         private Duration relayGroupCommitInterval = Duration.ofSeconds(1);
+        private boolean persistentResendLog = false;
+        private int resendLogSegmentMaxEntries = 65_536;
+        private Duration resendLogSegmentMaxAge = Duration.ofMinutes(5);
+        private long resendLogMaxEntries = 10_000_000L;
+        private int resendLogReadBatchMax = 5_000;
 
         private Builder(int quorum) {
             if (quorum < 1) {
@@ -369,6 +441,76 @@ public final class ReplicationConfig {
             return this;
         }
 
+        /**
+         * Enables the disk-backed resend op-log (#127). See {@link #persistentResendLog()}. Pair with
+         * {@link #replicationLogRetentionTime(Duration)} to set the temporal backlog window.
+         *
+         * @param persistentResendLog {@code true} to back the resend op-log with the on-disk store
+         * @return this builder
+         */
+        public Builder persistentResendLog(boolean persistentResendLog) {
+            this.persistentResendLog = persistentResendLog;
+            return this;
+        }
+
+        /**
+         * Sets the per-segment entry cap for the on-disk resend op-log.
+         *
+         * @param maxEntries entries per segment (must be >= 1)
+         * @return this builder
+         */
+        public Builder resendLogSegmentMaxEntries(int maxEntries) {
+            if (maxEntries < 1) {
+                throw new IllegalArgumentException("resendLogSegmentMaxEntries must be >= 1");
+            }
+            this.resendLogSegmentMaxEntries = maxEntries;
+            return this;
+        }
+
+        /**
+         * Sets the per-segment max age for the on-disk resend op-log. {@link Duration#ZERO} disables
+         * age-based segment rolling.
+         *
+         * @param maxAge the per-segment max age (must not be negative)
+         * @return this builder
+         */
+        public Builder resendLogSegmentMaxAge(Duration maxAge) {
+            Objects.requireNonNull(maxAge, "resendLogSegmentMaxAge");
+            if (maxAge.isNegative()) {
+                throw new IllegalArgumentException("resendLogSegmentMaxAge must not be negative");
+            }
+            this.resendLogSegmentMaxAge = maxAge;
+            return this;
+        }
+
+        /**
+         * Sets the hard disk-side count backstop per topic for the on-disk resend op-log.
+         *
+         * @param maxEntries the disk entry cap (must be >= 1)
+         * @return this builder
+         */
+        public Builder resendLogMaxEntries(long maxEntries) {
+            if (maxEntries < 1) {
+                throw new IllegalArgumentException("resendLogMaxEntries must be >= 1");
+            }
+            this.resendLogMaxEntries = maxEntries;
+            return this;
+        }
+
+        /**
+         * Sets the maximum number of sequences served from the disk resend op-log in one response.
+         *
+         * @param maxBatch the per-response read cap (must be >= 1)
+         * @return this builder
+         */
+        public Builder resendLogReadBatchMax(int maxBatch) {
+            if (maxBatch < 1) {
+                throw new IllegalArgumentException("resendLogReadBatchMax must be >= 1");
+            }
+            this.resendLogReadBatchMax = maxBatch;
+            return this;
+        }
+
         public ReplicationConfig build() {
             if (dataDirectory == null) {
                 throw new IllegalStateException("dataDirectory must be set");
@@ -376,7 +518,8 @@ public final class ReplicationConfig {
             return new ReplicationConfig(quorum, operationTimeout, retryInterval, strictConsistency, dataDirectory,
                     resendGapThreshold, resendTimeout, replicationLogRetention, replicationLogRetentionTime,
                     appliedSetMaxSize, operationLogMaxSize, leaderLocalApply, followerIngestMode, relayDurability,
-                    relayGroupCommitInterval);
+                    relayGroupCommitInterval, persistentResendLog, resendLogSegmentMaxEntries, resendLogSegmentMaxAge,
+                    resendLogMaxEntries, resendLogReadBatchMax);
         }
     }
 }
