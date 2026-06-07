@@ -63,5 +63,7 @@ public enum MessageType {
     /** Notification of new items in a queue. */
     QUEUE_NOTIFY,
     /** Follower → leader report of its applied-sequence progress (#129, join quiesce gate). */
-    FOLLOWER_PROGRESS
+    FOLLOWER_PROGRESS,
+    /** User-level best-effort broadcast message between nodes (broadcastMessage API). */
+    USER_BROADCAST
 }
