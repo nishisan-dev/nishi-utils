@@ -4,6 +4,34 @@
 
 ---
 
+## 2026-06-07 — 🟢 4.5.1 — Fix: sync proativo do cold-join contra líder quiescente (montagem manual)
+
+Corrige o **#131** (follow-up do #129 3a): em montagem **manual** do `ReplicationManager` (sem
+`NGridNodeBuilder`, como no `tevent-cardinal`), um follower **novo** contra um líder **quiescente**
+não fazia o sync proativo do cold-join — ficava em estado vazio indefinidamente. O caminho reativo
+(líder produzindo) sempre funcionou; só o proativo/sem-tráfego falhava.
+
+**Causa raiz:** `checkProactiveJoinSync` desistia quando `getTrackedLeaderHighWatermark() <= 0`. Esse
+watermark vem do heartbeat do líder, cujo valor é produzido pelo `leaderHighWatermarkSupplier` do
+coordinator — **fiado apenas pelo `NGridNode`** (default `-1`). Na montagem manual o supplier ficava no
+default, o líder emitia heartbeat com watermark `-1` e o proativo do follower era barrado para sempre.
+(A hipótese de epoch da issue é falso positivo: o fencing compara contra `trackedLeaderEpoch`, que
+começa em 0, não contra o `leaderEpoch` local da auto-eleição transitória.)
+
+**Correção:**
+- **`ReplicationManager.start()` passa a fiar o supplier do watermark** (`isLeader ? getGlobalSequence()
+  : getLastAppliedSequence()`), tornando-o correto em **qualquer** montagem (manual ou facade). A
+  fiação externa duplicada no `NGridNode` foi removida (fonte única).
+- **O cold-join proativo não depende mais de watermark > 0**: só pula quando o watermark é **conhecido
+  (>0) e já alcançado**; watermark desconhecido (`<=0`) vira "sincroniza por segurança" (pior caso:
+  snapshot vazio, 1x por termo).
+
+**Testes:** `ProactiveColdJoinWatermarkTest` (2, montagem manual — cobre o gap do #129 que usava o
+facade): heartbeat do líder carrega o watermark real após `start()`, e o follower cold dispara o sync
+proativo mesmo com watermark desconhecido (verificado que falha sem o fix). Suíte do core verde.
+
+---
+
 ## 2026-06-07 — 🟢 4.5.0 — Convergência do bootstrap sob carga (op-log em disco, apply em lote, sync no join) + broadcast inter-nós
 
 Fecha três falhas interligadas observadas na validação do `tevent-cardinal` (TEMS) em HA de 2 nós com

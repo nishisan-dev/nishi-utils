@@ -411,3 +411,9 @@ lag por `getGlobalSequence() − getLastAppliedSequence()`).
   reinicia contra um líder que não produz mais nada e converge **só** via sync proativo.
 - `LeaderPauseOnJoinTest`: o líder rejeita escritas enquanto um follower atrasado entra e retoma quando
   ele reporta *caught-up*.
+
+> **Fix 4.5.1 (#131):** o proativo (3a) dependia do watermark do líder via heartbeat, cujo supplier era
+> fiado apenas pelo `NGridNode` (default `-1`). Em montagem **manual** do `ReplicationManager` o
+> watermark chegava `-1` e o proativo era barrado (`watermark <= 0`). Agora o `ReplicationManager.start()`
+> fia o supplier sozinho (qualquer montagem) e o cold-join proativo trata watermark desconhecido como
+> "sincroniza por segurança". Cobertura: `ProactiveColdJoinWatermarkTest` (montagem manual + pairMode).
