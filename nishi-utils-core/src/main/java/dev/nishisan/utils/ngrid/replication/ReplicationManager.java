@@ -33,6 +33,7 @@ import dev.nishisan.utils.ngrid.common.SequenceResendRequestPayload;
 import dev.nishisan.utils.ngrid.common.SequenceResendResponsePayload;
 import dev.nishisan.utils.ngrid.common.SyncRequestPayload;
 import dev.nishisan.utils.ngrid.common.SyncResponsePayload;
+import dev.nishisan.utils.queue.NQueue;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -145,6 +146,20 @@ public class ReplicationManager implements TransportListener, LeadershipListener
     private final Set<String> resendPendingTopics = ConcurrentHashMap.newKeySet();
     private final Map<String, Instant> resendStartByTopic = new ConcurrentHashMap<>();
 
+    // ── Relay-log ingestion (#124, FollowerIngestMode.RELAY_LOG) ─────────────────
+    // The follower persists each REPLICATION_REQUEST to a durable relay (one NQueue per
+    // topic) and a per-topic consumer applies it at its own pace, decoupling reception
+    // from application. nextExpectedSequenceByTopic remains the durable apply frontier.
+    private volatile RelayStore relayStore;
+    private final Map<String, Thread> relayApplyThreads = new ConcurrentHashMap<>();
+    private final Map<String, Object> relaySignals = new ConcurrentHashMap<>();
+    // Small in-memory reorder buffer (per topic), used ONLY to bridge transport-hiccup gaps
+    // while a resend fills the hole. The large in-order backlog lives on disk (the relay), so
+    // this stays small; exceeding the cap means the follower is too far behind a hole and must
+    // bootstrap rather than buffer unbounded (the old OOM driver).
+    private final Map<String, PriorityQueue<RelayEntry>> relayReorderByTopic = new ConcurrentHashMap<>();
+    private static final int RELAY_REORDER_CAP = 50_000;
+
     // Metrics
     private final java.util.concurrent.atomic.AtomicLong gapsDetected = new java.util.concurrent.atomic.AtomicLong(0);
     private final java.util.concurrent.atomic.AtomicLong evictedSkipCount = new java.util.concurrent.atomic.AtomicLong(0);
@@ -211,6 +226,17 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             return;
         }
         running = true;
+        if (isRelayMode()) {
+            // Relay retention mirrors the leader op-log window (#122): an over-retention
+            // backlog is surfaced to the consumer and resolved by bootstrap, never silently
+            // dropped (the clamp guarantees that).
+            this.relayStore = new RelayStore(config.dataDirectory().resolve("relay"),
+                    config.replicationLogRetentionTime());
+            // Start consumers for any handler registered before start() (normal flow registers after).
+            for (String topic : handlers.keySet()) {
+                ensureRelayApplyLoop(topic);
+            }
+        }
         transport.addListener(this);
         coordinator.addLeadershipListener(this);
         Duration timeout = config.operationTimeout();
@@ -236,6 +262,17 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         }
         running = false;
         flushSequenceStateIfDirty(); // persist the latest coalesced sequence state on shutdown
+        // Wake and stop the per-topic relay apply consumers.
+        for (Map.Entry<String, Thread> e : relayApplyThreads.entrySet()) {
+            e.getValue().interrupt();
+            Object sig = relaySignals.get(e.getKey());
+            if (sig != null) {
+                synchronized (sig) {
+                    sig.notifyAll();
+                }
+            }
+        }
+        relayApplyThreads.clear();
         transport.removeListener(this);
         coordinator.removeLeadershipListener(this);
         failAllPending("ReplicationManager stopped");
@@ -243,6 +280,12 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
     public void registerHandler(String topic, ReplicationHandler handler) {
         handlers.put(topic, handler);
+        if (isRelayMode()) {
+            // Tie the apply consumer to handler registration, not to start(): an op may reach
+            // the relay before the handler exists (it is durably parked on disk until then),
+            // but apply must not begin until the handler is available.
+            ensureRelayApplyLoop(topic);
+        }
     }
 
     public long getGlobalSequence() {
@@ -822,6 +865,14 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             lastSeenLeaderEpoch = payloadEpoch;
         }
 
+        // RELAY_LOG: persist the op to the durable relay and ack on durable receipt; the per-topic
+        // consumer applies it at its own pace. This replaces the in-memory buffer + inline apply
+        // path below (which is the INLINE mode).
+        if (isRelayMode()) {
+            handleReplicationRelay(payload, message);
+            return;
+        }
+
         // Already being processed - skip entirely (dedup guard)
         if (processing.contains(opId)) {
             LOGGER.fine(() -> String.format(
@@ -914,6 +965,188 @@ public class ReplicationManager implements TransportListener, LeadershipListener
                         "Received old sequence seq=%d (expecting=%d) for topic=%s, ignoring",
                         seq, nextExpected, topic));
             }
+        } finally {
+            sequenceBufferLock.unlock();
+        }
+    }
+
+    // ── Relay-log ingestion (#124) ───────────────────────────────────────────────
+
+    private boolean isRelayMode() {
+        return config != null && config.followerIngestMode() == FollowerIngestMode.RELAY_LOG;
+    }
+
+    /**
+     * IO path (RELAY_LOG): encode + persist the op to the topic relay, then ack on durable
+     * receipt. Apply happens asynchronously in {@link #relayApplyLoop}. Never drops silently:
+     * if the handler is missing or the offer fails, it does NOT ack and the leader resends.
+     */
+    private void handleReplicationRelay(ReplicationPayload payload, ClusterMessage message) {
+        String topic = payload.topic();
+        UUID opId = payload.operationId();
+        ReplicationHandler handler = handlers.get(topic);
+        if (handler == null) {
+            LOGGER.fine(() -> "Relay: no handler yet for topic " + topic + ", deferring op " + opId
+                    + " (leader resend will redeliver)");
+            return;
+        }
+        try {
+            byte[] payloadBytes = handler.encodePayload(payload.data());
+            RelayEntry entry = new RelayEntry(payload.epoch(), payload.sequence(), topic, opId, payloadBytes);
+            relayFor(topic).offer(RelayEntryCodec.encode(entry));
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING, "Relay offer failed for topic " + topic + "; not acking op " + opId, e);
+            return; // no ack -> leader resends; no silent loss
+        }
+        sendAck(opId, message.source());
+        signalRelay(topic);
+    }
+
+    private NQueue<byte[]> relayFor(String topic) {
+        RelayStore store = relayStore;
+        if (store == null) {
+            throw new IllegalStateException("Relay store not initialized");
+        }
+        return store.relayFor(topic);
+    }
+
+    private void signalRelay(String topic) {
+        Object sig = relaySignals.get(topic);
+        if (sig != null) {
+            synchronized (sig) {
+                sig.notifyAll();
+            }
+        }
+    }
+
+    /** Starts the per-topic apply consumer once (idempotent). */
+    private synchronized void ensureRelayApplyLoop(String topic) {
+        if (!running || relayStore == null) {
+            return;
+        }
+        relaySignals.computeIfAbsent(topic, k -> new Object());
+        relayApplyThreads.computeIfAbsent(topic, t -> {
+            Thread thread = new Thread(() -> relayApplyLoop(topic), "ngrid-relay-apply-" + topic);
+            thread.setDaemon(true);
+            thread.start();
+            return thread;
+        });
+    }
+
+    private void relayApplyLoop(String topic) {
+        NQueue<byte[]> relay = relayFor(topic);
+        PriorityQueue<RelayEntry> reorder = relayReorderByTopic.computeIfAbsent(topic,
+                k -> new PriorityQueue<>(Comparator.comparingLong(RelayEntry::sequence)));
+        Object signal = relaySignals.computeIfAbsent(topic, k -> new Object());
+        while (running && !Thread.currentThread().isInterrupted()) {
+            try {
+                boolean progressed = drainRelayOnce(topic, relay, reorder);
+                if (!progressed) {
+                    synchronized (signal) {
+                        signal.wait(100);
+                    }
+                }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return;
+            } catch (Throwable t) {
+                LOGGER.log(Level.WARNING, "Relay apply loop error for topic " + topic + "; retrying head", t);
+                try {
+                    Thread.sleep(50);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }
+    }
+
+    /**
+     * One drain step: apply any now-contiguous buffered entries, then inspect the relay head and
+     * apply / discard / buffer-on-gap. Returns true when it made progress (so the loop keeps going
+     * without waiting).
+     */
+    private boolean drainRelayOnce(String topic, NQueue<byte[]> relay, PriorityQueue<RelayEntry> reorder)
+            throws Exception {
+        boolean progressed = drainReorderContiguous(topic, reorder);
+
+        Optional<byte[]> head = relay.peek();
+        if (head.isEmpty()) {
+            return progressed;
+        }
+        RelayEntry entry = RelayEntryCodec.decode(head.get());
+        long nextExpected = nextExpectedSequenceByTopic.getOrDefault(topic, 1L);
+
+        if (entry.epoch() < lastSeenLeaderEpoch || entry.sequence() < nextExpected) {
+            // Stale epoch, or a duplicate/already-applied sequence (re-peek after crash, or a resend
+            // copy): discard. Fencing on (epoch, sequence) is what makes the non-idempotent queue
+            // OFFER effectively-once.
+            relay.poll();
+            return true;
+        }
+        if (entry.sequence() == nextExpected) {
+            applyRelayEntry(topic, entry);
+            relay.poll();
+            return true;
+        }
+
+        // Gap: head.sequence() > nextExpected. Pull the head into the reorder buffer to expose the
+        // entries behind it (including resent ops that arrive at the relay tail), and ask the leader
+        // to resend the missing prefix.
+        reorder.add(entry);
+        relay.poll();
+        gapsDetected.incrementAndGet();
+        if (reorder.size() > RELAY_REORDER_CAP) {
+            LOGGER.warning(() -> "Relay reorder buffer cap hit for topic " + topic
+                    + "; backlog too far ahead of an unfilled gap — requesting snapshot");
+            snapshotFallbackCount.incrementAndGet();
+            reorder.clear();
+            if (syncingTopics.add(topic)) {
+                requestSync(topic);
+            }
+        } else if (!resendPendingTopics.contains(topic)) {
+            requestSequenceResend(topic, nextExpected, entry.sequence() - 1);
+        }
+        return true;
+    }
+
+    /** Applies buffered entries that have become contiguous with nextExpected. */
+    private boolean drainReorderContiguous(String topic, PriorityQueue<RelayEntry> reorder) throws Exception {
+        boolean any = false;
+        while (!reorder.isEmpty()) {
+            long nextExpected = nextExpectedSequenceByTopic.getOrDefault(topic, 1L);
+            RelayEntry min = reorder.peek();
+            if (min.sequence() < nextExpected) {
+                reorder.poll(); // stale duplicate buffered earlier
+                any = true;
+                continue;
+            }
+            if (min.sequence() != nextExpected) {
+                break; // still a hole
+            }
+            applyRelayEntry(topic, reorder.poll());
+            any = true;
+        }
+        return any;
+    }
+
+    /** Applies one relay entry to the handler and advances the durable apply frontier. */
+    private void applyRelayEntry(String topic, RelayEntry entry) throws Exception {
+        ReplicationHandler handler = handlers.get(topic);
+        if (handler == null) {
+            return; // handler vanished (shutdown): leave nextExpected untouched to retry later
+        }
+        Object payload = handler.decodePayload(entry.payloadBytes());
+        handler.apply(entry.operationId(), payload);
+
+        acquireSequenceLock();
+        try {
+            nextExpectedSequenceByTopic.merge(topic, entry.sequence() + 1,
+                    (cur, candidate) -> Math.max(cur, candidate));
+            applied.add(entry.operationId());
+            trimApplied();
+            recordApplied(); // global applied-op counter (drives the lag metric vs leader watermark)
+            sequenceStateDirty = true;
         } finally {
             sequenceBufferLock.unlock();
         }
@@ -1568,6 +1801,11 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             timeoutScheduler.awaitTermination(3, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        }
+        RelayStore store = relayStore;
+        if (store != null) {
+            store.close();
+            relayStore = null;
         }
     }
 
