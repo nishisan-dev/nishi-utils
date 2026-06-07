@@ -20,6 +20,7 @@ package dev.nishisan.utils.ngrid.structures;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.ngrid.replication.FollowerIngestMode;
+import dev.nishisan.utils.ngrid.replication.RelayDurability;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -54,6 +55,7 @@ public final class NGridNodeBuilder {
     private Path dataDir;
     private boolean strictConsistency = true;
     private FollowerIngestMode followerIngestMode = FollowerIngestMode.INLINE;
+    private RelayDurability relayDurability = RelayDurability.OS_MANAGED;
 
     NGridNodeBuilder(String host, int port) {
         this.host = Objects.requireNonNull(host, "host");
@@ -194,6 +196,18 @@ public final class NGridNodeBuilder {
     }
 
     /**
+     * Sets the relay-log tail durability policy (#124), analogous to MySQL's
+     * {@code sync_relay_log}. Defaults to {@link RelayDurability#OS_MANAGED}.
+     *
+     * @param relayDurability the durability policy (must not be {@code null})
+     * @return this builder
+     */
+    public NGridNodeBuilder relayDurability(RelayDurability relayDurability) {
+        this.relayDurability = Objects.requireNonNull(relayDurability, "relayDurability");
+        return this;
+    }
+
+    /**
      * Builds and starts the node.
      * <p>
      * If no data directory is specified, the build will fail for
@@ -213,7 +227,8 @@ public final class NGridNodeBuilder {
 
         NGridConfig.Builder builder = NGridConfig.builder(localInfo)
                 .strictConsistency(strictConsistency)
-                .followerIngestMode(followerIngestMode);
+                .followerIngestMode(followerIngestMode)
+                .relayDurability(relayDurability);
 
         if (dataDir != null) {
             builder.dataDirectory(dataDir);

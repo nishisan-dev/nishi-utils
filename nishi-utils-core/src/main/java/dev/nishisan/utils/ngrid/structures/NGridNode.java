@@ -360,6 +360,8 @@ public final class NGridNode implements Closeable {
         }
         replicationBuilder.strictConsistency(config.strictConsistency());
         replicationBuilder.followerIngestMode(config.followerIngestMode());
+        replicationBuilder.relayDurability(config.relayDurability());
+        replicationBuilder.relayGroupCommitInterval(config.relayGroupCommitInterval());
 
         // Determine replication data directory
         Path replicationDataDir;

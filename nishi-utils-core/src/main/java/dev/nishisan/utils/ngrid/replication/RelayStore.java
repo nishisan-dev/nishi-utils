@@ -27,6 +27,9 @@ import java.time.Duration;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -52,11 +55,30 @@ final class RelayStore implements Closeable {
 
     private final Path baseDir;
     private final Duration retention;
+    private final RelayDurability durability;
     private final Map<String, NQueue<byte[]>> byTopic = new ConcurrentHashMap<>();
+    private final ScheduledExecutorService syncExecutor;
 
     RelayStore(Path baseDir, Duration retention) {
+        this(baseDir, retention, RelayDurability.OS_MANAGED, Duration.ofSeconds(1));
+    }
+
+    RelayStore(Path baseDir, Duration retention, RelayDurability durability, Duration groupCommitInterval) {
         this.baseDir = Objects.requireNonNull(baseDir, "baseDir");
         this.retention = retention == null ? Duration.ZERO : retention;
+        this.durability = durability == null ? RelayDurability.OS_MANAGED : durability;
+        if (this.durability == RelayDurability.GROUP_COMMIT) {
+            long intervalMs = Math.max(1L, (groupCommitInterval == null ? Duration.ofSeconds(1) : groupCommitInterval)
+                    .toMillis());
+            this.syncExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "ngrid-relay-sync");
+                t.setDaemon(true);
+                return t;
+            });
+            this.syncExecutor.scheduleWithFixedDelay(this::syncAll, intervalMs, intervalMs, TimeUnit.MILLISECONDS);
+        } else {
+            this.syncExecutor = null;
+        }
     }
 
     /**
@@ -70,7 +92,7 @@ final class RelayStore implements Closeable {
     private NQueue<byte[]> open(String topic) {
         try {
             NQueue.Options options = NQueue.Options.defaults()
-                    .withFsync(false)
+                    .withFsync(durability == RelayDurability.ALWAYS)
                     .withShortCircuit(false)
                     .withMemoryBuffer(false)
                     .withRetentionPolicy(NQueue.Options.RetentionPolicy.TIME_BASED)
@@ -93,8 +115,22 @@ final class RelayStore implements Closeable {
         return safe + "-" + Integer.toHexString(topic.hashCode());
     }
 
+    /** Forces all open relays to disk (group-commit tick). */
+    private void syncAll() {
+        for (Map.Entry<String, NQueue<byte[]>> entry : byTopic.entrySet()) {
+            try {
+                entry.getValue().sync();
+            } catch (Exception e) {
+                LOGGER.log(Level.WARNING, "Relay group-commit sync failed for topic " + entry.getKey(), e);
+            }
+        }
+    }
+
     @Override
     public void close() {
+        if (syncExecutor != null) {
+            syncExecutor.shutdownNow();
+        }
         for (Map.Entry<String, NQueue<byte[]>> entry : byTopic.entrySet()) {
             try {
                 entry.getValue().close();

@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
 
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.UUID;
@@ -65,6 +66,29 @@ class RelayStoreTest {
             NQueue<byte[]> relay = reopened.relayFor("queue:orders");
             assertEquals(1L, relay.size(), "frame must survive a clean close + reopen");
             assertEquals(op, RelayEntryCodec.decode(relay.peek().orElseThrow()).operationId());
+        }
+    }
+
+    @Test
+    void framesAreDurableUnderEachRelayDurabilityPolicy() throws Exception {
+        for (RelayDurability mode : RelayDurability.values()) {
+            Path dir = tempDir.resolve("dur-" + mode);
+            Files.createDirectories(dir);
+            UUID op = UUID.randomUUID();
+
+            try (RelayStore store = new RelayStore(dir, Duration.ofMinutes(10), mode, Duration.ofMillis(50))) {
+                store.relayFor("queue:orders").offer(RelayEntryCodec.encode(
+                        new RelayEntry(1L, 1L, "queue:orders", op, new byte[] { 7 })));
+                if (mode == RelayDurability.GROUP_COMMIT) {
+                    Thread.sleep(150); // allow a group-commit tick to force the relay
+                }
+            }
+
+            try (RelayStore reopened = new RelayStore(dir, Duration.ofMinutes(10), mode, Duration.ofMillis(50))) {
+                NQueue<byte[]> relay = reopened.relayFor("queue:orders");
+                assertEquals(1L, relay.size(), "frame must be durable under " + mode);
+                assertEquals(op, RelayEntryCodec.decode(relay.peek().orElseThrow()).operationId());
+            }
         }
     }
 

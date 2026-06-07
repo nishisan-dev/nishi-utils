@@ -38,11 +38,14 @@ public final class ReplicationConfig {
     private final int operationLogMaxSize;
     private final boolean leaderLocalApply;
     private final FollowerIngestMode followerIngestMode;
+    private final RelayDurability relayDurability;
+    private final Duration relayGroupCommitInterval;
 
     private ReplicationConfig(int quorum, Duration operationTimeout, Duration retryInterval, boolean strictConsistency,
             Path dataDirectory, int resendGapThreshold, Duration resendTimeout, int replicationLogRetention,
             Duration replicationLogRetentionTime, int appliedSetMaxSize, int operationLogMaxSize,
-            boolean leaderLocalApply, FollowerIngestMode followerIngestMode) {
+            boolean leaderLocalApply, FollowerIngestMode followerIngestMode, RelayDurability relayDurability,
+            Duration relayGroupCommitInterval) {
         this.quorum = quorum;
         this.operationTimeout = Objects.requireNonNull(operationTimeout, "operationTimeout");
         this.retryInterval = Objects.requireNonNull(retryInterval, "retryInterval");
@@ -57,6 +60,8 @@ public final class ReplicationConfig {
         this.operationLogMaxSize = operationLogMaxSize;
         this.leaderLocalApply = leaderLocalApply;
         this.followerIngestMode = Objects.requireNonNull(followerIngestMode, "followerIngestMode");
+        this.relayDurability = Objects.requireNonNull(relayDurability, "relayDurability");
+        this.relayGroupCommitInterval = Objects.requireNonNull(relayGroupCommitInterval, "relayGroupCommitInterval");
     }
 
     public static ReplicationConfig of(int quorum) {
@@ -170,6 +175,26 @@ public final class ReplicationConfig {
         return followerIngestMode;
     }
 
+    /**
+     * Durability policy for the follower relay-log tail (#124), analogous to MySQL's
+     * {@code sync_relay_log}. Defaults to {@link RelayDurability#OS_MANAGED}.
+     *
+     * @return the relay durability policy (never {@code null})
+     */
+    public RelayDurability relayDurability() {
+        return relayDurability;
+    }
+
+    /**
+     * Interval between forced syncs of the relay when {@link RelayDurability#GROUP_COMMIT}
+     * is active. Ignored for the other policies.
+     *
+     * @return the group-commit interval (never {@code null})
+     */
+    public Duration relayGroupCommitInterval() {
+        return relayGroupCommitInterval;
+    }
+
     public static final class Builder {
         private final int quorum;
         private Duration operationTimeout = Duration.ofSeconds(30);
@@ -184,6 +209,8 @@ public final class ReplicationConfig {
         private int operationLogMaxSize = 2000;
         private boolean leaderLocalApply = true;
         private FollowerIngestMode followerIngestMode = FollowerIngestMode.INLINE;
+        private RelayDurability relayDurability = RelayDurability.OS_MANAGED;
+        private Duration relayGroupCommitInterval = Duration.ofSeconds(1);
 
         private Builder(int quorum) {
             if (quorum < 1) {
@@ -315,13 +342,41 @@ public final class ReplicationConfig {
             return this;
         }
 
+        /**
+         * Sets the relay-log tail durability policy (#124), analogous to MySQL's
+         * {@code sync_relay_log}. Defaults to {@link RelayDurability#OS_MANAGED}.
+         *
+         * @param relayDurability the durability policy (must not be {@code null})
+         * @return this builder
+         */
+        public Builder relayDurability(RelayDurability relayDurability) {
+            this.relayDurability = Objects.requireNonNull(relayDurability, "relayDurability");
+            return this;
+        }
+
+        /**
+         * Sets the forced-sync interval used when {@link RelayDurability#GROUP_COMMIT} is active.
+         *
+         * @param interval the group-commit interval (must be positive)
+         * @return this builder
+         */
+        public Builder relayGroupCommitInterval(Duration interval) {
+            Objects.requireNonNull(interval, "relayGroupCommitInterval");
+            if (interval.isNegative() || interval.isZero()) {
+                throw new IllegalArgumentException("relayGroupCommitInterval must be positive");
+            }
+            this.relayGroupCommitInterval = interval;
+            return this;
+        }
+
         public ReplicationConfig build() {
             if (dataDirectory == null) {
                 throw new IllegalStateException("dataDirectory must be set");
             }
             return new ReplicationConfig(quorum, operationTimeout, retryInterval, strictConsistency, dataDirectory,
                     resendGapThreshold, resendTimeout, replicationLogRetention, replicationLogRetentionTime,
-                    appliedSetMaxSize, operationLogMaxSize, leaderLocalApply, followerIngestMode);
+                    appliedSetMaxSize, operationLogMaxSize, leaderLocalApply, followerIngestMode, relayDurability,
+                    relayGroupCommitInterval);
         }
     }
 }

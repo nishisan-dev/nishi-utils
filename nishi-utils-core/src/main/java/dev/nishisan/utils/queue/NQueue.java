@@ -729,6 +729,31 @@ public class NQueue<T> implements Closeable {
     }
 
     /**
+     * Forces the durable log and metadata to disk on demand, independent of the
+     * per-operation {@link Options#withFsync(boolean)} setting. This enables a
+     * group-commit durability policy — run with {@code withFsync(false)} for speed and
+     * call {@code sync()} periodically — bounding the crash loss window without paying an
+     * fsync on every {@code offer}.
+     *
+     * @throws IOException if forcing the channels fails
+     */
+    public void sync() throws IOException {
+        lock.lock();
+        try {
+            if (dataChannel != null && dataChannel.isOpen()) {
+                dataChannel.force(true);
+            }
+        } finally {
+            lock.unlock();
+        }
+        synchronized (metaWriteLock) {
+            if (metaChannel != null && metaChannel.isOpen()) {
+                metaChannel.force(true);
+            }
+        }
+    }
+
+    /**
      * Forces an immediate, on-demand expiration pass, discarding the contiguous
      * prefix of records whose age (since {@code offer}) exceeds the configured
      * {@link Options#withExpireAfterWrite(Duration) expireAfterWrite} duration.

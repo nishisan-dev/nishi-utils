@@ -4,10 +4,15 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import java.nio.file.Path;
+import java.time.Duration;
 
 import org.junit.jupiter.api.Test;
 
 class ReplicationConfigTest {
+
+    private static ReplicationConfig.Builder builder() {
+        return ReplicationConfig.builder(1).dataDirectory(Path.of("target", "replication-config-test"));
+    }
 
     @Test
     void followerIngestModeDefaultsInlineAndBuilderPropagates() {
@@ -27,5 +32,18 @@ class ReplicationConfigTest {
         assertThrows(NullPointerException.class,
                 () -> ReplicationConfig.builder(1).followerIngestMode(null),
                 "null mode must be rejected");
+    }
+
+    @Test
+    void relayDurabilityDefaultsOsManagedAndBuilderPropagates() {
+        assertEquals(RelayDurability.OS_MANAGED, builder().build().relayDurability(),
+                "relay durability must default to OS_MANAGED");
+        assertEquals(RelayDurability.ALWAYS,
+                builder().relayDurability(RelayDurability.ALWAYS).build().relayDurability());
+
+        assertThrows(NullPointerException.class, () -> ReplicationConfig.builder(1).relayDurability(null));
+        assertThrows(IllegalArgumentException.class,
+                () -> ReplicationConfig.builder(1).relayGroupCommitInterval(Duration.ZERO),
+                "zero group-commit interval must be rejected");
     }
 }

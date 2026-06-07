@@ -4,6 +4,7 @@ import dev.nishisan.utils.map.NMapPersistenceMode;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.ngrid.replication.FollowerIngestMode;
+import dev.nishisan.utils.ngrid.replication.RelayDurability;
 import dev.nishisan.utils.ngrid.structures.DeploymentProfile;
 import dev.nishisan.utils.ngrid.structures.MapConfig;
 import dev.nishisan.utils.ngrid.structures.NGridConfig;
@@ -205,5 +206,24 @@ class NGridConfigValidationTest {
     void followerIngestModeRejectsNull() {
         assertThrows(NullPointerException.class,
                 () -> NGridConfig.builder(LOCAL).followerIngestMode(null));
+    }
+
+    @Test
+    void relayDurabilityDefaultsToOsManaged() {
+        NGridConfig config = NGridConfig.builder(LOCAL)
+                .dataDirectory(tempDir)
+                .build();
+
+        assertEquals(RelayDurability.OS_MANAGED, config.relayDurability());
+    }
+
+    @Test
+    void relayDurabilityAcceptsConfiguredValue() {
+        NGridConfig config = NGridConfig.builder(LOCAL)
+                .dataDirectory(tempDir)
+                .relayDurability(RelayDurability.GROUP_COMMIT)
+                .build();
+
+        assertEquals(RelayDurability.GROUP_COMMIT, config.relayDurability());
     }
 }
