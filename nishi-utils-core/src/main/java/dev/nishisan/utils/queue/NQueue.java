@@ -482,6 +482,8 @@ public class NQueue<T> implements Closeable {
                 stager.drainSync();
             }
 
+            skipExpiredRecordsLocked();
+
             if (handoffItem != null) {
                 long idx = handoffItem.index();
                 recordDeliveryIndex(idx);
@@ -523,6 +525,8 @@ public class NQueue<T> implements Closeable {
             if (recordCount == 0 && handoffItem == null && enableMemoryBuffer) {
                 stager.drainSync();
             }
+
+            skipExpiredRecordsLocked();
 
             if (handoffItem != null) {
                 long idx = handoffItem.index();
@@ -572,6 +576,8 @@ public class NQueue<T> implements Closeable {
     public Optional<T> peek() throws IOException {
         lock.lock();
         try {
+            skipExpiredRecordsLocked();
+
             if (handoffItem != null)
                 return Optional.of(handoffItem.item());
 
@@ -710,6 +716,28 @@ public class NQueue<T> implements Closeable {
             } finally {
                 lock.unlock();
             }
+        }
+    }
+
+    /**
+     * Forces an immediate, on-demand expiration pass, discarding the contiguous
+     * prefix of records whose age (since {@code offer}) exceeds the configured
+     * {@link Options#withExpireAfterWrite(Duration) expireAfterWrite} duration.
+     * <p>
+     * Returns {@code 0} when expiration is disabled. Discarding only advances the
+     * consumption cursor; the physical disk space is reclaimed later by the regular
+     * compaction. Expiration applies solely to the durable log segment — in-memory
+     * staged records and direct hand-offs are not affected.
+     *
+     * @return the number of records discarded by this call
+     * @throws IOException if persisting the advanced cursor state fails
+     */
+    public long flushExpired() throws IOException {
+        lock.lock();
+        try {
+            return skipExpiredRecordsLocked();
+        } finally {
+            lock.unlock();
         }
     }
 
@@ -915,6 +943,7 @@ public class NQueue<T> implements Closeable {
     public Optional<NQueueRecord> peekRecord() throws IOException {
         lock.lock();
         try {
+            skipExpiredRecordsLocked();
             if (recordCount == 0)
                 return Optional.empty();
             return readAtInternal(consumerOffset).map(NQueueReadResult::getRecord);
@@ -1017,6 +1046,58 @@ public class NQueue<T> implements Closeable {
             }
             return res.getRecord();
         });
+    }
+
+    /**
+     * Discards the contiguous prefix of expired records at the head of the queue,
+     * advancing the consumption cursor without delivering them.
+     * <p>
+     * Must be invoked while holding {@link #lock}. Each candidate is inspected
+     * reading only its header (no payload deserialization). Because writes are FIFO
+     * and the record timestamp is monotonic, expired records always form a
+     * contiguous prefix, so the scan stops at the first non-expired record. State is
+     * persisted once at the end and compaction is offered a single chance to reclaim
+     * disk space.
+     *
+     * @return the number of records discarded
+     * @throws IOException if persisting the advanced cursor state fails
+     */
+    private long skipExpiredRecordsLocked() throws IOException {
+        if (options.expireAfterWriteNanos <= 0)
+            return 0L;
+
+        long expireMillis = TimeUnit.NANOSECONDS.toMillis(options.expireAfterWriteNanos);
+        long now = System.currentTimeMillis();
+        long discarded = 0;
+
+        while (recordCount > 0) {
+            NQueueRecordMetaData.HeaderPrefix pref;
+            NQueueRecordMetaData meta;
+            try {
+                pref = NQueueRecordMetaData.readPrefix(dataChannel, consumerOffset);
+                meta = NQueueRecordMetaData.fromBuffer(dataChannel, consumerOffset, pref.headerLen);
+            } catch (IOException e) {
+                // Tolerant scan: stop on a truncated/corrupt head and let the normal
+                // read/recovery path handle it (mirrors findTimeBasedCutoff).
+                break;
+            }
+            if (now - meta.getTimestamp() <= expireMillis)
+                break; // head still valid; expired prefix exhausted
+
+            consumerOffset += NQueueRecordMetaData.fixedPrefixSize() + pref.headerLen + meta.getPayloadLen();
+            recordCount--;
+            approximateSize.decrementAndGet();
+            discarded++;
+            statsUtils.notifyHitCounter(NQueueMetrics.EXPIRED_EVENT);
+        }
+
+        if (discarded > 0) {
+            if (recordCount == 0)
+                consumerOffset = producerOffset;
+            persistCurrentStateLocked();
+            compactionEngine.maybeCompact(consumerOffset, producerOffset, recordCount, shutdownRequested);
+        }
+        return discarded;
     }
 
     private void persistCurrentStateLocked() throws IOException {
@@ -1273,6 +1354,7 @@ public class NQueue<T> implements Closeable {
         long maxSizeReconciliationIntervalNanos = TimeUnit.MINUTES.toNanos(1);
         RetentionPolicy retentionPolicy = RetentionPolicy.DELETE_ON_CONSUME;
         long retentionTimeNanos = 0;
+        long expireAfterWriteNanos = 0; // 0 = desabilitado
 
         private Options() {
         }
@@ -1300,6 +1382,28 @@ public class NQueue<T> implements Closeable {
             return this;
         }
 
+        /**
+         * Enables write-time expiration: records whose age (since {@code offer})
+         * exceeds the given duration are discarded opportunistically on
+         * {@code poll}/{@code peek} (and on demand via {@link NQueue#flushExpired()})
+         * instead of being delivered.
+         * <p>
+         * This is orthogonal to {@link RetentionPolicy} and can be combined with any
+         * policy. Expiration applies only to the durable log segment; in-memory
+         * staged records and direct hand-offs are not subject to it. A {@code zero}
+         * duration disables the feature (default).
+         *
+         * @param d non-negative expiration duration ({@link Duration#ZERO} disables)
+         * @return this options instance for chaining
+         */
+        public Options withExpireAfterWrite(Duration d) {
+            Objects.requireNonNull(d);
+            if (d.isNegative())
+                throw new IllegalArgumentException("negative");
+            this.expireAfterWriteNanos = d.toNanos();
+            return this;
+        }
+
         public Options copy() {
             Options copy = new Options();
             copy.compactionWasteThreshold = this.compactionWasteThreshold;
@@ -1317,6 +1421,7 @@ public class NQueue<T> implements Closeable {
             copy.maxSizeReconciliationIntervalNanos = this.maxSizeReconciliationIntervalNanos;
             copy.retentionPolicy = this.retentionPolicy;
             copy.retentionTimeNanos = this.retentionTimeNanos;
+            copy.expireAfterWriteNanos = this.expireAfterWriteNanos;
             return copy;
         }
 
@@ -1427,6 +1532,7 @@ public class NQueue<T> implements Closeable {
             final boolean enableOrderDetection;
             final RetentionPolicy retentionPolicy;
             final long retentionTimeNanos;
+            final long expireAfterWriteNanos;
 
             Snapshot(Options o) {
                 this.compactionWasteThreshold = o.compactionWasteThreshold;
@@ -1442,6 +1548,7 @@ public class NQueue<T> implements Closeable {
                 this.enableOrderDetection = o.enableOrderDetection;
                 this.retentionPolicy = o.retentionPolicy;
                 this.retentionTimeNanos = o.retentionTimeNanos;
+                this.expireAfterWriteNanos = o.expireAfterWriteNanos;
             }
         }
     }
