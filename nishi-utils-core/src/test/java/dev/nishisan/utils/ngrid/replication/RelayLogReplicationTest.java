@@ -179,6 +179,69 @@ class RelayLogReplicationTest {
     }
 
     /**
+     * #128: the public relay backlog metrics must reflect the apply lag and drain to zero on
+     * convergence. With replicationFactor=1 the leader does not throttle to the follower's ack, so a
+     * burst builds a visible relay backlog that the (now batched) apply consumer works off. The batch
+     * apply must still converge in strict order — the follower's queue head stays the first item.
+     */
+    @Test
+    @Timeout(value = 90, unit = TimeUnit.SECONDS)
+    void relayBacklogMetricsReflectLagAndDrain() throws Exception {
+        NodeInfo infoA = new NodeInfo(NodeId.of("relay-metric-a"), "localhost", 9854);
+        NodeInfo infoB = new NodeInfo(NodeId.of("relay-metric-b"), "localhost", 9855);
+        Path base = Files.createTempDirectory("ngrid-relay-metric");
+
+        try (NGridNode a = relayNode(infoA, infoB, base.resolve("a"), 1);
+                NGridNode b = relayNode(infoB, infoA, base.resolve("b"), 1)) {
+            a.start();
+            b.start();
+            ClusterTestUtils.awaitClusterConsensus(a, b);
+            a.getQueue("metric-queue", String.class);
+            b.getQueue("metric-queue", String.class);
+
+            NGridNode leader = a.coordinator().isLeader() ? a : b;
+            NGridNode follower = (leader == a) ? b : a;
+
+            int n = 3000;
+            DistributedQueue<String> queue = leader.getQueue("metric-queue", String.class);
+            for (int i = 0; i < n; i++) {
+                queue.offer("item-" + i);
+            }
+
+            // While the follower is still draining, the public metric must report a non-zero backlog.
+            boolean sawBacklog = false;
+            long produced = leader.replicationManager().getGlobalSequence();
+            long deadline = System.currentTimeMillis() + 50_000;
+            while (follower.replicationManager().getLastAppliedSequence() < produced
+                    && System.currentTimeMillis() < deadline) {
+                long backlog = follower.replicationManager().getRelaySizes().values().stream()
+                        .mapToLong(Long::longValue).sum();
+                if (backlog > 0) {
+                    sawBacklog = true;
+                    break;
+                }
+            }
+
+            awaitApplied(follower, produced, 50_000);
+
+            assertEquals(true, sawBacklog, "the relay backlog metric must reflect the apply lag while draining");
+            // On convergence the relay drains: backlog is zero and there is no relay head to age.
+            long drainedBacklog = follower.replicationManager().getRelaySizes().values().stream()
+                    .mapToLong(Long::longValue).sum();
+            assertEquals(0L, drainedBacklog, "relay backlog must drain to zero on convergence");
+            for (String topic : follower.replicationManager().getRelaySizes().keySet()) {
+                assertEquals(0L, follower.replicationManager().getRelayHeadAgeMillis(topic),
+                        "a drained relay has no head to age");
+            }
+            // Batch apply preserved order: the follower's queue head is still the first replicated item.
+            assertEquals("item-0", follower.getQueue("metric-queue", String.class).peek().orElse(null),
+                    "batched apply must converge in strict order");
+            assertEquals(0L, follower.replicationManager().getSnapshotFallbackCount(),
+                    "batched apply must converge without snapshot fallback");
+        }
+    }
+
+    /**
      * Fase 5: after killing the leader, a surviving relay node may only become a <em>ready</em> leader
      * once its relay backlog has fully drained ({@code isLeaderSyncing()} stays true until then — the
      * failover drain-gate). Then writes succeed and the cluster stays consistent (no divergence).
