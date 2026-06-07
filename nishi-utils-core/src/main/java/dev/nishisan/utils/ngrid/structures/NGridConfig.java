@@ -41,6 +41,8 @@ public final class NGridConfig {
     private final int replicationQuorum;
     private final int replicationFactor;
     private final Duration replicationOperationTimeout;
+    private final Integer replicationLogRetention;
+    private final Duration replicationLogRetentionTime;
     private final Duration rttProbeInterval;
     private final Duration heartbeatInterval;
     private final Duration leaseTimeout;
@@ -84,6 +86,8 @@ public final class NGridConfig {
         this.replicationQuorum = effectiveReplication;
         this.replicationFactor = effectiveReplication;
         this.replicationOperationTimeout = builder.replicationOperationTimeout;
+        this.replicationLogRetention = builder.replicationLogRetention;
+        this.replicationLogRetentionTime = builder.replicationLogRetentionTime;
         this.rttProbeInterval = builder.rttProbeInterval;
         this.heartbeatInterval = builder.heartbeatInterval;
         this.leaseTimeout = builder.leaseTimeout;
@@ -160,6 +164,27 @@ public final class NGridConfig {
      */
     public Duration replicationOperationTimeout() {
         return replicationOperationTimeout;
+    }
+
+    /**
+     * Optional count-based retention cap for the leader-side resend log (op-log). When null, the
+     * replication layer default is used.
+     *
+     * @return the resend-log count cap, or {@code null} when unset
+     */
+    public Integer replicationLogRetention() {
+        return replicationLogRetention;
+    }
+
+    /**
+     * Optional temporal retention window for the leader-side resend log (op-log). When null, the
+     * replication layer default is used (temporal eviction disabled). Complements
+     * {@link #replicationLogRetention()} — whichever limit is reached first evicts.
+     *
+     * @return the resend-log temporal retention window, or {@code null} when unset
+     */
+    public Duration replicationLogRetentionTime() {
+        return replicationLogRetentionTime;
     }
 
     public Duration rttProbeInterval() {
@@ -333,6 +358,8 @@ public final class NGridConfig {
         private int replicationQuorum = 2;
         private Integer replicationFactor;
         private Duration replicationOperationTimeout;
+        private Integer replicationLogRetention;
+        private Duration replicationLogRetentionTime;
         private Duration rttProbeInterval = Duration.ofSeconds(10);
         private Duration heartbeatInterval = Duration.ofSeconds(3);
         private Duration leaseTimeout;
@@ -495,6 +522,38 @@ public final class NGridConfig {
 
         public Builder replicationOperationTimeout(Duration timeout) {
             this.replicationOperationTimeout = Objects.requireNonNull(timeout, "timeout");
+            return this;
+        }
+
+        /**
+         * Sets the count-based retention cap for the leader-side resend log (op-log). When unset, the
+         * replication layer default is used.
+         *
+         * @param retention maximum resend-log entries per topic (must be >= 1)
+         * @return this builder
+         */
+        public Builder replicationLogRetention(int retention) {
+            if (retention < 1) {
+                throw new IllegalArgumentException("replicationLogRetention must be >= 1");
+            }
+            this.replicationLogRetention = retention;
+            return this;
+        }
+
+        /**
+         * Sets the temporal retention window for the leader-side resend log (op-log). Complements
+         * {@link #replicationLogRetention(int)} — whichever limit is reached first evicts. When unset
+         * (or {@link Duration#ZERO}), temporal eviction is disabled (count-only behavior).
+         *
+         * @param retentionTime the retention window ({@link Duration#ZERO} disables; must not be negative)
+         * @return this builder
+         */
+        public Builder replicationLogRetentionTime(Duration retentionTime) {
+            Objects.requireNonNull(retentionTime, "retentionTime");
+            if (retentionTime.isNegative()) {
+                throw new IllegalArgumentException("replicationLogRetentionTime must not be negative");
+            }
+            this.replicationLogRetentionTime = retentionTime;
             return this;
         }
 

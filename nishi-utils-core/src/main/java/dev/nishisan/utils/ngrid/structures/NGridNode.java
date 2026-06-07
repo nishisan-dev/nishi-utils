@@ -352,6 +352,12 @@ public final class NGridNode implements Closeable {
         if (config.replicationOperationTimeout() != null) {
             replicationBuilder.operationTimeout(config.replicationOperationTimeout());
         }
+        if (config.replicationLogRetention() != null) {
+            replicationBuilder.replicationLogRetention(config.replicationLogRetention());
+        }
+        if (config.replicationLogRetentionTime() != null) {
+            replicationBuilder.replicationLogRetentionTime(config.replicationLogRetentionTime());
+        }
         replicationBuilder.strictConsistency(config.strictConsistency());
 
         // Determine replication data directory

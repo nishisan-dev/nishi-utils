@@ -33,13 +33,15 @@ public final class ReplicationConfig {
     private final int resendGapThreshold;
     private final Duration resendTimeout;
     private final int replicationLogRetention;
+    private final Duration replicationLogRetentionTime;
     private final int appliedSetMaxSize;
     private final int operationLogMaxSize;
     private final boolean leaderLocalApply;
 
     private ReplicationConfig(int quorum, Duration operationTimeout, Duration retryInterval, boolean strictConsistency,
             Path dataDirectory, int resendGapThreshold, Duration resendTimeout, int replicationLogRetention,
-            int appliedSetMaxSize, int operationLogMaxSize, boolean leaderLocalApply) {
+            Duration replicationLogRetentionTime, int appliedSetMaxSize, int operationLogMaxSize,
+            boolean leaderLocalApply) {
         this.quorum = quorum;
         this.operationTimeout = Objects.requireNonNull(operationTimeout, "operationTimeout");
         this.retryInterval = Objects.requireNonNull(retryInterval, "retryInterval");
@@ -48,6 +50,8 @@ public final class ReplicationConfig {
         this.resendGapThreshold = resendGapThreshold;
         this.resendTimeout = Objects.requireNonNull(resendTimeout, "resendTimeout");
         this.replicationLogRetention = replicationLogRetention;
+        this.replicationLogRetentionTime = Objects.requireNonNull(replicationLogRetentionTime,
+                "replicationLogRetentionTime");
         this.appliedSetMaxSize = appliedSetMaxSize;
         this.operationLogMaxSize = operationLogMaxSize;
         this.leaderLocalApply = leaderLocalApply;
@@ -100,6 +104,22 @@ public final class ReplicationConfig {
     }
 
     /**
+     * Temporal retention window for the leader-side resend log (op-log). Entries older than this
+     * duration are evicted from {@code replicationLogBySequence}, complementing the count-based
+     * {@link #replicationLogRetention()} cap — whichever limit is reached first evicts (count bounds
+     * memory; time bounds the backlog window). A follower that requests deltas beyond the expired
+     * window falls into the existing gap-detection → snapshot fallback path, never silent divergence.
+     *
+     * <p>{@link Duration#ZERO} (the default) disables temporal eviction, preserving the previous
+     * count-only behavior.</p>
+     *
+     * @return the temporal retention window, or {@link Duration#ZERO} when disabled
+     */
+    public Duration replicationLogRetentionTime() {
+        return replicationLogRetentionTime;
+    }
+
+    /**
      * Maximum number of entries to keep in the dedup guard ({@code applied} set).
      * Oldest entries are evicted FIFO when the limit is reached.
      *
@@ -145,6 +165,7 @@ public final class ReplicationConfig {
         private int resendGapThreshold = 50;
         private Duration resendTimeout = Duration.ofSeconds(2);
         private int replicationLogRetention = 1000;
+        private Duration replicationLogRetentionTime = Duration.ZERO;
         private int appliedSetMaxSize = 5000;
         private int operationLogMaxSize = 2000;
         private boolean leaderLocalApply = true;
@@ -206,6 +227,24 @@ public final class ReplicationConfig {
         }
 
         /**
+         * Sets the temporal retention window for the leader-side resend log (op-log). Entries older
+         * than {@code retentionTime} are evicted, complementing the count-based
+         * {@link #replicationLogRetention(int)} cap (whichever is reached first evicts). Pass
+         * {@link Duration#ZERO} to disable temporal eviction (count-only behavior, the default).
+         *
+         * @param retentionTime the retention window ({@link Duration#ZERO} disables; must not be negative)
+         * @return this builder
+         */
+        public Builder replicationLogRetentionTime(Duration retentionTime) {
+            Objects.requireNonNull(retentionTime, "replicationLogRetentionTime");
+            if (retentionTime.isNegative()) {
+                throw new IllegalArgumentException("replicationLogRetentionTime must not be negative");
+            }
+            this.replicationLogRetentionTime = retentionTime;
+            return this;
+        }
+
+        /**
          * Sets the maximum number of entries in the applied-operations dedup set.
          * Oldest UUIDs are evicted FIFO when the limit is exceeded.
          *
@@ -253,7 +292,7 @@ public final class ReplicationConfig {
                 throw new IllegalStateException("dataDirectory must be set");
             }
             return new ReplicationConfig(quorum, operationTimeout, retryInterval, strictConsistency, dataDirectory,
-                    resendGapThreshold, resendTimeout, replicationLogRetention,
+                    resendGapThreshold, resendTimeout, replicationLogRetention, replicationLogRetentionTime,
                     appliedSetMaxSize, operationLogMaxSize, leaderLocalApply);
         }
     }
