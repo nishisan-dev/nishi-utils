@@ -22,6 +22,7 @@ import dev.nishisan.utils.queue.NQueue;
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Map;
@@ -52,6 +53,37 @@ import java.util.logging.Logger;
 final class RelayStore implements Closeable {
 
     private static final Logger LOGGER = Logger.getLogger(RelayStore.class.getName());
+
+    /** Marker file written on a clean shutdown; its absence on start signals a crash. */
+    static final String CLEAN_MARKER = ".clean-shutdown";
+
+    /**
+     * True when {@code relayDir} holds state from a prior run but no clean-shutdown marker —
+     * i.e. the previous shutdown was a crash, so the coalesced apply frontier may be stale and the
+     * follower must bootstrap rather than risk re-applying (duplicating) the non-idempotent queue.
+     */
+    static boolean isUncleanRestart(Path relayDir) {
+        return Files.exists(relayDir) && !Files.exists(relayDir.resolve(CLEAN_MARKER));
+    }
+
+    /** Removes the clean-shutdown marker on startup; from now until the next clean stop we are dirty. */
+    static void consumeCleanMarker(Path relayDir) {
+        try {
+            Files.deleteIfExists(relayDir.resolve(CLEAN_MARKER));
+        } catch (IOException e) {
+            LOGGER.log(Level.WARNING, "Failed to clear relay clean-shutdown marker", e);
+        }
+    }
+
+    /** Writes the clean-shutdown marker on graceful stop, after the apply frontier is flushed. */
+    static void writeCleanMarker(Path relayDir) {
+        try {
+            Files.createDirectories(relayDir);
+            Files.write(relayDir.resolve(CLEAN_MARKER), new byte[0]);
+        } catch (IOException e) {
+            LOGGER.log(Level.WARNING, "Failed to write relay clean-shutdown marker", e);
+        }
+    }
 
     private final Path baseDir;
     private final Duration retention;

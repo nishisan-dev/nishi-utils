@@ -159,6 +159,11 @@ public class ReplicationManager implements TransportListener, LeadershipListener
     // bootstrap rather than buffer unbounded (the old OOM driver).
     private final Map<String, PriorityQueue<RelayEntry>> relayReorderByTopic = new ConcurrentHashMap<>();
     private static final int RELAY_REORDER_CAP = 50_000;
+    // Topics that must bootstrap (fresh snapshot) on this start because the prior shutdown was
+    // unclean — the coalesced apply frontier may be behind the durable handler state, which would
+    // re-apply (duplicating the non-idempotent queue OFFER). A clean shutdown writes a marker that
+    // makes a clean restart resume without bootstrap.
+    private final Set<String> relayBootstrapTopics = ConcurrentHashMap.newKeySet();
 
     // Metrics
     private final java.util.concurrent.atomic.AtomicLong gapsDetected = new java.util.concurrent.atomic.AtomicLong(0);
@@ -227,6 +232,7 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         }
         running = true;
         if (isRelayMode()) {
+            detectUncleanRestartAndMarkBootstrap();
             // Relay retention mirrors the leader op-log window (#122): an over-retention
             // backlog is surfaced to the consumer and resolved by bootstrap, never silently
             // dropped (the clamp guarantees that).
@@ -274,14 +280,52 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             }
         }
         relayApplyThreads.clear();
+        // Apply consumers are quiesced; flush the final frontier and mark this as a clean shutdown so
+        // the next start resumes without a bootstrap (a crash leaves no marker -> bootstrap on restart).
+        flushSequenceStateIfDirty();
+        writeCleanShutdownMarker();
         transport.removeListener(this);
         coordinator.removeLeadershipListener(this);
         failAllPending("ReplicationManager stopped");
     }
 
+    /**
+     * Detects whether the previous shutdown was unclean (no clean-shutdown marker) while prior state
+     * exists, and if so marks the topics with prior applied state for a bootstrap snapshot — the
+     * crash-safe recovery for the relay model (the snapshot replaces local state, so the
+     * non-idempotent queue OFFER cannot be duplicated by re-applying a stale frontier).
+     */
+    private void detectUncleanRestartAndMarkBootstrap() {
+        Path relayDir = config.dataDirectory().resolve("relay");
+        boolean unclean = RelayStore.isUncleanRestart(relayDir);
+        RelayStore.consumeCleanMarker(relayDir);
+        if (unclean) {
+            for (Map.Entry<String, Long> entry : nextExpectedSequenceByTopic.entrySet()) {
+                if (entry.getValue() != null && entry.getValue() > 1L) {
+                    relayBootstrapTopics.add(entry.getKey());
+                }
+            }
+            if (!relayBootstrapTopics.isEmpty()) {
+                LOGGER.warning(() -> "Unclean relay restart detected; bootstrapping topics " + relayBootstrapTopics);
+            }
+        }
+    }
+
+    private void writeCleanShutdownMarker() {
+        if (!isRelayMode()) {
+            return;
+        }
+        RelayStore.writeCleanMarker(config.dataDirectory().resolve("relay"));
+    }
+
     public void registerHandler(String topic, ReplicationHandler handler) {
         handlers.put(topic, handler);
         if (isRelayMode()) {
+            if (relayBootstrapTopics.remove(topic) && syncingTopics.add(topic)) {
+                // Unclean restart: gate apply (syncingTopics) and pull a fresh snapshot before draining
+                // the relay. handleSyncResponse clears the gate and sets the frontier on completion.
+                requestSync(topic);
+            }
             // Tie the apply consumer to handler registration, not to start(): an op may reach
             // the relay before the handler exists (it is durably parked on disk until then),
             // but apply must not begin until the handler is available.
@@ -1069,6 +1113,9 @@ public class ReplicationManager implements TransportListener, LeadershipListener
      */
     private boolean drainRelayOnce(String topic, NQueue<byte[]> relay, PriorityQueue<RelayEntry> reorder)
             throws Exception {
+        if (syncingTopics.contains(topic)) {
+            return false; // a sync/bootstrap is installing a snapshot for this topic; pause apply
+        }
         boolean progressed = drainReorderContiguous(topic, reorder);
 
         Optional<byte[]> head = relay.peek();

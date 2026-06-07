@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -90,6 +91,26 @@ class RelayStoreTest {
                 assertEquals(op, RelayEntryCodec.decode(relay.peek().orElseThrow()).operationId());
             }
         }
+    }
+
+    @Test
+    void cleanShutdownMarkerDistinguishesCrashFromCleanRestart() throws Exception {
+        Path relayDir = tempDir.resolve("relay");
+
+        // Cold start: relay dir absent -> not unclean (nothing to bootstrap).
+        assertFalse(RelayStore.isUncleanRestart(relayDir));
+
+        // Prior run left state but no marker -> unclean (crash).
+        Files.createDirectories(relayDir);
+        assertTrue(RelayStore.isUncleanRestart(relayDir));
+
+        // A clean shutdown writes the marker -> next start is clean.
+        RelayStore.writeCleanMarker(relayDir);
+        assertFalse(RelayStore.isUncleanRestart(relayDir));
+
+        // Startup consumes the marker -> a subsequent crash (no new marker) is detected again.
+        RelayStore.consumeCleanMarker(relayDir);
+        assertTrue(RelayStore.isUncleanRestart(relayDir));
     }
 
     @Test
