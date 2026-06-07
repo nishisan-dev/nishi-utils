@@ -196,3 +196,37 @@ public class ConcurrencyExample {
 }
 ```
 
+## 8) Expiracao por tempo de escrita (`expireAfterWrite`)
+
+```java
+import dev.nishisan.utils.queue.NQueue;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.util.Optional;
+
+public class ExpireExample {
+    public static void main(String[] args) throws Exception {
+        Path baseDir = Path.of("/tmp/queues");
+
+        NQueue.Options options = NQueue.Options.defaults()
+                .withExpireAfterWrite(Duration.ofMillis(500)); // descarta itens com mais de 500ms
+
+        try (NQueue<String> queue = NQueue.open(baseDir, "expiring", options)) {
+            queue.offer("antigo-1");
+            queue.offer("antigo-2");
+
+            Thread.sleep(700); // ambos passam do limite de expiracao
+            queue.offer("recente");
+
+            // poll descarta silenciosamente o prefixo expirado e entrega o primeiro valido.
+            Optional<String> next = queue.poll();
+            System.out.println("poll=" + next.orElse("<vazio>")); // poll=recente
+
+            // Disparo manual: remove o prefixo expirado e informa quantos foram descartados.
+            long removidos = queue.flushExpired();
+            System.out.println("flushExpired=" + removidos);
+        }
+    }
+}
+```
+

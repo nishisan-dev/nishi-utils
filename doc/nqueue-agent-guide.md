@@ -38,6 +38,7 @@ Maven:
 - `offer(T value)` -> `long offset`
 - `poll()` / `poll(timeout, unit)` -> `Optional<T>`
 - `peek()` -> `Optional<T>`
+- `flushExpired()` -> `long` (descarta o prefixo expirado, retorna a quantidade)
 - `size()`, `isEmpty()`, `close()`
 
 Observação importante:
@@ -57,6 +58,7 @@ Controles principais:
 - `withFsync(boolean)`: durabilidade mais forte vs throughput.
 - `withRetentionPolicy(DELETE_ON_CONSUME|TIME_BASED)`: política de retenção.
 - `withRetentionTime(Duration)`: retenção em `TIME_BASED`.
+- `withExpireAfterWrite(Duration)`: expiração por tempo de escrita (ortogonal à política; `0` desabilita). Itens expirados são descartados no `poll`/`peek` ou via `flushExpired()`.
 - `withCompactionWasteThreshold(double)` e `withCompactionInterval(Duration)`: compactação.
 - `withMemoryBuffer(boolean)` e `withMemoryBufferSize(int)`: buffering em memória para burst.
 - `withShortCircuit(boolean)`: handoff direto para consumidor bloqueado.
@@ -103,7 +105,8 @@ Don't:
 
 - não assumir semântica exatamente-once (do ponto de vista da app);
 - não compartilhar o mesmo diretório de fila entre processos diferentes sem desenho explícito;
-- não ativar `withFsync(false)` em caminhos críticos sem aceite de risco.
+- não ativar `withFsync(false)` em caminhos críticos sem aceite de risco;
+- não esperar que `expireAfterWrite` afete itens no `MemoryBuffer` ou em handoff (só o segmento durável expira), nem que `size()`/`getRecordCount()` disparem a varredura de expirados — chame `flushExpired()` para forçar.
 
 ## Checklist de validação em projeto consumidor
 
