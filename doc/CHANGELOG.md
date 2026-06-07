@@ -4,6 +4,55 @@
 
 ---
 
+## 2026-06-07 — 🟢 4.5.0 — Convergência do bootstrap sob carga (op-log em disco, apply em lote, sync no join) + broadcast inter-nós
+
+Fecha três falhas interligadas observadas na validação do `tevent-cardinal` (TEMS) em HA de 2 nós com
+o `ReplicationManager` em **RELAY_LOG** (#124), sob carga real de produção (pré-prod 218/219), e
+adiciona uma primitiva de coordenação leve entre nós. Detalhes e diagramas em
+[`doc/ngrid/oplog-ha-hardening.md`](ngrid/oplog-ha-hardening.md) (seções 10–12) e
+[`doc/ngrid/broadcast-messaging.md`](ngrid/broadcast-messaging.md).
+
+**#127 — op-log de resend do líder em disco (híbrido).** O op-log de resend vivia em heap
+(`NavigableMap`), então sob alta produção o teto por **contagem** vencia a janela **temporal** e o gap
+de bootstrap era evictado → "missing sequences → snapshot fallback" em loop (relay do follower
+crescendo sem limite, 18 GB observados). Novo **`ResendLog`**: store próprio, segmentado, indexado por
+sequência (busca binária ordenada por inserção, tolerante a commits fora de ordem), com
+**auto-compactação por descarte de segmento** governada por tempo. O op-log passa a ser **híbrido**:
+cache quente em heap (recente) + `ResendLog` em disco (janela temporal profunda, off-heap). Opt-in via
+**`persistentResendLog`** (default `false`); janela por `replicationLogRetentionTime`.
+
+**#128 — throughput de apply em lote + métricas de relay.** O drain do relay era 1-a-1
+(`peek→apply→poll`); o apply do follower não acompanhava a produção sob burst. Agora **apply em lote**
+(`readRange(n)` + um único commit de frontier por lote), mantendo consumidor single-thread e ordem
+estrita (`effectively-once` preservado). Knob **`relayApplyBatchSize`** (default 256). Métricas
+públicas de lag: **`getRelaySize(topic)`**, **`getRelayHeadAgeMillis(topic)`**, **`getRelaySizes()`**.
+
+**#129 — sync proativo no join + leader-pause-on-join + sem caught-up transitório.** Em RELAY_LOG o
+follower só sincronizava reativamente, então um follower **novo** contra um líder **quiescente** nunca
+convergia. Agora: **(3a)** sync proativo no cold-join (lê o watermark do líder via heartbeat e puxa um
+snapshot, sem depender de tráfego); **(3b)** **leader-pause-on-join** opt-in (`leaderPauseOnJoin`) —
+o líder pausa a produção enquanto um follower atrasado entra, até ele alcançar / desconectar / estourar
+`joinQuiesceMaxDuration` (espelho do drain-gate de failover, novo canal `FOLLOWER_PROGRESS`);
+**(3c)** um nó que se auto-elege sozinho no boot (pair mode) não libera o gate por relay vazio dentro da
+`joinPeerDiscoveryWindow`, evitando marcar estado vazio como sincronizado.
+
+**Broadcast inter-nós.** Nova API **`broadcastMessage(String)`** + listener
+**`onMsgBroadcasted(NodeId produtor, String msg)`** (em `ReplicationManager` e `NGridNode`), sobre o
+`transport.broadcast` existente (novo `MessageType.USER_BROADCAST`). **Best-effort** (não-ordenado,
+não-durável) e **com loopback** (o produtor também recebe a própria mensagem). Para coordenação leve;
+para entrega garantida/ordenada, usar fila replicada.
+
+**Novas chaves de config (`ReplicationConfig`/`NGridNodeBuilder`):** `persistentResendLog`,
+`resendLogSegmentMaxEntries`, `resendLogSegmentMaxAge`, `resendLogMaxEntries`, `resendLogReadBatchMax`,
+`relayApplyBatchSize`, `leaderPauseOnJoin`, `joinQuiesceMaxDuration`, `followerProgressInterval`,
+`joinPeerDiscoveryWindow`, `joinSyncLagThreshold`. Defaults preservam o comportamento 4.4.0.
+
+**Testes:** `ResendLogTest` (9), `PersistentResendLogRegressionTest` (2, regressão da espiral),
+`RelayLogReplicationTest` (+2: métricas de backlog e cold-join contra líder quiescente),
+`LeaderPauseOnJoinTest` (1, gate), `BroadcastMessagingTest` (2). Suíte do core verde.
+
+---
+
 ## 2026-06-07 — 🟢 4.4.0 — Relay-log no follower (elimina a espiral de morte)
 
 Implementa o **modelo relay-log** no follower do `ReplicationManager` (#124), sobre as fundações da

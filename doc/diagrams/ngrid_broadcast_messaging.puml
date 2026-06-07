@@ -1,0 +1,21 @@
+@startuml
+title Broadcast inter-nos (broadcastMessage / onMsgBroadcasted) — best-effort, com loopback
+
+participant "App (no A)" as APP
+participant "ReplicationManager (A)" as RMA
+participant "Transport" as TX
+participant "ReplicationManager (B)" as RMB
+participant "Listener (B)" as LB
+participant "Listener (A)" as LA
+
+APP -> RMA : broadcastMessage("coordenar")
+RMA -> TX : broadcast(USER_BROADCAST,\nsource=A, BroadcastMessagePayload)
+note over TX : fan-out per-peer (virtual threads),\nexclui o local; best-effort
+TX -> RMB : USER_BROADCAST (source=A)
+RMB -> LB : onMsgBroadcasted(A, "coordenar")
+
+== Loopback (o produtor tambem recebe) ==
+RMA -> LA : onMsgBroadcasted(A, "coordenar")\n(numa worker thread)
+
+note over RMA, RMB : NAO ordenado, NAO duravel, NAO garantido.\nPara entrega garantida/ordenada: usar fila replicada.
+@enduml
