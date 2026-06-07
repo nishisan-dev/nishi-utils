@@ -359,6 +359,7 @@ public final class NGridNode implements Closeable {
             replicationBuilder.replicationLogRetentionTime(config.replicationLogRetentionTime());
         }
         replicationBuilder.strictConsistency(config.strictConsistency());
+        replicationBuilder.followerIngestMode(config.followerIngestMode());
 
         // Determine replication data directory
         Path replicationDataDir;
