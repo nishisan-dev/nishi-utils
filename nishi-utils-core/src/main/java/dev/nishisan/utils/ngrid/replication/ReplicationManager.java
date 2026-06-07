@@ -490,24 +490,38 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             if (syncingTopics.contains(topic)) {
                 continue;
             }
-            try {
-                long headTimestamp = store.relayFor(topic).peekRecord()
-                        .map(record -> record.meta().getTimestamp())
-                        .orElse(Long.MAX_VALUE);
-                if (headTimestamp == Long.MAX_VALUE) {
-                    continue; // empty relay
-                }
-                if (System.currentTimeMillis() - headTimestamp > retentionMs - marginMs) {
-                    LOGGER.warning(() -> "Relay head for topic " + topic
-                            + " is older than the retention window; bootstrapping (lag exceeded retention)");
-                    if (syncingTopics.add(topic)) {
-                        snapshotFallbackCount.incrementAndGet();
-                        requestSync(topic);
-                    }
-                }
-            } catch (Exception e) {
-                LOGGER.log(Level.FINE, "Relay head-age check failed for topic " + topic, e);
+            long headTimestamp = relayHeadTimestamp(topic);
+            if (headTimestamp == Long.MAX_VALUE) {
+                continue; // empty relay
             }
+            if (System.currentTimeMillis() - headTimestamp > retentionMs - marginMs) {
+                LOGGER.warning(() -> "Relay head for topic " + topic
+                        + " is older than the retention window; bootstrapping (lag exceeded retention)");
+                if (syncingTopics.add(topic)) {
+                    snapshotFallbackCount.incrementAndGet();
+                    requestSync(topic);
+                }
+            }
+        }
+    }
+
+    /**
+     * Epoch-millis timestamp of the oldest unapplied relay entry for {@code topic} (the relay head),
+     * or {@link Long#MAX_VALUE} when there is no relay/entry. Shared by the head-age bootstrap safety
+     * valve and the public {@link #getRelayHeadAgeMillis(String)} metric (#128).
+     */
+    private long relayHeadTimestamp(String topic) {
+        RelayStore store = relayStore;
+        if (store == null) {
+            return Long.MAX_VALUE;
+        }
+        try {
+            return store.relayFor(topic).peekRecord()
+                    .map(record -> record.meta().getTimestamp())
+                    .orElse(Long.MAX_VALUE);
+        } catch (Exception e) {
+            LOGGER.log(Level.FINE, "Relay head-age read failed for topic " + topic, e);
+            return Long.MAX_VALUE;
         }
     }
 
@@ -1231,8 +1245,16 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         }
         boolean progressed = drainReorderContiguous(topic, reorder);
 
-        Optional<byte[]> head = relay.peek();
-        if (head.isEmpty()) {
+        ReplicationHandler handler = handlers.get(topic);
+        if (handler == null) {
+            return progressed; // handler not ready (shutdown/registration race): retry later
+        }
+
+        // Batch-peek the relay head WITHOUT consuming (#128). The consumer stays single-threaded and
+        // applies in strict sequence order; batching only amortizes the per-op lock/flush/peek-poll
+        // overhead. readRange reads from the consumer offset (index 0 = oldest unapplied).
+        List<byte[]> frames = relay.readRange(0, Math.max(1, config.relayApplyBatchSize())).items();
+        if (frames.isEmpty()) {
             if (reorder.isEmpty()) {
                 // Relay + reorder buffer fully drained for this topic — release the failover drain-gate
                 // if one is held (no-op otherwise). Safe to read reorder here: this is its owner thread.
@@ -1240,40 +1262,73 @@ public class ReplicationManager implements TransportListener, LeadershipListener
             }
             return progressed;
         }
-        RelayEntry entry = RelayEntryCodec.decode(head.get());
+
         long nextExpected = nextExpectedSequenceByTopic.getOrDefault(topic, 1L);
-
-        if (entry.epoch() < lastSeenLeaderEpoch || entry.sequence() < nextExpected) {
-            // Stale epoch, or a duplicate/already-applied sequence (re-peek after crash, or a resend
-            // copy): discard. Fencing on (epoch, sequence) is what makes the non-idempotent queue
-            // OFFER effectively-once.
-            relay.poll();
-            return true;
-        }
-        if (entry.sequence() == nextExpected) {
-            applyRelayEntry(topic, entry);
-            relay.poll();
-            return true;
-        }
-
-        // Gap: head.sequence() > nextExpected. Pull the head into the reorder buffer to expose the
-        // entries behind it (including resent ops that arrive at the relay tail), and ask the leader
-        // to resend the missing prefix.
-        reorder.add(entry);
-        relay.poll();
-        gapsDetected.incrementAndGet();
-        if (reorder.size() > RELAY_REORDER_CAP) {
-            LOGGER.warning(() -> "Relay reorder buffer cap hit for topic " + topic
-                    + "; backlog too far ahead of an unfilled gap — requesting snapshot");
-            snapshotFallbackCount.incrementAndGet();
-            reorder.clear();
-            if (syncingTopics.add(topic)) {
-                requestSync(topic);
+        List<RelayEntry> appliedBatch = new ArrayList<>();
+        int consumed = 0;            // head frames to poll (stale-discarded + successfully applied)
+        RelayEntry gapEntry = null;  // first forward-gap frame: stops the batch
+        Exception applyError = null;
+        for (byte[] f : frames) {
+            RelayEntry entry = RelayEntryCodec.decode(f);
+            if (entry.epoch() < lastSeenLeaderEpoch || entry.sequence() < nextExpected) {
+                // Stale epoch, or a duplicate/already-applied sequence (re-peek after crash, or a resend
+                // copy): discard. Fencing on (epoch, sequence) is what makes the non-idempotent queue
+                // OFFER effectively-once.
+                consumed++;
+                continue;
             }
-        } else if (!resendPendingTopics.contains(topic)) {
-            requestSequenceResend(topic, nextExpected, entry.sequence() - 1);
+            if (entry.sequence() == nextExpected) {
+                try {
+                    handler.apply(entry.operationId(), handler.decodePayload(entry.payloadBytes()));
+                } catch (Exception e) {
+                    // Commit the prefix applied so far, poll it, then rethrow so the apply loop backs
+                    // off and retries this failing entry (it stays at the relay head).
+                    applyError = e;
+                    break;
+                }
+                appliedBatch.add(entry);
+                nextExpected++;
+                consumed++;
+                continue;
+            }
+            gapEntry = entry; // head.sequence() > nextExpected: forward gap, stop the batch here
+            break;
         }
-        return true;
+
+        // One locked frontier commit for the whole applied prefix, THEN poll the consumed head frames.
+        // Never poll an entry before its apply() returned AND its frontier advance is committed.
+        if (!appliedBatch.isEmpty()) {
+            commitRelayBatch(topic, appliedBatch);
+        }
+        for (int i = 0; i < consumed; i++) {
+            relay.poll();
+        }
+        if (applyError != null) {
+            throw applyError;
+        }
+
+        if (gapEntry != null) {
+            // The gap entry is now the relay head. Pull it into the reorder buffer to expose the entries
+            // behind it (including resent ops that arrive at the relay tail), and ask the leader to
+            // resend the missing prefix.
+            long frontier = nextExpectedSequenceByTopic.getOrDefault(topic, 1L);
+            reorder.add(gapEntry);
+            relay.poll();
+            gapsDetected.incrementAndGet();
+            if (reorder.size() > RELAY_REORDER_CAP) {
+                LOGGER.warning(() -> "Relay reorder buffer cap hit for topic " + topic
+                        + "; backlog too far ahead of an unfilled gap — requesting snapshot");
+                snapshotFallbackCount.incrementAndGet();
+                reorder.clear();
+                if (syncingTopics.add(topic)) {
+                    requestSync(topic);
+                }
+            } else if (!resendPendingTopics.contains(topic)) {
+                requestSequenceResend(topic, frontier, gapEntry.sequence() - 1);
+            }
+            return true;
+        }
+        return progressed || consumed > 0;
     }
 
     /** Applies buffered entries that have become contiguous with nextExpected. */
@@ -1302,16 +1357,26 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         if (handler == null) {
             return; // handler vanished (shutdown): leave nextExpected untouched to retry later
         }
-        Object payload = handler.decodePayload(entry.payloadBytes());
-        handler.apply(entry.operationId(), payload);
+        handler.apply(entry.operationId(), handler.decodePayload(entry.payloadBytes()));
+        commitRelayBatch(topic, List.of(entry));
+    }
 
+    /**
+     * Advances the durable apply frontier for a batch of already-applied, strictly contiguous entries
+     * (#128) under ONE lock acquisition — the throughput lever over the per-operation commit. The
+     * entries must be in ascending, gap-free sequence order ending at the batch's last sequence.
+     */
+    private void commitRelayBatch(String topic, List<RelayEntry> entries) {
+        RelayEntry last = entries.get(entries.size() - 1);
         acquireSequenceLock();
         try {
-            nextExpectedSequenceByTopic.merge(topic, entry.sequence() + 1,
+            nextExpectedSequenceByTopic.merge(topic, last.sequence() + 1,
                     (cur, candidate) -> Math.max(cur, candidate));
-            applied.add(entry.operationId());
+            for (RelayEntry e : entries) {
+                applied.add(e.operationId());
+            }
             trimApplied();
-            recordApplied(); // global applied-op counter (drives the lag metric vs leader watermark)
+            recordApplied(entries.size()); // global applied-op counter (drives the lag metric)
             sequenceStateDirty = true;
         } finally {
             sequenceBufferLock.unlock();
@@ -1992,6 +2057,58 @@ public class ReplicationManager implements TransportListener, LeadershipListener
         return (int) Math.max(heap, Math.min(Integer.MAX_VALUE, diskStore.size(topic)));
     }
 
+    /**
+     * Number of entries currently buffered in the follower relay-log for {@code topic} (#128). This is
+     * the durable apply backlog: it grows when the leader produces faster than the follower applies and
+     * shrinks as the apply consumer drains. {@code 0} when not in RELAY_LOG mode. Intended for lag
+     * observability and alarming (the cardinal could only infer lag from sequence deltas before).
+     *
+     * @param topic the replication topic
+     * @return the relay backlog size for the topic
+     */
+    public long getRelaySize(String topic) {
+        RelayStore store = relayStore;
+        if (store == null) {
+            return 0L;
+        }
+        try {
+            return store.relayFor(topic).size(true);
+        } catch (Exception e) {
+            LOGGER.log(Level.FINE, "Relay size read failed for topic " + topic, e);
+            return 0L;
+        }
+    }
+
+    /**
+     * Age, in milliseconds, of the oldest unapplied relay entry for {@code topic} (#128) — i.e. how
+     * long the follower's apply frontier has lagged the relay head. {@code 0} when the relay is empty
+     * or RELAY_LOG mode is off. A growing head age signals the apply consumer is falling behind.
+     *
+     * @param topic the replication topic
+     * @return the relay head age in milliseconds
+     */
+    public long getRelayHeadAgeMillis(String topic) {
+        long headTimestamp = relayHeadTimestamp(topic);
+        return headTimestamp == Long.MAX_VALUE ? 0L : Math.max(0L, System.currentTimeMillis() - headTimestamp);
+    }
+
+    /**
+     * Relay backlog size per registered topic (#128). Snapshot map for dashboards; empty when not in
+     * RELAY_LOG mode.
+     *
+     * @return a map of topic to relay backlog size
+     */
+    public Map<String, Long> getRelaySizes() {
+        Map<String, Long> sizes = new java.util.HashMap<>();
+        if (relayStore == null) {
+            return sizes;
+        }
+        for (String topic : handlers.keySet()) {
+            sizes.put(topic, getRelaySize(topic));
+        }
+        return sizes;
+    }
+
     public double getAverageConvergenceTimeMs() {
         long count = convergenceCount.get();
         return count > 0 ? (double) totalConvergenceTimeMs.get() / count : 0.0;
@@ -2365,6 +2482,10 @@ public class ReplicationManager implements TransportListener, LeadershipListener
 
     private void recordApplied() {
         lastAppliedSequence = appliedSequence.incrementAndGet();
+    }
+
+    private void recordApplied(int n) {
+        lastAppliedSequence = appliedSequence.addAndGet(n);
     }
 
     /**
