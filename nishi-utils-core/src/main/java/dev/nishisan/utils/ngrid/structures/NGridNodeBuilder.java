@@ -56,6 +56,7 @@ public final class NGridNodeBuilder {
     private boolean strictConsistency = true;
     private FollowerIngestMode followerIngestMode = FollowerIngestMode.INLINE;
     private RelayDurability relayDurability = RelayDurability.OS_MANAGED;
+    private boolean persistentResendLog = false;
 
     NGridNodeBuilder(String host, int port) {
         this.host = Objects.requireNonNull(host, "host");
@@ -208,6 +209,19 @@ public final class NGridNodeBuilder {
     }
 
     /**
+     * Enables the disk-backed resend op-log (#127), keeping the deep backlog window off-heap so a
+     * large {@link NGridConfig.Builder#replicationLogRetentionTime(java.time.Duration) temporal
+     * window} does not pressure the JVM heap. Defaults to {@code false}.
+     *
+     * @param persistentResendLog {@code true} to enable the on-disk resend op-log
+     * @return this builder
+     */
+    public NGridNodeBuilder persistentResendLog(boolean persistentResendLog) {
+        this.persistentResendLog = persistentResendLog;
+        return this;
+    }
+
+    /**
      * Builds and starts the node.
      * <p>
      * If no data directory is specified, the build will fail for
@@ -228,7 +242,8 @@ public final class NGridNodeBuilder {
         NGridConfig.Builder builder = NGridConfig.builder(localInfo)
                 .strictConsistency(strictConsistency)
                 .followerIngestMode(followerIngestMode)
-                .relayDurability(relayDurability);
+                .relayDurability(relayDurability)
+                .persistentResendLog(persistentResendLog);
 
         if (dataDir != null) {
             builder.dataDirectory(dataDir);

@@ -48,6 +48,7 @@ public final class NGridConfig {
     private final FollowerIngestMode followerIngestMode;
     private final RelayDurability relayDurability;
     private final Duration relayGroupCommitInterval;
+    private final boolean persistentResendLog;
     private final Duration rttProbeInterval;
     private final Duration heartbeatInterval;
     private final Duration leaseTimeout;
@@ -96,6 +97,7 @@ public final class NGridConfig {
         this.followerIngestMode = builder.followerIngestMode;
         this.relayDurability = builder.relayDurability;
         this.relayGroupCommitInterval = builder.relayGroupCommitInterval;
+        this.persistentResendLog = builder.persistentResendLog;
         this.rttProbeInterval = builder.rttProbeInterval;
         this.heartbeatInterval = builder.heartbeatInterval;
         this.leaseTimeout = builder.leaseTimeout;
@@ -214,6 +216,17 @@ public final class NGridConfig {
      */
     public RelayDurability relayDurability() {
         return relayDurability;
+    }
+
+    /**
+     * Whether the leader-side resend op-log is backed by a durable, segmented on-disk store (#127),
+     * keeping the deep backlog window off-heap. Defaults to {@code false}. Pair with
+     * {@link #replicationLogRetentionTime()} to size the temporal window.
+     *
+     * @return {@code true} when the disk-backed resend op-log is enabled
+     */
+    public boolean persistentResendLog() {
+        return persistentResendLog;
     }
 
     /**
@@ -401,6 +414,7 @@ public final class NGridConfig {
         private FollowerIngestMode followerIngestMode = FollowerIngestMode.INLINE;
         private RelayDurability relayDurability = RelayDurability.OS_MANAGED;
         private Duration relayGroupCommitInterval = Duration.ofSeconds(1);
+        private boolean persistentResendLog = false;
         private Duration rttProbeInterval = Duration.ofSeconds(10);
         private Duration heartbeatInterval = Duration.ofSeconds(3);
         private Duration leaseTimeout;
@@ -620,6 +634,19 @@ public final class NGridConfig {
          */
         public Builder relayDurability(RelayDurability relayDurability) {
             this.relayDurability = Objects.requireNonNull(relayDurability, "relayDurability");
+            return this;
+        }
+
+        /**
+         * Enables the disk-backed resend op-log (#127), keeping the deep backlog window off-heap.
+         * Pair with {@link #replicationLogRetentionTime(Duration)} to size the temporal window.
+         * Defaults to {@code false}.
+         *
+         * @param persistentResendLog {@code true} to enable the on-disk resend op-log
+         * @return this builder
+         */
+        public Builder persistentResendLog(boolean persistentResendLog) {
+            this.persistentResendLog = persistentResendLog;
             return this;
         }
 
