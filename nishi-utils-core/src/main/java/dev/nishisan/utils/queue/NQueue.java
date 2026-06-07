@@ -253,6 +253,15 @@ public class NQueue<T> implements Closeable {
         this.dataChannel = result.newChannel();
         this.consumerOffset = result.newConsumerOffset();
         this.producerOffset = result.newProducerOffset();
+        // Recompute recordCount from the surviving live segment. TIME_BASED compaction
+        // may physically discard head records (those older than the retention window),
+        // which the cursor-delta arithmetic alone cannot account for — leaving recordCount
+        // overcounted (stale). Recounting [consumerOffset, producerOffset) keeps size(),
+        // getRecordCount() and the persisted meta honest. Cheap: only the post-compaction
+        // live records are scanned (headers only). Benign for DELETE_ON_CONSUME (it only
+        // reclaims the already-consumed prefix, so the count is unchanged).
+        this.recordCount = countRecordsInRange(this.dataChannel, this.consumerOffset, this.producerOffset);
+        this.approximateSize.set(this.recordCount);
         persistCurrentStateLocked();
         if (stager != null) {
             stager.triggerDrainIfNeeded();
@@ -1149,6 +1158,26 @@ public class NQueue<T> implements Closeable {
         }
         ch.force(true);
         return new QueueState(count > 0 ? 0 : size, size, count, lastIdx);
+    }
+
+    /**
+     * Counts the complete records contained in {@code [start, end)} of the given
+     * channel by scanning record headers only. Used to recompute {@code recordCount}
+     * after a compaction that may have physically discarded records from the head
+     * (TIME_BASED retention), where cursor-delta arithmetic cannot tell how many
+     * records survived. A torn/partial trailing record stops the scan.
+     */
+    private static long countRecordsInRange(FileChannel ch, long start, long end) throws IOException {
+        long offset = start, count = 0;
+        while (offset < end) {
+            NQueueRecordMetaData.HeaderPrefix pref = NQueueRecordMetaData.readPrefix(ch, offset);
+            NQueueRecordMetaData meta = NQueueRecordMetaData.fromBuffer(ch, offset, pref.headerLen);
+            offset = offset + NQueueRecordMetaData.fixedPrefixSize() + pref.headerLen + meta.getPayloadLen();
+            if (offset > end)
+                break;
+            count++;
+        }
+        return count;
     }
 
     // ── Serialization Helpers ─────────────────────────────────────────────────
