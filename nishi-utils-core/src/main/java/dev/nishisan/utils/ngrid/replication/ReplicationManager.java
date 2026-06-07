@@ -22,6 +22,8 @@ import dev.nishisan.utils.ngrid.cluster.coordination.LeaseExpiredException;
 import dev.nishisan.utils.ngrid.cluster.coordination.LeadershipListener;
 import dev.nishisan.utils.ngrid.cluster.transport.Transport;
 import dev.nishisan.utils.ngrid.cluster.transport.TransportListener;
+import dev.nishisan.utils.ngrid.BroadcastListener;
+import dev.nishisan.utils.ngrid.common.BroadcastMessagePayload;
 import dev.nishisan.utils.ngrid.common.ClusterMessage;
 import dev.nishisan.utils.ngrid.common.FollowerProgressPayload;
 import dev.nishisan.utils.ngrid.common.MessageType;
@@ -170,6 +172,10 @@ public class ReplicationManager
     private volatile long joinQuiesceStartedMs;
     // Active members observed on the previous membership change, to detect newly-joined nodes.
     private final Set<NodeId> knownActiveMembers = ConcurrentHashMap.newKeySet();
+
+    // User-level broadcast messaging (broadcastMessage API): best-effort fire-and-forget messages
+    // between nodes for coordination. Listeners are invoked on a worker thread (keep them non-blocking).
+    private final Set<BroadcastListener> broadcastListeners = new java.util.concurrent.CopyOnWriteArraySet<>();
 
     // ── Relay-log ingestion (#124, FollowerIngestMode.RELAY_LOG) ─────────────────
     // The follower persists each REPLICATION_REQUEST to a durable relay (one NQueue per
@@ -867,6 +873,8 @@ public class ReplicationManager
             handleSequenceResendResponse(message);
         } else if (message.type() == MessageType.FOLLOWER_PROGRESS) {
             handleFollowerProgress(message);
+        } else if (message.type() == MessageType.USER_BROADCAST) {
+            handleBroadcast(message);
         }
     }
 
@@ -2553,6 +2561,55 @@ public class ReplicationManager
     private void clearJoinQuiesce() {
         quiescingFor.clear();
         joinQuiescing.set(false);
+    }
+
+    // ── User-level broadcast messaging (broadcastMessage API) ─────────────────────
+
+    /**
+     * Broadcasts a small, best-effort message to every node in the cluster, including this one
+     * (loopback). Listeners registered via {@link #addBroadcastListener(BroadcastListener)} receive
+     * it with the producer's {@link NodeId}. Fire-and-forget: not ordered, not durable, not
+     * guaranteed — for guaranteed/ordered delivery use a replicated queue.
+     *
+     * @param message the message body (must not be {@code null})
+     */
+    public void broadcastMessage(String message) {
+        Objects.requireNonNull(message, "message");
+        NodeId local = transport.local().nodeId();
+        transport.broadcast(ClusterMessage.request(MessageType.USER_BROADCAST, "broadcast", local, null,
+                new BroadcastMessagePayload(message)));
+        // Loopback: deliver to local listeners too, on a worker thread to mirror the remote path and
+        // avoid invoking a user listener inline on the caller's thread.
+        try {
+            executor.submit(() -> dispatchBroadcast(local, message));
+        } catch (java.util.concurrent.RejectedExecutionException ignored) {
+            // shutting down — the remote sends already went out; skip local loopback
+        }
+    }
+
+    /** Registers a listener for user-level broadcast messages (idempotent). */
+    public void addBroadcastListener(BroadcastListener listener) {
+        broadcastListeners.add(Objects.requireNonNull(listener, "listener"));
+    }
+
+    /** Removes a previously registered broadcast listener. */
+    public void removeBroadcastListener(BroadcastListener listener) {
+        broadcastListeners.remove(listener);
+    }
+
+    private void handleBroadcast(ClusterMessage message) {
+        BroadcastMessagePayload payload = message.payload(BroadcastMessagePayload.class);
+        dispatchBroadcast(message.source(), payload.body());
+    }
+
+    private void dispatchBroadcast(NodeId producer, String body) {
+        for (BroadcastListener listener : broadcastListeners) {
+            try {
+                listener.onMsgBroadcasted(producer, body);
+            } catch (Exception e) {
+                LOGGER.log(Level.WARNING, "Broadcast listener failed", e);
+            }
+        }
     }
 
     private void failAllPending(String reason) {
