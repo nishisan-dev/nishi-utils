@@ -84,6 +84,8 @@ public final class NGridConfig {
     private final Duration requestTimeout;
     private final int transportWorkerThreads;
     private final int outboundQueueCapacity;
+    private final boolean transportCompressionEnabled;
+    private final int transportCompressionMinSize;
 
     private NGridConfig(Builder builder) {
         this.clusterName = builder.clusterName;
@@ -137,6 +139,8 @@ public final class NGridConfig {
         this.requestTimeout = builder.requestTimeout;
         this.transportWorkerThreads = builder.transportWorkerThreads;
         this.outboundQueueCapacity = builder.outboundQueueCapacity;
+        this.transportCompressionEnabled = builder.transportCompressionEnabled;
+        this.transportCompressionMinSize = builder.transportCompressionMinSize;
     }
 
     public String clusterName() {
@@ -336,6 +340,29 @@ public final class NGridConfig {
         return outboundQueueCapacity;
     }
 
+    /**
+     * Whether outbound transport frames are eligible for LZ4 compression. Compression is
+     * additionally gated per-peer by the handshake capability negotiation, and decoding of
+     * compressed frames is always supported regardless of this flag. Defaults to {@code true}.
+     *
+     * @return {@code true} if outbound transport compression is enabled
+     * @since 4.6.0
+     */
+    public boolean transportCompressionEnabled() {
+        return transportCompressionEnabled;
+    }
+
+    /**
+     * Minimum serialized JSON size, in bytes, below which a transport frame is never
+     * compressed. Defaults to {@code 512}.
+     *
+     * @return the minimum payload size eligible for compression
+     * @since 4.6.0
+     */
+    public int transportCompressionMinSize() {
+        return transportCompressionMinSize;
+    }
+
     public boolean leaderReelectionEnabled() {
         return leaderReelectionEnabled;
     }
@@ -487,6 +514,8 @@ public final class NGridConfig {
         private Duration requestTimeout = Duration.ofSeconds(20);
         private int transportWorkerThreads = 2;
         private int outboundQueueCapacity = 0;
+        private boolean transportCompressionEnabled = true;
+        private int transportCompressionMinSize = 512;
 
         private Builder(NodeInfo local) {
             this.local = Objects.requireNonNull(local, "local");
@@ -553,6 +582,36 @@ public final class NGridConfig {
                 throw new IllegalArgumentException("outboundQueueCapacity must be >= 0");
             }
             this.outboundQueueCapacity = capacity;
+            return this;
+        }
+
+        /**
+         * Enables or disables LZ4 compression of outbound transport frames (default
+         * {@code true}). Compression is still negotiated per-peer in the handshake; decoding
+         * of compressed frames is always supported regardless of this flag.
+         *
+         * @param enabled whether to compress eligible outbound frames
+         * @return this builder
+         * @since 4.6.0
+         */
+        public Builder transportCompressionEnabled(boolean enabled) {
+            this.transportCompressionEnabled = enabled;
+            return this;
+        }
+
+        /**
+         * Sets the minimum serialized JSON size (bytes) eligible for compression (default
+         * {@code 512}). Smaller frames are sent uncompressed.
+         *
+         * @param minSize the minimum payload size, must be {@code >= 0}
+         * @return this builder
+         * @since 4.6.0
+         */
+        public Builder transportCompressionMinSize(int minSize) {
+            if (minSize < 0) {
+                throw new IllegalArgumentException("transportCompressionMinSize must be >= 0");
+            }
+            this.transportCompressionMinSize = minSize;
             return this;
         }
 

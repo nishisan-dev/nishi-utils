@@ -36,6 +36,7 @@ public final class HandshakePayload {
     private final NodeInfo local;
     private final Set<NodeInfo> peers;
     private final Map<NodeId, Double> latencies;
+    private final boolean supportsCompression;
 
     /**
      * Creates a handshake payload without latency information.
@@ -44,24 +45,45 @@ public final class HandshakePayload {
      * @param peers the set of known peers
      */
     public HandshakePayload(NodeInfo local, Set<NodeInfo> peers) {
-        this(local, peers, Collections.emptyMap());
+        this(local, peers, Collections.emptyMap(), true);
     }
 
     /**
-     * Creates a handshake payload with latency information.
+     * Creates a handshake payload with latency information, advertising compression support.
      *
      * @param local     the local node information
      * @param peers     the set of known peers
      * @param latencies measured latencies to known peers
      */
+    public HandshakePayload(NodeInfo local, Set<NodeInfo> peers, Map<NodeId, Double> latencies) {
+        this(local, peers, latencies, true);
+    }
+
+    /**
+     * Creates a handshake payload with latency information and an explicit compression
+     * capability flag.
+     *
+     * <p>{@code supportsCompression} advertises whether this node can handle LZ4-compressed
+     * transport frames. It is the {@link JsonCreator} target, so a payload from an older node
+     * that never serialized this field deserializes it as {@code false} (the primitive default) —
+     * meaning peers must not compress towards it. Newer nodes default this to {@code true} via the
+     * convenience constructors above.
+     *
+     * @param local               the local node information
+     * @param peers               the set of known peers
+     * @param latencies           measured latencies to known peers
+     * @param supportsCompression whether this node accepts LZ4-compressed transport frames
+     */
     @JsonCreator
     public HandshakePayload(
             @JsonProperty("local") NodeInfo local,
             @JsonProperty("peers") Set<NodeInfo> peers,
-            @JsonProperty("latencies") Map<NodeId, Double> latencies) {
+            @JsonProperty("latencies") Map<NodeId, Double> latencies,
+            @JsonProperty("supportsCompression") boolean supportsCompression) {
         this.local = Objects.requireNonNull(local, "local");
         this.peers = Collections.unmodifiableSet(new HashSet<>(Objects.requireNonNull(peers, "peers")));
         this.latencies = Collections.unmodifiableMap(new HashMap<>(Objects.requireNonNull(latencies, "latencies")));
+        this.supportsCompression = supportsCompression;
     }
 
     public NodeInfo local() {
@@ -74,5 +96,15 @@ public final class HandshakePayload {
 
     public Map<NodeId, Double> latencies() {
         return latencies;
+    }
+
+    /**
+     * Whether the sending node accepts LZ4-compressed transport frames.
+     *
+     * @return {@code true} if the peer can decode compressed frames; {@code false} for legacy
+     *         nodes that did not advertise the capability
+     */
+    public boolean supportsCompression() {
+        return supportsCompression;
     }
 }

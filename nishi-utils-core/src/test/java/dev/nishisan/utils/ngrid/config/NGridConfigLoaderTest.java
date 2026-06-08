@@ -201,6 +201,55 @@ class NGridConfigLoaderTest {
     }
 
     @Test
+    void shouldBindTransportCompressionFromYaml() throws IOException {
+        Path yamlFile = tempDir.resolve("compression.yaml");
+        NGridYamlConfig config = new NGridYamlConfig();
+
+        NodeIdentityConfig node = new NodeIdentityConfig();
+        node.setId("node-1");
+        node.setHost("127.0.0.1");
+        node.setPort(9000);
+        NodeIdentityConfig.DirsConfig dirs = new NodeIdentityConfig.DirsConfig();
+        dirs.setBase("/tmp/ngrid-compression-test");
+        node.setDirs(dirs);
+        config.setNode(node);
+
+        ClusterPolicyConfig cluster = new ClusterPolicyConfig();
+        ClusterPolicyConfig.TransportConfig transport = new ClusterPolicyConfig.TransportConfig();
+        ClusterPolicyConfig.CompressionConfig compression = new ClusterPolicyConfig.CompressionConfig();
+        compression.setEnabled(false);
+        compression.setMinSize(2048);
+        transport.setCompression(compression);
+        cluster.setTransport(transport);
+        config.setCluster(cluster);
+
+        // Round-trip through YAML to exercise Jackson (de)serialization.
+        NGridConfigLoader.save(yamlFile, config);
+        NGridConfig domain = NGridConfigLoader.convertToDomain(NGridConfigLoader.load(yamlFile));
+
+        assertFalse(domain.transportCompressionEnabled());
+        assertEquals(2048, domain.transportCompressionMinSize());
+    }
+
+    @Test
+    void shouldDefaultTransportCompressionEnabledWhenSectionAbsent() {
+        NGridYamlConfig config = new NGridYamlConfig();
+        NodeIdentityConfig node = new NodeIdentityConfig();
+        node.setId("node-1");
+        node.setHost("127.0.0.1");
+        node.setPort(9000);
+        NodeIdentityConfig.DirsConfig dirs = new NodeIdentityConfig.DirsConfig();
+        dirs.setBase("/tmp/ngrid-compression-test");
+        node.setDirs(dirs);
+        config.setNode(node);
+
+        NGridConfig domain = NGridConfigLoader.convertToDomain(config);
+
+        assertTrue(domain.transportCompressionEnabled());
+        assertEquals(512, domain.transportCompressionMinSize());
+    }
+
+    @Test
     void shouldNotDuplicateSeedPrefixWhenSeedHostAlreadyHasPrefix() {
         NGridYamlConfig config = new NGridYamlConfig();
 

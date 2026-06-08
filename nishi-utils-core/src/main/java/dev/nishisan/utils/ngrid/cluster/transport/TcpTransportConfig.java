@@ -37,6 +37,8 @@ public final class TcpTransportConfig {
     private final int workerThreads;
     private final Duration routeProbeInterval;
     private final int outboundQueueCapacity;
+    private final boolean compressionEnabled;
+    private final int compressionMinSize;
 
     private TcpTransportConfig(Builder builder) {
         this.local = builder.local;
@@ -47,6 +49,8 @@ public final class TcpTransportConfig {
         this.workerThreads = builder.workerThreads;
         this.routeProbeInterval = builder.routeProbeInterval;
         this.outboundQueueCapacity = builder.outboundQueueCapacity;
+        this.compressionEnabled = builder.compressionEnabled;
+        this.compressionMinSize = builder.compressionMinSize;
     }
 
     public NodeInfo local() {
@@ -103,6 +107,29 @@ public final class TcpTransportConfig {
         return outboundQueueCapacity;
     }
 
+    /**
+     * Whether outbound transport frames are eligible for LZ4 compression. Compression is
+     * additionally gated per-peer by the handshake capability negotiation, and decoding of
+     * compressed frames is always supported regardless of this flag. Defaults to {@code true}.
+     *
+     * @return {@code true} if outbound compression is enabled
+     * @since 4.6.0
+     */
+    public boolean compressionEnabled() {
+        return compressionEnabled;
+    }
+
+    /**
+     * Minimum serialized JSON size, in bytes, below which a frame is never compressed (small
+     * frames would not benefit and could even inflate). Defaults to {@code 512}.
+     *
+     * @return the minimum payload size eligible for compression
+     * @since 4.6.0
+     */
+    public int compressionMinSize() {
+        return compressionMinSize;
+    }
+
     public static Builder builder(NodeInfo local) {
         return new Builder(local);
     }
@@ -116,6 +143,8 @@ public final class TcpTransportConfig {
         private int workerThreads = Math.max(4, Runtime.getRuntime().availableProcessors());
         private Duration routeProbeInterval = Duration.ofSeconds(10);
         private int outboundQueueCapacity = 0;
+        private boolean compressionEnabled = true;
+        private int compressionMinSize = 512;
 
         private Builder(NodeInfo local) {
             this.local = Objects.requireNonNull(local, "local");
@@ -174,6 +203,36 @@ public final class TcpTransportConfig {
                 throw new IllegalArgumentException("outboundQueueCapacity must be >= 0");
             }
             this.outboundQueueCapacity = capacity;
+            return this;
+        }
+
+        /**
+         * Enables or disables LZ4 compression of outbound transport frames (default
+         * {@code true}). Compression is still negotiated per-peer in the handshake; decoding
+         * of compressed frames is always supported regardless of this flag.
+         *
+         * @param enabled whether to compress eligible outbound frames
+         * @return this builder
+         * @since 4.6.0
+         */
+        public Builder compressionEnabled(boolean enabled) {
+            this.compressionEnabled = enabled;
+            return this;
+        }
+
+        /**
+         * Sets the minimum serialized JSON size (bytes) eligible for compression (default
+         * {@code 512}). Smaller frames are sent uncompressed.
+         *
+         * @param minSize the minimum payload size, must be {@code >= 0}
+         * @return this builder
+         * @since 4.6.0
+         */
+        public Builder compressionMinSize(int minSize) {
+            if (minSize < 0) {
+                throw new IllegalArgumentException("compressionMinSize must be >= 0");
+            }
+            this.compressionMinSize = minSize;
             return this;
         }
 
