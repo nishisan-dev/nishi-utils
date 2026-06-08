@@ -51,6 +51,10 @@ public final class ReplicationConfig {
     private final Duration followerProgressInterval;
     private final Duration joinPeerDiscoveryWindow;
     private final long joinSyncLagThreshold;
+    private final int relayStreamFetchBatch;
+    private final Duration relayStreamPollInterval;
+    private final Duration relayStreamFetchTimeout;
+    private final int relayMaxBacklog;
 
     private ReplicationConfig(int quorum, Duration operationTimeout, Duration retryInterval, boolean strictConsistency,
             Path dataDirectory, int resendGapThreshold, Duration resendTimeout, int replicationLogRetention,
@@ -59,7 +63,9 @@ public final class ReplicationConfig {
             Duration relayGroupCommitInterval, boolean persistentResendLog, int resendLogSegmentMaxEntries,
             Duration resendLogSegmentMaxAge, long resendLogMaxEntries, int resendLogReadBatchMax,
             int relayApplyBatchSize, boolean leaderPauseOnJoin, Duration joinQuiesceMaxDuration,
-            Duration followerProgressInterval, Duration joinPeerDiscoveryWindow, long joinSyncLagThreshold) {
+            Duration followerProgressInterval, Duration joinPeerDiscoveryWindow, long joinSyncLagThreshold,
+            int relayStreamFetchBatch, Duration relayStreamPollInterval, Duration relayStreamFetchTimeout,
+            int relayMaxBacklog) {
         this.quorum = quorum;
         this.operationTimeout = Objects.requireNonNull(operationTimeout, "operationTimeout");
         this.retryInterval = Objects.requireNonNull(retryInterval, "retryInterval");
@@ -87,6 +93,10 @@ public final class ReplicationConfig {
         this.followerProgressInterval = Objects.requireNonNull(followerProgressInterval, "followerProgressInterval");
         this.joinPeerDiscoveryWindow = Objects.requireNonNull(joinPeerDiscoveryWindow, "joinPeerDiscoveryWindow");
         this.joinSyncLagThreshold = joinSyncLagThreshold;
+        this.relayStreamFetchBatch = relayStreamFetchBatch;
+        this.relayStreamPollInterval = Objects.requireNonNull(relayStreamPollInterval, "relayStreamPollInterval");
+        this.relayStreamFetchTimeout = Objects.requireNonNull(relayStreamFetchTimeout, "relayStreamFetchTimeout");
+        this.relayMaxBacklog = relayMaxBacklog;
     }
 
     public static ReplicationConfig of(int quorum) {
@@ -289,6 +299,47 @@ public final class ReplicationConfig {
     }
 
     /**
+     * Maximum number of op-log entries the follower pulls per {@code RELAY_STREAM_FETCH} in
+     * RELAY_STREAM mode (the leader also clamps to {@link #resendLogReadBatchMax()}). Defaults to 512.
+     *
+     * @return the relay-stream fetch batch size
+     */
+    public int relayStreamFetchBatch() {
+        return relayStreamFetchBatch;
+    }
+
+    /**
+     * How long a caught-up follower waits before re-polling the leader with a fetch in RELAY_STREAM
+     * mode (lightweight long-poll). Defaults to 50ms.
+     *
+     * @return the relay-stream poll interval
+     */
+    public Duration relayStreamPollInterval() {
+        return relayStreamPollInterval;
+    }
+
+    /**
+     * How long the follower waits for a {@code RELAY_STREAM_BATCH} before re-issuing the fetch from
+     * its durable cursor (idempotent retry) in RELAY_STREAM mode. Defaults to 2s.
+     *
+     * @return the relay-stream fetch timeout
+     */
+    public Duration relayStreamFetchTimeout() {
+        return relayStreamFetchTimeout;
+    }
+
+    /**
+     * Flow-control cap: the follower pauses fetching once its relay backlog (persisted-but-not-yet-
+     * applied entries) reaches this size, resuming when the apply loop drains below it. Bounds the
+     * follower's relay growth when apply lags the stream. Defaults to 200_000.
+     *
+     * @return the relay backlog flow-control cap
+     */
+    public int relayMaxBacklog() {
+        return relayMaxBacklog;
+    }
+
+    /**
      * Whether the leader pauses production while a not-caught-up follower joins (#129), generalizing
      * the failover drain-gate to the join path so convergence is deterministic (no firehose during
      * bootstrap). Bounded by {@link #joinQuiesceMaxDuration()} and released on the follower catching
@@ -368,6 +419,10 @@ public final class ReplicationConfig {
         private Duration followerProgressInterval = Duration.ofMillis(500);
         private Duration joinPeerDiscoveryWindow = Duration.ofSeconds(2);
         private long joinSyncLagThreshold = 0L;
+        private int relayStreamFetchBatch = 512;
+        private Duration relayStreamPollInterval = Duration.ofMillis(50);
+        private Duration relayStreamFetchTimeout = Duration.ofSeconds(2);
+        private int relayMaxBacklog = 200_000;
 
         private Builder(int quorum) {
             if (quorum < 1) {
@@ -611,6 +666,56 @@ public final class ReplicationConfig {
         }
 
         /**
+         * Sets the relay-stream fetch batch size (RELAY_STREAM mode). See {@link #relayStreamFetchBatch()}.
+         *
+         * @param batch the max entries per fetch (must be {@code >= 1})
+         * @return this builder
+         */
+        public Builder relayStreamFetchBatch(int batch) {
+            if (batch < 1) {
+                throw new IllegalArgumentException("relayStreamFetchBatch must be >= 1");
+            }
+            this.relayStreamFetchBatch = batch;
+            return this;
+        }
+
+        /**
+         * Sets the relay-stream poll interval (RELAY_STREAM mode). See {@link #relayStreamPollInterval()}.
+         *
+         * @param interval the caught-up re-poll interval
+         * @return this builder
+         */
+        public Builder relayStreamPollInterval(Duration interval) {
+            this.relayStreamPollInterval = Objects.requireNonNull(interval, "relayStreamPollInterval");
+            return this;
+        }
+
+        /**
+         * Sets the relay-stream fetch timeout (RELAY_STREAM mode). See {@link #relayStreamFetchTimeout()}.
+         *
+         * @param timeout the fetch response timeout before idempotent re-issue
+         * @return this builder
+         */
+        public Builder relayStreamFetchTimeout(Duration timeout) {
+            this.relayStreamFetchTimeout = Objects.requireNonNull(timeout, "relayStreamFetchTimeout");
+            return this;
+        }
+
+        /**
+         * Sets the relay backlog flow-control cap (RELAY_STREAM mode). See {@link #relayMaxBacklog()}.
+         *
+         * @param backlog the backlog cap (must be {@code >= 1})
+         * @return this builder
+         */
+        public Builder relayMaxBacklog(int backlog) {
+            if (backlog < 1) {
+                throw new IllegalArgumentException("relayMaxBacklog must be >= 1");
+            }
+            this.relayMaxBacklog = backlog;
+            return this;
+        }
+
+        /**
          * Enables leader-pause-on-join (#129). See {@link #leaderPauseOnJoin()}. Defaults to
          * {@code false}.
          *
@@ -690,7 +795,8 @@ public final class ReplicationConfig {
                     appliedSetMaxSize, operationLogMaxSize, leaderLocalApply, followerIngestMode, relayDurability,
                     relayGroupCommitInterval, persistentResendLog, resendLogSegmentMaxEntries, resendLogSegmentMaxAge,
                     resendLogMaxEntries, resendLogReadBatchMax, relayApplyBatchSize, leaderPauseOnJoin,
-                    joinQuiesceMaxDuration, followerProgressInterval, joinPeerDiscoveryWindow, joinSyncLagThreshold);
+                    joinQuiesceMaxDuration, followerProgressInterval, joinPeerDiscoveryWindow, joinSyncLagThreshold,
+                    relayStreamFetchBatch, relayStreamPollInterval, relayStreamFetchTimeout, relayMaxBacklog);
         }
     }
 }
