@@ -191,6 +191,7 @@ public class ReplicationManager
     // bootstrap rather than buffer unbounded (the old OOM driver).
     private final Map<String, PriorityQueue<RelayEntry>> relayReorderByTopic = new ConcurrentHashMap<>();
     private static final int RELAY_REORDER_CAP = 50_000;
+    private static final int RELAY_STALE_DISCARD_BATCH = 4096;
     // Topics that must bootstrap (fresh snapshot) on this start because the prior shutdown was
     // unclean — the coalesced apply frontier may be behind the durable handler state, which would
     // re-apply (duplicating the non-idempotent queue OFFER). A clean shutdown writes a marker that
@@ -231,6 +232,27 @@ public class ReplicationManager
      * travels on the wire (the payload is unwrapped before being sent to followers).
      */
     private static record TimedPayload(ReplicationPayload payload, long indexedAtMillis) {
+    }
+
+    /**
+     * Read-only per-topic follower state used by diagnostics dashboards and regression tests.
+     *
+     * @param topic                 replication topic
+     * @param nextExpectedSequence  next sequence the follower expects to apply
+     * @param relayHeadSequence     oldest unapplied relay sequence, or 0 when there is no relay head
+     * @param relayBacklog          number of unapplied relay entries
+     * @param syncing               true while a snapshot sync is active for the topic
+     * @param relayPendingBootstrap true while relay replay is waiting for bootstrap sync
+     * @param resendPending         true while a sequence resend is in flight
+     */
+    public record TopicReplicationStatus(
+            String topic,
+            long nextExpectedSequence,
+            long relayHeadSequence,
+            long relayBacklog,
+            boolean syncing,
+            boolean relayPendingBootstrap,
+            boolean resendPending) {
     }
 
     /**
@@ -993,28 +1015,7 @@ public class ReplicationManager
                     handler.onSnapshotInstalled();
                     LOGGER.info(
                             () -> "Sync completed for " + payload.topic() + ". Final sequence: " + payload.sequence());
-                    appliedSequence.updateAndGet(current -> Math.max(current, payload.sequence()));
-                    lastAppliedSequence = appliedSequence.get();
-                    acquireSequenceLock();
-                    try {
-                        long watermark = payload.sequence();
-                        nextExpectedSequenceByTopic.put(payload.topic(), watermark + 1);
-                        // Tail-replay: keep the buffered tail above the watermark so the contiguous
-                        // run (watermark+1, +2, ...) buffered during the round-trip is still applied.
-                        // The entries already covered (seq <= watermark) are discarded cheaply by
-                        // processSequenceBuffer's stale-discard loop below (O(log n) each), not by an
-                        // O(n^2) PriorityQueue.removeIf here.
-                        Map<Long, Instant> waitStart = sequenceWaitStartByTopic.get(payload.topic());
-                        if (waitStart != null) {
-                            waitStart.entrySet().removeIf(e -> e.getKey() <= watermark);
-                        }
-                        sequenceStateDirty = true;
-                        // Apply the contiguous tail the snapshot did not cover (called under the
-                        // lock, per processSequenceBuffer's contract).
-                        processSequenceBuffer(payload.topic());
-                    } finally {
-                        sequenceBufferLock.unlock();
-                    }
+                    completeSnapshotCutover(payload.topic(), payload.sequence());
                     syncingTopics.remove(payload.topic());
                     if (leaderSyncTopics.remove(payload.topic()) && leaderSyncTopics.isEmpty()) {
                         leaderSyncing.set(false);
@@ -1027,6 +1028,42 @@ public class ReplicationManager
                 syncingTopics.remove(payload.topic()); // allow retry
             }
         });
+    }
+
+    private void completeSnapshotCutover(String topic, long watermark) {
+        appliedSequence.updateAndGet(current -> Math.max(current, watermark));
+        lastAppliedSequence = appliedSequence.get();
+        relayPendingBootstrap.remove(topic);
+        resendPendingTopics.remove(topic);
+        resendStartByTopic.remove(topic);
+
+        PriorityQueue<RelayEntry> reorder = relayReorderByTopic.get(topic);
+        if (reorder != null) {
+            synchronized (reorder) {
+                reorder.clear();
+            }
+        }
+
+        acquireSequenceLock();
+        try {
+            nextExpectedSequenceByTopic.put(topic, watermark + 1);
+            PriorityQueue<BufferedReplication> buffer = sequenceBufferByTopic.get(topic);
+            if (buffer != null) {
+                while (!buffer.isEmpty() && buffer.peek().sequence() <= watermark) {
+                    buffer.poll();
+                }
+            }
+            Map<Long, Instant> waitStart = sequenceWaitStartByTopic.get(topic);
+            if (waitStart != null) {
+                waitStart.entrySet().removeIf(e -> e.getKey() <= watermark);
+            }
+            sequenceStateDirty = true;
+            processSequenceBuffer(topic);
+        } finally {
+            sequenceBufferLock.unlock();
+        }
+
+        signalRelay(topic);
     }
 
     private void requestSync(String topic) {
@@ -1320,6 +1357,10 @@ public class ReplicationManager
             return progressed; // handler not ready (shutdown/registration race): retry later
         }
 
+        if (discardStaleRelayPrefix(topic, relay)) {
+            return true;
+        }
+
         // Batch-peek the relay head WITHOUT consuming (#128). The consumer stays single-threaded and
         // applies in strict sequence order; batching only amortizes the per-op lock/flush/peek-poll
         // overhead. readRange reads from the consumer offset (index 0 = oldest unapplied).
@@ -1399,6 +1440,31 @@ public class ReplicationManager
             return true;
         }
         return progressed || consumed > 0;
+    }
+
+    private boolean discardStaleRelayPrefix(String topic, NQueue<byte[]> relay) throws Exception {
+        long nextExpected = nextExpectedSequenceByTopic.getOrDefault(topic, 1L);
+        List<byte[]> frames = relay.readRange(0, RELAY_STALE_DISCARD_BATCH).items();
+        if (frames.isEmpty()) {
+            return false;
+        }
+        int stale = 0;
+        for (byte[] frame : frames) {
+            RelayEntry entry = RelayEntryCodec.decode(frame);
+            if (entry.epoch() >= lastSeenLeaderEpoch && entry.sequence() >= nextExpected) {
+                break;
+            }
+            stale++;
+        }
+        for (int i = 0; i < stale; i++) {
+            relay.poll();
+        }
+        if (stale > 0) {
+            int discarded = stale;
+            LOGGER.fine(() -> "Discarded " + discarded + " stale relay entries for topic " + topic
+                    + " below nextExpected=" + nextExpected);
+        }
+        return stale > 0;
     }
 
     /** Applies buffered entries that have become contiguous with nextExpected. */
@@ -1927,39 +1993,51 @@ public class ReplicationManager
         resendPendingTopics.remove(topic);
         Instant startTime = resendStartByTopic.remove(topic);
 
-        if (!response.missingSequences().isEmpty()) {
+        long currentNextExpected = currentNextExpected(topic);
+        List<Long> missingAtOrAboveFrontier = response.missingSequences().stream()
+                .filter(seq -> seq >= currentNextExpected)
+                .toList();
+
+        if (!missingAtOrAboveFrontier.isEmpty()) {
             // The leader cannot resend these sequences. With synchronous indexing on commit, an op is
             // resendable the instant it is produced, so a "missing" sequence was produced earlier and
             // then EVICTED from the bounded resend log (the follower fell more than the retention
             // window behind). It will never come. If we already hold higher sequences in the buffer,
             // skip the evicted hole and drain the buffered tail to converge IN BULK — instead of
             // head-of-line blocking on one unfillable sequence and re-requesting it forever.
-            if (skipEvictedGapAndDrain(topic, response.missingSequences())) {
+            if (skipEvictedGapAndDrain(topic, missingAtOrAboveFrontier)) {
                 return;
             }
             // No buffered tail above the hole to jump to: a full snapshot is the only recovery.
             LOGGER.warning(() -> String.format(
                     "Leader reported %d missing sequences for topic=%s and no buffered tail to skip. "
-                            + "Falling back to snapshot sync.", response.missingSequences().size(), topic));
+                            + "Falling back to snapshot sync.", missingAtOrAboveFrontier.size(), topic));
             snapshotFallbackCount.incrementAndGet();
             if (syncingTopics.add(topic)) {
                 requestSync(topic);
             }
             return;
+        } else if (!response.missingSequences().isEmpty()) {
+            LOGGER.fine(() -> "Ignoring stale missing sequences below nextExpected=" + currentNextExpected
+                    + " for topic=" + topic);
         }
 
-        if (response.operations().isEmpty()) {
+        List<ReplicationPayload> operations = response.operations().stream()
+                .filter(payload -> payload.sequence() >= currentNextExpected)
+                .toList();
+
+        if (operations.isEmpty()) {
             LOGGER.fine(() -> "Received empty SEQUENCE_RESEND_RESPONSE for topic=" + topic);
             return;
         }
 
         LOGGER.info(() -> String.format(
                 "Received SEQUENCE_RESEND_RESPONSE for topic=%s with %d operations. Applying...",
-                topic, response.operations().size()));
+                topic, operations.size()));
 
         // Re-inject operations as replication requests — the existing sequence/buffer
         // logic handles ordering
-        for (ReplicationPayload payload : response.operations()) {
+        for (ReplicationPayload payload : operations) {
             ClusterMessage synthetic = ClusterMessage.request(
                     MessageType.REPLICATION_REQUEST,
                     null,
@@ -1979,7 +2057,16 @@ public class ReplicationManager
 
         LOGGER.info(() -> String.format(
                 "Successfully applied %d resent operations for topic=%s.",
-                response.operations().size(), topic));
+                operations.size(), topic));
+    }
+
+    private long currentNextExpected(String topic) {
+        acquireSequenceLock();
+        try {
+            return nextExpectedSequenceByTopic.getOrDefault(topic, 1L);
+        } finally {
+            sequenceBufferLock.unlock();
+        }
     }
 
     /**
@@ -2177,6 +2264,36 @@ public class ReplicationManager
             sizes.put(topic, getRelaySize(topic));
         }
         return sizes;
+    }
+
+    public Map<String, TopicReplicationStatus> getTopicReplicationStatuses() {
+        Map<String, TopicReplicationStatus> statuses = new java.util.HashMap<>();
+        for (String topic : handlers.keySet()) {
+            statuses.put(topic, new TopicReplicationStatus(
+                    topic,
+                    currentNextExpected(topic),
+                    relayHeadSequence(topic),
+                    getRelaySize(topic),
+                    syncingTopics.contains(topic),
+                    relayPendingBootstrap.contains(topic),
+                    resendPendingTopics.contains(topic)));
+        }
+        return statuses;
+    }
+
+    private long relayHeadSequence(String topic) {
+        RelayStore store = relayStore;
+        if (store == null) {
+            return 0L;
+        }
+        try {
+            return store.relayFor(topic).peekRecord()
+                    .map(record -> RelayEntryCodec.decode(record.payload()).sequence())
+                    .orElse(0L);
+        } catch (Exception e) {
+            LOGGER.log(Level.FINE, "Relay head sequence read failed for topic " + topic, e);
+            return 0L;
+        }
     }
 
     public double getAverageConvergenceTimeMs() {
