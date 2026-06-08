@@ -31,6 +31,11 @@
                 <type>pom</type>
                 <scope>import</scope>
             </dependency>
+            <dependency>
+                <groupId>org.lz4</groupId>
+                <artifactId>lz4-java</artifactId>
+                <version>${lz4.version}</version>
+            </dependency>
         </dependencies>
     </dependencyManagement>
 
@@ -83,6 +88,7 @@
     <properties>
         <spring-boot.version>3.5.6</spring-boot.version>
         <aws.sdk.version>2.28.0</aws.sdk.version>
+        <lz4.version>1.8.0</lz4.version>
         <testcontainers.localstack.version>1.21.3</testcontainers.localstack.version>
         <maven.compiler.release>21</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
