@@ -1,0 +1,44 @@
+@startuml
+title RELAY_STREAM - follower puxa o op-log do lider (modelo MySQL relay-log)
+
+actor "Cliente" as C
+participant "Lider\nReplicationManager" as L
+database "Op-log do lider\n(ResendLog / binlog)" as OPLOG
+participant "Follower\nfetch loop (IO)" as FET
+database "Relay do follower\n(NQueue por topico)" as RELAY
+participant "Follower\napply loop (SQL)" as APP
+participant "Handler\n(queue/map)" as H
+
+== Escrita (ASYNC: commit no proprio binlog, NAO espera follower) ==
+C -> L : replicate(topic, payload)
+L -> L : emission lock por topico\nseq = nextSequenceForTopic(topic)
+L -> L : checkCompletion (quorum=1 em stream)
+L -> OPLOG : append(seq, frame)  (binlog)
+L --> C : COMMITTED
+
+== Pull contiguo dirigido pelo cursor duravel ==
+loop enquanto follower & lider conhecido & backlog < relayMaxBacklog
+  FET -> L : RELAY_STREAM_FETCH(topic, from = cursor+1, maxBatch)
+  L -> OPLOG : read(from, from+maxBatch-1)
+  alt from < oldestSequence (abaixo do piso de retencao)
+    L --> FET : RELAY_STREAM_BATCH(needSnapshot = true)
+    FET -> APP : requestSync(topic)  (bootstrap -> cutover ancora cursor=watermark)
+  else run contiguo a partir de 'from'
+    L --> FET : RELAY_STREAM_BATCH(frames contiguos, leaderHwm, oldest)
+    FET -> RELAY : offer(frame) EM ORDEM ; cursor++ (so apos persistir)
+    FET -> APP : signalRelay(topic)
+  end
+end
+
+== Apply no proprio ritmo (drena do disco, sem gap) ==
+APP -> RELAY : readRange(0, relayApplyBatchSize)  (peek contiguo)
+APP -> H : apply(opId, decode(payload))
+APP -> APP : commitRelayBatch -> avanca nextExpected\n+ mirror no proprio op-log (continuidade de failover)
+APP -> RELAY : poll() (so apos apply + commit)
+
+note over FET, APP
+  Em regime permanente: zero gap, zero NAK, zero snapshot.
+  O cursor (cauda do relay) e duravel -> re-fetch e idempotente.
+  Restart limpo retoma do cursor; abaixo do piso -> snapshot -> retoma.
+end note
+@enduml
