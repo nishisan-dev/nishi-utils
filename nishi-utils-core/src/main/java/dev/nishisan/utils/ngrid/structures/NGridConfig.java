@@ -45,6 +45,7 @@ public final class NGridConfig {
     private final Duration replicationOperationTimeout;
     private final Integer replicationLogRetention;
     private final Duration replicationLogRetentionTime;
+    private final Long resendLogMaxEntries;
     private final FollowerIngestMode followerIngestMode;
     private final RelayDurability relayDurability;
     private final Duration relayGroupCommitInterval;
@@ -99,6 +100,7 @@ public final class NGridConfig {
         this.replicationOperationTimeout = builder.replicationOperationTimeout;
         this.replicationLogRetention = builder.replicationLogRetention;
         this.replicationLogRetentionTime = builder.replicationLogRetentionTime;
+        this.resendLogMaxEntries = builder.resendLogMaxEntries;
         this.followerIngestMode = builder.followerIngestMode;
         this.relayDurability = builder.relayDurability;
         this.relayGroupCommitInterval = builder.relayGroupCommitInterval;
@@ -194,6 +196,20 @@ public final class NGridConfig {
      */
     public Integer replicationLogRetention() {
         return replicationLogRetention;
+    }
+
+    /**
+     * Optional count cap for the leader-side durable op-log (the binlog: ResendLog), in entries per
+     * topic. This is the deep on-disk window that bounds how far a lagging follower can fall behind
+     * and still stream (below it the follower bootstraps from a snapshot) — distinct from the small
+     * heap hot-cache {@link #replicationLogRetention()}. When {@code null}, the replication-layer
+     * default (10,000,000) is used. Tune it to size the binlog retention window (analogous to a
+     * MySQL binlog size/count bound).
+     *
+     * @return the op-log count cap, or {@code null} when unset (replication default applies)
+     */
+    public Long resendLogMaxEntries() {
+        return resendLogMaxEntries;
     }
 
     /**
@@ -474,6 +490,7 @@ public final class NGridConfig {
         private Integer replicationFactor;
         private Duration replicationOperationTimeout;
         private Integer replicationLogRetention;
+        private Long resendLogMaxEntries;
         private Duration replicationLogRetentionTime;
         private FollowerIngestMode followerIngestMode = FollowerIngestMode.INLINE;
         private RelayDurability relayDurability = RelayDurability.OS_MANAGED;
@@ -691,6 +708,23 @@ public final class NGridConfig {
                 throw new IllegalArgumentException("replicationLogRetention must be >= 1");
             }
             this.replicationLogRetention = retention;
+            return this;
+        }
+
+        /**
+         * Sets the count cap for the leader-side durable op-log (binlog), in entries per topic. This
+         * sizes the deep on-disk retention window that bounds how far a follower can lag and still
+         * stream (below it the follower bootstraps from a snapshot). Defaults to 10,000,000 when
+         * unset. See {@link NGridConfig#resendLogMaxEntries()}.
+         *
+         * @param maxEntries the op-log count cap (must be {@code >= 1})
+         * @return this builder
+         */
+        public Builder resendLogMaxEntries(long maxEntries) {
+            if (maxEntries < 1) {
+                throw new IllegalArgumentException("resendLogMaxEntries must be >= 1");
+            }
+            this.resendLogMaxEntries = maxEntries;
             return this;
         }
 
