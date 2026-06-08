@@ -364,6 +364,12 @@ public final class NGridNode implements Closeable {
         if (config.resendLogMaxEntries() != null) {
             replicationBuilder.resendLogMaxEntries(config.resendLogMaxEntries());
         }
+        if (config.resendLogSegmentMaxBytes() != null) {
+            replicationBuilder.resendLogSegmentMaxBytes(config.resendLogSegmentMaxBytes());
+        }
+        if (config.resendLogMaxSegments() != null) {
+            replicationBuilder.resendLogMaxSegments(config.resendLogMaxSegments());
+        }
         replicationBuilder.strictConsistency(config.strictConsistency());
         replicationBuilder.followerIngestMode(config.followerIngestMode());
         replicationBuilder.relayDurability(config.relayDurability());

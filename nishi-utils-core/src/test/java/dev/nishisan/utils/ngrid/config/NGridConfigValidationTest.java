@@ -113,6 +113,53 @@ class NGridConfigValidationTest {
         assertEquals(DeploymentProfile.PRODUCTION, config.deploymentProfile());
     }
 
+    // ── PRODUCTION binlog (ResendLog) retention guardrails ──
+
+    @Test
+    void productionRejectsTinySegmentMaxBytes() {
+        var builder = NGridConfig.builder(LOCAL)
+                .dataDirectory(tempDir)
+                .deploymentProfile(DeploymentProfile.PRODUCTION)
+                .strictConsistency(true)
+                .replicationFactor(2)
+                .resendLogSegmentMaxBytes(64 * 1024); // 64KB < 1MB floor
+
+        IllegalArgumentException ex = assertThrows(
+                IllegalArgumentException.class, builder::build);
+        assertTrue(ex.getMessage().contains("[PRODUCTION]"));
+        assertTrue(ex.getMessage().contains("resendLogSegmentMaxBytes"));
+    }
+
+    @Test
+    void productionRejectsSingleSegmentCap() {
+        var builder = NGridConfig.builder(LOCAL)
+                .dataDirectory(tempDir)
+                .deploymentProfile(DeploymentProfile.PRODUCTION)
+                .strictConsistency(true)
+                .replicationFactor(2)
+                .resendLogMaxSegments(1);
+
+        IllegalArgumentException ex = assertThrows(
+                IllegalArgumentException.class, builder::build);
+        assertTrue(ex.getMessage().contains("[PRODUCTION]"));
+        assertTrue(ex.getMessage().contains("resendLogMaxSegments"));
+    }
+
+    @Test
+    void productionAcceptsSaneBinlogRetention() {
+        NGridConfig config = NGridConfig.builder(LOCAL)
+                .dataDirectory(tempDir)
+                .deploymentProfile(DeploymentProfile.PRODUCTION)
+                .strictConsistency(true)
+                .replicationFactor(2)
+                .resendLogSegmentMaxBytes(10L * 1024 * 1024 * 1024) // 10GB per file
+                .resendLogMaxSegments(10)                            // keep 10 files
+                .build();
+
+        assertEquals(10L * 1024 * 1024 * 1024, config.resendLogSegmentMaxBytes());
+        assertEquals(10, config.resendLogMaxSegments());
+    }
+
     // ── DEV profile: sem guardrails ──
 
     @Test

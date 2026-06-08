@@ -53,4 +53,29 @@ class NGridConfigOpLogKnobTest {
         assertThrows(IllegalArgumentException.class, () -> builder().resendLogMaxEntries(0));
         assertThrows(IllegalArgumentException.class, () -> builder().resendLogMaxEntries(-1));
     }
+
+    @Test
+    void segmentRetentionKnobsUnsetByDefault() {
+        NGridConfig config = builder().build();
+        assertNull(config.resendLogSegmentMaxBytes(),
+                "byte-based rolling stays unset so the replication-layer default (disabled) applies");
+        assertNull(config.resendLogMaxSegments(),
+                "segment-count retention stays unset so the replication-layer default (disabled) applies");
+    }
+
+    @Test
+    void segmentRetentionKnobsTunable() {
+        NGridConfig config = builder()
+                .resendLogSegmentMaxBytes(10L * 1024 * 1024 * 1024) // 10GB per file
+                .resendLogMaxSegments(10)                            // keep 10 files
+                .build();
+        assertEquals(10L * 1024 * 1024 * 1024, config.resendLogSegmentMaxBytes());
+        assertEquals(10, config.resendLogMaxSegments());
+    }
+
+    @Test
+    void segmentRetentionKnobsRejectNegative() {
+        assertThrows(IllegalArgumentException.class, () -> builder().resendLogSegmentMaxBytes(-1));
+        assertThrows(IllegalArgumentException.class, () -> builder().resendLogMaxSegments(-1));
+    }
 }

@@ -46,4 +46,30 @@ class ReplicationConfigTest {
                 () -> ReplicationConfig.builder(1).relayGroupCommitInterval(Duration.ZERO),
                 "zero group-commit interval must be rejected");
     }
+
+    @Test
+    void binlogSegmentRetentionKnobsDefaultDisabledAndBuilderPropagates() {
+        ReplicationConfig def = builder().build();
+        assertEquals(0L, def.resendLogSegmentMaxBytes(),
+                "byte-based rolling must default to disabled (current behavior preserved)");
+        assertEquals(0, def.resendLogMaxSegments(),
+                "segment-count retention must default to disabled");
+
+        ReplicationConfig tuned = builder()
+                .resendLogSegmentMaxBytes(10L * 1024 * 1024 * 1024) // 10GB
+                .resendLogMaxSegments(10)
+                .build();
+        assertEquals(10L * 1024 * 1024 * 1024, tuned.resendLogSegmentMaxBytes(),
+                "builder must propagate the per-segment byte cap");
+        assertEquals(10, tuned.resendLogMaxSegments(),
+                "builder must propagate the retained segment-count cap");
+    }
+
+    @Test
+    void binlogSegmentRetentionKnobsRejectNegatives() {
+        assertThrows(IllegalArgumentException.class,
+                () -> ReplicationConfig.builder(1).resendLogSegmentMaxBytes(-1L));
+        assertThrows(IllegalArgumentException.class,
+                () -> ReplicationConfig.builder(1).resendLogMaxSegments(-1));
+    }
 }

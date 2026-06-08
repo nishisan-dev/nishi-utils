@@ -153,6 +153,14 @@ public class NGridConfigLoader {
                         // Keep INLINE default for invalid values
                     }
                 }
+                long segmentMaxBytes = clusterConfig.getReplication().getResendLogSegmentMaxBytes();
+                if (segmentMaxBytes > 0) {
+                    builder.resendLogSegmentMaxBytes(segmentMaxBytes);
+                }
+                int maxSegments = clusterConfig.getReplication().getResendLogMaxSegments();
+                if (maxSegments > 0) {
+                    builder.resendLogMaxSegments(maxSegments);
+                }
             }
             if (clusterConfig.getTransport() != null) {
                 builder.transportWorkerThreads(clusterConfig.getTransport().getWorkers());

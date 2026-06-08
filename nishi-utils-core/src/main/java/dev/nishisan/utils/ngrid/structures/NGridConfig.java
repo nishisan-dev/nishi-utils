@@ -46,6 +46,8 @@ public final class NGridConfig {
     private final Integer replicationLogRetention;
     private final Duration replicationLogRetentionTime;
     private final Long resendLogMaxEntries;
+    private final Long resendLogSegmentMaxBytes;
+    private final Integer resendLogMaxSegments;
     private final FollowerIngestMode followerIngestMode;
     private final RelayDurability relayDurability;
     private final Duration relayGroupCommitInterval;
@@ -101,6 +103,8 @@ public final class NGridConfig {
         this.replicationLogRetention = builder.replicationLogRetention;
         this.replicationLogRetentionTime = builder.replicationLogRetentionTime;
         this.resendLogMaxEntries = builder.resendLogMaxEntries;
+        this.resendLogSegmentMaxBytes = builder.resendLogSegmentMaxBytes;
+        this.resendLogMaxSegments = builder.resendLogMaxSegments;
         this.followerIngestMode = builder.followerIngestMode;
         this.relayDurability = builder.relayDurability;
         this.relayGroupCommitInterval = builder.relayGroupCommitInterval;
@@ -210,6 +214,31 @@ public final class NGridConfig {
      */
     public Long resendLogMaxEntries() {
         return resendLogMaxEntries;
+    }
+
+    /**
+     * Optional per-segment byte cap for the leader-side binlog (ResendLog) — the MySQL
+     * {@code max_binlog_size} analog. A segment rolls on whichever per-segment bound is hit first
+     * (entries, age, or bytes). When {@code null}, byte-based rolling is disabled (entry/age rolling
+     * still applies). Combine with {@link #resendLogMaxSegments()} to express "N files of X bytes".
+     *
+     * @return the per-segment byte cap, or {@code null} when unset
+     */
+    public Long resendLogSegmentMaxBytes() {
+        return resendLogSegmentMaxBytes;
+    }
+
+    /**
+     * Optional cap on the number of binlog segment files retained per topic — the MySQL "keep N
+     * binlog files" model. When the count would exceed this, the oldest sealed segment is dropped
+     * whole (the active tail segment is never dropped). When {@code null}, the cap is disabled
+     * (count/time retention still applies). Combine with {@link #resendLogSegmentMaxBytes()} for
+     * "N files of X bytes" or with the replication-layer per-segment entry cap for "N files of X ops".
+     *
+     * @return the retained segment-count cap, or {@code null} when unset
+     */
+    public Integer resendLogMaxSegments() {
+        return resendLogMaxSegments;
     }
 
     /**
@@ -491,6 +520,8 @@ public final class NGridConfig {
         private Duration replicationOperationTimeout;
         private Integer replicationLogRetention;
         private Long resendLogMaxEntries;
+        private Long resendLogSegmentMaxBytes;
+        private Integer resendLogMaxSegments;
         private Duration replicationLogRetentionTime;
         private FollowerIngestMode followerIngestMode = FollowerIngestMode.INLINE;
         private RelayDurability relayDurability = RelayDurability.OS_MANAGED;
@@ -725,6 +756,40 @@ public final class NGridConfig {
                 throw new IllegalArgumentException("resendLogMaxEntries must be >= 1");
             }
             this.resendLogMaxEntries = maxEntries;
+            return this;
+        }
+
+        /**
+         * Sets the per-segment byte cap for the leader-side binlog (ResendLog) — the MySQL
+         * {@code max_binlog_size} analog. A segment rolls on whichever per-segment bound is hit first
+         * (entries, age, or bytes). Combine with {@link #resendLogMaxSegments(int)} to express
+         * "N files of X bytes". When unset (or {@code 0}), byte-based rolling is disabled.
+         *
+         * @param maxBytes bytes per binlog segment (must be {@code >= 0}; 0 disables)
+         * @return this builder
+         */
+        public Builder resendLogSegmentMaxBytes(long maxBytes) {
+            if (maxBytes < 0) {
+                throw new IllegalArgumentException("resendLogSegmentMaxBytes must be >= 0");
+            }
+            this.resendLogSegmentMaxBytes = maxBytes;
+            return this;
+        }
+
+        /**
+         * Sets the cap on the number of binlog segment files retained per topic — the MySQL "keep N
+         * binlog files" model. When exceeded, the oldest sealed segment is dropped whole (the active
+         * tail segment is never dropped). Combine with {@link #resendLogSegmentMaxBytes(long)} for
+         * "N files of X bytes". When unset (or {@code 0}), the cap is disabled.
+         *
+         * @param maxSegments the retained segment-count cap (must be {@code >= 0}; 0 disables)
+         * @return this builder
+         */
+        public Builder resendLogMaxSegments(int maxSegments) {
+            if (maxSegments < 0) {
+                throw new IllegalArgumentException("resendLogMaxSegments must be >= 0");
+            }
+            this.resendLogMaxSegments = maxSegments;
             return this;
         }
 
@@ -1037,6 +1102,23 @@ public final class NGridConfig {
                                     + "All maps must be persisted in production profile. "
                                     + "Set persistence to ASYNC_WITH_FSYNC or SYNC.");
                 }
+            }
+
+            // Binlog (ResendLog) retention guardrails: only sanity floors when the operator opts in,
+            // never mandatory (the resendLogMaxEntries count backstop already bounds disk growth).
+            if (resendLogSegmentMaxBytes != null && resendLogSegmentMaxBytes > 0
+                    && resendLogSegmentMaxBytes < 1_048_576L) {
+                throw new IllegalArgumentException(
+                        "[PRODUCTION] resendLogSegmentMaxBytes must be >= 1MB (current: "
+                                + resendLogSegmentMaxBytes + "). A tiny per-segment byte cap would roll "
+                                + "pathologically many micro-segments. Raise it or use DeploymentProfile.STAGING.");
+            }
+
+            if (resendLogMaxSegments != null && resendLogMaxSegments > 0 && resendLogMaxSegments < 2) {
+                throw new IllegalArgumentException(
+                        "[PRODUCTION] resendLogMaxSegments must be >= 2 (current: " + resendLogMaxSegments
+                                + "). The binlog needs at least the active segment plus one history "
+                                + "segment to serve resend/stream. Raise it or use DeploymentProfile.STAGING.");
             }
         }
     }

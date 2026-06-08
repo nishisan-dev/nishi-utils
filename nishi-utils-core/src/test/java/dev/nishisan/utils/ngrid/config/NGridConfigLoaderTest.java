@@ -128,6 +128,57 @@ class NGridConfigLoaderTest {
     }
 
     @Test
+    void binlogSegmentRetentionFromYaml() throws IOException {
+        Path yamlFile = tempDir.resolve("binlog-retention.yaml");
+        NGridYamlConfig config = new NGridYamlConfig();
+        NodeIdentityConfig node = new NodeIdentityConfig();
+        node.setHost("127.0.0.1");
+        node.setDirs(new NodeIdentityConfig.DirsConfig());
+        node.getDirs().setBase("/tmp");
+        config.setNode(node);
+
+        ClusterPolicyConfig cluster = new ClusterPolicyConfig();
+        ClusterPolicyConfig.ReplicationConfig replication = new ClusterPolicyConfig.ReplicationConfig();
+        replication.setFollowerIngestMode("relay_stream");
+        replication.setResendLogSegmentMaxBytes(10L * 1024 * 1024 * 1024); // 10GB per file
+        replication.setResendLogMaxSegments(10);                            // keep 10 files
+        cluster.setReplication(replication);
+        config.setCluster(cluster);
+
+        QueuePolicyConfig queue = new QueuePolicyConfig();
+        queue.setName("binlog-queue");
+        config.setQueue(queue);
+
+        // Round-trip through YAML to exercise Jackson (de)serialization.
+        NGridConfigLoader.save(yamlFile, config);
+        NGridConfig domain = NGridConfigLoader.convertToDomain(NGridConfigLoader.load(yamlFile));
+
+        assertEquals(10L * 1024 * 1024 * 1024, domain.resendLogSegmentMaxBytes());
+        assertEquals(10, domain.resendLogMaxSegments());
+    }
+
+    @Test
+    void binlogSegmentRetentionUnsetFromYamlStaysNull() {
+        NGridYamlConfig config = new NGridYamlConfig();
+        NodeIdentityConfig node = new NodeIdentityConfig();
+        node.setHost("127.0.0.1");
+        node.setDirs(new NodeIdentityConfig.DirsConfig());
+        node.getDirs().setBase("/tmp");
+        config.setNode(node);
+
+        ClusterPolicyConfig cluster = new ClusterPolicyConfig();
+        cluster.setReplication(new ClusterPolicyConfig.ReplicationConfig());
+        config.setCluster(cluster);
+
+        NGridConfig domain = NGridConfigLoader.convertToDomain(config);
+
+        assertNull(domain.resendLogSegmentMaxBytes(),
+                "absent YAML keys must leave the binlog byte cap unset (replication default applies)");
+        assertNull(domain.resendLogMaxSegments(),
+                "absent YAML keys must leave the segment-count cap unset");
+    }
+
+    @Test
     void testDurationParsing() throws IOException {
         Path yamlFile = tempDir.resolve("duration.yaml");
         NGridYamlConfig config = new NGridYamlConfig();

@@ -211,6 +211,8 @@ public class ClusterPolicyConfig  {
         private int factor = 1;
         private boolean strict = false;
         private String followerIngestMode;
+        private long resendLogSegmentMaxBytes = 0L;
+        private int resendLogMaxSegments = 0;
 
         /** Creates a default replication config. */
         public ReplicationConfig() {
@@ -270,6 +272,44 @@ public class ClusterPolicyConfig  {
          */
         public void setFollowerIngestMode(String followerIngestMode) {
             this.followerIngestMode = followerIngestMode;
+        }
+
+        /**
+         * Returns the per-segment byte cap for the leader-side binlog (the MySQL
+         * {@code max_binlog_size} analog), in bytes. {@code 0} (default) disables byte-based rolling.
+         *
+         * @return the per-segment byte cap in bytes
+         */
+        public long getResendLogSegmentMaxBytes() {
+            return resendLogSegmentMaxBytes;
+        }
+
+        /**
+         * Sets the per-segment byte cap for the leader-side binlog, in bytes.
+         *
+         * @param resendLogSegmentMaxBytes bytes per segment ({@code 0} disables)
+         */
+        public void setResendLogSegmentMaxBytes(long resendLogSegmentMaxBytes) {
+            this.resendLogSegmentMaxBytes = resendLogSegmentMaxBytes;
+        }
+
+        /**
+         * Returns the cap on the number of binlog segment files retained per topic — the MySQL
+         * "keep N binlog files" model. {@code 0} (default) disables the cap.
+         *
+         * @return the retained segment-count cap
+         */
+        public int getResendLogMaxSegments() {
+            return resendLogMaxSegments;
+        }
+
+        /**
+         * Sets the cap on the number of binlog segment files retained per topic.
+         *
+         * @param resendLogMaxSegments the retained segment-count cap ({@code 0} disables)
+         */
+        public void setResendLogMaxSegments(int resendLogMaxSegments) {
+            this.resendLogMaxSegments = resendLogMaxSegments;
         }
     }
 
