@@ -1,0 +1,29 @@
+@startuml
+title Epoch como termo de cluster monotonico + fencing por identidade
+
+participant "Lider (node-1)\nleaderEpoch persistido" as L
+participant "Follower (node-2)\ntrackedLeaderEpoch / lastSeen" as F
+
+== Bug: epoch do lider regride (perdeu leader-epoch.dat) ==
+note over L : tinha 7, dataDir relativo apagado\nno deploy -> re-elege em epoch 1
+note over F : ainda lembra epoch 4 (memoria volatil)
+
+L -> F : HEARTBEAT(epoch=1)
+note over F : ANTES: 1 < 4 -> IGNORA o lider legitimo\n(fencing so por magnitude) -> CONGELA
+
+== Correcao 1: convergencia (observeEpoch em todo heartbeat) ==
+F -> L : HEARTBEAT(epoch=4)  (todo no emite heartbeat)
+note over L : observeEpoch(4): 4 > 1 e SOU lider\n-> re-stamp para 5 (observed+1), persiste
+L -> F : HEARTBEAT(epoch=5)
+note over F : 5 >= 4 -> aceita; trackedLeaderEpoch=5
+note over L, F : guarda > estrito evita escalada por eco
+
+== Correcao 2: fencing por IDENTIDADE do lider acordado ==
+note over F : lider acordado = max(NodeId) (deterministico)
+L -> F : REPLICATION/STREAM (epoch do lider acordado)
+note over F : aceita do lider acordado e ADOTA seu epoch\n(mesmo que pareca menor) -> nunca congela
+note over F : rejeita SO de um source que NAO e o lider\nacordado com epoch < termo (ex-lider stale)
+
+== Eleicao por afinidade (reduz a reeleicao churn) ==
+note over L, F : ordena por (priority, NodeId).\nNao-preferido DEFERE na janela de boot ate\nconfirmar isolamento (lead-while-alone / AP);\ngossip do preferido -> reeleicao limpa.
+@enduml

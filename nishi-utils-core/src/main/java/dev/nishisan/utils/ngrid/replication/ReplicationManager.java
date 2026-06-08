@@ -30,6 +30,8 @@ import dev.nishisan.utils.ngrid.common.MessageType;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.ngrid.common.OperationStatus;
+import dev.nishisan.utils.ngrid.common.RelayStreamBatchPayload;
+import dev.nishisan.utils.ngrid.common.RelayStreamFetchPayload;
 import dev.nishisan.utils.ngrid.common.ReplicationAckPayload;
 import dev.nishisan.utils.ngrid.common.ReplicationPayload;
 import dev.nishisan.utils.ngrid.common.SequenceResendRequestPayload;
@@ -204,6 +206,23 @@ public class ReplicationManager
     private volatile boolean relayUncleanRestart = false;
     private final Set<String> relayPendingBootstrap = ConcurrentHashMap.newKeySet();
 
+    // RELAY_STREAM follower IO: a per-topic fetch loop pulls the leader op-log from a durable cursor
+    // (the relay tail) and persists contiguous runs in order; the existing apply loop drains the relay.
+    private final Map<String, Thread> relayFetchThreads = new ConcurrentHashMap<>();
+    private final Map<String, Object> relayFetchSignals = new ConcurrentHashMap<>();
+    private final Map<String, java.util.concurrent.atomic.AtomicLong> relayStreamCursorByTopic =
+            new ConcurrentHashMap<>();
+    // Epoch-millis before which the fetch loop must not issue a new fetch for a topic: set when a fetch
+    // is in flight (cleared on batch arrival), and reused as the caught-up long-poll gap.
+    private final Map<String, Long> relayFetchPendingUntilByTopic = new ConcurrentHashMap<>();
+    // Last leader high-watermark per topic, learned from RELAY_STREAM_BATCH (lag observability).
+    private final Map<String, Long> leaderHwmByTopic = new ConcurrentHashMap<>();
+    // Leader's retained-window floor per topic, learned from RELAY_STREAM_BATCH (snapshot-risk view).
+    private final Map<String, Long> leaderOldestByTopic = new ConcurrentHashMap<>();
+    // Cumulative stream bytes pulled per topic (RELAY_STREAM throughput observability).
+    private final Map<String, java.util.concurrent.atomic.AtomicLong> streamBytesInByTopic =
+            new ConcurrentHashMap<>();
+
     // Metrics
     private final java.util.concurrent.atomic.AtomicLong gapsDetected = new java.util.concurrent.atomic.AtomicLong(0);
     private final java.util.concurrent.atomic.AtomicLong evictedSkipCount = new java.util.concurrent.atomic.AtomicLong(0);
@@ -244,6 +263,12 @@ public class ReplicationManager
      * @param syncing               true while a snapshot sync is active for the topic
      * @param relayPendingBootstrap true while relay replay is waiting for bootstrap sync
      * @param resendPending         true while a sequence resend is in flight
+     * @param streamCursor          RELAY_STREAM: highest sequence persisted to the relay (pull cursor)
+     * @param leaderHighWatermark   leader's highest sequence for the topic (own, or learned via stream)
+     * @param leaderOldestSequence  leader's retained-window floor (oldest streamable), or -1 if unknown
+     * @param lag                   leader high-watermark minus the applied frontier (follower lag)
+     * @param streamBytesIn         cumulative stream bytes pulled for the topic (RELAY_STREAM)
+     * @param streaming             true while actively streaming the topic from the leader
      */
     public record TopicReplicationStatus(
             String topic,
@@ -252,7 +277,13 @@ public class ReplicationManager
             long relayBacklog,
             boolean syncing,
             boolean relayPendingBootstrap,
-            boolean resendPending) {
+            boolean resendPending,
+            long streamCursor,
+            long leaderHighWatermark,
+            long leaderOldestSequence,
+            long lag,
+            long streamBytesIn,
+            boolean streaming) {
     }
 
     /**
@@ -302,6 +333,10 @@ public class ReplicationManager
         coordinator.setLeaderHighWatermarkSupplier(
                 () -> coordinator.isLeader() ? getGlobalSequence() : getLastAppliedSequence());
         if (isRelayMode()) {
+            // Restore the applied progress metric from the durable per-topic frontiers so a clean
+            // restart does not report 0 applied (the counter is otherwise per-session). A bootstrap,
+            // if one happens, re-anchors it at the snapshot watermark.
+            seedAppliedSequenceFromFrontier();
             detectUncleanRestartAndMarkBootstrap();
             // Relay retention mirrors the leader op-log window (#122): an over-retention
             // backlog is surfaced to the consumer and resolved by bootstrap, never silently
@@ -312,11 +347,16 @@ public class ReplicationManager
             // Start consumers for any handler registered before start() (normal flow registers after).
             for (String topic : handlers.keySet()) {
                 ensureRelayApplyLoop(topic);
+                if (isStreamMode()) {
+                    ensureRelayFetchLoop(topic);
+                }
             }
         }
-        if (config.persistentResendLog()) {
+        if (config.persistentResendLog() || isStreamMode()) {
             // Disk-backed resend op-log (#127). Initialized regardless of role — a follower may be
             // promoted to leader later and must already be serving resends from a durable window.
+            // In RELAY_STREAM mode this op-log is the leader's binlog (the stream source of truth),
+            // so it is unconditional there, independent of the persistentResendLog flag.
             this.resendLogStore = new ResendLogStore(config.dataDirectory().resolve("resend-log"),
                     config.resendLogSegmentMaxEntries(), config.resendLogSegmentMaxAge(),
                     config.replicationLogRetentionTime(), config.resendLogMaxEntries(),
@@ -355,6 +395,10 @@ public class ReplicationManager
             return;
         }
         running = false;
+        // Stop the RELAY_STREAM fetch loops first: they only pull and persist to the relay (no apply
+        // state), so quiescing them before the apply loops keeps shutdown ordering simple and avoids a
+        // late append racing the clean-marker.
+        stopRelayFetchLoops();
         // Interrupt + wake the per-topic relay apply consumers, then JOIN them: no apply may be in
         // flight when we flush the final frontier and mark the shutdown clean — otherwise a thread still
         // inside handler.apply() could advance/poll the relay AFTER the flush, leaving durable state
@@ -436,6 +480,9 @@ public class ReplicationManager
             // the relay before the handler exists (it is durably parked on disk until then),
             // but apply must not begin until the handler is available.
             ensureRelayApplyLoop(topic);
+            if (isStreamMode()) {
+                ensureRelayFetchLoop(topic);
+            }
         }
     }
 
@@ -445,6 +492,22 @@ public class ReplicationManager
 
     public long getLastAppliedSequence() {
         return lastAppliedSequence;
+    }
+
+    /**
+     * Seeds the applied-progress metric from the durable per-topic apply frontiers, so a restart
+     * resumes the metric instead of reporting 0 (the counter is per-session). The total applied op
+     * count equals the sum of {@code (nextExpected - 1)} across topics.
+     */
+    private void seedAppliedSequenceFromFrontier() {
+        long applied = 0L;
+        for (Map.Entry<String, Long> e : nextExpectedSequenceByTopic.entrySet()) {
+            applied += Math.max(0L, e.getValue() - 1L);
+        }
+        if (applied > 0L) {
+            appliedSequence.set(applied);
+            lastAppliedSequence = applied;
+        }
     }
 
     /**
@@ -494,6 +557,13 @@ public class ReplicationManager
 
     private void checkLagAndSync() {
         if (!running || coordinator.isLeader()) {
+            return;
+        }
+        if (isStreamMode()) {
+            // RELAY_STREAM drives its own catch-up: the follower PULLS contiguously and the leader
+            // signals needSnapshot when the cursor falls below the retained window. No proactive or
+            // lag-based snapshot is needed — and firing one would be spurious during stream ramp-up
+            // (cold + empty relay before the first fetch lands).
             return;
         }
         if (isRelayMode()) {
@@ -686,6 +756,12 @@ public class ReplicationManager
     }
 
     private int requiredQuorum(Integer override) {
+        if (isStreamMode()) {
+            // RELAY_STREAM is ASYNC: the leader commits on its own durable op-log (the binlog) and
+            // never blocks on followers, which pull the stream at their own pace. (Semi-sync, which
+            // waits for a follower receipt before acking the client, is a separate opt-in.)
+            return 1;
+        }
         int requested = override != null ? override : config.quorum();
         if (requested < 1) {
             requested = 1;
@@ -711,24 +787,81 @@ public class ReplicationManager
             // Persist sequence state for leader recovery (coalesced; flushed off the hot path)
             sequenceStateDirty = true;
 
+            // RELAY_STREAM: the durable op-log (binlog) is the ONLY delivery path to followers, so it
+            // must be written BEFORE the write is acked. If the append fails, rewind the per-topic
+            // sequence (held under the emission lock, so safe and contiguous — no permanent hole that
+            // would stall followers) and fail the write instead of acking a record that is absent from
+            // the stream source.
+            if (isStreamMode() && !appendStreamOpLog(operation, seq)) {
+                rollbackTopicSequence(operation.topic, seq);
+                failOperation(operation, new IllegalStateException(
+                        "RELAY_STREAM op-log append failed (seq " + seq + ", topic " + operation.topic
+                                + "); write not durable in the stream source"));
+                return;
+            }
+
             ReplicationPayload payload = new ReplicationPayload(operation.operationId, seq,
                     coordinator.getLeaderEpoch(), operation.topic, operation.payload);
 
-            coordinator.activeMembers().stream()
-                    .filter(member -> !member.nodeId().equals(transport.local().nodeId()))
-                    .sorted(Comparator.comparing(NodeInfo::nodeId))
-                    .forEach(member -> {
-                        ClusterMessage message = ClusterMessage.request(MessageType.REPLICATION_REQUEST,
-                                operation.topic,
-                                transport.local().nodeId(),
-                                member.nodeId(),
-                                payload);
-                        transport.send(message);
-                    });
+            // RELAY_STREAM does NOT push: the leader records the op in its durable op-log (via
+            // completeOperation below) and followers PULL it as a sequential stream. Other modes
+            // broadcast the op to every follower (best-effort push + NAK recovery).
+            if (!isStreamMode()) {
+                coordinator.activeMembers().stream()
+                        .filter(member -> !member.nodeId().equals(transport.local().nodeId()))
+                        .sorted(Comparator.comparing(NodeInfo::nodeId))
+                        .forEach(member -> {
+                            ClusterMessage message = ClusterMessage.request(MessageType.REPLICATION_REQUEST,
+                                    operation.topic,
+                                    transport.local().nodeId(),
+                                    member.nodeId(),
+                                    payload);
+                            transport.send(message);
+                        });
+            }
             checkCompletion(operation);
         } finally {
             emissionLock.unlock();
         }
+    }
+
+    /**
+     * Appends a committed operation's frame to the durable op-log (binlog) for RELAY_STREAM, returning
+     * {@code false} on failure so the caller can fail the write rather than ack a record absent from
+     * the stream source. Called under the per-topic emission lock.
+     */
+    private boolean appendStreamOpLog(PendingOperation operation, long seq) {
+        ResendLogStore store = resendLogStore;
+        if (store == null) {
+            return false; // stream mode always initializes the op-log; defensive
+        }
+        ReplicationHandler handler = handlers.get(operation.topic);
+        if (handler == null) {
+            return false;
+        }
+        try {
+            byte[] payloadBytes = handler.encodePayload(operation.payload);
+            RelayEntry entry = new RelayEntry(operation.epoch, seq, operation.topic, operation.operationId,
+                    payloadBytes);
+            return store.append(operation.topic, seq, System.currentTimeMillis(), RelayEntryCodec.encode(entry));
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING, "RELAY_STREAM op-log append failed for seq " + seq
+                    + " (topic " + operation.topic + ")", e);
+            return false;
+        }
+    }
+
+    /**
+     * Rewinds the per-topic sequence counter from {@code seq} to {@code seq-1} so a failed emission does
+     * not burn the sequence (which would leave a permanent op-log hole). Safe only under the per-topic
+     * emission lock, where no other emission for the topic can race.
+     */
+    private void rollbackTopicSequence(String topic, long seq) {
+        java.util.concurrent.atomic.AtomicLong counter = sequenceByTopic.get(topic);
+        if (counter != null) {
+            counter.compareAndSet(seq, seq - 1);
+        }
+        sequenceStateDirty = true;
     }
 
     private ReentrantLock leaderEmissionLock(String topic) {
@@ -746,6 +879,13 @@ public class ReplicationManager
                 }
                 checkCompletion(operation);
                 if (operation.isDone()) {
+                    continue;
+                }
+                if (isStreamMode()) {
+                    // RELAY_STREAM does not push: followers pull committed ops from the op-log. Re-pushing
+                    // a still-committing op here would inject an out-of-band relay entry on the follower
+                    // and break the contiguous stream (spurious gaps). The checkCompletion above still
+                    // drives the commit; the op-log append makes it pullable.
                     continue;
                 }
                 ReplicationPayload payload = new ReplicationPayload(operation.operationId, operation.sequence,
@@ -910,6 +1050,10 @@ public class ReplicationManager
             handleSequenceResendRequest(message);
         } else if (message.type() == MessageType.SEQUENCE_RESEND_RESPONSE) {
             handleSequenceResendResponse(message);
+        } else if (message.type() == MessageType.RELAY_STREAM_FETCH) {
+            handleRelayStreamFetch(message);
+        } else if (message.type() == MessageType.RELAY_STREAM_BATCH) {
+            handleRelayStreamBatch(message);
         } else if (message.type() == MessageType.FOLLOWER_PROGRESS) {
             handleFollowerProgress(message);
         } else if (message.type() == MessageType.USER_BROADCAST) {
@@ -1063,6 +1207,15 @@ public class ReplicationManager
             sequenceBufferLock.unlock();
         }
 
+        // RELAY_STREAM: re-anchor the pull cursor at the snapshot watermark so the fetch loop resumes
+        // streaming from watermark+1 instead of a stale pre-snapshot cursor (which would re-pull below
+        // the retained window and bounce on needSnapshot). Let it fetch immediately.
+        if (isStreamMode()) {
+            relayStreamCursor(topic).set(watermark);
+            relayFetchPendingUntilByTopic.put(topic, 0L);
+            signalFetch(topic);
+        }
+
         signalRelay(topic);
     }
 
@@ -1112,17 +1265,25 @@ public class ReplicationManager
 
         // Already applied previously - send ACK and skip (checked below under lock)
 
-        // FENCING: Reject commands from stale leader epochs
+        // FENCING by leader IDENTITY, not just epoch magnitude. The cluster agrees on the leader
+        // deterministically (max NodeId) and the epoch is a monotonic cluster term (see
+        // ClusterCoordinator). Accept from the AGREED leader and adopt its term even if it
+        // momentarily appears lower than a ghost term we still remember — otherwise a leader whose
+        // term we last saw higher (before it converged) is fenced into a permanent freeze, which is
+        // exactly the production stall this fixes. Reject only a source that is NOT the agreed
+        // leader AND carries a stale (lower) term: a partitioned ex-leader's late writes.
         long payloadEpoch = payload.epoch();
-        if (payloadEpoch < lastSeenLeaderEpoch) {
+        boolean fromAgreedLeader = coordinator.leaderInfo()
+                .map(info -> info.nodeId())
+                .filter(id -> id.equals(message.source()))
+                .isPresent();
+        if (!fromAgreedLeader && payloadEpoch < lastSeenLeaderEpoch) {
             LOGGER.warning(() -> String.format(
-                    "[%s] Rejecting stale replication from epoch %d (current: %d) opId=%s",
-                    localNodeId, payloadEpoch, lastSeenLeaderEpoch, opId));
+                    "[%s] Rejecting stale replication from non-leader %s epoch %d (current: %d) opId=%s",
+                    localNodeId, message.source(), payloadEpoch, lastSeenLeaderEpoch, opId));
             return;
         }
-        if (payloadEpoch > lastSeenLeaderEpoch) {
-            lastSeenLeaderEpoch = payloadEpoch;
-        }
+        lastSeenLeaderEpoch = fromAgreedLeader ? payloadEpoch : Math.max(lastSeenLeaderEpoch, payloadEpoch);
 
         // RELAY_LOG: persist the op to the durable relay and ack on durable receipt; the per-topic
         // consumer applies it at its own pace. This replaces the in-memory buffer + inline apply
@@ -1232,7 +1393,13 @@ public class ReplicationManager
     // ── Relay-log ingestion (#124) ───────────────────────────────────────────────
 
     private boolean isRelayMode() {
-        return config != null && config.followerIngestMode() == FollowerIngestMode.RELAY_LOG;
+        return config != null && (config.followerIngestMode() == FollowerIngestMode.RELAY_LOG
+                || config.followerIngestMode() == FollowerIngestMode.RELAY_STREAM);
+    }
+
+    /** True in RELAY_STREAM mode: the follower pulls the leader op-log as a sequential stream. */
+    private boolean isStreamMode() {
+        return config != null && config.followerIngestMode() == FollowerIngestMode.RELAY_STREAM;
     }
 
     /**
@@ -1290,6 +1457,229 @@ public class ReplicationManager
             thread.start();
             return thread;
         });
+    }
+
+    /** Starts the per-topic RELAY_STREAM fetch loop once (idempotent). */
+    private synchronized void ensureRelayFetchLoop(String topic) {
+        if (!running || relayStore == null || !isStreamMode()) {
+            return;
+        }
+        relayFetchSignals.computeIfAbsent(topic, k -> new Object());
+        relayFetchThreads.computeIfAbsent(topic, t -> {
+            Thread thread = new Thread(() -> relayFetchLoop(topic), "ngrid-relay-fetch-" + topic);
+            thread.setDaemon(true);
+            thread.start();
+            return thread;
+        });
+    }
+
+    /**
+     * Per-topic IO loop (RELAY_STREAM): drives the pull of the leader op-log from this follower's
+     * durable cursor. It issues a fetch when eligible, then waits — woken early when a batch arrives
+     * (to pull the next run back-to-back) or on the poll interval (caught-up long-poll). Persisting
+     * and ordering happen in {@link #handleRelayStreamBatch}; applying happens in the apply loop.
+     */
+    private void relayFetchLoop(String topic) {
+        Object signal = relayFetchSignals.computeIfAbsent(topic, k -> new Object());
+        long pollMs = Math.max(1L, config.relayStreamPollInterval().toMillis());
+        while (running && !Thread.currentThread().isInterrupted()) {
+            try {
+                maybeSendFetch(topic);
+                synchronized (signal) {
+                    signal.wait(pollMs);
+                }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return;
+            } catch (Throwable t) {
+                LOGGER.log(Level.WARNING, "Relay fetch loop error for topic " + topic + "; retrying", t);
+                try {
+                    Thread.sleep(50);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }
+    }
+
+    /** Issues one RELAY_STREAM_FETCH when eligible (follower, leader known, not syncing, backlog ok). */
+    private void maybeSendFetch(String topic) {
+        if (coordinator.isLeader()) {
+            return; // the leader serves the stream, it does not pull
+        }
+        if (syncingTopics.contains(topic) || relayPendingBootstrap.contains(topic)) {
+            return; // a snapshot/bootstrap is installing; do not stream over it
+        }
+        NodeId leaderId = coordinator.leaderInfo().map(NodeInfo::nodeId).orElse(null);
+        if (leaderId == null) {
+            return; // no leader known yet
+        }
+        if (getRelaySize(topic) >= config.relayMaxBacklog()) {
+            return; // flow control: let the apply loop drain before pulling more
+        }
+        long now = System.currentTimeMillis();
+        Long pendingUntil = relayFetchPendingUntilByTopic.get(topic);
+        if (pendingUntil != null && now < pendingUntil) {
+            return; // a fetch is in flight, or we are in the caught-up poll gap
+        }
+        long from = nextFetchSequence(topic);
+        transport.send(ClusterMessage.request(MessageType.RELAY_STREAM_FETCH, "stream",
+                transport.local().nodeId(), leaderId,
+                new RelayStreamFetchPayload(topic, from, config.relayStreamFetchBatch())));
+        relayFetchPendingUntilByTopic.put(topic, now + config.relayStreamFetchTimeout().toMillis());
+    }
+
+    /** The next sequence to pull = one past the highest sequence already persisted to the relay. */
+    private long nextFetchSequence(String topic) {
+        return relayStreamCursor(topic).get() + 1L;
+    }
+
+    private java.util.concurrent.atomic.AtomicLong relayStreamCursor(String topic) {
+        return relayStreamCursorByTopic.computeIfAbsent(topic,
+                k -> new java.util.concurrent.atomic.AtomicLong(
+                        Math.max(currentNextExpected(topic) - 1L, relayTailSequence(topic))));
+    }
+
+    /**
+     * Highest sequence currently persisted in the topic relay (0 if empty). On a clean restart the
+     * relay durably holds the not-yet-applied tail; anchoring the cursor there resumes the stream from
+     * tail+1 instead of re-pulling (and re-storing) entries already on disk.
+     */
+    private long relayTailSequence(String topic) {
+        try {
+            long size = getRelaySize(topic);
+            if (size <= 0) {
+                return 0L;
+            }
+            int last = (int) Math.min(Integer.MAX_VALUE - 1L, size - 1L);
+            List<byte[]> tail = relayFor(topic).readRange(last, 1).items();
+            if (tail.isEmpty()) {
+                return 0L;
+            }
+            return RelayEntryCodec.decode(tail.get(0)).sequence();
+        } catch (Exception e) {
+            LOGGER.log(Level.FINE, "Could not read relay tail for topic " + topic, e);
+            return 0L;
+        }
+    }
+
+    private void signalFetch(String topic) {
+        Object sig = relayFetchSignals.get(topic);
+        if (sig != null) {
+            synchronized (sig) {
+                sig.notifyAll();
+            }
+        }
+    }
+
+    /** Stops all RELAY_STREAM fetch loops (interrupt + wake + join), before the apply loops quiesce. */
+    private void stopRelayFetchLoops() {
+        List<Thread> threads = new ArrayList<>(relayFetchThreads.values());
+        for (Map.Entry<String, Thread> e : relayFetchThreads.entrySet()) {
+            e.getValue().interrupt();
+            signalFetch(e.getKey());
+        }
+        for (Thread t : threads) {
+            try {
+                t.join(2000);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        relayFetchThreads.clear();
+    }
+
+    /**
+     * Ingests a RELAY_STREAM_BATCH on the follower: persists the contiguous run to the relay IN ORDER
+     * (advancing the durable cursor), wakes the apply loop, and pulls the next run. A need-snapshot
+     * signal triggers a bootstrap. Because the leader only sends contiguous runs and the cursor only
+     * advances on a durable append, re-fetching the same range is idempotent (duplicates are skipped).
+     */
+    private void handleRelayStreamBatch(ClusterMessage message) {
+        RelayStreamBatchPayload batch = message.payload(RelayStreamBatchPayload.class);
+        String topic = batch.topic();
+        // Fencing by leader IDENTITY (Fase 0.2): accept the stream only from the currently agreed
+        // leader. An in-flight fetch can straddle a leadership change, and a delayed batch from a
+        // superseded leader must NOT advance the cursor, update watermarks or apply stale ops. In
+        // RELAY_STREAM there are no REPLICATION_REQUESTs, so lastSeenLeaderEpoch is not otherwise
+        // maintained — this source check is the authoritative gate.
+        NodeId agreedLeader = coordinator.leaderInfo().map(NodeInfo::nodeId).orElse(null);
+        if (agreedLeader == null || !agreedLeader.equals(message.source())) {
+            LOGGER.fine(() -> "Ignoring RELAY_STREAM_BATCH from non-leader " + message.source()
+                    + " (agreed leader: " + agreedLeader + ")");
+            return;
+        }
+        leaderHwmByTopic.put(topic, batch.leaderHighWatermark());
+        leaderOldestByTopic.put(topic, batch.oldestSequence());
+        if (!batch.frames().isEmpty()) {
+            long bytes = 0L;
+            for (byte[] f : batch.frames()) {
+                bytes += f.length;
+            }
+            streamBytesInByTopic.computeIfAbsent(topic, k -> new java.util.concurrent.atomic.AtomicLong())
+                    .addAndGet(bytes);
+        }
+
+        if (batch.needSnapshot()) {
+            // Below the leader's retained window: bootstrap, then resume streaming from the watermark.
+            relayFetchPendingUntilByTopic.put(topic,
+                    System.currentTimeMillis() + config.relayStreamFetchTimeout().toMillis());
+            if (syncingTopics.add(topic)) {
+                requestSync(topic);
+            }
+            return;
+        }
+        ReplicationHandler handler = handlers.get(topic);
+        if (handler == null) {
+            relayFetchPendingUntilByTopic.remove(topic); // allow re-fetch once the handler registers
+            return;
+        }
+        java.util.concurrent.atomic.AtomicLong cursor = relayStreamCursor(topic);
+        int persisted = 0;
+        for (byte[] frame : batch.frames()) {
+            RelayEntry entry;
+            try {
+                entry = RelayEntryCodec.decode(frame);
+            } catch (Exception e) {
+                LOGGER.log(Level.WARNING, "Failed to decode relay-stream frame for topic " + topic, e);
+                break;
+            }
+            if (entry.epoch() < lastSeenLeaderEpoch) {
+                continue; // stale-epoch frame: fence (a late batch from a superseded leader)
+            }
+            long expected = cursor.get() + 1L;
+            if (entry.sequence() < expected) {
+                continue; // duplicate / already persisted
+            }
+            if (entry.sequence() != expected) {
+                // A hole must not occur in stream mode (the leader sends contiguous runs). Stop and
+                // let the next fetch re-pull from the cursor.
+                long got = entry.sequence();
+                LOGGER.warning(() -> "Non-contiguous relay-stream frame topic=" + topic + " seq=" + got
+                        + " expected=" + expected);
+                break;
+            }
+            try {
+                relayFor(topic).offer(frame);
+            } catch (Exception e) {
+                LOGGER.log(Level.WARNING, "Relay offer failed topic=" + topic + " seq=" + entry.sequence()
+                        + "; will re-fetch", e);
+                break; // cursor not advanced → the next fetch retries this sequence
+            }
+            cursor.incrementAndGet();
+            persisted++;
+        }
+        if (persisted > 0) {
+            // Got data: allow the next fetch immediately and wake both loops.
+            relayFetchPendingUntilByTopic.put(topic, 0L);
+            signalRelay(topic);
+            signalFetch(topic);
+        } else {
+            // Caught up: wait the poll interval before the next fetch to avoid busy-polling.
+            relayFetchPendingUntilByTopic.put(topic,
+                    System.currentTimeMillis() + Math.max(1L, config.relayStreamPollInterval().toMillis()));
+        }
     }
 
     private void relayApplyLoop(String topic) {
@@ -1535,6 +1925,32 @@ public class ReplicationManager
         } finally {
             sequenceBufferLock.unlock();
         }
+        mirrorAppliedToOpLog(topic, entries);
+    }
+
+    /**
+     * RELAY_STREAM: mirror an applied run into this node's own op-log (binlog) so that, if it is later
+     * promoted to leader, it can serve the full history as a sequential stream instead of forcing
+     * followers into a snapshot. Append-only and failure-tolerant — a miss only degrades a future
+     * fetch into the existing snapshot path, never the commit.
+     */
+    private void mirrorAppliedToOpLog(String topic, List<RelayEntry> entries) {
+        if (!isStreamMode()) {
+            return;
+        }
+        ResendLogStore store = resendLogStore;
+        if (store == null) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        for (RelayEntry e : entries) {
+            try {
+                store.append(topic, e.sequence(), now, RelayEntryCodec.encode(e));
+            } catch (Exception ex) {
+                LOGGER.log(Level.WARNING, "Op-log mirror append failed topic=" + topic
+                        + " seq=" + e.sequence(), ex);
+            }
+        }
     }
 
     /**
@@ -1757,9 +2173,11 @@ public class ReplicationManager
 
         // Disk tier (#127): mirror the entry to the durable, time-governed resend op-log so the backlog
         // window survives off-heap. A disk failure here must NOT fail the commit — it only degrades a
-        // future resend into the existing snapshot-fallback path.
+        // future resend into the existing snapshot-fallback path. In RELAY_STREAM the append is already
+        // done synchronously on the emission path (appendStreamOpLog), so skip it here to avoid a
+        // duplicate append.
         ResendLogStore diskStore = resendLogStore;
-        if (diskStore != null) {
+        if (diskStore != null && !isStreamMode()) {
             ReplicationHandler handler = handlers.get(topic);
             if (handler != null) {
                 try {
@@ -1834,6 +2252,71 @@ public class ReplicationManager
                 requestSync(topic);
             }
         });
+    }
+
+    /**
+     * Serves a follower's RELAY_STREAM_FETCH from the durable op-log (the leader's binlog): a
+     * strictly contiguous run starting at the requested sequence, or a need-snapshot signal when the
+     * follower is below the retained window. Only the leader answers; the op-log is the single source
+     * of truth, so the response is driven by what is actually persisted (no separate high-watermark to
+     * race the commit/append).
+     */
+    private void handleRelayStreamFetch(ClusterMessage message) {
+        if (!coordinator.isLeader()) {
+            LOGGER.fine(() -> "Ignoring RELAY_STREAM_FETCH: not the leader.");
+            return;
+        }
+        ResendLogStore store = resendLogStore;
+        if (store == null) {
+            LOGGER.warning("RELAY_STREAM_FETCH received but the op-log is not initialized");
+            return;
+        }
+        RelayStreamFetchPayload request = message.payload(RelayStreamFetchPayload.class);
+        String topic = request.topic();
+        long from = Math.max(1L, request.fromSequence());
+        int maxBatch = Math.min(Math.max(1, request.maxBatch()), config.resendLogReadBatchMax());
+
+        ResendLog log = store.logFor(topic);
+        long oldest = log.oldestSequence();
+        long to = from + (long) maxBatch - 1L;
+        List<RelayEntry> entries = log.read(from, to);
+        List<byte[]> frames = takeContiguousFrames(entries, from);
+
+        // Below the retained window with nothing contiguous to send → the follower must bootstrap.
+        boolean needSnapshot = frames.isEmpty() && oldest > 0 && from < oldest;
+        long hwm = currentLeaderTopicSequence(topic);
+
+        RelayStreamBatchPayload batch = new RelayStreamBatchPayload(topic, from, frames, hwm, oldest, needSnapshot);
+        transport.send(ClusterMessage.request(MessageType.RELAY_STREAM_BATCH, "stream",
+                transport.local().nodeId(), message.source(), batch));
+        if (needSnapshot || !frames.isEmpty()) {
+            int sent = frames.size();
+            LOGGER.fine(() -> String.format("Served RELAY_STREAM_FETCH from %s topic=%s from=%d: %d frames%s",
+                    message.source(), topic, from, sent, needSnapshot ? " (needSnapshot)" : ""));
+        }
+    }
+
+    /** Takes the leading contiguous run of frames starting at {@code from} (stops at the first hole). */
+    private List<byte[]> takeContiguousFrames(List<RelayEntry> entries, long from) {
+        List<byte[]> out = new ArrayList<>(entries.size());
+        long expected = from;
+        for (RelayEntry entry : entries) {
+            if (entry.sequence() < expected) {
+                continue; // duplicate / below the cursor
+            }
+            if (entry.sequence() != expected) {
+                break; // hole — a stream run must be contiguous
+            }
+            out.add(RelayEntryCodec.encode(entry));
+            expected++;
+        }
+        return out;
+    }
+
+    /** Best-effort highest assigned sequence for a topic (advisory lag metric carried to the follower). */
+    private long currentLeaderTopicSequence(String topic) {
+        java.util.concurrent.atomic.AtomicLong counter = sequenceByTopic.get(topic);
+        return counter == null ? 0L : counter.get();
     }
 
     /**
@@ -2306,6 +2789,53 @@ public class ReplicationManager
         }
     }
 
+    /** RELAY_STREAM: highest sequence this follower has persisted to the topic relay (the pull cursor). */
+    public long getRelayStreamCursor(String topic) {
+        java.util.concurrent.atomic.AtomicLong cursor = relayStreamCursorByTopic.get(topic);
+        return cursor == null ? 0L : cursor.get();
+    }
+
+    /**
+     * Leader high-watermark for a topic: the leader's own highest assigned sequence, or the value a
+     * follower learned from its last RELAY_STREAM_BATCH ({@code 0} if unknown yet).
+     */
+    public long getLeaderHighWatermark(String topic) {
+        if (coordinator.isLeader()) {
+            return currentLeaderTopicSequence(topic);
+        }
+        return leaderHwmByTopic.getOrDefault(topic, 0L);
+    }
+
+    /** Leader's retained-window floor for a topic (oldest sequence still streamable); {@code -1} if unknown. */
+    public long getLeaderOldestSequence(String topic) {
+        if (coordinator.isLeader()) {
+            ResendLogStore store = resendLogStore;
+            return store == null ? -1L : store.logFor(topic).oldestSequence();
+        }
+        return leaderOldestByTopic.getOrDefault(topic, -1L);
+    }
+
+    /** Replication lag for a topic on a follower: leader high-watermark minus the applied frontier. */
+    public long getReplicationLag(String topic) {
+        long hwm = getLeaderHighWatermark(topic);
+        if (hwm <= 0L) {
+            return 0L;
+        }
+        return Math.max(0L, hwm - (currentNextExpected(topic) - 1L));
+    }
+
+    /** Cumulative stream bytes pulled for a topic (RELAY_STREAM throughput). */
+    public long getStreamBytesIn(String topic) {
+        java.util.concurrent.atomic.AtomicLong bytes = streamBytesInByTopic.get(topic);
+        return bytes == null ? 0L : bytes.get();
+    }
+
+    /** True when this node is actively streaming the topic from the leader (RELAY_STREAM follower). */
+    public boolean isStreaming(String topic) {
+        return isStreamMode() && !coordinator.isLeader()
+                && relayFetchThreads.containsKey(topic) && !syncingTopics.contains(topic);
+    }
+
     /**
      * Age, in milliseconds, of the oldest unapplied relay entry for {@code topic} (#128) — i.e. how
      * long the follower's apply frontier has lagged the relay head. {@code 0} when the relay is empty
@@ -2346,7 +2876,13 @@ public class ReplicationManager
                     getRelaySize(topic),
                     syncingTopics.contains(topic),
                     relayPendingBootstrap.contains(topic),
-                    resendPendingTopics.contains(topic)));
+                    resendPendingTopics.contains(topic),
+                    getRelayStreamCursor(topic),
+                    getLeaderHighWatermark(topic),
+                    getLeaderOldestSequence(topic),
+                    getReplicationLag(topic),
+                    getStreamBytesIn(topic),
+                    isStreaming(topic)));
         }
         return statuses;
     }

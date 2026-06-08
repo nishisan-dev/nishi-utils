@@ -149,9 +149,9 @@ final class ResendLog implements Closeable {
      * @param timestamp the leader-local commit timestamp (epoch millis) driving temporal retention
      * @param frame     the {@link RelayEntryCodec}-encoded entry
      */
-    synchronized void append(long sequence, long timestamp, byte[] frame) {
+    synchronized boolean append(long sequence, long timestamp, byte[] frame) {
         if (closed) {
-            return;
+            return false;
         }
         try {
             if (active == null || active.count >= segmentMaxEntries || active.shouldRollByAge(segmentMaxAgeMillis)) {
@@ -160,10 +160,13 @@ final class ResendLog implements Closeable {
             active.append(sequence, timestamp, frame);
             totalEntries++;
             enforceRetention();
+            return true;
         } catch (IOException e) {
-            // An op-log append failure must never fail the commit; it only degrades a future resend
-            // into the existing snapshot-fallback path. Surface and continue.
+            // The caller decides what an append failure means: best-effort for the push resend op-log
+            // (only degrades a future resend into snapshot fallback), but load-bearing for RELAY_STREAM
+            // (the binlog is the only delivery path — see ReplicationManager.appendStreamOpLog).
             LOGGER.log(Level.WARNING, "ResendLog append failed for sequence " + sequence + " at " + dir, e);
+            return false;
         }
     }
 

@@ -80,9 +80,9 @@ final class ResendLogStore implements Closeable {
         return safe + "-" + Integer.toHexString(topic.hashCode());
     }
 
-    /** Appends a committed operation to the topic's resend log. */
-    void append(String topic, long sequence, long timestamp, byte[] frame) {
-        logFor(topic).append(sequence, timestamp, frame);
+    /** Appends a committed operation to the topic's resend log; returns false if the append failed. */
+    boolean append(String topic, long sequence, long timestamp, byte[] frame) {
+        return logFor(topic).append(sequence, timestamp, frame);
     }
 
     /** Reads present entries with sequence in {@code [from, to]} for the topic, ascending. */

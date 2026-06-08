@@ -38,5 +38,15 @@ public enum FollowerIngestMode {
      * (own rhythm). A lagging follower catches up from the relay instead of
      * resetting state and reinstalling a growing snapshot.
      */
-    RELAY_LOG
+    RELAY_LOG,
+
+    /**
+     * Relay-stream path: the follower PULLS the leader's durable op-log as a strictly sequential
+     * stream driven by its own durable cursor (the relay tail). It fetches the next contiguous run
+     * ({@code RELAY_STREAM_FETCH}), persists it in order, and applies at its own pace. Because the
+     * pull is contiguous by construction there is no gap detection and no NAK/resend storm in steady
+     * state — the MySQL master/slave relay-log model. A follower below the leader's retained window
+     * bootstraps once from a snapshot, then resumes streaming. This supersedes {@link #RELAY_LOG}.
+     */
+    RELAY_STREAM
 }
