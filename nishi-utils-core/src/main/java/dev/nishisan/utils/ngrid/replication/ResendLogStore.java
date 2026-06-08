@@ -45,18 +45,22 @@ final class ResendLogStore implements Closeable {
     private final Path baseDir;
     private final int segmentMaxEntries;
     private final Duration segmentMaxAge;
+    private final long segmentMaxBytes;
     private final Duration retentionTime;
     private final long maxEntries;
+    private final int maxSegments;
     private final boolean fsync;
     private final Map<String, ResendLog> byTopic = new ConcurrentHashMap<>();
 
-    ResendLogStore(Path baseDir, int segmentMaxEntries, Duration segmentMaxAge, Duration retentionTime,
-            long maxEntries, boolean fsync) {
+    ResendLogStore(Path baseDir, int segmentMaxEntries, Duration segmentMaxAge, long segmentMaxBytes,
+            Duration retentionTime, long maxEntries, int maxSegments, boolean fsync) {
         this.baseDir = Objects.requireNonNull(baseDir, "baseDir");
         this.segmentMaxEntries = segmentMaxEntries;
         this.segmentMaxAge = segmentMaxAge == null ? Duration.ZERO : segmentMaxAge;
+        this.segmentMaxBytes = segmentMaxBytes;
         this.retentionTime = retentionTime == null ? Duration.ZERO : retentionTime;
         this.maxEntries = maxEntries;
+        this.maxSegments = maxSegments;
         this.fsync = fsync;
     }
 
@@ -66,8 +70,8 @@ final class ResendLogStore implements Closeable {
     }
 
     private ResendLog open(String topic) {
-        return new ResendLog(baseDir.resolve(dirName(topic)), segmentMaxEntries, segmentMaxAge, retentionTime,
-                maxEntries, fsync);
+        return new ResendLog(baseDir.resolve(dirName(topic)), segmentMaxEntries, segmentMaxAge, segmentMaxBytes,
+                retentionTime, maxEntries, maxSegments, fsync);
     }
 
     /**
@@ -94,6 +98,18 @@ final class ResendLogStore implements Closeable {
     long size(String topic) {
         ResendLog log = byTopic.get(topic);
         return log == null ? 0L : log.size();
+    }
+
+    /** Current bytes on disk retained for the topic across all segments (0 if none open). */
+    long diskBytes(String topic) {
+        ResendLog log = byTopic.get(topic);
+        return log == null ? 0L : log.totalBytes();
+    }
+
+    /** Current number of segment files retained for the topic (0 if none open). */
+    int segmentCount(String topic) {
+        ResendLog log = byTopic.get(topic);
+        return log == null ? 0 : log.segmentCount();
     }
 
     @Override

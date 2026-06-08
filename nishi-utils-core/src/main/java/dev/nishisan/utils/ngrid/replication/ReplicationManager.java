@@ -359,7 +359,8 @@ public class ReplicationManager
             // so it is unconditional there, independent of the persistentResendLog flag.
             this.resendLogStore = new ResendLogStore(config.dataDirectory().resolve("resend-log"),
                     config.resendLogSegmentMaxEntries(), config.resendLogSegmentMaxAge(),
-                    config.replicationLogRetentionTime(), config.resendLogMaxEntries(),
+                    config.resendLogSegmentMaxBytes(), config.replicationLogRetentionTime(),
+                    config.resendLogMaxEntries(), config.resendLogMaxSegments(),
                     config.relayDurability() == RelayDurability.ALWAYS);
         }
         transport.addListener(this);

@@ -43,7 +43,9 @@ public final class ReplicationConfig {
     private final boolean persistentResendLog;
     private final int resendLogSegmentMaxEntries;
     private final Duration resendLogSegmentMaxAge;
+    private final long resendLogSegmentMaxBytes;
     private final long resendLogMaxEntries;
+    private final int resendLogMaxSegments;
     private final int resendLogReadBatchMax;
     private final int relayApplyBatchSize;
     private final boolean leaderPauseOnJoin;
@@ -61,7 +63,8 @@ public final class ReplicationConfig {
             Duration replicationLogRetentionTime, int appliedSetMaxSize, int operationLogMaxSize,
             boolean leaderLocalApply, FollowerIngestMode followerIngestMode, RelayDurability relayDurability,
             Duration relayGroupCommitInterval, boolean persistentResendLog, int resendLogSegmentMaxEntries,
-            Duration resendLogSegmentMaxAge, long resendLogMaxEntries, int resendLogReadBatchMax,
+            Duration resendLogSegmentMaxAge, long resendLogSegmentMaxBytes, long resendLogMaxEntries,
+            int resendLogMaxSegments, int resendLogReadBatchMax,
             int relayApplyBatchSize, boolean leaderPauseOnJoin, Duration joinQuiesceMaxDuration,
             Duration followerProgressInterval, Duration joinPeerDiscoveryWindow, long joinSyncLagThreshold,
             int relayStreamFetchBatch, Duration relayStreamPollInterval, Duration relayStreamFetchTimeout,
@@ -85,7 +88,9 @@ public final class ReplicationConfig {
         this.persistentResendLog = persistentResendLog;
         this.resendLogSegmentMaxEntries = resendLogSegmentMaxEntries;
         this.resendLogSegmentMaxAge = Objects.requireNonNull(resendLogSegmentMaxAge, "resendLogSegmentMaxAge");
+        this.resendLogSegmentMaxBytes = resendLogSegmentMaxBytes;
         this.resendLogMaxEntries = resendLogMaxEntries;
+        this.resendLogMaxSegments = resendLogMaxSegments;
         this.resendLogReadBatchMax = resendLogReadBatchMax;
         this.relayApplyBatchSize = relayApplyBatchSize;
         this.leaderPauseOnJoin = leaderPauseOnJoin;
@@ -266,6 +271,18 @@ public final class ReplicationConfig {
     }
 
     /**
+     * Maximum size in bytes of an on-disk resend-log segment before a new one is rolled — the
+     * MySQL {@code max_binlog_size} analog. A roll happens on whichever per-segment bound is hit
+     * first (entries, age, or bytes); a single record is never split, so a segment may exceed this
+     * by at most one record. {@code 0} disables byte-based rolling (entry/age rolling still applies).
+     *
+     * @return the per-segment byte cap, or {@code 0} when disabled
+     */
+    public long resendLogSegmentMaxBytes() {
+        return resendLogSegmentMaxBytes;
+    }
+
+    /**
      * Hard count backstop for the on-disk resend op-log across all segments of a topic, guarding
      * against unbounded disk growth. The temporal window ({@link #replicationLogRetentionTime()}) is
      * the intended governor; this is a safety cap.
@@ -274,6 +291,20 @@ public final class ReplicationConfig {
      */
     public long resendLogMaxEntries() {
         return resendLogMaxEntries;
+    }
+
+    /**
+     * Maximum number of segment files retained per topic — the MySQL "keep N binlog files" model
+     * (each segment being one binlog "index"). When the count would exceed this, the oldest sealed
+     * segment is dropped whole; the active (tail) segment is never dropped. Combine with
+     * {@link #resendLogSegmentMaxBytes()} to express "N files of X bytes" or with
+     * {@link #resendLogSegmentMaxEntries()} for "N files of X ops". {@code 0} disables the cap
+     * (count/time retention still applies).
+     *
+     * @return the retained segment-count cap per topic, or {@code 0} when disabled
+     */
+    public int resendLogMaxSegments() {
+        return resendLogMaxSegments;
     }
 
     /**
@@ -411,7 +442,9 @@ public final class ReplicationConfig {
         private boolean persistentResendLog = false;
         private int resendLogSegmentMaxEntries = 65_536;
         private Duration resendLogSegmentMaxAge = Duration.ofMinutes(5);
+        private long resendLogSegmentMaxBytes = 0L;
         private long resendLogMaxEntries = 10_000_000L;
+        private int resendLogMaxSegments = 0;
         private int resendLogReadBatchMax = 5_000;
         private int relayApplyBatchSize = 256;
         private boolean leaderPauseOnJoin = false;
@@ -624,6 +657,22 @@ public final class ReplicationConfig {
         }
 
         /**
+         * Sets the per-segment byte cap for the on-disk resend op-log — the MySQL
+         * {@code max_binlog_size} analog. A roll happens on whichever per-segment bound is hit first
+         * (entries, age, or bytes). {@code 0} disables byte-based rolling.
+         *
+         * @param maxBytes bytes per segment (must be >= 0; 0 disables)
+         * @return this builder
+         */
+        public Builder resendLogSegmentMaxBytes(long maxBytes) {
+            if (maxBytes < 0) {
+                throw new IllegalArgumentException("resendLogSegmentMaxBytes must be >= 0");
+            }
+            this.resendLogSegmentMaxBytes = maxBytes;
+            return this;
+        }
+
+        /**
          * Sets the hard disk-side count backstop per topic for the on-disk resend op-log.
          *
          * @param maxEntries the disk entry cap (must be >= 1)
@@ -634,6 +683,23 @@ public final class ReplicationConfig {
                 throw new IllegalArgumentException("resendLogMaxEntries must be >= 1");
             }
             this.resendLogMaxEntries = maxEntries;
+            return this;
+        }
+
+        /**
+         * Sets the maximum number of segment files retained per topic — the MySQL "keep N binlog
+         * files" model. When exceeded, the oldest sealed segment is dropped whole (the active tail
+         * segment is never dropped). Combine with {@link #resendLogSegmentMaxBytes(long)} for
+         * "N files of X bytes" or {@link #resendLogSegmentMaxEntries(int)} for "N files of X ops".
+         *
+         * @param maxSegments the retained segment-count cap (must be >= 0; 0 disables)
+         * @return this builder
+         */
+        public Builder resendLogMaxSegments(int maxSegments) {
+            if (maxSegments < 0) {
+                throw new IllegalArgumentException("resendLogMaxSegments must be >= 0");
+            }
+            this.resendLogMaxSegments = maxSegments;
             return this;
         }
 
@@ -794,7 +860,8 @@ public final class ReplicationConfig {
                     resendGapThreshold, resendTimeout, replicationLogRetention, replicationLogRetentionTime,
                     appliedSetMaxSize, operationLogMaxSize, leaderLocalApply, followerIngestMode, relayDurability,
                     relayGroupCommitInterval, persistentResendLog, resendLogSegmentMaxEntries, resendLogSegmentMaxAge,
-                    resendLogMaxEntries, resendLogReadBatchMax, relayApplyBatchSize, leaderPauseOnJoin,
+                    resendLogSegmentMaxBytes, resendLogMaxEntries, resendLogMaxSegments, resendLogReadBatchMax,
+                    relayApplyBatchSize, leaderPauseOnJoin,
                     joinQuiesceMaxDuration, followerProgressInterval, joinPeerDiscoveryWindow, joinSyncLagThreshold,
                     relayStreamFetchBatch, relayStreamPollInterval, relayStreamFetchTimeout, relayMaxBacklog);
         }

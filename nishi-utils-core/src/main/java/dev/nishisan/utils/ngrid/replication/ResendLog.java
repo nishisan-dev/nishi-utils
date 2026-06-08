@@ -82,8 +82,10 @@ final class ResendLog implements Closeable {
     private final Path dir;
     private final int segmentMaxEntries;
     private final long segmentMaxAgeMillis;
+    private final long segmentMaxBytes;
     private final long retentionMillis;
     private final long maxEntries;
+    private final int maxSegments;
     private final boolean fsync;
 
     /** Segments in creation (arrival) order; head is the oldest, tail is the active one. */
@@ -93,13 +95,15 @@ final class ResendLog implements Closeable {
     private long nextSegmentId;
     private boolean closed;
 
-    ResendLog(Path dir, int segmentMaxEntries, Duration segmentMaxAge, Duration retentionTime,
-            long maxEntries, boolean fsync) {
+    ResendLog(Path dir, int segmentMaxEntries, Duration segmentMaxAge, long segmentMaxBytes,
+            Duration retentionTime, long maxEntries, int maxSegments, boolean fsync) {
         this.dir = dir;
         this.segmentMaxEntries = Math.max(1, segmentMaxEntries);
         this.segmentMaxAgeMillis = segmentMaxAge == null ? 0L : Math.max(0L, segmentMaxAge.toMillis());
+        this.segmentMaxBytes = Math.max(0L, segmentMaxBytes);
         this.retentionMillis = retentionTime == null ? 0L : Math.max(0L, retentionTime.toMillis());
         this.maxEntries = Math.max(1L, maxEntries);
+        this.maxSegments = Math.max(0, maxSegments);
         this.fsync = fsync;
         open();
     }
@@ -154,7 +158,9 @@ final class ResendLog implements Closeable {
             return false;
         }
         try {
-            if (active == null || active.count >= segmentMaxEntries || active.shouldRollByAge(segmentMaxAgeMillis)) {
+            if (active == null || active.count >= segmentMaxEntries
+                    || active.shouldRollByAge(segmentMaxAgeMillis)
+                    || active.shouldRollBySize(segmentMaxBytes)) {
                 rollSegment();
             }
             active.append(sequence, timestamp, frame);
@@ -178,15 +184,20 @@ final class ResendLog implements Closeable {
         active = segment;
     }
 
-    /** Drops the whole oldest segment when it exceeds the count cap or falls outside the time window. */
+    /**
+     * Drops the whole oldest segment when any retention bound is exceeded: the total count cap
+     * ({@code maxEntries}), the retained-segment-count cap ({@code maxSegments}, MySQL-style "keep N
+     * binlog files"), or the temporal window. The active (tail) segment is never dropped.
+     */
     private void enforceRetention() {
         long now = System.currentTimeMillis();
         // Never drop the active (tail) segment: it is still receiving appends.
         while (segments.size() > 1) {
             Segment oldest = segments.get(0);
             boolean overCount = totalEntries > maxEntries;
+            boolean overSegments = maxSegments > 0 && segments.size() > maxSegments;
             boolean expired = retentionMillis > 0 && (now - oldest.maxTimestamp) > retentionMillis;
-            if (!overCount && !expired) {
+            if (!overCount && !overSegments && !expired) {
                 break;
             }
             segments.remove(0);
@@ -236,6 +247,20 @@ final class ResendLog implements Closeable {
     /** Total number of entries currently retained across all segments. */
     synchronized long size() {
         return totalEntries;
+    }
+
+    /** Total bytes on disk currently retained across all segments (sum of segment file sizes). */
+    synchronized long totalBytes() {
+        long bytes = 0L;
+        for (Segment segment : segments) {
+            bytes += segment.sizeBytes();
+        }
+        return bytes;
+    }
+
+    /** Number of segment files currently retained (the MySQL-style binlog "index" count). */
+    synchronized int segmentCount() {
+        return segments.size();
     }
 
     /** Lowest sequence still retained, or {@code -1} when empty. */
@@ -332,6 +357,14 @@ final class ResendLog implements Closeable {
 
         boolean shouldRollByAge(long maxAgeMillis) {
             return maxAgeMillis > 0 && (System.currentTimeMillis() - firstAppendMillis) > maxAgeMillis;
+        }
+
+        boolean shouldRollBySize(long maxBytes) {
+            return maxBytes > 0 && writePosition >= maxBytes;
+        }
+
+        long sizeBytes() {
+            return writePosition;
         }
 
         void append(long sequence, long timestamp, byte[] frame) throws IOException {

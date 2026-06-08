@@ -28,7 +28,7 @@ class ResendLogTest {
     }
 
     private static ResendLog open(Path dir, int segMaxEntries, Duration retention, long maxEntries) {
-        return new ResendLog(dir, segMaxEntries, Duration.ZERO, retention, maxEntries, false);
+        return new ResendLog(dir, segMaxEntries, Duration.ZERO, 0L, retention, maxEntries, 0, false);
     }
 
     @Test
@@ -111,7 +111,7 @@ class ResendLogTest {
 
     @Test
     void temporalRetentionDropsExpiredSegments() throws Exception {
-        try (ResendLog log = new ResendLog(tempDir, 3, Duration.ZERO, Duration.ofMillis(150), 1_000_000, false)) {
+        try (ResendLog log = new ResendLog(tempDir, 3, Duration.ZERO, 0L, Duration.ofMillis(150), 1_000_000, 0, false)) {
             long old = System.currentTimeMillis() - 10_000; // well beyond the window
             for (long seq = 1; seq <= 6; seq++) {
                 log.append(seq, old, frame(seq));
@@ -171,8 +171,59 @@ class ResendLogTest {
     }
 
     @Test
+    void rollsNewSegmentBySegmentByteSize() {
+        // segmentMaxEntries huge (count never triggers), segmentMaxBytes small -> byte-based rolling.
+        // Each on-disk record is ~70 bytes (len prefix + timestamp + encoded frame), so a 200-byte cap
+        // seals a segment every ~3 records. maxSegments/maxEntries disabled -> everything is retained.
+        try (ResendLog log = new ResendLog(tempDir, 1_000_000, Duration.ZERO, 200L, Duration.ZERO,
+                10_000_000L, 0, false)) {
+            long now = System.currentTimeMillis();
+            for (long seq = 1; seq <= 20; seq++) {
+                log.append(seq, now, frame(seq));
+            }
+            assertEquals(20L, log.size(), "byte rolling must not drop entries when retention is disabled");
+            assertTrue(log.segmentCount() >= 3,
+                    "small byte cap must roll several segments, was " + log.segmentCount());
+            assertNotNull(log.get(1L));
+            assertNotNull(log.get(20L));
+        }
+    }
+
+    @Test
+    void retainsAtMostMaxSegmentsDroppingOldest() {
+        // segmentMaxEntries=3 seals a segment every 3 ops; maxSegments=3 keeps only the newest 3 files
+        // (the MySQL "keep N binlog files" model). Sequences 1..15 -> 5 segments produced, 2 oldest dropped.
+        try (ResendLog log = new ResendLog(tempDir, 3, Duration.ZERO, 0L, Duration.ZERO,
+                10_000_000L, 3, false)) {
+            long now = System.currentTimeMillis();
+            for (long seq = 1; seq <= 15; seq++) {
+                log.append(seq, now, frame(seq));
+            }
+            assertEquals(3, log.segmentCount(), "must retain at most maxSegments files");
+            assertEquals(7L, log.oldestSequence(), "oldest two segments (seq 1..6) must be evicted");
+            assertNull(log.get(6L), "evicted sequence must be absent");
+            assertNotNull(log.get(7L));
+            assertNotNull(log.get(15L), "newest sequence must be retained");
+        }
+    }
+
+    @Test
+    void reportsTotalBytesAndSegmentCount() {
+        try (ResendLog log = open(tempDir, 4, Duration.ZERO, 1_000)) {
+            assertEquals(0L, log.totalBytes(), "empty log reports zero bytes");
+            assertEquals(0, log.segmentCount());
+            long now = System.currentTimeMillis();
+            for (long seq = 1; seq <= 10; seq++) {
+                log.append(seq, now, frame(seq));
+            }
+            assertTrue(log.totalBytes() > 0L, "retained bytes must be reported");
+            assertEquals(3, log.segmentCount(), "10 entries at 4/segment -> 3 segment files");
+        }
+    }
+
+    @Test
     void storeIsolatesTopics() {
-        try (ResendLogStore store = new ResendLogStore(tempDir, 8, Duration.ZERO, Duration.ZERO, 1_000, false)) {
+        try (ResendLogStore store = new ResendLogStore(tempDir, 8, Duration.ZERO, 0L, Duration.ZERO, 1_000, 0, false)) {
             long now = System.currentTimeMillis();
             store.append("queue:orders", 1L, now,
                     RelayEntryCodec.encode(new RelayEntry(1L, 1L, "queue:orders", UUID.randomUUID(), new byte[] { 1 })));
