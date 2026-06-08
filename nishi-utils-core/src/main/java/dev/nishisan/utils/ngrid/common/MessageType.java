@@ -56,6 +56,10 @@ public enum MessageType {
     SEQUENCE_RESEND_REQUEST,
     /** Response carrying resent sequence data. */
     SEQUENCE_RESEND_RESPONSE,
+    /** Follower → leader pull of a contiguous op-log run (RELAY_STREAM mode). */
+    RELAY_STREAM_FETCH,
+    /** Leader → follower contiguous op-log run (or a need-snapshot signal) for RELAY_STREAM mode. */
+    RELAY_STREAM_BATCH,
     /** Subscribe to a distributed queue topic. */
     QUEUE_SUBSCRIBE,
     /** Unsubscribe from a distributed queue topic. */
