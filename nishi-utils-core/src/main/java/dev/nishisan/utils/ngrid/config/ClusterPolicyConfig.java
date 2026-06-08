@@ -261,6 +261,7 @@ public class ClusterPolicyConfig  {
         @Serial
         private int workers = 2;
         private int outboundQueueCapacity = 0;
+        private CompressionConfig compression;
 
         /** Creates a default transport config. */
         public TransportConfig() {
@@ -303,6 +304,76 @@ public class ClusterPolicyConfig  {
          */
         public void setOutboundQueueCapacity(int outboundQueueCapacity) {
             this.outboundQueueCapacity = outboundQueueCapacity;
+        }
+
+        /**
+         * Returns the transport compression configuration, or {@code null} when the
+         * {@code compression} section is absent (defaults then apply).
+         *
+         * @return the compression config, or {@code null}
+         */
+        public CompressionConfig getCompression() {
+            return compression;
+        }
+
+        /**
+         * Sets the transport compression configuration.
+         *
+         * @param compression the compression config
+         */
+        public void setCompression(CompressionConfig compression) {
+            this.compression = compression;
+        }
+    }
+
+    /**
+     * Transport-layer LZ4 compression configuration (YAML section
+     * {@code cluster.transport.compression}).
+     */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class CompressionConfig {
+        private boolean enabled = true;
+        private int minSize = 512;
+
+        /** Creates a default compression config (enabled, 512-byte threshold). */
+        public CompressionConfig() {
+        }
+
+        /**
+         * Whether outbound transport frames are eligible for LZ4 compression (default
+         * {@code true}).
+         *
+         * @return {@code true} if compression is enabled
+         */
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        /**
+         * Enables or disables outbound transport compression.
+         *
+         * @param enabled whether to compress eligible frames
+         */
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        /**
+         * Minimum serialized JSON size (bytes) eligible for compression (default {@code 512}).
+         *
+         * @return the minimum payload size
+         */
+        public int getMinSize() {
+            return minSize;
+        }
+
+        /**
+         * Sets the minimum serialized JSON size (bytes) eligible for compression.
+         *
+         * @param minSize the minimum payload size
+         */
+        public void setMinSize(int minSize) {
+            this.minSize = minSize;
         }
     }
 }

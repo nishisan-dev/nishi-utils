@@ -156,6 +156,11 @@ public class NGridConfigLoader {
             if (clusterConfig.getTransport() != null) {
                 builder.transportWorkerThreads(clusterConfig.getTransport().getWorkers());
                 builder.outboundQueueCapacity(clusterConfig.getTransport().getOutboundQueueCapacity());
+                ClusterPolicyConfig.CompressionConfig compression = clusterConfig.getTransport().getCompression();
+                if (compression != null) {
+                    builder.transportCompressionEnabled(compression.isEnabled());
+                    builder.transportCompressionMinSize(compression.getMinSize());
+                }
             }
             if (clusterConfig.getSeedNodes() != null && !clusterConfig.getSeedNodes().isEmpty()) {
                 for (ClusterPolicyConfig.SeedNodeConfig seedNode : clusterConfig.getSeedNodes()) {
