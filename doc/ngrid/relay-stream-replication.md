@@ -38,14 +38,58 @@ Os dois arquivos têm políticas de limpeza diferentes, espelhando o MySQL:
 
 | | nishi-utils | MySQL |
 |---|---|---|
-| **Op-log do líder** (`ResendLog`) | retenção FIXA por **contagem** (`resendLogMaxEntries`, default 10M) + **tempo** opcional (`replicationLogRetentionTime`), drop de segmento inteiro; independe do consumo | binlog: `max_binlog_size` + `binlog_expire_logs_seconds`, independe do slave |
-| **Relay do follower** (`NQueue`) | `TIME_BASED` + **`retentionClampToConsumer=true`** + compactação 30s → guarda só o backlog não-aplicado | relay log purgado pela SQL thread (`relay_log_purge`) |
+| **Op-log do líder** (`ResendLog`) | segmentado (`seg-NNNNNNNNNN.dat`), rotaciona por **ops** (`resendLogSegmentMaxEntries`), **idade** (`resendLogSegmentMaxAge`) ou **bytes** (`resendLogSegmentMaxBytes`); retém por **contagem total** (`resendLogMaxEntries`), **nº de arquivos** (`resendLogMaxSegments`) ou **tempo** (`replicationLogRetentionTime`); drop de segmento inteiro, independe do consumo | binlog: `max_binlog_size` + `binlog_expire_logs_seconds`, índices `mysql-bin.NNNNNN`, independe do slave |
+| **Relay do follower** (`NQueue`) | `TIME_BASED` + **`retentionClampToConsumer=true`** + compactação 30s → guarda só o backlog não-aplicado; TTL duro opcional `relayExpireAfterWrite` | relay log purgado pela SQL thread (`relay_log_purge`) + `relay_log_space_limit` |
 
 O op-log é a fonte da verdade do stream e, no modo stream, é inicializado
 **incondicionalmente** (independente de `persistentResendLog`). O piso
 (`oldestSequence`) define até onde um follower atrasado pode puxar antes de
-precisar de snapshot — tunável por `resendLogMaxEntries` (exposto no
-`NGridConfig.Builder`).
+precisar de snapshot.
+
+### Retenção do binlog estilo MySQL — "N arquivos de X"
+
+Cada **segmento** (`seg-NNNNNNNNNN.dat`) é um arquivo de binlog (um "índice", no
+jargão MySQL). A rotação fecha o segmento ativo no **primeiro limite atingido**
+entre ops, idade e bytes; a retenção dropa o segmento mais antigo (nunca o ativo)
+quando qualquer teto é violado. O segmento ativo nunca é dropado, garantindo que o
+líder sempre tem janela para servir o stream.
+
+| Eixo | Knob | MySQL |
+|---|---|---|
+| Rotação por bytes do arquivo | `resendLogSegmentMaxBytes` | `max_binlog_size` |
+| Rotação por ops do arquivo | `resendLogSegmentMaxEntries` | — |
+| Rotação por idade do arquivo | `resendLogSegmentMaxAge` | — |
+| Retenção por nº de arquivos | `resendLogMaxSegments` | (nº de índices binlog) |
+| Retenção por contagem total | `resendLogMaxEntries` | — |
+| Retenção por tempo | `replicationLogRetentionTime` | `binlog_expire_logs_seconds` |
+
+**Exemplos** (combinação per-segmento + nº de segmentos):
+
+- **10 arquivos de 10GB** → `resendLogSegmentMaxBytes = 10GiB` + `resendLogMaxSegments = 10`.
+- **10 arquivos de 10M ops cada** → `resendLogSegmentMaxEntries = 10_000_000` + `resendLogMaxSegments = 10`.
+
+```yaml
+cluster:
+  replication:
+    followerIngestMode: RELAY_STREAM
+    resendLogSegmentMaxBytes: 10737418240   # 10GiB por arquivo (max_binlog_size)
+    resendLogMaxSegments: 10                # retém no máximo 10 índices
+    # relayExpireAfterWrite: 30m            # TTL duro opcional do relay do follower
+```
+
+```java
+NGridConfig.builder(local)
+    .followerIngestMode(FollowerIngestMode.RELAY_STREAM)
+    .resendLogSegmentMaxBytes(10L * 1024 * 1024 * 1024) // 10GiB por arquivo
+    .resendLogMaxSegments(10)                            // 10 arquivos
+    .build();
+```
+
+Defaults: `resendLogSegmentMaxBytes = 0` e `resendLogMaxSegments = 0`
+(desabilitados) — preserva o comportamento atual; o backstop de contagem
+(`resendLogMaxEntries = 10M`) continua limitando o disco out-of-box. Em
+`DeploymentProfile.PRODUCTION`, quando setados, valem os pisos: `≥ 1MB` por
+segmento e `≥ 2` segmentos retidos.
 
 ## Semântica de durabilidade — ASYNC (default)
 
@@ -99,7 +143,10 @@ Modo selecionado por `followerIngestMode: RELAY_STREAM` (YAML mapeia por nome) o
 | `relayStreamPollInterval` | 50ms | long-poll quando em dia |
 | `relayStreamFetchTimeout` | 2s | re-emissão idempotente de fetch perdido |
 | `relayMaxBacklog` | 200000 | flow-control: pausa o fetch quando o relay enche |
-| `resendLogMaxEntries` | 10M | janela do binlog (exposto em `NGridConfig.Builder`) |
+| `resendLogMaxEntries` | 10M | retenção do binlog por contagem total (exposto em `NGridConfig.Builder`) |
+| `resendLogSegmentMaxBytes` | 0 (off) | rotação do binlog por bytes do arquivo — `max_binlog_size` (builder + YAML) |
+| `resendLogMaxSegments` | 0 (off) | retenção do binlog por nº de arquivos/índices (builder + YAML) |
+| `relayExpireAfterWrite` | 0 (off) | TTL duro do relay do follower — relay-log expiry (builder + YAML) |
 
 Eleição (`ClusterCoordinatorConfig`): `bootDiscoveryWindow` (default ZERO =
 desligado) habilita a deferência do não-preferido; prioridade vem da

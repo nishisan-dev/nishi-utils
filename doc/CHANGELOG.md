@@ -4,6 +4,40 @@
 
 ---
 
+## 2026-06-08 — 🟢 4.7.0 — Feat: retenção do binlog do líder estilo MySQL (rotação por tamanho + nº de arquivos)
+
+Evolui a persistência do op-log do líder (o "binlog" do `RELAY_STREAM`, `ResendLog`) para reter um
+número configurável de arquivos por **tamanho** ou **contagem de ops**, equiparando ao
+relay/binlog do MySQL. O dono pode agora expressar **"10 arquivos de 10GB"** ou **"10 arquivos de
+10M ops cada"**.
+
+**Contexto:** o `ResendLog` já era segmentado (`seg-NNNNNNNNNN.dat`) e rotacionava por **ops**
+(`resendLogSegmentMaxEntries`) e **idade** (`resendLogSegmentMaxAge`), retendo por **contagem total**
+(`resendLogMaxEntries`) e **tempo** (`replicationLogRetentionTime`). Faltavam os dois eixos com que o
+operador raciocina no MySQL: rotação por **bytes do arquivo** (`max_binlog_size`) e retenção por
+**número de arquivos/índices** (`mysql-bin.NNNNNN`).
+
+**Mudanças:**
+- **Rotação por tamanho** (`resendLogSegmentMaxBytes`, o `max_binlog_size`): o segmento ativo rola no
+  primeiro limite atingido entre ops, idade e bytes; um registro nunca é partido.
+- **Retenção por nº de segmentos** (`resendLogMaxSegments`): mantém no máximo N arquivos de binlog; o
+  segmento ativo nunca é dropado, então o líder sempre tem janela para servir o stream.
+- **Exposição** no `ReplicationConfig`/`NGridConfig.Builder` e no YAML (`cluster.replication.*`), com
+  **guardrails de PRODUCTION** (piso de 1MB/segmento e ≥2 segmentos retidos quando opt-in).
+- **Observabilidade:** `ResendLog.totalBytes()/segmentCount()` e `ResendLogStore.diskBytes()/segmentCount()`.
+- **Relay do follower:** expõe o TTL `expireAfterWrite` que o `NQueue` já suportava como knob
+  `relayExpireAfterWrite` (o relay-log expiry do MySQL) — teto duro opt-in, default desligado.
+
+Knobs `0`/`ZERO` por default (desabilitados) → comportamento atual preservado; o backstop de contagem
+(`resendLogMaxEntries = 10M`) continua limitando o disco out-of-box.
+
+**Testes:** `ResendLogTest` (rotação por bytes, retenção por nº de segmentos, `totalBytes`/
+`segmentCount`), `ReplicationConfigTest`/`NGridConfigOpLogKnobTest` (defaults, propagação, rejeição de
+negativos), `NGridConfigValidationTest` (guardrails de PRODUCTION), `NGridConfigLoaderTest`
+(round-trip YAML), `RelayStoreTest` (TTL descarta entrada não-aplicada; default preserva).
+
+---
+
 ## 2026-06-08 — 🟢 4.5.2 — Feat: compressão LZ4 transparente na camada de transporte (#133)
 
 Adiciona **compressão LZ4** transparente ao transporte TCP do cluster (PR **#133**), reduzindo os
