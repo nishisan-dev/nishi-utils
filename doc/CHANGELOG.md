@@ -4,6 +4,40 @@
 
 ---
 
+## 2026-06-08 — 🟢 4.5.2 — Feat: compressão LZ4 transparente na camada de transporte (#133)
+
+Adiciona **compressão LZ4** transparente ao transporte TCP do cluster (PR **#133**), reduzindo os
+bytes trafegados na replicação — em especial `SYNC_RESPONSE` (snapshots multi-MB, byte-sliced) e
+`REPLICATION_REQUEST`. O `ReplicationManager` não foi tocado: a compressão é totalmente transparente,
+feita na camada de codec/transporte.
+
+**Contexto:** nenhuma camada do caminho de replicação comprimia nada; a serialização é JSON via
+Jackson, que ainda emite os `byte[]` dos payloads como Base64 (~+33%). O ganho é direto sobre esse
+volume inflado.
+
+**Como funciona:**
+- Novo marker de frame **`0x10`** no `CompositeMessageCodec` (LZ4 *block* + header
+  `[marker][originalLength]`, pois o block não guarda o tamanho descomprimido). `unwrap` valida o
+  tamanho contra um teto (256 MiB) antes de alocar.
+- **Threshold + ganho real:** só comprime JSON `>= minSize` (default **512B**) e apenas se o frame
+  comprimido ficar menor; caso contrário envia `0x00`+JSON. HEARTBEAT/PING seguem binários.
+- **Compatível com rolling upgrade:** capacidade negociada no handshake
+  (`HandshakePayload.supportsCompression`). Nó antigo (campo ausente → `false`) **nunca** recebe frame
+  comprimido; o `decode` sempre sabe descomprimir. O próprio handshake nunca vai comprimido.
+- **Per-connection:** cada `Connection` tem seu `CompositeMessageCodec`; a compressão de saída só liga
+  após o peer confirmar suporte (`compressionEnabled && peerSupportsCompression`).
+- **Configurável (default ligada):** `TcpTransportConfig`/`NGridConfig`
+  (`compressionEnabled`/`compressionMinSize`) e seção YAML `cluster.transport.compression`
+  (`enabled`/`minSize`). Dependência nova: `org.lz4:lz4-java`.
+
+**Testes:** `Lz4FrameCompressorTest`, `CompositeMessageCodecTest` (round-trip comprimido, threshold,
+incompressível, interop legado `0x00`/`0x7B`, HEARTBEAT binário), `HandshakePayloadTest` (campo
+ausente → `false`), `TransportCompressionConfigTest`, mapeamento YAML em `NGridConfigLoaderTest` e
+`TransportCompressionClusterTest` (cluster real de 2 nós: cold-join via snapshot comprimido +
+replicação ao vivo comprimida). Suíte do core verde (420 testes) com compressão ligada por default.
+
+---
+
 ## 2026-06-07 — 🟢 4.5.1 — Fix: sync proativo do cold-join contra líder quiescente (montagem manual)
 
 Corrige o **#131** (follow-up do #129 3a): em montagem **manual** do `ReplicationManager` (sem
