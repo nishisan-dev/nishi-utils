@@ -101,6 +101,27 @@ class EpochConvergenceTest {
         }
     }
 
+    @Test
+    void followerAdoptsAgreedLeaderEpochEvenWhenItRegresses() throws Exception {
+        // Fase 0.2 — fencing por IDENTIDADE: uma vez que o nó reconhece HIGH como líder acordado,
+        // ele adota o epoch de HIGH mesmo que regrida (5 -> 2), em vez de descartar como "stale".
+        // O modelo antigo (só magnitude) ignoraria o epoch 2 e manteria 5 — congelando o follower.
+        try (Harness h = Harness.follower(NodeId.of("node-1-follower"), NodeId.of("node-9-leader"))) {
+            NodeId leader = NodeId.of("node-9-leader");
+            // 1ª batida estabelece HIGH como líder acordado (no fencing ainda não era líder).
+            h.injectHeartbeat(leader, 5L);
+            h.awaitTrackedLeader(leader);
+            // 2ª batida (já como líder acordado) fixa trackedLeaderEpoch=5.
+            h.injectHeartbeat(leader, 5L);
+            h.awaitTrackedEpoch(5L);
+            // Líder regride o termo para 2 — por identidade, o follower ADOTA 2 (não fencia).
+            h.injectHeartbeat(leader, 2L);
+            h.awaitTrackedEpoch(2L);
+            assertEquals(2L, h.coord.getTrackedLeaderEpoch(),
+                    "follower deveria adotar o epoch do líder acordado mesmo regredido");
+        }
+    }
+
     // ---- harness ----
 
     private static final class Harness implements AutoCloseable {
@@ -174,6 +195,29 @@ class EpochConvergenceTest {
                 Thread.sleep(50);
             }
             assertEquals(expected, coord.getLeaderEpoch(), "epoch não convergiu para o esperado");
+        }
+
+        void awaitTrackedLeader(NodeId expected) throws InterruptedException {
+            long deadline = System.currentTimeMillis() + 5_000;
+            while (System.currentTimeMillis() < deadline) {
+                if (coord.leaderInfo().map(NodeInfo::nodeId).filter(expected::equals).isPresent()) {
+                    return;
+                }
+                Thread.sleep(50);
+            }
+            fail("líder acordado não convergiu para " + expected
+                    + " (observado=" + coord.leaderInfo().map(NodeInfo::nodeId).orElse(null) + ")");
+        }
+
+        void awaitTrackedEpoch(long expected) throws InterruptedException {
+            long deadline = System.currentTimeMillis() + 5_000;
+            while (System.currentTimeMillis() < deadline) {
+                if (coord.getTrackedLeaderEpoch() == expected) {
+                    return;
+                }
+                Thread.sleep(50);
+            }
+            assertEquals(expected, coord.getTrackedLeaderEpoch(), "trackedLeaderEpoch não convergiu");
         }
 
         @Override

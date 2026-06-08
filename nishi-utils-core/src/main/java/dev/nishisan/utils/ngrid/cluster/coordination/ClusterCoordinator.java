@@ -786,15 +786,21 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             // whose persisted epoch regressed re-learns the highest term any node has seen and
             // re-stamps above it (re-establishing itself as the legitimate, accepted leader).
             observeEpoch(heartbeatEpoch);
-            if (heartbeatEpoch > 0 && heartbeatEpoch < trackedLeaderEpoch) {
+
+            // FENCING by leader IDENTITY: the agreed leader (deterministic max NodeId) is
+            // authoritative — adopt its term even if it momentarily appears lower than a ghost term
+            // we remember, so a converged leader is never fenced into a permanent freeze. Reject a
+            // stale epoch only from a source that is NOT the agreed leader (a partitioned ex-leader
+            // still broadcasting); leadership itself is still decided by NodeId, not by this filter.
+            NodeId currentLeader = leader.get();
+            boolean fromAgreedLeader = currentLeader != null && currentLeader.equals(source);
+            if (!fromAgreedLeader && heartbeatEpoch > 0 && heartbeatEpoch < trackedLeaderEpoch) {
                 LOGGER.fine(() -> String.format(
-                        "Ignoring heartbeat from %s with stale epoch %d (current: %d)",
+                        "Ignoring heartbeat from non-leader %s with stale epoch %d (current: %d)",
                         source, heartbeatEpoch, trackedLeaderEpoch));
                 return;
             }
-
-            NodeId currentLeader = leader.get();
-            if (currentLeader != null && currentLeader.equals(source)) {
+            if (fromAgreedLeader) {
                 trackedLeaderHighWatermark = payload.leaderHighWatermark();
                 trackedLeaderEpoch = payload.leaderEpoch();
             }

@@ -1112,17 +1112,25 @@ public class ReplicationManager
 
         // Already applied previously - send ACK and skip (checked below under lock)
 
-        // FENCING: Reject commands from stale leader epochs
+        // FENCING by leader IDENTITY, not just epoch magnitude. The cluster agrees on the leader
+        // deterministically (max NodeId) and the epoch is a monotonic cluster term (see
+        // ClusterCoordinator). Accept from the AGREED leader and adopt its term even if it
+        // momentarily appears lower than a ghost term we still remember — otherwise a leader whose
+        // term we last saw higher (before it converged) is fenced into a permanent freeze, which is
+        // exactly the production stall this fixes. Reject only a source that is NOT the agreed
+        // leader AND carries a stale (lower) term: a partitioned ex-leader's late writes.
         long payloadEpoch = payload.epoch();
-        if (payloadEpoch < lastSeenLeaderEpoch) {
+        boolean fromAgreedLeader = coordinator.leaderInfo()
+                .map(info -> info.nodeId())
+                .filter(id -> id.equals(message.source()))
+                .isPresent();
+        if (!fromAgreedLeader && payloadEpoch < lastSeenLeaderEpoch) {
             LOGGER.warning(() -> String.format(
-                    "[%s] Rejecting stale replication from epoch %d (current: %d) opId=%s",
-                    localNodeId, payloadEpoch, lastSeenLeaderEpoch, opId));
+                    "[%s] Rejecting stale replication from non-leader %s epoch %d (current: %d) opId=%s",
+                    localNodeId, message.source(), payloadEpoch, lastSeenLeaderEpoch, opId));
             return;
         }
-        if (payloadEpoch > lastSeenLeaderEpoch) {
-            lastSeenLeaderEpoch = payloadEpoch;
-        }
+        lastSeenLeaderEpoch = fromAgreedLeader ? payloadEpoch : Math.max(lastSeenLeaderEpoch, payloadEpoch);
 
         // RELAY_LOG: persist the op to the durable relay and ack on durable receipt; the per-topic
         // consumer applies it at its own pace. This replaces the in-memory buffer + inline apply
