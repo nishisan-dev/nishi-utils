@@ -1118,6 +1118,15 @@ public class ReplicationManager
             sequenceBufferLock.unlock();
         }
 
+        // RELAY_STREAM: re-anchor the pull cursor at the snapshot watermark so the fetch loop resumes
+        // streaming from watermark+1 instead of a stale pre-snapshot cursor (which would re-pull below
+        // the retained window and bounce on needSnapshot). Let it fetch immediately.
+        if (isStreamMode()) {
+            relayStreamCursor(topic).set(watermark);
+            relayFetchPendingUntilByTopic.put(topic, 0L);
+            signalFetch(topic);
+        }
+
         signalRelay(topic);
     }
 
@@ -1439,7 +1448,31 @@ public class ReplicationManager
 
     private java.util.concurrent.atomic.AtomicLong relayStreamCursor(String topic) {
         return relayStreamCursorByTopic.computeIfAbsent(topic,
-                k -> new java.util.concurrent.atomic.AtomicLong(currentNextExpected(topic) - 1L));
+                k -> new java.util.concurrent.atomic.AtomicLong(
+                        Math.max(currentNextExpected(topic) - 1L, relayTailSequence(topic))));
+    }
+
+    /**
+     * Highest sequence currently persisted in the topic relay (0 if empty). On a clean restart the
+     * relay durably holds the not-yet-applied tail; anchoring the cursor there resumes the stream from
+     * tail+1 instead of re-pulling (and re-storing) entries already on disk.
+     */
+    private long relayTailSequence(String topic) {
+        try {
+            long size = getRelaySize(topic);
+            if (size <= 0) {
+                return 0L;
+            }
+            int last = (int) Math.min(Integer.MAX_VALUE - 1L, size - 1L);
+            List<byte[]> tail = relayFor(topic).readRange(last, 1).items();
+            if (tail.isEmpty()) {
+                return 0L;
+            }
+            return RelayEntryCodec.decode(tail.get(0)).sequence();
+        } catch (Exception e) {
+            LOGGER.log(Level.FINE, "Could not read relay tail for topic " + topic, e);
+            return 0L;
+        }
     }
 
     private void signalFetch(String topic) {
@@ -1782,6 +1815,32 @@ public class ReplicationManager
             sequenceStateDirty = true;
         } finally {
             sequenceBufferLock.unlock();
+        }
+        mirrorAppliedToOpLog(topic, entries);
+    }
+
+    /**
+     * RELAY_STREAM: mirror an applied run into this node's own op-log (binlog) so that, if it is later
+     * promoted to leader, it can serve the full history as a sequential stream instead of forcing
+     * followers into a snapshot. Append-only and failure-tolerant — a miss only degrades a future
+     * fetch into the existing snapshot path, never the commit.
+     */
+    private void mirrorAppliedToOpLog(String topic, List<RelayEntry> entries) {
+        if (!isStreamMode()) {
+            return;
+        }
+        ResendLogStore store = resendLogStore;
+        if (store == null) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        for (RelayEntry e : entries) {
+            try {
+                store.append(topic, e.sequence(), now, RelayEntryCodec.encode(e));
+            } catch (Exception ex) {
+                LOGGER.log(Level.WARNING, "Op-log mirror append failed topic=" + topic
+                        + " seq=" + e.sequence(), ex);
+            }
         }
     }
 
