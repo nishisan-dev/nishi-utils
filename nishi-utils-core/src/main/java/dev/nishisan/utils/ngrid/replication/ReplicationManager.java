@@ -787,6 +787,19 @@ public class ReplicationManager
             // Persist sequence state for leader recovery (coalesced; flushed off the hot path)
             sequenceStateDirty = true;
 
+            // RELAY_STREAM: the durable op-log (binlog) is the ONLY delivery path to followers, so it
+            // must be written BEFORE the write is acked. If the append fails, rewind the per-topic
+            // sequence (held under the emission lock, so safe and contiguous — no permanent hole that
+            // would stall followers) and fail the write instead of acking a record that is absent from
+            // the stream source.
+            if (isStreamMode() && !appendStreamOpLog(operation, seq)) {
+                rollbackTopicSequence(operation.topic, seq);
+                failOperation(operation, new IllegalStateException(
+                        "RELAY_STREAM op-log append failed (seq " + seq + ", topic " + operation.topic
+                                + "); write not durable in the stream source"));
+                return;
+            }
+
             ReplicationPayload payload = new ReplicationPayload(operation.operationId, seq,
                     coordinator.getLeaderEpoch(), operation.topic, operation.payload);
 
@@ -810,6 +823,45 @@ public class ReplicationManager
         } finally {
             emissionLock.unlock();
         }
+    }
+
+    /**
+     * Appends a committed operation's frame to the durable op-log (binlog) for RELAY_STREAM, returning
+     * {@code false} on failure so the caller can fail the write rather than ack a record absent from
+     * the stream source. Called under the per-topic emission lock.
+     */
+    private boolean appendStreamOpLog(PendingOperation operation, long seq) {
+        ResendLogStore store = resendLogStore;
+        if (store == null) {
+            return false; // stream mode always initializes the op-log; defensive
+        }
+        ReplicationHandler handler = handlers.get(operation.topic);
+        if (handler == null) {
+            return false;
+        }
+        try {
+            byte[] payloadBytes = handler.encodePayload(operation.payload);
+            RelayEntry entry = new RelayEntry(operation.epoch, seq, operation.topic, operation.operationId,
+                    payloadBytes);
+            return store.append(operation.topic, seq, System.currentTimeMillis(), RelayEntryCodec.encode(entry));
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING, "RELAY_STREAM op-log append failed for seq " + seq
+                    + " (topic " + operation.topic + ")", e);
+            return false;
+        }
+    }
+
+    /**
+     * Rewinds the per-topic sequence counter from {@code seq} to {@code seq-1} so a failed emission does
+     * not burn the sequence (which would leave a permanent op-log hole). Safe only under the per-topic
+     * emission lock, where no other emission for the topic can race.
+     */
+    private void rollbackTopicSequence(String topic, long seq) {
+        java.util.concurrent.atomic.AtomicLong counter = sequenceByTopic.get(topic);
+        if (counter != null) {
+            counter.compareAndSet(seq, seq - 1);
+        }
+        sequenceStateDirty = true;
     }
 
     private ReentrantLock leaderEmissionLock(String topic) {
@@ -1547,6 +1599,17 @@ public class ReplicationManager
     private void handleRelayStreamBatch(ClusterMessage message) {
         RelayStreamBatchPayload batch = message.payload(RelayStreamBatchPayload.class);
         String topic = batch.topic();
+        // Fencing by leader IDENTITY (Fase 0.2): accept the stream only from the currently agreed
+        // leader. An in-flight fetch can straddle a leadership change, and a delayed batch from a
+        // superseded leader must NOT advance the cursor, update watermarks or apply stale ops. In
+        // RELAY_STREAM there are no REPLICATION_REQUESTs, so lastSeenLeaderEpoch is not otherwise
+        // maintained — this source check is the authoritative gate.
+        NodeId agreedLeader = coordinator.leaderInfo().map(NodeInfo::nodeId).orElse(null);
+        if (agreedLeader == null || !agreedLeader.equals(message.source())) {
+            LOGGER.fine(() -> "Ignoring RELAY_STREAM_BATCH from non-leader " + message.source()
+                    + " (agreed leader: " + agreedLeader + ")");
+            return;
+        }
         leaderHwmByTopic.put(topic, batch.leaderHighWatermark());
         leaderOldestByTopic.put(topic, batch.oldestSequence());
         if (!batch.frames().isEmpty()) {
@@ -2110,9 +2173,11 @@ public class ReplicationManager
 
         // Disk tier (#127): mirror the entry to the durable, time-governed resend op-log so the backlog
         // window survives off-heap. A disk failure here must NOT fail the commit — it only degrades a
-        // future resend into the existing snapshot-fallback path.
+        // future resend into the existing snapshot-fallback path. In RELAY_STREAM the append is already
+        // done synchronously on the emission path (appendStreamOpLog), so skip it here to avoid a
+        // duplicate append.
         ResendLogStore diskStore = resendLogStore;
-        if (diskStore != null) {
+        if (diskStore != null && !isStreamMode()) {
             ReplicationHandler handler = handlers.get(topic);
             if (handler != null) {
                 try {
