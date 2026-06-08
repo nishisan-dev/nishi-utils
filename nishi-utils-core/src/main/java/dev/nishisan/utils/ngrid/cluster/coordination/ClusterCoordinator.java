@@ -157,15 +157,24 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
 
     private void loadEpoch() {
         if (epochPath == null || !Files.exists(epochPath)) {
+            // Absent on first boot (or after a wiped data dir): start at 0 and let epoch
+            // convergence (observeEpoch) lift the term from peers before this node can emit
+            // as leader. The cluster term is a monotonic logical clock, not a per-node count.
             return;
         }
         try {
             String content = Files.readString(epochPath).trim();
             long loaded = Long.parseLong(content);
-            leaderEpoch.set(loaded);
+            // Never regress: adopt the max of the persisted value and whatever we already hold.
+            // A lost/relative data dir previously reset the term to 0 and re-elected at 1,
+            // regressing it below what followers had seen — which fenced the legitimate leader.
+            leaderEpoch.updateAndGet(cur -> Math.max(cur, loaded));
             LOGGER.info(() -> "Loaded leader epoch: " + loaded);
         } catch (Exception e) {
-            LOGGER.log(Level.WARNING, "Failed to load epoch, starting from 0", e);
+            // Corrupt file: do NOT silently reset to 0 (that is what allowed the 7 -> 1
+            // regression). Keep the current term and converge upward from peers instead.
+            LOGGER.log(Level.SEVERE, "Corrupt leader-epoch file at " + epochPath
+                    + "; keeping current term and converging from peers", e);
         }
     }
 
@@ -179,6 +188,46 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         } catch (Exception e) {
             LOGGER.log(Level.SEVERE, "Failed to persist epoch", e);
         }
+    }
+
+    /**
+     * Converges the local leader epoch toward a term observed from a peer, making the epoch a
+     * monotonic, cluster-wide logical clock rather than a per-node counter. Called for every
+     * epoch carried by an inbound heartbeat (and any other epoch-bearing message).
+     *
+     * <p>Semantics, guarding against runaway escalation:
+     * <ul>
+     *   <li>{@code observed <= currentTerm}: ignore. In particular this stops the leader from
+     *       re-stamping in response to its own term echoed back by a follower's heartbeat.</li>
+     *   <li>{@code observed > currentTerm} and this node is a <b>follower</b>: adopt
+     *       {@code observed} (track the cluster maximum, so a future election here starts above
+     *       every term any peer has seen).</li>
+     *   <li>{@code observed > currentTerm} and this node is the <b>leader</b>: re-stamp to
+     *       {@code observed + 1} — a fresh unique term strictly above the ghost term a follower
+     *       still remembers, so the follower's {@code < trackedLeaderEpoch} fencing accepts this
+     *       leader again. This is what unblocks a leader whose persisted term regressed.</li>
+     * </ul>
+     *
+     * @param observed the leader epoch carried by a peer message ({@code <= 0} is ignored)
+     */
+    private void observeEpoch(long observed) {
+        if (observed <= 0) {
+            return;
+        }
+        long prev;
+        long next;
+        do {
+            prev = leaderEpoch.get();
+            if (observed <= prev) {
+                return; // not newer than ours — ignore (also breaks the follower-echo escalation)
+            }
+            next = isLeader() ? observed + 1 : observed;
+        } while (!leaderEpoch.compareAndSet(prev, next));
+        persistEpoch(next);
+        long converged = next;
+        boolean restamped = converged == observed + 1;
+        LOGGER.info(() -> "Leader epoch converged to " + converged
+                + (restamped ? " (leader re-stamp above observed " + observed + ")" : " (tracked from peer)"));
     }
 
     /**
@@ -733,6 +782,10 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             // This prevents an ex-leader that stepped down from being
             // re-accepted as a valid leader after reconnecting.
             long heartbeatEpoch = payload.leaderEpoch();
+            // Converge the cluster term from every peer heartbeat BEFORE fencing, so a leader
+            // whose persisted epoch regressed re-learns the highest term any node has seen and
+            // re-stamps above it (re-establishing itself as the legitimate, accepted leader).
+            observeEpoch(heartbeatEpoch);
             if (heartbeatEpoch > 0 && heartbeatEpoch < trackedLeaderEpoch) {
                 LOGGER.fine(() -> String.format(
                         "Ignoring heartbeat from %s with stale epoch %d (current: %d)",
