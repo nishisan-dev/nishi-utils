@@ -222,6 +222,74 @@ class SequenceResendProtocolTest {
         }
     }
 
+    @Test
+    void leaderEmitsSameTopicSequencesInOrderUnderConcurrentReplicate() throws Exception {
+        NodeInfo leaderNode = new NodeInfo(NodeId.of("zzz-leader"), "127.0.0.1", 0);
+        NodeInfo peerNode = new NodeInfo(NodeId.of("aaa-peer"), "127.0.0.1", 0);
+
+        RecordingTransport leaderTransport = new RecordingTransport(leaderNode, List.of(peerNode));
+        ClusterCoordinator leaderCoordinator = new ClusterCoordinator(
+                leaderTransport, ClusterCoordinatorConfig.defaults(), scheduler);
+        leaderCoordinator.start();
+        leaderTransport.simulatePeerConnected(peerNode);
+        assertTrue(leaderCoordinator.isLeader(), "zzz-leader should be elected as leader");
+
+        ReplicationManager leaderManager = new ReplicationManager(leaderTransport, leaderCoordinator,
+                ReplicationConfig.builder(1)
+                        .strictConsistency(false)
+                        .leaderLocalApply(false)
+                        .operationTimeout(Duration.ofSeconds(5))
+                        .dataDirectory(tempDir)
+                        .build());
+        leaderManager.registerHandler(TOPIC, (operationId, payload) -> {
+        });
+        leaderManager.start();
+
+        ExecutorService workers = Executors.newFixedThreadPool(8);
+        try {
+            int threads = 8;
+            int perThread = 200;
+            int total = threads * perThread;
+            CountDownLatch ready = new CountDownLatch(threads);
+            CountDownLatch start = new CountDownLatch(1);
+            List<Future<?>> futures = new ArrayList<>();
+
+            for (int t = 0; t < threads; t++) {
+                int worker = t;
+                futures.add(workers.submit(() -> {
+                    ready.countDown();
+                    start.await();
+                    for (int i = 0; i < perThread; i++) {
+                        leaderManager.replicate(TOPIC, "worker-" + worker + "-op-" + i)
+                                .get(2, TimeUnit.SECONDS);
+                    }
+                    return null;
+                }));
+            }
+
+            assertTrue(ready.await(2, TimeUnit.SECONDS), "workers should be ready");
+            start.countDown();
+            for (Future<?> f : futures) {
+                f.get(10, TimeUnit.SECONDS);
+            }
+
+            List<Long> emitted = leaderTransport.getSentMessages().stream()
+                    .filter(m -> m.type() == MessageType.REPLICATION_REQUEST && TOPIC.equals(m.qualifier()))
+                    .map(m -> m.payload(ReplicationPayload.class).sequence())
+                    .toList();
+
+            assertEquals(total, emitted.size(), "every operation must be emitted to the follower");
+            for (int i = 0; i < total; i++) {
+                assertEquals(i + 1L, emitted.get(i),
+                        "leader must emit same-topic replication in sequence order");
+            }
+        } finally {
+            workers.shutdownNow();
+            leaderManager.close();
+            leaderCoordinator.close();
+        }
+    }
+
     // ────────────────────────────────────────────────
     // Test 3: Leader responds with missingSequences when log is empty
     // ────────────────────────────────────────────────

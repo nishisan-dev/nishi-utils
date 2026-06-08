@@ -74,6 +74,7 @@ public class ReplicationManager
     private final Set<UUID> processing = ConcurrentHashMap.newKeySet();
     private final java.util.concurrent.atomic.AtomicLong globalSequence = new java.util.concurrent.atomic.AtomicLong(0);
     private final Map<String, java.util.concurrent.atomic.AtomicLong> sequenceByTopic = new ConcurrentHashMap<>();
+    private final Map<String, ReentrantLock> leaderEmissionLocksByTopic = new ConcurrentHashMap<>();
     private final java.util.concurrent.atomic.AtomicLong appliedSequence = new java.util.concurrent.atomic.AtomicLong(
             0);
     private volatile long lastAppliedSequence = 0;
@@ -678,28 +679,38 @@ public class ReplicationManager
     }
 
     private void replicateToFollowers(PendingOperation operation) {
-        globalSequence.incrementAndGet();
-        long seq = nextSequenceForTopic(operation.topic);
-        operation.sequence = seq;
+        ReentrantLock emissionLock = leaderEmissionLock(operation.topic);
+        emissionLock.lock();
+        try {
+            globalSequence.incrementAndGet();
+            long seq = nextSequenceForTopic(operation.topic);
+            operation.sequence = seq;
 
-        // Persist sequence state for leader recovery (coalesced; flushed off the hot path)
-        sequenceStateDirty = true;
+            // Persist sequence state for leader recovery (coalesced; flushed off the hot path)
+            sequenceStateDirty = true;
 
-        ReplicationPayload payload = new ReplicationPayload(operation.operationId, seq,
-                coordinator.getLeaderEpoch(), operation.topic, operation.payload);
+            ReplicationPayload payload = new ReplicationPayload(operation.operationId, seq,
+                    coordinator.getLeaderEpoch(), operation.topic, operation.payload);
 
-        for (NodeInfo member : coordinator.activeMembers()) {
-            if (member.nodeId().equals(transport.local().nodeId())) {
-                continue;
-            }
-            ClusterMessage message = ClusterMessage.request(MessageType.REPLICATION_REQUEST,
-                    operation.topic,
-                    transport.local().nodeId(),
-                    member.nodeId(),
-                    payload);
-            transport.send(message);
+            coordinator.activeMembers().stream()
+                    .filter(member -> !member.nodeId().equals(transport.local().nodeId()))
+                    .sorted(Comparator.comparing(NodeInfo::nodeId))
+                    .forEach(member -> {
+                        ClusterMessage message = ClusterMessage.request(MessageType.REPLICATION_REQUEST,
+                                operation.topic,
+                                transport.local().nodeId(),
+                                member.nodeId(),
+                                payload);
+                        transport.send(message);
+                    });
+            checkCompletion(operation);
+        } finally {
+            emissionLock.unlock();
         }
-        checkCompletion(operation);
+    }
+
+    private ReentrantLock leaderEmissionLock(String topic) {
+        return leaderEmissionLocksByTopic.computeIfAbsent(topic, ignored -> new ReentrantLock());
     }
 
     private void retryPending() {
