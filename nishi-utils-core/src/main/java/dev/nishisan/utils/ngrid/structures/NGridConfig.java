@@ -51,6 +51,7 @@ public final class NGridConfig {
     private final FollowerIngestMode followerIngestMode;
     private final RelayDurability relayDurability;
     private final Duration relayGroupCommitInterval;
+    private final Duration relayExpireAfterWrite;
     private final boolean persistentResendLog;
     private final int relayApplyBatchSize;
     private final boolean leaderPauseOnJoin;
@@ -108,6 +109,7 @@ public final class NGridConfig {
         this.followerIngestMode = builder.followerIngestMode;
         this.relayDurability = builder.relayDurability;
         this.relayGroupCommitInterval = builder.relayGroupCommitInterval;
+        this.relayExpireAfterWrite = builder.relayExpireAfterWrite;
         this.persistentResendLog = builder.persistentResendLog;
         this.relayApplyBatchSize = builder.relayApplyBatchSize;
         this.leaderPauseOnJoin = builder.leaderPauseOnJoin;
@@ -271,6 +273,18 @@ public final class NGridConfig {
      */
     public RelayDurability relayDurability() {
         return relayDurability;
+    }
+
+    /**
+     * Optional write-time TTL for the follower relay-log — the MySQL relay-log expiry analog. Relay
+     * entries older than this are discarded at peek/poll time even if not yet applied; a follower
+     * lagging beyond it falls into the snapshot bootstrap path. When {@code null}, the replication
+     * default ({@link Duration#ZERO}, disabled) applies.
+     *
+     * @return the relay write-time TTL, or {@code null} when unset
+     */
+    public Duration relayExpireAfterWrite() {
+        return relayExpireAfterWrite;
     }
 
     /**
@@ -526,6 +540,7 @@ public final class NGridConfig {
         private FollowerIngestMode followerIngestMode = FollowerIngestMode.INLINE;
         private RelayDurability relayDurability = RelayDurability.OS_MANAGED;
         private Duration relayGroupCommitInterval = Duration.ofSeconds(1);
+        private Duration relayExpireAfterWrite;
         private boolean persistentResendLog = false;
         private int relayApplyBatchSize = 256;
         private boolean leaderPauseOnJoin = false;
@@ -901,6 +916,24 @@ public final class NGridConfig {
                 throw new IllegalArgumentException("relayGroupCommitInterval must be positive");
             }
             this.relayGroupCommitInterval = interval;
+            return this;
+        }
+
+        /**
+         * Sets the write-time TTL for the follower relay-log (the MySQL relay-log expiry analog).
+         * Relay entries older than this are discarded at peek/poll time even if not yet applied; a
+         * follower lagging beyond it falls into the snapshot bootstrap path. When unset (or
+         * {@link Duration#ZERO}), the TTL is disabled.
+         *
+         * @param ttl the relay write-time TTL ({@link Duration#ZERO} disables; must not be negative)
+         * @return this builder
+         */
+        public Builder relayExpireAfterWrite(Duration ttl) {
+            Objects.requireNonNull(ttl, "relayExpireAfterWrite");
+            if (ttl.isNegative()) {
+                throw new IllegalArgumentException("relayExpireAfterWrite must not be negative");
+            }
+            this.relayExpireAfterWrite = ttl;
             return this;
         }
 

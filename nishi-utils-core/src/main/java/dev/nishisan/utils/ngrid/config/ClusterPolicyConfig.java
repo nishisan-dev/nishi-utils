@@ -213,6 +213,7 @@ public class ClusterPolicyConfig  {
         private String followerIngestMode;
         private long resendLogSegmentMaxBytes = 0L;
         private int resendLogMaxSegments = 0;
+        private String relayExpireAfterWrite;
 
         /** Creates a default replication config. */
         public ReplicationConfig() {
@@ -310,6 +311,26 @@ public class ClusterPolicyConfig  {
          */
         public void setResendLogMaxSegments(int resendLogMaxSegments) {
             this.resendLogMaxSegments = resendLogMaxSegments;
+        }
+
+        /**
+         * Returns the follower relay-log write-time TTL (the MySQL relay-log expiry analog) as a
+         * duration string (ISO-8601 like {@code PT2H} or simple forms like {@code 2h}/{@code 30m}),
+         * or {@code null} when unset (TTL disabled).
+         *
+         * @return the relay TTL duration string, or {@code null}
+         */
+        public String getRelayExpireAfterWrite() {
+            return relayExpireAfterWrite;
+        }
+
+        /**
+         * Sets the follower relay-log write-time TTL as a duration string.
+         *
+         * @param relayExpireAfterWrite the relay TTL duration string ({@code null} disables)
+         */
+        public void setRelayExpireAfterWrite(String relayExpireAfterWrite) {
+            this.relayExpireAfterWrite = relayExpireAfterWrite;
         }
     }
 

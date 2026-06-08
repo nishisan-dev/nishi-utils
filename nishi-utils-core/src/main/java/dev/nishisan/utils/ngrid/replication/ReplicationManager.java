@@ -343,7 +343,7 @@ public class ReplicationManager
             // dropped (the clamp guarantees that).
             this.relayStore = new RelayStore(config.dataDirectory().resolve("relay"),
                     config.replicationLogRetentionTime(), config.relayDurability(),
-                    config.relayGroupCommitInterval());
+                    config.relayGroupCommitInterval(), config.relayExpireAfterWrite());
             // Start consumers for any handler registered before start() (normal flow registers after).
             for (String topic : handlers.keySet()) {
                 ensureRelayApplyLoop(topic);

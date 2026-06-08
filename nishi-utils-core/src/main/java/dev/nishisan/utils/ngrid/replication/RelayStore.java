@@ -49,6 +49,12 @@ import java.util.logging.Logger;
  * <li>{@code fsync=false} — sustains the leader's throughput; the small loss window of
  * not-yet-fsynced tail entries is recovered by the leader's resend op-log (#122).</li>
  * </ul>
+ *
+ * <p>An optional write-time TTL ({@code expireAfterWrite}, the MySQL relay-log expiry analog,
+ * default disabled) discards relay entries older than the TTL at peek/poll time <b>even if not yet
+ * applied</b>. If a follower lags beyond the TTL, the resulting hole forces the existing snapshot
+ * bootstrap path (the safe recovery). Unlike the {@code TIME_BASED} retention above, this is not
+ * clamped to the apply cursor — it is an opt-in hard bound, off by default.
  */
 final class RelayStore implements Closeable {
 
@@ -93,17 +99,24 @@ final class RelayStore implements Closeable {
     private final Path baseDir;
     private final Duration retention;
     private final RelayDurability durability;
+    private final Duration expireAfterWrite;
     private final Map<String, NQueue<byte[]>> byTopic = new ConcurrentHashMap<>();
     private final ScheduledExecutorService syncExecutor;
 
     RelayStore(Path baseDir, Duration retention) {
-        this(baseDir, retention, RelayDurability.OS_MANAGED, Duration.ofSeconds(1));
+        this(baseDir, retention, RelayDurability.OS_MANAGED, Duration.ofSeconds(1), Duration.ZERO);
     }
 
     RelayStore(Path baseDir, Duration retention, RelayDurability durability, Duration groupCommitInterval) {
+        this(baseDir, retention, durability, groupCommitInterval, Duration.ZERO);
+    }
+
+    RelayStore(Path baseDir, Duration retention, RelayDurability durability, Duration groupCommitInterval,
+            Duration expireAfterWrite) {
         this.baseDir = Objects.requireNonNull(baseDir, "baseDir");
         this.retention = retention == null ? Duration.ZERO : retention;
         this.durability = durability == null ? RelayDurability.OS_MANAGED : durability;
+        this.expireAfterWrite = expireAfterWrite == null ? Duration.ZERO : expireAfterWrite;
         if (this.durability == RelayDurability.GROUP_COMMIT) {
             long intervalMs = Math.max(1L, (groupCommitInterval == null ? Duration.ofSeconds(1) : groupCommitInterval)
                     .toMillis());
@@ -135,6 +148,7 @@ final class RelayStore implements Closeable {
                     .withRetentionPolicy(NQueue.Options.RetentionPolicy.TIME_BASED)
                     .withRetentionTime(retention)
                     .withRetentionClampToConsumer(true)
+                    .withExpireAfterWrite(expireAfterWrite)
                     .withCompactionInterval(Duration.ofSeconds(30));
             return NQueue.open(baseDir, dirName(topic), options);
         } catch (IOException e) {

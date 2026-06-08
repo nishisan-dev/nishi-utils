@@ -72,4 +72,17 @@ class ReplicationConfigTest {
         assertThrows(IllegalArgumentException.class,
                 () -> ReplicationConfig.builder(1).resendLogMaxSegments(-1));
     }
+
+    @Test
+    void relayExpireAfterWriteDefaultsDisabledAndBuilderPropagates() {
+        assertEquals(Duration.ZERO, builder().build().relayExpireAfterWrite(),
+                "relay TTL must default to disabled (Duration.ZERO)");
+        assertEquals(Duration.ofMinutes(30),
+                builder().relayExpireAfterWrite(Duration.ofMinutes(30)).build().relayExpireAfterWrite());
+
+        assertThrows(NullPointerException.class,
+                () -> ReplicationConfig.builder(1).relayExpireAfterWrite(null));
+        assertThrows(IllegalArgumentException.class,
+                () -> ReplicationConfig.builder(1).relayExpireAfterWrite(Duration.ofSeconds(-1)));
+    }
 }

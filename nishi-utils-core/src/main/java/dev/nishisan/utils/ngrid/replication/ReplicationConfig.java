@@ -40,6 +40,7 @@ public final class ReplicationConfig {
     private final FollowerIngestMode followerIngestMode;
     private final RelayDurability relayDurability;
     private final Duration relayGroupCommitInterval;
+    private final Duration relayExpireAfterWrite;
     private final boolean persistentResendLog;
     private final int resendLogSegmentMaxEntries;
     private final Duration resendLogSegmentMaxAge;
@@ -62,7 +63,8 @@ public final class ReplicationConfig {
             Path dataDirectory, int resendGapThreshold, Duration resendTimeout, int replicationLogRetention,
             Duration replicationLogRetentionTime, int appliedSetMaxSize, int operationLogMaxSize,
             boolean leaderLocalApply, FollowerIngestMode followerIngestMode, RelayDurability relayDurability,
-            Duration relayGroupCommitInterval, boolean persistentResendLog, int resendLogSegmentMaxEntries,
+            Duration relayGroupCommitInterval, Duration relayExpireAfterWrite, boolean persistentResendLog,
+            int resendLogSegmentMaxEntries,
             Duration resendLogSegmentMaxAge, long resendLogSegmentMaxBytes, long resendLogMaxEntries,
             int resendLogMaxSegments, int resendLogReadBatchMax,
             int relayApplyBatchSize, boolean leaderPauseOnJoin, Duration joinQuiesceMaxDuration,
@@ -85,6 +87,7 @@ public final class ReplicationConfig {
         this.followerIngestMode = Objects.requireNonNull(followerIngestMode, "followerIngestMode");
         this.relayDurability = Objects.requireNonNull(relayDurability, "relayDurability");
         this.relayGroupCommitInterval = Objects.requireNonNull(relayGroupCommitInterval, "relayGroupCommitInterval");
+        this.relayExpireAfterWrite = Objects.requireNonNull(relayExpireAfterWrite, "relayExpireAfterWrite");
         this.persistentResendLog = persistentResendLog;
         this.resendLogSegmentMaxEntries = resendLogSegmentMaxEntries;
         this.resendLogSegmentMaxAge = Objects.requireNonNull(resendLogSegmentMaxAge, "resendLogSegmentMaxAge");
@@ -233,6 +236,19 @@ public final class ReplicationConfig {
      */
     public Duration relayGroupCommitInterval() {
         return relayGroupCommitInterval;
+    }
+
+    /**
+     * Optional write-time TTL for the follower relay-log — the MySQL relay-log expiry analog.
+     * Relay entries older than this are discarded at peek/poll time <b>even if not yet applied</b>;
+     * a follower that lags beyond it falls into the snapshot bootstrap path. Unlike the
+     * consumer-clamped time retention, this is an opt-in hard bound. {@link Duration#ZERO} (default)
+     * disables it.
+     *
+     * @return the relay write-time TTL ({@link Duration#ZERO} when disabled, never {@code null})
+     */
+    public Duration relayExpireAfterWrite() {
+        return relayExpireAfterWrite;
     }
 
     /**
@@ -439,6 +455,7 @@ public final class ReplicationConfig {
         private FollowerIngestMode followerIngestMode = FollowerIngestMode.INLINE;
         private RelayDurability relayDurability = RelayDurability.OS_MANAGED;
         private Duration relayGroupCommitInterval = Duration.ofSeconds(1);
+        private Duration relayExpireAfterWrite = Duration.ZERO;
         private boolean persistentResendLog = false;
         private int resendLogSegmentMaxEntries = 65_536;
         private Duration resendLogSegmentMaxAge = Duration.ofMinutes(5);
@@ -611,6 +628,24 @@ public final class ReplicationConfig {
                 throw new IllegalArgumentException("relayGroupCommitInterval must be positive");
             }
             this.relayGroupCommitInterval = interval;
+            return this;
+        }
+
+        /**
+         * Sets the write-time TTL for the follower relay-log (the MySQL relay-log expiry analog).
+         * Relay entries older than this are discarded at peek/poll time even if not yet applied; a
+         * follower lagging beyond it falls into the snapshot bootstrap path. {@link Duration#ZERO}
+         * (default) disables it.
+         *
+         * @param ttl the relay write-time TTL ({@link Duration#ZERO} disables; must not be negative)
+         * @return this builder
+         */
+        public Builder relayExpireAfterWrite(Duration ttl) {
+            Objects.requireNonNull(ttl, "relayExpireAfterWrite");
+            if (ttl.isNegative()) {
+                throw new IllegalArgumentException("relayExpireAfterWrite must not be negative");
+            }
+            this.relayExpireAfterWrite = ttl;
             return this;
         }
 
@@ -859,7 +894,8 @@ public final class ReplicationConfig {
             return new ReplicationConfig(quorum, operationTimeout, retryInterval, strictConsistency, dataDirectory,
                     resendGapThreshold, resendTimeout, replicationLogRetention, replicationLogRetentionTime,
                     appliedSetMaxSize, operationLogMaxSize, leaderLocalApply, followerIngestMode, relayDurability,
-                    relayGroupCommitInterval, persistentResendLog, resendLogSegmentMaxEntries, resendLogSegmentMaxAge,
+                    relayGroupCommitInterval, relayExpireAfterWrite, persistentResendLog,
+                    resendLogSegmentMaxEntries, resendLogSegmentMaxAge,
                     resendLogSegmentMaxBytes, resendLogMaxEntries, resendLogMaxSegments, resendLogReadBatchMax,
                     relayApplyBatchSize, leaderPauseOnJoin,
                     joinQuiesceMaxDuration, followerProgressInterval, joinPeerDiscoveryWindow, joinSyncLagThreshold,

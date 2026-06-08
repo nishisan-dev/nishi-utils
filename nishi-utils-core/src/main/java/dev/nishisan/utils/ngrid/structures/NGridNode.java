@@ -374,6 +374,9 @@ public final class NGridNode implements Closeable {
         replicationBuilder.followerIngestMode(config.followerIngestMode());
         replicationBuilder.relayDurability(config.relayDurability());
         replicationBuilder.relayGroupCommitInterval(config.relayGroupCommitInterval());
+        if (config.relayExpireAfterWrite() != null) {
+            replicationBuilder.relayExpireAfterWrite(config.relayExpireAfterWrite());
+        }
         replicationBuilder.persistentResendLog(config.persistentResendLog());
         replicationBuilder.relayApplyBatchSize(config.relayApplyBatchSize());
         replicationBuilder.leaderPauseOnJoin(config.leaderPauseOnJoin());

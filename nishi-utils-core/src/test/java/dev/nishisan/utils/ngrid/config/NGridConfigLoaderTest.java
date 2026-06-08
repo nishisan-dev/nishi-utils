@@ -142,6 +142,7 @@ class NGridConfigLoaderTest {
         replication.setFollowerIngestMode("relay_stream");
         replication.setResendLogSegmentMaxBytes(10L * 1024 * 1024 * 1024); // 10GB per file
         replication.setResendLogMaxSegments(10);                            // keep 10 files
+        replication.setRelayExpireAfterWrite("30m");                        // follower relay TTL
         cluster.setReplication(replication);
         config.setCluster(cluster);
 
@@ -155,6 +156,7 @@ class NGridConfigLoaderTest {
 
         assertEquals(10L * 1024 * 1024 * 1024, domain.resendLogSegmentMaxBytes());
         assertEquals(10, domain.resendLogMaxSegments());
+        assertEquals(Duration.ofMinutes(30), domain.relayExpireAfterWrite());
     }
 
     @Test

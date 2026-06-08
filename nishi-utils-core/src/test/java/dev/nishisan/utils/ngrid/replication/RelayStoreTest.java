@@ -114,6 +114,38 @@ class RelayStoreTest {
     }
 
     @Test
+    void expireAfterWriteDropsAgedUnappliedEntriesOnPeek() throws Exception {
+        // The relay-log TTL (MySQL relay-log expiry analog) discards entries older than the TTL at
+        // peek time even though they were never applied — forcing the snapshot bootstrap path.
+        try (RelayStore store = new RelayStore(tempDir, Duration.ofMinutes(10),
+                RelayDurability.OS_MANAGED, Duration.ofSeconds(1), Duration.ofMillis(100))) {
+            NQueue<byte[]> relay = store.relayFor("queue:orders");
+            relay.offer(RelayEntryCodec.encode(
+                    new RelayEntry(1L, 1L, "queue:orders", UUID.randomUUID(), new byte[] { 1 })));
+            assertEquals(1L, relay.size(), "entry is present right after offer");
+
+            Thread.sleep(250); // age well past the 100ms TTL
+            assertTrue(relay.peek().isEmpty(),
+                    "an un-applied entry older than the TTL must be discarded on peek");
+            assertEquals(0L, relay.size(), "expired entry must be dropped from the relay");
+        }
+    }
+
+    @Test
+    void disabledExpireAfterWriteRetainsUnappliedEntries() throws Exception {
+        // Default (Duration.ZERO) disables the TTL: un-applied entries are never dropped by age.
+        try (RelayStore store = new RelayStore(tempDir, Duration.ofMinutes(10),
+                RelayDurability.OS_MANAGED, Duration.ofSeconds(1), Duration.ZERO)) {
+            NQueue<byte[]> relay = store.relayFor("queue:orders");
+            relay.offer(RelayEntryCodec.encode(
+                    new RelayEntry(1L, 1L, "queue:orders", UUID.randomUUID(), new byte[] { 1 })));
+            Thread.sleep(150);
+            assertTrue(relay.peek().isPresent(), "with TTL disabled the entry must survive");
+            assertEquals(1L, relay.size());
+        }
+    }
+
+    @Test
     void dirNameSanitizesAndDisambiguates() {
         assertFalse(RelayStore.dirName("queue:orders").contains(":"), "':' must be sanitized");
         assertFalse(RelayStore.dirName("map/profiles").contains("/"), "'/' must be sanitized");

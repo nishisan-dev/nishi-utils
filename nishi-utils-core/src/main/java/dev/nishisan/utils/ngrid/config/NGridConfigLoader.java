@@ -161,6 +161,10 @@ public class NGridConfigLoader {
                 if (maxSegments > 0) {
                     builder.resendLogMaxSegments(maxSegments);
                 }
+                Duration relayTtl = parseDuration(clusterConfig.getReplication().getRelayExpireAfterWrite());
+                if (relayTtl != null) {
+                    builder.relayExpireAfterWrite(relayTtl);
+                }
             }
             if (clusterConfig.getTransport() != null) {
                 builder.transportWorkerThreads(clusterConfig.getTransport().getWorkers());
