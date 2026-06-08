@@ -12,11 +12,31 @@ public class NodeIdentityConfig {
     private String id;
     private String host;
     private int port;
+    private int priority;
     private Set<String> roles = Collections.emptySet();
     private DirsConfig dirs;
 
     public String getId() {
         return id;
+    }
+
+    /**
+     * Returns this node's leadership priority (affinity). Higher = preferred leader; ties broken by
+     * node id. Defaults to {@code 0}.
+     *
+     * @return the leadership priority
+     */
+    public int getPriority() {
+        return priority;
+    }
+
+    /**
+     * Sets this node's leadership priority (affinity).
+     *
+     * @param priority the leadership priority (higher = preferred)
+     */
+    public void setPriority(int priority) {
+        this.priority = priority;
     }
 
     public void setId(String id) {

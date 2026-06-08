@@ -59,6 +59,7 @@ public final class NGridNodeBuilder {
     private boolean persistentResendLog = false;
     private int relayApplyBatchSize = 256;
     private boolean leaderPauseOnJoin = false;
+    private int priority = 0;
 
     NGridNodeBuilder(String host, int port) {
         this.host = Objects.requireNonNull(host, "host");
@@ -74,6 +75,18 @@ public final class NGridNodeBuilder {
      */
     public NGridNodeBuilder id(String id) {
         this.nodeId = Objects.requireNonNull(id, "nodeId");
+        return this;
+    }
+
+    /**
+     * Sets this node's leadership priority (affinity). Higher values are preferred when electing a
+     * leader; ties are broken deterministically by node id. Defaults to {@code 0}.
+     *
+     * @param priority the leadership priority (higher = preferred leader)
+     * @return this builder
+     */
+    public NGridNodeBuilder priority(int priority) {
+        this.priority = priority;
         return this;
     }
 
@@ -267,7 +280,8 @@ public final class NGridNodeBuilder {
         // Generate NodeId if not set
         String effectiveNodeId = nodeId != null ? nodeId : host + ":" + effectivePort;
 
-        NodeInfo localInfo = new NodeInfo(NodeId.of(effectiveNodeId), host, effectivePort);
+        NodeInfo localInfo = new NodeInfo(NodeId.of(effectiveNodeId), host, effectivePort,
+                java.util.Collections.emptySet(), priority);
 
         NGridConfig.Builder builder = NGridConfig.builder(localInfo)
                 .strictConsistency(strictConsistency)

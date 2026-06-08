@@ -122,9 +122,29 @@ public class ClusterPolicyConfig  {
         private String id;
         private String host;
         private int port;
+        private int priority;
 
         /** Creates a default seed node config. */
         public SeedNodeConfig() {
+        }
+
+        /**
+         * Returns the seed node leadership priority (affinity). Higher = preferred leader; ties
+         * broken by node id. Defaults to {@code 0}.
+         *
+         * @return the leadership priority
+         */
+        public int getPriority() {
+            return priority;
+        }
+
+        /**
+         * Sets the seed node leadership priority (affinity).
+         *
+         * @param priority the leadership priority (higher = preferred)
+         */
+        public void setPriority(int priority) {
+            this.priority = priority;
         }
 
         /**

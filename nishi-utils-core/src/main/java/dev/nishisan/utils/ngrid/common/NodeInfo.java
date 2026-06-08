@@ -35,9 +35,14 @@ public final class NodeInfo {
     private final String host;
     private final int port;
     private final Set<String> roles;
+    private final int priority;
 
     public NodeInfo(NodeId nodeId, String host, int port) {
-        this(nodeId, host, port, Collections.emptySet());
+        this(nodeId, host, port, Collections.emptySet(), 0);
+    }
+
+    public NodeInfo(NodeId nodeId, String host, int port, Set<String> roles) {
+        this(nodeId, host, port, roles, 0);
     }
 
     @JsonCreator
@@ -45,15 +50,37 @@ public final class NodeInfo {
             @JsonProperty("nodeId") NodeId nodeId,
             @JsonProperty("host") String host,
             @JsonProperty("port") int port,
-            @JsonProperty("roles") Set<String> roles) {
+            @JsonProperty("roles") Set<String> roles,
+            @JsonProperty("priority") int priority) {
         this.nodeId = Objects.requireNonNull(nodeId, "nodeId");
         this.host = Objects.requireNonNull(host, "host");
         this.port = port;
         this.roles = Collections.unmodifiableSet(new HashSet<>(Objects.requireNonNull(roles, "roles")));
+        this.priority = priority;
+    }
+
+    /**
+     * Returns a copy of this node info carrying the given leadership priority.
+     *
+     * @param priority the leadership affinity (higher = preferred leader)
+     * @return a new {@code NodeInfo} with {@code priority} applied
+     */
+    public NodeInfo withPriority(int priority) {
+        return new NodeInfo(nodeId, host, port, roles, priority);
     }
 
     public NodeId nodeId() {
         return nodeId;
+    }
+
+    /**
+     * Returns this node's leadership priority (affinity). Higher values are preferred when electing
+     * a leader; ties are broken deterministically by {@link NodeId}. Defaults to {@code 0}.
+     *
+     * @return the leadership priority
+     */
+    public int priority() {
+        return priority;
     }
 
     public String host() {
@@ -82,6 +109,6 @@ public final class NodeInfo {
 
     @Override
     public String toString() {
-        return nodeId + "@" + host + ':' + port + roles;
+        return nodeId + "@" + host + ':' + port + roles + (priority != 0 ? " prio=" + priority : "");
     }
 }

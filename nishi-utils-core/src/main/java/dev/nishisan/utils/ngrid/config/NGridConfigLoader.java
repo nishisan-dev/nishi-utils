@@ -123,7 +123,8 @@ public class NGridConfigLoader {
                 nodeId,
                 nodeConfig.getHost(),
                 nodeConfig.getPort(),
-                nodeConfig.getRoles());
+                nodeConfig.getRoles(),
+                nodeConfig.getPriority());
 
         dev.nishisan.utils.ngrid.structures.NGridConfig.Builder builder = dev.nishisan.utils.ngrid.structures.NGridConfig
                 .builder(localNode);
@@ -175,7 +176,9 @@ public class NGridConfigLoader {
                     builder.addPeer(new dev.nishisan.utils.ngrid.common.NodeInfo(
                             dev.nishisan.utils.ngrid.common.NodeId.of(nodeIdValue),
                             seedNode.getHost(),
-                            seedNode.getPort()));
+                            seedNode.getPort(),
+                            java.util.Collections.emptySet(),
+                            seedNode.getPriority()));
                 }
             } else if (clusterConfig.getSeeds() != null) {
                 for (String seed : clusterConfig.getSeeds()) {
