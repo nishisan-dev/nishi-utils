@@ -24,7 +24,6 @@ import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.ngrid.common.PeerUpdatePayload;
 import dev.nishisan.utils.ngrid.cluster.transport.codec.CompositeMessageCodec;
-import dev.nishisan.utils.ngrid.cluster.transport.codec.MessageCodec;
 import dev.nishisan.utils.stats.StatsUtils;
 
 import java.io.Closeable;
@@ -85,8 +84,6 @@ public final class TcpTransport implements Transport {
         t.setDaemon(true);
         return t;
     });
-
-    private final MessageCodec codec = new CompositeMessageCodec();
 
     // Test seam: runs just before an outbound dial. Lets a test deterministically simulate a slow
     // or stuck connect for a given peer (e.g. a node that just died) without relying on real
@@ -489,7 +486,7 @@ public final class TcpTransport implements Transport {
 
     private Connection registerConnection(Socket socket, NodeInfo preResolved) throws IOException {
         socket.setTcpNoDelay(true);
-        Connection connection = new Connection(socket, preResolved != null, codec);
+        Connection connection = new Connection(socket, preResolved != null);
         if (preResolved != null) {
             connection.setRemote(preResolved);
             // NOTE: do not publish into `connections` here. Both the outbound path and the
@@ -569,7 +566,8 @@ public final class TcpTransport implements Transport {
     private void sendHandshake(Connection connection) {
         NodeInfo localInfo = config.local();
         Set<NodeInfo> peers = Set.copyOf(knownPeers.values());
-        HandshakePayload payload = new HandshakePayload(localInfo, peers, collectLatencies());
+        HandshakePayload payload = new HandshakePayload(localInfo, peers, collectLatencies(),
+                config.compressionEnabled());
         ClusterMessage message = ClusterMessage.request(MessageType.HANDSHAKE,
                 "hello",
                 localInfo.nodeId(),
@@ -583,6 +581,10 @@ public final class TcpTransport implements Transport {
         NodeInfo remoteInfo = payload.local();
         boolean firstHandshakeOnThisConnection = connection.remoteId().isEmpty();
         connection.setRemote(remoteInfo);
+        // Negotiate outbound compression for this connection based on the peer's advertised
+        // capability. Done before any early return so the connection that ends up winning a
+        // simultaneous-open tie-break already has the correct flag.
+        connection.setPeerSupportsCompression(payload.supportsCompression());
         List<NodeId> staleIds = new ArrayList<>();
         for (Map.Entry<NodeId, NodeInfo> entry : knownPeers.entrySet()) {
             NodeInfo existing = entry.getValue();
@@ -810,16 +812,20 @@ public final class TcpTransport implements Transport {
         private final Socket socket;
         private final DataOutputStream outputStream;
         private final DataInputStream inputStream;
-        private final MessageCodec codec;
+        // Per-connection codec: outbound compression is negotiated per-peer in the handshake, so
+        // each connection owns its codec and toggles its compress-output flag once the peer
+        // advertises support. Decoding is always capable, independent of this flag.
+        private final CompositeMessageCodec codec;
         private final OutboundChannel outbound = new OutboundChannel(config.outboundQueueCapacity());
         private final boolean outboundInitiated;
         private volatile NodeInfo remote;
+        private volatile boolean peerSupportsCompression;
         private volatile boolean open = true;
 
-        private Connection(Socket socket, boolean outboundInitiated, MessageCodec codec) throws IOException {
+        private Connection(Socket socket, boolean outboundInitiated) throws IOException {
             this.socket = socket;
             this.outboundInitiated = outboundInitiated;
-            this.codec = codec;
+            this.codec = new CompositeMessageCodec(config.compressionMinSize());
             this.outputStream = new DataOutputStream(socket.getOutputStream());
             this.outputStream.flush();
             this.inputStream = new DataInputStream(socket.getInputStream());
@@ -829,6 +835,17 @@ public final class TcpTransport implements Transport {
 
         void setRemote(NodeInfo remote) {
             this.remote = remote;
+        }
+
+        /**
+         * Records whether the remote peer can decode LZ4-compressed frames (advertised in its
+         * handshake) and enables outbound compression on this connection only when both this node
+         * has compression enabled and the peer supports it. Until this is called the flag stays
+         * disabled, so the handshake itself is never compressed.
+         */
+        void setPeerSupportsCompression(boolean peerSupports) {
+            this.peerSupportsCompression = peerSupports;
+            codec.setCompressOutput(config.compressionEnabled() && peerSupports);
         }
 
         Optional<NodeId> remoteId() {
