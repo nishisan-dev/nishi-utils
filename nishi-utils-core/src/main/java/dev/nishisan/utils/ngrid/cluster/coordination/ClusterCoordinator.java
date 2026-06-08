@@ -81,6 +81,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     private volatile long trackedLeaderEpoch = 0L;
     private volatile Instant leaseExpiresAt = Instant.MIN;
     private final Path epochPath;
+    /** Epoch-millis until which a non-preferred node defers self-election; {@code 0} = no deferral. */
+    private volatile long bootDiscoveryDeadlineMs = 0L;
 
     /**
      * Listener notified whenever the cluster membership changes (member joins,
@@ -263,6 +265,10 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         running = true;
         // Initialize lease so a freshly started leader has a valid window
         this.leaseExpiresAt = Instant.now().plus(config.leaseTimeout());
+        // Arm the boot discovery window: while it is open, a node outranked by a configured but
+        // not-yet-active higher-priority peer defers self-election (see recomputeLeader).
+        long bootWindowMs = config.bootDiscoveryWindow().toMillis();
+        this.bootDiscoveryDeadlineMs = bootWindowMs > 0 ? Instant.now().toEpochMilli() + bootWindowMs : 0L;
         NodeInfo local = transport.local();
         members.put(local.nodeId(), new ClusterMember(local));
         transport.addListener(this);
@@ -276,6 +282,11 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 evictionIntervalMs,
                 TimeUnit.MILLISECONDS);
         recomputeLeader();
+        if (bootWindowMs > 0) {
+            // Re-evaluate leadership the moment the discovery window closes, so a node that deferred
+            // self-election (the preferred peer never showed up) takes leadership at the deadline.
+            scheduler.schedule(this::recomputeLeader, bootWindowMs + 1, TimeUnit.MILLISECONDS);
+        }
     }
 
     /**
@@ -636,12 +647,55 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                     return;
                 }
             }
-            Optional<NodeId> newLeader = members.values().stream()
+            // Elect by leadership affinity: highest (priority, then NodeId). With all priorities at
+            // the default 0 this reduces to the legacy max(NodeId), so behaviour is unchanged unless
+            // priorities are configured.
+            NodeId electedId = members.values().stream()
                     .filter(ClusterMember::isActive)
+                    .max(Comparator.comparingInt((ClusterMember m) -> m.info().priority())
+                            .thenComparing(ClusterMember::id))
                     .map(ClusterMember::id)
-                    .max(Comparator.naturalOrder());
-            updateLeader(newLeader.orElse(null));
+                    .orElse(null);
+
+            // Boot discovery deferral: if WE would lead only because a configured, higher-affinity
+            // peer has not shown up yet, stay a follower until the discovery window elapses (or the
+            // peer appears). Avoids grabbing leadership and forcing a churny hand-back. After the
+            // window, if the preferred peer never appears, we still lead (lead-while-alone / AP).
+            if (electedId != null && electedId.equals(transport.local().nodeId())
+                    && Instant.now().toEpochMilli() < bootDiscoveryDeadlineMs
+                    && outrankedByAbsentConfiguredPeer()) {
+                updateLeader(null);
+                return;
+            }
+            updateLeader(electedId);
         }
+    }
+
+    /**
+     * Returns {@code true} if a configured peer of strictly higher leadership affinity than the
+     * local node ({@code (priority, NodeId)}) is not currently an active member — i.e. the preferred
+     * leader is expected by configuration but has not yet been discovered. Used only to gate boot
+     * self-election deferral; portless gossip placeholders are ignored.
+     */
+    private boolean outrankedByAbsentConfiguredPeer() {
+        NodeInfo local = transport.local();
+        int localPriority = local.priority();
+        NodeId localId = local.nodeId();
+        for (NodeInfo peer : transport.peers()) {
+            if (peer.nodeId().equals(localId) || peer.port() <= 0) {
+                continue; // self, or a portless gossip/discovery placeholder
+            }
+            boolean outranks = peer.priority() > localPriority
+                    || (peer.priority() == localPriority && peer.nodeId().compareTo(localId) > 0);
+            if (!outranks) {
+                continue;
+            }
+            ClusterMember member = members.get(peer.nodeId());
+            if (member == null || !member.isActive()) {
+                return true; // a higher-affinity configured peer is not (yet) active
+            }
+        }
+        return false;
     }
 
     private int requiredActiveMembersForLeadership() {

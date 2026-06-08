@@ -31,15 +31,18 @@ public final class ClusterCoordinatorConfig {
     private final int minClusterSize;
     private final Path dataDirectory;
     private final boolean pairMode;
+    private final Duration bootDiscoveryWindow;
 
     private ClusterCoordinatorConfig(Duration heartbeatInterval, Duration heartbeatTimeout,
-            Duration leaseTimeout, int minClusterSize, Path dataDirectory, boolean pairMode) {
+            Duration leaseTimeout, int minClusterSize, Path dataDirectory, boolean pairMode,
+            Duration bootDiscoveryWindow) {
         this.heartbeatInterval = heartbeatInterval;
         this.heartbeatTimeout = heartbeatTimeout;
         this.leaseTimeout = leaseTimeout;
         this.minClusterSize = minClusterSize;
         this.dataDirectory = dataDirectory;
         this.pairMode = pairMode;
+        this.bootDiscoveryWindow = bootDiscoveryWindow == null ? Duration.ZERO : bootDiscoveryWindow;
     }
 
     /**
@@ -51,7 +54,7 @@ public final class ClusterCoordinatorConfig {
     public static ClusterCoordinatorConfig defaults() {
         Duration defaultTimeout = Duration.ofSeconds(10);
         return new ClusterCoordinatorConfig(Duration.ofSeconds(3), defaultTimeout,
-                defaultTimeout.multipliedBy(3), 1, null, false);
+                defaultTimeout.multipliedBy(3), 1, null, false, Duration.ZERO);
     }
 
     /**
@@ -113,7 +116,8 @@ public final class ClusterCoordinatorConfig {
             throw new IllegalArgumentException("minClusterSize must be >= 1");
         }
         Duration effectiveLease = leaseTimeout != null ? leaseTimeout : timeout.multipliedBy(3);
-        return new ClusterCoordinatorConfig(interval, timeout, effectiveLease, minClusterSize, dataDirectory, false);
+        return new ClusterCoordinatorConfig(interval, timeout, effectiveLease, minClusterSize, dataDirectory,
+                false, Duration.ZERO);
     }
 
     /**
@@ -131,7 +135,36 @@ public final class ClusterCoordinatorConfig {
      */
     public ClusterCoordinatorConfig withPairMode(boolean pairMode) {
         return new ClusterCoordinatorConfig(heartbeatInterval, heartbeatTimeout, leaseTimeout,
-                minClusterSize, dataDirectory, pairMode);
+                minClusterSize, dataDirectory, pairMode, bootDiscoveryWindow);
+    }
+
+    /**
+     * Returns a copy of this configuration with the boot discovery window applied.
+     *
+     * <p>During this window after {@link ClusterCoordinator#start()}, a node that is outranked by a
+     * configured (but not yet active) higher-priority peer DEFERS self-election — it stays a
+     * follower to give the preferred leader time to appear via gossip/handshake, instead of grabbing
+     * leadership and forcing a churny re-election when the preferred node shows up. After the window
+     * (or once it has seen the higher-priority peer) normal priority election resumes; if the
+     * preferred peer never appears, the node still leads (lead-while-alone / AP). {@code ZERO}
+     * (default) disables the deferral entirely, preserving legacy immediate election.</p>
+     *
+     * @param bootDiscoveryWindow the deferral window; {@code null} or {@code ZERO} disables it
+     * @return a new configuration with the window applied
+     */
+    public ClusterCoordinatorConfig withBootDiscoveryWindow(Duration bootDiscoveryWindow) {
+        return new ClusterCoordinatorConfig(heartbeatInterval, heartbeatTimeout, leaseTimeout,
+                minClusterSize, dataDirectory, pairMode, bootDiscoveryWindow);
+    }
+
+    /**
+     * Returns the boot discovery window during which a non-preferred node defers self-election.
+     * {@code ZERO} means disabled. See {@link #withBootDiscoveryWindow(Duration)}.
+     *
+     * @return the boot discovery window
+     */
+    public Duration bootDiscoveryWindow() {
+        return bootDiscoveryWindow;
     }
 
     /**
