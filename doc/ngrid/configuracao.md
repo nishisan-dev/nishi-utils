@@ -74,6 +74,16 @@ cluster:
     # catch-up (gap/snapshot). Nao limita o trafego de controle (heartbeat).
     # Ver doc/ngrid/outbound-backpressure.md.
     outboundQueueCapacity: 0
+    # Compressao LZ4 dos frames de transporte (replicacao e snapshots).
+    # Reduz bytes na rede de REPLICATION_REQUEST e, sobretudo, SYNC_RESPONSE
+    # (snapshots multi-MB). Negociada por peer no handshake: so comprime para
+    # nos que anunciam suporte, entao e seguro em rolling upgrade. A
+    # descompressao e sempre suportada. Default: ligada, threshold 512 bytes.
+    compression:
+      enabled: true
+      # Tamanho minimo do JSON (bytes) elegivel a compressao; frames menores
+      # vao sem compressao (nao compensam e poderiam inflar).
+      minSize: 512
   # Lista de nos sementes para descoberta inicial (formato host:port)
   seeds:
     - 127.0.0.1:9001
