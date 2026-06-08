@@ -217,6 +217,11 @@ public class ReplicationManager
     private final Map<String, Long> relayFetchPendingUntilByTopic = new ConcurrentHashMap<>();
     // Last leader high-watermark per topic, learned from RELAY_STREAM_BATCH (lag observability).
     private final Map<String, Long> leaderHwmByTopic = new ConcurrentHashMap<>();
+    // Leader's retained-window floor per topic, learned from RELAY_STREAM_BATCH (snapshot-risk view).
+    private final Map<String, Long> leaderOldestByTopic = new ConcurrentHashMap<>();
+    // Cumulative stream bytes pulled per topic (RELAY_STREAM throughput observability).
+    private final Map<String, java.util.concurrent.atomic.AtomicLong> streamBytesInByTopic =
+            new ConcurrentHashMap<>();
 
     // Metrics
     private final java.util.concurrent.atomic.AtomicLong gapsDetected = new java.util.concurrent.atomic.AtomicLong(0);
@@ -258,6 +263,12 @@ public class ReplicationManager
      * @param syncing               true while a snapshot sync is active for the topic
      * @param relayPendingBootstrap true while relay replay is waiting for bootstrap sync
      * @param resendPending         true while a sequence resend is in flight
+     * @param streamCursor          RELAY_STREAM: highest sequence persisted to the relay (pull cursor)
+     * @param leaderHighWatermark   leader's highest sequence for the topic (own, or learned via stream)
+     * @param leaderOldestSequence  leader's retained-window floor (oldest streamable), or -1 if unknown
+     * @param lag                   leader high-watermark minus the applied frontier (follower lag)
+     * @param streamBytesIn         cumulative stream bytes pulled for the topic (RELAY_STREAM)
+     * @param streaming             true while actively streaming the topic from the leader
      */
     public record TopicReplicationStatus(
             String topic,
@@ -266,7 +277,13 @@ public class ReplicationManager
             long relayBacklog,
             boolean syncing,
             boolean relayPendingBootstrap,
-            boolean resendPending) {
+            boolean resendPending,
+            long streamCursor,
+            long leaderHighWatermark,
+            long leaderOldestSequence,
+            long lag,
+            long streamBytesIn,
+            boolean streaming) {
     }
 
     /**
@@ -316,6 +333,10 @@ public class ReplicationManager
         coordinator.setLeaderHighWatermarkSupplier(
                 () -> coordinator.isLeader() ? getGlobalSequence() : getLastAppliedSequence());
         if (isRelayMode()) {
+            // Restore the applied progress metric from the durable per-topic frontiers so a clean
+            // restart does not report 0 applied (the counter is otherwise per-session). A bootstrap,
+            // if one happens, re-anchors it at the snapshot watermark.
+            seedAppliedSequenceFromFrontier();
             detectUncleanRestartAndMarkBootstrap();
             // Relay retention mirrors the leader op-log window (#122): an over-retention
             // backlog is surfaced to the consumer and resolved by bootstrap, never silently
@@ -471,6 +492,22 @@ public class ReplicationManager
 
     public long getLastAppliedSequence() {
         return lastAppliedSequence;
+    }
+
+    /**
+     * Seeds the applied-progress metric from the durable per-topic apply frontiers, so a restart
+     * resumes the metric instead of reporting 0 (the counter is per-session). The total applied op
+     * count equals the sum of {@code (nextExpected - 1)} across topics.
+     */
+    private void seedAppliedSequenceFromFrontier() {
+        long applied = 0L;
+        for (Map.Entry<String, Long> e : nextExpectedSequenceByTopic.entrySet()) {
+            applied += Math.max(0L, e.getValue() - 1L);
+        }
+        if (applied > 0L) {
+            appliedSequence.set(applied);
+            lastAppliedSequence = applied;
+        }
     }
 
     /**
@@ -1511,6 +1548,15 @@ public class ReplicationManager
         RelayStreamBatchPayload batch = message.payload(RelayStreamBatchPayload.class);
         String topic = batch.topic();
         leaderHwmByTopic.put(topic, batch.leaderHighWatermark());
+        leaderOldestByTopic.put(topic, batch.oldestSequence());
+        if (!batch.frames().isEmpty()) {
+            long bytes = 0L;
+            for (byte[] f : batch.frames()) {
+                bytes += f.length;
+            }
+            streamBytesInByTopic.computeIfAbsent(topic, k -> new java.util.concurrent.atomic.AtomicLong())
+                    .addAndGet(bytes);
+        }
 
         if (batch.needSnapshot()) {
             // Below the leader's retained window: bootstrap, then resume streaming from the watermark.
@@ -2678,6 +2724,53 @@ public class ReplicationManager
         }
     }
 
+    /** RELAY_STREAM: highest sequence this follower has persisted to the topic relay (the pull cursor). */
+    public long getRelayStreamCursor(String topic) {
+        java.util.concurrent.atomic.AtomicLong cursor = relayStreamCursorByTopic.get(topic);
+        return cursor == null ? 0L : cursor.get();
+    }
+
+    /**
+     * Leader high-watermark for a topic: the leader's own highest assigned sequence, or the value a
+     * follower learned from its last RELAY_STREAM_BATCH ({@code 0} if unknown yet).
+     */
+    public long getLeaderHighWatermark(String topic) {
+        if (coordinator.isLeader()) {
+            return currentLeaderTopicSequence(topic);
+        }
+        return leaderHwmByTopic.getOrDefault(topic, 0L);
+    }
+
+    /** Leader's retained-window floor for a topic (oldest sequence still streamable); {@code -1} if unknown. */
+    public long getLeaderOldestSequence(String topic) {
+        if (coordinator.isLeader()) {
+            ResendLogStore store = resendLogStore;
+            return store == null ? -1L : store.logFor(topic).oldestSequence();
+        }
+        return leaderOldestByTopic.getOrDefault(topic, -1L);
+    }
+
+    /** Replication lag for a topic on a follower: leader high-watermark minus the applied frontier. */
+    public long getReplicationLag(String topic) {
+        long hwm = getLeaderHighWatermark(topic);
+        if (hwm <= 0L) {
+            return 0L;
+        }
+        return Math.max(0L, hwm - (currentNextExpected(topic) - 1L));
+    }
+
+    /** Cumulative stream bytes pulled for a topic (RELAY_STREAM throughput). */
+    public long getStreamBytesIn(String topic) {
+        java.util.concurrent.atomic.AtomicLong bytes = streamBytesInByTopic.get(topic);
+        return bytes == null ? 0L : bytes.get();
+    }
+
+    /** True when this node is actively streaming the topic from the leader (RELAY_STREAM follower). */
+    public boolean isStreaming(String topic) {
+        return isStreamMode() && !coordinator.isLeader()
+                && relayFetchThreads.containsKey(topic) && !syncingTopics.contains(topic);
+    }
+
     /**
      * Age, in milliseconds, of the oldest unapplied relay entry for {@code topic} (#128) — i.e. how
      * long the follower's apply frontier has lagged the relay head. {@code 0} when the relay is empty
@@ -2718,7 +2811,13 @@ public class ReplicationManager
                     getRelaySize(topic),
                     syncingTopics.contains(topic),
                     relayPendingBootstrap.contains(topic),
-                    resendPendingTopics.contains(topic)));
+                    resendPendingTopics.contains(topic),
+                    getRelayStreamCursor(topic),
+                    getLeaderHighWatermark(topic),
+                    getLeaderOldestSequence(topic),
+                    getReplicationLag(topic),
+                    getStreamBytesIn(topic),
+                    isStreaming(topic)));
         }
         return statuses;
     }
