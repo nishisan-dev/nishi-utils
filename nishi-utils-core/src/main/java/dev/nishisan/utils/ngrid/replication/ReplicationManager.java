@@ -30,6 +30,8 @@ import dev.nishisan.utils.ngrid.common.MessageType;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.ngrid.common.OperationStatus;
+import dev.nishisan.utils.ngrid.common.RelayStreamBatchPayload;
+import dev.nishisan.utils.ngrid.common.RelayStreamFetchPayload;
 import dev.nishisan.utils.ngrid.common.ReplicationAckPayload;
 import dev.nishisan.utils.ngrid.common.ReplicationPayload;
 import dev.nishisan.utils.ngrid.common.SequenceResendRequestPayload;
@@ -314,9 +316,11 @@ public class ReplicationManager
                 ensureRelayApplyLoop(topic);
             }
         }
-        if (config.persistentResendLog()) {
+        if (config.persistentResendLog() || isStreamMode()) {
             // Disk-backed resend op-log (#127). Initialized regardless of role — a follower may be
             // promoted to leader later and must already be serving resends from a durable window.
+            // In RELAY_STREAM mode this op-log is the leader's binlog (the stream source of truth),
+            // so it is unconditional there, independent of the persistentResendLog flag.
             this.resendLogStore = new ResendLogStore(config.dataDirectory().resolve("resend-log"),
                     config.resendLogSegmentMaxEntries(), config.resendLogSegmentMaxAge(),
                     config.replicationLogRetentionTime(), config.resendLogMaxEntries(),
@@ -910,6 +914,8 @@ public class ReplicationManager
             handleSequenceResendRequest(message);
         } else if (message.type() == MessageType.SEQUENCE_RESEND_RESPONSE) {
             handleSequenceResendResponse(message);
+        } else if (message.type() == MessageType.RELAY_STREAM_FETCH) {
+            handleRelayStreamFetch(message);
         } else if (message.type() == MessageType.FOLLOWER_PROGRESS) {
             handleFollowerProgress(message);
         } else if (message.type() == MessageType.USER_BROADCAST) {
@@ -1240,7 +1246,13 @@ public class ReplicationManager
     // ── Relay-log ingestion (#124) ───────────────────────────────────────────────
 
     private boolean isRelayMode() {
-        return config != null && config.followerIngestMode() == FollowerIngestMode.RELAY_LOG;
+        return config != null && (config.followerIngestMode() == FollowerIngestMode.RELAY_LOG
+                || config.followerIngestMode() == FollowerIngestMode.RELAY_STREAM);
+    }
+
+    /** True in RELAY_STREAM mode: the follower pulls the leader op-log as a sequential stream. */
+    private boolean isStreamMode() {
+        return config != null && config.followerIngestMode() == FollowerIngestMode.RELAY_STREAM;
     }
 
     /**
@@ -1842,6 +1854,71 @@ public class ReplicationManager
                 requestSync(topic);
             }
         });
+    }
+
+    /**
+     * Serves a follower's RELAY_STREAM_FETCH from the durable op-log (the leader's binlog): a
+     * strictly contiguous run starting at the requested sequence, or a need-snapshot signal when the
+     * follower is below the retained window. Only the leader answers; the op-log is the single source
+     * of truth, so the response is driven by what is actually persisted (no separate high-watermark to
+     * race the commit/append).
+     */
+    private void handleRelayStreamFetch(ClusterMessage message) {
+        if (!coordinator.isLeader()) {
+            LOGGER.fine(() -> "Ignoring RELAY_STREAM_FETCH: not the leader.");
+            return;
+        }
+        ResendLogStore store = resendLogStore;
+        if (store == null) {
+            LOGGER.warning("RELAY_STREAM_FETCH received but the op-log is not initialized");
+            return;
+        }
+        RelayStreamFetchPayload request = message.payload(RelayStreamFetchPayload.class);
+        String topic = request.topic();
+        long from = Math.max(1L, request.fromSequence());
+        int maxBatch = Math.min(Math.max(1, request.maxBatch()), config.resendLogReadBatchMax());
+
+        ResendLog log = store.logFor(topic);
+        long oldest = log.oldestSequence();
+        long to = from + (long) maxBatch - 1L;
+        List<RelayEntry> entries = log.read(from, to);
+        List<byte[]> frames = takeContiguousFrames(entries, from);
+
+        // Below the retained window with nothing contiguous to send → the follower must bootstrap.
+        boolean needSnapshot = frames.isEmpty() && oldest > 0 && from < oldest;
+        long hwm = currentLeaderTopicSequence(topic);
+
+        RelayStreamBatchPayload batch = new RelayStreamBatchPayload(topic, from, frames, hwm, oldest, needSnapshot);
+        transport.send(ClusterMessage.request(MessageType.RELAY_STREAM_BATCH, "stream",
+                transport.local().nodeId(), message.source(), batch));
+        if (needSnapshot || !frames.isEmpty()) {
+            int sent = frames.size();
+            LOGGER.fine(() -> String.format("Served RELAY_STREAM_FETCH from %s topic=%s from=%d: %d frames%s",
+                    message.source(), topic, from, sent, needSnapshot ? " (needSnapshot)" : ""));
+        }
+    }
+
+    /** Takes the leading contiguous run of frames starting at {@code from} (stops at the first hole). */
+    private List<byte[]> takeContiguousFrames(List<RelayEntry> entries, long from) {
+        List<byte[]> out = new ArrayList<>(entries.size());
+        long expected = from;
+        for (RelayEntry entry : entries) {
+            if (entry.sequence() < expected) {
+                continue; // duplicate / below the cursor
+            }
+            if (entry.sequence() != expected) {
+                break; // hole — a stream run must be contiguous
+            }
+            out.add(RelayEntryCodec.encode(entry));
+            expected++;
+        }
+        return out;
+    }
+
+    /** Best-effort highest assigned sequence for a topic (advisory lag metric carried to the follower). */
+    private long currentLeaderTopicSequence(String topic) {
+        java.util.concurrent.atomic.AtomicLong counter = sequenceByTopic.get(topic);
+        return counter == null ? 0L : counter.get();
     }
 
     /**
