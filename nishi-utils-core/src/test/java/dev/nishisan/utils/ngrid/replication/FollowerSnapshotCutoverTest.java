@@ -107,6 +107,68 @@ class FollowerSnapshotCutoverTest {
 
     @Test
     @Timeout(value = 20, unit = TimeUnit.SECONDS)
+    void relayModeResendResponseBuffersAtReorderHeadAndUnblocksFutureRelayEntry() throws Exception {
+        NodeInfo leaderNode = new NodeInfo(NodeId.of("zzz-leader"), "127.0.0.1", 0);
+        NodeInfo followerNode = new NodeInfo(NodeId.of("aaa-follower"), "127.0.0.1", 0);
+
+        RecordingTransport transport = new RecordingTransport(followerNode, List.of(leaderNode));
+        ClusterCoordinator coordinator = new ClusterCoordinator(
+                transport, ClusterCoordinatorConfig.defaults(), scheduler);
+        coordinator.start();
+        transport.simulatePeerConnected(leaderNode);
+
+        RecordingHandler handler = new RecordingHandler();
+        ReplicationManager follower = new ReplicationManager(transport, coordinator,
+                ReplicationConfig.builder(2)
+                        .dataDirectory(tempDir)
+                        .followerIngestMode(FollowerIngestMode.RELAY_LOG)
+                        .relayApplyBatchSize(4)
+                        .build());
+        follower.registerHandler(TOPIC, handler);
+        follower.start();
+
+        try {
+            deliverSyncResponse(transport, leaderNode, followerNode, 0L);
+            await(() -> follower.getTopicReplicationStatuses().get(TOPIC).nextExpectedSequence() == 1L,
+                    5_000, "snapshot cutover did not initialize nextExpected");
+
+            deliverReplication(transport, leaderNode, followerNode, 3L, "future-3");
+
+            await(() -> transport.getSentMessages().stream()
+                    .anyMatch(m -> m.type() == MessageType.SEQUENCE_RESEND_REQUEST),
+                    5_000, "relay gap did not request resend");
+
+            SequenceResendResponsePayload responsePayload = new SequenceResendResponsePayload(
+                    TOPIC,
+                    List.of(
+                            replicationPayload(1L, "head-1"),
+                            replicationPayload(2L, "head-2")),
+                    List.of());
+            ClusterMessage response = ClusterMessage.request(
+                    MessageType.SEQUENCE_RESEND_RESPONSE,
+                    "resend",
+                    leaderNode.nodeId(),
+                    followerNode.nodeId(),
+                    responsePayload);
+            transport.deliverToListeners(response);
+
+            await(() -> handler.applied().equals(List.of("head-1", "head-2", "future-3")),
+                    5_000, "resent relay prefix did not unblock the future relay entry");
+
+            assertEquals(4L, follower.getTopicReplicationStatuses().get(TOPIC).nextExpectedSequence());
+            assertEquals(0L, follower.getTopicReplicationStatuses().get(TOPIC).relayBacklog());
+            assertEquals(0L, follower.getSnapshotFallbackCount());
+            assertEquals(1L, transport.getSentMessages().stream()
+                    .filter(m -> m.type() == MessageType.SEQUENCE_RESEND_REQUEST)
+                    .count(), "resend response should unblock the original gap without overlapping requests");
+        } finally {
+            follower.close();
+            coordinator.close();
+        }
+    }
+
+    @Test
+    @Timeout(value = 20, unit = TimeUnit.SECONDS)
     void staleMissingResendResponseAfterFrontierAdvanceDoesNotTriggerSnapshot() throws Exception {
         NodeInfo leaderNode = new NodeInfo(NodeId.of("zzz-leader"), "127.0.0.1", 0);
         NodeInfo followerNode = new NodeInfo(NodeId.of("aaa-follower"), "127.0.0.1", 0);
@@ -172,12 +234,7 @@ class FollowerSnapshotCutoverTest {
 
     private static void deliverReplication(RecordingTransport transport, NodeInfo leaderNode, NodeInfo followerNode,
             long sequence, String value) {
-        ReplicationPayload payload = new ReplicationPayload(
-                UUID.randomUUID(),
-                sequence,
-                1L,
-                TOPIC,
-                value.getBytes(StandardCharsets.UTF_8));
+        ReplicationPayload payload = replicationPayload(sequence, value);
         ClusterMessage message = ClusterMessage.request(
                 MessageType.REPLICATION_REQUEST,
                 TOPIC,
@@ -185,6 +242,15 @@ class FollowerSnapshotCutoverTest {
                 followerNode.nodeId(),
                 payload);
         transport.deliverToListeners(message);
+    }
+
+    private static ReplicationPayload replicationPayload(long sequence, String value) {
+        return new ReplicationPayload(
+                UUID.randomUUID(),
+                sequence,
+                1L,
+                TOPIC,
+                value.getBytes(StandardCharsets.UTF_8));
     }
 
     private static void await(Condition condition, long timeoutMs, String failureMessage) throws Exception {

@@ -1366,7 +1366,11 @@ public class ReplicationManager
         // overhead. readRange reads from the consumer offset (index 0 = oldest unapplied).
         List<byte[]> frames = relay.readRange(0, Math.max(1, config.relayApplyBatchSize())).items();
         if (frames.isEmpty()) {
-            if (reorder.isEmpty()) {
+            boolean reorderEmpty;
+            synchronized (reorder) {
+                reorderEmpty = reorder.isEmpty();
+            }
+            if (reorderEmpty) {
                 // Relay + reorder buffer fully drained for this topic — release the failover drain-gate
                 // if one is held (no-op otherwise). Safe to read reorder here: this is its owner thread.
                 maybeReleaseRelayDrainGate(topic);
@@ -1423,14 +1427,22 @@ public class ReplicationManager
             // behind it (including resent ops that arrive at the relay tail), and ask the leader to
             // resend the missing prefix.
             long frontier = nextExpectedSequenceByTopic.getOrDefault(topic, 1L);
-            reorder.add(gapEntry);
+            synchronized (reorder) {
+                reorder.add(gapEntry);
+            }
             relay.poll();
             gapsDetected.incrementAndGet();
-            if (reorder.size() > RELAY_REORDER_CAP) {
+            int reorderSize;
+            synchronized (reorder) {
+                reorderSize = reorder.size();
+            }
+            if (reorderSize > RELAY_REORDER_CAP) {
                 LOGGER.warning(() -> "Relay reorder buffer cap hit for topic " + topic
                         + "; backlog too far ahead of an unfilled gap — requesting snapshot");
                 snapshotFallbackCount.incrementAndGet();
-                reorder.clear();
+                synchronized (reorder) {
+                    reorder.clear();
+                }
                 if (syncingTopics.add(topic)) {
                     requestSync(topic);
                 }
@@ -1470,21 +1482,27 @@ public class ReplicationManager
     /** Applies buffered entries that have become contiguous with nextExpected. */
     private boolean drainReorderContiguous(String topic, PriorityQueue<RelayEntry> reorder) throws Exception {
         boolean any = false;
-        while (!reorder.isEmpty()) {
-            long nextExpected = nextExpectedSequenceByTopic.getOrDefault(topic, 1L);
-            RelayEntry min = reorder.peek();
-            if (min.sequence() < nextExpected) {
-                reorder.poll(); // stale duplicate buffered earlier
-                any = true;
-                continue;
+        while (true) {
+            RelayEntry ready = null;
+            synchronized (reorder) {
+                if (reorder.isEmpty()) {
+                    return any;
+                }
+                long nextExpected = nextExpectedSequenceByTopic.getOrDefault(topic, 1L);
+                RelayEntry min = reorder.peek();
+                if (min.sequence() < nextExpected) {
+                    reorder.poll(); // stale duplicate buffered earlier
+                    any = true;
+                    continue;
+                }
+                if (min.sequence() != nextExpected) {
+                    return any; // still a hole
+                }
+                ready = reorder.poll();
             }
-            if (min.sequence() != nextExpected) {
-                break; // still a hole
-            }
-            applyRelayEntry(topic, reorder.poll());
+            applyRelayEntry(topic, ready);
             any = true;
         }
-        return any;
     }
 
     /** Applies one relay entry to the handler and advances the durable apply frontier. */
@@ -2031,6 +2049,20 @@ public class ReplicationManager
             return;
         }
 
+        if (isRelayMode()) {
+            int buffered = bufferRelayResendOperations(topic, operations);
+            if (buffered == 0) {
+                LOGGER.fine(() -> "Received SEQUENCE_RESEND_RESPONSE for topic=" + topic
+                        + " but no relay operations were buffered");
+                return;
+            }
+            recordResendSuccess(startTime);
+            LOGGER.info(() -> String.format(
+                    "Buffered %d resent operations for topic=%s into relay reorder.",
+                    buffered, topic));
+            return;
+        }
+
         LOGGER.info(() -> String.format(
                 "Received SEQUENCE_RESEND_RESPONSE for topic=%s with %d operations. Applying...",
                 topic, operations.size()));
@@ -2048,16 +2080,54 @@ public class ReplicationManager
         }
 
         // Record convergence metrics
+        recordResendSuccess(startTime);
+
+        LOGGER.info(() -> String.format(
+                "Successfully applied %d resent operations for topic=%s.",
+                operations.size(), topic));
+    }
+
+    private int bufferRelayResendOperations(String topic, List<ReplicationPayload> operations) {
+        ReplicationHandler handler = handlers.get(topic);
+        if (handler == null) {
+            return 0;
+        }
+        PriorityQueue<RelayEntry> reorder = relayReorderByTopic.computeIfAbsent(topic,
+                k -> new PriorityQueue<>(Comparator.comparingLong(RelayEntry::sequence)));
+        long currentNextExpected = currentNextExpected(topic);
+        List<ReplicationPayload> sorted = operations.stream()
+                .filter(payload -> payload.sequence() >= currentNextExpected)
+                .sorted(Comparator.comparingLong(ReplicationPayload::sequence))
+                .toList();
+        int buffered = 0;
+        synchronized (reorder) {
+            for (ReplicationPayload payload : sorted) {
+                try {
+                    byte[] payloadBytes = handler.encodePayload(payload.data());
+                    reorder.add(new RelayEntry(payload.epoch(), payload.sequence(), topic,
+                            payload.operationId(), payloadBytes));
+                    buffered++;
+                } catch (Exception e) {
+                    LOGGER.log(Level.WARNING,
+                            "Failed to encode resent operation seq " + payload.sequence()
+                                    + " for relay reorder (topic " + topic + ")",
+                            e);
+                }
+            }
+        }
+        if (buffered > 0) {
+            signalRelay(topic);
+        }
+        return buffered;
+    }
+
+    private void recordResendSuccess(Instant startTime) {
         resendSuccessCount.incrementAndGet();
         if (startTime != null) {
             long elapsedMs = Duration.between(startTime, Instant.now()).toMillis();
             totalConvergenceTimeMs.addAndGet(elapsedMs);
             convergenceCount.incrementAndGet();
         }
-
-        LOGGER.info(() -> String.format(
-                "Successfully applied %d resent operations for topic=%s.",
-                operations.size(), topic));
     }
 
     private long currentNextExpected(String topic) {
