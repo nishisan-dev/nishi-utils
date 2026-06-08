@@ -303,7 +303,9 @@ public final class NGridNode implements Closeable {
                 .reconnectInterval(config.reconnectInterval())
                 .requestTimeout(requestTimeout)
                 .workerThreads(config.transportWorkerThreads())
-                .outboundQueueCapacity(config.outboundQueueCapacity());
+                .outboundQueueCapacity(config.outboundQueueCapacity())
+                .compressionEnabled(config.transportCompressionEnabled())
+                .compressionMinSize(config.transportCompressionMinSize());
         config.peers().forEach(transportBuilder::addPeer);
         transport = new TcpTransport(transportBuilder.build(), stats);
 
