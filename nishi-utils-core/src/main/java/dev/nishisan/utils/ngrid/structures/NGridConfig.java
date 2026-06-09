@@ -59,6 +59,9 @@ public final class NGridConfig {
     private final Duration rttProbeInterval;
     private final Duration heartbeatInterval;
     private final Duration leaseTimeout;
+    private final boolean pairMode;
+    private final Integer minClusterSize;
+    private final Duration bootDiscoveryWindow;
     private final boolean leaderReelectionEnabled;
     private final Duration leaderReelectionInterval;
     private final Duration leaderReelectionCooldown;
@@ -117,6 +120,9 @@ public final class NGridConfig {
         this.rttProbeInterval = builder.rttProbeInterval;
         this.heartbeatInterval = builder.heartbeatInterval;
         this.leaseTimeout = builder.leaseTimeout;
+        this.pairMode = builder.pairMode;
+        this.minClusterSize = builder.minClusterSize;
+        this.bootDiscoveryWindow = builder.bootDiscoveryWindow;
         this.leaderReelectionEnabled = builder.leaderReelectionEnabled;
         this.leaderReelectionInterval = builder.leaderReelectionInterval;
         this.leaderReelectionCooldown = builder.leaderReelectionCooldown;
@@ -366,6 +372,37 @@ public final class NGridConfig {
         return leaseTimeout;
     }
 
+    /**
+     * Whether pair-mode is enabled (active/standby of two nodes): leadership requires only
+     * {@link #minClusterSize()} active members, so a node that loses its peer still leads. Default
+     * {@code false}. See {@code ClusterCoordinatorConfig.withPairMode(boolean)}.
+     *
+     * @return {@code true} if pair-mode is enabled
+     */
+    public boolean pairMode() {
+        return pairMode;
+    }
+
+    /**
+     * Explicit minimum cluster size for leadership, or {@code null} to derive it from the replication
+     * quorum. In pair-mode set this to {@code 1} so a solo node leads.
+     *
+     * @return the configured minimum cluster size, or {@code null} to derive
+     */
+    public Integer minClusterSize() {
+        return minClusterSize;
+    }
+
+    /**
+     * Boot-discovery window during which a freshly started node defers self-election while it discovers
+     * peers and their replication watermarks (sync-before-reclaim). {@code null}/{@code ZERO} disables it.
+     *
+     * @return the boot-discovery window, or {@code null} if unset
+     */
+    public Duration bootDiscoveryWindow() {
+        return bootDiscoveryWindow;
+    }
+
     public boolean strictConsistency() {
         return strictConsistency;
     }
@@ -548,6 +585,9 @@ public final class NGridConfig {
         private Duration rttProbeInterval = Duration.ofSeconds(10);
         private Duration heartbeatInterval = Duration.ofSeconds(3);
         private Duration leaseTimeout;
+        private boolean pairMode = false;
+        private Integer minClusterSize;
+        private Duration bootDiscoveryWindow;
         private boolean leaderReelectionEnabled = false;
         private Duration leaderReelectionInterval = Duration.ofSeconds(5);
         private Duration leaderReelectionCooldown = Duration.ofSeconds(60);
@@ -980,6 +1020,48 @@ public final class NGridConfig {
                 throw new IllegalArgumentException("timeout must be positive");
             }
             this.leaseTimeout = timeout;
+            return this;
+        }
+
+        /**
+         * Enables pair-mode (active/standby of two nodes): leadership requires only
+         * {@link #minClusterSize(int)} active members, so a node that loses its peer still leads.
+         * Combine with {@code minClusterSize(1)} for a two-node pair. Defaults to {@code false}.
+         *
+         * @param pairMode {@code true} to enable pair-mode
+         * @return this builder
+         */
+        public Builder pairMode(boolean pairMode) {
+            this.pairMode = pairMode;
+            return this;
+        }
+
+        /**
+         * Sets an explicit minimum cluster size for leadership (overrides the quorum-derived default).
+         * In pair-mode set this to {@code 1} so a solo node leads.
+         *
+         * @param minClusterSize minimum active members for leadership ({@code >= 1})
+         * @return this builder
+         */
+        public Builder minClusterSize(int minClusterSize) {
+            if (minClusterSize < 1) {
+                throw new IllegalArgumentException("minClusterSize must be >= 1");
+            }
+            this.minClusterSize = minClusterSize;
+            return this;
+        }
+
+        /**
+         * Sets the boot-discovery window during which a freshly started node defers self-election while
+         * it discovers peers and their replication watermarks (sync-before-reclaim). A returning
+         * higher-affinity node uses this window to learn the incumbent's state before deciding whether to
+         * reclaim. {@code ZERO}/unset disables the deferral (legacy immediate election).
+         *
+         * @param bootDiscoveryWindow the deferral window
+         * @return this builder
+         */
+        public Builder bootDiscoveryWindow(Duration bootDiscoveryWindow) {
+            this.bootDiscoveryWindow = bootDiscoveryWindow;
             return this;
         }
 

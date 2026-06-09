@@ -91,6 +91,7 @@ public class ReplicationManager
             false);
     private final java.util.concurrent.atomic.AtomicReference<NodeId> lastLeader = new java.util.concurrent.atomic.AtomicReference<>();
 
+
     // Multi-thread executor to prevent starvation when async apply callbacks recursively
     // submit tasks (leader local-apply path).
     private final ExecutorService executor = Executors.newFixedThreadPool(4, r -> {
@@ -295,8 +296,29 @@ public class ReplicationManager
         // ReplicationManager is assembled manually (without NGridNode). The follower reads this
         // watermark to drive the proactive cold-join sync (#129); the coordinator default (-1) starved
         // it, so a fresh follower never converged against a quiescent leader in manual assemblies (#131).
+        //
+        // The advertised watermark is the node's TOTAL APPLIED state frontier — for the leader this is
+        // max(produced, applied), NOT just globalSequence. A follower that is PROMOTED to leader has a
+        // globalSequence that counts only ITS OWN productions (it never produced while a follower), which
+        // is BELOW the state it actually applied from the previous leader. Advertising the raw
+        // globalSequence would make the promoted leader claim a watermark below its real state — and the
+        // sync-before-reclaim gate would then let a returning higher-affinity peer reclaim after matching
+        // only that understated frontier, i.e. with the incumbent's tail still unsynced. Using
+        // max(globalSequence, lastApplied) keeps the advertised watermark on the same scale as every
+        // follower's applied frontier, so the gate compares like with like.
         coordinator.setLeaderHighWatermarkSupplier(
-                () -> coordinator.isLeader() ? getGlobalSequence() : getLastAppliedSequence());
+                () -> coordinator.isLeader()
+                        ? Math.max(getGlobalSequence(), getLastAppliedSequence())
+                        : getLastAppliedSequence());
+        // Sync-before-reclaim (watermark gate): feed the coordinator the local APPLIED frontier and the
+        // catch-up tolerance. The coordinator compares this against every peer's advertised watermark
+        // (learned from heartbeats) to decide whether a returning higher-affinity node may reclaim
+        // leadership (only once caught up) and whether an incumbent may step down (only once the
+        // higher-affinity candidate has caught up). The threshold reuses joinSyncLagThreshold (#129).
+        coordinator.setReplicationProgressGate(this::getLastAppliedSequence, config.joinSyncLagThreshold());
+        // Nudge the coordinator to recompute leadership as our applied frontier advances, so a deferred
+        // reclaim is promoted promptly once we catch up (membership/eviction ticks would also trigger it).
+        timeoutScheduler.scheduleAtFixedRate(this::nudgeLeadershipOnCatchUp, 200, 200, TimeUnit.MILLISECONDS);
         if (isStreamMode()) {
             // Restore the applied progress metric from the durable per-topic frontiers so a clean
             // restart does not report 0 applied (the counter is otherwise per-session). A bootstrap,
@@ -509,6 +531,32 @@ public class ReplicationManager
 
     public boolean isLeaderSyncing() {
         return leaderSyncing.get();
+    }
+
+    /**
+     * Periodic nudge for sync-before-reclaim (watermark gate): when this node is a deferring follower
+     * that has now caught up to the cluster's max peer watermark, ask the coordinator to recompute
+     * leadership so the deferred affinity reclaim is promoted promptly (rather than waiting for the next
+     * membership/eviction tick). No-op when we already lead or when no peer is ahead. The authoritative
+     * decision still lives in {@link ClusterCoordinator#recomputeLeader()}; this only reduces latency.
+     */
+    private void nudgeLeadershipOnCatchUp() {
+        if (!running || coordinator.isLeader()) {
+            return;
+        }
+        try {
+            long maxPeer = coordinator.maxActivePeerHighWatermark();
+            if (maxPeer < 0) {
+                return; // no peer ahead — nothing deferred (lead-while-alone is handled by recompute)
+            }
+            long applied = getLastAppliedSequence();
+            long threshold = Math.max(0L, config.joinSyncLagThreshold());
+            if (applied >= maxPeer - threshold) {
+                coordinator.reevaluateLeadership();
+            }
+        } catch (Throwable t) {
+            LOGGER.log(Level.FINE, "nudgeLeadershipOnCatchUp failed", t);
+        }
     }
 
     /**

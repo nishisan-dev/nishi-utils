@@ -321,13 +321,17 @@ public final class NGridNode implements Closeable {
             t.setDaemon(true);
             return t;
         });
-        int minClusterSize = Math.max(1, Math.min(config.replicationQuorum(), config.peers().size() + 1));
+        int derivedMinClusterSize = Math.max(1, Math.min(config.replicationQuorum(), config.peers().size() + 1));
+        int minClusterSize = config.minClusterSize() != null ? config.minClusterSize() : derivedMinClusterSize;
         ClusterCoordinatorConfig coordinatorConfig = ClusterCoordinatorConfig.of(
                 config.heartbeatInterval(),
                 config.heartbeatInterval().multipliedBy(3),
                 config.leaseTimeout(),
                 minClusterSize,
-                null);
+                null)
+                .withPairMode(config.pairMode())
+                .withBootDiscoveryWindow(
+                        config.bootDiscoveryWindow() != null ? config.bootDiscoveryWindow() : Duration.ZERO);
         coordinator = new ClusterCoordinator(transport, coordinatorConfig, coordinatorScheduler);
         coordinator.start();
 
