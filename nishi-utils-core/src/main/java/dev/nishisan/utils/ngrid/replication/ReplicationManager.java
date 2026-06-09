@@ -90,7 +90,6 @@ public class ReplicationManager
     private final java.util.concurrent.atomic.AtomicBoolean leaderSyncing = new java.util.concurrent.atomic.AtomicBoolean(
             false);
     private final java.util.concurrent.atomic.AtomicReference<NodeId> lastLeader = new java.util.concurrent.atomic.AtomicReference<>();
-    private volatile long lastSeenLeaderEpoch = 0L;
 
     // Multi-thread executor to prevent starvation when async apply callbacks recursively
     // submit tasks (leader local-apply path).
@@ -1194,9 +1193,9 @@ public class ReplicationManager
         String topic = batch.topic();
         // Fencing by leader IDENTITY (Fase 0.2): accept the stream only from the currently agreed
         // leader. An in-flight fetch can straddle a leadership change, and a delayed batch from a
-        // superseded leader must NOT advance the cursor, update watermarks or apply stale ops. In
-        // RELAY_STREAM there are no REPLICATION_REQUESTs, so lastSeenLeaderEpoch is not otherwise
-        // maintained — this source check is the authoritative gate.
+        // superseded leader must NOT advance the cursor, update watermarks or apply stale ops. This
+        // source check is the SOLE and authoritative fence — frames are NOT re-fenced by epoch
+        // magnitude (which would wrongly drop the same leader's earlier-epoch ops after a convergence).
         NodeId agreedLeader = coordinator.leaderInfo().map(NodeInfo::nodeId).orElse(null);
         if (agreedLeader == null || !agreedLeader.equals(message.source())) {
             LOGGER.fine(() -> "Ignoring RELAY_STREAM_BATCH from non-leader " + message.source()
@@ -1238,9 +1237,10 @@ public class ReplicationManager
                 LOGGER.log(Level.WARNING, "Failed to decode relay-stream frame for topic " + topic, e);
                 break;
             }
-            if (entry.epoch() < lastSeenLeaderEpoch) {
-                continue; // stale-epoch frame: fence (a late batch from a superseded leader)
-            }
+            // No epoch-magnitude fence here: the batch is already fenced by leader IDENTITY above
+            // (Fase 0.2), so every frame is from the agreed leader. An earlier-epoch frame (the same
+            // leader, before a convergence re-stamp) is legitimate and contiguous — fencing it by
+            // magnitude would skip it without advancing the cursor and wedge the stream.
             long expected = cursor.get() + 1L;
             if (entry.sequence() < expected) {
                 continue; // duplicate / already persisted
@@ -1359,10 +1359,14 @@ public class ReplicationManager
         Exception applyError = null;
         for (byte[] f : frames) {
             RelayEntry entry = RelayEntryCodec.decode(f);
-            if (entry.epoch() < lastSeenLeaderEpoch || entry.sequence() < nextExpected) {
-                // Stale epoch, or a duplicate/already-applied sequence (re-peek after crash, or a resend
-                // copy): discard. Fencing on (epoch, sequence) is what makes the non-idempotent queue
-                // OFFER effectively-once.
+            if (entry.sequence() < nextExpected) {
+                // Duplicate/already-applied sequence (re-peek after crash, or a resend copy): discard.
+                // Sequence-only dedup is what makes the non-idempotent queue OFFER effectively-once.
+                // NOTE: do NOT fence by epoch magnitude here. The relay only holds frames from the
+                // agreed leader (identity-fenced at persist in handleRelayStreamBatch, Fase 0.2). After
+                // an epoch convergence re-stamp the SAME leader's earlier-epoch ops carry a lower epoch
+                // but are legitimate and contiguous — fencing them by magnitude would drop a real op and
+                // wedge the apply frontier (a lower-epoch entry consumed without advancing nextExpected).
                 consumed++;
                 continue;
             }
@@ -1413,7 +1417,9 @@ public class ReplicationManager
         int stale = 0;
         for (byte[] frame : frames) {
             RelayEntry entry = RelayEntryCodec.decode(frame);
-            if (entry.epoch() >= lastSeenLeaderEpoch && entry.sequence() >= nextExpected) {
+            // Sequence-only dedup (no epoch-magnitude fence): see the note in drainRelayOnce. An
+            // earlier-epoch entry from the agreed leader (after a convergence re-stamp) is legitimate.
+            if (entry.sequence() >= nextExpected) {
                 break;
             }
             stale++;
