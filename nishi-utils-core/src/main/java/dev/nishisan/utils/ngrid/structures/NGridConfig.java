@@ -255,9 +255,9 @@ public final class NGridConfig {
     }
 
     /**
-     * How a follower ingests replicated operations. Defaults to
-     * {@link FollowerIngestMode#INLINE}; {@link FollowerIngestMode#RELAY_LOG} enables
-     * the on-disk relay-log ingestion path (#124).
+     * How a follower ingests replicated operations. Since 5.0.0 the only mode is
+     * {@link FollowerIngestMode#RELAY_STREAM} (the default): the follower PULLS the leader's durable
+     * op-log as a sequential stream and applies it at its own pace.
      *
      * @return the follower ingest mode (never {@code null})
      */
@@ -311,7 +311,7 @@ public final class NGridConfig {
 
     /**
      * Whether the leader pauses production while a not-caught-up follower joins (#129). Defaults to
-     * {@code false}. Relevant in RELAY_LOG deployments needing deterministic bootstrap convergence.
+     * {@code false}. Relevant in deployments needing deterministic bootstrap convergence.
      *
      * @return {@code true} when leader-pause-on-join is enabled
      */
@@ -537,7 +537,7 @@ public final class NGridConfig {
         private Long resendLogSegmentMaxBytes;
         private Integer resendLogMaxSegments;
         private Duration replicationLogRetentionTime;
-        private FollowerIngestMode followerIngestMode = FollowerIngestMode.INLINE;
+        private FollowerIngestMode followerIngestMode = FollowerIngestMode.RELAY_STREAM;
         private RelayDurability relayDurability = RelayDurability.OS_MANAGED;
         private Duration relayGroupCommitInterval = Duration.ofSeconds(1);
         private Duration relayExpireAfterWrite;
@@ -826,9 +826,9 @@ public final class NGridConfig {
         }
 
         /**
-         * Sets how a follower ingests replicated operations. Defaults to
-         * {@link FollowerIngestMode#INLINE} (legacy behavior); {@link FollowerIngestMode#RELAY_LOG}
-         * enables the on-disk relay-log ingestion path (#124).
+         * Sets how a follower ingests replicated operations. Since 5.0.0 the only mode is
+         * {@link FollowerIngestMode#RELAY_STREAM} (the default): the follower PULLS the leader's
+         * durable op-log as a sequential stream and applies it at its own pace.
          *
          * @param followerIngestMode the follower ingest mode (must not be {@code null})
          * @return this builder

@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Timeout;
 
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -32,17 +33,33 @@ class DistributedMapDestroyTest {
             m0.put("key2", "value2");
             m0.put("key3", "value3");
 
-            // Verify data is visible on followers
-            assertEquals(Optional.of("value1"), m1.getOptional("key1"));
-            assertEquals(Optional.of("value2"), m2.getOptional("key2"));
+            // Verify data is visible on followers. RELAY_STREAM replicates by async pull (followers poll
+            // the leader op-log), so visibility is eventual — await convergence instead of asserting it
+            // synchronously.
+            awaitTrue(() -> Optional.of("value1").equals(m1.getOptional("key1")),
+                    "Node 1 should see value1 after replication");
+            awaitTrue(() -> Optional.of("value2").equals(m2.getOptional("key2")),
+                    "Node 2 should see value2 after replication");
 
             // Destroy from node 0 (may or may not be leader — the method routes correctly)
             m0.destroy();
 
-            // Verify data is cleared on all remaining map instances
-            assertTrue(m1.isEmpty(), "Node 1 should have empty map after destroy");
-            assertTrue(m2.isEmpty(), "Node 2 should have empty map after destroy");
+            // Verify data is cleared on all remaining map instances (await async pull of the destroy).
+            awaitTrue(m1::isEmpty, "Node 1 should have empty map after destroy");
+            awaitTrue(m2::isEmpty, "Node 2 should have empty map after destroy");
         }
+    }
+
+    /** Polls {@code condition} until true or the timeout elapses, then asserts it (eventual consistency). */
+    private static void awaitTrue(BooleanSupplier condition, String message) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(15);
+        while (System.currentTimeMillis() < deadline) {
+            if (condition.getAsBoolean()) {
+                return;
+            }
+            Thread.sleep(50);
+        }
+        assertTrue(condition.getAsBoolean(), message);
     }
 
     @Test

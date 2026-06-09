@@ -54,7 +54,7 @@ public final class NGridNodeBuilder {
     private Integer replicationFactor;
     private Path dataDir;
     private boolean strictConsistency = true;
-    private FollowerIngestMode followerIngestMode = FollowerIngestMode.INLINE;
+    private FollowerIngestMode followerIngestMode = FollowerIngestMode.RELAY_STREAM;
     private RelayDurability relayDurability = RelayDurability.OS_MANAGED;
     private boolean persistentResendLog = false;
     private int relayApplyBatchSize = 256;
@@ -199,9 +199,9 @@ public final class NGridNodeBuilder {
     }
 
     /**
-     * Sets how this node ingests replication when acting as a follower. Defaults to
-     * {@link FollowerIngestMode#INLINE}; {@link FollowerIngestMode#RELAY_LOG} enables
-     * the on-disk relay-log ingestion path (#124).
+     * Sets how this node ingests replication when acting as a follower. Since 5.0.0 the only mode is
+     * {@link FollowerIngestMode#RELAY_STREAM} (the default): the follower PULLS the leader's durable
+     * op-log as a sequential stream and applies it at its own pace.
      *
      * @param mode the follower ingest mode (must not be {@code null})
      * @return this builder

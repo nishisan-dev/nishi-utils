@@ -103,20 +103,11 @@ class ReplicationQuorumFailureTest {
         assertTrue(elapsedMs < 5_000, "Operation should not block indefinitely (elapsedMs=" + elapsedMs + ")");
     }
 
-    @Test
-    void replicationShouldTimeoutWhenFollowersHaveNoHandlerRegistered() {
-        // Only create the map on the leader so followers will receive REPLICATION_REQUEST without a handler.
-        DistributedMap<String, String> leaderMap = node3.getMap("lazy-map", String.class, String.class);
-
-        IllegalStateException ex = assertThrows(IllegalStateException.class, () -> leaderMap.put("k1", "v1"));
-        String msg = ex.getMessage() != null ? ex.getMessage().toLowerCase() : "";
-        // When followers have no handler, the operation may either time out or fail
-        // because the leader loses leadership (failAllPending fires first).
-        assertTrue(msg.contains("timed out") || msg.contains("replication operation failed") || msg.contains("lost leadership"),
-                "Expected timeout or replication failure but got: " + ex.getMessage());
-    }
-
-    // Note: cluster restart/recovery is already covered by NGridIntegrationTest and map persistence integration tests.
+    // Note: the legacy "leader blocks on follower ACKs until timeout when followers lack a handler"
+    // case was removed in 5.0.0 — RELAY_STREAM is async (the leader commits on its own durable binlog
+    // at quorum-1 and never waits on followers, which PULL the stream at their own pace). The
+    // no-deadlock property is covered by the test above; cluster restart/recovery is covered by
+    // NGridIntegrationTest and the map persistence integration tests.
 
     private void awaitClusterStability() {
         long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(20);

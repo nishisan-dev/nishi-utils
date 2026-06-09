@@ -4,6 +4,52 @@
 
 ---
 
+## 2026-06-08 — 🔴 5.0.0 — BREAKING: `RELAY_STREAM` é o único modelo de replicação (remoção definitiva do legado)
+
+Consolida o modelo definitivo **MySQL binlog/relay-log**: o líder grava um op-log durável segmentado
+(o binlog) e o follower **PUXA** por cursor durável (`RELAY_STREAM`), persistindo em ordem e aplicando
+no seu ritmo. `FollowerIngestMode` passa a ter **um único valor: `RELAY_STREAM`** (o default). Todo o
+maquinário dos modos legados (`INLINE` e `RELAY_LOG`) era código morto e foi **removido**.
+
+**BREAKING CHANGES:**
+- **`FollowerIngestMode`**: removidos `INLINE` e `RELAY_LOG`; resta só `RELAY_STREAM` (default em
+  `ReplicationConfig`/`NGridConfig`/`NGridNodeBuilder`). YAML/Cardinal continuam podendo setar o knob
+  `followerIngestMode` = `RELAY_STREAM` (valores inválidos/ausentes caem no default tolerante).
+- **Protocolo NAK (push + resend) REMOVIDO**: `SEQUENCE_RESEND_REQUEST`/`SEQUENCE_RESEND_RESPONSE`
+  (enum `MessageType` + payloads `SequenceResendRequestPayload`/`SequenceResendResponsePayload`),
+  detecção de gap, reenvio por lacuna e o skip de lacuna evicta. Em `RELAY_STREAM` o pull é contíguo
+  por construção — não há gap nem NAK.
+- **Push de replicação REMOVIDO**: o líder não faz mais broadcast de `REPLICATION_REQUEST` (enum +
+  caminho de recepção do follower). Removidos também `REPLICATION_ACK`/`ReplicationAckPayload` (o
+  ack-channel do quorum síncrono): o líder commita assíncrono em quorum-1 sobre o próprio binlog; os
+  followers puxam o stream. **`replicate()` não bloqueia mais aguardando ACKs de followers.**
+- **Reorder buffer e buffer INLINE REMOVIDOS**: buffer de sequência em memória
+  (`sequenceBufferByTopic`), reorder buffer (`relayReorderByTopic`, `RELAY_REORDER_CAP`) e seus
+  caminhos. Mantidos intactos o `sequenceBufferLock` (agora serializa apenas o frontier durável de
+  apply do stream), o avanço do frontier, a aplicação ordenada e a liberação do drain-gate de failover.
+- **Drop policy do `OutboundChannel` REMOVIDA**: existia só para o push de `REPLICATION_REQUEST`; o
+  canal agora é uma fila FIFO ilimitada (métricas de depth/dropped reportam `0` estável).
+- **Catch-up legado REMOVIDO**: `checkLagAndSync` (lag-based snapshot), `checkProactiveJoinSync`,
+  `checkRelayHeadAgeAndBootstrap`, `attemptLeaderSync`/`retryLeaderSync` (pull-snapshot-to-lead). Em
+  `RELAY_STREAM` o follower puxa e o líder sinaliza `needSnapshot` quando o cursor cai abaixo da janela
+  retida; na promoção o nó drena o próprio relay (drain-gate) em vez de puxar snapshot para liderar.
+
+**API pública preservada (compat de observabilidade/testes):** `getGapsDetected()`,
+`getInlineSequenceBufferSize()`, `getResendSuccessCount()`, `getAverageConvergenceTimeMs()`,
+`getEvictedSkipCount()` retornam `0`/constantes estáveis (os comportamentos subjacentes não existem
+mais em `RELAY_STREAM`). `TopicReplicationStatus.resendPending` é sempre `false`. `getReplicationLogSize`
+passa a reportar a janela de índice em heap governada por `replicationLogRetention(Time)` (o binlog em
+disco é uma store segmentada separada).
+
+**Testes:** removidos os que validavam exclusivamente o legado (`SequenceResendProtocolTest`,
+`RelayLogReplicationTest`, `PersistentResendLogRegressionTest`, `FollowerSnapshotCutoverTest`,
+`ReplicationManagerQuorumFailureTest`); ajustados para `RELAY_STREAM`-only os de config/retention/
+cold-join/drop. Cobertura do stream em `RelayStream*Test` (incl. `streamContiguousUnderFirehoseNoNak`,
+`slowFollowerLagsButNeverLoses`, `restartResumesFromCursorNoSnapshot`,
+`failoverContinuesBinlogAcrossPromotion`).
+
+---
+
 ## 2026-06-08 — 🟢 4.7.0 — Feat: retenção do binlog do líder estilo MySQL (rotação por tamanho + nº de arquivos)
 
 Evolui a persistência do op-log do líder (o "binlog" do `RELAY_STREAM`, `ResendLog`) para reter um

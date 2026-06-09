@@ -36,10 +36,6 @@ public enum MessageType {
     LEADER_SCORE,
     /** Suggestion to change the current leader. */
     LEADER_SUGGESTION,
-    /** Replication request from leader to followers. */
-    REPLICATION_REQUEST,
-    /** Acknowledgement of a replication request. */
-    REPLICATION_ACK,
     /** Client-originated request routed through the cluster. */
     CLIENT_REQUEST,
     /** Response to a client request. */
@@ -52,10 +48,6 @@ public enum MessageType {
     CONFIG_FETCH_REQUEST,
     /** Configuration fetch response. */
     CONFIG_FETCH_RESPONSE,
-    /** Request to resend a sequence range. */
-    SEQUENCE_RESEND_REQUEST,
-    /** Response carrying resent sequence data. */
-    SEQUENCE_RESEND_RESPONSE,
     /** Follower → leader pull of a contiguous op-log run (RELAY_STREAM mode). */
     RELAY_STREAM_FETCH,
     /** Leader → follower contiguous op-log run (or a need-snapshot signal) for RELAY_STREAM mode. */

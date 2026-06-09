@@ -73,12 +73,12 @@ class JacksonMessageCodecTest {
         ReplicationPayload payload = new ReplicationPayload(opId, 1L, 1L, "test-topic", "test-data");
 
         ClusterMessage message = ClusterMessage.request(
-                MessageType.REPLICATION_REQUEST, "replicate", sourceId, destId, payload);
+                MessageType.RELAY_STREAM_BATCH, "replicate", sourceId, destId, payload);
 
         byte[] encoded = codec.encode(message);
         ClusterMessage decoded = codec.decode(encoded);
 
-        assertEquals(MessageType.REPLICATION_REQUEST, decoded.type());
+        assertEquals(MessageType.RELAY_STREAM_BATCH, decoded.type());
         ReplicationPayload dp = decoded.payload(ReplicationPayload.class);
         assertNotNull(dp);
         assertEquals(opId, dp.operationId());

@@ -256,8 +256,8 @@ public class ClusterPolicyConfig  {
         }
 
         /**
-         * Returns the follower ingest mode name ({@code INLINE} / {@code RELAY_LOG}),
-         * or {@code null} when unset (defaults to {@code INLINE}).
+         * Returns the follower ingest mode name ({@code RELAY_STREAM}, the only mode since 5.0.0),
+         * or {@code null} when unset (defaults to {@code RELAY_STREAM}).
          *
          * @return the configured follower ingest mode name, or {@code null}
          */
@@ -266,10 +266,10 @@ public class ClusterPolicyConfig  {
         }
 
         /**
-         * Sets the follower ingest mode name. Case-insensitive; invalid values fall
-         * back to {@code INLINE} at load time.
+         * Sets the follower ingest mode name. Case-insensitive; invalid or unset values fall back to
+         * {@code RELAY_STREAM} at load time (the single, definitive mode).
          *
-         * @param followerIngestMode the mode name ({@code INLINE} or {@code RELAY_LOG})
+         * @param followerIngestMode the mode name ({@code RELAY_STREAM})
          */
         public void setFollowerIngestMode(String followerIngestMode) {
             this.followerIngestMode = followerIngestMode;

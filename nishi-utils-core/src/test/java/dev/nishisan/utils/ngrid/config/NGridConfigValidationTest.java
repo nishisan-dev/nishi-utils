@@ -231,22 +231,22 @@ class NGridConfigValidationTest {
     // ── followerIngestMode (issue #124) ──
 
     @Test
-    void followerIngestModeDefaultsToInline() {
+    void followerIngestModeDefaultsToRelayStream() {
         NGridConfig config = NGridConfig.builder(LOCAL)
                 .dataDirectory(tempDir)
                 .build();
 
-        assertEquals(FollowerIngestMode.INLINE, config.followerIngestMode());
+        assertEquals(FollowerIngestMode.RELAY_STREAM, config.followerIngestMode());
     }
 
     @Test
     void followerIngestModeAcceptsConfiguredValue() {
         NGridConfig config = NGridConfig.builder(LOCAL)
                 .dataDirectory(tempDir)
-                .followerIngestMode(FollowerIngestMode.RELAY_LOG)
+                .followerIngestMode(FollowerIngestMode.RELAY_STREAM)
                 .build();
 
-        assertEquals(FollowerIngestMode.RELAY_LOG, config.followerIngestMode());
+        assertEquals(FollowerIngestMode.RELAY_STREAM, config.followerIngestMode());
     }
 
     @Test

@@ -150,7 +150,7 @@ public class NGridConfigLoader {
                         builder.followerIngestMode(dev.nishisan.utils.ngrid.replication.FollowerIngestMode
                                 .valueOf(ingest.trim().toUpperCase()));
                     } catch (IllegalArgumentException ignored) {
-                        // Keep INLINE default for invalid values
+                        // Keep RELAY_STREAM default for invalid values (tolerant parse)
                     }
                 }
                 long segmentMaxBytes = clusterConfig.getReplication().getResendLogSegmentMaxBytes();

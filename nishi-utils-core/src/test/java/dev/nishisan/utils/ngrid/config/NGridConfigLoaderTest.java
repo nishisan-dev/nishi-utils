@@ -96,12 +96,12 @@ class NGridConfigLoaderTest {
 
     @Test
     void followerIngestModeFromYaml() throws IOException {
-        // unset -> INLINE (default preserved)
-        assertEquals(FollowerIngestMode.INLINE, loadWithIngestMode(null).followerIngestMode());
-        // explicit, case-insensitive -> RELAY_LOG
-        assertEquals(FollowerIngestMode.RELAY_LOG, loadWithIngestMode("relay_log").followerIngestMode());
-        // invalid -> falls back to INLINE (tolerant parse)
-        assertEquals(FollowerIngestMode.INLINE, loadWithIngestMode("bogus").followerIngestMode());
+        // unset -> RELAY_STREAM (the single, definitive mode default)
+        assertEquals(FollowerIngestMode.RELAY_STREAM, loadWithIngestMode(null).followerIngestMode());
+        // explicit, case-insensitive -> RELAY_STREAM
+        assertEquals(FollowerIngestMode.RELAY_STREAM, loadWithIngestMode("relay_stream").followerIngestMode());
+        // invalid -> falls back to RELAY_STREAM (tolerant parse)
+        assertEquals(FollowerIngestMode.RELAY_STREAM, loadWithIngestMode("bogus").followerIngestMode());
     }
 
     private NGridConfig loadWithIngestMode(String ingest) throws IOException {

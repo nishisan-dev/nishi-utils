@@ -68,10 +68,11 @@ class ReplicationMemoryEvictionTest {
     }
 
     /**
-     * Scenario 1: applied set never exceeds appliedSetMaxSize.
+     * Scenario 1: the applied dedup set never exceeds appliedSetMaxSize.
      *
-     * Applies N+50 operations through a follower path simulation (direct
-     * handleReplicationRequest) and validates that the dedup set stays bounded.
+     * Drives N + 100 committed operations through the leader path (replicate → quorum-1 async commit
+     * in RELAY_STREAM), each of which records its operationId in the {@code applied} dedup set, and
+     * validates that the set stays bounded by {@code trimApplied}.
      */
     @Test
     @Timeout(value = 30)
@@ -84,11 +85,16 @@ class ReplicationMemoryEvictionTest {
 
         int total = maxSize + 100;
         for (int i = 1; i <= total; i++) {
-            simulateFollowerApply(manager, "t1", i, "payload-" + i);
+            // RELAY_STREAM appends to the binlog synchronously; default encodePayload needs a byte[].
+            manager.replicate("t1", ("payload-" + i).getBytes(java.nio.charset.StandardCharsets.UTF_8))
+                    .get(5, TimeUnit.SECONDS);
         }
 
-        // Allow executor tasks to settle
-        Thread.sleep(500);
+        // Allow async leader-apply executor tasks to settle (applied.add happens in the apply callback)
+        long deadline = System.currentTimeMillis() + 5_000;
+        while (System.currentTimeMillis() < deadline && manager.getAppliedSetSize() > maxSize) {
+            Thread.sleep(100);
+        }
 
         int size = manager.getAppliedSetSize();
         assertTrue(size <= maxSize,
@@ -98,8 +104,8 @@ class ReplicationMemoryEvictionTest {
     }
 
     /**
-     * Scenario 2: operation audit log does not exceed operationLogMaxSize after
-     * trimLog is triggered explicitly via direct invocation (simulated scheduler).
+     * Scenario 2: the operation audit log does not exceed operationLogMaxSize after the scheduled
+     * trimLog fires.
      */
     @Test
     @Timeout(value = 30)
@@ -112,21 +118,18 @@ class ReplicationMemoryEvictionTest {
         });
         manager.start();
 
-        // Replicate logMaxSize+50 operations on the leader path
+        // Replicate logMaxSize+50 operations on the leader path (RELAY_STREAM commits at quorum-1).
         int total = logMaxSize + 50;
         for (int i = 0; i < total; i++) {
-            CompletableFuture<ReplicationResult> f = manager.replicate("t2", "msg-" + i);
-            // The follower ACKs immediately via the fake transport interceptor
-            transport.drainAcksTo(manager);
             try {
-                f.get(5, TimeUnit.SECONDS);
+                manager.replicate("t2", ("msg-" + i).getBytes(java.nio.charset.StandardCharsets.UTF_8))
+                        .get(5, TimeUnit.SECONDS);
             } catch (Exception ignored) {
-                // may timeout if quorum unreachable in isolation — that's OK
+                // best-effort; commit is async quorum-1
             }
         }
 
-        // Manually advance time by waiting for the scheduled trimLog to fire
-        // (max(5000, 500*5) = 5000ms). We poll for convergence instead.
+        // Poll for the scheduled trimLog (max(5000, 500*5) = 5000ms) to converge.
         long deadline = System.currentTimeMillis() + 15_000;
         while (System.currentTimeMillis() < deadline) {
             if (manager.getOperationLogSize() <= logMaxSize) {
@@ -138,48 +141,6 @@ class ReplicationMemoryEvictionTest {
         int size = manager.getOperationLogSize();
         assertTrue(size <= logMaxSize,
                 "operation log should be trimmed to <= " + logMaxSize + " but was " + size);
-
-        manager.close();
-    }
-
-    /**
-     * Scenario 3: dedup still works after eviction from applied set.
-     *
-     * After filling and evicting the applied set, re-delivering an evicted UUID
-     * should NOT cause double application because the sequence-based guard in
-     * processSequenceBuffer prevents replay (old sequence is ignored).
-     */
-    @Test
-    @Timeout(value = 30)
-    void dedupGuardRemainsEffectiveViaSequenceFencing() throws Exception {
-        int maxSize = 10;
-        ReplicationManager manager = buildManager(maxSize, 2000);
-        AtomicInteger applyCount = new AtomicInteger();
-        manager.registerHandler("t3", (opId, payload) -> applyCount.incrementAndGet());
-        manager.start();
-
-        // Apply maxSize+5 ops to force eviction of early UUIDs
-        List<UUID> earlyOpIds = new ArrayList<>();
-        for (int i = 1; i <= maxSize + 5; i++) {
-            UUID opId = simulateFollowerApply(manager, "t3", i, "p" + i);
-            if (i <= 3) {
-                earlyOpIds.add(opId);
-            }
-        }
-        Thread.sleep(300);
-
-        int beforeReplay = applyCount.get();
-
-        // Re-deliver the 3 early operations (now potentially evicted from applied set)
-        // Their sequences are all < nextExpected, so the sequence guard rejects them.
-        for (int idx = 0; idx < earlyOpIds.size(); idx++) {
-            simulateFollowerApplyWithId(manager, "t3", idx + 1, "p" + (idx + 1), earlyOpIds.get(idx));
-        }
-        Thread.sleep(300);
-
-        int afterReplay = applyCount.get();
-        assertEquals(beforeReplay, afterReplay,
-                "No additional apply should occur for old sequences, even if UUID was evicted from applied set");
 
         manager.close();
     }
@@ -197,30 +158,6 @@ class ReplicationMemoryEvictionTest {
                         .build());
     }
 
-    /**
-     * Simulates a follower receiving a replication request by constructing and
-     * dispatching a REPLICATION_REQUEST message directly to the manager.
-     *
-     * @return the UUID of the operation
-     */
-    private UUID simulateFollowerApply(ReplicationManager manager, String topic, long seq, String data) {
-        UUID opId = UUID.randomUUID();
-        return simulateFollowerApplyWithId(manager, topic, seq, data, opId);
-    }
-
-    private UUID simulateFollowerApplyWithId(ReplicationManager manager, String topic, long seq, String data,
-            UUID opId) {
-        var payload = new dev.nishisan.utils.ngrid.common.ReplicationPayload(opId, seq, 1L, topic, data);
-        var msg = dev.nishisan.utils.ngrid.common.ClusterMessage.request(
-                MessageType.REPLICATION_REQUEST,
-                topic,
-                NodeId.of("node-leader"),
-                NodeId.of("node-leader"),
-                payload);
-        manager.onMessage(msg);
-        return opId;
-    }
-
     // ── Fake Transport ──
 
     private static final class FakeTransport implements Transport {
@@ -229,22 +166,12 @@ class ReplicationMemoryEvictionTest {
         private final List<NodeInfo> peers;
         private final CopyOnWriteArraySet<TransportListener> listeners = new CopyOnWriteArraySet<>();
         private final java.util.concurrent.ConcurrentHashMap<NodeId, Boolean> connected = new java.util.concurrent.ConcurrentHashMap<>();
-        // Captures sent ACK messages so tests can drain them to the manager
-        private final java.util.concurrent.ConcurrentLinkedQueue<ClusterMessage> sentAcks = new java.util.concurrent.ConcurrentLinkedQueue<>();
 
         FakeTransport(NodeInfo local, List<NodeInfo> peers) {
             this.local = local;
             this.peers = new ArrayList<>(peers);
             for (NodeInfo peer : peers) {
                 connected.put(peer.nodeId(), true);
-            }
-        }
-
-        /** Drains ACK messages back into the manager (simulates follower ACK). */
-        void drainAcksTo(ReplicationManager manager) {
-            ClusterMessage msg;
-            while ((msg = sentAcks.poll()) != null) {
-                manager.onMessage(msg);
             }
         }
 
@@ -286,10 +213,7 @@ class ReplicationMemoryEvictionTest {
 
         @Override
         public void send(ClusterMessage message) {
-            // Intercept REPLICATION_ACK messages so drainAcksTo can replay them
-            if (message.type() == MessageType.REPLICATION_ACK) {
-                sentAcks.add(message);
-            }
+            // RELAY_STREAM: the leader does not push; followers pull. Nothing to capture here.
         }
 
         @Override

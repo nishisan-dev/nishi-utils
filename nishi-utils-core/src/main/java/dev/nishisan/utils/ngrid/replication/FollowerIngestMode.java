@@ -20,25 +20,12 @@ package dev.nishisan.utils.ngrid.replication;
 /**
  * Selects how a <b>follower</b> ingests replicated operations. This is a
  * follower-side knob, orthogonal to the leader-side {@link ReplicationConfig#leaderLocalApply()}.
+ *
+ * <p>Since 5.0.0 there is a single, definitive mode: {@link #RELAY_STREAM}. The two legacy
+ * follower paths — inline apply with an in-memory reorder buffer, and a push-based durable relay
+ * with NAK/resend recovery — were removed; the pull-driven relay stream supersedes both.
  */
 public enum FollowerIngestMode {
-
-    /**
-     * Legacy path: each {@code REPLICATION_REQUEST} is applied inline, with
-     * out-of-order sequences held in an in-memory buffer until their turn. Under a
-     * sustained gap the buffer is capped and the follower falls back to a full
-     * snapshot — the failure mode the relay-log replaces.
-     */
-    INLINE,
-
-    /**
-     * Relay-log path (#124): each {@code REPLICATION_REQUEST} is first persisted to
-     * an on-disk relay (one NQueue per topic) and applied by a separate consumer at
-     * its own pace, decoupling reception (durable, never drops) from application
-     * (own rhythm). A lagging follower catches up from the relay instead of
-     * resetting state and reinstalling a growing snapshot.
-     */
-    RELAY_LOG,
 
     /**
      * Relay-stream path: the follower PULLS the leader's durable op-log as a strictly sequential
@@ -46,7 +33,7 @@ public enum FollowerIngestMode {
      * ({@code RELAY_STREAM_FETCH}), persists it in order, and applies at its own pace. Because the
      * pull is contiguous by construction there is no gap detection and no NAK/resend storm in steady
      * state — the MySQL master/slave relay-log model. A follower below the leader's retained window
-     * bootstraps once from a snapshot, then resumes streaming. This supersedes {@link #RELAY_LOG}.
+     * bootstraps once from a snapshot, then resumes streaming.
      */
     RELAY_STREAM
 }

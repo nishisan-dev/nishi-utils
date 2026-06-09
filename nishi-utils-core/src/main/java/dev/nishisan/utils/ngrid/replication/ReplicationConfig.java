@@ -207,10 +207,10 @@ public final class ReplicationConfig {
     }
 
     /**
-     * How this node, when acting as a follower, ingests replicated operations.
-     * {@link FollowerIngestMode#INLINE} (the default) preserves the legacy in-memory
-     * buffer + apply path; {@link FollowerIngestMode#RELAY_LOG} persists each request
-     * to an on-disk relay and applies it from a separate consumer (#124).
+     * How this node, when acting as a follower, ingests replicated operations. Since 5.0.0 the only
+     * mode is {@link FollowerIngestMode#RELAY_STREAM} (the default): the follower PULLS the leader's
+     * durable op-log as a sequential stream from a durable cursor, persists each contiguous run in
+     * order, and applies it from a separate consumer at its own pace.
      *
      * @return the follower ingest mode (never {@code null})
      */
@@ -452,7 +452,7 @@ public final class ReplicationConfig {
         private int appliedSetMaxSize = 5000;
         private int operationLogMaxSize = 2000;
         private boolean leaderLocalApply = true;
-        private FollowerIngestMode followerIngestMode = FollowerIngestMode.INLINE;
+        private FollowerIngestMode followerIngestMode = FollowerIngestMode.RELAY_STREAM;
         private RelayDurability relayDurability = RelayDurability.OS_MANAGED;
         private Duration relayGroupCommitInterval = Duration.ofSeconds(1);
         private Duration relayExpireAfterWrite = Duration.ZERO;
@@ -592,9 +592,9 @@ public final class ReplicationConfig {
         }
 
         /**
-         * Sets how this node ingests replication when acting as a follower. Defaults to
-         * {@link FollowerIngestMode#INLINE} (legacy behavior); {@link FollowerIngestMode#RELAY_LOG}
-         * enables the on-disk relay-log ingestion path (#124).
+         * Sets how this node ingests replication when acting as a follower. Since 5.0.0 the only mode
+         * is {@link FollowerIngestMode#RELAY_STREAM} (the default): the follower PULLS the leader's
+         * durable op-log as a sequential stream and applies it at its own pace.
          *
          * @param followerIngestMode the follower ingest mode (must not be {@code null})
          * @return this builder

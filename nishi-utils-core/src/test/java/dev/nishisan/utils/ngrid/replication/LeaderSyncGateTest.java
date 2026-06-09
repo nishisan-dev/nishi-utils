@@ -75,8 +75,10 @@ class LeaderSyncGateTest {
     @Test
     @Timeout(30)
     void replicateRejectsWritesWhileLeaderSyncing() throws Exception {
-        // Local leader WITH an active peer → resolveSyncSource finds the peer, so leaderSyncing
-        // stays true (a real catch-up is in flight).
+        // On promotion the RELAY_STREAM failover drain-gate holds writes (leaderSyncing) until the
+        // promoted node's relay backlog is fully applied. The apply consumers are what release the
+        // gate, so this manager is intentionally NOT started: the gate stays held and the write-gate
+        // rejection in replicate() is deterministic (no race with a drained empty relay).
         NodeInfo local = new NodeInfo(NodeId.of("zzz-leader"), "127.0.0.1", 0);
         NodeInfo peer = new NodeInfo(NodeId.of("aaa-peer"), "127.0.0.1", 0);
         transport = new FakeTransport(local, List.of(peer));
@@ -88,37 +90,45 @@ class LeaderSyncGateTest {
         manager = newManager();
         manager.registerHandler(TOPIC, (opId, payload) -> {
         });
-        manager.start();
 
         manager.onLeaderChanged(local.nodeId());
 
-        assertTrue(manager.isLeaderSyncing(), "leader with a reachable sync source should be syncing");
-        assertThrows(LeaderSyncingException.class, () -> manager.replicate(TOPIC, "x"),
+        assertTrue(manager.isLeaderSyncing(), "promoted leader holds the drain-gate until its relay drains");
+        assertThrows(LeaderSyncingException.class,
+                () -> manager.replicate(TOPIC, "x".getBytes(java.nio.charset.StandardCharsets.UTF_8)),
                 "writes must be rejected while the leader is syncing");
     }
 
     @Test
     @Timeout(30)
-    void leaderSyncingClearsWhenNoReachableSyncSource() throws Exception {
-        // Single node, NO peers → resolveSyncSource returns null. The clear-on-no-source fix must
-        // release leaderSyncing so the node can lead immediately (it is the most-advanced replica).
+    void leaderSyncingClearsWhenRelayDrainsOnLoneLeader() throws Exception {
+        // Single node, NO peers and an EMPTY relay. In RELAY_STREAM a promoted node holds the failover
+        // drain-gate until its relay backlog is fully applied; with nothing to drain it is the
+        // most-advanced replica, so the per-topic apply consumer releases the gate (it does NOT pull a
+        // snapshot to lead). joinPeerDiscoveryWindow=0 disables the lone-boot hold so the release is
+        // immediate (no transient peer-discovery window to wait out).
         NodeInfo local = new NodeInfo(NodeId.of("solo-node"), "127.0.0.1", 0);
         transport = new FakeTransport(local, List.of());
         coordinator = new ClusterCoordinator(transport, ClusterCoordinatorConfig.defaults(), scheduler);
         coordinator.start();
         awaitLeadership();
 
-        manager = newManager();
+        manager = newManagerNoDiscoveryWindow();
         manager.registerHandler(TOPIC, (opId, payload) -> {
         });
         manager.start();
 
         manager.onLeaderChanged(local.nodeId());
 
+        // The apply consumer releases the gate once the (empty) relay is fully drained.
+        long deadline = System.currentTimeMillis() + 5000;
+        while (System.currentTimeMillis() < deadline && manager.isLeaderSyncing()) {
+            Thread.sleep(20);
+        }
         assertFalse(manager.isLeaderSyncing(),
-                "with no reachable sync source the leaderSyncing flag must be cleared, not stuck");
-        assertDoesNotThrow(() -> manager.replicate(TOPIC, "x"),
-                "a leader with nothing to sync should accept writes immediately");
+                "a lone leader with a drained relay must release the write gate, not stay stuck");
+        assertDoesNotThrow(() -> manager.replicate(TOPIC, "x".getBytes(java.nio.charset.StandardCharsets.UTF_8)),
+                "a leader with nothing to drain should accept writes once the gate releases");
     }
 
     @Test
@@ -174,6 +184,16 @@ class LeaderSyncGateTest {
                         .operationTimeout(Duration.ofMillis(500))
                         .dataDirectory(replicationDir)
                         .strictConsistency(false)
+                        .build());
+    }
+
+    private ReplicationManager newManagerNoDiscoveryWindow() {
+        return new ReplicationManager(transport, coordinator,
+                ReplicationConfig.builder(1)
+                        .operationTimeout(Duration.ofMillis(500))
+                        .dataDirectory(replicationDir)
+                        .strictConsistency(false)
+                        .joinPeerDiscoveryWindow(Duration.ZERO)
                         .build());
     }
 

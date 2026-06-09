@@ -18,45 +18,26 @@
 package dev.nishisan.utils.ngrid.cluster.transport;
 
 import dev.nishisan.utils.ngrid.common.ClusterMessage;
-import dev.nishisan.utils.ngrid.common.MessageType;
 
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Outbound message buffer for a single transport connection, with a bounded
- * backpressure policy applied <em>only</em> to replication traffic.
+ * Outbound message buffer for a single transport connection.
  *
  * <p>
- * Under best-effort writes ({@code quorum=1}), a burst of large
- * {@link MessageType#REPLICATION_REQUEST} messages could grow the per-connection
- * outbound queue without limit, risking leader heap pressure / OOM. This channel
- * caps the number of <strong>pending replication</strong> messages per connection
- * and, when the cap is reached, <strong>drops</strong> the excess replication
- * message instead of buffering it. The lagging follower then recovers through the
- * existing gap/snapshot catch-up mechanism, which is driven periodically by the
- * leader high-watermark carried in heartbeats &mdash; so a dropped replication
- * message is reconciled even if the burst stops.
+ * Since 5.0.0 (RELAY_STREAM, the definitive replication model) the leader no longer pushes
+ * replication traffic: followers PULL the durable op-log as a sequential stream and the leader
+ * commits asynchronously on its own binlog. There is therefore no unbounded best-effort data plane
+ * to bound, and the legacy per-connection replication drop policy (which dropped excess
+ * {@code REPLICATION_REQUEST} bursts and let the follower recover via gap/snapshot catch-up) was
+ * removed along with the push protocol. This channel is now a plain unbounded outbound queue.
  * </p>
  *
  * <p>
- * Control and non-replication traffic (heartbeats, pings, sync, acks, client
- * requests/responses, sequence resends, ...) is <strong>never</strong> counted
- * nor dropped, so it always flows: the heartbeat cycle is never throttled and
- * thus the drop policy carries no risk of spurious re-election.
- * </p>
- *
- * <p>
- * The cap is a <em>soft</em> limit: the {@code check-then-increment} on
- * {@link #enqueue(ClusterMessage)} can momentarily overshoot the configured
- * capacity by at most the number of concurrent producers, but it can never grow
- * unbounded. Replication depth is tracked even when no capacity is configured
- * ({@code capacity == 0}, unbounded), so the {@link #dataDepth() occupancy
- * metric} stays meaningful for diagnosing pressure before a bound is set; in that
- * mode replication is measured but never dropped, preserving the legacy
- * behaviour.
+ * The depth/dropped/capacity accessors are retained as stable {@code 0} values so the transport's
+ * observability surface (occupancy and drop metrics) keeps compiling and reporting a meaningful
+ * "no drops" view.
  * </p>
  *
  * <p>
@@ -68,58 +49,33 @@ import java.util.concurrent.atomic.AtomicLong;
 final class OutboundChannel {
 
     private final LinkedBlockingQueue<ClusterMessage> queue = new LinkedBlockingQueue<>();
-    private final AtomicInteger pendingReplication = new AtomicInteger();
-    private final AtomicLong droppedReplication = new AtomicLong();
-    private final int replicationCapacity;
 
     /**
-     * Creates an outbound channel.
+     * Creates an outbound channel. The {@code replicationCapacity} argument is accepted for source
+     * compatibility but no longer has any effect (the replication drop policy was removed with the
+     * push protocol in 5.0.0).
      *
-     * @param replicationCapacity the maximum number of pending replication
-     *                            messages allowed per connection; {@code 0} means
-     *                            unbounded (legacy behaviour, never drops)
+     * @param replicationCapacity ignored; must be {@code >= 0}
      * @throws IllegalArgumentException if {@code replicationCapacity} is negative
      */
     OutboundChannel(int replicationCapacity) {
         if (replicationCapacity < 0) {
             throw new IllegalArgumentException("replicationCapacity must be >= 0");
         }
-        this.replicationCapacity = replicationCapacity;
     }
 
     /**
-     * Enqueues a message, applying the drop policy to replication traffic only.
+     * Enqueues a message. The backing queue is unbounded, so this always accepts.
      *
      * @param message the message to enqueue
-     * @return {@code true} if the message was accepted; {@code false} if it was a
-     *         replication message dropped due to backpressure
+     * @return {@code true} (always)
      */
     boolean enqueue(ClusterMessage message) {
-        if (!isCountable(message.type())) {
-            // Control / non-replication traffic is never bounded nor dropped.
-            return queue.offer(message);
-        }
-        // Replication (data plane): always measured; dropped only when capped.
-        if (replicationCapacity > 0 && pendingReplication.get() >= replicationCapacity) {
-            droppedReplication.incrementAndGet();
-            return false; // follower recovers via gap/snapshot catch-up
-        }
-        pendingReplication.incrementAndGet();
-        if (!queue.offer(message)) {
-            // The backing queue is unbounded, so offer never fails; account
-            // defensively as a drop to keep the metric consistent.
-            pendingReplication.decrementAndGet();
-            droppedReplication.incrementAndGet();
-            return false;
-        }
-        return true;
+        return queue.offer(message);
     }
 
     /**
-     * Polls the next message, waiting up to the given timeout. Replication depth
-     * is decremented as soon as a replication message leaves the queue (before it
-     * is written to the socket), so the metric reflects "pending in queue" and
-     * never leaks on a write-error path.
+     * Polls the next message, waiting up to the given timeout.
      *
      * @param timeout the maximum time to wait
      * @param unit    the unit of {@code timeout}
@@ -127,42 +83,35 @@ final class OutboundChannel {
      * @throws InterruptedException if interrupted while waiting
      */
     ClusterMessage poll(long timeout, TimeUnit unit) throws InterruptedException {
-        ClusterMessage message = queue.poll(timeout, unit);
-        if (message != null && isCountable(message.type())) {
-            pendingReplication.decrementAndGet();
-        }
-        return message;
+        return queue.poll(timeout, unit);
     }
 
     /**
-     * Returns the current number of replication messages pending in the queue.
+     * Returns the replication queue depth. Always {@code 0} since the push data plane was removed.
      *
-     * @return the replication queue depth (occupancy metric, RF3)
+     * @return {@code 0}
      */
     int dataDepth() {
-        return pendingReplication.get();
+        return 0;
     }
 
     /**
-     * Returns the cumulative number of replication messages dropped by
-     * backpressure since this channel was created.
+     * Returns the cumulative number of replication messages dropped by backpressure. Always
+     * {@code 0} since the drop policy was removed.
      *
-     * @return the dropped replication count
+     * @return {@code 0}
      */
     long droppedCount() {
-        return droppedReplication.get();
+        return 0L;
     }
 
     /**
-     * Returns the configured replication capacity ({@code 0} = unbounded).
+     * Returns the configured replication capacity. Always {@code 0} (unbounded) since the drop
+     * policy was removed.
      *
-     * @return the replication capacity
+     * @return {@code 0}
      */
     int capacity() {
-        return replicationCapacity;
-    }
-
-    private static boolean isCountable(MessageType type) {
-        return type == MessageType.REPLICATION_REQUEST;
+        return 0;
     }
 }

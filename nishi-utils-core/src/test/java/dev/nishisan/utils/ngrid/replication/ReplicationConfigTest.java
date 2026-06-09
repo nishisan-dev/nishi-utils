@@ -15,18 +15,18 @@ class ReplicationConfigTest {
     }
 
     @Test
-    void followerIngestModeDefaultsInlineAndBuilderPropagates() {
+    void followerIngestModeDefaultsRelayStreamAndBuilderPropagates() {
         ReplicationConfig def = ReplicationConfig.builder(1)
                 .dataDirectory(Path.of("target", "replication-config-test"))
                 .build();
-        assertEquals(FollowerIngestMode.INLINE, def.followerIngestMode(),
-                "follower ingest mode must default to INLINE (4.3.0 behavior preserved)");
+        assertEquals(FollowerIngestMode.RELAY_STREAM, def.followerIngestMode(),
+                "follower ingest mode must default to RELAY_STREAM (the single, definitive mode)");
 
         ReplicationConfig relay = ReplicationConfig.builder(1)
                 .dataDirectory(Path.of("target", "replication-config-test"))
-                .followerIngestMode(FollowerIngestMode.RELAY_LOG)
+                .followerIngestMode(FollowerIngestMode.RELAY_STREAM)
                 .build();
-        assertEquals(FollowerIngestMode.RELAY_LOG, relay.followerIngestMode(),
+        assertEquals(FollowerIngestMode.RELAY_STREAM, relay.followerIngestMode(),
                 "builder must propagate the configured follower ingest mode");
 
         assertThrows(NullPointerException.class,

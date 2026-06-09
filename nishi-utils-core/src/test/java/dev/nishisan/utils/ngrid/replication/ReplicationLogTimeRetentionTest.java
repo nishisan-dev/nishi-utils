@@ -8,8 +8,6 @@ import dev.nishisan.utils.ngrid.common.ClusterMessage;
 import dev.nishisan.utils.ngrid.common.MessageType;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
-import dev.nishisan.utils.ngrid.common.SequenceResendRequestPayload;
-import dev.nishisan.utils.ngrid.common.SequenceResendResponsePayload;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -105,36 +103,6 @@ class ReplicationLogTimeRetentionTest {
 
     @Test
     @Timeout(30)
-    void resendForTimeEvictedSequenceIsReportedMissing() throws Exception {
-        ReplicationManager manager = buildManager(10_000, Duration.ofMillis(120));
-        manager.registerHandler(TOPIC, (opId, payload) -> {
-        });
-        manager.start();
-        try {
-            commit(manager, 3); // sequences 1..3
-            Thread.sleep(250); // age past the 120ms window
-            commit(manager, 1); // sequence 4 — evicts 1..3 opportunistically
-            assertEquals(1, manager.getReplicationLogSize(TOPIC));
-
-            // A follower asks the leader to resend the now-evicted range [1..3].
-            SequenceResendRequestPayload req = new SequenceResendRequestPayload(TOPIC, 1, 3);
-            ClusterMessage request = ClusterMessage.request(
-                    MessageType.SEQUENCE_RESEND_REQUEST, "resend",
-                    NodeId.of("aaa-peer"), NodeId.of("zzz-leader"), req);
-            manager.onMessage(request);
-
-            SequenceResendResponsePayload response = transport.awaitResendResponse(2000);
-            assertNotNull(response, "leader should have answered the resend request");
-            assertTrue(response.operations().isEmpty(), "no operations can be served for evicted sequences");
-            assertEquals(List.of(1L, 2L, 3L), response.missingSequences(),
-                    "all evicted sequences must be reported as missing (→ snapshot fallback)");
-        } finally {
-            manager.close();
-        }
-    }
-
-    @Test
-    @Timeout(30)
     void temporalRetentionDisabledByDefaultKeepsCountOnlyBehavior() throws Exception {
         // Duration.ZERO disables temporal eviction (the default).
         ReplicationManager manager = buildManager(10_000, Duration.ZERO);
@@ -189,12 +157,15 @@ class ReplicationLogTimeRetentionTest {
     /** Commits {@code count} operations on the leader; each commits+indexes synchronously. */
     private void commit(ReplicationManager manager, int count) throws Exception {
         for (int i = 0; i < count; i++) {
-            CompletableFuture<ReplicationResult> f = manager.replicate(TOPIC, "data");
+            // RELAY_STREAM appends each committed op to the durable binlog synchronously; the default
+            // ReplicationHandler.encodePayload expects a byte[] wire payload.
+            CompletableFuture<ReplicationResult> f = manager.replicate(TOPIC,
+                    "data".getBytes(java.nio.charset.StandardCharsets.UTF_8));
             f.get(5, java.util.concurrent.TimeUnit.SECONDS);
         }
     }
 
-    // ── Transport that captures SEQUENCE_RESEND_RESPONSE messages ──
+    // ── Minimal transport: drives a real ClusterCoordinator + ReplicationManager ──
 
     private static final class CapturingTransport implements Transport {
 
@@ -202,7 +173,6 @@ class ReplicationLogTimeRetentionTest {
         private final List<NodeInfo> peers;
         private final CopyOnWriteArraySet<TransportListener> listeners = new CopyOnWriteArraySet<>();
         private final java.util.concurrent.ConcurrentHashMap<NodeId, Boolean> connected = new java.util.concurrent.ConcurrentHashMap<>();
-        private final ConcurrentLinkedQueue<SequenceResendResponsePayload> resendResponses = new ConcurrentLinkedQueue<>();
 
         CapturingTransport(NodeInfo local, List<NodeInfo> peers) {
             this.local = local;
@@ -210,18 +180,6 @@ class ReplicationLogTimeRetentionTest {
             for (NodeInfo peer : peers) {
                 connected.put(peer.nodeId(), true);
             }
-        }
-
-        SequenceResendResponsePayload awaitResendResponse(long timeoutMs) throws InterruptedException {
-            long deadline = System.currentTimeMillis() + timeoutMs;
-            while (System.currentTimeMillis() < deadline) {
-                SequenceResendResponsePayload p = resendResponses.poll();
-                if (p != null) {
-                    return p;
-                }
-                Thread.sleep(20);
-            }
-            return resendResponses.poll();
         }
 
         void simulatePeerConnected(NodeInfo peer) {
@@ -263,9 +221,7 @@ class ReplicationLogTimeRetentionTest {
 
         @Override
         public void send(ClusterMessage message) {
-            if (message.type() == MessageType.SEQUENCE_RESEND_RESPONSE) {
-                resendResponses.add(message.payload(SequenceResendResponsePayload.class));
-            }
+            // RELAY_STREAM: the leader does not push; nothing to capture here.
         }
 
         @Override

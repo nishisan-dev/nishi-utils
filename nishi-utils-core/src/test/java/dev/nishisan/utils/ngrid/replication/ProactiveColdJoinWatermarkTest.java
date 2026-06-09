@@ -96,9 +96,14 @@ class ProactiveColdJoinWatermarkTest {
         }
     }
 
-    /** Fix (2): a fresh follower fires the proactive cold-join sync even with an unknown watermark. */
+    /**
+     * RELAY_STREAM cold-join: a fresh follower converges by PULLING the leader op-log — the fetch
+     * loop emits a {@code RELAY_STREAM_FETCH} from its durable cursor as soon as a leader is known,
+     * even before any heartbeat watermark is learned. (The legacy proactive {@code SYNC_REQUEST}
+     * cold-join path was removed with the push/INLINE model.)
+     */
     @Test
-    void proactiveColdJoinSyncFiresWhenLeaderWatermarkUnknown() throws Exception {
+    void coldFollowerStreamsFetchAgainstLeaderEvenWithUnknownWatermark() throws Exception {
         NodeInfo leaderNode = new NodeInfo(NodeId.of("zzz-leader"), "127.0.0.1", 0);
         NodeInfo followerNode = new NodeInfo(NodeId.of("aaa-follower"), "127.0.0.1", 0);
 
@@ -112,17 +117,17 @@ class ProactiveColdJoinWatermarkTest {
         ReplicationManager follower = new ReplicationManager(transport, coordinator,
                 ReplicationConfig.builder(2)
                         .dataDirectory(tempDir)
-                        .followerIngestMode(FollowerIngestMode.RELAY_LOG)
+                        .followerIngestMode(FollowerIngestMode.RELAY_STREAM)
                         .build());
         follower.registerHandler(TOPIC, (operationId, payload) -> {
         });
         follower.start();
         try {
-            // checkLagAndSync runs every 2s; with the fix, the cold follower proactively requests a sync
-            // despite the unknown (-1) watermark. Without the fix, the gate bails forever.
-            boolean syncRequested = awaitMessageType(transport, MessageType.SYNC_REQUEST, 6_000);
-            assertTrue(syncRequested,
-                    "fresh follower must proactively request a sync against a leader even with unknown watermark");
+            // The per-topic fetch loop pulls from cursor+1 as soon as a leader is known — convergence
+            // is pull-driven and does not depend on a known watermark.
+            boolean streamFetch = awaitMessageType(transport, MessageType.RELAY_STREAM_FETCH, 6_000);
+            assertTrue(streamFetch,
+                    "fresh follower must pull the leader op-log (RELAY_STREAM_FETCH) even with unknown watermark");
         } finally {
             follower.close();
             coordinator.close();

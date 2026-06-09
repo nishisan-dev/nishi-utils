@@ -124,6 +124,9 @@ class QueueNodeFailoverIntegrationTest {
             queue.offer("item-" + i);
         }
 
+        // Await async-pull convergence before the failover (see awaitFollowersCaughtUp).
+        awaitFollowersCaughtUp(leader, 15_000);
+
         // Kill the leader
         closeQuietly(leader);
         disableNode(leader);
@@ -160,6 +163,9 @@ class QueueNodeFailoverIntegrationTest {
         for (int i = 0; i < initialItems; i++) {
             queue.offer("initial-" + i);
         }
+
+        // Await async-pull convergence before the failover (see awaitFollowersCaughtUp).
+        awaitFollowersCaughtUp(leader, 15_000);
 
         // Kill leader
         closeQuietly(leader);
@@ -242,6 +248,39 @@ class QueueNodeFailoverIntegrationTest {
             }
         }
         throw new IllegalStateException("No leader elected in time");
+    }
+
+    /**
+     * Awaits that every surviving follower has pulled+applied up to the leader's current op-log
+     * sequence. RELAY_STREAM replicates by async pull (followers poll the leader op-log at
+     * {@code relayStreamPollInterval}); killing the leader before the followers stream the tail loses
+     * those writes — the MySQL async-replication window (semi-sync would close it). Awaiting convergence
+     * before a failover drill keeps the test asserting the real guarantee: replicated writes survive.
+     */
+    private void awaitFollowersCaughtUp(NGridNode leader, long timeoutMs) {
+        long target = leader.replicationManager().getGlobalSequence();
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < deadline) {
+            boolean allCaught = true;
+            for (NGridNode n : new NGridNode[] { node1, node2, node3 }) {
+                if (n != null && n != leader
+                        && n.replicationManager().getLastAppliedSequence() < target) {
+                    allCaught = false;
+                    break;
+                }
+            }
+            if (allCaught) {
+                return;
+            }
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException(e);
+            }
+        }
+        throw new IllegalStateException("Followers did not catch up to leader seq " + target
+                + " before failover");
     }
 
     private void disableNode(NGridNode node) {
