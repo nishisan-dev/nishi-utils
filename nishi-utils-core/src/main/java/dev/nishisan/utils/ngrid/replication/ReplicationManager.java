@@ -199,8 +199,14 @@ public class ReplicationManager
     // never increments — it is retained at 0 to keep the public getGapsDetected() API/observability
     // contract stable (RELAY_STREAM tests assert gapsDetected == 0).
     private final java.util.concurrent.atomic.AtomicLong gapsDetected = new java.util.concurrent.atomic.AtomicLong(0);
-    // Evicted-gap skips and resend convergence are legacy concerns absent in RELAY_STREAM; these
-    // counters never increment and stay at 0 (kept for the stable public metrics API).
+    // RELAY_STREAM forward-gap recovery (relay-log TTL analog): when the relay's write-time TTL
+    // (relayExpireAfterWrite) ages an UN-APPLIED head entry out from under the apply consumer, a
+    // forward gap surfaces at the relay head. A FOLLOWER recovers cleanly via snapshot bootstrap
+    // (requestSync). A PROMOTED LEADER has no peer to bootstrap from, so it SKIPS the gap (advances
+    // nextExpected to the head and continues draining) and increments this counter — the surviving
+    // entries still apply and the Cardinal re-derives the skipped state idempotently from Kafka. A
+    // non-zero, growing value signals async loss for those skipped sequences (recovered to eventual
+    // consistency by the upstream replay), exactly the spirit of the removed skipEvictedGapAndDrain.
     private final java.util.concurrent.atomic.AtomicLong evictedSkipCount = new java.util.concurrent.atomic.AtomicLong(0);
     private final java.util.concurrent.atomic.AtomicLong resendSuccessCount = new java.util.concurrent.atomic.AtomicLong(
             0);
@@ -1342,90 +1348,171 @@ public class ReplicationManager
             return true;
         }
 
-        // Batch-peek the relay head WITHOUT consuming (#128). The consumer stays single-threaded and
-        // applies in strict sequence order; batching only amortizes the per-op lock/flush/peek-poll
-        // overhead. readRange reads from the consumer offset (index 0 = oldest unapplied).
-        List<byte[]> frames = relay.readRange(0, Math.max(1, config.relayApplyBatchSize())).items();
-        if (frames.isEmpty()) {
-            // Relay fully drained for this topic — release the failover drain-gate if one is held
-            // (no-op otherwise).
-            maybeReleaseRelayDrainGate(topic);
-            return false;
-        }
-
+        // CONSUME-AND-INSPECT (root-cause fix): drive consumption through peek + a VERIFIED poll, never
+        // a readRange(0,N) peek followed by a blind poll(N). Under an active relay TTL
+        // (relayExpireAfterWrite), readRange ignores expiry while poll() opportunistically expires the
+        // head FIRST — so a poll can silently discard an aged head and consume the NEXT record. The old
+        // peek(N)-then-poll(N) pattern thus desynced the apply frontier from the relay head (an entry
+        // "applied" in the peek loop was never the entry actually removed), dropping one entry per
+        // expired head from an otherwise contiguous relay and surfacing a phantom forward gap. Here we
+        // remove the head with pollRecord() and VERIFY the removed sequence is the one we decided on; a
+        // mismatch (expiry fired in the peek→poll window) is treated as a forward gap and recovered,
+        // never silently absorbed.
+        int batch = Math.max(1, config.relayApplyBatchSize());
         long nextExpected = nextExpectedSequenceByTopic.getOrDefault(topic, 1L);
-        List<RelayEntry> appliedBatch = new ArrayList<>();
-        int consumed = 0;            // head frames to poll (stale-discarded + successfully applied)
         Exception applyError = null;
-        for (byte[] f : frames) {
-            RelayEntry entry = RelayEntryCodec.decode(f);
+        boolean progressed = false;
+        for (int i = 0; i < batch; i++) {
+            // Peek the REAL (post-expiry) head; do not remove it until we have decided to.
+            byte[] headFrame = relay.peek().orElse(null);
+            if (headFrame == null) {
+                break; // relay drained for now
+            }
+            RelayEntry entry = RelayEntryCodec.decode(headFrame);
+
             if (entry.sequence() < nextExpected) {
-                // Duplicate/already-applied sequence (re-peek after crash, or a resend copy): discard.
+                // Duplicate/already-applied (re-peek after crash, or a resend copy): drop the real head.
                 // Sequence-only dedup is what makes the non-idempotent queue OFFER effectively-once.
-                // NOTE: do NOT fence by epoch magnitude here. The relay only holds frames from the
-                // agreed leader (identity-fenced at persist in handleRelayStreamBatch, Fase 0.2). After
-                // an epoch convergence re-stamp the SAME leader's earlier-epoch ops carry a lower epoch
-                // but are legitimate and contiguous — fencing them by magnitude would drop a real op and
-                // wedge the apply frontier (a lower-epoch entry consumed without advancing nextExpected).
-                consumed++;
+                if (!pollExpected(relay, entry.sequence())) {
+                    break; // head moved under us (expiry); re-evaluate from the top
+                }
+                progressed = true;
                 continue;
             }
+
             if (entry.sequence() == nextExpected) {
                 try {
                     handler.apply(entry.operationId(), handler.decodePayload(entry.payloadBytes()));
                 } catch (Exception e) {
-                    // Commit the prefix applied so far, poll it, then rethrow so the apply loop backs
-                    // off and retries this failing entry (it stays at the relay head).
+                    // The failing entry stays at the relay head (not yet polled): rethrow so the apply
+                    // loop backs off and retries it. Nothing was committed for it.
                     applyError = e;
                     break;
                 }
-                appliedBatch.add(entry);
+                // Frontier first, THEN remove from the relay: never poll an entry before its apply()
+                // returned AND its frontier advance is committed (crash-safety of effectively-once).
+                commitRelayBatch(topic, List.of(entry));
+                if (!pollExpected(relay, entry.sequence())) {
+                    // Expiry fired between our peek and the poll: the head we just applied/committed was
+                    // itself aged out and the poll removed a newer entry. The frontier is at entry+1; the
+                    // next iteration sees a forward gap and recovers. Stop this batch to re-evaluate.
+                    progressed = true;
+                    break;
+                }
                 nextExpected++;
-                consumed++;
+                progressed = true;
                 continue;
             }
-            // head.sequence() > nextExpected: a forward gap. This cannot happen in RELAY_STREAM (the
-            // fetch loop only persists contiguous runs), so it would indicate corruption. Stop the
-            // batch at the prefix applied so far; the cursor stays put and the fetch loop re-pulls.
-            long got = entry.sequence();
-            long want = nextExpected;
-            LOGGER.warning(() -> "Non-contiguous relay head for topic " + topic + " seq=" + got
-                    + " expected=" + want + "; stopping batch (fetch loop will re-pull from cursor)");
-            break;
+
+            // entry.sequence() > nextExpected: a FORWARD GAP at the relay head. In steady state the
+            // stream is contiguous, but the relay's write-time TTL (relayExpireAfterWrite) can age an
+            // un-applied head entry out from under us, leaving a hole. Recover by role instead of
+            // wedging — this is the relay-log-corruption / GTID-auto-position recovery of MySQL.
+            recoverFromRelayForwardGap(topic, relay, nextExpected, entry.sequence());
+            return true;
         }
 
-        // One locked frontier commit for the whole applied prefix, THEN poll the consumed head frames.
-        // Never poll an entry before its apply() returned AND its frontier advance is committed.
-        if (!appliedBatch.isEmpty()) {
-            commitRelayBatch(topic, appliedBatch);
-        }
-        for (int i = 0; i < consumed; i++) {
-            relay.poll();
-        }
         if (applyError != null) {
             throw applyError;
         }
-        return consumed > 0;
+        if (!progressed) {
+            // Relay fully drained for this topic — release the failover drain-gate if one is held
+            // (no-op otherwise), so a promoted node can finish draining and activate leadership.
+            maybeReleaseRelayDrainGate(topic);
+        }
+        return progressed;
+    }
+
+    /**
+     * Removes the relay head and confirms it carried {@code expectedSequence}. Returns {@code false}
+     * (without having advanced any apply state) when expiry fired in the peek→poll window and a
+     * different (newer) record was removed, or the relay drained — letting the caller re-evaluate the
+     * real head rather than silently trust a stale peek. This is the atomic guard that closes the
+     * readRange↔poll divergence under {@code relayExpireAfterWrite}: {@link NQueue#poll()} expires the
+     * aged head prefix FIRST and returns the actual surviving head frame, so a mismatch here is a
+     * head-moved-under-us event we surface rather than absorb.
+     */
+    private boolean pollExpected(NQueue<byte[]> relay, long expectedSequence) throws Exception {
+        Optional<byte[]> removed = relay.poll();
+        if (removed.isEmpty()) {
+            return false;
+        }
+        long got = RelayEntryCodec.decode(removed.get()).sequence();
+        return got == expectedSequence;
+    }
+
+    /**
+     * Recovers the apply loop from a forward gap at the relay head (a sequence above {@code want} when
+     * the entry for {@code want} has been TTL-evicted from the relay). Recovery is by role, mirroring
+     * the removed {@code skipEvictedGapAndDrain}/snapshot-bootstrap recovery:
+     * <ul>
+     * <li><b>Follower</b> (a leader is known): request a fresh snapshot ({@code requestSync}). This
+     * re-bootstraps local state cleanly — the only way to recover the lost prefix — and re-anchors the
+     * apply frontier and the relay cursor. Re-pulling from the cursor would NOT recover the evicted
+     * entry (it is gone from the leader's retained window too), so a bootstrap is mandatory.</li>
+     * <li><b>Promoted leader</b> (no peer to bootstrap from): SKIP the gap — advance {@code nextExpected}
+     * to the head's sequence and continue draining. The skipped op's effect is re-derived idempotently
+     * from the upstream source (e.g. Kafka), so async loss is acceptable; what is NOT acceptable is a
+     * permanent wedge that keeps the node in STANDBY and never releases the failover drain-gate.</li>
+     * </ul>
+     */
+    private void recoverFromRelayForwardGap(String topic, NQueue<byte[]> relay, long want, long got)
+            throws Exception {
+        if (coordinator.isLeader()) {
+            // Promoted leader: skip the unrecoverable gap so the drain can finish and leadership activate.
+            long skipped = got - want;
+            evictedSkipCount.addAndGet(skipped);
+            acquireSequenceLock();
+            try {
+                nextExpectedSequenceByTopic.merge(topic, got, (cur, cand) -> Math.max(cur, cand));
+                sequenceStateDirty = true;
+            } finally {
+                sequenceBufferLock.unlock();
+            }
+            LOGGER.warning(() -> "Relay forward-gap on promoted leader topic=" + topic + " expected=" + want
+                    + " head=" + got + "; skipping " + skipped
+                    + " TTL-evicted sequence(s) and continuing drain (state re-derived idempotently upstream)");
+            // Do NOT poll the head: it is now == nextExpected and will be applied on the next iteration.
+            signalRelay(topic);
+            return;
+        }
+        if (coordinator.leaderInfo().isPresent()) {
+            // Follower: the only clean recovery is a snapshot bootstrap. Pause apply until it installs.
+            snapshotFallbackCount.incrementAndGet();
+            LOGGER.warning(() -> "Relay forward-gap on follower topic=" + topic + " expected=" + want
+                    + " head=" + got + " (TTL-evicted prefix); requesting snapshot bootstrap");
+            if (syncingTopics.add(topic)) {
+                requestSync(topic);
+            }
+            return;
+        }
+        // No leader known yet: leave the head in place and retry on the next tick.
+        LOGGER.fine(() -> "Relay forward-gap topic=" + topic + " expected=" + want + " head=" + got
+                + " but no leader known yet; deferring recovery");
     }
 
     private boolean discardStaleRelayPrefix(String topic, NQueue<byte[]> relay) throws Exception {
         long nextExpected = nextExpectedSequenceByTopic.getOrDefault(topic, 1L);
-        List<byte[]> frames = relay.readRange(0, RELAY_STALE_DISCARD_BATCH).items();
-        if (frames.isEmpty()) {
-            return false;
-        }
         int stale = 0;
-        for (byte[] frame : frames) {
+        // Consume-and-inspect: poll the REAL head only while it is a stale duplicate, and VERIFY the
+        // removed sequence is the stale one we peeked. A readRange(0,N) peek would ignore TTL expiry and
+        // could desync from the subsequent polls; even peek+poll can race (expiry firing in between),
+        // so the verified poll guards against discarding a needed (>= nextExpected) entry by accident.
+        while (stale < RELAY_STALE_DISCARD_BATCH) {
+            byte[] frame = relay.peek().orElse(null);
+            if (frame == null) {
+                break;
+            }
             RelayEntry entry = RelayEntryCodec.decode(frame);
-            // Sequence-only dedup (no epoch-magnitude fence): see the note in drainRelayOnce. An
-            // earlier-epoch entry from the agreed leader (after a convergence re-stamp) is legitimate.
+            // Sequence-only dedup (no epoch-magnitude fence): an earlier-epoch entry from the agreed
+            // leader (after a convergence re-stamp) is legitimate and must not be skipped.
             if (entry.sequence() >= nextExpected) {
                 break;
             }
+            if (!pollExpected(relay, entry.sequence())) {
+                break; // expiry advanced the head past the stale entry; re-evaluate the real head
+            }
             stale++;
-        }
-        for (int i = 0; i < stale; i++) {
-            relay.poll();
         }
         if (stale > 0) {
             int discarded = stale;
@@ -1689,11 +1776,15 @@ public class ReplicationManager
     }
 
     /**
-     * Number of operations the follower has skipped past because they were evicted from the leader's
-     * resend log (unfillable head-of-line gaps). A non-zero, growing value signals the follower fell
-     * far enough behind to lose strong ordering for those ops (recovered to eventual LWW).
+     * Number of relay sequences a PROMOTED LEADER has skipped past because the relay's write-time TTL
+     * ({@link ReplicationConfig#relayExpireAfterWrite()}) aged an un-applied head entry out from under
+     * the apply consumer, opening a forward gap the promoted node cannot bootstrap away (no peer). The
+     * node skips the gap to finish draining and activate leadership; the skipped state is re-derived
+     * idempotently from the upstream source. A non-zero, growing value signals async loss for those
+     * sequences (recovered to eventual consistency). Stays {@code 0} for a follower (which recovers a
+     * relay gap cleanly via snapshot bootstrap) and in steady state.
      *
-     * @return total evicted sequences skipped
+     * @return total relay sequences skipped on promotion to recover a TTL-evicted forward gap
      */
     public long getEvictedSkipCount() {
         return evictedSkipCount.get();
@@ -1989,6 +2080,15 @@ public class ReplicationManager
         leaderSyncTopics.clear();
         leaderSyncTopics.addAll(handlers.keySet());
         leaderSyncing.set(!leaderSyncTopics.isEmpty());
+        // Abandon any in-flight FOLLOWER-side bootstrap on promotion. A topic can be parked in
+        // syncingTopics because, while still a follower, a relay forward-gap (TTL-evicted prefix)
+        // requested a snapshot that the now-dead leader never served. A promoted node has no peer to
+        // bootstrap from, and drainRelayOnce pauses apply while syncingTopics/relayPendingBootstrap hold
+        // the topic — so without clearing them the relay never drains, the drain-gate never releases,
+        // and the node wedges in STANDBY forever. Clearing here lets the apply loop drain its own relay
+        // and recover any residual forward-gap via the promoted-leader skip path.
+        syncingTopics.clear();
+        relayPendingBootstrap.clear();
         // Notify handlers of leadership promotion so they can clean up stale data
         // (e.g., truncate queues with persisted data from a previous epoch).
         for (ReplicationHandler handler : handlers.values()) {

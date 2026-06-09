@@ -986,6 +986,52 @@ public class NQueue<T> implements Closeable {
         }
     }
 
+    /**
+     * Non-blocking variant of {@link #poll()} that returns the consumed head as a raw
+     * {@link NQueueRecord} (metadata + payload) instead of the deserialized element, or empty when the
+     * queue is logically empty. Crucially, the returned record is exactly the record the cursor was
+     * advanced past — including the effect of any opportunistic head expiration
+     * ({@link Options#withExpireAfterWrite(Duration)}) that ran first. A consumer that must reconcile
+     * "what was peeked" with "what was removed" (e.g. a replay-log apply loop) MUST drive consumption
+     * through this method rather than a {@code readRange(0,N)} peek followed by a blind {@code poll()}
+     * count: under an active TTL the two views of the head can diverge (a poll can silently discard an
+     * expired head and consume the next record), dropping an entry from an otherwise contiguous log.
+     *
+     * @return the consumed head record, or empty if no element was available
+     * @throws IOException if reading or persisting consumption progress fails
+     */
+    public Optional<NQueueRecord> pollRecord() throws IOException {
+        lock.lock();
+        try {
+            if (recordCount == 0 && handoffItem == null && enableMemoryBuffer) {
+                stager.drainSync();
+            }
+
+            skipExpiredRecordsLocked();
+
+            if (handoffItem != null) {
+                long idx = handoffItem.index();
+                recordDeliveryIndex(idx);
+                byte[] payload = toBytes(handoffItem.item());
+                NQueueRecord rec = new NQueueRecord(
+                        new NQueueRecordMetaData(idx, System.currentTimeMillis(), handoffItem.key(),
+                                handoffItem.headers(), payload.length,
+                                handoffItem.item().getClass().getCanonicalName()),
+                        payload);
+                handoffItem = null;
+                return Optional.of(rec);
+            }
+
+            if (recordCount == 0)
+                return Optional.empty();
+
+            return consumeNextRecordLocked();
+        } finally {
+            statsUtils.notifyHitCounter(NQueueMetrics.POLL_EVENT);
+            lock.unlock();
+        }
+    }
+
     // ── Internal Write Path ──────────────────────────────────────────────────
 
     private long offerDirectLocked(byte[] key, NQueueHeaders headers, T object) throws IOException {
