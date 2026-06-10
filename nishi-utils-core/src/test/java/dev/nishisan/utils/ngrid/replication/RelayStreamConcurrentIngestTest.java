@@ -222,6 +222,40 @@ class RelayStreamConcurrentIngestTest {
         }
     }
 
+    @Test
+    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    @DisplayName("Gap re-pull com purge falho cai para snapshot — nunca re-fetch sobre relay sujo")
+    void gapRepullFallsBackToSnapshotWhenPurgeFails() throws Exception {
+        // Relay perfurado [1,2,4,5] como no caso legado, mas com o diretório do tópico SEM permissão
+        // de escrita: o truncate do purge não consegue apagar os arquivos. Re-anchorar o cursor assim
+        // mesmo appendaria os frames re-fetchados ATRÁS do head antigo e o apply ficaria preso no
+        // mesmo gap para sempre — o caminho correto é degradar para snapshot bootstrap.
+        Path relayDir = tempDir.resolve("relay");
+        RelayStore store = new RelayStore(relayDir, Duration.ofHours(1));
+        store.relayFor(TOPIC).offer(frame(1));
+        store.relayFor(TOPIC).offer(frame(2));
+        store.relayFor(TOPIC).offer(frame(4));
+        store.relayFor(TOPIC).offer(frame(5));
+        store.close();
+        RelayStore.writeCleanMarker(relayDir);
+        Path topicDir = relayDir.resolve(RelayStore.dirName(TOPIC));
+        java.nio.file.Files.setPosixFilePermissions(topicDir,
+                java.nio.file.attribute.PosixFilePermissions.fromString("r-xr-xr-x"));
+
+        try (Follower f = new Follower(tempDir)) {
+            f.awaitAgreedLeader();
+            // O apply drena 1,2 e bate no gap; o purge falha (dir read-only) → snapshot bootstrap.
+            f.awaitSyncRequested(15_000);
+            assertEquals(1L, f.manager.getSnapshotFallbackCount(),
+                    "purge falho deve degradar o gap re-pull para snapshot");
+            assertEquals(0L, f.manager.getRelayRefetchCount(),
+                    "sem purge não pode haver re-anchor/re-fetch (o relay ainda tem o head antigo)");
+        } finally {
+            java.nio.file.Files.setPosixFilePermissions(topicDir,
+                    java.nio.file.attribute.PosixFilePermissions.fromString("rwxr-xr-x"));
+        }
+    }
+
     private static RelayStreamBatchPayload batchOf(int from, int to, long leaderHwm) {
         List<byte[]> frames = new ArrayList<>();
         for (int seq = from; seq <= to; seq++) {

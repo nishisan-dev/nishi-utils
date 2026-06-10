@@ -1173,16 +1173,24 @@ public class ReplicationManager
     /**
      * Drops the whole on-disk relay content for {@code topic} (close + truncate + reopen, same NQueue
      * instance so every cached reference stays valid). Callers MUST hold the topic's ingest lock and
-     * re-anchor the stream cursor right after — the dropped suffix is re-pulled from the leader binlog.
+     * decide by the RESULT: on success the stream cursor is re-anchored and the dropped suffix is
+     * re-pulled from the leader binlog; on failure the surviving relay content is still in place, so
+     * a gap-fill re-pull would append the re-fetched frames BEHIND the old head and wedge the apply
+     * loop on the same gap forever — that caller must fall back to a snapshot instead. (The snapshot
+     * cutover caller tolerates a failed purge: everything left is ≤ the installed watermark and the
+     * apply loop discards it as a stale prefix.)
+     *
+     * @return {@code true} when the relay is verifiably empty and reopened
      */
-    private void purgeRelay(String topic) {
+    private boolean purgeRelay(String topic) {
         try {
             NQueue<byte[]> relay = relayFor(topic);
             relay.close();
             relay.truncateAndReopen();
+            return true;
         } catch (Exception e) {
-            LOGGER.log(Level.WARNING, "Relay purge failed for topic " + topic
-                    + "; stale entries will be discarded by the apply loop instead", e);
+            LOGGER.log(Level.WARNING, "Relay purge failed for topic " + topic, e);
+            return false;
         }
     }
 
@@ -1654,27 +1662,39 @@ public class ReplicationManager
                 // drop the post-hole suffix (it is re-fetched in order right after) and re-anchor the
                 // fetch cursor at the gap. If the leader no longer retains `want`, the next batch
                 // answers needSnapshot and the bootstrap path still runs — correct floor, not fallback.
-                relayRefetchCount.incrementAndGet();
-                LOGGER.warning(() -> "Relay forward-gap on follower topic=" + topic + " expected=" + want
-                        + " head=" + got + " with relay TTL off (ingestion hole); re-pulling from the"
-                        + " leader binlog at " + want + " instead of snapshot");
                 java.util.concurrent.locks.ReentrantLock ingest = relayIngestLock(topic);
+                boolean purged;
                 ingest.lock();
                 try {
-                    purgeRelay(topic);
-                    relayStreamCursor(topic).set(want - 1L);
+                    purged = purgeRelay(topic);
+                    if (purged) {
+                        relayStreamCursor(topic).set(want - 1L);
+                    }
                 } finally {
                     ingest.unlock();
                 }
-                relayFetchPendingUntilByTopic.put(topic, 0L);
-                signalFetch(topic);
-                return;
+                if (purged) {
+                    relayRefetchCount.incrementAndGet();
+                    LOGGER.warning(() -> "Relay forward-gap on follower topic=" + topic + " expected="
+                            + want + " head=" + got + " with relay TTL off (ingestion hole); re-pulling"
+                            + " from the leader binlog at " + want + " instead of snapshot");
+                    relayFetchPendingUntilByTopic.put(topic, 0L);
+                    signalFetch(topic);
+                    return;
+                }
+                // Purge failed: the old suffix survives at the relay head, so a re-pull would append
+                // the re-fetched frames BEHIND it and the apply loop would hit this same gap forever.
+                // Fall through to the snapshot bootstrap (install replaces state and the cutover
+                // re-anchors the cursor; its own purge failure is tolerated by stale-prefix discard).
+                LOGGER.warning(() -> "Relay purge failed during gap re-pull for topic " + topic
+                        + "; falling back to snapshot bootstrap");
             }
-            // Relay TTL ON: the prefix may genuinely have aged out of the leader's retained window too;
-            // the only clean recovery is a snapshot bootstrap. Pause apply until it installs.
+            // Relay TTL ON (or gap re-pull unavailable): the prefix may genuinely have aged out of the
+            // leader's retained window too; the only clean recovery is a snapshot bootstrap. Pause
+            // apply until it installs.
             snapshotFallbackCount.incrementAndGet();
             LOGGER.warning(() -> "Relay forward-gap on follower topic=" + topic + " expected=" + want
-                    + " head=" + got + " (TTL-evicted prefix); requesting snapshot bootstrap");
+                    + " head=" + got + "; requesting snapshot bootstrap");
             if (syncingTopics.add(topic)) {
                 requestSync(topic);
             }
