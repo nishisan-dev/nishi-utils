@@ -187,6 +187,14 @@ public class ReplicationManager
     // Epoch-millis before which the fetch loop must not issue a new fetch for a topic: set when a fetch
     // is in flight (cleared on batch arrival), and reused as the caught-up long-poll gap.
     private final Map<String, Long> relayFetchPendingUntilByTopic = new ConcurrentHashMap<>();
+    // Serializes ALL relay ingestion and cursor re-anchoring per topic (issue tems#9, D7). The transport
+    // dispatches each message on its own virtual thread, so two overlapping RELAY_STREAM_BATCHes (a
+    // timeout re-fetch, or an in-flight pre-sync batch racing the snapshot cutover) used to run
+    // handleRelayStreamBatch concurrently; the per-frame check→offer→increment is not atomic, so a
+    // doubly-approved frame advanced the cursor twice and punched a DURABLE one-op hole in the relay
+    // (the second op was never appended) — surfacing much later as a forward gap → snapshot loop.
+    private final Map<String, java.util.concurrent.locks.ReentrantLock> relayIngestLockByTopic =
+            new ConcurrentHashMap<>();
     // Last leader high-watermark per topic, learned from RELAY_STREAM_BATCH (lag observability).
     private final Map<String, Long> leaderHwmByTopic = new ConcurrentHashMap<>();
     // Leader's retained-window floor per topic, learned from RELAY_STREAM_BATCH (snapshot-risk view).
@@ -212,6 +220,12 @@ public class ReplicationManager
     private final java.util.concurrent.atomic.AtomicLong resendSuccessCount = new java.util.concurrent.atomic.AtomicLong(
             0);
     private final java.util.concurrent.atomic.AtomicLong snapshotFallbackCount = new java.util.concurrent.atomic.AtomicLong(
+            0);
+    // Forward-gap recoveries resolved by a cursor re-pull from the leader binlog instead of a snapshot
+    // (issue tems#9, D7): with the relay TTL off, a "TTL-evicted prefix" is impossible, so the hole is
+    // an ingestion artifact (or legacy on-disk damage) and the missing range still lives in the leader's
+    // durable op-log — re-fetching it is orders of magnitude cheaper than a snapshot bootstrap.
+    private final java.util.concurrent.atomic.AtomicLong relayRefetchCount = new java.util.concurrent.atomic.AtomicLong(
             0);
     // Total snapshot/sync requests this node has initiated (chunk 0). In RELAY_STREAM this stays flat
     // in regime — lag is absorbed by the stream/relay; a snapshot is only the cold-bootstrap path.
@@ -405,14 +419,16 @@ public class ReplicationManager
         }
         relayApplyThreads.clear();
         // Frontier is now consistent (no in-flight apply). Persist it, then mark the shutdown clean ONLY
-        // if every applier actually terminated; otherwise leave no marker so the next start bootstraps
-        // (the safe side).
-        flushSequenceStateIfDirty();
-        if (allAppliersTerminated) {
+        // if every applier actually terminated AND the final flush landed on disk; otherwise leave no
+        // marker so the next start bootstraps (the safe side — a clean marker over a stale frontier
+        // would replay/skip ops on restart).
+        boolean frontierFlushed = flushSequenceStateIfDirty();
+        if (allAppliersTerminated && frontierFlushed) {
             writeCleanShutdownMarker();
         } else {
-            LOGGER.warning("Relay apply consumers did not all terminate on stop; skipping clean-shutdown "
-                    + "marker so the next start bootstraps as a safety measure.");
+            LOGGER.warning("Skipping clean-shutdown marker (appliersTerminated=" + allAppliersTerminated
+                    + ", frontierFlushed=" + frontierFlushed
+                    + "); the next start bootstraps as a safety measure.");
         }
         transport.removeListener(this);
         coordinator.removeLeadershipListener(this);
@@ -1084,8 +1100,21 @@ public class ReplicationManager
 
         // RELAY_STREAM: re-anchor the pull cursor at the snapshot watermark so the fetch loop resumes
         // streaming from watermark+1 instead of a stale pre-snapshot cursor (which would re-pull below
-        // the retained window and bounce on needSnapshot). Let it fetch immediately.
-        relayStreamCursor(topic).set(watermark);
+        // the retained window and bounce on needSnapshot). Purge + re-anchor run atomically under the
+        // ingest lock (issue tems#9, D7): an in-flight pre-sync batch must not interleave with the
+        // cursor reset (it could land its increments on the new anchor and punch a hole), and the old
+        // relay content is dropped wholesale — everything ≥ watermark+1 is re-pulled in order anyway,
+        // and anything ≤ watermark is stale by definition after the install.
+        if (isStreamMode()) {
+            java.util.concurrent.locks.ReentrantLock ingest = relayIngestLock(topic);
+            ingest.lock();
+            try {
+                purgeRelay(topic);
+                relayStreamCursor(topic).set(watermark);
+            } finally {
+                ingest.unlock();
+            }
+        }
         relayFetchPendingUntilByTopic.put(topic, 0L);
         signalFetch(topic);
         if (completedBootstrap && relayPendingBootstrap.isEmpty()) {
@@ -1133,6 +1162,28 @@ public class ReplicationManager
             throw new IllegalStateException("Relay store not initialized");
         }
         return store.relayFor(topic);
+    }
+
+    /** The per-topic lock serializing relay ingestion and cursor re-anchoring (issue tems#9, D7). */
+    private java.util.concurrent.locks.ReentrantLock relayIngestLock(String topic) {
+        return relayIngestLockByTopic.computeIfAbsent(topic,
+                k -> new java.util.concurrent.locks.ReentrantLock());
+    }
+
+    /**
+     * Drops the whole on-disk relay content for {@code topic} (close + truncate + reopen, same NQueue
+     * instance so every cached reference stays valid). Callers MUST hold the topic's ingest lock and
+     * re-anchor the stream cursor right after — the dropped suffix is re-pulled from the leader binlog.
+     */
+    private void purgeRelay(String topic) {
+        try {
+            NQueue<byte[]> relay = relayFor(topic);
+            relay.close();
+            relay.truncateAndReopen();
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING, "Relay purge failed for topic " + topic
+                    + "; stale entries will be discarded by the apply loop instead", e);
+        }
     }
 
     private void signalRelay(String topic) {
@@ -1334,41 +1385,59 @@ public class ReplicationManager
             relayFetchPendingUntilByTopic.remove(topic); // allow re-fetch once the handler registers
             return;
         }
-        java.util.concurrent.atomic.AtomicLong cursor = relayStreamCursor(topic);
+        // Serialize ingestion per topic (issue tems#9, D7): batches arrive on independent virtual
+        // threads, and the per-frame check→offer→increment below is only correct single-writer. Two
+        // overlapping batches (timeout re-fetch / pre-sync batch racing the cutover) interleaving here
+        // used to double-approve a frame, advance the cursor twice and punch a durable hole in the relay.
+        java.util.concurrent.locks.ReentrantLock ingest = relayIngestLock(topic);
+        ingest.lock();
         int persisted = 0;
-        for (byte[] frame : batch.frames()) {
-            RelayEntry entry;
-            try {
-                entry = RelayEntryCodec.decode(frame);
-            } catch (Exception e) {
-                LOGGER.log(Level.WARNING, "Failed to decode relay-stream frame for topic " + topic, e);
-                break;
+        try {
+            if (syncingTopics.contains(topic) || relayPendingBootstrap.contains(topic)) {
+                // A snapshot is installing (or a bootstrap is pending): an in-flight batch must not
+                // append around the cutover — it would land sequences past the new watermark before the
+                // post-cutover refetch re-anchors. Everything is re-pulled from watermark+1 afterwards.
+                LOGGER.fine(() -> "Discarding in-flight relay-stream batch for topic " + topic
+                        + " while a snapshot install is in progress");
+                return;
             }
-            // No epoch-magnitude fence here: the batch is already fenced by leader IDENTITY above
-            // (Fase 0.2), so every frame is from the agreed leader. An earlier-epoch frame (the same
-            // leader, before a convergence re-stamp) is legitimate and contiguous — fencing it by
-            // magnitude would skip it without advancing the cursor and wedge the stream.
-            long expected = cursor.get() + 1L;
-            if (entry.sequence() < expected) {
-                continue; // duplicate / already persisted
+            java.util.concurrent.atomic.AtomicLong cursor = relayStreamCursor(topic);
+            for (byte[] frame : batch.frames()) {
+                RelayEntry entry;
+                try {
+                    entry = RelayEntryCodec.decode(frame);
+                } catch (Exception e) {
+                    LOGGER.log(Level.WARNING, "Failed to decode relay-stream frame for topic " + topic, e);
+                    break;
+                }
+                // No epoch-magnitude fence here: the batch is already fenced by leader IDENTITY above
+                // (Fase 0.2), so every frame is from the agreed leader. An earlier-epoch frame (the same
+                // leader, before a convergence re-stamp) is legitimate and contiguous — fencing it by
+                // magnitude would skip it without advancing the cursor and wedge the stream.
+                long expected = cursor.get() + 1L;
+                if (entry.sequence() < expected) {
+                    continue; // duplicate / already persisted
+                }
+                if (entry.sequence() != expected) {
+                    // A hole must not occur in stream mode (the leader sends contiguous runs). Stop and
+                    // let the next fetch re-pull from the cursor.
+                    long got = entry.sequence();
+                    LOGGER.warning(() -> "Non-contiguous relay-stream frame topic=" + topic + " seq=" + got
+                            + " expected=" + expected);
+                    break;
+                }
+                try {
+                    relayFor(topic).offer(frame);
+                } catch (Exception e) {
+                    LOGGER.log(Level.WARNING, "Relay offer failed topic=" + topic + " seq=" + entry.sequence()
+                            + "; will re-fetch", e);
+                    break; // cursor not advanced → the next fetch retries this sequence
+                }
+                cursor.incrementAndGet();
+                persisted++;
             }
-            if (entry.sequence() != expected) {
-                // A hole must not occur in stream mode (the leader sends contiguous runs). Stop and
-                // let the next fetch re-pull from the cursor.
-                long got = entry.sequence();
-                LOGGER.warning(() -> "Non-contiguous relay-stream frame topic=" + topic + " seq=" + got
-                        + " expected=" + expected);
-                break;
-            }
-            try {
-                relayFor(topic).offer(frame);
-            } catch (Exception e) {
-                LOGGER.log(Level.WARNING, "Relay offer failed topic=" + topic + " seq=" + entry.sequence()
-                        + "; will re-fetch", e);
-                break; // cursor not advanced → the next fetch retries this sequence
-            }
-            cursor.incrementAndGet();
-            persisted++;
+        } finally {
+            ingest.unlock();
         }
         if (persisted > 0) {
             // Got data: allow the next fetch immediately and wake both loops.
@@ -1578,7 +1647,31 @@ public class ReplicationManager
             return;
         }
         if (coordinator.leaderInfo().isPresent()) {
-            // Follower: the only clean recovery is a snapshot bootstrap. Pause apply until it installs.
+            if (config.relayExpireAfterWrite() == null || config.relayExpireAfterWrite().isZero()) {
+                // Relay TTL OFF: a "TTL-evicted prefix" is impossible, so the hole is an ingestion
+                // artifact (issue tems#9, D7) or legacy on-disk damage. The missing range still lives
+                // in the leader's durable binlog, so the clean AND cheap recovery is a cursor re-pull:
+                // drop the post-hole suffix (it is re-fetched in order right after) and re-anchor the
+                // fetch cursor at the gap. If the leader no longer retains `want`, the next batch
+                // answers needSnapshot and the bootstrap path still runs — correct floor, not fallback.
+                relayRefetchCount.incrementAndGet();
+                LOGGER.warning(() -> "Relay forward-gap on follower topic=" + topic + " expected=" + want
+                        + " head=" + got + " with relay TTL off (ingestion hole); re-pulling from the"
+                        + " leader binlog at " + want + " instead of snapshot");
+                java.util.concurrent.locks.ReentrantLock ingest = relayIngestLock(topic);
+                ingest.lock();
+                try {
+                    purgeRelay(topic);
+                    relayStreamCursor(topic).set(want - 1L);
+                } finally {
+                    ingest.unlock();
+                }
+                relayFetchPendingUntilByTopic.put(topic, 0L);
+                signalFetch(topic);
+                return;
+            }
+            // Relay TTL ON: the prefix may genuinely have aged out of the leader's retained window too;
+            // the only clean recovery is a snapshot bootstrap. Pause apply until it installs.
             snapshotFallbackCount.incrementAndGet();
             LOGGER.warning(() -> "Relay forward-gap on follower topic=" + topic + " expected=" + want
                     + " head=" + got + " (TTL-evicted prefix); requesting snapshot bootstrap");
@@ -1864,6 +1957,19 @@ public class ReplicationManager
 
     public long getSnapshotFallbackCount() {
         return snapshotFallbackCount.get();
+    }
+
+    /**
+     * Forward-gap recoveries resolved by a cursor re-pull from the leader binlog instead of a snapshot
+     * bootstrap (issue tems#9, D7) — the path taken when the relay TTL is off, where a hole can only be
+     * an ingestion artifact (or legacy on-disk damage) and the missing range is still durably retained
+     * by the leader. A growing value with a flat {@link #getSnapshotFallbackCount()} means gaps are
+     * being healed cheaply by the stream itself.
+     *
+     * @return the cumulative count of gap recoveries via binlog re-pull
+     */
+    public long getRelayRefetchCount() {
+        return relayRefetchCount.get();
     }
 
     /**
@@ -2656,12 +2762,16 @@ public class ReplicationManager
      * thread-safe concurrent structures. Clears the dirty flag before writing so a concurrent
      * dirty-mark during the write re-arms it for the next flush (no lost update).
      */
-    private void flushSequenceStateIfDirty() {
+    private boolean flushSequenceStateIfDirty() {
         if (!sequenceStateDirty) {
-            return;
+            return true;
         }
         sequenceStateDirty = false;
-        saveSequenceState();
+        boolean saved = saveSequenceState();
+        if (!saved) {
+            sequenceStateDirty = true; // re-arm so the next periodic flush retries
+        }
+        return saved;
     }
 
     /**
@@ -2671,9 +2781,9 @@ public class ReplicationManager
      * - globalSequence (for leader, stored as "_global" key)
      * - sequenceByTopic (for leader, stored as "_topic:{topic}" keys)
      */
-    private void saveSequenceState() {
+    private boolean saveSequenceState() {
         if (sequenceStatePath == null) {
-            return; // Test mode, no persistence
+            return true; // Test mode, no persistence
         }
         try {
             Files.createDirectories(sequenceStatePath.getParent());
@@ -2685,12 +2795,24 @@ public class ReplicationManager
             // Add per-topic sequences
             sequenceByTopic.forEach((topic, seq) -> toSave.put("_topic:" + topic, seq.get()));
 
+            // Write-to-temp + atomic move (issue tems#9, D7/F3): the periodic flush (1s scheduler) and
+            // the final flush in stop() may race on this path, and a crash mid-write must never leave a
+            // torn sequence-state behind a clean-shutdown marker.
+            Path tmp = sequenceStatePath.resolveSibling(sequenceStatePath.getFileName() + ".tmp");
             try (java.io.ObjectOutputStream oos = new java.io.ObjectOutputStream(
-                    Files.newOutputStream(sequenceStatePath))) {
+                    Files.newOutputStream(tmp))) {
                 oos.writeObject(toSave);
             }
+            try {
+                Files.move(tmp, sequenceStatePath, java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            } catch (java.nio.file.AtomicMoveNotSupportedException e) {
+                Files.move(tmp, sequenceStatePath, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            }
+            return true;
         } catch (IOException e) {
             LOGGER.log(Level.WARNING, "Failed to save sequence state", e);
+            return false;
         }
     }
 }
