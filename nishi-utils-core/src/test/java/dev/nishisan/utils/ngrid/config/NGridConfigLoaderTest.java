@@ -140,6 +140,7 @@ class NGridConfigLoaderTest {
         ClusterPolicyConfig cluster = new ClusterPolicyConfig();
         ClusterPolicyConfig.ReplicationConfig replication = new ClusterPolicyConfig.ReplicationConfig();
         replication.setFollowerIngestMode("relay_stream");
+        replication.setResendLogSegmentMaxEntries(1_000_000);
         replication.setResendLogSegmentMaxBytes(10L * 1024 * 1024 * 1024); // 10GB per file
         replication.setResendLogMaxSegments(10);                            // keep 10 files
         replication.setRelayExpireAfterWrite("30m");                        // follower relay TTL
@@ -154,6 +155,7 @@ class NGridConfigLoaderTest {
         NGridConfigLoader.save(yamlFile, config);
         NGridConfig domain = NGridConfigLoader.convertToDomain(NGridConfigLoader.load(yamlFile));
 
+        assertEquals(1_000_000, domain.resendLogSegmentMaxEntries());
         assertEquals(10L * 1024 * 1024 * 1024, domain.resendLogSegmentMaxBytes());
         assertEquals(10, domain.resendLogMaxSegments());
         assertEquals(Duration.ofMinutes(30), domain.relayExpireAfterWrite());
@@ -176,6 +178,8 @@ class NGridConfigLoaderTest {
 
         assertNull(domain.resendLogSegmentMaxBytes(),
                 "absent YAML keys must leave the binlog byte cap unset (replication default applies)");
+        assertNull(domain.resendLogSegmentMaxEntries(),
+                "absent YAML keys must leave the per-segment entry cap unset");
         assertNull(domain.resendLogMaxSegments(),
                 "absent YAML keys must leave the segment-count cap unset");
     }

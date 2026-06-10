@@ -95,6 +95,73 @@ class LeaderAffinityElectionTest {
         }
     }
 
+    @Test
+    void localLeadershipIneligibleFollowsActivePeer() throws Exception {
+        try (Harness h = new Harness(LOW_ID, 100, HIGH_ID, 10, true, Duration.ZERO)) {
+            h.coord.setLocalLeadershipEligibility(() -> false);
+            h.start();
+
+            h.injectHeartbeat(HIGH_ID, 1L, 42L);
+
+            h.awaitLeader(HIGH_ID);
+            assertFalse(h.coord.isLeader(),
+                    "nó local com estado não-confiável não deve liderar enquanto há peer ativo");
+        }
+    }
+
+    @Test
+    void localLeadershipIneligibleStillLeadsAloneAfterBootWindow() throws Exception {
+        Duration window = Duration.ofMillis(700);
+        try (Harness h = new Harness(LOW_ID, 100, HIGH_ID, 10, true, window)) {
+            h.coord.setLocalLeadershipEligibility(() -> false);
+            h.start();
+
+            Thread.sleep(250);
+            assertFalse(h.coord.isLeader(),
+                    "nó local inelegível deve aguardar peers durante a janela de boot");
+
+            h.awaitLeader(LOW_ID);
+        }
+    }
+
+    @Test
+    void staleEpochHeartbeatStillRecordsPeerWatermark() throws Exception {
+        try (Harness h = new Harness(LOW_ID, 100, HIGH_ID, 10, true, Duration.ZERO)) {
+            h.start();
+            h.awaitLeader(LOW_ID);
+
+            // Establish a high tracked epoch for the agreed local leader. The next heartbeat from the
+            // peer has a lower epoch and is fenced as leadership, but its watermark must still be kept.
+            h.injectHeartbeat(LOW_ID, 10L, -1L);
+            h.injectHeartbeat(HIGH_ID, 1L, 200L);
+
+            assertEquals(200L, h.coord.maxActivePeerHighWatermark(),
+                    "watermark de peer com epoch antigo ainda precisa alimentar o sync-before-reclaim");
+        }
+    }
+
+    @Test
+    void wholeClusterIneligibleHigherAffinityLeadsAfterBootWindow() throws Exception {
+        // Os DOIS nós voltam unclean: ambos inelegíveis (bootstrap pendente) e o peer anuncia
+        // watermark -1. Sem escape AP, ambos deferem um ao outro (deadlock leaderless). Com o fix, o
+        // nó de MAIOR afinidade (local, prio 100) assume após a janela de boot; o outro faz bootstrap.
+        Duration window = Duration.ofMillis(700);
+        try (Harness h = new Harness(LOW_ID, 100, HIGH_ID, 10, true, window)) {
+            h.coord.setLocalLeadershipEligibility(() -> false);
+            h.start();
+
+            // Peer ativo, porém também em bootstrap (anuncia -1 → não é um líder viável para sincronizar).
+            h.injectHeartbeat(HIGH_ID, 1L, -1L);
+
+            Thread.sleep(250);
+            assertFalse(h.coord.isLeader(),
+                    "durante a janela de boot, o nó inelegível ainda defere mesmo sem peer viável");
+
+            // Após a janela, sem peer viável para sincronizar, o de maior afinidade DEVE assumir (AP).
+            h.awaitLeader(LOW_ID);
+        }
+    }
+
     // ---- harness ----
 
     private final class Harness implements AutoCloseable {
@@ -123,8 +190,12 @@ class LeaderAffinityElectionTest {
         }
 
         void injectHeartbeat(NodeId source, long epoch) {
+            injectHeartbeat(source, epoch, -1L);
+        }
+
+        void injectHeartbeat(NodeId source, long epoch, long watermark) {
             coord.onMessage(ClusterMessage.lightweight(MessageType.HEARTBEAT, "hb", source, null,
-                    HeartbeatPayload.now(-1L, epoch)));
+                    HeartbeatPayload.now(watermark, epoch)));
         }
 
         void awaitLeader(NodeId expected) throws InterruptedException {

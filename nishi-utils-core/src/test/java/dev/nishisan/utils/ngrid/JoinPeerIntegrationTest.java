@@ -78,10 +78,13 @@ class JoinPeerIntegrationTest {
     void joinShouldDiscoverAllPeersThroughOneKnownNode() {
         long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(10);
         while (System.currentTimeMillis() < deadline) {
-            boolean node1Members = node1.coordinator().activeMembers().size() == 3;
-            boolean node2Members = node2.coordinator().activeMembers().size() == 3;
-            boolean node3Members = node3.coordinator().activeMembers().size() == 3;
-            if (node1Members && node2Members && node3Members) {
+            boolean node1Ready = node1.coordinator().activeMembers().size() == 3
+                    && node1.coordinator().leaderInfo().isPresent();
+            boolean node2Ready = node2.coordinator().activeMembers().size() == 3
+                    && node2.coordinator().leaderInfo().isPresent();
+            boolean node3Ready = node3.coordinator().activeMembers().size() == 3
+                    && node3.coordinator().leaderInfo().isPresent();
+            if (node1Ready && node2Ready && node3Ready) {
                 break;
             }
             try {

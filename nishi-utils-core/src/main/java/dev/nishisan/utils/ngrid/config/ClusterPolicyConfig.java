@@ -211,6 +211,7 @@ public class ClusterPolicyConfig  {
         private int factor = 1;
         private boolean strict = false;
         private String followerIngestMode;
+        private int resendLogSegmentMaxEntries = 0;
         private long resendLogSegmentMaxBytes = 0L;
         private int resendLogMaxSegments = 0;
         private String relayExpireAfterWrite;
@@ -273,6 +274,25 @@ public class ClusterPolicyConfig  {
          */
         public void setFollowerIngestMode(String followerIngestMode) {
             this.followerIngestMode = followerIngestMode;
+        }
+
+        /**
+         * Returns the per-segment entry cap for the leader-side binlog. {@code 0} (default) leaves the
+         * replication-layer default in effect.
+         *
+         * @return entries per segment, or {@code 0} when unset
+         */
+        public int getResendLogSegmentMaxEntries() {
+            return resendLogSegmentMaxEntries;
+        }
+
+        /**
+         * Sets the per-segment entry cap for the leader-side binlog.
+         *
+         * @param resendLogSegmentMaxEntries entries per segment ({@code 0} leaves default)
+         */
+        public void setResendLogSegmentMaxEntries(int resendLogSegmentMaxEntries) {
+            this.resendLogSegmentMaxEntries = resendLogSegmentMaxEntries;
         }
 
         /**

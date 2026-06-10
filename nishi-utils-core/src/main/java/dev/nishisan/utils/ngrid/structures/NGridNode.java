@@ -321,35 +321,18 @@ public final class NGridNode implements Closeable {
             t.setDaemon(true);
             return t;
         });
-        int minClusterSize = Math.max(1, Math.min(config.replicationQuorum(), config.peers().size() + 1));
+        int derivedMinClusterSize = Math.max(1, Math.min(config.replicationQuorum(), config.peers().size() + 1));
+        int minClusterSize = config.minClusterSize() != null ? config.minClusterSize() : derivedMinClusterSize;
         ClusterCoordinatorConfig coordinatorConfig = ClusterCoordinatorConfig.of(
                 config.heartbeatInterval(),
                 config.heartbeatInterval().multipliedBy(3),
                 config.leaseTimeout(),
                 minClusterSize,
-                null);
+                null)
+                .withPairMode(config.pairMode())
+                .withBootDiscoveryWindow(
+                        config.bootDiscoveryWindow() != null ? config.bootDiscoveryWindow() : Duration.ZERO);
         coordinator = new ClusterCoordinator(transport, coordinatorConfig, coordinatorScheduler);
-        coordinator.start();
-
-        metricsScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "ngrid-metrics");
-            t.setDaemon(true);
-            return t;
-        });
-        rttMonitor = new RttMonitor(transport, coordinator, stats, metricsScheduler, config.rttProbeInterval());
-        rttMonitor.start();
-        if (config.leaderReelectionEnabled()) {
-            leaderReelectionService = new LeaderReelectionService(
-                    transport,
-                    coordinator,
-                    stats,
-                    metricsScheduler,
-                    config.leaderReelectionInterval(),
-                    config.leaderReelectionCooldown(),
-                    config.leaderReelectionSuggestionTtl(),
-                    config.leaderReelectionMinDelta());
-            leaderReelectionService.start();
-        }
 
         ReplicationConfig.Builder replicationBuilder = ReplicationConfig.builder(config.replicationFactor());
         if (config.replicationOperationTimeout() != null) {
@@ -363,6 +346,9 @@ public final class NGridNode implements Closeable {
         }
         if (config.resendLogMaxEntries() != null) {
             replicationBuilder.resendLogMaxEntries(config.resendLogMaxEntries());
+        }
+        if (config.resendLogSegmentMaxEntries() != null) {
+            replicationBuilder.resendLogSegmentMaxEntries(config.resendLogSegmentMaxEntries());
         }
         if (config.resendLogSegmentMaxBytes() != null) {
             replicationBuilder.resendLogSegmentMaxBytes(config.resendLogSegmentMaxBytes());
@@ -398,6 +384,27 @@ public final class NGridNode implements Closeable {
         // The leader high-watermark supplier is wired by ReplicationManager.start() itself (#131), so
         // it is correct for manual assemblies too — no external wiring needed here.
         replicationManager.start();
+        coordinator.start();
+
+        metricsScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "ngrid-metrics");
+            t.setDaemon(true);
+            return t;
+        });
+        rttMonitor = new RttMonitor(transport, coordinator, stats, metricsScheduler, config.rttProbeInterval());
+        rttMonitor.start();
+        if (config.leaderReelectionEnabled()) {
+            leaderReelectionService = new LeaderReelectionService(
+                    transport,
+                    coordinator,
+                    stats,
+                    metricsScheduler,
+                    config.leaderReelectionInterval(),
+                    config.leaderReelectionCooldown(),
+                    config.leaderReelectionSuggestionTtl(),
+                    config.leaderReelectionMinDelta());
+            leaderReelectionService.start();
+        }
 
         NQueue.Options queueOptions = config.queueOptions() != null ? config.queueOptions() : NQueue.Options.defaults();
         defaultQueueConfig = DistributedQueueConfig.builder(config.queueName())

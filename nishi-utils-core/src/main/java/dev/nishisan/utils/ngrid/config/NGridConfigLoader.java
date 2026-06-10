@@ -157,6 +157,10 @@ public class NGridConfigLoader {
                 if (segmentMaxBytes > 0) {
                     builder.resendLogSegmentMaxBytes(segmentMaxBytes);
                 }
+                int segmentMaxEntries = clusterConfig.getReplication().getResendLogSegmentMaxEntries();
+                if (segmentMaxEntries > 0) {
+                    builder.resendLogSegmentMaxEntries(segmentMaxEntries);
+                }
                 int maxSegments = clusterConfig.getReplication().getResendLogMaxSegments();
                 if (maxSegments > 0) {
                     builder.resendLogMaxSegments(maxSegments);
