@@ -95,6 +95,51 @@ class LeaderAffinityElectionTest {
         }
     }
 
+    @Test
+    void localLeadershipIneligibleFollowsActivePeer() throws Exception {
+        try (Harness h = new Harness(LOW_ID, 100, HIGH_ID, 10, true, Duration.ZERO)) {
+            h.coord.setLocalLeadershipEligibility(() -> false);
+            h.start();
+
+            h.injectHeartbeat(HIGH_ID, 1L, 42L);
+
+            h.awaitLeader(HIGH_ID);
+            assertFalse(h.coord.isLeader(),
+                    "nó local com estado não-confiável não deve liderar enquanto há peer ativo");
+        }
+    }
+
+    @Test
+    void localLeadershipIneligibleStillLeadsAloneAfterBootWindow() throws Exception {
+        Duration window = Duration.ofMillis(700);
+        try (Harness h = new Harness(LOW_ID, 100, HIGH_ID, 10, true, window)) {
+            h.coord.setLocalLeadershipEligibility(() -> false);
+            h.start();
+
+            Thread.sleep(250);
+            assertFalse(h.coord.isLeader(),
+                    "nó local inelegível deve aguardar peers durante a janela de boot");
+
+            h.awaitLeader(LOW_ID);
+        }
+    }
+
+    @Test
+    void staleEpochHeartbeatStillRecordsPeerWatermark() throws Exception {
+        try (Harness h = new Harness(LOW_ID, 100, HIGH_ID, 10, true, Duration.ZERO)) {
+            h.start();
+            h.awaitLeader(LOW_ID);
+
+            // Establish a high tracked epoch for the agreed local leader. The next heartbeat from the
+            // peer has a lower epoch and is fenced as leadership, but its watermark must still be kept.
+            h.injectHeartbeat(LOW_ID, 10L, -1L);
+            h.injectHeartbeat(HIGH_ID, 1L, 200L);
+
+            assertEquals(200L, h.coord.maxActivePeerHighWatermark(),
+                    "watermark de peer com epoch antigo ainda precisa alimentar o sync-before-reclaim");
+        }
+    }
+
     // ---- harness ----
 
     private final class Harness implements AutoCloseable {
@@ -123,8 +168,12 @@ class LeaderAffinityElectionTest {
         }
 
         void injectHeartbeat(NodeId source, long epoch) {
+            injectHeartbeat(source, epoch, -1L);
+        }
+
+        void injectHeartbeat(NodeId source, long epoch, long watermark) {
             coord.onMessage(ClusterMessage.lightweight(MessageType.HEARTBEAT, "hb", source, null,
-                    HeartbeatPayload.now(-1L, epoch)));
+                    HeartbeatPayload.now(watermark, epoch)));
         }
 
         void awaitLeader(NodeId expected) throws InterruptedException {

@@ -35,7 +35,6 @@ import java.util.concurrent.ScheduledExecutorService;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
 import dev.nishisan.utils.ngrid.cluster.coordination.ClusterCoordinator;
@@ -82,7 +81,6 @@ class ReplicationManagerSequenceStateTest {
     }
 
     @Test
-    @Disabled("reprodução da issue #139 (D1) — habilitar junto com o fix do filtro de chaves sintéticas")
     void seedAppliedIgnoresSyntheticSequenceStateKeys() throws Exception {
         // sequence-state.dat como um nó real persiste (saveSequenceState): o frontier do tópico
         // convive com as chaves sintéticas "_global" e "_topic:{t}" no MESMO mapa serializado.

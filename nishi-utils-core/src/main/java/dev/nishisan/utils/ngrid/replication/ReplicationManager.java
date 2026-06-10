@@ -306,16 +306,14 @@ public class ReplicationManager
         // only that understated frontier, i.e. with the incumbent's tail still unsynced. Using
         // max(globalSequence, lastApplied) keeps the advertised watermark on the same scale as every
         // follower's applied frontier, so the gate compares like with like.
-        coordinator.setLeaderHighWatermarkSupplier(
-                () -> coordinator.isLeader()
-                        ? Math.max(getGlobalSequence(), getLastAppliedSequence())
-                        : getLastAppliedSequence());
+        coordinator.setLeaderHighWatermarkSupplier(this::advertisedLeaderHighWatermark);
         // Sync-before-reclaim (watermark gate): feed the coordinator the local APPLIED frontier and the
         // catch-up tolerance. The coordinator compares this against every peer's advertised watermark
         // (learned from heartbeats) to decide whether a returning higher-affinity node may reclaim
         // leadership (only once caught up) and whether an incumbent may step down (only once the
         // higher-affinity candidate has caught up). The threshold reuses joinSyncLagThreshold (#129).
-        coordinator.setReplicationProgressGate(this::getLastAppliedSequence, config.joinSyncLagThreshold());
+        coordinator.setReplicationProgressGate(this::localAppliedForReclaim, config.joinSyncLagThreshold());
+        coordinator.setLocalLeadershipEligibility(this::isLocallyEligibleForLeadership);
         // Nudge the coordinator to recompute leadership as our applied frontier advances, so a deferred
         // reclaim is promoted promptly once we catch up (membership/eviction ticks would also trigger it).
         timeoutScheduler.scheduleAtFixedRate(this::nudgeLeadershipOnCatchUp, 200, 200, TimeUnit.MILLISECONDS);
@@ -325,6 +323,7 @@ public class ReplicationManager
             // if one happens, re-anchors it at the snapshot watermark.
             seedAppliedSequenceFromFrontier();
             detectUncleanRestartAndMarkBootstrap();
+            markPendingBootstrapForRegisteredHandlers();
             // Relay retention mirrors the leader op-log window (#122): an over-retention
             // backlog is surfaced to the consumer and resolved by bootstrap, never silently
             // dropped (the clamp guarantees that).
@@ -448,19 +447,54 @@ public class ReplicationManager
     public void registerHandler(String topic, ReplicationHandler handler) {
         handlers.put(topic, handler);
         if (isStreamMode()) {
-            if (relayUncleanRestart
-                    && RelayStore.hasTopicData(config.dataDirectory().resolve("relay"), topic)) {
-                // Unclean restart and this topic had prior relay data: it must bootstrap before applying
-                // (regardless of any saved frontier, which may be lost). The snapshot is actually
-                // requested by the apply loop once a leader is known and this node is a follower
-                // (drainRelayOnce), avoiding a leader-syncs-from-itself loop.
-                relayPendingBootstrap.add(topic);
-            }
+            markPendingBootstrapIfNeeded(topic);
             // Tie the apply consumer to handler registration, not to start(): an op may reach
             // the relay before the handler exists (it is durably parked on disk until then),
             // but apply must not begin until the handler is available.
             ensureRelayApplyLoop(topic);
             ensureRelayFetchLoop(topic);
+        }
+    }
+
+    private long advertisedLeaderHighWatermark() {
+        if (hasPendingRelayBootstrap()) {
+            return -1L;
+        }
+        return coordinator.isLeader()
+                ? Math.max(getGlobalSequence(), getLastAppliedSequence())
+                : getLastAppliedSequence();
+    }
+
+    private long localAppliedForReclaim() {
+        return hasPendingRelayBootstrap() ? Long.MIN_VALUE : getLastAppliedSequence();
+    }
+
+    private boolean isLocallyEligibleForLeadership() {
+        return !hasPendingRelayBootstrap();
+    }
+
+    private boolean hasPendingRelayBootstrap() {
+        return isStreamMode() && !relayPendingBootstrap.isEmpty();
+    }
+
+    private void markPendingBootstrapForRegisteredHandlers() {
+        if (!relayUncleanRestart) {
+            return;
+        }
+        handlers.keySet().forEach(this::markPendingBootstrapIfNeeded);
+    }
+
+    private void markPendingBootstrapIfNeeded(String topic) {
+        if (!isStreamMode() || !relayUncleanRestart
+                || !RelayStore.hasTopicData(config.dataDirectory().resolve("relay"), topic)) {
+            return;
+        }
+        if (relayPendingBootstrap.add(topic)) {
+            // Unclean restart and this topic had prior relay data: it must bootstrap before applying
+            // (regardless of any saved frontier, which may be lost). The snapshot is requested by the
+            // apply loop once a leader is known and this node is a follower.
+            LOGGER.info(() -> "Relay bootstrap pending for topic " + topic + " after unclean restart");
+            coordinator.reevaluateLeadership();
         }
     }
 
@@ -480,6 +514,9 @@ public class ReplicationManager
     private void seedAppliedSequenceFromFrontier() {
         long applied = 0L;
         for (Map.Entry<String, Long> e : nextExpectedSequenceByTopic.entrySet()) {
+            if (isSyntheticSequenceStateKey(e.getKey())) {
+                continue;
+            }
             applied += Math.max(0L, e.getValue() - 1L);
         }
         if (applied > 0L) {
@@ -541,7 +578,7 @@ public class ReplicationManager
      * decision still lives in {@link ClusterCoordinator#recomputeLeader()}; this only reduces latency.
      */
     private void nudgeLeadershipOnCatchUp() {
-        if (!running || coordinator.isLeader()) {
+        if (!running || coordinator.isLeader() || hasPendingRelayBootstrap()) {
             return;
         }
         try {
@@ -1022,7 +1059,7 @@ public class ReplicationManager
     private void completeSnapshotCutover(String topic, long watermark) {
         appliedSequence.updateAndGet(current -> Math.max(current, watermark));
         lastAppliedSequence = appliedSequence.get();
-        relayPendingBootstrap.remove(topic);
+        boolean completedBootstrap = relayPendingBootstrap.remove(topic);
 
         acquireSequenceLock();
         try {
@@ -1038,6 +1075,9 @@ public class ReplicationManager
         relayStreamCursor(topic).set(watermark);
         relayFetchPendingUntilByTopic.put(topic, 0L);
         signalFetch(topic);
+        if (completedBootstrap && relayPendingBootstrap.isEmpty()) {
+            coordinator.reevaluateLeadership();
+        }
 
         signalRelay(topic);
     }
@@ -2565,7 +2605,11 @@ public class ReplicationManager
                 Files.newInputStream(sequenceStatePath))) {
             @SuppressWarnings("unchecked")
             Map<String, Long> loaded = (Map<String, Long>) ois.readObject();
-            nextExpectedSequenceByTopic.putAll(loaded);
+            loaded.forEach((topic, nextExpected) -> {
+                if (!isSyntheticSequenceStateKey(topic)) {
+                    nextExpectedSequenceByTopic.put(topic, nextExpected);
+                }
+            });
 
             // Load globalSequence (stored as "_global" key for compatibility)
             Long savedGlobal = loaded.get("_global");
@@ -2588,6 +2632,10 @@ public class ReplicationManager
         } catch (Exception e) {
             LOGGER.log(Level.WARNING, "Failed to load sequence state, starting from 1", e);
         }
+    }
+
+    private static boolean isSyntheticSequenceStateKey(String key) {
+        return "_global".equals(key) || key.startsWith("_topic:");
     }
 
     /**

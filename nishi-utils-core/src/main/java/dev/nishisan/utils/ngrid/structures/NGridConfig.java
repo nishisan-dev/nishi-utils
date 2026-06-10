@@ -46,6 +46,7 @@ public final class NGridConfig {
     private final Integer replicationLogRetention;
     private final Duration replicationLogRetentionTime;
     private final Long resendLogMaxEntries;
+    private final Integer resendLogSegmentMaxEntries;
     private final Long resendLogSegmentMaxBytes;
     private final Integer resendLogMaxSegments;
     private final FollowerIngestMode followerIngestMode;
@@ -107,6 +108,7 @@ public final class NGridConfig {
         this.replicationLogRetention = builder.replicationLogRetention;
         this.replicationLogRetentionTime = builder.replicationLogRetentionTime;
         this.resendLogMaxEntries = builder.resendLogMaxEntries;
+        this.resendLogSegmentMaxEntries = builder.resendLogSegmentMaxEntries;
         this.resendLogSegmentMaxBytes = builder.resendLogSegmentMaxBytes;
         this.resendLogMaxSegments = builder.resendLogMaxSegments;
         this.followerIngestMode = builder.followerIngestMode;
@@ -222,6 +224,17 @@ public final class NGridConfig {
      */
     public Long resendLogMaxEntries() {
         return resendLogMaxEntries;
+    }
+
+    /**
+     * Optional per-segment entry cap for the leader-side binlog (ResendLog). A segment rolls on
+     * whichever per-segment bound is hit first (entries, age, or bytes). When {@code null}, the
+     * replication-layer default is used. Set this high when byte-sized segments should govern rolling.
+     *
+     * @return the per-segment entry cap, or {@code null} when unset
+     */
+    public Integer resendLogSegmentMaxEntries() {
+        return resendLogSegmentMaxEntries;
     }
 
     /**
@@ -571,6 +584,7 @@ public final class NGridConfig {
         private Duration replicationOperationTimeout;
         private Integer replicationLogRetention;
         private Long resendLogMaxEntries;
+        private Integer resendLogSegmentMaxEntries;
         private Long resendLogSegmentMaxBytes;
         private Integer resendLogMaxSegments;
         private Duration replicationLogRetentionTime;
@@ -811,6 +825,23 @@ public final class NGridConfig {
                 throw new IllegalArgumentException("resendLogMaxEntries must be >= 1");
             }
             this.resendLogMaxEntries = maxEntries;
+            return this;
+        }
+
+        /**
+         * Sets the per-segment entry cap for the leader-side binlog (ResendLog). A segment rolls on
+         * whichever per-segment bound is hit first (entries, age, or bytes). Combine with
+         * {@link #resendLogSegmentMaxBytes(long)} when byte-sized rolling should dominate by setting a
+         * sufficiently high entry cap.
+         *
+         * @param maxEntries entries per binlog segment (must be {@code >= 1})
+         * @return this builder
+         */
+        public Builder resendLogSegmentMaxEntries(int maxEntries) {
+            if (maxEntries < 1) {
+                throw new IllegalArgumentException("resendLogSegmentMaxEntries must be >= 1");
+            }
+            this.resendLogSegmentMaxEntries = maxEntries;
             return this;
         }
 

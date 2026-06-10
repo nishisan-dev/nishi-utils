@@ -240,9 +240,21 @@ public final class NGridLocalBuilder {
             throws InterruptedException {
         long deadline = System.currentTimeMillis() + timeout.toMillis();
         int expectedMembers = nodes.size();
+        Optional<NodeInfo> stableLeader = Optional.empty();
+        int stableChecks = 0;
 
         while (System.currentTimeMillis() < deadline) {
-            if (hasConsensus(nodes, expectedMembers)) {
+            Optional<NodeInfo> leader = consensusLeader(nodes, expectedMembers);
+            if (leader.isPresent() && leader.equals(stableLeader)) {
+                stableChecks++;
+            } else if (leader.isPresent()) {
+                stableLeader = leader;
+                stableChecks = 1;
+            } else {
+                stableLeader = Optional.empty();
+                stableChecks = 0;
+            }
+            if (stableChecks >= 3) {
                 return;
             }
             Thread.sleep(200);
@@ -251,22 +263,22 @@ public final class NGridLocalBuilder {
         throw new IllegalStateException("Local cluster did not reach consensus within " + timeout);
     }
 
-    private static boolean hasConsensus(List<NGridNode> nodes, int expectedMembers) {
+    private static Optional<NodeInfo> consensusLeader(List<NGridNode> nodes, int expectedMembers) {
         // All nodes must agree on leader
         Optional<NodeInfo> firstLeader = nodes.get(0).coordinator().leaderInfo();
         if (firstLeader.isEmpty()) {
-            return false;
+            return Optional.empty();
         }
         for (NGridNode node : nodes) {
             if (!firstLeader.equals(node.coordinator().leaderInfo())) {
-                return false;
+                return Optional.empty();
             }
         }
 
         // All nodes must see all members
         for (NGridNode node : nodes) {
             if (node.coordinator().activeMembers().size() != expectedMembers) {
-                return false;
+                return Optional.empty();
             }
         }
 
@@ -276,7 +288,7 @@ public final class NGridLocalBuilder {
                 if (i == j) continue;
                 NodeId otherId = nodes.get(j).transport().local().nodeId();
                 if (!nodes.get(i).transport().isConnected(otherId)) {
-                    return false;
+                    return Optional.empty();
                 }
             }
         }
@@ -285,11 +297,11 @@ public final class NGridLocalBuilder {
         // "Leader sync in progress")
         for (NGridNode node : nodes) {
             if (node.replicationManager() != null && node.replicationManager().isLeaderSyncing()) {
-                return false;
+                return Optional.empty();
             }
         }
 
-        return true;
+        return firstLeader;
     }
 
     private static int allocateFreeLocalPort(Set<Integer> avoid) throws IOException {

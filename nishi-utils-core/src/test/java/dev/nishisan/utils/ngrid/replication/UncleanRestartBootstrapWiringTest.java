@@ -34,7 +34,6 @@ import java.util.concurrent.ScheduledExecutorService;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
 import dev.nishisan.utils.ngrid.cluster.coordination.ClusterCoordinator;
@@ -88,7 +87,6 @@ class UncleanRestartBootstrapWiringTest {
      * Hoje não arma (NO-OP) — o defeito D2 da issue #139.
      */
     @Test
-    @Disabled("reprodução da issue #139 (D2) — habilitar junto com o backfill da marcação em start()")
     void preStartHandlerRegistrationArmsBootstrapOnUncleanRestart() throws Exception {
         simulatePriorUncleanRunWithTopicData();
 

@@ -22,7 +22,6 @@ import dev.nishisan.utils.ngrid.structures.DistributedQueue;
 import dev.nishisan.utils.ngrid.structures.NGridConfig;
 import dev.nishisan.utils.ngrid.structures.NGridNode;
 import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
@@ -88,7 +87,6 @@ class StaleFrontierReclaimE2ETest {
      */
     @Test
     @Timeout(value = 180, unit = TimeUnit.SECONDS)
-    @Disabled("reprodução da issue #139 (D1) — habilitar junto com o fix do filtro de chaves sintéticas")
     void staleFrontierMustNotShortCircuitReclaimSync() throws Exception {
         runScenario(false);
     }
@@ -99,7 +97,6 @@ class StaleFrontierReclaimE2ETest {
      */
     @Test
     @Timeout(value = 180, unit = TimeUnit.SECONDS)
-    @Disabled("reprodução da issue #139 (D1+D2/D3) — habilitar junto com o fix do ramo unclean")
     void uncleanReturnMustBootstrapBeforeReclaiming() throws Exception {
         runScenario(true);
     }

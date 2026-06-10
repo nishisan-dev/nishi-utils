@@ -77,6 +77,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     private final AtomicReference<NodeId> leader = new AtomicReference<>();
     private final AtomicLong leaderEpoch = new AtomicLong(0);
     private volatile java.util.function.LongSupplier leaderHighWatermarkSupplier = () -> -1L;
+    private volatile java.util.function.BooleanSupplier localLeadershipEligibilitySupplier = () -> true;
     private volatile long trackedLeaderHighWatermark = -1L;
     private volatile long trackedLeaderEpoch = 0L;
     private volatile Instant leaseExpiresAt = Instant.MIN;
@@ -103,6 +104,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      * immediate-by-affinity behaviour — the gate only ever engages once a real frontier is supplied.
      */
     private volatile java.util.function.LongSupplier localAppliedSupplier = () -> Long.MAX_VALUE;
+    private volatile boolean replicationProgressGateEnabled = false;
 
     /**
      * Lag tolerance (in sequences) for the watermark gate: the local node is considered "caught up" to a
@@ -165,6 +167,18 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     }
 
     /**
+     * Registers a local leadership eligibility predicate. This lets subsystems that own durable state
+     * keep the local node from taking leadership while that state is known to be unsafe to serve. The
+     * predicate is local-only; peers express their readiness indirectly through their advertised
+     * watermark.
+     *
+     * @param supplier {@code true} when the local node may lead
+     */
+    public void setLocalLeadershipEligibility(java.util.function.BooleanSupplier supplier) {
+        this.localLeadershipEligibilitySupplier = supplier != null ? supplier : (() -> true);
+    }
+
+    /**
      * Wires the local node's applied replication frontier and the lag tolerance used by the
      * sync-before-reclaim watermark gate. Called by the
      * {@link dev.nishisan.utils.ngrid.replication.ReplicationManager}. Until wired, the gate is inert
@@ -177,6 +191,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             long lagThreshold) {
         this.localAppliedSupplier = localAppliedSupplier != null ? localAppliedSupplier
                 : (() -> Long.MAX_VALUE);
+        this.replicationProgressGateEnabled = localAppliedSupplier != null;
         this.syncReclaimLagThreshold = Math.max(0L, lagThreshold);
     }
 
@@ -777,6 +792,19 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
 
             NodeId localId = transport.local().nodeId();
             boolean weWouldLead = electedId != null && electedId.equals(localId);
+            boolean localIneligible = weWouldLead && !safeLocalLeadershipEligible();
+            if (localIneligible
+                    && (hasActivePeer(localId) || Instant.now().toEpochMilli() < bootDiscoveryDeadlineMs)) {
+                NodeId current = leader.get();
+                NodeId followTarget = (current != null && !current.equals(localId) && isActiveMember(current))
+                        ? current
+                        : highestWatermarkActivePeer(localId);
+                if (followTarget == null) {
+                    followTarget = highestAffinityActivePeer(localId);
+                }
+                updateLeader(followTarget);
+                return;
+            }
 
             // ── Sync-before-reclaim gate A (RECLAIM side) — watermark-driven ──────────────────────────
             // If WE would win by affinity but a peer is AHEAD of us by watermark (it holds newer state we
@@ -788,16 +816,14 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             // preserved: with no active peer ahead, maxActivePeerHighWatermark() is -1 and the gate is a
             // no-op, so the node still leads (after the boot-discovery window, handled above).
             boolean behindAheadPeer = weWouldLead && !isCaughtUpToCluster();
-            // Boot-window watermark-unknown deferral: closes the very race the pré-prod run exposed —
-            // node-1 self-elects on boot BEFORE it has heard node-2's heartbeat (and thus its watermark),
-            // so isCaughtUpToCluster() returns true vacuously (no peer watermark known yet) and node-1
-            // grabs leadership with stale state. While the boot-discovery window is open and a CONFIGURED
-            // peer is an active member but has NOT yet reported its watermark, DEFER: that peer may be the
-            // incumbent ahead of us. Once it reports (or the window lapses), the normal watermark gate / AP
-            // takes over. Never blocks lead-while-alone: it only triggers for an ACTIVE, unheard peer.
+            // Watermark-unknown deferral: if a peer is already ACTIVE, never hand leadership to us before
+            // it reports a watermark; that peer may be the incumbent ahead of us. The boot window only
+            // bounds waiting for configured peers that have not appeared at all, preserving AP when alone.
             boolean bootWindowUnknownPeer = weWouldLead
-                    && Instant.now().toEpochMilli() < bootDiscoveryDeadlineMs
-                    && hasConfiguredPeerWithUnknownWatermark(localId);
+                    && replicationProgressGateEnabled
+                    && (hasActivePeerWithUnknownWatermark(localId)
+                            || (Instant.now().toEpochMilli() < bootDiscoveryDeadlineMs
+                                    && hasConfiguredPeerWithUnknownWatermark(localId)));
             if (behindAheadPeer || bootWindowUnknownPeer) {
                 // Behind a peer's state (or still discovering it): do not seize leadership. Adopt the peer
                 // that is ahead as our LOCAL leader so we become its follower and the replication layer
@@ -854,6 +880,12 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             return true; // already caught up this session; do not chase the incumbent's moving tail
         }
         long localApplied = safeLocalApplied();
+        NodeId localId = transport.local().nodeId();
+        if (Instant.now().toEpochMilli() < bootDiscoveryDeadlineMs
+                && hasActivePeer(localId)
+                && maxPeer < localApplied) {
+            return false;
+        }
         if (localApplied >= maxPeer - syncReclaimLagThreshold) {
             reclaimCaughtUpLatch = true;
             return true;
@@ -886,6 +918,46 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             // A supplier failure must not crash the election; treat as "unknown frontier = behind".
             return Long.MIN_VALUE;
         }
+    }
+
+    private boolean safeLocalLeadershipEligible() {
+        try {
+            return localLeadershipEligibilitySupplier.getAsBoolean();
+        } catch (RuntimeException e) {
+            // A supplier failure must not promote an unsafe node.
+            return false;
+        }
+    }
+
+    private boolean hasActivePeer(NodeId localId) {
+        for (ClusterMember member : members.values()) {
+            if (isRealActivePeer(member, localId)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean hasActivePeerWithUnknownWatermark(NodeId localId) {
+        for (ClusterMember member : members.values()) {
+            if (isRealActivePeer(member, localId) && !peerHighWatermark.containsKey(member.id())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private NodeId highestAffinityActivePeer(NodeId localId) {
+        return members.values().stream()
+                .filter(m -> isRealActivePeer(m, localId))
+                .max(Comparator.comparingInt((ClusterMember m) -> m.info().priority())
+                        .thenComparing(ClusterMember::id))
+                .map(ClusterMember::id)
+                .orElse(null);
+    }
+
+    private boolean isRealActivePeer(ClusterMember member, NodeId localId) {
+        return !member.id().equals(localId) && member.isActive() && member.info().port() > 0;
     }
 
     /**
@@ -1092,33 +1164,18 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             // re-stamps above it (re-establishing itself as the legitimate, accepted leader).
             observeEpoch(heartbeatEpoch);
 
-            // FENCING by leader IDENTITY: the agreed leader (deterministic max NodeId) is
-            // authoritative — adopt its term even if it momentarily appears lower than a ghost term
-            // we remember, so a converged leader is never fenced into a permanent freeze. Reject a
-            // stale epoch only from a source that is NOT the agreed leader (a partitioned ex-leader
-            // still broadcasting); leadership itself is still decided by NodeId, not by this filter.
-            NodeId currentLeader = leader.get();
-            boolean fromAgreedLeader = currentLeader != null && currentLeader.equals(source);
-            if (!fromAgreedLeader && heartbeatEpoch > 0 && heartbeatEpoch < trackedLeaderEpoch) {
-                LOGGER.fine(() -> String.format(
-                        "Ignoring heartbeat from non-leader %s with stale epoch %d (current: %d)",
-                        source, heartbeatEpoch, trackedLeaderEpoch));
-                return;
-            }
-            if (fromAgreedLeader) {
-                trackedLeaderHighWatermark = payload.leaderHighWatermark();
-                trackedLeaderEpoch = payload.leaderEpoch();
-            }
-            // Sync-before-reclaim (watermark gate): record every peer's advertised replication watermark.
-            // This is the cluster-wide progress signal the gate uses — a returning node defers leadership
-            // while a peer is ahead of it, and an incumbent retains leadership while a higher-affinity
-            // candidate is behind it. Independent of who "asserts" leadership; depends only on the gap.
+            // Record membership and watermarks before epoch fencing. A stale-epoch heartbeat must not be
+            // accepted as leadership, but its sender can still be the incumbent with newer replicated
+            // state; the sync-before-reclaim gate needs that watermark to correct a premature reclaim.
             boolean watermarkAdvanced = false;
             if (!source.equals(transport.local().nodeId())) {
                 long reported = payload.leaderHighWatermark();
                 if (reported >= 0) {
                     Long prev = peerHighWatermark.put(source, reported);
                     watermarkAdvanced = prev == null || reported != prev;
+                    if (watermarkAdvanced && reported > safeLocalApplied() + syncReclaimLagThreshold) {
+                        reclaimCaughtUpLatch = false;
+                    }
                 }
             }
             boolean[] isNewMember = {false};
@@ -1131,6 +1188,27 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 return new ClusterMember(
                         findPeerInfo(source).orElseGet(() -> new NodeInfo(source, "", 0)));
             });
+
+            // FENCING by leader IDENTITY: the agreed leader (deterministic max NodeId) is
+            // authoritative — adopt its term even if it momentarily appears lower than a ghost term
+            // we remember, so a converged leader is never fenced into a permanent freeze. Reject a
+            // stale epoch only from a source that is NOT the agreed leader (a partitioned ex-leader
+            // still broadcasting); leadership itself is still decided by NodeId, not by this filter.
+            NodeId currentLeader = leader.get();
+            boolean fromAgreedLeader = currentLeader != null && currentLeader.equals(source);
+            if (!fromAgreedLeader && heartbeatEpoch > 0 && heartbeatEpoch < trackedLeaderEpoch) {
+                LOGGER.fine(() -> String.format(
+                        "Ignoring heartbeat from non-leader %s with stale epoch %d (current: %d)",
+                        source, heartbeatEpoch, trackedLeaderEpoch));
+                if (isNewMember[0] || watermarkAdvanced) {
+                    recomputeLeader();
+                }
+                return;
+            }
+            if (fromAgreedLeader) {
+                trackedLeaderHighWatermark = payload.leaderHighWatermark();
+                trackedLeaderEpoch = payload.leaderEpoch();
+            }
             if (isNewMember[0] || watermarkAdvanced) {
                 // A new member, or a peer whose watermark changed: recompute so the watermark gate can
                 // (a) defer our reclaim while a peer is ahead, or (b) release the incumbent's step-down
