@@ -176,6 +176,9 @@ public class ReplicationManager
     // the non-idempotent queue OFFER. relayPendingBootstrap holds those topics until the apply loop
     // requests the snapshot (deferred so a follower syncs from the leader, never from itself).
     private volatile boolean relayUncleanRestart = false;
+    // Unclean restart with prior relay data on disk (issue tems#9, D8): engages the bootstrap gate
+    // from the very first heartbeat, before any handler registers and arms the per-topic pending.
+    private volatile boolean uncleanWithPriorRelayData = false;
     private final Set<String> relayPendingBootstrap = ConcurrentHashMap.newKeySet();
 
     // RELAY_STREAM follower IO: a per-topic fetch loop pulls the leader op-log from a durable cursor
@@ -446,6 +449,12 @@ public class ReplicationManager
     private void detectUncleanRestartAndMarkBootstrap() {
         Path relayDir = config.dataDirectory().resolve("relay");
         relayUncleanRestart = RelayStore.isUncleanRestart(relayDir);
+        // Issue tems#9, D8: the per-topic pending bootstrap only arms in registerHandler (the relay
+        // dir names are hashed, so topics cannot be enumerated from disk). In wirings where handlers
+        // register AFTER start(), the early heartbeats would otherwise advertise the seeded frontier
+        // of a possibly dead lineage as a real watermark. This flag keeps the node un-advertisable
+        // and ineligible from the FIRST heartbeat until the first handler arms (or no data exists).
+        uncleanWithPriorRelayData = relayUncleanRestart && RelayStore.hasAnyTopicData(relayDir);
         RelayStore.consumeCleanMarker(relayDir);
         if (relayUncleanRestart) {
             LOGGER.warning("Unclean relay restart detected; topics with prior data will bootstrap from a "
@@ -473,7 +482,7 @@ public class ReplicationManager
     }
 
     private long advertisedLeaderHighWatermark() {
-        if (hasPendingRelayBootstrap()) {
+        if (bootstrapGateEngaged()) {
             return -1L;
         }
         return coordinator.isLeader()
@@ -482,15 +491,27 @@ public class ReplicationManager
     }
 
     private long localAppliedForReclaim() {
-        return hasPendingRelayBootstrap() ? Long.MIN_VALUE : getLastAppliedSequence();
+        return bootstrapGateEngaged() ? Long.MIN_VALUE : getLastAppliedSequence();
     }
 
     private boolean isLocallyEligibleForLeadership() {
-        return !hasPendingRelayBootstrap();
+        return !bootstrapGateEngaged();
     }
 
     private boolean hasPendingRelayBootstrap() {
         return isStreamMode() && !relayPendingBootstrap.isEmpty();
+    }
+
+    /**
+     * True while the node must not advertise its frontier nor accept leadership (issue tems#9, D8):
+     * a per-topic bootstrap is pending (unclean restart with prior data, cleared only when the
+     * snapshot INSTALLS), or the unclean restart was detected but no handler has registered yet to
+     * arm the per-topic pending (the startup window where the seeded frontier of a possibly dead
+     * lineage would otherwise leak into the first heartbeats as a real watermark).
+     */
+    private boolean bootstrapGateEngaged() {
+        return hasPendingRelayBootstrap()
+                || (isStreamMode() && uncleanWithPriorRelayData && handlers.isEmpty());
     }
 
     private void markPendingBootstrapForRegisteredHandlers() {
@@ -520,6 +541,29 @@ public class ReplicationManager
 
     public long getLastAppliedSequence() {
         return lastAppliedSequence;
+    }
+
+    /**
+     * The watermark this node currently advertises in heartbeats: {@code -1} while the bootstrap
+     * gate is engaged (unclean restart with un-bootstrapped prior data — issue tems#9, D8), else
+     * the applied frontier (leaders advertise {@code max(produced, applied)}). Observability mirror
+     * of the heartbeat supplier — what peers' sync-before-reclaim gates actually see.
+     *
+     * @return the advertised high watermark, or {@code -1} while not advertisable
+     */
+    public long getAdvertisedHighWatermark() {
+        return advertisedLeaderHighWatermark();
+    }
+
+    /**
+     * Whether this node currently accepts leadership: {@code false} while the bootstrap gate is
+     * engaged (a pending relay bootstrap, or an unclean restart with prior data before any handler
+     * registered — issue tems#9, D8). Observability mirror of the coordinator eligibility hook.
+     *
+     * @return {@code true} when the node may lead
+     */
+    public boolean isLeadershipEligible() {
+        return isLocallyEligibleForLeadership();
     }
 
     /**
@@ -1026,6 +1070,17 @@ public class ReplicationManager
         ReplicationHandler handler = handlers.get(payload.topic());
         if (handler == null)
             return;
+        if (coordinator.isLeader()) {
+            // Role guard (issue tems#9, D8): an ACTIVE LEADER never installs a peer snapshot. A late
+            // chunk from a sync requested while this node was still a follower (the server may answer
+            // around a leadership flip) used to resetState() the live leader mid-write — and the
+            // chunk chain then died on a self-addressed follow-up request. Drop it and release the
+            // sync guard; the leader's own op-log is the source of truth.
+            LOGGER.warning(() -> "Ignoring snapshot chunk for " + payload.topic()
+                    + " received while LEADER (late response from a pre-promotion sync)");
+            syncingTopics.remove(payload.topic());
+            return;
+        }
 
         executor.submit(() -> {
             try {
@@ -1086,8 +1141,20 @@ public class ReplicationManager
     }
 
     private void completeSnapshotCutover(String topic, long watermark) {
-        appliedSequence.updateAndGet(current -> Math.max(current, watermark));
-        lastAppliedSequence = appliedSequence.get();
+        // The installed snapshot REPLACES the local state (resetState + install), so every counter
+        // re-anchors on the serving leader's lineage at the watermark — SET, not max (issue tems#9,
+        // D8). The old max() kept the seeded frontier of a dead lineage (an unclean ex-leader whose
+        // pre-crash applied was numerically above the incumbent's watermark), so the node kept
+        // advertising — and later producing from — a counter the cluster history never contained.
+        // Re-anchoring globalSequence/sequenceByTopic also makes a future promotion produce
+        // contiguously with the lineage it actually holds (fixes the understated-watermark case the
+        // supplier comment in start() documents). The active-leader path never gets here (role guard
+        // in handleSyncResponse).
+        appliedSequence.set(watermark);
+        lastAppliedSequence = watermark;
+        globalSequence.updateAndGet(current -> watermark);
+        sequenceByTopic.computeIfAbsent(topic, k -> new java.util.concurrent.atomic.AtomicLong())
+                .set(watermark);
         boolean completedBootstrap = relayPendingBootstrap.remove(topic);
 
         acquireSequenceLock();
@@ -1096,6 +1163,15 @@ public class ReplicationManager
             sequenceStateDirty = true;
         } finally {
             sequenceBufferLock.unlock();
+        }
+
+        // Drop the LOCAL binlog of the replaced lineage (issue tems#9, D8): it still holds the
+        // dead tail above the incumbent's watermark and would be served verbatim to a follower
+        // fetching that range after a later promotion. The post-cutover stream rebuilds it from
+        // watermark+1 on the new lineage.
+        ResendLogStore store = resendLogStore;
+        if (store != null) {
+            store.logFor(topic).truncate();
         }
 
         // RELAY_STREAM: re-anchor the pull cursor at the snapshot watermark so the fetch loop resumes
@@ -1130,6 +1206,12 @@ public class ReplicationManager
 
     private void requestSync(String topic, int chunkIndex) {
         coordinator.leaderInfo().ifPresent(leader -> {
+            if (leader.nodeId().equals(transport.local().nodeId())) {
+                // Never self-sync (issue tems#9, D8): a continuation chunk requested after this node
+                // got promoted would be addressed to itself and silently die in the transport
+                // ("No route available"), leaving a half-installed state behind.
+                return;
+            }
             if (chunkIndex == 0) {
                 syncRequestCount.incrementAndGet();
                 LOGGER.info(() -> "Lag detected (" + (coordinator.getTrackedLeaderHighWatermark() - lastAppliedSequence)
@@ -1503,8 +1585,12 @@ public class ReplicationManager
                 relayPendingBootstrap.remove(topic);
             } else if (coordinator.leaderInfo().isPresent()) {
                 // Follower with a known leader: pull a fresh snapshot first (replaces local state, so a
-                // stale/lost frontier cannot duplicate the non-idempotent queue OFFER).
-                relayPendingBootstrap.remove(topic);
+                // stale/lost frontier cannot duplicate the non-idempotent queue OFFER). The pending
+                // bootstrap is NOT removed here (issue tems#9, D8): it only clears when the snapshot
+                // actually INSTALLS (completeSnapshotCutover). Removing it on the mere REQUEST re-armed
+                // leadership eligibility and the advertised watermark while the sync could still die
+                // silently (e.g. the targeted node stepped down and drops SYNC_REQUEST) — letting a
+                // dead-lineage frontier win the reclaim gate at the end of the boot window.
                 if (syncingTopics.add(topic)) {
                     requestSync(topic);
                 }

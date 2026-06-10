@@ -86,6 +86,24 @@ final class RelayStore implements Closeable {
         return Files.exists(relayDir.resolve(dirName(topic)));
     }
 
+    /**
+     * True if ANY topic has a relay directory under {@code relayDir} from a prior run (issue
+     * tems#9, D8). The dir names are hashed, so topics cannot be enumerated back — this is the
+     * topic-agnostic "the node has un-bootstrapped prior data" signal used to keep the bootstrap
+     * gate engaged from the first heartbeat until handlers register and arm the per-topic pending.
+     */
+    static boolean hasAnyTopicData(Path relayDir) {
+        if (!Files.isDirectory(relayDir)) {
+            return false;
+        }
+        try (var stream = Files.newDirectoryStream(relayDir, Files::isDirectory)) {
+            return stream.iterator().hasNext();
+        } catch (IOException e) {
+            LOGGER.log(Level.WARNING, "Failed to scan relay dir for prior topic data", e);
+            return true; // fail safe: treat as having data (stays ineligible until handlers arm)
+        }
+    }
+
     /** Writes the clean-shutdown marker on graceful stop, after the apply frontier is flushed. */
     static void writeCleanMarker(Path relayDir) {
         try {

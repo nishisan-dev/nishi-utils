@@ -274,6 +274,27 @@ final class ResendLog implements Closeable {
         return min == Long.MAX_VALUE ? -1L : min;
     }
 
+    /**
+     * Drops ALL segments and resets the log to empty, keeping it open for new appends (issue
+     * tems#9, D8). Used when a snapshot install replaces the node's state: the local binlog still
+     * holds the dead-lineage tail (sequences above the incumbent's watermark that were never
+     * replicated) and must never be served to a follower after the cutover re-anchors the
+     * counters on the new lineage.
+     */
+    synchronized void truncate() {
+        for (Segment segment : segments) {
+            segment.close();
+            try {
+                Files.deleteIfExists(segment.file);
+            } catch (IOException e) {
+                LOGGER.log(Level.WARNING, "Failed to drop resend-log segment " + segment.file, e);
+            }
+        }
+        segments.clear();
+        active = null;
+        totalEntries = 0;
+    }
+
     @Override
     public synchronized void close() {
         if (closed) {
