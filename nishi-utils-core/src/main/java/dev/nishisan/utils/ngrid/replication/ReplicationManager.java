@@ -230,6 +230,8 @@ public class ReplicationManager
     // durable op-log — re-fetching it is orders of magnitude cheaper than a snapshot bootstrap.
     private final java.util.concurrent.atomic.AtomicLong relayRefetchCount = new java.util.concurrent.atomic.AtomicLong(
             0);
+    // Rate-limit for the not-the-leader fetch refusal warning (issue tems#9, D9).
+    private volatile long lastFetchRefusalLogMs = 0L;
     // Total snapshot/sync requests this node has initiated (chunk 0). In RELAY_STREAM this stays flat
     // in regime — lag is absorbed by the stream/relay; a snapshot is only the cold-bootstrap path.
     private final java.util.concurrent.atomic.AtomicLong syncRequestCount = new java.util.concurrent.atomic.AtomicLong(
@@ -584,6 +586,32 @@ public class ReplicationManager
         // defers to it by affinity and the cluster wedges leaderless. Seeding from max(frontierSum,
         // globalSequence) restores the true applied frontier for both roles (they coincide for a single
         // topic), so the election/watermark gate picks the right leader. Synthetic keys stay filtered (D1).
+        //
+        // D9 (issue tems#9): the FRONTIER itself must be re-anchored on the per-topic PRODUCED counter
+        // first. An ex-leader's frontier is stale at the point it last applied as a follower (a leader
+        // never advances it), while "_topic:{t}" holds everything it produced — and the node is the
+        // source of truth for its own production. Leaving the stale frontier in place made a clean
+        // rejoin re-pull (and RE-APPLY!) the node's own produced tail from the new leader's binlog,
+        // double-counting it into the applied metric: the inflated counter armed a PREMATURE reclaim,
+        // then froze (post-reclaim production restarts below it, so max() never advances), the follower's
+        // honest counter crossed it ~20 heartbeats later, and gate A evicted the leader into a leaderless
+        // mutual-deferral stalemate.
+        acquireSequenceLock();
+        try {
+            sequenceByTopic.forEach((topic, seq) -> {
+                long produced = seq.get();
+                if (produced <= 0L) {
+                    return;
+                }
+                Long frontier = nextExpectedSequenceByTopic.get(topic);
+                if (frontier == null || frontier < produced + 1L) {
+                    nextExpectedSequenceByTopic.put(topic, produced + 1L);
+                    sequenceStateDirty = true;
+                }
+            });
+        } finally {
+            sequenceBufferLock.unlock();
+        }
         long frontierSum = 0L;
         for (Map.Entry<String, Long> e : nextExpectedSequenceByTopic.entrySet()) {
             if (isSyntheticSequenceStateKey(e.getKey())) {
@@ -1097,7 +1125,12 @@ public class ReplicationManager
                     sequenceBufferLock.unlock();
                 }
                 long currentApplied = Math.max(0L, currentNext - 1L);
-                if (payload.sequence() < currentApplied) {
+                // The stale-sync guard NEVER applies while a bootstrap is pending for the topic (issue
+                // tems#9, D8/D9): the local lineage is untrusted by definition (unclean restart) and
+                // sequence numbers across divergent lineages are incomparable — a returning ex-leader's
+                // re-anchored frontier is routinely ABOVE the incumbent's honest watermark, yet the
+                // incumbent's snapshot is exactly what must replace the local state.
+                if (!relayPendingBootstrap.contains(payload.topic()) && payload.sequence() < currentApplied) {
                     LOGGER.warning(() -> "Ignoring stale sync for " + payload.topic()
                             + " (sequence=" + payload.sequence() + ", current=" + currentApplied + ")");
                     syncingTopics.remove(payload.topic());
@@ -1448,6 +1481,16 @@ public class ReplicationManager
         if (agreedLeader == null || !agreedLeader.equals(message.source())) {
             LOGGER.fine(() -> "Ignoring RELAY_STREAM_BATCH from non-leader " + message.source()
                     + " (agreed leader: " + agreedLeader + ")");
+            return;
+        }
+        if (batch.leaderUnavailable()) {
+            // Our ADOPTED leader refuses leadership (issue tems#9, D9): it deferred to someone else
+            // (or to us) and cannot serve the stream. Surface the refusal to the coordinator — if we
+            // are not behind the refusing node, its escape takes leadership and breaks the mutual-
+            // deferral stalemate; otherwise the next recompute re-adopts whoever can actually serve.
+            relayFetchPendingUntilByTopic.put(topic,
+                    System.currentTimeMillis() + Math.max(1L, config.relayStreamPollInterval().toMillis()));
+            coordinator.noteLeaderRefusal(message.source());
             return;
         }
         leaderHwmByTopic.put(topic, batch.leaderHighWatermark());
@@ -1936,7 +1979,21 @@ public class ReplicationManager
      */
     private void handleRelayStreamFetch(ClusterMessage message) {
         if (!coordinator.isLeader()) {
-            LOGGER.fine(() -> "Ignoring RELAY_STREAM_FETCH: not the leader.");
+            // Issue tems#9, D9: NEVER refuse silently. A follower whose adopted leader refuses
+            // leadership (a mutual-deferral stalemate) would starve forever waiting for a stream only
+            // a leader serves — answer with leaderUnavailable so the requester's coordinator learns
+            // the refusal and can break the stalemate (the ahead node takes over).
+            RelayStreamFetchPayload request = message.payload(RelayStreamFetchPayload.class);
+            long now = System.currentTimeMillis();
+            if (now - lastFetchRefusalLogMs > 10_000L) {
+                lastFetchRefusalLogMs = now;
+                LOGGER.warning(() -> "Refusing RELAY_STREAM_FETCH from " + message.source()
+                        + " (topic=" + request.topic() + "): this node is not the leader");
+            }
+            transport.send(ClusterMessage.request(MessageType.RELAY_STREAM_BATCH, "stream",
+                    transport.local().nodeId(), message.source(),
+                    new RelayStreamBatchPayload(request.topic(), request.fromSequence(), List.of(),
+                            -1L, -1L, false, true)));
             return;
         }
         ResendLogStore store = resendLogStore;

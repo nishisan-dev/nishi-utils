@@ -96,6 +96,13 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
 
     /** Per-peer last-known replication high-watermark, learned from heartbeats. -1 until first heard. */
     private final Map<NodeId, Long> peerHighWatermark = new ConcurrentHashMap<>();
+    // Last time each peer REFUSED to serve the stream as a non-leader (issue tems#9, D9): fed by the
+    // replication layer when a RELAY_STREAM_FETCH addressed to our adopted leader comes back with
+    // leaderUnavailable. A recent refusal from the affinity-elected node is the stalemate signal that
+    // lets the ahead node take over instead of deferring forever.
+    private final Map<NodeId, Long> leaderRefusalAtMs = new ConcurrentHashMap<>();
+    // Rate-limit for the leader-behind-own-follower warning (issue tems#9, D9).
+    private volatile long lastLeaderBehindWarnMs = 0L;
 
     /**
      * Supplies the local node's applied replication frontier (how much state it has). Wired by the
@@ -827,7 +834,24 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             // up — then the latch flips and the next recompute promotes us. Lead-while-alone / AP is
             // preserved: with no active peer ahead, maxActivePeerHighWatermark() is -1 and the gate is a
             // no-op, so the node still leads (after the boot-discovery window, handled above).
-            boolean behindAheadPeer = weWouldLead && !isCaughtUpToCluster();
+            //
+            // Gate A NEVER evicts the CURRENT leader (issue tems#9, D9): it gates the RECLAIM of a
+            // returning node; the incumbent's side is gate B. In stream mode the serving leader IS the
+            // source of the stream — a leader observing a follower's counter above its own is, by
+            // construction, a counter-scale desync (e.g. an inflated restart seed), never a reason to
+            // abdicate into a leaderless mutual-deferral stalemate.
+            boolean leaderBehindOwnFollower = weWouldLead && isLeaderInternal(localId)
+                    && !isCaughtUpToCluster();
+            if (leaderBehindOwnFollower) {
+                long now = Instant.now().toEpochMilli();
+                if (now - lastLeaderBehindWarnMs > 60_000L) {
+                    lastLeaderBehindWarnMs = now;
+                    LOGGER.warning(() -> "Current leader observes a peer watermark above its own applied ("
+                            + safeLocalApplied() + " < " + maxActivePeerHighWatermark()
+                            + "); retaining leadership (counter-scale desync symptom — see issue tems#9/D9)");
+                }
+            }
+            boolean behindAheadPeer = weWouldLead && !isLeaderInternal(localId) && !isCaughtUpToCluster();
             // Watermark-unknown deferral: if a peer is already ACTIVE, never hand leadership to us before
             // it reports a watermark; that peer may be the incumbent ahead of us. The boot window only
             // bounds waiting for configured peers that have not appeared at all, preserving AP when alone.
@@ -866,8 +890,49 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 return;
             }
 
+            // ── Leaderless-stalemate escape (issue tems#9, D9) ─────────────────────────────────────────
+            // We are about to defer to the affinity-elected peer — but if that peer has RECENTLY refused
+            // to serve the stream as a non-leader (it is itself deferring, e.g. behind us via gate A) and
+            // we are NOT behind it, deferring would close the mutual-deferral loop: it cannot catch up
+            // (only a leader serves the stream) and we never lead (affinity). The ahead node takes over;
+            // the behind one converges as its follower and the normal affinity handoff resumes later.
+            if (electedId != null && !electedId.equals(localId)
+                    && replicationProgressGateEnabled
+                    && safeLocalLeadershipEligible()) {
+                Long refusedAt = leaderRefusalAtMs.get(electedId);
+                boolean recentRefusal = refusedAt != null
+                        && Instant.now().toEpochMilli() - refusedAt <= config.heartbeatTimeout().toMillis();
+                Long electedWatermark = peerHighWatermark.get(electedId);
+                long localApplied = safeLocalApplied();
+                // STRICTLY ahead beyond the tolerance: with equal watermarks (every fresh boot is 0/0)
+                // the affinity election must win — a transient refusal during an election dance must
+                // never invert affinity. The genuine stalemate signature is local state the elected
+                // node does not have.
+                if (recentRefusal && electedWatermark != null && localApplied >= 0
+                        && localApplied > electedWatermark + syncReclaimLagThreshold) {
+                    LOGGER.warning(() -> "Affinity-elected " + electedId + " refuses leadership and is not"
+                            + " ahead (peer=" + electedWatermark + ", local=" + localApplied
+                            + "); taking leadership to break the leaderless stalemate (issue tems#9, D9)");
+                    updateLeader(localId);
+                    return;
+                }
+            }
+
             updateLeader(electedId);
         }
+    }
+
+    /**
+     * Records that {@code node} refused to serve the replication stream because it is not the leader
+     * (issue tems#9, D9). Fed by the replication layer when a fetch addressed to the locally adopted
+     * leader answers {@code leaderUnavailable}. Triggers a leadership re-evaluation so the stalemate
+     * escape in {@link #recomputeLeader()} can run while the refusal is fresh.
+     *
+     * @param node the peer that refused to serve as leader
+     */
+    public void noteLeaderRefusal(NodeId node) {
+        leaderRefusalAtMs.put(node, Instant.now().toEpochMilli());
+        reevaluateLeadership();
     }
 
     /** True if {@code nodeId} is the current leader (internal, lock-held variant of {@link #isLeader()}). */
