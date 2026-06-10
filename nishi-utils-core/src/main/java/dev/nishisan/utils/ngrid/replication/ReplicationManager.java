@@ -512,13 +512,26 @@ public class ReplicationManager
      * count equals the sum of {@code (nextExpected - 1)} across topics.
      */
     private void seedAppliedSequenceFromFrontier() {
-        long applied = 0L;
+        // Two durable measures of how much state this node has APPLIED, restored from sequence-state.dat:
+        //  - the per-topic FOLLOWER frontier sum (nextExpectedSequenceByTopic) — non-empty when this node
+        //    was a follower for those topics;
+        //  - the LEADER-produced count (globalSequence, the "_global" key) — non-zero when this node was
+        //    the leader (a leader applies everything it produces, but never populates the follower
+        //    frontier, so its frontier sum is 0).
+        // A returning ex-LEADER therefore has frontier sum 0 while it actually holds globalSequence ops.
+        // Seeding from the frontier alone would advertise applied=0 — making the (higher-affinity)
+        // ex-leader look permanently behind the ex-follower, so it defers to sync while the ex-follower
+        // defers to it by affinity and the cluster wedges leaderless. Seeding from max(frontierSum,
+        // globalSequence) restores the true applied frontier for both roles (they coincide for a single
+        // topic), so the election/watermark gate picks the right leader. Synthetic keys stay filtered (D1).
+        long frontierSum = 0L;
         for (Map.Entry<String, Long> e : nextExpectedSequenceByTopic.entrySet()) {
             if (isSyntheticSequenceStateKey(e.getKey())) {
                 continue;
             }
-            applied += Math.max(0L, e.getValue() - 1L);
+            frontierSum += Math.max(0L, e.getValue() - 1L);
         }
+        long applied = Math.max(frontierSum, Math.max(0L, globalSequence.get()));
         if (applied > 0L) {
             appliedSequence.set(applied);
             lastAppliedSequence = applied;
