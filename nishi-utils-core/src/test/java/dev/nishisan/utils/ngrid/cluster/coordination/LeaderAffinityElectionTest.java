@@ -140,6 +140,28 @@ class LeaderAffinityElectionTest {
         }
     }
 
+    @Test
+    void wholeClusterIneligibleHigherAffinityLeadsAfterBootWindow() throws Exception {
+        // Os DOIS nós voltam unclean: ambos inelegíveis (bootstrap pendente) e o peer anuncia
+        // watermark -1. Sem escape AP, ambos deferem um ao outro (deadlock leaderless). Com o fix, o
+        // nó de MAIOR afinidade (local, prio 100) assume após a janela de boot; o outro faz bootstrap.
+        Duration window = Duration.ofMillis(700);
+        try (Harness h = new Harness(LOW_ID, 100, HIGH_ID, 10, true, window)) {
+            h.coord.setLocalLeadershipEligibility(() -> false);
+            h.start();
+
+            // Peer ativo, porém também em bootstrap (anuncia -1 → não é um líder viável para sincronizar).
+            h.injectHeartbeat(HIGH_ID, 1L, -1L);
+
+            Thread.sleep(250);
+            assertFalse(h.coord.isLeader(),
+                    "durante a janela de boot, o nó inelegível ainda defere mesmo sem peer viável");
+
+            // Após a janela, sem peer viável para sincronizar, o de maior afinidade DEVE assumir (AP).
+            h.awaitLeader(LOW_ID);
+        }
+    }
+
     // ---- harness ----
 
     private final class Harness implements AutoCloseable {

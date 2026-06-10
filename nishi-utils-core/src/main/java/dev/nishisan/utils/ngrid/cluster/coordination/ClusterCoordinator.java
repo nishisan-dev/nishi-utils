@@ -793,17 +793,29 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             NodeId localId = transport.local().nodeId();
             boolean weWouldLead = electedId != null && electedId.equals(localId);
             boolean localIneligible = weWouldLead && !safeLocalLeadershipEligible();
-            if (localIneligible
-                    && (hasActivePeer(localId) || Instant.now().toEpochMilli() < bootDiscoveryDeadlineMs)) {
-                NodeId current = leader.get();
-                NodeId followTarget = (current != null && !current.equals(localId) && isActiveMember(current))
-                        ? current
-                        : highestWatermarkActivePeer(localId);
-                if (followTarget == null) {
-                    followTarget = highestAffinityActivePeer(localId);
+            if (localIneligible) {
+                // Defer (stay a follower and sync) ONLY while there is someone to defer TO — an active
+                // peer advertising a KNOWN (>= 0) watermark, i.e. a node able to lead and serve us a
+                // snapshot — or while we are still inside the boot-discovery window (peers/incumbent may
+                // not have appeared yet). AP escape: once the window lapses and NO active peer is viable
+                // (every active peer is itself ineligible/bootstrapping → advertising -1 → no known
+                // watermark), do NOT keep deferring — fall through to the affinity election so the
+                // highest-affinity node leads and the rest bootstrap from it. Without this escape the
+                // whole-cluster unclean restart wedges leaderless forever (both nodes defer to each other).
+                boolean withinBootWindow = Instant.now().toEpochMilli() < bootDiscoveryDeadlineMs;
+                boolean hasViableLeaderPeer = highestWatermarkActivePeer(localId) != null;
+                if (withinBootWindow || hasViableLeaderPeer) {
+                    NodeId current = leader.get();
+                    NodeId followTarget = (current != null && !current.equals(localId) && isActiveMember(current))
+                            ? current
+                            : highestWatermarkActivePeer(localId);
+                    if (followTarget == null) {
+                        followTarget = highestAffinityActivePeer(localId);
+                    }
+                    updateLeader(followTarget);
+                    return;
                 }
-                updateLeader(followTarget);
-                return;
+                // else: AP escape — fall through to the affinity election below.
             }
 
             // ── Sync-before-reclaim gate A (RECLAIM side) — watermark-driven ──────────────────────────
@@ -1170,7 +1182,17 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             boolean watermarkAdvanced = false;
             if (!source.equals(transport.local().nodeId())) {
                 long reported = payload.leaderHighWatermark();
-                if (reported >= 0) {
+                // Record the peer's watermark even when it is -1 (a node with a pending relay bootstrap
+                // advertises -1 to say "my state is not safe to serve yet"). Recording -1 keeps "heard but
+                // behind/bootstrapping" DISTINCT from "never heard": the unknown-watermark deferral
+                // (hasActivePeerWithUnknownWatermark) must not treat a bootstrapping peer as a possible
+                // incumbent ahead of us — otherwise a whole-cluster unclean restart deadlocks (every node
+                // defers to a peer that is itself bootstrapping). The first heartbeat (prev == null) also
+                // triggers a recompute, so the AP escape fires promptly once the boot window lapses.
+                // Scale-safe: maxActivePeerHighWatermark / highestWatermarkActivePeer compare > -1, so a -1
+                // peer never counts as "ahead" or as a viable sync source; candidateIsBehindLocalWatermark
+                // reads -1 as "behind" (gate B keeps leadership), unchanged.
+                if (reported >= -1) {
                     Long prev = peerHighWatermark.put(source, reported);
                     watermarkAdvanced = prev == null || reported != prev;
                     if (watermarkAdvanced && reported > safeLocalApplied() + syncReclaimLagThreshold) {
