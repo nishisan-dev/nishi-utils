@@ -31,6 +31,30 @@ try (NgrrdHandle handle = Ngrrd.fromYaml(
 
 Documentação completa em [`doc/oss/ngrrd.md`](../doc/oss/ngrrd.md).
 
+## Persistência incremental (rrdtool-like)
+
+Por padrão (`writePolicy.persistenceMode: blockRollover`) a janela do bloco vive só em
+memória e é materializada no rollover (ao cruzar `blockSizeSec`) ou em `flush()`. O modo
+**`incremental`** dá semântica estilo rrdtool:
+
+```yaml
+spec:
+  storage:
+    objectNaming:
+      statePrefix: "state"          # onde o estado durável é gravado
+    writePolicy:
+      persistenceMode: incremental
+      persistLastValue: true
+```
+
+- o estado da série (último valor por DS raw + acumuladores da janela) é persistido em
+  `state/<seriesKey>/writer.state` e **reidratado no `open`** — o handle fica stateless na
+  reabertura (o counter sobrevive a eviction/restart);
+- `handle.checkpoint()` materializa o bloco aberto como **parcial** (`FLAG_PARTIAL`) sem
+  fechar a janela, deixando o dado legível antes do rollover (sem perda por overwrite);
+- ideal para consumidores com working set grande e cache de handles pequeno (ex.: Kafka
+  consumer de métricas), em que `flush()` por bloco reiniciaria a derivação de counter.
+
 ## Testes
 
 ```bash
