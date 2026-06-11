@@ -417,3 +417,88 @@ lag por `getGlobalSequence() − getLastAppliedSequence()`).
 > watermark chegava `-1` e o proativo era barrado (`watermark <= 0`). Agora o `ReplicationManager.start()`
 > fia o supplier sozinho (qualquer montagem) e o cold-join proativo trata watermark desconhecido como
 > "sincroniza por segurança". Cobertura: `ProactiveColdJoinWatermarkTest` (montagem manual + pairMode).
+
+---
+
+## 13. Handoff por afinidade sob produção contínua (issue tems#9, D10)
+
+A validação do D9 em pré-prod expôs o D10: no rejoin do nó de maior afinidade sob firehose contínuo,
+o cluster degenerava em **dual-leader estável** — gate B estrito (threshold 0) nunca abria porque o
+delta in-flight nunca zerava; o candidato armava o latch de caught-up contra watermark de heartbeat
+**stale** e assumia; nenhum lado cedia e a mecânica de epoch virava escada infinita de re-stamps
+(22→105+ no incidente; contenção manual: SIGTERM + wipe + cold bootstrap). Três frentes
+complementares:
+
+### (a) Join-quiesce cobre o catch-up real (D10a)
+
+No incidente o quiesce do (3b) liberou em **1,5s** com catch-up real de 64s. Causa primária
+(confirmada em código): o release comparava o progresso reportado contra o `globalSequence` **cru**
+do líder — um contador de produção local que, num líder **promovido de follower**, fica muito abaixo
+do watermark real. Endurecimentos:
+
+- release/engage comparam contra `max(globalSequence, lastApplied)` — a mesma escala do watermark
+  anunciado em heartbeat;
+- progresso com frontier `-1` (bootstrap gate) ou **epoch divergente** é descartado (escala
+  incomparável);
+- o follower reporta o watermark **anunciável**, não o `lastAppliedSequence` cru;
+- rejoin descarta a entrada de progresso da sessão anterior e o release periódico exige report
+  **fresco** do epoch corrente.
+
+### (b) Quiesce-assisted reclaim — "leader pause on reclaim" (D10b, opt-in)
+
+Espelho do (3b) no caminho do **reclaim**: quando um candidato de **maior afinidade** (prioridade,
+depois NodeId — o comparator da eleição) se aproxima do watermark do líder (delta ≤
+`reclaimQuiesceThreshold`), o incumbente **pausa a produção** (`LeaderSyncingException`, retry do
+cliente), o watermark **congela**, o candidato emparelha **exato** e o gate B abre — o handoff
+completa de forma coordenada. O `FOLLOWER_PROGRESS` do emparelhamento é repassado ao coordinator na
+hora (`noteFollowerWatermark`) para não esperar o próximo heartbeat. A pausa é **bounded por
+construção**: cobre só o trecho final (nunca o catch-up inteiro), expira em
+`reclaimQuiesceMaxDuration` **retendo a liderança** (disponibilidade primeiro) e o
+`reclaimQuiesceCooldown` impede loop de re-engage. Join-quiesce ativo tem precedência.
+
+### (c) Detecção + resolução determinística de dual-leader (D10c, sempre ativa)
+
+O heartbeat ganhou a **flag de líder** (1 byte opcional ao final do frame binário, retro-compatível
+nos dois sentidos — decoder antigo ignora o byte extra; frame antigo decodifica `false`; caminho
+JSON coberto pelo default Jackson). Um líder que observa **3 heartbeats consecutivos** de outro nó
+com a flag (debounce — a janela de overlap de um handoff legítimo é sub-heartbeat) resolve pela
+**mesma ordem total da eleição**: o de menor afinidade cede, adota o rival e **ressinca via a
+maquinaria do D8** (pending bootstrap → snapshot → cutover com SET dos contadores + truncate do
+binlog local — a cauda produzida na janela dual é **descartada**, o mesmo desfecho da contenção
+operacional, agora automático e bounded); o de maior afinidade retém. A escada de epochs morre na
+primeira observação: o lado perdedor **adota** o termo observado em vez de re-stampar acima. O F2 do
+D9 segue intocado — a resolução é um caminho novo, exclusivo de dois líderes se observando.
+
+### Configuração
+
+```java
+.leaderPauseOnReclaim(true)                         // opt-in (default false) — recomendado em pares HA com prioridades
+.reclaimQuiesceThreshold(1024L)                     // "perto" em sequências
+.reclaimQuiesceMaxDuration(Duration.ofSeconds(5))   // pausa bounded
+.reclaimQuiesceCooldown(Duration.ofSeconds(60))     // anti-loop
+// (c) é sempre ativo; a flag de líder no heartbeat é retro-compatível (rolling upgrade seguro)
+```
+
+### Validação
+
+- `JoinQuiesceReleaseGateTest` (3): reproduz o release de 1,5s (falhava antes do fix) e os
+  endurecimentos H2/H3.
+- `ReclaimQuiesceTest` (5): engage só na janela de aproximação de candidato de maior afinidade,
+  pausa em `replicate()`, handoff por emparelhamento exato, timeout+cooldown, precedência do
+  join-quiesce.
+- `DualLeaderResolutionTest` (6): perdedor cede após o debounce (hook 1×), vencedor nunca cede,
+  flap não resolve, escada de epoch suprimida, tie-break por NodeId, afinidade desconhecida não
+  resolve.
+- `DualLeaderYieldResyncTest` (2): yield arma pending para todos os tópicos, sobrevive ao REQUEST,
+  cutover re-ancora na linhagem do vencedor; re-promoção supersede o yield.
+- `DualLeaderLivelockE2ETest`: **produção contínua durante o handoff** (padrão novo na suíte) —
+  líder único no deadline, nunca dois líderes além do overlap transitório, epoch estável, zero
+  duplicatas e zero perda de itens ackados.
+
+### Limitação conhecida (follow-up epoch-aware)
+
+Os contadores de progresso são **escalares e cegos a linhagem**: se um nó alguma vez aplicou ops de
+um ramo descartado (ex.: janela dual ou churn de eleição no boot **com produção ativa**), seu
+contador fica inflado em relação à linhagem vencedora e o emparelhamento numérico exato fica
+inalcançável — o (b) expira e o (c) resolve com descarte. O endurecimento estrutural (ordenação
+epoch-aware de linhagem no protocolo de heartbeat) é o follow-up já registrado da PR #142.

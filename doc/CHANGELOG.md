@@ -4,6 +4,39 @@
 
 ---
 
+## 2026-06-11 — 🟠 Fix: handoff por afinidade sob produção contínua — dual-leader livelock (issue tems#9, D10)
+
+A validação do D9 em pré-prod expôs o D10: no rejoin do nó de maior afinidade sob firehose, o
+cluster degenerava em **dual-leader estável** (gate B estrito nunca abria pelo delta in-flight; o
+candidato armava o latch contra watermark stale e assumia; escada infinita de re-stamps de epoch).
+Pacote em três frentes complementares:
+
+- **(a) Join-quiesce cobre o catch-up real:** o release comparava o progresso do follower contra o
+  `globalSequence` CRU do líder (escala errada num líder promovido — liberava em 1,5s com catch-up
+  de 64s). Agora compara contra `max(globalSequence, lastApplied)`, descarta progresso com epoch
+  divergente/frontier -1 e exige report fresco (entrada stale de sessão anterior não pré-satisfaz).
+- **(b) Quiesce-assisted reclaim (opt-in, `leaderPauseOnReclaim`):** espelho do pause-on-join no
+  caminho do reclaim — com o candidato de maior afinidade a ≤ `reclaimQuiesceThreshold` do
+  watermark, o incumbente pausa a produção, o watermark congela, o candidato emparelha EXATO e o
+  gate B abre (handoff coordenado). Pausa bounded (`reclaimQuiesceMaxDuration`, retém na
+  expiração) + cooldown anti-loop.
+- **(c) Detecção + resolução determinística de dual-leader (sempre ativa):** flag de líder no
+  heartbeat (1 byte retro-compatível no frame binário); 3 observações consecutivas → o de MENOR
+  afinidade (ordem da eleição: prioridade, depois NodeId) cede, adota o termo do rival (mata a
+  escada de epochs) e ressinca via maquinaria D8 (a cauda da janela dual é descartada — o desfecho
+  da contenção manual, agora automático). O F2 do D9 permanece intocado.
+
+Testes: `JoinQuiesceReleaseGateTest` (reproduzia o release de 1,5s), `ReclaimQuiesceTest`,
+`DualLeaderResolutionTest`, `DualLeaderYieldResyncTest`, codec (frame legado/novo) e
+`DualLeaderLivelockE2ETest` — o primeiro E2E da suíte com **produção contínua durante o handoff**:
+líder único, epoch estável, zero duplicatas e zero perda de itens ackados.
+
+Limitação conhecida (follow-up epoch-aware da PR #142): contadores escalares cegos a linhagem —
+ops aplicadas de ramos descartados inflam o contador e inviabilizam o emparelhamento exato.
+Detalhes: `doc/ngrid/oplog-ha-hardening.md` §13 e `planning/issue-tems9-d10-dual-leader-livelock.md`.
+
+---
+
 ## 2026-06-08 — 🔴 5.0.0 — BREAKING: `RELAY_STREAM` é o único modelo de replicação (remoção definitiva do legado)
 
 Consolida o modelo definitivo **MySQL binlog/relay-log**: o líder grava um op-log durável segmentado
