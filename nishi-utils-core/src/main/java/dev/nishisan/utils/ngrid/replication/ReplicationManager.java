@@ -147,7 +147,7 @@ public class ReplicationManager
     // production while a not-caught-up follower joins, until it catches up / disconnects / times out.
     private final java.util.concurrent.atomic.AtomicBoolean joinQuiescing = new java.util.concurrent.atomic.AtomicBoolean(
             false);
-    private final Map<NodeId, Long> followerAppliedByNode = new ConcurrentHashMap<>();
+    private final Map<NodeId, FollowerProgress> followerAppliedByNode = new ConcurrentHashMap<>();
     private final Set<NodeId> quiescingFor = ConcurrentHashMap.newKeySet();
     private volatile long joinQuiesceStartedMs;
     // Active members observed on the previous membership change, to detect newly-joined nodes.
@@ -2529,17 +2529,15 @@ public class ReplicationManager
         }
         NodeId localId = transport.local().nodeId();
         if (coordinator.isLeader()) {
-            long leaderSeq = globalSequence.get();
-            long threshold = config.joinSyncLagThreshold();
             for (NodeId member : current) {
                 if (member.equals(localId) || knownActiveMembers.contains(member)) {
                     continue; // only newly-joined members
                 }
-                long applied = followerAppliedByNode.getOrDefault(member, -1L);
-                if (applied < 0 || applied < leaderSeq - threshold) {
-                    // Behind (or unknown): pause production until it catches up / disconnects / times out.
-                    quiescingFor.add(member);
-                }
+                // A rejoining node's progress from its PREVIOUS session says nothing about the new
+                // one (issue tems#9, D10a) — and a kill -9 + fast reconnect may race the disconnect
+                // cleanup. Drop any stale entry and hold the gate until a fresh post-join report.
+                followerAppliedByNode.remove(member);
+                quiescingFor.add(member);
             }
             if (!quiescingFor.isEmpty() && joinQuiescing.compareAndSet(false, true)) {
                 joinQuiesceStartedMs = System.currentTimeMillis();
@@ -2559,10 +2557,16 @@ public class ReplicationManager
         }
         FollowerProgressPayload payload = message.payload(FollowerProgressPayload.class);
         NodeId source = message.source();
-        followerAppliedByNode.put(source, payload.appliedSequence());
+        // Issue tems#9, D10a: a bootstrap-gated follower advertises -1 (no usable frontier) and a
+        // follower still tracking another lineage's epoch reports progress on an incomparable
+        // scale — releasing the quiesce against either value reopens the 1.5s-release hole.
+        if (payload.appliedSequence() < 0 || payload.epoch() != coordinator.getLeaderEpoch()) {
+            return;
+        }
+        followerAppliedByNode.put(source,
+                new FollowerProgress(payload.appliedSequence(), payload.epoch(), System.currentTimeMillis()));
         if (quiescingFor.contains(source)) {
-            long leaderSeq = globalSequence.get();
-            if (payload.appliedSequence() >= leaderSeq - config.joinSyncLagThreshold()) {
+            if (payload.appliedSequence() >= leaderQuiesceTarget() - config.joinSyncLagThreshold()) {
                 quiescingFor.remove(source);
                 maybeReleaseJoinQuiesce();
             }
@@ -2575,7 +2579,9 @@ public class ReplicationManager
             return;
         }
         coordinator.leaderInfo().ifPresent(leader -> {
-            FollowerProgressPayload payload = new FollowerProgressPayload(lastAppliedSequence,
+            // Report the advertised watermark (issue tems#9, D10a): -1 while the bootstrap gate is
+            // engaged, so the leader never mistakes a pre-bootstrap frontier for catch-up progress.
+            FollowerProgressPayload payload = new FollowerProgressPayload(advertisedLeaderHighWatermark(),
                     coordinator.getTrackedLeaderEpoch());
             transport.send(ClusterMessage.request(MessageType.FOLLOWER_PROGRESS, "follower-progress",
                     transport.local().nodeId(), leader.nodeId(), payload));
@@ -2593,10 +2599,20 @@ public class ReplicationManager
             clearJoinQuiesce();
             return;
         }
-        // Drop joiners that are no longer active or have since caught up.
-        long leaderSeq = globalSequence.get();
+        // Drop joiners that have since caught up — judged only on a FRESH report from the current
+        // epoch (issue tems#9, D10a): a stale entry must never release the gate.
+        long target = leaderQuiesceTarget();
         long threshold = config.joinSyncLagThreshold();
-        quiescingFor.removeIf(node -> followerAppliedByNode.getOrDefault(node, -1L) >= leaderSeq - threshold);
+        long freshnessMs = followerProgressFreshnessMs();
+        long now = System.currentTimeMillis();
+        long currentEpoch = coordinator.getLeaderEpoch();
+        quiescingFor.removeIf(node -> {
+            FollowerProgress progress = followerAppliedByNode.get(node);
+            return progress != null
+                    && progress.epoch() == currentEpoch
+                    && now - progress.atMillis() <= freshnessMs
+                    && progress.applied() >= target - threshold;
+        });
         maybeReleaseJoinQuiesce();
     }
 
@@ -2610,6 +2626,26 @@ public class ReplicationManager
     private void clearJoinQuiesce() {
         quiescingFor.clear();
         joinQuiescing.set(false);
+    }
+
+    /**
+     * Leader-side catch-up target for the quiesce gates (issue tems#9, D10a): the same scale the
+     * leader advertises in heartbeats. {@code globalSequence} alone understates the frontier of a
+     * leader promoted without a snapshot cutover (it is a local production counter), which let the
+     * join-quiesce release against a target the joiner had trivially passed (1.5s release while the
+     * real catch-up took 64s).
+     */
+    private long leaderQuiesceTarget() {
+        return Math.max(getGlobalSequence(), getLastAppliedSequence());
+    }
+
+    /** Max age for a follower progress report to count toward releasing a quiesce gate. */
+    private long followerProgressFreshnessMs() {
+        return Math.max(50L, config.followerProgressInterval().toMillis()) * 3L;
+    }
+
+    /** A follower's apply progress as last reported (issue tems#9, D10a). */
+    private record FollowerProgress(long applied, long epoch, long atMillis) {
     }
 
     // ── User-level broadcast messaging (broadcastMessage API) ─────────────────────
