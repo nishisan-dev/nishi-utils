@@ -10,7 +10,7 @@ plugável (disco local ou S3-compatível) e definição declarativa em YAML.
 <dependency>
   <groupId>dev.nishisan</groupId>
   <artifactId>nishi-utils-oss</artifactId>
-  <version>3.7.1</version>
+  <version>6.0.0</version>
 </dependency>
 ```
 
@@ -25,35 +25,33 @@ try (NgrrdHandle handle = Ngrrd.fromYaml(
         StorageFactory.StorageBindings.forLocalDisk(Path.of("/var/ngrrd")),
         Map.of("deviceId", "r1", "interfaceId", "eth0"))) {
     handle.write("in_octets", new Sample(System.currentTimeMillis(), 12345L));
+    handle.checkpoint();
     var daily = handle.read("daily").get("in_bps");
 }
 ```
 
 Documentação completa em [`doc/oss/ngrrd.md`](../doc/oss/ngrrd.md).
 
-## Persistência incremental (rrdtool-like)
+## Objeto único (paridade com o RRDtool)
 
-Por padrão (`writePolicy.persistenceMode: blockRollover`) a janela do bloco vive só em
-memória e é materializada no rollover (ao cruzar `blockSizeSec`) ou em `flush()`. O modo
-**`incremental`** dá semântica estilo rrdtool:
+A partir da 6.0.0 cada série é um **único objeto binário** (`<seriesPrefix>/<seriesKey>.ngrr`),
+de tamanho fixo e pré-alocado, com ring buffers atualizados in-place — em paridade com o
+arquivo `.rrd`. Não há mais blocos por `(rra,ds,cf)` nem manifesto YAML (resolve a explosão
+de arquivos em disco local da [#144](https://github.com/nishisan-dev/nishi-utils/issues/144)).
 
-```yaml
-spec:
-  storage:
-    objectNaming:
-      statePrefix: "state"          # onde o estado durável é gravado
-    writePolicy:
-      persistenceMode: incremental
-      persistLastValue: true
-```
+A persistência é sempre **incremental (rrdtool-like)**:
 
-- o estado da série (último valor por DS raw + acumuladores da janela) é persistido em
-  `state/<seriesKey>/writer.state` e **reidratado no `open`** — o handle fica stateless na
-  reabertura (o counter sobrevive a eviction/restart);
-- `handle.checkpoint()` materializa o bloco aberto como **parcial** (`FLAG_PARTIAL`) sem
-  fechar a janela, deixando o dado legível antes do rollover (sem perda por overwrite);
-- ideal para consumidores com working set grande e cache de handles pequeno (ex.: Kafka
-  consumer de métricas), em que `flush()` por bloco reiniciaria a derivação de counter.
+- o estado vivo (último valor por DS raw + acumuladores + ponteiros do ring) mora no próprio
+  objeto e é **reidratado no `open`** — o handle fica stateless na reabertura (o counter
+  sobrevive a eviction/restart);
+- `handle.checkpoint()` (ou `flush()`) materializa o CDP em progresso como **parcial** e
+  torna o objeto durável (`fsync` no disco / PUT no S3), deixando o dado legível antes do
+  passo do RRA fechar;
+- a retenção é o ring buffer de cada RRA (`rows × stepSec`): o CDP mais antigo é sobrescrito
+  in-place, sem deletar arquivos.
+
+Em disco o objeto é gravado por região via `FileChannel` (só o que mudou); em S3 o objeto
+inteiro é regravado por PUT no `checkpoint()`/`close()`. **Invariante:** um writer por série.
 
 ## Testes
 

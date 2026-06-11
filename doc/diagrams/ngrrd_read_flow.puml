@@ -1,14 +1,13 @@
 @startuml
-title ngrrd — Fluxo de leitura (view)
+title ngrrd — Fluxo de leitura (view, objeto único NGRR)
 
 actor Cliente
 participant "Ngrrd.read" as Facade
 participant "ViewExecutor" as View
 participant "NgrrdReader" as Reader
 participant "BestFitSelector" as Selector
-participant "NgrrdStorage" as Storage
-participant "ManifestCodec" as MCodec
-participant "BlockCodec" as BCodec
+participant "SeriesFileCodec" as Codec
+participant "SeriesChannel\n(snapshot de leitura)" as Channel
 
 Cliente -> Facade : read("daily")
 Facade -> View : run(preset, tags)
@@ -17,20 +16,22 @@ View -> Reader : new NgrrdReader(def, storage, seriesKey)
 loop por DS no preset.series
   View -> Reader : read(dsName, ViewQuery)
   Reader -> Selector : pick(query, rras)
-  Selector --> Reader : RraDef escolhida
-  Reader -> Storage : list(manifest/<seriesKey>/)
-  Reader -> Storage : get(v{maxN}.yaml)
-  Reader -> MCodec : readYaml(bytes)
-  MCodec --> Reader : NgrrdManifest
-  Reader -> Reader : filtra blocks por (rra, ds, cf)
-  loop por bloco dentro da window
-    Reader -> Storage : get(block.storageKey)
-    Reader -> BCodec : decode(bytes)
-    BCodec --> Reader : EncodedBlock (header + double[])
-  end
+  Selector --> Reader : RraDef escolhida → (rra, cf) = archive
+  Reader -> Channel : openSeries(seriesKey.ngrr)
+  Reader -> Channel : readRegion(header)
+  Reader -> Codec : decodeFixedHeader (valida geometria/hash)
+  Reader -> Channel : readRegion(live-state) → curRow / anchor
+  Reader -> Channel : readRegion(ring do archive)
+  Reader -> Reader : reconstrói (ts,valor) por curRow/anchor/stepSec
   Reader -> Reader : recorta para window + downsample maxPoints
   Reader --> View : SeriesResult
 end
 View --> Cliente : Map<ds, SeriesResult>
+
+note right of Reader
+  Sem manifesto: a geometria e os
+  ponteiros do ring são auto-descritos
+  no próprio objeto da série.
+end note
 
 @enduml
