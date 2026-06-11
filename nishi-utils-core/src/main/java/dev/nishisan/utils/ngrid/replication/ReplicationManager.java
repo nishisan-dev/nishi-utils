@@ -152,6 +152,19 @@ public class ReplicationManager
     private volatile long joinQuiesceStartedMs;
     // Active members observed on the previous membership change, to detect newly-joined nodes.
     private final Set<NodeId> knownActiveMembers = ConcurrentHashMap.newKeySet();
+    // Leader-side reclaim-quiesce gate (issue tems#9, D10b, opt-in via config.leaderPauseOnReclaim):
+    // when a HIGHER-affinity candidate approaches the local watermark (within
+    // reclaimQuiesceThreshold), the leader pauses production so the candidate can pair up EXACTLY
+    // and the affinity handoff completes coordinately. Without it, under continuous production the
+    // in-flight delta never zeroes: the strict step-down gate (B) retains forever while the
+    // candidate's caught-up latch (gate A) arms against a stale heartbeat watermark — the
+    // dual-leader livelock. Separate from joinQuiescing: distinct trigger (proximity, not join),
+    // single candidate, exact pairing, own timeout and cooldown.
+    private final java.util.concurrent.atomic.AtomicBoolean reclaimQuiescing = new java.util.concurrent.atomic.AtomicBoolean(
+            false);
+    private volatile NodeId reclaimQuiesceFor;
+    private volatile long reclaimQuiesceStartedMs;
+    private volatile long reclaimQuiesceCooldownUntilMs;
 
     // User-level broadcast messaging (broadcastMessage API): best-effort fire-and-forget messages
     // between nodes for coordination. Listeners are invoked on a worker thread (keep them non-blocking).
@@ -369,10 +382,18 @@ public class ReplicationManager
             // Leader-pause-on-join (#129): detect joins (membership), have followers report progress, and
             // periodically re-evaluate the quiesce gate (release on catch-up / disconnect / timeout).
             coordinator.addMembershipListener(this);
+            timeoutScheduler.scheduleAtFixedRate(this::checkJoinQuiesce, 200, 200, TimeUnit.MILLISECONDS);
+        }
+        if (config.leaderPauseOnJoin() || config.leaderPauseOnReclaim()) {
+            // Both quiesce gates are driven by FOLLOWER_PROGRESS reports.
             long progressMs = Math.max(50L, config.followerProgressInterval().toMillis());
             timeoutScheduler.scheduleAtFixedRate(this::sendFollowerProgress, progressMs, progressMs,
                     TimeUnit.MILLISECONDS);
-            timeoutScheduler.scheduleAtFixedRate(this::checkJoinQuiesce, 200, 200, TimeUnit.MILLISECONDS);
+        }
+        if (config.leaderPauseOnReclaim()) {
+            // Quiesce-assisted reclaim (issue tems#9, D10b): engage on candidate approach, bound the
+            // pause, abort (with cooldown) if the candidate never pairs up or leaves.
+            timeoutScheduler.scheduleAtFixedRate(this::checkReclaimQuiesce, 200, 200, TimeUnit.MILLISECONDS);
         }
         Duration timeout = config.operationTimeout();
         long periodMs = Math.max(100L, timeout.toMillis() / 2);
@@ -768,6 +789,13 @@ public class ReplicationManager
             // on catch-up/disconnect/timeout. Mirror of the failover drain-gate, on the join path.
             throw new LeaderSyncingException(
                     "Leader is quiescing for a joining follower (catch-up in progress), write rejected");
+        }
+        if (config.leaderPauseOnReclaim() && isReclaimQuiescing()) {
+            // Quiesce-assisted reclaim (issue tems#9, D10b): a higher-affinity candidate is within the
+            // approach threshold; pause production so it pairs up EXACTLY and the handoff completes —
+            // under a firehose the in-flight delta would otherwise never zero. Bounded + cooldown.
+            throw new LeaderSyncingException(
+                    "Leader is quiescing for an affinity handoff (candidate pairing up), write rejected");
         }
         if (!coordinator.hasValidLease()) {
             throw new LeaseExpiredException("Leader lease expired, write rejected to prevent data divergence");
@@ -2443,6 +2471,9 @@ public class ReplicationManager
                 leaderSyncing.set(false);
                 leaderSyncTopics.clear();
                 clearJoinQuiesce();
+                // Handoff observed (issue tems#9, D10b): the reclaim-quiesce did its job — the
+                // candidate paired up and took over. Resume production as a follower (forwarding).
+                clearReclaimQuiesce();
             }
             failAllPending("Lost leadership to " + newLeader);
             return;
@@ -2571,6 +2602,17 @@ public class ReplicationManager
                 maybeReleaseJoinQuiesce();
             }
         }
+        if (reclaimQuiescing.get() && source.equals(reclaimQuiesceFor)
+                && payload.appliedSequence() >= leaderQuiesceTarget()) {
+            // The candidate paired up exactly against the frozen watermark (issue tems#9, D10b):
+            // surface it to the coordinator NOW — waiting for the candidate's next heartbeat (up to
+            // one interval stale) would stretch the pause for nothing. Gate B opens, recompute hands
+            // leadership to the candidate, and onLeaderChanged releases this quiesce.
+            coordinator.noteFollowerWatermark(source, payload.appliedSequence());
+        } else if (config.leaderPauseOnReclaim() && !reclaimQuiescing.get()) {
+            // Fresh progress is the approach signal — engaging here beats the 200ms tick.
+            maybeEngageReclaimQuiesce();
+        }
     }
 
     /** Follower-side: periodically report apply progress so the leader can release its join-quiesce. */
@@ -2646,6 +2688,110 @@ public class ReplicationManager
 
     /** A follower's apply progress as last reported (issue tems#9, D10a). */
     private record FollowerProgress(long applied, long epoch, long atMillis) {
+    }
+
+    // ── Quiesce-assisted reclaim — "leader pause on reclaim" (issue tems#9, D10b) ───────────────
+
+    /** True while the leader is pausing production for an approaching reclaim candidate. */
+    public boolean isReclaimQuiescing() {
+        return reclaimQuiescing.get();
+    }
+
+    /**
+     * Periodic guard of the reclaim-quiesce: bounds the pause ({@code reclaimQuiesceMaxDuration}),
+     * aborts when the candidate leaves, releases when leadership already changed hands, and
+     * re-evaluates engagement otherwise.
+     */
+    private void checkReclaimQuiesce() {
+        if (!running || !config.leaderPauseOnReclaim()) {
+            return;
+        }
+        if (!reclaimQuiescing.get()) {
+            maybeEngageReclaimQuiesce();
+            return;
+        }
+        if (!coordinator.isLeader()) {
+            // Handoff completed (or leadership otherwise changed) — onLeaderChanged also clears;
+            // this is the belt for a missed listener tick.
+            clearReclaimQuiesce();
+            return;
+        }
+        NodeId candidate = reclaimQuiesceFor;
+        if (System.currentTimeMillis() - reclaimQuiesceStartedMs > config.reclaimQuiesceMaxDuration().toMillis()) {
+            LOGGER.warning(() -> "Reclaim-quiesce exceeded max duration; resuming production and"
+                    + " retaining leadership (candidate " + candidate + " did not pair up in time)");
+            abortReclaimQuiesce();
+            return;
+        }
+        boolean candidateActive = candidate != null && coordinator.activeMembers().stream()
+                .anyMatch(m -> candidate.equals(m.nodeId()));
+        if (!candidateActive) {
+            LOGGER.warning(() -> "Reclaim-quiesce candidate " + candidate
+                    + " left the membership; resuming production and retaining leadership");
+            abortReclaimQuiesce();
+        }
+    }
+
+    /**
+     * Engages the reclaim-quiesce when a HIGHER-affinity candidate (election order: priority, then
+     * NodeId) has fresh, comparable progress within {@code reclaimQuiesceThreshold} of the local
+     * watermark. Never engages for a lower-affinity peer (there is no handoff to assist), while the
+     * join-quiesce is already pausing production, or during the post-abort cooldown.
+     */
+    private void maybeEngageReclaimQuiesce() {
+        if (!running || !config.leaderPauseOnReclaim() || !coordinator.isLeader()
+                || reclaimQuiescing.get() || isJoinQuiescing()
+                || System.currentTimeMillis() < reclaimQuiesceCooldownUntilMs) {
+            return;
+        }
+        NodeInfo local = transport.local();
+        long target = leaderQuiesceTarget();
+        long freshnessMs = followerProgressFreshnessMs();
+        long now = System.currentTimeMillis();
+        long currentEpoch = coordinator.getLeaderEpoch();
+        for (NodeInfo member : coordinator.activeMembers()) {
+            if (member.nodeId().equals(local.nodeId()) || member.port() <= 0
+                    || !hasHigherAffinity(member, local)) {
+                continue;
+            }
+            FollowerProgress progress = followerAppliedByNode.get(member.nodeId());
+            if (progress == null || progress.applied() < 0 || progress.epoch() != currentEpoch
+                    || now - progress.atMillis() > freshnessMs) {
+                continue; // no fresh, comparable report — not an approach signal
+            }
+            long delta = target - progress.applied();
+            if (delta >= 0 && delta <= config.reclaimQuiesceThreshold()) {
+                reclaimQuiesceFor = member.nodeId();
+                reclaimQuiesceStartedMs = now;
+                if (reclaimQuiescing.compareAndSet(false, true)) {
+                    LOGGER.info(() -> "Reclaim-quiesce engaged: pausing production so higher-affinity"
+                            + " candidate " + member.nodeId() + " can pair up (delta=" + delta
+                            + ", issue tems#9, D10b)");
+                }
+                return;
+            }
+        }
+    }
+
+    /** Election-order affinity comparison: higher priority wins; NodeId breaks ties. */
+    private static boolean hasHigherAffinity(NodeInfo candidate, NodeInfo reference) {
+        if (candidate.priority() != reference.priority()) {
+            return candidate.priority() > reference.priority();
+        }
+        return candidate.nodeId().compareTo(reference.nodeId()) > 0;
+    }
+
+    /** Abort without handoff: release the pause and arm the re-engagement cooldown. */
+    private void abortReclaimQuiesce() {
+        clearReclaimQuiesce();
+        reclaimQuiesceCooldownUntilMs = System.currentTimeMillis() + config.reclaimQuiesceCooldown().toMillis();
+    }
+
+    private void clearReclaimQuiesce() {
+        reclaimQuiesceFor = null;
+        if (reclaimQuiescing.compareAndSet(true, false)) {
+            LOGGER.info(() -> "Reclaim-quiesce released; resuming production.");
+        }
     }
 
     // ── User-level broadcast messaging (broadcastMessage API) ─────────────────────

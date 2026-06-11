@@ -935,6 +935,23 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         reevaluateLeadership();
     }
 
+    /**
+     * Surfaces a follower's just-reported applied watermark into the peer-watermark map (merge-max)
+     * and re-evaluates leadership immediately (issue tems#9, D10b). During a reclaim-quiesce the
+     * candidate's heartbeat (up to one interval stale) would otherwise delay the step-down gate's
+     * release after the candidate has already paired up against the frozen watermark.
+     *
+     * @param node      the reporting follower
+     * @param watermark its applied watermark (ignored when negative)
+     */
+    public void noteFollowerWatermark(NodeId node, long watermark) {
+        if (node == null || watermark < 0 || node.equals(transport.local().nodeId())) {
+            return;
+        }
+        peerHighWatermark.merge(node, watermark, Math::max);
+        reevaluateLeadership();
+    }
+
     /** True if {@code nodeId} is the current leader (internal, lock-held variant of {@link #isLeader()}). */
     private boolean isLeaderInternal(NodeId nodeId) {
         NodeId l = leader.get();
