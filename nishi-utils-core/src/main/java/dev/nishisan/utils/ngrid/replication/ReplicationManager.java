@@ -165,6 +165,10 @@ public class ReplicationManager
     private volatile NodeId reclaimQuiesceFor;
     private volatile long reclaimQuiesceStartedMs;
     private volatile long reclaimQuiesceCooldownUntilMs;
+    // True from the dual-leader yield hook (issue tems#9, D10c) until the bootstrap resync installs:
+    // keeps the promoted-leader auto-disarm in drainRelayOnce from undoing the pending bootstrap in
+    // the window where this (yielding) node still answers isLeader().
+    private volatile boolean dualLeaderYielding = false;
 
     // User-level broadcast messaging (broadcastMessage API): best-effort fire-and-forget messages
     // between nodes for coordination. Listeners are invoked on a worker thread (keep them non-blocking).
@@ -346,6 +350,9 @@ public class ReplicationManager
         // higher-affinity candidate has caught up). The threshold reuses joinSyncLagThreshold (#129).
         coordinator.setReplicationProgressGate(this::localAppliedForReclaim, config.joinSyncLagThreshold());
         coordinator.setLocalLeadershipEligibility(this::isLocallyEligibleForLeadership);
+        // Dual-leader resolution (issue tems#9, D10c): when this node is the losing (lower-affinity)
+        // side, discard the dual-window lineage and resync from the winner via the D8 machinery.
+        coordinator.setDualLeaderYieldHook(this::onDualLeaderYield);
         // Nudge the coordinator to recompute leadership as our applied frontier advances, so a deferred
         // reclaim is promoted promptly once we catch up (membership/eviction ticks would also trigger it).
         timeoutScheduler.scheduleAtFixedRate(this::nudgeLeadershipOnCatchUp, 200, 200, TimeUnit.MILLISECONDS);
@@ -1255,6 +1262,9 @@ public class ReplicationManager
         relayFetchPendingUntilByTopic.put(topic, 0L);
         signalFetch(topic);
         if (completedBootstrap && relayPendingBootstrap.isEmpty()) {
+            // A dual-leader yield resync (issue tems#9, D10c) completes here: the local state now
+            // belongs to the winner's lineage and the drainRelayOnce guard can stand down.
+            dualLeaderYielding = false;
             coordinator.reevaluateLeadership();
         }
 
@@ -1648,8 +1658,10 @@ public class ReplicationManager
     private boolean drainRelayOnce(String topic, NQueue<byte[]> relay) throws Exception {
         if (relayPendingBootstrap.contains(topic)) {
             // Unclean restart: do not apply this topic's relay until it is bootstrapped, or the decision
-            // is made that no bootstrap is needed.
-            if (coordinator.isLeader()) {
+            // is made that no bootstrap is needed. A dual-leader yield (issue tems#9, D10c) arms the
+            // pending BEFORE the demotion lands — the auto-disarm below must not undo it while this
+            // node transiently still answers isLeader().
+            if (coordinator.isLeader() && !dualLeaderYielding) {
                 // Promoted/leader: there is no peer to bootstrap from; the failover drain-gate + sequence
                 // fencing recover the backlog. (A lost frontier on a promoted-with-backlog node is the
                 // residual edge case that needs crash-safe frontier co-location — out of scope here.)
@@ -2490,6 +2502,9 @@ public class ReplicationManager
         // and recover any residual forward-gap via the promoted-leader skip path.
         syncingTopics.clear();
         relayPendingBootstrap.clear();
+        // A promotion supersedes any in-flight dual-leader yield (issue tems#9, D10c): the rival
+        // died mid-yield and this node is the only lineage left — nothing to resync from.
+        dualLeaderYielding = false;
         // Notify handlers of leadership promotion so they can clean up stale data
         // (e.g., truncate queues with persisted data from a previous epoch).
         for (ReplicationHandler handler : handlers.values()) {
@@ -2779,6 +2794,29 @@ public class ReplicationManager
             return candidate.priority() > reference.priority();
         }
         return candidate.nodeId().compareTo(reference.nodeId()) > 0;
+    }
+
+    /**
+     * Losing side of a dual-leader resolution (issue tems#9, D10c), invoked by the coordinator
+     * BEFORE the demotion: everything this node produced during the dual window belongs to a
+     * DIVERGENT lineage, so every registered topic is marked for bootstrap resync. The existing D8
+     * machinery does the rest once the node is a follower of the winner — {@code drainRelayOnce}
+     * requests the snapshot, {@code completeSnapshotCutover} installs it (resetState + counter SET +
+     * local binlog truncate), and the bootstrap gate keeps the node non-advertisable/ineligible
+     * until the install lands. The dual-window tail is discarded by design — the same outcome the
+     * operational containment (wipe + cold bootstrap) produced manually, now automatic and bounded.
+     */
+    private void onDualLeaderYield() {
+        if (!isStreamMode()) {
+            return;
+        }
+        dualLeaderYielding = true;
+        for (String topic : handlers.keySet()) {
+            relayPendingBootstrap.add(topic);
+        }
+        LOGGER.warning(() -> "Dual-leader yield: topics " + handlers.keySet() + " marked for"
+                + " bootstrap resync; the locally produced dual-window tail will be discarded"
+                + " (issue tems#9, D10c)");
     }
 
     /** Abort without handoff: release the pause and arm the re-engagement cooldown. */
