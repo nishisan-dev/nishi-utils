@@ -197,6 +197,27 @@ public final class SeriesGeometry {
         return a.ringBaseOffset() + ((long) row * columnCount() + col) * Double.BYTES;
     }
 
+    /**
+     * Hash SHA-256 sobre os campos que definem a geometria física (step base,
+     * colunas e archives). Gravado no cabeçalho do arquivo; divergência força a
+     * recriação (clean cut) pois os offsets mudaram.
+     */
+    public byte[] geometryHash() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("base=").append(baseStepSec).append(";cols=");
+        for (Column c : columns) {
+            sb.append(c.derivedName()).append('|').append(c.rawName())
+                    .append('|').append(c.rawType().ordinal()).append(',');
+        }
+        sb.append(";arch=");
+        for (Archive a : archives) {
+            sb.append(a.rraName()).append('|').append(a.cf().ordinal()).append('|')
+                    .append(a.stepSec()).append('|').append(a.rows()).append('|')
+                    .append(a.xff()).append(',');
+        }
+        return DefinitionHash.sha256(sb.toString());
+    }
+
     static long align8(long v) {
         return (v + 7L) & ~7L;
     }

@@ -1,40 +1,41 @@
 package dev.nishisan.utils.oss.writer;
 
+import dev.nishisan.utils.oss.api.ConsolidationFunction;
 import dev.nishisan.utils.oss.api.Sample;
+import dev.nishisan.utils.oss.api.SeriesResult;
+import dev.nishisan.utils.oss.api.ViewQuery;
 import dev.nishisan.utils.oss.config.NgrrdYamlLoader;
 import dev.nishisan.utils.oss.definition.NgrrdDefinition;
-import dev.nishisan.utils.oss.format.NgrrdManifest;
+import dev.nishisan.utils.oss.reader.NgrrdReader;
 import dev.nishisan.utils.oss.storage.LocalDiskStorage;
 import dev.nishisan.utils.oss.storage.NgrrdStorage;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Valida que o {@link NgrrdWriter} respeita a janela {@code rows × stepSec}
- * de cada RRA — blocos cujo final em segundos cai fora dessa janela são
- * removidos tanto do Storage quanto da lista interna usada pelo
- * {@link ManifestUpdater}. Sem essa expiração, o ngrrd cresceria
- * indefinidamente e perderia paridade conceitual com o RRDtool.
+ * Valida a retenção como ring buffer (paridade com o RRDtool): cada RRA mantém
+ * exatamente {@code rows} CDPs; janelas mais antigas são sobrescritas in-place,
+ * sem deletar arquivos. Não há mais blocos nem manifesto — a verificação é feita
+ * lendo a série de volta pelo {@link NgrrdReader}.
  */
 class NgrrdRetentionTest {
 
     /**
-     * YAML mínimo desenhado especificamente para tornar a janela observável:
+     * YAML mínimo desenhado para tornar o ring observável:
      *
      * <ul>
      *     <li>baseStepSec = 60 s (1 min)</li>
-     *     <li>blockSizeSec = 120 s (2 PDPs/bloco)</li>
-     *     <li>RRA com stepSec=120 e rows=3 → janela = 360 s (3 blocos)</li>
+     *     <li>RRA com stepSec=120 (2 PDPs/CDP) e rows=3 → janela = 360 s</li>
      * </ul>
      *
-     * Ingerindo 5 blocos sequenciais, esperamos sobrar apenas os 3 mais novos.
+     * Ingerindo 5 janelas de 2 min, esperamos ler de volta só as 3 mais novas.
      */
     private static final String TINY_YAML = """
             apiVersion: ngrrd/v1
@@ -44,7 +45,6 @@ class NgrrdRetentionTest {
             spec:
               time:
                 baseStepSec: 60
-                blockSizeSec: 120
               identity:
                 seriesKeyTemplate: "s:{id}"
                 tags:
@@ -80,84 +80,66 @@ class NgrrdRetentionTest {
                 backend: localDisk
                 objectNaming:
                   scheme: deterministic
-                  rawPrefix: raw
-                  aggPrefix: agg
-                  manifestPrefix: manifest
+                  seriesPrefix: series
                   schemaPrefix: schema
                 writePolicy:
                   mode: append_only
                   idempotency:
-                    key: ""
+                    key: "{seriesKey}"
                     onConflict: verify_or_replace_if_identical
-                manifestPolicy:
-                  updateMode: periodic_snapshot
-                  intervalSec: 60
               quality:
                 emitMetrics: []
             """;
 
-    private static final long BLOCK_START_SEC = 1_747_339_200L;
-    private static final long BLOCK_START_MS = BLOCK_START_SEC * 1000L;
-    private static final int BLOCK_MS = 120_000;
+    private static final long BASE_SEC = 1_747_339_200L;
+    private static final long BASE_MS = BASE_SEC * 1000L;
+    private static final int WINDOW_SEC = 120;
 
-    @Test
-    void blocosForaDaJanelaDeRetencaoSaoRemovidosDoStorageEDoRegistro(@TempDir Path tempDir) {
-        NgrrdDefinition def = NgrrdYamlLoader.parse(TINY_YAML, k -> null);
-        NgrrdStorage storage = new LocalDiskStorage(tempDir);
-
-        try (NgrrdWriter writer = new NgrrdWriter(def, storage, "s:r1")) {
-            // 5 blocos de 2 min, cada um com 2 amostras dentro.
-            for (int block = 0; block < 5; block++) {
-                long base = BLOCK_START_MS + (long) block * BLOCK_MS;
-                writer.write("cpu", new Sample(base, 10.0 + block));
-                writer.write("cpu", new Sample(base + 60_000L, 20.0 + block));
-            }
-            writer.flush();
-
-            List<PersistedBlock> remaining = writer.persistedBlocks();
-            // RRA tem rows=3; após 5 blocos, sobram os 3 mais novos.
-            assertEquals(3, remaining.size(),
-                    "esperava 3 blocos remanescentes, obteve " + remaining.size()
-                            + ": " + remaining);
-            long minBlockStart = remaining.stream()
-                    .mapToLong(PersistedBlock::blockStartEpoch).min().orElseThrow();
-            long maxBlockStart = remaining.stream()
-                    .mapToLong(PersistedBlock::blockStartEpoch).max().orElseThrow();
-            // Os 3 mais novos: blocos #2, #3, #4 a partir de BLOCK_START_SEC.
-            assertEquals(BLOCK_START_SEC + 2L * 120, minBlockStart);
-            assertEquals(BLOCK_START_SEC + 4L * 120, maxBlockStart);
-
-            // Arquivos físicos dos blocos antigos sumiram do disco.
-            for (int block = 0; block < 2; block++) {
-                String oldKey = "agg/s:r1/rra_2m_3__cpu_pct__AVERAGE/120/"
-                        + (BLOCK_START_SEC + (long) block * 120) + ".ngrrd";
-                assertFalse(storage.exists(oldKey),
-                        "bloco expirado ainda presente no storage: " + oldKey);
-            }
-
-            // Manifesto reflete o estado pós-expiração.
-            NgrrdManifest snapshot = new ManifestUpdater(writer, storage, "h", 60).writeSnapshot();
-            assertEquals(1, snapshot.rras().size());
-            assertEquals(3, snapshot.rras().get(0).blocks().size());
+    private static void ingestWindows(NgrrdWriter writer, int windows) {
+        for (int w = 0; w < windows; w++) {
+            long slotA = BASE_MS + (long) w * WINDOW_SEC * 1000L;
+            long slotB = slotA + 60_000L;
+            writer.write("cpu", new Sample(slotA, 10.0 + w)); // slot par
+            writer.write("cpu", new Sample(slotB, 20.0 + w)); // slot ímpar → CDP AVG = 15 + w
         }
+        writer.flush();
+    }
+
+    private static List<Double> readNonNaN(NgrrdDefinition def, NgrrdStorage storage, long endMs) {
+        NgrrdReader reader = new NgrrdReader(def, storage, "s:r1");
+        ViewQuery query = new ViewQuery(Duration.ofHours(1), 120, ConsolidationFunction.AVERAGE, 100);
+        SeriesResult result = reader.read("cpu_pct", query, endMs);
+        return result.points().stream().map(p -> p.value())
+                .filter(v -> !Double.isNaN(v)).toList();
     }
 
     @Test
-    void semExpiracaoQuandoVolumeAindaCabeNaJanela(@TempDir Path tempDir) {
+    void janelasForaDoRingSaoSobrescritasMantendoApenasAsMaisRecentes(@TempDir Path tempDir) {
         NgrrdDefinition def = NgrrdYamlLoader.parse(TINY_YAML, k -> null);
         NgrrdStorage storage = new LocalDiskStorage(tempDir);
 
         try (NgrrdWriter writer = new NgrrdWriter(def, storage, "s:r1")) {
-            // Apenas 2 blocos — abaixo da janela rows=3.
-            for (int block = 0; block < 2; block++) {
-                long base = BLOCK_START_MS + (long) block * BLOCK_MS;
-                writer.write("cpu", new Sample(base, 10.0));
-                writer.write("cpu", new Sample(base + 60_000L, 20.0));
-            }
-            writer.flush();
-
-            assertTrue(writer.persistedBlocks().size() == 2,
-                    "esperava 2 blocos retidos (abaixo da janela)");
+            ingestWindows(writer, 5); // janelas 0..4 (valores 15..19)
         }
+
+        long endMs = BASE_MS + 5L * WINDOW_SEC * 1000L;
+        List<Double> values = readNonNaN(def, storage, endMs);
+        // rows=3 → sobrevivem as 3 janelas mais novas: 17, 18, 19.
+        assertEquals(List.of(17.0, 18.0, 19.0), values,
+                "ring deveria reter só as 3 janelas mais recentes, obteve " + values);
+    }
+
+    @Test
+    void semSobrescritaQuandoVolumeCabeNoRing(@TempDir Path tempDir) {
+        NgrrdDefinition def = NgrrdYamlLoader.parse(TINY_YAML, k -> null);
+        NgrrdStorage storage = new LocalDiskStorage(tempDir);
+
+        try (NgrrdWriter writer = new NgrrdWriter(def, storage, "s:r1")) {
+            ingestWindows(writer, 2); // janelas 0..1 (valores 15, 16) — abaixo de rows=3
+        }
+
+        long endMs = BASE_MS + 2L * WINDOW_SEC * 1000L;
+        List<Double> values = readNonNaN(def, storage, endMs);
+        assertEquals(List.of(15.0, 16.0), values, "esperava 2 janelas retidas, obteve " + values);
     }
 }

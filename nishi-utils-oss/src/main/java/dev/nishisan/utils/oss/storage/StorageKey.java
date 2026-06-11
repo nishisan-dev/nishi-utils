@@ -7,23 +7,19 @@ import java.util.Objects;
 /**
  * Construtor de chaves determinísticas para os objetos persistidos pelo ngrrd.
  *
- * <p>Convenção (a partir de {@code spec.storage.objectNaming}):</p>
+ * <p>No formato de série única (NGRR) há apenas dois tipos de objeto:</p>
  *
  * <pre>
- * raw block       : {rawPrefix}/{seriesKey}/{dsName}/{stepSec}/{blockStartEpoch}.ngrrd
- * aggregated block: {aggPrefix}/{seriesKey}/{rraName}/{stepSec}/{blockStartEpoch}.ngrrd
- * manifest version: {manifestPrefix}/{seriesKey}/v{version}.yaml
- * schema snapshot : {schemaPrefix}/{definitionName}.yaml
+ * série            : {seriesPrefix}/{seriesKey}.ngrr
+ * snapshot schema  : {schemaPrefix}/{definitionName}.yaml
  * </pre>
  *
  * <p>Os prefixos NÃO incluem barra final. A classe nunca produz {@code //}.</p>
  */
 public final class StorageKey {
 
-    private static final String BLOCK_EXT = ".ngrrd";
     private static final String SERIES_EXT = ".ngrr";
     private static final String YAML_EXT = ".yaml";
-    private static final String STATE_EXT = ".state";
 
     private StorageKey() {
     }
@@ -38,46 +34,9 @@ public final class StorageKey {
         return join(naming.seriesPrefixOrDefault(), seriesKey + SERIES_EXT);
     }
 
-    public static String rawBlock(ObjectNaming naming, String seriesKey, String dsName,
-                                  int stepSec, long blockStartEpoch) {
-        Objects.requireNonNull(naming, "naming é obrigatório");
-        return join(naming.rawPrefix(), seriesKey, dsName, Integer.toString(stepSec),
-                blockStartEpoch + BLOCK_EXT);
-    }
-
-    public static String aggBlock(ObjectNaming naming, String seriesKey, String rraName,
-                                  int stepSec, long blockStartEpoch) {
-        Objects.requireNonNull(naming, "naming é obrigatório");
-        return join(naming.aggPrefix(), seriesKey, rraName, Integer.toString(stepSec),
-                blockStartEpoch + BLOCK_EXT);
-    }
-
-    public static String manifestVersion(ObjectNaming naming, String seriesKey, int version) {
-        Objects.requireNonNull(naming, "naming é obrigatório");
-        if (version <= 0) {
-            throw new IllegalArgumentException("version deve ser > 0: " + version);
-        }
-        return join(naming.manifestPrefix(), seriesKey, "v" + version + YAML_EXT);
-    }
-
-    public static String manifestPrefix(ObjectNaming naming, String seriesKey) {
-        Objects.requireNonNull(naming, "naming é obrigatório");
-        return join(naming.manifestPrefix(), seriesKey);
-    }
-
     public static String schemaSnapshot(ObjectNaming naming, String definitionName) {
         Objects.requireNonNull(naming, "naming é obrigatório");
-        return join(naming.schemaPrefix(), definitionName + YAML_EXT);
-    }
-
-    /**
-     * Estado do writer no modo incremental: {@code {statePrefix}/{seriesKey}/writer.state}.
-     * Carrega o último valor por DS raw e os acumuladores da janela aberta para
-     * reconstruir o writer na reabertura do handle (semântica rrdtool-like).
-     */
-    public static String seriesState(ObjectNaming naming, String seriesKey) {
-        Objects.requireNonNull(naming, "naming é obrigatório");
-        return join(naming.statePrefixOrDefault(), seriesKey, "writer" + STATE_EXT);
+        return join(naming.schemaPrefixOrDefault(), definitionName + YAML_EXT);
     }
 
     private static String join(String... segments) {

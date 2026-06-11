@@ -26,9 +26,7 @@ import java.util.regex.Pattern;
  *
  * <ul>
  *     <li>apiVersion e kind compatíveis.</li>
- *     <li>{@code time.baseStepSec > 0} e divisível por 60.</li>
- *     <li>{@code time.blockSizeSec} múltiplo de {@code baseStepSec} e
- *     {@code >= max(rra.stepSec)}.</li>
+ *     <li>{@code time.baseStepSec > 0}.</li>
  *     <li>Cada {@code rra.stepSec} múltiplo de {@code baseStepSec};
  *     {@code rows > 0}; {@code xff in [0.0, 1.0)}; {@code cf} não vazio.</li>
  *     <li>{@code archives.appliesTo.include} referencia DS existentes (raw ou
@@ -54,7 +52,7 @@ public final class NgrrdDefinitionValidator {
         }
         validateRoot(def);
         NgrrdSpec spec = def.spec();
-        validateTime(spec.time(), spec.archives());
+        validateTime(spec.time());
         Set<String> dsNames = collectDataSourceNames(spec.dataSources());
         validateDataSources(spec.dataSources());
         validateArchives(spec.archives(), spec.time(), dsNames);
@@ -76,28 +74,12 @@ public final class NgrrdDefinitionValidator {
         }
     }
 
-    private static void validateTime(TimeSpec time, ArchiveSpec archives) {
+    private static void validateTime(TimeSpec time) {
         if (time == null) {
             throw new NgrrdDefinitionException("spec.time é obrigatório");
         }
         if (time.baseStepSec() <= 0) {
             throw new NgrrdDefinitionException("time.baseStepSec deve ser > 0");
-        }
-        if (time.blockSizeSec() <= 0) {
-            throw new NgrrdDefinitionException("time.blockSizeSec deve ser > 0");
-        }
-        if (time.blockSizeSec() % time.baseStepSec() != 0) {
-            throw new NgrrdDefinitionException(
-                    "time.blockSizeSec (" + time.blockSizeSec() + ") deve ser múltiplo de baseStepSec ("
-                            + time.baseStepSec() + ")");
-        }
-        if (archives != null) {
-            int maxRraStep = archives.rras().stream().mapToInt(RraDef::stepSec).max().orElse(0);
-            if (maxRraStep > time.blockSizeSec()) {
-                throw new NgrrdDefinitionException(
-                        "time.blockSizeSec (" + time.blockSizeSec() + ") deve ser >= max(rra.stepSec) ("
-                                + maxRraStep + ")");
-            }
         }
         if (time.lateSamplePolicy() != null && time.lateSamplePolicy().maxLatenessSec() < 0) {
             throw new NgrrdDefinitionException("lateSamplePolicy.maxLatenessSec não pode ser negativo");

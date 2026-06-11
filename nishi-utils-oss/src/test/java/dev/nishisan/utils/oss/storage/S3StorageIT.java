@@ -104,4 +104,27 @@ class S3StorageIT {
         assertEquals(VerifyResult.IDENTICAL_SKIPPED, storage.verifyOrReplaceIfIdentical(key, v1));
         assertEquals(VerifyResult.REPLACED, storage.verifyOrReplaceIfIdentical(key, new byte[]{2, 2}));
     }
+
+    @Test
+    void seriesChannelFazReadModifyWriteEReabreComMudancas() {
+        String key = "series/device:r1/iface:eth0.ngrr";
+        assertFalse(storage.seriesExists(key));
+
+        byte[] head = "HEADER--".getBytes(); // 8 bytes
+        byte[] mid = "MIDDLE!!".getBytes();   // 8 bytes
+        try (SeriesChannel ch = storage.openSeries(key)) {
+            ch.allocate(64);
+            ch.writeRegion(0, head);
+            ch.writeRegion(40, mid);
+            ch.force(); // PUT do objeto inteiro
+        }
+
+        assertTrue(storage.seriesExists(key));
+        try (SeriesChannel ch = storage.openSeries(key)) {
+            assertEquals(64, ch.size());
+            assertArrayEquals(head, ch.readRegion(0, 8));
+            assertArrayEquals(mid, ch.readRegion(40, 8));
+            assertArrayEquals(new byte[8], ch.readRegion(16, 8));
+        }
+    }
 }

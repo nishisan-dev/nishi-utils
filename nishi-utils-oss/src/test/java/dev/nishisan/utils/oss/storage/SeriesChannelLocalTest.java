@@ -20,7 +20,7 @@ class SeriesChannelLocalTest {
 
     @Test
     void chaveSeriesUsaPrefixoEExtensaoNgrr() {
-        ObjectNaming naming = new ObjectNaming(NamingScheme.DETERMINISTIC, null, null, null, null);
+        ObjectNaming naming = new ObjectNaming(NamingScheme.DETERMINISTIC, null, null);
         assertEquals("series/device:r1/iface:eth0.ngrr",
                 StorageKey.series(naming, "device:r1/iface:eth0"));
     }

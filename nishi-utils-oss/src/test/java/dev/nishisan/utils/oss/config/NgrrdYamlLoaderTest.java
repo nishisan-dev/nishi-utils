@@ -33,7 +33,6 @@ class NgrrdYamlLoaderTest {
         assertEquals("iface-traffic-errors-v1", def.metadata().name());
 
         assertEquals(300, def.spec().time().baseStepSec());
-        assertEquals(21600, def.spec().time().blockSizeSec());
         assertEquals(TimestampAlignment.EPOCH, def.spec().time().timestampAlignment());
         assertEquals(LateSampleAction.BUCKET_IF_POSSIBLE, def.spec().time().lateSamplePolicy().onLate());
         assertEquals("NaN", def.spec().time().missingValue());
@@ -80,10 +79,10 @@ class NgrrdYamlLoaderTest {
         assertEquals(400, daily.maxPoints());
 
         assertEquals(StorageBackendType.OBJECT_STORAGE, def.spec().storage().backend());
-        assertEquals("raw", def.spec().storage().objectNaming().rawPrefix());
-        assertEquals("{seriesKey}/{ds}/{stepSec}/{blockStartEpoch}",
+        assertEquals("series", def.spec().storage().objectNaming().seriesPrefix());
+        assertEquals("schema", def.spec().storage().objectNaming().schemaPrefix());
+        assertEquals("{seriesKey}",
                 def.spec().storage().writePolicy().idempotency().key());
-        assertEquals(900, def.spec().storage().manifestPolicy().intervalSec());
 
         assertEquals(5, def.spec().quality().emitMetrics().size());
         assertTrue(def.spec().quality().emitMetrics().contains("counter_reset_count"));
