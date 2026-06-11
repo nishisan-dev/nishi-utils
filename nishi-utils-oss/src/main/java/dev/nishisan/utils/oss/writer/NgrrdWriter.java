@@ -28,6 +28,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Ingere {@link Sample}s e mantém um único arquivo de série NGRR por
@@ -166,35 +167,36 @@ public final class NgrrdWriter implements AutoCloseable {
 
     /** Materializa o CDP em progresso como parcial e torna o arquivo durável. */
     public void flush() {
-        awaitCommand(new Command.Flush(new CountDownLatch(1)));
+        sync();
     }
 
     /** Idêntico a {@link #flush()} no formato de série única (sempre incremental). */
     public void checkpoint() {
-        awaitCommand(new Command.Checkpoint(new CountDownLatch(1)));
+        sync();
     }
 
-    private void awaitCommand(Command cmd) {
+    /**
+     * Enfileira um checkpoint síncrono e bloqueia até a worker thread concluí-lo.
+     * Uma falha de persistência (ex.: PUT no S3 / fsync) é propagada ao chamador
+     * em vez de travar indefinidamente em {@code await()}.
+     */
+    private void sync() {
         if (closed) {
             return;
         }
-        CountDownLatch latch = latchOf(cmd);
-        queue.add(cmd);
+        CountDownLatch latch = new CountDownLatch(1);
+        AtomicReference<RuntimeException> error = new AtomicReference<>();
+        queue.add(new Command.Sync(latch, error));
         try {
             latch.await();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new RuntimeException("comando do writer interrompido", e);
         }
-    }
-
-    private static CountDownLatch latchOf(Command cmd) {
-        return switch (cmd) {
-            case Command.Flush f -> f.latch();
-            case Command.Checkpoint c -> c.latch();
-            case Command.Shutdown s -> s.latch();
-            case Command.Write ignored -> throw new IllegalArgumentException("Write não tem latch");
-        };
+        RuntimeException failure = error.get();
+        if (failure != null) {
+            throw failure;
+        }
     }
 
     @Override
@@ -232,19 +234,23 @@ public final class NgrrdWriter implements AutoCloseable {
                 Command cmd = queue.take();
                 switch (cmd) {
                     case Command.Write w -> handleWrite(w);
-                    case Command.Flush f -> {
-                        checkpointAndForce();
-                        f.latch().countDown();
-                    }
-                    case Command.Checkpoint c -> {
-                        checkpointAndForce();
-                        c.latch().countDown();
+                    case Command.Sync s -> {
+                        // Sempre libera o latch; uma falha vai para o chamador via error ref.
+                        try {
+                            checkpointAndForce();
+                        } catch (RuntimeException e) {
+                            s.error().set(e);
+                        } finally {
+                            s.latch().countDown();
+                        }
                     }
                     case Command.Shutdown s -> {
                         try {
                             checkpointAndForce();
-                            channel.close();
+                        } catch (RuntimeException e) {
+                            System.err.println("ngrrd-writer: falha no checkpoint final: " + e);
                         } finally {
+                            closeChannelQuietly();
                             s.latch().countDown();
                         }
                         return;
@@ -489,14 +495,20 @@ public final class NgrrdWriter implements AutoCloseable {
         channel.force();
     }
 
+    private void closeChannelQuietly() {
+        try {
+            channel.close();
+        } catch (RuntimeException e) {
+            System.err.println("ngrrd-writer: falha ao fechar canal de " + storageKey + ": " + e);
+        }
+    }
+
     private sealed interface Command {
         record Write(String dsName, Sample sample) implements Command {
         }
 
-        record Flush(CountDownLatch latch) implements Command {
-        }
-
-        record Checkpoint(CountDownLatch latch) implements Command {
+        /** Checkpoint síncrono; {@code error} carrega uma eventual falha de volta ao chamador. */
+        record Sync(CountDownLatch latch, AtomicReference<RuntimeException> error) implements Command {
         }
 
         record Shutdown(CountDownLatch latch) implements Command {
