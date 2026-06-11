@@ -29,16 +29,31 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public final class ManifestUpdater implements AutoCloseable {
 
+    /** No modo incremental mantém apenas as N versões mais recentes do manifesto. */
+    private static final int INCREMENTAL_KEEP_VERSIONS = 2;
+
     private final NgrrdWriter writer;
     private final NgrrdStorage storage;
     private final String definitionHash;
     private final long intervalSec;
+
+    /**
+     * {@code true} no modo incremental: os snapshots são disparados pelo
+     * {@code checkpoint()} (não há thread agendada por handle) e versões antigas
+     * são podadas a cada escrita.
+     */
+    private final boolean incremental;
 
     private final ScheduledExecutorService scheduler;
     private final AtomicInteger nextVersion = new AtomicInteger();
 
     public ManifestUpdater(NgrrdWriter writer, NgrrdStorage storage,
                            String definitionHash, long intervalSec) {
+        this(writer, storage, definitionHash, intervalSec, false);
+    }
+
+    public ManifestUpdater(NgrrdWriter writer, NgrrdStorage storage,
+                           String definitionHash, long intervalSec, boolean incremental) {
         this.writer = Objects.requireNonNull(writer, "writer é obrigatório");
         this.storage = Objects.requireNonNull(storage, "storage é obrigatório");
         this.definitionHash = Objects.requireNonNull(definitionHash, "definitionHash é obrigatório");
@@ -46,17 +61,23 @@ public final class ManifestUpdater implements AutoCloseable {
             throw new IllegalArgumentException("intervalSec deve ser > 0: " + intervalSec);
         }
         this.intervalSec = intervalSec;
+        this.incremental = incremental;
         this.nextVersion.set(discoverNextVersion());
 
-        this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+        // No modo incremental não há thread agendada por handle (reduz o churn de
+        // threads sob eviction): os snapshots vêm do checkpoint do consumer.
+        this.scheduler = incremental ? null : Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "ngrrd-manifest-" + writer.seriesKey());
             t.setDaemon(true);
             return t;
         });
     }
 
-    /** Inicia o agendamento (chamar uma única vez). */
+    /** Inicia o agendamento (chamar uma única vez); no-op no modo incremental. */
     public void start() {
+        if (scheduler == null) {
+            return;
+        }
         scheduler.scheduleAtFixedRate(this::writeSnapshotSafe,
                 intervalSec, intervalSec, TimeUnit.SECONDS);
     }
@@ -78,11 +99,47 @@ public final class ManifestUpdater implements AutoCloseable {
                 writer.seriesKey(),
                 version);
         storage.atomicReplace(key, yaml);
+        if (incremental) {
+            pruneOldVersions(version);
+        }
         return manifest;
+    }
+
+    /**
+     * Remove versões de manifesto anteriores a {@code currentVersion -
+     * INCREMENTAL_KEEP_VERSIONS}. Como o reader sempre lê a versão máxima, manter
+     * só as últimas evita que checkpoints frequentes acumulem milhares de
+     * {@code vN.yaml}.
+     */
+    private void pruneOldVersions(int currentVersion) {
+        int threshold = currentVersion - INCREMENTAL_KEEP_VERSIONS;
+        if (threshold <= 0) {
+            return;
+        }
+        var naming = writer.definition().spec().storage().objectNaming();
+        String prefix = StorageKey.manifestPrefix(naming, writer.seriesKey());
+        for (String existing : storage.list(prefix)) {
+            int slash = existing.lastIndexOf('/');
+            String name = slash >= 0 ? existing.substring(slash + 1) : existing;
+            if (!(name.startsWith("v") && name.endsWith(".yaml"))) {
+                continue;
+            }
+            try {
+                int n = Integer.parseInt(name.substring(1, name.length() - ".yaml".length()));
+                if (n <= threshold) {
+                    storage.delete(existing);
+                }
+            } catch (NumberFormatException ignored) {
+                // arquivo fora do padrão — ignora.
+            }
+        }
     }
 
     @Override
     public void close() {
+        if (scheduler == null) {
+            return;
+        }
         scheduler.shutdown();
         try {
             if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {

@@ -28,6 +28,14 @@ public interface NgrrdHandle extends AutoCloseable {
     /** Força o fechamento do bloco aberto e a gravação do manifesto. */
     void flush();
 
+    /**
+     * Persiste incrementalmente o bloco aberto (parcial) e o estado durável,
+     * mantendo a janela viva, e regrava o manifesto. Semântica rrdtool-like: o
+     * dado fica legível antes do rollover. No modo {@code BLOCK_ROLLOVER} degrada
+     * para {@link #flush()}.
+     */
+    void checkpoint();
+
     /** Lê uma série materializada com base em uma {@link ViewQuery} explícita. */
     SeriesResult read(String dsName, ViewQuery query);
 

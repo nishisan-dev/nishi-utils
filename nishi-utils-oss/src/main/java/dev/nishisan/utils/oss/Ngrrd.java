@@ -99,8 +99,12 @@ public final class Ngrrd {
 
         NgrrdMetrics metrics = new NgrrdMetrics(metricsListener);
         NgrrdWriter writer = new NgrrdWriter(def, storage, seriesKey, metrics);
+        dev.nishisan.utils.oss.definition.WritePolicy writePolicy = def.spec().storage().writePolicy();
+        boolean incremental = writePolicy != null
+                && writePolicy.persistenceModeOrDefault()
+                == dev.nishisan.utils.oss.api.PersistenceMode.INCREMENTAL;
         ManifestUpdater updater = new ManifestUpdater(writer, storage, definitionHash,
-                def.spec().storage().manifestPolicy().intervalSec());
+                def.spec().storage().manifestPolicy().intervalSec(), incremental);
         updater.start();
 
         return new DefaultHandle(def, storage, seriesKey, writer, updater, metrics, Map.copyOf(tags));
@@ -177,6 +181,12 @@ public final class Ngrrd {
         @Override
         public void flush() {
             writer.flush();
+            updater.writeSnapshot();
+        }
+
+        @Override
+        public void checkpoint() {
+            writer.checkpoint();
             updater.writeSnapshot();
         }
 

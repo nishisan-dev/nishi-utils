@@ -22,6 +22,7 @@ public final class StorageKey {
 
     private static final String BLOCK_EXT = ".ngrrd";
     private static final String YAML_EXT = ".yaml";
+    private static final String STATE_EXT = ".state";
 
     private StorageKey() {
     }
@@ -56,6 +57,16 @@ public final class StorageKey {
     public static String schemaSnapshot(ObjectNaming naming, String definitionName) {
         Objects.requireNonNull(naming, "naming é obrigatório");
         return join(naming.schemaPrefix(), definitionName + YAML_EXT);
+    }
+
+    /**
+     * Estado do writer no modo incremental: {@code {statePrefix}/{seriesKey}/writer.state}.
+     * Carrega o último valor por DS raw e os acumuladores da janela aberta para
+     * reconstruir o writer na reabertura do handle (semântica rrdtool-like).
+     */
+    public static String seriesState(ObjectNaming naming, String seriesKey) {
+        Objects.requireNonNull(naming, "naming é obrigatório");
+        return join(naming.statePrefixOrDefault(), seriesKey, "writer" + STATE_EXT);
     }
 
     private static String join(String... segments) {

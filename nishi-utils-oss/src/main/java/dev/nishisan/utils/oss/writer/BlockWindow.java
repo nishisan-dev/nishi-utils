@@ -73,6 +73,18 @@ final class BlockWindow {
         bucketsFor(derivedDsName)[slot].add(value);
     }
 
+    /**
+     * Instala um array de PDPs já reconstituído para um DS derivado (usado na
+     * reidratação do estado durável no modo incremental).
+     */
+    void restoreBucket(String derivedDsName, PrimaryDataPoint[] pdps) {
+        if (pdps.length != slots) {
+            throw new IllegalArgumentException(
+                    "PDPs=" + pdps.length + " incompatível com slots=" + slots + " em " + derivedDsName);
+        }
+        bucketsByDerivedDs.put(derivedDsName, pdps);
+    }
+
     CounterPrev counterPrev(String rawDsName) {
         return counterPrevByRawDs.get(rawDsName);
     }

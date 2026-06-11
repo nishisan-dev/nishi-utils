@@ -72,4 +72,28 @@ public final class PrimaryDataPoint {
             case LAST -> last;
         };
     }
+
+    /**
+     * Memento imutável do estado interno do acumulador, usado para persistir e
+     * reconstruir a janela aberta no modo de persistência incremental.
+     */
+    public record Memento(double sum, int count, double min, double max, double last, int missing) {
+    }
+
+    /** Captura o estado interno atual para serialização. */
+    public Memento snapshot() {
+        return new Memento(sum, count, min, max, last, missing);
+    }
+
+    /** Reconstrói um acumulador a partir de um {@link Memento} persistido. */
+    public static PrimaryDataPoint restore(Memento m) {
+        PrimaryDataPoint pdp = new PrimaryDataPoint();
+        pdp.sum = m.sum();
+        pdp.count = m.count();
+        pdp.min = m.min();
+        pdp.max = m.max();
+        pdp.last = m.last();
+        pdp.missing = m.missing();
+        return pdp;
+    }
 }

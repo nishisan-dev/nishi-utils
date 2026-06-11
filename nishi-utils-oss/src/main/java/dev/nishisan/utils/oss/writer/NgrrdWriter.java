@@ -2,6 +2,7 @@ package dev.nishisan.utils.oss.writer;
 
 import dev.nishisan.utils.oss.api.ConsolidationFunction;
 import dev.nishisan.utils.oss.api.DataSourceType;
+import dev.nishisan.utils.oss.api.PersistenceMode;
 import dev.nishisan.utils.oss.api.Sample;
 import dev.nishisan.utils.oss.definition.AppliesTo;
 import dev.nishisan.utils.oss.definition.ArchiveSpec;
@@ -9,6 +10,7 @@ import dev.nishisan.utils.oss.definition.DataSourceDef;
 import dev.nishisan.utils.oss.definition.NgrrdDefinition;
 import dev.nishisan.utils.oss.definition.ObjectNaming;
 import dev.nishisan.utils.oss.definition.RraDef;
+import dev.nishisan.utils.oss.definition.WritePolicy;
 import dev.nishisan.utils.oss.engine.CounterDeriver;
 import dev.nishisan.utils.oss.engine.PrimaryDataPoint;
 import dev.nishisan.utils.oss.engine.RraConsolidator;
@@ -21,9 +23,11 @@ import dev.nishisan.utils.oss.storage.StorageKey;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
@@ -69,6 +73,12 @@ public final class NgrrdWriter implements AutoCloseable {
 
     private final List<PersistedBlock> persistedBlocks = new CopyOnWriteArrayList<>();
     private final NgrrdMetricsListener metrics;
+
+    /** Persistência incremental (rrdtool-like) habilitada via writePolicy. */
+    private final boolean incremental;
+    /** Chave do estado durável da série (último valor + acumuladores da janela). */
+    private final String stateKey;
+
     private volatile boolean closed;
 
     private BlockWindow current;
@@ -102,12 +112,59 @@ public final class NgrrdWriter implements AutoCloseable {
                 ? Set.of()
                 : Set.copyOf(appliesTo.include());
 
+        WritePolicy writePolicy = definition.spec().storage().writePolicy();
+        this.incremental = writePolicy != null
+                && writePolicy.persistenceModeOrDefault() == PersistenceMode.INCREMENTAL;
+        this.stateKey = StorageKey.seriesState(naming, seriesKey);
+        if (incremental) {
+            // Reabertura stateless: reidrata a janela aberta + counterPrev do disco.
+            this.current = loadState();
+        }
+
         this.worker = Executors.newSingleThreadExecutor(r -> {
             Thread t = new Thread(r, "ngrrd-writer-" + seriesKey);
             t.setDaemon(true);
             return t;
         });
+        // submit() estabelece happens-before com o estado reidratado acima.
         this.worker.submit(this::runLoop);
+    }
+
+    /**
+     * Reconstrói a janela aberta a partir do estado durável (modo incremental).
+     * Retorna {@code null} se não houver estado, se a geometria mudou na
+     * definição, ou se o estado estiver ilegível (recomeça vazio com segurança).
+     */
+    private BlockWindow loadState() {
+        try {
+            Optional<byte[]> bytes = storage.get(stateKey);
+            if (bytes.isEmpty()) {
+                return null;
+            }
+            SeriesWriterState st = SeriesStateCodec.decode(bytes.get());
+            if (st.baseStepSec() != baseStepSec || st.blockSizeSec() != blockSizeSec) {
+                return null;
+            }
+            BlockWindow w = new BlockWindow(st.blockStartEpochSec(), baseStepSec, blockSizeSec);
+            for (Map.Entry<String, BlockWindow.CounterPrev> e : st.counterPrev().entrySet()) {
+                w.setCounterPrev(e.getKey(), e.getValue());
+            }
+            for (Map.Entry<String, PrimaryDataPoint.Memento[]> e : st.buckets().entrySet()) {
+                PrimaryDataPoint.Memento[] mem = e.getValue();
+                if (mem.length != w.slots()) {
+                    continue;
+                }
+                PrimaryDataPoint[] arr = new PrimaryDataPoint[mem.length];
+                for (int i = 0; i < mem.length; i++) {
+                    arr[i] = PrimaryDataPoint.restore(mem[i]);
+                }
+                w.restoreBucket(e.getKey(), arr);
+            }
+            return w;
+        } catch (RuntimeException e) {
+            System.err.println("ngrrd-writer: estado ilegível em " + stateKey + ", iniciando vazio: " + e);
+            return null;
+        }
     }
 
     /** Enfileira uma amostra para o DS raw indicado. */
@@ -121,21 +178,46 @@ public final class NgrrdWriter implements AutoCloseable {
     }
 
     /**
-     * Bloqueia até a fila atual ser drenada e o bloco aberto ser fechado e
-     * persistido (caso tenha conteúdo).
+     * Bloqueia até a fila atual ser drenada e o bloco aberto ser materializado.
+     *
+     * <p>No modo {@code BLOCK_ROLLOVER} fecha o bloco aberto (janela zerada). No
+     * modo {@code INCREMENTAL} comporta-se como {@link #checkpoint()}: persiste o
+     * bloco aberto como parcial + o estado durável, <em>sem</em> fechar a janela.</p>
      */
     public void flush() {
+        awaitCommand(new Command.Flush(new CountDownLatch(1)));
+    }
+
+    /**
+     * Persiste o bloco aberto como parcial ({@code FLAG_PARTIAL}) e o estado
+     * durável da série, mantendo a janela viva (semântica rrdtool-like). No modo
+     * {@code BLOCK_ROLLOVER} degrada para {@link #flush()} (fecha o bloco).
+     */
+    public void checkpoint() {
+        awaitCommand(new Command.Checkpoint(new CountDownLatch(1)));
+    }
+
+    private void awaitCommand(Command cmd) {
         if (closed) {
             return;
         }
-        CountDownLatch latch = new CountDownLatch(1);
-        queue.add(new Command.Flush(latch));
+        CountDownLatch latch = latchOf(cmd);
+        queue.add(cmd);
         try {
             latch.await();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw new RuntimeException("flush interrompido", e);
+            throw new RuntimeException("comando do writer interrompido", e);
         }
+    }
+
+    private static CountDownLatch latchOf(Command cmd) {
+        return switch (cmd) {
+            case Command.Flush f -> f.latch();
+            case Command.Checkpoint c -> c.latch();
+            case Command.Shutdown s -> s.latch();
+            case Command.Write ignored -> throw new IllegalArgumentException("Write não tem latch");
+        };
     }
 
     @Override
@@ -179,11 +261,15 @@ public final class NgrrdWriter implements AutoCloseable {
                 switch (cmd) {
                     case Command.Write w -> handleWrite(w);
                     case Command.Flush f -> {
-                        closeCurrentBlock();
+                        flushOrCheckpoint();
                         f.latch().countDown();
                     }
+                    case Command.Checkpoint c -> {
+                        flushOrCheckpoint();
+                        c.latch().countDown();
+                    }
                     case Command.Shutdown s -> {
-                        closeCurrentBlock();
+                        flushOrCheckpoint();
                         s.latch().countDown();
                         return;
                     }
@@ -265,8 +351,31 @@ public final class NgrrdWriter implements AutoCloseable {
             for (Map.Entry<String, BlockWindow.CounterPrev> e : finished.counterPrevSnapshot().entrySet()) {
                 current.setCounterPrev(e.getKey(), e.getValue());
             }
-            persistBlock(finished);
+            // Bloco anterior é finalizado (não-parcial), gravado exatamente uma vez.
+            persistBlock(finished, false);
         }
+    }
+
+    /** Comportamento de {@code flush()}/{@code checkpoint()}/{@code shutdown}. */
+    private void flushOrCheckpoint() {
+        if (incremental) {
+            checkpointOpenBlock();
+        } else {
+            closeCurrentBlock();
+        }
+    }
+
+    /**
+     * Persiste o bloco aberto como parcial e grava o estado durável, mantendo a
+     * janela viva. Como a janela é a acumulação completa (reidratada + novas
+     * amostras), o {@code atomicReplace} do bloco é lossless.
+     */
+    private void checkpointOpenBlock() {
+        if (current == null) {
+            return;
+        }
+        persistBlock(current, true);
+        persistState();
     }
 
     private void closeCurrentBlock() {
@@ -275,10 +384,35 @@ public final class NgrrdWriter implements AutoCloseable {
         }
         BlockWindow finished = current;
         current = null;
-        persistBlock(finished);
+        persistBlock(finished, false);
     }
 
-    private void persistBlock(BlockWindow window) {
+    private void persistState() {
+        if (!incremental || current == null) {
+            return;
+        }
+        try {
+            storage.atomicReplace(stateKey, SeriesStateCodec.encode(snapshotState(current)));
+        } catch (RuntimeException e) {
+            System.err.println("ngrrd-writer: falha ao persistir estado " + stateKey + ": " + e);
+        }
+    }
+
+    private SeriesWriterState snapshotState(BlockWindow window) {
+        Map<String, PrimaryDataPoint.Memento[]> buckets = new LinkedHashMap<>();
+        for (Map.Entry<String, PrimaryDataPoint[]> e : window.bucketsSnapshot().entrySet()) {
+            PrimaryDataPoint[] arr = e.getValue();
+            PrimaryDataPoint.Memento[] mem = new PrimaryDataPoint.Memento[arr.length];
+            for (int i = 0; i < arr.length; i++) {
+                mem[i] = arr[i].snapshot();
+            }
+            buckets.put(e.getKey(), mem);
+        }
+        Map<String, BlockWindow.CounterPrev> cp = new LinkedHashMap<>(window.counterPrevSnapshot());
+        return new SeriesWriterState(window.blockStartEpochSec(), baseStepSec, blockSizeSec, cp, buckets);
+    }
+
+    private void persistBlock(BlockWindow window, boolean partial) {
         Map<String, PrimaryDataPoint[]> buckets = window.bucketsSnapshot();
         if (buckets.isEmpty()) {
             return;
@@ -291,7 +425,7 @@ public final class NgrrdWriter implements AutoCloseable {
             PrimaryDataPoint[] pdps = entry.getValue();
             for (RraDef rra : archives.rras()) {
                 for (ConsolidationFunction cf : rra.cf()) {
-                    persistRraBlock(window, derivedDsName, rra, cf, pdps);
+                    persistRraBlock(window, derivedDsName, rra, cf, pdps, partial);
                 }
             }
         }
@@ -346,7 +480,7 @@ public final class NgrrdWriter implements AutoCloseable {
     }
 
     private void persistRraBlock(BlockWindow window, String derivedDsName, RraDef rra,
-                                 ConsolidationFunction cf, PrimaryDataPoint[] pdps) {
+                                 ConsolidationFunction cf, PrimaryDataPoint[] pdps, boolean partial) {
         if (rra.stepSec() % baseStepSec != 0) {
             return; // protegido pelo validator, mas evita estado inconsistente.
         }
@@ -394,7 +528,7 @@ public final class NgrrdWriter implements AutoCloseable {
 
         BlockHeader header = new BlockHeader(
                 BlockHeader.CURRENT_VERSION,
-                BlockHeader.flags(false, false, true),
+                BlockHeader.flags(false, partial, true),
                 rra.stepSec(),
                 cf,
                 DataSourceType.GAUGE,
@@ -404,6 +538,10 @@ public final class NgrrdWriter implements AutoCloseable {
         storage.atomicReplace(storageKeyStr, encoded);
 
         long crc = readCrcFromEncoded(encoded);
+        // Idempotência: um mesmo bloco (mesma chave) pode ser reescrito a cada
+        // checkpoint (parcial) e novamente ao finalizar — substitui a entrada
+        // anterior para o manifesto não acumular duplicatas.
+        persistedBlocks.removeIf(b -> b.storageKey().equals(storageKeyStr));
         persistedBlocks.add(new PersistedBlock(
                 rra.name(),
                 derivedDsName,
@@ -427,6 +565,9 @@ public final class NgrrdWriter implements AutoCloseable {
         }
 
         record Flush(CountDownLatch latch) implements Command {
+        }
+
+        record Checkpoint(CountDownLatch latch) implements Command {
         }
 
         record Shutdown(CountDownLatch latch) implements Command {
