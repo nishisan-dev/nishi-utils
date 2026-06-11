@@ -34,12 +34,18 @@ import java.util.List;
  * bootstrap from a snapshot before resuming. {@code leaderHighWatermark} and {@code oldestSequence}
  * are advisory, for follower lag/floor metrics.
  *
+ * <p>{@code leaderUnavailable} is {@code true} when the addressed node is NOT the leader and cannot
+ * serve the stream (issue tems#9, D9). Without it the refusal was silent (a FINE log on the server)
+ * and a follower whose adopted leader refuses leadership could starve forever — the flag lets the
+ * requester surface the refusal to its coordinator and break the leaderless stalemate.
+ *
  * @param topic               the replication topic
  * @param fromSequence        the first sequence of the run (equals the request's fromSequence)
  * @param frames              contiguous, ascending {@code RelayEntryCodec} frames; may be empty
  * @param leaderHighWatermark the highest committed sequence the leader holds for the topic
  * @param oldestSequence      the lowest sequence still retained in the leader op-log ({@code -1} if empty)
  * @param needSnapshot        {@code true} if the follower must snapshot before it can stream
+ * @param leaderUnavailable   {@code true} when the addressed node is not the leader and cannot serve
  */
 public record RelayStreamBatchPayload(
                 String topic,
@@ -47,5 +53,12 @@ public record RelayStreamBatchPayload(
                 List<byte[]> frames,
                 long leaderHighWatermark,
                 long oldestSequence,
-                boolean needSnapshot) {
+                boolean needSnapshot,
+                boolean leaderUnavailable) {
+
+        /** Serving-leader response (no refusal) — the pre-D9 shape, kept for every existing call-site. */
+        public RelayStreamBatchPayload(String topic, long fromSequence, List<byte[]> frames,
+                        long leaderHighWatermark, long oldestSequence, boolean needSnapshot) {
+                this(topic, fromSequence, frames, leaderHighWatermark, oldestSequence, needSnapshot, false);
+        }
 }

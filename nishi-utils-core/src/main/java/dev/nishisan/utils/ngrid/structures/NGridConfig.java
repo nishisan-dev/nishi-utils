@@ -57,6 +57,10 @@ public final class NGridConfig {
     private final int relayApplyBatchSize;
     private final boolean leaderPauseOnJoin;
     private final Duration joinQuiesceMaxDuration;
+    private final boolean leaderPauseOnReclaim;
+    private final long reclaimQuiesceThreshold;
+    private final Duration reclaimQuiesceMaxDuration;
+    private final Duration reclaimQuiesceCooldown;
     private final Duration rttProbeInterval;
     private final Duration heartbeatInterval;
     private final Duration leaseTimeout;
@@ -119,6 +123,10 @@ public final class NGridConfig {
         this.relayApplyBatchSize = builder.relayApplyBatchSize;
         this.leaderPauseOnJoin = builder.leaderPauseOnJoin;
         this.joinQuiesceMaxDuration = builder.joinQuiesceMaxDuration;
+        this.leaderPauseOnReclaim = builder.leaderPauseOnReclaim;
+        this.reclaimQuiesceThreshold = builder.reclaimQuiesceThreshold;
+        this.reclaimQuiesceMaxDuration = builder.reclaimQuiesceMaxDuration;
+        this.reclaimQuiesceCooldown = builder.reclaimQuiesceCooldown;
         this.rttProbeInterval = builder.rttProbeInterval;
         this.heartbeatInterval = builder.heartbeatInterval;
         this.leaseTimeout = builder.leaseTimeout;
@@ -346,6 +354,46 @@ public final class NGridConfig {
      */
     public Duration joinQuiesceMaxDuration() {
         return joinQuiesceMaxDuration;
+    }
+
+    /**
+     * Whether the leader pauses production when a HIGHER-affinity candidate approaches its watermark,
+     * so the affinity handoff completes coordinately under continuous production (issue tems#9,
+     * D10b). Defaults to {@code false} (opt-in). Recommended for HA pairs with distinct priorities.
+     *
+     * @return {@code true} when leader-pause-on-reclaim is enabled
+     */
+    public boolean leaderPauseOnReclaim() {
+        return leaderPauseOnReclaim;
+    }
+
+    /**
+     * How close (in sequences) the reclaim candidate must be for the reclaim-quiesce to engage
+     * (issue tems#9, D10b). Defaults to 1024.
+     *
+     * @return the reclaim-quiesce approach threshold
+     */
+    public long reclaimQuiesceThreshold() {
+        return reclaimQuiesceThreshold;
+    }
+
+    /**
+     * Hard cap on a reclaim-quiesce pause (issue tems#9, D10b). Defaults to 5s.
+     *
+     * @return the maximum reclaim-quiesce duration
+     */
+    public Duration reclaimQuiesceMaxDuration() {
+        return reclaimQuiesceMaxDuration;
+    }
+
+    /**
+     * Cooldown before re-engaging the reclaim-quiesce after an aborted attempt (issue tems#9, D10b).
+     * Defaults to 60s.
+     *
+     * @return the reclaim-quiesce cooldown
+     */
+    public Duration reclaimQuiesceCooldown() {
+        return reclaimQuiesceCooldown;
     }
 
     /**
@@ -596,6 +644,10 @@ public final class NGridConfig {
         private int relayApplyBatchSize = 256;
         private boolean leaderPauseOnJoin = false;
         private Duration joinQuiesceMaxDuration = Duration.ofSeconds(10);
+        private boolean leaderPauseOnReclaim = false;
+        private long reclaimQuiesceThreshold = 1024L;
+        private Duration reclaimQuiesceMaxDuration = Duration.ofSeconds(5);
+        private Duration reclaimQuiesceCooldown = Duration.ofSeconds(60);
         private Duration rttProbeInterval = Duration.ofSeconds(10);
         private Duration heartbeatInterval = Duration.ofSeconds(3);
         private Duration leaseTimeout;
@@ -972,6 +1024,62 @@ public final class NGridConfig {
                 throw new IllegalArgumentException("joinQuiesceMaxDuration must be positive");
             }
             this.joinQuiesceMaxDuration = duration;
+            return this;
+        }
+
+        /**
+         * Enables the quiesce-assisted reclaim (issue tems#9, D10b). Defaults to {@code false}.
+         *
+         * @param leaderPauseOnReclaim {@code true} to pause production for an approaching
+         *                             higher-affinity reclaim candidate
+         * @return this builder
+         */
+        public Builder leaderPauseOnReclaim(boolean leaderPauseOnReclaim) {
+            this.leaderPauseOnReclaim = leaderPauseOnReclaim;
+            return this;
+        }
+
+        /**
+         * Sets the approach threshold for the reclaim-quiesce (issue tems#9, D10b).
+         *
+         * @param threshold the approach threshold in sequences (must be >= 0)
+         * @return this builder
+         */
+        public Builder reclaimQuiesceThreshold(long threshold) {
+            if (threshold < 0) {
+                throw new IllegalArgumentException("reclaimQuiesceThreshold must be >= 0");
+            }
+            this.reclaimQuiesceThreshold = threshold;
+            return this;
+        }
+
+        /**
+         * Sets the hard cap on a reclaim-quiesce pause (issue tems#9, D10b).
+         *
+         * @param duration the maximum reclaim-quiesce duration (must be positive)
+         * @return this builder
+         */
+        public Builder reclaimQuiesceMaxDuration(Duration duration) {
+            Objects.requireNonNull(duration, "reclaimQuiesceMaxDuration");
+            if (duration.isNegative() || duration.isZero()) {
+                throw new IllegalArgumentException("reclaimQuiesceMaxDuration must be positive");
+            }
+            this.reclaimQuiesceMaxDuration = duration;
+            return this;
+        }
+
+        /**
+         * Sets the cooldown before re-engaging the reclaim-quiesce (issue tems#9, D10b).
+         *
+         * @param cooldown the cooldown (must not be negative)
+         * @return this builder
+         */
+        public Builder reclaimQuiesceCooldown(Duration cooldown) {
+            Objects.requireNonNull(cooldown, "reclaimQuiesceCooldown");
+            if (cooldown.isNegative()) {
+                throw new IllegalArgumentException("reclaimQuiesceCooldown must not be negative");
+            }
+            this.reclaimQuiesceCooldown = cooldown;
             return this;
         }
 

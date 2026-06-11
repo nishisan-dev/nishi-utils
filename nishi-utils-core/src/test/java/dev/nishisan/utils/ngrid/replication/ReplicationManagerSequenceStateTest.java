@@ -122,6 +122,57 @@ class ReplicationManagerSequenceStateTest {
         }
     }
 
+    /**
+     * D9 (issue tems#9): o frontier de um EX-LÍDER deve re-ancorar no contador PRODUZIDO do tópico no
+     * seed do boot. Um líder nunca avança o próprio frontier de follower — após um restart limpo o
+     * frontier fica stale no ponto do último apply-como-follower enquanto "_topic:{t}" guarda tudo que
+     * o nó produziu. Sem a re-âncora, o cursor de fetch nasce no frontier stale e o nó RE-PUXA e
+     * RE-APLICA a própria cauda produzida ao reingressar (apply duplicado + contador inflado →
+     * reclaim prematuro → applied congelado → abdicação aos ~20 heartbeats → impasse leaderless).
+     */
+    @Test
+    void seedReanchorsExLeaderFrontierOnProducedCounter() throws Exception {
+        // Ex-líder: aplicou 100 como follower no passado (frontier stale = 101), depois liderou e
+        // produziu até 300 (_topic e _global em 300). O frontier verdadeiro do nó é 301.
+        Map<String, Long> persisted = new HashMap<>();
+        persisted.put(TOPIC, 101L);
+        persisted.put("_global", 300L);
+        persisted.put("_topic:" + TOPIC, 300L);
+        try (java.io.ObjectOutputStream oos = new java.io.ObjectOutputStream(
+                Files.newOutputStream(tempDir.resolve("sequence-state.dat")))) {
+            oos.writeObject(persisted);
+        }
+
+        NodeInfo local = new NodeInfo(NodeId.of("aaa-node"), "127.0.0.1", 0);
+        NodeInfo peer = new NodeInfo(NodeId.of("zzz-peer"), "127.0.0.1", 0);
+        StubTransport transport = new StubTransport(local, List.of(peer));
+        ClusterCoordinator coordinator = new ClusterCoordinator(transport,
+                ClusterCoordinatorConfig.of(Duration.ofMillis(150), Duration.ofSeconds(10), 2), scheduler);
+        coordinator.start();
+
+        ReplicationManager manager = new ReplicationManager(transport, coordinator,
+                ReplicationConfig.builder(1)
+                        .dataDirectory(tempDir)
+                        .followerIngestMode(FollowerIngestMode.RELAY_STREAM)
+                        .build());
+        manager.registerHandler(TOPIC, (operationId, payload) -> {
+        });
+        manager.start();
+        try {
+            ReplicationManager.TopicReplicationStatus status =
+                    manager.getTopicReplicationStatuses().get(TOPIC);
+            assertEquals(301L, status.nextExpectedSequence(),
+                    "o frontier do ex-líder deve re-ancorar no contador produzido (+1): o nó é a fonte "
+                            + "da verdade do que produziu — frontier stale faria o fetch re-puxar e "
+                            + "RE-APLICAR a própria cauda (issue tems#9, D9)");
+            assertEquals(300L, manager.getLastAppliedSequence(),
+                    "o applied semeado deve refletir o estado real (produzido), numa escala única");
+        } finally {
+            manager.close();
+            coordinator.close();
+        }
+    }
+
     /** Transporte mínimo para montar ClusterCoordinator + ReplicationManager reais (assembly manual). */
     private static final class StubTransport implements Transport {
         private final NodeInfo local;

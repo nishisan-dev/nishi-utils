@@ -96,6 +96,31 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
 
     /** Per-peer last-known replication high-watermark, learned from heartbeats. -1 until first heard. */
     private final Map<NodeId, Long> peerHighWatermark = new ConcurrentHashMap<>();
+    // Last time each peer REFUSED to serve the stream as a non-leader (issue tems#9, D9): fed by the
+    // replication layer when a RELAY_STREAM_FETCH addressed to our adopted leader comes back with
+    // leaderUnavailable. A recent refusal from the affinity-elected node is the stalemate signal that
+    // lets the ahead node take over instead of deferring forever.
+    private final Map<NodeId, Long> leaderRefusalAtMs = new ConcurrentHashMap<>();
+    // Rate-limit for the leader-behind-own-follower warning (issue tems#9, D9).
+    private volatile long lastLeaderBehindWarnMs = 0L;
+
+    // ── Dual-leader detection + deterministic resolution (issue tems#9, D10c) ──────────────────
+    // Consecutive heartbeats in which a peer asserted leadership WHILE we are leader, per peer.
+    // Resolution fires only after DUAL_LEADER_OBSERVATIONS_TO_RESOLVE consecutive observations: the
+    // overlap window of a legitimate handoff (both sides answering isLeader for a sub-heartbeat
+    // instant) never reaches the debounce, while a genuine stable dual-leader does in ~3 heartbeat
+    // intervals. Any heartbeat from the peer WITHOUT the flag zeroes its count.
+    private final Map<NodeId, Integer> dualLeaderObservations = new ConcurrentHashMap<>();
+    private static final int DUAL_LEADER_OBSERVATIONS_TO_RESOLVE = 3;
+    // True while this (leader) node has observed a higher-affinity rival leader and will yield once
+    // the debounce completes: suppresses the epoch re-stamp ("above observed") so the losing side
+    // stops feeding the epoch ladder from the very first observation.
+    private volatile boolean yieldingToDualLeader = false;
+    // Hook wired by the ReplicationManager, invoked BEFORE the demotion when this node yields a
+    // dual-leader: arms the bootstrap resync that discards the dual-window tail (divergent lineage).
+    private volatile Runnable dualLeaderYieldHook;
+    // Rate-limit for the winner-side dual-leader warning.
+    private volatile long lastDualLeaderRetainWarnMs = 0L;
 
     /**
      * Supplies the local node's applied replication frontier (how much state it has). Wired by the
@@ -342,7 +367,11 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             if (observed <= prev) {
                 return; // not newer than ours — ignore (also breaks the follower-echo escalation)
             }
-            next = isLeader() ? observed + 1 : observed;
+            // A leader re-stamps above the observed term — EXCEPT while it is the losing side of a
+            // dual-leader observation (issue tems#9, D10c): re-stamping would feed the infinite
+            // epoch ladder (both leaders bumping above each other every heartbeat). The loser
+            // adopts the term and yields; only the winner keeps re-stamping.
+            next = isLeader() && !yieldingToDualLeader ? observed + 1 : observed;
         } while (!leaderEpoch.compareAndSet(prev, next));
         persistEpoch(next);
         long converged = next;
@@ -649,7 +678,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 return;
             }
             HeartbeatPayload payload = HeartbeatPayload.now(leaderHighWatermarkSupplier.getAsLong(),
-                    leaderEpoch.get());
+                    leaderEpoch.get(), isLeader());
             ClusterMessage heartbeat = ClusterMessage.lightweight(MessageType.HEARTBEAT,
                     "hb",
                     transport.local().nodeId(),
@@ -827,7 +856,24 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             // up — then the latch flips and the next recompute promotes us. Lead-while-alone / AP is
             // preserved: with no active peer ahead, maxActivePeerHighWatermark() is -1 and the gate is a
             // no-op, so the node still leads (after the boot-discovery window, handled above).
-            boolean behindAheadPeer = weWouldLead && !isCaughtUpToCluster();
+            //
+            // Gate A NEVER evicts the CURRENT leader (issue tems#9, D9): it gates the RECLAIM of a
+            // returning node; the incumbent's side is gate B. In stream mode the serving leader IS the
+            // source of the stream — a leader observing a follower's counter above its own is, by
+            // construction, a counter-scale desync (e.g. an inflated restart seed), never a reason to
+            // abdicate into a leaderless mutual-deferral stalemate.
+            boolean leaderBehindOwnFollower = weWouldLead && isLeaderInternal(localId)
+                    && !isCaughtUpToCluster();
+            if (leaderBehindOwnFollower) {
+                long now = Instant.now().toEpochMilli();
+                if (now - lastLeaderBehindWarnMs > 60_000L) {
+                    lastLeaderBehindWarnMs = now;
+                    LOGGER.warning(() -> "Current leader observes a peer watermark above its own applied ("
+                            + safeLocalApplied() + " < " + maxActivePeerHighWatermark()
+                            + "); retaining leadership (counter-scale desync symptom — see issue tems#9/D9)");
+                }
+            }
+            boolean behindAheadPeer = weWouldLead && !isLeaderInternal(localId) && !isCaughtUpToCluster();
             // Watermark-unknown deferral: if a peer is already ACTIVE, never hand leadership to us before
             // it reports a watermark; that peer may be the incumbent ahead of us. The boot window only
             // bounds waiting for configured peers that have not appeared at all, preserving AP when alone.
@@ -866,8 +912,152 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 return;
             }
 
+            // ── Leaderless-stalemate escape (issue tems#9, D9) ─────────────────────────────────────────
+            // We are about to defer to the affinity-elected peer — but if that peer has RECENTLY refused
+            // to serve the stream as a non-leader (it is itself deferring, e.g. behind us via gate A) and
+            // we are NOT behind it, deferring would close the mutual-deferral loop: it cannot catch up
+            // (only a leader serves the stream) and we never lead (affinity). The ahead node takes over;
+            // the behind one converges as its follower and the normal affinity handoff resumes later.
+            if (electedId != null && !electedId.equals(localId)
+                    && replicationProgressGateEnabled
+                    && safeLocalLeadershipEligible()) {
+                Long refusedAt = leaderRefusalAtMs.get(electedId);
+                boolean recentRefusal = refusedAt != null
+                        && Instant.now().toEpochMilli() - refusedAt <= config.heartbeatTimeout().toMillis();
+                Long electedWatermark = peerHighWatermark.get(electedId);
+                long localApplied = safeLocalApplied();
+                // STRICTLY ahead beyond the tolerance: with equal watermarks (every fresh boot is 0/0)
+                // the affinity election must win — a transient refusal during an election dance must
+                // never invert affinity. The genuine stalemate signature is local state the elected
+                // node does not have.
+                if (recentRefusal && electedWatermark != null && localApplied >= 0
+                        && localApplied > electedWatermark + syncReclaimLagThreshold) {
+                    LOGGER.warning(() -> "Affinity-elected " + electedId + " refuses leadership and is not"
+                            + " ahead (peer=" + electedWatermark + ", local=" + localApplied
+                            + "); taking leadership to break the leaderless stalemate (issue tems#9, D9)");
+                    updateLeader(localId);
+                    return;
+                }
+            }
+
             updateLeader(electedId);
         }
+    }
+
+    /**
+     * Records that {@code node} refused to serve the replication stream because it is not the leader
+     * (issue tems#9, D9). Fed by the replication layer when a fetch addressed to the locally adopted
+     * leader answers {@code leaderUnavailable}. Triggers a leadership re-evaluation so the stalemate
+     * escape in {@link #recomputeLeader()} can run while the refusal is fresh.
+     *
+     * @param node the peer that refused to serve as leader
+     */
+    public void noteLeaderRefusal(NodeId node) {
+        leaderRefusalAtMs.put(node, Instant.now().toEpochMilli());
+        reevaluateLeadership();
+    }
+
+    /**
+     * Surfaces a follower's just-reported applied watermark into the peer-watermark map (merge-max)
+     * and re-evaluates leadership immediately (issue tems#9, D10b). During a reclaim-quiesce the
+     * candidate's heartbeat (up to one interval stale) would otherwise delay the step-down gate's
+     * release after the candidate has already paired up against the frozen watermark.
+     *
+     * @param node      the reporting follower
+     * @param watermark its applied watermark (ignored when negative)
+     */
+    public void noteFollowerWatermark(NodeId node, long watermark) {
+        if (node == null || watermark < 0 || node.equals(transport.local().nodeId())) {
+            return;
+        }
+        peerHighWatermark.merge(node, watermark, Math::max);
+        reevaluateLeadership();
+    }
+
+    /**
+     * Wires the hook invoked when this node YIELDS a dual-leader resolution (issue tems#9, D10c) —
+     * BEFORE the demotion: the replication layer arms the bootstrap resync that replaces the local
+     * dual-window lineage (the tail this node produced while both leaders ran) with the winner's.
+     *
+     * @param hook the yield callback (runs on the heartbeat-processing thread)
+     */
+    public void setDualLeaderYieldHook(Runnable hook) {
+        this.dualLeaderYieldHook = hook;
+    }
+
+    /**
+     * Tracks a peer's leadership assertion against the local one (issue tems#9, D10c). Both sides
+     * run the SAME total-order comparison (priority, then NodeId — the election order), so exactly
+     * one of the two yields: the lower-affinity node adopts the rival after
+     * {@link #DUAL_LEADER_OBSERVATIONS_TO_RESOLVE} consecutive assertions and resyncs via the yield
+     * hook; the higher-affinity node retains and only logs. A rival with unknown {@link NodeInfo}
+     * (placeholder) is never resolved against — affinity must not be guessed.
+     */
+    private void observeLeaderAssertion(NodeId rival, boolean rivalAssertsLeadership) {
+        if (!rivalAssertsLeadership || !isLeader()) {
+            // Any heartbeat without the assertion breaks the CONSECUTIVE requirement.
+            dualLeaderObservations.remove(rival);
+            if (dualLeaderObservations.isEmpty()) {
+                yieldingToDualLeader = false;
+            }
+            return;
+        }
+        ClusterMember member = members.get(rival);
+        NodeInfo rivalInfo = member != null ? member.info() : null;
+        if (rivalInfo == null || rivalInfo.port() <= 0) {
+            rivalInfo = findPeerInfo(rival).orElse(null);
+        }
+        if (rivalInfo == null || rivalInfo.port() <= 0) {
+            return; // unknown affinity — wait for the handshake before deciding anything
+        }
+        if (!outranks(rivalInfo, transport.local())) {
+            // WE win the deterministic order: retain leadership and expect the rival to yield.
+            long now = Instant.now().toEpochMilli();
+            if (now - lastDualLeaderRetainWarnMs > 10_000L) {
+                lastDualLeaderRetainWarnMs = now;
+                LOGGER.warning(() -> "Dual-leader detected with " + rival
+                        + "; retaining (higher affinity) and expecting the peer to yield"
+                        + " (issue tems#9, D10c)");
+            }
+            return;
+        }
+        yieldingToDualLeader = true; // stop feeding the epoch ladder from the first observation
+        int observations = dualLeaderObservations.merge(rival, 1, Integer::sum);
+        if (observations >= DUAL_LEADER_OBSERVATIONS_TO_RESOLVE) {
+            resolveDualLeaderYield(rival);
+        }
+    }
+
+    /** The losing side of a confirmed dual-leader steps down to the rival and arms the resync. */
+    private void resolveDualLeaderYield(NodeId rival) {
+        synchronized (leaderComputationLock) {
+            dualLeaderObservations.clear();
+            if (!isLeader()) {
+                yieldingToDualLeader = false;
+                return; // already demoted by another path
+            }
+            LOGGER.warning(() -> "Dual-leader resolved: yielding leadership to higher-affinity "
+                    + rival + " and resyncing from its lineage — the local dual-window tail is"
+                    + " discarded (issue tems#9, D10c)");
+            Runnable hook = dualLeaderYieldHook;
+            if (hook != null) {
+                try {
+                    hook.run();
+                } catch (RuntimeException e) {
+                    LOGGER.log(java.util.logging.Level.SEVERE, "Dual-leader yield hook failed", e);
+                }
+            }
+            updateLeader(rival);
+            yieldingToDualLeader = false;
+        }
+    }
+
+    /** Election-order affinity: higher priority outranks; NodeId breaks ties (strict total order). */
+    private static boolean outranks(NodeInfo candidate, NodeInfo reference) {
+        if (candidate.priority() != reference.priority()) {
+            return candidate.priority() > reference.priority();
+        }
+        return candidate.nodeId().compareTo(reference.nodeId()) > 0;
     }
 
     /** True if {@code nodeId} is the current leader (internal, lock-held variant of {@link #isLeader()}). */
@@ -1084,6 +1274,12 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 // arm the latch fresh for the NEXT session (it is only meaningful while catching up).
                 reclaimCaughtUpLatch = false;
             }
+            if (wasLeader && !isNowLeader) {
+                // No longer a leader: dual-leader observations are only meaningful between two
+                // asserting leaders (issue tems#9, D10c).
+                dualLeaderObservations.clear();
+                yieldingToDualLeader = false;
+            }
 
             leadershipListeners.forEach(listener -> listener.onLeaderChanged(newLeaderId));
 
@@ -1156,6 +1352,11 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             // waiting on a peer that is genuinely gone (lead-while-alone): with no active peer ahead, the
             // reclaim gate is a no-op and the node leads.
             peerHighWatermark.remove(peerId);
+            // A gone rival can no longer sustain a dual-leader (issue tems#9, D10c).
+            dualLeaderObservations.remove(peerId);
+            if (dualLeaderObservations.isEmpty()) {
+                yieldingToDualLeader = false;
+            }
             recomputeLeader();
             notifyMembershipListeners();
         }
@@ -1171,6 +1372,14 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             // This prevents an ex-leader that stepped down from being
             // re-accepted as a valid leader after reconnecting.
             long heartbeatEpoch = payload.leaderEpoch();
+            // Dual-leader detection (issue tems#9, D10c) BEFORE epoch convergence: when both sides
+            // assert leadership, the lower-affinity one must ADOPT the rival's term instead of
+            // re-stamping above it, and yield after the debounce — running first keeps the loser
+            // from feeding the epoch ladder and lands the post-yield observeEpoch on the follower
+            // (adopt) path.
+            if (!source.equals(transport.local().nodeId())) {
+                observeLeaderAssertion(source, payload.leader());
+            }
             // Converge the cluster term from every peer heartbeat BEFORE fencing, so a leader
             // whose persisted epoch regressed re-learns the highest term any node has seen and
             // re-stamps above it (re-establishing itself as the legitimate, accepted leader).

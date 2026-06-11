@@ -147,11 +147,28 @@ public class ReplicationManager
     // production while a not-caught-up follower joins, until it catches up / disconnects / times out.
     private final java.util.concurrent.atomic.AtomicBoolean joinQuiescing = new java.util.concurrent.atomic.AtomicBoolean(
             false);
-    private final Map<NodeId, Long> followerAppliedByNode = new ConcurrentHashMap<>();
+    private final Map<NodeId, FollowerProgress> followerAppliedByNode = new ConcurrentHashMap<>();
     private final Set<NodeId> quiescingFor = ConcurrentHashMap.newKeySet();
     private volatile long joinQuiesceStartedMs;
     // Active members observed on the previous membership change, to detect newly-joined nodes.
     private final Set<NodeId> knownActiveMembers = ConcurrentHashMap.newKeySet();
+    // Leader-side reclaim-quiesce gate (issue tems#9, D10b, opt-in via config.leaderPauseOnReclaim):
+    // when a HIGHER-affinity candidate approaches the local watermark (within
+    // reclaimQuiesceThreshold), the leader pauses production so the candidate can pair up EXACTLY
+    // and the affinity handoff completes coordinately. Without it, under continuous production the
+    // in-flight delta never zeroes: the strict step-down gate (B) retains forever while the
+    // candidate's caught-up latch (gate A) arms against a stale heartbeat watermark — the
+    // dual-leader livelock. Separate from joinQuiescing: distinct trigger (proximity, not join),
+    // single candidate, exact pairing, own timeout and cooldown.
+    private final java.util.concurrent.atomic.AtomicBoolean reclaimQuiescing = new java.util.concurrent.atomic.AtomicBoolean(
+            false);
+    private volatile NodeId reclaimQuiesceFor;
+    private volatile long reclaimQuiesceStartedMs;
+    private volatile long reclaimQuiesceCooldownUntilMs;
+    // True from the dual-leader yield hook (issue tems#9, D10c) until the bootstrap resync installs:
+    // keeps the promoted-leader auto-disarm in drainRelayOnce from undoing the pending bootstrap in
+    // the window where this (yielding) node still answers isLeader().
+    private volatile boolean dualLeaderYielding = false;
 
     // User-level broadcast messaging (broadcastMessage API): best-effort fire-and-forget messages
     // between nodes for coordination. Listeners are invoked on a worker thread (keep them non-blocking).
@@ -176,6 +193,9 @@ public class ReplicationManager
     // the non-idempotent queue OFFER. relayPendingBootstrap holds those topics until the apply loop
     // requests the snapshot (deferred so a follower syncs from the leader, never from itself).
     private volatile boolean relayUncleanRestart = false;
+    // Unclean restart with prior relay data on disk (issue tems#9, D8): engages the bootstrap gate
+    // from the very first heartbeat, before any handler registers and arms the per-topic pending.
+    private volatile boolean uncleanWithPriorRelayData = false;
     private final Set<String> relayPendingBootstrap = ConcurrentHashMap.newKeySet();
 
     // RELAY_STREAM follower IO: a per-topic fetch loop pulls the leader op-log from a durable cursor
@@ -227,6 +247,8 @@ public class ReplicationManager
     // durable op-log — re-fetching it is orders of magnitude cheaper than a snapshot bootstrap.
     private final java.util.concurrent.atomic.AtomicLong relayRefetchCount = new java.util.concurrent.atomic.AtomicLong(
             0);
+    // Rate-limit for the not-the-leader fetch refusal warning (issue tems#9, D9).
+    private volatile long lastFetchRefusalLogMs = 0L;
     // Total snapshot/sync requests this node has initiated (chunk 0). In RELAY_STREAM this stays flat
     // in regime — lag is absorbed by the stream/relay; a snapshot is only the cold-bootstrap path.
     private final java.util.concurrent.atomic.AtomicLong syncRequestCount = new java.util.concurrent.atomic.AtomicLong(
@@ -328,6 +350,9 @@ public class ReplicationManager
         // higher-affinity candidate has caught up). The threshold reuses joinSyncLagThreshold (#129).
         coordinator.setReplicationProgressGate(this::localAppliedForReclaim, config.joinSyncLagThreshold());
         coordinator.setLocalLeadershipEligibility(this::isLocallyEligibleForLeadership);
+        // Dual-leader resolution (issue tems#9, D10c): when this node is the losing (lower-affinity)
+        // side, discard the dual-window lineage and resync from the winner via the D8 machinery.
+        coordinator.setDualLeaderYieldHook(this::onDualLeaderYield);
         // Nudge the coordinator to recompute leadership as our applied frontier advances, so a deferred
         // reclaim is promoted promptly once we catch up (membership/eviction ticks would also trigger it).
         timeoutScheduler.scheduleAtFixedRate(this::nudgeLeadershipOnCatchUp, 200, 200, TimeUnit.MILLISECONDS);
@@ -364,10 +389,18 @@ public class ReplicationManager
             // Leader-pause-on-join (#129): detect joins (membership), have followers report progress, and
             // periodically re-evaluate the quiesce gate (release on catch-up / disconnect / timeout).
             coordinator.addMembershipListener(this);
+            timeoutScheduler.scheduleAtFixedRate(this::checkJoinQuiesce, 200, 200, TimeUnit.MILLISECONDS);
+        }
+        if (config.leaderPauseOnJoin() || config.leaderPauseOnReclaim()) {
+            // Both quiesce gates are driven by FOLLOWER_PROGRESS reports.
             long progressMs = Math.max(50L, config.followerProgressInterval().toMillis());
             timeoutScheduler.scheduleAtFixedRate(this::sendFollowerProgress, progressMs, progressMs,
                     TimeUnit.MILLISECONDS);
-            timeoutScheduler.scheduleAtFixedRate(this::checkJoinQuiesce, 200, 200, TimeUnit.MILLISECONDS);
+        }
+        if (config.leaderPauseOnReclaim()) {
+            // Quiesce-assisted reclaim (issue tems#9, D10b): engage on candidate approach, bound the
+            // pause, abort (with cooldown) if the candidate never pairs up or leaves.
+            timeoutScheduler.scheduleAtFixedRate(this::checkReclaimQuiesce, 200, 200, TimeUnit.MILLISECONDS);
         }
         Duration timeout = config.operationTimeout();
         long periodMs = Math.max(100L, timeout.toMillis() / 2);
@@ -446,6 +479,12 @@ public class ReplicationManager
     private void detectUncleanRestartAndMarkBootstrap() {
         Path relayDir = config.dataDirectory().resolve("relay");
         relayUncleanRestart = RelayStore.isUncleanRestart(relayDir);
+        // Issue tems#9, D8: the per-topic pending bootstrap only arms in registerHandler (the relay
+        // dir names are hashed, so topics cannot be enumerated from disk). In wirings where handlers
+        // register AFTER start(), the early heartbeats would otherwise advertise the seeded frontier
+        // of a possibly dead lineage as a real watermark. This flag keeps the node un-advertisable
+        // and ineligible from the FIRST heartbeat until the first handler arms (or no data exists).
+        uncleanWithPriorRelayData = relayUncleanRestart && RelayStore.hasAnyTopicData(relayDir);
         RelayStore.consumeCleanMarker(relayDir);
         if (relayUncleanRestart) {
             LOGGER.warning("Unclean relay restart detected; topics with prior data will bootstrap from a "
@@ -473,7 +512,7 @@ public class ReplicationManager
     }
 
     private long advertisedLeaderHighWatermark() {
-        if (hasPendingRelayBootstrap()) {
+        if (bootstrapGateEngaged()) {
             return -1L;
         }
         return coordinator.isLeader()
@@ -482,15 +521,27 @@ public class ReplicationManager
     }
 
     private long localAppliedForReclaim() {
-        return hasPendingRelayBootstrap() ? Long.MIN_VALUE : getLastAppliedSequence();
+        return bootstrapGateEngaged() ? Long.MIN_VALUE : getLastAppliedSequence();
     }
 
     private boolean isLocallyEligibleForLeadership() {
-        return !hasPendingRelayBootstrap();
+        return !bootstrapGateEngaged();
     }
 
     private boolean hasPendingRelayBootstrap() {
         return isStreamMode() && !relayPendingBootstrap.isEmpty();
+    }
+
+    /**
+     * True while the node must not advertise its frontier nor accept leadership (issue tems#9, D8):
+     * a per-topic bootstrap is pending (unclean restart with prior data, cleared only when the
+     * snapshot INSTALLS), or the unclean restart was detected but no handler has registered yet to
+     * arm the per-topic pending (the startup window where the seeded frontier of a possibly dead
+     * lineage would otherwise leak into the first heartbeats as a real watermark).
+     */
+    private boolean bootstrapGateEngaged() {
+        return hasPendingRelayBootstrap()
+                || (isStreamMode() && uncleanWithPriorRelayData && handlers.isEmpty());
     }
 
     private void markPendingBootstrapForRegisteredHandlers() {
@@ -523,6 +574,29 @@ public class ReplicationManager
     }
 
     /**
+     * The watermark this node currently advertises in heartbeats: {@code -1} while the bootstrap
+     * gate is engaged (unclean restart with un-bootstrapped prior data — issue tems#9, D8), else
+     * the applied frontier (leaders advertise {@code max(produced, applied)}). Observability mirror
+     * of the heartbeat supplier — what peers' sync-before-reclaim gates actually see.
+     *
+     * @return the advertised high watermark, or {@code -1} while not advertisable
+     */
+    public long getAdvertisedHighWatermark() {
+        return advertisedLeaderHighWatermark();
+    }
+
+    /**
+     * Whether this node currently accepts leadership: {@code false} while the bootstrap gate is
+     * engaged (a pending relay bootstrap, or an unclean restart with prior data before any handler
+     * registered — issue tems#9, D8). Observability mirror of the coordinator eligibility hook.
+     *
+     * @return {@code true} when the node may lead
+     */
+    public boolean isLeadershipEligible() {
+        return isLocallyEligibleForLeadership();
+    }
+
+    /**
      * Seeds the applied-progress metric from the durable per-topic apply frontiers, so a restart
      * resumes the metric instead of reporting 0 (the counter is per-session). The total applied op
      * count equals the sum of {@code (nextExpected - 1)} across topics.
@@ -540,6 +614,32 @@ public class ReplicationManager
         // defers to it by affinity and the cluster wedges leaderless. Seeding from max(frontierSum,
         // globalSequence) restores the true applied frontier for both roles (they coincide for a single
         // topic), so the election/watermark gate picks the right leader. Synthetic keys stay filtered (D1).
+        //
+        // D9 (issue tems#9): the FRONTIER itself must be re-anchored on the per-topic PRODUCED counter
+        // first. An ex-leader's frontier is stale at the point it last applied as a follower (a leader
+        // never advances it), while "_topic:{t}" holds everything it produced — and the node is the
+        // source of truth for its own production. Leaving the stale frontier in place made a clean
+        // rejoin re-pull (and RE-APPLY!) the node's own produced tail from the new leader's binlog,
+        // double-counting it into the applied metric: the inflated counter armed a PREMATURE reclaim,
+        // then froze (post-reclaim production restarts below it, so max() never advances), the follower's
+        // honest counter crossed it ~20 heartbeats later, and gate A evicted the leader into a leaderless
+        // mutual-deferral stalemate.
+        acquireSequenceLock();
+        try {
+            sequenceByTopic.forEach((topic, seq) -> {
+                long produced = seq.get();
+                if (produced <= 0L) {
+                    return;
+                }
+                Long frontier = nextExpectedSequenceByTopic.get(topic);
+                if (frontier == null || frontier < produced + 1L) {
+                    nextExpectedSequenceByTopic.put(topic, produced + 1L);
+                    sequenceStateDirty = true;
+                }
+            });
+        } finally {
+            sequenceBufferLock.unlock();
+        }
         long frontierSum = 0L;
         for (Map.Entry<String, Long> e : nextExpectedSequenceByTopic.entrySet()) {
             if (isSyntheticSequenceStateKey(e.getKey())) {
@@ -696,6 +796,13 @@ public class ReplicationManager
             // on catch-up/disconnect/timeout. Mirror of the failover drain-gate, on the join path.
             throw new LeaderSyncingException(
                     "Leader is quiescing for a joining follower (catch-up in progress), write rejected");
+        }
+        if (config.leaderPauseOnReclaim() && isReclaimQuiescing()) {
+            // Quiesce-assisted reclaim (issue tems#9, D10b): a higher-affinity candidate is within the
+            // approach threshold; pause production so it pairs up EXACTLY and the handoff completes —
+            // under a firehose the in-flight delta would otherwise never zero. Bounded + cooldown.
+            throw new LeaderSyncingException(
+                    "Leader is quiescing for an affinity handoff (candidate pairing up), write rejected");
         }
         if (!coordinator.hasValidLease()) {
             throw new LeaseExpiredException("Leader lease expired, write rejected to prevent data divergence");
@@ -1026,6 +1133,17 @@ public class ReplicationManager
         ReplicationHandler handler = handlers.get(payload.topic());
         if (handler == null)
             return;
+        if (coordinator.isLeader()) {
+            // Role guard (issue tems#9, D8): an ACTIVE LEADER never installs a peer snapshot. A late
+            // chunk from a sync requested while this node was still a follower (the server may answer
+            // around a leadership flip) used to resetState() the live leader mid-write — and the
+            // chunk chain then died on a self-addressed follow-up request. Drop it and release the
+            // sync guard; the leader's own op-log is the source of truth.
+            LOGGER.warning(() -> "Ignoring snapshot chunk for " + payload.topic()
+                    + " received while LEADER (late response from a pre-promotion sync)");
+            syncingTopics.remove(payload.topic());
+            return;
+        }
 
         executor.submit(() -> {
             try {
@@ -1042,7 +1160,12 @@ public class ReplicationManager
                     sequenceBufferLock.unlock();
                 }
                 long currentApplied = Math.max(0L, currentNext - 1L);
-                if (payload.sequence() < currentApplied) {
+                // The stale-sync guard NEVER applies while a bootstrap is pending for the topic (issue
+                // tems#9, D8/D9): the local lineage is untrusted by definition (unclean restart) and
+                // sequence numbers across divergent lineages are incomparable — a returning ex-leader's
+                // re-anchored frontier is routinely ABOVE the incumbent's honest watermark, yet the
+                // incumbent's snapshot is exactly what must replace the local state.
+                if (!relayPendingBootstrap.contains(payload.topic()) && payload.sequence() < currentApplied) {
                     LOGGER.warning(() -> "Ignoring stale sync for " + payload.topic()
                             + " (sequence=" + payload.sequence() + ", current=" + currentApplied + ")");
                     syncingTopics.remove(payload.topic());
@@ -1086,8 +1209,20 @@ public class ReplicationManager
     }
 
     private void completeSnapshotCutover(String topic, long watermark) {
-        appliedSequence.updateAndGet(current -> Math.max(current, watermark));
-        lastAppliedSequence = appliedSequence.get();
+        // The installed snapshot REPLACES the local state (resetState + install), so every counter
+        // re-anchors on the serving leader's lineage at the watermark — SET, not max (issue tems#9,
+        // D8). The old max() kept the seeded frontier of a dead lineage (an unclean ex-leader whose
+        // pre-crash applied was numerically above the incumbent's watermark), so the node kept
+        // advertising — and later producing from — a counter the cluster history never contained.
+        // Re-anchoring globalSequence/sequenceByTopic also makes a future promotion produce
+        // contiguously with the lineage it actually holds (fixes the understated-watermark case the
+        // supplier comment in start() documents). The active-leader path never gets here (role guard
+        // in handleSyncResponse).
+        appliedSequence.set(watermark);
+        lastAppliedSequence = watermark;
+        globalSequence.updateAndGet(current -> watermark);
+        sequenceByTopic.computeIfAbsent(topic, k -> new java.util.concurrent.atomic.AtomicLong())
+                .set(watermark);
         boolean completedBootstrap = relayPendingBootstrap.remove(topic);
 
         acquireSequenceLock();
@@ -1096,6 +1231,15 @@ public class ReplicationManager
             sequenceStateDirty = true;
         } finally {
             sequenceBufferLock.unlock();
+        }
+
+        // Drop the LOCAL binlog of the replaced lineage (issue tems#9, D8): it still holds the
+        // dead tail above the incumbent's watermark and would be served verbatim to a follower
+        // fetching that range after a later promotion. The post-cutover stream rebuilds it from
+        // watermark+1 on the new lineage.
+        ResendLogStore store = resendLogStore;
+        if (store != null) {
+            store.logFor(topic).truncate();
         }
 
         // RELAY_STREAM: re-anchor the pull cursor at the snapshot watermark so the fetch loop resumes
@@ -1118,6 +1262,9 @@ public class ReplicationManager
         relayFetchPendingUntilByTopic.put(topic, 0L);
         signalFetch(topic);
         if (completedBootstrap && relayPendingBootstrap.isEmpty()) {
+            // A dual-leader yield resync (issue tems#9, D10c) completes here: the local state now
+            // belongs to the winner's lineage and the drainRelayOnce guard can stand down.
+            dualLeaderYielding = false;
             coordinator.reevaluateLeadership();
         }
 
@@ -1130,6 +1277,12 @@ public class ReplicationManager
 
     private void requestSync(String topic, int chunkIndex) {
         coordinator.leaderInfo().ifPresent(leader -> {
+            if (leader.nodeId().equals(transport.local().nodeId())) {
+                // Never self-sync (issue tems#9, D8): a continuation chunk requested after this node
+                // got promoted would be addressed to itself and silently die in the transport
+                // ("No route available"), leaving a half-installed state behind.
+                return;
+            }
             if (chunkIndex == 0) {
                 syncRequestCount.incrementAndGet();
                 LOGGER.info(() -> "Lag detected (" + (coordinator.getTrackedLeaderHighWatermark() - lastAppliedSequence)
@@ -1368,6 +1521,16 @@ public class ReplicationManager
                     + " (agreed leader: " + agreedLeader + ")");
             return;
         }
+        if (batch.leaderUnavailable()) {
+            // Our ADOPTED leader refuses leadership (issue tems#9, D9): it deferred to someone else
+            // (or to us) and cannot serve the stream. Surface the refusal to the coordinator — if we
+            // are not behind the refusing node, its escape takes leadership and breaks the mutual-
+            // deferral stalemate; otherwise the next recompute re-adopts whoever can actually serve.
+            relayFetchPendingUntilByTopic.put(topic,
+                    System.currentTimeMillis() + Math.max(1L, config.relayStreamPollInterval().toMillis()));
+            coordinator.noteLeaderRefusal(message.source());
+            return;
+        }
         leaderHwmByTopic.put(topic, batch.leaderHighWatermark());
         leaderOldestByTopic.put(topic, batch.oldestSequence());
         if (!batch.frames().isEmpty()) {
@@ -1495,16 +1658,22 @@ public class ReplicationManager
     private boolean drainRelayOnce(String topic, NQueue<byte[]> relay) throws Exception {
         if (relayPendingBootstrap.contains(topic)) {
             // Unclean restart: do not apply this topic's relay until it is bootstrapped, or the decision
-            // is made that no bootstrap is needed.
-            if (coordinator.isLeader()) {
+            // is made that no bootstrap is needed. A dual-leader yield (issue tems#9, D10c) arms the
+            // pending BEFORE the demotion lands — the auto-disarm below must not undo it while this
+            // node transiently still answers isLeader().
+            if (coordinator.isLeader() && !dualLeaderYielding) {
                 // Promoted/leader: there is no peer to bootstrap from; the failover drain-gate + sequence
                 // fencing recover the backlog. (A lost frontier on a promoted-with-backlog node is the
                 // residual edge case that needs crash-safe frontier co-location — out of scope here.)
                 relayPendingBootstrap.remove(topic);
             } else if (coordinator.leaderInfo().isPresent()) {
                 // Follower with a known leader: pull a fresh snapshot first (replaces local state, so a
-                // stale/lost frontier cannot duplicate the non-idempotent queue OFFER).
-                relayPendingBootstrap.remove(topic);
+                // stale/lost frontier cannot duplicate the non-idempotent queue OFFER). The pending
+                // bootstrap is NOT removed here (issue tems#9, D8): it only clears when the snapshot
+                // actually INSTALLS (completeSnapshotCutover). Removing it on the mere REQUEST re-armed
+                // leadership eligibility and the advertised watermark while the sync could still die
+                // silently (e.g. the targeted node stepped down and drops SYNC_REQUEST) — letting a
+                // dead-lineage frontier win the reclaim gate at the end of the boot window.
                 if (syncingTopics.add(topic)) {
                     requestSync(topic);
                 }
@@ -1850,7 +2019,21 @@ public class ReplicationManager
      */
     private void handleRelayStreamFetch(ClusterMessage message) {
         if (!coordinator.isLeader()) {
-            LOGGER.fine(() -> "Ignoring RELAY_STREAM_FETCH: not the leader.");
+            // Issue tems#9, D9: NEVER refuse silently. A follower whose adopted leader refuses
+            // leadership (a mutual-deferral stalemate) would starve forever waiting for a stream only
+            // a leader serves — answer with leaderUnavailable so the requester's coordinator learns
+            // the refusal and can break the stalemate (the ahead node takes over).
+            RelayStreamFetchPayload request = message.payload(RelayStreamFetchPayload.class);
+            long now = System.currentTimeMillis();
+            if (now - lastFetchRefusalLogMs > 10_000L) {
+                lastFetchRefusalLogMs = now;
+                LOGGER.warning(() -> "Refusing RELAY_STREAM_FETCH from " + message.source()
+                        + " (topic=" + request.topic() + "): this node is not the leader");
+            }
+            transport.send(ClusterMessage.request(MessageType.RELAY_STREAM_BATCH, "stream",
+                    transport.local().nodeId(), message.source(),
+                    new RelayStreamBatchPayload(request.topic(), request.fromSequence(), List.of(),
+                            -1L, -1L, false, true)));
             return;
         }
         ResendLogStore store = resendLogStore;
@@ -2300,6 +2483,9 @@ public class ReplicationManager
                 leaderSyncing.set(false);
                 leaderSyncTopics.clear();
                 clearJoinQuiesce();
+                // Handoff observed (issue tems#9, D10b): the reclaim-quiesce did its job — the
+                // candidate paired up and took over. Resume production as a follower (forwarding).
+                clearReclaimQuiesce();
             }
             failAllPending("Lost leadership to " + newLeader);
             return;
@@ -2316,6 +2502,9 @@ public class ReplicationManager
         // and recover any residual forward-gap via the promoted-leader skip path.
         syncingTopics.clear();
         relayPendingBootstrap.clear();
+        // A promotion supersedes any in-flight dual-leader yield (issue tems#9, D10c): the rival
+        // died mid-yield and this node is the only lineage left — nothing to resync from.
+        dualLeaderYielding = false;
         // Notify handlers of leadership promotion so they can clean up stale data
         // (e.g., truncate queues with persisted data from a previous epoch).
         for (ReplicationHandler handler : handlers.values()) {
@@ -2386,17 +2575,15 @@ public class ReplicationManager
         }
         NodeId localId = transport.local().nodeId();
         if (coordinator.isLeader()) {
-            long leaderSeq = globalSequence.get();
-            long threshold = config.joinSyncLagThreshold();
             for (NodeId member : current) {
                 if (member.equals(localId) || knownActiveMembers.contains(member)) {
                     continue; // only newly-joined members
                 }
-                long applied = followerAppliedByNode.getOrDefault(member, -1L);
-                if (applied < 0 || applied < leaderSeq - threshold) {
-                    // Behind (or unknown): pause production until it catches up / disconnects / times out.
-                    quiescingFor.add(member);
-                }
+                // A rejoining node's progress from its PREVIOUS session says nothing about the new
+                // one (issue tems#9, D10a) — and a kill -9 + fast reconnect may race the disconnect
+                // cleanup. Drop any stale entry and hold the gate until a fresh post-join report.
+                followerAppliedByNode.remove(member);
+                quiescingFor.add(member);
             }
             if (!quiescingFor.isEmpty() && joinQuiescing.compareAndSet(false, true)) {
                 joinQuiesceStartedMs = System.currentTimeMillis();
@@ -2416,13 +2603,30 @@ public class ReplicationManager
         }
         FollowerProgressPayload payload = message.payload(FollowerProgressPayload.class);
         NodeId source = message.source();
-        followerAppliedByNode.put(source, payload.appliedSequence());
+        // Issue tems#9, D10a: a bootstrap-gated follower advertises -1 (no usable frontier) and a
+        // follower still tracking another lineage's epoch reports progress on an incomparable
+        // scale — releasing the quiesce against either value reopens the 1.5s-release hole.
+        if (payload.appliedSequence() < 0 || payload.epoch() != coordinator.getLeaderEpoch()) {
+            return;
+        }
+        followerAppliedByNode.put(source,
+                new FollowerProgress(payload.appliedSequence(), payload.epoch(), System.currentTimeMillis()));
         if (quiescingFor.contains(source)) {
-            long leaderSeq = globalSequence.get();
-            if (payload.appliedSequence() >= leaderSeq - config.joinSyncLagThreshold()) {
+            if (payload.appliedSequence() >= leaderQuiesceTarget() - config.joinSyncLagThreshold()) {
                 quiescingFor.remove(source);
                 maybeReleaseJoinQuiesce();
             }
+        }
+        if (reclaimQuiescing.get() && source.equals(reclaimQuiesceFor)
+                && payload.appliedSequence() >= leaderQuiesceTarget()) {
+            // The candidate paired up exactly against the frozen watermark (issue tems#9, D10b):
+            // surface it to the coordinator NOW — waiting for the candidate's next heartbeat (up to
+            // one interval stale) would stretch the pause for nothing. Gate B opens, recompute hands
+            // leadership to the candidate, and onLeaderChanged releases this quiesce.
+            coordinator.noteFollowerWatermark(source, payload.appliedSequence());
+        } else if (config.leaderPauseOnReclaim() && !reclaimQuiescing.get()) {
+            // Fresh progress is the approach signal — engaging here beats the 200ms tick.
+            maybeEngageReclaimQuiesce();
         }
     }
 
@@ -2432,7 +2636,9 @@ public class ReplicationManager
             return;
         }
         coordinator.leaderInfo().ifPresent(leader -> {
-            FollowerProgressPayload payload = new FollowerProgressPayload(lastAppliedSequence,
+            // Report the advertised watermark (issue tems#9, D10a): -1 while the bootstrap gate is
+            // engaged, so the leader never mistakes a pre-bootstrap frontier for catch-up progress.
+            FollowerProgressPayload payload = new FollowerProgressPayload(advertisedLeaderHighWatermark(),
                     coordinator.getTrackedLeaderEpoch());
             transport.send(ClusterMessage.request(MessageType.FOLLOWER_PROGRESS, "follower-progress",
                     transport.local().nodeId(), leader.nodeId(), payload));
@@ -2450,10 +2656,20 @@ public class ReplicationManager
             clearJoinQuiesce();
             return;
         }
-        // Drop joiners that are no longer active or have since caught up.
-        long leaderSeq = globalSequence.get();
+        // Drop joiners that have since caught up — judged only on a FRESH report from the current
+        // epoch (issue tems#9, D10a): a stale entry must never release the gate.
+        long target = leaderQuiesceTarget();
         long threshold = config.joinSyncLagThreshold();
-        quiescingFor.removeIf(node -> followerAppliedByNode.getOrDefault(node, -1L) >= leaderSeq - threshold);
+        long freshnessMs = followerProgressFreshnessMs();
+        long now = System.currentTimeMillis();
+        long currentEpoch = coordinator.getLeaderEpoch();
+        quiescingFor.removeIf(node -> {
+            FollowerProgress progress = followerAppliedByNode.get(node);
+            return progress != null
+                    && progress.epoch() == currentEpoch
+                    && now - progress.atMillis() <= freshnessMs
+                    && progress.applied() >= target - threshold;
+        });
         maybeReleaseJoinQuiesce();
     }
 
@@ -2467,6 +2683,153 @@ public class ReplicationManager
     private void clearJoinQuiesce() {
         quiescingFor.clear();
         joinQuiescing.set(false);
+    }
+
+    /**
+     * Leader-side catch-up target for the quiesce gates (issue tems#9, D10a): the same scale the
+     * leader advertises in heartbeats. {@code globalSequence} alone understates the frontier of a
+     * leader promoted without a snapshot cutover (it is a local production counter), which let the
+     * join-quiesce release against a target the joiner had trivially passed (1.5s release while the
+     * real catch-up took 64s).
+     */
+    private long leaderQuiesceTarget() {
+        return Math.max(getGlobalSequence(), getLastAppliedSequence());
+    }
+
+    /** Max age for a follower progress report to count toward releasing a quiesce gate. */
+    private long followerProgressFreshnessMs() {
+        return Math.max(50L, config.followerProgressInterval().toMillis()) * 3L;
+    }
+
+    /** A follower's apply progress as last reported (issue tems#9, D10a). */
+    private record FollowerProgress(long applied, long epoch, long atMillis) {
+    }
+
+    // ── Quiesce-assisted reclaim — "leader pause on reclaim" (issue tems#9, D10b) ───────────────
+
+    /** True while the leader is pausing production for an approaching reclaim candidate. */
+    public boolean isReclaimQuiescing() {
+        return reclaimQuiescing.get();
+    }
+
+    /**
+     * Periodic guard of the reclaim-quiesce: bounds the pause ({@code reclaimQuiesceMaxDuration}),
+     * aborts when the candidate leaves, releases when leadership already changed hands, and
+     * re-evaluates engagement otherwise.
+     */
+    private void checkReclaimQuiesce() {
+        if (!running || !config.leaderPauseOnReclaim()) {
+            return;
+        }
+        if (!reclaimQuiescing.get()) {
+            maybeEngageReclaimQuiesce();
+            return;
+        }
+        if (!coordinator.isLeader()) {
+            // Handoff completed (or leadership otherwise changed) — onLeaderChanged also clears;
+            // this is the belt for a missed listener tick.
+            clearReclaimQuiesce();
+            return;
+        }
+        NodeId candidate = reclaimQuiesceFor;
+        if (System.currentTimeMillis() - reclaimQuiesceStartedMs > config.reclaimQuiesceMaxDuration().toMillis()) {
+            LOGGER.warning(() -> "Reclaim-quiesce exceeded max duration; resuming production and"
+                    + " retaining leadership (candidate " + candidate + " did not pair up in time)");
+            abortReclaimQuiesce();
+            return;
+        }
+        boolean candidateActive = candidate != null && coordinator.activeMembers().stream()
+                .anyMatch(m -> candidate.equals(m.nodeId()));
+        if (!candidateActive) {
+            LOGGER.warning(() -> "Reclaim-quiesce candidate " + candidate
+                    + " left the membership; resuming production and retaining leadership");
+            abortReclaimQuiesce();
+        }
+    }
+
+    /**
+     * Engages the reclaim-quiesce when a HIGHER-affinity candidate (election order: priority, then
+     * NodeId) has fresh, comparable progress within {@code reclaimQuiesceThreshold} of the local
+     * watermark. Never engages for a lower-affinity peer (there is no handoff to assist), while the
+     * join-quiesce is already pausing production, or during the post-abort cooldown.
+     */
+    private void maybeEngageReclaimQuiesce() {
+        if (!running || !config.leaderPauseOnReclaim() || !coordinator.isLeader()
+                || reclaimQuiescing.get() || isJoinQuiescing()
+                || System.currentTimeMillis() < reclaimQuiesceCooldownUntilMs) {
+            return;
+        }
+        NodeInfo local = transport.local();
+        long target = leaderQuiesceTarget();
+        long freshnessMs = followerProgressFreshnessMs();
+        long now = System.currentTimeMillis();
+        long currentEpoch = coordinator.getLeaderEpoch();
+        for (NodeInfo member : coordinator.activeMembers()) {
+            if (member.nodeId().equals(local.nodeId()) || member.port() <= 0
+                    || !hasHigherAffinity(member, local)) {
+                continue;
+            }
+            FollowerProgress progress = followerAppliedByNode.get(member.nodeId());
+            if (progress == null || progress.applied() < 0 || progress.epoch() != currentEpoch
+                    || now - progress.atMillis() > freshnessMs) {
+                continue; // no fresh, comparable report — not an approach signal
+            }
+            long delta = target - progress.applied();
+            if (delta >= 0 && delta <= config.reclaimQuiesceThreshold()) {
+                reclaimQuiesceFor = member.nodeId();
+                reclaimQuiesceStartedMs = now;
+                if (reclaimQuiescing.compareAndSet(false, true)) {
+                    LOGGER.info(() -> "Reclaim-quiesce engaged: pausing production so higher-affinity"
+                            + " candidate " + member.nodeId() + " can pair up (delta=" + delta
+                            + ", issue tems#9, D10b)");
+                }
+                return;
+            }
+        }
+    }
+
+    /** Election-order affinity comparison: higher priority wins; NodeId breaks ties. */
+    private static boolean hasHigherAffinity(NodeInfo candidate, NodeInfo reference) {
+        if (candidate.priority() != reference.priority()) {
+            return candidate.priority() > reference.priority();
+        }
+        return candidate.nodeId().compareTo(reference.nodeId()) > 0;
+    }
+
+    /**
+     * Losing side of a dual-leader resolution (issue tems#9, D10c), invoked by the coordinator
+     * BEFORE the demotion: everything this node produced during the dual window belongs to a
+     * DIVERGENT lineage, so every registered topic is marked for bootstrap resync. The existing D8
+     * machinery does the rest once the node is a follower of the winner — {@code drainRelayOnce}
+     * requests the snapshot, {@code completeSnapshotCutover} installs it (resetState + counter SET +
+     * local binlog truncate), and the bootstrap gate keeps the node non-advertisable/ineligible
+     * until the install lands. The dual-window tail is discarded by design — the same outcome the
+     * operational containment (wipe + cold bootstrap) produced manually, now automatic and bounded.
+     */
+    private void onDualLeaderYield() {
+        if (!isStreamMode()) {
+            return;
+        }
+        dualLeaderYielding = true;
+        for (String topic : handlers.keySet()) {
+            relayPendingBootstrap.add(topic);
+        }
+        LOGGER.warning(() -> "Dual-leader yield: topics " + handlers.keySet() + " marked for"
+                + " bootstrap resync; the locally produced dual-window tail will be discarded"
+                + " (issue tems#9, D10c)");
+    }
+
+    /** Abort without handoff: release the pause and arm the re-engagement cooldown. */
+    private void abortReclaimQuiesce() {
+        clearReclaimQuiesce();
+        reclaimQuiesceCooldownUntilMs = System.currentTimeMillis() + config.reclaimQuiesceCooldown().toMillis();
+    }
+
+    private void clearReclaimQuiesce() {
+        reclaimQuiesceFor = null;
+        if (reclaimQuiescing.compareAndSet(true, false)) {
+            LOGGER.info(() -> "Reclaim-quiesce released; resuming production.");
+        }
     }
 
     // ── User-level broadcast messaging (broadcastMessage API) ─────────────────────
