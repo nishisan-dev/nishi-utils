@@ -26,15 +26,6 @@ class NgrrdDefinitionValidatorTest {
     }
 
     @Test
-    void rejeitaBlockSizeNaoMultiplo() {
-        NgrrdDefinition def = parse(baseYaml()
-                .replace("blockSizeSec: 3600", "blockSizeSec: 3650"));
-        NgrrdDefinitionException ex = assertThrows(NgrrdDefinitionException.class,
-                () -> NgrrdDefinitionValidator.validate(def));
-        assertTrue(ex.getMessage().contains("blockSizeSec"));
-    }
-
-    @Test
     void rejeitaRraStepNaoMultiplo() {
         NgrrdDefinition def = parse(baseYaml()
                 .replace("stepSec: 60\n", "stepSec: 75\n"));

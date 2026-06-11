@@ -5,35 +5,16 @@ import dev.nishisan.utils.oss.definition.ObjectNaming;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class StorageKeyTest {
 
     private static final ObjectNaming NAMING = new ObjectNaming(
-            NamingScheme.DETERMINISTIC, "raw", "agg", "manifest", "schema");
+            NamingScheme.DETERMINISTIC, "schema", "series");
 
     @Test
-    void rawBlockSegueTemplateDoYaml() {
-        String key = StorageKey.rawBlock(NAMING, "device:r1/iface:eth0", "in_octets", 300, 1_747_339_200L);
-        assertEquals("raw/device:r1/iface:eth0/in_octets/300/1747339200.ngrrd", key);
-    }
-
-    @Test
-    void aggBlockUsaRraNameComoTerceiroSegmento() {
-        String key = StorageKey.aggBlock(NAMING, "device:r1/iface:eth0", "rra_5m_30d", 300, 1_747_339_200L);
-        assertEquals("agg/device:r1/iface:eth0/rra_5m_30d/300/1747339200.ngrrd", key);
-    }
-
-    @Test
-    void manifestVersionUsaPrefixoVMaisVersao() {
-        String key = StorageKey.manifestVersion(NAMING, "device:r1/iface:eth0", 42);
-        assertEquals("manifest/device:r1/iface:eth0/v42.yaml", key);
-    }
-
-    @Test
-    void manifestPrefixNaoIncluiVersao() {
-        String key = StorageKey.manifestPrefix(NAMING, "device:r1/iface:eth0");
-        assertEquals("manifest/device:r1/iface:eth0", key);
+    void seriesUsaPrefixoEExtensaoNgrr() {
+        String key = StorageKey.series(NAMING, "device:r1/iface:eth0");
+        assertEquals("series/device:r1/iface:eth0.ngrr", key);
     }
 
     @Test
@@ -43,16 +24,15 @@ class StorageKeyTest {
     }
 
     @Test
-    void rejeitaVersaoZero() {
-        assertThrows(IllegalArgumentException.class,
-                () -> StorageKey.manifestVersion(NAMING, "s", 0));
+    void prefixosOmitidosUsamDefaults() {
+        ObjectNaming defaults = new ObjectNaming(NamingScheme.DETERMINISTIC, null, null);
+        assertEquals("series/s.ngrr", StorageKey.series(defaults, "s"));
+        assertEquals("schema/d.yaml", StorageKey.schemaSnapshot(defaults, "d"));
     }
 
     @Test
     void absorveBarrasExtrasNosPrefixos() {
-        ObjectNaming sloppy = new ObjectNaming(
-                NamingScheme.DETERMINISTIC, "/raw/", "/agg/", "/manifest/", "/schema/");
-        assertEquals("raw/x/in/300/1.ngrrd",
-                StorageKey.rawBlock(sloppy, "x", "in", 300, 1L));
+        ObjectNaming sloppy = new ObjectNaming(NamingScheme.DETERMINISTIC, "/schema/", "/series/");
+        assertEquals("series/x.ngrr", StorageKey.series(sloppy, "x"));
     }
 }

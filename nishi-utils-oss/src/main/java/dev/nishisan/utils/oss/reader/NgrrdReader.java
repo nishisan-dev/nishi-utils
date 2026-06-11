@@ -1,72 +1,56 @@
 package dev.nishisan.utils.oss.reader;
 
-import dev.nishisan.utils.oss.api.ConsolidationFunction;
 import dev.nishisan.utils.oss.api.DataPoint;
 import dev.nishisan.utils.oss.api.SeriesResult;
 import dev.nishisan.utils.oss.api.ViewQuery;
 import dev.nishisan.utils.oss.definition.NgrrdDefinition;
 import dev.nishisan.utils.oss.definition.RraDef;
 import dev.nishisan.utils.oss.engine.BestFitSelector;
-import dev.nishisan.utils.oss.format.BlockCodec;
-import dev.nishisan.utils.oss.format.EncodedBlock;
-import dev.nishisan.utils.oss.format.ManifestBlock;
-import dev.nishisan.utils.oss.format.ManifestCodec;
-import dev.nishisan.utils.oss.format.NgrrdManifest;
-import dev.nishisan.utils.oss.format.RraManifest;
+import dev.nishisan.utils.oss.format.NgrrdFormatException;
+import dev.nishisan.utils.oss.format.SeriesFileCodec;
+import dev.nishisan.utils.oss.format.SeriesGeometry;
+import dev.nishisan.utils.oss.format.SeriesHeader;
+import dev.nishisan.utils.oss.format.SeriesLiveState;
 import dev.nishisan.utils.oss.storage.NgrrdStorage;
+import dev.nishisan.utils.oss.storage.SeriesChannel;
+import dev.nishisan.utils.oss.storage.SeriesChannelProvider;
 import dev.nishisan.utils.oss.storage.StorageKey;
 
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.ArrayList;
-import java.util.Comparator;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 
 /**
- * Materializa séries temporais persistidas no Storage para uma janela e
- * granularidade-alvo. Opera sobre o manifesto versionado mais recente; nunca
- * varre o storage diretamente, mantendo o manifesto como fonte de verdade.
+ * Materializa séries temporais a partir do objeto único NGRR. Lê os ring buffers
+ * diretamente do arquivo (sem manifesto): escolhe o RRA via
+ * {@link BestFitSelector}, mapeia {@code (rra, cf)} para o archive, reconstrói os
+ * timestamps pelo ponteiro do ring e recorta para a janela solicitada.
  */
 public final class NgrrdReader {
 
     private final NgrrdDefinition definition;
-    private final NgrrdStorage storage;
+    private final SeriesChannelProvider provider;
     private final String seriesKey;
+    private final SeriesGeometry geo;
+    private final byte[] geometryHash;
+    private final String storageKey;
 
     public NgrrdReader(NgrrdDefinition definition, NgrrdStorage storage, String seriesKey) {
         this.definition = Objects.requireNonNull(definition, "definition é obrigatório");
-        this.storage = Objects.requireNonNull(storage, "storage é obrigatório");
+        Objects.requireNonNull(storage, "storage é obrigatório");
         this.seriesKey = Objects.requireNonNull(seriesKey, "seriesKey é obrigatório");
-    }
-
-    /**
-     * Executa uma leitura para o DS derivado informado dentro do range
-     * {@code [endExclusiveEpochMs - window, endExclusiveEpochMs)}.
-     */
-    public SeriesResult read(String dsName, ViewQuery query, long endExclusiveEpochMs) {
-        Objects.requireNonNull(dsName, "dsName é obrigatório");
-        Objects.requireNonNull(query, "query é obrigatório");
-
-        Optional<RraDef> rra = BestFitSelector.pick(query, definition.spec().archives().rras());
-        if (rra.isEmpty()) {
-            return new SeriesResult(dsName, null, query.cf(), query.targetStepSec(), List.of());
+        if (!(storage instanceof SeriesChannelProvider p)) {
+            throw new IllegalArgumentException(
+                    "storage não suporta SeriesChannel: " + storage.getClass().getName());
         }
-
-        long endExclusiveSec = endExclusiveEpochMs / 1000L;
-        long startInclusiveSec = endExclusiveSec - query.window().getSeconds();
-
-        Optional<NgrrdManifest> manifest = loadLatestManifest();
-        if (manifest.isEmpty()) {
-            return new SeriesResult(dsName, rra.get().name(), query.cf(),
-                    rra.get().stepSec(), List.of());
-        }
-
-        List<ManifestBlock> blocks = filterBlocks(manifest.get(), rra.get(), dsName, query.cf());
-        List<DataPoint> raw = decodeAndConcat(blocks, rra.get().stepSec(),
-                startInclusiveSec, endExclusiveSec);
-        List<DataPoint> downsampled = downsample(raw, query.maxPoints());
-        return new SeriesResult(dsName, rra.get().name(), query.cf(),
-                rra.get().stepSec(), downsampled);
+        this.provider = p;
+        this.geo = new SeriesGeometry(definition);
+        this.geometryHash = geo.geometryHash();
+        this.storageKey = StorageKey.series(definition.spec().storage().objectNaming(), seriesKey);
     }
 
     /** Variante de conveniência que usa {@link System#currentTimeMillis()} como fim do range. */
@@ -74,77 +58,78 @@ public final class NgrrdReader {
         return read(dsName, query, System.currentTimeMillis());
     }
 
-    /** Carrega a versão de manifesto mais recente disponível no Storage. */
-    public Optional<NgrrdManifest> loadLatestManifest() {
-        String prefix = StorageKey.manifestPrefix(
-                definition.spec().storage().objectNaming(), seriesKey);
-        List<String> keys = storage.list(prefix);
-        int maxVersion = -1;
-        String bestKey = null;
-        for (String key : keys) {
-            int slash = key.lastIndexOf('/');
-            String name = slash >= 0 ? key.substring(slash + 1) : key;
-            if (!(name.startsWith("v") && name.endsWith(".yaml"))) {
-                continue;
-            }
-            String number = name.substring(1, name.length() - ".yaml".length());
-            try {
-                int n = Integer.parseInt(number);
-                if (n > maxVersion) {
-                    maxVersion = n;
-                    bestKey = key;
-                }
-            } catch (NumberFormatException ignored) {
-                // ignora arquivos fora do padrão.
-            }
+    /**
+     * Lê o DS derivado {@code dsName} no range
+     * {@code [endExclusiveEpochMs - window, endExclusiveEpochMs)}.
+     */
+    public SeriesResult read(String dsName, ViewQuery query, long endExclusiveEpochMs) {
+        Objects.requireNonNull(dsName, "dsName é obrigatório");
+        Objects.requireNonNull(query, "query é obrigatório");
+
+        Optional<RraDef> rraOpt = BestFitSelector.pick(query, definition.spec().archives().rras());
+        if (rraOpt.isEmpty()) {
+            return new SeriesResult(dsName, null, query.cf(), query.targetStepSec(), List.of());
         }
-        if (bestKey == null) {
-            return Optional.empty();
+        RraDef rra = rraOpt.get();
+        int col = geo.columnIndex(dsName);
+        int arch = geo.archiveIndex(rra.name(), query.cf());
+        if (col < 0 || arch < 0 || !provider.seriesExists(storageKey)) {
+            return new SeriesResult(dsName, rra.name(), query.cf(), rra.stepSec(), List.of());
         }
-        return storage.get(bestKey).map(ManifestCodec::readYaml);
+
+        try (SeriesChannel channel = provider.openSeries(storageKey)) {
+            List<DataPoint> points = readPoints(channel, arch, col, query, endExclusiveEpochMs);
+            List<DataPoint> downsampled = downsample(points, query.maxPoints());
+            return new SeriesResult(dsName, rra.name(), query.cf(), rra.stepSec(), downsampled);
+        } catch (NgrrdFormatException e) {
+            return new SeriesResult(dsName, rra.name(), query.cf(), rra.stepSec(), List.of());
+        }
     }
 
-    private List<ManifestBlock> filterBlocks(NgrrdManifest manifest, RraDef rra,
-                                             String dsName, ConsolidationFunction cf) {
-        for (RraManifest rm : manifest.rras()) {
-            if (!rm.rraName().equals(rra.name())) {
-                continue;
-            }
-            List<ManifestBlock> matching = new ArrayList<>();
-            for (ManifestBlock mb : rm.blocks()) {
-                if (Objects.equals(mb.dsName(), dsName) && mb.cf() == cf) {
-                    matching.add(mb);
-                }
-            }
-            matching.sort(Comparator.comparingLong(ManifestBlock::blockStartEpoch));
-            return matching;
+    private List<DataPoint> readPoints(SeriesChannel channel, int arch, int col,
+                                       ViewQuery query, long endExclusiveEpochMs) {
+        if (channel.size() < SeriesFileCodec.FIXED_HEADER_BYTES) {
+            return List.of();
         }
-        return List.of();
-    }
+        SeriesHeader header = SeriesFileCodec.decodeFixedHeader(
+                channel.readRegion(0, SeriesFileCodec.FIXED_HEADER_BYTES));
+        boolean compatible = header.formatVersion() == SeriesFileCodec.CURRENT_VERSION
+                && header.fileTotalBytes() == geo.fileTotalBytes()
+                && Arrays.equals(header.definitionHash(), geometryHash);
+        if (!compatible) {
+            return List.of(); // geometria divergente (em recriação) — sem dados ainda.
+        }
+        SeriesLiveState live = SeriesFileCodec.decodeLiveState(geo,
+                channel.readRegion(geo.liveStateOffset(), (int) geo.liveStateBytes()));
 
-    private List<DataPoint> decodeAndConcat(List<ManifestBlock> blocks, int stepSec,
-                                            long startInclusiveSec, long endExclusiveSec) {
+        SeriesGeometry.Archive archive = geo.archives().get(arch);
+        int rows = archive.rows();
+        int s = archive.stepSec();
+        int curRow = live.curRow[arch];
+        long anchor = live.curRowEpochSec[arch];
+        if (curRow < 0) {
+            return List.of(); // ring nunca escrito.
+        }
+
+        long endSec = endExclusiveEpochMs / 1000L;
+        long startSec = endSec - query.window().getSeconds();
+
+        // Lê a região inteira do ring deste archive de uma vez (uma syscall).
+        int d = geo.columnCount();
+        byte[] ring = channel.readRegion(archive.ringBaseOffset(), rows * d * Double.BYTES);
+        ByteBuffer buf = ByteBuffer.wrap(ring).order(ByteOrder.BIG_ENDIAN);
+
         List<DataPoint> result = new ArrayList<>();
-        for (ManifestBlock mb : blocks) {
-            long blockEnd = mb.blockStartEpoch() + (long) mb.rows() * stepSec;
-            if (blockEnd <= startInclusiveSec) {
+        // j: 0 = linha mais antiga do ring; rows-1 = mais nova (anchor).
+        for (int j = 0; j < rows; j++) {
+            int distanceFromNewest = rows - 1 - j;
+            long tsSec = anchor - (long) distanceFromNewest * s;
+            if (tsSec < startSec || tsSec >= endSec) {
                 continue;
             }
-            if (mb.blockStartEpoch() >= endExclusiveSec) {
-                continue;
-            }
-            byte[] bytes = storage.get(mb.storageKey())
-                    .orElseThrow(() -> new IllegalStateException(
-                            "Bloco listado no manifesto não existe no storage: " + mb.storageKey()));
-            EncodedBlock block = BlockCodec.decode(bytes);
-            double[] payload = block.payload();
-            for (int i = 0; i < payload.length; i++) {
-                long tsSec = block.header().blockStartEpoch() + (long) i * block.header().stepSec();
-                if (tsSec < startInclusiveSec || tsSec >= endExclusiveSec) {
-                    continue;
-                }
-                result.add(new DataPoint(tsSec * 1000L, payload[i]));
-            }
+            int row = ((curRow - distanceFromNewest) % rows + rows) % rows;
+            double v = buf.getDouble((row * d + col) * Double.BYTES);
+            result.add(new DataPoint(tsSec * 1000L, v));
         }
         return result;
     }

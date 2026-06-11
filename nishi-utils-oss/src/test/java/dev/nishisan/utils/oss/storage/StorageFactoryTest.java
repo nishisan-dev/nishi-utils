@@ -1,12 +1,10 @@
 package dev.nishisan.utils.oss.storage;
 
 import dev.nishisan.utils.oss.api.ConflictResolution;
-import dev.nishisan.utils.oss.api.ManifestUpdateMode;
 import dev.nishisan.utils.oss.api.NamingScheme;
 import dev.nishisan.utils.oss.api.StorageBackendType;
 import dev.nishisan.utils.oss.api.WriteMode;
 import dev.nishisan.utils.oss.definition.IdempotencyDef;
-import dev.nishisan.utils.oss.definition.ManifestPolicy;
 import dev.nishisan.utils.oss.definition.ObjectNaming;
 import dev.nishisan.utils.oss.definition.StorageSpec;
 import dev.nishisan.utils.oss.definition.WritePolicy;
@@ -23,10 +21,9 @@ class StorageFactoryTest {
     private static StorageSpec spec(StorageBackendType backend) {
         return new StorageSpec(
                 backend,
-                new ObjectNaming(NamingScheme.DETERMINISTIC, "raw", "agg", "manifest", "schema"),
+                new ObjectNaming(NamingScheme.DETERMINISTIC, "schema", "series"),
                 new WritePolicy(WriteMode.APPEND_ONLY,
-                        new IdempotencyDef("{seriesKey}/{ds}", ConflictResolution.VERIFY_OR_REPLACE_IF_IDENTICAL)),
-                new ManifestPolicy(ManifestUpdateMode.PERIODIC_SNAPSHOT, 900));
+                        new IdempotencyDef("{seriesKey}", ConflictResolution.VERIFY_OR_REPLACE_IF_IDENTICAL)));
     }
 
     @Test

@@ -4,7 +4,7 @@
 skinparam componentStyle rectangle
 skinparam linetype ortho
 
-title ngrrd — Visão de Contêiner (C4)
+title ngrrd — Visão de Contêiner (C4, objeto único NGRR)
 
 actor "Aplicação cliente" as App
 
@@ -13,31 +13,29 @@ package "nishi-utils-oss" {
   component "NgrrdYamlLoader\n+ Validator" as Loader
   component "Engine pura\n(CounterDeriver, PDP,\nRraConsolidator, BestFit)" as Engine
   component "NgrrdWriter\n(thread única)" as Writer
-  component "ManifestUpdater\n(ScheduledExecutor)" as Manifest
   component "NgrrdReader\n+ ViewExecutor" as Reader
-  component "BlockCodec\n+ ManifestCodec" as Format
+  component "SeriesGeometry\n+ SeriesFileCodec" as Format
   component "NgrrdMetrics" as Metrics
 }
 
-interface "NgrrdStorage" as Storage
-component "LocalDiskStorage" as Local
-component "S3Storage\n(AWS SDK v2)" as S3
+interface "NgrrdStorage\n+ SeriesChannelProvider" as Storage
+component "LocalDiskStorage\n(FileChannel in-place)" as Local
+component "S3Storage\n(imagem + PUT)" as S3
 
-database "Disco local" as Disk
-cloud "S3 / MinIO / Ceph" as Cloud
+database "Disco local\n(1 arquivo .ngrr/série)" as Disk
+cloud "S3 / MinIO / Ceph\n(1 objeto .ngrr/série)" as Cloud
 
-App --> Facade : write(ds, Sample)\nread(preset|query)
-Facade --> Loader : carrega YAML
-Loader --> Engine : valida + monta\ndefinição imutável
+App --> Facade : write(ds, Sample)\ncheckpoint()\nread(preset|query)
+Facade --> Loader : carrega + valida YAML
+Loader --> Engine : monta definição imutável
 Facade --> Writer : ingestão assíncrona
 Facade --> Reader : leitura síncrona
-Writer --> Engine : pipeline\nCounterDeriver → PDP → RRA
-Writer --> Format : encode bloco
-Writer --> Storage : atomicReplace(block)
+Writer --> Engine : CounterDeriver → PDP → CDP (contínuo)
+Writer --> Format : encode header/live-state + offsets do ring
+Writer --> Storage : SeriesChannel.writeRegion / force
 Writer --> Metrics : eventos quality
-Manifest --> Storage : atomicReplace(manifest)
-Reader --> Storage : list(prefix) + get(block)
-Reader --> Format : decode bloco + manifest
+Reader --> Storage : SeriesChannel.openSeries + readRegion
+Reader --> Format : decode header/live-state + ring
 Storage <|-- Local
 Storage <|-- S3
 Local --> Disk

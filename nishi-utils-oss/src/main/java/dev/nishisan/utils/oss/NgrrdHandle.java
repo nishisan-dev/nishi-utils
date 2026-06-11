@@ -14,8 +14,8 @@ import java.util.Map;
  * <p>O escopo é o da série identificada pelas {@code tags} fornecidas — o
  * handle resolve {@code seriesKey} via {@code IdentitySpec.seriesKeyTemplate}.</p>
  *
- * <p>{@link #close()} faz shutdown ordenado: flush do bloco aberto + última
- * gravação de manifesto + fechamento das threads de writer/manifest.</p>
+ * <p>{@link #close()} faz shutdown ordenado: materializa o CDP em progresso,
+ * torna o objeto da série durável e encerra a thread do writer.</p>
  */
 public interface NgrrdHandle extends AutoCloseable {
 
@@ -25,8 +25,15 @@ public interface NgrrdHandle extends AutoCloseable {
     /** Enfileira uma amostra para o DS raw indicado. */
     void write(String dsName, Sample sample);
 
-    /** Força o fechamento do bloco aberto e a gravação do manifesto. */
+    /** Equivalente a {@link #checkpoint()} no formato de série única. */
     void flush();
+
+    /**
+     * Materializa o CDP em progresso como parcial e torna o objeto da série
+     * durável (fsync no disco / PUT no S3), mantendo o estado vivo. Semântica
+     * rrdtool-like: o dado fica legível antes do passo do RRA fechar.
+     */
+    void checkpoint();
 
     /** Lê uma série materializada com base em uma {@link ViewQuery} explícita. */
     SeriesResult read(String dsName, ViewQuery query);

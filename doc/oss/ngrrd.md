@@ -1,8 +1,9 @@
 # ngrrd — Nishi Grid Round-Robin Database
 
-Formato de séries temporais com paridade conceitual ao RRDtool, persistência
-em backends pluggable (disco local e Object Storage S3-compatível) e definição
-declarativa em YAML.
+Formato de séries temporais em **paridade com o RRDtool**: um **único objeto
+binário por série** (arquivo `.ngrr`), de tamanho fixo, pré-alocado, com ring
+buffers atualizados in-place. Persistência em backends pluggable (disco local e
+Object Storage S3-compatível) e definição declarativa em YAML.
 
 - **Pacote Java:** `dev.nishisan.utils.oss`
 - **Artefato Maven:** `dev.nishisan:nishi-utils-oss`
@@ -21,15 +22,16 @@ declarativa em YAML.
 | **CF** (Consolidation Function) | `AVERAGE`, `MAX`, `MIN`, `LAST`. |
 | **RRA** (Round-Robin Archive) | Arquivo finito com seu próprio `stepSec`, `rows` e CFs. |
 | **XFF** | Fração máxima de PDPs missing num CDP antes de virá-lo `NaN`. |
-| **Bloco** | Unidade física de persistência (`blockSizeSec`). Vira 1 arquivo `.ngrrd`. |
-| **Manifesto** | YAML versionado (`v{N}.yaml`) que lista todos os blocos por RRA. |
-| **Counter reset / wrap** | Discontinuidade detectada automaticamente em DS COUNTER. |
+| **Coluna** | Um DS derivado (ex.: `in_bps`); todas as colunas compartilham a geometria das RRAs. |
+| **Archive** | Par `(rra, cf)` — cada um possui um ring buffer de `rows × nº de colunas` doubles. |
+| **Série (`.ngrr`)** | O único objeto físico por série: header + dicionários + live-state + rings. |
+| **Counter reset / wrap** | Descontinuidade detectada automaticamente em DS COUNTER. |
 
 > **Uma série modela várias métricas.** Assim como um RRD real de interface de
 > rede (traffic in/out, errors, discards…), um único `MetricSeriesDefinition`
 > declara **múltiplos DS**. Cada DS COUNTER pode virar uma série derivada — ex.:
-> `in_octets` → `in_bps`. Ver a seção *Exemplo prático — uma interface de rede
-> completa*.
+> `in_octets` → `in_bps`. Todas as métricas derivadas viram **colunas** dentro
+> do mesmo objeto `.ngrr`.
 
 ---
 
@@ -39,14 +41,18 @@ declarativa em YAML.
 
 - **Engine pura** (`engine/`): determinística e sem IO — `CounterDeriver`,
   `PrimaryDataPoint`, `RraConsolidator`, `BestFitSelector`, `TimeBucket`,
-  `LateSampleHandler`, `FormulaEvaluator`, `RingBuffer`.
-- **Formato** (`format/`): `BlockHeader` (30 bytes), `BlockCodec` com CRC32,
-  `ManifestCodec` em YAML + SHA-256 do YAML original.
-- **Storage** (`storage/`): interface `NgrrdStorage` + `LocalDiskStorage` e
-  `S3Storage` (SDK v2, suporta endpointOverride para MinIO/Ceph).
-- **Writer** (`writer/`): worker thread única, fila bloqueante, `ManifestUpdater`
-  periódico via `ScheduledExecutorService`.
-- **Reader** (`reader/`): `NgrrdReader` + `ViewExecutor` (preset → ViewQuery).
+  `LateSampleHandler`, `FormulaEvaluator`.
+- **Formato** (`format/`): `SeriesGeometry` (offsets determinísticos a partir da
+  definição), `SeriesFileCodec` (header + live-state + CRC32), `SeriesHeader` e
+  `SeriesLiveState`.
+- **Storage** (`storage/`): interface `NgrrdStorage` + `SeriesChannelProvider`
+  (`LocalDiskStorage` com `FileChannel` in-place; `S3Storage` com imagem em
+  memória + PUT). O `SeriesChannel` abstrai escrita por região.
+- **Writer** (`writer/`): worker thread única; consolidação **contínua** estilo
+  RRDtool (`cdp_prep`); `checkpoint()` materializa o CDP em progresso como
+  parcial e torna o estado durável.
+- **Reader** (`reader/`): `NgrrdReader` + `ViewExecutor` — lê os ring buffers
+  diretamente do objeto único, sem manifesto.
 - **Métricas** (`metrics/`): `NgrrdMetrics` + listener para Micrometer/JMX/log.
 
 ---
@@ -55,15 +61,21 @@ declarativa em YAML.
 
 ![Fluxo de escrita](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan-dev/nishi-utils/main/doc/diagrams/ngrrd_write_flow.puml)
 
-1. Cliente enfileira `Sample` por DS raw.
-2. Worker aplica `CounterDeriver` em DS COUNTER com `derive.output`, gerando o
+1. Na abertura, o writer abre o `SeriesChannel`. Se o objeto não existir (ou a
+   geometria divergir), ele é pré-alocado no tamanho fixo final com os rings em
+   `NaN`; senão o estado vivo (counterPrev + acumuladores + ponteiros) é
+   reidratado.
+2. Cliente enfileira `Sample` por DS raw.
+3. Worker aplica `CounterDeriver` em DS COUNTER com `derive.output`, gerando o
    DS derivado (ex.: `in_octets` → `in_bps`). Flags `RESET`/`WRAP` viram
-   métricas.
-3. Encaixa em `PrimaryDataPoint` por bucket do step base.
-4. Ao cruzar `blockEndEpoch`, fecha o bloco: para cada `(RRA, CF)`, consolida
-   PDPs em CDPs (`RraConsolidator`), encoda via `BlockCodec`, grava no Storage
-   sob `aggPrefix/{seriesKey}/{rra}_{ds}_{cf}/{stepSec}/{blockStart}.ngrrd`.
-5. `ManifestUpdater` grava snapshots versionados a cada `intervalSec`.
+   métricas e o counter anterior (`last_ds`) é atualizado.
+4. O valor derivado entra no PDP do step base corrente da coluna.
+5. Ao avançar o slot base, o PDP completo é dobrado no CDP em progresso de cada
+   archive; quando o passo do archive fecha, o CDP é finalizado (XFF) e gravado
+   no ring (avançando o ponteiro, sobrescrevendo o mais antigo — retenção como
+   ring buffer).
+6. `checkpoint()`/`flush()` emite o CDP em progresso como **parcial** (legível
+   antes do passo fechar) e torna o objeto durável (`fsync` no disco / PUT no S3).
 
 ---
 
@@ -73,116 +85,98 @@ declarativa em YAML.
 
 1. `ViewExecutor` traduz `PresetDef` → `ViewQuery` e resolve `seriesKey` via
    `IdentitySpec.seriesKeyTemplate`.
-2. `NgrrdReader` escolhe a melhor RRA via `BestFitSelector`.
-3. Lê a versão **mais recente** do manifesto e filtra blocos por
-   `(rra, dsName, cf)`.
-4. Baixa cada bloco, decodifica (com verificação CRC32), recorta para
-   `window`, aplica `maxPoints` (downsample uniforme).
+2. `NgrrdReader` escolhe a melhor RRA via `BestFitSelector` e mapeia
+   `(rra, cf)` → archive.
+3. Abre o objeto da série, valida o header (geometria/hash) e lê a live-state
+   (`curRow`/`curRowEpochSec`) e o ring do archive.
+4. Reconstrói os pares `(timestamp, valor)` a partir do ponteiro do ring,
+   recorta para a `window` e aplica `maxPoints` (downsample uniforme).
 
-> O manifesto é a **fonte de verdade**. O reader nunca varre o storage por
-> listagem para construir séries.
+> **Sem manifesto.** A geometria e os ponteiros do ring são auto-descritos no
+> próprio objeto `.ngrr`; o reader nunca varre o storage por listagem.
 
 ---
 
-## Layout binário do bloco
+## Layout binário da série (NGRR)
+
+Todos os campos em big-endian. Os offsets são determinísticos a partir da
+geometria (`SeriesGeometry`), o que permite escrita in-place e pré-alocação.
 
 ```
-+----------------+--------+-----------+-------+----+----+--------------------+------+---------+
-| MAGIC (4)      | VER(2) | FLAGS(2)  | STEP  | CF | DS | BLOCK_START_EPOCH  | ROWS | CRC32   |
-| 0x4E 47 52 44  |        |           | (4)   |(1) |(1) |       (8)          | (4)  | (4)     |
-+----------------+--------+-----------+-------+----+----+--------------------+------+---------+
-| PAYLOAD: ROWS x 8 bytes (double IEEE-754; NaN = unknown/missing)                            |
-+--------------------------------------------------------------------------------------------+
+=== SEÇÃO ESTÁTICA (imutável após create) ===
+0   MAGIC "NGRR" (4) | 4 version u16 | 6 flags u16 | 8 baseStepSec i32
+12  definitionHash SHA-256 (32) | 44 D i32 | 48 A i32
+52  staticSectionBytes i64 | 60 liveStateOffset i64 | 68 liveStateBytes i64
+76  ringDataOffset i64 | 84 fileTotalBytes i64 | 92 headerCrc32 i32  (CRC sobre [0..92))
+96  DS_DICT[D]    { nameLen u16, name, originRawLen u16, originRaw, dsType u8 }
+    ARCH_TABLE[A] { rraNameLen u16, rraName, cf u8, stepSec i32, rows i32, xff f64 }
+    (pad 8-align até liveStateOffset)
+
+=== LIVE-STATE (tamanho fixo, sobrescrito in-place) ===
+lastUpEpochMs i64
+D   × { prevValue f64, prevTsEpochMs i64 }                      -- last_ds (counterPrev)
+D   × { sum f64, count i32, min f64, max f64, last f64, missing i32, slotSec i64 }  -- pdp_prep
+A   × { curRow i32, curRowEpochSec i64 }                        -- rra_ptr
+A*D × { cdpPartial f64, foldedCount i32, missingCount i32 }     -- cdp_prep
+liveStateCrc32 i32
+
+=== RING-DATA (8-align, sobrescrito in-place) ===
+por archive a: rows × D doubles (8 bytes), row-major (row,col); NaN = missing
 ```
 
-- `MAGIC` = ASCII `"NGRD"` (`0x4E475244`).
-- Sem timestamps no payload — derivam de `blockStartEpoch + i*stepSec`.
-- `FLAGS` reserva bits para `compressed` (futuro), `partial` (snapshot não
-  fechado) e `agg` (bloco agregado vs raw).
-- `CRC32` cobre header (excluindo o próprio campo) + payload completo.
+- `MAGIC` = ASCII `"NGRR"` (`0x4E475252`).
+- Sem timestamps no payload — derivam de `curRowEpochSec` + `stepSec` + posição no ring.
+- `D` = nº de colunas (DS derivados); `A` = nº de archives (`Σ rra.cf`).
+- **CRC:** `headerCrc32` cobre o header fixo (escrito uma vez); `liveStateCrc32`
+  é regravado a cada `force()`. Os rings não têm CRC por linha — a integridade
+  vem da pré-alocação + ordem (grava ring → `force` → grava live-state) +
+  sentinela `NaN`. Live-state ilegível na reabertura ⇒ recriação segura.
 
 ---
 
 ## Layout físico (storage)
 
 ```
-<rawPrefix>/<seriesKey>/<ds>/<stepSec>/<blockStartEpoch>.ngrrd
-<aggPrefix>/<seriesKey>/<rraName>__<dsName>__<cf>/<stepSec>/<blockStartEpoch>.ngrrd
-<manifestPrefix>/<seriesKey>/v{N}.yaml
-<schemaPrefix>/<definitionName>.yaml
+<seriesPrefix>/<seriesKey>.ngrr        # único objeto de dados por série
+<schemaPrefix>/<definitionName>.yaml   # snapshot opcional de schema
 ```
 
-Idempotência via chave determinística + `verify_or_replace_if_identical` no
-`NgrrdStorage`.
+Um objeto por série, em qualquer backend. Em disco local é gravado in-place
+(`FileChannel`); em S3 o objeto inteiro é regravado por PUT (read-modify-write)
+no `checkpoint()`/`close()`.
 
 ---
 
-## Tamanho do arquivo — fixo ou dinâmico?
+## Tamanho do arquivo — fixo e pré-alocado
 
-Resposta curta: **cada bloco `.ngrrd` tem tamanho fixo e determinístico**; o
-**total por série é limitado** (não cresce indefinidamente). O modelo, porém, é
-diferente do RRDtool clássico.
-
-### Por bloco (fixo)
-
-Assim que um bloco fecha, seu tamanho é exato:
+Em paridade com o RRDtool, o arquivo tem **tamanho fixo e determinístico** desde
+a criação:
 
 ```
-tamanhoBloco   = 30 (header) + linhasPorBloco × 8 (payload, double IEEE-754)
-linhasPorBloco = blockSizeSec / rra.stepSec
+fileTotalBytes = 96 (header) + dicionários + live-state + Σ_archives(rows × D × 8)
 ```
 
-Para `blockSizeSec = 21600` (6 h) e os RRAs do exemplo (assumindo `blockSizeSec`
-múltiplo do `stepSec` de cada RRA):
+O termo dominante é a soma dos rings. Para o exemplo prático abaixo (6 colunas
+derivadas, 3 RRAs × 2 CFs = 6 archives):
 
-| RRA | stepSec | linhas/bloco | bytes/bloco |
-|-----|---------|--------------|-------------|
-| `rra_5m_30d` | 300 | 72 | 606 B |
-| `rra_1h_6mo` | 3600 | 6 | 78 B |
-| `rra_2h_1y` | 7200 | 3 | 54 B |
+| Archive (rra × cf) | rows | bytes do ring (rows × 6 × 8) |
+|--------------------|------|------------------------------|
+| `rra_5m_30d` × {AVG,MAX} | 8640 | 2 × 414.720 = 829.440 B |
+| `rra_1h_6mo` × {AVG,MAX} | 4320 | 2 × 207.360 = 414.720 B |
+| `rra_2h_1y`  × {AVG,MAX} | 4380 | 2 × 210.240 = 420.480 B |
 
-### Por série (limitado, não infinito)
+Total ≈ **1,59 MiB em um único arquivo** `.ngrr` (header + live-state somam
+~1 KB). Compare com o modelo anterior (blocos): ~2,4 MiB espalhados em ~27,6 mil
+arquivos — a motivação da [issue #144](https://github.com/nishisan-dev/nishi-utils/issues/144).
 
-O writer expira blocos fora da janela de retenção de cada RRA
-(`retentionSec = rows × stepSec`), comportando-se como um **ring buffer no nível
-de bloco**. O footprint estável de cada combinação `(RRA, DS, CF)` é:
+### Paridade com o RRDtool
 
-```
-footprint   = rows × (8 + 30 × stepSec / blockSizeSec)  bytes
-blocosVivos = ceil(rows × stepSec / blockSizeSec)
-```
-
-O payload total fecha exatamente em `rows × 8`; o termo extra é o overhead dos
-headers dos `blocosVivos`. Para o exemplo prático abaixo (6 DS, 3 RRAs e 2 CFs
-— `AVERAGE` + `MAX`):
-
-| RRA | rows | blocos vivos | footprint por (RRA,DS,CF) |
-|-----|------|--------------|---------------------------|
-| `rra_5m_30d` | 8640 | 120 | 72.720 B (~71 KiB) |
-| `rra_1h_6mo` | 4320 | 720 | 56.160 B (~55 KiB) |
-| `rra_2h_1y` | 4380 | 1460 | 78.840 B (~77 KiB) |
-
-Total da série em retenção plena: `6 DS × 3 RRA × 2 CF` ≈ **2,4 MiB**,
-distribuídos em ≈ **27,6 mil arquivos** (um por janela de 6 h, por combinação).
-
-### Diferença para o RRDtool clássico
-
-| | RRDtool | ngrrd |
-|--|---------|-------|
-| **Arquivos** | 1 arquivo único | muitos arquivos pequenos (1 por bloco × RRA × DS × CF) |
-| **Alocação** | pré-alocado no tamanho final desde o dia 1 | cresce de zero até o teto e estabiliza |
-| **Expiração** | sobrescrita in-place no ring | remoção de blocos antigos fora da janela |
-
-### Tuning
-
-Em RRAs grossos cada bloco guarda poucas linhas, então o header de 30 B pesa
-(ex.: `rra_2h_1y` → 54 B/bloco, ~56% de overhead). Regra prática: escolha um
-`blockSizeSec` grande o suficiente em relação ao `stepSec` do RRA mais grosso
-para amortizar o header e reduzir a contagem de arquivos.
-
-> **Nota (implementação atual):** apenas blocos **agregados** (RRAs) são
-> materializados. `StorageKey` reserva o prefixo `raw` na convenção de nomes, mas
-> o writer atual não grava blocos raw — o footprint é 100% definido pelos RRAs.
+| | RRDtool | ngrrd (NGRR) |
+|--|---------|--------------|
+| **Arquivos** | 1 arquivo único | 1 objeto `.ngrr` por série |
+| **Alocação** | pré-alocado no tamanho final | pré-alocado no tamanho final |
+| **Atualização** | sobrescrita in-place no ring | sobrescrita in-place no ring |
+| **Expiração** | ring buffer (sobrescreve o mais antigo) | ring buffer (sobrescreve o mais antigo) |
 
 ---
 
@@ -197,7 +191,6 @@ metadata:
 spec:
   time:
     baseStepSec: 300
-    blockSizeSec: 21600
     lateSamplePolicy:
       maxLatenessSec: 600
       onLate: "bucket_if_possible"
@@ -236,9 +229,8 @@ spec:
 
   storage:
     backend: localDisk
-    objectNaming: {scheme: deterministic, rawPrefix: raw, aggPrefix: agg, manifestPrefix: manifest, schemaPrefix: schema}
-    writePolicy: {mode: append_only, idempotency: {key: "{seriesKey}/{ds}/{stepSec}/{blockStartEpoch}", onConflict: "verify_or_replace_if_identical"}}
-    manifestPolicy: {updateMode: periodic_snapshot, intervalSec: 900}
+    objectNaming: {scheme: deterministic, seriesPrefix: series, schemaPrefix: schema}
+    writePolicy: {mode: append_only, idempotency: {key: "{seriesKey}", onConflict: "verify_or_replace_if_identical"}}
 
   quality:
     emitMetrics: [missing_ratio, ingest_lag_sec, late_sample_count, counter_reset_count, wrap_detected_count]
@@ -246,6 +238,11 @@ spec:
 
 Interpolação de variáveis: `${VAR}` e `${VAR:default}` são resolvidos no load
 contra `System.getenv` (substituível em testes).
+
+> **Notas de schema (6.0.0).** O formato de série única removeu `time.blockSizeSec`,
+> `storage.manifestPolicy` e `writePolicy.persistenceMode` — a persistência é
+> sempre incremental (rrdtool-like) e a retenção é o ring de cada RRA
+> (`rows × stepSec`). `objectNaming` usa `seriesPrefix` (e `schemaPrefix`).
 
 ---
 
@@ -255,9 +252,8 @@ No mundo real você não monitora um único contador: uma interface de rede tem
 **tráfego de entrada e saída, erros e descartes (discards)**. No ngrrd cada uma
 dessas métricas é um **DataSource** (DS) — tipicamente um `COUNTER` SNMP — que a
 engine converte automaticamente em uma série de taxa via `derive.output`
-(`in_octets`, em bytes acumulados, → `in_bps`, em bits/s).
-
-A definição abaixo modela **6 métricas** numa única série:
+(`in_octets`, em bytes acumulados, → `in_bps`, em bits/s). Cada DS derivado é
+uma **coluna** do objeto `.ngrr`.
 
 | DS coletado (raw) | Tipo | Série derivada | Unidade |
 |-------------------|------|----------------|---------|
@@ -274,7 +270,6 @@ metadata:
 spec:
   time:
     baseStepSec: 300
-    blockSizeSec: 21600
     timestampAlignment: epoch
     lateSamplePolicy:
       maxLatenessSec: 600
@@ -370,9 +365,8 @@ spec:
 
   storage:
     backend: localDisk
-    objectNaming: {scheme: deterministic, rawPrefix: raw, aggPrefix: agg, manifestPrefix: manifest, schemaPrefix: schema}
-    writePolicy: {mode: append_only, idempotency: {key: "{seriesKey}/{ds}/{stepSec}/{blockStartEpoch}", onConflict: "verify_or_replace_if_identical"}}
-    manifestPolicy: {updateMode: periodic_snapshot, intervalSec: 900}
+    objectNaming: {scheme: deterministic, seriesPrefix: series, schemaPrefix: schema}
+    writePolicy: {mode: append_only, idempotency: {key: "{seriesKey}", onConflict: "verify_or_replace_if_identical"}}
 
   quality:
     emitMetrics: [missing_ratio, ingest_lag_sec, late_sample_count, counter_reset_count, wrap_detected_count]
@@ -385,7 +379,7 @@ spec:
 
 ## Uso programático
 
-Abertura, ingestão das 6 métricas e leitura — o fluxo espelha os testes
+Abertura, ingestão das métricas e leitura — o fluxo espelha os testes
 `NgrrdFacadeTest` e `IfaceTrafficSmokeIT`.
 
 ```java
@@ -410,15 +404,12 @@ try (NgrrdHandle handle = Ngrrd.fromYaml(yaml, bindings, tags)) {
     handle.write("out_octets",   new Sample(ts, outOctets));
     handle.write("in_errors",    new Sample(ts, inErrors));
     handle.write("out_errors",   new Sample(ts, outErrors));
-    handle.write("in_discards",  new Sample(ts, inDiscards));
-    handle.write("out_discards", new Sample(ts, outDiscards));
 
-    handle.flush();   // bloqueia até o bloco corrente fechar e persistir
+    handle.checkpoint();   // torna o CDP em progresso durável e legível
 
     // Leitura por preset: retorna todas as séries do preset de uma vez.
     Map<String, SeriesResult> daily = handle.read("daily");
     SeriesResult inBps  = daily.get("in_bps");
-    SeriesResult outBps = daily.get("out_bps");
     for (DataPoint p : inBps.points()) {
         // p.tsEpochMs(), p.value()  → Double.NaN representa gap/unknown
     }
@@ -426,9 +417,10 @@ try (NgrrdHandle handle = Ngrrd.fromYaml(yaml, bindings, tags)) {
 ```
 
 `write` é assíncrono: o cliente apenas enfileira e uma worker thread única aplica
-`CounterDeriver`, encaixa nos `PrimaryDataPoint` e fecha o bloco ao cruzar
-`blockSizeSec`. `flush()` força o fechamento imediato. Um `RESET`/`WRAP` de
-counter vira ponto `NaN` na série derivada (`onReset: unknown`).
+`CounterDeriver`, encaixa nos `PrimaryDataPoint` e consolida continuamente nos
+ring buffers. `checkpoint()` (ou `flush()`) torna o CDP em progresso durável e
+legível antes do passo do RRA fechar. Um `RESET`/`WRAP` de counter vira ponto
+`NaN` na série derivada (`onReset: unknown`).
 
 Para uma consulta ad-hoc (janela, step e CF explícitos), use `ViewQuery` — o
 `BestFitSelector` escolhe o RRA com melhor resolução para o `targetStepSec` e
@@ -453,17 +445,21 @@ S3Settings s3 = S3Settings.forEndpoint(
 var bindings = StorageFactory.StorageBindings.forS3(s3);
 ```
 
+> **Invariante:** um writer por série. O objeto da série sofre escrita in-place
+> no disco e read-modify-write no S3; dois writers concorrentes na mesma chave
+> causariam perda silenciosa (last-write-wins no S3).
+
 ---
 
 ## Métricas emitidas
 
 | Nome | Tipo | Origem |
 |------|------|--------|
-| `late_sample_count` | counter | sample anterior ao bloco corrente |
+| `late_sample_count` | counter | sample anterior ao slot corrente |
 | `counter_reset_count` | counter | flag RESET do CounterDeriver |
 | `wrap_detected_count` | counter | flag WRAP do CounterDeriver |
 | `last_ingest_lag_sec` | gauge | atraso da última sample observado |
-| `last_missing_ratio` | gauge | proporção de PDPs missing no último bloco fechado |
+| `last_missing_ratio` | gauge | proporção de PDPs missing no último CDP fechado |
 
 Plugue Micrometer/JMX/log com `NgrrdMetricsListener` passado a
 `Ngrrd.fromYaml(yaml, bindings, tags, listener)`.

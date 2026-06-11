@@ -7,55 +7,36 @@ import java.util.Objects;
 /**
  * Construtor de chaves determinísticas para os objetos persistidos pelo ngrrd.
  *
- * <p>Convenção (a partir de {@code spec.storage.objectNaming}):</p>
+ * <p>No formato de série única (NGRR) há apenas dois tipos de objeto:</p>
  *
  * <pre>
- * raw block       : {rawPrefix}/{seriesKey}/{dsName}/{stepSec}/{blockStartEpoch}.ngrrd
- * aggregated block: {aggPrefix}/{seriesKey}/{rraName}/{stepSec}/{blockStartEpoch}.ngrrd
- * manifest version: {manifestPrefix}/{seriesKey}/v{version}.yaml
- * schema snapshot : {schemaPrefix}/{definitionName}.yaml
+ * série            : {seriesPrefix}/{seriesKey}.ngrr
+ * snapshot schema  : {schemaPrefix}/{definitionName}.yaml
  * </pre>
  *
  * <p>Os prefixos NÃO incluem barra final. A classe nunca produz {@code //}.</p>
  */
 public final class StorageKey {
 
-    private static final String BLOCK_EXT = ".ngrrd";
+    private static final String SERIES_EXT = ".ngrr";
     private static final String YAML_EXT = ".yaml";
 
     private StorageKey() {
     }
 
-    public static String rawBlock(ObjectNaming naming, String seriesKey, String dsName,
-                                  int stepSec, long blockStartEpoch) {
+    /**
+     * Chave do objeto único da série no formato NGRR:
+     * {@code {seriesPrefix}/{seriesKey}.ngrr}. É o único objeto de dados por
+     * série (paridade com o arquivo {@code .rrd} do RRDtool).
+     */
+    public static String series(ObjectNaming naming, String seriesKey) {
         Objects.requireNonNull(naming, "naming é obrigatório");
-        return join(naming.rawPrefix(), seriesKey, dsName, Integer.toString(stepSec),
-                blockStartEpoch + BLOCK_EXT);
-    }
-
-    public static String aggBlock(ObjectNaming naming, String seriesKey, String rraName,
-                                  int stepSec, long blockStartEpoch) {
-        Objects.requireNonNull(naming, "naming é obrigatório");
-        return join(naming.aggPrefix(), seriesKey, rraName, Integer.toString(stepSec),
-                blockStartEpoch + BLOCK_EXT);
-    }
-
-    public static String manifestVersion(ObjectNaming naming, String seriesKey, int version) {
-        Objects.requireNonNull(naming, "naming é obrigatório");
-        if (version <= 0) {
-            throw new IllegalArgumentException("version deve ser > 0: " + version);
-        }
-        return join(naming.manifestPrefix(), seriesKey, "v" + version + YAML_EXT);
-    }
-
-    public static String manifestPrefix(ObjectNaming naming, String seriesKey) {
-        Objects.requireNonNull(naming, "naming é obrigatório");
-        return join(naming.manifestPrefix(), seriesKey);
+        return join(naming.seriesPrefixOrDefault(), seriesKey + SERIES_EXT);
     }
 
     public static String schemaSnapshot(ObjectNaming naming, String definitionName) {
         Objects.requireNonNull(naming, "naming é obrigatório");
-        return join(naming.schemaPrefix(), definitionName + YAML_EXT);
+        return join(naming.schemaPrefixOrDefault(), definitionName + YAML_EXT);
     }
 
     private static String join(String... segments) {

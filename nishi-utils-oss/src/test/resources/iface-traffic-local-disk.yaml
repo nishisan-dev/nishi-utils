@@ -7,7 +7,6 @@ metadata:
 spec:
   time:
     baseStepSec: 300
-    blockSizeSec: 21600
     timestampAlignment: epoch
     lateSamplePolicy:
       maxLatenessSec: 600
@@ -103,18 +102,13 @@ spec:
     backend: localDisk
     objectNaming:
       scheme: deterministic
-      rawPrefix: "raw"
-      aggPrefix: "agg"
-      manifestPrefix: "manifest"
+      seriesPrefix: "series"
       schemaPrefix: "schema"
     writePolicy:
       mode: append_only
       idempotency:
-        key: "{seriesKey}/{ds}/{stepSec}/{blockStartEpoch}"
+        key: "{seriesKey}"
         onConflict: "verify_or_replace_if_identical"
-    manifestPolicy:
-      updateMode: periodic_snapshot
-      intervalSec: 900
 
   quality:
     emitMetrics:

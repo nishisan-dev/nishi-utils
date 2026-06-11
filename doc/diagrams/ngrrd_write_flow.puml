@@ -1,43 +1,44 @@
 @startuml
-title ngrrd — Fluxo de escrita (ingestão)
+title ngrrd — Fluxo de escrita (ingestão, objeto único NGRR)
 
 actor Cliente
 participant "Ngrrd.fromYaml" as Facade
 participant "NgrrdWriter\n(worker thread)" as Writer
 participant "CounterDeriver" as Deriv
-participant "PrimaryDataPoint[]" as PDP
-participant "RraConsolidator" as RRA
-participant "BlockCodec" as Codec
-participant "NgrrdStorage" as Storage
-participant "ManifestUpdater\n(scheduler)" as Manifest
+participant "PDP em progresso\n(por coluna)" as PDP
+participant "CDP em progresso\n(por archive×coluna)" as CDP
+participant "SeriesFileCodec" as Codec
+participant "SeriesChannel\n(disco in-place / S3 RMW)" as Channel
 
 Cliente -> Facade : fromYaml(yaml, bindings, tags)
-Facade -> Writer : start (worker + queue)
-Facade -> Manifest : start (periodic)
+Facade -> Writer : abre série (openOrCreate)
+Writer -> Channel : openSeries(seriesKey.ngrr)
+alt arquivo ausente / geometria divergente
+  Writer -> Codec : buildInitialImage (pré-aloca + rings NaN)
+  Writer -> Channel : writeRegion(0, imagem) + force
+else arquivo existente
+  Writer -> Channel : readRegion(header + live-state)
+  Writer -> Codec : decode → reidrata counterPrev + acumuladores
+end
+
 loop por sample
   Cliente -> Writer : write("in_octets", Sample(ts, v))
-  Writer -> Deriv : derive(prev, curr)
-  Deriv --> Writer : derivedValue + flag
-  alt flag = RESET
-    Writer -> Writer : metrics.onCounterReset
-  else flag = WRAP
-    Writer -> Writer : metrics.onWrapDetected
+  Writer -> Deriv : derive(prev, curr) [atualiza counterPrev]
+  Deriv --> Writer : derivedValue + flag (RESET/WRAP → métrica)
+  alt slot base avançou
+    Writer -> CDP : fold PDP completo (por archive)
+    alt passo do archive fechou
+      Writer -> CDP : finaliza CDP (xff)
+      Writer -> Channel : writeRegion(cell) [avança ring, NaN-init]
+    end
   end
   Writer -> PDP : add(derivedValue)
-  alt ts >= blockEndEpoch
-    loop por RRA × CF
-      Writer -> RRA : consolidate(pdps, cf, xff)
-      RRA --> Writer : cdpValue[]
-      Writer -> Codec : encode(header, cdpValue[])
-      Writer -> Storage : atomicReplace(key, bytes)
-    end
-    Writer -> Writer : roll para novo BlockWindow
-  end
 end
-loop a cada intervalSec
-  Manifest -> Storage : list(manifest/<seriesKey>/)
-  Manifest -> Codec : writeYaml(NgrrdManifest)
-  Manifest -> Storage : atomicReplace(v{N}.yaml)
+
+loop checkpoint() / flush()
+  Writer -> CDP : emite CDP em progresso como parcial
+  Writer -> Channel : writeRegion(cells parciais)
+  Writer -> Channel : writeRegion(live-state) + force (fsync / PUT)
 end
 
 @enduml
