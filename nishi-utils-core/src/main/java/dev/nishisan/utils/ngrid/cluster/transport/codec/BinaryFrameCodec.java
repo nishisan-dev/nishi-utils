@@ -46,7 +46,12 @@ import java.util.UUID;
  * | 3+N      | 8 bytes  | epochMilli                              |
  * | 11+N     | 8 bytes  | leaderHighWatermark                     |
  * | 19+N     | 8 bytes  | leaderEpoch                             |
+ * | 27+N     | 1 byte   | leader flag (0/1) — OPTIONAL trailing   |
  * </pre>
+ * <p>
+ * The trailing leader flag (issue tems#9, D10c) is wire-compatible in both directions: an old
+ * decoder stops after the three longs and ignores trailing bytes; a new decoder reads the flag
+ * only when present ({@code remaining() > 0}) and defaults to {@code false} for old frames.
  * <p>
  * This codec is thread-safe.
  *
@@ -100,14 +105,15 @@ public final class BinaryFrameCodec {
         HeartbeatPayload payload = message.payload(HeartbeatPayload.class);
         byte[] sourceBytes = message.source().value().getBytes(StandardCharsets.UTF_8);
 
-        // 1 (marker) + 2 (source length) + N (source) + 24 (3 longs)
-        ByteBuffer buffer = ByteBuffer.allocate(1 + 2 + sourceBytes.length + 24);
+        // 1 (marker) + 2 (source length) + N (source) + 24 (3 longs) + 1 (leader flag)
+        ByteBuffer buffer = ByteBuffer.allocate(1 + 2 + sourceBytes.length + 24 + 1);
         buffer.put(marker);
         buffer.putShort((short) sourceBytes.length);
         buffer.put(sourceBytes);
         buffer.putLong(payload.epochMilli());
         buffer.putLong(payload.leaderHighWatermark());
         buffer.putLong(payload.leaderEpoch());
+        buffer.put(payload.leader() ? (byte) 1 : (byte) 0);
 
         return buffer.array();
     }
@@ -142,8 +148,11 @@ public final class BinaryFrameCodec {
             long epochMilli = buffer.getLong();
             long leaderHighWatermark = buffer.getLong();
             long leaderEpoch = buffer.getLong();
+            // Optional trailing leader flag (issue tems#9, D10c): absent in frames from older
+            // peers — decode as false (a node that cannot assert is never treated as a dual leader).
+            boolean leader = buffer.remaining() > 0 && buffer.get() != 0;
 
-            HeartbeatPayload payload = new HeartbeatPayload(epochMilli, leaderHighWatermark, leaderEpoch);
+            HeartbeatPayload payload = new HeartbeatPayload(epochMilli, leaderHighWatermark, leaderEpoch, leader);
 
             String qualifier = type == MessageType.HEARTBEAT ? "hb" : "rtt";
             return new ClusterMessage(ZERO_UUID, null, type, qualifier, source, null, payload, 1);

@@ -54,6 +54,10 @@ public final class ReplicationConfig {
     private final Duration followerProgressInterval;
     private final Duration joinPeerDiscoveryWindow;
     private final long joinSyncLagThreshold;
+    private final boolean leaderPauseOnReclaim;
+    private final long reclaimQuiesceThreshold;
+    private final Duration reclaimQuiesceMaxDuration;
+    private final Duration reclaimQuiesceCooldown;
     private final int relayStreamFetchBatch;
     private final Duration relayStreamPollInterval;
     private final Duration relayStreamFetchTimeout;
@@ -69,6 +73,8 @@ public final class ReplicationConfig {
             int resendLogMaxSegments, int resendLogReadBatchMax,
             int relayApplyBatchSize, boolean leaderPauseOnJoin, Duration joinQuiesceMaxDuration,
             Duration followerProgressInterval, Duration joinPeerDiscoveryWindow, long joinSyncLagThreshold,
+            boolean leaderPauseOnReclaim, long reclaimQuiesceThreshold, Duration reclaimQuiesceMaxDuration,
+            Duration reclaimQuiesceCooldown,
             int relayStreamFetchBatch, Duration relayStreamPollInterval, Duration relayStreamFetchTimeout,
             int relayMaxBacklog) {
         this.quorum = quorum;
@@ -101,6 +107,10 @@ public final class ReplicationConfig {
         this.followerProgressInterval = Objects.requireNonNull(followerProgressInterval, "followerProgressInterval");
         this.joinPeerDiscoveryWindow = Objects.requireNonNull(joinPeerDiscoveryWindow, "joinPeerDiscoveryWindow");
         this.joinSyncLagThreshold = joinSyncLagThreshold;
+        this.leaderPauseOnReclaim = leaderPauseOnReclaim;
+        this.reclaimQuiesceThreshold = reclaimQuiesceThreshold;
+        this.reclaimQuiesceMaxDuration = Objects.requireNonNull(reclaimQuiesceMaxDuration, "reclaimQuiesceMaxDuration");
+        this.reclaimQuiesceCooldown = Objects.requireNonNull(reclaimQuiesceCooldown, "reclaimQuiesceCooldown");
         this.relayStreamFetchBatch = relayStreamFetchBatch;
         this.relayStreamPollInterval = Objects.requireNonNull(relayStreamPollInterval, "relayStreamPollInterval");
         this.relayStreamFetchTimeout = Objects.requireNonNull(relayStreamFetchTimeout, "relayStreamFetchTimeout");
@@ -439,6 +449,55 @@ public final class ReplicationConfig {
         return joinSyncLagThreshold;
     }
 
+    /**
+     * Enables the quiesce-assisted reclaim — "leader pause on reclaim" (issue tems#9, D10b): when a
+     * HIGHER-affinity candidate approaches the leader's watermark (within
+     * {@link #reclaimQuiesceThreshold()}), the incumbent pauses production so the candidate can pair
+     * up exactly and the affinity handoff completes coordinately. Without it, under continuous
+     * production the in-flight delta never zeroes and the strict step-down gate retains leadership
+     * forever. Bounded by {@link #reclaimQuiesceMaxDuration()}; re-engagement after an aborted
+     * attempt is suppressed for {@link #reclaimQuiesceCooldown()}. Defaults to {@code false}
+     * (opt-in, like {@link #leaderPauseOnJoin()}).
+     *
+     * @return {@code true} when the leader pauses production for an approaching reclaim candidate
+     */
+    public boolean leaderPauseOnReclaim() {
+        return leaderPauseOnReclaim;
+    }
+
+    /**
+     * How close (in sequences) a higher-affinity candidate must be to the leader's watermark for the
+     * reclaim-quiesce to engage (issue tems#9, D10b). The pause covers only this final stretch —
+     * never the full catch-up. Defaults to 1024.
+     *
+     * @return the reclaim-quiesce approach threshold in sequences
+     */
+    public long reclaimQuiesceThreshold() {
+        return reclaimQuiesceThreshold;
+    }
+
+    /**
+     * Upper bound for a reclaim-quiesce pause (issue tems#9, D10b): if the candidate does not pair
+     * up in time, the leader resumes production and retains leadership (availability first).
+     * Defaults to 5s.
+     *
+     * @return the maximum reclaim-quiesce duration
+     */
+    public Duration reclaimQuiesceMaxDuration() {
+        return reclaimQuiesceMaxDuration;
+    }
+
+    /**
+     * Cooldown after an aborted reclaim-quiesce (timeout / candidate left) before another attempt
+     * may engage (issue tems#9, D10b) — prevents a periodic pause loop against a candidate that
+     * cannot keep up. Defaults to 60s.
+     *
+     * @return the reclaim-quiesce re-engagement cooldown
+     */
+    public Duration reclaimQuiesceCooldown() {
+        return reclaimQuiesceCooldown;
+    }
+
     public static final class Builder {
         private final int quorum;
         private Duration operationTimeout = Duration.ofSeconds(30);
@@ -469,6 +528,10 @@ public final class ReplicationConfig {
         private Duration followerProgressInterval = Duration.ofMillis(500);
         private Duration joinPeerDiscoveryWindow = Duration.ofSeconds(2);
         private long joinSyncLagThreshold = 0L;
+        private boolean leaderPauseOnReclaim = false;
+        private long reclaimQuiesceThreshold = 1024L;
+        private Duration reclaimQuiesceMaxDuration = Duration.ofSeconds(5);
+        private Duration reclaimQuiesceCooldown = Duration.ofSeconds(60);
         private int relayStreamFetchBatch = 512;
         private Duration relayStreamPollInterval = Duration.ofMillis(50);
         private Duration relayStreamFetchTimeout = Duration.ofSeconds(2);
@@ -887,6 +950,63 @@ public final class ReplicationConfig {
             return this;
         }
 
+        /**
+         * Enables the quiesce-assisted reclaim (issue tems#9, D10b). See
+         * {@link ReplicationConfig#leaderPauseOnReclaim()}. Defaults to {@code false} (opt-in).
+         *
+         * @param leaderPauseOnReclaim {@code true} to pause production for an approaching
+         *                             higher-affinity reclaim candidate
+         * @return this builder
+         */
+        public Builder leaderPauseOnReclaim(boolean leaderPauseOnReclaim) {
+            this.leaderPauseOnReclaim = leaderPauseOnReclaim;
+            return this;
+        }
+
+        /**
+         * Sets the approach threshold for the reclaim-quiesce (issue tems#9, D10b).
+         *
+         * @param threshold the approach threshold in sequences (must be >= 0)
+         * @return this builder
+         */
+        public Builder reclaimQuiesceThreshold(long threshold) {
+            if (threshold < 0) {
+                throw new IllegalArgumentException("reclaimQuiesceThreshold must be >= 0");
+            }
+            this.reclaimQuiesceThreshold = threshold;
+            return this;
+        }
+
+        /**
+         * Sets the maximum duration of a reclaim-quiesce pause (issue tems#9, D10b).
+         *
+         * @param duration the maximum pause duration (must be positive)
+         * @return this builder
+         */
+        public Builder reclaimQuiesceMaxDuration(Duration duration) {
+            Objects.requireNonNull(duration, "reclaimQuiesceMaxDuration");
+            if (duration.isZero() || duration.isNegative()) {
+                throw new IllegalArgumentException("reclaimQuiesceMaxDuration must be positive");
+            }
+            this.reclaimQuiesceMaxDuration = duration;
+            return this;
+        }
+
+        /**
+         * Sets the re-engagement cooldown after an aborted reclaim-quiesce (issue tems#9, D10b).
+         *
+         * @param cooldown the cooldown (must not be negative)
+         * @return this builder
+         */
+        public Builder reclaimQuiesceCooldown(Duration cooldown) {
+            Objects.requireNonNull(cooldown, "reclaimQuiesceCooldown");
+            if (cooldown.isNegative()) {
+                throw new IllegalArgumentException("reclaimQuiesceCooldown must not be negative");
+            }
+            this.reclaimQuiesceCooldown = cooldown;
+            return this;
+        }
+
         public ReplicationConfig build() {
             if (dataDirectory == null) {
                 throw new IllegalStateException("dataDirectory must be set");
@@ -899,6 +1019,7 @@ public final class ReplicationConfig {
                     resendLogSegmentMaxBytes, resendLogMaxEntries, resendLogMaxSegments, resendLogReadBatchMax,
                     relayApplyBatchSize, leaderPauseOnJoin,
                     joinQuiesceMaxDuration, followerProgressInterval, joinPeerDiscoveryWindow, joinSyncLagThreshold,
+                    leaderPauseOnReclaim, reclaimQuiesceThreshold, reclaimQuiesceMaxDuration, reclaimQuiesceCooldown,
                     relayStreamFetchBatch, relayStreamPollInterval, relayStreamFetchTimeout, relayMaxBacklog);
         }
     }

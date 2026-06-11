@@ -367,6 +367,10 @@ public final class NGridNode implements Closeable {
         replicationBuilder.relayApplyBatchSize(config.relayApplyBatchSize());
         replicationBuilder.leaderPauseOnJoin(config.leaderPauseOnJoin());
         replicationBuilder.joinQuiesceMaxDuration(config.joinQuiesceMaxDuration());
+        replicationBuilder.leaderPauseOnReclaim(config.leaderPauseOnReclaim());
+        replicationBuilder.reclaimQuiesceThreshold(config.reclaimQuiesceThreshold());
+        replicationBuilder.reclaimQuiesceMaxDuration(config.reclaimQuiesceMaxDuration());
+        replicationBuilder.reclaimQuiesceCooldown(config.reclaimQuiesceCooldown());
 
         // Determine replication data directory
         Path replicationDataDir;

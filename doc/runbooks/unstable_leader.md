@@ -99,6 +99,26 @@ O `LeaderReelectionService` pode estar sugerindo trocas de líder com base em wr
 2. Se o nó está degradado, forçar failover matando o processo.
 3. O cluster elegerá um novo líder automaticamente.
 
+### Cenário E: Dual-leader (dois nós se afirmando líderes)
+
+Assinatura nos logs: `Dual-leader detected with <node>` e/ou `Leader epoch converged to N (leader
+re-stamp above observed N-1)` recorrente nos dois nós (issue tems#9, D10).
+
+**A resolução é automática**: o heartbeat carrega a flag de líder e, após 3 heartbeats consecutivos
+de observação mútua, o nó de **menor afinidade** cede de forma determinística (prioridade, depois
+NodeId), ressinca do vencedor via snapshot e **descarta a cauda produzida na janela dual** (estado
+não-confiável por definição). Logs esperados do desfecho: `Dual-leader resolved: yielding leadership
+to higher-affinity <node>` no perdedor e `retaining (higher affinity)` no vencedor.
+
+1. **Não intervir** durante a resolução (segundos); confirmar líder único na sequência.
+2. Se o dual ocorreu durante um handoff por afinidade sob produção contínua, habilitar/ajustar o
+   **quiesce-assisted reclaim** (`leaderPauseOnReclaim` + `reclaimQuiesceThreshold`) — ele elimina a
+   causa-raiz (delta in-flight eterno) e evita o descarte da janela dual.
+3. Verificar a saúde do **join-quiesce** no rejoin (`Join-quiesce released` deve acontecer por
+   catch-up real ou timeout, nunca em ~1s sob lag grande).
+4. A contenção manual antiga (SIGTERM no nó de menor afinidade + wipe + cold bootstrap) permanece
+   válida apenas para versões sem o fix do D10.
+
 ---
 
 ## Validação Pós-Estabilização

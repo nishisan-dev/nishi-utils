@@ -24,25 +24,42 @@ import java.time.Instant;
 
 /**
  * Simple heartbeat payload carrying a timestamp from the sender.
+ * <p>
+ * Carries the sender's advertised watermark, its leader-epoch view and — issue tems#9, D10c —
+ * whether the SENDER currently asserts leadership. The flag is what makes a dual-leader
+ * OBSERVABLE: two nodes asserting it to each other trigger the deterministic affinity resolution.
+ * Absent on the wire (older peers), it decodes as {@code false} on both the binary and the JSON
+ * paths.
  */
 public final class HeartbeatPayload {
 
     private final long epochMilli;
     private final long leaderHighWatermark;
     private final long leaderEpoch;
+    private final boolean leader;
 
     @JsonCreator
     public HeartbeatPayload(
             @JsonProperty("epochMilli") long epochMilli,
             @JsonProperty("leaderHighWatermark") long leaderHighWatermark,
-            @JsonProperty("leaderEpoch") long leaderEpoch) {
+            @JsonProperty("leaderEpoch") long leaderEpoch,
+            @JsonProperty("leader") boolean leader) {
         this.epochMilli = epochMilli;
         this.leaderHighWatermark = leaderHighWatermark;
         this.leaderEpoch = leaderEpoch;
+        this.leader = leader;
+    }
+
+    public HeartbeatPayload(long epochMilli, long leaderHighWatermark, long leaderEpoch) {
+        this(epochMilli, leaderHighWatermark, leaderEpoch, false);
+    }
+
+    public static HeartbeatPayload now(long leaderHighWatermark, long leaderEpoch, boolean leader) {
+        return new HeartbeatPayload(Instant.now().toEpochMilli(), leaderHighWatermark, leaderEpoch, leader);
     }
 
     public static HeartbeatPayload now(long leaderHighWatermark, long leaderEpoch) {
-        return new HeartbeatPayload(Instant.now().toEpochMilli(), leaderHighWatermark, leaderEpoch);
+        return now(leaderHighWatermark, leaderEpoch, false);
     }
 
     public static HeartbeatPayload now() {
@@ -59,5 +76,10 @@ public final class HeartbeatPayload {
 
     public long leaderEpoch() {
         return leaderEpoch;
+    }
+
+    /** True when the SENDER asserted leadership at send time (issue tems#9, D10c). */
+    public boolean leader() {
+        return leader;
     }
 }

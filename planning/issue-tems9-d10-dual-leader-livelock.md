@@ -1,8 +1,23 @@
 # D10 — Dual-leader livelock no handoff por afinidade sob produção contínua
 
 > Descoberto em 2026-06-10 (tarde) durante a validação do D9 em pré-prod. Mesmo ciclo da issue
-> tems#9. **ABERTO** — defeito pré-existente que era mascarado pela abdicação patológica do D9;
-> com o F2 do D9 removendo a capitulação, o estado latente aflorou como dual-leader estável.
+> tems#9. **FIX IMPLEMENTADO em 2026-06-11** (branch `fix/d10-dual-leader-livelock`, pacote
+> a+b+c — ver `planning/fix-d10-dual-leader-livelock.md` e seção 13 de
+> `doc/ngrid/oplog-ha-hardening.md`). Pendente: validação em pré-prod com o roteiro do incidente.
+>
+> **Diagnóstico do (a) CONFIRMADO em código:** a liberação precoce do join-quiesce (1,5s vs 64s)
+> era mismatch de escala — o release comparava o progresso do follower contra o `globalSequence`
+> CRU do líder (contador de produção local, nunca re-ancorado numa promoção sem cutover), enquanto
+> o watermark real é `max(globalSequence, lastApplied)` (a fórmula do próprio
+> `advertisedLeaderHighWatermark()`). Num líder promovido de follower o alvo ficava trivialmente
+> abaixo do primeiro `FOLLOWER_PROGRESS`. Endurecimentos adicionais: progresso com epoch divergente
+> ou frontier -1 descartado; entrada stale da sessão anterior descartada no rejoin; release exige
+> report fresco. Reprodução determinística: `JoinQuiesceReleaseGateTest`.
+>
+> **Achado adicional da implementação (E2E):** os contadores de progresso são escalares e cegos a
+> linhagem — ops aplicadas de ramos descartados (churn de boot/janela dual com produção ativa)
+> inflam o contador e tornam o emparelhamento numérico exato inalcançável (o (b) expira e o (c)
+> resolve com descarte). Reforça o follow-up estrutural epoch-aware já registrado na PR #142.
 
 ## Sintoma (ambiente real, 2 nós, firehose contínuo)
 
@@ -50,12 +65,16 @@
   um ciclo de heartbeat.
 - **(d)** F2 do D9 permanece como está; (b) e (c) são o complemento que faltava.
 
-## Contenção operacional (até o fix)
+## Contenção operacional (superada pelo fix)
 
-- **Evitar restart do nó de maior afinidade** (node-1): o caminho de reclaim por afinidade é o
-  que entra em dual sob produção contínua.
-- Se entrar em dual: SIGTERM no nó de menor afinidade → líder único; depois wipe do var do nó
-  parado e cold bootstrap (ressync do zero) — o estado produzido na janela dual não é confiável.
+> Com o pacote a+b+c o dual-leader é autocorrigido: a resolução determinística (c) cede o nó de
+> menor afinidade em ~1 ciclo de debounce e o ressync (maquinaria D8) descarta a cauda da janela
+> dual automaticamente — o mesmo desfecho da contenção manual abaixo, agora bounded e sem operador.
+
+- ~~**Evitar restart do nó de maior afinidade** (node-1): o caminho de reclaim por afinidade é o
+  que entra em dual sob produção contínua.~~
+- ~~Se entrar em dual: SIGTERM no nó de menor afinidade → líder único; depois wipe do var do nó
+  parado e cold bootstrap (ressync do zero) — o estado produzido na janela dual não é confiável.~~
 
 ## Evidências (pré-prod 2026-06-10, 17:27–17:40)
 

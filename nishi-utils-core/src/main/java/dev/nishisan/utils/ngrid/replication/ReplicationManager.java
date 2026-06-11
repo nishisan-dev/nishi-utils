@@ -147,11 +147,28 @@ public class ReplicationManager
     // production while a not-caught-up follower joins, until it catches up / disconnects / times out.
     private final java.util.concurrent.atomic.AtomicBoolean joinQuiescing = new java.util.concurrent.atomic.AtomicBoolean(
             false);
-    private final Map<NodeId, Long> followerAppliedByNode = new ConcurrentHashMap<>();
+    private final Map<NodeId, FollowerProgress> followerAppliedByNode = new ConcurrentHashMap<>();
     private final Set<NodeId> quiescingFor = ConcurrentHashMap.newKeySet();
     private volatile long joinQuiesceStartedMs;
     // Active members observed on the previous membership change, to detect newly-joined nodes.
     private final Set<NodeId> knownActiveMembers = ConcurrentHashMap.newKeySet();
+    // Leader-side reclaim-quiesce gate (issue tems#9, D10b, opt-in via config.leaderPauseOnReclaim):
+    // when a HIGHER-affinity candidate approaches the local watermark (within
+    // reclaimQuiesceThreshold), the leader pauses production so the candidate can pair up EXACTLY
+    // and the affinity handoff completes coordinately. Without it, under continuous production the
+    // in-flight delta never zeroes: the strict step-down gate (B) retains forever while the
+    // candidate's caught-up latch (gate A) arms against a stale heartbeat watermark — the
+    // dual-leader livelock. Separate from joinQuiescing: distinct trigger (proximity, not join),
+    // single candidate, exact pairing, own timeout and cooldown.
+    private final java.util.concurrent.atomic.AtomicBoolean reclaimQuiescing = new java.util.concurrent.atomic.AtomicBoolean(
+            false);
+    private volatile NodeId reclaimQuiesceFor;
+    private volatile long reclaimQuiesceStartedMs;
+    private volatile long reclaimQuiesceCooldownUntilMs;
+    // True from the dual-leader yield hook (issue tems#9, D10c) until the bootstrap resync installs:
+    // keeps the promoted-leader auto-disarm in drainRelayOnce from undoing the pending bootstrap in
+    // the window where this (yielding) node still answers isLeader().
+    private volatile boolean dualLeaderYielding = false;
 
     // User-level broadcast messaging (broadcastMessage API): best-effort fire-and-forget messages
     // between nodes for coordination. Listeners are invoked on a worker thread (keep them non-blocking).
@@ -333,6 +350,9 @@ public class ReplicationManager
         // higher-affinity candidate has caught up). The threshold reuses joinSyncLagThreshold (#129).
         coordinator.setReplicationProgressGate(this::localAppliedForReclaim, config.joinSyncLagThreshold());
         coordinator.setLocalLeadershipEligibility(this::isLocallyEligibleForLeadership);
+        // Dual-leader resolution (issue tems#9, D10c): when this node is the losing (lower-affinity)
+        // side, discard the dual-window lineage and resync from the winner via the D8 machinery.
+        coordinator.setDualLeaderYieldHook(this::onDualLeaderYield);
         // Nudge the coordinator to recompute leadership as our applied frontier advances, so a deferred
         // reclaim is promoted promptly once we catch up (membership/eviction ticks would also trigger it).
         timeoutScheduler.scheduleAtFixedRate(this::nudgeLeadershipOnCatchUp, 200, 200, TimeUnit.MILLISECONDS);
@@ -369,10 +389,18 @@ public class ReplicationManager
             // Leader-pause-on-join (#129): detect joins (membership), have followers report progress, and
             // periodically re-evaluate the quiesce gate (release on catch-up / disconnect / timeout).
             coordinator.addMembershipListener(this);
+            timeoutScheduler.scheduleAtFixedRate(this::checkJoinQuiesce, 200, 200, TimeUnit.MILLISECONDS);
+        }
+        if (config.leaderPauseOnJoin() || config.leaderPauseOnReclaim()) {
+            // Both quiesce gates are driven by FOLLOWER_PROGRESS reports.
             long progressMs = Math.max(50L, config.followerProgressInterval().toMillis());
             timeoutScheduler.scheduleAtFixedRate(this::sendFollowerProgress, progressMs, progressMs,
                     TimeUnit.MILLISECONDS);
-            timeoutScheduler.scheduleAtFixedRate(this::checkJoinQuiesce, 200, 200, TimeUnit.MILLISECONDS);
+        }
+        if (config.leaderPauseOnReclaim()) {
+            // Quiesce-assisted reclaim (issue tems#9, D10b): engage on candidate approach, bound the
+            // pause, abort (with cooldown) if the candidate never pairs up or leaves.
+            timeoutScheduler.scheduleAtFixedRate(this::checkReclaimQuiesce, 200, 200, TimeUnit.MILLISECONDS);
         }
         Duration timeout = config.operationTimeout();
         long periodMs = Math.max(100L, timeout.toMillis() / 2);
@@ -768,6 +796,13 @@ public class ReplicationManager
             // on catch-up/disconnect/timeout. Mirror of the failover drain-gate, on the join path.
             throw new LeaderSyncingException(
                     "Leader is quiescing for a joining follower (catch-up in progress), write rejected");
+        }
+        if (config.leaderPauseOnReclaim() && isReclaimQuiescing()) {
+            // Quiesce-assisted reclaim (issue tems#9, D10b): a higher-affinity candidate is within the
+            // approach threshold; pause production so it pairs up EXACTLY and the handoff completes —
+            // under a firehose the in-flight delta would otherwise never zero. Bounded + cooldown.
+            throw new LeaderSyncingException(
+                    "Leader is quiescing for an affinity handoff (candidate pairing up), write rejected");
         }
         if (!coordinator.hasValidLease()) {
             throw new LeaseExpiredException("Leader lease expired, write rejected to prevent data divergence");
@@ -1227,6 +1262,9 @@ public class ReplicationManager
         relayFetchPendingUntilByTopic.put(topic, 0L);
         signalFetch(topic);
         if (completedBootstrap && relayPendingBootstrap.isEmpty()) {
+            // A dual-leader yield resync (issue tems#9, D10c) completes here: the local state now
+            // belongs to the winner's lineage and the drainRelayOnce guard can stand down.
+            dualLeaderYielding = false;
             coordinator.reevaluateLeadership();
         }
 
@@ -1620,8 +1658,10 @@ public class ReplicationManager
     private boolean drainRelayOnce(String topic, NQueue<byte[]> relay) throws Exception {
         if (relayPendingBootstrap.contains(topic)) {
             // Unclean restart: do not apply this topic's relay until it is bootstrapped, or the decision
-            // is made that no bootstrap is needed.
-            if (coordinator.isLeader()) {
+            // is made that no bootstrap is needed. A dual-leader yield (issue tems#9, D10c) arms the
+            // pending BEFORE the demotion lands — the auto-disarm below must not undo it while this
+            // node transiently still answers isLeader().
+            if (coordinator.isLeader() && !dualLeaderYielding) {
                 // Promoted/leader: there is no peer to bootstrap from; the failover drain-gate + sequence
                 // fencing recover the backlog. (A lost frontier on a promoted-with-backlog node is the
                 // residual edge case that needs crash-safe frontier co-location — out of scope here.)
@@ -2443,6 +2483,9 @@ public class ReplicationManager
                 leaderSyncing.set(false);
                 leaderSyncTopics.clear();
                 clearJoinQuiesce();
+                // Handoff observed (issue tems#9, D10b): the reclaim-quiesce did its job — the
+                // candidate paired up and took over. Resume production as a follower (forwarding).
+                clearReclaimQuiesce();
             }
             failAllPending("Lost leadership to " + newLeader);
             return;
@@ -2459,6 +2502,9 @@ public class ReplicationManager
         // and recover any residual forward-gap via the promoted-leader skip path.
         syncingTopics.clear();
         relayPendingBootstrap.clear();
+        // A promotion supersedes any in-flight dual-leader yield (issue tems#9, D10c): the rival
+        // died mid-yield and this node is the only lineage left — nothing to resync from.
+        dualLeaderYielding = false;
         // Notify handlers of leadership promotion so they can clean up stale data
         // (e.g., truncate queues with persisted data from a previous epoch).
         for (ReplicationHandler handler : handlers.values()) {
@@ -2529,17 +2575,15 @@ public class ReplicationManager
         }
         NodeId localId = transport.local().nodeId();
         if (coordinator.isLeader()) {
-            long leaderSeq = globalSequence.get();
-            long threshold = config.joinSyncLagThreshold();
             for (NodeId member : current) {
                 if (member.equals(localId) || knownActiveMembers.contains(member)) {
                     continue; // only newly-joined members
                 }
-                long applied = followerAppliedByNode.getOrDefault(member, -1L);
-                if (applied < 0 || applied < leaderSeq - threshold) {
-                    // Behind (or unknown): pause production until it catches up / disconnects / times out.
-                    quiescingFor.add(member);
-                }
+                // A rejoining node's progress from its PREVIOUS session says nothing about the new
+                // one (issue tems#9, D10a) — and a kill -9 + fast reconnect may race the disconnect
+                // cleanup. Drop any stale entry and hold the gate until a fresh post-join report.
+                followerAppliedByNode.remove(member);
+                quiescingFor.add(member);
             }
             if (!quiescingFor.isEmpty() && joinQuiescing.compareAndSet(false, true)) {
                 joinQuiesceStartedMs = System.currentTimeMillis();
@@ -2559,13 +2603,30 @@ public class ReplicationManager
         }
         FollowerProgressPayload payload = message.payload(FollowerProgressPayload.class);
         NodeId source = message.source();
-        followerAppliedByNode.put(source, payload.appliedSequence());
+        // Issue tems#9, D10a: a bootstrap-gated follower advertises -1 (no usable frontier) and a
+        // follower still tracking another lineage's epoch reports progress on an incomparable
+        // scale — releasing the quiesce against either value reopens the 1.5s-release hole.
+        if (payload.appliedSequence() < 0 || payload.epoch() != coordinator.getLeaderEpoch()) {
+            return;
+        }
+        followerAppliedByNode.put(source,
+                new FollowerProgress(payload.appliedSequence(), payload.epoch(), System.currentTimeMillis()));
         if (quiescingFor.contains(source)) {
-            long leaderSeq = globalSequence.get();
-            if (payload.appliedSequence() >= leaderSeq - config.joinSyncLagThreshold()) {
+            if (payload.appliedSequence() >= leaderQuiesceTarget() - config.joinSyncLagThreshold()) {
                 quiescingFor.remove(source);
                 maybeReleaseJoinQuiesce();
             }
+        }
+        if (reclaimQuiescing.get() && source.equals(reclaimQuiesceFor)
+                && payload.appliedSequence() >= leaderQuiesceTarget()) {
+            // The candidate paired up exactly against the frozen watermark (issue tems#9, D10b):
+            // surface it to the coordinator NOW — waiting for the candidate's next heartbeat (up to
+            // one interval stale) would stretch the pause for nothing. Gate B opens, recompute hands
+            // leadership to the candidate, and onLeaderChanged releases this quiesce.
+            coordinator.noteFollowerWatermark(source, payload.appliedSequence());
+        } else if (config.leaderPauseOnReclaim() && !reclaimQuiescing.get()) {
+            // Fresh progress is the approach signal — engaging here beats the 200ms tick.
+            maybeEngageReclaimQuiesce();
         }
     }
 
@@ -2575,7 +2636,9 @@ public class ReplicationManager
             return;
         }
         coordinator.leaderInfo().ifPresent(leader -> {
-            FollowerProgressPayload payload = new FollowerProgressPayload(lastAppliedSequence,
+            // Report the advertised watermark (issue tems#9, D10a): -1 while the bootstrap gate is
+            // engaged, so the leader never mistakes a pre-bootstrap frontier for catch-up progress.
+            FollowerProgressPayload payload = new FollowerProgressPayload(advertisedLeaderHighWatermark(),
                     coordinator.getTrackedLeaderEpoch());
             transport.send(ClusterMessage.request(MessageType.FOLLOWER_PROGRESS, "follower-progress",
                     transport.local().nodeId(), leader.nodeId(), payload));
@@ -2593,10 +2656,20 @@ public class ReplicationManager
             clearJoinQuiesce();
             return;
         }
-        // Drop joiners that are no longer active or have since caught up.
-        long leaderSeq = globalSequence.get();
+        // Drop joiners that have since caught up — judged only on a FRESH report from the current
+        // epoch (issue tems#9, D10a): a stale entry must never release the gate.
+        long target = leaderQuiesceTarget();
         long threshold = config.joinSyncLagThreshold();
-        quiescingFor.removeIf(node -> followerAppliedByNode.getOrDefault(node, -1L) >= leaderSeq - threshold);
+        long freshnessMs = followerProgressFreshnessMs();
+        long now = System.currentTimeMillis();
+        long currentEpoch = coordinator.getLeaderEpoch();
+        quiescingFor.removeIf(node -> {
+            FollowerProgress progress = followerAppliedByNode.get(node);
+            return progress != null
+                    && progress.epoch() == currentEpoch
+                    && now - progress.atMillis() <= freshnessMs
+                    && progress.applied() >= target - threshold;
+        });
         maybeReleaseJoinQuiesce();
     }
 
@@ -2610,6 +2683,153 @@ public class ReplicationManager
     private void clearJoinQuiesce() {
         quiescingFor.clear();
         joinQuiescing.set(false);
+    }
+
+    /**
+     * Leader-side catch-up target for the quiesce gates (issue tems#9, D10a): the same scale the
+     * leader advertises in heartbeats. {@code globalSequence} alone understates the frontier of a
+     * leader promoted without a snapshot cutover (it is a local production counter), which let the
+     * join-quiesce release against a target the joiner had trivially passed (1.5s release while the
+     * real catch-up took 64s).
+     */
+    private long leaderQuiesceTarget() {
+        return Math.max(getGlobalSequence(), getLastAppliedSequence());
+    }
+
+    /** Max age for a follower progress report to count toward releasing a quiesce gate. */
+    private long followerProgressFreshnessMs() {
+        return Math.max(50L, config.followerProgressInterval().toMillis()) * 3L;
+    }
+
+    /** A follower's apply progress as last reported (issue tems#9, D10a). */
+    private record FollowerProgress(long applied, long epoch, long atMillis) {
+    }
+
+    // ── Quiesce-assisted reclaim — "leader pause on reclaim" (issue tems#9, D10b) ───────────────
+
+    /** True while the leader is pausing production for an approaching reclaim candidate. */
+    public boolean isReclaimQuiescing() {
+        return reclaimQuiescing.get();
+    }
+
+    /**
+     * Periodic guard of the reclaim-quiesce: bounds the pause ({@code reclaimQuiesceMaxDuration}),
+     * aborts when the candidate leaves, releases when leadership already changed hands, and
+     * re-evaluates engagement otherwise.
+     */
+    private void checkReclaimQuiesce() {
+        if (!running || !config.leaderPauseOnReclaim()) {
+            return;
+        }
+        if (!reclaimQuiescing.get()) {
+            maybeEngageReclaimQuiesce();
+            return;
+        }
+        if (!coordinator.isLeader()) {
+            // Handoff completed (or leadership otherwise changed) — onLeaderChanged also clears;
+            // this is the belt for a missed listener tick.
+            clearReclaimQuiesce();
+            return;
+        }
+        NodeId candidate = reclaimQuiesceFor;
+        if (System.currentTimeMillis() - reclaimQuiesceStartedMs > config.reclaimQuiesceMaxDuration().toMillis()) {
+            LOGGER.warning(() -> "Reclaim-quiesce exceeded max duration; resuming production and"
+                    + " retaining leadership (candidate " + candidate + " did not pair up in time)");
+            abortReclaimQuiesce();
+            return;
+        }
+        boolean candidateActive = candidate != null && coordinator.activeMembers().stream()
+                .anyMatch(m -> candidate.equals(m.nodeId()));
+        if (!candidateActive) {
+            LOGGER.warning(() -> "Reclaim-quiesce candidate " + candidate
+                    + " left the membership; resuming production and retaining leadership");
+            abortReclaimQuiesce();
+        }
+    }
+
+    /**
+     * Engages the reclaim-quiesce when a HIGHER-affinity candidate (election order: priority, then
+     * NodeId) has fresh, comparable progress within {@code reclaimQuiesceThreshold} of the local
+     * watermark. Never engages for a lower-affinity peer (there is no handoff to assist), while the
+     * join-quiesce is already pausing production, or during the post-abort cooldown.
+     */
+    private void maybeEngageReclaimQuiesce() {
+        if (!running || !config.leaderPauseOnReclaim() || !coordinator.isLeader()
+                || reclaimQuiescing.get() || isJoinQuiescing()
+                || System.currentTimeMillis() < reclaimQuiesceCooldownUntilMs) {
+            return;
+        }
+        NodeInfo local = transport.local();
+        long target = leaderQuiesceTarget();
+        long freshnessMs = followerProgressFreshnessMs();
+        long now = System.currentTimeMillis();
+        long currentEpoch = coordinator.getLeaderEpoch();
+        for (NodeInfo member : coordinator.activeMembers()) {
+            if (member.nodeId().equals(local.nodeId()) || member.port() <= 0
+                    || !hasHigherAffinity(member, local)) {
+                continue;
+            }
+            FollowerProgress progress = followerAppliedByNode.get(member.nodeId());
+            if (progress == null || progress.applied() < 0 || progress.epoch() != currentEpoch
+                    || now - progress.atMillis() > freshnessMs) {
+                continue; // no fresh, comparable report — not an approach signal
+            }
+            long delta = target - progress.applied();
+            if (delta >= 0 && delta <= config.reclaimQuiesceThreshold()) {
+                reclaimQuiesceFor = member.nodeId();
+                reclaimQuiesceStartedMs = now;
+                if (reclaimQuiescing.compareAndSet(false, true)) {
+                    LOGGER.info(() -> "Reclaim-quiesce engaged: pausing production so higher-affinity"
+                            + " candidate " + member.nodeId() + " can pair up (delta=" + delta
+                            + ", issue tems#9, D10b)");
+                }
+                return;
+            }
+        }
+    }
+
+    /** Election-order affinity comparison: higher priority wins; NodeId breaks ties. */
+    private static boolean hasHigherAffinity(NodeInfo candidate, NodeInfo reference) {
+        if (candidate.priority() != reference.priority()) {
+            return candidate.priority() > reference.priority();
+        }
+        return candidate.nodeId().compareTo(reference.nodeId()) > 0;
+    }
+
+    /**
+     * Losing side of a dual-leader resolution (issue tems#9, D10c), invoked by the coordinator
+     * BEFORE the demotion: everything this node produced during the dual window belongs to a
+     * DIVERGENT lineage, so every registered topic is marked for bootstrap resync. The existing D8
+     * machinery does the rest once the node is a follower of the winner — {@code drainRelayOnce}
+     * requests the snapshot, {@code completeSnapshotCutover} installs it (resetState + counter SET +
+     * local binlog truncate), and the bootstrap gate keeps the node non-advertisable/ineligible
+     * until the install lands. The dual-window tail is discarded by design — the same outcome the
+     * operational containment (wipe + cold bootstrap) produced manually, now automatic and bounded.
+     */
+    private void onDualLeaderYield() {
+        if (!isStreamMode()) {
+            return;
+        }
+        dualLeaderYielding = true;
+        for (String topic : handlers.keySet()) {
+            relayPendingBootstrap.add(topic);
+        }
+        LOGGER.warning(() -> "Dual-leader yield: topics " + handlers.keySet() + " marked for"
+                + " bootstrap resync; the locally produced dual-window tail will be discarded"
+                + " (issue tems#9, D10c)");
+    }
+
+    /** Abort without handoff: release the pause and arm the re-engagement cooldown. */
+    private void abortReclaimQuiesce() {
+        clearReclaimQuiesce();
+        reclaimQuiesceCooldownUntilMs = System.currentTimeMillis() + config.reclaimQuiesceCooldown().toMillis();
+    }
+
+    private void clearReclaimQuiesce() {
+        reclaimQuiesceFor = null;
+        if (reclaimQuiescing.compareAndSet(true, false)) {
+            LOGGER.info(() -> "Reclaim-quiesce released; resuming production.");
+        }
     }
 
     // ── User-level broadcast messaging (broadcastMessage API) ─────────────────────

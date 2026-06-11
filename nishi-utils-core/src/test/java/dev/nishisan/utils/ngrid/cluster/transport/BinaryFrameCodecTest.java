@@ -79,6 +79,52 @@ class BinaryFrameCodecTest {
     }
 
     @Test
+    void shouldRoundTripLeaderFlag() throws Exception {
+        NodeId source = NodeId.of("node-leader");
+        for (boolean leader : new boolean[] { true, false }) {
+            HeartbeatPayload payload = new HeartbeatPayload(
+                    System.currentTimeMillis(), 42L, 7L, leader);
+            ClusterMessage original = ClusterMessage.lightweight(
+                    MessageType.HEARTBEAT, "hb", source, null, payload);
+
+            HeartbeatPayload decoded = codec.decode(codec.encode(original))
+                    .payload(HeartbeatPayload.class);
+            assertEquals(leader, decoded.leader(),
+                    "a flag de líder deve sobreviver ao round-trip binário (tems#9, D10c)");
+        }
+    }
+
+    @Test
+    void shouldDecodeLegacyFrameWithoutLeaderFlagAsFalse() throws Exception {
+        // Frame no layout ANTIGO (sem o byte final da flag): peers de versões anteriores.
+        NodeId source = NodeId.of("node-old");
+        byte[] sourceBytes = source.value().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        java.nio.ByteBuffer legacy = java.nio.ByteBuffer.allocate(1 + 2 + sourceBytes.length + 24);
+        legacy.put(BinaryFrameCodec.HEARTBEAT_MARKER);
+        legacy.putShort((short) sourceBytes.length);
+        legacy.put(sourceBytes);
+        legacy.putLong(System.currentTimeMillis());
+        legacy.putLong(42L);
+        legacy.putLong(7L);
+
+        HeartbeatPayload decoded = codec.decode(legacy.array()).payload(HeartbeatPayload.class);
+        assertEquals(42L, decoded.leaderHighWatermark());
+        assertEquals(7L, decoded.leaderEpoch());
+        assertFalse(decoded.leader(),
+                "frame legado (sem o byte da flag) decodifica leader=false — retro-compat de rolling upgrade");
+    }
+
+    @Test
+    void newFrameIsExactlyOneByteLongerThanLegacy() throws Exception {
+        NodeId source = NodeId.of("node-size");
+        byte[] sourceBytes = source.value().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        ClusterMessage message = ClusterMessage.lightweight(MessageType.HEARTBEAT, "hb", source, null,
+                new HeartbeatPayload(System.currentTimeMillis(), 1L, 1L, true));
+        assertEquals(1 + 2 + sourceBytes.length + 24 + 1, codec.encode(message).length,
+                "o frame novo carrega exatamente +1 byte (a flag de líder no final)");
+    }
+
+    @Test
     void shouldRejectUnsupportedType() {
         NodeId source = NodeId.of("node-1");
         ClusterMessage message = ClusterMessage.request(

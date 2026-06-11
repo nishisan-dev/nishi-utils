@@ -59,6 +59,7 @@ public final class NGridNodeBuilder {
     private boolean persistentResendLog = false;
     private int relayApplyBatchSize = 256;
     private boolean leaderPauseOnJoin = false;
+    private boolean leaderPauseOnReclaim = false;
     private int priority = 0;
 
     NGridNodeBuilder(String host, int port) {
@@ -265,6 +266,21 @@ public final class NGridNodeBuilder {
     }
 
     /**
+     * Enables the quiesce-assisted reclaim (issue tems#9, D10b): when a higher-affinity candidate
+     * approaches the leader's watermark, the incumbent pauses production so the candidate pairs up
+     * exactly and the affinity handoff completes coordinately. Bounded and cooldown-protected.
+     * Defaults to {@code false}. Recommended for HA pairs with distinct priorities.
+     *
+     * @param leaderPauseOnReclaim {@code true} to pause production for an approaching reclaim
+     *                             candidate
+     * @return this builder
+     */
+    public NGridNodeBuilder leaderPauseOnReclaim(boolean leaderPauseOnReclaim) {
+        this.leaderPauseOnReclaim = leaderPauseOnReclaim;
+        return this;
+    }
+
+    /**
      * Builds and starts the node.
      * <p>
      * If no data directory is specified, the build will fail for
@@ -289,7 +305,8 @@ public final class NGridNodeBuilder {
                 .relayDurability(relayDurability)
                 .persistentResendLog(persistentResendLog)
                 .relayApplyBatchSize(relayApplyBatchSize)
-                .leaderPauseOnJoin(leaderPauseOnJoin);
+                .leaderPauseOnJoin(leaderPauseOnJoin)
+                .leaderPauseOnReclaim(leaderPauseOnReclaim);
 
         if (dataDir != null) {
             builder.dataDirectory(dataDir);
