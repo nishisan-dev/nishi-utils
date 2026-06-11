@@ -46,6 +46,30 @@ class JacksonMessageCodecTest {
     }
 
     @Test
+    void shouldRoundTripHeartbeatLeaderFlag() throws Exception {
+        NodeId sourceId = NodeId.of("node-1");
+        HeartbeatPayload payload = new HeartbeatPayload(System.currentTimeMillis(), 42L, 7L, true);
+        ClusterMessage message = ClusterMessage.request(
+                MessageType.HEARTBEAT, "heartbeat", sourceId, NodeId.of("node-2"), payload);
+
+        HeartbeatPayload decoded = codec.decode(codec.encode(message)).payload(HeartbeatPayload.class);
+        assertTrue(decoded.leader(),
+                "a flag de líder deve sobreviver ao round-trip JSON (tems#9, D10c)");
+    }
+
+    @Test
+    void heartbeatJsonWithoutLeaderFieldDecodesAsFalse() throws Exception {
+        // Payload de um peer de versão anterior: o campo "leader" não existe no JSON.
+        com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+        HeartbeatPayload decoded = mapper.readValue(
+                "{\"epochMilli\":1,\"leaderHighWatermark\":42,\"leaderEpoch\":7}",
+                HeartbeatPayload.class);
+        assertEquals(42L, decoded.leaderHighWatermark());
+        assertFalse(decoded.leader(),
+                "JSON sem o campo decodifica leader=false — retro-compat de rolling upgrade");
+    }
+
+    @Test
     void shouldRoundTripHeartbeatMessage() throws Exception {
         NodeId sourceId = NodeId.of("node-1");
         NodeId destId = NodeId.of("node-2");

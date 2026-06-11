@@ -656,7 +656,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 return;
             }
             HeartbeatPayload payload = HeartbeatPayload.now(leaderHighWatermarkSupplier.getAsLong(),
-                    leaderEpoch.get());
+                    leaderEpoch.get(), isLeader());
             ClusterMessage heartbeat = ClusterMessage.lightweight(MessageType.HEARTBEAT,
                     "hb",
                     transport.local().nodeId(),
