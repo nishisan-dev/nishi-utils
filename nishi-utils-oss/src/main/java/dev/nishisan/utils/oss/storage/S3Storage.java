@@ -22,6 +22,7 @@ import software.amazon.awssdk.services.s3.model.S3Object;
 import software.amazon.awssdk.services.s3.paginators.ListObjectsV2Iterable;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -37,8 +38,12 @@ import java.util.Optional;
  *
  * <p>O cliente subjacente é criado uma vez no construtor e fechado em
  * {@link #close()}. Esta classe é thread-safe (o {@link S3Client} é).</p>
+ *
+ * <p>O objeto único da série é acessado via {@link SeriesChannelProvider}: como
+ * S3 não suporta escrita parcial, o canal mantém a imagem do objeto em memória
+ * (read-modify-write) e regrava o objeto inteiro por PUT em {@code force()}.</p>
  */
-public final class S3Storage implements NgrrdStorage, AutoCloseable {
+public final class S3Storage implements NgrrdStorage, SeriesChannelProvider, AutoCloseable {
 
     private final S3Client client;
     private final String bucket;
@@ -139,7 +144,83 @@ public final class S3Storage implements NgrrdStorage, AutoCloseable {
     }
 
     @Override
+    public boolean seriesExists(String key) {
+        return exists(key);
+    }
+
+    @Override
+    public SeriesChannel openSeries(String key) {
+        byte[] image = get(key).orElseGet(() -> new byte[0]);
+        return new S3SeriesChannel(key, image);
+    }
+
+    @Override
     public void close() {
         client.close();
+    }
+
+    /** Canal sobre imagem em memória: read-modify-write com PUT em {@code force()}. */
+    private final class S3SeriesChannel implements SeriesChannel {
+
+        private final String key;
+        private byte[] image;
+        private boolean dirty;
+
+        S3SeriesChannel(String key, byte[] image) {
+            this.key = key;
+            this.image = image;
+        }
+
+        @Override
+        public long size() {
+            return image.length;
+        }
+
+        @Override
+        public void allocate(long totalBytes) {
+            if (totalBytes > Integer.MAX_VALUE) {
+                throw new NgrrdStorageException("Série excede o tamanho máximo suportado: " + totalBytes);
+            }
+            int n = (int) totalBytes;
+            if (image.length != n) {
+                image = Arrays.copyOf(image, n);
+                dirty = true;
+            }
+        }
+
+        @Override
+        public byte[] readRegion(long offset, int len) {
+            int off = (int) offset;
+            if (off < 0 || off + len > image.length) {
+                throw new NgrrdStorageException("Leitura além do fim da série " + key
+                        + " (offset=" + offset + ", len=" + len + ", size=" + image.length + ")");
+            }
+            return Arrays.copyOfRange(image, off, off + len);
+        }
+
+        @Override
+        public void writeRegion(long offset, byte[] data) {
+            int off = (int) offset;
+            int end = off + data.length;
+            if (end > image.length) {
+                image = Arrays.copyOf(image, end);
+            }
+            System.arraycopy(data, 0, image, off, data.length);
+            dirty = true;
+        }
+
+        @Override
+        public void force() {
+            if (!dirty) {
+                return;
+            }
+            put(key, image);
+            dirty = false;
+        }
+
+        @Override
+        public void close() {
+            force();
+        }
     }
 }

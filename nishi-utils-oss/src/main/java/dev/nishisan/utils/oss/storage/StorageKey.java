@@ -21,10 +21,21 @@ import java.util.Objects;
 public final class StorageKey {
 
     private static final String BLOCK_EXT = ".ngrrd";
+    private static final String SERIES_EXT = ".ngrr";
     private static final String YAML_EXT = ".yaml";
     private static final String STATE_EXT = ".state";
 
     private StorageKey() {
+    }
+
+    /**
+     * Chave do objeto único da série no formato NGRR:
+     * {@code {seriesPrefix}/{seriesKey}.ngrr}. É o único objeto de dados por
+     * série (paridade com o arquivo {@code .rrd} do RRDtool).
+     */
+    public static String series(ObjectNaming naming, String seriesKey) {
+        Objects.requireNonNull(naming, "naming é obrigatório");
+        return join(naming.seriesPrefixOrDefault(), seriesKey + SERIES_EXT);
     }
 
     public static String rawBlock(ObjectNaming naming, String seriesKey, String dsName,
