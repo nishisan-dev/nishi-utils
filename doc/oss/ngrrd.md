@@ -73,7 +73,8 @@ Object Storage S3-compatível) e definição declarativa em YAML.
 5. Ao avançar o slot base, o PDP completo é dobrado no CDP em progresso de cada
    archive; quando o passo do archive fecha, o CDP é finalizado (XFF) e gravado
    no ring (avançando o ponteiro, sobrescrevendo o mais antigo — retenção como
-   ring buffer).
+   ring buffer). A região do live-state é regravada junto (sem `fsync`) para
+   manter ponteiro e células coerentes para leitores concorrentes do handle.
 6. `checkpoint()`/`flush()` emite o CDP em progresso como **parcial** (legível
    antes do passo fechar) e torna o objeto durável (`fsync` no disco / PUT no S3).
 
@@ -445,9 +446,36 @@ S3Settings s3 = S3Settings.forEndpoint(
 var bindings = StorageFactory.StorageBindings.forS3(s3);
 ```
 
-> **Invariante:** um writer por série. O objeto da série sofre escrita in-place
-> no disco e read-modify-write no S3; dois writers concorrentes na mesma chave
-> causariam perda silenciosa (last-write-wins no S3).
+### Concorrência no mesmo handle
+
+O `NgrrdHandle` é seguro para **1 writer lógico + N readers** no mesmo
+processo, sem serialização externa:
+
+- `read(...)` pode ser chamado por N threads, concorrentes entre si e com
+  `write(...)`/`checkpoint()`. Cada leitura observa um estado consistente da
+  série; leituras não bloqueiam umas às outras.
+- `write(...)` é thread-safe (enfileira para a worker thread única), mas a
+  série permanece single-writer lógico: com múltiplas threads escrevendo, a
+  ordem relativa entre elas é indefinida.
+- `checkpoint()`/`flush()` são síncronos: drenam a fila do writer antes de
+  retornar.
+
+A garantia é implementada por um `ReadWriteLock` por handle, compartilhado
+entre o writer e os leitores: a worker thread adquire o write-lock em volta de
+cada mutação do objeto da série (e regrava o live-state sempre que o ring
+avança, mantendo ponteiro e células coerentes); leitores adquirem o read-lock
+na sequência live-state → ring. `force()` (fsync/PUT) ocorre fora do lock.
+
+**Visibilidade por backend:** no disco local, CDPs de passos já fechados
+tornam-se legíveis assim que o passo fecha; o CDP em progresso (parcial)
+torna-se legível após `checkpoint()`. No S3, toda leitura reflete o último
+`checkpoint()` publicado (PUT atômico) — nada fica visível entre checkpoints.
+
+> **Invariante:** um writer por série, e todo acesso concorrente passa pelo
+> mesmo handle. O objeto da série sofre escrita in-place no disco e
+> read-modify-write no S3: um segundo processo leitor pode observar estado
+> rasgado no disco, e dois writers concorrentes na mesma chave causariam perda
+> silenciosa (last-write-wins no S3).
 
 ---
 
