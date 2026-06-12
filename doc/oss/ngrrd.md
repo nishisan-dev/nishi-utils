@@ -22,7 +22,7 @@ Object Storage S3-compatível) e definição declarativa em YAML.
 | **CF** (Consolidation Function) | `AVERAGE`, `MAX`, `MIN`, `LAST`. |
 | **RRA** (Round-Robin Archive) | Arquivo finito com seu próprio `stepSec`, `rows` e CFs. |
 | **XFF** | Fração máxima de PDPs missing num CDP antes de virá-lo `NaN`. |
-| **Coluna** | Um DS derivado (ex.: `in_bps`); todas as colunas compartilham a geometria das RRAs. |
+| **Coluna** | Um DS persistido — derivado (ex.: `in_bps`) ou as-is (`GAUGE` sem `derive`); todas compartilham a geometria das RRAs. |
 | **Archive** | Par `(rra, cf)` — cada um possui um ring buffer de `rows × nº de colunas` doubles. |
 | **Série (`.ngrr`)** | O único objeto físico por série: header + dicionários + live-state + rings. |
 | **Counter reset / wrap** | Descontinuidade detectada automaticamente em DS COUNTER. |
@@ -61,14 +61,16 @@ Object Storage S3-compatível) e definição declarativa em YAML.
 
 ![Fluxo de escrita](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan-dev/nishi-utils/main/doc/diagrams/ngrrd_write_flow.puml)
 
-1. Na abertura, o writer abre o `SeriesChannel`. Se o objeto não existir (ou a
-   geometria divergir), ele é pré-alocado no tamanho fixo final com os rings em
-   `NaN`; senão o estado vivo (counterPrev + acumuladores + ponteiros) é
-   reidratado.
+1. Na abertura, antes de abrir o `SeriesChannel`, a geometria gravada é
+   reconciliada com a nova ([Evolução de schema](#evolução-de-schema-ongeometrychange--schemarevision)):
+   objeto inexistente é pré-alocado no tamanho final com os rings em `NaN`;
+   geometria idêntica apenas reidrata o estado vivo (counterPrev + acumuladores
+   + ponteiros); geometria divergente aplica `onGeometryChange`.
 2. Cliente enfileira `Sample` por DS raw.
-3. Worker aplica `CounterDeriver` em DS COUNTER com `derive.output`, gerando o
-   DS derivado (ex.: `in_octets` → `in_bps`). Flags `RESET`/`WRAP` viram
-   métricas e o counter anterior (`last_ds`) é atualizado.
+3. Worker aplica o `SampleDeriver` conforme o **tipo** do DS (paridade RRD):
+   `GAUGE` as-is, `COUNTER` taxa via `CounterDeriver` (com detecção de
+   reset/wrap), `DERIVE` delta/Δt com sinal, `ABSOLUTE` valor/Δt. Flags
+   `RESET`/`WRAP` viram métricas e o valor anterior (`last_ds`) é atualizado.
 4. O valor derivado entra no PDP do step base corrente da coluna.
 5. Ao avançar o slot base, o PDP completo é dobrado no CDP em progresso de cada
    archive; quando o passo do archive fecha, o CDP é finalizado (XFF) e gravado
@@ -108,7 +110,7 @@ geometria (`SeriesGeometry`), o que permite escrita in-place e pré-alocação.
 
 ```
 === SEÇÃO ESTÁTICA (imutável após create) ===
-0   MAGIC "NGRR" (4) | 4 version u16 | 6 flags u16 | 8 baseStepSec i32
+0   MAGIC "NGRR" (4) | 4 version u16 | 6 schemaRevision u16 | 8 baseStepSec i32
 12  definitionHash SHA-256 (32) | 44 D i32 | 48 A i32
 52  staticSectionBytes i64 | 60 liveStateOffset i64 | 68 liveStateBytes i64
 76  ringDataOffset i64 | 84 fileTotalBytes i64 | 92 headerCrc32 i32  (CRC sobre [0..92))
@@ -191,6 +193,7 @@ apiVersion: ngrrd/v1
 kind: MetricSeriesDefinition
 metadata:
   name: iface-traffic-errors-v1
+  schemaRevision: 1            # incremente ao mudar a geometria (ver "Evolução de schema")
 
 spec:
   time:
@@ -234,6 +237,7 @@ spec:
   storage:
     backend: localDisk
     durability: fsync            # fsync (padrão) | os_cache — ver "Durabilidade do checkpoint"
+    onGeometryChange: fail       # fail (padrão) | migrate | recreate — ver "Evolução de schema"
     objectNaming: {scheme: deterministic, seriesPrefix: series, schemaPrefix: schema}
     writePolicy: {mode: append_only, idempotency: {key: "{seriesKey}", onConflict: "verify_or_replace_if_identical"}}
 
@@ -243,6 +247,15 @@ spec:
 
 Interpolação de variáveis: `${VAR}` e `${VAR:default}` são resolvidos no load
 contra `System.getenv` (substituível em testes).
+
+> **Notas de schema (7.0.0).** Mudança de **comportamento (breaking)**: o default
+> ao abrir uma série com geometria divergente passou de _clean cut_ silencioso
+> para **`onGeometryChange: fail`** — um restart nunca mais descarta a história
+> por omissão. Veja [Evolução de schema](#evolução-de-schema-ongeometrychange--schemarevision).
+> Além disso, **todo DS vira coluna persistida** (paridade RRD: `GAUGE` as-is,
+> `DERIVE`/`ABSOLUTE` derivando por tipo) — antes só DS com `derive.output` eram
+> arquivados. O campo de 16 bits do header (antes `flags`) passou a carregar
+> `metadata.schemaRevision`.
 
 > **Notas de schema (6.0.0).** O formato de série única removeu `time.blockSizeSec`,
 > `storage.manifestPolicy` e `writePolicy.persistenceMode` — a persistência é
@@ -528,6 +541,93 @@ diretamente: `true → Durability.FSYNC`, `false → Durability.OS_CACHE`.
 > checkpoints num único `force`, limitando a janela de perda sem `fsync` por
 > checkpoint) — análogo ao `RelayDurability.GROUP_COMMIT` do core — fica para um
 > follow-up.
+
+---
+
+## Evolução de schema (onGeometryChange + schemaRevision)
+
+Quando a definição muda a **geometria** de uma série (adicionar/remover/reordenar
+DS, adicionar/remover archives, ou alterar `baseStepSec`/`stepSec`/`rows`), o
+`geometryHash` gravado no header diverge do esperado. O ngrrd **nunca descarta a
+história por omissão**: o tratamento é governado por `onGeometryChange`, com uma
+trava por `schemaRevision`.
+
+![Reconciliação de geometria](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan-dev/nishi-utils/main/doc/diagrams/ngrrd_geometry_reconcile.puml)
+
+### `onGeometryChange`
+
+| Valor | Efeito quando a geometria diverge |
+|-------|-----------------------------------|
+| `fail` (**padrão**) | Aborta a abertura com `NgrrdGeometryChangeException` e um relatório do que mudou; a série não é tocada. |
+| `migrate` | Reescreve a série preservando a história compatível (remapeia colunas/archives por nome; coluna nova começa `NaN`). Mudança que exija reamostragem recai em falha. |
+| `recreate` | Descarta a série antiga e cria uma nova vazia (clean cut). |
+
+Precedência de resolução: **`OpenOptions` (abertura) > `spec.storage.onGeometryChange` (YAML) > `fail`**.
+
+```java
+// override por abertura (ex.: janela de manutenção)
+Ngrrd.fromYaml(yaml, bindings, tags, null,
+        Ngrrd.OpenOptions.onGeometryChange(OnGeometryChange.MIGRATE));
+```
+
+### `schemaRevision` — a trava anti-acidente
+
+`metadata.schemaRevision` (inteiro `0..65535`, default `0`) é persistido no header
+e funciona como gate: um rewrite (`migrate`/`recreate`) **só dispara quando a
+revisão da definição é maior que a gravada na série**. Se a geometria mudou mas a
+revisão **não** foi incrementada, a abertura **sempre falha** — uma edição
+acidental de YAML nunca vira reescrita de um dataset inteiro sozinha.
+
+> Após o upgrade, a primeira mudança intencional de geometria exige incrementar
+> `schemaRevision` (séries antigas têm revisão `0`). Geometria idêntica reabre
+> normalmente, sem exigir bump.
+
+### Paridade RRD: DS sem `derive`
+
+O **tipo** do DS define a transformação; o bloco `derive` é opcional:
+
+| Tipo | Sem `derive` | Com `derive.output` |
+|------|--------------|---------------------|
+| `GAUGE` | valor as-is (apenas filtro `min`/`max` → `NaN` fora da faixa) | — |
+| `COUNTER` | taxa `delta/Δt` com detecção de reset/wrap | fórmula/clamp/onReset/onWrap custom |
+| `DERIVE` | taxa `delta/Δt` (permite negativo, sem wrap/reset) | idem + fórmula |
+| `ABSOLUTE` | `valor/Δt` (contador zerado a cada leitura) | idem |
+
+O nome da coluna é o `derive.output.name` quando há derivação; senão, o próprio
+`ds.name()`.
+
+```yaml
+dataSources:
+  - name: temperature      # GAUGE puro: persiste o valor as-is
+    type: GAUGE
+    heartbeatSec: 900
+    min: -40
+    max: 125
+```
+
+### CLI `ngrrd-migrate`
+
+Para datasets grandes, prefira uma janela de manutenção offline. O CLI varre
+todas as séries do dataset, classifica a divergência e — fora do `--dry-run` —
+reescreve em lote com paralelismo limitado:
+
+```bash
+# Relatório (não escreve nada): N séries, quantas migráveis, bytes a reescrever
+java -cp nishi-utils-oss.jar dev.nishisan.utils.oss.cli.NgrrdMigrateCli \
+     definition.yaml /var/ngrrd --dry-run
+
+# Execução: migra em lote (default MIGRATE), 8 threads
+java -cp nishi-utils-oss.jar dev.nishisan.utils.oss.cli.NgrrdMigrateCli \
+     definition.yaml /var/ngrrd --parallelism 8 --on-geometry-change MIGRATE
+```
+
+Backend `objectStorage`: configure `NGRRD_S3_BUCKET`, `NGRRD_S3_REGION` e
+(opcional) `NGRRD_S3_ENDPOINT` em vez do `rootDir`.
+
+> **Quando usar cada caminho.** Migração *eager no boot* acontece naturalmente ao
+> abrir cada handle com `onGeometryChange: migrate` (paralelizada pela aplicação);
+> para reescritas grandes (dezenas de GB), use o CLI numa janela controlada,
+> sempre com `--dry-run` antes.
 
 ---
 
