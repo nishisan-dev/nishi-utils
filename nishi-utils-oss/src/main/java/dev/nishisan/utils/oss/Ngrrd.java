@@ -137,11 +137,15 @@ public final class Ngrrd {
         NgrrdStorage storage = StorageFactory.from(storageSpec, bindings);
         String seriesKey = resolveSeriesKey(def.spec().identity().seriesKeyTemplate(), tags);
 
+        // Tratamento de mudança de geometria: override de abertura > YAML > FAIL.
+        OnGeometryChange onGeometryChange = resolveGeometryChange(options, storageSpec);
+
         NgrrdMetrics metrics = new NgrrdMetrics(metricsListener);
         // Lock por handle compartilhado entre writer e leitores: garante o
         // contrato de 1 writer + N readers do NgrrdHandle.
         ReadWriteLock seriesLock = new ReentrantReadWriteLock();
-        NgrrdWriter writer = new NgrrdWriter(def, storage, seriesKey, metrics, seriesLock, durability);
+        NgrrdWriter writer = new NgrrdWriter(def, storage, seriesKey, metrics, seriesLock,
+                durability, onGeometryChange);
 
         return new DefaultHandle(def, storage, seriesKey, writer, metrics, Map.copyOf(tags), seriesLock);
     }
@@ -154,6 +158,16 @@ public final class Ngrrd {
             return storageSpec.durability();
         }
         return Durability.FSYNC;
+    }
+
+    static OnGeometryChange resolveGeometryChange(OpenOptions options, StorageSpec storageSpec) {
+        if (options.onGeometryChange() != null) {
+            return options.onGeometryChange();
+        }
+        if (storageSpec.onGeometryChange() != null) {
+            return storageSpec.onGeometryChange();
+        }
+        return OnGeometryChange.FAIL;
     }
 
     /**

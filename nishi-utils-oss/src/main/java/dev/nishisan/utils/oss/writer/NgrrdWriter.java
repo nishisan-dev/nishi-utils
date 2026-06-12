@@ -2,6 +2,7 @@ package dev.nishisan.utils.oss.writer;
 
 import dev.nishisan.utils.oss.api.ConsolidationFunction;
 import dev.nishisan.utils.oss.api.Durability;
+import dev.nishisan.utils.oss.api.OnGeometryChange;
 import dev.nishisan.utils.oss.api.Sample;
 import dev.nishisan.utils.oss.definition.DataSourceDef;
 import dev.nishisan.utils.oss.definition.NgrrdDefinition;
@@ -15,6 +16,7 @@ import dev.nishisan.utils.oss.format.SeriesHeader;
 import dev.nishisan.utils.oss.format.SeriesLiveState;
 import dev.nishisan.utils.oss.format.NgrrdFormatException;
 import dev.nishisan.utils.oss.metrics.NgrrdMetricsListener;
+import dev.nishisan.utils.oss.migration.GeometryReconciler;
 import dev.nishisan.utils.oss.storage.NgrrdStorage;
 import dev.nishisan.utils.oss.storage.SeriesChannel;
 import dev.nishisan.utils.oss.storage.SeriesChannelProvider;
@@ -106,14 +108,27 @@ public final class NgrrdWriter implements AutoCloseable {
     }
 
     /**
-     * Variante completa com política de {@link Durability}. Em
-     * {@link Durability#OS_CACHE} o checkpoint materializa os bytes mas pula o
-     * {@code fsync} por checkpoint (o SO descarrega no seu ritmo); um
-     * {@code close()} limpo ainda descarrega o pendente.
+     * Variante com política de {@link Durability}; o tratamento de mudança de
+     * geometria recai no padrão {@link OnGeometryChange#FAIL}.
      */
     public NgrrdWriter(NgrrdDefinition definition, NgrrdStorage storage, String seriesKey,
                        NgrrdMetricsListener metrics, ReadWriteLock seriesLock,
                        Durability durability) {
+        this(definition, storage, seriesKey, metrics, seriesLock, durability, OnGeometryChange.FAIL);
+    }
+
+    /**
+     * Variante completa com política de {@link Durability} e
+     * {@link OnGeometryChange}. Antes de abrir o objeto para escrita, reconcilia a
+     * geometria gravada com a nova ({@link GeometryReconciler}); se a série já
+     * existir com a mesma geometria, apenas reidrata. Em {@link Durability#OS_CACHE}
+     * o checkpoint materializa os bytes mas pula o {@code fsync} por checkpoint (o
+     * SO descarrega no seu ritmo); um {@code close()} limpo ainda descarrega o
+     * pendente.
+     */
+    public NgrrdWriter(NgrrdDefinition definition, NgrrdStorage storage, String seriesKey,
+                       NgrrdMetricsListener metrics, ReadWriteLock seriesLock,
+                       Durability durability, OnGeometryChange onGeometryChange) {
         this.definition = Objects.requireNonNull(definition, "definition é obrigatório");
         Objects.requireNonNull(storage, "storage é obrigatório");
         this.seriesKey = Objects.requireNonNull(seriesKey, "seriesKey é obrigatório");
@@ -144,6 +159,10 @@ public final class NgrrdWriter implements AutoCloseable {
         }
 
         this.storageKey = StorageKey.series(definition.spec().storage().objectNaming(), seriesKey);
+        // Reconcilia a geometria gravada com a nova antes de abrir o canal de
+        // escrita: aplica onGeometryChange (FAIL/RECREATE/MIGRATE) ou no-op.
+        GeometryReconciler.reconcile(storage, storageKey, geo, geometryHash, schemaRevision,
+                Objects.requireNonNull(onGeometryChange, "onGeometryChange é obrigatório"));
         this.channel = provider.openSeries(storageKey);
         this.state = openOrCreate();
 
@@ -157,8 +176,10 @@ public final class NgrrdWriter implements AutoCloseable {
     }
 
     /**
-     * Abre o arquivo: cria+pré-aloca se ausente/incompatível; senão reidrata a
-     * live-state. Geometria divergente (hash) ⇒ recriação (clean cut).
+     * Abre o arquivo: cria+pré-aloca se ausente; senão reidrata a live-state. A
+     * divergência de geometria já foi tratada pelo {@link GeometryReconciler}
+     * antes da abertura do canal; aqui, qualquer incompatibilidade ou arquivo
+     * ilegível é um estado inesperado (nunca recria silenciosamente).
      */
     private SeriesLiveState openOrCreate() {
         if (channel.size() < SeriesFileCodec.FIXED_HEADER_BYTES) {
@@ -171,16 +192,14 @@ public final class NgrrdWriter implements AutoCloseable {
                     && header.fileTotalBytes() == geo.fileTotalBytes()
                     && Arrays.equals(header.definitionHash(), geometryHash);
             if (!compatible) {
-                System.err.println("ngrrd-writer: geometria divergente em " + storageKey
-                        + ", recriando (clean cut)");
-                return createFresh();
+                throw new IllegalStateException("ngrrd-writer: geometria divergente em " + storageKey
+                        + " após reconciliação — estado inesperado");
             }
             byte[] live = channel.readRegion(geo.liveStateOffset(), (int) geo.liveStateBytes());
             return SeriesFileCodec.decodeLiveState(geo, live);
         } catch (NgrrdFormatException e) {
-            System.err.println("ngrrd-writer: arquivo de série ilegível em " + storageKey
-                    + ", recriando: " + e);
-            return createFresh();
+            throw new IllegalStateException("ngrrd-writer: arquivo de série ilegível em " + storageKey
+                    + " após reconciliação: " + e, e);
         }
     }
 
