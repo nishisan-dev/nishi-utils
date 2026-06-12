@@ -76,7 +76,10 @@ Object Storage S3-compatível) e definição declarativa em YAML.
    ring buffer). A região do live-state é regravada junto (sem `fsync`) para
    manter ponteiro e células coerentes para leitores concorrentes do handle.
 6. `checkpoint()`/`flush()` emite o CDP em progresso como **parcial** (legível
-   antes do passo fechar) e torna o objeto durável (`fsync` no disco / PUT no S3).
+   antes do passo fechar) e — sob a durabilidade `FSYNC` (padrão) — torna o
+   objeto durável (`fsync` no disco / PUT no S3). Sob `OS_CACHE` o checkpoint
+   apenas materializa os bytes (sem `fsync`); ver [Durabilidade do
+   checkpoint](#durabilidade-do-checkpoint-fsync--os_cache).
 
 ---
 
@@ -230,6 +233,7 @@ spec:
 
   storage:
     backend: localDisk
+    durability: fsync            # fsync (padrão) | os_cache — ver "Durabilidade do checkpoint"
     objectNaming: {scheme: deterministic, seriesPrefix: series, schemaPrefix: schema}
     writePolicy: {mode: append_only, idempotency: {key: "{seriesKey}", onConflict: "verify_or_replace_if_identical"}}
 
@@ -366,6 +370,7 @@ spec:
 
   storage:
     backend: localDisk
+    durability: fsync            # fsync (padrão) | os_cache — ver "Durabilidade do checkpoint"
     objectNaming: {scheme: deterministic, seriesPrefix: series, schemaPrefix: schema}
     writePolicy: {mode: append_only, idempotency: {key: "{seriesKey}", onConflict: "verify_or_replace_if_identical"}}
 
@@ -476,6 +481,53 @@ torna-se legível após `checkpoint()`. No S3, toda leitura reflete o último
 > read-modify-write no S3: um segundo processo leitor pode observar estado
 > rasgado no disco, e dois writers concorrentes na mesma chave causariam perda
 > silenciosa (last-write-wins no S3).
+
+### Durabilidade do checkpoint (FSYNC | OS_CACHE)
+
+Cada `checkpoint()`/`flush()` faz duas coisas distintas: **materializa** os bytes
+do CDP em progresso (escrita in-place no disco / read-modify-write na imagem em
+memória do S3) e, em seguida, **força** a durabilidade. A política `Durability`
+controla apenas o segundo passo:
+
+| Modo | Por checkpoint | Visibilidade (disco) | Janela de perda |
+|------|----------------|----------------------|-----------------|
+| `FSYNC` (padrão) | `fsync` no disco / `PUT` no S3 | CDP parcial legível | nenhuma (durável a cada checkpoint) |
+| `OS_CACHE` | materializa, **sem** `fsync` | CDP parcial legível (page cache) | tail não descarregado, só em **crash abrupto** |
+
+Em `OS_CACHE`, os leitores no mesmo processo continuam enxergando o CDP parcial
+logo após o checkpoint (a escrita in-place já está no page cache do SO), mas o
+SO decide quando descarregar para o disco. Um `close()` limpo **sempre**
+descarrega o pendente (o `SeriesChannel.close()` força no fechamento), de modo
+que a janela de perda se restringe a um crash/queda de energia abrupta — útil
+para backfills e séries voláteis em que throughput vale mais que durabilidade
+por checkpoint.
+
+> **`OS_CACHE` é exclusivo de disco local.** No `OBJECT_STORAGE` (S3) o `force()`
+> **é** o próprio `PUT` (a publicação); pular o force nunca publicaria a série.
+> A abertura **rejeita** `OBJECT_STORAGE` + `OS_CACHE` com `IllegalArgumentException`.
+
+**Configuração.** O default vem do YAML (`spec.storage.durability: fsync | os_cache`;
+ausente = `fsync`) e pode ser **sobrescrito por abertura** via `Ngrrd.OpenOptions`
+— a mesma definição abre `FSYNC` em produção e `OS_CACHE` num job de backfill:
+
+```java
+import dev.nishisan.utils.oss.Ngrrd.OpenOptions;
+import dev.nishisan.utils.oss.api.Durability;
+
+// Precedência: override de abertura > default do YAML > FSYNC.
+try (NgrrdHandle handle = Ngrrd.fromYaml(yaml, bindings, tags,
+        OpenOptions.durability(Durability.OS_CACHE))) {
+    // ... ingestão de alto throughput; close() final descarrega o pendente.
+}
+```
+
+Uma camada consumidora que exponha um booleano `commit.fsync` mapeia-o
+diretamente: `true → Durability.FSYNC`, `false → Durability.OS_CACHE`.
+
+> **Evolução planejada.** Um terceiro modo `GROUP_COMMIT` (coalescer N
+> checkpoints num único `force`, limitando a janela de perda sem `fsync` por
+> checkpoint) — análogo ao `RelayDurability.GROUP_COMMIT` do core — fica para um
+> follow-up.
 
 ---
 
