@@ -1,13 +1,13 @@
 package dev.nishisan.utils.oss.writer;
 
 import dev.nishisan.utils.oss.api.ConsolidationFunction;
-import dev.nishisan.utils.oss.api.DataSourceType;
 import dev.nishisan.utils.oss.api.Durability;
 import dev.nishisan.utils.oss.api.Sample;
 import dev.nishisan.utils.oss.definition.DataSourceDef;
 import dev.nishisan.utils.oss.definition.NgrrdDefinition;
 import dev.nishisan.utils.oss.engine.CounterDeriver;
 import dev.nishisan.utils.oss.engine.PrimaryDataPoint;
+import dev.nishisan.utils.oss.engine.SampleDeriver;
 import dev.nishisan.utils.oss.engine.TimeBucket;
 import dev.nishisan.utils.oss.format.SeriesFileCodec;
 import dev.nishisan.utils.oss.format.SeriesGeometry;
@@ -354,29 +354,23 @@ public final class NgrrdWriter implements AutoCloseable {
     }
 
     private double deriveValue(DataSourceDef rawDs, int col, Sample sample) {
-        if (rawDs.type() == DataSourceType.COUNTER && rawDs.derive() != null
-                && rawDs.derive().output() != null) {
-            double prevValue = state.counterPrevValue[col];
-            long prevTs = state.counterPrevTsMs[col];
-            CounterDeriver.CounterDeriverResult result = CounterDeriver.derive(
-                    rawDs, prevValue, prevTs, sample.value(), sample.tsEpochMs());
-            state.counterPrevValue[col] = sample.value();
-            state.counterPrevTsMs[col] = sample.tsEpochMs();
-            if (metrics != null) {
-                switch (result.flag()) {
-                    case RESET -> metrics.onCounterReset(rawDs.name());
-                    case WRAP -> metrics.onWrapDetected(rawDs.name());
-                    default -> {
-                    }
+        // Despacho por tipo (paridade RRD): GAUGE as-is; COUNTER/DERIVE/ABSOLUTE
+        // derivam de delta. O estado "prev" é mantido para todos os tipos —
+        // inócuo para GAUGE, necessário para os tipos de taxa.
+        CounterDeriver.CounterDeriverResult result = SampleDeriver.derive(
+                rawDs, state.counterPrevValue[col], state.counterPrevTsMs[col],
+                sample.value(), sample.tsEpochMs());
+        state.counterPrevValue[col] = sample.value();
+        state.counterPrevTsMs[col] = sample.tsEpochMs();
+        if (metrics != null) {
+            switch (result.flag()) {
+                case RESET -> metrics.onCounterReset(rawDs.name());
+                case WRAP -> metrics.onWrapDetected(rawDs.name());
+                default -> {
                 }
             }
-            return result.value();
         }
-        // GAUGE/DERIVE/ABSOLUTE com derive declarado: passthrough.
-        if (rawDs.derive() != null && rawDs.derive().output() != null) {
-            return sample.value();
-        }
-        return Double.NaN;
+        return result.value();
     }
 
     /**

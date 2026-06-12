@@ -3,6 +3,7 @@ package dev.nishisan.utils.oss.engine;
 import dev.nishisan.utils.oss.api.ResetBehavior;
 import dev.nishisan.utils.oss.api.WrapBehavior;
 import dev.nishisan.utils.oss.definition.DataSourceDef;
+import dev.nishisan.utils.oss.definition.DeriveOutputDef;
 
 import java.util.Map;
 
@@ -35,13 +36,17 @@ import java.util.Map;
  */
 public final class CounterDeriver {
 
+    /** Fórmula de taxa padrão quando o DS não declara {@code derive.output}. */
+    private static final String DEFAULT_RATE_FORMULA = "delta / deltaT";
+
     private CounterDeriver() {
     }
 
     /**
      * Calcula a derivação para uma transição de counter.
      *
-     * @param ds          definição do Data Source (deve ter {@code derive.output} setado)
+     * @param ds          definição do Data Source ({@code derive.output} opcional —
+     *                    ausente usa defaults de taxa: fórmula {@code delta/deltaT})
      * @param prevValue   valor anterior do counter (NaN = primeira amostra)
      * @param prevTsMs    timestamp anterior em ms
      * @param currValue   valor atual
@@ -53,25 +58,28 @@ public final class CounterDeriver {
                                               long prevTsMs,
                                               double currValue,
                                               long currTsMs) {
-        if (ds.derive() == null || ds.derive().output() == null) {
-            throw new IllegalArgumentException("DS sem derive.output não pode ser derivado: " + ds.name());
-        }
         if (Double.isNaN(prevValue) || prevTsMs <= 0) {
             return new CounterDeriverResult(Double.NaN, Flag.FIRST_SAMPLE);
         }
         if (currTsMs <= prevTsMs) {
             return new CounterDeriverResult(Double.NaN, Flag.NON_MONOTONIC_TIME);
         }
+        // Sem derive.output (paridade RRD), a taxa usa defaults: fórmula delta/Δt,
+        // sem clamp, wrap AUTO, reset UNKNOWN.
+        DeriveOutputDef out = ds.derive() == null ? null : ds.derive().output();
+        String formula = out != null && out.formula() != null ? out.formula() : DEFAULT_RATE_FORMULA;
+        boolean clampNegativeToZero = out != null && out.clampNegativeToZero();
+        WrapBehavior onWrap = out != null && out.onWrap() != null ? out.onWrap() : WrapBehavior.AUTO;
+        ResetBehavior onReset = out != null && out.onReset() != null ? out.onReset() : ResetBehavior.UNKNOWN;
+
         double deltaT = (currTsMs - prevTsMs) / 1000.0;
         double delta = currValue - prevValue;
         if (delta >= 0) {
-            return finalize(ds, delta, deltaT, Flag.OK);
+            return finalize(formula, clampNegativeToZero, delta, deltaT, Flag.OK);
         }
         // delta negativo: tenta interpretar como wrap antes de declarar reset.
         boolean detectReset = ds.resetPolicy() != null && ds.resetPolicy().detectCounterReset();
         Integer counterBits = ds.counterBits();
-        WrapBehavior onWrap = ds.derive().output().onWrap();
-        ResetBehavior onReset = ds.derive().output().onReset();
         if (detectReset && counterBits != null) {
             double maxValue = Math.pow(2.0, counterBits);
             double wrappedDelta = maxValue - prevValue + currValue;
@@ -82,7 +90,7 @@ public final class CounterDeriver {
                 if (onWrap == WrapBehavior.UNKNOWN) {
                     return new CounterDeriverResult(Double.NaN, Flag.WRAP);
                 }
-                return finalize(ds, wrappedDelta, deltaT, Flag.WRAP);
+                return finalize(formula, clampNegativeToZero, wrappedDelta, deltaT, Flag.WRAP);
             }
         }
         // Não é wrap plausível: avalia maxResetDeltaRatio antes de classificar como reset.
@@ -100,18 +108,17 @@ public final class CounterDeriver {
             // de ordem, não um reset legítimo. Devolve NaN sem contar como reset.
             return new CounterDeriverResult(Double.NaN, Flag.SPIKE_DOWN);
         }
-        double resetValue = switch (onReset == null ? ResetBehavior.UNKNOWN : onReset) {
+        double resetValue = switch (onReset) {
             case UNKNOWN, CARRY -> Double.NaN;
             case ZERO -> 0.0;
         };
         return new CounterDeriverResult(resetValue, Flag.RESET);
     }
 
-    private static CounterDeriverResult finalize(DataSourceDef ds, double delta, double deltaT, Flag flag) {
-        double rate = FormulaEvaluator.evaluate(
-                ds.derive().output().formula(),
-                Map.of("delta", delta, "deltaT", deltaT));
-        if (ds.derive().output().clampNegativeToZero() && rate < 0) {
+    private static CounterDeriverResult finalize(String formula, boolean clampNegativeToZero,
+                                                 double delta, double deltaT, Flag flag) {
+        double rate = FormulaEvaluator.evaluate(formula, Map.of("delta", delta, "deltaT", deltaT));
+        if (clampNegativeToZero && rate < 0) {
             rate = 0.0;
         }
         return new CounterDeriverResult(rate, flag);

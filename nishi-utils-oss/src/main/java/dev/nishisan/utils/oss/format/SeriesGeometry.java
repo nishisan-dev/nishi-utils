@@ -55,8 +55,10 @@ public final class SeriesGeometry {
             throw new IllegalArgumentException("baseStepSec deve ser > 0: " + baseStepSec);
         }
 
-        // Colunas: DS com derive.output, na ordem de declaração, filtradas por
-        // archives.appliesTo (include vazio ⇒ todas).
+        // Colunas: um por DS, na ordem de declaração, filtradas por
+        // archives.appliesTo (include vazio ⇒ todas). O nome da coluna é o DS
+        // derivado quando há derive.output; senão o próprio nome do DS — paridade
+        // RRD para GAUGE/COUNTER/DERIVE/ABSOLUTE sem bloco derive.
         AppliesTo appliesTo = definition.spec().archives() == null
                 ? null : definition.spec().archives().appliesTo();
         Set<String> include = appliesTo == null || appliesTo.include() == null
@@ -64,10 +66,9 @@ public final class SeriesGeometry {
         List<Column> cols = new ArrayList<>();
         Map<String, Integer> colIndex = new HashMap<>();
         for (DataSourceDef ds : definition.spec().dataSources()) {
-            if (ds.derive() == null || ds.derive().output() == null) {
-                continue;
-            }
-            String derivedName = ds.derive().output().name();
+            String derivedName = ds.derive() != null && ds.derive().output() != null
+                    ? ds.derive().output().name()
+                    : ds.name();
             if (!include.isEmpty() && !include.contains(derivedName)) {
                 continue;
             }
