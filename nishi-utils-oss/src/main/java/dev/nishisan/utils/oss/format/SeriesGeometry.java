@@ -37,6 +37,14 @@ public final class SeriesGeometry {
                           double xff, int groupSize, long ringBaseOffset) {
     }
 
+    /**
+     * Definição de archive sem offsets ({@code groupSize}/{@code ringBaseOffset}
+     * são derivados): forma de entrada para construir a geometria a partir da
+     * definição ou de um arquivo persistido.
+     */
+    public record ArchiveDef(String rraName, ConsolidationFunction cf, int stepSec, int rows, double xff) {
+    }
+
     private final int baseStepSec;
     private final List<Column> columns;
     private final List<Archive> archives;
@@ -49,61 +57,36 @@ public final class SeriesGeometry {
     private final long fileTotalBytes;
 
     public SeriesGeometry(NgrrdDefinition definition) {
-        Objects.requireNonNull(definition, "definition é obrigatório");
-        this.baseStepSec = definition.spec().time().baseStepSec();
+        this(baseStepOf(definition), columnsOf(definition), archiveDefsOf(definition));
+    }
+
+    /**
+     * Construtor canônico: calcula todos os offsets a partir do step base, das
+     * colunas e das definições de archive — usado tanto pela definição quanto
+     * pela geometria reconstruída de um arquivo ({@link #fromPersisted}).
+     */
+    private SeriesGeometry(int baseStepSec, List<Column> columns, List<ArchiveDef> archiveDefs) {
         if (baseStepSec <= 0) {
             throw new IllegalArgumentException("baseStepSec deve ser > 0: " + baseStepSec);
         }
-
-        // Colunas: um por DS, na ordem de declaração, filtradas por
-        // archives.appliesTo (include vazio ⇒ todas). O nome da coluna é o DS
-        // derivado quando há derive.output; senão o próprio nome do DS — paridade
-        // RRD para GAUGE/COUNTER/DERIVE/ABSOLUTE sem bloco derive.
-        AppliesTo appliesTo = definition.spec().archives() == null
-                ? null : definition.spec().archives().appliesTo();
-        Set<String> include = appliesTo == null || appliesTo.include() == null
-                ? Set.of() : Set.copyOf(appliesTo.include());
-        List<Column> cols = new ArrayList<>();
+        this.baseStepSec = baseStepSec;
+        this.columns = List.copyOf(columns);
         Map<String, Integer> colIndex = new HashMap<>();
-        for (DataSourceDef ds : definition.spec().dataSources()) {
-            String derivedName = ds.derive() != null && ds.derive().output() != null
-                    ? ds.derive().output().name()
-                    : ds.name();
-            if (!include.isEmpty() && !include.contains(derivedName)) {
-                continue;
-            }
-            colIndex.put(derivedName, cols.size());
-            cols.add(new Column(derivedName, ds.name(), ds.type()));
+        for (int i = 0; i < this.columns.size(); i++) {
+            colIndex.put(this.columns.get(i).derivedName(), i);
         }
-        this.columns = List.copyOf(cols);
         this.colIndexByDerivedName = Map.copyOf(colIndex);
-        int d = columns.size();
-
-        // Archives: produto (rra × cf) achatado na ordem de declaração.
-        ArchiveSpec archiveSpec = definition.spec().archives();
-        List<RraDef> rras = archiveSpec == null ? List.of() : archiveSpec.rras();
-        List<int[]> archGeom = new ArrayList<>(); // [stepSec, rows]
-        List<String> archRra = new ArrayList<>();
-        List<ConsolidationFunction> archCf = new ArrayList<>();
-        List<Double> archXff = new ArrayList<>();
-        for (RraDef rra : rras) {
-            for (ConsolidationFunction cf : rra.cf()) {
-                archRra.add(rra.name());
-                archCf.add(cf);
-                archGeom.add(new int[]{rra.stepSec(), rra.rows()});
-                archXff.add(rra.xff());
-            }
-        }
-        int a = archRra.size();
+        int d = this.columns.size();
+        int a = archiveDefs.size();
 
         // Offsets: seção estática (header fixo + dicionários), live-state e rings.
         long dictBytes = 0;
-        for (Column c : columns) {
+        for (Column c : this.columns) {
             dictBytes += 2 + utf8Len(c.derivedName()) + 2 + utf8Len(c.rawName()) + 1;
         }
         long archBytes = 0;
-        for (String rraName : archRra) {
-            archBytes += 2 + utf8Len(rraName) + 1 + 4 + 4 + 8;
+        for (ArchiveDef ad : archiveDefs) {
+            archBytes += 2 + utf8Len(ad.rraName()) + 1 + 4 + 4 + 8;
         }
         this.staticSectionBytes = SeriesFileCodec.FIXED_HEADER_BYTES + dictBytes + archBytes;
         this.liveStateOffset = align8(staticSectionBytes);
@@ -113,16 +96,66 @@ public final class SeriesGeometry {
         // Bases dos rings e tamanho total.
         List<Archive> built = new ArrayList<>(a);
         long ringCursor = ringDataOffset;
-        for (int i = 0; i < a; i++) {
-            int stepSec = archGeom.get(i)[0];
-            int rows = archGeom.get(i)[1];
-            int groupSize = stepSec / baseStepSec;
-            built.add(new Archive(archRra.get(i), archCf.get(i), stepSec, rows,
-                    archXff.get(i), groupSize, ringCursor));
-            ringCursor += (long) rows * d * Double.BYTES;
+        for (ArchiveDef ad : archiveDefs) {
+            int groupSize = ad.stepSec() / baseStepSec;
+            built.add(new Archive(ad.rraName(), ad.cf(), ad.stepSec(), ad.rows(),
+                    ad.xff(), groupSize, ringCursor));
+            ringCursor += (long) ad.rows() * d * Double.BYTES;
         }
         this.archives = List.copyOf(built);
         this.fileTotalBytes = ringCursor;
+    }
+
+    /**
+     * Reconstrói a geometria a partir de um objeto de série persistido (cabeçalho
+     * + seção estática), <strong>sem</strong> a definição YAML. Base do diff e da
+     * migração de geometria.
+     */
+    public static SeriesGeometry fromPersisted(SeriesHeader header, byte[] image) {
+        SeriesFileCodec.DecodedStatic decoded = SeriesFileCodec.decodeStaticSection(header, image);
+        return new SeriesGeometry(header.baseStepSec(), decoded.columns(), decoded.archiveDefs());
+    }
+
+    private static int baseStepOf(NgrrdDefinition definition) {
+        Objects.requireNonNull(definition, "definition é obrigatório");
+        return definition.spec().time().baseStepSec();
+    }
+
+    /**
+     * Colunas: um por DS, na ordem de declaração, filtradas por
+     * {@code archives.appliesTo} (include vazio ⇒ todas). O nome da coluna é o DS
+     * derivado quando há {@code derive.output}; senão o próprio nome do DS —
+     * paridade RRD para GAUGE/COUNTER/DERIVE/ABSOLUTE sem bloco derive.
+     */
+    private static List<Column> columnsOf(NgrrdDefinition definition) {
+        AppliesTo appliesTo = definition.spec().archives() == null
+                ? null : definition.spec().archives().appliesTo();
+        Set<String> include = appliesTo == null || appliesTo.include() == null
+                ? Set.of() : Set.copyOf(appliesTo.include());
+        List<Column> cols = new ArrayList<>();
+        for (DataSourceDef ds : definition.spec().dataSources()) {
+            String derivedName = ds.derive() != null && ds.derive().output() != null
+                    ? ds.derive().output().name()
+                    : ds.name();
+            if (!include.isEmpty() && !include.contains(derivedName)) {
+                continue;
+            }
+            cols.add(new Column(derivedName, ds.name(), ds.type()));
+        }
+        return cols;
+    }
+
+    /** Archives: produto {@code (rra × cf)} achatado na ordem de declaração. */
+    private static List<ArchiveDef> archiveDefsOf(NgrrdDefinition definition) {
+        ArchiveSpec archiveSpec = definition.spec().archives();
+        List<RraDef> rras = archiveSpec == null ? List.of() : archiveSpec.rras();
+        List<ArchiveDef> defs = new ArrayList<>();
+        for (RraDef rra : rras) {
+            for (ConsolidationFunction cf : rra.cf()) {
+                defs.add(new ArchiveDef(rra.name(), cf, rra.stepSec(), rra.rows(), rra.xff()));
+            }
+        }
+        return defs;
     }
 
     /** Tamanho da seção de live-state para {@code d} colunas e {@code a} archives. */

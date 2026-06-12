@@ -113,6 +113,38 @@ class SeriesFileCodecTest {
     }
 
     @Test
+    void geometriaPersistidaReconstroiOffsetsEArchives() {
+        SeriesGeometry geo = geometry();
+        byte[] image = SeriesFileCodec.buildInitialImage(geo, geo.geometryHash(), 7);
+
+        SeriesHeader header = SeriesFileCodec.decodeFixedHeader(image);
+        assertEquals(7, header.schemaRevision());
+
+        SeriesGeometry restored = SeriesGeometry.fromPersisted(header, image);
+        assertEquals(geo.baseStepSec(), restored.baseStepSec());
+        assertEquals(geo.fileTotalBytes(), restored.fileTotalBytes());
+        assertEquals(geo.liveStateOffset(), restored.liveStateOffset());
+        assertEquals(geo.ringDataOffset(), restored.ringDataOffset());
+        // O hash reconstruído deve bater — base para o diff/migração confiarem nos offsets.
+        assertArrayEquals(geo.geometryHash(), restored.geometryHash());
+
+        for (int i = 0; i < geo.columnCount(); i++) {
+            assertEquals(geo.columns().get(i).derivedName(), restored.columns().get(i).derivedName());
+            assertEquals(geo.columns().get(i).rawName(), restored.columns().get(i).rawName());
+            assertEquals(geo.columns().get(i).rawType(), restored.columns().get(i).rawType());
+        }
+        for (int i = 0; i < geo.archiveCount(); i++) {
+            SeriesGeometry.Archive expected = geo.archives().get(i);
+            SeriesGeometry.Archive actual = restored.archives().get(i);
+            assertEquals(expected.rraName(), actual.rraName());
+            assertEquals(expected.cf(), actual.cf());
+            assertEquals(expected.stepSec(), actual.stepSec());
+            assertEquals(expected.rows(), actual.rows());
+            assertEquals(expected.ringBaseOffset(), actual.ringBaseOffset());
+        }
+    }
+
+    @Test
     void liveStateRoundTrip() {
         SeriesGeometry geo = geometry();
         SeriesLiveState st = new SeriesLiveState(2, 2);
