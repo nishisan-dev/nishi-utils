@@ -72,6 +72,11 @@ public final class NgrrdDefinitionValidator {
         if (def.metadata().name() == null || def.metadata().name().isBlank()) {
             throw new NgrrdDefinitionException("metadata.name é obrigatório");
         }
+        Integer schemaRevision = def.metadata().schemaRevision();
+        if (schemaRevision != null && (schemaRevision < 0 || schemaRevision > 65535)) {
+            throw new NgrrdDefinitionException(
+                    "metadata.schemaRevision deve estar em [0, 65535] (recebido: " + schemaRevision + ")");
+        }
     }
 
     private static void validateTime(TimeSpec time) {

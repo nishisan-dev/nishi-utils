@@ -64,6 +64,7 @@ public final class NgrrdWriter implements AutoCloseable {
 
     private final SeriesGeometry geo;
     private final byte[] geometryHash;
+    private final int schemaRevision;
     private final int baseStepSec;
     private final int d;
     private final int a;
@@ -127,6 +128,7 @@ public final class NgrrdWriter implements AutoCloseable {
 
         this.geo = new SeriesGeometry(definition);
         this.geometryHash = geo.geometryHash();
+        this.schemaRevision = definition.metadata().schemaRevisionOrDefault();
         this.baseStepSec = geo.baseStepSec();
         this.d = geo.columnCount();
         this.a = geo.archiveCount();
@@ -184,7 +186,7 @@ public final class NgrrdWriter implements AutoCloseable {
 
     private SeriesLiveState createFresh() {
         channel.allocate(geo.fileTotalBytes());
-        channel.writeRegion(0, SeriesFileCodec.buildInitialImage(geo, geometryHash));
+        channel.writeRegion(0, SeriesFileCodec.buildInitialImage(geo, geometryHash, schemaRevision));
         channel.force();
         return new SeriesLiveState(d, a);
     }

@@ -18,7 +18,7 @@ import java.util.zip.CRC32;
  *
  * <pre>
  * === SEÇÃO ESTÁTICA (imutável após create) ===
- * 0  MAGIC "NGRR" | 4 version u16 | 6 flags u16 | 8 baseStepSec i32
+ * 0  MAGIC "NGRR" | 4 version u16 | 6 schemaRevision u16 | 8 baseStepSec i32
  * 12 definitionHash SHA-256 (32) | 44 D i32 | 48 A i32
  * 52 staticSectionBytes i64 | 60 liveStateOffset i64 | 68 liveStateBytes i64
  * 76 ringDataOffset i64 | 84 fileTotalBytes i64 | 92 headerCrc32 i32  (CRC sobre [0..92))
@@ -52,18 +52,21 @@ public final class SeriesFileCodec {
     private SeriesFileCodec() {
     }
 
+    /** Limite do campo de revisão de schema (16 bits no cabeçalho). */
+    public static final int MAX_SCHEMA_REVISION = 0xFFFF;
+
     /**
      * Constrói a imagem completa pré-alocada de uma série vazia: seção estática +
      * live-state vazia + rings preenchidos com {@code NaN}.
      */
-    public static byte[] buildInitialImage(SeriesGeometry geo, byte[] definitionHash) {
+    public static byte[] buildInitialImage(SeriesGeometry geo, byte[] definitionHash, int schemaRevision) {
         long total = geo.fileTotalBytes();
         if (total > Integer.MAX_VALUE) {
             throw new NgrrdFormatException("Série excede o tamanho máximo suportado: " + total + " bytes");
         }
         byte[] image = new byte[(int) total];
 
-        byte[] staticSection = encodeStaticSection(geo, definitionHash);
+        byte[] staticSection = encodeStaticSection(geo, definitionHash, schemaRevision);
         System.arraycopy(staticSection, 0, image, 0, staticSection.length);
 
         byte[] live = encodeLiveState(geo, new SeriesLiveState(geo.columnCount(), geo.archiveCount()));
@@ -78,17 +81,21 @@ public final class SeriesFileCodec {
     }
 
     /** Serializa a seção estática (cabeçalho fixo + dicionários + pad até live-state). */
-    public static byte[] encodeStaticSection(SeriesGeometry geo, byte[] definitionHash) {
+    public static byte[] encodeStaticSection(SeriesGeometry geo, byte[] definitionHash, int schemaRevision) {
         Objects.requireNonNull(definitionHash, "definitionHash é obrigatório");
         if (definitionHash.length != DefinitionHash.BYTES) {
             throw new IllegalArgumentException("definitionHash deve ter " + DefinitionHash.BYTES + " bytes");
+        }
+        if (schemaRevision < 0 || schemaRevision > MAX_SCHEMA_REVISION) {
+            throw new IllegalArgumentException(
+                    "schemaRevision deve estar em [0, " + MAX_SCHEMA_REVISION + "]: " + schemaRevision);
         }
         byte[] bytes = new byte[(int) geo.liveStateOffset()];
         ByteBuffer buf = ByteBuffer.wrap(bytes).order(ByteOrder.BIG_ENDIAN);
 
         buf.putInt(MAGIC);
         buf.putShort((short) CURRENT_VERSION);
-        buf.putShort((short) 0); // flags
+        buf.putShort((short) schemaRevision); // revisão de schema (16 bits)
         buf.putInt(geo.baseStepSec());
         buf.put(definitionHash);
         buf.putInt(geo.columnCount());
@@ -136,7 +143,7 @@ public final class SeriesFileCodec {
         if (version != CURRENT_VERSION) {
             throw new NgrrdFormatException("Versão de série não suportada: " + version);
         }
-        int flags = Short.toUnsignedInt(buf.getShort());
+        int schemaRevision = Short.toUnsignedInt(buf.getShort());
         int baseStepSec = buf.getInt();
         byte[] defHash = new byte[DefinitionHash.BYTES];
         buf.get(defHash);
@@ -154,7 +161,7 @@ public final class SeriesFileCodec {
             throw new NgrrdFormatException(String.format(
                     "CRC32 de cabeçalho divergente: armazenado=0x%08X calculado=0x%08X", storedCrc, actualCrc));
         }
-        return new SeriesHeader(version, flags, baseStepSec, defHash, d, a,
+        return new SeriesHeader(version, schemaRevision, baseStepSec, defHash, d, a,
                 staticSectionBytes, liveStateOffset, liveStateBytes, ringDataOffset, fileTotalBytes);
     }
 

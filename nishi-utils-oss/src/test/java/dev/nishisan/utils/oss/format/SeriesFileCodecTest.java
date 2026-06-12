@@ -84,7 +84,7 @@ class SeriesFileCodecTest {
         byte[] hash = new byte[DefinitionHash.BYTES];
         Arrays.fill(hash, (byte) 0xAB);
 
-        byte[] image = SeriesFileCodec.buildInitialImage(geo, hash);
+        byte[] image = SeriesFileCodec.buildInitialImage(geo, hash, 0);
         assertEquals((int) geo.fileTotalBytes(), image.length);
 
         SeriesHeader header = SeriesFileCodec.decodeFixedHeader(image);
@@ -157,7 +157,7 @@ class SeriesFileCodecTest {
     void crcDeCabecalhoCorrompidoLancaExcecao() {
         SeriesGeometry geo = geometry();
         byte[] hash = new byte[DefinitionHash.BYTES];
-        byte[] image = SeriesFileCodec.buildInitialImage(geo, hash);
+        byte[] image = SeriesFileCodec.buildInitialImage(geo, hash, 0);
         image[8] ^= 0x7F; // corrompe baseStepSec dentro da área coberta pelo CRC
         assertThrows(NgrrdFormatException.class, () -> SeriesFileCodec.decodeFixedHeader(image));
     }
