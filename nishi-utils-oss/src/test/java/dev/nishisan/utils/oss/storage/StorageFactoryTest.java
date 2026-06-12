@@ -23,7 +23,8 @@ class StorageFactoryTest {
                 backend,
                 new ObjectNaming(NamingScheme.DETERMINISTIC, "schema", "series"),
                 new WritePolicy(WriteMode.APPEND_ONLY,
-                        new IdempotencyDef("{seriesKey}", ConflictResolution.VERIFY_OR_REPLACE_IF_IDENTICAL)));
+                        new IdempotencyDef("{seriesKey}", ConflictResolution.VERIFY_OR_REPLACE_IF_IDENTICAL)),
+                null);
     }
 
     @Test

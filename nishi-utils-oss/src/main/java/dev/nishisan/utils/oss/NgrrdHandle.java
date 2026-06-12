@@ -14,8 +14,42 @@ import java.util.Map;
  * <p>O escopo é o da série identificada pelas {@code tags} fornecidas — o
  * handle resolve {@code seriesKey} via {@code IdentitySpec.seriesKeyTemplate}.</p>
  *
+ * <h2>Concorrência</h2>
+ *
+ * <p>O handle é seguro para <strong>1 writer lógico + N readers</strong> no
+ * mesmo processo, sem serialização externa:</p>
+ *
+ * <ul>
+ *   <li>{@link #read(String, ViewQuery)} (e variantes) pode ser chamado por N
+ *       threads concorrentes entre si e com {@link #write(String, Sample)} /
+ *       {@link #checkpoint()}. Cada leitura observa um estado consistente da
+ *       série (ponteiros do ring e células sempre coerentes entre si); leituras
+ *       não bloqueiam umas às outras.</li>
+ *   <li>{@link #write(String, Sample)} é thread-safe (enfileira para a worker
+ *       thread única do writer), mas a série permanece single-writer lógico:
+ *       se múltiplas threads escreverem, a ordem relativa entre elas é
+ *       indefinida — o que importa para counters/derives é a ordem temporal
+ *       das amostras.</li>
+ *   <li>{@link #checkpoint()} / {@link #flush()} são síncronos: drenam a fila
+ *       do writer antes de retornar.</li>
+ * </ul>
+ *
+ * <p><strong>Visibilidade por backend:</strong> no disco local, CDPs de passos
+ * já fechados tornam-se legíveis assim que o passo fecha; o CDP em progresso
+ * (parcial) torna-se legível após {@link #checkpoint()}. No S3, toda leitura
+ * reflete o último {@link #checkpoint()} publicado (PUT atômico) — nada fica
+ * visível entre checkpoints.</p>
+ *
+ * <p><strong>Fora do contrato:</strong> ler ou escrever a mesma série por um
+ * segundo handle ou processo concorrente ao writer. O objeto {@code .ngrr}
+ * sofre escrita in-place no disco (um segundo processo leitor pode observar
+ * estado rasgado) e read-modify-write no S3 (dois writers causam perda
+ * silenciosa, last-write-wins). O invariante "um writer por série" permanece;
+ * todo acesso concorrente deve passar pelo mesmo handle.</p>
+ *
  * <p>{@link #close()} faz shutdown ordenado: materializa o CDP em progresso,
- * torna o objeto da série durável e encerra a thread do writer.</p>
+ * torna o objeto da série durável e encerra a thread do writer. O handle não
+ * deve ser usado após {@code close()}.</p>
  */
 public interface NgrrdHandle extends AutoCloseable {
 

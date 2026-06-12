@@ -73,9 +73,13 @@ Object Storage S3-compatível) e definição declarativa em YAML.
 5. Ao avançar o slot base, o PDP completo é dobrado no CDP em progresso de cada
    archive; quando o passo do archive fecha, o CDP é finalizado (XFF) e gravado
    no ring (avançando o ponteiro, sobrescrevendo o mais antigo — retenção como
-   ring buffer).
+   ring buffer). A região do live-state é regravada junto (sem `fsync`) para
+   manter ponteiro e células coerentes para leitores concorrentes do handle.
 6. `checkpoint()`/`flush()` emite o CDP em progresso como **parcial** (legível
-   antes do passo fechar) e torna o objeto durável (`fsync` no disco / PUT no S3).
+   antes do passo fechar) e — sob a durabilidade `FSYNC` (padrão) — torna o
+   objeto durável (`fsync` no disco / PUT no S3). Sob `OS_CACHE` o checkpoint
+   apenas materializa os bytes (sem `fsync`); ver [Durabilidade do
+   checkpoint](#durabilidade-do-checkpoint-fsync--os_cache).
 
 ---
 
@@ -229,6 +233,7 @@ spec:
 
   storage:
     backend: localDisk
+    durability: fsync            # fsync (padrão) | os_cache — ver "Durabilidade do checkpoint"
     objectNaming: {scheme: deterministic, seriesPrefix: series, schemaPrefix: schema}
     writePolicy: {mode: append_only, idempotency: {key: "{seriesKey}", onConflict: "verify_or_replace_if_identical"}}
 
@@ -365,6 +370,7 @@ spec:
 
   storage:
     backend: localDisk
+    durability: fsync            # fsync (padrão) | os_cache — ver "Durabilidade do checkpoint"
     objectNaming: {scheme: deterministic, seriesPrefix: series, schemaPrefix: schema}
     writePolicy: {mode: append_only, idempotency: {key: "{seriesKey}", onConflict: "verify_or_replace_if_identical"}}
 
@@ -445,9 +451,83 @@ S3Settings s3 = S3Settings.forEndpoint(
 var bindings = StorageFactory.StorageBindings.forS3(s3);
 ```
 
-> **Invariante:** um writer por série. O objeto da série sofre escrita in-place
-> no disco e read-modify-write no S3; dois writers concorrentes na mesma chave
-> causariam perda silenciosa (last-write-wins no S3).
+### Concorrência no mesmo handle
+
+O `NgrrdHandle` é seguro para **1 writer lógico + N readers** no mesmo
+processo, sem serialização externa:
+
+- `read(...)` pode ser chamado por N threads, concorrentes entre si e com
+  `write(...)`/`checkpoint()`. Cada leitura observa um estado consistente da
+  série; leituras não bloqueiam umas às outras.
+- `write(...)` é thread-safe (enfileira para a worker thread única), mas a
+  série permanece single-writer lógico: com múltiplas threads escrevendo, a
+  ordem relativa entre elas é indefinida.
+- `checkpoint()`/`flush()` são síncronos: drenam a fila do writer antes de
+  retornar.
+
+A garantia é implementada por um `ReadWriteLock` por handle, compartilhado
+entre o writer e os leitores: a worker thread adquire o write-lock em volta de
+cada mutação do objeto da série (e regrava o live-state sempre que o ring
+avança, mantendo ponteiro e células coerentes); leitores adquirem o read-lock
+na sequência live-state → ring. `force()` (fsync/PUT) ocorre fora do lock.
+
+**Visibilidade por backend:** no disco local, CDPs de passos já fechados
+tornam-se legíveis assim que o passo fecha; o CDP em progresso (parcial)
+torna-se legível após `checkpoint()`. No S3, toda leitura reflete o último
+`checkpoint()` publicado (PUT atômico) — nada fica visível entre checkpoints.
+
+> **Invariante:** um writer por série, e todo acesso concorrente passa pelo
+> mesmo handle. O objeto da série sofre escrita in-place no disco e
+> read-modify-write no S3: um segundo processo leitor pode observar estado
+> rasgado no disco, e dois writers concorrentes na mesma chave causariam perda
+> silenciosa (last-write-wins no S3).
+
+### Durabilidade do checkpoint (FSYNC | OS_CACHE)
+
+Cada `checkpoint()`/`flush()` faz duas coisas distintas: **materializa** os bytes
+do CDP em progresso (escrita in-place no disco / read-modify-write na imagem em
+memória do S3) e, em seguida, **força** a durabilidade. A política `Durability`
+controla apenas o segundo passo:
+
+| Modo | Por checkpoint | Visibilidade (disco) | Janela de perda |
+|------|----------------|----------------------|-----------------|
+| `FSYNC` (padrão) | `fsync` no disco / `PUT` no S3 | CDP parcial legível | nenhuma (durável a cada checkpoint) |
+| `OS_CACHE` | materializa, **sem** `fsync` | CDP parcial legível (page cache) | tail não descarregado, só em **crash abrupto** |
+
+Em `OS_CACHE`, os leitores no mesmo processo continuam enxergando o CDP parcial
+logo após o checkpoint (a escrita in-place já está no page cache do SO), mas o
+SO decide quando descarregar para o disco. Um `close()` limpo **sempre**
+descarrega o pendente (o `SeriesChannel.close()` força no fechamento), de modo
+que a janela de perda se restringe a um crash/queda de energia abrupta — útil
+para backfills e séries voláteis em que throughput vale mais que durabilidade
+por checkpoint.
+
+> **`OS_CACHE` é exclusivo de disco local.** No `OBJECT_STORAGE` (S3) o `force()`
+> **é** o próprio `PUT` (a publicação); pular o force nunca publicaria a série.
+> A abertura **rejeita** `OBJECT_STORAGE` + `OS_CACHE` com `IllegalArgumentException`.
+
+**Configuração.** O default vem do YAML (`spec.storage.durability: fsync | os_cache`;
+ausente = `fsync`) e pode ser **sobrescrito por abertura** via `Ngrrd.OpenOptions`
+— a mesma definição abre `FSYNC` em produção e `OS_CACHE` num job de backfill:
+
+```java
+import dev.nishisan.utils.oss.Ngrrd.OpenOptions;
+import dev.nishisan.utils.oss.api.Durability;
+
+// Precedência: override de abertura > default do YAML > FSYNC.
+try (NgrrdHandle handle = Ngrrd.fromYaml(yaml, bindings, tags,
+        OpenOptions.durability(Durability.OS_CACHE))) {
+    // ... ingestão de alto throughput; close() final descarrega o pendente.
+}
+```
+
+Uma camada consumidora que exponha um booleano `commit.fsync` mapeia-o
+diretamente: `true → Durability.FSYNC`, `false → Durability.OS_CACHE`.
+
+> **Evolução planejada.** Um terceiro modo `GROUP_COMMIT` (coalescer N
+> checkpoints num único `force`, limitando a janela de perda sem `fsync` por
+> checkpoint) — análogo ao `RelayDurability.GROUP_COMMIT` do core — fica para um
+> follow-up.
 
 ---
 

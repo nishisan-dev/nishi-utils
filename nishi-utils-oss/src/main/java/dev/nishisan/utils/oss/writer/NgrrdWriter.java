@@ -2,6 +2,7 @@ package dev.nishisan.utils.oss.writer;
 
 import dev.nishisan.utils.oss.api.ConsolidationFunction;
 import dev.nishisan.utils.oss.api.DataSourceType;
+import dev.nishisan.utils.oss.api.Durability;
 import dev.nishisan.utils.oss.api.Sample;
 import dev.nishisan.utils.oss.definition.DataSourceDef;
 import dev.nishisan.utils.oss.definition.NgrrdDefinition;
@@ -29,6 +30,9 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * Ingere {@link Sample}s e mantém um único arquivo de série NGRR por
@@ -37,7 +41,12 @@ import java.util.concurrent.atomic.AtomicReference;
  *
  * <p>Modelo de execução: produtor-consumidor com worker thread única. Toda
  * mutação de estado e todo acesso ao {@link SeriesChannel} ocorrem na worker
- * thread.</p>
+ * thread. Quando um {@link ReadWriteLock} é compartilhado com leitores (caso do
+ * {@code NgrrdHandle}), a worker adquire o write-lock em volta de toda mutação
+ * do objeto da série, e a região do live-state é regravada sempre que o ring
+ * avança — o par (ponteiro do ring, células) persistido fica sempre coerente
+ * para leituras concorrentes no mesmo processo. {@code force()} (fsync/PUT)
+ * ocorre fora do lock para não bloquear leitores durante I/O de durabilidade.</p>
  *
  * <p>Consolidação contínua (estilo {@code cdp_prep}): cada amostra é derivada via
  * {@link CounterDeriver} e acumulada no PDP do step base da coluna; ao avançar o
@@ -66,6 +75,9 @@ public final class NgrrdWriter implements AutoCloseable {
 
     private final SeriesChannel channel;
     private final SeriesLiveState state;
+    private final Lock writeLock;
+    private final Durability durability;
+    private boolean ringDirty;
 
     private final ExecutorService worker;
     private final LinkedBlockingQueue<Command> queue = new LinkedBlockingQueue<>();
@@ -78,10 +90,35 @@ public final class NgrrdWriter implements AutoCloseable {
 
     public NgrrdWriter(NgrrdDefinition definition, NgrrdStorage storage, String seriesKey,
                        NgrrdMetricsListener metrics) {
+        this(definition, storage, seriesKey, metrics, new ReentrantReadWriteLock());
+    }
+
+    /**
+     * Variante com {@link ReadWriteLock} compartilhado com leitores da mesma
+     * série (mesmo processo): o write-lock é adquirido em volta de toda mutação
+     * do objeto da série, permitindo leituras consistentes concorrentes.
+     * Durabilidade {@link Durability#FSYNC} (padrão).
+     */
+    public NgrrdWriter(NgrrdDefinition definition, NgrrdStorage storage, String seriesKey,
+                       NgrrdMetricsListener metrics, ReadWriteLock seriesLock) {
+        this(definition, storage, seriesKey, metrics, seriesLock, Durability.FSYNC);
+    }
+
+    /**
+     * Variante completa com política de {@link Durability}. Em
+     * {@link Durability#OS_CACHE} o checkpoint materializa os bytes mas pula o
+     * {@code fsync} por checkpoint (o SO descarrega no seu ritmo); um
+     * {@code close()} limpo ainda descarrega o pendente.
+     */
+    public NgrrdWriter(NgrrdDefinition definition, NgrrdStorage storage, String seriesKey,
+                       NgrrdMetricsListener metrics, ReadWriteLock seriesLock,
+                       Durability durability) {
         this.definition = Objects.requireNonNull(definition, "definition é obrigatório");
         Objects.requireNonNull(storage, "storage é obrigatório");
         this.seriesKey = Objects.requireNonNull(seriesKey, "seriesKey é obrigatório");
         this.metrics = metrics;
+        this.writeLock = Objects.requireNonNull(seriesLock, "seriesLock é obrigatório").writeLock();
+        this.durability = Objects.requireNonNull(durability, "durability é obrigatório");
 
         if (!(storage instanceof SeriesChannelProvider provider)) {
             throw new IllegalArgumentException(
@@ -233,7 +270,20 @@ public final class NgrrdWriter implements AutoCloseable {
             try {
                 Command cmd = queue.take();
                 switch (cmd) {
-                    case Command.Write w -> handleWrite(w);
+                    case Command.Write w -> {
+                        writeLock.lock();
+                        try {
+                            handleWrite(w);
+                            if (ringDirty) {
+                                // ring avançou: mantém (ponteiro, células) coerente
+                                // no objeto para leitores concorrentes; durabilidade
+                                // continua sendo responsabilidade do checkpoint.
+                                persistLiveState();
+                            }
+                        } finally {
+                            writeLock.unlock();
+                        }
+                    }
                     case Command.Sync s -> {
                         // Sempre libera o latch; uma falha vai para o chamador via error ref.
                         try {
@@ -477,22 +527,42 @@ public final class NgrrdWriter implements AutoCloseable {
 
     private void writeCell(int arch, int row, int col, double value) {
         channel.writeRegion(geo.cellOffset(arch, row, col), SeriesFileCodec.doubleBytes(value));
+        ringDirty = true;
+    }
+
+    /** Regrava a região do live-state (sem force) e limpa a flag do ring. */
+    private void persistLiveState() {
+        channel.writeRegion(geo.liveStateOffset(), SeriesFileCodec.encodeLiveState(geo, state));
+        ringDirty = false;
     }
 
     /** Emite os CDPs em progresso como parciais e torna o arquivo durável. */
     private void checkpointAndForce() {
-        for (int col = 0; col < d; col++) {
-            long slot = state.pdpSlotSec[col];
-            if (slot == -1L) {
-                continue;
+        writeLock.lock();
+        try {
+            for (int col = 0; col < d; col++) {
+                long slot = state.pdpSlotSec[col];
+                if (slot == -1L) {
+                    continue;
+                }
+                for (int arch = 0; arch < a; arch++) {
+                    long windowStart = TimeBucket.alignDown(slot, geo.archives().get(arch).stepSec());
+                    emit(arch, col, windowStart, false);
+                }
             }
-            for (int arch = 0; arch < a; arch++) {
-                long windowStart = TimeBucket.alignDown(slot, geo.archives().get(arch).stepSec());
-                emit(arch, col, windowStart, false);
-            }
+            persistLiveState();
+        } finally {
+            writeLock.unlock();
         }
-        channel.writeRegion(geo.liveStateOffset(), SeriesFileCodec.encodeLiveState(geo, state));
-        channel.force();
+        // fsync (disco) / PUT (S3) fora do lock: não muta a imagem e não deve
+        // bloquear leitores durante o I/O de durabilidade.
+        if (durability == Durability.FSYNC) {
+            channel.force();
+        }
+        // OS_CACHE: pula o fsync por checkpoint; o SO descarrega no seu ritmo.
+        // Os bytes já estão materializados (legíveis por leitores no mesmo
+        // processo via page cache); a janela de perda é um crash abrupto, pois
+        // um close() limpo ainda descarrega o pendente via channel.close().
     }
 
     private void closeChannelQuietly() {

@@ -8,7 +8,10 @@ package dev.nishisan.utils.oss.storage;
  * é mantida em memória e sofre read-modify-write).
  *
  * <p>Invariante de uso: <strong>um writer por série</strong>. O reader abre seu
- * próprio canal (snapshot de leitura).</p>
+ * próprio canal: no S3 ele é um snapshot imutável (GET); no disco é uma visão
+ * viva do mesmo arquivo — a consistência entre leitor e writer concorrentes no
+ * mesmo processo é coordenada pelo {@code ReadWriteLock} compartilhado do
+ * {@code NgrrdHandle}, não pelo canal.</p>
  */
 public interface SeriesChannel extends AutoCloseable {
 

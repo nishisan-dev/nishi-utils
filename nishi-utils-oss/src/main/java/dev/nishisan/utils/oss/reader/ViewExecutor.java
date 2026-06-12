@@ -10,6 +10,8 @@ import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * Resolve presets declarativos do YAML ({@link PresetDef}) em {@link ViewQuery}s
@@ -20,10 +22,21 @@ public final class ViewExecutor {
 
     private final NgrrdDefinition definition;
     private final NgrrdStorage storage;
+    private final ReadWriteLock seriesLock;
 
     public ViewExecutor(NgrrdDefinition definition, NgrrdStorage storage) {
+        this(definition, storage, new ReentrantReadWriteLock());
+    }
+
+    /**
+     * Variante com {@link ReadWriteLock} compartilhado com o writer da série
+     * (mesmo processo), repassado aos {@link NgrrdReader}s criados por execução.
+     */
+    public ViewExecutor(NgrrdDefinition definition, NgrrdStorage storage,
+                        ReadWriteLock seriesLock) {
         this.definition = Objects.requireNonNull(definition, "definition é obrigatório");
         this.storage = Objects.requireNonNull(storage, "storage é obrigatório");
+        this.seriesLock = Objects.requireNonNull(seriesLock, "seriesLock é obrigatório");
     }
 
     public Map<String, SeriesResult> run(String presetName, Map<String, String> tags) {
@@ -41,7 +54,7 @@ public final class ViewExecutor {
                 .orElseThrow(() -> new IllegalArgumentException("Preset desconhecido: " + presetName));
 
         String seriesKey = resolveSeriesKey(safeTags);
-        NgrrdReader reader = new NgrrdReader(definition, storage, seriesKey);
+        NgrrdReader reader = new NgrrdReader(definition, storage, seriesKey, seriesLock);
         ViewQuery query = new ViewQuery(
                 Duration.parse(preset.window()),
                 preset.targetStepSec(),

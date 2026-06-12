@@ -23,12 +23,20 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * Materializa séries temporais a partir do objeto único NGRR. Lê os ring buffers
  * diretamente do arquivo (sem manifesto): escolhe o RRA via
  * {@link BestFitSelector}, mapeia {@code (rra, cf)} para o archive, reconstrói os
  * timestamps pelo ponteiro do ring e recorta para a janela solicitada.
+ *
+ * <p>Quando construído com o {@link ReadWriteLock} compartilhado com o writer da
+ * série (caso do {@code NgrrdHandle}), a sequência live-state → ring é lida sob
+ * o read-lock — atômica em relação às mutações do writer e em paralelo com
+ * outros leitores. A abertura do canal (GET no S3) ocorre fora do lock.</p>
  */
 public final class NgrrdReader {
 
@@ -38,8 +46,18 @@ public final class NgrrdReader {
     private final SeriesGeometry geo;
     private final byte[] geometryHash;
     private final String storageKey;
+    private final Lock readLock;
 
     public NgrrdReader(NgrrdDefinition definition, NgrrdStorage storage, String seriesKey) {
+        this(definition, storage, seriesKey, new ReentrantReadWriteLock());
+    }
+
+    /**
+     * Variante com {@link ReadWriteLock} compartilhado com o writer da mesma
+     * série (mesmo processo), garantindo leituras consistentes concorrentes.
+     */
+    public NgrrdReader(NgrrdDefinition definition, NgrrdStorage storage, String seriesKey,
+                       ReadWriteLock seriesLock) {
         this.definition = Objects.requireNonNull(definition, "definition é obrigatório");
         Objects.requireNonNull(storage, "storage é obrigatório");
         this.seriesKey = Objects.requireNonNull(seriesKey, "seriesKey é obrigatório");
@@ -51,6 +69,7 @@ public final class NgrrdReader {
         this.geo = new SeriesGeometry(definition);
         this.geometryHash = geo.geometryHash();
         this.storageKey = StorageKey.series(definition.spec().storage().objectNaming(), seriesKey);
+        this.readLock = Objects.requireNonNull(seriesLock, "seriesLock é obrigatório").readLock();
     }
 
     /** Variante de conveniência que usa {@link System#currentTimeMillis()} como fim do range. */
@@ -78,7 +97,13 @@ public final class NgrrdReader {
         }
 
         try (SeriesChannel channel = provider.openSeries(storageKey)) {
-            List<DataPoint> points = readPoints(channel, arch, col, query, endExclusiveEpochMs);
+            List<DataPoint> points;
+            readLock.lock();
+            try {
+                points = readPoints(channel, arch, col, query, endExclusiveEpochMs);
+            } finally {
+                readLock.unlock();
+            }
             List<DataPoint> downsampled = downsample(points, query.maxPoints());
             return new SeriesResult(dsName, rra.name(), query.cf(), rra.stepSec(), downsampled);
         } catch (NgrrdFormatException e) {
