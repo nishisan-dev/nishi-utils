@@ -20,6 +20,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * Façade pública do formato <strong>ngrrd</strong>.
@@ -95,9 +97,12 @@ public final class Ngrrd {
         String seriesKey = resolveSeriesKey(def.spec().identity().seriesKeyTemplate(), tags);
 
         NgrrdMetrics metrics = new NgrrdMetrics(metricsListener);
-        NgrrdWriter writer = new NgrrdWriter(def, storage, seriesKey, metrics);
+        // Lock por handle compartilhado entre writer e leitores: garante o
+        // contrato de 1 writer + N readers do NgrrdHandle.
+        ReadWriteLock seriesLock = new ReentrantReadWriteLock();
+        NgrrdWriter writer = new NgrrdWriter(def, storage, seriesKey, metrics, seriesLock);
 
-        return new DefaultHandle(def, storage, seriesKey, writer, metrics, Map.copyOf(tags));
+        return new DefaultHandle(def, storage, seriesKey, writer, metrics, Map.copyOf(tags), seriesLock);
     }
 
     static String resolveSeriesKey(String template, Map<String, String> tags) {
@@ -139,13 +144,14 @@ public final class Ngrrd {
         private volatile boolean closed;
 
         DefaultHandle(NgrrdDefinition def, NgrrdStorage storage, String seriesKey,
-                      NgrrdWriter writer, NgrrdMetrics metrics, Map<String, String> tags) {
+                      NgrrdWriter writer, NgrrdMetrics metrics, Map<String, String> tags,
+                      ReadWriteLock seriesLock) {
             this.storage = storage;
             this.seriesKey = seriesKey;
             this.writer = writer;
             this.metrics = metrics;
-            this.reader = new NgrrdReader(def, storage, seriesKey);
-            this.viewExecutor = new ViewExecutor(def, storage);
+            this.reader = new NgrrdReader(def, storage, seriesKey, seriesLock);
+            this.viewExecutor = new ViewExecutor(def, storage, seriesLock);
             this.tags = tags;
         }
 
