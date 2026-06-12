@@ -2,6 +2,7 @@ package dev.nishisan.utils.oss.writer;
 
 import dev.nishisan.utils.oss.api.ConsolidationFunction;
 import dev.nishisan.utils.oss.api.DataSourceType;
+import dev.nishisan.utils.oss.api.Durability;
 import dev.nishisan.utils.oss.api.Sample;
 import dev.nishisan.utils.oss.definition.DataSourceDef;
 import dev.nishisan.utils.oss.definition.NgrrdDefinition;
@@ -75,6 +76,7 @@ public final class NgrrdWriter implements AutoCloseable {
     private final SeriesChannel channel;
     private final SeriesLiveState state;
     private final Lock writeLock;
+    private final Durability durability;
     private boolean ringDirty;
 
     private final ExecutorService worker;
@@ -95,14 +97,28 @@ public final class NgrrdWriter implements AutoCloseable {
      * Variante com {@link ReadWriteLock} compartilhado com leitores da mesma
      * série (mesmo processo): o write-lock é adquirido em volta de toda mutação
      * do objeto da série, permitindo leituras consistentes concorrentes.
+     * Durabilidade {@link Durability#FSYNC} (padrão).
      */
     public NgrrdWriter(NgrrdDefinition definition, NgrrdStorage storage, String seriesKey,
                        NgrrdMetricsListener metrics, ReadWriteLock seriesLock) {
+        this(definition, storage, seriesKey, metrics, seriesLock, Durability.FSYNC);
+    }
+
+    /**
+     * Variante completa com política de {@link Durability}. Em
+     * {@link Durability#OS_CACHE} o checkpoint materializa os bytes mas pula o
+     * {@code fsync} por checkpoint (o SO descarrega no seu ritmo); um
+     * {@code close()} limpo ainda descarrega o pendente.
+     */
+    public NgrrdWriter(NgrrdDefinition definition, NgrrdStorage storage, String seriesKey,
+                       NgrrdMetricsListener metrics, ReadWriteLock seriesLock,
+                       Durability durability) {
         this.definition = Objects.requireNonNull(definition, "definition é obrigatório");
         Objects.requireNonNull(storage, "storage é obrigatório");
         this.seriesKey = Objects.requireNonNull(seriesKey, "seriesKey é obrigatório");
         this.metrics = metrics;
         this.writeLock = Objects.requireNonNull(seriesLock, "seriesLock é obrigatório").writeLock();
+        this.durability = Objects.requireNonNull(durability, "durability é obrigatório");
 
         if (!(storage instanceof SeriesChannelProvider provider)) {
             throw new IllegalArgumentException(
@@ -540,7 +556,13 @@ public final class NgrrdWriter implements AutoCloseable {
         }
         // fsync (disco) / PUT (S3) fora do lock: não muta a imagem e não deve
         // bloquear leitores durante o I/O de durabilidade.
-        channel.force();
+        if (durability == Durability.FSYNC) {
+            channel.force();
+        }
+        // OS_CACHE: pula o fsync por checkpoint; o SO descarrega no seu ritmo.
+        // Os bytes já estão materializados (legíveis por leitores no mesmo
+        // processo via page cache); a janela de perda é um crash abrupto, pois
+        // um close() limpo ainda descarrega o pendente via channel.close().
     }
 
     private void closeChannelQuietly() {

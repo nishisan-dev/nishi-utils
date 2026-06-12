@@ -1,10 +1,13 @@
 package dev.nishisan.utils.oss;
 
+import dev.nishisan.utils.oss.api.Durability;
 import dev.nishisan.utils.oss.api.Sample;
 import dev.nishisan.utils.oss.api.SeriesResult;
+import dev.nishisan.utils.oss.api.StorageBackendType;
 import dev.nishisan.utils.oss.api.ViewQuery;
 import dev.nishisan.utils.oss.config.NgrrdYamlLoader;
 import dev.nishisan.utils.oss.definition.NgrrdDefinition;
+import dev.nishisan.utils.oss.definition.StorageSpec;
 import dev.nishisan.utils.oss.metrics.NgrrdMetrics;
 import dev.nishisan.utils.oss.metrics.NgrrdMetricsListener;
 import dev.nishisan.utils.oss.reader.NgrrdReader;
@@ -60,6 +63,13 @@ public final class Ngrrd {
     public static NgrrdHandle fromYaml(Path yamlFile,
                                        StorageFactory.StorageBindings bindings,
                                        Map<String, String> tags) {
+        return fromYaml(yamlFile, bindings, tags, OpenOptions.defaults());
+    }
+
+    public static NgrrdHandle fromYaml(Path yamlFile,
+                                       StorageFactory.StorageBindings bindings,
+                                       Map<String, String> tags,
+                                       OpenOptions options) {
         Objects.requireNonNull(yamlFile, "yamlFile é obrigatório");
         String raw;
         try {
@@ -67,16 +77,23 @@ public final class Ngrrd {
         } catch (IOException e) {
             throw new IllegalArgumentException("Falha ao ler YAML em " + yamlFile, e);
         }
-        return fromYaml(raw, bindings, tags, null);
+        return fromYaml(raw, bindings, tags, null, options);
     }
 
     public static NgrrdHandle fromYaml(InputStream input,
                                        StorageFactory.StorageBindings bindings,
                                        Map<String, String> tags) {
+        return fromYaml(input, bindings, tags, OpenOptions.defaults());
+    }
+
+    public static NgrrdHandle fromYaml(InputStream input,
+                                       StorageFactory.StorageBindings bindings,
+                                       Map<String, String> tags,
+                                       OpenOptions options) {
         Objects.requireNonNull(input, "input é obrigatório");
         try {
             return fromYaml(new String(input.readAllBytes(), StandardCharsets.UTF_8),
-                    bindings, tags, null);
+                    bindings, tags, null, options);
         } catch (IOException e) {
             throw new IllegalArgumentException("Falha ao ler YAML do InputStream", e);
         }
@@ -86,23 +103,78 @@ public final class Ngrrd {
                                        StorageFactory.StorageBindings bindings,
                                        Map<String, String> tags,
                                        NgrrdMetricsListener metricsListener) {
+        return fromYaml(yamlContent, bindings, tags, metricsListener, OpenOptions.defaults());
+    }
+
+    public static NgrrdHandle fromYaml(String yamlContent,
+                                       StorageFactory.StorageBindings bindings,
+                                       Map<String, String> tags,
+                                       NgrrdMetricsListener metricsListener,
+                                       OpenOptions options) {
         Objects.requireNonNull(yamlContent, "yamlContent é obrigatório");
         Objects.requireNonNull(bindings, "bindings é obrigatório");
         Objects.requireNonNull(tags, "tags é obrigatório");
+        Objects.requireNonNull(options, "options é obrigatório");
 
         NgrrdDefinition def = NgrrdYamlLoader.parse(yamlContent, System::getenv);
         dev.nishisan.utils.oss.config.NgrrdDefinitionValidator.validate(def);
 
-        NgrrdStorage storage = StorageFactory.from(def.spec().storage(), bindings);
+        StorageSpec storageSpec = def.spec().storage();
+        // Durabilidade efetiva: override de abertura > default do YAML > FSYNC.
+        Durability durability = resolveDurability(options, storageSpec);
+        // Fail-fast antes de instanciar o backend/abrir o writer (evita GET no
+        // S3): no OBJECT_STORAGE o force() é o próprio PUT (publicação), logo
+        // OS_CACHE nunca publicaria a série.
+        if (storageSpec.backend() == StorageBackendType.OBJECT_STORAGE
+                && durability == Durability.OS_CACHE) {
+            throw new IllegalArgumentException(
+                    "durability OS_CACHE não é suportada com backend OBJECT_STORAGE: no S3 o "
+                            + "force() é o próprio PUT (publicação); desligá-lo nunca publicaria "
+                            + "a série. Use FSYNC ou backend localDisk.");
+        }
+
+        NgrrdStorage storage = StorageFactory.from(storageSpec, bindings);
         String seriesKey = resolveSeriesKey(def.spec().identity().seriesKeyTemplate(), tags);
 
         NgrrdMetrics metrics = new NgrrdMetrics(metricsListener);
         // Lock por handle compartilhado entre writer e leitores: garante o
         // contrato de 1 writer + N readers do NgrrdHandle.
         ReadWriteLock seriesLock = new ReentrantReadWriteLock();
-        NgrrdWriter writer = new NgrrdWriter(def, storage, seriesKey, metrics, seriesLock);
+        NgrrdWriter writer = new NgrrdWriter(def, storage, seriesKey, metrics, seriesLock, durability);
 
         return new DefaultHandle(def, storage, seriesKey, writer, metrics, Map.copyOf(tags), seriesLock);
+    }
+
+    static Durability resolveDurability(OpenOptions options, StorageSpec storageSpec) {
+        if (options.durability() != null) {
+            return options.durability();
+        }
+        if (storageSpec.durability() != null) {
+            return storageSpec.durability();
+        }
+        return Durability.FSYNC;
+    }
+
+    /**
+     * Opções de abertura de um {@link NgrrdHandle}. Independem da forma da série
+     * (descrita no YAML) e variam por deployment/execução.
+     *
+     * <p>{@code durability} {@code null} significa "usar o default do YAML"
+     * ({@code spec.storage.durability}), que por sua vez recai em
+     * {@link Durability#FSYNC} quando ausente. Um valor não-nulo sobrescreve o
+     * YAML — permitindo, por exemplo, abrir a mesma definição com
+     * {@link Durability#FSYNC} em produção e {@link Durability#OS_CACHE} num job
+     * de backfill.</p>
+     */
+    public record OpenOptions(Durability durability) {
+
+        public static OpenOptions defaults() {
+            return new OpenOptions(null);
+        }
+
+        public static OpenOptions durability(Durability durability) {
+            return new OpenOptions(durability);
+        }
     }
 
     static String resolveSeriesKey(String template, Map<String, String> tags) {
