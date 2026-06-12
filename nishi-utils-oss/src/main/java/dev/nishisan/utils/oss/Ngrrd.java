@@ -1,6 +1,7 @@
 package dev.nishisan.utils.oss;
 
 import dev.nishisan.utils.oss.api.Durability;
+import dev.nishisan.utils.oss.api.OnGeometryChange;
 import dev.nishisan.utils.oss.api.Sample;
 import dev.nishisan.utils.oss.api.SeriesResult;
 import dev.nishisan.utils.oss.api.StorageBackendType;
@@ -136,11 +137,15 @@ public final class Ngrrd {
         NgrrdStorage storage = StorageFactory.from(storageSpec, bindings);
         String seriesKey = resolveSeriesKey(def.spec().identity().seriesKeyTemplate(), tags);
 
+        // Tratamento de mudança de geometria: override de abertura > YAML > FAIL.
+        OnGeometryChange onGeometryChange = resolveGeometryChange(options, storageSpec);
+
         NgrrdMetrics metrics = new NgrrdMetrics(metricsListener);
         // Lock por handle compartilhado entre writer e leitores: garante o
         // contrato de 1 writer + N readers do NgrrdHandle.
         ReadWriteLock seriesLock = new ReentrantReadWriteLock();
-        NgrrdWriter writer = new NgrrdWriter(def, storage, seriesKey, metrics, seriesLock, durability);
+        NgrrdWriter writer = new NgrrdWriter(def, storage, seriesKey, metrics, seriesLock,
+                durability, onGeometryChange);
 
         return new DefaultHandle(def, storage, seriesKey, writer, metrics, Map.copyOf(tags), seriesLock);
     }
@@ -155,25 +160,43 @@ public final class Ngrrd {
         return Durability.FSYNC;
     }
 
+    static OnGeometryChange resolveGeometryChange(OpenOptions options, StorageSpec storageSpec) {
+        if (options.onGeometryChange() != null) {
+            return options.onGeometryChange();
+        }
+        if (storageSpec.onGeometryChange() != null) {
+            return storageSpec.onGeometryChange();
+        }
+        return OnGeometryChange.FAIL;
+    }
+
     /**
      * Opções de abertura de um {@link NgrrdHandle}. Independem da forma da série
      * (descrita no YAML) e variam por deployment/execução.
      *
-     * <p>{@code durability} {@code null} significa "usar o default do YAML"
-     * ({@code spec.storage.durability}), que por sua vez recai em
-     * {@link Durability#FSYNC} quando ausente. Um valor não-nulo sobrescreve o
-     * YAML — permitindo, por exemplo, abrir a mesma definição com
-     * {@link Durability#FSYNC} em produção e {@link Durability#OS_CACHE} num job
-     * de backfill.</p>
+     * <p>Campos {@code null} significam "usar o default do YAML"
+     * ({@code spec.storage.*}), que por sua vez recaem nos defaults globais
+     * ({@link Durability#FSYNC}, {@link OnGeometryChange#FAIL}). Um valor não-nulo
+     * sobrescreve o YAML — permitindo, por exemplo, abrir em produção com
+     * {@link OnGeometryChange#FAIL} e rodar um job de manutenção com
+     * {@link OnGeometryChange#MIGRATE}.</p>
      */
-    public record OpenOptions(Durability durability) {
+    public record OpenOptions(Durability durability, OnGeometryChange onGeometryChange) {
 
         public static OpenOptions defaults() {
-            return new OpenOptions(null);
+            return new OpenOptions(null, null);
         }
 
         public static OpenOptions durability(Durability durability) {
-            return new OpenOptions(durability);
+            return new OpenOptions(durability, null);
+        }
+
+        public static OpenOptions onGeometryChange(OnGeometryChange onGeometryChange) {
+            return new OpenOptions(null, onGeometryChange);
+        }
+
+        public static OpenOptions of(Durability durability, OnGeometryChange onGeometryChange) {
+            return new OpenOptions(durability, onGeometryChange);
         }
     }
 

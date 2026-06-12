@@ -42,7 +42,7 @@ class NgrrdDurabilityFacadeTest {
     }
 
     private static StorageSpec specWithDurability(Durability durability) {
-        return new StorageSpec(null, null, null, durability);
+        return new StorageSpec(null, null, null, durability, null);
     }
 
     @Test

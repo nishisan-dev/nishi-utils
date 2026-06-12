@@ -1,0 +1,42 @@
+@startuml
+title ngrrd — Reconciliacao de geometria na abertura da serie
+
+start
+:Abrir serie (storage.get(key));
+
+if (objeto existe?) then (nao)
+  :createFresh\npre-aloca no tamanho final\nrings = NaN;
+  stop
+else (sim)
+endif
+
+if (geometryHash gravado == esperado?) then (sim)
+  :Reidrata live-state\n(no-op: mesma geometria);
+  stop
+else (nao — geometria divergente)
+endif
+
+if (schemaRevision da definicao > gravado?) then (nao)
+  :FAIL\nNgrrdGeometryChangeException\n"incremente metadata.schemaRevision";
+  stop
+else (sim — mudanca intencional)
+endif
+
+switch (onGeometryChange?)
+case ( FAIL )
+  :FAIL\nrelatorio do diff + aborta\n(serie intacta);
+  stop
+case ( RECREATE )
+  :atomicReplace\nimagem nova vazia (clean cut);
+  stop
+case ( MIGRATE )
+  if (estruturalmente migravel?) then (sim)
+    :GeometryMigrator\nremapeia colunas/archives por nome\ncopia rings comuns + live-state\ncoluna nova = NaN;
+    :atomicReplace (imagem migrada);
+    stop
+  else (nao — reamostragem)
+    :FAIL\n"requer reamostragem; use RECREATE";
+    stop
+  endif
+endswitch
+@enduml

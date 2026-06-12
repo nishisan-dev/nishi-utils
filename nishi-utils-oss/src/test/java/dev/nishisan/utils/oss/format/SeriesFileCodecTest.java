@@ -84,7 +84,7 @@ class SeriesFileCodecTest {
         byte[] hash = new byte[DefinitionHash.BYTES];
         Arrays.fill(hash, (byte) 0xAB);
 
-        byte[] image = SeriesFileCodec.buildInitialImage(geo, hash);
+        byte[] image = SeriesFileCodec.buildInitialImage(geo, hash, 0);
         assertEquals((int) geo.fileTotalBytes(), image.length);
 
         SeriesHeader header = SeriesFileCodec.decodeFixedHeader(image);
@@ -110,6 +110,38 @@ class SeriesFileCodecTest {
                 Arrays.copyOfRange(image, (int) geo.cellOffset(0, 0, 0),
                         (int) geo.cellOffset(0, 0, 0) + 8));
         assertTrue(Double.isNaN(firstCell));
+    }
+
+    @Test
+    void geometriaPersistidaReconstroiOffsetsEArchives() {
+        SeriesGeometry geo = geometry();
+        byte[] image = SeriesFileCodec.buildInitialImage(geo, geo.geometryHash(), 7);
+
+        SeriesHeader header = SeriesFileCodec.decodeFixedHeader(image);
+        assertEquals(7, header.schemaRevision());
+
+        SeriesGeometry restored = SeriesGeometry.fromPersisted(header, image);
+        assertEquals(geo.baseStepSec(), restored.baseStepSec());
+        assertEquals(geo.fileTotalBytes(), restored.fileTotalBytes());
+        assertEquals(geo.liveStateOffset(), restored.liveStateOffset());
+        assertEquals(geo.ringDataOffset(), restored.ringDataOffset());
+        // O hash reconstruído deve bater — base para o diff/migração confiarem nos offsets.
+        assertArrayEquals(geo.geometryHash(), restored.geometryHash());
+
+        for (int i = 0; i < geo.columnCount(); i++) {
+            assertEquals(geo.columns().get(i).derivedName(), restored.columns().get(i).derivedName());
+            assertEquals(geo.columns().get(i).rawName(), restored.columns().get(i).rawName());
+            assertEquals(geo.columns().get(i).rawType(), restored.columns().get(i).rawType());
+        }
+        for (int i = 0; i < geo.archiveCount(); i++) {
+            SeriesGeometry.Archive expected = geo.archives().get(i);
+            SeriesGeometry.Archive actual = restored.archives().get(i);
+            assertEquals(expected.rraName(), actual.rraName());
+            assertEquals(expected.cf(), actual.cf());
+            assertEquals(expected.stepSec(), actual.stepSec());
+            assertEquals(expected.rows(), actual.rows());
+            assertEquals(expected.ringBaseOffset(), actual.ringBaseOffset());
+        }
     }
 
     @Test
@@ -157,7 +189,7 @@ class SeriesFileCodecTest {
     void crcDeCabecalhoCorrompidoLancaExcecao() {
         SeriesGeometry geo = geometry();
         byte[] hash = new byte[DefinitionHash.BYTES];
-        byte[] image = SeriesFileCodec.buildInitialImage(geo, hash);
+        byte[] image = SeriesFileCodec.buildInitialImage(geo, hash, 0);
         image[8] ^= 0x7F; // corrompe baseStepSec dentro da área coberta pelo CRC
         assertThrows(NgrrdFormatException.class, () -> SeriesFileCodec.decodeFixedHeader(image));
     }

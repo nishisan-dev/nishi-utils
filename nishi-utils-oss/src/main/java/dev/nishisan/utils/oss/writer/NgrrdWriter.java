@@ -1,13 +1,14 @@
 package dev.nishisan.utils.oss.writer;
 
 import dev.nishisan.utils.oss.api.ConsolidationFunction;
-import dev.nishisan.utils.oss.api.DataSourceType;
 import dev.nishisan.utils.oss.api.Durability;
+import dev.nishisan.utils.oss.api.OnGeometryChange;
 import dev.nishisan.utils.oss.api.Sample;
 import dev.nishisan.utils.oss.definition.DataSourceDef;
 import dev.nishisan.utils.oss.definition.NgrrdDefinition;
 import dev.nishisan.utils.oss.engine.CounterDeriver;
 import dev.nishisan.utils.oss.engine.PrimaryDataPoint;
+import dev.nishisan.utils.oss.engine.SampleDeriver;
 import dev.nishisan.utils.oss.engine.TimeBucket;
 import dev.nishisan.utils.oss.format.SeriesFileCodec;
 import dev.nishisan.utils.oss.format.SeriesGeometry;
@@ -15,6 +16,7 @@ import dev.nishisan.utils.oss.format.SeriesHeader;
 import dev.nishisan.utils.oss.format.SeriesLiveState;
 import dev.nishisan.utils.oss.format.NgrrdFormatException;
 import dev.nishisan.utils.oss.metrics.NgrrdMetricsListener;
+import dev.nishisan.utils.oss.migration.GeometryReconciler;
 import dev.nishisan.utils.oss.storage.NgrrdStorage;
 import dev.nishisan.utils.oss.storage.SeriesChannel;
 import dev.nishisan.utils.oss.storage.SeriesChannelProvider;
@@ -64,6 +66,7 @@ public final class NgrrdWriter implements AutoCloseable {
 
     private final SeriesGeometry geo;
     private final byte[] geometryHash;
+    private final int schemaRevision;
     private final int baseStepSec;
     private final int d;
     private final int a;
@@ -105,14 +108,27 @@ public final class NgrrdWriter implements AutoCloseable {
     }
 
     /**
-     * Variante completa com política de {@link Durability}. Em
-     * {@link Durability#OS_CACHE} o checkpoint materializa os bytes mas pula o
-     * {@code fsync} por checkpoint (o SO descarrega no seu ritmo); um
-     * {@code close()} limpo ainda descarrega o pendente.
+     * Variante com política de {@link Durability}; o tratamento de mudança de
+     * geometria recai no padrão {@link OnGeometryChange#FAIL}.
      */
     public NgrrdWriter(NgrrdDefinition definition, NgrrdStorage storage, String seriesKey,
                        NgrrdMetricsListener metrics, ReadWriteLock seriesLock,
                        Durability durability) {
+        this(definition, storage, seriesKey, metrics, seriesLock, durability, OnGeometryChange.FAIL);
+    }
+
+    /**
+     * Variante completa com política de {@link Durability} e
+     * {@link OnGeometryChange}. Antes de abrir o objeto para escrita, reconcilia a
+     * geometria gravada com a nova ({@link GeometryReconciler}); se a série já
+     * existir com a mesma geometria, apenas reidrata. Em {@link Durability#OS_CACHE}
+     * o checkpoint materializa os bytes mas pula o {@code fsync} por checkpoint (o
+     * SO descarrega no seu ritmo); um {@code close()} limpo ainda descarrega o
+     * pendente.
+     */
+    public NgrrdWriter(NgrrdDefinition definition, NgrrdStorage storage, String seriesKey,
+                       NgrrdMetricsListener metrics, ReadWriteLock seriesLock,
+                       Durability durability, OnGeometryChange onGeometryChange) {
         this.definition = Objects.requireNonNull(definition, "definition é obrigatório");
         Objects.requireNonNull(storage, "storage é obrigatório");
         this.seriesKey = Objects.requireNonNull(seriesKey, "seriesKey é obrigatório");
@@ -127,6 +143,7 @@ public final class NgrrdWriter implements AutoCloseable {
 
         this.geo = new SeriesGeometry(definition);
         this.geometryHash = geo.geometryHash();
+        this.schemaRevision = definition.metadata().schemaRevisionOrDefault();
         this.baseStepSec = geo.baseStepSec();
         this.d = geo.columnCount();
         this.a = geo.archiveCount();
@@ -142,6 +159,10 @@ public final class NgrrdWriter implements AutoCloseable {
         }
 
         this.storageKey = StorageKey.series(definition.spec().storage().objectNaming(), seriesKey);
+        // Reconcilia a geometria gravada com a nova antes de abrir o canal de
+        // escrita: aplica onGeometryChange (FAIL/RECREATE/MIGRATE) ou no-op.
+        GeometryReconciler.reconcile(storage, storageKey, geo, geometryHash, schemaRevision,
+                Objects.requireNonNull(onGeometryChange, "onGeometryChange é obrigatório"));
         this.channel = provider.openSeries(storageKey);
         this.state = openOrCreate();
 
@@ -155,8 +176,10 @@ public final class NgrrdWriter implements AutoCloseable {
     }
 
     /**
-     * Abre o arquivo: cria+pré-aloca se ausente/incompatível; senão reidrata a
-     * live-state. Geometria divergente (hash) ⇒ recriação (clean cut).
+     * Abre o arquivo: cria+pré-aloca se ausente; senão reidrata a live-state. A
+     * divergência de geometria já foi tratada pelo {@link GeometryReconciler}
+     * antes da abertura do canal; aqui, qualquer incompatibilidade ou arquivo
+     * ilegível é um estado inesperado (nunca recria silenciosamente).
      */
     private SeriesLiveState openOrCreate() {
         if (channel.size() < SeriesFileCodec.FIXED_HEADER_BYTES) {
@@ -169,22 +192,20 @@ public final class NgrrdWriter implements AutoCloseable {
                     && header.fileTotalBytes() == geo.fileTotalBytes()
                     && Arrays.equals(header.definitionHash(), geometryHash);
             if (!compatible) {
-                System.err.println("ngrrd-writer: geometria divergente em " + storageKey
-                        + ", recriando (clean cut)");
-                return createFresh();
+                throw new IllegalStateException("ngrrd-writer: geometria divergente em " + storageKey
+                        + " após reconciliação — estado inesperado");
             }
             byte[] live = channel.readRegion(geo.liveStateOffset(), (int) geo.liveStateBytes());
             return SeriesFileCodec.decodeLiveState(geo, live);
         } catch (NgrrdFormatException e) {
-            System.err.println("ngrrd-writer: arquivo de série ilegível em " + storageKey
-                    + ", recriando: " + e);
-            return createFresh();
+            throw new IllegalStateException("ngrrd-writer: arquivo de série ilegível em " + storageKey
+                    + " após reconciliação: " + e, e);
         }
     }
 
     private SeriesLiveState createFresh() {
         channel.allocate(geo.fileTotalBytes());
-        channel.writeRegion(0, SeriesFileCodec.buildInitialImage(geo, geometryHash));
+        channel.writeRegion(0, SeriesFileCodec.buildInitialImage(geo, geometryHash, schemaRevision));
         channel.force();
         return new SeriesLiveState(d, a);
     }
@@ -352,29 +373,23 @@ public final class NgrrdWriter implements AutoCloseable {
     }
 
     private double deriveValue(DataSourceDef rawDs, int col, Sample sample) {
-        if (rawDs.type() == DataSourceType.COUNTER && rawDs.derive() != null
-                && rawDs.derive().output() != null) {
-            double prevValue = state.counterPrevValue[col];
-            long prevTs = state.counterPrevTsMs[col];
-            CounterDeriver.CounterDeriverResult result = CounterDeriver.derive(
-                    rawDs, prevValue, prevTs, sample.value(), sample.tsEpochMs());
-            state.counterPrevValue[col] = sample.value();
-            state.counterPrevTsMs[col] = sample.tsEpochMs();
-            if (metrics != null) {
-                switch (result.flag()) {
-                    case RESET -> metrics.onCounterReset(rawDs.name());
-                    case WRAP -> metrics.onWrapDetected(rawDs.name());
-                    default -> {
-                    }
+        // Despacho por tipo (paridade RRD): GAUGE as-is; COUNTER/DERIVE/ABSOLUTE
+        // derivam de delta. O estado "prev" é mantido para todos os tipos —
+        // inócuo para GAUGE, necessário para os tipos de taxa.
+        CounterDeriver.CounterDeriverResult result = SampleDeriver.derive(
+                rawDs, state.counterPrevValue[col], state.counterPrevTsMs[col],
+                sample.value(), sample.tsEpochMs());
+        state.counterPrevValue[col] = sample.value();
+        state.counterPrevTsMs[col] = sample.tsEpochMs();
+        if (metrics != null) {
+            switch (result.flag()) {
+                case RESET -> metrics.onCounterReset(rawDs.name());
+                case WRAP -> metrics.onWrapDetected(rawDs.name());
+                default -> {
                 }
             }
-            return result.value();
         }
-        // GAUGE/DERIVE/ABSOLUTE com derive declarado: passthrough.
-        if (rawDs.derive() != null && rawDs.derive().output() != null) {
-            return sample.value();
-        }
-        return Double.NaN;
+        return result.value();
     }
 
     /**

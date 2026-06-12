@@ -9,7 +9,8 @@ package dev.nishisan.utils.oss.format;
  * pela comparação de {@code definitionHash}.</p>
  *
  * @param formatVersion      versão do formato binário NGRR
- * @param flags              bits reservados
+ * @param schemaRevision     revisão de schema gravada (16 bits, antigo campo de
+ *                           flags); governa o gate de mudança de geometria
  * @param baseStepSec        step base em segundos
  * @param definitionHash     SHA-256 (32 bytes) do YAML da definição
  * @param columnCount        número de colunas (DS derivados)
@@ -22,7 +23,7 @@ package dev.nishisan.utils.oss.format;
  */
 public record SeriesHeader(
         int formatVersion,
-        int flags,
+        int schemaRevision,
         int baseStepSec,
         byte[] definitionHash,
         int columnCount,
