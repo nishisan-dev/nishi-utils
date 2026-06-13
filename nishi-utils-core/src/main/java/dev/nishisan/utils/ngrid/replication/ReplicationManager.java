@@ -1978,7 +1978,12 @@ public class ReplicationManager
                 applied.add(e.operationId());
             }
             trimApplied();
-            recordApplied(entries.size()); // global applied-op counter (drives the lag metric)
+            // Re-anchor the global applied odometer to the lineage position of the last applied entry
+            // (issue tems#9, D11) instead of blind-counting entries. This MATCHES the leader, which sets
+            // applied = max(op.sequence) (the per-topic sequence) on commit, and is immune to a relay
+            // re-pull / duplicate frame re-inflating the follower above the leader's lineage — the
+            // residual "offset de linhagem". Monotonic (accumulateAndGet with max never regresses).
+            lastAppliedSequence = appliedSequence.accumulateAndGet(last.sequence(), Math::max);
             sequenceStateDirty = true;
         } finally {
             sequenceBufferLock.unlock();
@@ -2537,6 +2542,20 @@ public class ReplicationManager
         NodeId localId = transport.local().nodeId();
         NodeId previousLeader = lastLeader.getAndSet(newLeader);
         if (!localId.equals(newLeader)) {
+            // Orchestrated affinity handback backstop (issue tems#9, D11): if we are the interim leader
+            // demoting to the candidate via its higher-epoch heartbeat (the HANDBACK_COMPLETE was lost or
+            // raced this leadership change), re-anchor to the frozen watermark here too. The COMPLETE path
+            // already re-anchored and cleared the role before firing this, so this only runs when the
+            // message did NOT arrive — closing the hole that would otherwise leave the demoted incumbent on
+            // its pre-handback odometer base (the permanent lineage offset).
+            if (handbackRole.get() == HandbackRole.LEADER_SERVING && newLeader.equals(handbackPeer)) {
+                long frozen = handoverFrozenWatermark;
+                handoverFreezing.set(false);
+                handoverFrozenWatermark = -1L;
+                handbackRole.set(HandbackRole.NONE);
+                handbackPeer = null;
+                reanchorAsDemotedIncumbent(frozen);
+            }
             if (previousLeader != null && previousLeader.equals(localId)) {
                 leaderSyncing.set(false);
                 leaderSyncTopics.clear();
@@ -3070,6 +3089,12 @@ public class ReplicationManager
         NodeId newLeader = message.source();
         LOGGER.info(() -> "Affinity handback: candidate " + newLeader + " completed cutover at "
                 + payload.cutoverWatermark() + " (epoch " + payload.newEpoch() + "); demoting (issue tems#9, D11)");
+        // Re-anchor our counters to the cutover watermark BEFORE demoting (issue tems#9, D11): the
+        // symmetric counterpart of the candidate's completeSnapshotCutover SET. Without it the demoted
+        // incumbent keeps its pre-handback odometer base and reappears as a permanent lineage offset
+        // (the counter-scale desync the new leader then logs forever). Runs before acceptHandbackWinner
+        // so the first follower heartbeat already advertises W.
+        reanchorAsDemotedIncumbent(payload.cutoverWatermark());
         handoverFreezing.set(false);
         handoverFrozenWatermark = -1L;
         handbackRole.set(HandbackRole.NONE);
@@ -3083,6 +3108,64 @@ public class ReplicationManager
                 LOGGER.log(Level.WARNING, "onDemotedAfterHandover listener failed", t);
             }
         }
+    }
+
+    /**
+     * INTERIM-LEADER side of a handback (issue tems#9, D11): re-anchor this node's counters to the frozen
+     * handover watermark {@code W} on demotion — the symmetric counterpart of the candidate's
+     * {@link #completeSnapshotCutover} SET. The interim leader froze production at exactly {@code W}, so it
+     * holds the canonical lineage up to {@code W}; a hard SET (not max) re-bases the global applied
+     * odometer, the produced counter, and the primary topic's frontier/relay cursor so that, as a
+     * follower, it advertises {@code W} (== the new leader's frontier) instead of its pre-handback base.
+     * Without this the demoted incumbent carries a permanent "offset de linhagem" that re-fires the
+     * counter-scale desync warning and defeats the watermark gates. It does NOT install a snapshot (the
+     * state up to {@code W} is already canonical) and never calls back into the coordinator, so it is safe
+     * to invoke under the coordinator's leadership lock (the heartbeat-driven backstop path).
+     *
+     * @param watermark the frozen handover watermark {@code W} (the candidate's cutover watermark)
+     */
+    private void reanchorAsDemotedIncumbent(long watermark) {
+        if (watermark < 0L) {
+            return;
+        }
+        appliedSequence.set(watermark);
+        lastAppliedSequence = watermark;
+        globalSequence.updateAndGet(current -> watermark);
+        String topic = primaryTopic();
+        if (!topic.isEmpty()) {
+            sequenceByTopic.computeIfAbsent(topic, k -> new java.util.concurrent.atomic.AtomicLong())
+                    .set(watermark);
+            acquireSequenceLock();
+            try {
+                nextExpectedSequenceByTopic.put(topic, watermark + 1);
+                sequenceStateDirty = true;
+            } finally {
+                sequenceBufferLock.unlock();
+            }
+            // Drop the local binlog of the lineage we produced as interim leader — its tail above W is dead
+            // once the candidate's lineage wins, and would be served verbatim to a follower fetching that
+            // range after a later promotion. The post-cutover stream rebuilds it from W+1 on the new lineage.
+            ResendLogStore store = resendLogStore;
+            if (store != null) {
+                store.logFor(topic).truncate();
+            }
+            // RELAY_STREAM: purge the stale relay and re-anchor the pull cursor at W so the fetch loop
+            // resumes streaming the new leader's W+1.. in order instead of bouncing on a pre-handback cursor.
+            if (isStreamMode()) {
+                java.util.concurrent.locks.ReentrantLock ingest = relayIngestLock(topic);
+                ingest.lock();
+                try {
+                    purgeRelay(topic);
+                    relayStreamCursor(topic).set(watermark);
+                } finally {
+                    ingest.unlock();
+                }
+            }
+            relayFetchPendingUntilByTopic.put(topic, 0L);
+            signalFetch(topic);
+        }
+        LOGGER.info(() -> "Affinity handback: demoted incumbent re-anchored to W=" + watermark
+                + " (lineage offset zeroed; issue tems#9, D11)");
     }
 
     /**
@@ -3375,10 +3458,6 @@ public class ReplicationManager
 
     private void recordApplied() {
         lastAppliedSequence = appliedSequence.incrementAndGet();
-    }
-
-    private void recordApplied(int n) {
-        lastAppliedSequence = appliedSequence.addAndGet(n);
     }
 
     /**
