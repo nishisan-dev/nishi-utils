@@ -61,5 +61,13 @@ public enum MessageType {
     /** Follower → leader report of its applied-sequence progress (#129, join quiesce gate). */
     FOLLOWER_PROGRESS,
     /** User-level best-effort broadcast message between nodes (broadcastMessage API). */
-    USER_BROADCAST
+    USER_BROADCAST,
+    /** Candidate → interim leader: request an orchestrated affinity handback (issue tems#9, D11). */
+    HANDBACK_REQUEST,
+    /** Interim leader → candidate: PREP done, production frozen at W; pull the snapshot (D11). */
+    HANDBACK_GRANT,
+    /** Either side → other: cancel the in-flight handback; the interim leader resumes (D11). */
+    HANDBACK_ABORT,
+    /** Candidate → interim leader: cut over at W and asserted a higher epoch; demote now (D11). */
+    HANDBACK_COMPLETE
 }
