@@ -127,6 +127,20 @@ EVENT_PATTERNS = [
      lambda m: "unclean restart → bootstrap pendente"),
     ("BOOTSTRAP", "yellow", re.compile(r"Relay bootstrap pending for topic (\S+)"),
      lambda m: f"bootstrap pendente {m.group(1)}"),
+    # --- Consumo do Kafka (lado Cardinal, via --consume; cardinal.log/replication-cardinal.log) ---
+    # A "largada/parada" do Kafka: o membership no consumer group espelha a liderança (líder
+    # subscribe/consome, follower unsubscribe). Útil p/ ver se o novo líder REALMENTE retomou o
+    # consumo (e se o ex-líder saiu do grupo) após um failover/handback.
+    ("CONSUME-ON", "bgreen", re.compile(r"Consumer ENTROU no grupo"),
+     lambda m: "Kafka: ENTROU no consumer group (consumindo)"),
+    ("CONSUME-OFF", "byellow", re.compile(r"Consumer SAIU do grupo"),
+     lambda m: "Kafka: SAIU do consumer group (partições liberadas)"),
+    ("CONSUME-HOLD", "yellow", re.compile(r"Consumo seguro \(leader-pause-on-join\)"),
+     lambda m: "Kafka: consumo segurado (leader-pause-on-join)"),
+    ("LEAD-ACTIVATE", "green", re.compile(r"Liderança ATIVADA.*?\((.*?)\)"),
+     lambda m: f"liderança ATIVADA — consumo retomado ({m.group(1)})"),
+    ("LEAD-STANDBY", "yellow", re.compile(r"é FOLLOWER \(standby\)"),
+     lambda m: "FOLLOWER (standby) — consumo pausado"),
 ]
 
 # Pré-filtro: só linhas que contêm um destes tokens são transferidas/parseadas.
@@ -142,6 +156,14 @@ PREFILTER_TOKENS = [
 # Regex ERE para o grep remoto (escapando os parênteses do conteúdo literal).
 PREFILTER_ERE = "|".join(re.escape(t) for t in PREFILTER_TOKENS)
 
+# Tokens do lado Cardinal (cardinal.log / replication-cardinal.log), só usados com --consume:
+# a largada/parada do consumo do Kafka, em formato de log diferente ([NIVEL] dd-Mon-yyyy ...).
+CONSUME_PREFILTER_TOKENS = [
+    "Consumer ENTROU no grupo", "Consumer SAIU do grupo", "Consumo seguro",
+    "Liderança ATIVADA", "é FOLLOWER (standby)",
+]
+CONSUME_PREFILTER_ERE = "|".join(re.escape(t) for t in CONSUME_PREFILTER_TOKENS)
+
 CATEGORY_ORDER = [p[0] for p in EVENT_PATTERNS] + ["ERROR", "OTHER"]
 
 # Linha de log: 2026-06-13 01:07:40.044 [INFO] dev.x.y.Logger mensagem...
@@ -149,6 +171,27 @@ LINE_RE = re.compile(
     r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}) \[(?P<lvl>\w+)\] (?P<logger>[\w.$]+) (?P<msg>.*)$"
 )
 NODE_RE = re.compile(r"(node[-_]?\d+)")
+
+# Formato dos logs do Cardinal (cardinal.log / replication-cardinal.log), diferente do replication-ngrid:
+#   [ WARN] 13-Jun-2026 15:00:09.797 - [consumer-1] - [com.osstelecom...Logger] - mensagem
+CARDINAL_LINE_RE = re.compile(
+    r"^\[\s*(?P<lvl>\w+)\]\s+(?P<d>\d{2})-(?P<mon>\w{3})-(?P<y>\d{4})\s+(?P<t>\d{2}:\d{2}:\d{2}(?:\.\d{3})?)"
+    r"\s+-\s+\[[^\]]*\]\s+-\s+\[(?P<logger>[\w.$]+)\]\s+-\s+(?P<msg>.*)$"
+)
+_MONTHS = {"Jan": "01", "Feb": "02", "Mar": "03", "Apr": "04", "May": "05", "Jun": "06",
+           "Jul": "07", "Aug": "08", "Sep": "09", "Oct": "10", "Nov": "11", "Dec": "12"}
+
+
+def _cardinal_ts(m):
+    """Normaliza a data do Cardinal (dd-Mon-yyyy HH:MM:SS.mmm) p/ ISO 'yyyy-MM-dd HH:MM:SS.mmm'
+    (ordenável como string, alinhada ao ts do replication-ngrid)."""
+    mon = _MONTHS.get(m.group("mon"))
+    if mon is None:
+        return None
+    t = m.group("t")
+    if "." not in t:
+        t += ".000"  # cardinal.log não tem ms; padroniza p/ ordenar com o replication-ngrid
+    return f"{m.group('y')}-{mon}-{m.group('d')} {t}"
 
 
 class Event:
@@ -194,8 +237,15 @@ def parse_rows(rows):
                 node = nm.group(1)
             line = rest
         m = LINE_RE.match(line)
-        if not m:
-            continue
+        if m:
+            ts = m.group("ts")
+        else:
+            m = CARDINAL_LINE_RE.match(line)  # logs do Cardinal (--consume): formato dd-Mon-yyyy
+            if not m:
+                continue
+            ts = _cardinal_ts(m)
+            if ts is None:
+                continue
         msg = m.group("msg")
         level = m.group("lvl")
         res = classify(msg)
@@ -206,7 +256,7 @@ def parse_rows(rows):
                 continue  # token de pré-filtro casou mas não é evento de interesse
         else:
             cat, color, detail = res
-        events.append(Event(m.group("ts"), node, cat, color, detail, level, msg))
+        events.append(Event(ts, node, cat, color, detail, level, msg))
     return events
 
 
@@ -214,18 +264,26 @@ def parse_rows(rows):
 # Coleta (local / SSH)
 # --------------------------------------------------------------------------------------
 
-def fetch_local(path):
+def fetch_local(path, tokens=PREFILTER_TOKENS):
     out = []
     for p in _expand_local(path):
         node = _node_from_path(p) or os.path.basename(p)
         try:
             with open(p, "r", errors="replace") as fh:
                 for line in fh:
-                    if any(tok in line for tok in PREFILTER_TOKENS):
+                    if any(tok in line for tok in tokens):
                         out.append((node, line))
         except OSError as e:
             print(f"[aviso] não li {p}: {e}", file=sys.stderr)
     return out
+
+
+def _cardinal_log_path(repl_path):
+    """Deriva o caminho do cardinal.log irmão a partir do path do replication-ngrid
+    (mesmo diretório). Ex.: /app/*/log/replication-ngrid*.log -> /app/*/log/cardinal.log."""
+    import posixpath
+    d = posixpath.dirname(repl_path)
+    return posixpath.join(d, "cardinal.log") if d else "cardinal.log"
 
 
 def _expand_local(path):
@@ -239,13 +297,13 @@ def _node_from_path(path):
     return m.group(1) if m else None
 
 
-def _build_remote_cmd(remote_path):
+def _build_remote_cmd(remote_path, ere=PREFILTER_ERE):
     # grep -H (com nome do arquivo, p/ deduzir o nó), -a (trata binário como texto),
     # -E (ERE). O glob é expandido pelo shell REMOTO. 2>/dev/null engole 'No such file'.
-    return f"grep -HaE '{PREFILTER_ERE}' {remote_path} 2>/dev/null"
+    return f"grep -HaE '{ere}' {remote_path} 2>/dev/null"
 
 
-def fetch_ssh_key(user, host, remote_path, port):
+def fetch_ssh_key(user, host, remote_path, port, ere=PREFILTER_ERE):
     """Via OpenSSH (chave/agent). Retorna lista de (node_fallback, raw_line)."""
     target = f"{user}@{host}" if user else host
     cmd = [
@@ -253,22 +311,22 @@ def fetch_ssh_key(user, host, remote_path, port):
         "-o", "ConnectTimeout=10",
         "-o", "StrictHostKeyChecking=no",
         "-o", "BatchMode=yes",  # falha rápido se exigir senha (não trava esperando)
-        target, _build_remote_cmd(remote_path),
+        target, _build_remote_cmd(remote_path, ere),
     ]
     return _run_capture(cmd, host)
 
 
-def fetch_ssh_sshpass(user, host, remote_path, port, password):
+def fetch_ssh_sshpass(user, host, remote_path, port, password, ere=PREFILTER_ERE):
     target = f"{user}@{host}" if user else host
     cmd = [
         "sshpass", "-p", password, "ssh", "-p", str(port),
         "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=no",
-        target, _build_remote_cmd(remote_path),
+        target, _build_remote_cmd(remote_path, ere),
     ]
     return _run_capture(cmd, host)
 
 
-def fetch_ssh_paramiko(user, host, remote_path, port, password):
+def fetch_ssh_paramiko(user, host, remote_path, port, password, ere=PREFILTER_ERE):
     import paramiko  # import tardio: só quando há senha e sshpass ausente
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -276,7 +334,7 @@ def fetch_ssh_paramiko(user, host, remote_path, port, password):
     try:
         client.connect(host, port=port, username=user, password=password, timeout=10,
                        allow_agent=False, look_for_keys=False)
-        _, stdout, stderr = client.exec_command(_build_remote_cmd(remote_path), timeout=120)
+        _, stdout, stderr = client.exec_command(_build_remote_cmd(remote_path, ere), timeout=120)
         data = stdout.read().decode("utf-8", errors="replace")
         for line in data.splitlines():
             out.append((host, line))
@@ -426,31 +484,47 @@ def collect_events(args):
         for s in interactive_sources():
             sources.append(s)
 
-    events = []
+    # Normaliza p/ dict e resolve a senha 1x por host (evita prompt duplicado entre os dois passes).
+    norm = []
     for src in sources:
-        kind = src[0]
+        if src[0] == "local":
+            norm.append({"kind": "local", "path": src[1]})
+        else:  # ("ssh", host, user, password, path[, port])
+            norm.append({"kind": "ssh", "host": src[1], "user": src[2], "password": src[3],
+                         "path": src[4], "port": src[5] if len(src) > 5 else args.port})
+    for s in norm:
+        if s["kind"] == "ssh" and s["password"] is None and args.ask_pass:
+            s["password"] = getpass.getpass(f"senha p/ {s.get('user') or ''}@{s['host']}: ")
+
+    events = []
+    # Passe 1: replication-ngrid (eventos da lib NGrid).
+    for s in norm:
         try:
-            if kind == "local":
-                rows = fetch_local(src[1])  # já devolve (node, raw_line)
-                events.extend(parse_rows(rows))
-                continue
-            # ssh: (kind, host, user, password, path[, port])
-            _, host, user, password, path = src[:5]
-            port = src[5] if len(src) > 5 else args.port
-            if password is None and args.ask_pass:
-                password = getpass.getpass(f"senha p/ {user or ''}@{host}: ")
-            print(f"[coletando] {user or ''}@{host}:{path} ...", file=sys.stderr)
-            if password:
-                if shutil.which("sshpass"):
-                    rows = fetch_ssh_sshpass(user, host, path, port, password)
-                else:
-                    rows = fetch_ssh_paramiko(user, host, path, port, password)
-            else:
-                rows = fetch_ssh_key(user, host, path, port)
-            events.extend(parse_rows(rows))  # grep -H → o nó sai do caminho
+            events.extend(_fetch_source(s, s["path"], PREFILTER_ERE, PREFILTER_TOKENS))
         except Exception as e:
-            print(f"[erro] origem {src[1] if len(src) > 1 else src}: {e}", file=sys.stderr)
+            print(f"[erro] origem {s.get('host') or s.get('path')}: {e}", file=sys.stderr)
+    # Passe 2 (--consume): cardinal.log irmão — largada/parada do consumo do Kafka.
+    if getattr(args, "consume", False):
+        for s in norm:
+            cpath = _cardinal_log_path(s["path"])
+            try:
+                events.extend(_fetch_source(s, cpath, CONSUME_PREFILTER_ERE, CONSUME_PREFILTER_TOKENS))
+            except Exception as e:
+                print(f"[erro] consume {s.get('host') or s.get('path')}: {e}", file=sys.stderr)
     return events
+
+
+def _fetch_source(s, path, ere, tokens):
+    """Fetch+parse de UMA fonte (local/ssh) com o conjunto de tokens/ere dado, no caminho informado."""
+    if s["kind"] == "local":
+        return parse_rows(fetch_local(path, tokens))
+    host, user, password, port = s["host"], s.get("user"), s.get("password"), s["port"]
+    print(f"[coletando] {user or ''}@{host}:{path} ...", file=sys.stderr)
+    if password:
+        if shutil.which("sshpass"):
+            return parse_rows(fetch_ssh_sshpass(user, host, path, port, password, ere))
+        return parse_rows(fetch_ssh_paramiko(user, host, path, port, password, ere))
+    return parse_rows(fetch_ssh_key(user, host, path, port, ere))
 
 
 def annotate_leader(events):
@@ -525,6 +599,9 @@ def main():
     ap.add_argument("--ask-pass", action="store_true", help="pergunta a senha SSH por host (usa sshpass ou paramiko)")
     ap.add_argument("--port", type=int, default=22, help="porta SSH (default 22)")
     ap.add_argument("--types", help="filtra categorias (csv). Ex: handback,election,snapshot")
+    ap.add_argument("--consume", action="store_true",
+                    help="também lê o cardinal.log irmão e mostra a largada/parada do Kafka "
+                         "(CONSUME-ON/OFF/HOLD, LEAD-ACTIVATE/STANDBY)")
     ap.add_argument("--node", help="filtra por nó/origem (substring). Ex: node-1")
     ap.add_argument("--since", help='timestamp mínimo "YYYY-MM-DD HH:MM[:SS]"')
     ap.add_argument("--until", help='timestamp máximo "YYYY-MM-DD HH:MM[:SS]"')
