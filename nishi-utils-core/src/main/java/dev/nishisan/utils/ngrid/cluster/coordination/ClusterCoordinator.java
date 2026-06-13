@@ -908,18 +908,29 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 return;
             }
 
-            // ── Affinity handback supersedes the watermark reclaim (issue tems#9, D11) ───────────────
-            // With orchestrated handback enabled, a returning highest-affinity FOLLOWER must NOT reclaim
-            // leadership via the watermark gates below — a lineage-blind counter offset can defeat them
-            // (the permanent applied skew that keeps reclaim-quiesce from ever engaging). It stays a
-            // follower; the ReplicationManager drives an explicit stop-the-world snapshot handover that
-            // re-anchors counters on cutover (SET), zeroing the offset. Genuine failover is unaffected:
-            // this only holds while a DISTINCT, ACTIVE agreed leader exists — if the leader died, no such
-            // leader remains and the affinity election below promotes this node (the survivor).
-            if (affinityHandbackMode && weWouldLead && !isLeaderInternal(localId)) {
+            // ── Affinity handback supersedes the watermark reclaim AND step-down (issue tems#9, D11) ──
+            // With orchestrated handback enabled, leadership transfers between the affinity pair ONLY via
+            // the explicit handover (assumeLeadershipForHandback / acceptHandbackWinner, which call
+            // updateLeader directly, bypassing this election), never via the watermark gates below — a
+            // lineage-blind counter offset can defeat them (the permanent applied skew that keeps
+            // reclaim-quiesce from ever engaging). The candidate stays a follower until it has installed
+            // the incumbent's snapshot and cut over (SET — offset zeroed); the incumbent retains until
+            // the candidate completes. Genuine failover is unaffected: these only hold while a DISTINCT,
+            // ACTIVE leader/candidate exists — if a node died, the affinity election below promotes the
+            // survivor.
+            if (affinityHandbackMode) {
                 NodeId current = leader.get();
-                if (current != null && !current.equals(localId) && isActiveMember(current)) {
-                    updateLeader(current); // remain follower; the handback handshake performs the transition
+                if (weWouldLead && !isLeaderInternal(localId)
+                        && current != null && !current.equals(localId) && isActiveMember(current)) {
+                    // CANDIDATE side: do not reclaim via watermark; the handshake drives the transition.
+                    updateLeader(current);
+                    return;
+                }
+                if (isLeaderInternal(localId) && electedId != null && !electedId.equals(localId)
+                        && isActiveMember(electedId)) {
+                    // INCUMBENT side: a higher-affinity peer would win by affinity, but the watermark
+                    // step-down is replaced by the explicit handback — retain until the candidate completes.
+                    updateLeader(localId);
                     return;
                 }
             }
