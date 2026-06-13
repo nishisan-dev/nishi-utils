@@ -45,10 +45,42 @@ def to_xml(data: object, metadata: dict[str, object]) -> str:
     return minidom.parseString(xml_bytes).toprettyxml(indent="  ")
 
 
+def geometry_to_xml(geometry: dict[str, object]) -> str:
+    """Serialize a :meth:`NgrrdReader.describe_geometry` payload into XML."""
+
+    root = ET.Element("ngrrd-geometry")
+    root.set("file", str(geometry.get("file", "")))
+    root.set("last_update_ms", str(geometry.get("last_update_ms", "")))
+
+    header = geometry.get("header", {})
+    header_elem = ET.SubElement(root, "header")
+    if isinstance(header, dict):
+        for key, value in header.items():
+            ET.SubElement(header_elem, key).text = str(value)
+
+    columns_elem = ET.SubElement(root, "columns")
+    for column in geometry.get("columns", []):
+        attrs = {key: str(value) for key, value in column.items()}
+        ET.SubElement(columns_elem, "column", attrs)
+
+    archives_elem = ET.SubElement(root, "archives")
+    for archive in geometry.get("archives", []):
+        attrs = {key: str(value) for key, value in archive.items()}
+        ET.SubElement(archives_elem, "archive", attrs)
+
+    xml_bytes = ET.tostring(root, encoding="utf-8")
+    return minidom.parseString(xml_bytes).toprettyxml(indent="  ")
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Export NGRR archive data to JSON or XML")
+    parser = argparse.ArgumentParser(description="Export NGRR geometry or archive data to JSON or XML")
     parser.add_argument("file", type=Path, help="Path to the .ngrr file")
-    parser.add_argument("--archive", required=True, help="Archive/RRA name to dump")
+    parser.add_argument("--archive", help="Archive/RRA name to dump; omit for geometry only")
+    parser.add_argument(
+        "--geometry",
+        action="store_true",
+        help="Dump the structural geometry only (no ring data); takes precedence over --archive",
+    )
     parser.add_argument(
         "--cf",
         choices=[cf.name for cf in ConsolidationFunction],
@@ -64,21 +96,30 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    geometry_mode = args.geometry or args.archive is None
+
     try:
         cf = ConsolidationFunction[args.cf] if args.cf else None
         with NgrrdReader(args.file) as reader:
-            metadata = reader.get_metadata()
-            data = (
-                reader.read_archive_rows(args.archive, cf)
-                if args.rows
-                else reader.read_archive_as_dict(args.archive, cf)
-            )
-
-        output = (
-            json.dumps({"metadata": metadata, "data": data}, indent=2, allow_nan=True)
-            if args.format == "json"
-            else to_xml(data, metadata)
-        )
+            if geometry_mode:
+                geometry = reader.describe_geometry()
+                output = (
+                    json.dumps(geometry, indent=2, allow_nan=True)
+                    if args.format == "json"
+                    else geometry_to_xml(geometry)
+                )
+            else:
+                metadata = reader.get_metadata()
+                data = (
+                    reader.read_archive_rows(args.archive, cf)
+                    if args.rows
+                    else reader.read_archive_as_dict(args.archive, cf)
+                )
+                output = (
+                    json.dumps({"metadata": metadata, "data": data}, indent=2, allow_nan=True)
+                    if args.format == "json"
+                    else to_xml(data, metadata)
+                )
 
         if args.output:
             args.output.write_text(output, encoding="utf-8")
