@@ -23,9 +23,14 @@ import dev.nishisan.utils.ngrid.cluster.coordination.LeadershipListener;
 import dev.nishisan.utils.ngrid.cluster.transport.Transport;
 import dev.nishisan.utils.ngrid.cluster.transport.TransportListener;
 import dev.nishisan.utils.ngrid.BroadcastListener;
+import dev.nishisan.utils.ngrid.HandoverListener;
 import dev.nishisan.utils.ngrid.common.BroadcastMessagePayload;
 import dev.nishisan.utils.ngrid.common.ClusterMessage;
 import dev.nishisan.utils.ngrid.common.FollowerProgressPayload;
+import dev.nishisan.utils.ngrid.common.HandbackAbortPayload;
+import dev.nishisan.utils.ngrid.common.HandbackCompletePayload;
+import dev.nishisan.utils.ngrid.common.HandbackGrantPayload;
+import dev.nishisan.utils.ngrid.common.HandbackRequestPayload;
 import dev.nishisan.utils.ngrid.common.MessageType;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
@@ -169,6 +174,25 @@ public class ReplicationManager
     // keeps the promoted-leader auto-disarm in drainRelayOnce from undoing the pending bootstrap in
     // the window where this (yielding) node still answers isLeader().
     private volatile boolean dualLeaderYielding = false;
+
+    // ── Orchestrated affinity handback (issue tems#9, D11, opt-in via config.affinityHandbackMode) ──
+    // Replaces the lineage-blind watermark reclaim with a stop-the-world snapshot handover. The
+    // candidate (returning highest-affinity follower) requests; the interim leader freezes production
+    // at a watermark, serves a full snapshot, and demotes; the candidate cuts over (SET — the lineage
+    // offset is zeroed) and asserts leadership. The HandoverListener carries the app-facing pause/flush.
+    private enum HandbackRole { NONE, CANDIDATE_REQUESTING, CANDIDATE_INSTALLING, LEADER_PREPARING, LEADER_SERVING }
+    private final java.util.concurrent.atomic.AtomicReference<HandbackRole> handbackRole =
+            new java.util.concurrent.atomic.AtomicReference<>(HandbackRole.NONE);
+    // INTERIM-LEADER production freeze: gates replicate() so nothing is produced above the frozen
+    // watermark while the candidate installs the snapshot (defense in depth vs the app's consumer pause).
+    private final java.util.concurrent.atomic.AtomicBoolean handoverFreezing =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+    private volatile long handoverFrozenWatermark = -1L;
+    private volatile NodeId handbackPeer;        // candidate (on the leader) / interim leader (on the candidate)
+    private volatile long handbackGrantedEpoch;  // candidate side: the incumbent's epoch from the GRANT
+    private volatile long handbackStartedMs;
+    private volatile long handbackCooldownUntilMs;
+    private final Set<HandoverListener> handoverListeners = new java.util.concurrent.CopyOnWriteArraySet<>();
 
     // User-level broadcast messaging (broadcastMessage API): best-effort fire-and-forget messages
     // between nodes for coordination. Listeners are invoked on a worker thread (keep them non-blocking).
@@ -353,6 +377,10 @@ public class ReplicationManager
         // Dual-leader resolution (issue tems#9, D10c): when this node is the losing (lower-affinity)
         // side, discard the dual-window lineage and resync from the winner via the D8 machinery.
         coordinator.setDualLeaderYieldHook(this::onDualLeaderYield);
+        // Orchestrated affinity handback (issue tems#9, D11): gate the coordinator's watermark reclaim
+        // and let it suppress the epoch re-stamp / dual-leader contest while a handover is in flight.
+        coordinator.setAffinityHandbackMode(config.affinityHandbackMode());
+        coordinator.setHandoverInProgressSupplier(() -> handbackRole.get() != HandbackRole.NONE);
         // Nudge the coordinator to recompute leadership as our applied frontier advances, so a deferred
         // reclaim is promoted promptly once we catch up (membership/eviction ticks would also trigger it).
         timeoutScheduler.scheduleAtFixedRate(this::nudgeLeadershipOnCatchUp, 200, 200, TimeUnit.MILLISECONDS);
@@ -401,6 +429,13 @@ public class ReplicationManager
             // Quiesce-assisted reclaim (issue tems#9, D10b): engage on candidate approach, bound the
             // pause, abort (with cooldown) if the candidate never pairs up or leaves.
             timeoutScheduler.scheduleAtFixedRate(this::checkReclaimQuiesce, 200, 200, TimeUnit.MILLISECONDS);
+        }
+        if (config.affinityHandbackMode()) {
+            // Orchestrated affinity handback (issue tems#9, D11): the candidate periodically checks
+            // whether to request a handover; the interim leader bounds an in-flight handover (timeout
+            // / candidate gone → abort and retain leadership).
+            timeoutScheduler.scheduleAtFixedRate(this::maybeInitiateHandback, 200, 200, TimeUnit.MILLISECONDS);
+            timeoutScheduler.scheduleAtFixedRate(this::checkHandover, 200, 200, TimeUnit.MILLISECONDS);
         }
         Duration timeout = config.operationTimeout();
         long periodMs = Math.max(100L, timeout.toMillis() / 2);
@@ -804,6 +839,14 @@ public class ReplicationManager
             throw new LeaderSyncingException(
                     "Leader is quiescing for an affinity handoff (candidate pairing up), write rejected");
         }
+        if (handoverFreezing.get()) {
+            // Orchestrated affinity handback (issue tems#9, D11): production is frozen at the handover
+            // watermark while the returning higher-affinity candidate installs a full snapshot and cuts
+            // over. Nothing may get a sequence above the frozen watermark until the handover completes or
+            // aborts — defense in depth even if the app's consumer pause races a straggler thread.
+            throw new LeaderSyncingException(
+                    "Leader is frozen for an affinity handback (snapshot handover in progress), write rejected");
+        }
         if (!coordinator.hasValidLease()) {
             throw new LeaseExpiredException("Leader lease expired, write rejected to prevent data divergence");
         }
@@ -1076,6 +1119,14 @@ public class ReplicationManager
             handleFollowerProgress(message);
         } else if (message.type() == MessageType.USER_BROADCAST) {
             handleBroadcast(message);
+        } else if (message.type() == MessageType.HANDBACK_REQUEST) {
+            handleHandbackRequest(message);
+        } else if (message.type() == MessageType.HANDBACK_GRANT) {
+            handleHandbackGrant(message);
+        } else if (message.type() == MessageType.HANDBACK_COMPLETE) {
+            handleHandbackComplete(message);
+        } else if (message.type() == MessageType.HANDBACK_ABORT) {
+            handleHandbackAbort(message);
         }
     }
 
@@ -1265,7 +1316,14 @@ public class ReplicationManager
             // A dual-leader yield resync (issue tems#9, D10c) completes here: the local state now
             // belongs to the winner's lineage and the drainRelayOnce guard can stand down.
             dualLeaderYielding = false;
-            coordinator.reevaluateLeadership();
+            if (handbackRole.get() == HandbackRole.CANDIDATE_INSTALLING) {
+                // Orchestrated affinity handback (issue tems#9, D11): the candidate installed the
+                // incumbent's full snapshot and re-anchored its counters via the SET above — the lineage
+                // offset is now zero. Assert leadership above the granted epoch and signal completion.
+                completeHandbackAsCandidate(watermark);
+            } else {
+                coordinator.reevaluateLeadership();
+            }
         }
 
         signalRelay(topic);
@@ -2830,6 +2888,309 @@ public class ReplicationManager
         if (reclaimQuiescing.compareAndSet(true, false)) {
             LOGGER.info(() -> "Reclaim-quiesce released; resuming production.");
         }
+    }
+
+    // ── Orchestrated affinity handback (issue tems#9, D11) ────────────────────────────────────────
+
+    /** Registers a listener for the orchestrated handback choreography (idempotent). */
+    public void addHandoverListener(HandoverListener listener) {
+        handoverListeners.add(Objects.requireNonNull(listener, "listener"));
+    }
+
+    /** True while this (interim leader) node has frozen production for an in-flight handback. */
+    public boolean isHandoverFreezing() {
+        return handoverFreezing.get();
+    }
+
+    /**
+     * CANDIDATE side (scheduled): when this node is the returning highest-affinity follower and a
+     * healthy incumbent exists, request an orchestrated handover instead of reclaiming via the
+     * lineage-blind watermark gates. Engages at most one handback at a time, after any abort cooldown.
+     */
+    private void maybeInitiateHandback() {
+        if (!running || !config.affinityHandbackMode() || !isStreamMode()) {
+            return;
+        }
+        if (handbackRole.get() != HandbackRole.NONE
+                || System.currentTimeMillis() < handbackCooldownUntilMs) {
+            return;
+        }
+        // Must be a STABLE follower: not leader, not bootstrapping, not mid-sync, with handlers ready.
+        if (coordinator.isLeader() || bootstrapGateEngaged() || isLeaderSyncing()
+                || !relayPendingBootstrap.isEmpty() || handlers.isEmpty()) {
+            return;
+        }
+        if (!coordinator.localIsPreferredLeader() || !coordinator.isAgreedLeaderHealthy()) {
+            return; // not the preferred node, or no healthy distinct leader to hand back FROM
+        }
+        coordinator.leaderInfo().ifPresent(leader -> {
+            NodeId localId = transport.local().nodeId();
+            if (leader.nodeId().equals(localId)) {
+                return;
+            }
+            if (!handbackRole.compareAndSet(HandbackRole.NONE, HandbackRole.CANDIDATE_REQUESTING)) {
+                return;
+            }
+            handbackPeer = leader.nodeId();
+            handbackStartedMs = System.currentTimeMillis();
+            LOGGER.info(() -> "Affinity handback: requesting orchestrated handover from leader "
+                    + leader.nodeId() + " (issue tems#9, D11)");
+            transport.send(ClusterMessage.request(MessageType.HANDBACK_REQUEST, "handback", localId,
+                    leader.nodeId(), new HandbackRequestPayload(localId, getLastAppliedSequence(),
+                            coordinator.getTrackedLeaderHighWatermark())));
+        });
+    }
+
+    /** INTERIM-LEADER side: accept a handback request — freeze production, then flush + grant async. */
+    private void handleHandbackRequest(ClusterMessage message) {
+        NodeId candidate = message.source();
+        if (!config.affinityHandbackMode() || !isStreamMode() || !coordinator.isLeader()) {
+            sendHandbackAbort(candidate, "not an eligible leader");
+            return;
+        }
+        if (System.currentTimeMillis() < handbackCooldownUntilMs) {
+            sendHandbackAbort(candidate, "handback cooling down");
+            return;
+        }
+        NodeInfo local = transport.local();
+        NodeInfo candidateInfo = coordinator.activeMembers().stream()
+                .filter(m -> m.nodeId().equals(candidate)).findFirst().orElse(null);
+        if (candidateInfo == null || !hasHigherAffinity(candidateInfo, local)) {
+            sendHandbackAbort(candidate, "candidate is not higher-affinity");
+            return;
+        }
+        if (!handbackRole.compareAndSet(HandbackRole.NONE, HandbackRole.LEADER_PREPARING)) {
+            sendHandbackAbort(candidate, "handback already in progress");
+            return;
+        }
+        handbackPeer = candidate;
+        handbackStartedMs = System.currentTimeMillis();
+        // Stop-the-world: freeze production immediately. replicate() now rejects, so nothing gets a
+        // sequence above the watermark we capture after the app drains.
+        handoverFreezing.set(true);
+        LOGGER.info(() -> "Affinity handback: PREP for candidate " + candidate
+                + "; production frozen (issue tems#9, D11)");
+        // Flush + grant off the transport thread: onHandoverPrepare may block (bounded) while the app
+        // drains its in-flight pipe, and that blocking IS the "frozen, snapshot-ready" signal.
+        try {
+            executor.submit(() -> prepareAndGrantHandback(candidate));
+        } catch (java.util.concurrent.RejectedExecutionException e) {
+            abortHandover("executor unavailable for PREP");
+        }
+    }
+
+    private void prepareAndGrantHandback(NodeId candidate) {
+        if (handbackRole.get() != HandbackRole.LEADER_PREPARING || !candidate.equals(handbackPeer)) {
+            return; // aborted/superseded while queued
+        }
+        try {
+            for (HandoverListener l : handoverListeners) {
+                l.onHandoverPrepare();
+            }
+        } catch (Throwable t) {
+            LOGGER.log(Level.WARNING, "Handback PREP flush failed; aborting handover", t);
+            abortHandover("prep flush failed");
+            return;
+        }
+        if (handbackRole.get() != HandbackRole.LEADER_PREPARING) {
+            return; // aborted during the (possibly long) flush
+        }
+        long frozen = leaderQuiesceTarget();
+        handoverFrozenWatermark = frozen;
+        handbackRole.set(HandbackRole.LEADER_SERVING);
+        String topic = primaryTopic();
+        LOGGER.info(() -> "Affinity handback: granting handover to " + candidate + " at W=" + frozen
+                + " (issue tems#9, D11)");
+        transport.send(ClusterMessage.request(MessageType.HANDBACK_GRANT, "handback",
+                transport.local().nodeId(), candidate,
+                new HandbackGrantPayload(topic, frozen, coordinator.getLeaderEpoch())));
+    }
+
+    /** CANDIDATE side: handover granted — arm bootstrap for all topics and pull the full snapshot. */
+    private void handleHandbackGrant(ClusterMessage message) {
+        HandbackGrantPayload payload = message.payload(HandbackGrantPayload.class);
+        if (handbackRole.get() != HandbackRole.CANDIDATE_REQUESTING
+                || !message.source().equals(handbackPeer)) {
+            return;
+        }
+        if (!handbackRole.compareAndSet(HandbackRole.CANDIDATE_REQUESTING, HandbackRole.CANDIDATE_INSTALLING)) {
+            return;
+        }
+        handbackGrantedEpoch = payload.leaderEpoch();
+        if (handlers.isEmpty()) {
+            sendHandbackAbort(message.source(), "candidate has no topics");
+            clearCandidateHandback("no topics", true);
+            return;
+        }
+        LOGGER.info(() -> "Affinity handback: GRANT received (frozenWatermark=" + payload.frozenWatermark()
+                + ", leaderEpoch=" + payload.leaderEpoch() + "); installing full snapshot (issue tems#9, D11)");
+        // Arm bootstrap for every topic we follow — the same machinery as the dual-leader yield: the
+        // apply loop requests the snapshot, completeSnapshotCutover installs it (SET — lineage offset
+        // zeroed), and the stale-sync guard is skipped while the bootstrap is pending so the incumbent's
+        // snapshot replaces our (possibly numerically higher) stale frontier. When the last topic cuts
+        // over we assert leadership (completeSnapshotCutover tail → completeHandbackAsCandidate).
+        for (String topic : handlers.keySet()) {
+            syncingTopics.remove(topic);
+            relayPendingBootstrap.add(topic);
+            signalRelay(topic);
+        }
+        coordinator.reevaluateLeadership();
+    }
+
+    /** CANDIDATE side: snapshot installed and cut over — assert leadership above the granted epoch. */
+    private void completeHandbackAsCandidate(long watermark) {
+        long grantedEpoch = handbackGrantedEpoch;
+        NodeId interimLeader = handbackPeer;
+        handbackRole.set(HandbackRole.NONE);
+        handbackPeer = null;
+        LOGGER.info(() -> "Affinity handback: cutover complete at " + watermark
+                + "; asserting leadership above epoch " + grantedEpoch + " (issue tems#9, D11)");
+        long newEpoch = coordinator.assumeLeadershipForHandback(grantedEpoch);
+        if (interimLeader != null) {
+            transport.send(ClusterMessage.request(MessageType.HANDBACK_COMPLETE, "handback",
+                    transport.local().nodeId(), interimLeader,
+                    new HandbackCompletePayload(watermark, newEpoch)));
+        }
+        for (HandoverListener l : handoverListeners) {
+            try {
+                l.onPromotionComplete();
+            } catch (Throwable t) {
+                LOGGER.log(Level.WARNING, "onPromotionComplete listener failed", t);
+            }
+        }
+    }
+
+    /** INTERIM-LEADER side: candidate finished cutover and asserted leadership — demote cleanly. */
+    private void handleHandbackComplete(ClusterMessage message) {
+        HandbackCompletePayload payload = message.payload(HandbackCompletePayload.class);
+        if (handbackRole.get() != HandbackRole.LEADER_SERVING
+                || !message.source().equals(handbackPeer)) {
+            return;
+        }
+        NodeId newLeader = message.source();
+        LOGGER.info(() -> "Affinity handback: candidate " + newLeader + " completed cutover at "
+                + payload.cutoverWatermark() + " (epoch " + payload.newEpoch() + "); demoting (issue tems#9, D11)");
+        handoverFreezing.set(false);
+        handoverFrozenWatermark = -1L;
+        handbackRole.set(HandbackRole.NONE);
+        handbackPeer = null;
+        // Step down to the winner promptly; the candidate's higher-epoch heartbeats are the backstop.
+        coordinator.acceptHandbackWinner(newLeader, payload.newEpoch());
+        for (HandoverListener l : handoverListeners) {
+            try {
+                l.onDemotedAfterHandover(newLeader);
+            } catch (Throwable t) {
+                LOGGER.log(Level.WARNING, "onDemotedAfterHandover listener failed", t);
+            }
+        }
+    }
+
+    /**
+     * Periodic guard of an in-flight handback (issue tems#9, D11): bounds the interim leader's freeze
+     * (timeout / candidate gone → abort and RETAIN leadership) and the candidate's wait (timeout →
+     * abandon and stay follower). Never leaves a leader stuck-frozen or a half-handover dangling.
+     */
+    private void checkHandover() {
+        if (!running || !config.affinityHandbackMode()) {
+            return;
+        }
+        HandbackRole role = handbackRole.get();
+        if (role == HandbackRole.NONE) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (role == HandbackRole.LEADER_PREPARING || role == HandbackRole.LEADER_SERVING) {
+            NodeId candidate = handbackPeer;
+            if (now - handbackStartedMs > config.handoverMaxDuration().toMillis()) {
+                LOGGER.warning(() -> "Affinity handback exceeded max duration; aborting and retaining"
+                        + " leadership (candidate " + candidate + " did not complete in time)");
+                abortHandover("handover timed out");
+                return;
+            }
+            boolean candidateActive = candidate != null && coordinator.activeMembers().stream()
+                    .anyMatch(m -> candidate.equals(m.nodeId()));
+            if (!candidateActive) {
+                LOGGER.warning(() -> "Affinity handback candidate " + candidate
+                        + " left the membership; aborting and retaining leadership");
+                abortHandover("candidate left");
+            }
+        } else { // CANDIDATE_REQUESTING / CANDIDATE_INSTALLING
+            long bound = role == HandbackRole.CANDIDATE_REQUESTING
+                    ? config.handoverRequestTimeout().toMillis()
+                    : config.handoverSnapshotTimeout().toMillis();
+            if (now - handbackStartedMs > bound) {
+                NodeId peer = handbackPeer;
+                LOGGER.warning(() -> "Affinity handback (candidate) timed out in " + role
+                        + "; abandoning attempt and staying follower (issue tems#9, D11)");
+                // Tell the incumbent so it un-freezes promptly. If we already armed the bootstrap
+                // (INSTALLING), leave it: the normal path still installs the incumbent's snapshot, and
+                // with the role cleared completeSnapshotCutover will not assert leadership.
+                if (peer != null) {
+                    sendHandbackAbort(peer, "candidate timed out");
+                }
+                clearCandidateHandback("candidate-side timeout", true);
+            }
+        }
+    }
+
+    /** INTERIM-LEADER abort: un-freeze, resume production, retain leadership, arm cooldown, notify peer. */
+    private void abortHandover(String reason) {
+        finishHandoverAbort(reason, true);
+    }
+
+    private void finishHandoverAbort(String reason, boolean notifyPeer) {
+        NodeId peer = handbackPeer;
+        boolean wasFreezing = handoverFreezing.getAndSet(false);
+        handoverFrozenWatermark = -1L;
+        handbackRole.set(HandbackRole.NONE);
+        handbackPeer = null;
+        handbackCooldownUntilMs = System.currentTimeMillis() + config.handoverCooldown().toMillis();
+        if (notifyPeer && peer != null) {
+            sendHandbackAbort(peer, reason);
+        }
+        if (wasFreezing) {
+            for (HandoverListener l : handoverListeners) {
+                try {
+                    l.onHandoverAborted(reason);
+                } catch (Throwable t) {
+                    LOGGER.log(Level.WARNING, "onHandoverAborted listener failed", t);
+                }
+            }
+        }
+    }
+
+    private void clearCandidateHandback(String reason, boolean cooldown) {
+        handbackRole.set(HandbackRole.NONE);
+        handbackPeer = null;
+        if (cooldown) {
+            handbackCooldownUntilMs = System.currentTimeMillis() + config.handoverCooldown().toMillis();
+        }
+        LOGGER.fine(() -> "Affinity handback (candidate) cleared: " + reason);
+    }
+
+    private void sendHandbackAbort(NodeId target, String reason) {
+        transport.send(ClusterMessage.request(MessageType.HANDBACK_ABORT, "handback",
+                transport.local().nodeId(), target, new HandbackAbortPayload(reason)));
+    }
+
+    private void handleHandbackAbort(ClusterMessage message) {
+        HandbackAbortPayload payload = message.payload(HandbackAbortPayload.class);
+        HandbackRole role = handbackRole.get();
+        if (role == HandbackRole.NONE) {
+            return;
+        }
+        String reason = payload.reason();
+        LOGGER.warning(() -> "Affinity handback aborted by peer " + message.source() + ": " + reason
+                + " (issue tems#9, D11)");
+        if (role == HandbackRole.LEADER_PREPARING || role == HandbackRole.LEADER_SERVING) {
+            finishHandoverAbort("aborted by candidate: " + reason, false); // do not echo an abort back
+        } else {
+            clearCandidateHandback("aborted by leader", true);
+        }
+    }
+
+    private String primaryTopic() {
+        return handlers.keySet().stream().findFirst().orElse("");
     }
 
     // ── User-level broadcast messaging (broadcastMessage API) ─────────────────────
