@@ -152,9 +152,9 @@ NODE_RE = re.compile(r"(node[-_]?\d+)")
 
 
 class Event:
-    __slots__ = ("ts", "node", "cat", "color", "detail", "level", "raw")
+    __slots__ = ("ts", "node", "cat", "color", "detail", "level", "raw", "leader")
 
-    def __init__(self, ts, node, cat, color, detail, level, raw):
+    def __init__(self, ts, node, cat, color, detail, level, raw, leader="?"):
         self.ts = ts
         self.node = node
         self.cat = cat
@@ -162,6 +162,7 @@ class Event:
         self.detail = detail
         self.level = level
         self.raw = raw
+        self.leader = leader  # líder corrente derivado da timeline (preenchido por annotate_leader)
 
 
 def classify(msg):
@@ -312,9 +313,9 @@ def render_table(events, use_color, show_raw):
         print("Nenhum evento encontrado (com os filtros atuais).")
         return
     term_w = shutil.get_terminal_size((140, 40)).columns
-    ts_w, node_w, cat_w = 23, 9, 12
-    fixed = ts_w + node_w + cat_w + 3 * 3  # 3 separadores " │ "
-    detail_w = max(20, term_w - fixed) if not show_raw else max(20, term_w - fixed)
+    ts_w, node_w, lead_w, cat_w = 23, 9, 9, 12
+    fixed = ts_w + node_w + lead_w + cat_w + 4 * 3  # 4 separadores " │ "
+    detail_w = max(20, term_w - fixed)
 
     def cell(s, w):
         s = s if len(s) <= w else s[: w - 1] + "…"
@@ -323,16 +324,19 @@ def render_table(events, use_color, show_raw):
     header = (
         colorize(cell("TIME", ts_w), "bold", use_color) + " │ " +
         colorize(cell("NODE", node_w), "bold", use_color) + " │ " +
+        colorize(cell("LEADER", lead_w), "bold", use_color) + " │ " +
         colorize(cell("EVENT", cat_w), "bold", use_color) + " │ " +
         colorize(cell("DETAIL", detail_w), "bold", use_color)
     )
     print(header)
-    print("─" * min(term_w, ts_w + node_w + cat_w + detail_w + 9))
+    print("─" * min(term_w, ts_w + node_w + lead_w + cat_w + detail_w + 12))
     for ev in events:
         detail = ev.detail if not show_raw else ev.raw
+        lead_color = "green" if ev.leader != "?" else "dim"
         line = (
             cell(ev.ts, ts_w) + " │ " +
             colorize(cell(ev.node, node_w), "cyan", use_color) + " │ " +
+            colorize(cell(ev.leader, lead_w), lead_color, use_color) + " │ " +
             colorize(cell(ev.cat, cat_w), ev.color, use_color) + " │ " +
             colorize(cell(detail, detail_w), ev.color, use_color)
         )
@@ -449,6 +453,41 @@ def collect_events(args):
     return events
 
 
+def annotate_leader(events):
+    """Deriva o líder corrente percorrendo a timeline (eventos JÁ ordenados por ts) e anota
+    cada evento com o líder vigente NAQUELE ponto. Roda sobre o conjunto COMPLETO, antes de
+    qualquer filtro, para que --types não remova os eventos de liderança que alimentam a derivação.
+
+    Regra: ELECT / PROMOTE / handback 'asserting leadership' definem o líder = nó do evento;
+    STEP-DOWN / LEASE do líder corrente o zeram ('?') até a próxima eleição.
+
+    Durante um handback (entre 'PREP/granting' e 'asserting'/step-down do incumbente) o incumbente
+    permanece o líder e o churn transitório de eleição do candidato (auto-eleição de boot que logo
+    deferiu) é ignorado — assim a coluna mostra o incumbente servindo o snapshot, não '?'.
+    """
+    cur = None
+    handover_incumbent = None  # incumbente enquanto um handback está em curso
+    for ev in events:
+        is_hb = ev.cat == "HANDBACK"
+        if is_hb and ("PREP for candidate" in ev.detail or "granting handover" in ev.detail):
+            cur = ev.node               # incumbente cedendo; segue líder até o candidato assumir
+            handover_incumbent = ev.node
+        elif is_hb and "asserting leadership" in ev.detail:
+            cur = ev.node               # candidato assumiu no cutover
+            handover_incumbent = None
+        elif handover_incumbent is not None:
+            # handback em curso: ignora o churn de ELECT/STEP-DOWN do candidato; só o step-down do
+            # próprio incumbente encerra a janela (cai para '?' até o 'asserting' do candidato).
+            if ev.cat in ("STEP-DOWN", "LEASE") and ev.node == handover_incumbent:
+                cur = None
+                handover_incumbent = None
+        elif ev.cat in ("ELECT", "PROMOTE"):
+            cur = ev.node
+        elif ev.cat in ("STEP-DOWN", "LEASE") and ev.node == cur:
+            cur = None
+        ev.leader = cur or "?"
+
+
 def apply_filters(events, args):
     if args.types:
         wanted = {t.strip().upper() for t in args.types.split(",")}
@@ -506,6 +545,8 @@ def main():
     use_color = sys.stdout.isatty() and not args.no_color and os.environ.get("NO_COLOR") is None
 
     events = collect_events(args)
+    events.sort(key=lambda e: e.ts)
+    annotate_leader(events)  # deriva o líder na timeline COMPLETA, antes dos filtros
     events = apply_filters(events, args)
     render_table(events, use_color, args.raw)
     if not args.no_summary:
