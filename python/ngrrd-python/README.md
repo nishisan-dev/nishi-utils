@@ -58,14 +58,35 @@ natural for APIs and data tooling:
 [{"ts": 1700000900, "in_bps": 10.0, "out_bps": 20.0}]
 ```
 
+### Geometry dump
+
+`get_metadata()` is a compact summary. To inspect the full structure of a file
+without reading any ring data, use `describe_geometry()`:
+
+```python
+with NgrrdReader("series.ngrr") as reader:
+    geometry = reader.describe_geometry()
+    # geometry["header"]   -> decoded 96-byte header, including section offsets
+    # geometry["columns"]  -> [{derived_name, raw_name, raw_type, raw_type_ordinal}]
+    # geometry["archives"] -> [{rra_name, cf, step_sec, rows, xff, group_size, ring_bytes, ...}]
+```
+
+The `SeriesHeader`, `SeriesColumn`, and `SeriesArchive` dataclasses also expose
+`to_dict()` for JSON-friendly serialization.
+
 ## CLI
 
 After installation, the package exposes `ngrrd-dump`:
 
 ```bash
+ngrrd-dump series.ngrr                                  # geometry only (no --archive)
+ngrrd-dump series.ngrr --geometry --format xml          # geometry as XML
 ngrrd-dump series.ngrr --archive daily --cf AVERAGE
 ngrrd-dump series.ngrr --archive daily --cf AVERAGE --rows --format xml
 ```
+
+Omitting `--archive` (or passing `--geometry`) dumps the file geometry instead
+of ring data; `--geometry` takes precedence when both are given.
 
 The example script is a thin wrapper around the same command:
 

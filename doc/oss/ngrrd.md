@@ -464,6 +464,39 @@ S3Settings s3 = S3Settings.forEndpoint(
 var bindings = StorageFactory.StorageBindings.forS3(s3);
 ```
 
+### Leitura via Python (`ngrrd-python`)
+
+O subprojeto `python/ngrrd-python/` traz um reader read-only que espelha o
+`SeriesFileCodec`: abre o `.ngrr` via `mmap`, valida os CRC32 e materializa os
+ring buffers apenas sob demanda. Além de ler dados, ele expõe a **geometria**
+completa do arquivo sem tocar nos rings.
+
+```python
+from ngrrd_python import NgrrdReader
+
+with NgrrdReader("series.ngrr") as reader:
+    # Resumo barato (nomes de coluna e "rra/CF").
+    print(reader.get_metadata())
+
+    # Dump completo da geometria: header com offsets, colunas (nome derivado,
+    # DS raw e tipo) e archives (cf, step, rows, xff, group_size, ring_bytes).
+    geometry = reader.describe_geometry()
+    for column in geometry["columns"]:
+        print(column["derived_name"], column["raw_name"], column["raw_type"])
+    for archive in geometry["archives"]:
+        print(archive["rra_name"], archive["cf"], archive["step_sec"], archive["rows"])
+```
+
+Pelo CLI `ngrrd-dump`, omitir `--archive` (ou passar `--geometry`) emite só a
+geometria, em JSON ou XML — útil para inspecionar a estrutura de um arquivo sem
+ler as séries:
+
+```bash
+ngrrd-dump series.ngrr                      # geometria em JSON
+ngrrd-dump series.ngrr --geometry --format xml
+ngrrd-dump series.ngrr --archive daily --cf AVERAGE   # dados de um archive
+```
+
 ### Concorrência no mesmo handle
 
 O `NgrrdHandle` é seguro para **1 writer lógico + N readers** no mesmo
