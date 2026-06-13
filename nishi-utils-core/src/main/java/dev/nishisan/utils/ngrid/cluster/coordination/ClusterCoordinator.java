@@ -122,6 +122,17 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     // Rate-limit for the winner-side dual-leader warning.
     private volatile long lastDualLeaderRetainWarnMs = 0L;
 
+    // ── Orchestrated affinity handback (issue tems#9, D11) ─────────────────────────────────────
+    // When enabled, a returning highest-affinity FOLLOWER does NOT reclaim leadership via the
+    // watermark gates (a lineage-blind counter offset can defeat them); the ReplicationManager drives
+    // an explicit stop-the-world snapshot handover instead. Genuine-failover election is unchanged.
+    private volatile boolean affinityHandbackMode = false;
+    // True while THIS node has an in-flight handover (interim leader serving, or candidate installing),
+    // supplied by the ReplicationManager. Suppresses the epoch re-stamp and the dual-leader contest so
+    // the choreographed transition lands as a single clean leader change; the dual-leader resolver
+    // remains the backstop once the handover clears (e.g. a lost completion message).
+    private volatile java.util.function.BooleanSupplier handoverInProgressSupplier = () -> false;
+
     /**
      * Supplies the local node's applied replication frontier (how much state it has). Wired by the
      * {@link dev.nishisan.utils.ngrid.replication.ReplicationManager}. The default {@code MAX_VALUE} means
@@ -371,7 +382,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             // dual-leader observation (issue tems#9, D10c): re-stamping would feed the infinite
             // epoch ladder (both leaders bumping above each other every heartbeat). The loser
             // adopts the term and yields; only the winner keeps re-stamping.
-            next = isLeader() && !yieldingToDualLeader ? observed + 1 : observed;
+            next = isLeader() && !yieldingToDualLeader && !handoverInProgress() ? observed + 1 : observed;
         } while (!leaderEpoch.compareAndSet(prev, next));
         persistEpoch(next);
         long converged = next;
@@ -897,6 +908,33 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 return;
             }
 
+            // ── Affinity handback supersedes the watermark reclaim AND step-down (issue tems#9, D11) ──
+            // With orchestrated handback enabled, leadership transfers between the affinity pair ONLY via
+            // the explicit handover (assumeLeadershipForHandback / acceptHandbackWinner, which call
+            // updateLeader directly, bypassing this election), never via the watermark gates below — a
+            // lineage-blind counter offset can defeat them (the permanent applied skew that keeps
+            // reclaim-quiesce from ever engaging). The candidate stays a follower until it has installed
+            // the incumbent's snapshot and cut over (SET — offset zeroed); the incumbent retains until
+            // the candidate completes. Genuine failover is unaffected: these only hold while a DISTINCT,
+            // ACTIVE leader/candidate exists — if a node died, the affinity election below promotes the
+            // survivor.
+            if (affinityHandbackMode) {
+                NodeId current = leader.get();
+                if (weWouldLead && !isLeaderInternal(localId)
+                        && current != null && !current.equals(localId) && isActiveMember(current)) {
+                    // CANDIDATE side: do not reclaim via watermark; the handshake drives the transition.
+                    updateLeader(current);
+                    return;
+                }
+                if (isLeaderInternal(localId) && electedId != null && !electedId.equals(localId)
+                        && isActiveMember(electedId)) {
+                    // INCUMBENT side: a higher-affinity peer would win by affinity, but the watermark
+                    // step-down is replaced by the explicit handback — retain until the candidate completes.
+                    updateLeader(localId);
+                    return;
+                }
+            }
+
             // ── Sync-before-reclaim gate B (STEP-DOWN side) — watermark-driven ───────────────────────
             // If WE are the current leader and the affinity-elected candidate is a DIFFERENT, higher-
             // affinity peer that is still BEHIND our watermark, do NOT step down to it yet — retain
@@ -985,6 +1023,105 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         this.dualLeaderYieldHook = hook;
     }
 
+    // ── Orchestrated affinity handback (issue tems#9, D11) ─────────────────────────────────────
+
+    /**
+     * Enables/disables the orchestrated affinity handback gating (issue tems#9, D11). When enabled,
+     * {@link #recomputeLeader()} stops promoting a returning highest-affinity follower through the
+     * watermark gates while a healthy incumbent exists; the ReplicationManager drives the explicit
+     * snapshot handover instead. Wired from {@code ReplicationManager.start()}.
+     *
+     * @param enabled whether orchestrated handback mode is active
+     */
+    public void setAffinityHandbackMode(boolean enabled) {
+        this.affinityHandbackMode = enabled;
+    }
+
+    /**
+     * Wires the predicate that reports whether THIS node has an in-flight handover (issue tems#9, D11).
+     * While it returns {@code true} the epoch re-stamp and the dual-leader resolver are suppressed so the
+     * choreographed transition lands as a single clean leader change.
+     *
+     * @param supplier the in-progress predicate (must not be {@code null})
+     */
+    public void setHandoverInProgressSupplier(java.util.function.BooleanSupplier supplier) {
+        this.handoverInProgressSupplier = Objects.requireNonNull(supplier, "supplier");
+    }
+
+    private boolean handoverInProgress() {
+        try {
+            return handoverInProgressSupplier.getAsBoolean();
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Whether the local node is the highest-affinity (priority, then NodeId) member among the currently
+     * active members — the candidate predicate for initiating an affinity handback (issue tems#9, D11).
+     *
+     * @return {@code true} when the local node would win the affinity election
+     */
+    public boolean localIsPreferredLeader() {
+        synchronized (leaderComputationLock) {
+            NodeId localId = transport.local().nodeId();
+            NodeId electedId = members.values().stream()
+                    .filter(ClusterMember::isActive)
+                    .max(Comparator.comparingInt((ClusterMember m) -> m.info().priority())
+                            .thenComparing(ClusterMember::id))
+                    .map(ClusterMember::id)
+                    .orElse(null);
+            return localId.equals(electedId);
+        }
+    }
+
+    /**
+     * Whether a DISTINCT, active agreed leader currently exists (issue tems#9, D11) — the condition that
+     * makes an affinity handback applicable (there is an incumbent to hand back FROM). When false (no
+     * agreed leader, or the leader died and was evicted) the genuine-failover election path applies.
+     *
+     * @return {@code true} when a healthy distinct agreed leader exists
+     */
+    public boolean isAgreedLeaderHealthy() {
+        NodeId current = leader.get();
+        NodeId localId = transport.local().nodeId();
+        return current != null && !current.equals(localId) && isActiveMember(current);
+    }
+
+    /**
+     * CANDIDATE side of a handback (issue tems#9, D11): asserts local leadership at a term strictly above
+     * {@code grantedEpoch} (the incumbent's epoch carried in the grant) so the candidate's first leader
+     * heartbeat fences the incumbent cleanly, then promotes the local node. Returns the new epoch.
+     *
+     * @param grantedEpoch the interim leader's epoch from the {@code HANDBACK_GRANT}
+     * @return the local leader epoch after assuming leadership (strictly above {@code grantedEpoch})
+     */
+    public long assumeLeadershipForHandback(long grantedEpoch) {
+        synchronized (leaderComputationLock) {
+            leaderEpoch.updateAndGet(cur -> Math.max(cur, grantedEpoch));
+            updateLeader(transport.local().nodeId()); // increments to >= grantedEpoch+1, fires listeners
+            return leaderEpoch.get();
+        }
+    }
+
+    /**
+     * INTERIM-LEADER side of a handback (issue tems#9, D11): steps down to the candidate that completed
+     * the cutover and adopts its term. Called on the {@code HANDBACK_COMPLETE} message for a prompt, clean
+     * demotion; the candidate's higher-epoch heartbeats are the authoritative backstop.
+     *
+     * @param newLeader the candidate that took over
+     * @param newEpoch  the candidate's asserted epoch
+     */
+    public void acceptHandbackWinner(NodeId newLeader, long newEpoch) {
+        synchronized (leaderComputationLock) {
+            if (newLeader == null) {
+                return;
+            }
+            updateLeader(newLeader); // step down to the winner (was leader -> "stepped down")
+            observeEpoch(newEpoch);  // now a follower -> adopt the winner's term (no re-stamp)
+        }
+    }
+
     /**
      * Tracks a peer's leadership assertion against the local one (issue tems#9, D10c). Both sides
      * run the SAME total-order comparison (priority, then NodeId — the election order), so exactly
@@ -994,6 +1131,12 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      * (placeholder) is never resolved against — affinity must not be guessed.
      */
     private void observeLeaderAssertion(NodeId rival, boolean rivalAssertsLeadership) {
+        if (handoverInProgress()) {
+            // Orchestrated affinity handback (issue tems#9, D11): the choreographed transition demotes
+            // the interim leader explicitly; do not let the brief assertion overlap during the handover
+            // trip the dual-leader resolver. It stays the backstop once the handover clears.
+            return;
+        }
         if (!rivalAssertsLeadership || !isLeader()) {
             // Any heartbeat without the assertion breaks the CONSECUTIVE requirement.
             dualLeaderObservations.remove(rival);

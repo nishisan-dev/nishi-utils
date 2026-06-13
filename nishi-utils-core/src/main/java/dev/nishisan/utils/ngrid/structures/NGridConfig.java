@@ -61,6 +61,11 @@ public final class NGridConfig {
     private final long reclaimQuiesceThreshold;
     private final Duration reclaimQuiesceMaxDuration;
     private final Duration reclaimQuiesceCooldown;
+    private final boolean affinityHandbackMode;
+    private final Duration handoverMaxDuration;
+    private final Duration handoverSnapshotTimeout;
+    private final Duration handoverRequestTimeout;
+    private final Duration handoverCooldown;
     private final Duration rttProbeInterval;
     private final Duration heartbeatInterval;
     private final Duration leaseTimeout;
@@ -127,6 +132,11 @@ public final class NGridConfig {
         this.reclaimQuiesceThreshold = builder.reclaimQuiesceThreshold;
         this.reclaimQuiesceMaxDuration = builder.reclaimQuiesceMaxDuration;
         this.reclaimQuiesceCooldown = builder.reclaimQuiesceCooldown;
+        this.affinityHandbackMode = builder.affinityHandbackMode;
+        this.handoverMaxDuration = builder.handoverMaxDuration;
+        this.handoverSnapshotTimeout = builder.handoverSnapshotTimeout;
+        this.handoverRequestTimeout = builder.handoverRequestTimeout;
+        this.handoverCooldown = builder.handoverCooldown;
         this.rttProbeInterval = builder.rttProbeInterval;
         this.heartbeatInterval = builder.heartbeatInterval;
         this.leaseTimeout = builder.leaseTimeout;
@@ -397,6 +407,53 @@ public final class NGridConfig {
     }
 
     /**
+     * Whether the orchestrated automatic affinity handback is enabled (issue tems#9, D11): a returning
+     * highest-affinity follower hands leadership back via an explicit stop-the-world snapshot handover
+     * instead of the lineage-blind watermark reclaim. Defaults to {@code false} (opt-in).
+     *
+     * @return {@code true} when orchestrated affinity handback is enabled
+     */
+    public boolean affinityHandbackMode() {
+        return affinityHandbackMode;
+    }
+
+    /**
+     * Upper bound on a handback once the incumbent freezes production (issue tems#9, D11). Defaults to 120s.
+     *
+     * @return the maximum handover duration
+     */
+    public Duration handoverMaxDuration() {
+        return handoverMaxDuration;
+    }
+
+    /**
+     * Candidate-side snapshot-install timeout for a handback (issue tems#9, D11). Defaults to 120s.
+     *
+     * @return the handover snapshot timeout
+     */
+    public Duration handoverSnapshotTimeout() {
+        return handoverSnapshotTimeout;
+    }
+
+    /**
+     * Candidate-side wait for a {@code HANDBACK_GRANT} before retrying (issue tems#9, D11). Defaults to 30s.
+     *
+     * @return the handover request timeout
+     */
+    public Duration handoverRequestTimeout() {
+        return handoverRequestTimeout;
+    }
+
+    /**
+     * Cooldown after an aborted/timed-out handback before another attempt (issue tems#9, D11). Defaults to 60s.
+     *
+     * @return the handover cooldown
+     */
+    public Duration handoverCooldown() {
+        return handoverCooldown;
+    }
+
+    /**
      * Interval between forced relay syncs when {@link RelayDurability#GROUP_COMMIT} is active.
      *
      * @return the group-commit interval (never {@code null})
@@ -648,6 +705,11 @@ public final class NGridConfig {
         private long reclaimQuiesceThreshold = 1024L;
         private Duration reclaimQuiesceMaxDuration = Duration.ofSeconds(5);
         private Duration reclaimQuiesceCooldown = Duration.ofSeconds(60);
+        private boolean affinityHandbackMode = false;
+        private Duration handoverMaxDuration = Duration.ofSeconds(120);
+        private Duration handoverSnapshotTimeout = Duration.ofSeconds(120);
+        private Duration handoverRequestTimeout = Duration.ofSeconds(30);
+        private Duration handoverCooldown = Duration.ofSeconds(60);
         private Duration rttProbeInterval = Duration.ofSeconds(10);
         private Duration heartbeatInterval = Duration.ofSeconds(3);
         private Duration leaseTimeout;
@@ -1080,6 +1142,77 @@ public final class NGridConfig {
                 throw new IllegalArgumentException("reclaimQuiesceCooldown must not be negative");
             }
             this.reclaimQuiesceCooldown = cooldown;
+            return this;
+        }
+
+        /**
+         * Enables the orchestrated automatic affinity handback (issue tems#9, D11). Defaults to {@code false}.
+         *
+         * @param enabled {@code true} to use the snapshot-orchestrated handover instead of watermark reclaim
+         * @return this builder
+         */
+        public Builder affinityHandbackMode(boolean enabled) {
+            this.affinityHandbackMode = enabled;
+            return this;
+        }
+
+        /**
+         * Sets the upper bound on a handback once the incumbent freezes production (issue tems#9, D11).
+         *
+         * @param duration the maximum handover duration (must be positive)
+         * @return this builder
+         */
+        public Builder handoverMaxDuration(Duration duration) {
+            Objects.requireNonNull(duration, "handoverMaxDuration");
+            if (duration.isNegative() || duration.isZero()) {
+                throw new IllegalArgumentException("handoverMaxDuration must be positive");
+            }
+            this.handoverMaxDuration = duration;
+            return this;
+        }
+
+        /**
+         * Sets the candidate-side snapshot-install timeout for a handback (issue tems#9, D11).
+         *
+         * @param duration the snapshot timeout (must be positive)
+         * @return this builder
+         */
+        public Builder handoverSnapshotTimeout(Duration duration) {
+            Objects.requireNonNull(duration, "handoverSnapshotTimeout");
+            if (duration.isNegative() || duration.isZero()) {
+                throw new IllegalArgumentException("handoverSnapshotTimeout must be positive");
+            }
+            this.handoverSnapshotTimeout = duration;
+            return this;
+        }
+
+        /**
+         * Sets the candidate-side wait for a {@code HANDBACK_GRANT} before retrying (issue tems#9, D11).
+         *
+         * @param duration the request timeout (must be positive)
+         * @return this builder
+         */
+        public Builder handoverRequestTimeout(Duration duration) {
+            Objects.requireNonNull(duration, "handoverRequestTimeout");
+            if (duration.isNegative() || duration.isZero()) {
+                throw new IllegalArgumentException("handoverRequestTimeout must be positive");
+            }
+            this.handoverRequestTimeout = duration;
+            return this;
+        }
+
+        /**
+         * Sets the cooldown after an aborted/timed-out handback before another attempt (issue tems#9, D11).
+         *
+         * @param cooldown the cooldown (must not be negative)
+         * @return this builder
+         */
+        public Builder handoverCooldown(Duration cooldown) {
+            Objects.requireNonNull(cooldown, "handoverCooldown");
+            if (cooldown.isNegative()) {
+                throw new IllegalArgumentException("handoverCooldown must not be negative");
+            }
+            this.handoverCooldown = cooldown;
             return this;
         }
 

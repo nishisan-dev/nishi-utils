@@ -62,6 +62,11 @@ public final class ReplicationConfig {
     private final Duration relayStreamPollInterval;
     private final Duration relayStreamFetchTimeout;
     private final int relayMaxBacklog;
+    private final boolean affinityHandbackMode;
+    private final Duration handoverMaxDuration;
+    private final Duration handoverSnapshotTimeout;
+    private final Duration handoverRequestTimeout;
+    private final Duration handoverCooldown;
 
     private ReplicationConfig(int quorum, Duration operationTimeout, Duration retryInterval, boolean strictConsistency,
             Path dataDirectory, int resendGapThreshold, Duration resendTimeout, int replicationLogRetention,
@@ -76,7 +81,9 @@ public final class ReplicationConfig {
             boolean leaderPauseOnReclaim, long reclaimQuiesceThreshold, Duration reclaimQuiesceMaxDuration,
             Duration reclaimQuiesceCooldown,
             int relayStreamFetchBatch, Duration relayStreamPollInterval, Duration relayStreamFetchTimeout,
-            int relayMaxBacklog) {
+            int relayMaxBacklog,
+            boolean affinityHandbackMode, Duration handoverMaxDuration, Duration handoverSnapshotTimeout,
+            Duration handoverRequestTimeout, Duration handoverCooldown) {
         this.quorum = quorum;
         this.operationTimeout = Objects.requireNonNull(operationTimeout, "operationTimeout");
         this.retryInterval = Objects.requireNonNull(retryInterval, "retryInterval");
@@ -115,6 +122,11 @@ public final class ReplicationConfig {
         this.relayStreamPollInterval = Objects.requireNonNull(relayStreamPollInterval, "relayStreamPollInterval");
         this.relayStreamFetchTimeout = Objects.requireNonNull(relayStreamFetchTimeout, "relayStreamFetchTimeout");
         this.relayMaxBacklog = relayMaxBacklog;
+        this.affinityHandbackMode = affinityHandbackMode;
+        this.handoverMaxDuration = Objects.requireNonNull(handoverMaxDuration, "handoverMaxDuration");
+        this.handoverSnapshotTimeout = Objects.requireNonNull(handoverSnapshotTimeout, "handoverSnapshotTimeout");
+        this.handoverRequestTimeout = Objects.requireNonNull(handoverRequestTimeout, "handoverRequestTimeout");
+        this.handoverCooldown = Objects.requireNonNull(handoverCooldown, "handoverCooldown");
     }
 
     public static ReplicationConfig of(int quorum) {
@@ -397,6 +409,64 @@ public final class ReplicationConfig {
     }
 
     /**
+     * Enables the orchestrated automatic affinity handback (issue tems#9, D11): when the
+     * highest-affinity node returns to a cluster that already has a healthy leader, it does NOT
+     * reclaim via the watermark gates (which a lineage-blind counter offset can defeat — the
+     * permanent {@code applied} skew that makes {@link #reclaimQuiesceThreshold()} unreachable).
+     * Instead it requests a stop-the-world handover: the incumbent freezes production, the candidate
+     * installs a full snapshot and cuts over (SET — lineage offset zeroed), then asserts leadership
+     * and the incumbent demotes cleanly. The genuine-failover election (leader died) is unchanged.
+     * Defaults to {@code false} (opt-in; the lib stays on the legacy reclaim path).
+     *
+     * @return {@code true} when orchestrated affinity handback is enabled
+     */
+    public boolean affinityHandbackMode() {
+        return affinityHandbackMode;
+    }
+
+    /**
+     * Upper bound on a handback once the incumbent enters PREP (issue tems#9, D11): if the candidate
+     * does not complete the snapshot install + cutover within this window, the incumbent aborts,
+     * un-freezes production and retains leadership (availability first; no demotion → no dual-leader).
+     * Sized for a multi-GB snapshot transfer + deserialization. Defaults to 120s.
+     *
+     * @return the maximum handover duration
+     */
+    public Duration handoverMaxDuration() {
+        return handoverMaxDuration;
+    }
+
+    /**
+     * How long the candidate waits for snapshot progress during a handback before giving up the
+     * attempt (issue tems#9, D11). Defaults to 120s.
+     *
+     * @return the handover snapshot timeout
+     */
+    public Duration handoverSnapshotTimeout() {
+        return handoverSnapshotTimeout;
+    }
+
+    /**
+     * How long the candidate waits for a {@code HANDBACK_GRANT} after sending a request before
+     * abandoning the attempt and retrying later (issue tems#9, D11). Defaults to 30s.
+     *
+     * @return the handover request timeout
+     */
+    public Duration handoverRequestTimeout() {
+        return handoverRequestTimeout;
+    }
+
+    /**
+     * Cooldown after an aborted/timed-out handback before another attempt may engage (issue tems#9,
+     * D11) — prevents a pause loop against a candidate that cannot complete. Defaults to 60s.
+     *
+     * @return the handover re-engagement cooldown
+     */
+    public Duration handoverCooldown() {
+        return handoverCooldown;
+    }
+
+    /**
      * Whether the leader pauses production while a not-caught-up follower joins (#129), generalizing
      * the failover drain-gate to the join path so convergence is deterministic (no firehose during
      * bootstrap). Bounded by {@link #joinQuiesceMaxDuration()} and released on the follower catching
@@ -536,6 +606,11 @@ public final class ReplicationConfig {
         private Duration relayStreamPollInterval = Duration.ofMillis(50);
         private Duration relayStreamFetchTimeout = Duration.ofSeconds(2);
         private int relayMaxBacklog = 200_000;
+        private boolean affinityHandbackMode = false;
+        private Duration handoverMaxDuration = Duration.ofSeconds(120);
+        private Duration handoverSnapshotTimeout = Duration.ofSeconds(120);
+        private Duration handoverRequestTimeout = Duration.ofSeconds(30);
+        private Duration handoverCooldown = Duration.ofSeconds(60);
 
         private Builder(int quorum) {
             if (quorum < 1) {
@@ -1007,6 +1082,79 @@ public final class ReplicationConfig {
             return this;
         }
 
+        /**
+         * Enables the orchestrated automatic affinity handback (issue tems#9, D11). See
+         * {@link ReplicationConfig#affinityHandbackMode()}. Defaults to {@code false} (opt-in).
+         *
+         * @param affinityHandbackMode {@code true} to replace the legacy watermark reclaim with the
+         *                             snapshot-orchestrated handback
+         * @return this builder
+         */
+        public Builder affinityHandbackMode(boolean affinityHandbackMode) {
+            this.affinityHandbackMode = affinityHandbackMode;
+            return this;
+        }
+
+        /**
+         * Sets the upper bound on a handback once the incumbent enters PREP (issue tems#9, D11).
+         *
+         * @param duration the maximum handover duration (must be positive)
+         * @return this builder
+         */
+        public Builder handoverMaxDuration(Duration duration) {
+            Objects.requireNonNull(duration, "handoverMaxDuration");
+            if (duration.isNegative() || duration.isZero()) {
+                throw new IllegalArgumentException("handoverMaxDuration must be positive");
+            }
+            this.handoverMaxDuration = duration;
+            return this;
+        }
+
+        /**
+         * Sets how long the candidate waits for snapshot progress during a handback (issue tems#9, D11).
+         *
+         * @param duration the snapshot timeout (must be positive)
+         * @return this builder
+         */
+        public Builder handoverSnapshotTimeout(Duration duration) {
+            Objects.requireNonNull(duration, "handoverSnapshotTimeout");
+            if (duration.isNegative() || duration.isZero()) {
+                throw new IllegalArgumentException("handoverSnapshotTimeout must be positive");
+            }
+            this.handoverSnapshotTimeout = duration;
+            return this;
+        }
+
+        /**
+         * Sets how long the candidate waits for a {@code HANDBACK_GRANT} before retrying (issue tems#9, D11).
+         *
+         * @param duration the request timeout (must be positive)
+         * @return this builder
+         */
+        public Builder handoverRequestTimeout(Duration duration) {
+            Objects.requireNonNull(duration, "handoverRequestTimeout");
+            if (duration.isNegative() || duration.isZero()) {
+                throw new IllegalArgumentException("handoverRequestTimeout must be positive");
+            }
+            this.handoverRequestTimeout = duration;
+            return this;
+        }
+
+        /**
+         * Sets the cooldown after an aborted/timed-out handback before another attempt (issue tems#9, D11).
+         *
+         * @param cooldown the cooldown (must not be negative)
+         * @return this builder
+         */
+        public Builder handoverCooldown(Duration cooldown) {
+            Objects.requireNonNull(cooldown, "handoverCooldown");
+            if (cooldown.isNegative()) {
+                throw new IllegalArgumentException("handoverCooldown must not be negative");
+            }
+            this.handoverCooldown = cooldown;
+            return this;
+        }
+
         public ReplicationConfig build() {
             if (dataDirectory == null) {
                 throw new IllegalStateException("dataDirectory must be set");
@@ -1020,7 +1168,9 @@ public final class ReplicationConfig {
                     relayApplyBatchSize, leaderPauseOnJoin,
                     joinQuiesceMaxDuration, followerProgressInterval, joinPeerDiscoveryWindow, joinSyncLagThreshold,
                     leaderPauseOnReclaim, reclaimQuiesceThreshold, reclaimQuiesceMaxDuration, reclaimQuiesceCooldown,
-                    relayStreamFetchBatch, relayStreamPollInterval, relayStreamFetchTimeout, relayMaxBacklog);
+                    relayStreamFetchBatch, relayStreamPollInterval, relayStreamFetchTimeout, relayMaxBacklog,
+                    affinityHandbackMode, handoverMaxDuration, handoverSnapshotTimeout, handoverRequestTimeout,
+                    handoverCooldown);
         }
     }
 }
