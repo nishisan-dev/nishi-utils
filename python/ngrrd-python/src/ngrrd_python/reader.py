@@ -110,6 +110,27 @@ class NgrrdReader:
             "file_total_bytes": header.file_total_bytes,
         }
 
+    def describe_geometry(self) -> dict[str, Any]:
+        """Return the full structural geometry without materializing ring data.
+
+        Unlike :meth:`get_metadata`, which is a compact summary, this exposes the
+        decoded header (including section offsets), every derived column with its
+        raw data source and type, and every physical archive with its step, row
+        count, ``xff`` and ring layout. No ring buffers are read.
+        """
+
+        header = self._require_header()
+        return {
+            "file": str(self.file_path),
+            "header": header.to_dict(),
+            "last_update_ms": self._live_state["last_up_ms"],
+            "columns": [column.to_dict() for column in self.columns],
+            "archives": [
+                {**archive.to_dict(), "ring_bytes": archive.rows * header.column_count * self._F64.size}
+                for archive in self.archives
+            ],
+        }
+
     def read_archive_as_dict(
         self, archive_name: str, cf: ConsolidationFunction | str | None = None
     ) -> dict[str, list[dict[str, Any]]]:

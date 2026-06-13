@@ -1,3 +1,4 @@
+import json
 import math
 import struct
 import zlib
@@ -10,6 +11,7 @@ from ngrrd_python import (
     NgrrdFormatError,
     NgrrdReader,
 )
+from ngrrd_python import cli
 
 
 FIXED_HEADER_FORMAT = ">4sHHi32siiQQQQQi"
@@ -283,3 +285,144 @@ def test_truncated_file_raises_format_error(tmp_path):
 
     with pytest.raises(NgrrdFormatError, match="truncated"):
         NgrrdReader(p).open()
+
+
+def _multi_geometry_image(p):
+    create_mock_ngrr(
+        p,
+        columns=[
+            ("in_bps", "in_octets", DataSourceType.COUNTER),
+            ("out_bps", "out_octets", DataSourceType.GAUGE),
+        ],
+        archives=[
+            ("rra_5m", ConsolidationFunction.AVERAGE, 300, 8, 0.5),
+            ("rra_1h", ConsolidationFunction.MAX, 3600, 24, 0.25),
+        ],
+        pointers=[(0, 1_700_000_600), (0, 1_700_003_600)],
+    )
+    return p
+
+
+def test_describe_geometry(tmp_path):
+    p = _multi_geometry_image(tmp_path / "geom.ngrr")
+
+    with NgrrdReader(p) as reader:
+        geom = reader.describe_geometry()
+
+    assert geom["file"].endswith("geom.ngrr")
+    assert geom["last_update_ms"] == 1_700_000_000_000
+
+    header = geom["header"]
+    assert header["version"] == 1
+    assert header["base_step_sec"] == 300
+    assert header["definition_hash"] == (b"x" * 32).hex()
+    assert header["column_count"] == 2
+    assert header["archive_count"] == 2
+    # Section offsets are part of the geometry, not exposed by get_metadata().
+    for key in ("static_section_bytes", "live_state_offset", "live_state_bytes", "ring_data_offset"):
+        assert isinstance(header[key], int)
+
+    columns = geom["columns"]
+    assert [c["derived_name"] for c in columns] == ["in_bps", "out_bps"]
+    assert columns[0]["raw_name"] == "in_octets"
+    assert columns[0]["raw_type"] == "COUNTER"
+    assert columns[1]["raw_type"] == "GAUGE"
+
+    archives = geom["archives"]
+    assert [a["rra_name"] for a in archives] == ["rra_5m", "rra_1h"]
+    assert archives[0]["cf"] == "AVERAGE"
+    assert archives[0]["step_sec"] == 300
+    assert archives[0]["rows"] == 8
+    assert archives[0]["xff"] == 0.5
+    assert archives[0]["group_size"] == 1
+    assert archives[0]["ring_bytes"] == 8 * 2 * 8
+    assert archives[1]["cf"] == "MAX"
+    assert archives[1]["group_size"] == 12  # 3600 / 300
+    assert archives[1]["ring_bytes"] == 24 * 2 * 8
+
+
+def test_to_dict_models(tmp_path):
+    p = _multi_geometry_image(tmp_path / "models.ngrr")
+
+    with NgrrdReader(p) as reader:
+        header_dict = reader.header.to_dict()
+        column_dict = reader.columns[0].to_dict()
+        archive_dict = reader.archives[0].to_dict()
+
+    assert set(header_dict) == {
+        "version",
+        "schema_revision",
+        "base_step_sec",
+        "definition_hash",
+        "column_count",
+        "archive_count",
+        "static_section_bytes",
+        "live_state_offset",
+        "live_state_bytes",
+        "ring_data_offset",
+        "file_total_bytes",
+    }
+    assert column_dict == {
+        "derived_name": "in_bps",
+        "raw_name": "in_octets",
+        "raw_type": "COUNTER",
+        "raw_type_ordinal": 0,
+    }
+    assert set(archive_dict) == {
+        "rra_name",
+        "cf",
+        "cf_ordinal",
+        "step_sec",
+        "rows",
+        "xff",
+        "group_size",
+        "ring_base_offset",
+    }
+    assert archive_dict["cf"] == "AVERAGE"
+    assert archive_dict["cf_ordinal"] == 0
+
+
+def test_cli_geometry_json(tmp_path, capsys):
+    p = _multi_geometry_image(tmp_path / "cli.ngrr")
+
+    # No --archive: defaults to geometry mode.
+    assert cli.main([str(p)]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert "data" not in payload
+    assert payload["header"]["column_count"] == 2
+    assert [c["raw_type"] for c in payload["columns"]] == ["COUNTER", "GAUGE"]
+    assert [a["rra_name"] for a in payload["archives"]] == ["rra_5m", "rra_1h"]
+
+
+def test_cli_geometry_flag_takes_precedence_over_archive(tmp_path, capsys):
+    p = _multi_geometry_image(tmp_path / "cli-flag.ngrr")
+
+    assert cli.main([str(p), "--geometry", "--archive", "rra_5m"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert "data" not in payload
+    assert "header" in payload
+
+
+def test_cli_geometry_xml(tmp_path, capsys):
+    p = _multi_geometry_image(tmp_path / "cli.ngrr")
+
+    assert cli.main([str(p), "--geometry", "--format", "xml"]) == 0
+    out = capsys.readouterr().out
+
+    assert "<ngrrd-geometry" in out
+    assert "rra_5m" in out
+    assert "<data>" not in out
+
+
+def test_cli_archive_mode_unchanged(tmp_path, capsys):
+    p = tmp_path / "daily.ngrr"
+    create_mock_ngrr(p, ring_values=[[[10.0], [20.0], [float("nan")], [float("nan")]]])
+
+    assert cli.main([str(p), "--archive", "daily"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert "metadata" in payload
+    assert "data" in payload
+    assert payload["data"]["cpu"][3]["value"] == 20.0
