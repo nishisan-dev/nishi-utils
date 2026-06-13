@@ -502,3 +502,67 @@ um ramo descartado (ex.: janela dual ou churn de eleição no boot **com produç
 contador fica inflado em relação à linhagem vencedora e o emparelhamento numérico exato fica
 inalcançável — o (b) expira e o (c) resolve com descarte. O endurecimento estrutural (ordenação
 epoch-aware de linhagem no protocolo de heartbeat) é o follow-up já registrado da PR #142.
+
+> **Resolvido pela §14 (D11):** o handback orquestrado por snapshot dispensa o emparelhamento numérico
+> — o cutover `SET` reancora os contadores na linhagem do incumbente, zerando o offset por construção.
+
+## 14. Handback automático orquestrado por snapshot (issue tems#9, D11)
+
+**Motivação (a limitação acima confirmada em campo):** em pré-prod observou-se, ao vivo, um offset de
+linhagem **constante e crescente** entre os contadores `applied` dos dois nós (ex.: 54.024, acumulado
+por reclaims sucessivos, com `leaderLocalApply=false`). Como esse offset excede o
+`reclaimQuiesceThreshold`, o reclaim-quiesce (D10b) **nunca engata** na volta e ela degrada para
+dual-leader → descarte (D10c) = **perda silenciosa**. O delta-pairing por watermark é, por construção,
+frágil enquanto os contadores forem escalares cegos a linhagem.
+
+**Mecanismo (opt-in via `affinityHandbackMode`):** quando o nó de MAIOR afinidade retorna a um cluster
+que já tem um líder SAUDÁVEL, ele **não reassume pelos gates de watermark** — pede um **handover
+stop-the-world**:
+
+```
+candidato (volta como follower, NÃO self-elege)
+  HANDBACK_REQUEST ─►
+incumbente: handoverFreezing=true (replicate() rejeita); onHandoverPrepare() (app para de consumir +
+            drena o pipe); W = max(global,applied)
+  ◄─ HANDBACK_GRANT(W, epoch)
+candidato: relayPendingBootstrap(todos os tópicos) → snapshot FULL → completeSnapshotCutover (SET →
+           offset ZERADO) → assumeLeadershipForHandback(epoch+1)
+  HANDBACK_COMPLETE ─►
+incumbente: acceptHandbackWinner → demote a follower; onDemotedAfterHandover()
+candidato: drain-gate libera → onPromotionComplete → app volta a consumir
+```
+
+- A transição é **única e limpa**: durante o handover o re-stamp de epoch e a detecção de dual-leader
+  são **suprimidos** (`handoverInProgress`); o detector de dual-leader (D10c) permanece como
+  **backstop** se a conclusão se perder.
+- O `recomputeLeader` deixa de transferir liderança entre o par por watermark (gate A do candidato e o
+  step-down do incumbente são suprimidos em modo handback); a liderança só passa via
+  `assumeLeadershipForHandback`/`acceptHandbackWinner`. **Failover genuíno (líder morto) é
+  inalterado**: a supressão só vale enquanto existe um líder/candidato ativo e distinto.
+- **Aborto bounded** (`handoverMaxDuration`, candidato saiu, flush falhou): o incumbente descongela e
+  **RETÉM** a liderança — nunca um líder preso congelado, nunca dual-leader por aborto.
+
+**Por que cura o offset:** o cutover do snapshot usa `SET` (não `max`) em applied/global/topic = o
+watermark do líder servindo → o nó que volta herda a escala exata da linhagem do incumbente → offset
+**zerado a cada handback** (auto-curável). Substitui o delta-pairing; é o caminho definitivo da volta.
+
+### Configuração
+
+| Knob (lib) | Default lib | Default Cardinal | Significado |
+|---|---|---|---|
+| `affinityHandbackMode` | false | **true** | liga o handback; substitui o reclaim por watermark |
+| `handoverMaxDuration` | 120s | 120s | backstop do freeze (snapshot multi-GB) → aborta e retém |
+| `handoverSnapshotTimeout` | 120s | 120s | timeout do install no candidato |
+| `handoverRequestTimeout` | 30s | 30s | espera do GRANT antes de reabandonar |
+| `handoverCooldown` | 60s | 60s | cooldown pós-aborto |
+
+Com `affinityHandbackMode` ligado, o Cardinal força `leaderPauseOnReclaim=false` (o freeze explícito
+substitui o reclaim-quiesce). O app implementa `HandoverListener` (`onHandoverPrepare` pausa o consumo
+e drena o pipe; `onHandoverAborted` retoma).
+
+### Validação
+
+E2E (`AutomaticLeaderHandbackE2ETest`): coreografia completa, **sem janela de dual-leader**, pós-volta
+`applied == global == follower.applied` (offset 0), zero perda/duplicata. `HandbackSafetyE2ETest`:
+failover genuíno promove o sobrevivente; aborto retém a liderança e descongela. Regressões D8/D9/D10
+verdes (handback é opt-in; default da lib off).

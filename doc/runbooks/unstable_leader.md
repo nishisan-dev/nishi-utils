@@ -119,6 +119,25 @@ to higher-affinity <node>` no perdedor e `retaining (higher affinity)` no venced
 4. A contenção manual antiga (SIGTERM no nó de menor afinidade + wipe + cold bootstrap) permanece
    válida apenas para versões sem o fix do D10.
 
+### Cenário F: Volta do líder por afinidade com `affinityHandbackMode` (D11)
+
+Com o handback orquestrado ligado (default no Cardinal), a volta do líder preferido NÃO usa os gates
+de watermark — segue um handover stop-the-world. Assinatura saudável nos logs:
+`Affinity handback: requesting orchestrated handover` (candidato) → `PREP for candidate` /
+`granting handover to ... at W=` (incumbente) → `GRANT received ... installing full snapshot` →
+`cutover complete ... asserting leadership` → `completed cutover ... demoting` (incumbente). O offset
+de linhagem (`counter-scale desync symptom`) **desaparece** após o handback (cutover `SET` zera).
+
+1. **Não intervir** durante o handover (segundos a poucos minutos para snapshot multi-GB; bounded por
+   `handoverMaxDuration`). O consumo do Kafka pausa no incumbente e retoma no novo líder após o
+   drain-gate; o backlog drena depois (lag, não perda — o Kafka bufferiza).
+2. Se aparecer `handover ... aborted`/`exceeded max duration`: o incumbente **retém** a liderança e
+   retoma o consumo (seguro). Investigar por que o candidato não completou (transfer travado, snapshot
+   muito grande vs `handoverMaxDuration`, candidato instável). O backstop de dual-leader (D10c)
+   continua valendo para qualquer aborto sujo.
+3. Para desligar o handback e voltar ao caminho legado (D10b): `affinityHandbackMode=false` (a config
+   reativa `leaderPauseOnReclaim`).
+
 ---
 
 ## Validação Pós-Estabilização
