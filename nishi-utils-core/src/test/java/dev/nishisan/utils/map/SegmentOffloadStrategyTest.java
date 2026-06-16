@@ -326,6 +326,116 @@ class SegmentOffloadStrategyTest {
     }
 
     @Test
+    void hintFileWrittenOnCloseAndUsedOnReopen() throws Exception {
+        String name = "hint";
+        try (SegmentOffloadStrategy<String, String> s = open(name, 4)) {
+            for (int i = 0; i < 100; i++) {
+                s.put("k" + i, "v" + i);
+            }
+        }
+        // A hint file must exist after a clean close
+        try (Stream<Path> st = Files.list(segmentDir(name))) {
+            assertTrue(st.anyMatch(p -> p.getFileName().toString().endsWith(".hint")),
+                    "expected a .hint file after close");
+        }
+        // Reopen uses the hint
+        try (SegmentOffloadStrategy<String, String> s = open(name, 4)) {
+            assertEquals(100, s.size());
+            assertEquals("v50", s.get("k50"));
+        }
+        // Delete hints → must fall back to full log replay and stay correct
+        try (Stream<Path> st = Files.list(segmentDir(name))) {
+            for (Path p : st.filter(x -> x.getFileName().toString().endsWith(".hint")).toList()) {
+                Files.delete(p);
+            }
+        }
+        try (SegmentOffloadStrategy<String, String> s = open(name, 4)) {
+            assertEquals(100, s.size());
+            assertEquals("v99", s.get("k99"));
+        }
+    }
+
+    @Test
+    void incrementalRecoveryPicksUpDeltaAfterStaleHint() throws Exception {
+        String name = "incremental";
+        try (SegmentOffloadStrategy<String, String> s = open(name, 4)) {
+            for (int i = 0; i < 100; i++) {
+                s.put("k" + i, "v" + i);
+            }
+        }
+        // Reopen (loads hint), append more WITHOUT closing — simulates a crash
+        SegmentOffloadStrategy<String, String> crashed = open(name, 4);
+        crashed.put("late-1", "L1");
+        crashed.put("late-2", "L2");
+        crashed.remove("k0");
+        // Do NOT close 'crashed' (no fresh hint). A new instance must replay the delta.
+        try (SegmentOffloadStrategy<String, String> s = open(name, 4)) {
+            assertEquals("L1", s.get("late-1"));
+            assertEquals("L2", s.get("late-2"));
+            assertNull(s.get("k0"));
+            assertEquals(101, s.size()); // 100 - k0 + late-1 + late-2
+        }
+        crashed.close();
+    }
+
+    @Test
+    void manualCompactionReclaimsSpace() throws Exception {
+        String name = "compact";
+        String big = "X".repeat(2_000);
+        Path log = tempDir.resolve(name).resolve("segment-offload").resolve("seg-000.log");
+        // threshold 1.0 disables auto-compaction; cache disabled to force disk reads
+        try (SegmentOffloadStrategy<String, String> s =
+                new SegmentOffloadStrategy<>(tempDir, name, 1, false, 0, 1.0, false)) {
+            for (int i = 0; i < 100; i++) {
+                s.put("k", big + i); // 99 dead versions of the same key
+            }
+            for (int i = 0; i < 50; i++) {
+                s.put("live" + i, big);
+            }
+            long before = Files.size(log);
+            s.compactNow(0);
+            long after = Files.size(log);
+            assertTrue(after < before, "after=" + after + " should be < before=" + before);
+            assertEquals(big + 99, s.get("k"));
+            assertEquals(big, s.get("live0"));
+            assertEquals(51, s.size());
+        }
+        // Post-compaction data must survive a restart (compaction rewrote the hint)
+        try (SegmentOffloadStrategy<String, String> s =
+                new SegmentOffloadStrategy<>(tempDir, name, 1, false, 0, 1.0, false)) {
+            assertEquals(big + 99, s.get("k"));
+            assertEquals(51, s.size());
+        }
+    }
+
+    @Test
+    void automaticCompactionKeepsLogBounded() throws Exception {
+        String name = "auto-compact";
+        String big = "Y".repeat(4_000);
+        Path log = tempDir.resolve(name).resolve("segment-offload").resolve("seg-000.log");
+        try (SegmentOffloadStrategy<String, String> s =
+                new SegmentOffloadStrategy<>(tempDir, name, 1, false, 0, 0.5, false)) {
+            // ~4 MB of writes over only 10 live keys → mostly garbage
+            for (int round = 0; round < 100; round++) {
+                for (int i = 0; i < 10; i++) {
+                    s.put("k" + i, big + round);
+                }
+            }
+            // Background compaction must keep the log far below the total written
+            long deadline = System.currentTimeMillis() + 10_000;
+            while (System.currentTimeMillis() < deadline && Files.size(log) > 1_000_000) {
+                Thread.sleep(25);
+            }
+            assertTrue(Files.size(log) < 1_000_000,
+                    "expected auto-compaction to bound the log, size=" + Files.size(log));
+            for (int i = 0; i < 10; i++) {
+                assertEquals(big + 99, s.get("k" + i));
+            }
+            assertEquals(10, s.size());
+        }
+    }
+
+    @Test
     void worksThroughNMapApi() throws Exception {
         NMapConfig cfg = NMapConfig.builder()
                 .mode(NMapPersistenceMode.DISABLED)

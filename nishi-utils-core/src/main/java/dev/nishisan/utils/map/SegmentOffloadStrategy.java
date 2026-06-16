@@ -21,6 +21,8 @@ import dev.nishisan.utils.ngrid.cluster.transport.codec.Lz4FrameCompressor;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
@@ -28,13 +30,16 @@ import java.io.Serializable;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.AbstractMap;
 import java.util.AbstractSet;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -42,10 +47,15 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.BiConsumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.util.zip.CRC32;
 
 /**
  * Log-structured (Bitcask-style) disk offloading strategy for {@link NMap}.
@@ -78,6 +88,17 @@ public final class SegmentOffloadStrategy<K, V>
 
     private static final String OFFLOAD_DIR = "segment-offload";
     private static final String LOG_SUFFIX = ".log";
+    private static final String HINT_SUFFIX = ".hint";
+    private static final String TEMP_SUFFIX = ".tmp";
+    private static final String COMPACTING_SUFFIX = ".compacting";
+
+    /** Hint file magic — ASCII "NMSH". */
+    private static final int HINT_MAGIC = 0x4E4D5348;
+    private static final byte HINT_VERSION = 1;
+    private static final int HINT_HEADER_LEN = 4 + 1 + 8 + 4; // magic + version + coveredOffset + count
+
+    /** Segments below this size are never compacted (avoids churn on tiny logs). */
+    private static final long MIN_COMPACT_BYTES = 64 * 1024;
 
     /** Minimum number of segments. */
     static final int MIN_SEGMENTS = 1;
@@ -94,6 +115,7 @@ public final class SegmentOffloadStrategy<K, V>
     /** Global key index: key → location of its latest record. */
     private final ConcurrentHashMap<K, EntryLocation> index = new ConcurrentHashMap<>();
     private final List<Segment> segments;
+    private final ExecutorService compactionExecutor;
 
     /** Location of a record within a segment log. */
     private record EntryLocation(int segmentId, long offset, int recordLength) {
@@ -152,6 +174,11 @@ public final class SegmentOffloadStrategy<K, V>
         this.fsyncOnWrite = fsyncOnWrite;
         this.maxPerSegment = hotCacheMaxEntries == 0 ? 0 : Math.max(1, hotCacheMaxEntries / numSegments);
         this.segments = new ArrayList<>(numSegments);
+        this.compactionExecutor = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "nmap-segment-compaction");
+            t.setDaemon(true);
+            return t;
+        });
         try {
             Files.createDirectories(offloadDir);
             for (int i = 0; i < numSegments; i++) {
@@ -370,13 +397,78 @@ public final class SegmentOffloadStrategy<K, V>
 
     @Override
     public void close() {
+        shutdownCompaction();
         lockAll();
         try {
+            Map<Integer, Map<K, EntryLocation>> bySegment = groupIndexBySegment();
             for (Segment seg : segments) {
+                try {
+                    seg.writeHint(bySegment.getOrDefault(seg.id, Map.of()));
+                } catch (IOException e) {
+                    LOGGER.log(Level.WARNING, "Failed to write hint on close for " + seg.logPath, e);
+                }
                 seg.closeSegment();
             }
         } finally {
             unlockAll();
+        }
+    }
+
+    private void shutdownCompaction() {
+        compactionExecutor.shutdown();
+        try {
+            if (!compactionExecutor.awaitTermination(30, TimeUnit.SECONDS)) {
+                compactionExecutor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            compactionExecutor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /** Groups the current index entries by their segment id. */
+    private Map<Integer, Map<K, EntryLocation>> groupIndexBySegment() {
+        Map<Integer, Map<K, EntryLocation>> bySegment = new HashMap<>();
+        for (Map.Entry<K, EntryLocation> e : index.entrySet()) {
+            bySegment.computeIfAbsent(e.getValue().segmentId(), k -> new HashMap<>())
+                    .put(e.getKey(), e.getValue());
+        }
+        return bySegment;
+    }
+
+    /**
+     * Schedules a background compaction of the segment when its dead-bytes ratio
+     * crosses the configured threshold. Caller holds the segment's write lock.
+     */
+    private void maybeCompact(Segment seg) {
+        if (seg.compacting || seg.appendOffset < MIN_COMPACT_BYTES) {
+            return;
+        }
+        if (seg.deadBytes < compactionThreshold * seg.appendOffset) {
+            return;
+        }
+        seg.compacting = true;
+        try {
+            compactionExecutor.execute(seg::compact);
+        } catch (RejectedExecutionException e) {
+            seg.compacting = false; // executor shutting down — skip
+        }
+    }
+
+    /**
+     * Compacts the given segment synchronously. Package-private for tests.
+     *
+     * @param segmentId the segment index
+     */
+    void compactNow(int segmentId) {
+        segments.get(segmentId).compact();
+    }
+
+    private static void atomicMove(Path src, Path dst) throws IOException {
+        try {
+            Files.move(src, dst, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } catch (AtomicMoveNotSupportedException e) {
+            Files.move(src, dst, StandardCopyOption.REPLACE_EXISTING);
         }
     }
 
@@ -444,15 +536,18 @@ public final class SegmentOffloadStrategy<K, V>
     private final class Segment {
         private final int id;
         private final Path logPath;
+        private final Path hintPath;
         private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
         private final LinkedHashMap<K, V> hotCache;
         private FileChannel channel;
         private long appendOffset;
         private long deadBytes;
+        private volatile boolean compacting;
 
         Segment(int id) {
             this.id = id;
             this.logPath = offloadDir.resolve(String.format("seg-%03d%s", id, LOG_SUFFIX));
+            this.hintPath = offloadDir.resolve(String.format("seg-%03d%s", id, HINT_SUFFIX));
             this.hotCache = newHotCache(maxPerSegment);
         }
 
@@ -460,7 +555,15 @@ public final class SegmentOffloadStrategy<K, V>
             this.channel = FileChannel.open(logPath,
                     StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE);
             long size = channel.size();
-            long offset = 0;
+            long[] hint = loadHint(size);
+            long offset;
+            if (hint != null) {
+                offset = hint[0];
+                deadBytes = hint[0] - hint[1]; // coveredOffset - liveBytes
+            } else {
+                offset = 0;
+                deadBytes = 0;
+            }
             while (true) {
                 SegmentRecord.Decoded decoded = SegmentRecord.readAt(channel, offset, size);
                 if (decoded == null) {
@@ -519,6 +622,7 @@ public final class SegmentOffloadStrategy<K, V>
                 if (old != null) {
                     deadBytes += old.recordLength();
                 }
+                maybeCompact(this);
             } catch (IOException e) {
                 LOGGER.log(Level.WARNING, "Failed to append record to " + logPath, e);
                 throw new UncheckedIOException("Failed to append record", e);
@@ -537,6 +641,7 @@ public final class SegmentOffloadStrategy<K, V>
                 appendOffset += record.length;
                 index.remove(key);
                 deadBytes += current.recordLength() + record.length;
+                maybeCompact(this);
             } catch (IOException e) {
                 LOGGER.log(Level.WARNING, "Failed to append tombstone to " + logPath, e);
                 throw new UncheckedIOException("Failed to append tombstone", e);
@@ -600,10 +705,16 @@ public final class SegmentOffloadStrategy<K, V>
             hotCache.clear();
             deadBytes = 0;
             appendOffset = 0;
+            compacting = false;
             try {
                 channel.truncate(0);
             } catch (IOException e) {
                 LOGGER.log(Level.WARNING, "Failed to truncate segment " + logPath, e);
+            }
+            try {
+                Files.deleteIfExists(hintPath);
+            } catch (IOException e) {
+                LOGGER.log(Level.WARNING, "Failed to delete hint " + hintPath, e);
             }
         }
 
@@ -615,6 +726,167 @@ public final class SegmentOffloadStrategy<K, V>
                 }
             } catch (IOException e) {
                 LOGGER.log(Level.WARNING, "Failed to close segment " + logPath, e);
+            }
+        }
+
+        /**
+         * Rewrites the segment keeping only the live records, reclaiming the
+         * space taken by superseded entries and tombstones. Holds the segment's
+         * write lock for the whole operation: other segments are unaffected, and
+         * the swap is atomic (temp file + {@code ATOMIC_MOVE}). On any I/O error
+         * the original segment is left intact.
+         */
+        void compact() {
+            lock.writeLock().lock();
+            try {
+                doCompact();
+            } catch (IOException e) {
+                LOGGER.log(Level.WARNING, "Compaction failed for " + logPath, e);
+            } finally {
+                compacting = false;
+                lock.writeLock().unlock();
+            }
+        }
+
+        private void doCompact() throws IOException {
+            if (appendOffset == 0 || deadBytes == 0) {
+                return;
+            }
+            Path tempPath = offloadDir.resolve(logPath.getFileName().toString() + COMPACTING_SUFFIX);
+            Map<K, EntryLocation> live = new HashMap<>();
+            long tempOffset = 0;
+            FileChannel temp = FileChannel.open(tempPath, StandardOpenOption.CREATE,
+                    StandardOpenOption.WRITE, StandardOpenOption.READ, StandardOpenOption.TRUNCATE_EXISTING);
+            try {
+                for (Map.Entry<K, EntryLocation> e : index.entrySet()) {
+                    EntryLocation loc = e.getValue();
+                    if (loc.segmentId() != id) {
+                        continue;
+                    }
+                    ByteBuffer buf = ByteBuffer.allocate(loc.recordLength());
+                    if (!readFully(channel, buf, loc.offset())) {
+                        continue;
+                    }
+                    buf.flip();
+                    writeFully(temp, buf, tempOffset);
+                    live.put(e.getKey(), new EntryLocation(id, tempOffset, loc.recordLength()));
+                    tempOffset += loc.recordLength();
+                }
+                if (fsyncOnWrite) {
+                    temp.force(true);
+                }
+            } finally {
+                temp.close();
+            }
+            atomicMove(tempPath, logPath);
+            channel.close();
+            channel = FileChannel.open(logPath, StandardOpenOption.READ, StandardOpenOption.WRITE);
+            appendOffset = tempOffset;
+            deadBytes = 0;
+            for (Map.Entry<K, EntryLocation> e : live.entrySet()) {
+                index.put(e.getKey(), e.getValue());
+            }
+            writeHint(live);
+        }
+
+        /**
+         * Writes the hint (index snapshot) file for fast startup. {@code live}
+         * maps every live key of this segment to its current location. Caller
+         * holds the segment's write lock.
+         */
+        void writeHint(Map<K, EntryLocation> live) throws IOException {
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            DataOutputStream out = new DataOutputStream(baos);
+            out.writeInt(HINT_MAGIC);
+            out.writeByte(HINT_VERSION);
+            out.writeLong(appendOffset);
+            out.writeInt(live.size());
+            for (Map.Entry<K, EntryLocation> e : live.entrySet()) {
+                byte[] keyBytes = serialize(e.getKey());
+                out.writeInt(keyBytes.length);
+                out.write(keyBytes);
+                out.writeLong(e.getValue().offset());
+                out.writeInt(e.getValue().recordLength());
+            }
+            out.flush();
+            byte[] payload = baos.toByteArray();
+            CRC32 crc = new CRC32();
+            crc.update(payload);
+            ByteBuffer full = ByteBuffer.allocate(payload.length + 4);
+            full.put(payload);
+            full.putInt((int) crc.getValue());
+            full.flip();
+            Path tempHint = offloadDir.resolve(hintPath.getFileName().toString() + TEMP_SUFFIX);
+            try (FileChannel hc = FileChannel.open(tempHint, StandardOpenOption.CREATE,
+                    StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
+                while (full.hasRemaining()) {
+                    hc.write(full);
+                }
+                if (fsyncOnWrite) {
+                    hc.force(true);
+                }
+            }
+            atomicMove(tempHint, hintPath);
+        }
+
+        /**
+         * Loads the hint file into the global index. Returns
+         * {@code [coveredOffset, liveBytes]} on success, or {@code null} if the
+         * hint is absent, corrupt, or inconsistent with the current log size (in
+         * which case the global index is left untouched and the caller falls back
+         * to a full log replay).
+         */
+        long[] loadHint(long fileSize) {
+            if (!Files.exists(hintPath)) {
+                return null;
+            }
+            try {
+                byte[] all = Files.readAllBytes(hintPath);
+                if (all.length < HINT_HEADER_LEN + 4) {
+                    return null;
+                }
+                CRC32 crc = new CRC32();
+                crc.update(all, 0, all.length - 4);
+                int storedCrc = ByteBuffer.wrap(all, all.length - 4, 4).getInt();
+                if ((int) crc.getValue() != storedCrc) {
+                    return null;
+                }
+                DataInputStream in = new DataInputStream(new ByteArrayInputStream(all, 0, all.length - 4));
+                if (in.readInt() != HINT_MAGIC || in.readByte() != HINT_VERSION) {
+                    return null;
+                }
+                long coveredOffset = in.readLong();
+                if (coveredOffset < 0 || coveredOffset > fileSize) {
+                    return null;
+                }
+                int count = in.readInt();
+                if (count < 0) {
+                    return null;
+                }
+                Map<K, EntryLocation> loaded = new HashMap<>(Math.max(16, count * 2));
+                long liveBytes = 0;
+                for (int i = 0; i < count; i++) {
+                    int keyLen = in.readInt();
+                    if (keyLen <= 0 || keyLen > SegmentRecord.MAX_FIELD_LEN) {
+                        return null;
+                    }
+                    byte[] keyBytes = new byte[keyLen];
+                    in.readFully(keyBytes);
+                    long off = in.readLong();
+                    int recordLength = in.readInt();
+                    if (off < 0 || recordLength <= 0 || off + recordLength > coveredOffset) {
+                        return null;
+                    }
+                    @SuppressWarnings("unchecked")
+                    K key = (K) deserialize(keyBytes);
+                    loaded.put(key, new EntryLocation(id, off, recordLength));
+                    liveBytes += recordLength;
+                }
+                index.putAll(loaded);
+                return new long[]{coveredOffset, liveBytes};
+            } catch (IOException | ClassNotFoundException e) {
+                LOGGER.log(Level.WARNING, "Ignoring unreadable hint " + hintPath + "; replaying log", e);
+                return null;
             }
         }
     }
