@@ -1,0 +1,63 @@
+@startuml nmap_segment_offload
+!theme plain
+
+title NMap — Offload Log-structured (SegmentOffloadStrategy)
+skinparam componentStyle rectangle
+skinparam backgroundColor white
+skinparam defaultFontName Inter
+
+package "dev.nishisan.utils.map" as pkg_map {
+
+    component "NMap<K,V>" as NMap <<Facade>> #LightBlue {
+        portin " put / get / remove " as api
+    }
+
+    component "NMapConfig" as Config <<Configuration>> {
+        portin " offloadMode = SEGMENT " as mode
+    }
+
+    component "SegmentOffloadStrategy<K,V>" as Strategy <<Strategy>> #LightGreen {
+        portin " get / put / remove " as sapi
+    }
+
+    component "Índice global (heap)\nchave -> (segmento, offset, tamanho)" as Index <<Index>> #LightYellow
+
+    component "Hot-cache LRU\n(por segmento, com teto)" as Cache <<Cache>>
+
+    component "Compaction worker\n(daemon, 1 thread)" as Compactor <<Background>> #Wheat
+}
+
+package "dev.nishisan.utils.ngrid...codec" as pkg_codec #WhiteSmoke {
+    component "Lz4FrameCompressor" as Lz4 <<Util>>
+}
+
+' --- Relacoes ---
+NMap --> Config : le knobs
+NMap --> Strategy : buildStrategy(SEGMENT)
+Strategy --> Index : roteia por SHA-1 % numSegments
+Strategy --> Cache : hits / warm-up
+Strategy ..> Lz4 : compressionEnabled (value)
+Compactor --> Strategy : GC quando deadBytes/total >= threshold
+
+' --- Storage (segment-offload/) ---
+database "segment-offload/" as FS {
+    file "seg-000.log\n(append-only)" as log0
+    file "seg-000.hint\n(indice persistido)" as hint0
+    file "seg-001.log" as log1
+    file "seg-001.hint" as hint1
+}
+
+note bottom of FS
+  Registro: magic | version | flags(LZ4) | type(PUT/TOMBSTONE)
+           | keyLen | valLen | key | value | CRC32
+  Total de arquivos = 2 x numSegments (1..128)
+end note
+
+Strategy --> log0 : append (PUT/TOMBSTONE)
+Strategy --> log1 : append
+Strategy --> hint0 : grava no close / pos-compactacao
+Strategy --> hint1 : grava no close / pos-compactacao
+Index <-- hint0 : recovery (hint + replay incremental)
+Compactor --> log0 : reescreve vivos (temp + ATOMIC_MOVE)
+
+@enduml
