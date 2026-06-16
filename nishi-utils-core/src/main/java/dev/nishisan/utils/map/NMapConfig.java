@@ -31,6 +31,11 @@ public final class NMapConfig {
     private final Duration batchTimeout;
     private final NMapHealthListener healthListener;
     private final NMapOffloadStrategyFactory offloadStrategyFactory;
+    private final OffloadMode offloadMode;
+    private final int hotCacheMaxEntries;
+    private final EvictionPolicy evictionPolicy;
+    private final int shardDepth;
+    private final int shardWidth;
 
     private NMapConfig(Builder builder) {
         this.mode = Objects.requireNonNull(builder.mode, "mode");
@@ -40,6 +45,11 @@ public final class NMapConfig {
         this.batchTimeout = Objects.requireNonNull(builder.batchTimeout, "batchTimeout");
         this.healthListener = builder.healthListener;
         this.offloadStrategyFactory = builder.offloadStrategyFactory;
+        this.offloadMode = Objects.requireNonNull(builder.offloadMode, "offloadMode");
+        this.hotCacheMaxEntries = builder.hotCacheMaxEntries;
+        this.evictionPolicy = Objects.requireNonNull(builder.evictionPolicy, "evictionPolicy");
+        this.shardDepth = builder.shardDepth;
+        this.shardWidth = builder.shardWidth;
         validate();
     }
 
@@ -108,11 +118,42 @@ public final class NMapConfig {
     }
 
     /**
-     * Returns the offload strategy factory, or {@code null} if none configured
-     * (default: in-memory).
+     * Returns the offload strategy factory, or {@code null} if none configured.
+     * When set, it takes precedence over {@link #offloadMode()}.
      */
     public NMapOffloadStrategyFactory offloadStrategyFactory() {
         return offloadStrategyFactory;
+    }
+
+    /**
+     * Returns the declarative offload mode (default {@link OffloadMode#IN_MEMORY}).
+     * Ignored when an {@link #offloadStrategyFactory()} is set.
+     */
+    public OffloadMode offloadMode() {
+        return offloadMode;
+    }
+
+    /**
+     * Returns the upper bound on the in-memory hot cache for disk-backed
+     * strategies ({@code 0} disables caching).
+     */
+    public int hotCacheMaxEntries() {
+        return hotCacheMaxEntries;
+    }
+
+    /** Returns the eviction policy used by the {@link OffloadMode#HYBRID} mode. */
+    public EvictionPolicy evictionPolicy() {
+        return evictionPolicy;
+    }
+
+    /** Returns the shard depth (directory levels) for {@link OffloadMode#DISK}. */
+    public int shardDepth() {
+        return shardDepth;
+    }
+
+    /** Returns the shard width (hex chars per level) for {@link OffloadMode#DISK}. */
+    public int shardWidth() {
+        return shardWidth;
     }
 
     private void validate() {
@@ -128,6 +169,18 @@ public final class NMapConfig {
         if (batchTimeout.isNegative() || batchTimeout.isZero()) {
             throw new IllegalArgumentException("batchTimeout must be > 0");
         }
+        if (hotCacheMaxEntries < 0) {
+            throw new IllegalArgumentException("hotCacheMaxEntries must be >= 0");
+        }
+        if (shardWidth < 1) {
+            throw new IllegalArgumentException("shardWidth must be >= 1");
+        }
+        if (shardDepth < 0) {
+            throw new IllegalArgumentException("shardDepth must be >= 0");
+        }
+        if (shardDepth * shardWidth > 40) {
+            throw new IllegalArgumentException("shardDepth * shardWidth must be <= 40 (SHA-1 hex length)");
+        }
     }
 
     /**
@@ -142,6 +195,11 @@ public final class NMapConfig {
         private NMapHealthListener healthListener = (name, type, cause) -> {
         };
         private NMapOffloadStrategyFactory offloadStrategyFactory;
+        private OffloadMode offloadMode = OffloadMode.IN_MEMORY;
+        private int hotCacheMaxEntries = 10_000;
+        private EvictionPolicy evictionPolicy = EvictionPolicy.LRU;
+        private int shardDepth = OffloadLayout.DEFAULT_SHARD_DEPTH;
+        private int shardWidth = OffloadLayout.DEFAULT_SHARD_WIDTH;
 
         private Builder() {
         }
@@ -189,6 +247,45 @@ public final class NMapConfig {
          */
         public Builder offloadStrategyFactory(NMapOffloadStrategyFactory factory) {
             this.offloadStrategyFactory = factory;
+            return this;
+        }
+
+        /**
+         * Selects the declarative offload backend. When set (and no
+         * {@link #offloadStrategyFactory(NMapOffloadStrategyFactory)} is
+         * provided), {@link NMap} assembles the matching strategy from the
+         * remaining knobs. Default: {@link OffloadMode#IN_MEMORY}.
+         */
+        public Builder offloadMode(OffloadMode mode) {
+            this.offloadMode = Objects.requireNonNull(mode, "offloadMode");
+            return this;
+        }
+
+        /**
+         * Sets the upper bound on the in-memory hot cache for disk-backed
+         * strategies (also the {@code maxInMemoryEntries} of
+         * {@link OffloadMode#HYBRID}). Use {@code 0} to disable caching.
+         * Default: 10,000.
+         */
+        public Builder hotCacheMaxEntries(int max) {
+            this.hotCacheMaxEntries = max;
+            return this;
+        }
+
+        /** Sets the eviction policy for {@link OffloadMode#HYBRID}. Default: LRU. */
+        public Builder evictionPolicy(EvictionPolicy policy) {
+            this.evictionPolicy = Objects.requireNonNull(policy, "evictionPolicy");
+            return this;
+        }
+
+        /**
+         * Sets the shard fan-out for {@link OffloadMode#DISK}: {@code shardDepth}
+         * directory levels of {@code shardWidth} hex characters each. Must
+         * satisfy {@code shardDepth * shardWidth <= 40}. Default: 2 / 2.
+         */
+        public Builder shardFanOut(int shardDepth, int shardWidth) {
+            this.shardDepth = shardDepth;
+            this.shardWidth = shardWidth;
             return this;
         }
 

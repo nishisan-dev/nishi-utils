@@ -355,6 +355,41 @@ class NMapOffloadTest {
         }
     }
 
+    /**
+     * Com um hot-cache pequeno, entradas além do teto ainda devem ser legíveis
+     * (warm-up a partir do disco), provando que o cache é limitado mas não
+     * perde dados.
+     */
+    @Test
+    void diskOffloadBoundedHotCacheStillServesAllEntries() throws Exception {
+        try (DiskOffloadStrategy<String, String> strategy =
+                new DiskOffloadStrategy<>(tempDir, "bounded-cache", 2, 2, 32)) {
+            for (int i = 0; i < 500; i++) {
+                strategy.put("key-" + i, "val-" + i);
+            }
+            assertEquals(500, strategy.size());
+            for (int i = 0; i < 500; i++) {
+                assertEquals("val-" + i, strategy.get("key-" + i));
+            }
+        }
+    }
+
+    /**
+     * Com {@code hotCacheMaxEntries=0} o cache é desabilitado: leituras sempre
+     * vão ao disco, mas os dados continuam corretos.
+     */
+    @Test
+    void diskOffloadWithCacheDisabled() throws Exception {
+        try (DiskOffloadStrategy<String, String> strategy =
+                new DiskOffloadStrategy<>(tempDir, "no-cache", 2, 2, 0)) {
+            strategy.put("a", "1");
+            strategy.put("b", "2");
+            assertEquals("1", strategy.get("a"));
+            assertEquals("2", strategy.get("b"));
+            assertEquals(2, strategy.size());
+        }
+    }
+
     @Test
     void diskOffloadShouldRejectInvalidFanOut() {
         // shardWidth must be >= 1
