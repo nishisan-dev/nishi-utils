@@ -34,11 +34,75 @@ import java.util.stream.Stream;
 
 /**
  * Internal helpers for mapping offloaded entries to disk paths.
+ * <p>
+ * The directory fan-out is configurable: a layout produces sharded paths with
+ * {@code shardDepth} directory levels, each consuming {@code shardWidth}
+ * hexadecimal characters of the key hash. The historical layout
+ * ({@code hash[0:2]/hash[2:4]/hash.dat}) corresponds to {@link #defaults()}
+ * ({@code shardDepth=2}, {@code shardWidth=2}).
+ * <p>
+ * Hashing ({@link #keyHash(Object)}) and flat (legacy) paths are independent of
+ * the fan-out and remain static. Sharded-path construction depends on the
+ * configured fan-out and is therefore instance scoped.
  */
 final class OffloadLayout {
-    private static final int SHARD_CHARS = 2;
 
-    private OffloadLayout() {
+    /** Historical shard depth (number of directory levels). */
+    static final int DEFAULT_SHARD_DEPTH = 2;
+    /** Historical shard width (hex characters per directory level). */
+    static final int DEFAULT_SHARD_WIDTH = 2;
+    /** Length, in hex characters, of the SHA-1 key hash. */
+    private static final int HASH_HEX_LENGTH = 40;
+
+    private final int shardDepth;
+    private final int shardWidth;
+
+    private OffloadLayout(int shardDepth, int shardWidth) {
+        if (shardDepth < 0) {
+            throw new IllegalArgumentException("shardDepth must be >= 0");
+        }
+        if (shardWidth < 1) {
+            throw new IllegalArgumentException("shardWidth must be >= 1");
+        }
+        if (shardDepth * shardWidth > HASH_HEX_LENGTH) {
+            throw new IllegalArgumentException(
+                    "shardDepth * shardWidth must be <= " + HASH_HEX_LENGTH
+                            + " (got " + (shardDepth * shardWidth) + ")");
+        }
+        this.shardDepth = shardDepth;
+        this.shardWidth = shardWidth;
+    }
+
+    /**
+     * Creates a layout with the given fan-out.
+     *
+     * @param shardDepth number of directory levels (0 = flat layout)
+     * @param shardWidth hex characters consumed per directory level
+     * @return the layout
+     */
+    static OffloadLayout of(int shardDepth, int shardWidth) {
+        return new OffloadLayout(shardDepth, shardWidth);
+    }
+
+    /**
+     * Returns the historical layout ({@code shardDepth=2}, {@code shardWidth=2}),
+     * preserving compatibility with data written before the fan-out became
+     * configurable.
+     *
+     * @return the default layout
+     */
+    static OffloadLayout defaults() {
+        return new OffloadLayout(DEFAULT_SHARD_DEPTH, DEFAULT_SHARD_WIDTH);
+    }
+
+    /** Returns the configured shard depth. */
+    int shardDepth() {
+        return shardDepth;
+    }
+
+    /** Returns the configured shard width. */
+    int shardWidth() {
+        return shardWidth;
     }
 
     static String keyHash(Object key) {
@@ -61,14 +125,16 @@ final class OffloadLayout {
         return rootDir.resolve(keyHash + entrySuffix);
     }
 
-    static Path shardedPath(Path rootDir, String keyHash, String entrySuffix) {
+    Path shardedPath(Path rootDir, String keyHash, String entrySuffix) {
         Objects.requireNonNull(rootDir, "rootDir");
         Objects.requireNonNull(keyHash, "keyHash");
         Objects.requireNonNull(entrySuffix, "entrySuffix");
-        return rootDir
-                .resolve(keyHash.substring(0, SHARD_CHARS))
-                .resolve(keyHash.substring(SHARD_CHARS, SHARD_CHARS * 2))
-                .resolve(keyHash + entrySuffix);
+        Path dir = rootDir;
+        for (int level = 0; level < shardDepth; level++) {
+            int start = level * shardWidth;
+            dir = dir.resolve(keyHash.substring(start, start + shardWidth));
+        }
+        return dir.resolve(keyHash + entrySuffix);
     }
 
     static boolean isSharded(Path rootDir, Path candidate) {
@@ -88,7 +154,7 @@ final class OffloadLayout {
         return candidateSharded && !currentSharded;
     }
 
-    static Path preferredExistingPath(Path rootDir, String keyHash, String entrySuffix) {
+    Path preferredExistingPath(Path rootDir, String keyHash, String entrySuffix) {
         Path sharded = shardedPath(rootDir, keyHash, entrySuffix);
         if (Files.exists(sharded)) {
             return sharded;

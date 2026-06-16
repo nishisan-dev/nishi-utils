@@ -101,6 +101,7 @@ public final class HybridOffloadStrategy<K, V>
     private static final int CONCURRENCY_LEVEL = 16;
 
     private final Path offloadDir;
+    private final OffloadLayout layout = OffloadLayout.defaults();
     private final int maxInMemoryEntries;
     private final int maxPerStripe;
     private final EvictionPolicy evictionPolicy;
@@ -596,7 +597,7 @@ public final class HybridOffloadStrategy<K, V>
     }
 
     private Path pathForKey(String keyHash) {
-        return OffloadLayout.shardedPath(offloadDir, keyHash, ENTRY_SUFFIX);
+        return layout.shardedPath(offloadDir, keyHash, ENTRY_SUFFIX);
     }
 
     private Path legacyPathForKey(String keyHash) {
@@ -656,7 +657,7 @@ public final class HybridOffloadStrategy<K, V>
         if (indexedPath != null && Files.exists(indexedPath)) {
             return indexedPath;
         }
-        Path resolved = OffloadLayout.preferredExistingPath(offloadDir, keyHash(key), ENTRY_SUFFIX);
+        Path resolved = layout.preferredExistingPath(offloadDir, keyHash(key), ENTRY_SUFFIX);
         if (resolved != null) {
             coldIndex.put(key, resolved);
             return resolved;

@@ -83,20 +83,42 @@ public final class DiskOffloadStrategy<K, V>
     private static final int CONCURRENCY_LEVEL = 16;
 
     private final Path offloadDir;
+    private final OffloadLayout layout;
     private final ConcurrentHashMap<K, Path> index = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<K, SoftReference<V>> cache = new ConcurrentHashMap<>();
     private final ReentrantReadWriteLock[] locks;
 
     /**
-     * Creates a new disk offload strategy.
+     * Creates a new disk offload strategy with the default shard fan-out
+     * ({@value OffloadLayout#DEFAULT_SHARD_DEPTH} levels of
+     * {@value OffloadLayout#DEFAULT_SHARD_WIDTH} hex characters).
      *
      * @param baseDir the base directory for data storage
      * @param name    the map name (used as subdirectory)
      */
     public DiskOffloadStrategy(Path baseDir, String name) {
+        this(baseDir, name, OffloadLayout.DEFAULT_SHARD_DEPTH, OffloadLayout.DEFAULT_SHARD_WIDTH);
+    }
+
+    /**
+     * Creates a new disk offload strategy with a configurable shard fan-out.
+     * <p>
+     * The fan-out determines how key files are spread across subdirectories:
+     * {@code shardDepth} directory levels, each consuming {@code shardWidth}
+     * hexadecimal characters of the key hash. It must be fixed at map creation
+     * time — changing it for an already-populated directory orphans the
+     * previously written paths.
+     *
+     * @param baseDir    the base directory for data storage
+     * @param name       the map name (used as subdirectory)
+     * @param shardDepth number of directory levels (0 = flat layout)
+     * @param shardWidth hex characters consumed per directory level
+     */
+    public DiskOffloadStrategy(Path baseDir, String name, int shardDepth, int shardWidth) {
         Objects.requireNonNull(baseDir, "baseDir");
         Objects.requireNonNull(name, "name");
         this.offloadDir = baseDir.resolve(name).resolve(OFFLOAD_DIR);
+        this.layout = OffloadLayout.of(shardDepth, shardWidth);
         this.locks = new ReentrantReadWriteLock[CONCURRENCY_LEVEL];
         for (int i = 0; i < CONCURRENCY_LEVEL; i++) {
             locks[i] = new ReentrantReadWriteLock();
@@ -419,7 +441,7 @@ public final class DiskOffloadStrategy<K, V>
     }
 
     private Path pathForKey(String keyHash) {
-        return OffloadLayout.shardedPath(offloadDir, keyHash, ENTRY_SUFFIX);
+        return layout.shardedPath(offloadDir, keyHash, ENTRY_SUFFIX);
     }
 
     private Path legacyPathForKey(String keyHash) {
@@ -461,7 +483,7 @@ public final class DiskOffloadStrategy<K, V>
         if (indexedPath != null && Files.exists(indexedPath)) {
             return indexedPath;
         }
-        Path resolved = OffloadLayout.preferredExistingPath(offloadDir, keyHash(key), ENTRY_SUFFIX);
+        Path resolved = layout.preferredExistingPath(offloadDir, keyHash(key), ENTRY_SUFFIX);
         if (resolved != null) {
             index.put(key, resolved);
             return resolved;
