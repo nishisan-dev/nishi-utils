@@ -24,7 +24,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -433,6 +435,38 @@ class SegmentOffloadStrategyTest {
             }
             assertEquals(10, s.size());
         }
+    }
+
+    @Test
+    void entrySetYieldsOnlyLiveNonNullEntries() {
+        try (SegmentOffloadStrategy<String, String> s = open("entryset", 4)) {
+            s.put("a", "1");
+            s.put("b", "2");
+            s.put("c", "3");
+            s.remove("b");
+            Map<String, String> copy = new HashMap<>();
+            for (Map.Entry<String, String> e : s.entrySet()) {
+                org.junit.jupiter.api.Assertions.assertNotNull(e.getValue(), "entry value must not be null");
+                copy.put(e.getKey(), e.getValue());
+            }
+            assertEquals(Map.of("a", "1", "c", "3"), copy);
+        }
+    }
+
+    @Test
+    void orphanCompactingTempIsCleanedOnRecover() throws Exception {
+        String name = "orphan-temp";
+        try (SegmentOffloadStrategy<String, String> s = open(name, 2)) {
+            s.put("k", "v");
+        }
+        // Simulate a crash mid-compaction: a leftover .compacting file
+        Path orphan = segmentDir(name).resolve("seg-000.log.compacting");
+        Files.write(orphan, new byte[]{1, 2, 3});
+        assertTrue(Files.exists(orphan));
+        try (SegmentOffloadStrategy<String, String> s = open(name, 2)) {
+            assertEquals("v", s.get("k"));
+        }
+        assertFalse(Files.exists(orphan), "orphan .compacting must be removed on recover");
     }
 
     @Test

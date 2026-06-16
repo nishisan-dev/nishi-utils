@@ -186,8 +186,16 @@ public final class SegmentOffloadStrategy<K, V>
                 segment.recover();
                 segments.add(segment);
             }
-        } catch (IOException e) {
-            throw new UncheckedIOException("Failed to initialize segment offload directory", e);
+        } catch (IOException | RuntimeException e) {
+            // Avoid leaking channels/executor if a segment fails to recover
+            for (Segment seg : segments) {
+                seg.closeSegment();
+            }
+            compactionExecutor.shutdownNow();
+            if (e instanceof IOException io) {
+                throw new UncheckedIOException("Failed to initialize segment offload directory", io);
+            }
+            throw (RuntimeException) e;
         }
     }
 
@@ -297,16 +305,35 @@ public final class SegmentOffloadStrategy<K, V>
             @Override
             public Iterator<Map.Entry<K, V>> iterator() {
                 Iterator<K> keys = index.keySet().iterator();
+                // Look-ahead iterator that skips keys whose value resolved to null
+                // (concurrently removed), so it never emits a (key, null) entry.
                 return new Iterator<>() {
+                    private Map.Entry<K, V> nextEntry = advance();
+
+                    private Map.Entry<K, V> advance() {
+                        while (keys.hasNext()) {
+                            K key = keys.next();
+                            V value = get(key);
+                            if (value != null) {
+                                return new AbstractMap.SimpleImmutableEntry<>(key, value);
+                            }
+                        }
+                        return null;
+                    }
+
                     @Override
                     public boolean hasNext() {
-                        return keys.hasNext();
+                        return nextEntry != null;
                     }
 
                     @Override
                     public Map.Entry<K, V> next() {
-                        K key = keys.next();
-                        return new AbstractMap.SimpleImmutableEntry<>(key, get(key));
+                        if (nextEntry == null) {
+                            throw new java.util.NoSuchElementException();
+                        }
+                        Map.Entry<K, V> current = nextEntry;
+                        nextEntry = advance();
+                        return current;
                     }
                 };
             }
@@ -552,8 +579,20 @@ public final class SegmentOffloadStrategy<K, V>
         }
 
         void recover() throws IOException {
+            // Remove leftovers from a compaction/hint write interrupted by a crash
+            Files.deleteIfExists(offloadDir.resolve(logPath.getFileName().toString() + COMPACTING_SUFFIX));
+            Files.deleteIfExists(offloadDir.resolve(hintPath.getFileName().toString() + TEMP_SUFFIX));
             this.channel = FileChannel.open(logPath,
                     StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE);
+            try {
+                replay();
+            } catch (IOException | RuntimeException e) {
+                closeSegment(); // avoid leaking the channel if replay fails
+                throw e;
+            }
+        }
+
+        private void replay() throws IOException {
             long size = channel.size();
             long[] hint = loadHint(size);
             long offset;
@@ -567,6 +606,10 @@ public final class SegmentOffloadStrategy<K, V>
             while (true) {
                 SegmentRecord.Decoded decoded = SegmentRecord.readAt(channel, offset, size);
                 if (decoded == null) {
+                    if (offset < size) {
+                        LOGGER.log(Level.WARNING, "Discarding {0} corrupt/truncated tail byte(s) in {1}",
+                                new Object[]{size - offset, logPath});
+                    }
                     channel.truncate(offset);
                     break;
                 }
@@ -577,6 +620,7 @@ public final class SegmentOffloadStrategy<K, V>
                     key = k;
                 } catch (ClassNotFoundException | IOException e) {
                     LOGGER.log(Level.WARNING, "Skipping unreadable record in " + logPath, e);
+                    deadBytes += decoded.recordLength(); // reclaimable orphan bytes
                     offset += decoded.recordLength();
                     continue;
                 }
@@ -708,6 +752,9 @@ public final class SegmentOffloadStrategy<K, V>
             compacting = false;
             try {
                 channel.truncate(0);
+                if (fsyncOnWrite) {
+                    channel.force(true); // make the emptied log durable before dropping the hint
+                }
             } catch (IOException e) {
                 LOGGER.log(Level.WARNING, "Failed to truncate segment " + logPath, e);
             }
@@ -754,39 +801,51 @@ public final class SegmentOffloadStrategy<K, V>
             }
             Path tempPath = offloadDir.resolve(logPath.getFileName().toString() + COMPACTING_SUFFIX);
             Map<K, EntryLocation> live = new HashMap<>();
-            long tempOffset = 0;
-            FileChannel temp = FileChannel.open(tempPath, StandardOpenOption.CREATE,
-                    StandardOpenOption.WRITE, StandardOpenOption.READ, StandardOpenOption.TRUNCATE_EXISTING);
             try {
-                for (Map.Entry<K, EntryLocation> e : index.entrySet()) {
-                    EntryLocation loc = e.getValue();
-                    if (loc.segmentId() != id) {
-                        continue;
+                long tempOffset = 0;
+                FileChannel temp = FileChannel.open(tempPath, StandardOpenOption.CREATE,
+                        StandardOpenOption.WRITE, StandardOpenOption.READ, StandardOpenOption.TRUNCATE_EXISTING);
+                try {
+                    for (Map.Entry<K, EntryLocation> e : index.entrySet()) {
+                        EntryLocation loc = e.getValue();
+                        if (loc.segmentId() != id) {
+                            continue;
+                        }
+                        ByteBuffer buf = ByteBuffer.allocate(loc.recordLength());
+                        if (!readFully(channel, buf, loc.offset())) {
+                            continue;
+                        }
+                        buf.flip();
+                        writeFully(temp, buf, tempOffset);
+                        live.put(e.getKey(), new EntryLocation(id, tempOffset, loc.recordLength()));
+                        tempOffset += loc.recordLength();
                     }
-                    ByteBuffer buf = ByteBuffer.allocate(loc.recordLength());
-                    if (!readFully(channel, buf, loc.offset())) {
-                        continue;
-                    }
-                    buf.flip();
-                    writeFully(temp, buf, tempOffset);
-                    live.put(e.getKey(), new EntryLocation(id, tempOffset, loc.recordLength()));
-                    tempOffset += loc.recordLength();
-                }
-                if (fsyncOnWrite) {
+                    // Compaction is infrequent: make the compacted data durable before the swap.
                     temp.force(true);
+                } finally {
+                    temp.close();
                 }
-            } finally {
-                temp.close();
+                // Invalidate the stale hint BEFORE swapping the log, so a crash in the
+                // swap window leaves no hint and recovery safely replays the new log.
+                Files.deleteIfExists(hintPath);
+                atomicMove(tempPath, logPath);
+                // Reopen the new log BEFORE closing the old channel: if the open
+                // fails, the old channel still serves the (logically identical)
+                // pre-compaction data via its now-renamed inode, keeping the
+                // in-memory index consistent. A restart replays the new log.
+                FileChannel previous = channel;
+                channel = FileChannel.open(logPath, StandardOpenOption.READ, StandardOpenOption.WRITE);
+                appendOffset = tempOffset;
+                deadBytes = 0;
+                for (Map.Entry<K, EntryLocation> e : live.entrySet()) {
+                    index.put(e.getKey(), e.getValue());
+                }
+                previous.close();
+                writeHint(live);
+            } catch (IOException | RuntimeException e) {
+                Files.deleteIfExists(tempPath); // never leave an orphan .compacting file
+                throw e;
             }
-            atomicMove(tempPath, logPath);
-            channel.close();
-            channel = FileChannel.open(logPath, StandardOpenOption.READ, StandardOpenOption.WRITE);
-            appendOffset = tempOffset;
-            deadBytes = 0;
-            for (Map.Entry<K, EntryLocation> e : live.entrySet()) {
-                index.put(e.getKey(), e.getValue());
-            }
-            writeHint(live);
         }
 
         /**
@@ -795,6 +854,11 @@ public final class SegmentOffloadStrategy<K, V>
          * holds the segment's write lock.
          */
         void writeHint(Map<K, EntryLocation> live) throws IOException {
+            // The hint is renamed durably; force the log first so coveredOffset
+            // never references bytes that have not reached disk.
+            if (channel != null && channel.isOpen()) {
+                channel.force(false);
+            }
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
             DataOutputStream out = new DataOutputStream(baos);
             out.writeInt(HINT_MAGIC);

@@ -351,17 +351,35 @@ public final class DiskOffloadStrategy<K, V>
             @Override
             public Iterator<Map.Entry<K, V>> iterator() {
                 Iterator<K> keys = index.keySet().iterator();
+                // Look-ahead iterator that skips keys whose value resolved to null
+                // (concurrently removed), so it never emits a (key, null) entry.
                 return new Iterator<>() {
+                    private Map.Entry<K, V> nextEntry = advance();
+
+                    private Map.Entry<K, V> advance() {
+                        while (keys.hasNext()) {
+                            K key = keys.next();
+                            V value = get(key);
+                            if (value != null) {
+                                return new AbstractMap.SimpleImmutableEntry<>(key, value);
+                            }
+                        }
+                        return null;
+                    }
+
                     @Override
                     public boolean hasNext() {
-                        return keys.hasNext();
+                        return nextEntry != null;
                     }
 
                     @Override
                     public Map.Entry<K, V> next() {
-                        K key = keys.next();
-                        V value = get(key);
-                        return new AbstractMap.SimpleImmutableEntry<>(key, value);
+                        if (nextEntry == null) {
+                            throw new java.util.NoSuchElementException();
+                        }
+                        Map.Entry<K, V> current = nextEntry;
+                        nextEntry = advance();
+                        return current;
                     }
                 };
             }
