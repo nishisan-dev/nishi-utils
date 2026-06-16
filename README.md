@@ -2,7 +2,7 @@
 
 Coleção de utilitários em Java, com foco em:
 
-- **NMap**: mapa **persistente** standalone (WAL + snapshot), com **offloading plugável** (in-memory, disco, híbrido com LRU).
+- **NMap**: mapa **persistente** standalone (WAL + snapshot), com **offloading plugável** (in-memory, disco, híbrido com LRU, log-structured por segmentos).
 - **NQueue**: fila **persistente** (FIFO) baseada em arquivos, segura para múltiplas threads.
 - **NGrid**: infraestrutura **distribuída** via TCP com **fila** (stream/log distribuído) e **mapa** (KV distribuído) — replicação por líder + quorum, consumer lógico com cursor persistente e serialização type-safe de POJOs.
 - **Stats**: utilitários para **métricas/estatísticas** simples (contadores, médias, valores, memória).
@@ -10,10 +10,11 @@ Coleção de utilitários em Java, com foco em:
 ### NMap (mapa persistente standalone)
 
 - **Persistência WAL + snapshot** com recuperação robusta a falhas
-- **Offloading plugável** via `NMapOffloadStrategy`:
+- **Offloading plugável** via `NMapOffloadStrategy`, selecionável de forma declarativa por `OffloadMode` no `NMapConfig` (ou via `offloadStrategyFactory` para estratégias custom):
   - `InMemoryStrategy` (default): `ConcurrentHashMap`, zero mudança para quem já usa
-  - `DiskOffloadStrategy`: todas as entries em disco, índice leve em memória
+  - `DiskOffloadStrategy`: um arquivo por entrada em disco, índice leve em memória, **fan-out de sharding configurável** e **hot-cache LRU com teto previsível**
   - `HybridOffloadStrategy`: cache in-memory limitado com spillover automático para disco
+  - `SegmentOffloadStrategy`: **log-structured (Bitcask-like)** — agrupa as entradas em poucos arquivos-segmento append-only (1..128) em vez de um arquivo por entrada, colapsando a contagem de inodes; suporta **compressão LZ4 opt-in** e **compactação** automática em background
 - **Políticas de evicção**: `LRU` (Least Recently Used) e `SIZE_THRESHOLD` (por volume)
 - **Warm-up automático**: entries frias são promovidas ao `get()`
 - **Observabilidade**: integração com `StatsUtils` (hit/miss, evictions, latência de disco)
@@ -245,6 +246,40 @@ try (NMap<String, String> map = NMap.open(Path.of("/data"), "sessions", cfg)) {
   map.get("session-1"); // hot: leitura do cache
 }
 ```
+
+### Offloading: Log-structured por segmentos (SEGMENT)
+
+Para mapas de **alta cardinalidade**, o modo `SEGMENT` agrupa as entradas em
+poucos arquivos-segmento append-only (1..128) em vez de um arquivo por entrada,
+evitando o esgotamento de inodes e a lentidão de operações de diretório. O índice
+fica em memória (chave → offset), a leitura é um único acesso posicional, updates
+geram um novo append e remoções um tombstone; a **compactação** em background
+reclama o espaço de versões superadas/tombstones. Configuração declarativa via
+`OffloadMode`:
+
+```java
+import dev.nishisan.utils.map.OffloadMode;
+
+NMapConfig cfg = NMapConfig.builder()
+    .mode(NMapPersistenceMode.ASYNC_WITH_FSYNC) // controla o fsync por append
+    .offloadMode(OffloadMode.SEGMENT)
+    .numSegments(64)              // 1..128 (sharding/nº de arquivos)
+    .compressionEnabled(true)     // compressão LZ4 opt-in do value
+    .hotCacheMaxEntries(50_000)   // teto do hot-cache LRU (0 desabilita)
+    .compactionThreshold(0.5)     // fração de bytes mortos que dispara a compactação
+    .build();
+
+try (NMap<String, String> map = NMap.open(Path.of("/data"), "lookup", cfg)) {
+  for (int i = 0; i < 5_000_000; i++) {
+    map.put("k" + i, "v" + i);   // 5M entradas → no máx. 64 arquivos .log + .hint
+  }
+}
+```
+
+> O `OffloadMode` também cobre os demais backends de forma declarativa:
+> `DISK` (com `shardFanOut(depth, width)` e `hotCacheMaxEntries`), `HYBRID`
+> (com `evictionPolicy` e `hotCacheMaxEntries`) e `IN_MEMORY` (default). Um
+> `offloadStrategyFactory` custom, se presente, tem precedência sobre o modo.
 
 ### Observabilidade com StatsUtils
 

@@ -64,7 +64,7 @@ class HybridOffloadStrategyTest {
 
     private Path shardedPath(String name, String key) {
         String keyHash = OffloadLayout.keyHash(key);
-        return OffloadLayout.shardedPath(offloadDir(name), keyHash, ".dat");
+        return OffloadLayout.defaults().shardedPath(offloadDir(name), keyHash, ".dat");
     }
 
     private Path legacyPath(String name, String key) {

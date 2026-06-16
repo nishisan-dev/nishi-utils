@@ -2,7 +2,7 @@
 
 O `NMap<K,V>` é um mapa concorrente com persistência local opcional, baseado em **WAL (Write-Ahead Log) + Snapshots**. Análogo ao `NQueue`, pode ser usado de forma **independente** do NGrid.
 
-![Diagrama de Componentes](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan-dev/nishi-utils/main/docs/diagrams/nmap_component.puml)
+![Diagrama de Componentes](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan-dev/nishi-utils/main/doc/diagrams/nmap_component.puml)
 
 ## Quick Start
 
@@ -49,10 +49,17 @@ try (NMap<String, byte[]> blobs = NMap.open(Path.of("/data"), "blobs", config)) 
 | `NMapWALEntry` | Record que representa uma entrada no WAL |
 | `NMapMetadata` | Metadados persistidos de snapshot e última mutação |
 | `NMapHealthListener` | Callback funcional para falhas de persistência |
+| `NMapOffloadStrategy<K,V>` | Interface do backend de armazenamento (in-memory / disco) |
+| `OffloadMode` | Seleção declarativa do backend: `IN_MEMORY`, `DISK`, `HYBRID`, `SEGMENT` |
+| `InMemoryStrategy` | Backend em heap (`ConcurrentHashMap`) — default |
+| `DiskOffloadStrategy` | Um arquivo por entrada, fan-out de sharding configurável, hot-cache LRU |
+| `HybridOffloadStrategy` | Hot em memória + cold em disco, evicção `LRU`/`SIZE_THRESHOLD` |
+| `SegmentOffloadStrategy` | Log-structured (Bitcask-like): poucos segmentos append-only, LZ4 opt-in, compactação |
+| `OffloadLayout` | Mapeia chaves → caminhos com fan-out (`shardDepth`/`shardWidth`) configurável |
 
 ### Fluxo de Persistência
 
-![Fluxo de Persistência](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan-dev/nishi-utils/main/docs/diagrams/nmap_persistence_flow.puml)
+![Fluxo de Persistência](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan-dev/nishi-utils/main/doc/diagrams/nmap_persistence_flow.puml)
 
 **Estratégia WAL + Snapshot:**
 
@@ -117,6 +124,18 @@ public interface NMapHealthListener {
 | `batchSize` | `100` | Tamanho do batch de escrita no WAL |
 | `batchTimeout` | `10 ms` | Timeout para flush do batch |
 | `healthListener` | no-op | Callback de falhas |
+| `offloadMode` | `IN_MEMORY` | Backend declarativo (`IN_MEMORY`/`DISK`/`HYBRID`/`SEGMENT`) |
+| `offloadStrategyFactory` | `null` | Estratégia custom; **tem precedência** sobre `offloadMode` |
+| `hotCacheMaxEntries` | `10.000` | Teto do hot-cache (DISK/HYBRID/SEGMENT); `0` desabilita |
+| `evictionPolicy` | `LRU` | Política de evicção do modo `HYBRID` |
+| `shardFanOut(depth, width)` | `2 / 2` | Fan-out de diretórios do modo `DISK` (`depth*width ≤ 40`) |
+| `numSegments` | `16` | Nº de segmentos (1..128) do modo `SEGMENT` |
+| `compressionEnabled` | `false` | Compressão LZ4 do value no modo `SEGMENT` |
+| `compactionThreshold` | `0.5` | Fração de bytes mortos que dispara compactação (`SEGMENT`) |
+
+> **Seleção do backend:** se `offloadStrategyFactory` for definido, ele é usado
+> (extension point para estratégias custom). Caso contrário, o `offloadMode`
+> determina a estratégia, montada pelo `NMap` a partir dos knobs acima.
 
 ## Integração com NGrid
 
@@ -128,6 +147,9 @@ O NGrid utiliza o `NMap` internamente para seus mapas distribuídos:
 
 ## Estrutura de Arquivos no Disco
 
+Modo em memória com persistência WAL + snapshot (estratégias não inerentemente
+persistentes):
+
 ```
 <baseDir>/<mapName>/
 ├── snapshot.dat      ← Snapshot completo serializado (Java ObjectStream)
@@ -135,10 +157,67 @@ O NGrid utiliza o `NMap` internamente para seus mapas distribuídos:
 └── meta.json         ← Metadados (versão do snapshot, contadores)
 ```
 
+Modo `DISK` (`DiskOffloadStrategy`) — um arquivo por entrada, com fan-out
+configurável (default `hash[0:2]/hash[2:4]/hash.dat`):
+
+```
+<baseDir>/<mapName>/offload/
+└── ab/cd/abcd…sha1.dat   ← um arquivo por chave
+```
+
+Modo `SEGMENT` (`SegmentOffloadStrategy`) — poucos segmentos append-only:
+
+```
+<baseDir>/<mapName>/segment-offload/
+├── seg-000.log   ← log append-only (registros PUT/TOMBSTONE)
+├── seg-000.hint  ← índice persistido (chave → offset) p/ startup rápido
+├── seg-001.log
+└── ...           ← total de arquivos = 2 × numSegments
+```
+
+## Offloading log-structured (modo `SEGMENT`)
+
+O `SegmentOffloadStrategy` é um backend estilo **Bitcask** voltado a mapas de
+alta cardinalidade, onde "um arquivo por entrada" esgota inodes e torna lentas as
+operações de diretório (backup, `find`, `rsync`). Em vez disso, as entradas são
+agrupadas em um número fixo e pequeno de **segmentos append-only** (1..128).
+
+- **Roteamento:** a chave vai para `segmento = (32 bits do SHA-1 da chave) % numSegments`,
+  estável entre reinícios (a chave sempre cai no mesmo segmento). `numSegments`
+  deve ser fixo para um diretório já populado.
+- **Registro:** `magic | version | flags | type(PUT/TOMBSTONE) | keyLen | valLen | key | value | CRC32`.
+  A chave fica sempre em claro (permite reconstruir o índice sem descomprimir);
+  o value é comprimido com **LZ4** quando `compressionEnabled`.
+- **Índice em memória:** `chave → (segmento, offset, tamanho)`; leitura é um único
+  `read` posicional. Update gera novo append (a versão antiga vira lixo); remoção
+  grava um tombstone.
+- **Recovery:** carrega o `.hint` (validado por CRC) e faz **replay incremental**
+  apenas do delta após o `coveredOffset`; sem hint válido, faz replay completo do
+  log. Registros truncados/corrompidos na cauda são descartados (`truncate`).
+- **Compactação (GC):** quando `bytesMortos / tamanho ≥ compactionThreshold`, uma
+  thread em background reescreve o segmento mantendo só os registros vivos (swap
+  atômico via arquivo temporário + `ATOMIC_MOVE`), regravando o `.hint`. A
+  operação segura o lock daquele segmento; os demais seguem operando.
+- **Durabilidade:** o `fsync` por append é derivado do `NMapPersistenceMode`
+  (`ASYNC_WITH_FSYNC` força em cada escrita; os demais confiam no flush do SO).
+
+**Trade-off de memória:** o índice (chave → offset) reside todo em heap — é o
+custo do modelo Bitcask. Ele não guarda o value (só o offset), mas em
+cardinalidades muito altas (dezenas de milhões de chaves) exige heap dedicado.
+Resolve o problema prioritário de inodes/diretório; um índice esparso/em disco é
+trabalho futuro.
+
+![Offload Segmentado](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan-dev/nishi-utils/main/doc/diagrams/nmap_segment_offload.puml)
+
 ## Testes
 
 | Teste | Tipo | Cobertura |
 |---|---|---|
 | `NMapTest` | Unitário | CRUD, putAll, clear, snapshot, in-memory, modos de persistência |
 | `NMapRecoveryTest` | Integração | Crash recovery via WAL replay e snapshot |
+| `NMapOffloadTest` | Unitário | `DiskOffloadStrategy`: CRUD, restart, layout legado, fan-out configurável, hot-cache, concorrência |
+| `HybridOffloadStrategyTest` | Unitário | Evicção `LRU`/`SIZE_THRESHOLD`, warm-up, persistência, métricas |
+| `SegmentOffloadStrategyTest` | Unitário | `SegmentOffloadStrategy`: CRUD, restart/hint/replay incremental, compactação, compressão, tolerância a cauda corrompida, limites de `numSegments` |
+| `NMapConfigOffloadModeTest` | Unitário | Seleção via `OffloadMode`, precedência da factory, validações |
+| `NMapDestroyTest` | Unitário | `destroy()` por estratégia (remoção de diretórios) |
 | `NMapExample` | Exemplo | Uso standalone completo como referência |

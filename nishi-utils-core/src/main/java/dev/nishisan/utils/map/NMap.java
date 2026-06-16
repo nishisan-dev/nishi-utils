@@ -82,11 +82,7 @@ public final class NMap<K, V> implements Closeable {
         this.config = Objects.requireNonNull(config, "config");
 
         // Instantiate storage strategy
-        if (config.offloadStrategyFactory() != null) {
-            this.storage = config.offloadStrategyFactory().create(baseDir, name);
-        } else {
-            this.storage = new InMemoryStrategy<>();
-        }
+        this.storage = buildStrategy(baseDir, name, config);
 
         // Persistence engine: only for non-inherently-persistent strategies
         if (config.mode() != NMapPersistenceMode.DISABLED && !storage.isInherentlyPersistent()) {
@@ -94,6 +90,31 @@ public final class NMap<K, V> implements Closeable {
         } else {
             this.persistence = null;
         }
+    }
+
+    /**
+     * Builds the offload strategy for the given configuration. A custom
+     * {@link NMapConfig#offloadStrategyFactory()} takes precedence; otherwise
+     * the declarative {@link OffloadMode} drives the choice.
+     */
+    private static <K, V> NMapOffloadStrategy<K, V> buildStrategy(
+            Path baseDir, String name, NMapConfig config) {
+        if (config.offloadStrategyFactory() != null) {
+            return config.offloadStrategyFactory().create(baseDir, name);
+        }
+        return switch (config.offloadMode()) {
+            case IN_MEMORY -> new InMemoryStrategy<>();
+            case DISK -> new DiskOffloadStrategy<>(baseDir, name,
+                    config.shardDepth(), config.shardWidth(), config.hotCacheMaxEntries());
+            case HYBRID -> HybridOffloadStrategy.<K, V>builder(baseDir, name)
+                    .evictionPolicy(config.evictionPolicy())
+                    .maxInMemoryEntries(Math.max(1, config.hotCacheMaxEntries()))
+                    .build();
+            case SEGMENT -> new SegmentOffloadStrategy<>(baseDir, name,
+                    config.numSegments(), config.compressionEnabled(), config.hotCacheMaxEntries(),
+                    config.compactionThreshold(),
+                    config.mode() == NMapPersistenceMode.ASYNC_WITH_FSYNC);
+        };
     }
 
     // ── Factory Methods ─────────────────────────────────────────────────

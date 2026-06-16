@@ -35,6 +35,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class NMapOffloadTest {
@@ -57,7 +58,7 @@ class NMapOffloadTest {
 
     private Path shardedPath(String mapName, String key) {
         String keyHash = OffloadLayout.keyHash(key);
-        return OffloadLayout.shardedPath(offloadDir(mapName), keyHash, ".dat");
+        return OffloadLayout.defaults().shardedPath(offloadDir(mapName), keyHash, ".dat");
     }
 
     private Path legacyPath(String mapName, String key) {
@@ -322,6 +323,81 @@ class NMapOffloadTest {
             assertEquals(Optional.of("value-for-BB"), map.get(key2), "key2 deve sobreviver ao restart");
             assertEquals(2, map.size());
         }
+    }
+
+    /**
+     * Verifica que o fan-out de sharding é configurável: com {@code shardDepth=1}
+     * e {@code shardWidth=3} a entrada é gravada em {@code hash[0:3]/hash.dat},
+     * e não no layout padrão {@code hash[0:2]/hash[2:4]/hash.dat}.
+     */
+    @Test
+    void diskOffloadCustomFanOutWritesAtConfiguredDepth() throws Exception {
+        String mapName = "offload-custom-fanout";
+        String key = "fan-out-key";
+
+        try (DiskOffloadStrategy<String, String> strategy =
+                new DiskOffloadStrategy<>(tempDir, mapName, 1, 3)) {
+            strategy.put(key, "value");
+            assertEquals("value", strategy.get(key));
+        }
+
+        String keyHash = OffloadLayout.keyHash(key);
+        Path customPath = OffloadLayout.of(1, 3).shardedPath(offloadDir(mapName), keyHash, ".dat");
+        Path defaultPath = OffloadLayout.defaults().shardedPath(offloadDir(mapName), keyHash, ".dat");
+        assertTrue(Files.exists(customPath), "Entry should be written at depth=1/width=3 path");
+        assertFalse(Files.exists(defaultPath), "Default-layout path must not be used");
+
+        // Reopen with the same fan-out — data must survive
+        try (DiskOffloadStrategy<String, String> strategy =
+                new DiskOffloadStrategy<>(tempDir, mapName, 1, 3)) {
+            assertEquals("value", strategy.get(key));
+            assertEquals(1, strategy.size());
+        }
+    }
+
+    /**
+     * Com um hot-cache pequeno, entradas além do teto ainda devem ser legíveis
+     * (warm-up a partir do disco), provando que o cache é limitado mas não
+     * perde dados.
+     */
+    @Test
+    void diskOffloadBoundedHotCacheStillServesAllEntries() throws Exception {
+        try (DiskOffloadStrategy<String, String> strategy =
+                new DiskOffloadStrategy<>(tempDir, "bounded-cache", 2, 2, 32)) {
+            for (int i = 0; i < 500; i++) {
+                strategy.put("key-" + i, "val-" + i);
+            }
+            assertEquals(500, strategy.size());
+            for (int i = 0; i < 500; i++) {
+                assertEquals("val-" + i, strategy.get("key-" + i));
+            }
+        }
+    }
+
+    /**
+     * Com {@code hotCacheMaxEntries=0} o cache é desabilitado: leituras sempre
+     * vão ao disco, mas os dados continuam corretos.
+     */
+    @Test
+    void diskOffloadWithCacheDisabled() throws Exception {
+        try (DiskOffloadStrategy<String, String> strategy =
+                new DiskOffloadStrategy<>(tempDir, "no-cache", 2, 2, 0)) {
+            strategy.put("a", "1");
+            strategy.put("b", "2");
+            assertEquals("1", strategy.get("a"));
+            assertEquals("2", strategy.get("b"));
+            assertEquals(2, strategy.size());
+        }
+    }
+
+    @Test
+    void diskOffloadShouldRejectInvalidFanOut() {
+        // shardWidth must be >= 1
+        assertThrows(IllegalArgumentException.class,
+                () -> new DiskOffloadStrategy<String, String>(tempDir, "bad-width", 1, 0));
+        // shardDepth * shardWidth must be <= 40 (SHA-1 hex length)
+        assertThrows(IllegalArgumentException.class,
+                () -> new DiskOffloadStrategy<String, String>(tempDir, "bad-span", 3, 20));
     }
 
     /**

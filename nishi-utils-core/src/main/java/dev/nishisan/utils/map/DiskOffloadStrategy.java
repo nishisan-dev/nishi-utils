@@ -24,7 +24,6 @@ import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.io.Serializable;
 import java.io.UncheckedIOException;
-import java.lang.ref.SoftReference;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.AbstractMap;
@@ -32,6 +31,7 @@ import java.util.AbstractSet;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -46,9 +46,10 @@ import java.util.logging.Logger;
  * <p>
  * Entries are serialized to individual files on disk under a dedicated
  * directory. A lightweight index ({@code ConcurrentHashMap<K, Path>}) maps
- * keys to their file locations, keeping heap usage minimal. An optional
- * {@link SoftReference} cache avoids re-reads for hot entries; the JVM
- * will reclaim cached values under memory pressure.
+ * keys to their file locations, keeping heap usage minimal. A bounded,
+ * per-stripe LRU hot cache avoids re-reads for recently accessed entries and
+ * gives a predictable memory ceiling ({@code hotCacheMaxEntries}); set it to
+ * {@code 0} to disable caching entirely.
  * <p>
  * <b>Thread safety:</b> All public operations are protected by a
  * striped {@link ReentrantReadWriteLock} scheme. Instead of a single
@@ -82,23 +83,86 @@ public final class DiskOffloadStrategy<K, V>
      */
     private static final int CONCURRENCY_LEVEL = 16;
 
+    /** Default hot-cache ceiling when constructed without an explicit value. */
+    static final int DEFAULT_HOT_CACHE_MAX_ENTRIES = 10_000;
+
     private final Path offloadDir;
+    private final OffloadLayout layout;
     private final ConcurrentHashMap<K, Path> index = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<K, SoftReference<V>> cache = new ConcurrentHashMap<>();
+
+    /**
+     * Per-stripe access-ordered LRU hot caches, each capped at
+     * {@link #maxPerStripe}. Accessed only under the owning stripe's lock.
+     */
+    private final LinkedHashMap<K, V>[] hotCaches;
+    private final int maxPerStripe;
     private final ReentrantReadWriteLock[] locks;
 
     /**
-     * Creates a new disk offload strategy.
+     * Creates a new disk offload strategy with the default shard fan-out
+     * ({@value OffloadLayout#DEFAULT_SHARD_DEPTH} levels of
+     * {@value OffloadLayout#DEFAULT_SHARD_WIDTH} hex characters) and the default
+     * hot-cache ceiling ({@value #DEFAULT_HOT_CACHE_MAX_ENTRIES}).
      *
      * @param baseDir the base directory for data storage
      * @param name    the map name (used as subdirectory)
      */
     public DiskOffloadStrategy(Path baseDir, String name) {
+        this(baseDir, name, OffloadLayout.DEFAULT_SHARD_DEPTH, OffloadLayout.DEFAULT_SHARD_WIDTH,
+                DEFAULT_HOT_CACHE_MAX_ENTRIES);
+    }
+
+    /**
+     * Creates a new disk offload strategy with a configurable shard fan-out and
+     * the default hot-cache ceiling ({@value #DEFAULT_HOT_CACHE_MAX_ENTRIES}).
+     *
+     * @param baseDir    the base directory for data storage
+     * @param name       the map name (used as subdirectory)
+     * @param shardDepth number of directory levels (0 = flat layout)
+     * @param shardWidth hex characters consumed per directory level
+     */
+    public DiskOffloadStrategy(Path baseDir, String name, int shardDepth, int shardWidth) {
+        this(baseDir, name, shardDepth, shardWidth, DEFAULT_HOT_CACHE_MAX_ENTRIES);
+    }
+
+    /**
+     * Creates a new disk offload strategy with a configurable shard fan-out and
+     * a bounded hot cache.
+     * <p>
+     * The fan-out determines how key files are spread across subdirectories:
+     * {@code shardDepth} directory levels, each consuming {@code shardWidth}
+     * hexadecimal characters of the key hash. It must be fixed at map creation
+     * time — changing it for an already-populated directory orphans the
+     * previously written paths.
+     * <p>
+     * The hot cache is an access-ordered LRU split across the lock stripes; it
+     * holds at most {@code hotCacheMaxEntries} values in memory (per-stripe
+     * ceiling {@code max(1, hotCacheMaxEntries / CONCURRENCY_LEVEL)}). A value
+     * of {@code 0} disables caching, forcing every read to hit the disk.
+     *
+     * @param baseDir            the base directory for data storage
+     * @param name               the map name (used as subdirectory)
+     * @param shardDepth         number of directory levels (0 = flat layout)
+     * @param shardWidth         hex characters consumed per directory level
+     * @param hotCacheMaxEntries upper bound on cached values ({@code 0} disables)
+     */
+    @SuppressWarnings("unchecked")
+    public DiskOffloadStrategy(Path baseDir, String name, int shardDepth, int shardWidth,
+            int hotCacheMaxEntries) {
         Objects.requireNonNull(baseDir, "baseDir");
         Objects.requireNonNull(name, "name");
+        if (hotCacheMaxEntries < 0) {
+            throw new IllegalArgumentException("hotCacheMaxEntries must be >= 0");
+        }
         this.offloadDir = baseDir.resolve(name).resolve(OFFLOAD_DIR);
+        this.layout = OffloadLayout.of(shardDepth, shardWidth);
+        this.maxPerStripe = hotCacheMaxEntries == 0
+                ? 0
+                : Math.max(1, hotCacheMaxEntries / CONCURRENCY_LEVEL);
+        this.hotCaches = new LinkedHashMap[CONCURRENCY_LEVEL];
         this.locks = new ReentrantReadWriteLock[CONCURRENCY_LEVEL];
         for (int i = 0; i < CONCURRENCY_LEVEL; i++) {
+            hotCaches[i] = newHotCache(maxPerStripe);
             locks[i] = new ReentrantReadWriteLock();
         }
         try {
@@ -107,6 +171,15 @@ public final class DiskOffloadStrategy<K, V>
         } catch (IOException e) {
             throw new UncheckedIOException("Failed to initialize disk offload directory", e);
         }
+    }
+
+    private static <K, V> LinkedHashMap<K, V> newHotCache(int capacity) {
+        return new LinkedHashMap<>(16, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<K, V> eldest) {
+                return size() > capacity;
+            }
+        };
     }
 
     // ── Stripe helpers ──────────────────────────────────────────────────
@@ -145,6 +218,29 @@ public final class DiskOffloadStrategy<K, V>
         }
     }
 
+    // ── Hot cache helpers (callers must hold the key's stripe lock) ──────
+
+    private V cacheGet(K key) {
+        if (maxPerStripe == 0) {
+            return null;
+        }
+        return hotCaches[stripeFor(key)].get(key);
+    }
+
+    private void cachePut(K key, V value) {
+        if (maxPerStripe == 0) {
+            return;
+        }
+        hotCaches[stripeFor(key)].put(key, value);
+    }
+
+    private void cacheRemove(K key) {
+        if (maxPerStripe == 0) {
+            return;
+        }
+        hotCaches[stripeFor(key)].remove(key);
+    }
+
     // ── NMapOffloadStrategy ─────────────────────────────────────────────
 
     @Override
@@ -155,13 +251,10 @@ public final class DiskOffloadStrategy<K, V>
             if (!index.containsKey(key)) {
                 return null;
             }
-            // Check soft cache first
-            SoftReference<V> ref = cache.get(key);
-            if (ref != null) {
-                V cached = ref.get();
-                if (cached != null) {
-                    return cached;
-                }
+            // Check hot cache first
+            V cached = cacheGet(key);
+            if (cached != null) {
+                return cached;
             }
             // Cache miss — read from disk
             Path path = resolvePathForRead(key, index.get(key));
@@ -170,7 +263,7 @@ public final class DiskOffloadStrategy<K, V>
             }
             try {
                 V value = deserialize(path);
-                cache.put(key, new SoftReference<>(value));
+                cachePut(key, value);
                 return value;
             } catch (IOException e) {
                 LOGGER.log(Level.WARNING, "Failed to read offloaded entry: " + path, e);
@@ -193,7 +286,7 @@ public final class DiskOffloadStrategy<K, V>
             try {
                 serialize(path, key, value);
                 index.put(key, path);
-                cache.put(key, new SoftReference<>(value));
+                cachePut(key, value);
                 if (!path.equals(legacyPath)) {
                     OffloadLayout.deleteFileQuietly(offloadDir, legacyPath, LOGGER);
                 }
@@ -213,7 +306,7 @@ public final class DiskOffloadStrategy<K, V>
         try {
             V previous = getUnderLock(key);
             index.remove(key);
-            cache.remove(key);
+            cacheRemove(key);
             String keyHash = keyHash(key);
             OffloadLayout.deleteFileQuietly(offloadDir, pathForKey(keyHash), LOGGER);
             OffloadLayout.deleteFileQuietly(offloadDir, legacyPathForKey(keyHash), LOGGER);
@@ -258,17 +351,35 @@ public final class DiskOffloadStrategy<K, V>
             @Override
             public Iterator<Map.Entry<K, V>> iterator() {
                 Iterator<K> keys = index.keySet().iterator();
+                // Look-ahead iterator that skips keys whose value resolved to null
+                // (concurrently removed), so it never emits a (key, null) entry.
                 return new Iterator<>() {
+                    private Map.Entry<K, V> nextEntry = advance();
+
+                    private Map.Entry<K, V> advance() {
+                        while (keys.hasNext()) {
+                            K key = keys.next();
+                            V value = get(key);
+                            if (value != null) {
+                                return new AbstractMap.SimpleImmutableEntry<>(key, value);
+                            }
+                        }
+                        return null;
+                    }
+
                     @Override
                     public boolean hasNext() {
-                        return keys.hasNext();
+                        return nextEntry != null;
                     }
 
                     @Override
                     public Map.Entry<K, V> next() {
-                        K key = keys.next();
-                        V value = get(key);
-                        return new AbstractMap.SimpleImmutableEntry<>(key, value);
+                        if (nextEntry == null) {
+                            throw new java.util.NoSuchElementException();
+                        }
+                        Map.Entry<K, V> current = nextEntry;
+                        nextEntry = advance();
+                        return current;
                     }
                 };
             }
@@ -295,7 +406,9 @@ public final class DiskOffloadStrategy<K, V>
         lockAllWrite();
         try {
             index.clear();
-            cache.clear();
+            for (LinkedHashMap<K, V> hotCache : hotCaches) {
+                hotCache.clear();
+            }
             OffloadLayout.clearDirectoryContentsRecursively(offloadDir, LOGGER);
         } finally {
             unlockAllWrite();
@@ -359,8 +472,15 @@ public final class DiskOffloadStrategy<K, V>
 
     @Override
     public void close() {
-        cache.clear();
-        // Index and files remain on disk for future reopens
+        lockAllWrite();
+        try {
+            for (LinkedHashMap<K, V> hotCache : hotCaches) {
+                hotCache.clear();
+            }
+            // Index and files remain on disk for future reopens
+        } finally {
+            unlockAllWrite();
+        }
     }
 
     /**
@@ -379,7 +499,7 @@ public final class DiskOffloadStrategy<K, V>
     // ── Internal helpers ────────────────────────────────────────────────
 
     /**
-     * Reads a value from the soft cache or disk <b>without acquiring any
+     * Reads a value from the hot cache or disk <b>without acquiring any
      * lock</b>. Must only be called when the caller already holds the
      * write lock for the key's stripe.
      */
@@ -387,12 +507,9 @@ public final class DiskOffloadStrategy<K, V>
         if (!index.containsKey(key)) {
             return null;
         }
-        SoftReference<V> ref = cache.get(key);
-        if (ref != null) {
-            V cached = ref.get();
-            if (cached != null) {
-                return cached;
-            }
+        V cached = cacheGet(key);
+        if (cached != null) {
+            return cached;
         }
         Path path = resolvePathForRead(key, index.get(key));
         if (path == null) {
@@ -400,7 +517,7 @@ public final class DiskOffloadStrategy<K, V>
         }
         try {
             V value = deserialize(path);
-            cache.put(key, new SoftReference<>(value));
+            cachePut(key, value);
             return value;
         } catch (IOException e) {
             LOGGER.log(Level.WARNING, "Failed to read offloaded entry: " + path, e);
@@ -419,7 +536,7 @@ public final class DiskOffloadStrategy<K, V>
     }
 
     private Path pathForKey(String keyHash) {
-        return OffloadLayout.shardedPath(offloadDir, keyHash, ENTRY_SUFFIX);
+        return layout.shardedPath(offloadDir, keyHash, ENTRY_SUFFIX);
     }
 
     private Path legacyPathForKey(String keyHash) {
@@ -461,7 +578,7 @@ public final class DiskOffloadStrategy<K, V>
         if (indexedPath != null && Files.exists(indexedPath)) {
             return indexedPath;
         }
-        Path resolved = OffloadLayout.preferredExistingPath(offloadDir, keyHash(key), ENTRY_SUFFIX);
+        Path resolved = layout.preferredExistingPath(offloadDir, keyHash(key), ENTRY_SUFFIX);
         if (resolved != null) {
             index.put(key, resolved);
             return resolved;
@@ -469,7 +586,7 @@ public final class DiskOffloadStrategy<K, V>
         if (indexedPath != null) {
             index.remove(key, indexedPath);
         }
-        cache.remove(key);
+        cacheRemove(key);
         return null;
     }
 
