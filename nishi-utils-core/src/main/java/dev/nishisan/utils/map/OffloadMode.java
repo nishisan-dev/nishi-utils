@@ -46,5 +46,13 @@ public enum OffloadMode {
      * ({@link HybridOffloadStrategy}) by a configurable eviction policy.
      * Inherently persistent.
      */
-    HYBRID
+    HYBRID,
+
+    /**
+     * Log-structured store ({@link SegmentOffloadStrategy}): entries are grouped
+     * into a small, fixed number of append-only segment files, collapsing the
+     * inode/file count at scale. Supports optional LZ4 value compression and
+     * background compaction. Inherently persistent.
+     */
+    SEGMENT
 }

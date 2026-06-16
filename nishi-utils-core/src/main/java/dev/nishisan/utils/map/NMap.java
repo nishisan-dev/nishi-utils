@@ -110,6 +110,10 @@ public final class NMap<K, V> implements Closeable {
                     .evictionPolicy(config.evictionPolicy())
                     .maxInMemoryEntries(Math.max(1, config.hotCacheMaxEntries()))
                     .build();
+            case SEGMENT -> new SegmentOffloadStrategy<>(baseDir, name,
+                    config.numSegments(), config.compressionEnabled(), config.hotCacheMaxEntries(),
+                    config.compactionThreshold(),
+                    config.mode() == NMapPersistenceMode.ASYNC_WITH_FSYNC);
         };
     }
 

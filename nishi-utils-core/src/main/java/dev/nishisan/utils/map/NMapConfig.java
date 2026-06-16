@@ -36,6 +36,9 @@ public final class NMapConfig {
     private final EvictionPolicy evictionPolicy;
     private final int shardDepth;
     private final int shardWidth;
+    private final int numSegments;
+    private final boolean compressionEnabled;
+    private final double compactionThreshold;
 
     private NMapConfig(Builder builder) {
         this.mode = Objects.requireNonNull(builder.mode, "mode");
@@ -50,6 +53,9 @@ public final class NMapConfig {
         this.evictionPolicy = Objects.requireNonNull(builder.evictionPolicy, "evictionPolicy");
         this.shardDepth = builder.shardDepth;
         this.shardWidth = builder.shardWidth;
+        this.numSegments = builder.numSegments;
+        this.compressionEnabled = builder.compressionEnabled;
+        this.compactionThreshold = builder.compactionThreshold;
         validate();
     }
 
@@ -156,6 +162,21 @@ public final class NMapConfig {
         return shardWidth;
     }
 
+    /** Returns the number of segment logs for {@link OffloadMode#SEGMENT}. */
+    public int numSegments() {
+        return numSegments;
+    }
+
+    /** Returns whether values are LZ4-compressed in {@link OffloadMode#SEGMENT}. */
+    public boolean compressionEnabled() {
+        return compressionEnabled;
+    }
+
+    /** Returns the dead-bytes fraction that triggers segment compaction. */
+    public double compactionThreshold() {
+        return compactionThreshold;
+    }
+
     private void validate() {
         if (snapshotIntervalOperations < 0) {
             throw new IllegalArgumentException("snapshotIntervalOperations must be >= 0");
@@ -181,6 +202,12 @@ public final class NMapConfig {
         if (shardDepth * shardWidth > 40) {
             throw new IllegalArgumentException("shardDepth * shardWidth must be <= 40 (SHA-1 hex length)");
         }
+        if (numSegments < 1 || numSegments > 128) {
+            throw new IllegalArgumentException("numSegments must be in [1, 128]");
+        }
+        if (compactionThreshold <= 0.0 || compactionThreshold > 1.0) {
+            throw new IllegalArgumentException("compactionThreshold must be in (0, 1]");
+        }
     }
 
     /**
@@ -200,6 +227,9 @@ public final class NMapConfig {
         private EvictionPolicy evictionPolicy = EvictionPolicy.LRU;
         private int shardDepth = OffloadLayout.DEFAULT_SHARD_DEPTH;
         private int shardWidth = OffloadLayout.DEFAULT_SHARD_WIDTH;
+        private int numSegments = SegmentOffloadStrategy.DEFAULT_NUM_SEGMENTS;
+        private boolean compressionEnabled = false;
+        private double compactionThreshold = SegmentOffloadStrategy.DEFAULT_COMPACTION_THRESHOLD;
 
         private Builder() {
         }
@@ -286,6 +316,33 @@ public final class NMapConfig {
         public Builder shardFanOut(int shardDepth, int shardWidth) {
             this.shardDepth = shardDepth;
             this.shardWidth = shardWidth;
+            return this;
+        }
+
+        /**
+         * Sets the number of segment logs for {@link OffloadMode#SEGMENT} (1..128).
+         * Must be fixed across restarts for a given directory. Default: 16.
+         */
+        public Builder numSegments(int numSegments) {
+            this.numSegments = numSegments;
+            return this;
+        }
+
+        /**
+         * Enables LZ4 compression of values on disk for {@link OffloadMode#SEGMENT}.
+         * Default: disabled.
+         */
+        public Builder compressionEnabled(boolean compressionEnabled) {
+            this.compressionEnabled = compressionEnabled;
+            return this;
+        }
+
+        /**
+         * Sets the dead-bytes fraction ({@code 0 < t <= 1}) that triggers
+         * compaction of a segment in {@link OffloadMode#SEGMENT}. Default: 0.5.
+         */
+        public Builder compactionThreshold(double compactionThreshold) {
+            this.compactionThreshold = compactionThreshold;
             return this;
         }
 
