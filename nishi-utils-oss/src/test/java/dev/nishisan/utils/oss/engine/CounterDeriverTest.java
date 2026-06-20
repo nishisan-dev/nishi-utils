@@ -102,7 +102,7 @@ class CounterDeriverTest {
                 new ResetPolicyDef(false, 0.9),
                 new DeriveDef(new DeriveOutputDef(
                         "rate", "u", "delta - 1000",
-                        true, ResetBehavior.UNKNOWN, WrapBehavior.AUTO)));
+                        true, ResetBehavior.UNKNOWN, WrapBehavior.AUTO)), null);
         long prevMs = 1L;
         long currMs = 301_000L;
         CounterDeriver.CounterDeriverResult r = CounterDeriver.derive(ds, 100.0, prevMs, 200.0, currMs);
@@ -117,7 +117,7 @@ class CounterDeriverTest {
                 new ResetPolicyDef(true, 0.90),
                 new DeriveDef(new DeriveOutputDef(
                         "in_bps", "bit/s", "delta * 8 / deltaT",
-                        true, ResetBehavior.UNKNOWN, WrapBehavior.AUTO)));
+                        true, ResetBehavior.UNKNOWN, WrapBehavior.AUTO)), null);
     }
 
     private static DataSourceDef ds32() {
@@ -126,6 +126,6 @@ class CounterDeriverTest {
                 new ResetPolicyDef(true, 0.90),
                 new DeriveDef(new DeriveOutputDef(
                         "in_eps", "errors/s", "delta * 8 / deltaT",
-                        true, ResetBehavior.UNKNOWN, WrapBehavior.AUTO)));
+                        true, ResetBehavior.UNKNOWN, WrapBehavior.AUTO)), null);
     }
 }

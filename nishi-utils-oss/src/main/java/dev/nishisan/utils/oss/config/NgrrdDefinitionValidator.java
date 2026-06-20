@@ -1,6 +1,8 @@
 package dev.nishisan.utils.oss.config;
 
+import dev.nishisan.utils.oss.api.ConsolidationFunction;
 import dev.nishisan.utils.oss.api.DataSourceType;
+import dev.nishisan.utils.oss.definition.AppliesTo;
 import dev.nishisan.utils.oss.definition.ArchiveSpec;
 import dev.nishisan.utils.oss.definition.DataSourceDef;
 import dev.nishisan.utils.oss.definition.NgrrdDefinition;
@@ -56,6 +58,7 @@ public final class NgrrdDefinitionValidator {
         Set<String> dsNames = collectDataSourceNames(spec.dataSources());
         validateDataSources(spec.dataSources());
         validateArchives(spec.archives(), spec.time(), dsNames);
+        validateStateConsolidation(spec.dataSources(), spec.archives());
         validateViews(spec.views(), spec.archives());
         validateIdentity(spec.identity() == null ? null : spec.identity().seriesKeyTemplate(),
                 spec.identity() == null ? List.of() : tagNames(spec.identity().tags()));
@@ -204,6 +207,62 @@ public final class NgrrdDefinitionValidator {
                 }
             }
         }
+    }
+
+    /**
+     * Um DS portador de {@code dictionary} é um DS de estado/enum (ex.:
+     * {@code ifOperStatus} 1=up/2=down). Consolidar estado por {@code AVERAGE}
+     * produz frações sem sentido (a média de 1 e 0). Como o CF é escolhido por
+     * RRA (não por coluna), exigimos que exista ao menos uma RRA cobrindo o DS
+     * com um CF não-AVERAGE ({@code LAST}/{@code MAX}/{@code MIN}); a leitura
+     * deve então usar esse CF.
+     */
+    private static void validateStateConsolidation(List<DataSourceDef> dataSources, ArchiveSpec archives) {
+        List<String> stateColumns = dataSources.stream()
+                .filter(ds -> !ds.dictionary().isEmpty())
+                .map(NgrrdDefinitionValidator::columnName)
+                .toList();
+        if (stateColumns.isEmpty()) {
+            return;
+        }
+        Set<String> archived = resolveArchivedColumns(dataSources, archives);
+        boolean hasNonAverage = archives.rras().stream()
+                .flatMap(rra -> rra.cf().stream())
+                .anyMatch(cf -> cf != ConsolidationFunction.AVERAGE);
+        for (String column : stateColumns) {
+            if (archived.contains(column) && !hasNonAverage) {
+                throw new NgrrdDefinitionException(
+                        "DS de estado '" + column + "' (com dictionary) está arquivado apenas com AVERAGE; "
+                                + "declare uma RRA com cf LAST/MAX/MIN para consolidar estado corretamente");
+            }
+        }
+    }
+
+    private static String columnName(DataSourceDef ds) {
+        if (ds.derive() != null && ds.derive().output() != null
+                && ds.derive().output().name() != null) {
+            return ds.derive().output().name();
+        }
+        return ds.name();
+    }
+
+    private static Set<String> resolveArchivedColumns(List<DataSourceDef> dataSources, ArchiveSpec archives) {
+        LinkedHashSet<String> all = new LinkedHashSet<>();
+        for (DataSourceDef ds : dataSources) {
+            all.add(columnName(ds));
+        }
+        AppliesTo applies = archives.appliesTo();
+        LinkedHashSet<String> result;
+        if (applies == null || applies.include().isEmpty()) {
+            result = new LinkedHashSet<>(all);
+        } else {
+            result = new LinkedHashSet<>(applies.include());
+            result.retainAll(all);
+        }
+        if (applies != null) {
+            applies.exclude().forEach(result::remove);
+        }
+        return result;
     }
 
     private static void validateViews(ViewSpec views, ArchiveSpec archives) {
