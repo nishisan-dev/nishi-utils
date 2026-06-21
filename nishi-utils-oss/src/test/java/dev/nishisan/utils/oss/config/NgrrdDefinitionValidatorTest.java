@@ -1,11 +1,14 @@
 package dev.nishisan.utils.oss.config;
 
+import dev.nishisan.utils.oss.definition.DataSourceDef;
 import dev.nishisan.utils.oss.definition.NgrrdDefinition;
 import org.junit.jupiter.api.Test;
 
 import java.io.InputStream;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -176,6 +179,88 @@ class NgrrdDefinitionValidatorTest {
         NgrrdDefinitionException ex = assertThrows(NgrrdDefinitionException.class,
                 () -> NgrrdDefinitionValidator.validate(def));
         assertTrue(ex.getMessage().contains("hostName"));
+    }
+
+    @Test
+    void rejeitaDictionarioArquivadoApenasComAverage() {
+        // cpu vira DS de estado (tem dictionary), mas as RRAs só consolidam por
+        // AVERAGE — média de estados (1/0) é lixo. O validator deve barrar.
+        String yaml = baseYaml().replace(
+                "      type: GAUGE\n      heartbeatSec: 120\n",
+                "      type: GAUGE\n      heartbeatSec: 120\n"
+                        + "      dictionary:\n        1: up\n        2: down\n");
+        NgrrdDefinition def = parse(yaml);
+        NgrrdDefinitionException ex = assertThrows(NgrrdDefinitionException.class,
+                () -> NgrrdDefinitionValidator.validate(def));
+        assertTrue(ex.getMessage().contains("cpu"),
+                "mensagem deve citar o DS de estado, obteve: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("AVERAGE"),
+                "mensagem deve citar AVERAGE, obteve: " + ex.getMessage());
+    }
+
+    @Test
+    void aceitaDictionarioComRraNaoAverage() {
+        // Mesma cpu com dictionary, mas agora há um CF não-AVERAGE (LAST) cobrindo-a.
+        String yaml = baseYaml()
+                .replace(
+                        "      type: GAUGE\n      heartbeatSec: 120\n",
+                        "      type: GAUGE\n      heartbeatSec: 120\n"
+                                + "      dictionary:\n        1: up\n        2: down\n")
+                .replace("cf: [AVERAGE]", "cf: [AVERAGE, LAST]");
+        NgrrdDefinition def = parse(yaml);
+        assertDoesNotThrow(() -> NgrrdDefinitionValidator.validate(def));
+    }
+
+    @Test
+    void rejeitaDictionarioEmExcludeArquivadoApenasComAverage() {
+        // appliesTo.exclude NAO e aplicado na geometria de escrita
+        // (SeriesGeometry.columnsOf so honra include), entao um DS de estado
+        // listado em exclude CONTINUA arquivado. O guard deve barra-lo mesmo
+        // assim — paridade com a escrita; senao o estado seria gravado com AVERAGE.
+        String yaml = baseYaml()
+                .replace(
+                        "      type: GAUGE\n      heartbeatSec: 120\n",
+                        "      type: GAUGE\n      heartbeatSec: 120\n"
+                                + "      dictionary:\n        1: up\n        2: down\n")
+                .replace("      include: [cpu]\n", "      include: [cpu]\n      exclude: [cpu]\n");
+        NgrrdDefinition def = parse(yaml);
+        NgrrdDefinitionException ex = assertThrows(NgrrdDefinitionException.class,
+                () -> NgrrdDefinitionValidator.validate(def));
+        assertTrue(ex.getMessage().contains("cpu"),
+                "mensagem deve citar o DS de estado, obteve: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("AVERAGE"),
+                "mensagem deve citar AVERAGE, obteve: " + ex.getMessage());
+    }
+
+    @Test
+    void dicionarioEhLidoDoYaml() {
+        String yaml = """
+                apiVersion: ngrrd/v1
+                kind: MetricSeriesDefinition
+                metadata:
+                  name: with-dictionary
+                spec:
+                  time:
+                    baseStepSec: 60
+                    blockSizeSec: 3600
+                  dataSources:
+                    - name: oper_status
+                      type: GAUGE
+                      heartbeatSec: 120
+                      dictionary:
+                        1: up
+                        2: down
+                  archives:
+                    rras:
+                      - name: r
+                        stepSec: 60
+                        rows: 60
+                        cf: [LAST]
+                        xff: 0.5
+                """;
+        NgrrdDefinition def = parse(yaml);
+        DataSourceDef ds = def.spec().dataSources().get(0);
+        assertEquals(Map.of(1, "up", 2, "down"), ds.dictionary());
     }
 
     private static String baseYaml() {
