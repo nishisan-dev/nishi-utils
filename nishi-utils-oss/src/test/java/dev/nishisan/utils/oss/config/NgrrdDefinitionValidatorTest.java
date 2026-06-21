@@ -212,6 +212,27 @@ class NgrrdDefinitionValidatorTest {
     }
 
     @Test
+    void rejeitaDictionarioEmExcludeArquivadoApenasComAverage() {
+        // appliesTo.exclude NAO e aplicado na geometria de escrita
+        // (SeriesGeometry.columnsOf so honra include), entao um DS de estado
+        // listado em exclude CONTINUA arquivado. O guard deve barra-lo mesmo
+        // assim — paridade com a escrita; senao o estado seria gravado com AVERAGE.
+        String yaml = baseYaml()
+                .replace(
+                        "      type: GAUGE\n      heartbeatSec: 120\n",
+                        "      type: GAUGE\n      heartbeatSec: 120\n"
+                                + "      dictionary:\n        1: up\n        2: down\n")
+                .replace("      include: [cpu]\n", "      include: [cpu]\n      exclude: [cpu]\n");
+        NgrrdDefinition def = parse(yaml);
+        NgrrdDefinitionException ex = assertThrows(NgrrdDefinitionException.class,
+                () -> NgrrdDefinitionValidator.validate(def));
+        assertTrue(ex.getMessage().contains("cpu"),
+                "mensagem deve citar o DS de estado, obteve: " + ex.getMessage());
+        assertTrue(ex.getMessage().contains("AVERAGE"),
+                "mensagem deve citar AVERAGE, obteve: " + ex.getMessage());
+    }
+
+    @Test
     void dicionarioEhLidoDoYaml() {
         String yaml = """
                 apiVersion: ngrrd/v1

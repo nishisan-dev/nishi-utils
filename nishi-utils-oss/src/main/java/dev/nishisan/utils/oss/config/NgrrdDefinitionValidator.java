@@ -246,22 +246,25 @@ public final class NgrrdDefinitionValidator {
         return ds.name();
     }
 
+    /**
+     * Colunas efetivamente arquivadas — espelha a geometria de ESCRITA
+     * ({@code SeriesGeometry.columnsOf}): filtra apenas por {@code appliesTo.include}
+     * (vazio ⇒ todas). O {@code exclude} <strong>não</strong> é aplicado na geometria
+     * de escrita, então o guard tampouco pode honrá-lo: um DS de estado listado em
+     * {@code exclude} continua sendo arquivado pelo writer e precisa cair na checagem
+     * de CF (senão escaparia do guard e seria gravado com AVERAGE).
+     */
     private static Set<String> resolveArchivedColumns(List<DataSourceDef> dataSources, ArchiveSpec archives) {
         LinkedHashSet<String> all = new LinkedHashSet<>();
         for (DataSourceDef ds : dataSources) {
             all.add(columnName(ds));
         }
         AppliesTo applies = archives.appliesTo();
-        LinkedHashSet<String> result;
         if (applies == null || applies.include().isEmpty()) {
-            result = new LinkedHashSet<>(all);
-        } else {
-            result = new LinkedHashSet<>(applies.include());
-            result.retainAll(all);
+            return all;
         }
-        if (applies != null) {
-            applies.exclude().forEach(result::remove);
-        }
+        LinkedHashSet<String> result = new LinkedHashSet<>(applies.include());
+        result.retainAll(all);
         return result;
     }
 
