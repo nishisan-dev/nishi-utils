@@ -20,9 +20,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class CatalogJournalTest {
 
     private static final CatalogEntry E1 =
-            new CatalogEntry("series/a.ngrr", 1, 4096L, 8192L, State.LIVE);
+            new CatalogEntry("series/a.ngrr", 1, 4096L, 8192L, 8000L, State.LIVE);
     private static final CatalogEntry E2 =
-            new CatalogEntry("series/b.ngrr", 2, 12288L, 8192L, State.DELETED);
+            new CatalogEntry("series/b.ngrr", 2, 12288L, 8192L, 7000L, State.DELETED);
 
     @Test
     void appendAndReplayRoundTrip(@TempDir Path dir) {

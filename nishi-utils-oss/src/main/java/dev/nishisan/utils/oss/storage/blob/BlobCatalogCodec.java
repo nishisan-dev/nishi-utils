@@ -43,7 +43,7 @@ public final class BlobCatalogCodec {
                 throw new BlobVolumeException("catalogKey excede 65535 bytes: " + e.key());
             }
             keyBytes.add(kb);
-            total += 2 + kb.length + 4 + 8 + 8 + 1 + 4;
+            total += 2 + kb.length + 4 + 8 + 8 + 8 + 1 + 4;
         }
 
         ByteBuffer buf = ByteBuffer.allocate(total);
@@ -68,6 +68,7 @@ public final class BlobCatalogCodec {
             buf.putInt(e.shardId());
             buf.putLong(e.regionOffset());
             buf.putLong(e.regionBytes());
+            buf.putLong(e.objectBytes());
             buf.put(e.state().code());
             int entryLen = buf.position() - entryStart;
             buf.putInt(BlobCodecs.crc32(image, entryStart, entryLen));
@@ -117,6 +118,7 @@ public final class BlobCatalogCodec {
                 int shardId = buf.getInt();
                 long regionOffset = buf.getLong();
                 long regionBytes = buf.getLong();
+                long objectBytes = buf.getLong();
                 byte stateCode = buf.get();
                 int entryLen = buf.position() - entryStart;
                 int storedCrc = buf.getInt();
@@ -124,7 +126,7 @@ public final class BlobCatalogCodec {
                     throw new BlobVolumeException("catalog.bin com CRC inválido na entrada " + i);
                 }
                 entries.add(new CatalogEntry(new String(kb, StandardCharsets.UTF_8),
-                        shardId, regionOffset, regionBytes, CatalogEntry.State.fromCode(stateCode)));
+                        shardId, regionOffset, regionBytes, objectBytes, CatalogEntry.State.fromCode(stateCode)));
             }
         } catch (BufferUnderflowException | IndexOutOfBoundsException e) {
             throw new BlobVolumeException("catalog.bin com entradas malformadas", e);

@@ -113,15 +113,17 @@ desprezível, pois `regionBytes << segmentBytes`).
 | key          | u8[keyLen]  | catalogKey UTF-8 = `series/<seriesKey>.ngrr` (§8)|
 | shardId      | u32         | shard onde a região reside (autoritativo)        |
 | regionOffset | u64         | offset absoluto na data region do shard (≥ 4096) |
-| regionBytes  | u64         | tamanho da região = `align(fileTotalBytes)`      |
-| state        | u8          | 1 = LIVE, 2 = DELETED (tombstone, §9)            |
+| regionBytes  | u64         | tamanho da região física (slot) = `align(objectBytes)` |
+| objectBytes  | u64         | tamanho lógico do objeto (= `fileTotalBytes` da série); `get` devolve exatamente estes bytes |
+| state        | u8          | 1 = LIVE, 2 = DELETED (reservado; v1 só persiste LIVE, §9) |
 | entryCrc32   | u32         | CRC sobre os bytes da entrada `[keyLen..state]`  |
 
 **Trailer:** `u32 catalogCrc32` = CRC sobre **toda a região de entradas**
 (`bytes[64 .. fileLen-4)`).
 
-> Uma migração que cria um volume novo escreve **apenas** entradas `LIVE`
-> (sem tombstones) — `bumpCursor` por shard = maior `regionOffset+regionBytes`.
+> O snapshot v1 contém **apenas** entradas `LIVE` (§9) — `bumpCursor` por shard
+> = maior `regionOffset+regionBytes`. O estado `DELETED` é reservado para um
+> futuro compactor.
 
 ## 7. Catálogo — journal (`catalog.wal`)
 
@@ -141,6 +143,7 @@ payload :=
   u32        shardId
   u64        regionOffset
   u64        regionBytes
+  u64        objectBytes
   u32        payloadCrc32  (CRC sobre payload[0 .. len-4))
 ```
 
@@ -177,16 +180,19 @@ consistente de alocações futuras.
 ## 9. Modelo de verdade e reconstrução do alocador
 
 - **O catálogo é a fonte de verdade** de `seriesKey → (shardId, offset, len)`.
-  Mantém entradas `LIVE` e tombstones `DELETED` (a região de um tombstone é
-  reaproveitável).
+  O snapshot v1 persiste **apenas entradas `LIVE`**.
 - **O alocador (bumpCursor + free-lists por size-class) é rederivado do catálogo
   na reabertura**, não persistido como verdade. O superblock guarda `bumpCursor`
   apenas como hint e `shardCapacityBytes` como dado durável (reflete `setLength`).
-- **Reconstrução por shard, no open:**
-  1. `bumpCursor = max(offset + regionBytes)` sobre **todas** as entradas (LIVE+DELETED)
-     do shard; `= headerBytes` se não houver nenhuma.
-  2. `freeList[regionBytes]` = conjunto de offsets das entradas `DELETED` daquele
-     tamanho. `allocate` consome do free-list primeiro; só então faz bump.
+- **Reconstrução por shard, no open:** `bumpCursor = max(offset + regionBytes)`
+  sobre as entradas `LIVE` do shard (`= headerBytes` se nenhuma); free-lists
+  **vazias**.
+- **Free dentro da sessão:** `delete`/`atomicReplace` que liberam uma região
+  empilham o slot num free-list **em memória** (reaproveitado pela próxima
+  alocação da mesma size-class na mesma sessão). Após reinício, free-lists
+  começam vazias: regiões liberadas no topo são reabsorvidas pelo `bumpCursor`
+  (que cai para o high-water das `LIVE`), e regiões liberadas no interior ficam
+  **leaked** até um compactor offline (deletes são raros em séries temporais).
 - Isso elimina qualquer necessidade de atomicidade cross-file: só o catálogo
   (WAL+snapshot) precisa ser durável-atômico; superblock e free-lists são regeneráveis.
 

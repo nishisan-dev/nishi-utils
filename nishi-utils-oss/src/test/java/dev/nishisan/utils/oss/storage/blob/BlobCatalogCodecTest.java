@@ -27,9 +27,9 @@ class BlobCatalogCodecTest {
     @Test
     void roundTripMultipleEntriesIncludingTombstone() {
         List<CatalogEntry> entries = List.of(
-                new CatalogEntry("series/device:r1/iface:eth0/group:traffic-v1.ngrr", 37, 4096L, 344064L, State.LIVE),
-                new CatalogEntry("series/höst=π;if=eth0.ngrr", 15, 348160L, 8192L, State.LIVE),
-                new CatalogEntry("series/old.ngrr", 3, 356352L, 8192L, State.DELETED));
+                new CatalogEntry("series/device:r1/iface:eth0/group:traffic-v1.ngrr", 37, 4096L, 344064L, 343808L, State.LIVE),
+                new CatalogEntry("series/höst=π;if=eth0.ngrr", 15, 348160L, 8192L, 8000L, State.LIVE),
+                new CatalogEntry("series/old.ngrr", 3, 356352L, 8192L, 8100L, State.DELETED));
         byte[] image = BlobCatalogCodec.encode(64, UUID_V, 99L, entries);
         BlobCatalogCodec.Snapshot s = BlobCatalogCodec.decode(image);
         assertEquals(entries, s.entries());
@@ -53,7 +53,7 @@ class BlobCatalogCodecTest {
     @Test
     void rejectsCorruptedEntry() {
         List<CatalogEntry> entries = List.of(
-                new CatalogEntry("series/a.ngrr", 1, 4096L, 8192L, State.LIVE));
+                new CatalogEntry("series/a.ngrr", 1, 4096L, 8192L, 8000L, State.LIVE));
         byte[] image = BlobCatalogCodec.encode(64, UUID_V, 1L, entries);
         image[image.length - 8] ^= 0xFF; // muta bytes de uma entrada
         assertThrows(BlobVolumeException.class, () -> BlobCatalogCodec.decode(image));
@@ -62,7 +62,7 @@ class BlobCatalogCodecTest {
     @Test
     void rejectsCorruptedTrailerCrc() {
         List<CatalogEntry> entries = List.of(
-                new CatalogEntry("series/a.ngrr", 1, 4096L, 8192L, State.LIVE));
+                new CatalogEntry("series/a.ngrr", 1, 4096L, 8192L, 8000L, State.LIVE));
         byte[] image = BlobCatalogCodec.encode(64, UUID_V, 1L, entries);
         image[image.length - 1] ^= 0xFF; // muta o trailer CRC
         assertThrows(BlobVolumeException.class, () -> BlobCatalogCodec.decode(image));

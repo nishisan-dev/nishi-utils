@@ -24,7 +24,7 @@ public final class CatalogJournal implements AutoCloseable {
 
     private static final byte[] MAGIC = "NCWA".getBytes(StandardCharsets.US_ASCII);
     private static final int ENTRY_VERSION = 1;
-    private static final int MIN_PAYLOAD = 4 + 2 + 1 + 1 + 8 + 2 + 0 + 4 + 8 + 8 + 4;
+    private static final int MIN_PAYLOAD = 4 + 2 + 1 + 1 + 8 + 2 + 0 + 4 + 8 + 8 + 8 + 4;
     private static final int MAX_PAYLOAD = 1 << 20;
 
     private final FileChannel channel;
@@ -114,6 +114,7 @@ public final class CatalogJournal implements AutoCloseable {
         b.putInt(record.entry().shardId());
         b.putLong(record.entry().regionOffset());
         b.putLong(record.entry().regionBytes());
+        b.putLong(record.entry().objectBytes());
         byte[] image = b.array();
         b.putInt(BlobCodecs.crc32(image, 0, len - 4));
         return image;
@@ -181,9 +182,10 @@ public final class CatalogJournal implements AutoCloseable {
         int shardId = b.getInt();
         long regionOffset = b.getLong();
         long regionBytes = b.getLong();
+        long objectBytes = b.getLong();
         State state = op == WalOp.ALLOC ? State.LIVE : State.DELETED;
-        return new WalRecord(op, generation,
-                new CatalogEntry(new String(key, StandardCharsets.UTF_8), shardId, regionOffset, regionBytes, state));
+        return new WalRecord(op, generation, new CatalogEntry(
+                new String(key, StandardCharsets.UTF_8), shardId, regionOffset, regionBytes, objectBytes, state));
     }
 
     private static int readInt(FileChannel ch, long pos) throws IOException {

@@ -10,10 +10,12 @@ import java.util.Objects;
  * @param key          catalogKey (UTF-8), idêntica à storage key passada a openSeries
  * @param shardId      shard onde a região reside (autoritativo)
  * @param regionOffset offset absoluto na data region do shard (≥ headerBytes)
- * @param regionBytes  tamanho da região (= align(fileTotalBytes))
+ * @param regionBytes  tamanho da região física/slot (= align(objectBytes))
+ * @param objectBytes  tamanho lógico do objeto (= fileTotalBytes da série); o que {@code get} devolve
  * @param state        LIVE ou DELETED (tombstone reaproveitável)
  */
-public record CatalogEntry(String key, int shardId, long regionOffset, long regionBytes, State state) {
+public record CatalogEntry(String key, int shardId, long regionOffset, long regionBytes,
+                           long objectBytes, State state) {
 
     public CatalogEntry {
         Objects.requireNonNull(key, "key é obrigatória");

@@ -84,9 +84,9 @@ class ShardAllocatorTest {
     @Test
     void rebuildFromCatalogRestoresBumpAndFreeList() {
         List<CatalogEntry> entries = List.of(
-                new CatalogEntry("series/a.ngrr", 0, 4096L, 8192L, State.LIVE),
-                new CatalogEntry("series/b.ngrr", 0, 12288L, 8192L, State.DELETED),
-                new CatalogEntry("series/c.ngrr", 0, 20480L, 4096L, State.LIVE));
+                new CatalogEntry("series/a.ngrr", 0, 4096L, 8192L, 8000L, State.LIVE),
+                new CatalogEntry("series/b.ngrr", 0, 12288L, 8192L, 8000L, State.DELETED),
+                new CatalogEntry("series/c.ngrr", 0, 20480L, 4096L, 4000L, State.LIVE));
         ShardAllocator alloc = ShardAllocator.rebuild(HEADER, BIG_SEGMENT, BIG_CAPACITY, entries);
         assertEquals(24576L, alloc.bumpCursor()); // high-water = 20480 + 4096
         // O slot DELETED (12288, 8192) deve ser reaproveitado antes de qualquer bump.
