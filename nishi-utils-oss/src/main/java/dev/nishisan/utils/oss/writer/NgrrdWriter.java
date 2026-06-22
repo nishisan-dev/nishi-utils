@@ -375,7 +375,7 @@ public final class NgrrdWriter implements AutoCloseable {
         long cur = state.pdpSlotSec[i];
         if (cur != -1L && slotSec < cur) {
             if (metrics != null) {
-                metrics.onLateSample(w.dsName(), cur - slotSec);
+                metrics.onLateSample(seriesKey, w.dsName(), cur - slotSec);
             }
             return; // amostra atrasada: descarta sem derivar (preserva continuidade do counter).
         }
@@ -402,8 +402,8 @@ public final class NgrrdWriter implements AutoCloseable {
         state.counterPrevTsMs[col] = sample.tsEpochMs();
         if (metrics != null) {
             switch (result.flag()) {
-                case RESET -> metrics.onCounterReset(rawDs.name());
-                case WRAP -> metrics.onWrapDetected(rawDs.name());
+                case RESET -> metrics.onCounterReset(seriesKey, rawDs.name());
+                case WRAP -> metrics.onWrapDetected(seriesKey, rawDs.name());
                 default -> {
                 }
             }
@@ -509,7 +509,7 @@ public final class NgrrdWriter implements AutoCloseable {
             int g = archive.groupSize();
             int observed = state.cdpFolded[state.cdpIndex(arch, col)];
             double ratio = g > 0 ? (double) Math.max(0, g - observed) / g : 0.0;
-            metrics.onBlockClosed(archive.rraName(), geo.columns().get(col).derivedName(), ratio);
+            metrics.onBlockClosed(seriesKey, archive.rraName(), geo.columns().get(col).derivedName(), ratio);
         }
     }
 

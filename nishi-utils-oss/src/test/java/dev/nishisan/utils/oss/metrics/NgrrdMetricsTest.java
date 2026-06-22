@@ -11,6 +11,8 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.InputStream;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -86,6 +88,36 @@ class NgrrdMetricsTest {
             writer.flush();
         }
         assertEquals(1, metrics.lateSampleCount());
+    }
+
+    @Test
+    void formaCanonicaPropagaSeriesKeyAoForward() {
+        List<String> seriesKeys = new ArrayList<>();
+        NgrrdMetricsListener forward = new NgrrdMetricsListener() {
+            @Override
+            public void onCounterReset(String seriesKey, String dsName) {
+                seriesKeys.add(seriesKey);
+            }
+        };
+        NgrrdMetrics metrics = new NgrrdMetrics(forward);
+        metrics.onCounterReset("device:r1/iface:eth0", "in_octets");
+        assertEquals(1, metrics.counterResetCount());
+        assertEquals(List.of("device:r1/iface:eth0"), seriesKeys);
+    }
+
+    @Test
+    void listenerLegadoRecebeEventosViaDelegacaoDaFormaCanonica() {
+        // Um listener que só conhece a forma antiga (sem seriesKey) continua
+        // recebendo eventos quando o produtor chama a forma canônica.
+        long[] resets = {0};
+        NgrrdMetricsListener legacy = new NgrrdMetricsListener() {
+            @Override
+            public void onCounterReset(String dsName) {
+                resets[0]++;
+            }
+        };
+        legacy.onCounterReset("series-x", "in_octets"); // canônico -> delega ao legado
+        assertEquals(1, resets[0]);
     }
 
     @Test
