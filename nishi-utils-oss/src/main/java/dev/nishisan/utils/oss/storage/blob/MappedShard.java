@@ -10,6 +10,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * Um shard mapeado em memória: um {@link FileChannel} (1 FD) e um array de
@@ -28,9 +29,11 @@ public final class MappedShard implements AutoCloseable {
     private final RandomAccessFile raf;
     private final FileChannel channel;
     private final long segmentBytes;
-    private final List<MappedByteBuffer> segments;
-    private long capacity;
-    private ShardSuperblock superblock;
+    // CopyOnWriteArrayList: grow() (sob structuralLock) adiciona segmentos enquanto
+    // leituras/escritas de regiões existentes podem ocorrer concorrentemente.
+    private final CopyOnWriteArrayList<MappedByteBuffer> segments;
+    private volatile long capacity;
+    private volatile ShardSuperblock superblock;
 
     private MappedShard(Path file, RandomAccessFile raf, FileChannel channel, long segmentBytes,
                         long capacity, List<MappedByteBuffer> segments, ShardSuperblock superblock) {
@@ -39,7 +42,7 @@ public final class MappedShard implements AutoCloseable {
         this.channel = channel;
         this.segmentBytes = segmentBytes;
         this.capacity = capacity;
-        this.segments = segments;
+        this.segments = new CopyOnWriteArrayList<>(segments);
         this.superblock = superblock;
     }
 
