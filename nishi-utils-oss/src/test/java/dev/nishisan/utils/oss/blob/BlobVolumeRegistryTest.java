@@ -1,5 +1,7 @@
 package dev.nishisan.utils.oss.blob;
 
+import dev.nishisan.utils.oss.metrics.BlobVolumeMetricsListener;
+import dev.nishisan.utils.oss.metrics.NgrrdMetricsListener;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -63,6 +65,22 @@ class BlobVolumeRegistryTest {
             BlobVolume first = reg.open(cfg);
             BlobVolume second = reg.open(cfg);
             assertSame(first, second);
+        }
+    }
+
+    @Test
+    void openComListenersEhIdempotentePorNome(@TempDir Path base) {
+        BlobVolumeConfig cfg = new BlobVolumeConfig("v1", base.resolve("v1"), 2, 1L << 20, 1L << 20);
+        NgrrdMetricsListener quality = new NgrrdMetricsListener() {
+        };
+        BlobVolumeMetricsListener volume = new BlobVolumeMetricsListener() {
+        };
+        try (BlobVolumeRegistry reg = NgrrdBlob.registry().build()) {
+            BlobVolume first = reg.open(cfg, quality, volume);
+            BlobVolume second = reg.open(cfg); // sem listeners -> mesmo volume (listeners fora da chave)
+            assertSame(first, second);
+            assertSame(quality, first.qualityListener());
+            assertSame(volume, first.volumeMetricsListener());
         }
     }
 
