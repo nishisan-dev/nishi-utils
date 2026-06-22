@@ -6,6 +6,9 @@ import dev.nishisan.utils.oss.api.Sample;
 import dev.nishisan.utils.oss.api.SeriesResult;
 import dev.nishisan.utils.oss.api.StorageBackendType;
 import dev.nishisan.utils.oss.api.ViewQuery;
+import dev.nishisan.utils.oss.blob.BlobVolume;
+import dev.nishisan.utils.oss.blob.BlobVolumeRegistry;
+import dev.nishisan.utils.oss.blob.NgrrdUri;
 import dev.nishisan.utils.oss.config.NgrrdYamlLoader;
 import dev.nishisan.utils.oss.definition.NgrrdDefinition;
 import dev.nishisan.utils.oss.definition.StorageSpec;
@@ -119,7 +122,45 @@ public final class Ngrrd {
 
         NgrrdDefinition def = NgrrdYamlLoader.parse(yamlContent, System::getenv);
         dev.nishisan.utils.oss.config.NgrrdDefinitionValidator.validate(def);
+        String seriesKey = resolveSeriesKey(def.spec().identity().seriesKeyTemplate(), tags);
+        return buildHandle(def, bindings, seriesKey, metricsListener, options);
+    }
 
+    // ------------------------------------------------------------ blob locator
+
+    /**
+     * Abre uma série de um blob volume pelo locator {@code ngrrd://<volume>/<path>}:
+     * o {@code <path>} é usado diretamente como {@code seriesKey} (modo locator),
+     * dispensando {@code tags}+{@code seriesKeyTemplate}.
+     */
+    public static NgrrdHandle open(BlobVolumeRegistry registry, NgrrdUri locator, String yamlContent) {
+        return open(registry, locator, yamlContent, OpenOptions.defaults());
+    }
+
+    public static NgrrdHandle open(BlobVolumeRegistry registry, NgrrdUri locator, String yamlContent,
+                                   OpenOptions options) {
+        Objects.requireNonNull(registry, "registry é obrigatório");
+        Objects.requireNonNull(locator, "locator é obrigatório");
+        return open(registry.require(locator.volume()), locator, yamlContent, options);
+    }
+
+    public static NgrrdHandle open(BlobVolume volume, NgrrdUri locator, String yamlContent) {
+        return open(volume, locator, yamlContent, OpenOptions.defaults());
+    }
+
+    public static NgrrdHandle open(BlobVolume volume, NgrrdUri locator, String yamlContent, OpenOptions options) {
+        Objects.requireNonNull(volume, "volume é obrigatório");
+        Objects.requireNonNull(locator, "locator é obrigatório");
+        Objects.requireNonNull(yamlContent, "yamlContent é obrigatório");
+        Objects.requireNonNull(options, "options é obrigatório");
+        NgrrdDefinition def = NgrrdYamlLoader.parse(yamlContent, System::getenv);
+        dev.nishisan.utils.oss.config.NgrrdDefinitionValidator.validate(def);
+        return buildHandle(def, volume.bindings(), locator.seriesPath(), null, options);
+    }
+
+    private static NgrrdHandle buildHandle(NgrrdDefinition def, StorageFactory.StorageBindings bindings,
+                                           String seriesKey, NgrrdMetricsListener metricsListener,
+                                           OpenOptions options) {
         StorageSpec storageSpec = def.spec().storage();
         // Durabilidade efetiva: override de abertura > default do YAML > FSYNC.
         Durability durability = resolveDurability(options, storageSpec);
@@ -135,8 +176,6 @@ public final class Ngrrd {
         }
 
         NgrrdStorage storage = StorageFactory.from(storageSpec, bindings);
-        String seriesKey = resolveSeriesKey(def.spec().identity().seriesKeyTemplate(), tags);
-
         // Tratamento de mudança de geometria: override de abertura > YAML > FAIL.
         OnGeometryChange onGeometryChange = resolveGeometryChange(options, storageSpec);
 
@@ -147,7 +186,10 @@ public final class Ngrrd {
         NgrrdWriter writer = new NgrrdWriter(def, storage, seriesKey, metrics, seriesLock,
                 durability, onGeometryChange);
 
-        return new DefaultHandle(def, storage, seriesKey, writer, metrics, Map.copyOf(tags), seriesLock);
+        // O volume SHARDED_BLOB é compartilhado entre handles; quem o fecha é o
+        // BlobVolumeRegistry, não o handle individual.
+        boolean ownsStorage = storageSpec.backend() != StorageBackendType.SHARDED_BLOB;
+        return new DefaultHandle(def, storage, seriesKey, writer, metrics, seriesLock, ownsStorage);
     }
 
     static Durability resolveDurability(OpenOptions options, StorageSpec storageSpec) {
@@ -235,19 +277,19 @@ public final class Ngrrd {
         private final NgrrdMetrics metrics;
         private final NgrrdReader reader;
         private final ViewExecutor viewExecutor;
-        private final Map<String, String> tags;
+        private final boolean ownsStorage;
         private volatile boolean closed;
 
         DefaultHandle(NgrrdDefinition def, NgrrdStorage storage, String seriesKey,
-                      NgrrdWriter writer, NgrrdMetrics metrics, Map<String, String> tags,
-                      ReadWriteLock seriesLock) {
+                      NgrrdWriter writer, NgrrdMetrics metrics,
+                      ReadWriteLock seriesLock, boolean ownsStorage) {
             this.storage = storage;
             this.seriesKey = seriesKey;
             this.writer = writer;
             this.metrics = metrics;
             this.reader = new NgrrdReader(def, storage, seriesKey, seriesLock);
-            this.viewExecutor = new ViewExecutor(def, storage, seriesLock);
-            this.tags = tags;
+            this.viewExecutor = new ViewExecutor(def, storage, seriesKey, seriesLock);
+            this.ownsStorage = ownsStorage;
         }
 
         @Override
@@ -286,12 +328,12 @@ public final class Ngrrd {
 
         @Override
         public Map<String, SeriesResult> read(String presetName) {
-            return viewExecutor.run(presetName, tags);
+            return viewExecutor.run(presetName);
         }
 
         @Override
         public Map<String, SeriesResult> read(String presetName, long endExclusiveEpochMs) {
-            return viewExecutor.run(presetName, tags, endExclusiveEpochMs);
+            return viewExecutor.run(presetName, endExclusiveEpochMs);
         }
 
         @Override
@@ -303,7 +345,9 @@ public final class Ngrrd {
             try {
                 writer.close();
             } finally {
-                if (storage instanceof AutoCloseable ac) {
+                // Volumes SHARDED_BLOB são compartilhados (ownsStorage=false) e
+                // fechados pelo BlobVolumeRegistry, não por handle.
+                if (ownsStorage && storage instanceof AutoCloseable ac) {
                     try {
                         ac.close();
                     } catch (Exception e) {

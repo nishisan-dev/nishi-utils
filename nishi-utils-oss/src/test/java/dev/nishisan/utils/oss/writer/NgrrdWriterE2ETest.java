@@ -35,15 +35,6 @@ class NgrrdWriterE2ETest {
         }
     }
 
-    private Map<String, String> sampleTags() {
-        return Map.of(
-                "deviceId", "r1",
-                "interfaceId", "eth0",
-                "region", "br-sp",
-                "vendor", "x",
-                "role", "core");
-    }
-
     @Test
     void ingestDeUmaHoraMaterializaCdpsEDailyPresetRecuperaPontos(@TempDir Path tempDir) throws Exception {
         NgrrdDefinition def = loadDefinition();
@@ -61,8 +52,8 @@ class NgrrdWriterE2ETest {
         }
 
         long endMs = BLOCK_START_MS + 12 * STEP_MS + 1000L;
-        ViewExecutor viewer = new ViewExecutor(def, storage);
-        Map<String, SeriesResult> result = viewer.run("daily", sampleTags(), endMs);
+        ViewExecutor viewer = new ViewExecutor(def, storage, seriesKey);
+        Map<String, SeriesResult> result = viewer.run("daily", endMs);
 
         SeriesResult inBps = result.get("in_bps");
         assertNotNull(inBps);
