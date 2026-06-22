@@ -11,8 +11,8 @@ import json
 import sys
 from typing import List, Optional
 
-from . import migrate as migrate_mod
-from . import verify as verify_mod
+from .migrate import DEFAULT_SEGMENT_BYTES, DEFAULT_SHARD_COUNT, MigrationReport, migrate
+from .verify import VerifyReport, verify
 from .volume import BlobVolumeWriter
 
 
@@ -26,8 +26,8 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("source_root", help="raiz que contém <series_prefix>/**/*.ngrr")
     m.add_argument("target_volume", help="diretório do blob volume de destino")
     m.add_argument("--series-prefix", default="series")
-    m.add_argument("--shards", type=int, default=migrate_mod.DEFAULT_SHARD_COUNT)
-    m.add_argument("--segment-bytes", type=int, default=migrate_mod.DEFAULT_SEGMENT_BYTES)
+    m.add_argument("--shards", type=int, default=DEFAULT_SHARD_COUNT)
+    m.add_argument("--segment-bytes", type=int, default=DEFAULT_SEGMENT_BYTES)
     m.add_argument("--initial-capacity", type=int, default=None)
     m.add_argument("--resume", action="store_true", help="pula séries já migradas (no catálogo)")
     m.add_argument("--dry-run", action="store_true", help="relata sem escrever")
@@ -59,14 +59,14 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 
 def _do_migrate(args) -> int:
-    report = migrate_mod.migrate(
+    report = migrate(
         args.source_root, args.target_volume,
         series_prefix=args.series_prefix, shard_count=args.shards,
         segment_bytes=args.segment_bytes, initial_capacity=args.initial_capacity,
         resume=args.resume, dry_run=args.dry_run)
     failed = bool(report.unreadable)
     if args.verify and not args.dry_run:
-        vreport = verify_mod.verify(args.target_volume, source_root=args.source_root)
+        vreport = verify(args.target_volume, source_root=args.source_root)
         failed = failed or not vreport.healthy
         if args.json:
             print(json.dumps({"migrate": report.as_dict(), "verify": vreport.as_dict()}, indent=2))
@@ -82,7 +82,7 @@ def _do_migrate(args) -> int:
 
 
 def _do_verify(args) -> int:
-    report = verify_mod.verify(args.target_volume, source_root=args.source_root,
+    report = verify(args.target_volume, source_root=args.source_root,
                                series_prefix=args.series_prefix)
     if args.json:
         print(json.dumps(report.as_dict(), indent=2))
@@ -116,7 +116,7 @@ def _do_inspect(args) -> int:
     return 0
 
 
-def _print_migrate(report: migrate_mod.MigrationReport) -> None:
+def _print_migrate(report: MigrationReport) -> None:
     tag = "[dry-run] " if report.dry_run else ""
     print(f"{tag}migrated={report.migrated} skipped={report.skipped} "
           f"bytes={report.total_object_bytes} unreadable={len(report.unreadable)}")
@@ -124,7 +124,7 @@ def _print_migrate(report: migrate_mod.MigrationReport) -> None:
         print(f"  ILEGÍVEL {key}: {reason}", file=sys.stderr)
 
 
-def _print_verify(report: verify_mod.VerifyReport) -> None:
+def _print_verify(report: VerifyReport) -> None:
     print(f"verify: checked={report.checked} ok={report.ok} failures={len(report.failures)} "
           f"healthy={report.healthy}")
     for key, reason in report.failures:
