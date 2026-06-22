@@ -155,7 +155,9 @@ public final class Ngrrd {
         Objects.requireNonNull(options, "options é obrigatório");
         NgrrdDefinition def = NgrrdYamlLoader.parse(yamlContent, System::getenv);
         dev.nishisan.utils.oss.config.NgrrdDefinitionValidator.validate(def);
-        return buildHandle(def, volume.bindings(), locator.seriesPath(), null, options);
+        // Propaga o listener de qualidade default do volume a cada handle (coleta
+        // central por série); null quando não configurado preserva o comportamento atual.
+        return buildHandle(def, volume.bindings(), locator.seriesPath(), volume.qualityListener(), options);
     }
 
     private static NgrrdHandle buildHandle(NgrrdDefinition def, StorageFactory.StorageBindings bindings,
