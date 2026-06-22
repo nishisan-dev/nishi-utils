@@ -18,6 +18,16 @@ de dezenas de milhares de FDs.
 arquivo `.ngrr` standalone (formato `SeriesFileCodec`, inalterado). Migrar = copiar
 os bytes do `.ngrr` para uma região + indexar no catálogo.
 
+## Diagramas
+
+Layout físico do volume:
+
+![Layout do blob volume](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan-dev/nishi-utils/main/doc/oss/diagrams/blob_volume_layout.puml)
+
+Fluxo de migração (Python) + leitura (Java):
+
+![Migração e leitura](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan-dev/nishi-utils/main/doc/oss/diagrams/blob_migration_sequence.puml)
+
 ## 2. Convenções
 
 - **Endianness:** big-endian em **tudo** (paridade com o `.ngrr`/`SeriesFileCodec`).

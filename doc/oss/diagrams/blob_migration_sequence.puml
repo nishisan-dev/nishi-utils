@@ -1,0 +1,30 @@
+@startuml blob_migration_sequence
+title ngrrd — Migração de .ngrr para blob volume (Python) + leitura (Java)
+
+skinparam shadowing false
+actor Operador as op
+participant "ngrrd-blob-migrate\n(Python)" as py
+database "diretório .ngrr\n(<root>/series/**)" as src
+database "blob volume\n(shards + catálogo)" as vol
+participant "BlobStorage\n(Java)" as java
+
+== Migração (offline) ==
+op -> py : migrate <root> <vol> --shards 64 --verify
+py -> src : walk lazy *.ngrr\n(catalogKey = path relativo)
+loop por série
+  py -> src : valida header (MAGIC/CRC/file_total_bytes)
+  py -> py : shard = sha256(key)[:8] % N\noffset = bump (+ grow se cheio)
+  py -> vol : escreve bytes do .ngrr (verbatim) na região
+  py -> vol : registra no catálogo (key -> shard/offset/len/objectBytes)
+end
+py -> vol : checkpoint (catalog.bin atômico + fsync)
+py -> vol : verify (header + paridade byte-a-byte)
+py --> op : migrated=N, unreadable=0, healthy=True
+
+== Leitura posterior (online) ==
+java -> vol : open (lê volume.meta + superblocks + catalog.bin)
+java -> java : reconstrói alocador (bump = high-water das LIVE)
+op -> java : Ngrrd.open("ngrrd://<volume>/<seriesKey>", yaml)
+java -> vol : openSeries -> região no shard (mmap)
+java --> op : SeriesResult (mesmos pontos)
+@enduml
