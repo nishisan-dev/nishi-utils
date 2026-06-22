@@ -1,5 +1,6 @@
 package dev.nishisan.utils.oss.storage.blob;
 
+import dev.nishisan.utils.oss.metrics.BlobVolumeStats;
 import dev.nishisan.utils.oss.storage.SeriesChannel;
 import dev.nishisan.utils.oss.storage.VerifyResult;
 import org.junit.jupiter.api.Test;
@@ -171,6 +172,49 @@ class BlobStorageTest {
         // reabre e confere persistência pós-crescimento
         try (BlobStorage bs = BlobStorage.openOrCreate(dir, 1, 64 * 1024, 64 * 1024)) {
             assertArrayEquals(pattern(8192, 11), bs.get("series/s11.ngrr").orElseThrow());
+        }
+    }
+
+    @Test
+    void statsRefleteUsoLiquidoPorShard(@TempDir Path dir) {
+        int n = 20;
+        try (BlobStorage bs = open(dir)) {
+            for (int i = 0; i < n; i++) {
+                bs.put("series/s" + i + ".ngrr", pattern(4096, i));
+            }
+
+            BlobVolumeStats stats = bs.stats();
+            assertEquals(SHARDS, stats.shardCount());
+            assertEquals(n, stats.catalogEntryCount());
+
+            // seriesPerShard bate com o group-by esperado via roteamento
+            long[] expectedSeries = new long[SHARDS];
+            for (int i = 0; i < n; i++) {
+                expectedSeries[BlobRouting.shardFor("series/s" + i + ".ngrr", SHARDS)]++;
+            }
+            assertArrayEquals(expectedSeries, stats.seriesPerShard());
+
+            // fill ratio em [0,1] e uso <= capacidade
+            for (int s = 0; s < SHARDS; s++) {
+                assertTrue(stats.fillRatioPerShard()[s] >= 0.0 && stats.fillRatioPerShard()[s] <= 1.0,
+                        "fillRatio fora de [0,1] no shard " + s);
+                assertTrue(stats.shardUsedBytes()[s] <= stats.shardCapacityBytes()[s]);
+            }
+
+            // uso LÍQUIDO: deletar uma série faz o used do seu shard cair
+            String victim = "series/s0.ngrr";
+            int vs = BlobRouting.shardFor(victim, SHARDS);
+            long usedBefore = bs.stats().shardUsedBytes()[vs];
+            bs.delete(victim);
+            long usedAfter = bs.stats().shardUsedBytes()[vs];
+            assertTrue(usedAfter < usedBefore, "used líquido deve cair após delete");
+            assertEquals(n - 1, bs.stats().catalogEntryCount());
+
+            // WAL tem bytes antes do checkpoint; cai (rotação) e catalog.bin > 0 depois
+            assertTrue(bs.stats().walBytes() > 0, "WAL deve ter bytes antes do checkpoint");
+            bs.checkpoint();
+            assertEquals(0L, bs.stats().walBytes(), "WAL deve zerar após rotação no checkpoint");
+            assertTrue(bs.stats().catalogImageBytes() > 0, "catalog.bin deve ter bytes após checkpoint");
         }
     }
 

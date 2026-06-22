@@ -1,5 +1,6 @@
 package dev.nishisan.utils.oss.storage.blob;
 
+import dev.nishisan.utils.oss.metrics.BlobVolumeStats;
 import dev.nishisan.utils.oss.storage.NgrrdStorage;
 import dev.nishisan.utils.oss.storage.SeriesChannel;
 import dev.nishisan.utils.oss.storage.SeriesChannelProvider;
@@ -362,6 +363,43 @@ public final class BlobStorage implements NgrrdStorage, SeriesChannelProvider, A
 
     public int shardCount() {
         return shardCount;
+    }
+
+    /**
+     * Snapshot dos gauges operacionais do volume (modelo <em>pull</em>): uso líquido,
+     * fill ratio e séries por shard, além do tamanho de catálogo e WAL. Lido sob o
+     * {@code structuralLock} para uma fotografia consistente; destina-se a poll de
+     * baixa frequência. Ver {@link BlobVolumeStats}.
+     */
+    public BlobVolumeStats stats() {
+        structuralLock.lock();
+        try {
+            long[] capacity = new long[shardCount];
+            long[] used = new long[shardCount];
+            long[] series = new long[shardCount];
+            for (int i = 0; i < shardCount; i++) {
+                capacity[i] = shards[i].capacity();
+            }
+            for (CatalogEntry e : catalog.values()) {
+                used[e.shardId()] += e.regionBytes();
+                series[e.shardId()]++;
+            }
+            double[] fill = new double[shardCount];
+            for (int i = 0; i < shardCount; i++) {
+                fill[i] = capacity[i] > 0 ? (double) used[i] / capacity[i] : 0.0;
+            }
+            long catalogImageBytes;
+            try {
+                Path bin = volumeDir.resolve(CATALOG_BIN);
+                catalogImageBytes = Files.exists(bin) ? Files.size(bin) : 0L;
+            } catch (IOException ex) {
+                throw new BlobVolumeException("falha ao ler o tamanho de " + CATALOG_BIN, ex);
+            }
+            return new BlobVolumeStats(shardCount, capacity, used, series, fill,
+                    catalog.size(), catalogImageBytes, journal.size());
+        } finally {
+            structuralLock.unlock();
+        }
     }
 
     // ---------------------------------------------------------------- helpers
