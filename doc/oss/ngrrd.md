@@ -153,6 +153,51 @@ no `checkpoint()`/`close()`.
 
 ---
 
+## Backend `sharded blob` (escala 30k+ séries)
+
+O backend padrão materializa **um arquivo `.ngrr` por série**. Em produção com
+dezenas de milhares de métricas isso esgota *file handles* e abre milhares de
+threads de writer. O backend **`sharded blob`** resolve o gargalo de FDs: um
+*volume* com N shards pré-alocados (default **64**), onde cada série é uma
+**região contígua** dentro de um shard, acessada via `MappedByteBuffer` (memória
+paginada). Independente do número de séries, são apenas **64 file handles + os
+segmentos mmap**. A imagem da região é **byte-a-byte idêntica** a um `.ngrr`
+standalone (formato inalterado).
+
+O formato do volume (superblock, catálogo WAL+snapshot, roteamento) está
+especificado em [`ngrrd-blob-volume.md`](ngrrd-blob-volume.md). É exclusivo de
+disco local (mmap coerente); S3 permanece como está.
+
+### Configuração e abertura
+
+A "config geral" (o `ngrrd-blob-base-path`) e os volumes vivem numa camada de
+topologia programática — **fora** do YAML de série (que carrega só `backend: blob`):
+
+```java
+// Registro de volumes (abrir uma vez por processo; fechar no shutdown):
+BlobVolumeRegistry volumes = NgrrdBlob.registry()
+        .basePath(Path.of("/var/ngrrd/blobs"))      // ngrrd-blob-base-path
+        .volume("ifaceStats")                        // -> /var/ngrrd/blobs/ifaceStats, 64 shards
+        .build();
+
+// Abertura por locator ngrrd://<volume>/<seriesPath> (o path vira o seriesKey):
+try (NgrrdHandle h = Ngrrd.open(volumes,
+        NgrrdUri.parse("ngrrd://ifaceStats/device:r1/iface:eth0"), seriesYaml)) {
+    h.write("in_octets", new Sample(ts, 12345L));
+    SeriesResult daily = h.read("daily").get("in_bps");
+}
+
+// Modo compat (migração de cliente existente = trocar só o binding):
+StorageFactory.StorageBindings bindings = volumes.require("ifaceStats").bindings();
+try (NgrrdHandle h = Ngrrd.fromYaml(seriesYaml, bindings, tags, null)) { /* ... */ }
+```
+
+O volume é **compartilhado** entre handles: `NgrrdHandle.close()` não o fecha
+(responsabilidade do `BlobVolumeRegistry`). Para migrar dados existentes, veja a
+ferramenta Python `ngrrd-blob-migrate` em `python/ngrrd-python`.
+
+---
+
 ## Tamanho do arquivo — fixo e pré-alocado
 
 Em paridade com o RRDtool, o arquivo tem **tamanho fixo e determinístico** desde

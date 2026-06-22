@@ -24,6 +24,7 @@ dev = [
 
 [project.scripts]
 ngrrd-dump = "ngrrd_python.cli:main"
+ngrrd-blob-migrate = "ngrrd_python.blob.cli:main"
 
 [project.urls]
 "Homepage" = "https://github.com/nishisan-dev/nishi-utils"

@@ -1,0 +1,35 @@
+@startuml blob_volume_layout
+title ngrrd — Layout físico do sharded blob volume
+
+skinparam shadowing false
+skinparam componentStyle rectangle
+
+package "<base>/<volume>/" {
+  artifact "volume.meta\n(uuid, N, segmentBytes,\nrouting, generation)" as meta
+  artifact "catalog.bin\n(snapshot: key -> shard/offset/len)" as cat
+  artifact "catalog.wal\n(journal ALLOC/FREE)" as wal
+
+  package "shard-00.blob" as s0 {
+    rectangle "superblock\n(4096B: capacidade, bumpCursor)" as sb0
+    rectangle "região série A\n(.ngrr byte-a-byte)" as ra
+    rectangle "região série B\n(.ngrr byte-a-byte)" as rb
+    rectangle "... (bump / free-list)" as free0
+  }
+  package "shard-01.blob" as s1 {
+    rectangle "superblock" as sb1
+    rectangle "região série C" as rc
+  }
+  artifact "shard-NN.blob ..." as sN
+}
+
+note right of meta
+  hash(seriesKey) % N -> shard preferencial
+  (SHA256_PREFIX64); localização real
+  é gravada no catálogo (autoritativo).
+end note
+
+cat ..> ra : aponta (shard,offset,len)
+cat ..> rb
+cat ..> rc
+sb0 .. ra : mmap segmentado\n(MappedByteBuffer)
+@enduml

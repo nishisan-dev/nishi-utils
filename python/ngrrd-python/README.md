@@ -94,6 +94,36 @@ The example script is a thin wrapper around the same command:
 python examples/ngrrd_dump.py series.ngrr --archive daily --cf AVERAGE
 ```
 
+## Blob volume migration
+
+The `ngrrd_python.blob` subpackage migrates a directory of individual `.ngrr`
+files into a **sharded blob volume** (a fixed set of mmap-backed shard files +
+catalog) read by the Java `BlobStorage`. This solves file-handle exhaustion at
+30k+ series scale. The on-disk format is the contract in
+[`doc/oss/ngrrd-blob-volume.md`](../../doc/oss/ngrrd-blob-volume.md); the routing
+hash and codecs are byte-for-byte identical to the Java side (enforced by
+cross-language tests).
+
+After installation, the package exposes `ngrrd-blob-migrate`:
+
+```bash
+# Migrate <root>/series/**/*.ngrr into the blob volume at /var/ngrrd/blobs/ifaceStats
+ngrrd-blob-migrate migrate /data/ngrrd /var/ngrrd/blobs/ifaceStats \
+    --shards 64 --verify
+
+ngrrd-blob-migrate migrate /data/ngrrd /var/ngrrd/blobs/ifaceStats --dry-run
+ngrrd-blob-migrate verify  /var/ngrrd/blobs/ifaceStats --source-root /data/ngrrd
+ngrrd-blob-migrate inspect /var/ngrrd/blobs/ifaceStats
+```
+
+Key flags: `--shards` (default 64, immutable per volume), `--segment-bytes`,
+`--resume` (skip series already in the catalog — idempotent re-runs), `--dry-run`
+(report counts/sizes/per-shard distribution without writing), `--verify` (run a
+fidelity pass after migrating), `--json`. Source files are never deleted.
+
+> **Run migration offline** (no Java writer active on the same series): the tool
+> assumes exclusive ownership of the target volume during the run.
+
 ## Supported Format
 
 This reader supports NGRR format version `1`, matching the Java
@@ -105,4 +135,6 @@ This reader supports NGRR format version `1`, matching the Java
 - row-major ring buffers containing IEEE-754 doubles;
 - `NaN` values represent missing points.
 
-The reader is read-only. It does not create or mutate `.ngrr` files.
+The `NgrrdReader` is read-only — it does not create or mutate `.ngrr` files. The
+`ngrrd_python.blob` subpackage does write blob volumes (shards + catalog), but
+never mutates the source `.ngrr` files it reads.

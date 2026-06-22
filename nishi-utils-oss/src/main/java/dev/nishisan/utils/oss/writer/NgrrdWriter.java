@@ -27,10 +27,9 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
@@ -82,8 +81,11 @@ public final class NgrrdWriter implements AutoCloseable {
     private final Durability durability;
     private boolean ringDirty;
 
-    private final ExecutorService worker;
+    private final WriterScheduler scheduler;
     private final LinkedBlockingQueue<Command> queue = new LinkedBlockingQueue<>();
+    // Garante no máximo uma tarefa de drain por writer a qualquer instante: preserva
+    // ordem total por série (single-writer) sobre o pool compartilhado.
+    private final AtomicBoolean scheduled = new AtomicBoolean(false);
 
     private volatile boolean closed;
 
@@ -166,13 +168,9 @@ public final class NgrrdWriter implements AutoCloseable {
         this.channel = provider.openSeries(storageKey);
         this.state = openOrCreate();
 
-        this.worker = Executors.newSingleThreadExecutor(r -> {
-            Thread t = new Thread(r, "ngrrd-writer-" + seriesKey);
-            t.setDaemon(true);
-            return t;
-        });
-        // submit() estabelece happens-before com o estado reidratado acima.
-        this.worker.submit(this::runLoop);
+        // Pool de writers compartilhado: o drain por-writer (agendado sob demanda)
+        // estabelece happens-before com o estado reidratado acima via a flag scheduled.
+        this.scheduler = WriterScheduler.acquire();
     }
 
     /**
@@ -220,7 +218,7 @@ public final class NgrrdWriter implements AutoCloseable {
         if (!rawDefByName.containsKey(dsName)) {
             throw new IllegalArgumentException("DS desconhecido: " + dsName);
         }
-        queue.add(new Command.Write(dsName, sample));
+        enqueue(new Command.Write(dsName, sample));
     }
 
     /** Materializa o CDP em progresso como parcial e torna o arquivo durável. */
@@ -244,7 +242,7 @@ public final class NgrrdWriter implements AutoCloseable {
         }
         CountDownLatch latch = new CountDownLatch(1);
         AtomicReference<RuntimeException> error = new AtomicReference<>();
-        queue.add(new Command.Sync(latch, error));
+        enqueue(new Command.Sync(latch, error));
         try {
             latch.await();
         } catch (InterruptedException e) {
@@ -264,18 +262,13 @@ public final class NgrrdWriter implements AutoCloseable {
         }
         closed = true;
         CountDownLatch latch = new CountDownLatch(1);
-        queue.add(new Command.Shutdown(latch));
+        enqueue(new Command.Shutdown(latch));
         try {
             latch.await(30, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
-        worker.shutdown();
-        try {
-            worker.awaitTermination(5, TimeUnit.SECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
+        scheduler.release();
     }
 
     public String seriesKey() {
@@ -286,55 +279,81 @@ public final class NgrrdWriter implements AutoCloseable {
         return definition;
     }
 
-    private void runLoop() {
-        while (true) {
-            try {
-                Command cmd = queue.take();
-                switch (cmd) {
-                    case Command.Write w -> {
-                        writeLock.lock();
-                        try {
-                            handleWrite(w);
-                            if (ringDirty) {
-                                // ring avançou: mantém (ponteiro, células) coerente
-                                // no objeto para leitores concorrentes; durabilidade
-                                // continua sendo responsabilidade do checkpoint.
-                                persistLiveState();
-                            }
-                        } finally {
-                            writeLock.unlock();
-                        }
-                    }
-                    case Command.Sync s -> {
-                        // Sempre libera o latch; uma falha vai para o chamador via error ref.
-                        try {
-                            checkpointAndForce();
-                        } catch (RuntimeException e) {
-                            s.error().set(e);
-                        } finally {
-                            s.latch().countDown();
-                        }
-                    }
-                    case Command.Shutdown s -> {
-                        try {
-                            checkpointAndForce();
-                        } catch (RuntimeException e) {
-                            System.err.println("ngrrd-writer: falha no checkpoint final: " + e);
-                        } finally {
-                            closeChannelQuietly();
-                            s.latch().countDown();
-                        }
-                        return;
-                    }
-                }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return;
-            } catch (RuntimeException e) {
-                // erro de uma amostra individual não pode derrubar a worker thread.
-                System.err.println("ngrrd-writer error: " + e);
+    /** Enfileira um comando e garante que um drain está/será agendado. */
+    private void enqueue(Command cmd) {
+        queue.add(cmd);
+        schedule();
+    }
+
+    /** Agenda um drain no pool compartilhado se ainda não houver um ativo. */
+    private void schedule() {
+        if (scheduled.compareAndSet(false, true)) {
+            scheduler.submit(this::drain);
+        }
+    }
+
+    /**
+     * Drena a fila desta série. No máximo um drain roda por writer (flag
+     * {@code scheduled}), preservando ordem total e o invariante single-writer.
+     * Ao esvaziar, libera a flag e reagenda se chegou comando na janela de corrida.
+     */
+    private void drain() {
+        Command cmd;
+        while ((cmd = queue.poll()) != null) {
+            if (processOne(cmd)) {
+                return; // Shutdown processado: writer encerrado, não reagenda.
             }
         }
+        scheduled.set(false);
+        if (!queue.isEmpty()) {
+            schedule();
+        }
+    }
+
+    /** Processa um comando. Retorna {@code true} se foi um Shutdown (encerra o writer). */
+    private boolean processOne(Command cmd) {
+        try {
+            switch (cmd) {
+                case Command.Write w -> {
+                    writeLock.lock();
+                    try {
+                        handleWrite(w);
+                        if (ringDirty) {
+                            // ring avançou: mantém (ponteiro, células) coerente no objeto
+                            // para leitores concorrentes; durabilidade fica no checkpoint.
+                            persistLiveState();
+                        }
+                    } finally {
+                        writeLock.unlock();
+                    }
+                }
+                case Command.Sync s -> {
+                    // Sempre libera o latch; uma falha vai para o chamador via error ref.
+                    try {
+                        checkpointAndForce();
+                    } catch (RuntimeException e) {
+                        s.error().set(e);
+                    } finally {
+                        s.latch().countDown();
+                    }
+                }
+                case Command.Shutdown s -> {
+                    try {
+                        checkpointAndForce();
+                    } catch (RuntimeException e) {
+                        System.err.println("ngrrd-writer: falha no checkpoint final: " + e);
+                    } finally {
+                        closeChannelQuietly();
+                        s.latch().countDown();
+                    }
+                    return true;
+                }
+            }
+        } catch (RuntimeException e) {
+            // erro de uma amostra individual não pode derrubar o drain.
+            System.err.println("ngrrd-writer error: " + e);
+        }
+        return false;
     }
 
     private void handleWrite(Command.Write w) {

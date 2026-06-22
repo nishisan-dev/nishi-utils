@@ -7,7 +7,7 @@
     <parent>
         <groupId>dev.nishisan</groupId>
         <artifactId>nishi-utils-parent</artifactId>
-        <version>7.3.0</version>
+        <version>8.0.0</version>
         <relativePath>../pom.xml</relativePath>
     </parent>
 
@@ -161,6 +161,35 @@
                                 <TESTCONTAINERS_RYUK_DISABLED>true</TESTCONTAINERS_RYUK_DISABLED>
                                 <DOCKER_API_VERSION>1.43</DOCKER_API_VERSION>
                             </environmentVariables>
+                        </configuration>
+                        <executions>
+                            <execution>
+                                <goals>
+                                    <goal>integration-test</goal>
+                                    <goal>verify</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <!-- Testes cross-language Java<->Python do blob volume (requer python3 no PATH) -->
+        <profile>
+            <id>blob-crosslang</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-failsafe-plugin</artifactId>
+                        <version>3.2.5</version>
+                        <configuration>
+                            <forkCount>1</forkCount>
+                            <reuseForks>false</reuseForks>
+                            <includes>
+                                <include>**/*CrossLangIT.java</include>
+                            </includes>
                         </configuration>
                         <executions>
                             <execution>

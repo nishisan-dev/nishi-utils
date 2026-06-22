@@ -2,6 +2,7 @@ package dev.nishisan.utils.oss.storage;
 
 import dev.nishisan.utils.oss.api.StorageBackendType;
 import dev.nishisan.utils.oss.definition.StorageSpec;
+import dev.nishisan.utils.oss.storage.blob.BlobStorage;
 
 import java.nio.file.Path;
 import java.util.Objects;
@@ -29,6 +30,8 @@ public final class StorageFactory {
                     "bindings.localRoot é obrigatório para backend LOCAL_DISK"));
             case OBJECT_STORAGE -> new S3Storage(Objects.requireNonNull(bindings.s3Settings(),
                     "bindings.s3Settings é obrigatório para backend OBJECT_STORAGE"));
+            case SHARDED_BLOB -> Objects.requireNonNull(bindings.blobVolume(),
+                    "bindings.blobVolume é obrigatório para backend SHARDED_BLOB");
         };
     }
 
@@ -42,16 +45,22 @@ public final class StorageFactory {
 
     /**
      * Parâmetros de conexão por backend. Apenas o campo correspondente ao backend
-     * efetivamente usado precisa estar populado.
+     * efetivamente usado precisa estar populado. O backend {@code SHARDED_BLOB}
+     * recebe uma instância de {@link BlobStorage} já aberta e <strong>compartilhada</strong>
+     * (um volume vive muito além de uma série; não é recriado por {@code fromYaml}).
      */
-    public record StorageBindings(Path localRoot, S3Settings s3Settings) {
+    public record StorageBindings(Path localRoot, S3Settings s3Settings, BlobStorage blobVolume) {
 
         public static StorageBindings forLocalDisk(Path rootDir) {
-            return new StorageBindings(rootDir, null);
+            return new StorageBindings(rootDir, null, null);
         }
 
         public static StorageBindings forS3(S3Settings settings) {
-            return new StorageBindings(null, settings);
+            return new StorageBindings(null, settings, null);
+        }
+
+        public static StorageBindings forBlob(BlobStorage volume) {
+            return new StorageBindings(null, null, volume);
         }
     }
 }
