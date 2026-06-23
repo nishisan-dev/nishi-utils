@@ -4,6 +4,26 @@
 
 ---
 
+## 2026-06-23 — 🟢 Feature: idle-skip de checkpoint redundante no ngrrd writer
+
+O `checkpoint()`/`flush()` re-emitia o CDP parcial de todos os RRAs e forçava a durabilidade
+(fsync no disco / **PUT do objeto inteiro** no S3) a cada chamada — mesmo sem nenhuma amostra
+nova desde o último force. Com checkpoints frequentes (~1s) e ingestão mais lenta, isso gerava
+N forces/PUTs idênticos por intervalo.
+
+- **Gate idle-skip:** `NgrrdWriter` pula `checkpointAndForce()` quando nada mudou desde o último
+  force (`changedSinceForce`, por série, confinado à worker thread). A re-emissão parcial seria
+  byte-idêntica e o canal já estaria limpo, então o force/PUT seria no-op. Estritamente
+  Pareto-positivo: leitura e durabilidade **idênticas**.
+- **Segurança:** o flag é marcado em **toda** amostra aplicada (mesmo sem virar passo, para não
+  perder o PDP parcial do slot aberto no shutdown) e limpo **só após** persistir/forçar com
+  sucesso (retry se o `force()` lançar). Publicado pelo mesmo mecanismo de `ringDirty`.
+- **Observabilidade:** novo `checkpoint_coalesced_count` (`onCheckpointCoalesced` no
+  `NgrrdMetricsListener`/`NgrrdMetrics`, forma canônica + legada).
+
+Contrato: `checkpoint()`/`flush()` passam a documentar o no-op idle. Sem mudança de layout
+on-disk nem de `formatVersion`.
+
 ## 2026-06-22 — 🟢 Feature: observabilidade global do blob volume (ngrrd, issue #160) — release 8.1.0
 
 A v8.0.0 introduziu o backend `SHARDED_BLOB`, onde milhares de séries compartilham um volume; a
