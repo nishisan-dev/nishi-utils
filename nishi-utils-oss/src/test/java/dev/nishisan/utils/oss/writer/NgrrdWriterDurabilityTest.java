@@ -80,10 +80,97 @@ class NgrrdWriterDurabilityTest {
             w.checkpoint();
             assertEquals(afterCreate + 1, storage.forceCount.get(),
                     "FSYNC deveria forçar uma vez por checkpoint");
+            // Com idle-skip, um checkpoint só força se houver amostra nova desde o
+            // último force: ingere mais uma antes do segundo checkpoint.
+            w.write("in_octets", new Sample(START_MS + 2 * STEP_MS, 1_200_000L));
             w.checkpoint();
             assertEquals(afterCreate + 2, storage.forceCount.get(),
-                    "cada checkpoint adicional em FSYNC deveria forçar de novo");
+                    "checkpoint com dado novo em FSYNC deveria forçar de novo");
         }
+    }
+
+    @Test
+    void checkpointOciosoNaoForcaEmFsync(@TempDir Path tempDir) throws Exception {
+        NgrrdDefinition def = definition();
+        ForceCountingStorage storage = new ForceCountingStorage(tempDir);
+
+        try (NgrrdWriter w = writer(def, storage, Durability.FSYNC)) {
+            int afterCreate = storage.forceCount.get();
+            w.write("in_octets", new Sample(START_MS, 1_000_000L));
+            w.write("in_octets", new Sample(START_MS + STEP_MS, 1_100_000L));
+            w.checkpoint();
+            int afterFirst = storage.forceCount.get();
+            assertEquals(afterCreate + 1, afterFirst, "1o checkpoint com dados deveria forçar");
+
+            // Sem amostra nova entre os checkpoints: idle-skip não força de novo.
+            w.checkpoint();
+            w.checkpoint();
+            assertEquals(afterFirst, storage.forceCount.get(),
+                    "checkpoint ocioso (sem amostra nova) não deveria forçar");
+        }
+    }
+
+    @Test
+    void amostraNoSlotAbertoSemVirarPassoNaoEhPulada(@TempDir Path tempDir) throws Exception {
+        NgrrdDefinition def = definition();
+        ForceCountingStorage storage = new ForceCountingStorage(tempDir);
+
+        try (NgrrdWriter w = writer(def, storage, Durability.FSYNC)) {
+            w.write("in_octets", new Sample(START_MS, 1_000_000L));
+            w.write("in_octets", new Sample(START_MS + STEP_MS, 1_100_000L));
+            w.checkpoint();
+            int afterCheckpoint = storage.forceCount.get();
+
+            // Amostra no MESMO slot base ainda aberto (sem virar passo): só acumula
+            // o PDP, mas muda o slot in-progress -> o próximo checkpoint NÃO pode
+            // ser pulado. Guarda o requisito de marcar o flag mesmo sem ring-advance.
+            w.write("in_octets", new Sample(START_MS + STEP_MS + 60_000, 1_130_000L));
+            w.checkpoint();
+            assertEquals(afterCheckpoint + 1, storage.forceCount.get(),
+                    "checkpoint após amostra no slot aberto (sem virar passo) deveria forçar");
+        }
+    }
+
+    @Test
+    void checkpointOciosoNaoMudaLeituraDoSlotEmProgresso(@TempDir Path tempDir) throws Exception {
+        NgrrdDefinition def = definition();
+        ForceCountingStorage storage = new ForceCountingStorage(tempDir);
+        long end = START_MS + 2L * STEP_MS;
+
+        try (NgrrdWriter w = writer(def, storage, Durability.FSYNC)) {
+            w.write("in_octets", new Sample(START_MS, 1_000_000L));
+            w.write("in_octets", new Sample(START_MS + STEP_MS, 1_100_000L));
+            w.checkpoint();
+            List<Double> antes = readInBps(def, storage, end);
+            int forcesAntes = storage.forceCount.get();
+
+            // Checkpoint ocioso: não força e não altera o valor lido do slot aberto
+            // (a re-emissão parcial seria byte-idêntica).
+            w.checkpoint();
+            assertEquals(forcesAntes, storage.forceCount.get(),
+                    "checkpoint ocioso não deveria forçar");
+            List<Double> depois = readInBps(def, storage, end);
+            assertEquals(antes, depois,
+                    "checkpoint ocioso não deveria alterar a leitura do slot em progresso");
+        }
+    }
+
+    @Test
+    void dadoCheckpointadoSobreviveAoCloseComIdleSkip(@TempDir Path tempDir) throws Exception {
+        NgrrdDefinition def = definition();
+        ForceCountingStorage storage = new ForceCountingStorage(tempDir);
+        long end = START_MS + 2L * STEP_MS;
+
+        NgrrdWriter w = writer(def, storage, Durability.FSYNC);
+        w.write("in_octets", new Sample(START_MS, 1_000_000L));
+        w.write("in_octets", new Sample(START_MS + STEP_MS, 1_100_000L));
+        w.checkpoint(); // força + limpa o flag
+        w.checkpoint(); // idle-skip
+        w.close();      // shutdown ocioso: dado já durável
+
+        List<Double> values = readInBps(def, storage, end);
+        assertTrue(values.contains(EXPECTED_BPS),
+                "dado checkpointado deve permanecer legível após close com idle-skip: " + values);
     }
 
     @Test

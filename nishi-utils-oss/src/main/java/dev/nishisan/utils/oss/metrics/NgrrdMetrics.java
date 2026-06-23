@@ -16,6 +16,9 @@ import java.util.concurrent.atomic.AtomicReference;
  *     timestamp da sample e o instante do recebimento.</li>
  *     <li>{@code missing_ratio} — última proporção de PDPs ausentes observada
  *     em um bloco fechado, em [0.0, 1.0].</li>
+ *     <li>{@code checkpoint_coalesced_count} — checkpoints redundantes pulados
+ *     (idle-skip): nenhuma amostra aplicada desde o último force. Contador de
+ *     eficiência, não de qualidade.</li>
  * </ul>
  *
  * <p>Implementa a forma <em>canônica</em> (com {@code seriesKey}) de cada callback,
@@ -32,6 +35,7 @@ public final class NgrrdMetrics implements NgrrdMetricsListener {
     private final AtomicLong wrapDetectedCount = new AtomicLong();
     private final AtomicLong lastIngestLagSec = new AtomicLong();
     private final AtomicReference<Double> lastMissingRatio = new AtomicReference<>(0.0);
+    private final AtomicLong checkpointCoalescedCount = new AtomicLong();
     private final NgrrdMetricsListener forward;
 
     public NgrrdMetrics() {
@@ -60,6 +64,10 @@ public final class NgrrdMetrics implements NgrrdMetricsListener {
 
     public double lastMissingRatio() {
         return lastMissingRatio.get();
+    }
+
+    public long checkpointCoalescedCount() {
+        return checkpointCoalescedCount.get();
     }
 
     // ------------------------------------------------------------ forma canônica
@@ -104,6 +112,14 @@ public final class NgrrdMetrics implements NgrrdMetricsListener {
         }
     }
 
+    @Override
+    public void onCheckpointCoalesced(String seriesKey) {
+        checkpointCoalescedCount.incrementAndGet();
+        if (forward != null) {
+            forward.onCheckpointCoalesced(seriesKey);
+        }
+    }
+
     // --------------------------------------------------------------- forma legada
 
     @Override
@@ -129,5 +145,10 @@ public final class NgrrdMetrics implements NgrrdMetricsListener {
     @Override
     public void onBlockClosed(String rraName, String dsName, double missingRatio) {
         onBlockClosed(null, rraName, dsName, missingRatio);
+    }
+
+    @Override
+    public void onCheckpointCoalesced() {
+        onCheckpointCoalesced(null);
     }
 }
