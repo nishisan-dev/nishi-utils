@@ -28,6 +28,10 @@ Fluxo de migração (Python) + leitura (Java):
 
 ![Migração e leitura](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan-dev/nishi-utils/main/doc/oss/diagrams/blob_migration_sequence.puml)
 
+Observabilidade do volume (listeners + gauges):
+
+![Observabilidade do blob volume](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan-dev/nishi-utils/main/doc/oss/diagrams/blob_observability.puml)
+
 ## 2. Convenções
 
 - **Endianness:** big-endian em **tudo** (paridade com o `.ngrr`/`SeriesFileCodec`).
@@ -226,7 +230,52 @@ espaço não usado (recuperado pela próxima alocação).
   sobre as mesmas séries (janela de manutenção). Único escritor dos shards durante
   a migração são os próprios workers, particionados por shard.
 
-## 11. Versionamento
+## 11. Observabilidade do volume
+
+> **Não-normativa.** Esta seção descreve telemetria de runtime; não altera o
+> layout on-disk e **não** dispara bump de `formatVersion` nem afeta a compatibilidade
+> cross-language.
+
+A observabilidade tem dois canais independentes, ambos **aditivos e opcionais**
+(default no-op / `null`):
+
+**1. Qualidade por-volume (reuso de `NgrrdMetricsListener`).** Um listener default
+configurado no volume é propagado a **cada handle** aberto via `Ngrrd.open(...)`,
+evitando fiar um listener por série em escala (30k+). Os callbacks são a forma
+**canônica**, que recebe o `seriesKey` como primeiro parâmetro
+(`onCounterReset(seriesKey, dsName)`, `onWrapDetected`, `onLateSample`,
+`onIngestLag`, `onBlockClosed`) — permitindo coleta central com atribuição à série
+de origem. As variantes legadas (sem `seriesKey`) continuam válidas: o produtor
+chama a canônica e o `default` delega à legada. Cada handle mantém também um
+`NgrrdMetrics` **local** (contagem por-série) e faz forward 1→1 ao listener global,
+sem dupla contagem.
+
+**2. Operacional do volume (`BlobVolumeMetricsListener`).** Um listener único por
+volume observa a camada física:
+
+| Evento (push) | Quando |
+|---|---|
+| `onShardGrow(shardId, oldCap, newCap)` | shard cresce em disco (`setLength`+map) |
+| `onRegionAllocate(shardId, regionBytes)` | nova região alocada (não no resize same-size) |
+| `onRegionFree(shardId, regionBytes)` | região liberada (delete ou realocação) |
+| `onCheckpoint(durationMs, entryCount)` | snapshot do catálogo concluído |
+
+Gauges são lidos por **pull** via `BlobVolume.stats()` → `BlobVolumeStats`
+(`fillRatioPerShard`, `seriesPerShard`, `shardUsedBytes` — **uso líquido**, recua no
+free —, `catalogImageBytes`, `walBytes`), desacoplando a coleta da frequência de
+checkpoint.
+
+**Contrato de thread-safety.** `onShardGrow`/`onRegionAllocate`/`onRegionFree` são
+emitidos **sob o `structuralLock`** do volume; as implementações **devem** ser
+thread-safe e **O(1)/non-blocking** (bloquear serializa todo o volume).
+`onCheckpoint` é emitido **fora** do lock — inclusive no checkpoint implícito do
+`close()` (esperado: conte um checkpoint extra no shutdown).
+
+**Configuração.** Via `NgrrdBlob.Builder` (escopo de registro, aplicado a todos os
+volumes): `.qualityListener(...)` e `.volumeMetricsListener(...)`. Os listeners
+**não** entram em `BlobVolumeConfig`, preservando a idempotência por nome do volume.
+
+## 12. Versionamento
 
 Toda estrutura carrega `MAGIC + formatVersion`. Um leitor que encontre
 `formatVersion` desconhecido **falha explicitamente** (nunca interpreta às cegas).

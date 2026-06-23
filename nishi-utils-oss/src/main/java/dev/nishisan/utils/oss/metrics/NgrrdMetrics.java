@@ -18,6 +18,11 @@ import java.util.concurrent.atomic.AtomicReference;
  *     em um bloco fechado, em [0.0, 1.0].</li>
  * </ul>
  *
+ * <p>Implementa a forma <em>canônica</em> (com {@code seriesKey}) de cada callback,
+ * acumulando localmente e fazendo forward canônico. As variantes legadas delegam à
+ * canônica com {@code seriesKey == null}, de modo que chamadas antigas também são
+ * contabilizadas exatamente uma vez.</p>
+ *
  * <p>Thread-safe (todos os campos são atômicos).</p>
  */
 public final class NgrrdMetrics implements NgrrdMetricsListener {
@@ -57,43 +62,72 @@ public final class NgrrdMetrics implements NgrrdMetricsListener {
         return lastMissingRatio.get();
     }
 
+    // ------------------------------------------------------------ forma canônica
+
     @Override
-    public void onLateSample(String dsName, long latenessSec) {
+    public void onLateSample(String seriesKey, String dsName, long latenessSec) {
         lateSampleCount.incrementAndGet();
         if (forward != null) {
-            forward.onLateSample(dsName, latenessSec);
+            forward.onLateSample(seriesKey, dsName, latenessSec);
         }
+    }
+
+    @Override
+    public void onCounterReset(String seriesKey, String dsName) {
+        counterResetCount.incrementAndGet();
+        if (forward != null) {
+            forward.onCounterReset(seriesKey, dsName);
+        }
+    }
+
+    @Override
+    public void onWrapDetected(String seriesKey, String dsName) {
+        wrapDetectedCount.incrementAndGet();
+        if (forward != null) {
+            forward.onWrapDetected(seriesKey, dsName);
+        }
+    }
+
+    @Override
+    public void onIngestLag(String seriesKey, String dsName, long lagSec) {
+        lastIngestLagSec.set(lagSec);
+        if (forward != null) {
+            forward.onIngestLag(seriesKey, dsName, lagSec);
+        }
+    }
+
+    @Override
+    public void onBlockClosed(String seriesKey, String rraName, String dsName, double missingRatio) {
+        lastMissingRatio.set(missingRatio);
+        if (forward != null) {
+            forward.onBlockClosed(seriesKey, rraName, dsName, missingRatio);
+        }
+    }
+
+    // --------------------------------------------------------------- forma legada
+
+    @Override
+    public void onLateSample(String dsName, long latenessSec) {
+        onLateSample(null, dsName, latenessSec);
     }
 
     @Override
     public void onCounterReset(String dsName) {
-        counterResetCount.incrementAndGet();
-        if (forward != null) {
-            forward.onCounterReset(dsName);
-        }
+        onCounterReset(null, dsName);
     }
 
     @Override
     public void onWrapDetected(String dsName) {
-        wrapDetectedCount.incrementAndGet();
-        if (forward != null) {
-            forward.onWrapDetected(dsName);
-        }
+        onWrapDetected(null, dsName);
     }
 
     @Override
     public void onIngestLag(String dsName, long lagSec) {
-        lastIngestLagSec.set(lagSec);
-        if (forward != null) {
-            forward.onIngestLag(dsName, lagSec);
-        }
+        onIngestLag(null, dsName, lagSec);
     }
 
     @Override
     public void onBlockClosed(String rraName, String dsName, double missingRatio) {
-        lastMissingRatio.set(missingRatio);
-        if (forward != null) {
-            forward.onBlockClosed(rraName, dsName, missingRatio);
-        }
+        onBlockClosed(null, rraName, dsName, missingRatio);
     }
 }

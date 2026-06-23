@@ -34,6 +34,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.LongSupplier;
 
 /**
  * Ingere {@link Sample}s e mantém um único arquivo de série NGRR por
@@ -79,6 +80,7 @@ public final class NgrrdWriter implements AutoCloseable {
     private final SeriesLiveState state;
     private final Lock writeLock;
     private final Durability durability;
+    private final LongSupplier nowEpochMs;
     private boolean ringDirty;
 
     private final WriterScheduler scheduler;
@@ -131,6 +133,21 @@ public final class NgrrdWriter implements AutoCloseable {
     public NgrrdWriter(NgrrdDefinition definition, NgrrdStorage storage, String seriesKey,
                        NgrrdMetricsListener metrics, ReadWriteLock seriesLock,
                        Durability durability, OnGeometryChange onGeometryChange) {
+        this(definition, storage, seriesKey, metrics, seriesLock, durability, onGeometryChange,
+                System::currentTimeMillis);
+    }
+
+    /**
+     * Variante completa com relógio de ingestão injetável ({@code nowEpochMs}):
+     * usado para medir {@code ingest_lag_sec} (diferença entre o instante do
+     * recebimento da sample e o seu timestamp). O default é
+     * {@code System::currentTimeMillis}; os testes injetam um relógio fixo.
+     */
+    public NgrrdWriter(NgrrdDefinition definition, NgrrdStorage storage, String seriesKey,
+                       NgrrdMetricsListener metrics, ReadWriteLock seriesLock,
+                       Durability durability, OnGeometryChange onGeometryChange,
+                       LongSupplier nowEpochMs) {
+        this.nowEpochMs = Objects.requireNonNull(nowEpochMs, "nowEpochMs é obrigatório");
         this.definition = Objects.requireNonNull(definition, "definition é obrigatório");
         Objects.requireNonNull(storage, "storage é obrigatório");
         this.seriesKey = Objects.requireNonNull(seriesKey, "seriesKey é obrigatório");
@@ -218,7 +235,9 @@ public final class NgrrdWriter implements AutoCloseable {
         if (!rawDefByName.containsKey(dsName)) {
             throw new IllegalArgumentException("DS desconhecido: " + dsName);
         }
-        enqueue(new Command.Write(dsName, sample));
+        // Carimba o instante do recebimento no enfileiramento (relógio injetável):
+        // base do ingest_lag_sec, calculado quando a worker processa a sample.
+        enqueue(new Command.Write(dsName, sample, nowEpochMs.getAsLong()));
     }
 
     /** Materializa o CDP em progresso como parcial e torna o arquivo durável. */
@@ -362,6 +381,16 @@ public final class NgrrdWriter implements AutoCloseable {
         long tsSec = tsMs / 1000L;
         long slotSec = TimeBucket.alignDown(tsSec, baseStepSec);
 
+        // ingest_lag_sec: atraso entre o timestamp da sample e o instante do
+        // recebimento. Só reportamos lag positivo (lag <= 0 = skew de relógio /
+        // sample futura).
+        if (metrics != null) {
+            long lagSec = (w.receivedAtMs() - tsMs) / 1000L;
+            if (lagSec > 0) {
+                metrics.onIngestLag(seriesKey, w.dsName(), lagSec);
+            }
+        }
+
         if (tsMs > state.lastUpEpochMs) {
             state.lastUpEpochMs = tsMs;
         }
@@ -375,7 +404,7 @@ public final class NgrrdWriter implements AutoCloseable {
         long cur = state.pdpSlotSec[i];
         if (cur != -1L && slotSec < cur) {
             if (metrics != null) {
-                metrics.onLateSample(w.dsName(), cur - slotSec);
+                metrics.onLateSample(seriesKey, w.dsName(), cur - slotSec);
             }
             return; // amostra atrasada: descarta sem derivar (preserva continuidade do counter).
         }
@@ -402,8 +431,8 @@ public final class NgrrdWriter implements AutoCloseable {
         state.counterPrevTsMs[col] = sample.tsEpochMs();
         if (metrics != null) {
             switch (result.flag()) {
-                case RESET -> metrics.onCounterReset(rawDs.name());
-                case WRAP -> metrics.onWrapDetected(rawDs.name());
+                case RESET -> metrics.onCounterReset(seriesKey, rawDs.name());
+                case WRAP -> metrics.onWrapDetected(seriesKey, rawDs.name());
                 default -> {
                 }
             }
@@ -509,7 +538,7 @@ public final class NgrrdWriter implements AutoCloseable {
             int g = archive.groupSize();
             int observed = state.cdpFolded[state.cdpIndex(arch, col)];
             double ratio = g > 0 ? (double) Math.max(0, g - observed) / g : 0.0;
-            metrics.onBlockClosed(archive.rraName(), geo.columns().get(col).derivedName(), ratio);
+            metrics.onBlockClosed(seriesKey, archive.rraName(), geo.columns().get(col).derivedName(), ratio);
         }
     }
 
@@ -608,7 +637,7 @@ public final class NgrrdWriter implements AutoCloseable {
     }
 
     private sealed interface Command {
-        record Write(String dsName, Sample sample) implements Command {
+        record Write(String dsName, Sample sample, long receivedAtMs) implements Command {
         }
 
         /** Checkpoint síncrono; {@code error} carrega uma eventual falha de volta ao chamador. */

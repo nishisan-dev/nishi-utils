@@ -91,6 +91,15 @@ public final class CatalogJournal implements AutoCloseable {
         }
     }
 
+    /** Tamanho atual do arquivo de WAL, em bytes (gauge {@code walBytes}). */
+    public long size() {
+        try {
+            return channel.size();
+        } catch (IOException e) {
+            throw new BlobVolumeException("falha ao ler o tamanho do WAL do catálogo", e);
+        }
+    }
+
     @Override
     public void close() {
         try {

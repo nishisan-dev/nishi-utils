@@ -1,5 +1,8 @@
 package dev.nishisan.utils.oss.blob;
 
+import dev.nishisan.utils.oss.metrics.BlobVolumeMetricsListener;
+import dev.nishisan.utils.oss.metrics.NgrrdMetricsListener;
+
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -33,6 +36,8 @@ public final class NgrrdBlob {
         private int shardCount = BlobVolumeConfig.DEFAULT_SHARD_COUNT;
         private long segmentBytes = BlobVolumeConfig.DEFAULT_SEGMENT_BYTES;
         private long initialCapacity = -1;
+        private NgrrdMetricsListener qualityListener;
+        private BlobVolumeMetricsListener volumeMetricsListener;
         private final List<BlobVolumeConfig> configs = new ArrayList<>();
 
         /** Diretório base sob o qual volumes referenciados por nome são criados. */
@@ -56,6 +61,21 @@ public final class NgrrdBlob {
             return this;
         }
 
+        /**
+         * Listener de qualidade default aplicado a todos os volumes do registro,
+         * propagado a cada handle aberto via {@code Ngrrd.open(...)}.
+         */
+        public Builder qualityListener(NgrrdMetricsListener qualityListener) {
+            this.qualityListener = qualityListener;
+            return this;
+        }
+
+        /** Listener de métricas operacionais aplicado a todos os volumes do registro. */
+        public Builder volumeMetricsListener(BlobVolumeMetricsListener volumeMetricsListener) {
+            this.volumeMetricsListener = volumeMetricsListener;
+            return this;
+        }
+
         /** Registra um volume por nome: diretório = {@code basePath/name}, usando os defaults atuais. */
         public Builder volume(String name) {
             Objects.requireNonNull(basePath, "basePath é obrigatório para registrar volume por nome");
@@ -74,7 +94,7 @@ public final class NgrrdBlob {
         public BlobVolumeRegistry build() {
             BlobVolumeRegistry registry = new BlobVolumeRegistry();
             for (BlobVolumeConfig config : configs) {
-                registry.open(config);
+                registry.open(config, qualityListener, volumeMetricsListener);
             }
             return registry;
         }

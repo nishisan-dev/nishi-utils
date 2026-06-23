@@ -1,5 +1,8 @@
 package dev.nishisan.utils.oss.blob;
 
+import dev.nishisan.utils.oss.metrics.BlobVolumeMetricsListener;
+import dev.nishisan.utils.oss.metrics.NgrrdMetricsListener;
+
 import java.util.Collection;
 import java.util.List;
 import java.util.Objects;
@@ -17,8 +20,20 @@ public final class BlobVolumeRegistry implements AutoCloseable {
 
     /** Abre (ou retorna o já aberto) volume para a configuração. Idempotente por nome. */
     public BlobVolume open(BlobVolumeConfig config) {
+        return open(config, null, null);
+    }
+
+    /**
+     * Abre (ou retorna o já aberto) volume associando os listeners default de
+     * qualidade e operacional. Idempotente por nome: se o volume já existir, os
+     * listeners desta chamada são ignorados (não fazem parte da chave de
+     * identidade do volume).
+     */
+    public BlobVolume open(BlobVolumeConfig config, NgrrdMetricsListener qualityListener,
+                           BlobVolumeMetricsListener volumeMetricsListener) {
         Objects.requireNonNull(config, "config é obrigatório");
-        return volumes.computeIfAbsent(config.name(), name -> DefaultBlobVolume.open(config));
+        return volumes.computeIfAbsent(config.name(),
+                name -> DefaultBlobVolume.open(config, qualityListener, volumeMetricsListener));
     }
 
     /** Volume registrado pelo nome; lança se ausente. */

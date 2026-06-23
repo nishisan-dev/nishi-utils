@@ -1,5 +1,8 @@
 package dev.nishisan.utils.oss.blob;
 
+import dev.nishisan.utils.oss.metrics.BlobVolumeMetricsListener;
+import dev.nishisan.utils.oss.metrics.BlobVolumeStats;
+import dev.nishisan.utils.oss.metrics.NgrrdMetricsListener;
 import dev.nishisan.utils.oss.storage.StorageFactory;
 import dev.nishisan.utils.oss.storage.blob.BlobStorage;
 
@@ -30,6 +33,25 @@ public interface BlobVolume extends AutoCloseable {
 
     /** Escreve um snapshot do catálogo e rotaciona o WAL. */
     void checkpoint();
+
+    /**
+     * Listener de qualidade default deste volume, propagado a cada handle aberto
+     * via {@code Ngrrd.open(...)} (evita fiar um listener por série). {@code null}
+     * se não configurado.
+     */
+    default NgrrdMetricsListener qualityListener() {
+        return null;
+    }
+
+    /** Listener de métricas operacionais deste volume; {@code null} se não configurado. */
+    default BlobVolumeMetricsListener volumeMetricsListener() {
+        return null;
+    }
+
+    /** Snapshot dos gauges operacionais do volume (modelo pull). Ver {@link BlobVolumeStats}. */
+    default BlobVolumeStats stats() {
+        return storage().stats();
+    }
 
     @Override
     void close();

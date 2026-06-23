@@ -722,6 +722,18 @@ Backend `objectStorage`: configure `NGRRD_S3_BUCKET`, `NGRRD_S3_REGION` e
 Plugue Micrometer/JMX/log com `NgrrdMetricsListener` passado a
 `Ngrrd.fromYaml(yaml, bindings, tags, listener)`.
 
+> **Forma canônica com `seriesKey`.** Desde a 8.1.0 os callbacks têm a forma
+> canônica `on*(seriesKey, …)` (as legadas sem `seriesKey` permanecem válidas por
+> delegação). `last_ingest_lag_sec` passou a ser **efetivamente emitida** pelo
+> writer (era declarada-porém-não-emitida).
+>
+> **Coleta central no blob volume.** Em vez de um listener por série, configure um
+> listener default no volume via `NgrrdBlob.registry().qualityListener(listener)`:
+> ele é propagado a cada handle aberto por `Ngrrd.open(...)` (que antes ignorava
+> qualquer listener). Para a observabilidade **operacional** do volume (fill ratio,
+> grow/alloc/free, checkpoints), ver a seção *Observabilidade do volume* em
+> [`ngrrd-blob-volume.md`](./ngrrd-blob-volume.md).
+
 ---
 
 ## Build & testes

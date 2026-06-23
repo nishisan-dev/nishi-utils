@@ -1,5 +1,7 @@
 package dev.nishisan.utils.oss.storage.blob;
 
+import dev.nishisan.utils.oss.metrics.BlobVolumeMetricsListener;
+import dev.nishisan.utils.oss.metrics.BlobVolumeStats;
 import dev.nishisan.utils.oss.storage.NgrrdStorage;
 import dev.nishisan.utils.oss.storage.SeriesChannel;
 import dev.nishisan.utils.oss.storage.SeriesChannelProvider;
@@ -42,6 +44,10 @@ public final class BlobStorage implements NgrrdStorage, SeriesChannelProvider, A
     private static final String CATALOG_WAL = "catalog.wal";
     private static final String CATALOG_WAL_OLD = "catalog.wal.old";
 
+    /** Listener no-op padrão: evita guardas {@code != null} nos call-sites de telemetria. */
+    private static final BlobVolumeMetricsListener NO_OP = new BlobVolumeMetricsListener() {
+    };
+
     private final Path volumeDir;
     private final int shardCount;
     private final UUID volumeUuid;
@@ -50,6 +56,7 @@ public final class BlobStorage implements NgrrdStorage, SeriesChannelProvider, A
     private final ShardAllocator[] allocators;
     private final ConcurrentHashMap<String, CatalogEntry> catalog;
     private final ReentrantLock structuralLock = new ReentrantLock();
+    private final BlobVolumeMetricsListener volumeMetrics;
 
     private CatalogJournal journal;
     private long generation;
@@ -57,7 +64,8 @@ public final class BlobStorage implements NgrrdStorage, SeriesChannelProvider, A
 
     private BlobStorage(Path volumeDir, int shardCount, UUID volumeUuid, long segmentBytes,
                         MappedShard[] shards, ShardAllocator[] allocators,
-                        ConcurrentHashMap<String, CatalogEntry> catalog, CatalogJournal journal, long generation) {
+                        ConcurrentHashMap<String, CatalogEntry> catalog, CatalogJournal journal, long generation,
+                        BlobVolumeMetricsListener volumeMetrics) {
         this.volumeDir = volumeDir;
         this.shardCount = shardCount;
         this.volumeUuid = volumeUuid;
@@ -67,6 +75,11 @@ public final class BlobStorage implements NgrrdStorage, SeriesChannelProvider, A
         this.catalog = catalog;
         this.journal = journal;
         this.generation = generation;
+        this.volumeMetrics = volumeMetrics == null ? NO_OP : volumeMetrics;
+    }
+
+    /** Record interno do resultado de um checkpoint, para emitir a telemetria fora do lock. */
+    private record CheckpointInfo(long durationMs, int entryCount) {
     }
 
     /** Região física de uma série dentro de um shard. */
@@ -76,9 +89,14 @@ public final class BlobStorage implements NgrrdStorage, SeriesChannelProvider, A
     // ---------------------------------------------------------------- lifecycle
 
     public static BlobStorage openOrCreate(Path volumeDir, int shardCount, long segmentBytes, long initialCapacity) {
+        return openOrCreate(volumeDir, shardCount, segmentBytes, initialCapacity, NO_OP);
+    }
+
+    public static BlobStorage openOrCreate(Path volumeDir, int shardCount, long segmentBytes, long initialCapacity,
+                                           BlobVolumeMetricsListener volumeMetrics) {
         Objects.requireNonNull(volumeDir, "volumeDir é obrigatório");
         if (Files.exists(volumeDir.resolve(VOLUME_META))) {
-            BlobStorage bs = open(volumeDir);
+            BlobStorage bs = open(volumeDir, volumeMetrics);
             if (bs.shardCount != shardCount) {
                 throw new BlobVolumeException("volume " + volumeDir + " tem shardCount=" + bs.shardCount
                         + " (≠ " + shardCount + "); resharding não é suportado");
@@ -89,10 +107,15 @@ public final class BlobStorage implements NgrrdStorage, SeriesChannelProvider, A
             }
             return bs;
         }
-        return create(volumeDir, shardCount, segmentBytes, initialCapacity);
+        return create(volumeDir, shardCount, segmentBytes, initialCapacity, volumeMetrics);
     }
 
     public static BlobStorage create(Path volumeDir, int shardCount, long segmentBytes, long initialCapacity) {
+        return create(volumeDir, shardCount, segmentBytes, initialCapacity, NO_OP);
+    }
+
+    public static BlobStorage create(Path volumeDir, int shardCount, long segmentBytes, long initialCapacity,
+                                     BlobVolumeMetricsListener volumeMetrics) {
         if (shardCount <= 0) {
             throw new BlobVolumeException("shardCount deve ser > 0: " + shardCount);
         }
@@ -120,13 +143,17 @@ public final class BlobStorage implements NgrrdStorage, SeriesChannelProvider, A
                     BlobCatalogCodec.encode(shardCount, uuid, gen, List.of()));
             CatalogJournal journal = new CatalogJournal(volumeDir.resolve(CATALOG_WAL));
             return new BlobStorage(volumeDir, shardCount, uuid, segmentBytes, shards, allocators,
-                    new ConcurrentHashMap<>(), journal, gen);
+                    new ConcurrentHashMap<>(), journal, gen, volumeMetrics);
         } catch (IOException e) {
             throw new BlobVolumeException("falha ao criar volume " + volumeDir, e);
         }
     }
 
     public static BlobStorage open(Path volumeDir) {
+        return open(volumeDir, NO_OP);
+    }
+
+    public static BlobStorage open(Path volumeDir, BlobVolumeMetricsListener volumeMetrics) {
         try {
             VolumeMetadata meta = VolumeMetadata.decode(Files.readAllBytes(volumeDir.resolve(VOLUME_META)));
             int shardCount = meta.shardCount();
@@ -180,7 +207,8 @@ public final class BlobStorage implements NgrrdStorage, SeriesChannelProvider, A
                         shards[i].capacity(), live);
             }
             CatalogJournal journal = new CatalogJournal(volumeDir.resolve(CATALOG_WAL));
-            return new BlobStorage(volumeDir, shardCount, uuid, segmentBytes, shards, allocators, catalog, journal, gen);
+            return new BlobStorage(volumeDir, shardCount, uuid, segmentBytes, shards, allocators, catalog, journal,
+                    gen, volumeMetrics);
         } catch (IOException e) {
             throw new BlobVolumeException("falha ao abrir volume " + volumeDir, e);
         }
@@ -211,12 +239,14 @@ public final class BlobStorage implements NgrrdStorage, SeriesChannelProvider, A
                 allocators[existing.shardId()].free(existing.regionOffset(), existing.regionBytes());
                 journal.appendFree(++generation, existing);
                 catalog.remove(key);
+                volumeMetrics.onRegionFree(existing.shardId(), existing.regionBytes());
             }
             int shardId = BlobRouting.shardFor(key, shardCount);
             long offset = allocateInShard(shardId, regionBytes);
             CatalogEntry entry = new CatalogEntry(key, shardId, offset, regionBytes, totalBytes, State.LIVE);
             journal.appendAlloc(++generation, entry);
             catalog.put(key, entry);
+            volumeMetrics.onRegionAllocate(shardId, regionBytes);
             return new Region(shards[shardId], offset, regionBytes);
         } finally {
             structuralLock.unlock();
@@ -228,9 +258,14 @@ public final class BlobStorage implements NgrrdStorage, SeriesChannelProvider, A
         OptionalLong offset = alloc.allocate(regionBytes);
         while (offset.isEmpty()) {
             MappedShard shard = shards[shardId];
-            shard.grow(shard.capacity() + segmentBytes); // setLength + force + map (durável)
+            long oldCapacity = shard.capacity();
+            shard.grow(oldCapacity + segmentBytes); // setLength + force + map (durável)
             persistSuperblock(shardId); // capacidade durável ANTES de jornalizar a alocação (§9)
-            alloc.grow(shard.capacity());
+            long newCapacity = shard.capacity();
+            alloc.grow(newCapacity);
+            if (newCapacity > oldCapacity) {
+                volumeMetrics.onShardGrow(shardId, oldCapacity, newCapacity);
+            }
             offset = alloc.allocate(regionBytes);
         }
         return offset.getAsLong();
@@ -300,6 +335,7 @@ public final class BlobStorage implements NgrrdStorage, SeriesChannelProvider, A
             if (e != null) {
                 allocators[e.shardId()].free(e.regionOffset(), e.regionBytes());
                 journal.appendFree(++generation, e);
+                volumeMetrics.onRegionFree(e.shardId(), e.regionBytes());
             }
         } finally {
             structuralLock.unlock();
@@ -318,7 +354,24 @@ public final class BlobStorage implements NgrrdStorage, SeriesChannelProvider, A
 
     /** Escreve um snapshot do catálogo e rotaciona o WAL (limita o tamanho do WAL). */
     public void checkpoint() {
+        CheckpointInfo info;
         structuralLock.lock();
+        try {
+            info = writeCheckpointLocked();
+        } finally {
+            structuralLock.unlock();
+        }
+        // Telemetria fora do lock: nunca segura o structuralLock durante código de usuário.
+        volumeMetrics.onCheckpoint(info.durationMs(), info.entryCount());
+    }
+
+    /**
+     * Materializa o snapshot do catálogo e rotaciona o WAL. Pré-condição: chamado
+     * segurando o {@code structuralLock}. Não emite telemetria (o chamador emite
+     * {@code onCheckpoint} após liberar o lock).
+     */
+    private CheckpointInfo writeCheckpointLocked() {
+        long startNanos = System.nanoTime();
         try {
             long gen = ++generation;
             List<CatalogEntry> live = new ArrayList<>(catalog.values());
@@ -335,21 +388,22 @@ public final class BlobStorage implements NgrrdStorage, SeriesChannelProvider, A
             }
             journal = new CatalogJournal(wal);
             Files.deleteIfExists(walOld);
+            long durationMs = (System.nanoTime() - startNanos) / 1_000_000L;
+            return new CheckpointInfo(durationMs, live.size());
         } catch (IOException e) {
             throw new BlobVolumeException("falha no checkpoint do volume " + volumeDir, e);
-        } finally {
-            structuralLock.unlock();
         }
     }
 
     @Override
     public void close() {
+        CheckpointInfo info = null;
         structuralLock.lock();
         try {
             if (closed) {
                 return;
             }
-            checkpoint();
+            info = writeCheckpointLocked();
             journal.close();
             for (MappedShard shard : shards) {
                 shard.close();
@@ -358,10 +412,51 @@ public final class BlobStorage implements NgrrdStorage, SeriesChannelProvider, A
         } finally {
             structuralLock.unlock();
         }
+        // close() também dispara onCheckpoint (checkpoint implícito de shutdown), fora do lock.
+        if (info != null) {
+            volumeMetrics.onCheckpoint(info.durationMs(), info.entryCount());
+        }
     }
 
     public int shardCount() {
         return shardCount;
+    }
+
+    /**
+     * Snapshot dos gauges operacionais do volume (modelo <em>pull</em>): uso líquido,
+     * fill ratio e séries por shard, além do tamanho de catálogo e WAL. Lido sob o
+     * {@code structuralLock} para uma fotografia consistente; destina-se a poll de
+     * baixa frequência. Ver {@link BlobVolumeStats}.
+     */
+    public BlobVolumeStats stats() {
+        structuralLock.lock();
+        try {
+            long[] capacity = new long[shardCount];
+            long[] used = new long[shardCount];
+            long[] series = new long[shardCount];
+            for (int i = 0; i < shardCount; i++) {
+                capacity[i] = shards[i].capacity();
+            }
+            for (CatalogEntry e : catalog.values()) {
+                used[e.shardId()] += e.regionBytes();
+                series[e.shardId()]++;
+            }
+            double[] fill = new double[shardCount];
+            for (int i = 0; i < shardCount; i++) {
+                fill[i] = capacity[i] > 0 ? (double) used[i] / capacity[i] : 0.0;
+            }
+            long catalogImageBytes;
+            try {
+                Path bin = volumeDir.resolve(CATALOG_BIN);
+                catalogImageBytes = Files.exists(bin) ? Files.size(bin) : 0L;
+            } catch (IOException ex) {
+                throw new BlobVolumeException("falha ao ler o tamanho de " + CATALOG_BIN, ex);
+            }
+            return new BlobVolumeStats(shardCount, capacity, used, series, fill,
+                    catalog.size(), catalogImageBytes, journal.size());
+        } finally {
+            structuralLock.unlock();
+        }
     }
 
     // ---------------------------------------------------------------- helpers

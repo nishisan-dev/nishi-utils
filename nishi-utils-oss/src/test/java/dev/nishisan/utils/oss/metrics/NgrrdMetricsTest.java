@@ -1,5 +1,7 @@
 package dev.nishisan.utils.oss.metrics;
 
+import dev.nishisan.utils.oss.api.Durability;
+import dev.nishisan.utils.oss.api.OnGeometryChange;
 import dev.nishisan.utils.oss.api.Sample;
 import dev.nishisan.utils.oss.config.NgrrdYamlLoader;
 import dev.nishisan.utils.oss.definition.NgrrdDefinition;
@@ -11,6 +13,11 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.InputStream;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.LongSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -86,6 +93,62 @@ class NgrrdMetricsTest {
             writer.flush();
         }
         assertEquals(1, metrics.lateSampleCount());
+    }
+
+    @Test
+    void emiteIngestLagApenasParaLagPositivo(@TempDir Path tempDir) throws Exception {
+        NgrrdDefinition def = loadDefinition();
+        NgrrdStorage storage = new LocalDiskStorage(tempDir);
+        List<Long> lags = new CopyOnWriteArrayList<>();
+        List<String> keys = new CopyOnWriteArrayList<>();
+        NgrrdMetricsListener listener = new NgrrdMetricsListener() {
+            @Override
+            public void onIngestLag(String seriesKey, String dsName, long lagSec) {
+                keys.add(seriesKey);
+                lags.add(lagSec);
+            }
+        };
+        long now = BLOCK_START_MS + 10_000L;
+        LongSupplier clock = () -> now;
+        try (NgrrdWriter writer = new NgrrdWriter(def, storage, "device:r1/iface:eth0", listener,
+                new ReentrantReadWriteLock(), Durability.FSYNC, OnGeometryChange.FAIL, clock)) {
+            writer.write("in_octets", new Sample(BLOCK_START_MS + 5_000L, 1_000_000L)); // lag = 5s
+            writer.flush();
+            writer.write("in_octets", new Sample(now + 5_000L, 2_000_000L));            // futura: sem emit
+            writer.flush();
+        }
+        assertEquals(List.of(5L), lags);
+        assertEquals(List.of("device:r1/iface:eth0"), keys);
+    }
+
+    @Test
+    void formaCanonicaPropagaSeriesKeyAoForward() {
+        List<String> seriesKeys = new ArrayList<>();
+        NgrrdMetricsListener forward = new NgrrdMetricsListener() {
+            @Override
+            public void onCounterReset(String seriesKey, String dsName) {
+                seriesKeys.add(seriesKey);
+            }
+        };
+        NgrrdMetrics metrics = new NgrrdMetrics(forward);
+        metrics.onCounterReset("device:r1/iface:eth0", "in_octets");
+        assertEquals(1, metrics.counterResetCount());
+        assertEquals(List.of("device:r1/iface:eth0"), seriesKeys);
+    }
+
+    @Test
+    void listenerLegadoRecebeEventosViaDelegacaoDaFormaCanonica() {
+        // Um listener que só conhece a forma antiga (sem seriesKey) continua
+        // recebendo eventos quando o produtor chama a forma canônica.
+        long[] resets = {0};
+        NgrrdMetricsListener legacy = new NgrrdMetricsListener() {
+            @Override
+            public void onCounterReset(String dsName) {
+                resets[0]++;
+            }
+        };
+        legacy.onCounterReset("series-x", "in_octets"); // canônico -> delega ao legado
+        assertEquals(1, resets[0]);
     }
 
     @Test

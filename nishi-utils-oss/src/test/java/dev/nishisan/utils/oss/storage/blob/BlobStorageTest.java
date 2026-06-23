@@ -1,5 +1,8 @@
 package dev.nishisan.utils.oss.storage.blob;
 
+import dev.nishisan.utils.oss.metrics.BlobVolumeMetrics;
+import dev.nishisan.utils.oss.metrics.BlobVolumeMetricsListener;
+import dev.nishisan.utils.oss.metrics.BlobVolumeStats;
 import dev.nishisan.utils.oss.storage.SeriesChannel;
 import dev.nishisan.utils.oss.storage.VerifyResult;
 import org.junit.jupiter.api.Test;
@@ -7,6 +10,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -171,6 +175,115 @@ class BlobStorageTest {
         // reabre e confere persistência pós-crescimento
         try (BlobStorage bs = BlobStorage.openOrCreate(dir, 1, 64 * 1024, 64 * 1024)) {
             assertArrayEquals(pattern(8192, 11), bs.get("series/s11.ngrr").orElseThrow());
+        }
+    }
+
+    @Test
+    void emiteOnShardGrowAoCrescer(@TempDir Path tmp) {
+        Path dir = tmp.resolve("vol");
+        List<long[]> grows = new CopyOnWriteArrayList<>(); // [shardId, oldCap, newCap]
+        BlobVolumeMetricsListener listener = new BlobVolumeMetricsListener() {
+            @Override
+            public void onShardGrow(int shardId, long oldCapacityBytes, long newCapacityBytes) {
+                grows.add(new long[]{shardId, oldCapacityBytes, newCapacityBytes});
+            }
+        };
+        try (BlobStorage bs = BlobStorage.openOrCreate(dir, 1, 64 * 1024, 64 * 1024, listener)) {
+            for (int i = 0; i < 12; i++) {
+                bs.put("series/s" + i + ".ngrr", pattern(8192, i));
+            }
+        }
+        assertFalse(grows.isEmpty(), "esperado ao menos um onShardGrow");
+        for (long[] g : grows) {
+            assertEquals(0L, g[0], "único shard");
+            assertTrue(g[2] > g[1], "newCap deve ser > oldCap");
+            assertEquals(0L, g[2] % (64 * 1024), "newCap múltiplo do segmento");
+        }
+    }
+
+    @Test
+    void contabilizaAllocEFreeSemDuplicarEmResize(@TempDir Path dir) {
+        BlobVolumeMetrics m = new BlobVolumeMetrics();
+        try (BlobStorage bs = BlobStorage.openOrCreate(dir, SHARDS, SEG, INITIAL_CAP, m)) {
+            // put novo -> 1 alloc, 0 free
+            bs.put("series/k.ngrr", pattern(4096, 1));
+            assertEquals(1, m.regionAllocateCount());
+            assertEquals(0, m.regionFreeCount());
+
+            // put same-size (align(4090)==align(4096)) com objectBytes diferente -> 0 eventos
+            bs.put("series/k.ngrr", pattern(4090, 2));
+            assertEquals(1, m.regionAllocateCount());
+            assertEquals(0, m.regionFreeCount());
+
+            // put de tamanho diferente -> 1 free (região antiga) + 1 alloc (nova)
+            bs.put("series/k.ngrr", pattern(20000, 3));
+            assertEquals(2, m.regionAllocateCount());
+            assertEquals(1, m.regionFreeCount());
+
+            // delete -> 1 free
+            bs.delete("series/k.ngrr");
+            assertEquals(2, m.regionAllocateCount());
+            assertEquals(2, m.regionFreeCount());
+        }
+    }
+
+    @Test
+    void emiteOnCheckpointComContagemEDuracao(@TempDir Path dir) {
+        BlobVolumeMetrics m = new BlobVolumeMetrics();
+        int n = 5;
+        try (BlobStorage bs = BlobStorage.openOrCreate(dir, SHARDS, SEG, INITIAL_CAP, m)) {
+            for (int i = 0; i < n; i++) {
+                bs.put("series/s" + i + ".ngrr", pattern(2048, i));
+            }
+            bs.checkpoint();
+            assertEquals(1, m.checkpointCount());
+            assertEquals(n, m.lastCheckpointEntryCount());
+            assertTrue(m.lastCheckpointDurationMs() >= 0);
+        }
+        // close() dispara um checkpoint adicional no shutdown
+        assertEquals(2, m.checkpointCount());
+    }
+
+    @Test
+    void statsRefleteUsoLiquidoPorShard(@TempDir Path dir) {
+        int n = 20;
+        try (BlobStorage bs = open(dir)) {
+            for (int i = 0; i < n; i++) {
+                bs.put("series/s" + i + ".ngrr", pattern(4096, i));
+            }
+
+            BlobVolumeStats stats = bs.stats();
+            assertEquals(SHARDS, stats.shardCount());
+            assertEquals(n, stats.catalogEntryCount());
+
+            // seriesPerShard bate com o group-by esperado via roteamento
+            long[] expectedSeries = new long[SHARDS];
+            for (int i = 0; i < n; i++) {
+                expectedSeries[BlobRouting.shardFor("series/s" + i + ".ngrr", SHARDS)]++;
+            }
+            assertArrayEquals(expectedSeries, stats.seriesPerShard());
+
+            // fill ratio em [0,1] e uso <= capacidade
+            for (int s = 0; s < SHARDS; s++) {
+                assertTrue(stats.fillRatioPerShard()[s] >= 0.0 && stats.fillRatioPerShard()[s] <= 1.0,
+                        "fillRatio fora de [0,1] no shard " + s);
+                assertTrue(stats.shardUsedBytes()[s] <= stats.shardCapacityBytes()[s]);
+            }
+
+            // uso LÍQUIDO: deletar uma série faz o used do seu shard cair
+            String victim = "series/s0.ngrr";
+            int vs = BlobRouting.shardFor(victim, SHARDS);
+            long usedBefore = bs.stats().shardUsedBytes()[vs];
+            bs.delete(victim);
+            long usedAfter = bs.stats().shardUsedBytes()[vs];
+            assertTrue(usedAfter < usedBefore, "used líquido deve cair após delete");
+            assertEquals(n - 1, bs.stats().catalogEntryCount());
+
+            // WAL tem bytes antes do checkpoint; cai (rotação) e catalog.bin > 0 depois
+            assertTrue(bs.stats().walBytes() > 0, "WAL deve ter bytes antes do checkpoint");
+            bs.checkpoint();
+            assertEquals(0L, bs.stats().walBytes(), "WAL deve zerar após rotação no checkpoint");
+            assertTrue(bs.stats().catalogImageBytes() > 0, "catalog.bin deve ter bytes após checkpoint");
         }
     }
 

@@ -4,6 +4,28 @@
 
 ---
 
+## 2026-06-22 — 🟢 Feature: observabilidade global do blob volume (ngrrd, issue #160) — release 8.1.0
+
+A v8.0.0 introduziu o backend `SHARDED_BLOB`, onde milhares de séries compartilham um volume; a
+observabilidade era apenas por-handle/por-série. A 8.1.0 fecha duas lacunas, de forma **aditiva e
+não-breaking**:
+
+- **(a) Listener de qualidade por-volume:** `Ngrrd.open(BlobVolume, …)` passava `metricsListener=null`
+  fixo (séries abertas por volume nunca recebiam listener). Agora propaga `volume.qualityListener()`
+  a cada handle — coleta central via `NgrrdBlob.registry().qualityListener(...)`, sem fiar um
+  listener por série.
+- **(b) seriesKey nos callbacks de qualidade:** forma canônica `on*(seriesKey, …)` (legadas
+  preservadas por delegação), permitindo atribuir eventos à série de origem num listener global.
+- **(c) Métricas operacionais do volume:** nova `BlobVolumeMetricsListener` (push: `onShardGrow`,
+  `onRegionAllocate`, `onRegionFree`, `onCheckpoint`) instrumentada no `BlobStorage` — eventos
+  estruturais sob o `structuralLock` (contrato O(1)/non-blocking), `onCheckpoint` fora do lock. Mais
+  `BlobVolumeStats` (gauges pull: fill ratio e séries por shard com **uso líquido**, tamanho de
+  catálogo e WAL) via `BlobVolume.stats()`.
+- **(d) `ingest_lag_sec`:** métrica antes declarada-porém-não-emitida; agora instrumentada no writer
+  com relógio de ingestão injetável (emite só lag positivo).
+
+Telemetria não altera o layout on-disk — sem bump de `formatVersion` nem impacto cross-language.
+
 ## 2026-06-11 — 🟠 Fix: handoff por afinidade sob produção contínua — dual-leader livelock (issue tems#9, D10)
 
 A validação do D9 em pré-prod expôs o D10: no rejoin do nó de maior afinidade sob firehose, o

@@ -1,0 +1,48 @@
+@startuml blob_observability
+title ngrrd — Observabilidade do blob volume (issue #160)
+
+skinparam shadowing false
+skinparam componentStyle rectangle
+
+actor "Consumidor\n(Micrometer/JMX/log)" as consumer
+
+package "NgrrdBlob.Builder" as builder {
+  rectangle "qualityListener (NgrrdMetricsListener)" as ql
+  rectangle "volumeMetricsListener (BlobVolumeMetricsListener)" as vml
+}
+
+package "BlobVolume" as vol {
+  rectangle "qualityListener()" as volql
+  rectangle "volumeMetricsListener()" as volvml
+  rectangle "stats() -> BlobVolumeStats\n(pull: fillRatio, séries/shard,\ncatalogBytes, walBytes)" as stats
+}
+
+package "BlobStorage (structuralLock)" as storage {
+  rectangle "allocateRegion / delete\n-> onRegionAllocate / onRegionFree" as alloc
+  rectangle "allocateInShard (grow)\n-> onShardGrow" as grow
+  rectangle "checkpoint()\n-> onCheckpoint (fora do lock)" as ckpt
+}
+
+package "Handles (Ngrrd.open)" as handles {
+  rectangle "NgrrdWriter\n-> onCounterReset/onWrapDetected/\nonLateSample/onIngestLag/onBlockClosed\n(canônico, com seriesKey)" as writer
+  rectangle "NgrrdMetrics (por-série, local)" as local
+}
+
+builder --> vol : open(config, ql, vml)
+volql --> writer : propagado a cada handle
+vml --> storage : eventos operacionais (push)
+alloc --> vml
+grow --> vml
+ckpt --> vml
+writer --> local : conta local
+local --> volql : forward 1->1 (com seriesKey)
+vml --> consumer
+volql --> consumer
+stats ..> consumer : poll
+
+note bottom of storage
+  Eventos estruturais (grow/alloc/free) emitidos SOB o
+  structuralLock: callbacks devem ser O(1)/non-blocking.
+  onCheckpoint é emitido FORA do lock (inclusive no close()).
+end note
+@enduml
