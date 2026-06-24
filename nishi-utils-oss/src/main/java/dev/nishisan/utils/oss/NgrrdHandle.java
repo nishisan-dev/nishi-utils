@@ -66,6 +66,12 @@ public interface NgrrdHandle extends AutoCloseable {
      * Materializa o CDP em progresso como parcial e torna o objeto da série
      * durável (fsync no disco / PUT no S3), mantendo o estado vivo. Semântica
      * rrdtool-like: o dado fica legível antes do passo do RRA fechar.
+     *
+     * <p>É um no-op de durabilidade quando nenhuma amostra foi aplicada desde o
+     * último force (idle-skip): a série já está durável naquele estado, então a
+     * re-emissão parcial (byte-idêntica) e o {@code fsync}/{@code PUT} são
+     * pulados. Não há perda de visibilidade — o slot em progresso já reflete o
+     * último estado materializado.</p>
      */
     void checkpoint();
 

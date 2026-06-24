@@ -220,6 +220,12 @@ Total ≈ **1,59 MiB em um único arquivo** `.ngrr` (header + live-state somam
 ~1 KB). Compare com o modelo anterior (blocos): ~2,4 MiB espalhados em ~27,6 mil
 arquivos — a motivação da [issue #144](https://github.com/nishisan-dev/nishi-utils/issues/144).
 
+> **Calculadora de dimensionamento.** Para estimar o tamanho de cada série, o
+> total de uma frota (X devices × Y interfaces) e o IOPS de durabilidade nos três
+> backends a partir de um ou mais YAMLs, abra [`sizing-calculator.html`](sizing-calculator.html)
+> — um SPA estático (offline) que porta byte-a-byte a `SeriesGeometry`. O golden
+> da paridade JS↔Java é travado por `SeriesGeometrySizingTest`.
+
 ### Paridade com o RRDtool
 
 | | RRDtool | ngrrd (NGRR) |
@@ -582,8 +588,17 @@ controla apenas o segundo passo:
 
 | Modo | Por checkpoint | Visibilidade (disco) | Janela de perda |
 |------|----------------|----------------------|-----------------|
-| `FSYNC` (padrão) | `fsync` no disco / `PUT` no S3 | CDP parcial legível | nenhuma (durável a cada checkpoint) |
+| `FSYNC` (padrão) | `fsync` no disco / `PUT` no S3 | CDP parcial legível | nenhuma (durável a cada checkpoint **com dado novo**) |
 | `OS_CACHE` | materializa, **sem** `fsync` | CDP parcial legível (page cache) | tail não descarregado, só em **crash abrupto** |
+
+**Idle-skip (coalescing).** Um `checkpoint()`/`flush()` sem nenhuma amostra aplicada
+desde o último force é um **no-op de durabilidade**: a re-emissão do CDP parcial seria
+byte-idêntica e o `force()`/`PUT` já seria inócuo, então ambos são pulados — a série já
+está durável naquele estado. Corta forces/PUTs redundantes quando os checkpoints são
+mais frequentes que a ingestão, **sem** perda de visibilidade ou durabilidade (a leitura
+do slot em progresso é idêntica). Cada pulo emite `checkpoint_coalesced_count`. Por isso
+a linha "durável a cada checkpoint" vale para checkpoints **com dado novo**; um checkpoint
+ocioso não força porque não há nada novo a tornar durável.
 
 Em `OS_CACHE`, os leitores no mesmo processo continuam enxergando o CDP parcial
 logo após o checkpoint (a escrita in-place já está no page cache do SO), mas o
@@ -718,6 +733,7 @@ Backend `objectStorage`: configure `NGRRD_S3_BUCKET`, `NGRRD_S3_REGION` e
 | `wrap_detected_count` | counter | flag WRAP do CounterDeriver |
 | `last_ingest_lag_sec` | gauge | atraso da última sample observado |
 | `last_missing_ratio` | gauge | proporção de PDPs missing no último CDP fechado |
+| `checkpoint_coalesced_count` | counter | checkpoint redundante pulado (idle-skip: sem amostra nova desde o último force) |
 
 Plugue Micrometer/JMX/log com `NgrrdMetricsListener` passado a
 `Ngrrd.fromYaml(yaml, bindings, tags, listener)`.

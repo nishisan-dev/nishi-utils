@@ -1,0 +1,37 @@
+@startuml checkpoint_idle_skip
+title ngrrd — Idle-skip de checkpoint redundante (coalescing)
+
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+
+actor "App" as app
+participant "NgrrdHandle\n(write/checkpoint)" as handle
+participant "NgrrdWriter\n(worker thread)" as writer
+participant "SeriesChannel\n(disco / S3)" as channel
+participant "NgrrdMetricsListener" as metrics
+
+== Ingestão (marca mudança) ==
+app -> handle : write(ds, sample)
+handle -> writer : enfileira Command.Write
+writer -> writer : handleWrite()\nchangedSinceForce = true
+
+== Checkpoint com dado novo ==
+app -> handle : checkpoint() / flush()
+handle -> writer : enfileira Command.Sync (bloqueia)
+writer -> writer : checkpointAndForce()\nchangedSinceForce == true
+writer -> channel : re-emite CDPs parciais + persistLiveState
+writer -> channel : force()  (fsync / PUT)
+note right of channel : se force() lançar,\nchangedSinceForce permanece true (retry)
+writer -> writer : changedSinceForce = false
+writer --> handle : latch.countDown()
+
+== Checkpoint ocioso (idle-skip) ==
+app -> handle : checkpoint() / flush()
+handle -> writer : enfileira Command.Sync (bloqueia)
+writer -> writer : checkpointAndForce()\nchangedSinceForce == false
+note right of writer : nada mudou desde o último force:\nre-emissão seria byte-idêntica,\ncanal já limpo → force() seria no-op
+writer -> metrics : onCheckpointCoalesced(seriesKey)
+writer --> handle : early-return + latch.countDown()
+note over channel : nenhum I/O — leitura e\ndurabilidade idênticas
+
+@enduml

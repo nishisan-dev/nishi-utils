@@ -43,6 +43,16 @@ public interface NgrrdMetricsListener {
         onBlockClosed(rraName, dsName, missingRatio);
     }
 
+    /**
+     * Checkpoint coalescido (idle-skip): nenhuma amostra foi aplicada desde o
+     * último force, então a re-emissão dos CDPs parciais e o {@code force()}
+     * foram pulados — a série já está durável naquele estado. Contador de
+     * eficiência (não um defeito de qualidade).
+     */
+    default void onCheckpointCoalesced(String seriesKey) {
+        onCheckpointCoalesced();
+    }
+
     // --------------------------------------------------------------- forma legada
 
     /** Variante legada (sem {@code seriesKey}); ver a forma canônica {@link #onLateSample(String, String, long)}. */
@@ -63,5 +73,9 @@ public interface NgrrdMetricsListener {
 
     /** Variante legada (sem {@code seriesKey}); ver a forma canônica {@link #onBlockClosed(String, String, String, double)}. */
     default void onBlockClosed(String rraName, String dsName, double missingRatio) {
+    }
+
+    /** Variante legada (sem {@code seriesKey}); ver a forma canônica {@link #onCheckpointCoalesced(String)}. */
+    default void onCheckpointCoalesced() {
     }
 }

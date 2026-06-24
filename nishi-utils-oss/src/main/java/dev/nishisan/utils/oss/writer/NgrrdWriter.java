@@ -82,6 +82,12 @@ public final class NgrrdWriter implements AutoCloseable {
     private final Durability durability;
     private final LongSupplier nowEpochMs;
     private boolean ringDirty;
+    // Idle-skip de checkpoint: marcado em cada amostra aplicada, limpo ao final de
+    // um checkpoint executado por completo. Quando false, checkpointAndForce() é um
+    // no-op de durabilidade — nada mudou desde o último force, a série já está
+    // durável naquele estado. Confinado à worker thread (como ringDirty); init true
+    // garante o primeiro checkpoint.
+    private boolean changedSinceForce = true;
 
     private final WriterScheduler scheduler;
     private final LinkedBlockingQueue<Command> queue = new LinkedBlockingQueue<>();
@@ -240,12 +246,20 @@ public final class NgrrdWriter implements AutoCloseable {
         enqueue(new Command.Write(dsName, sample, nowEpochMs.getAsLong()));
     }
 
-    /** Materializa o CDP em progresso como parcial e torna o arquivo durável. */
+    /**
+     * Materializa o CDP em progresso como parcial e torna o arquivo durável.
+     * No-op de durabilidade quando nenhuma amostra foi aplicada desde o último
+     * force (idle-skip): a série já está durável naquele estado.
+     */
     public void flush() {
         sync();
     }
 
-    /** Idêntico a {@link #flush()} no formato de série única (sempre incremental). */
+    /**
+     * Idêntico a {@link #flush()} no formato de série única (sempre incremental).
+     * No-op de durabilidade quando nenhuma amostra foi aplicada desde o último
+     * force (idle-skip).
+     */
     public void checkpoint() {
         sync();
     }
@@ -408,6 +422,11 @@ public final class NgrrdWriter implements AutoCloseable {
             }
             return; // amostra atrasada: descarta sem derivar (preserva continuidade do counter).
         }
+        // A amostra será aplicada (init de slot, advanceColumn, counterPrev e/ou PDP):
+        // marca para o próximo checkpoint não ser pulado. Incondicional de propósito —
+        // mesmo uma amostra que só acumula no PDP do slot corrente muda o slot
+        // in-progress lido pelo reader e o CDP parcial materializado no checkpoint.
+        changedSinceForce = true;
         if (cur == -1L) {
             state.pdpSlotSec[i] = slotSec;
         } else if (slotSec > cur) {
@@ -599,8 +618,21 @@ public final class NgrrdWriter implements AutoCloseable {
         ringDirty = false;
     }
 
-    /** Emite os CDPs em progresso como parciais e torna o arquivo durável. */
+    /**
+     * Emite os CDPs em progresso como parciais e torna o arquivo durável. Quando
+     * nenhuma amostra foi aplicada desde o último force ({@code changedSinceForce
+     * == false}), é um no-op de durabilidade (idle-skip): a re-emissão parcial
+     * seria byte-idêntica e o canal já está limpo, então o {@code force()} seria
+     * inócuo. O early-return é normal (nunca via exceção): o {@code latch} do
+     * comando é liberado no {@code finally} do chamador em {@link #processOne}.
+     */
     private void checkpointAndForce() {
+        if (!changedSinceForce) {
+            if (metrics != null) {
+                metrics.onCheckpointCoalesced(seriesKey);
+            }
+            return;
+        }
         writeLock.lock();
         try {
             for (int col = 0; col < d; col++) {
@@ -626,6 +658,11 @@ public final class NgrrdWriter implements AutoCloseable {
         // Os bytes já estão materializados (legíveis por leitores no mesmo
         // processo via page cache); a janela de perda é um crash abrupto, pois
         // um close() limpo ainda descarrega o pendente via channel.close().
+        //
+        // Limpa o flag só após persistir/forçar com sucesso: se channel.force()
+        // lançar (ex.: PUT no S3), o flag permanece true e o próximo checkpoint
+        // tenta de novo — nunca deixa bytes não-persistidos com o flag limpo.
+        changedSinceForce = false;
     }
 
     private void closeChannelQuietly() {

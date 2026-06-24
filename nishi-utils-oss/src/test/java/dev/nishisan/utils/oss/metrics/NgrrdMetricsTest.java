@@ -122,6 +122,34 @@ class NgrrdMetricsTest {
     }
 
     @Test
+    void checkpointOciosoIncrementaCoalesced(@TempDir Path tempDir) throws Exception {
+        NgrrdDefinition def = loadDefinition();
+        NgrrdStorage storage = new LocalDiskStorage(tempDir);
+        List<String> keys = new CopyOnWriteArrayList<>();
+        NgrrdMetrics metrics = new NgrrdMetrics(new NgrrdMetricsListener() {
+            @Override
+            public void onCheckpointCoalesced(String seriesKey) {
+                keys.add(seriesKey);
+            }
+        });
+        try (NgrrdWriter writer = new NgrrdWriter(def, storage, "device:r1/iface:eth0", metrics)) {
+            writer.write("in_octets", new Sample(BLOCK_START_MS, 1_000_000L));
+            writer.write("in_octets", new Sample(BLOCK_START_MS + STEP_MS, 2_000_000L));
+            writer.flush(); // dado novo desde a criação: força, não coalesce
+            assertEquals(0, metrics.checkpointCoalescedCount());
+
+            writer.flush(); // ocioso: nenhuma amostra nova -> coalescido
+            writer.flush(); // ocioso: coalescido de novo
+            assertEquals(2, metrics.checkpointCoalescedCount());
+            assertEquals(2, keys.size());
+            assertTrue(keys.stream().allMatch("device:r1/iface:eth0"::equals),
+                    "coalescing deve propagar o seriesKey: " + keys);
+        }
+        // Nota: o close() dispara um Command.Shutdown que, estando ocioso, também
+        // é coalescido (contador sobe para 3) — comportamento esperado.
+    }
+
+    @Test
     void formaCanonicaPropagaSeriesKeyAoForward() {
         List<String> seriesKeys = new ArrayList<>();
         NgrrdMetricsListener forward = new NgrrdMetricsListener() {

@@ -32,6 +32,10 @@ Observabilidade do volume (listeners + gauges):
 
 ![Observabilidade do blob volume](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan-dev/nishi-utils/main/doc/oss/diagrams/blob_observability.puml)
 
+Idle-skip de checkpoint redundante (coalescing):
+
+![Idle-skip de checkpoint](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan-dev/nishi-utils/main/doc/oss/diagrams/checkpoint_idle_skip.puml)
+
 ## 2. Convenções
 
 - **Endianness:** big-endian em **tudo** (paridade com o `.ngrr`/`SeriesFileCodec`).
@@ -270,6 +274,15 @@ emitidos **sob o `structuralLock`** do volume; as implementações **devem** ser
 thread-safe e **O(1)/non-blocking** (bloquear serializa todo o volume).
 `onCheckpoint` é emitido **fora** do lock — inclusive no checkpoint implícito do
 `close()` (esperado: conte um checkpoint extra no shutdown).
+
+**3. Coalescing de checkpoint (idle-skip).** Com milhares de séries por volume e
+checkpoints frequentes, o writer **pula** o `checkpointAndForce` de uma série quando
+nenhuma amostra foi aplicada desde o último force: a re-emissão do CDP parcial seria
+byte-idêntica e o `force()` (fsync no disco / **PUT do objeto inteiro** no S3) já seria
+no-op. Cada pulo emite `onCheckpointCoalesced(seriesKey)` (forma canônica + legada no
+`NgrrdMetricsListener`), permitindo medir quantos forces/PUTs redundantes foram evitados.
+Leitura e durabilidade permanecem **idênticas**; ver *Durabilidade do checkpoint* em
+[`ngrrd.md`](./ngrrd.md).
 
 **Configuração.** Via `NgrrdBlob.Builder` (escopo de registro, aplicado a todos os
 volumes): `.qualityListener(...)` e `.volumeMetricsListener(...)`. Os listeners
