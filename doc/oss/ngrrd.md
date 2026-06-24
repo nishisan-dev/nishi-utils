@@ -220,6 +220,12 @@ Total ≈ **1,59 MiB em um único arquivo** `.ngrr` (header + live-state somam
 ~1 KB). Compare com o modelo anterior (blocos): ~2,4 MiB espalhados em ~27,6 mil
 arquivos — a motivação da [issue #144](https://github.com/nishisan-dev/nishi-utils/issues/144).
 
+> **Calculadora de dimensionamento.** Para estimar o tamanho de cada série, o
+> total de uma frota (X devices × Y interfaces) e o IOPS de durabilidade nos três
+> backends a partir de um ou mais YAMLs, abra [`sizing-calculator.html`](sizing-calculator.html)
+> — um SPA estático (offline) que porta byte-a-byte a `SeriesGeometry`. O golden
+> da paridade JS↔Java é travado por `SeriesGeometrySizingTest`.
+
 ### Paridade com o RRDtool
 
 | | RRDtool | ngrrd (NGRR) |
