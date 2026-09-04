@@ -4,6 +4,39 @@
 
 ---
 
+## 2026-09-04 — 🔴 Fix: leitura descartava as amostras mais recentes da janela — release 8.2.0
+
+O `NgrrdReader.downsample` reduzia a `maxPoints` **amostrando um índice por balde**
+(`floor(i*n/maxPoints)`) e descartando o resto. Como o último índice visitado é
+`n − ceil(n/maxPoints)`, as `ceil(n/maxPoints) − 1` amostras **mais recentes do range nunca
+entravam na resposta** — justamente onde mora uma transição acabada de acontecer. E, por rodar
+depois da escolha do anel do RRA, o resultado era idêntico em AVERAGE, MAX e LAST.
+
+- **Sintoma em produção (TEMS):** uma interface caída às 23:57 aparecia, na tira `oper_status`
+  da janela de 24h, como "up 100,0 % · down 0,0 % · 0 transição(ões)" — ao lado de um cabeçalho
+  `DOWN` e de um alarme `INTERFACE_OPER_DOWN` ativo. Com `n = 287` e `maxPoints = 120`, os
+  índices 284 e 285 (`23:55` e `00:00`, os **únicos** com `down`) não eram sequer olhados.
+- **Sintoma em contadores:** subestimação de pico em janelas longas. A mesma série lida em 30
+  dias com `maxPoints=1000` reportava **393 Mbps** onde o máximo real era **562 Mbps**.
+- **Fix:** `reduce` agrega **baldes contíguos que particionam `[0, n)` sem sobra** — o último
+  termina exatamente em `n`, então a amostra mais recente sempre participa — reduzidos pela
+  mesma `cf` da `ViewQuery` (MAX preserva o pico, LAST o valor final, AVERAGE a média). `NaN` é
+  ignorado na redução; balde inteiramente `NaN` emite `NaN` e os gaps ficam preservados.
+- **`SeriesResult.stepSec`** passa a informar o **espaçamento real** dos pontos devolvidos. Antes
+  repassava o step do RRA mesmo após reduzir, e uma resposta espaçada de 600s anunciava 300s.
+- **`cf` não materializada agora falha:** quando nenhuma RRA declara a `cf` pedida, o
+  `BestFitSelector` não acha candidato e o reader devolvia lista vazia — indistinguível de
+  "janela sem amostras", e no cliente HTTP um `200` com arrays vazios. Passa a lançar
+  `NgrrdQueryException` listando as `cf` disponíveis. A distinção é segura porque o seletor só
+  devolve vazio por esse motivo quando **há** RRAs declaradas.
+
+Lição: a validação `validateStateConsolidation` já exigia, desde sempre, uma RRA não-AVERAGE
+para DS com `dictionary`, e o javadoc dizia "a leitura deve então usar esse CF" — uma obrigação
+declarada que **nenhum código impunha**. Um contrato que só existe em comentário não é contrato.
+
+Cobertura: `NgrrdReadReductionTest` (7 casos — cauda preservada, MAX/LAST/AVERAGE, passthrough,
+step efetivo, `cf` ausente). Sem mudança de layout on-disk nem de `formatVersion`.
+
 ## 2026-06-23 — 🟢 Feature: idle-skip de checkpoint redundante no ngrrd writer
 
 O `checkpoint()`/`flush()` re-emitia o CDP parcial de todos os RRAs e forçava a durabilidade
