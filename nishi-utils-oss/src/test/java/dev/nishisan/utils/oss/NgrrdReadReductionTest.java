@@ -2,6 +2,7 @@ package dev.nishisan.utils.oss;
 
 import dev.nishisan.utils.oss.api.ConsolidationFunction;
 import dev.nishisan.utils.oss.api.DataPoint;
+import dev.nishisan.utils.oss.api.NgrrdQueryException;
 import dev.nishisan.utils.oss.api.Sample;
 import dev.nishisan.utils.oss.api.SeriesResult;
 import dev.nishisan.utils.oss.api.ViewQuery;
@@ -15,6 +16,8 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -150,6 +153,18 @@ class NgrrdReadReductionTest {
             // 300 amostras em 100 buckets => 3 amostras por bucket => 900s.
             assertEquals(900, r.stepSec(),
                     "stepSec deve informar o espacamento real, nao o do RRA");
+        }
+    }
+
+    @Test
+    void cfNaoDeclaradaPorNenhumaRraFalhaExplicitamente(@TempDir Path dir) {
+        try (NgrrdHandle h = serieCom(dir, rampa())) {
+            // A RRA declara [AVERAGE, MAX, LAST]. Antes, MIN devolvia lista vazia em
+            // silencio e virava 200 com arrays vazios no cliente HTTP.
+            NgrrdQueryException e = assertThrows(NgrrdQueryException.class,
+                    () -> h.read("level", query(ConsolidationFunction.MIN, 1000), fimExclusivoMs()));
+            assertNotNull(e.getMessage());
+            assertTrue(e.getMessage().contains("MIN"), e.getMessage());
         }
     }
 }

@@ -2,6 +2,7 @@ package dev.nishisan.utils.oss.reader;
 
 import dev.nishisan.utils.oss.api.ConsolidationFunction;
 import dev.nishisan.utils.oss.api.DataPoint;
+import dev.nishisan.utils.oss.api.NgrrdQueryException;
 import dev.nishisan.utils.oss.api.SeriesResult;
 import dev.nishisan.utils.oss.api.ViewQuery;
 import dev.nishisan.utils.oss.definition.NgrrdDefinition;
@@ -86,8 +87,16 @@ public final class NgrrdReader {
         Objects.requireNonNull(dsName, "dsName é obrigatório");
         Objects.requireNonNull(query, "query é obrigatório");
 
-        Optional<RraDef> rraOpt = BestFitSelector.pick(query, definition.spec().archives().rras());
+        List<RraDef> rras = definition.spec().archives().rras();
+        Optional<RraDef> rraOpt = BestFitSelector.pick(query, rras);
         if (rraOpt.isEmpty()) {
+            // A unica razao de o seletor nao achar candidato com RRAs declaradas e o cf
+            // pedido nao existir em nenhuma delas. Devolver vazio aqui era indistinguivel
+            // de "janela sem amostras" e virava 200 com arrays vazios no cliente.
+            if (rras != null && !rras.isEmpty()) {
+                throw new NgrrdQueryException("cf " + query.cf() + " nao e consolidada por nenhuma RRA de '"
+                        + seriesKey + "'; disponiveis: " + declaredCfs(rras));
+            }
             return new SeriesResult(dsName, null, query.cf(), query.targetStepSec(), List.of());
         }
         RraDef rra = rraOpt.get();
@@ -233,5 +242,14 @@ public final class NgrrdReader {
             return rraStepSec;
         }
         return (int) Math.max(1, Math.round((double) rawSize / reducedSize * rraStepSec));
+    }
+
+    private static String declaredCfs(List<RraDef> rras) {
+        return rras.stream()
+                .flatMap(rra -> rra.cf().stream())
+                .map(Enum::name)
+                .distinct()
+                .sorted()
+                .collect(java.util.stream.Collectors.joining(", "));
     }
 }
