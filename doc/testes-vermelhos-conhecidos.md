@@ -24,9 +24,21 @@ receita está no fim). Se você consertar um, remova a entrada no mesmo commit.
 - **Efeito prático:** `mvn test` na raiz termina em `BUILD FAILURE` com
   `Tests run: 536, Failures: 1`. O módulo `nishi-utils-oss` fica **verde**
   (234 testes) e é o que importa para quem mexe no ngrrd.
-- **Contorno enquanto não for corrigido:** valide o módulo que você tocou —
-  `mvn -pl nishi-utils-oss test`. Para publicar, `mvn install -DskipTests`
-  **depois** de a suite do seu módulo passar.
+- **Não bloqueia CI nem publicação — por desenho.** A classe vive em
+  `dev.nishisan.utils.ngrid.replication`, e o perfil `exclude-ngrid` do `pom.xml`
+  corta `**/ngrid/**` do surefire. O `pr-validation.yml` roda justamente com
+  `-DexcludeNgrid=true`, com o motivo escrito no próprio workflow: a suíte de
+  resiliência do NGrid é sensível a tempo e recursos e *"does not pass reliably
+  on hosted runners"*. O `publish.yml` roda com `-DskipTests`.
+
+  Ou seja: este vermelho **só aparece para quem roda a suíte completa localmente**.
+  Não é um teste órfão que ninguém viu — é uma suíte que o projeto assume como
+  local-only. O que o repo deve a você é dizer isso antes de você perder meia
+  hora investigando.
+- **Contorno:** valide o módulo que você tocou (`mvn -pl nishi-utils-oss test`).
+  Para rodar a suite inteira sem o ruído, use o mesmo interruptor do CI:
+  `mvn test -DexcludeNgrid=true`. A suíte de resiliência tem perfil próprio:
+  `mvn test -Presilience` / `mvn verify -Pdocker-resilience`.
 
 Convergência parcial (metade dos 400 esperados) com timeout de 30 s tem cara de
 janela curta demais para a máquina, ou de o stream parar de aplicar no meio. Não
