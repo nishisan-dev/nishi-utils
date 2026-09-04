@@ -96,10 +96,30 @@ Object Storage S3-compatível) e definição declarativa em YAML.
 3. Abre o objeto da série, valida o header (geometria/hash) e lê a live-state
    (`curRow`/`curRowEpochSec`) e o ring do archive.
 4. Reconstrói os pares `(timestamp, valor)` a partir do ponteiro do ring,
-   recorta para a `window` e aplica `maxPoints` (downsample uniforme).
+   recorta para a `window` e reduz a `maxPoints`.
 
 > **Sem manifesto.** A geometria e os ponteiros do ring são auto-descritos no
 > próprio objeto `.ngrr`; o reader nunca varre o storage por listagem.
+
+### `cf` e `maxPoints` na leitura
+
+O `cf` da `ViewQuery` **escolhe o anel do RRA**; não é uma agregação feita na
+hora. Um `cf` que nenhuma RRA da definição declara não tem anel para ler, e a
+leitura lança `NgrrdQueryException` (desde a 8.2.0) em vez de devolver uma lista
+vazia indistinguível de "janela sem amostras".
+
+O `maxPoints` reduz por **agregação de baldes contíguos** que particionam o
+range sem sobra, usando o mesmo `cf`. O `SeriesResult.stepSec` informa o
+espaçamento **real** dos pontos devolvidos, que só é igual ao step do RRA quando
+não houve redução.
+
+> **DS de estado.** Um DS com `dictionary` (ex.: `ifOperStatus` 1=up, 2=down)
+> **não pode** ser lido com `AVERAGE`: a média de `up(1)` com `down(2)` é `1,5`,
+> que não é nenhum dos dois e arredonda de volta para "up", apagando a queda. O
+> `NgrrdDefinitionValidator` exige que exista uma RRA não-AVERAGE cobrindo o DS,
+> mas quem lê precisa efetivamente pedir esse `cf` — prefira o extremo oposto ao
+> ordinal de "up" (`MAX` quando `up` é o menor), que responde "esteve não-up em
+> algum ponto do balde".
 
 ---
 
