@@ -1,5 +1,6 @@
 package dev.nishisan.utils.oss.reader;
 
+import dev.nishisan.utils.oss.api.ConsolidationFunction;
 import dev.nishisan.utils.oss.api.DataPoint;
 import dev.nishisan.utils.oss.api.SeriesResult;
 import dev.nishisan.utils.oss.api.ViewQuery;
@@ -104,8 +105,9 @@ public final class NgrrdReader {
             } finally {
                 readLock.unlock();
             }
-            List<DataPoint> downsampled = downsample(points, query.maxPoints());
-            return new SeriesResult(dsName, rra.name(), query.cf(), rra.stepSec(), downsampled);
+            List<DataPoint> reduced = reduce(points, query.maxPoints(), query.cf());
+            return new SeriesResult(dsName, rra.name(), query.cf(),
+                    effectiveStepSec(points.size(), reduced.size(), rra.stepSec()), reduced);
         } catch (NgrrdFormatException e) {
             return new SeriesResult(dsName, rra.name(), query.cf(), rra.stepSec(), List.of());
         }
@@ -159,19 +161,77 @@ public final class NgrrdReader {
         return result;
     }
 
-    private List<DataPoint> downsample(List<DataPoint> points, int maxPoints) {
-        if (points.size() <= maxPoints) {
+    /**
+     * Reduz {@code points} a no maximo {@code maxPoints} agregando buckets
+     * contiguos com a mesma funcao de consolidacao do RRA.
+     *
+     * <p>O bucket {@code i} cobre {@code [floor(i*n/mp), floor((i+1)*n/mp))}, de
+     * modo que os buckets particionam {@code [0, n)} sem sobra: o ultimo termina
+     * exatamente em {@code n} e a amostra mais recente sempre participa do
+     * resultado. A implementacao anterior amostrava um indice por bucket
+     * ({@code floor(i*n/mp)}) e descartava o resto, o que jogava fora as
+     * {@code ceil(n/mp)-1} amostras MAIS RECENTES da janela — justamente onde
+     * mora uma transicao acabada de acontecer. Para um DS de estado (com
+     * {@code dictionary}) isso apagava a queda; para contadores, subestimava
+     * o pico em janelas longas.</p>
+     *
+     * <p>{@code NaN} (unknown/missing) e ignorado na reducao; um bucket
+     * inteiramente {@code NaN} emite {@code NaN}, preservando os gaps.</p>
+     */
+    private List<DataPoint> reduce(List<DataPoint> points, int maxPoints, ConsolidationFunction cf) {
+        int n = points.size();
+        if (n <= maxPoints) {
             return points;
         }
         List<DataPoint> out = new ArrayList<>(maxPoints);
-        double step = (double) points.size() / maxPoints;
         for (int i = 0; i < maxPoints; i++) {
-            int idx = (int) Math.floor(i * step);
-            if (idx >= points.size()) {
-                idx = points.size() - 1;
+            int from = (int) ((long) i * n / maxPoints);
+            int to = (int) ((long) (i + 1) * n / maxPoints);
+            if (to <= from) {
+                to = from + 1;
             }
-            out.add(points.get(idx));
+            // Borda esquerda como timestamp do bucket: espacamento regular e monotonico.
+            out.add(new DataPoint(points.get(from).tsEpochMs(), reduceRange(points, from, to, cf)));
         }
         return out;
+    }
+
+    private static double reduceRange(List<DataPoint> points, int from, int to,
+                                      ConsolidationFunction cf) {
+        double acc = Double.NaN;
+        double sum = 0;
+        int count = 0;
+        for (int j = from; j < to; j++) {
+            double v = points.get(j).value();
+            if (Double.isNaN(v)) {
+                continue;
+            }
+            switch (cf) {
+                case MAX -> acc = Double.isNaN(acc) ? v : Math.max(acc, v);
+                case MIN -> acc = Double.isNaN(acc) ? v : Math.min(acc, v);
+                case LAST -> acc = v;
+                case AVERAGE -> {
+                    sum += v;
+                    count++;
+                }
+            }
+        }
+        if (cf == ConsolidationFunction.AVERAGE) {
+            return count == 0 ? Double.NaN : sum / count;
+        }
+        return acc;
+    }
+
+    /**
+     * Espacamento real dos pontos devolvidos. Sem agregacao e o step do RRA;
+     * com agregacao, o step medio do bucket. Reportar o step do RRA nesse
+     * segundo caso fazia o cliente acreditar numa resolucao que a resposta
+     * nao tem.
+     */
+    private static int effectiveStepSec(int rawSize, int reducedSize, int rraStepSec) {
+        if (reducedSize <= 0 || reducedSize >= rawSize) {
+            return rraStepSec;
+        }
+        return (int) Math.max(1, Math.round((double) rawSize / reducedSize * rraStepSec));
     }
 }

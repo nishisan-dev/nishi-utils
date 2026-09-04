@@ -9,7 +9,9 @@ import java.util.Objects;
  * @param window         janela total a recuperar (ex.: {@code Duration.ofDays(1)})
  * @param targetStepSec  granularidade desejada (segundos)
  * @param cf             função de consolidação preferida
- * @param maxPoints      limite máximo de pontos retornados (downsample uniforme)
+ * @param maxPoints      limite máximo de pontos retornados; se o range tiver mais
+ *                       amostras, elas são agregadas em buckets contíguos usando
+ *                       o mesmo {@code cf} (nenhuma amostra é descartada)
  */
 public record ViewQuery(
         Duration window,
