@@ -56,23 +56,37 @@ dispatcher (+3 s) e `node.close()` ficam fora do deadline.
 Defeito PRÉ-EXISTENTE confirmado por A/B (falha também sem M2, sob carga): sob churn de liderança o líder pode recolocar
 uma série existente e o nó aceita o hint criando uma série vazia no lugar errado → seção 0 obrigatória da spec do M3.
 
-### M3 — migração e rebalanceamento — EM ANDAMENTO, NÃO commitado (atualizado 2026-09-17 ~15h)
-Core: duas correções de eleição COMMITADAS (d521d5e maioria só de votantes elegíveis; 3ff1ace seguidores adotam
-quem de fato lidera + guard de sync não fica preso), ambas aprovadas por Refuter com análise de partições; suíte do
-core 567/0/8. Não commitado no core: passthrough `NGridNodeBuilder.bootDiscoveryWindow(Duration)` + teste.
-Módulo (não commitado): gate `ownership` para série esquecida (`registry.forget/isForgotten`, `ownershipForgotten`
-só confia em `placementStrong`); `MigrationCoordinator` com `resumeInFlight` em laço, FINISH com 20 tentativas e
-trava `activeMigrationIds`; `Rebalancer.triggerNow` com log por movimento; `StorageNodeConfig.bootDiscoveryWindow`
-(default 3 s) aplicado ao storage node. 233 unitários verdes (cobertura 76%). `LeaderFailoverDuringMigrationClusterTest`
-3/3; `DistributedWriteReadClusterTest`/`NodeRestartClusterTest` verdes.
-**Decisão:** quórum por votantes é correto: com 2 storage nodes, perder um = sem líder (comandos de líder param;
-escrita/leitura no dono sobrevivente seguem). Tolerar falha de 1 nó exige ≥ 3 storage nodes (documentar).
-`StorageNodeClusterTest` ganha retentativa de NOT_LEADER no PLACE cru; `AdminStatusClusterTest` passa a 3 nós.
-**Em investigação (Fable, com edição de módulo e core):** (1) leitura vazia determinística em `device:rb2`
-(`RebalanceClusterTest` 3/3) e `device:churn0` — timestamps do teste vs janela/RRA, ou reader do oss;
-(2) divergência de membership sob reinícios repetidos do líder (`PlacementUnderLeaderChurnClusterTest` 2/3:
-`storage-1` deixa de ver `storage-2`). Depois: 3× cada teste de cluster novo, Refuter do M3, commits.
-Chips abertos: saída graciosa/janela de bootstrap padrão/prefixo de nodeId nos logs; reclaim cego à linhagem.
+### M3 — migração e rebalanceamento — QUASE FECHADO, NÃO commitado (sessão pausada 2026-09-17 ~18h)
+Core: TUDO commitado (d521d5e quórum de votantes; 3ff1ace deferência a três + sync guard; 77177e7 relay só
+conectado; 20f4a05 graça de desconexão/placeholder/D9 confirmado; 5b935ca passthroughs bootDiscoveryWindow e
+affinityHandbackMode). Suíte completa do core 578/0/8. Árvore do core limpa.
+Módulo (NÃO commitado, ~40 arquivos): M3 completo — seção 0 (placement seguro), `discard/forget/isForgotten`,
+`MigrationExecutor`, `MigrationCoordinator` (abort/finish com revalidação forte, `activeMigrationIds`,
+`healStuckMigrations`), `RebalancePlanner`/`Rebalancer`, cliente (`ownerChanged`), `ADMIN_REBALANCE`,
+`StorageNodeConfig` com `bootDiscoveryWindow` 3 s e `affinityHandbackMode` true (documentado o cooldown de 60 s).
+244 unitários verdes, cobertura 85%. Cluster: `RebalanceClusterTest` verde (16-19 s, 5+ execuções seguidas),
+`PlacementUnderLeaderChurnClusterTest` verde (260-277 s), quatro testes de 2 nós verdes.
+Refuter r2 (módulo): bloqueador de perda de dados RESOLVIDO e confirmado; REPROVADO por itens menores.
+**Próximo passo exato (Builder sonnet, depois Refuter r3 curto, depois commits atômicos):**
+1. [ALTO residual] `MigrationCoordinator.abort` (~:394-407): gravar a reversão do catálogo ANTES de mandar os
+   `MIGRATE_ABORT`; `complete` (~:353) ganha a mesma pré-condição `isStillMigratingWithId` do abort. Teste.
+2. [MÉDIO] `MigrationExecutor.healStuckMigrations` (~:520): incluir `SOURCE/COMMITTED` (caso real de FINISH
+   perdido) nos candidatos e não varrer (`sweepExpiredStates` ~:487) entrada cuja série ainda está `isMigrating`.
+   Testes com fase COMMITTED (os atuais injetam STARTED).
+3. [MÉDIO] `AdminStatusClusterTest` (3 nós): `REACHABILITY_TIMEOUT` 10 s → 30 s (detecção do core em malha de
+   4 com proxy é mais lenta); 2/4 falhas medidas só nessa asserção.
+4. [BAIXO] `Rebalancer.triggerNow` (~:159-181) com `try/finally` liberando `running`; import `assertFalse` sem
+   uso em `RebalancerTest`; ruído SEVERE do `NodeStatusReporter` após fechar o volume (parar o tick antes).
+5. `handleAbort` no destino com `state == null` responde OK sem registrar e chunks seguintes recriam staging
+   (cópia órfã, segura) — registrar no doc como caso que o reconciliador do M4 trata.
+Commits sugeridos: (a) rebalance/ executor+coordinator+planner+rebalancer+testes; (b) node/ (gate esquecida,
+config, reporter heal) + client (`ownerChanged`, connect); (c) protocol/admin rebalance; (d) testes de cluster
++ harness. Depois atualizar este checkpoint e iniciar o M4 (`spec-m4.md`).
+**Vermelho conhecido dependente do core (registrar em `doc/testes-vermelhos-conhecidos.md` no M5):**
+`LeaderFailoverDuringMigrationClusterTest` falha ~1 em 4: após matar o líder (3 storage + cliente), sobreviventes
+ficam 150 s em "Direct connection failed for storage-2 / Failing over to proxy ngrrd-client-…" e elegem tarde;
+log `stepped down: activeVoters=1, requiredVoterMajority=2, activeMembers=2`. É roteamento por proxy para nó
+morto + membership — mesma família do chip de higiene do TcpTransport; investigar com Fable (autorizado).
 
 ## Observações
 - `DualLeaderLivelockE2ETest` falhou uma vez sob carga da suíte completa; 4/4 na main e 3/3 isolado na
