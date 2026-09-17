@@ -78,7 +78,11 @@ sobreviventes por 90 s; sem o membro inelegível elegem em 0,7-3 s). Como `leade
 M0, isso é provavelmente REGRESSÃO do M0 (escape D9 / mutual-deferral em `ClusterCoordinator.recomputeLeader`), não
 defeito pré-existente. Decisão do orquestrador: NÃO enfraquecer o `PlacementUnderLeaderChurnClusterTest`; investigar
 no core com um Debugger (opus) reproduzindo a variante H do A/B como teste do core, corrigir, reinstalar e só então
-voltar ao teste de churn. Fluxo ao retomar: (1) Debugger no core; (2) Builder termina o M3 (gate do `ownership` +
+voltar ao teste de churn. **Autorização registrada (2026-09-17):** o usuário autorizou a investigação no core ao retomar e recomendou um
+subagente **Fable** (`model: "fable"`) para ela; observou que o NGrid não se mostrou muito estável em testes
+pessoais e que esta investigação pode elevar a maturidade dele — ou seja, o escopo pode ir além do sintoma
+(eleição após saída de membro inelegível) e cobrir o churn de liderança em bootstrap/failover que os Refuters
+vêm registrando. Fluxo ao retomar: (1) Debugger Fable no core; (2) Builder termina o M3 (gate do `ownership` +
 `RebalanceClusterTest` estável + churn verde); (3) Refuter; (4) commits atômicos; (5) M4.
 
 ## Observações
