@@ -28,10 +28,14 @@ import java.util.Objects;
  * campos primitivos (sem {@link Duration}/{@link java.time.Instant}) para um
  * round-trip estável no protocolo do cluster.
  *
- * <p>Valida os mesmos invariantes do construtor compacto de {@link ViewQuery}
- * — de propósito: o erro de um pedido malformado deve estourar no cliente, ao
- * montar o {@code ReadRequest}, e não depois de uma viagem de rede até o dono
- * da série.</p>
+ * <p>Valida os invariantes do construtor compacto de {@link ViewQuery}
+ * ({@code dsName}/{@code cf} obrigatórios, {@code targetStepSec}/{@code maxPoints}
+ * {@code > 0}) e, de propósito, é <strong>mais estrita</strong> num ponto:
+ * {@code windowMs} também precisa ser {@code > 0} aqui, enquanto o construtor
+ * compacto de {@link ViewQuery} não rejeita uma janela zero (ou negativa) — só
+ * verifica que {@code window} não é {@code null}. A validação extra existe para
+ * que o erro de um pedido malformado estoure no cliente, ao montar o
+ * {@code ReadRequest}, e não depois de uma viagem de rede até o dono da série.</p>
  *
  * @param seriesKey            chave lógica da série
  * @param dsName               data source a ler

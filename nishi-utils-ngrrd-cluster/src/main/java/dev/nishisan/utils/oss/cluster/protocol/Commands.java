@@ -68,7 +68,13 @@ public final class Commands {
     /** Coordenador (líder): dispara um ciclo de rebalanceamento imediato. */
     public static final String ADMIN_REBALANCE = "ngrrd.admin.rebalance";
 
-    /** Comandos atendidos exclusivamente pelo líder do cluster. */
+    /**
+     * Comandos atendidos exclusivamente pelo líder do cluster.
+     *
+     * <p>{@link #ADMIN_METRICS} fica de fora deliberadamente: métricas são
+     * locais a cada nó (ver {@code StorageRequestHandler.metricsSnapshot()}) e
+     * qualquer storage node — líder ou não — responde por si mesmo.</p>
+     */
     public static final Set<String> LEADER_COMMANDS = Set.of(
             PLACE, ADMIN_DRAIN, ADMIN_ACTIVATE, ADMIN_STATUS, ADMIN_REBALANCE);
 

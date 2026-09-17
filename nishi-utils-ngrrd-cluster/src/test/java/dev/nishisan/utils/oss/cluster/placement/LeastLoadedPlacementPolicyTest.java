@@ -133,6 +133,30 @@ class LeastLoadedPlacementPolicyTest {
     }
 
     @Test
+    void empatePorCargaEfetivaComCapacidadeMistaEhDeterministicoEmQualquerPermutacao() {
+        long now = 1_000L;
+        // Carga efetiva empatada nos três (seriesCount=5, sem pendente). Capacidade mista:
+        // x desconhecida (sortable 0.0), y conhecida com fillRatio 0.0 (mesmo valor sortable de x),
+        // z conhecida com fillRatio 0.2 (pior, perde o desempate). Entre x e y — empatados em carga
+        // efetiva e em fillRatio sortable — o nodeId decide: "node-x" < "node-y".
+        StorageNodeStatus x = node("node-x", NodeState.ACTIVE, 5, 0, 0, now);
+        StorageNodeStatus y = node("node-y", NodeState.ACTIVE, 5, 0, 1000, now);
+        StorageNodeStatus z = node("node-z", NodeState.ACTIVE, 5, 200, 1000, now);
+        Set<String> reachable = Set.of("node-x", "node-y", "node-z");
+
+        List<List<StorageNodeStatus>> permutations = List.of(
+                List.of(x, y, z), List.of(x, z, y), List.of(y, x, z),
+                List.of(y, z, x), List.of(z, x, y), List.of(z, y, x));
+
+        List<Optional<String>> winners = permutations.stream()
+                .map(nodes -> policy.choose(context(nodes, reachable, Map.of(), now, null)))
+                .collect(Collectors.toList());
+
+        assertTrue(winners.stream().allMatch(winner -> winner.equals(Optional.of("node-x"))),
+                "toda permutação deveria eleger node-x; resultados: " + winners);
+    }
+
+    @Test
     void cargaEfetivaSomaPendenteAoSeriesCount() {
         long now = 1_000L;
         StorageNodeStatus a = node("node-a", NodeState.ACTIVE, 5, 0, 0, now);
