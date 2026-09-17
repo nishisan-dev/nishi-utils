@@ -56,40 +56,23 @@ dispatcher (+3 s) e `node.close()` ficam fora do deadline.
 Defeito PRÉ-EXISTENTE confirmado por A/B (falha também sem M2, sob carga): sob churn de liderança o líder pode recolocar
 uma série existente e o nó aceita o hint criando uma série vazia no lugar errado → seção 0 obrigatória da spec do M3.
 
-### M3 — migração e rebalanceamento — EM ANDAMENTO, NÃO commitado (sessão pausada em 2026-09-17)
-Árvore tem ~26 arquivos do M3 sem commit (`rebalance/`, `CatalogView`, ajustes em `node/`, `client/`, `protocol/`,
-testes). Estado real: `mvn -pl nishi-utils-ngrrd-cluster verify` = 228 unitários verdes, cobertura 82%; os quatro
-testes de cluster anteriores verdes; `LeaderFailoverDuringMigrationClusterTest` 3/3 verde (58-68 s);
-`RebalanceClusterTest` intermitente (1 passe em 38 s, 3 rodadas vermelhas: imagem de `device:rb1` apagada no dono
-antigo / `Not the leader`); `PlacementUnderLeaderChurnClusterTest` vermelho, bloqueado (abaixo).
-Defeitos corrigidos nesta etapa (sem commit): `NodeStatusReporter` acumulava cadeias ilimitadas de retentativa a cada
-tick/troca de líder e alimentava o churn (agora cadeia única, 3 tentativas); `MigrationCoordinator.complete/abort`
-gravavam o flip do catálogo uma vez só e `LeaderSyncingException` ao assumir liderança deixava a série `MIGRATING`
-para sempre (agora 20 × 500 ms enquanto líder; sem flip não há `MIGRATE_FINISH`); `MIGRATE_FINISH` usava `discard`
-mantendo o YAML em cache e uma escrita atrasada recriava a série VAZIA na origem (novo `registry.forget`).
-**Próximo passo exato (do agente):** em `StorageRequestHandler.ownership()` (~:389-450), quando a série estiver
-"esquecida" no registry (`registry.isForgotten(key)`, a expor), não confiar em `placementLocal`: exigir
-`placementStrong` antes de autorizar um OPEN que criaria a série (a seção 0 blindou só o caminho do
-`placementHint`; o caminho "réplica local diz que sou dono" continua aberto). Depois testes unitários do gate e
-`RebalanceClusterTest` 3×.
-**Bloqueio no core — RESOLVIDO (commit "fix(ngrid): maioria de eleição só entre votantes elegíveis"):** o
-Fable provou por bisect que NÃO era regressão do M0: `TcpTransport.knownPeers` nunca esquece peers e a maioria
-dinâmica contava todo peer com porta > 0 no denominador, então cada cliente efêmero inflava o quórum para sempre
-(e uma minoria de votantes podia liderar sustentada por clientes). Correção: maioria só entre votantes elegíveis;
-líder corrente não abdica por peer novo sem watermark; escape D9 só com eleito que de fato não se afirma líder.
-Refuter (opus) aprovou com análise de partições. Suíte do core 562/0/8. Chip aberto para saída graciosa (LEAVE +
-tombstone), janela de bootstrap padrão e prefixo de nodeId nos logs. Histórico da decisão original: A/B com NGrid puro mostrou que, depois que um membro `leader-ineligible`
-entra e sai da malha, os nós elegíveis restantes NÃO elegem novo líder quando o incumbente cai (`leader=<none>` nos
-sobreviventes por 90 s; sem o membro inelegível elegem em 0,7-3 s). Como `leader-ineligible` é o role introduzido no
-M0, isso é provavelmente REGRESSÃO do M0 (escape D9 / mutual-deferral em `ClusterCoordinator.recomputeLeader`), não
-defeito pré-existente. Decisão do orquestrador: NÃO enfraquecer o `PlacementUnderLeaderChurnClusterTest`; investigar
-no core com um Debugger (opus) reproduzindo a variante H do A/B como teste do core, corrigir, reinstalar e só então
-voltar ao teste de churn. **Autorização registrada (2026-09-17):** o usuário autorizou a investigação no core ao retomar e recomendou um
-subagente **Fable** (`model: "fable"`) para ela; observou que o NGrid não se mostrou muito estável em testes
-pessoais e que esta investigação pode elevar a maturidade dele — ou seja, o escopo pode ir além do sintoma
-(eleição após saída de membro inelegível) e cobrir o churn de liderança em bootstrap/failover que os Refuters
-vêm registrando. Fluxo ao retomar: (1) Debugger Fable no core; (2) Builder termina o M3 (gate do `ownership` +
-`RebalanceClusterTest` estável + churn verde); (3) Refuter; (4) commits atômicos; (5) M4.
+### M3 — migração e rebalanceamento — EM ANDAMENTO, NÃO commitado (atualizado 2026-09-17 ~15h)
+Core: duas correções de eleição COMMITADAS (d521d5e maioria só de votantes elegíveis; 3ff1ace seguidores adotam
+quem de fato lidera + guard de sync não fica preso), ambas aprovadas por Refuter com análise de partições; suíte do
+core 567/0/8. Não commitado no core: passthrough `NGridNodeBuilder.bootDiscoveryWindow(Duration)` + teste.
+Módulo (não commitado): gate `ownership` para série esquecida (`registry.forget/isForgotten`, `ownershipForgotten`
+só confia em `placementStrong`); `MigrationCoordinator` com `resumeInFlight` em laço, FINISH com 20 tentativas e
+trava `activeMigrationIds`; `Rebalancer.triggerNow` com log por movimento; `StorageNodeConfig.bootDiscoveryWindow`
+(default 3 s) aplicado ao storage node. 233 unitários verdes (cobertura 76%). `LeaderFailoverDuringMigrationClusterTest`
+3/3; `DistributedWriteReadClusterTest`/`NodeRestartClusterTest` verdes.
+**Decisão:** quórum por votantes é correto: com 2 storage nodes, perder um = sem líder (comandos de líder param;
+escrita/leitura no dono sobrevivente seguem). Tolerar falha de 1 nó exige ≥ 3 storage nodes (documentar).
+`StorageNodeClusterTest` ganha retentativa de NOT_LEADER no PLACE cru; `AdminStatusClusterTest` passa a 3 nós.
+**Em investigação (Fable, com edição de módulo e core):** (1) leitura vazia determinística em `device:rb2`
+(`RebalanceClusterTest` 3/3) e `device:churn0` — timestamps do teste vs janela/RRA, ou reader do oss;
+(2) divergência de membership sob reinícios repetidos do líder (`PlacementUnderLeaderChurnClusterTest` 2/3:
+`storage-1` deixa de ver `storage-2`). Depois: 3× cada teste de cluster novo, Refuter do M3, commits.
+Chips abertos: saída graciosa/janela de bootstrap padrão/prefixo de nodeId nos logs; reclaim cego à linhagem.
 
 ## Observações
 - `DualLeaderLivelockE2ETest` falhou uma vez sob carga da suíte completa; 4/4 na main e 3/3 isolado na
