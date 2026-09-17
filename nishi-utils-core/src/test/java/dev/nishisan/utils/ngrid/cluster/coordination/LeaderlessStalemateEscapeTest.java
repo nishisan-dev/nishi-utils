@@ -175,6 +175,37 @@ class LeaderlessStalemateEscapeTest {
         }
     }
 
+    /**
+     * F3 (guard, regression): a refusal is only a stalemate signal while the elected node is NOT
+     * leading. Here the affinity-elected peer ASSERTS leadership in its heartbeats and merely lags the
+     * local applied frontier by the ordinary sub-heartbeat skew (a serving leader's advertised
+     * watermark trails what its followers have already applied); a refusal recorded meanwhile
+     * (issued earlier, while it deferred, or reordered on the wire) must not promote the local node
+     * against a healthy leader — that self-inflicted dual-leader was firing on every membership
+     * recompute (client join/leave) within {@code heartbeatTimeout} of the boot-time refusal.
+     */
+    @Test
+    @DisplayName("Recusa obsoleta não dispara o escape quando o eleito já se afirma líder (guarda do F3)")
+    void staleRefusalDoesNotEscapeOnceElectedAssertsLeadership() throws Exception {
+        Harness h = harness(INCUMBENT, 50, PREFERRED, 100, Duration.ofMillis(400));
+        h.coord.setReplicationProgressGate(() -> 1000L, 0L); // local "ahead" by one op (1000 > 999)
+        h.start();
+        h.startPeerHeartbeats(PREFERRED, 7L, 999L, true); // peer LEADING, trailing by ordinary skew
+
+        Thread.sleep(600); // boot window elapsed, peer known and adopted as leader
+        awaitLeader(h, PREFERRED);
+
+        h.coord.noteLeaderRefusal(PREFERRED); // stale refusal: the elected node is leading now
+
+        long deadline = System.currentTimeMillis() + 1200;
+        while (System.currentTimeMillis() < deadline) {
+            assertFalse(h.coord.isLeader(),
+                    "a refusal from a node whose latest heartbeat asserts leadership is stale and must"
+                            + " never promote the local node against that healthy leader");
+            Thread.sleep(50);
+        }
+    }
+
     // ---- harness (espelho do LeaderSyncBeforeReclaimTest) ----
 
     private Harness harness(NodeId localId, int localPriority, NodeId peerId, int peerPriority,
@@ -227,9 +258,13 @@ class LeaderlessStalemateEscapeTest {
         }
 
         void startPeerHeartbeats(NodeId source, long epoch, long highWatermark) {
+            startPeerHeartbeats(source, epoch, highWatermark, false);
+        }
+
+        void startPeerHeartbeats(NodeId source, long epoch, long highWatermark, boolean assertsLeadership) {
             peerTask = sched.scheduleAtFixedRate(() -> coord.onMessage(
                     ClusterMessage.lightweight(MessageType.HEARTBEAT, "hb", source, null,
-                            HeartbeatPayload.now(highWatermark, epoch))),
+                            HeartbeatPayload.now(highWatermark, epoch, assertsLeadership))),
                     0, 100, TimeUnit.MILLISECONDS);
         }
 

@@ -101,6 +101,13 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     // leaderUnavailable. A recent refusal from the affinity-elected node is the stalemate signal that
     // lets the ahead node take over instead of deferring forever.
     private final Map<NodeId, Long> leaderRefusalAtMs = new ConcurrentHashMap<>();
+    // Whether each peer's LATEST heartbeat asserted leadership. A refusal is only a stalemate signal
+    // while the refusing node is still not leading: the moment its heartbeat asserts leadership the
+    // refusal is stale (it was recorded while the node was deferring, e.g. during the boot dance) and
+    // must not arm the D9 escape — otherwise any recompute within heartbeatTimeout of that stale
+    // refusal, combined with the normal ≤ one-heartbeat watermark skew, promotes a follower into a
+    // genuine dual-leader.
+    private final Map<NodeId, Boolean> peerAssertsLeadership = new ConcurrentHashMap<>();
     // Rate-limit for the leader-behind-own-follower warning (issue tems#9, D9).
     private volatile long lastLeaderBehindWarnMs = 0L;
 
@@ -596,19 +603,21 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             Thread.sleep(200);
         }
         throw new IllegalStateException(String.format(
-                "Cluster did not stabilize within %s. Current state: leader=%s, activeMembers=%d, requiredActiveMembers=%d",
+                "Cluster did not stabilize within %s. Current state: leader=%s, activeMembers=%d,"
+                        + " minClusterSize=%d, activeVoters=%d, requiredVoterMajority=%d, pairMode=%s",
                 timeout, leaderInfo().map(NodeInfo::nodeId).orElse(null),
-                activeMembers().size(), requiredActiveMembersForLeadership()));
+                activeMemberCount(), config.minClusterSize(), activeVoterCount(), requiredVoterMajority(),
+                config.pairMode()));
     }
 
     /**
      * Checks if the cluster is currently stable.
-     * 
-     * @return true if a leader is present and the cluster has sufficient active
-     *         members
+     *
+     * @return true if a leader is present and the leadership quorum holds (see
+     *         {@link #hasLeadershipQuorum()})
      */
     private boolean isStable() {
-        return leaderInfo().isPresent() && activeMembers().size() >= requiredActiveMembersForLeadership();
+        return leaderInfo().isPresent() && hasLeadershipQuorum();
     }
 
     /**
@@ -759,6 +768,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                     member.markInactive();
                     // Drop the dead peer's tracked watermark so a deferring higher-affinity node can lead.
                     peerHighWatermark.remove(member.id());
+                    leaderRefusalAtMs.remove(member.id());
+                    peerAssertsLeadership.remove(member.id());
                     changed = true;
                 }
             }
@@ -769,11 +780,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
 
             // Renew lease only while the node still has enough active members to
             // legitimately hold leadership for the currently known cluster size.
-            if (isLeader()) {
-                long activeCount = members.values().stream().filter(ClusterMember::isActive).count();
-                if (activeCount >= requiredActiveMembersForLeadership()) {
-                    this.leaseExpiresAt = Instant.now().plus(config.leaseTimeout());
-                }
+            if (isLeader() && hasLeadershipQuorum()) {
+                this.leaseExpiresAt = Instant.now().plus(config.leaseTimeout());
             }
         } catch (Throwable t) {
             LOGGER.log(java.util.logging.Level.SEVERE, "Unexpected error in eviction task", t);
@@ -797,8 +805,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      */
     private void recomputeLeader() {
         synchronized (leaderComputationLock) {
-            long activeCount = members.values().stream().filter(ClusterMember::isActive).count();
-            if (activeCount < requiredActiveMembersForLeadership()) {
+            if (!hasLeadershipQuorum()) {
                 updateLeader(null);
                 return;
             }
@@ -895,7 +902,14 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             // Watermark-unknown deferral: if a peer is already ACTIVE, never hand leadership to us before
             // it reports a watermark; that peer may be the incumbent ahead of us. The boot window only
             // bounds waiting for configured peers that have not appeared at all, preserving AP when alone.
+            // Like gate A, this deferral gates the RECLAIM of a node that is not leading — it NEVER evicts
+            // the CURRENT leader (issue tems#9, D9): a serving leader that sees a new peer connect (a
+            // joining client, a returning follower) must not abdicate to its own follower until that
+            // peer's first heartbeat lands, only to re-elect itself milliseconds later — that flap bumps
+            // the epoch twice and fires the demotion/promotion listeners on every join. A rival that is
+            // genuinely ahead resolves through the dual-leader path (D10c), never through this gate.
             boolean bootWindowUnknownPeer = weWouldLead
+                    && !isLeaderInternal(localId)
                     && replicationProgressGateEnabled
                     && (hasActivePeerWithUnknownWatermark(localId)
                             || (Instant.now().toEpochMilli() < bootDiscoveryDeadlineMs
@@ -973,13 +987,20 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 Long refusedAt = leaderRefusalAtMs.get(electedId);
                 boolean recentRefusal = refusedAt != null
                         && Instant.now().toEpochMilli() - refusedAt <= config.heartbeatTimeout().toMillis();
+                // The refusal must still be CURRENT: the elected node's latest heartbeat must not assert
+                // leadership. A node that is leading cannot be "refusing to lead" — its refusal was
+                // recorded while it deferred (boot dance, handoff) and a serving leader's watermark lags
+                // its followers' applied frontier by up to one heartbeat, so a stale refusal plus that
+                // ordinary skew would read as the stalemate signature and promote a follower against a
+                // healthy leader (a self-inflicted dual-leader on every membership recompute).
+                boolean electedStillNotLeading = !Boolean.TRUE.equals(peerAssertsLeadership.get(electedId));
                 Long electedWatermark = peerHighWatermark.get(electedId);
                 long localApplied = safeLocalApplied();
                 // STRICTLY ahead beyond the tolerance: with equal watermarks (every fresh boot is 0/0)
                 // the affinity election must win — a transient refusal during an election dance must
                 // never invert affinity. The genuine stalemate signature is local state the elected
                 // node does not have.
-                if (recentRefusal && electedWatermark != null && localApplied >= 0
+                if (recentRefusal && electedStillNotLeading && electedWatermark != null && localApplied >= 0
                         && localApplied > electedWatermark + syncReclaimLagThreshold) {
                     LOGGER.warning(() -> "Affinity-elected " + electedId + " refuses leadership and is not"
                             + " ahead (peer=" + electedWatermark + ", local=" + localApplied
@@ -1315,9 +1336,15 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         return false;
     }
 
+    /**
+     * Returns {@code true} if some active, leader-eligible peer with a real listen port has not yet
+     * reported a replication watermark. A leader-ineligible peer (a client) is ignored: it can never be
+     * the incumbent ahead of us, so its unknown frontier is no reason to defer.
+     */
     private boolean hasActivePeerWithUnknownWatermark(NodeId localId) {
         for (ClusterMember member : members.values()) {
-            if (isRealActivePeer(member, localId) && !peerHighWatermark.containsKey(member.id())) {
+            if (isRealActivePeer(member, localId) && member.info().isLeaderEligible()
+                    && !peerHighWatermark.containsKey(member.id())) {
                 return true;
             }
         }
@@ -1392,22 +1419,73 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         return member != null && member.isActive();
     }
 
-    private int requiredActiveMembersForLeadership() {
+    /** Number of currently active members, clients included (the population {@code minClusterSize} is about). */
+    private long activeMemberCount() {
+        return members.values().stream().filter(ClusterMember::isActive).count();
+    }
+
+    /**
+     * Number of ACTIVE members that take part in the leadership majority (the "voters"): active members
+     * that are leader-eligible (do not carry {@link NodeInfo#ROLE_LEADER_INELIGIBLE}). Compared against
+     * {@link #requiredVoterMajority()}, which is computed over the same population, so a
+     * leader-ineligible member (a client) neither helps nor hinders the majority. HEARTBEAT
+     * placeholders (empty host, created before the handshake) are excluded as well: they never
+     * appear in the denominator, so counting them here would inflate the numerator alone.
+     */
+    private long activeVoterCount() {
+        return members.values().stream()
+                .filter(m -> m.isActive() && !m.info().host().isBlank() && m.info().isLeaderEligible())
+                .count();
+    }
+
+    /**
+     * Leadership quorum predicate. Two independent requirements, each over its own population:
+     * <ul>
+     *   <li>{@code minClusterSize} counts ALL active members, clients included — it derives from the
+     *       replication quorum ({@code NGridNode}: {@code min(replicationQuorum, peers + 1)}) and a
+     *       leader-ineligible member is still a replica, so it legitimately satisfies it;</li>
+     *   <li>the dynamic majority (non-pair mode) counts only the VOTERS, on both sides of the comparison —
+     *       see {@link #requiredVoterMajority()}.</li>
+     * </ul>
+     */
+    private boolean hasLeadershipQuorum() {
+        if (activeMemberCount() < config.minClusterSize()) {
+            return false;
+        }
         // Pair mode: bypass the dynamic majority — leadership requires only minClusterSize active
         // members (typically 1), so a node that loses its peer still leads. Split-brain during a
         // partition is accepted and reconciled on reconnect by electing the highest NodeId
         // (recomputeLeader already picks max(NodeId); epoch fencing rejects the stale leader's writes).
         if (config.pairMode()) {
-            return config.minClusterSize();
+            return true;
         }
-        // transport.peers() is backed by knownPeers and already includes the local node.
-        // Count only eligible peers (those with a real listen port): discovery clients and
-        // gossip placeholders carry port 0 and must not inflate the required majority — an
-        // inflated denominator can make a healthy quorum fall short and stall the election.
-        long eligible = transport.peers().stream().filter(p -> p.port() > 0).count();
-        int totalExpected = (int) Math.max(1, eligible);
-        int dynamicMajority = (totalExpected / 2) + 1;
-        return Math.max(config.minClusterSize(), dynamicMajority);
+        return activeVoterCount() >= requiredVoterMajority();
+    }
+
+    /**
+     * Dynamic majority of the VOTERS known to the transport. {@code transport.peers()} is backed by
+     * {@code knownPeers} and already includes the local node. Only peers with a real listen port that are
+     * leader-eligible count:
+     * <ul>
+     *   <li>discovery clients and gossip placeholders carry port 0 and must not inflate the required
+     *       majority — an inflated denominator can make a healthy quorum fall short and stall the
+     *       election;</li>
+     *   <li>leader-ineligible members ({@link NodeInfo#ROLE_LEADER_INELIGIBLE}, e.g. short-lived clients)
+     *       are excluded for the same reason: {@code knownPeers} never forgets a peer that left (there is
+     *       no graceful-leave message, and dropping departed peers would weaken split-brain safety for the
+     *       durable members), so every client that ever joined would otherwise keep raising the majority
+     *       the eligible survivors must reach — until a single failover, or even plain client churn, left
+     *       the cluster permanently leaderless. Clients can never lead, so they belong on neither side of
+     *       the majority (see {@link #activeVoterCount()}): counting them on the active side alone would
+     *       let a node partitioned away with its clients out-vote the eligible majority.</li>
+     * </ul>
+     */
+    private int requiredVoterMajority() {
+        long voters = transport.peers().stream()
+                .filter(p -> p.port() > 0 && p.isLeaderEligible())
+                .count();
+        int totalExpected = (int) Math.max(1, voters);
+        return (totalExpected / 2) + 1;
     }
 
     /**
@@ -1533,6 +1611,9 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             // waiting on a peer that is genuinely gone (lead-while-alone): with no active peer ahead, the
             // reclaim gate is a no-op and the node leads.
             peerHighWatermark.remove(peerId);
+            // A gone peer can neither refuse nor assert leadership (issue tems#9, D9).
+            leaderRefusalAtMs.remove(peerId);
+            peerAssertsLeadership.remove(peerId);
             // A gone rival can no longer sustain a dual-leader (issue tems#9, D10c).
             dualLeaderObservations.remove(peerId);
             if (dualLeaderObservations.isEmpty()) {
@@ -1560,6 +1641,11 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             // (adopt) path.
             if (!source.equals(transport.local().nodeId())) {
                 observeLeaderAssertion(source, payload.leader());
+                peerAssertsLeadership.put(source, payload.leader());
+                if (payload.leader()) {
+                    // The peer is leading: any refusal it issued while deferring is stale (D9 escape).
+                    leaderRefusalAtMs.remove(source);
+                }
             }
             // Converge the cluster term from every peer heartbeat BEFORE fencing, so a leader
             // whose persisted epoch regressed re-learns the highest term any node has seen and
