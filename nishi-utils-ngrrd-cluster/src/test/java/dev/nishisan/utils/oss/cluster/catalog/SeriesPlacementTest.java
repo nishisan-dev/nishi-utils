@@ -19,6 +19,12 @@ package dev.nishisan.utils.oss.cluster.catalog;
 
 import org.junit.jupiter.api.Test;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -26,6 +32,27 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class SeriesPlacementTest {
+
+    /**
+     * B1 (achado do Debugger): {@code NMapPersistence} (core) grava o WAL via {@code ObjectOutputStream}
+     * — sem {@link java.io.Serializable}, todo append falhava com {@code NotSerializableException} e o
+     * catálogo persistente nunca persistia de fato.
+     */
+    @Test
+    void sobrevivePeloObjectOutputStreamEObjectInputStream() throws IOException, ClassNotFoundException {
+        SeriesPlacement original = SeriesPlacement.active("storage-0", 1_000L);
+
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (ObjectOutputStream out = new ObjectOutputStream(bytes)) {
+            out.writeObject(original);
+        }
+        SeriesPlacement roundTripped;
+        try (ObjectInputStream in = new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray()))) {
+            roundTripped = (SeriesPlacement) in.readObject();
+        }
+
+        assertEquals(original, roundTripped);
+    }
 
     @Test
     void construtorFalhaQuandoOwnerNodeIdEhNulo() {

@@ -17,6 +17,7 @@
 
 package dev.nishisan.utils.oss.cluster.catalog;
 
+import java.io.Serializable;
 import java.time.Duration;
 import java.util.Objects;
 
@@ -37,7 +38,10 @@ public record StorageNodeStatus(
         long seriesCount,
         long usedBytes,
         long capacityBytes,
-        long reportedAtEpochMs) {
+        long reportedAtEpochMs) implements Serializable {
+
+    /** B1 (achado do Debugger): ver Javadoc de {@code SeriesPlacement#serialVersionUID}. */
+    private static final long serialVersionUID = 1L;
 
     public StorageNodeStatus {
         Objects.requireNonNull(nodeId, "nodeId é obrigatório");
@@ -67,8 +71,16 @@ public record StorageNodeStatus(
         return (double) usedBytes / (double) capacityBytes;
     }
 
-    /** Indica se o status ainda é considerado válido — dentro de {@code 2 × interval} do relatório. */
-    public boolean isFresh(long now, Duration interval) {
-        return now - reportedAtEpochMs <= 2 * interval.toMillis();
+    /**
+     * Indica se o status ainda é considerado válido — dentro de {@code staleAfter} do último
+     * relatório. {@code staleAfter} já é o prazo completo (ex.:
+     * {@code StorageNodeConfig.nodeStatusStaleAfter()}, tipicamente
+     * {@code max(5 × statusReportInterval, 15s)}); esta comparação não multiplica nada por conta
+     * própria — a antiga versão (`2 × interval`) descartava um nó legítimo cujo último status visível
+     * ao líder já estava "velho" logo após um handoff de liderança (o novo líder só recebe o próximo
+     * relatório daquele nó depois de um ciclo inteiro).
+     */
+    public boolean isFresh(long now, Duration staleAfter) {
+        return now - reportedAtEpochMs <= staleAfter.toMillis();
     }
 }

@@ -19,6 +19,11 @@ package dev.nishisan.utils.oss.cluster.catalog;
 
 import org.junit.jupiter.api.Test;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
 import java.time.Duration;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -27,7 +32,24 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class StorageNodeStatusTest {
 
-    private static final Duration INTERVAL = Duration.ofSeconds(10);
+    private static final Duration STALE_AFTER = Duration.ofSeconds(10);
+
+    /** B1 (achado do Debugger): ver o mesmo teste em {@code SeriesPlacementTest}. */
+    @Test
+    void sobrevivePeloObjectOutputStreamEObjectInputStream() throws IOException, ClassNotFoundException {
+        StorageNodeStatus original = new StorageNodeStatus("storage-0", NodeState.ACTIVE, 42, 1_000, 10_000, 5_000L);
+
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (ObjectOutputStream out = new ObjectOutputStream(bytes)) {
+            out.writeObject(original);
+        }
+        StorageNodeStatus roundTripped;
+        try (ObjectInputStream in = new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray()))) {
+            roundTripped = (StorageNodeStatus) in.readObject();
+        }
+
+        assertEquals(original, roundTripped);
+    }
 
     @Test
     void fillRatioEhZeroQuandoCapacidadeEhZero() {
@@ -51,21 +73,24 @@ class StorageNodeStatusTest {
     }
 
     @Test
-    void isFreshNaFronteiraExataDeDuasVezesOIntervaloEhVerdadeiro() {
+    void isFreshNaFronteiraExataDoPrazoEhVerdadeiro() {
+        // F2.1 (Debugger): isFresh agora compara DIRETO com staleAfter — o chamador já decide o prazo
+        // completo (ex.: StorageNodeConfig.nodeStatusStaleAfter(), tipicamente 5x o intervalo de
+        // relatório, não 2x); isFresh não multiplica nada por conta própria.
         long now = 100_000L;
-        long reportedAt = now - 2 * INTERVAL.toMillis();
+        long reportedAt = now - STALE_AFTER.toMillis();
         StorageNodeStatus status = new StorageNodeStatus("node-a", NodeState.ACTIVE, 0, 0, 0, reportedAt);
 
-        assertTrue(status.isFresh(now, INTERVAL), "exatamente 2x o intervalo ainda deve ser fresh (<=)");
+        assertTrue(status.isFresh(now, STALE_AFTER), "exatamente no prazo ainda deve ser fresh (<=)");
     }
 
     @Test
     void isFreshUmMilissegundoAlemDaFronteiraEhFalso() {
         long now = 100_000L;
-        long reportedAt = now - 2 * INTERVAL.toMillis() - 1;
+        long reportedAt = now - STALE_AFTER.toMillis() - 1;
         StorageNodeStatus status = new StorageNodeStatus("node-a", NodeState.ACTIVE, 0, 0, 0, reportedAt);
 
-        assertFalse(status.isFresh(now, INTERVAL), "1ms além de 2x o intervalo não deve mais ser fresh");
+        assertFalse(status.isFresh(now, STALE_AFTER), "1ms além do prazo não deve mais ser fresh");
     }
 
     @Test

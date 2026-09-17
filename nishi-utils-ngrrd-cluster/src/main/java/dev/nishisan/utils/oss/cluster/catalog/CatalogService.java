@@ -17,6 +17,7 @@
 
 package dev.nishisan.utils.oss.cluster.catalog;
 
+import dev.nishisan.utils.map.NMapPersistenceMode;
 import dev.nishisan.utils.ngrid.structures.Consistency;
 import dev.nishisan.utils.ngrid.structures.DistributedMap;
 import dev.nishisan.utils.ngrid.structures.NGridNode;
@@ -63,9 +64,21 @@ public final class CatalogService {
      * Registra os dois mapas do catálogo no builder do nó. Necessário porque o
      * NGrid exige que todo mapa usado por um nó esteja declarado em todos os
      * participantes do cluster, sob pena de {@code UnknownMapRequestHandler}.
+     *
+     * <p>Persistência em disco ({@link NMapPersistenceMode#ASYNC_WITH_FSYNC}),
+     * não o padrão {@code DISABLED} de {@link NGridNodeBuilder#map(String)}: sem
+     * isso, a réplica local do catálogo de um nó reiniciado (mesmo
+     * {@code nodeId}/porta/diretórios) volta vazia — o {@code ReplicationManager}
+     * persiste o watermark de replicação, então o nó se considera "em dia" com um
+     * mapa que na verdade nunca foi escrito em disco, e passa a responder
+     * {@code WRONG_OWNER} para séries que são suas. Também satisfaz a
+     * exigência de {@link dev.nishisan.utils.ngrid.structures.DeploymentProfile#PRODUCTION}
+     * de que todo mapa configurado tenha persistência habilitada (ver
+     * planning/ngrrd-cluster.md, seção 3).</p>
      */
     public static void declareMaps(NGridNodeBuilder builder) {
-        builder.map(CATALOG_MAP).map(NODES_MAP);
+        builder.map(CATALOG_MAP, NMapPersistenceMode.ASYNC_WITH_FSYNC)
+                .map(NODES_MAP, NMapPersistenceMode.ASYNC_WITH_FSYNC);
     }
 
     /** Constrói o serviço a partir dos mapas já registrados e iniciados em {@code node}. */

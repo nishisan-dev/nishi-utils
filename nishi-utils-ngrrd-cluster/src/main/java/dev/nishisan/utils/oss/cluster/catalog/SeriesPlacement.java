@@ -17,6 +17,7 @@
 
 package dev.nishisan.utils.oss.cluster.catalog;
 
+import java.io.Serializable;
 import java.util.Objects;
 
 /**
@@ -41,7 +42,15 @@ public record SeriesPlacement(
         PlacementState state,
         String migrationId,
         long createdAtEpochMs,
-        long updatedAtEpochMs) {
+        long updatedAtEpochMs) implements Serializable {
+
+    /**
+     * B1 (achado do Debugger): o {@code NMapPersistence} do core grava o WAL via
+     * {@code ObjectOutputStream} — sem {@link Serializable}, TODO append falhava com
+     * {@code NotSerializableException} e o catálogo persistente (F1.3) nunca persistia de fato,
+     * mesmo com {@code persistenceMode = ASYNC_WITH_FSYNC} configurado.
+     */
+    private static final long serialVersionUID = 1L;
 
     public SeriesPlacement {
         Objects.requireNonNull(ownerNodeId, "ownerNodeId é obrigatório");
