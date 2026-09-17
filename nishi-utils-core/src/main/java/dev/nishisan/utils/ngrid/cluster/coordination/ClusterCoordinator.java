@@ -253,9 +253,10 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     }
 
     /**
-     * Returns the active peer (distinct from {@code localId}) advertising the highest replication
-     * watermark — the node a deferring local node should follow and sync from — or {@code null} if no
-     * active peer has reported a watermark yet.
+     * Returns the active, leader-eligible peer (distinct from {@code localId}) advertising the
+     * highest replication watermark — the node a deferring local node should follow and sync from —
+     * or {@code null} if no such peer has reported a watermark yet. A leader-ineligible peer is never
+     * returned: a deferring node must never adopt an ineligible peer as its local leader.
      */
     private NodeId highestWatermarkActivePeer(NodeId localId) {
         NodeId best = null;
@@ -264,7 +265,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             if (e.getKey().equals(localId) || e.getValue() == null) {
                 continue;
             }
-            if (isActiveMember(e.getKey()) && e.getValue() > bestWm) {
+            ClusterMember member = members.get(e.getKey());
+            if (member != null && isLeaderCandidate(member) && e.getValue() > bestWm) {
                 bestWm = e.getValue();
                 best = e.getKey();
             }
@@ -804,16 +806,21 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             NodeId preferred = preferredLeader.get();
             if (preferred != null && preferredLeaderUntilMs > Instant.now().toEpochMilli()) {
                 ClusterMember preferredMember = members.get(preferred);
-                if (preferredMember != null && preferredMember.isActive()) {
+                // A preferred-leader suggestion (e.g. LeaderReelectionService, by write-rate) must not
+                // override role-based ineligibility: fall through to the normal affinity election below
+                // when the suggested node carries NodeInfo.ROLE_LEADER_INELIGIBLE.
+                if (preferredMember != null && isLeaderCandidate(preferredMember)) {
                     updateLeader(preferred);
                     return;
                 }
             }
-            // Elect by leadership affinity: highest (priority, then NodeId). With all priorities at
-            // the default 0 this reduces to the legacy max(NodeId), so behaviour is unchanged unless
-            // priorities are configured.
+            // Elect by leadership affinity: highest (priority, then NodeId), restricted to members
+            // that are not leader-ineligible (NodeInfo.ROLE_LEADER_INELIGIBLE). With all priorities
+            // at the default 0 and no ineligible member this reduces to the legacy max(NodeId), so
+            // behaviour is unchanged unless priorities/roles are configured. When every active member
+            // is ineligible, electedId is null and the cluster ends up leaderless below.
             NodeId electedId = members.values().stream()
-                    .filter(ClusterMember::isActive)
+                    .filter(ClusterCoordinator::isLeaderCandidate)
                     .max(Comparator.comparingInt((ClusterMember m) -> m.info().priority())
                             .thenComparing(ClusterMember::id))
                     .map(ClusterMember::id)
@@ -956,9 +963,13 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             // we are NOT behind it, deferring would close the mutual-deferral loop: it cannot catch up
             // (only a leader serves the stream) and we never lead (affinity). The ahead node takes over;
             // the behind one converges as its follower and the normal affinity handoff resumes later.
+            // A role-ineligible local node (NodeInfo.ROLE_LEADER_INELIGIBLE) must never self-elect via
+            // this escape, no matter how far ahead its local state is — role eligibility is checked
+            // in addition to the replication-progress gate.
             if (electedId != null && !electedId.equals(localId)
                     && replicationProgressGateEnabled
-                    && safeLocalLeadershipEligible()) {
+                    && safeLocalLeadershipEligible()
+                    && transport.local().isLeaderEligible()) {
                 Long refusedAt = leaderRefusalAtMs.get(electedId);
                 boolean recentRefusal = refusedAt != null
                         && Instant.now().toEpochMilli() - refusedAt <= config.heartbeatTimeout().toMillis();
@@ -1066,7 +1077,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         synchronized (leaderComputationLock) {
             NodeId localId = transport.local().nodeId();
             NodeId electedId = members.values().stream()
-                    .filter(ClusterMember::isActive)
+                    .filter(ClusterCoordinator::isLeaderCandidate)
                     .max(Comparator.comparingInt((ClusterMember m) -> m.info().priority())
                             .thenComparing(ClusterMember::id))
                     .map(ClusterMember::id)
@@ -1093,11 +1104,22 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      * {@code grantedEpoch} (the incumbent's epoch carried in the grant) so the candidate's first leader
      * heartbeat fences the incumbent cleanly, then promotes the local node. Returns the new epoch.
      *
+     * <p>Defense in depth (M0 role safety): if the local node is leader-ineligible (role
+     * {@link NodeInfo#ROLE_LEADER_INELIGIBLE}), this is a no-op that logs a warning instead of
+     * assuming leadership — {@code ReplicationManager} already refuses to reach this point for an
+     * ineligible candidate, but this guard holds the invariant regardless of caller.
+     *
      * @param grantedEpoch the interim leader's epoch from the {@code HANDBACK_GRANT}
-     * @return the local leader epoch after assuming leadership (strictly above {@code grantedEpoch})
+     * @return the local leader epoch after assuming leadership (strictly above {@code grantedEpoch}),
+     *         or the current epoch, unchanged, if the local node is leader-ineligible
      */
     public long assumeLeadershipForHandback(long grantedEpoch) {
         synchronized (leaderComputationLock) {
+            if (!transport.local().isLeaderEligible()) {
+                LOGGER.warning(() -> "Ignoring handback leadership assumption: local node "
+                        + transport.local().nodeId() + " is leader-ineligible (issue tems#9, D11)");
+                return leaderEpoch.get();
+            }
             leaderEpoch.updateAndGet(cur -> Math.max(cur, grantedEpoch));
             updateLeader(transport.local().nodeId()); // increments to >= grantedEpoch+1, fires listeners
             return leaderEpoch.get();
@@ -1195,12 +1217,22 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         }
     }
 
-    /** Election-order affinity: higher priority outranks; NodeId breaks ties (strict total order). */
+    /** Election-order affinity: delegates to the shared {@link LeadershipAffinity#outranks}. */
     private static boolean outranks(NodeInfo candidate, NodeInfo reference) {
-        if (candidate.priority() != reference.priority()) {
-            return candidate.priority() > reference.priority();
-        }
-        return candidate.nodeId().compareTo(reference.nodeId()) > 0;
+        return LeadershipAffinity.outranks(candidate, reference);
+    }
+
+    /**
+     * Single leadership-candidacy predicate: an active member with a known host that is also
+     * eligible (does not carry role {@link NodeInfo#ROLE_LEADER_INELIGIBLE}). The host check excludes
+     * the HEARTBEAT placeholder (blank host, e.g. {@code new NodeInfo(source, "", 0)} created for an
+     * unknown source before its real {@link NodeInfo} is learned via handshake). Port {@code 0} alone
+     * is not disqualifying: several legitimate test harnesses (and pair-mode/loopback setups) use
+     * real, non-placeholder {@code NodeInfo}s with port {@code 0}. Centralizes the eligibility rule so
+     * it is not scattered across the coordinator's several election/affinity points.
+     */
+    private static boolean isLeaderCandidate(ClusterMember m) {
+        return m.isActive() && !m.info().host().isBlank() && m.info().isLeaderEligible();
     }
 
     /** True if {@code nodeId} is the current leader (internal, lock-held variant of {@link #isLeader()}). */
@@ -1294,7 +1326,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
 
     private NodeId highestAffinityActivePeer(NodeId localId) {
         return members.values().stream()
-                .filter(m -> isRealActivePeer(m, localId))
+                .filter(m -> isRealActivePeer(m, localId) && isLeaderCandidate(m))
                 .max(Comparator.comparingInt((ClusterMember m) -> m.info().priority())
                         .thenComparing(ClusterMember::id))
                 .map(ClusterMember::id)
@@ -1330,15 +1362,16 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      * Returns {@code true} if a configured peer of strictly higher leadership affinity than the
      * local node ({@code (priority, NodeId)}) is not currently an active member — i.e. the preferred
      * leader is expected by configuration but has not yet been discovered. Used only to gate boot
-     * self-election deferral; portless gossip placeholders are ignored.
+     * self-election deferral; portless gossip placeholders and leader-ineligible peers (they can
+     * never become the preferred leader) are ignored.
      */
     private boolean outrankedByAbsentConfiguredPeer() {
         NodeInfo local = transport.local();
         int localPriority = local.priority();
         NodeId localId = local.nodeId();
         for (NodeInfo peer : transport.peers()) {
-            if (peer.nodeId().equals(localId) || peer.port() <= 0) {
-                continue; // self, or a portless gossip/discovery placeholder
+            if (peer.nodeId().equals(localId) || peer.port() <= 0 || !peer.isLeaderEligible()) {
+                continue; // self, a portless gossip/discovery placeholder, or an ineligible peer
             }
             boolean outranks = peer.priority() > localPriority
                     || (peer.priority() == localPriority && peer.nodeId().compareTo(localId) > 0);
@@ -1469,9 +1502,14 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     public void onPeerConnected(NodeInfo peer) {
         members.compute(peer.nodeId(), (id, existing) -> {
             // Replace any placeholder member information (e.g. created from a heartbeat
-            // before we learned host/port)
-            // or update when host/port changes (e.g. peer restarted on a new port).
-            if (existing == null || !existing.info().equals(peer)) {
+            // before we learned host/port), or update when host/port changes (e.g. peer restarted
+            // on a new port). NodeInfo.equals ignores roles/priority (identity is nodeId+host+port),
+            // so also replace when either changed — e.g. a client that (re)connects after gaining
+            // NodeInfo.ROLE_LEADER_INELIGIBLE, or a priority reconfiguration — so the coordinator's
+            // affinity/eligibility decisions always see the peer's latest NodeInfo.
+            if (existing == null || !existing.info().equals(peer)
+                    || !existing.info().roles().equals(peer.roles())
+                    || existing.info().priority() != peer.priority()) {
                 return new ClusterMember(peer);
             }
             existing.touch();

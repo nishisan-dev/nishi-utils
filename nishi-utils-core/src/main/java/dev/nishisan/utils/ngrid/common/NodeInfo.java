@@ -18,6 +18,7 @@
 package dev.nishisan.utils.ngrid.common;
 
 import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonProperty;
 
 import java.util.Collections;
@@ -30,6 +31,14 @@ import java.util.Set;
  * a TCP connection.
  */
 public final class NodeInfo {
+
+    /**
+     * Role that marks a member as ineligible for leadership: no node in the cluster ever chooses it
+     * as leader, regardless of {@code priority} or preferred-leader configuration. Useful for
+     * "client-only" members that participate in the cluster (replicated maps, gossip) but must never
+     * coordinate it.
+     */
+    public static final String ROLE_LEADER_INELIGIBLE = "leader-ineligible";
 
     private final NodeId nodeId;
     private final String host;
@@ -93,6 +102,18 @@ public final class NodeInfo {
 
     public Set<String> roles() {
         return roles;
+    }
+
+    /**
+     * Returns whether this node may be chosen as cluster leader, i.e. whether {@link #roles()} does
+     * not contain {@link #ROLE_LEADER_INELIGIBLE}. Not a JSON property: derived purely from
+     * {@link #roles()}, which already round-trips on its own.
+     *
+     * @return {@code true} if the node is eligible for leadership
+     */
+    @JsonIgnore
+    public boolean isLeaderEligible() {
+        return !roles.contains(ROLE_LEADER_INELIGIBLE);
     }
 
     @Override

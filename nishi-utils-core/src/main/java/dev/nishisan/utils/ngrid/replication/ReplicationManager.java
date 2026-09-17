@@ -18,6 +18,7 @@
 package dev.nishisan.utils.ngrid.replication;
 
 import dev.nishisan.utils.ngrid.cluster.coordination.ClusterCoordinator;
+import dev.nishisan.utils.ngrid.cluster.coordination.LeadershipAffinity;
 import dev.nishisan.utils.ngrid.cluster.coordination.LeaseExpiredException;
 import dev.nishisan.utils.ngrid.cluster.coordination.LeadershipListener;
 import dev.nishisan.utils.ngrid.cluster.transport.Transport;
@@ -2843,7 +2844,7 @@ public class ReplicationManager
         long currentEpoch = coordinator.getLeaderEpoch();
         for (NodeInfo member : coordinator.activeMembers()) {
             if (member.nodeId().equals(local.nodeId()) || member.port() <= 0
-                    || !hasHigherAffinity(member, local)) {
+                    || !LeadershipAffinity.outranks(member, local)) {
                 continue;
             }
             FollowerProgress progress = followerAppliedByNode.get(member.nodeId());
@@ -2863,14 +2864,6 @@ public class ReplicationManager
                 return;
             }
         }
-    }
-
-    /** Election-order affinity comparison: higher priority wins; NodeId breaks ties. */
-    private static boolean hasHigherAffinity(NodeInfo candidate, NodeInfo reference) {
-        if (candidate.priority() != reference.priority()) {
-            return candidate.priority() > reference.priority();
-        }
-        return candidate.nodeId().compareTo(reference.nodeId()) > 0;
     }
 
     /**
@@ -2974,7 +2967,7 @@ public class ReplicationManager
         NodeInfo local = transport.local();
         NodeInfo candidateInfo = coordinator.activeMembers().stream()
                 .filter(m -> m.nodeId().equals(candidate)).findFirst().orElse(null);
-        if (candidateInfo == null || !hasHigherAffinity(candidateInfo, local)) {
+        if (candidateInfo == null || !LeadershipAffinity.outranks(candidateInfo, local)) {
             sendHandbackAbort(candidate, "candidate is not higher-affinity");
             return;
         }
@@ -3033,6 +3026,18 @@ public class ReplicationManager
             return;
         }
         if (!handbackRole.compareAndSet(HandbackRole.CANDIDATE_REQUESTING, HandbackRole.CANDIDATE_INSTALLING)) {
+            return;
+        }
+        if (!transport.local().isLeaderEligible()) {
+            // Defense in depth (M0 role safety): a leader-ineligible node must never assume
+            // leadership, even via the orchestrated handback path. The incumbent should not have
+            // sent a HANDBACK_REQUEST-driven grant to an ineligible candidate in the first place, but
+            // this guard makes the invariant hold regardless of how the request was triggered.
+            LOGGER.warning(() -> "Affinity handback: GRANT received but the local node is"
+                    + " leader-ineligible; aborting instead of installing the snapshot and assuming"
+                    + " leadership (issue tems#9, D11)");
+            sendHandbackAbort(message.source(), "candidate is leader-ineligible");
+            clearCandidateHandback("leader-ineligible", true);
             return;
         }
         handbackGrantedEpoch = payload.leaderEpoch();

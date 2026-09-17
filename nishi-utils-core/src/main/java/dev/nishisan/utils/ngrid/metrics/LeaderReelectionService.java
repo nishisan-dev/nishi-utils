@@ -165,6 +165,13 @@ public final class LeaderReelectionService implements TransportListener, Closeab
         double leaderRate = rates.getOrDefault(currentLeader, 0.0);
         double bestRate = leaderRate;
         for (NodeInfo member : coordinator.activeMembers()) {
+            if (!member.isLeaderEligible()) {
+                // Never suggest a leader-ineligible node: ClusterCoordinator.recomputeLeader()
+                // would refuse to honor the resulting preferred-leader suggestion anyway (it only
+                // elects an isLeaderCandidate), so proposing one only wastes a LEADER_SUGGESTION
+                // broadcast.
+                continue;
+            }
             NodeId id = member.nodeId();
             double rate = rates.getOrDefault(id, 0.0);
             if (rate > bestRate) {

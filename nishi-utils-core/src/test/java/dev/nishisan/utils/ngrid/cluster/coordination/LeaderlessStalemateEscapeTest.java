@@ -33,6 +33,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -146,11 +147,44 @@ class LeaderlessStalemateEscapeTest {
         }
     }
 
+    /**
+     * B1 (regression): the same scenario as F3 (local ahead, the affinity-elected peer refused
+     * leadership and is behind) — but the local node carries {@link NodeInfo#ROLE_LEADER_INELIGIBLE}.
+     * The stalemate escape must NEVER promote an ineligible node, even while ahead and even with the
+     * refusal recorded.
+     */
+    @Test
+    @DisplayName("Nó inelegível nunca escapa do impasse se autoelegendo, mesmo à frente e com recusa (B1)")
+    void ineligibleNodeDoesNotEscapeTheStalemateBySelfElecting() throws Exception {
+        Harness h = harness(INCUMBENT, 50, Set.of(NodeInfo.ROLE_LEADER_INELIGIBLE),
+                PREFERRED, 100, Duration.ofMillis(400));
+        h.coord.setReplicationProgressGate(() -> 1000L, 0L); // local ahead (1000), as in F3
+        h.start();
+        h.startPeerHeartbeats(PREFERRED, 7L, 900L); // peer active but BEHIND (900)
+
+        Thread.sleep(600); // boot window elapsed, peer known
+
+        h.coord.noteLeaderRefusal(PREFERRED); // the same refusal that would trigger the escape in F3
+
+        long deadline = System.currentTimeMillis() + 1200;
+        while (System.currentTimeMillis() < deadline) {
+            assertFalse(h.coord.isLeader(),
+                    "an ineligible node should never self-elect via the stalemate escape, even while"
+                            + " ahead and with the elected peer refusing leadership");
+            Thread.sleep(50);
+        }
+    }
+
     // ---- harness (espelho do LeaderSyncBeforeReclaimTest) ----
 
     private Harness harness(NodeId localId, int localPriority, NodeId peerId, int peerPriority,
             Duration discoveryWindow) {
-        Harness h = new Harness(localId, localPriority, peerId, peerPriority, discoveryWindow);
+        return harness(localId, localPriority, Collections.emptySet(), peerId, peerPriority, discoveryWindow);
+    }
+
+    private Harness harness(NodeId localId, int localPriority, Set<String> localRoles,
+            NodeId peerId, int peerPriority, Duration discoveryWindow) {
+        Harness h = new Harness(localId, localPriority, localRoles, peerId, peerPriority, discoveryWindow);
         closeables.add(h);
         return h;
     }
@@ -174,8 +208,9 @@ class LeaderlessStalemateEscapeTest {
         final ScheduledExecutorService sched;
         volatile java.util.concurrent.ScheduledFuture<?> peerTask;
 
-        Harness(NodeId localId, int localPriority, NodeId peerId, int peerPriority, Duration discoveryWindow) {
-            NodeInfo localInfo = new NodeInfo(localId, "127.0.0.1", 1, Collections.emptySet(), localPriority);
+        Harness(NodeId localId, int localPriority, Set<String> localRoles, NodeId peerId, int peerPriority,
+                Duration discoveryWindow) {
+            NodeInfo localInfo = new NodeInfo(localId, "127.0.0.1", 1, localRoles, localPriority);
             NodeInfo peerInfo = new NodeInfo(peerId, "127.0.0.1", 2, Collections.emptySet(), peerPriority);
             this.transport = new LoopbackTransport(localInfo, List.of(peerInfo));
             ClusterCoordinatorConfig cfg = ClusterCoordinatorConfig.of(
