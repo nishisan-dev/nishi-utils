@@ -44,6 +44,7 @@ import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 /**
@@ -143,6 +144,16 @@ class ServingLeaderAdoptionTest {
         h.startPeerHeartbeats(LOW, 3L, 30L, false);  // plain follower
         awaitLeader(h, MID);                          // the local node leads and serves
 
+        // Every transition away from local leadership is recorded: the invariant is that the FIRST
+        // one never goes to the asserting rival. (Once the node has stepped down to the affinity
+        // winner it is a follower, and following the peer that serves is then the correct rule.)
+        List<NodeId> stepDownTargets = new java.util.concurrent.CopyOnWriteArrayList<>();
+        h.coord.addLeadershipListener(newLeader -> {
+            if (newLeader != null && !newLeader.equals(MID)) {
+                stepDownTargets.add(newLeader);
+            }
+        });
+
         // A lower-affinity rival starts asserting leadership while a caught-up higher-affinity
         // candidate joins without asserting yet.
         h.stopPeerHeartbeats(LOW);
@@ -152,11 +163,33 @@ class ServingLeaderAdoptionTest {
 
         long deadline = System.currentTimeMillis() + 1_000;
         while (System.currentTimeMillis() < deadline) {
-            NodeId observed = h.coord.leaderInfo().map(NodeInfo::nodeId).orElse(null);
-            assertFalse(LOW.equals(observed),
-                    "a serving leader must never step down to a lower-affinity asserting rival");
+            assertFalse(!stepDownTargets.isEmpty() && LOW.equals(stepDownTargets.get(0)),
+                    "a serving leader must never step down to a lower-affinity asserting rival"
+                            + " (transitions: " + stepDownTargets + ")");
             Thread.sleep(50);
         }
+    }
+
+    /**
+     * Cold start with the orchestrated handback enabled (D11): three fresh nodes, nobody serving. The
+     * highest-affinity node deferred during boot discovery to a watermark-tie pick and, before the
+     * fix, the handback CANDIDATE branch kept it glued to that pick forever — a follower — while the
+     * other two followed the affinity winner: a three-way view with no leader at all, and a
+     * HANDBACK_REQUEST to a non-leader aborted on every cooldown. With no serving peer the candidate
+     * must fall through to the ordinary election and lead.
+     */
+    @Test
+    void handbackCandidateLeadsOnColdStartWhenNoPeerIsServing() throws Exception {
+        Harness h = harness(HIGH, List.of(LOW, MID), Duration.ofMillis(400));
+        h.coord.setAffinityHandbackMode(true);
+        h.coord.setReplicationProgressGate(() -> 0L, 0L);
+        h.start();
+        h.connectAll();
+        h.startPeerHeartbeats(LOW, 1L, 0L, false); // fresh followers, nobody asserts leadership
+        h.startPeerHeartbeats(MID, 1L, 0L, false);
+
+        awaitLeader(h, HIGH);
+        assertTrue(h.coord.isLeader(), "with no serving peer the affinity winner must lead (AP)");
     }
 
     // ---- harness (three-member variant of the LeaderlessStalemateEscapeTest loopback) ----

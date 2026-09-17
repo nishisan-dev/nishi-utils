@@ -2117,8 +2117,8 @@ public class ReplicationManager
             long now = System.currentTimeMillis();
             if (now - lastFetchRefusalLogMs > 10_000L) {
                 lastFetchRefusalLogMs = now;
-                LOGGER.warning(() -> "Refusing RELAY_STREAM_FETCH from " + message.source()
-                        + " (topic=" + request.topic() + "): this node is not the leader");
+                LOGGER.warning(() -> "[" + transport.local().nodeId() + "] Refusing RELAY_STREAM_FETCH from "
+                        + message.source() + " (topic=" + request.topic() + "): this node is not the leader");
             }
             transport.send(ClusterMessage.request(MessageType.RELAY_STREAM_BATCH, "stream",
                     transport.local().nodeId(), message.source(),

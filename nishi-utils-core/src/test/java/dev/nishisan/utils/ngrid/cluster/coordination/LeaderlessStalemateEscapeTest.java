@@ -206,6 +206,40 @@ class LeaderlessStalemateEscapeTest {
         }
     }
 
+    /**
+     * F3 (guard, regression): a refusal only arms the escape once a heartbeat received AFTER it
+     * still denies leadership. Between the elected node taking leadership and its first leader
+     * heartbeat (up to one interval), a just-recorded refusal would otherwise read as a stalemate
+     * and promote this node against a node that had just started serving (a third leader under
+     * D10c, with its tail discarded on yield). With no heartbeat after the refusal the local node
+     * must keep deferring; the next denying heartbeat confirms the signal and the escape runs.
+     */
+    @Test
+    @DisplayName("Recusa só dispara o escape depois de confirmada por heartbeat posterior (guarda do F3)")
+    void refusalEscapesOnlyAfterALaterHeartbeatStillDeniesLeadership() throws Exception {
+        Harness h = harness(INCUMBENT, 50, PREFERRED, 100, Duration.ofMillis(400));
+        h.coord.setReplicationProgressGate(() -> 1000L, 0L); // local ahead (1000)
+        h.start();
+        h.startPeerHeartbeats(PREFERRED, 7L, 900L); // peer active but BEHIND (900), not leading
+
+        Thread.sleep(600); // boot window elapsed, peer known, local deferring by affinity
+        h.stopPeerHeartbeats();
+        h.coord.noteLeaderRefusal(PREFERRED); // refusal with NO heartbeat after it (yet)
+
+        // Well inside heartbeatTimeout (600 ms): the peer is still an active member, and the refusal
+        // is unconfirmed — no escape.
+        long deadline = System.currentTimeMillis() + 300;
+        while (System.currentTimeMillis() < deadline) {
+            assertFalse(h.coord.isLeader(),
+                    "an unconfirmed refusal (no heartbeat received after it) must not promote the local node");
+            Thread.sleep(50);
+        }
+
+        // The elected node keeps denying leadership in its next heartbeats: the refusal is confirmed.
+        h.startPeerHeartbeats(PREFERRED, 7L, 900L);
+        awaitLeader(h, INCUMBENT);
+    }
+
     // ---- harness (espelho do LeaderSyncBeforeReclaimTest) ----
 
     private Harness harness(NodeId localId, int localPriority, NodeId peerId, int peerPriority,
@@ -259,6 +293,13 @@ class LeaderlessStalemateEscapeTest {
 
         void startPeerHeartbeats(NodeId source, long epoch, long highWatermark) {
             startPeerHeartbeats(source, epoch, highWatermark, false);
+        }
+
+        void stopPeerHeartbeats() {
+            if (peerTask != null) {
+                peerTask.cancel(true);
+                peerTask = null;
+            }
         }
 
         void startPeerHeartbeats(NodeId source, long epoch, long highWatermark, boolean assertsLeadership) {

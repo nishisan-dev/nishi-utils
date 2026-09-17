@@ -979,17 +979,17 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             // ACTIVE leader/candidate exists — if a node died, the affinity election below promotes the
             // survivor.
             if (affinityHandbackMode) {
-                NodeId current = leader.get();
-                if (weWouldLead && !isLeaderInternal(localId)
-                        && current != null && !current.equals(localId) && isActiveMember(current)) {
-                    // CANDIDATE side: do not reclaim via watermark; the handshake drives the transition.
-                    // Follow the peer that ASSERTS leadership, not blindly the node adopted during boot
-                    // discovery (a watermark-tie pick that may itself be a follower): the HANDBACK_REQUEST
-                    // is addressed to the adopted leader, and a follower aborts it ("not an eligible
-                    // leader") — with three members the candidate then sat on a 60 s cooldown while the
-                    // cluster disagreed on the leader.
-                    NodeId serving = assertingLeaderPeer(localId);
-                    updateLeader(serving != null ? serving : current);
+                // CANDIDATE side: do not reclaim via watermark; the handshake drives the transition. This
+                // only holds while a peer is actually SERVING (asserting leadership in its heartbeats):
+                // the node adopted during boot discovery is a watermark-tie pick that may itself be a
+                // follower, and following it blindly deadlocked a cold start — every node deferred to the
+                // affinity winner, the winner stuck to its boot-time pick, nobody ever led, and the
+                // HANDBACK_REQUEST addressed to that pick was aborted ("not an eligible leader") every
+                // cooldown. With no serving peer there is nothing to hand back FROM: fall through to the
+                // ordinary election (lead-while-alone / AP).
+                NodeId serving = weWouldLead && !isLeaderInternal(localId) ? assertingLeaderPeer(localId) : null;
+                if (serving != null) {
+                    updateLeader(serving);
                     return;
                 }
                 if (isLeaderInternal(localId) && electedId != null && !electedId.equals(localId)
@@ -1039,15 +1039,28 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 // ordinary skew would read as the stalemate signature and promote a follower against a
                 // healthy leader (a self-inflicted dual-leader on every membership recompute).
                 boolean electedStillNotLeading = !Boolean.TRUE.equals(peerAssertsLeadership.get(electedId));
+                // ... and CONFIRMED by a heartbeat received AFTER the refusal: the refusal is issued on
+                // the stream path while the heartbeat that would flip peerAssertsLeadership can be up to
+                // one interval away, so in the window between the elected node taking leadership and
+                // its first leader heartbeat a just-recorded refusal still reads as "not leading". A
+                // recompute in that window (a membership change, a watermark heartbeat from a third
+                // node) promoted this node against a node that had just started serving — a third
+                // leader under D10c, whose tail is discarded when it yields. Requiring a post-refusal
+                // heartbeat that still denies leadership closes the window at the cost of at most one
+                // heartbeat interval of delay for the genuine stalemate.
+                ClusterMember electedMember = members.get(electedId);
+                boolean refusalConfirmedByLaterHeartbeat = refusedAt != null && electedMember != null
+                        && electedMember.lastHeartbeat() > refusedAt;
                 Long electedWatermark = peerHighWatermark.get(electedId);
                 long localApplied = safeLocalApplied();
                 // STRICTLY ahead beyond the tolerance: with equal watermarks (every fresh boot is 0/0)
                 // the affinity election must win — a transient refusal during an election dance must
                 // never invert affinity. The genuine stalemate signature is local state the elected
                 // node does not have.
-                if (recentRefusal && electedStillNotLeading && electedWatermark != null && localApplied >= 0
+                if (recentRefusal && electedStillNotLeading && refusalConfirmedByLaterHeartbeat
+                        && electedWatermark != null && localApplied >= 0
                         && localApplied > electedWatermark + syncReclaimLagThreshold) {
-                    LOGGER.warning(() -> "Affinity-elected " + electedId + " refuses leadership and is not"
+                    LOGGER.warning(() -> "[" + localId + "] Affinity-elected " + electedId + " refuses leadership and is not"
                             + " ahead (peer=" + electedWatermark + ", local=" + localApplied
                             + "); taking leadership to break the leaderless stalemate (issue tems#9, D9)");
                     updateLeader(localId);
@@ -1183,7 +1196,11 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     public boolean isAgreedLeaderHealthy() {
         NodeId current = leader.get();
         NodeId localId = transport.local().nodeId();
-        return current != null && !current.equals(localId) && isActiveMember(current);
+        // "Healthy" means SERVING: the adopted leader's latest heartbeat asserts leadership. A node
+        // adopted during boot discovery that is itself a follower is not an incumbent to hand back
+        // FROM — a request to it is aborted ("not an eligible leader") and costs a full cooldown.
+        return current != null && !current.equals(localId) && isActiveMember(current)
+                && Boolean.TRUE.equals(peerAssertsLeadership.get(current));
     }
 
     /**
@@ -1578,8 +1595,15 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             if (isNowLeader || wasLeader) {
                 long newEpoch = leaderEpoch.incrementAndGet();
                 persistEpoch(newEpoch);
-                LOGGER.info(() -> "Leader epoch changed: " + newEpoch
-                        + (isNowLeader ? " (elected)" : " (stepped down)"));
+                // Attributable and diagnosable: several nodes log into the same stream in in-process
+                // clusters, and a step-down to LEADERLESS is only explainable with the quorum figures.
+                String quorum = newLeaderId == null
+                        ? " to <none>: activeVoters=" + activeVoterCount() + ", requiredVoterMajority="
+                                + requiredVoterMajority() + ", activeMembers=" + activeMemberCount()
+                                + ", minClusterSize=" + config.minClusterSize()
+                        : " to " + newLeaderId;
+                LOGGER.info(() -> "[" + localNodeId + "] Leader epoch changed: " + newEpoch
+                        + (isNowLeader ? " (elected)" : " (stepped down" + quorum + ")"));
             }
 
             // Re-arm the lease the moment this node becomes leader. While it was a follower the
@@ -1601,12 +1625,35 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 yieldingToDualLeader = false;
             }
 
+            if (!isNowLeader && !wasLeader) {
+                // A follower changing whom it follows never bumps the epoch, yet it decides where its
+                // stream fetches and snapshot requests go — log it so a wrong adoption is attributable.
+                LOGGER.info(() -> "[" + localNodeId + "] Leader view changed: " + previous + " -> " + newLeaderId);
+            }
             leadershipListeners.forEach(listener -> listener.onLeaderChanged(newLeaderId));
 
             // Notify LeaderElectionListener if local node's leadership status changed
             if (wasLeader != isNowLeader) {
                 leaderElectionListeners.forEach(listener -> listener.onLeadershipChanged(isNowLeader, newLeaderId));
+                // Announce the change right away instead of at the next periodic tick: peers decide whom
+                // to follow, whether a refusal is stale (D9 escape) and whether a rival is a dual-leader
+                // from the leader flag of the LATEST heartbeat, and a full interval of silence after a
+                // promotion (3 s at the default cadence) let a third node promote itself against a node
+                // that was already serving.
+                announceLeadershipChange();
             }
+        }
+    }
+
+    /** Sends an out-of-band heartbeat carrying the new local leadership flag (best-effort, async). */
+    private void announceLeadershipChange() {
+        if (!running) {
+            return;
+        }
+        try {
+            scheduler.schedule(this::sendHeartbeat, 0, TimeUnit.MILLISECONDS);
+        } catch (java.util.concurrent.RejectedExecutionException e) {
+            // Scheduler shut down (closing): the periodic heartbeat is gone as well; nothing to announce.
         }
     }
 
@@ -1627,6 +1674,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 leadershipListeners.forEach(listener -> listener.onLeaderChanged(null));
                 leaderElectionListeners.forEach(listener -> listener.onLeadershipChanged(false, null));
                 notifyMembershipListeners();
+                announceLeadershipChange();
             }
         }
     }
@@ -1665,8 +1713,40 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
 
     @Override
     public void onPeerDisconnected(NodeId peerId) {
+        if (members.get(peerId) == null) {
+            return;
+        }
+        // A transport-level disconnect is not proof of death. During a join (a new node, a client) the
+        // mesh reshuffles its connections — simultaneous-open tie-breaks and reconnects close sockets to
+        // peers that are alive and heartbeating — and marking the member inactive on the spot made the
+        // leader lose its majority for an instant, step down to leaderless, and hand the cluster to the
+        // D9 escape / dual-leader machinery (whose resolution discards a leader's tail). Give the peer
+        // the same grace the eviction path gives an overdue-but-reachable member: one heartbeat
+        // interval to be connected again (directly or via a proxy) before it is declared gone. A dead
+        // peer is still detected within that interval; a flapping one never leaves the membership.
+        long graceMs = running ? config.heartbeatInterval().toMillis() : 0L;
+        if (graceMs > 0) {
+            try {
+                scheduler.schedule(() -> confirmPeerDisconnect(peerId), graceMs, TimeUnit.MILLISECONDS);
+                return;
+            } catch (java.util.concurrent.RejectedExecutionException e) {
+                // Scheduler shut down (closing): fall through to the immediate path.
+            }
+        }
+        confirmPeerDisconnect(peerId);
+    }
+
+    /**
+     * Declares {@code peerId} gone unless the transport reports it connected again (directly or via a
+     * proxy) — the deferred half of {@link #onPeerDisconnected(NodeId)}.
+     */
+    private void confirmPeerDisconnect(NodeId peerId) {
+        if (transport.isConnected(peerId) || transport.isProxied(peerId)) {
+            LOGGER.fine(() -> "Peer " + peerId + " reconnected within the disconnect grace; membership kept");
+            return;
+        }
         ClusterMember member = members.get(peerId);
-        if (member != null) {
+        if (member != null && member.isActive()) {
             member.markInactive();
             NodeId preferred = preferredLeader.get();
             if (preferred != null && preferred.equals(peerId)) {
@@ -1741,6 +1821,18 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             boolean[] isNewMember = {false};
             members.compute(source, (id, existing) -> {
                 if (existing != null) {
+                    if (existing.info().host().isBlank()) {
+                        // Upgrade a HEARTBEAT placeholder as soon as the transport knows the peer's real
+                        // NodeInfo (learned by gossip). A heartbeat can arrive through a proxy before the
+                        // direct handshake, and a placeholder (blank host) is not a leadership candidate:
+                        // left in place it made this node ignore the serving leader in every election,
+                        // defer to a watermark-tie follower and fetch the stream from it forever.
+                        Optional<NodeInfo> real = findPeerInfo(source).filter(info -> !info.host().isBlank());
+                        if (real.isPresent()) {
+                            isNewMember[0] = true;
+                            return new ClusterMember(real.get());
+                        }
+                    }
                     existing.touch();
                     return existing;
                 }
@@ -1772,6 +1864,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 }
                 return;
             }
+            boolean confirmsRefusal = false;
             if (fromPeer) {
                 // Record the assertion only for heartbeats that passed the epoch fence. A peer starting
                 // or stopping to assert leadership changes whom a follower should adopt
@@ -1781,13 +1874,17 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 if (payload.leader()) {
                     // The peer is leading: any refusal it issued while deferring is stale (D9 escape).
                     leaderRefusalAtMs.remove(source);
+                } else {
+                    // A heartbeat that still denies leadership AFTER a recorded refusal confirms the
+                    // stalemate signal (D9 escape): recompute so the escape can run on it.
+                    confirmsRefusal = leaderRefusalAtMs.containsKey(source);
                 }
             }
             if (fromAgreedLeader) {
                 trackedLeaderHighWatermark = payload.leaderHighWatermark();
                 trackedLeaderEpoch = payload.leaderEpoch();
             }
-            if (isNewMember[0] || watermarkAdvanced || assertionChanged) {
+            if (isNewMember[0] || watermarkAdvanced || assertionChanged || confirmsRefusal) {
                 // A new member, or a peer whose watermark changed: recompute so the watermark gate can
                 // (a) defer our reclaim while a peer is ahead, or (b) release the incumbent's step-down
                 // guard the moment a higher-affinity candidate has caught up to our state.
