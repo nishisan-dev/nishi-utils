@@ -27,8 +27,10 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * Builder for creating a single NGrid node for production usage.
@@ -61,6 +63,7 @@ public final class NGridNodeBuilder {
     private boolean leaderPauseOnJoin = false;
     private boolean leaderPauseOnReclaim = false;
     private int priority = 0;
+    private Set<String> roles = Collections.emptySet();
 
     NGridNodeBuilder(String host, int port) {
         this.host = Objects.requireNonNull(host, "host");
@@ -88,6 +91,24 @@ public final class NGridNodeBuilder {
      */
     public NGridNodeBuilder priority(int priority) {
         this.priority = priority;
+        return this;
+    }
+
+    /**
+     * Sets this node's roles, propagated by gossip in {@link NodeInfo#roles()}. Use
+     * {@link NodeInfo#ROLE_LEADER_INELIGIBLE} to mark the node as ineligible for leadership (e.g. a
+     * client-only node that joins the cluster but must never coordinate it). Without calling this,
+     * the node carries no roles. Neither the array nor any of its elements may be {@code null}.
+     *
+     * @param roles the node's roles (must not be {@code null}, nor contain {@code null} elements)
+     * @return this builder
+     */
+    public NGridNodeBuilder roles(String... roles) {
+        Objects.requireNonNull(roles, "roles");
+        for (String role : roles) {
+            Objects.requireNonNull(role, "role");
+        }
+        this.roles = Set.copyOf(List.of(roles));
         return this;
     }
 
@@ -297,7 +318,7 @@ public final class NGridNodeBuilder {
         String effectiveNodeId = nodeId != null ? nodeId : host + ":" + effectivePort;
 
         NodeInfo localInfo = new NodeInfo(NodeId.of(effectiveNodeId), host, effectivePort,
-                java.util.Collections.emptySet(), priority);
+                roles, priority);
 
         NGridConfig.Builder builder = NGridConfig.builder(localInfo)
                 .strictConsistency(strictConsistency)

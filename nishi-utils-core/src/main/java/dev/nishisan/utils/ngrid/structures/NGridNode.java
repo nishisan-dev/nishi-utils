@@ -194,9 +194,13 @@ public final class NGridNode implements Closeable {
             // 1. Send Handshake (required by TcpTransport on the seed)
 
             int advertisedPort = config.local().port() > 0 ? config.local().port() : 0;
+            // Carry the full local NodeInfo (roles + priority), not just id/host/port: the seed must
+            // learn this node's leadership role (e.g. NodeInfo.ROLE_LEADER_INELIGIBLE) and priority
+            // from the very first handshake, so its ClusterCoordinator elects correctly from the start.
             dev.nishisan.utils.ngrid.common.HandshakePayload handshake = new dev.nishisan.utils.ngrid.common.HandshakePayload(
 
-                    new NodeInfo(localId, config.local().host(), advertisedPort),
+                    new NodeInfo(localId, config.local().host(), advertisedPort,
+                            config.local().roles(), config.local().priority()),
 
                     java.util.Collections.emptySet()
 
