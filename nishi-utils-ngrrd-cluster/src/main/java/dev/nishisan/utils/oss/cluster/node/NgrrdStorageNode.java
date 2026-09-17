@@ -26,6 +26,7 @@ import dev.nishisan.utils.oss.blob.BlobVolumeRegistry;
 import dev.nishisan.utils.oss.blob.NgrrdBlob;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
+import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
 import dev.nishisan.utils.oss.cluster.placement.LeastLoadedPlacementPolicy;
 import dev.nishisan.utils.oss.cluster.rpc.TransportClusterRpc;
 
@@ -59,11 +60,12 @@ public final class NgrrdStorageNode implements Closeable {
     private final StorageRequestHandler storageHandler;
     private final PlacementRequestHandler placementHandler;
     private final NodeStatusReporter statusReporter;
+    private final AdminRequestHandler adminHandler;
 
     private NgrrdStorageNode(StorageNodeConfig config, BlobVolumeRegistry volumeRegistry, BlobVolume volume,
             NGridNode node, CatalogService catalog, TransportClusterRpc rpc, SeriesHandleRegistry registry,
             StorageRequestHandler storageHandler, PlacementRequestHandler placementHandler,
-            NodeStatusReporter statusReporter) {
+            NodeStatusReporter statusReporter, AdminRequestHandler adminHandler) {
         this.config = config;
         this.volumeRegistry = volumeRegistry;
         this.volume = volume;
@@ -74,6 +76,7 @@ public final class NgrrdStorageNode implements Closeable {
         this.storageHandler = storageHandler;
         this.placementHandler = placementHandler;
         this.statusReporter = statusReporter;
+        this.adminHandler = adminHandler;
     }
 
     /**
@@ -141,19 +144,25 @@ public final class NgrrdStorageNode implements Closeable {
                 PlacementRequestHandler placementHandler = new PlacementRequestHandler(node.transport(), catalog,
                         leaderView, new LeastLoadedPlacementPolicy(), cfg.nodeStatusStaleAfter(), Clock.systemUTC());
 
+                NodeStatusReporter statusReporter = new NodeStatusReporter(catalog, volume, registry, cfg.nodeId(),
+                        cfg.capacityBytes(), cfg.statusReportInterval(), Clock.systemUTC(),
+                        storageHandler::metricsSnapshot, node.coordinator()::isLeader, cfg.metricsListener());
+                AdminRequestHandler adminHandler = new AdminRequestHandler(node.transport(), self, leaderView,
+                        catalog, statusReporter::metricsSnapshot, rpc);
+
                 node.transport().addListener(storageHandler);
                 node.transport().addListener(placementHandler);
+                node.transport().addListener(adminHandler);
                 node.coordinator().addLeadershipListener(placementHandler);
                 rpc.registerLocalHandler(storageHandler);
                 rpc.registerLocalHandler(placementHandler);
+                rpc.registerLocalHandler(adminHandler);
 
-                NodeStatusReporter statusReporter = new NodeStatusReporter(catalog, volume, registry, cfg.nodeId(),
-                        cfg.capacityBytes(), cfg.statusReportInterval(), Clock.systemUTC());
                 node.coordinator().addLeadershipListener(statusReporter);
                 statusReporter.start();
 
                 return new NgrrdStorageNode(cfg, volumeRegistry, volume, node, catalog, rpc, registry,
-                        storageHandler, placementHandler, statusReporter);
+                        storageHandler, placementHandler, statusReporter, adminHandler);
             } catch (RuntimeException e) {
                 try {
                     node.close();
@@ -204,9 +213,9 @@ public final class NgrrdStorageNode implements Closeable {
         return config;
     }
 
-    /** Métricas mínimas do {@link StorageRequestHandler} deste nó. */
-    public StorageRequestHandler.StorageHandlerMetrics metricsSnapshot() {
-        return storageHandler.metricsSnapshot();
+    /** Snapshot completo das métricas operacionais deste nó (ver {@link NodeMetricsSnapshot}). */
+    public NodeMetricsSnapshot metricsSnapshot() {
+        return statusReporter.metricsSnapshot();
     }
 
     /**
@@ -225,10 +234,12 @@ public final class NgrrdStorageNode implements Closeable {
         safely("handlers", () -> {
             node.transport().removeListener(storageHandler);
             node.transport().removeListener(placementHandler);
+            node.transport().removeListener(adminHandler);
             node.coordinator().removeLeadershipListener(placementHandler);
             node.coordinator().removeLeadershipListener(statusReporter);
             rpc.unregisterLocalHandler(storageHandler);
             rpc.unregisterLocalHandler(placementHandler);
+            rpc.unregisterLocalHandler(adminHandler);
         });
         safely("series handle registry", registry::close);
         safely("NGrid node", () -> {

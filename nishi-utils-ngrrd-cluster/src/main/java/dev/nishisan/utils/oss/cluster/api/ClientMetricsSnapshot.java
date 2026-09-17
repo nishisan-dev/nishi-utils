@@ -17,6 +17,7 @@
 
 package dev.nishisan.utils.oss.cluster.api;
 
+import dev.nishisan.utils.oss.cluster.metrics.LatencySnapshot;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesStatus;
 
 import java.util.Map;
@@ -35,6 +36,10 @@ import java.util.Objects;
  * @param retriesByStatus retentativas observadas, agrupadas pelo {@link SeriesStatus} que as motivou
  * @param bufferedSamples amostras atualmente no buffer de cada nó de destino, por {@code nodeId}
  * @param openHandles     quantidade de {@code NgrrdHandle} abertos neste cliente
+ * @param rpcLatency      latência de toda chamada RPC síncrona feita por este cliente
+ *                        ({@code place}, {@code writeBatch}, {@code checkpoint}, {@code read}, ...),
+ *                        agregada num único histograma (não quebrada por comando)
+ * @param placeCount      total de chamadas {@code ngrrd.place} feitas por este cliente
  */
 public record ClientMetricsSnapshot(
         long samplesEnqueued,
@@ -43,10 +48,13 @@ public record ClientMetricsSnapshot(
         long batchesSent,
         Map<SeriesStatus, Long> retriesByStatus,
         Map<String, Long> bufferedSamples,
-        int openHandles) {
+        int openHandles,
+        LatencySnapshot rpcLatency,
+        long placeCount) {
 
     public ClientMetricsSnapshot {
         retriesByStatus = Map.copyOf(Objects.requireNonNullElse(retriesByStatus, Map.of()));
         bufferedSamples = Map.copyOf(Objects.requireNonNullElse(bufferedSamples, Map.of()));
+        rpcLatency = Objects.requireNonNullElse(rpcLatency, LatencySnapshot.EMPTY);
     }
 }

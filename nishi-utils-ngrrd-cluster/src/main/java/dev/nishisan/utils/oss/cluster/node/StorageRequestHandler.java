@@ -27,6 +27,8 @@ import dev.nishisan.utils.oss.api.Sample;
 import dev.nishisan.utils.oss.api.SeriesResult;
 import dev.nishisan.utils.oss.cluster.catalog.PlacementState;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
+import dev.nishisan.utils.oss.cluster.metrics.LatencyHistogram;
+import dev.nishisan.utils.oss.cluster.metrics.LatencySnapshot;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.protocol.OpenRequest;
 import dev.nishisan.utils.oss.cluster.protocol.ReadPresetRequest;
@@ -98,16 +100,33 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
         Optional<SeriesPlacement> placementStrong(String seriesKey);
     }
 
-    /** Snapshot das métricas mínimas deste handler. O M2 amplia. */
+    /**
+     * Snapshot das métricas deste handler, incluindo latência (M2) de
+     * {@code writeBatch}/{@code checkpoint}/leitura ({@code read}+{@code readPreset}
+     * somados no mesmo histograma).
+     *
+     * @param samplesFailed amostras descartadas por {@link SeriesStatus#ERROR} — não inclui
+     *                      pendências rejeitadas por {@code WRONG_OWNER}/{@code NOT_OPEN}/
+     *                      {@code MIGRATING} (essas são retentadas pelo cliente, não perdidas)
+     * @param flushes       total de requisições {@code flush} atendidas com sucesso
+     */
     public record StorageHandlerMetrics(
             long writeBatches,
             long samplesWritten,
+            long samplesFailed,
             long reads,
             long checkpoints,
-            Map<SeriesStatus, Long> errorsByStatus) {
+            long flushes,
+            Map<SeriesStatus, Long> errorsByStatus,
+            LatencySnapshot writeBatchLatency,
+            LatencySnapshot checkpointLatency,
+            LatencySnapshot readLatency) {
 
         public StorageHandlerMetrics {
             errorsByStatus = Map.copyOf(Objects.requireNonNullElse(errorsByStatus, Map.of()));
+            writeBatchLatency = Objects.requireNonNullElse(writeBatchLatency, LatencySnapshot.EMPTY);
+            checkpointLatency = Objects.requireNonNullElse(checkpointLatency, LatencySnapshot.EMPTY);
+            readLatency = Objects.requireNonNullElse(readLatency, LatencySnapshot.EMPTY);
         }
     }
 
@@ -123,9 +142,14 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
 
     private final LongAdder writeBatchesCount = new LongAdder();
     private final LongAdder samplesWrittenCount = new LongAdder();
+    private final LongAdder samplesFailedCount = new LongAdder();
     private final LongAdder readsCount = new LongAdder();
     private final LongAdder checkpointsCount = new LongAdder();
+    private final LongAdder flushesCount = new LongAdder();
     private final ConcurrentMap<SeriesStatus, LongAdder> errorsByStatus = new ConcurrentHashMap<>();
+    private final LatencyHistogram writeBatchLatency = new LatencyHistogram();
+    private final LatencyHistogram checkpointLatency = new LatencyHistogram();
+    private final LatencyHistogram readLatency = new LatencyHistogram();
     private final ConcurrentMap<String, Long> negativeLookupCacheExpiryMs = new ConcurrentHashMap<>();
 
     public StorageRequestHandler(Transport transport, PlacementLookup placementLookup,
@@ -154,12 +178,13 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
         };
     }
 
-    /** Snapshot atual das métricas mínimas do handler. */
+    /** Snapshot atual das métricas do handler. */
     public StorageHandlerMetrics metricsSnapshot() {
         Map<SeriesStatus, Long> errors = errorsByStatus.entrySet().stream()
                 .collect(Collectors.toMap(Map.Entry::getKey, entry -> entry.getValue().sum()));
-        return new StorageHandlerMetrics(writeBatchesCount.sum(), samplesWrittenCount.sum(), readsCount.sum(),
-                checkpointsCount.sum(), errors);
+        return new StorageHandlerMetrics(writeBatchesCount.sum(), samplesWrittenCount.sum(), samplesFailedCount.sum(),
+                readsCount.sum(), checkpointsCount.sum(), flushesCount.sum(), errors, writeBatchLatency.snapshot(),
+                checkpointLatency.snapshot(), readLatency.snapshot());
     }
 
     private SeriesStatusResponse handleOpen(OpenRequest request) {
@@ -204,6 +229,7 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
             // amostras já gravadas antes da falha continuam contando em `samplesWritten` (o lote não
             // é atômico por série — ver Javadoc de WriteBatchResponse).
             long[] writtenSoFar = {0L};
+            long startNanos = System.nanoTime();
             try {
                 Optional<Long> written = withHandleSelfHealing(seriesKey, handle -> {
                     for (SeriesWrite write : entry.getValue()) {
@@ -212,6 +238,7 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
                     }
                     return writtenSoFar[0];
                 });
+                writeBatchLatency.record(System.nanoTime() - startNanos);
                 if (written.isEmpty()) {
                     statusBySeries.put(seriesKey, SeriesStatus.NOT_OPEN);
                     recordError(SeriesStatus.NOT_OPEN);
@@ -220,7 +247,9 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
                     statusBySeries.put(seriesKey, SeriesStatus.OK);
                 }
             } catch (RuntimeException e) {
+                writeBatchLatency.record(System.nanoTime() - startNanos);
                 samplesWrittenCount.add(writtenSoFar[0]);
+                samplesFailedCount.add(entry.getValue().size() - writtenSoFar[0]);
                 statusBySeries.put(seriesKey, SeriesStatus.ERROR);
                 errorBySeries.put(seriesKey, describe(e));
                 recordError(SeriesStatus.ERROR);
@@ -230,7 +259,7 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
     }
 
     private SeriesStatusResponse handleCheckpoint(SeriesCommandRequest request) {
-        SeriesStatusResponse response = handleSeriesOp(request.seriesKey(), NgrrdHandle::checkpoint);
+        SeriesStatusResponse response = handleSeriesOp(request.seriesKey(), NgrrdHandle::checkpoint, checkpointLatency);
         if (response.status() == SeriesStatus.OK) {
             checkpointsCount.increment();
         }
@@ -238,26 +267,43 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
     }
 
     private SeriesStatusResponse handleFlush(SeriesCommandRequest request) {
-        return handleSeriesOp(request.seriesKey(), NgrrdHandle::flush);
+        SeriesStatusResponse response = handleSeriesOp(request.seriesKey(), NgrrdHandle::flush, null);
+        if (response.status() == SeriesStatus.OK) {
+            flushesCount.increment();
+        }
+        return response;
     }
 
-    private SeriesStatusResponse handleSeriesOp(String seriesKey, Consumer<NgrrdHandle> operation) {
+    /**
+     * @param latency histograma a alimentar com a duração da chamada ao handle (dentro do lock de
+     *                {@link SeriesHandleRegistry#withHandle}); {@code null} = não medir (ex.: {@code flush},
+     *                sem campo dedicado em {@link StorageHandlerMetrics})
+     */
+    private SeriesStatusResponse handleSeriesOp(String seriesKey, Consumer<NgrrdHandle> operation,
+            LatencyHistogram latency) {
         Ownership ownership = ownership(seriesKey, null);
         if (ownership.status() != SeriesStatus.OK) {
             recordError(ownership.status());
             return new SeriesStatusResponse(ownership.status(), ownership.owner(), null);
         }
+        long startNanos = System.nanoTime();
         try {
             Optional<Boolean> executed = withHandleSelfHealing(seriesKey, handle -> {
                 operation.accept(handle);
                 return Boolean.TRUE;
             });
+            if (latency != null) {
+                latency.record(System.nanoTime() - startNanos);
+            }
             if (executed.isEmpty()) {
                 recordError(SeriesStatus.NOT_OPEN);
                 return new SeriesStatusResponse(SeriesStatus.NOT_OPEN, self.value(), null);
             }
             return new SeriesStatusResponse(SeriesStatus.OK, self.value(), null);
         } catch (RuntimeException e) {
+            if (latency != null) {
+                latency.record(System.nanoTime() - startNanos);
+            }
             recordError(SeriesStatus.ERROR);
             return new SeriesStatusResponse(SeriesStatus.ERROR, self.value(), describe(e));
         }
@@ -271,17 +317,20 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
         }
         // m7: só conta a leitura depois que a checagem de dono passou.
         readsCount.increment();
+        long startNanos = System.nanoTime();
         try {
             Optional<SeriesResult> result = withHandleSelfHealing(request.seriesKey(), handle ->
                     request.endExclusiveEpochMs() != null
                             ? handle.read(request.dsName(), request.toViewQuery(), request.endExclusiveEpochMs())
                             : handle.read(request.dsName(), request.toViewQuery()));
+            readLatency.record(System.nanoTime() - startNanos);
             if (result.isEmpty()) {
                 recordError(SeriesStatus.NOT_OPEN);
                 return new ReadResponse(SeriesStatus.NOT_OPEN, self.value(), null, null);
             }
             return new ReadResponse(SeriesStatus.OK, self.value(), result.get(), null);
         } catch (RuntimeException e) {
+            readLatency.record(System.nanoTime() - startNanos);
             recordError(SeriesStatus.ERROR);
             return new ReadResponse(SeriesStatus.ERROR, self.value(), null, describe(e));
         }
@@ -295,17 +344,20 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
         }
         // m7: só conta a leitura depois que a checagem de dono passou.
         readsCount.increment();
+        long startNanos = System.nanoTime();
         try {
             Optional<Map<String, SeriesResult>> results = withHandleSelfHealing(request.seriesKey(), handle ->
                     request.endExclusiveEpochMs() != null
                             ? handle.read(request.presetName(), request.endExclusiveEpochMs())
                             : handle.read(request.presetName()));
+            readLatency.record(System.nanoTime() - startNanos);
             if (results.isEmpty()) {
                 recordError(SeriesStatus.NOT_OPEN);
                 return new ReadPresetResponse(SeriesStatus.NOT_OPEN, self.value(), null, null);
             }
             return new ReadPresetResponse(SeriesStatus.OK, self.value(), results.get(), null);
         } catch (RuntimeException e) {
+            readLatency.record(System.nanoTime() - startNanos);
             recordError(SeriesStatus.ERROR);
             return new ReadPresetResponse(SeriesStatus.ERROR, self.value(), null, describe(e));
         }

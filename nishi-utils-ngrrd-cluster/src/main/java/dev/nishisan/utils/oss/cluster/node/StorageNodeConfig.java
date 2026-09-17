@@ -20,6 +20,7 @@ package dev.nishisan.utils.oss.cluster.node;
 import dev.nishisan.utils.oss.api.Durability;
 import dev.nishisan.utils.oss.api.OnGeometryChange;
 import dev.nishisan.utils.oss.blob.BlobVolumeConfig;
+import dev.nishisan.utils.oss.cluster.metrics.NgrrdClusterMetricsListener;
 
 import java.nio.file.Path;
 import java.time.Duration;
@@ -56,6 +57,8 @@ import java.util.Objects;
  * @param requestTimeout            prazo de espera por resposta a um RPC do cluster
  * @param defaultDurability         durabilidade default aplicada quando o pedido de abertura não especifica uma
  * @param defaultOnGeometryChange   política de mudança de geometria default quando o pedido não especifica uma
+ * @param metricsListener           integração opcional de métricas (ver {@link NgrrdClusterMetricsListener});
+ *                                  {@code null} = nenhuma (só o log marker {@code NGRRD_NODE_STATUS})
  */
 public record StorageNodeConfig(
         String nodeId,
@@ -77,7 +80,8 @@ public record StorageNodeConfig(
         int maxOpenHandles,
         Duration requestTimeout,
         Durability defaultDurability,
-        OnGeometryChange defaultOnGeometryChange) {
+        OnGeometryChange defaultOnGeometryChange,
+        NgrrdClusterMetricsListener metricsListener) {
 
     public StorageNodeConfig {
         Objects.requireNonNull(nodeId, "nodeId é obrigatório");
@@ -155,6 +159,7 @@ public record StorageNodeConfig(
         private Duration requestTimeout = Duration.ofSeconds(20);
         private Durability defaultDurability = Durability.FSYNC;
         private OnGeometryChange defaultOnGeometryChange = OnGeometryChange.FAIL;
+        private NgrrdClusterMetricsListener metricsListener;
 
         private Builder() {
         }
@@ -265,6 +270,12 @@ public record StorageNodeConfig(
             return this;
         }
 
+        /** Integração opcional de métricas; {@code null} (default) = nenhuma. */
+        public Builder metricsListener(NgrrdClusterMetricsListener metricsListener) {
+            this.metricsListener = metricsListener;
+            return this;
+        }
+
         private static final Duration MIN_NODE_STATUS_STALE_AFTER = Duration.ofSeconds(15);
 
         public StorageNodeConfig build() {
@@ -274,7 +285,7 @@ public record StorageNodeConfig(
             return new StorageNodeConfig(nodeId, host, port, seed, peers, dataDir, priority, volumeDir,
                     volumeName, shardCount, segmentBytes, initialShardCapacityBytes, capacityBytes,
                     statusReportInterval, resolvedStaleAfter, handleIdleTtl, maxOpenHandles, requestTimeout,
-                    defaultDurability, defaultOnGeometryChange);
+                    defaultDurability, defaultOnGeometryChange, metricsListener);
         }
 
         private static Duration maxDuration(Duration a, Duration b) {

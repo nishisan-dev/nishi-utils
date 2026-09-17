@@ -17,6 +17,8 @@
 
 package dev.nishisan.utils.oss.cluster.api;
 
+import dev.nishisan.utils.oss.cluster.metrics.NgrrdClusterMetricsListener;
+
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
@@ -49,6 +51,8 @@ import java.util.UUID;
  * @param closeTimeout              orçamento TOTAL (não por handle) para {@code close()} drenar os
  *                                  buffers de escrita antes de desistir; handles que não couberem no
  *                                  prazo fecham sem flush, e a amostra descartada é logada em ERROR
+ * @param metricsListener           integração opcional de métricas (ver {@link NgrrdClusterMetricsListener});
+ *                                  {@code null} = nenhuma
  */
 public record NgrrdClusterConfig(
         String clientId,
@@ -66,7 +70,8 @@ public record NgrrdClusterConfig(
         Duration retryBackoffMin,
         Duration retryBackoffMax,
         Duration leaderWaitTimeout,
-        Duration closeTimeout) {
+        Duration closeTimeout,
+        NgrrdClusterMetricsListener metricsListener) {
 
     public NgrrdClusterConfig {
         Objects.requireNonNull(clientId, "clientId é obrigatório");
@@ -153,6 +158,7 @@ public record NgrrdClusterConfig(
         private Duration retryBackoffMax = Duration.ofSeconds(2);
         private Duration leaderWaitTimeout = Duration.ofSeconds(30);
         private Duration closeTimeout = Duration.ofSeconds(30);
+        private NgrrdClusterMetricsListener metricsListener;
 
         private Builder() {
         }
@@ -243,10 +249,16 @@ public record NgrrdClusterConfig(
             return this;
         }
 
+        /** Integração opcional de métricas; {@code null} (default) = nenhuma. */
+        public Builder metricsListener(NgrrdClusterMetricsListener metricsListener) {
+            this.metricsListener = metricsListener;
+            return this;
+        }
+
         public NgrrdClusterConfig build() {
             return new NgrrdClusterConfig(clientId, host, port, seed, peers, dataDir, batchMaxSamples,
                     batchMaxDelay, maxBufferedSamplesPerNode, bufferFullPolicy, requestTimeout, retryTimeout,
-                    retryBackoffMin, retryBackoffMax, leaderWaitTimeout, closeTimeout);
+                    retryBackoffMin, retryBackoffMax, leaderWaitTimeout, closeTimeout, metricsListener);
         }
     }
 }

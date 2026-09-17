@@ -23,16 +23,22 @@ import dev.nishisan.utils.oss.blob.BlobVolume;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
 import dev.nishisan.utils.oss.cluster.catalog.NodeState;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
+import dev.nishisan.utils.oss.cluster.metrics.BlobVolumeSummary;
+import dev.nishisan.utils.oss.cluster.metrics.NgrrdClusterMetricsListener;
+import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
 import dev.nishisan.utils.oss.metrics.BlobVolumeStats;
 
 import java.io.Closeable;
 import java.time.Clock;
 import java.time.Duration;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
+import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -50,6 +56,13 @@ import java.util.logging.Logger;
  * descartar nós legítimos por status "velho" logo após um handoff (achado
  * F2 do Debugger). Falha ao publicar não espera o próximo tick: retenta com
  * backoff curto (200 ms → 2 s).</p>
+ *
+ * <p>M2: a cada tick, também monta um {@link NodeMetricsSnapshot} completo (via
+ * {@link #metricsSnapshot()} — reaproveitado tanto aqui quanto por
+ * {@code ngrrd.admin.metrics} para uma consulta pontual), loga a linha de marcador
+ * {@code NGRRD_NODE_STATUS} (padrão de log marker do projeto — Docker ITs futuros podem
+ * depender dela, não renomear) e, se configurado, notifica
+ * {@link NgrrdClusterMetricsListener#onNodeMetrics}.</p>
  */
 public final class NodeStatusReporter implements Closeable, LeadershipListener {
 
@@ -64,14 +77,27 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
     private final long capacityBytes;
     private final Duration interval;
     private final Clock clock;
+    private final Supplier<StorageRequestHandler.StorageHandlerMetrics> handlerMetricsSupplier;
+    private final BooleanSupplier leaderSupplier;
+    private final NgrrdClusterMetricsListener metricsListener;
     private final ScheduledExecutorService scheduler;
 
     private volatile ScheduledFuture<?> task;
     /** Retentativa de publicação em voo (backoff), separada de {@link #task} — o tick periódico continua existindo. */
     private volatile ScheduledFuture<?> pendingRetry;
 
+    /**
+     * Taxa de {@code samples/s} do log marker é calculada ENTRE ticks — só {@link #tick()} (sempre
+     * a mesma thread única do {@link #scheduler}) lê/escreve estes dois campos, então não precisam
+     * de sincronização própria.
+     */
+    private long lastSamplesWritten = -1L;
+    private long lastSamplesAtEpochMs;
+
     public NodeStatusReporter(CatalogService catalog, BlobVolume volume, SeriesHandleRegistry registry,
-            String nodeId, long capacityBytes, Duration interval, Clock clock) {
+            String nodeId, long capacityBytes, Duration interval, Clock clock,
+            Supplier<StorageRequestHandler.StorageHandlerMetrics> handlerMetricsSupplier,
+            BooleanSupplier leaderSupplier, NgrrdClusterMetricsListener metricsListener) {
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.volume = Objects.requireNonNull(volume, "volume");
         this.registry = Objects.requireNonNull(registry, "registry");
@@ -79,6 +105,9 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
         this.capacityBytes = capacityBytes;
         this.interval = Objects.requireNonNull(interval, "interval");
         this.clock = Objects.requireNonNull(clock, "clock");
+        this.handlerMetricsSupplier = Objects.requireNonNull(handlerMetricsSupplier, "handlerMetricsSupplier");
+        this.leaderSupplier = Objects.requireNonNull(leaderSupplier, "leaderSupplier");
+        this.metricsListener = metricsListener;
         this.scheduler = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "ngrrd-status-reporter");
             thread.setDaemon(true);
@@ -105,6 +134,81 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
         } catch (Throwable e) {
             LOGGER.log(Level.SEVERE, "Falha ao fechar handles ociosos do nó " + nodeId, e);
         }
+        try {
+            publishMetrics();
+        } catch (Throwable e) {
+            LOGGER.log(Level.SEVERE, "Falha ao publicar métricas do nó " + nodeId, e);
+        }
+    }
+
+    /**
+     * Monta o {@link NodeMetricsSnapshot}, loga a linha {@code NGRRD_NODE_STATUS} e notifica
+     * {@link #metricsListener}, se configurado.
+     */
+    private void publishMetrics() {
+        NodeMetricsSnapshot snapshot = metricsSnapshot();
+        double samplesPerSecond = computeSamplesPerSecond(snapshot.samplesWritten(), snapshot.capturedAtEpochMs());
+        LOGGER.info(String.format(Locale.ROOT,
+                "NGRRD_NODE_STATUS nodeId=%s leader=%s series=%d usedBytes=%d openHandles=%d samples/s=%.1f "
+                        + "writeBatchP99us=%d checkpointP99us=%d readP99us=%d",
+                snapshot.nodeId(), snapshot.leader(), snapshot.seriesCount(), snapshot.usedBytes(),
+                snapshot.openHandles(), samplesPerSecond, snapshot.writeBatchLatency().p99Micros(),
+                snapshot.checkpointLatency().p99Micros(), snapshot.readLatency().p99Micros()));
+        if (metricsListener != null) {
+            metricsListener.onNodeMetrics(snapshot);
+        }
+    }
+
+    /**
+     * Amostras/s entre este tick e o anterior — primeiro tick sempre devolve {@code 0.0} (não há
+     * "anterior" ainda para comparar). Só chamado por {@link #tick()}, sempre na mesma thread única
+     * do {@link #scheduler}, então {@link #lastSamplesWritten}/{@link #lastSamplesAtEpochMs} não
+     * precisam de sincronização própria.
+     */
+    private double computeSamplesPerSecond(long samplesWritten, long nowEpochMs) {
+        if (lastSamplesWritten < 0) {
+            lastSamplesWritten = samplesWritten;
+            lastSamplesAtEpochMs = nowEpochMs;
+            return 0.0;
+        }
+        long elapsedMs = nowEpochMs - lastSamplesAtEpochMs;
+        double rate = elapsedMs > 0 ? (samplesWritten - lastSamplesWritten) * 1_000.0 / elapsedMs : 0.0;
+        lastSamplesWritten = samplesWritten;
+        lastSamplesAtEpochMs = nowEpochMs;
+        return Math.max(0.0, rate);
+    }
+
+    /**
+     * Snapshot completo das métricas operacionais deste nó, montado sob demanda — usado tanto pelo
+     * tick periódico quanto por uma consulta pontual de {@code ngrrd.admin.metrics}. Não depende do
+     * catálogo replicado {@code ngrrd.nodes} (que pode estar levemente atrasado): lê
+     * {@link BlobVolume#stats()} e o {@link SeriesHandleRegistry} diretamente, a mesma fonte usada
+     * por {@link #report()}.
+     */
+    public NodeMetricsSnapshot metricsSnapshot() {
+        BlobVolumeStats stats = volume.stats();
+        StorageRequestHandler.StorageHandlerMetrics handlerMetrics = handlerMetricsSupplier.get();
+        return new NodeMetricsSnapshot(
+                nodeId,
+                clock.millis(),
+                leaderSupplier.getAsBoolean(),
+                stats.catalogEntryCount(),
+                sum(stats.shardUsedBytes()),
+                capacityBytes,
+                registry.openCount(),
+                handlerMetrics.writeBatches(),
+                handlerMetrics.samplesWritten(),
+                handlerMetrics.samplesFailed(),
+                handlerMetrics.checkpoints(),
+                handlerMetrics.flushes(),
+                handlerMetrics.reads(),
+                handlerMetrics.writeBatchLatency(),
+                handlerMetrics.checkpointLatency(),
+                handlerMetrics.readLatency(),
+                handlerMetrics.errorsByStatus(),
+                BlobVolumeSummary.from(stats),
+                0L,
+                0L);
     }
 
     /**

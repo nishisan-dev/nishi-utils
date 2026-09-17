@@ -17,15 +17,23 @@
 
 package dev.nishisan.utils.oss.cluster.protocol;
 
+import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
+
+import java.util.Objects;
+
 /**
- * Pedido de administração dirigido a um nó específico: {@code ngrrd.admin.drain}
- * / {@code ngrrd.admin.activate} / {@code ngrrd.admin.metrics}.
+ * Um {@link StorageNodeStatus} do catálogo, anotado com se o líder que montou
+ * a resposta de {@code ngrrd.admin.status} enxerga o nó como alcançável agora
+ * (via {@code ClusterCoordinator}/{@code Transport}) — {@code state} sozinho
+ * (do catálogo replicado) não distingue "caiu agora mesmo" de "ainda não
+ * reportou de novo".
  *
- * @param nodeId    storage node alvo; {@code null} em {@code ngrrd.admin.metrics} pede as
- *                  métricas do próprio nó que atende a requisição
- * @param forwarded {@code ngrrd.admin.metrics} apenas: {@code true} quando este pedido já é o
- *                  encaminhamento de um nó que não era o alvo — impede um segundo encaminhamento
- *                  (um salto no máximo) caso o catálogo local do nó intermediário estivesse errado
+ * @param status    último status publicado pelo nó
+ * @param reachable se o líder considera este nó alcançável no instante da resposta
  */
-public record AdminNodeRequest(String nodeId, boolean forwarded) {
+public record NodeStatusView(StorageNodeStatus status, boolean reachable) {
+
+    public NodeStatusView {
+        Objects.requireNonNull(status, "status é obrigatório");
+    }
 }

@@ -424,6 +424,33 @@ class StorageRequestHandlerTest {
         assertEquals(1L, metrics.errorsByStatus().get(SeriesStatus.WRONG_OWNER));
     }
 
+    @Test
+    void metricsSnapshotPreencheLatenciasDeWriteBatchCheckpointEReadAposOperacoes() {
+        String seriesKey = "series-latencias";
+        placementLookup.put(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+        handler.handle(Commands.OPEN, openRequest(seriesKey, null), SOURCE);
+
+        long baseStepMs = 300_000L;
+        long t0 = 1_700_000_000_000L - (1_700_000_000_000L % baseStepMs);
+        WriteBatchRequest batch = new WriteBatchRequest(List.of(
+                new SeriesWrite(seriesKey, "in_octets", t0, 1_000d),
+                new SeriesWrite(seriesKey, "in_octets", t0 + baseStepMs, 1_500d)));
+        handler.handle(Commands.WRITE_BATCH, batch, SOURCE);
+        handler.handle(Commands.CHECKPOINT, new SeriesCommandRequest(seriesKey), SOURCE);
+        handler.handle(Commands.FLUSH, new SeriesCommandRequest(seriesKey), SOURCE);
+        ReadRequest readRequest = new ReadRequest(seriesKey, "in_bps", Duration.ofDays(1).toMillis(), 300,
+                ConsolidationFunction.AVERAGE, 500, t0 + 2 * baseStepMs);
+        handler.handle(Commands.READ, readRequest, SOURCE);
+
+        StorageRequestHandler.StorageHandlerMetrics metrics = handler.metricsSnapshot();
+
+        assertEquals(1L, metrics.writeBatchLatency().count());
+        assertTrue(metrics.writeBatchLatency().maxMicros() >= 0);
+        assertEquals(1L, metrics.checkpointLatency().count());
+        assertEquals(1L, metrics.readLatency().count());
+        assertEquals(1L, metrics.flushes());
+    }
+
     /** {@link Clock} determinístico para forçar fechamento por ociosidade via {@link SeriesHandleRegistry#closeIdle()}. */
     private static final class MutableClock extends Clock {
         private Instant instant;

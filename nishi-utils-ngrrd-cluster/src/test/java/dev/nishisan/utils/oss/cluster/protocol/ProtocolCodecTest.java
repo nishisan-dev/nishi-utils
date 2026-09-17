@@ -33,6 +33,9 @@ import dev.nishisan.utils.oss.cluster.catalog.NodeState;
 import dev.nishisan.utils.oss.cluster.catalog.PlacementState;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
+import dev.nishisan.utils.oss.cluster.metrics.BlobVolumeSummary;
+import dev.nishisan.utils.oss.cluster.metrics.LatencySnapshot;
+import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
@@ -43,6 +46,7 @@ import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Verifica que todo payload do protocolo do cluster ngrrd sobrevive a um
@@ -276,25 +280,61 @@ class ProtocolCodecTest {
 
     @Test
     void adminNodeRequestSobreviveAoRoundTrip() throws IOException {
-        AdminNodeRequest original = new AdminNodeRequest("node-a");
+        AdminNodeRequest original = new AdminNodeRequest("node-a", false);
         assertEquals(original, roundTripRequestBody(Commands.ADMIN_DRAIN, original));
+    }
+
+    @Test
+    void adminNodeRequestEncaminhadoSobreviveAoRoundTrip() throws IOException {
+        AdminNodeRequest original = new AdminNodeRequest("node-a", true);
+        AdminNodeRequest roundTripped = roundTripRequestBody(Commands.ADMIN_METRICS, original);
+        assertEquals(original, roundTripped);
+        assertTrue(roundTripped.forwarded());
     }
 
     @Test
     void adminStatusResponseComNosEContagensSobreviveAoRoundTrip() throws IOException {
         StorageNodeStatus nodeA = new StorageNodeStatus("node-a", NodeState.ACTIVE, 120, 1_000_000, 10_000_000, 5_000L);
         StorageNodeStatus nodeB = new StorageNodeStatus("node-b", NodeState.DRAINING, 80, 500_000, 10_000_000, 5_000L);
-        AdminStatusResponse original = new AdminStatusResponse("node-a", List.of(nodeA, nodeB), 1,
+        AdminStatusResponse original = new AdminStatusResponse(SeriesStatus.OK, "node-a",
+                List.of(new NodeStatusView(nodeA, true), new NodeStatusView(nodeB, false)), 1,
                 Map.of("node-a", 120L, "node-b", 80L));
         assertEquals(original, roundTripResponseBody(Commands.ADMIN_STATUS, original));
     }
 
     @Test
     void adminStatusResponseComListasEMapasNulosViramVazios() throws IOException {
-        AdminStatusResponse original = new AdminStatusResponse(null, null, 0, null);
+        AdminStatusResponse original = new AdminStatusResponse(SeriesStatus.NOT_LEADER, null, null, 0, null);
         AdminStatusResponse roundTripped = roundTripResponseBody(Commands.ADMIN_STATUS, original);
         assertEquals(List.of(), roundTripped.nodes());
         assertEquals(Map.of(), roundTripped.seriesCountByNode());
         assertEquals(original, roundTripped);
+    }
+
+    @Test
+    void nodeMetricsSnapshotComHistogramasEErrosPorStatusSobreviveAoRoundTrip() throws IOException {
+        // M2 (achado do Refuter): cobre especificamente os campos que um round-trip vazio não
+        // exercitaria — Map<SeriesStatus, Long> não vazio, os três LatencySnapshot com valores reais
+        // (não LatencySnapshot.EMPTY) e o BlobVolumeSummary.
+        LatencySnapshot writeBatchLatency = new LatencySnapshot(120L, 850L, 4_200L, 9_100L);
+        LatencySnapshot checkpointLatency = new LatencySnapshot(30L, 1_500L, 6_000L, 12_000L);
+        LatencySnapshot readLatency = new LatencySnapshot(75L, 300L, 1_100L, 2_500L);
+        BlobVolumeSummary blobStats = new BlobVolumeSummary(4, 10_485_760L, 104_857_600L, 0.42, 350, 8_192L);
+        Map<SeriesStatus, Long> errorsByStatus = Map.of(
+                SeriesStatus.WRONG_OWNER, 3L,
+                SeriesStatus.NOT_OPEN, 1L,
+                SeriesStatus.ERROR, 2L);
+        NodeMetricsSnapshot original = new NodeMetricsSnapshot("storage-0", 1_700_000_000_000L, true, 350L,
+                10_485_760L, 104_857_600L, 12, 120L, 4_800L, 7L, 30L, 5L, 75L, writeBatchLatency, checkpointLatency,
+                readLatency, errorsByStatus, blobStats, 0L, 0L);
+
+        NodeMetricsSnapshot roundTripped = roundTripResponseBody(Commands.ADMIN_METRICS, original);
+
+        assertEquals(original, roundTripped);
+        assertEquals(errorsByStatus, roundTripped.errorsByStatus());
+        assertEquals(writeBatchLatency, roundTripped.writeBatchLatency());
+        assertEquals(checkpointLatency, roundTripped.checkpointLatency());
+        assertEquals(readLatency, roundTripped.readLatency());
+        assertEquals(blobStats, roundTripped.blobStats());
     }
 }

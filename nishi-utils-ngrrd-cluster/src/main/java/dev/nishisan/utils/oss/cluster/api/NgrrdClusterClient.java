@@ -20,6 +20,8 @@ package dev.nishisan.utils.oss.cluster.api;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.oss.Ngrrd;
 import dev.nishisan.utils.oss.NgrrdHandle;
+import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
+import dev.nishisan.utils.oss.cluster.protocol.AdminStatusResponse;
 
 import java.io.Closeable;
 import java.nio.file.Path;
@@ -52,6 +54,16 @@ public interface NgrrdClusterClient extends Closeable {
 
     /** Snapshot atual das métricas do cliente. */
     ClientMetricsSnapshot metrics();
+
+    /**
+     * Status geral do cluster segundo o líder atual — vai ao líder ({@code ngrrd.admin.status}),
+     * com re-resolução automática se a resposta indicar {@code NOT_LEADER} (mesmo tratamento de
+     * {@code NOT_LEADER} usado ao posicionar uma série nova).
+     */
+    AdminStatusResponse clusterStatus();
+
+    /** Métricas operacionais do storage node {@code nodeId} ({@code ngrrd.admin.metrics}, um RPC direto). */
+    NodeMetricsSnapshot nodeMetrics(String nodeId);
 
     /** Identificador deste cliente no cluster NGrid. */
     NodeId clientNodeId();

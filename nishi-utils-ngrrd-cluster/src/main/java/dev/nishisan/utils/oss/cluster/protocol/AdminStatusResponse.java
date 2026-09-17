@@ -17,27 +17,33 @@
 
 package dev.nishisan.utils.oss.cluster.protocol;
 
-import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
-
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
 /**
- * Resposta de {@code ngrrd.admin.status}: visão geral do cluster segundo o líder.
+ * Resposta de {@code ngrrd.admin.status}: visão geral do cluster segundo o líder —
+ * só o líder responde com {@link SeriesStatus#OK}; qualquer outro nó responde
+ * {@link SeriesStatus#NOT_LEADER} (com {@code leaderNodeId} preenchido, se
+ * conhecido), mesmo padrão de {@code PlaceResponse}.
  *
- * @param leaderNodeId        líder atual do cluster
- * @param nodes               status de cada storage node conhecido; nunca {@code null}
+ * @param status              {@link SeriesStatus#OK} em caso de sucesso; {@link SeriesStatus#NOT_LEADER}
+ *                            se quem respondeu não é o líder atual
+ * @param leaderNodeId        líder atual do cluster segundo quem respondeu; pode ser {@code null}
+ *                            se {@code status == NOT_LEADER} e nem quem respondeu sabe quem é o líder
+ * @param nodes               status de cada storage node conhecido, com alcançabilidade; nunca {@code null}
  * @param migrationsInFlight  quantidade de migrações em curso
  * @param seriesCountByNode   quantidade de séries por nó, segundo o catálogo; nunca {@code null}
  */
 public record AdminStatusResponse(
+        SeriesStatus status,
         String leaderNodeId,
-        List<StorageNodeStatus> nodes,
+        List<NodeStatusView> nodes,
         int migrationsInFlight,
         Map<String, Long> seriesCountByNode) {
 
     public AdminStatusResponse {
+        Objects.requireNonNull(status, "status é obrigatório");
         nodes = List.copyOf(Objects.requireNonNullElse(nodes, List.of()));
         seriesCountByNode = Map.copyOf(Objects.requireNonNullElse(seriesCountByNode, Map.of()));
     }
