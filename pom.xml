@@ -11,6 +11,7 @@
     <modules>
         <module>nishi-utils-core</module>
         <module>nishi-utils-oss</module>
+        <module>nishi-utils-ngrrd-cluster</module>
         <module>ngrid-test</module>
     </modules>
 
