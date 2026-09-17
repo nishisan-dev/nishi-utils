@@ -150,6 +150,45 @@ class StorageNodeClusterTest {
      * {@value #STABLE_CHECKS_REQUIRED} checagens seguidas, não apenas uma vez (mesmo critério de
      * {@code NGridLocalBuilder.awaitConsensus}, indisponível aqui por ser privado ao core).
      */
+    /**
+     * {@code PLACE} cru com retentativa: re-resolve o líder a cada tentativa e segue o
+     * {@code leaderNodeId} devolvido em {@code NOT_LEADER}, como faz o {@code PlacementResolver} do
+     * cliente de alto nível. Só {@code OK} devolve; qualquer outro status que não seja
+     * {@code NOT_LEADER} falha o teste na hora.
+     */
+    private PlaceResponse placeWithRetry(String seriesKey) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + AWAIT_TIMEOUT.toMillis();
+        PlaceRequest request = new PlaceRequest(seriesKey, "hash-" + seriesKey, null);
+        PlaceResponse last = null;
+        NodeId target = null;
+        while (System.currentTimeMillis() < deadline) {
+            if (target == null) {
+                target = client.coordinator().leaderInfo().map(NodeInfo::nodeId).orElse(null);
+            }
+            if (target == null) {
+                Thread.sleep(150L);
+                continue;
+            }
+            try {
+                last = clientRpc.call(target, Commands.PLACE, request, PlaceResponse.class);
+            } catch (RuntimeException transportFailure) {
+                target = null; // líder pode ter caído/mudado: re-resolve na próxima volta
+                Thread.sleep(150L);
+                continue;
+            }
+            if (last.status() == SeriesStatus.OK) {
+                return last;
+            }
+            if (last.status() != SeriesStatus.NOT_LEADER) {
+                fail("PLACE falhou para " + seriesKey + ": " + last.status() + " (" + last.message() + ")");
+            }
+            target = last.leaderNodeId() != null ? NodeId.of(last.leaderNodeId()) : null;
+            Thread.sleep(150L);
+        }
+        fail("PLACE de " + seriesKey + " não obteve OK dentro de " + AWAIT_TIMEOUT + " (último: " + last + ")");
+        return last;
+    }
+
     private void awaitClusterStable(Duration timeout) throws InterruptedException {
         NGridNode[] nodes = {storage1.node(), storage2.node(), client};
         long deadline = System.currentTimeMillis() + timeout.toMillis();
@@ -228,13 +267,10 @@ class StorageNodeClusterTest {
         }
 
         for (String seriesKey : seriesKeys) {
-            // Relê o líder a cada iteração em vez de fixar um NodeId capturado no início do teste:
-            // a rajada de PLACEs demora o suficiente para o cluster reeleger o líder por conta
-            // própria (M0 ainda em ajuste fino de afinidade/estabilidade).
-            NodeId leaderId = client.coordinator().leaderInfo().orElseThrow().nodeId();
-            PlaceResponse placeResponse = clientRpc.call(leaderId, Commands.PLACE,
-                    new PlaceRequest(seriesKey, "hash-" + seriesKey, null), PlaceResponse.class);
-            assertEquals(SeriesStatus.OK, placeResponse.status(), "PLACE falhou para " + seriesKey);
+            // PLACE cru com retentativa e re-resolução do líder (como o PlacementResolver do cliente de
+            // alto nível): a rajada de PLACEs demora o suficiente para o cluster reeleger o líder, e um
+            // NOT_LEADER no meio dela é comportamento normal do NGrid, não falha do storage node.
+            PlaceResponse placeResponse = placeWithRetry(seriesKey);
             placementBySeries.put(seriesKey, placeResponse.placement());
 
             NodeId owner = NodeId.of(placeResponse.placement().ownerNodeId());

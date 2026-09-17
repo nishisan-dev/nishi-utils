@@ -43,6 +43,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BiConsumer;
 import java.util.function.Function;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -199,6 +200,34 @@ class WriteDispatcherTest {
                 .toList();
         assertEquals(List.of(1L, 2L, 3L), timestampsAtNewOwner,
                 "o novo dono deveria receber as amostras em ordem estritamente crescente de timestamp");
+    }
+
+    @Test
+    void wrongOwnerComDonoConhecidoNotificaOCallbackOwnerChanged() {
+        // M3 (nota do Refuter do M1c): sem este callback, RemoteSeriesHandle.owner nunca mudava por
+        // este caminho — verifica que o WriteDispatcher o chama com (seriesKey, novoDono) sempre que
+        // WRONG_OWNER já traz o dono novo.
+        rpc = new RecordingClusterRpc(NodeId.of("client-under-test"));
+        placementLookup = new FakePlacementLookup();
+        RetryPolicy retry = new RetryPolicy(Duration.ofSeconds(5), Duration.ofMillis(10), Duration.ofMillis(200));
+        List<String> ownerChangedCalls = new CopyOnWriteArrayList<>();
+        BiConsumer<String, String> ownerChanged = (seriesKey, newOwner) ->
+                ownerChangedCalls.add(seriesKey + "=" + newOwner);
+        dispatcher = new WriteDispatcher(rpc, placementLookup, retry, 1, Duration.ofSeconds(30), 1_000,
+                NgrrdClusterConfig.BufferFullPolicy.BLOCK, Duration.ofSeconds(5), key -> true, ownerChanged,
+                Clock.systemUTC(), null, null);
+        rpc.respondNext((cmd, body) -> {
+            WriteBatchRequest req = (WriteBatchRequest) body;
+            String key = req.writes().get(0).seriesKey();
+            return new WriteBatchResponse(Map.of(key, SeriesStatus.WRONG_OWNER),
+                    Map.of(key, OWNER_B.value()), Map.of());
+        });
+        rpc.respondDefault((cmd, body) -> okFor((WriteBatchRequest) body));
+
+        dispatcher.enqueue(OWNER_A.value(), write("s1", 1L, 42.0));
+
+        Await.untilTrue("re-roteado e confirmado no novo dono", AWAIT_TIMEOUT, () -> dispatcher.samplesSent() == 1L);
+        assertEquals(List.of("s1=" + OWNER_B.value()), ownerChangedCalls);
     }
 
     @Test

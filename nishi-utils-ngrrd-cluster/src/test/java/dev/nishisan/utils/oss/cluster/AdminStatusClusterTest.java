@@ -67,8 +67,12 @@ class AdminStatusClusterTest {
 
     private static final int SERIES_COUNT = 20;
     private static final Duration AWAIT_TIMEOUT = Duration.ofSeconds(60);
-    private static final Duration REACHABILITY_TIMEOUT = Duration.ofSeconds(10);
+    // Refuter r2 (MÉDIO): 10s era curto demais para a detecção de queda convergir numa malha de 4
+    // (3 storage + cliente) com roteamento por proxy — medições reais levaram mais que isso.
+    private static final Duration REACHABILITY_TIMEOUT = Duration.ofSeconds(30);
 
+    /** Mínimo para tolerar a queda de um nó sem perder o líder (maioria de votantes). */
+    private static final int STORAGE_NODE_COUNT = 3;
     private NgrrdClusterTestHarness harness;
 
     @AfterEach
@@ -95,9 +99,12 @@ class AdminStatusClusterTest {
         statusLogger.setLevel(Level.ALL);
 
         try {
-            harness = NgrrdClusterTestHarness.start(base, 2, builder -> { });
+            // 3 storage nodes: tolerar a queda de UM nó exige maioria de votantes (ver Javadoc de
+            // StorageNodeConfig) — com 2, derrubar um deixa o cluster sem líder e os comandos de líder
+            // (clusterStatus/nodeMetrics) param, o que não é o que este teste verifica.
+            harness = NgrrdClusterTestHarness.start(base, STORAGE_NODE_COUNT, builder -> { });
             harness.awaitLeader();
-            harness.awaitNodeStatuses(2);
+            harness.awaitNodeStatuses(STORAGE_NODE_COUNT);
 
             NgrrdClusterClient client = harness.connectClient(builder -> builder
                     // curtos de propósito (cluster local): depois de derrubar um nó, tanto o
@@ -154,7 +161,7 @@ class AdminStatusClusterTest {
                 }
             });
             AdminStatusResponse status = statusRef.get();
-            assertEquals(2, status.nodes().size());
+            assertEquals(STORAGE_NODE_COUNT, status.nodes().size());
             for (NodeStatusView view : status.nodes()) {
                 assertTrue(view.reachable(), view.status().nodeId() + " deveria estar alcançável antes de derrubar nó algum");
             }
@@ -185,7 +192,8 @@ class AdminStatusClusterTest {
             NgrrdStorageNode victim = harness.nodes().stream()
                     .filter(node -> !node.nodeId().equals(leader.nodeId()))
                     .findFirst()
-                    .orElseThrow(() -> new AssertionError("cluster de 2 nós deveria ter um não-líder"));
+                    .orElseThrow(() -> new AssertionError("cluster de " + STORAGE_NODE_COUNT
+                            + " nós deveria ter um não-líder"));
             String victimId = victim.nodeId();
             victim.close();
 

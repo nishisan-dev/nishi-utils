@@ -25,6 +25,7 @@ import dev.nishisan.utils.oss.cluster.catalog.PlacementState;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
 import dev.nishisan.utils.oss.cluster.node.NgrrdStorageNode;
 import dev.nishisan.utils.oss.cluster.node.StorageNodeConfig;
+import dev.nishisan.utils.oss.cluster.rebalance.MigrationCoordinator;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -39,6 +40,7 @@ import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
+import java.util.function.IntFunction;
 
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -53,7 +55,19 @@ import static org.junit.jupiter.api.Assertions.fail;
  */
 public final class NgrrdClusterTestHarness implements Closeable {
 
-    private static final Duration DEFAULT_AWAIT_TIMEOUT = Duration.ofSeconds(60);
+    /**
+     * M3: 60 s bastava para os harnesses de 2 storage nodes (única configuração exercitada até o M2).
+     * Os testes de churn de liderança do M3 (seção 0) são os primeiros a montar harnesses de 3+
+     * storage nodes + cliente — medido isoladamente (só {@code NgrrdCluster.connect} num harness de 3
+     * nós, sem série alguma), a malha de 4 membros (3 storage + 1 cliente) pode legitimamente levar
+     * ~15 s só para o PRIMEIRO assentamento (member count oscila 2→3→4 e o líder muda até então) antes
+     * de sequer começar a contar as {@value #STABLE_CHECKS_REQUIRED} checagens seguidas — sob a carga
+     * adicional de escritas/placements concorrentes, esse tempo aumenta. Não é o mesmo risco descrito
+     * no Javadoc de {@link #STABLE_CHECKS_REQUIRED} (aquele é sobre pedir MAIS checagens seguidas,
+     * o que aumenta a chance de cair no meio de um live-lock); aumentar só o teto TOTAL de espera dá
+     * mais tentativas para a mesma janela de 5 checagens ser encontrada, sem mudar o critério em si.
+     */
+    private static final Duration DEFAULT_AWAIT_TIMEOUT = Duration.ofSeconds(150);
     private static final Duration DEFAULT_STATUS_REPORT_INTERVAL = Duration.ofSeconds(2);
     /**
      * Checagens seguidas exigidas antes de considerar a malha estável — mesmo valor de
@@ -88,6 +102,21 @@ public final class NgrrdClusterTestHarness implements Closeable {
      */
     public static NgrrdClusterTestHarness start(Path base, int storageNodeCount,
             Consumer<StorageNodeConfig.Builder> customize) throws IOException {
+        return start(base, storageNodeCount, customize, index -> NO_OP_MIGRATION_HOOKS);
+    }
+
+    private static final MigrationCoordinator.MigrationHooks NO_OP_MIGRATION_HOOKS =
+            new MigrationCoordinator.MigrationHooks() {
+            };
+
+    /**
+     * Como {@link #start(Path, int, Consumer)}, mas permitindo injetar
+     * {@link MigrationCoordinator.MigrationHooks} por índice de nó — usado apenas pelos testes de
+     * queda do líder durante uma migração (M3), que não sabem de antemão qual nó será eleito.
+     */
+    public static NgrrdClusterTestHarness start(Path base, int storageNodeCount,
+            Consumer<StorageNodeConfig.Builder> customize,
+            IntFunction<MigrationCoordinator.MigrationHooks> migrationHooksByIndex) throws IOException {
         Objects.requireNonNull(base, "base");
         if (storageNodeCount <= 0) {
             throw new IllegalArgumentException("storageNodeCount deve ser > 0: " + storageNodeCount);
@@ -111,7 +140,7 @@ public final class NgrrdClusterTestHarness implements Closeable {
             customize.accept(builder);
             StorageNodeConfig config = builder.build();
             configs.add(config);
-            nodes.add(NgrrdStorageNode.start(config));
+            nodes.add(NgrrdStorageNode.start(config, migrationHooksByIndex.apply(i)));
         }
         return new NgrrdClusterTestHarness(base, configs, nodes);
     }
@@ -128,6 +157,14 @@ public final class NgrrdClusterTestHarness implements Closeable {
      * preenchidos.
      */
     public NgrrdClusterClient connectClient(Consumer<NgrrdClusterConfig.Builder> customize) {
+        // M3: espera a malha de storage nodes JÁ estar assentada ANTES de entrar com o cliente.
+        // Medido por A/B com NGrid puro (3 nós + um membro leader-ineligible entrando e saindo): um
+        // membro que entra numa malha ainda em eleição leva os nós a adotarem líderes DIFERENTES entre
+        // si (ciclo de 3 vias: A→A, B→C, C→B) e a malha não volta a convergir dentro de 150 s; entrando
+        // depois do assentamento, a reconvergência é de ~3,6 s. Como {@code start()} devolve os nós
+        // recém-subidos e os testes chamam {@code awaitLeader()} (que exige só que ALGUM nó veja um
+        // líder), sem esta espera o cliente entrava exatamente na janela de bootstrap.
+        awaitMeshStable();
         NgrrdClusterConfig.Builder builder = NgrrdClusterConfig.builder()
                 .peers(storagePeerAddresses())
                 .dataDir(base.resolve("client-" + clients.size() + "/data"));
@@ -159,8 +196,16 @@ public final class NgrrdClusterTestHarness implements Closeable {
                 storageNodes.stream().anyMatch(node -> node.node().coordinator().leaderInfo().isPresent()));
     }
 
-    /** Espera até que o catálogo local do primeiro storage node reporte {@code n} nós. */
+    /**
+     * Espera até que o catálogo local do primeiro storage node reporte {@code n} nós.
+     *
+     * <p>Espera a malha assentar primeiro: o status de cada nó é uma escrita roteada ao líder, então
+     * enquanto os nós não concordarem sobre quem é o líder as publicações são recusadas e a contagem
+     * não avança. Esperar a estabilidade antes torna a falha (quando houver) apontar para a causa
+     * certa — malha que não converge — em vez de "status não reportado".</p>
+     */
     public void awaitNodeStatuses(int n) {
+        awaitMeshStable();
         CatalogService catalog = storageNodes.get(0).catalog();
         awaitTrue(n + " storage node(s) reportados no catálogo", () -> catalog.nodesLocal().size() == n);
     }
@@ -233,7 +278,7 @@ public final class NgrrdClusterTestHarness implements Closeable {
      * (sem passar por {@link #close()}), então o único invariante verificável de fora é o consenso
      * entre os storage nodes, não um número fixo.
      */
-    private void awaitMeshStable() {
+    public void awaitMeshStable() {
         long deadline = System.currentTimeMillis() + DEFAULT_AWAIT_TIMEOUT.toMillis();
         Optional<NodeInfo> stableLeader = Optional.empty();
         int stableChecks = 0;
@@ -258,7 +303,27 @@ public final class NgrrdClusterTestHarness implements Closeable {
                 fail("interrompido aguardando a malha estabilizar");
             }
         }
-        fail("malha não estabilizou dentro de " + DEFAULT_AWAIT_TIMEOUT);
+        fail("malha não estabilizou dentro de " + DEFAULT_AWAIT_TIMEOUT + " — " + meshDiagnostics());
+    }
+
+    /**
+     * Retrato da visão de cada storage node (líder visto, contagem e composição dos membros ativos),
+     * anexado à mensagem de falha de {@link #awaitMeshStable()} — sem ele, a falha só diz "não
+     * estabilizou" e não permite distinguir divergência de líder de divergência de contagem de membros.
+     */
+    private String meshDiagnostics() {
+        StringBuilder sb = new StringBuilder("visão por nó: ");
+        for (NgrrdStorageNode node : storageNodes) {
+            sb.append('[').append(node.nodeId())
+                    .append(" leader=").append(node.node().coordinator().leaderInfo()
+                            .map(info -> info.nodeId().value()).orElse("<none>"))
+                    .append(" members=").append(node.node().coordinator().activeMembers().stream()
+                            .map(info -> info.nodeId().value())
+                            .sorted()
+                            .toList())
+                    .append("] ");
+        }
+        return sb.toString();
     }
 
     private Optional<NodeInfo> consensusLeader() {
