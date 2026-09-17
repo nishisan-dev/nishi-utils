@@ -16,16 +16,17 @@ Refuter r2 aprovou (63 testes; ordem total do placement confirmada por probe ind
 baixos foram para a seção 0 da spec do M1b. Decisões: gate JaCoCo do módulo fica para o M1c; versão do
 reactor segue 8.2.0 até o M5.
 
-### M1b — rpc + node + StorageNodeClusterTest — implementado, aguardando Refuter
-Builder: 106 testes unitários (8 classes) + `StorageNodeClusterTest` 3/3. RPC a si mesmo via despacho local
-(`LocalRequestHandler`), pois `TcpTransport` não faz loopback. `NgrrdHandle.close()` já força durabilidade.
-Divergências a julgar pelo Refuter: `reopenIfKnown` com `OpenOptions.defaults()`; `READ` não reabre handle.
-Builder observou churn de liderança no bootstrap de 3 nós (epoch 1→6, dual-leader detectado) — Refuter
-investiga se é ruído padrão do NGrid ou interação com o M0.
-**Próximo passo:** veredito do Refuter → correções → commits atômicos (rpc; node; testes/recursos) →
-M1c (`planning/ngrrd-cluster/spec-m1c.md`).
+### M1b — rpc + node + StorageNodeClusterTest — COMMITADO (2f5e8a0, 0c47af0, f2155c7, bfac70c)
+Três rodadas de Refuter: r1 reprovou deadlock AB-BA no registry de handles, uso de handle após
+fechamento por outra thread (falso OK em checkpoint), timeout embrulhado virando REMOTE_ERROR; r2 reprovou
+READ sem auto-cura após ociosidade e TOCTOU em open/reopenIfKnown; r3 aprovou. Desenho final do registry:
+entrada por série com lock próprio, `withHandle` como único caminho de uso, evict/closeIdle com tryLock
+fora de qualquer outro lock, `closedByClient` distingue CLOSE explícito de fechamento por ociosidade,
+OpenOptions guardadas por hash. Churn de liderança no bootstrap é ruído padrão do NGrid (A/B do Refuter).
+Residuais informativos: `handleClose` não checa dono (limpeza local idempotente); `withHandleSelfHealing`
+trata `fn` nulo como "não aberta" — operações novas não podem devolver null.
 
-### M1c — spec pronta, não iniciado
+### M1c — cliente transparente + harness — Builder em andamento (spec `spec-m1c.md`; inclui gate JaCoCo)
 Cliente transparente + harness + `DistributedWriteReadClusterTest`; ligar o gate JaCoCo do módulo.
 
 ## Observações
