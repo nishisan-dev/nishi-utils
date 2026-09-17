@@ -26,6 +26,7 @@ import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.metrics.BlobVolumeSummary;
 import dev.nishisan.utils.oss.cluster.metrics.NgrrdClusterMetricsListener;
 import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
+import dev.nishisan.utils.oss.cluster.rebalance.MigrationExecutor;
 import dev.nishisan.utils.oss.metrics.BlobVolumeStats;
 
 import java.io.Closeable;
@@ -37,6 +38,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 import java.util.logging.Level;
@@ -69,6 +71,14 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
     private static final Logger LOGGER = Logger.getLogger(NodeStatusReporter.class.getName());
     private static final long RETRY_BACKOFF_MIN_MS = 200L;
     private static final long RETRY_BACKOFF_MAX_MS = 2_000L;
+    /**
+     * M3 — teto de tentativas por rodada de publicação. Ver {@link #reportGeneration} para o porquê
+     * de o valor ser baixo: esgotado o teto, a rodada desiste e o próximo tick periódico
+     * (a cada {@code interval}) tenta de novo, em vez de manter uma cadeia de retentativas viva.
+     */
+    private static final int MAX_REPORT_ATTEMPTS = 3;
+    /** M3: prazo após o qual entradas terminais de {@link MigrationExecutor} são varridas a cada tick. */
+    private static final Duration MIGRATION_STATE_TTL = Duration.ofMinutes(10);
 
     private final CatalogService catalog;
     private final BlobVolume volume;
@@ -80,11 +90,39 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
     private final Supplier<StorageRequestHandler.StorageHandlerMetrics> handlerMetricsSupplier;
     private final BooleanSupplier leaderSupplier;
     private final NgrrdClusterMetricsListener metricsListener;
+    /** {@code null} nos testes que não montam o executor de migração (M3) — métricas ficam 0/0. */
+    private final MigrationExecutor migrationExecutor;
+    /**
+     * Prazo usado por {@link MigrationExecutor#healStuckMigrations} a cada tick — mesmo
+     * {@code migrationTimeout} de {@code StorageNodeConfig}/{@code MigrationCoordinator}; irrelevante
+     * quando {@link #migrationExecutor} é {@code null}.
+     */
+    private final Duration migrationTimeout;
     private final ScheduledExecutorService scheduler;
 
     private volatile ScheduledFuture<?> task;
     /** Retentativa de publicação em voo (backoff), separada de {@link #task} — o tick periódico continua existindo. */
     private volatile ScheduledFuture<?> pendingRetry;
+
+    /**
+     * Geração da rodada de publicação corrente. Cada tick periódico e cada {@link #onLeaderChanged}
+     * incrementam este contador e carregam a geração resultante pela cadeia de retentativas; uma
+     * retentativa cuja geração ficou para trás simplesmente desiste.
+     *
+     * <p>Defeito que isto corrige (M3, causa raiz da não convergência da malha de 3 nós): antes,
+     * cada tick que falhava iniciava uma cadeia de retentativas <em>própria</em> e <em>ilimitada</em>
+     * (200 ms → 2 s, para sempre), e {@link #onLeaderChanged} iniciava mais uma. Numa troca de líder
+     * as publicações falham em todos os nós, então as cadeias se acumulavam — dezenas delas, cada uma
+     * republicando a cada 2 s. Cada publicação é um {@code DistributedMap.put} roteado ao líder
+     * adotado localmente; quando esse nó responde "não sou o líder", o core registra a recusa e
+     * reavalia a liderança (escape de impasse D9 do {@code ClusterCoordinator}), o que troca o líder,
+     * o que dispara {@link #onLeaderChanged} em todos os nós, o que cria mais cadeias — realimentação
+     * positiva que impedia a malha de assentar. Medido por A/B com 3 nós: NGrid puro e NGrid com os
+     * mapas do catálogo declarados convergem em ≤ 3,6 s; com uma publicação de status a cada 2 s por
+     * nó (sem retentativa) os piores casos vão a 12-15 s; com as cadeias acumuladas, passava de 150 s
+     * sem convergir.</p>
+     */
+    private final AtomicLong reportGeneration = new AtomicLong();
 
     /**
      * Taxa de {@code samples/s} do log marker é calculada ENTRE ticks — só {@link #tick()} (sempre
@@ -98,6 +136,16 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
             String nodeId, long capacityBytes, Duration interval, Clock clock,
             Supplier<StorageRequestHandler.StorageHandlerMetrics> handlerMetricsSupplier,
             BooleanSupplier leaderSupplier, NgrrdClusterMetricsListener metricsListener) {
+        // migrationTimeout não importa aqui: sem migrationExecutor, healStuckMigrations nunca roda.
+        this(catalog, volume, registry, nodeId, capacityBytes, interval, clock, handlerMetricsSupplier,
+                leaderSupplier, metricsListener, null, MIGRATION_STATE_TTL);
+    }
+
+    public NodeStatusReporter(CatalogService catalog, BlobVolume volume, SeriesHandleRegistry registry,
+            String nodeId, long capacityBytes, Duration interval, Clock clock,
+            Supplier<StorageRequestHandler.StorageHandlerMetrics> handlerMetricsSupplier,
+            BooleanSupplier leaderSupplier, NgrrdClusterMetricsListener metricsListener,
+            MigrationExecutor migrationExecutor, Duration migrationTimeout) {
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.volume = Objects.requireNonNull(volume, "volume");
         this.registry = Objects.requireNonNull(registry, "registry");
@@ -108,6 +156,8 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
         this.handlerMetricsSupplier = Objects.requireNonNull(handlerMetricsSupplier, "handlerMetricsSupplier");
         this.leaderSupplier = Objects.requireNonNull(leaderSupplier, "leaderSupplier");
         this.metricsListener = metricsListener;
+        this.migrationExecutor = migrationExecutor;
+        this.migrationTimeout = Objects.requireNonNull(migrationTimeout, "migrationTimeout");
         this.scheduler = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "ngrrd-status-reporter");
             thread.setDaemon(true);
@@ -128,11 +178,23 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
      * scheduler silenciosamente.
      */
     private void tick() {
-        reportWithRetry(1);
+        reportWithRetry(1, reportGeneration.incrementAndGet());
         try {
             registry.closeIdle();
         } catch (Throwable e) {
             LOGGER.log(Level.SEVERE, "Falha ao fechar handles ociosos do nó " + nodeId, e);
+        }
+        if (migrationExecutor != null) {
+            try {
+                migrationExecutor.sweepExpiredStates(MIGRATION_STATE_TTL);
+            } catch (Throwable e) {
+                LOGGER.log(Level.SEVERE, "Falha ao varrer migrações expiradas do nó " + nodeId, e);
+            }
+            try {
+                migrationExecutor.healStuckMigrations(migrationTimeout);
+            } catch (Throwable e) {
+                LOGGER.log(Level.SEVERE, "Falha ao autocurar migrações presas do nó " + nodeId, e);
+            }
         }
         try {
             publishMetrics();
@@ -188,6 +250,9 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
     public NodeMetricsSnapshot metricsSnapshot() {
         BlobVolumeStats stats = volume.stats();
         StorageRequestHandler.StorageHandlerMetrics handlerMetrics = handlerMetricsSupplier.get();
+        MigrationExecutor.ExecutorMetrics migrationMetrics = migrationExecutor != null
+                ? migrationExecutor.metricsSnapshot()
+                : new MigrationExecutor.ExecutorMetrics(0L, 0L);
         return new NodeMetricsSnapshot(
                 nodeId,
                 clock.millis(),
@@ -207,8 +272,8 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
                 handlerMetrics.readLatency(),
                 handlerMetrics.errorsByStatus(),
                 BlobVolumeSummary.from(stats),
-                0L,
-                0L);
+                migrationMetrics.migrationsIn(),
+                migrationMetrics.migrationsOut());
     }
 
     /**
@@ -216,18 +281,37 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
      * (200 ms → 2 s, dobrando a cada tentativa) em vez de esperar o próximo
      * tick regular — uma falha de publicação não deve deixar o líder sem um
      * status fresco deste nó por até {@code interval} inteiro.
+     *
+     * <p>A rodada desiste ao atingir {@value #MAX_REPORT_ATTEMPTS} tentativas, e qualquer tentativa
+     * de uma geração superada por um tick (ou troca de líder) mais recente sai sem publicar: no
+     * máximo UMA cadeia de retentativas fica viva por vez. Ver {@link #reportGeneration} para a
+     * realimentação positiva que isso corrige.</p>
      */
-    private void reportWithRetry(int attempt) {
+    private void reportWithRetry(int attempt, long generation) {
+        if (generation != reportGeneration.get()) {
+            // Superada por um tick periódico ou uma troca de líder mais recente: aquela rodada
+            // publica o status mais novo, republicar o antigo aqui só somaria pressão no líder.
+            return;
+        }
         try {
             report();
         } catch (Throwable e) {
+            if (attempt >= MAX_REPORT_ATTEMPTS) {
+                // Falhar aqui é esperado durante uma eleição (o líder adotado localmente recusa a
+                // escrita, ou ainda está em catch-up): WARNING sem stack trace, e o próximo tick
+                // periódico tenta de novo com um status mais fresco.
+                LOGGER.log(Level.WARNING, () -> "Status do nó " + nodeId + " não publicado após "
+                        + attempt + " tentativas (" + e + "); nova tentativa no próximo tick");
+                return;
+            }
             long backoffMs = Math.min(RETRY_BACKOFF_MIN_MS << Math.min(attempt - 1, 4), RETRY_BACKOFF_MAX_MS);
-            LOGGER.log(Level.SEVERE, "Falha ao reportar status do nó " + nodeId + " (tentativa " + attempt
+            LOGGER.log(Level.FINE, "Falha ao reportar status do nó " + nodeId + " (tentativa " + attempt
                     + "); retentando em " + backoffMs + " ms", e);
             try {
-                pendingRetry = scheduler.schedule(() -> reportWithRetry(attempt + 1), backoffMs, TimeUnit.MILLISECONDS);
+                pendingRetry = scheduler.schedule(() -> reportWithRetry(attempt + 1, generation),
+                        backoffMs, TimeUnit.MILLISECONDS);
             } catch (RuntimeException scheduleFailure) {
-                LOGGER.log(Level.SEVERE, "Não foi possível reagendar o reporte de status do nó " + nodeId
+                LOGGER.log(Level.FINE, "Não foi possível reagendar o reporte de status do nó " + nodeId
                         + " após falha; scheduler provavelmente já foi encerrado", scheduleFailure);
             }
         }
@@ -240,7 +324,8 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
     @Override
     public void onLeaderChanged(NodeId newLeader) {
         try {
-            scheduler.execute(() -> reportWithRetry(1));
+            long generation = reportGeneration.incrementAndGet();
+            scheduler.execute(() -> reportWithRetry(1, generation));
         } catch (RuntimeException e) {
             LOGGER.log(Level.FINE, "Reporte imediato de status ignorado (scheduler encerrado?) no nó " + nodeId, e);
         }
@@ -273,10 +358,19 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
         if (retry != null) {
             retry.cancel(false);
         }
-        scheduler.shutdownNow();
+        // (Refuter r2, BAIXO) shutdown() graciosa, não shutdownNow(): um tick em andamento nesta thread
+        // pode estar no meio de uma operação de I/O sobre o BlobVolume (ex.: registry.closeIdle() ou
+        // publishMetrics() tocando um FileChannel) — interrompê-la à força fecha esse canal por baixo
+        // (ClosedByInterruptException) e loga SEVERE, mesmo o volume ainda sendo perfeitamente válido
+        // (NgrrdStorageNode.close() chama isto ANTES de fechar o volume, de propósito — ver seu
+        // Javadoc). Esperar o tick terminar sozinho evita o barulho; só recorre a shutdownNow() como
+        // último caso, se a espera graciosa estourar o prazo.
+        scheduler.shutdown();
         try {
             if (!scheduler.awaitTermination(5, TimeUnit.SECONDS)) {
-                LOGGER.log(Level.WARNING, "Scheduler do status reporter do nó " + nodeId + " não parou em 5s");
+                LOGGER.log(Level.WARNING, "Scheduler do status reporter do nó " + nodeId + " não parou em 5s "
+                        + "de forma graciosa — forçando");
+                scheduler.shutdownNow();
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();

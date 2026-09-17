@@ -23,10 +23,12 @@ import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
 import dev.nishisan.utils.oss.cluster.protocol.AdminNodeRequest;
+import dev.nishisan.utils.oss.cluster.protocol.AdminRebalanceResponse;
 import dev.nishisan.utils.oss.cluster.protocol.AdminStatusResponse;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.protocol.NodeStatusView;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesStatus;
+import dev.nishisan.utils.oss.cluster.rebalance.Rebalancer;
 import dev.nishisan.utils.oss.cluster.rpc.ClusterRpc;
 import dev.nishisan.utils.oss.cluster.rpc.RequestHandlerSupport;
 
@@ -60,15 +62,18 @@ public final class AdminRequestHandler extends RequestHandlerSupport {
     private final CatalogService catalog;
     private final Supplier<NodeMetricsSnapshot> localMetricsSupplier;
     private final ClusterRpc rpc;
+    private final Rebalancer rebalancer;
 
     public AdminRequestHandler(Transport transport, NodeId self, PlacementRequestHandler.LeaderView leaderView,
-            CatalogService catalog, Supplier<NodeMetricsSnapshot> localMetricsSupplier, ClusterRpc rpc) {
-        super(transport, Set.of(Commands.ADMIN_STATUS, Commands.ADMIN_METRICS));
+            CatalogService catalog, Supplier<NodeMetricsSnapshot> localMetricsSupplier, ClusterRpc rpc,
+            Rebalancer rebalancer) {
+        super(transport, Set.of(Commands.ADMIN_STATUS, Commands.ADMIN_METRICS, Commands.ADMIN_REBALANCE));
         this.self = Objects.requireNonNull(self, "self");
         this.leaderView = Objects.requireNonNull(leaderView, "leaderView");
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.localMetricsSupplier = Objects.requireNonNull(localMetricsSupplier, "localMetricsSupplier");
         this.rpc = Objects.requireNonNull(rpc, "rpc");
+        this.rebalancer = Objects.requireNonNull(rebalancer, "rebalancer");
     }
 
     @Override
@@ -76,8 +81,17 @@ public final class AdminRequestHandler extends RequestHandlerSupport {
         return switch (command) {
             case Commands.ADMIN_STATUS -> handleStatus();
             case Commands.ADMIN_METRICS -> handleMetrics((AdminNodeRequest) body);
+            case Commands.ADMIN_REBALANCE -> handleRebalance();
             default -> throw new IllegalArgumentException("Comando não suportado por AdminRequestHandler: " + command);
         };
+    }
+
+    private AdminRebalanceResponse handleRebalance() {
+        if (!leaderView.isLeader()) {
+            return new AdminRebalanceResponse(SeriesStatus.NOT_LEADER, leaderView.leaderId().orElse(null), 0, 0);
+        }
+        Rebalancer.TriggerResult result = rebalancer.triggerNow();
+        return new AdminRebalanceResponse(SeriesStatus.OK, self.value(), result.planned(), result.started());
     }
 
     private AdminStatusResponse handleStatus() {

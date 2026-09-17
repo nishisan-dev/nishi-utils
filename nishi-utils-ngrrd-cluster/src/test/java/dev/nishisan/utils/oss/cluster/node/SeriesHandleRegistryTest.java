@@ -255,6 +255,43 @@ class SeriesHandleRegistryTest {
     }
 
     @Test
+    void forgetMarcaASerieComoEsquecidaEFechaOHandleSemMantelaAberta() {
+        // MIGRATE_FINISH (M3): a origem chama forget() depois de apagar a imagem local — a série deve
+        // sair do registry (como discard) e ficar marcada isForgotten até um novo open() legítimo.
+        SeriesHandleRegistry registry = registry(Duration.ofMinutes(10), 10, Clock.systemUTC());
+        String seriesKey = "device:rb1/iface:eth0";
+        registry.open(seriesKey, yaml, Ngrrd.OpenOptions.defaults());
+
+        registry.forget(seriesKey);
+
+        assertTrue(registry.isForgotten(seriesKey), "forget() deveria marcar a série como esquecida");
+        assertTrue(registry.existing(seriesKey).isEmpty(), "forget() deveria soltar o handle aberto");
+        assertTrue(registry.reopenIfKnown(seriesKey).isEmpty(),
+                "reopenIfKnown não deveria reabrir sozinho uma série esquecida");
+
+        registry.close();
+    }
+
+    @Test
+    void openAposForgetLimpaAMarcaDeEsquecida() {
+        // "confirmação forte" no StorageRequestHandler só chama registry.open() depois de o líder
+        // confirmar ACTIVE(self) — é esse open() legítimo que precisa limpar isForgotten, senão a
+        // série ficaria presa no caminho de placementStrong para sempre, mesmo já reaberta de verdade.
+        SeriesHandleRegistry registry = registry(Duration.ofMinutes(10), 10, Clock.systemUTC());
+        String seriesKey = "device:rb1/iface:eth1";
+        registry.open(seriesKey, yaml, Ngrrd.OpenOptions.defaults());
+        registry.forget(seriesKey);
+        assertTrue(registry.isForgotten(seriesKey));
+
+        registry.open(seriesKey, yaml, Ngrrd.OpenOptions.defaults());
+
+        assertFalse(registry.isForgotten(seriesKey), "open() deveria limpar a marca de esquecida");
+        assertTrue(registry.existing(seriesKey).isPresent());
+
+        registry.close();
+    }
+
+    @Test
     void closeIdleConcorrenteComWithHandleNuncaFechaHandleEmUso() throws InterruptedException {
         // B1+B2: closeIdle() e withHandle() disputam o MESMO lock de entrada — enquanto o
         // checkpoint roda dentro de withHandle, closeIdle deve pular a entrada (tryLock falha),

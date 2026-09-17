@@ -22,6 +22,7 @@ import dev.nishisan.utils.ngrid.structures.NGrid;
 import dev.nishisan.utils.ngrid.structures.NGridCluster;
 import dev.nishisan.utils.ngrid.structures.NGridNode;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
+import dev.nishisan.utils.oss.cluster.catalog.CatalogView;
 import dev.nishisan.utils.oss.cluster.catalog.NodeState;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
@@ -40,7 +41,10 @@ import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -48,6 +52,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Cobre {@link PlacementRequestHandler} sem montar um cluster de vários nós:
@@ -61,6 +66,8 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 class PlacementRequestHandlerTest {
 
     private static final Duration INTERVAL = Duration.ofSeconds(10);
+    /** Janela de graça (seção 0 do M3) usada nestes testes — explícita, não o default de produção. */
+    private static final Duration GRACE = Duration.ofSeconds(3);
 
     private NGridCluster cluster;
     private CatalogService catalog;
@@ -79,7 +86,7 @@ class PlacementRequestHandlerTest {
         leaderView = new LeaderViewFake();
         clock = new MutableClock(Instant.parse("2026-01-01T00:00:00Z"));
         handler = new PlacementRequestHandler(node.transport(), catalog, leaderView,
-                new LeastLoadedPlacementPolicy(), INTERVAL, clock);
+                new LeastLoadedPlacementPolicy(), INTERVAL, GRACE, clock);
     }
 
     @AfterEach
@@ -239,6 +246,9 @@ class PlacementRequestHandlerTest {
 
         leaderView.leader = true;
         handler.onLeaderChanged(NodeId.of("self"));
+        // Passa da janela de graça (seção 0 do M3) — este teste cobre o recompute de pending, não a
+        // janela em si (coberta por testes dedicados).
+        clock.advance(GRACE.plusSeconds(1));
 
         PlaceResponse response = (PlaceResponse) handler.handle(Commands.PLACE,
                 new PlaceRequest("series-nova", "hash-nova", null), NodeId.of("client"));
@@ -270,6 +280,107 @@ class PlacementRequestHandlerTest {
                 new PlaceRequest("series-1", "hash-1", "node-b"), NodeId.of("client"));
 
         assertEquals("node-b", response.placement().ownerNodeId());
+    }
+
+    // ---------------------------------------------------------------- seção 0 do M3
+
+    @Test
+    void handlePlaceDentroDaJanelaDeGracaRecusaCriarNovoPlacement() {
+        leaderView.leader = true;
+        handler.onLeaderChanged(NodeId.of("self"));
+        // Ainda dentro de GRACE (o clock não avançou desde onLeaderChanged) — mesmo com um candidato
+        // disponível, handlePlace deve recusar CRIAR um placement novo (responde NOT_LEADER, o
+        // cliente retenta) em vez de arriscar recriar uma série que o catálogo local ainda não viu.
+        putNode("node-a", 0, clock.millis());
+
+        PlaceResponse response = (PlaceResponse) handler.handle(Commands.PLACE,
+                new PlaceRequest("series-1", "hash-1", null), NodeId.of("client"));
+
+        assertEquals(SeriesStatus.NOT_LEADER, response.status());
+        assertNull(response.placement());
+        assertEquals(Optional.empty(), catalog.placementStrong("series-1"), "nada deveria ter sido gravado");
+    }
+
+    @Test
+    void handlePlaceDentroDaJanelaDeGracaContinuaRespondendoPlacementsJaExistentes() {
+        leaderView.leader = true;
+        putNode("node-a", 0, clock.millis());
+        PlaceResponse before = (PlaceResponse) handler.handle(Commands.PLACE,
+                new PlaceRequest("series-1", "hash-1", null), NodeId.of("client"));
+        assertEquals(SeriesStatus.OK, before.status());
+
+        // Simula um handoff bem no instante seguinte: a série já existe no catálogo antes da janela
+        // começar a contar, então mesmo dentro da janela de graça a resposta deve ser OK, normalmente.
+        handler.onLeaderChanged(NodeId.of("self"));
+
+        PlaceResponse response = (PlaceResponse) handler.handle(Commands.PLACE,
+                new PlaceRequest("series-1", "hash-1", null), NodeId.of("client"));
+
+        assertEquals(SeriesStatus.OK, response.status());
+        assertEquals(before.placement(), response.placement());
+    }
+
+    @Test
+    void handlePlaceAposAJanelaDeGracaCriaNormalmente() {
+        leaderView.leader = true;
+        handler.onLeaderChanged(NodeId.of("self"));
+        clock.advance(GRACE.plusSeconds(1));
+        putNode("node-a", 0, clock.millis());
+
+        PlaceResponse response = (PlaceResponse) handler.handle(Commands.PLACE,
+                new PlaceRequest("series-1", "hash-1", null), NodeId.of("client"));
+
+        assertEquals(SeriesStatus.OK, response.status());
+        assertEquals("node-a", response.placement().ownerNodeId());
+    }
+
+    @Test
+    void putPlacementLancandoRespondeNotLeaderSemGravarNada() {
+        ThrowingCatalogFake fakeCatalog = new ThrowingCatalogFake();
+        fakeCatalog.putNode(new StorageNodeStatus("node-a", NodeState.ACTIVE, 0, 0, 0, clock.millis()));
+        leaderView.leader = true;
+        leaderView.reachable.add("node-a");
+        PlacementRequestHandler throwingHandler = new PlacementRequestHandler(cluster.node(0).transport(),
+                fakeCatalog, leaderView, new LeastLoadedPlacementPolicy(), INTERVAL, Duration.ZERO, clock);
+
+        PlaceResponse response = (PlaceResponse) throwingHandler.handle(Commands.PLACE,
+                new PlaceRequest("series-1", "hash-1", null), NodeId.of("client"));
+
+        assertEquals(SeriesStatus.NOT_LEADER, response.status());
+        assertTrue(fakeCatalog.putAttempted, "putPlacement deveria ter sido tentado");
+        assertTrue(fakeCatalog.placementsLocal().isEmpty(), "nenhum placement deveria ter sido gravado após a falha");
+    }
+
+    /** {@link CatalogView} fake cujo {@code putPlacement} sempre lança (simula {@code LeaderSyncingException}). */
+    private static final class ThrowingCatalogFake implements CatalogView {
+        private final Map<String, StorageNodeStatus> nodes = new LinkedHashMap<>();
+        private final Map<String, SeriesPlacement> placements = new LinkedHashMap<>();
+        private boolean putAttempted;
+
+        void putNode(StorageNodeStatus status) {
+            nodes.put(status.nodeId(), status);
+        }
+
+        @Override
+        public Optional<SeriesPlacement> placementStrong(String seriesKey) {
+            return Optional.ofNullable(placements.get(seriesKey));
+        }
+
+        @Override
+        public Collection<StorageNodeStatus> nodesLocal() {
+            return List.copyOf(nodes.values());
+        }
+
+        @Override
+        public Map<String, SeriesPlacement> placementsLocal() {
+            return Map.copyOf(placements);
+        }
+
+        @Override
+        public void putPlacement(String seriesKey, SeriesPlacement placement) {
+            putAttempted = true;
+            throw new IllegalStateException("simulando LeaderSyncingException do core");
+        }
     }
 
     /** {@link PlacementRequestHandler.LeaderView} fake, sem {@code ClusterCoordinator}/{@code Transport} reais. */

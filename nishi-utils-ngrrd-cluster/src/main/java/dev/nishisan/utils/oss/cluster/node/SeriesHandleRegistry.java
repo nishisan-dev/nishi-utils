@@ -92,6 +92,16 @@ public final class SeriesHandleRegistry implements Closeable {
      * fechamento por ociosidade/LRU); só um novo {@link #open} limpa a marca.
      */
     private final Set<String> closedByClient = ConcurrentHashMap.newKeySet();
+    /**
+     * Séries esquecidas por {@link #forget(String)} — a origem de uma migração concluída
+     * ({@code MIGRATE_FINISH}) marca aqui a chave para fechar em definitivo a corrida "réplica local
+     * atrasada": enquanto marcada, quem decide se um {@code OPEN} pode (re)criar a série neste nó não é
+     * mais a réplica LOCAL do catálogo (que ainda pode dizer {@code ACTIVE(self)} por um instante depois
+     * do FINISH) nem o {@code placementHint} do cliente, e sim uma confirmação forte do líder — ver
+     * {@code StorageRequestHandler#ownership}. Só {@link #open} limpa a marca (a mesma reabertura
+     * legítima que já limpa {@link #closedByClient}), nunca {@link #reopenIfKnown} sozinho.
+     */
+    private final Set<String> forgotten = ConcurrentHashMap.newKeySet();
 
     public SeriesHandleRegistry(BlobVolume volume, String volumeName, Duration idleTtl, int maxOpenHandles,
             Clock clock) {
@@ -147,6 +157,10 @@ public final class SeriesHandleRegistry implements Closeable {
                     cacheDefinition(seriesKey, yaml, options);
                 }
                 closedByClient.remove(seriesKey);
+                // Reabertura legítima: quem chama open() já passou pela checagem forte de dono em
+                // StorageRequestHandler#ownership (isForgotten força placementStrong antes de chegar
+                // aqui) — é o único lugar que limpa a marca de esquecida.
+                forgotten.remove(seriesKey);
                 entry.touch(clock.millis());
                 handle = entry.handle;
                 break;
@@ -302,6 +316,72 @@ public final class SeriesHandleRegistry implements Closeable {
     }
 
     /**
+     * Libera a referência local da série SEM marcar {@link #closedByClient}: checkpoint+close do
+     * handle, se aberto, e remove a entrada — {@link #reopenIfKnown} continua livre para reabri-la
+     * depois. Usado pela migração (M3): o destino chama antes de gravar a imagem recebida (garante
+     * que nenhum handle antigo desta série sobrevive à substituição do arquivo por baixo); a origem
+     * chama após {@code MIGRATE_FINISH} apagar a cópia local. Idempotente.
+     *
+     * <p>Diferente de {@link #close(String)} (fechamento explícito do cliente, que bloqueia
+     * reaberturas automáticas): aqui a série pode voltar a ser aberta livremente — o que a impede,
+     * durante a migração, é {@link #markMigrating}, não esta chamada.</p>
+     */
+    public void discard(String seriesKey) {
+        Objects.requireNonNull(seriesKey, "seriesKey");
+        HandleEntry entry = entries.get(seriesKey);
+        if (entry == null) {
+            return;
+        }
+        entry.lock.lock();
+        try {
+            if (entries.remove(seriesKey, entry)) {
+                closeQuietly(seriesKey, entry.handle);
+            }
+        } finally {
+            entry.lock.unlock();
+        }
+    }
+
+    /**
+     * Como {@link #discard(String)} e, além disso, <strong>esquece a definição</strong> da série:
+     * depois desta chamada {@link #reopenIfKnown} não consegue mais reabri-la sozinho — só um
+     * {@link #open} explícito (com a definição vinda do cliente, e portanto com o dono confirmado por
+     * {@code placementStrong}) traz a série de volta a este nó. Idempotente.
+     *
+     * <p>Defeito que isto corrige (M3, mesma família da seção 0 da spec — recriação de série vazia no
+     * nó errado): a origem chamava {@link #discard} depois de {@code MIGRATE_FINISH} apagar a imagem
+     * local, mas {@code discard} só solta o handle e mantém o YAML/opções em cache. Uma escrita
+     * atrasada do cliente que chegasse à origem logo depois (com a réplica local do catálogo ainda
+     * dizendo {@code ACTIVE} aqui, e sem a marca de {@code migrating}, já limpa pelo FINISH) passava
+     * pelo teste de dono e caía na auto-cura de {@code StorageRequestHandler}, que chamava
+     * {@code reopenIfKnown} — e este RECRIAVA o arquivo da série, vazio, no dono antigo. O resultado é
+     * uma órfã permanente: reproduzido por {@code RebalanceClusterTest} ("imagem ... não deveria mais
+     * existir no dono antigo"). Marcar a série como esquecida fecha o caminho na raiz.</p>
+     */
+    public void forget(String seriesKey) {
+        Objects.requireNonNull(seriesKey, "seriesKey");
+        // Reaproveita o mesmo bloqueio de reabertura automática de close(): o conjunto é consultado
+        // DENTRO do lock da entrada por open()/reopenIfKnown, então não há janela em que uma
+        // reabertura concorrente escape. hashBySeriesKey só é limpo por último — definitionByHash é
+        // compartilhado por todas as séries do mesmo YAML e nunca pode ser removido por uma delas.
+        closedByClient.add(seriesKey);
+        // Marca separada de closedByClient: além de bloquear reopenIfKnown, isForgotten é consultada
+        // por StorageRequestHandler#ownership para nunca confiar na réplica local (nem no hint) de
+        // dono enquanto esta série não for reaberta com confirmação forte do líder.
+        forgotten.add(seriesKey);
+        discard(seriesKey);
+        hashBySeriesKey.remove(seriesKey);
+    }
+
+    /**
+     * Indica se {@code seriesKey} está {@link #forget esquecida} neste nó — só {@link #open} (uma
+     * reabertura legítima, já validada por confirmação forte do dono) limpa a marca.
+     */
+    public boolean isForgotten(String seriesKey) {
+        return forgotten.contains(seriesKey);
+    }
+
+    /**
      * Fecha handles ociosos há mais de {@code idleTtl}. Candidatos são
      * escolhidos por um snapshot ordenado por {@code lastAccess}, sem lock;
      * cada um só é fechado se {@link ReentrantLock#tryLock()} conseguir a
@@ -420,6 +500,20 @@ public final class SeriesHandleRegistry implements Closeable {
     /** Indica se a série está marcada como em migração. */
     public boolean isMigrating(String seriesKey) {
         return migrating.contains(seriesKey);
+    }
+
+    /**
+     * YAML da definição cacheada para {@code seriesKey} (de um {@link #open} ou {@link #reopenIfKnown}
+     * anterior neste processo), se houver. Usado pela migração (M3) para resolver a chave física do
+     * objeto no {@code BlobStorage} ({@code StorageKey.series(objectNaming, seriesKey)}) — a origem de
+     * uma migração sempre serviu a série antes (é o dono ativo), então a definição está garantidamente
+     * em cache quando {@code markMigrating} é chamado no início do {@code MIGRATE_START}.
+     */
+    public Optional<String> cachedYaml(String seriesKey) {
+        Objects.requireNonNull(seriesKey, "seriesKey");
+        String hash = hashBySeriesKey.get(seriesKey);
+        DefinitionRecord definition = hash != null ? definitionByHash.get(hash) : null;
+        return definition != null ? Optional.of(definition.yaml()) : Optional.empty();
     }
 
     /** Fecha (checkpoint+close) todos os handles abertos. */

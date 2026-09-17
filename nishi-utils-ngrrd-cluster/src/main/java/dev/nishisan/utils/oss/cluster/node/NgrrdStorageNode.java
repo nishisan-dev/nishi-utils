@@ -28,6 +28,10 @@ import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
 import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
 import dev.nishisan.utils.oss.cluster.placement.LeastLoadedPlacementPolicy;
+import dev.nishisan.utils.oss.cluster.rebalance.MigrationCoordinator;
+import dev.nishisan.utils.oss.cluster.rebalance.MigrationExecutor;
+import dev.nishisan.utils.oss.cluster.rebalance.RebalanceSettings;
+import dev.nishisan.utils.oss.cluster.rebalance.Rebalancer;
 import dev.nishisan.utils.oss.cluster.rpc.TransportClusterRpc;
 
 import java.io.Closeable;
@@ -49,6 +53,10 @@ public final class NgrrdStorageNode implements Closeable {
     private static final Logger LOGGER = Logger.getLogger(NgrrdStorageNode.class.getName());
 
     private static final String STORAGE_ROLE = "storage";
+    /** Hooks no-op — usado por {@link #start(StorageNodeConfig)} (produção; sem testes de queda do líder). */
+    private static final MigrationCoordinator.MigrationHooks DEFAULT_MIGRATION_HOOKS =
+            new MigrationCoordinator.MigrationHooks() {
+            };
 
     private final StorageNodeConfig config;
     private final BlobVolumeRegistry volumeRegistry;
@@ -61,11 +69,15 @@ public final class NgrrdStorageNode implements Closeable {
     private final PlacementRequestHandler placementHandler;
     private final NodeStatusReporter statusReporter;
     private final AdminRequestHandler adminHandler;
+    private final MigrationExecutor migrationExecutor;
+    private final MigrationCoordinator migrationCoordinator;
+    private final Rebalancer rebalancer;
 
     private NgrrdStorageNode(StorageNodeConfig config, BlobVolumeRegistry volumeRegistry, BlobVolume volume,
             NGridNode node, CatalogService catalog, TransportClusterRpc rpc, SeriesHandleRegistry registry,
             StorageRequestHandler storageHandler, PlacementRequestHandler placementHandler,
-            NodeStatusReporter statusReporter, AdminRequestHandler adminHandler) {
+            NodeStatusReporter statusReporter, AdminRequestHandler adminHandler,
+            MigrationExecutor migrationExecutor, MigrationCoordinator migrationCoordinator, Rebalancer rebalancer) {
         this.config = config;
         this.volumeRegistry = volumeRegistry;
         this.volume = volume;
@@ -77,6 +89,9 @@ public final class NgrrdStorageNode implements Closeable {
         this.placementHandler = placementHandler;
         this.statusReporter = statusReporter;
         this.adminHandler = adminHandler;
+        this.migrationExecutor = migrationExecutor;
+        this.migrationCoordinator = migrationCoordinator;
+        this.rebalancer = rebalancer;
     }
 
     /**
@@ -89,7 +104,18 @@ public final class NgrrdStorageNode implements Closeable {
      * {@code NGridNode}.</p>
      */
     public static NgrrdStorageNode start(StorageNodeConfig cfg) throws IOException {
+        return start(cfg, DEFAULT_MIGRATION_HOOKS);
+    }
+
+    /**
+     * Como {@link #start(StorageNodeConfig)}, mas injetando {@code migrationHooks} no
+     * {@link MigrationCoordinator} deste nó — usado exclusivamente pelos testes de queda do líder
+     * durante uma migração (ver Javadoc de {@link MigrationCoordinator.MigrationHooks}).
+     */
+    public static NgrrdStorageNode start(StorageNodeConfig cfg, MigrationCoordinator.MigrationHooks migrationHooks)
+            throws IOException {
         Objects.requireNonNull(cfg, "cfg");
+        Objects.requireNonNull(migrationHooks, "migrationHooks");
 
         BlobVolumeRegistry volumeRegistry = NgrrdBlob.registry()
                 .basePath(cfg.volumeDir())
@@ -105,7 +131,17 @@ public final class NgrrdStorageNode implements Closeable {
                     .id(cfg.nodeId())
                     .priority(cfg.priority())
                     .roles(STORAGE_ROLE)
-                    .dataDir(cfg.dataDir());
+                    .dataDir(cfg.dataDir())
+                    // Mitiga a deferência mútua a três (D9/D10c) que trava a sincronização do 3º nó
+                    // (achado desta sessão em RebalanceClusterTest/PlacementUnderLeaderChurnClusterTest):
+                    // dá tempo do nó recém-subido descobrir peers e watermarks antes de se autoeleger.
+                    // O cliente não passa por aqui (é inelegível para liderança, não precisa da janela).
+                    .bootDiscoveryWindow(cfg.bootDiscoveryWindow())
+                    // Handback orquestrado (D11): sem ele, o nó de maior afinidade que volta reassume
+                    // por watermark enquanto o incumbente ainda produz — dois líderes, e o D10c descarta
+                    // a cauda do perdedor (flips do catálogo já confirmados sumiam e a série migrada era
+                    // recriada vazia na origem — achado do RebalanceClusterTest com log FINE).
+                    .affinityHandbackMode(cfg.affinityHandbackMode());
             CatalogService.declareMaps(builder);
             if (cfg.seed() != null) {
                 builder.seed(cfg.seed());
@@ -142,27 +178,54 @@ public final class NgrrdStorageNode implements Closeable {
                 PlacementRequestHandler.LeaderView leaderView =
                         PlacementRequestHandler.fromCoordinator(node.coordinator(), node.transport());
                 PlacementRequestHandler placementHandler = new PlacementRequestHandler(node.transport(), catalog,
-                        leaderView, new LeastLoadedPlacementPolicy(), cfg.nodeStatusStaleAfter(), Clock.systemUTC());
+                        leaderView, new LeastLoadedPlacementPolicy(), cfg.nodeStatusStaleAfter(),
+                        cfg.placementGraceAfterLeadership(), Clock.systemUTC());
+
+                MigrationExecutor migrationExecutor = new MigrationExecutor(node.transport(), registry, volume, rpc,
+                        catalog, self, cfg.migrationChunkBytes(), cfg.maxSeriesBytes(), Clock.systemUTC());
+                MigrationCoordinator migrationCoordinator = new MigrationCoordinator(catalog, rpc, leaderView,
+                        cfg.maxConcurrentMigrations(), cfg.migrationStatusPollInterval(), cfg.migrationTimeout(),
+                        Clock.systemUTC(), migrationHooks);
+                RebalanceSettings rebalanceSettings = new RebalanceSettings(cfg.rebalanceMinDelta(),
+                        cfg.rebalanceTolerance(), cfg.maxMovesPerCycle());
+                Rebalancer rebalancer = new Rebalancer(catalog, leaderView, migrationCoordinator, rebalanceSettings,
+                        cfg.rebalanceEnabled(), cfg.rebalanceInterval(), cfg.migrationTimeout(), Clock.systemUTC());
 
                 NodeStatusReporter statusReporter = new NodeStatusReporter(catalog, volume, registry, cfg.nodeId(),
                         cfg.capacityBytes(), cfg.statusReportInterval(), Clock.systemUTC(),
-                        storageHandler::metricsSnapshot, node.coordinator()::isLeader, cfg.metricsListener());
+                        storageHandler::metricsSnapshot, node.coordinator()::isLeader, cfg.metricsListener(),
+                        migrationExecutor, cfg.migrationTimeout());
                 AdminRequestHandler adminHandler = new AdminRequestHandler(node.transport(), self, leaderView,
-                        catalog, statusReporter::metricsSnapshot, rpc);
+                        catalog, statusReporter::metricsSnapshot, rpc, rebalancer);
 
                 node.transport().addListener(storageHandler);
                 node.transport().addListener(placementHandler);
                 node.transport().addListener(adminHandler);
+                node.transport().addListener(migrationExecutor);
                 node.coordinator().addLeadershipListener(placementHandler);
+                node.coordinator().addLeadershipListener(migrationCoordinator);
+                node.coordinator().addLeadershipListener(rebalancer);
+                node.coordinator().addMembershipListener(rebalancer);
                 rpc.registerLocalHandler(storageHandler);
                 rpc.registerLocalHandler(placementHandler);
                 rpc.registerLocalHandler(adminHandler);
+                rpc.registerLocalHandler(migrationExecutor);
 
                 node.coordinator().addLeadershipListener(statusReporter);
                 statusReporter.start();
 
+                // Seed: addLeadershipListener não dispara um callback sintético para quem já registra o
+                // listener com o nó JÁ líder — ex.: o primeiro líder eleito de um cluster recém-formado,
+                // decidido durante builder.start() acima, ANTES deste registro. Sem isto,
+                // migrationCoordinator/rebalancer deste nó nunca saberiam que já são líder até a PRÓXIMA
+                // troca de liderança (se houver alguma) — nenhuma migração nem rebalanceamento automático
+                // rodaria nele enquanto ele seguisse líder ininterruptamente desde o início.
+                migrationCoordinator.onLeaderChanged(self);
+                rebalancer.onLeaderChanged(self);
+
                 return new NgrrdStorageNode(cfg, volumeRegistry, volume, node, catalog, rpc, registry,
-                        storageHandler, placementHandler, statusReporter, adminHandler);
+                        storageHandler, placementHandler, statusReporter, adminHandler, migrationExecutor,
+                        migrationCoordinator, rebalancer);
             } catch (RuntimeException e) {
                 try {
                     node.close();
@@ -213,6 +276,18 @@ public final class NgrrdStorageNode implements Closeable {
         return config;
     }
 
+    public MigrationExecutor migrationExecutor() {
+        return migrationExecutor;
+    }
+
+    public MigrationCoordinator migrationCoordinator() {
+        return migrationCoordinator;
+    }
+
+    public Rebalancer rebalancer() {
+        return rebalancer;
+    }
+
     /** Snapshot completo das métricas operacionais deste nó (ver {@link NodeMetricsSnapshot}). */
     public NodeMetricsSnapshot metricsSnapshot() {
         return statusReporter.metricsSnapshot();
@@ -231,15 +306,23 @@ public final class NgrrdStorageNode implements Closeable {
     @Override
     public void close() {
         safely("status reporter", statusReporter::close);
+        safely("rebalancer", rebalancer::close);
+        safely("migration coordinator", migrationCoordinator::close);
+        safely("migration executor", migrationExecutor::close);
         safely("handlers", () -> {
             node.transport().removeListener(storageHandler);
             node.transport().removeListener(placementHandler);
             node.transport().removeListener(adminHandler);
+            node.transport().removeListener(migrationExecutor);
             node.coordinator().removeLeadershipListener(placementHandler);
+            node.coordinator().removeLeadershipListener(migrationCoordinator);
+            node.coordinator().removeLeadershipListener(rebalancer);
+            node.coordinator().removeMembershipListener(rebalancer);
             node.coordinator().removeLeadershipListener(statusReporter);
             rpc.unregisterLocalHandler(storageHandler);
             rpc.unregisterLocalHandler(placementHandler);
             rpc.unregisterLocalHandler(adminHandler);
+            rpc.unregisterLocalHandler(migrationExecutor);
         });
         safely("series handle registry", registry::close);
         safely("NGrid node", () -> {

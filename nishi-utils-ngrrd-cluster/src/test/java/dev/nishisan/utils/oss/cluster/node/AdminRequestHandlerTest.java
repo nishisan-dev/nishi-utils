@@ -29,15 +29,21 @@ import dev.nishisan.utils.oss.cluster.metrics.BlobVolumeSummary;
 import dev.nishisan.utils.oss.cluster.metrics.LatencySnapshot;
 import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
 import dev.nishisan.utils.oss.cluster.protocol.AdminNodeRequest;
+import dev.nishisan.utils.oss.cluster.protocol.AdminRebalanceResponse;
 import dev.nishisan.utils.oss.cluster.protocol.AdminStatusResponse;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.protocol.NodeStatusView;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesStatus;
+import dev.nishisan.utils.oss.cluster.rebalance.MigrationCoordinator;
+import dev.nishisan.utils.oss.cluster.rebalance.RebalanceSettings;
+import dev.nishisan.utils.oss.cluster.rebalance.Rebalancer;
 import dev.nishisan.utils.oss.cluster.rpc.ClusterRpc;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.time.Clock;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -69,6 +75,8 @@ class AdminRequestHandlerTest {
     private RecordingRpc rpc;
     private NodeMetricsSnapshot localSnapshot;
     private AdminRequestHandler handler;
+    private MigrationCoordinator coordinator;
+    private Rebalancer rebalancer;
 
     @BeforeEach
     void setUp() throws Exception {
@@ -81,11 +89,18 @@ class AdminRequestHandlerTest {
         leaderView = new LeaderViewFake();
         rpc = new RecordingRpc();
         localSnapshot = fixedSnapshot(SELF.value());
-        handler = new AdminRequestHandler(node.transport(), SELF, leaderView, catalog, () -> localSnapshot, rpc);
+        coordinator = new MigrationCoordinator(catalog, rpc, leaderView, 2, Duration.ofMillis(10),
+                Duration.ofSeconds(5), Clock.systemUTC());
+        rebalancer = new Rebalancer(catalog, leaderView, coordinator, new RebalanceSettings(50L, 0.10, 50), false,
+                Duration.ofSeconds(60), Duration.ofSeconds(5), Clock.systemUTC());
+        handler = new AdminRequestHandler(node.transport(), SELF, leaderView, catalog, () -> localSnapshot, rpc,
+                rebalancer);
     }
 
     @AfterEach
     void tearDown() throws Exception {
+        rebalancer.close();
+        coordinator.close();
         cluster.close();
     }
 
@@ -170,6 +185,32 @@ class AdminRequestHandlerTest {
         assertThrows(IllegalStateException.class, () -> handler.handle(Commands.ADMIN_METRICS,
                 new AdminNodeRequest("storage-c", true), CLIENT));
         assertTrue(rpc.calls.isEmpty(), "não deveria nem tentar um segundo encaminhamento");
+    }
+
+    @Test
+    void rebalanceForaDoLiderRespondeNotLeaderComOIdDoLiderConhecido() {
+        leaderView.leader = false;
+        leaderView.leaderId = Optional.of("storage-b");
+
+        AdminRebalanceResponse response =
+                (AdminRebalanceResponse) handler.handle(Commands.ADMIN_REBALANCE, null, CLIENT);
+
+        assertEquals(SeriesStatus.NOT_LEADER, response.status());
+        assertEquals("storage-b", response.leaderNodeId());
+    }
+
+    @Test
+    void rebalanceNoLiderDisparaCicloEDevolvePlanejadoEIniciado() {
+        leaderView.leader = true;
+
+        AdminRebalanceResponse response =
+                (AdminRebalanceResponse) handler.handle(Commands.ADMIN_REBALANCE, null, CLIENT);
+
+        assertEquals(SeriesStatus.OK, response.status());
+        assertEquals(SELF.value(), response.leaderNodeId());
+        // Catálogo vazio (nenhum StorageNodeStatus/placement registrado neste teste) -> nada a mover.
+        assertEquals(0, response.planned());
+        assertEquals(0, response.started());
     }
 
     /** {@link PlacementRequestHandler.LeaderView} fake, sem {@code ClusterCoordinator}/{@code Transport} reais. */

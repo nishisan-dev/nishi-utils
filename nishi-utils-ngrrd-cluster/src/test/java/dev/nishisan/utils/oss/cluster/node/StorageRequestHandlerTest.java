@@ -141,14 +141,49 @@ class StorageRequestHandlerTest {
     }
 
     @Test
-    void semPlacementMasComHintDoDonoAtualAceitaComoOk() {
-        String seriesKey = "series-hint";
+    void hintConfirmadoPeloLiderAceitaComoOk() {
+        // Seção 0 do M3: o hint por si só NUNCA basta — só é aceito quando placementStrong (round-trip
+        // real ao líder) confirma o MESMO dono. Réplica local ainda vazia (ex.: corrida líder→dono logo
+        // após um PLACE), simulada via putStrongOnly.
+        String seriesKey = "series-hint-confirmado";
         SeriesPlacement hint = SeriesPlacement.active(SELF.value(), 1_000L);
+        placementLookup.putStrongOnly(seriesKey, hint);
 
         SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
                 openRequest(seriesKey, hint), SOURCE);
 
         assertEquals(SeriesStatus.OK, response.status());
+    }
+
+    @Test
+    void hintNaoConfirmadoPeloLiderRespondeWrongOwner() {
+        // Seção 0 do M3 (defeito pré-existente corrigido): sob churn de liderança, o líder pode "não
+        // achar" uma série já colocada e mandar um hint de um dono errado — sem confirmação de
+        // placementStrong, aceitar o hint criaria uma cópia vazia no lugar errado (dados órfãos no
+        // dono verdadeiro). O líder aqui não conhece a série (nem no hint, nem noutro dono).
+        String seriesKey = "series-hint-nao-confirmado";
+        SeriesPlacement hint = SeriesPlacement.active(SELF.value(), 1_000L);
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequest(seriesKey, hint), SOURCE);
+
+        assertEquals(SeriesStatus.WRONG_OWNER, response.status());
+        assertNull(response.ownerNodeId());
+        assertFalse(registry.isOpen(seriesKey), "OPEN não deveria ter criado uma série vazia sem confirmação do líder");
+    }
+
+    @Test
+    void hintDeUmDonoMasLiderConfirmaOutroRespondeWrongOwnerComODonoCorreto() {
+        String seriesKey = "series-hint-divergente";
+        SeriesPlacement hint = SeriesPlacement.active(SELF.value(), 1_000L);
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.active(OTHER.value(), 1_000L));
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequest(seriesKey, hint), SOURCE);
+
+        assertEquals(SeriesStatus.WRONG_OWNER, response.status());
+        assertEquals(OTHER.value(), response.ownerNodeId());
+        assertFalse(registry.isOpen(seriesKey));
     }
 
     @Test
@@ -199,6 +234,21 @@ class StorageRequestHandlerTest {
 
         assertEquals(SeriesStatus.WRONG_OWNER, response.status());
         assertEquals(OTHER.value(), response.ownerNodeId());
+    }
+
+    @Test
+    void writeBatchComDonoConfirmadoMasSemDefinicaoCachedaNaoCriaSerieNoVolume() {
+        // Seção 0 do M3: "writeBatch/read nunca criam" — mesmo com o líder confirmando este nó como
+        // dono, sem handle aberto nem definição em cache (registry.reopenIfKnown não tem o que reabrir)
+        // o self-healing decide NOT_OPEN, nunca cria a série do zero a partir de um WRITE_BATCH.
+        String seriesKey = "series-write-sem-definicao";
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+
+        WriteBatchRequest batch = new WriteBatchRequest(List.of(new SeriesWrite(seriesKey, "in_octets", 1_000L, 1d)));
+        WriteBatchResponse response = (WriteBatchResponse) handler.handle(Commands.WRITE_BATCH, batch, SOURCE);
+
+        assertEquals(Map.of(seriesKey, SeriesStatus.NOT_OPEN), response.statusBySeries());
+        assertFalse(registry.isOpen(seriesKey), "WRITE_BATCH não deveria ter criado a série no volume");
     }
 
     @Test
@@ -275,6 +325,46 @@ class StorageRequestHandlerTest {
 
         assertEquals(SeriesStatus.MIGRATING, response.status());
         assertEquals(SELF.value(), response.ownerNodeId());
+    }
+
+    @Test
+    void serieEsquecidaComReplicaLocalDesatualizadaEliderConfirmandoOutroDonoRespondeWrongOwner() {
+        // Próximo passo do M3: depois de um MIGRATE_FINISH (simulado aqui por registry.forget), a
+        // réplica LOCAL do catálogo pode continuar dizendo ACTIVE(self) por um instante — ownership()
+        // não pode confiar nela (nem no hint, ausente aqui) enquanto a série estiver isForgotten; só
+        // placementStrong decide, e o líder já confirma o novo dono (OTHER).
+        String seriesKey = "series-migrada-replica-local-atrasada";
+        placementLookup.put(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+        handler.handle(Commands.OPEN, openRequest(seriesKey, null), SOURCE);
+        registry.forget(seriesKey);
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.active(OTHER.value(), 2_000L));
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequest(seriesKey, null), SOURCE);
+
+        assertEquals(SeriesStatus.WRONG_OWNER, response.status());
+        assertEquals(OTHER.value(), response.ownerNodeId());
+        assertFalse(registry.isOpen(seriesKey),
+                "OPEN não deveria recriar a série esquecida sem confirmação forte do líder");
+    }
+
+    @Test
+    void serieEsquecidaComLiderConfirmandoSelfAbreEDesmarcaEsquecida() {
+        // Caso simétrico: a série voltou a este nó de verdade (ex.: um rebalanceamento posterior) e o
+        // líder confirma ACTIVE(self) — o OPEN deve prosseguir e a marca de esquecida deve ser limpa.
+        String seriesKey = "series-migrada-de-volta";
+        placementLookup.put(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+        handler.handle(Commands.OPEN, openRequest(seriesKey, null), SOURCE);
+        registry.forget(seriesKey);
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.active(SELF.value(), 3_000L));
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequest(seriesKey, null), SOURCE);
+
+        assertEquals(SeriesStatus.OK, response.status());
+        assertFalse(registry.isForgotten(seriesKey),
+                "a marca de esquecida deveria ter sido limpa após a confirmação forte do líder");
+        assertTrue(registry.isOpen(seriesKey));
     }
 
     @Test

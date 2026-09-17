@@ -390,6 +390,9 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
         if (registry.isMigrating(seriesKey)) {
             return new Ownership(SeriesStatus.MIGRATING, null);
         }
+        if (registry.isForgotten(seriesKey)) {
+            return ownershipForgotten(seriesKey);
+        }
         Optional<SeriesPlacement> placement = placementLookup.placementLocal(seriesKey);
         if (placement.isPresent()) {
             SeriesPlacement current = placement.get();
@@ -401,17 +404,31 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
             }
             return new Ownership(SeriesStatus.OK, current.ownerNodeId());
         }
-        if (placementHint != null && placementHint.isOwnedBy(self.value())) {
-            return new Ownership(SeriesStatus.OK, placementHint.ownerNodeId());
-        }
         if (registry.isOpen(seriesKey)) {
             return new Ownership(SeriesStatus.OK, self.value());
         }
+        // Seção 0 do M3 (achado do Refuter do M2, reproduzido A/B): sob churn de liderança, o líder
+        // pode não encontrar no catálogo uma série já colocada (réplica local do novo líder ainda
+        // convergindo) e criar um placement NOVO noutro nó; o cliente então abre a série aqui com um
+        // placementHint que, se aceito de cara, faz este open() criar uma cópia VAZIA no lugar errado
+        // — o catálogo passa a apontar para ela e os dados reais ficam órfãos no dono antigo. Por isso
+        // o hint NUNCA é aceito por si só: serve apenas de atalho para consultar o líder já sabendo
+        // qual dono verificar — quem decide é sempre placementStrong (round-trip real ao líder).
+        if (placementHint != null) {
+            Optional<SeriesPlacement> strong = placementLookup.placementStrong(seriesKey);
+            if (strong.isPresent() && strong.get().isOwnedBy(self.value())) {
+                negativeLookupCacheExpiryMs.remove(seriesKey);
+                return new Ownership(SeriesStatus.OK, strong.get().ownerNodeId());
+            }
+            // Sem confirmação do líder (nem para o hint, nem para outro dono) — WRONG_OWNER com o dono
+            // que o líder de fato conhece (pode ser null, se a série realmente ainda não existe lá).
+            return new Ownership(SeriesStatus.WRONG_OWNER, strong.map(SeriesPlacement::ownerNodeId).orElse(null));
+        }
         // Réplica local vazia (ex.: logo após um restart, antes do catálogo persistido convergir via
-        // replicação) e nem o placementHint nem o registry local confirmam o dono: consulta o líder
-        // (placementStrong) antes de desistir. NUNCA responder WRONG_OWNER(null) só porque a cópia
-        // local está vazia — era exatamente isso que fazia o WriteDispatcher do cliente re-enfileirar
-        // para sempre num nó que, na verdade, é o dono correto (ver F1.2 do achado do Debugger).
+        // replicação) e o registry local não confirma o dono: consulta o líder (placementStrong) antes
+        // de desistir. NUNCA responder WRONG_OWNER(null) só porque a cópia local está vazia — era
+        // exatamente isso que fazia o WriteDispatcher do cliente re-enfileirar para sempre num nó que,
+        // na verdade, é o dono correto (ver F1.2 do achado do Debugger).
         long now = clock.millis();
         Long negativeCacheExpiry = negativeLookupCacheExpiryMs.get(seriesKey);
         if (negativeCacheExpiry != null) {
@@ -438,6 +455,27 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
         // não tinha a série aberta) — o self-healing do write/read/checkpoint decide NOT_OPEN a partir
         // daqui; open() sempre tem a definição YAML no corpo da requisição.
         return new Ownership(SeriesStatus.OK, current.ownerNodeId());
+    }
+
+    /**
+     * Próximo passo do M3 (mesma família da seção 0): depois de {@code MIGRATE_FINISH} a origem chama
+     * {@link SeriesHandleRegistry#forget}, mas a réplica LOCAL do catálogo pode continuar dizendo
+     * {@code ACTIVE(self)} por um instante — se {@link #ownership} confiasse nela (ou no {@code
+     * placementHint} do cliente) para uma série esquecida, um {@code OPEN} nessa janela recriaria a
+     * série VAZIA aqui, exatamente o defeito da seção 0, só que pelo caminho da réplica local em vez do
+     * hint. Por isso, enquanto {@link SeriesHandleRegistry#isForgotten} for verdadeiro, nem {@code
+     * placementLocal} nem o hint são consultados: só {@code placementStrong} (round-trip real ao líder)
+     * decide. Se o líder confirmar {@code ACTIVE(self)}, o {@code OPEN} pode prosseguir — a marca é
+     * limpa por {@link SeriesHandleRegistry#open} quando o handler efetivamente reabre a série; qualquer
+     * outro resultado responde {@code WRONG_OWNER} com o dono que o líder de fato conhece.
+     */
+    private Ownership ownershipForgotten(String seriesKey) {
+        Optional<SeriesPlacement> strong = placementLookup.placementStrong(seriesKey);
+        if (strong.isPresent() && strong.get().isOwnedBy(self.value())) {
+            negativeLookupCacheExpiryMs.remove(seriesKey);
+            return new Ownership(SeriesStatus.OK, strong.get().ownerNodeId());
+        }
+        return new Ownership(SeriesStatus.WRONG_OWNER, strong.map(SeriesPlacement::ownerNodeId).orElse(null));
     }
 
     /**
