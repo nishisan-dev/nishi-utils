@@ -1,0 +1,352 @@
+/*
+ *  Copyright (C) 2020-2025 Lucas Nishimura <lucas.nishimura at gmail.com>
+ *
+ *  This program is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program.  If not, see <https://www.gnu.org/licenses/>
+ */
+
+package dev.nishisan.utils.oss.cluster.client;
+
+import dev.nishisan.utils.ngrid.common.NodeId;
+import dev.nishisan.utils.ngrid.common.NodeInfo;
+import dev.nishisan.utils.ngrid.structures.NGrid;
+import dev.nishisan.utils.ngrid.structures.NGridNode;
+import dev.nishisan.utils.ngrid.structures.NGridNodeBuilder;
+import dev.nishisan.utils.oss.Ngrrd;
+import dev.nishisan.utils.oss.NgrrdHandle;
+import dev.nishisan.utils.oss.cluster.api.ClientMetricsSnapshot;
+import dev.nishisan.utils.oss.cluster.api.ErrorCode;
+import dev.nishisan.utils.oss.cluster.api.NgrrdClusterClient;
+import dev.nishisan.utils.oss.cluster.api.NgrrdClusterConfig;
+import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
+import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
+import dev.nishisan.utils.oss.cluster.rpc.TransportClusterRpc;
+import dev.nishisan.utils.oss.format.DefinitionHash;
+
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Clock;
+import java.time.Duration;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import java.util.stream.Stream;
+
+/**
+ * Implementação padrão de {@link NgrrdClusterClient}: entra no cluster NGrid
+ * como membro sem volume ({@code client} + {@link NodeInfo#ROLE_LEADER_INELIGIBLE}),
+ * monta os colaboradores ({@link PlacementResolver}, {@link WriteDispatcher})
+ * e devolve {@link RemoteSeriesHandle} por série, com deduplicação por
+ * {@code seriesKey}.
+ */
+public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
+
+    private static final Logger LOGGER = Logger.getLogger(DefaultNgrrdClusterClient.class.getName());
+    private static final long LEADER_POLL_INTERVAL_MS = 50L;
+    private static final String CLIENT_ROLE = "client";
+    /** Mesmo papel usado por {@code NgrrdStorageNode} para se anunciar ao cluster. */
+    private static final String STORAGE_ROLE = "storage";
+
+    private final NgrrdClusterConfig config;
+    private final NGridNode node;
+    private final Path dataDir;
+    private final boolean temporaryDataDir;
+    private final TransportClusterRpc rpc;
+    private final PlacementResolver resolver;
+    private final WriteDispatcher dispatcher;
+    private final ConcurrentMap<String, RemoteSeriesHandle> handles;
+    /**
+     * item 10 (achado do Refuter): lock por {@code seriesKey} usado só para serializar aberturas
+     * concorrentes DA MESMA série — ver {@link #open(String, Map, Ngrrd.OpenOptions)}.
+     */
+    private final ConcurrentMap<String, Object> openLocks;
+
+    private volatile boolean closed;
+
+    private DefaultNgrrdClusterClient(NgrrdClusterConfig config, NGridNode node, Path dataDir,
+            boolean temporaryDataDir, TransportClusterRpc rpc, PlacementResolver resolver,
+            WriteDispatcher dispatcher, ConcurrentMap<String, RemoteSeriesHandle> handles) {
+        this.config = config;
+        this.node = node;
+        this.dataDir = dataDir;
+        this.temporaryDataDir = temporaryDataDir;
+        this.rpc = rpc;
+        this.resolver = resolver;
+        this.dispatcher = dispatcher;
+        this.handles = handles;
+        this.openLocks = new ConcurrentHashMap<>();
+    }
+
+    /** Conecta ao cluster ngrrd e devolve um cliente pronto para {@link #open}. */
+    public static DefaultNgrrdClusterClient connect(NgrrdClusterConfig cfg) {
+        Objects.requireNonNull(cfg, "cfg");
+        Path dataDir;
+        boolean temporaryDataDir;
+        try {
+            if (cfg.dataDir() != null) {
+                Files.createDirectories(cfg.dataDir());
+                dataDir = cfg.dataDir();
+                temporaryDataDir = false;
+            } else {
+                dataDir = Files.createTempDirectory("ngrrd-client");
+                temporaryDataDir = true;
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException("falha ao preparar o dataDir do cliente ngrrd", e);
+        }
+
+        NGridNodeBuilder builder = NGrid.node(cfg.host(), cfg.port())
+                .id(cfg.clientId())
+                .priority(0)
+                .roles(CLIENT_ROLE, NodeInfo.ROLE_LEADER_INELIGIBLE)
+                .dataDir(dataDir);
+        CatalogService.declareMaps(builder);
+        if (cfg.seed() != null && !cfg.seed().isBlank()) {
+            builder.seed(cfg.seed());
+        }
+        if (!cfg.peers().isEmpty()) {
+            builder.peers(cfg.peers().toArray(new String[0]));
+        }
+
+        NGridNode node;
+        try {
+            node = builder.start();
+        } catch (IOException e) {
+            throw new UncheckedIOException("falha ao iniciar o nó cliente do cluster ngrrd", e);
+        }
+        try {
+            awaitLeaderOrThrow(node, cfg.leaderWaitTimeout());
+            awaitStorageConnectionsOrThrow(node, cfg.leaderWaitTimeout());
+
+            CatalogService catalog = CatalogService.from(node);
+            TransportClusterRpc rpc = new TransportClusterRpc(node.transport(), node.coordinator(),
+                    cfg.requestTimeout());
+            RetryPolicy leaderRetry = new RetryPolicy(cfg.leaderWaitTimeout(), cfg.retryBackoffMin(),
+                    cfg.retryBackoffMax());
+            PlacementResolver resolver = new PlacementResolver(catalog, rpc, leaderRetry, Clock.systemUTC());
+
+            ConcurrentMap<String, RemoteSeriesHandle> handles = new ConcurrentHashMap<>();
+            RetryPolicy opRetry = new RetryPolicy(cfg.retryTimeout(), cfg.retryBackoffMin(), cfg.retryBackoffMax());
+            WriteDispatcher dispatcher = new WriteDispatcher(rpc, resolver, opRetry, cfg.batchMaxSamples(),
+                    cfg.batchMaxDelay(), cfg.maxBufferedSamplesPerNode(), cfg.bufferFullPolicy(),
+                    cfg.requestTimeout(), seriesKey -> {
+                        RemoteSeriesHandle handle = handles.get(seriesKey);
+                        return handle != null && handle.reopen();
+                    }, Clock.systemUTC());
+            return new DefaultNgrrdClusterClient(cfg, node, dataDir, temporaryDataDir, rpc, resolver, dispatcher,
+                    handles);
+        } catch (RuntimeException e) {
+            try {
+                node.close();
+            } catch (IOException | RuntimeException closeError) {
+                e.addSuppressed(closeError);
+            }
+            throw e;
+        }
+    }
+
+    private static void awaitLeaderOrThrow(NGridNode node, Duration timeout) {
+        long deadline = System.currentTimeMillis() + timeout.toMillis();
+        Optional<NodeInfo> leader = node.coordinator().leaderInfo();
+        while (leader.isEmpty() && System.currentTimeMillis() < deadline) {
+            try {
+                Thread.sleep(LEADER_POLL_INTERVAL_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new NgrrdClusterException(ErrorCode.NO_LEADER, "interrompido aguardando líder do cluster", e);
+            }
+            leader = node.coordinator().leaderInfo();
+        }
+        if (leader.isEmpty()) {
+            throw new NgrrdClusterException(ErrorCode.NO_LEADER,
+                    "nenhum líder eleito ao conectar em " + timeout);
+        }
+    }
+
+    /**
+     * B3(i) (achado do Refuter): esperar só o líder estar eleito não bastava — o cliente podia ficar
+     * "pronto" antes do {@code Transport} TCP terminar de conectar com algum storage node, e a 1a
+     * chamada RPC para esse nó falhava com "No connection available for storage-N" (o segundo cliente
+     * de {@code DistributedWriteReadClusterTest} chegou a esperar até 60s antes desta correção).
+     * Espera explicitamente {@code transport.isConnected(id)} para TODO membro ativo com papel
+     * {@code "storage"} — não só o líder — antes de liberar o cliente para uso.
+     */
+    private static void awaitStorageConnectionsOrThrow(NGridNode node, Duration timeout) {
+        long deadline = System.currentTimeMillis() + timeout.toMillis();
+        List<NodeId> disconnected = disconnectedStorageMembers(node);
+        while (!disconnected.isEmpty() && System.currentTimeMillis() < deadline) {
+            try {
+                Thread.sleep(LEADER_POLL_INTERVAL_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new NgrrdClusterException(ErrorCode.TIMEOUT,
+                        "interrompido aguardando conexão de transporte com os storage nodes", e);
+            }
+            disconnected = disconnectedStorageMembers(node);
+        }
+        if (!disconnected.isEmpty()) {
+            throw new NgrrdClusterException(ErrorCode.TIMEOUT,
+                    "conexão de transporte não estabelecida a tempo (" + timeout + ") com os storage nodes "
+                            + disconnected);
+        }
+    }
+
+    private static List<NodeId> disconnectedStorageMembers(NGridNode node) {
+        return node.coordinator().activeMembers().stream()
+                .filter(info -> info.roles().contains(STORAGE_ROLE))
+                .map(NodeInfo::nodeId)
+                .filter(id -> !node.transport().isConnected(id))
+                .toList();
+    }
+
+    @Override
+    public NgrrdHandle open(String yaml, Map<String, String> tags) {
+        return open(yaml, tags, Ngrrd.OpenOptions.defaults());
+    }
+
+    @Override
+    public NgrrdHandle open(String yaml, Map<String, String> tags, Ngrrd.OpenOptions options) {
+        ensureOpen();
+        Objects.requireNonNull(yaml, "yaml");
+        Objects.requireNonNull(tags, "tags");
+        String template = SeriesKeyTemplate.templateOf(yaml);
+        String seriesKey = SeriesKeyTemplate.resolve(template, tags);
+        RemoteSeriesHandle existing = handles.get(seriesKey);
+        if (existing != null) {
+            return existing;
+        }
+        // item 10 (achado do Refuter): nunca fazer RPC dentro de computeIfAbsent — isso mantinha o bin
+        // lock interno do ConcurrentHashMap preso durante toda a chamada de rede de openNewHandle
+        // (OPEN no dono), bloqueando get()/put() de QUALQUER OUTRA série neste mesmo mapa até a rede
+        // responder. Em vez disso, um lock por seriesKey (openLocks, construído sem I/O) serializa só
+        // as aberturas concorrentes DA MESMA série; handles só é tocado com get/put simples.
+        Object lock = openLocks.computeIfAbsent(seriesKey, key -> new Object());
+        try {
+            synchronized (lock) {
+                existing = handles.get(seriesKey);
+                if (existing != null) {
+                    return existing;
+                }
+                RemoteSeriesHandle handle = openNewHandle(seriesKey, yaml, tags, options);
+                handles.put(seriesKey, handle);
+                return handle;
+            }
+        } finally {
+            openLocks.remove(seriesKey, lock);
+        }
+    }
+
+    @Override
+    public NgrrdHandle open(Path yamlFile, Map<String, String> tags) {
+        Objects.requireNonNull(yamlFile, "yamlFile");
+        try {
+            String yaml = Files.readString(yamlFile, StandardCharsets.UTF_8);
+            return open(yaml, tags);
+        } catch (IOException e) {
+            throw new UncheckedIOException("falha ao ler a definição YAML: " + yamlFile, e);
+        }
+    }
+
+    private RemoteSeriesHandle openNewHandle(String seriesKey, String yaml, Map<String, String> tags,
+            Ngrrd.OpenOptions options) {
+        String definitionHashHex = DefinitionHash.hex(yaml);
+        RetryPolicy opRetry = new RetryPolicy(config.retryTimeout(), config.retryBackoffMin(),
+                config.retryBackoffMax());
+        RemoteSeriesHandle handle = new RemoteSeriesHandle(seriesKey, yaml, definitionHashHex, tags, options,
+                resolver, rpc, dispatcher, opRetry, Clock.systemUTC(), handles::remove);
+        handle.open();
+        return handle;
+    }
+
+    @Override
+    public void flushAll() {
+        ensureOpen();
+        dispatcher.flushAllSync();
+    }
+
+    @Override
+    public ClientMetricsSnapshot metrics() {
+        return new ClientMetricsSnapshot(dispatcher.samplesEnqueued(), dispatcher.samplesSent(),
+                dispatcher.samplesFailed(), dispatcher.batchesSent(), dispatcher.retriesByStatus(),
+                dispatcher.bufferedSamples(), handles.size());
+    }
+
+    @Override
+    public NodeId clientNodeId() {
+        return node.transport().local().nodeId();
+    }
+
+    @Override
+    public void close() {
+        if (closed) {
+            return;
+        }
+        closed = true;
+        // Orçamento TOTAL (não por handle) — O1: se houver muitos handles, cada um recebe só o que
+        // sobrou do prazo, em vez de multiplicar closeTimeout pelo número de séries abertas. Um handle
+        // que não coube no orçamento fecha sem flush (log em RemoteSeriesHandle.close); as amostras
+        // pendentes dele ficam a cargo do dispatcher.close() logo abaixo, que loga quantas descartou.
+        long deadline = System.currentTimeMillis() + config.closeTimeout().toMillis();
+        for (RemoteSeriesHandle handle : List.copyOf(handles.values())) {
+            long remainingMs = deadline - System.currentTimeMillis();
+            Duration flushBudget = remainingMs > 0 ? Duration.ofMillis(remainingMs) : Duration.ZERO;
+            try {
+                handle.close(flushBudget);
+            } catch (RuntimeException e) {
+                LOGGER.log(Level.WARNING, "Falha ao fechar a série " + handle.seriesKey() + " durante o close do cliente", e);
+            }
+        }
+        try {
+            dispatcher.close();
+        } catch (RuntimeException e) {
+            LOGGER.log(Level.WARNING, "Falha ao fechar o write dispatcher do cliente", e);
+        }
+        try {
+            node.close();
+        } catch (IOException | RuntimeException e) {
+            LOGGER.log(Level.WARNING, "Falha ao fechar o nó cliente do cluster ngrrd", e);
+        }
+        if (temporaryDataDir) {
+            deleteRecursivelyQuietly(dataDir);
+        }
+    }
+
+    private void ensureOpen() {
+        if (closed) {
+            throw new NgrrdClusterException(ErrorCode.CLOSED, "cliente do cluster ngrrd já foi fechado");
+        }
+    }
+
+    private static void deleteRecursivelyQuietly(Path dir) {
+        try (Stream<Path> paths = Files.walk(dir)) {
+            paths.sorted(Comparator.reverseOrder()).forEach(path -> {
+                try {
+                    Files.deleteIfExists(path);
+                } catch (IOException e) {
+                    LOGGER.log(Level.WARNING, "Falha ao apagar " + path + " do dataDir temporário do cliente", e);
+                }
+            });
+        } catch (IOException e) {
+            LOGGER.log(Level.WARNING, "Falha ao apagar o dataDir temporário do cliente: " + dir, e);
+        }
+    }
+}
