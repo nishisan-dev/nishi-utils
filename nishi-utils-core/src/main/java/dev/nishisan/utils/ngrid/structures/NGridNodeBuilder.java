@@ -27,6 +27,7 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -63,6 +64,8 @@ public final class NGridNodeBuilder {
     private int relayApplyBatchSize = 256;
     private boolean leaderPauseOnJoin = false;
     private boolean leaderPauseOnReclaim = false;
+    private Duration bootDiscoveryWindow;
+    private boolean affinityHandbackMode = false;
     private int priority = 0;
     private Set<String> roles = Collections.emptySet();
 
@@ -323,6 +326,36 @@ public final class NGridNodeBuilder {
     }
 
     /**
+     * Sets the boot-discovery window during which a freshly started node defers self-election while it
+     * discovers peers and their replication watermarks (sync-before-reclaim), passed through to
+     * {@link NGridConfig.Builder#bootDiscoveryWindow(Duration)}. {@code null}/{@code ZERO} disables the
+     * deferral (legacy immediate election) — see that method's Javadoc for the full rationale.
+     *
+     * @param bootDiscoveryWindow the deferral window, or {@code null} to disable it
+     * @return this builder
+     */
+    public NGridNodeBuilder bootDiscoveryWindow(Duration bootDiscoveryWindow) {
+        this.bootDiscoveryWindow = bootDiscoveryWindow;
+        return this;
+    }
+
+    /**
+     * Enables the orchestrated affinity handback (issue tems#9, D11), passed through to
+     * {@link NGridConfig.Builder#affinityHandbackMode(boolean)}. When enabled, a returning
+     * highest-affinity follower never reclaims leadership through the watermark gates (a handoff
+     * that, under load, overlaps two producing leaders and discards the loser's tail); the
+     * replication layer drives an explicit stop-the-world snapshot handover instead. Defaults to
+     * {@code false} (legacy watermark reclaim).
+     *
+     * @param enabled {@code true} to use the snapshot-orchestrated handover
+     * @return this builder
+     */
+    public NGridNodeBuilder affinityHandbackMode(boolean enabled) {
+        this.affinityHandbackMode = enabled;
+        return this;
+    }
+
+    /**
      * Builds and starts the node.
      * <p>
      * If no data directory is specified, the build will fail for
@@ -348,7 +381,9 @@ public final class NGridNodeBuilder {
                 .persistentResendLog(persistentResendLog)
                 .relayApplyBatchSize(relayApplyBatchSize)
                 .leaderPauseOnJoin(leaderPauseOnJoin)
-                .leaderPauseOnReclaim(leaderPauseOnReclaim);
+                .leaderPauseOnReclaim(leaderPauseOnReclaim)
+                .bootDiscoveryWindow(bootDiscoveryWindow)
+                .affinityHandbackMode(affinityHandbackMode);
 
         if (dataDir != null) {
             builder.dataDirectory(dataDir);
