@@ -47,7 +47,16 @@ segue enfileirando no dono antigo e cada lote reroteado é prependido à frente 
 (reintroduz inversão de ordem). Também: `connect()` falha se qualquer storage node ativo estiver
 inalcançável dentro de `leaderWaitTimeout` (sem disponibilidade parcial).
 
-### M2 — métricas por nó e admin — Builder em andamento (spec `spec-m2.md`)
+### M2 — métricas por nó e admin — COMMITADO (2 commits: métricas/admin; orçamento total de close)
+Refuter r1 reprovou: `close()` ignorava o orçamento no CLOSE remoto e o dispatcher recebia `requestTimeout` no lugar de
+`closeTimeout` (um nó morto custava `requestTimeout` por handle); teste de admin flaky. r2 aprovou: 191 testes,
+cobertura de linha 82%, `AdminStatusClusterTest` 7/7 (8-20 s). Trade-off deliberado: com o orçamento esgotado o
+dispatcher descarta pendências com log SEVERE e `samplesFailed`. Residuais baixos: `awaitTermination`/`join` do
+dispatcher (+3 s) e `node.close()` ficam fora do deadline.
+Defeito PRÉ-EXISTENTE confirmado por A/B (falha também sem M2, sob carga): sob churn de liderança o líder pode recolocar
+uma série existente e o nó aceita o hint criando uma série vazia no lugar errado → seção 0 obrigatória da spec do M3.
+
+### M3 — migração e rebalanceamento — Builder em andamento (spec `spec-m3.md`, seção 0 primeiro)
 
 ## Observações
 - `DualLeaderLivelockE2ETest` falhou uma vez sob carga da suíte completa; 4/4 na main e 3/3 isolado na

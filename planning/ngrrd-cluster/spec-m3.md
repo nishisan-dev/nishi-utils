@@ -11,6 +11,29 @@ Pré-requisito: M2 commitado (`metrics/`, `AdminRequestHandler`, `NodeMetricsSna
 - Nunca segurar dois locks de entrada do `SeriesHandleRegistry` ao mesmo tempo (ver desenho do M1b). Toda exceção em handler vira resposta de erro.
 - Gate JaCoCo (40%) continua passando em `verify`.
 
+## 0. Pré-requisito obrigatório — placement nunca recria uma série existente (defeito pré-existente, risco de dados)
+Refuter do M2 reproduziu (A/B, também sem o M2): durante churn de liderança do NGrid, `PlacementRequestHandler.handlePlace`
+pode não encontrar no catálogo uma série já colocada (réplica do novo líder ainda convergindo; `LeaderSyncingException`
+em `putPlacement`) e criar um placement NOVO em outro nó; o cliente envia `OPEN` com esse `placementHint` e
+`StorageRequestHandler.ownership()` o aceita, fazendo `SeriesHandleRegistry.open` criar uma série VAZIA no nó errado.
+Resultado: o catálogo passa a apontar para a cópia vazia e os dados reais ficam órfãos no dono antigo.
+Correções (todas):
+- Líder: `PlacementRequestHandler` só cria placements quando o nó está fora da janela de sincronização —
+  `LeaderSyncingException` (ou qualquer falha de `putPlacement`) responde `NOT_LEADER` com `leaderNodeId` (cliente retenta),
+  e há um `placementGraceAfterLeadership` (default 3 s, configurável) após `onLeaderChanged` para self durante o qual
+  `handlePlace` responde `NOT_LEADER`/retry em vez de criar. Placements existentes continuam sendo respondidos normalmente.
+- Nó: `ownership()` deixa de aceitar `placementHint` por si só; a corrida líder→réplica local é resolvida por
+  `catalog.placementStrong(key)` (consulta ao líder, já usada no caminho de `WRONG_OWNER`). O hint pode servir só como
+  atalho quando `placementStrong` confirma o mesmo dono. Sem confirmação → `WRONG_OWNER(owner ou null)`.
+- Nó: criar uma série nova no volume (`Ngrrd.open` de chave inexistente) só acontece via `OPEN` com dono confirmado;
+  `writeBatch`/`read` nunca criam (já é assim pela auto-cura só reabrir definições conhecidas — confirme).
+- Testes unitários: `handlePlace` em janela de graça → `NOT_LEADER`; `putPlacement` lançando → `NOT_LEADER` e nenhum
+  placement gravado; `ownership` com hint não confirmado → `WRONG_OWNER`; com hint confirmado → OK.
+- Teste de cluster: `PlacementUnderLeaderChurnClusterTest` — 3 nós + cliente; 30 séries escritas + checkpoint; laço de
+  10 rodadas: derrubar e religar o líder (harness), abrir/escrever/ler as mesmas séries com um cliente novo a cada
+  rodada; ao final, cada série tem exatamente UMA imagem entre os volumes (`storage().exists`) e a leitura devolve
+  todos os pontos. `@Timeout(SEPARATE_THREAD)`, ≤ 180 s.
+
 ## 1. Configuração (`StorageNodeConfig`)
 `rebalanceEnabled` (true), `rebalanceInterval` (60 s), `rebalanceMinDelta` (50 séries), `rebalanceTolerance` (0,10 = 10% da média),
 `maxConcurrentMigrations` (2), `maxMovesPerCycle` (50), `migrationTimeout` (10 min), `migrationChunkBytes` (256 KiB),
