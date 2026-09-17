@@ -201,10 +201,19 @@ via `NgrrdBlob.registry()`, `SeriesHandleRegistry`, `StorageRequestHandler`, `No
 
 ### 7. Placement (estágio 1)
 
-`LeastLoadedPlacementPolicy.choose(candidates)`: entre nós com `state == ACTIVE`, membro ativo no
-`ClusterCoordinator` e `reportedAt` dentro de `2 × statusReportInterval`, escolhe menor
-`usedBytes/capacityBytes`; empate → menor `seriesCount`; empate → menor `nodeId`. Sem candidatos →
-`NO_STORAGE_NODE_AVAILABLE`. Interface `PlacementPolicy` permite trocar a política em teste.
+`LeastLoadedPlacementPolicy.choose(ctx)`, ordem total e determinística (o resultado não pode depender
+da ordem de iteração do catálogo local, que varia entre nós e reinícios do líder):
+
+1. Candidatos: `state == ACTIVE`, membro ativo e alcançável no `ClusterCoordinator`, `reportedAt`
+   dentro de `2 × statusReportInterval`, e **não** saturado (capacidade conhecida com `fillRatio >= 0.95`
+   é excluída).
+2. Se `preferredOwnerNodeId` (adoção pelo `LocalReconciler`) estiver entre os candidatos, vence.
+3. Chave primária: carga efetiva = `seriesCount` reportado + placements feitos pelo líder desde o
+   último `reportedAt` daquele nó (`pendingSeriesByNode`; sem isso, uma rajada de séries novas cairia
+   toda no mesmo nó até o próximo reporte de status).
+4. Secundária: `fillRatio` (capacidade desconhecida vale `0.0`). Terciária: `nodeId`.
+
+Sem candidatos → `NO_STORAGE_NODE_AVAILABLE`. Interface `PlacementPolicy` permite trocar a política em teste.
 
 ### 8. Rebalanceamento (estágio 2) e migração
 
