@@ -24,6 +24,12 @@ import java.util.Objects;
  * Resposta de um {@link WriteBatchRequest}: status por série do lote, já que um
  * lote pode misturar séries com resultados diferentes (uma migrando, outra ok).
  *
+ * <p><strong>O lote não é atômico por série:</strong> as amostras de uma mesma
+ * série são aplicadas em sequência (na ordem recebida); se uma amostra no meio
+ * falhar, as anteriores já aplicadas àquela série permanecem gravadas — o
+ * {@code status == ERROR} reporta que o lote não terminou de aplicar por
+ * completo, não que nada foi escrito. Não há rollback.</p>
+ *
  * @param statusBySeries status de cada série presente no lote; nunca {@code null}
  * @param ownerBySeries  dono atual reportado para séries com {@code WRONG_OWNER}; nunca {@code null}
  * @param errorBySeries  mensagem de erro para séries com {@code status == ERROR}; nunca {@code null}
