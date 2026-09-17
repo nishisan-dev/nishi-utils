@@ -26,8 +26,28 @@ OpenOptions guardadas por hash. Churn de liderança no bootstrap é ruído padr�
 Residuais informativos: `handleClose` não checa dono (limpeza local idempotente); `withHandleSelfHealing`
 trata `fn` nulo como "não aberta" — operações novas não podem devolver null.
 
-### M1c — cliente transparente + harness — Builder em andamento (spec `spec-m1c.md`; inclui gate JaCoCo)
-Cliente transparente + harness + `DistributedWriteReadClusterTest`; ligar o gate JaCoCo do módulo.
+### M1c — cliente transparente + harness — COMMITADO (6cd744c, ef5a99d, ecc1415, c73a142, 9db1e9c)
+Duas rodadas de Refuter + Debugger. Causas raiz encontradas: (1) records do catálogo sem `Serializable`
+→ WAL do NMap falhava em silêncio e o nó reiniciado voltava com catálogo vazio (agora `Serializable` +
+persistência `ASYNC_WITH_FSYNC` declarada via nova API `NGridNodeBuilder.map(name, mode)` no core);
+(2) nó reiniciado respondia `WRONG_OWNER` sem dono e o cliente re-enfileirava em loop silencioso → nó
+consulta o líder antes de responder, cliente reabre e loga com rate limit; (3) filtro de frescor de 4 s
+descartava o nó que perdeu a liderança → `nodeStatusStaleAfter`, republicação imediata na troca de líder,
+fallback para nós alcançáveis; (4) `PlacementResolver` ignorava o líder informado em `NOT_LEADER`;
+(5) reroteamento invertia a ordem por série → o backlog da série migra junto. Resultado: 171 testes
+unitários (cobertura 80%), `DistributedWriteReadClusterTest` 5/5, `NodeRestartClusterTest` 3/3.
+Divergência aceita: distribuição "≥ 1/4 por nó" em vez de "20 ± 2" (churn de bootstrap do NGrid).
+Tarefas de core abertas como chips (fora do escopo): ressincronização de mapa não persistente após
+restart; higiene do TcpTransport (reconexão infinita, proxy para si mesmo, fast-path em sendAndAwait);
+NMapPersistence falhar alto em valor não serializável.
+
+**Para o M3 (registrar na spec):** `RemoteSeriesHandle.owner` não é atualizado quando o `WriteDispatcher`
+reroteia por `WRONG_OWNER` com dono conhecido (só `noteOwner`, sem `reopener`) → após migração, `write()`
+segue enfileirando no dono antigo e cada lote reroteado é prependido à frente do backlog já movido
+(reintroduz inversão de ordem). Também: `connect()` falha se qualquer storage node ativo estiver
+inalcançável dentro de `leaderWaitTimeout` (sem disponibilidade parcial).
+
+### M2 — métricas por nó e admin — Builder em andamento (spec `spec-m2.md`)
 
 ## Observações
 - `DualLeaderLivelockE2ETest` falhou uma vez sob carga da suíte completa; 4/4 na main e 3/3 isolado na
