@@ -282,6 +282,51 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     }
 
     /**
+     * Returns the active, leader-eligible peer (distinct from {@code localId}) whose LATEST heartbeat
+     * asserts leadership — the node that is actually serving — or {@code null} if none does. With more
+     * than one asserting peer (a dual-leader still being resolved, or a sub-heartbeat handoff overlap)
+     * the highest affinity wins, matching the D10c resolution order so every observer converges on the
+     * same node.
+     */
+    private NodeId assertingLeaderPeer(NodeId localId) {
+        return members.values().stream()
+                .filter(m -> !m.id().equals(localId) && isLeaderCandidate(m)
+                        && Boolean.TRUE.equals(peerAssertsLeadership.get(m.id())))
+                .max(Comparator.comparingInt((ClusterMember m) -> m.info().priority())
+                        .thenComparing(ClusterMember::id))
+                .map(ClusterMember::id)
+                .orElse(null);
+    }
+
+    /**
+     * The node a DEFERRING local node (one that must stay a follower and sync) should adopt as its
+     * leader — i.e. the node it will pull the stream / request a snapshot from, so the choice decides
+     * whether the catch-up can succeed at all:
+     * <ol>
+     *   <li>the peer that asserts leadership (it serves the stream);</li>
+     *   <li>else the currently adopted leader, if still active and not known to be refusing (its
+     *       assertion unknown, e.g. no heartbeat yet) — stickiness avoids flapping during discovery;</li>
+     *   <li>else the eligible peer with the highest watermark (the likely incumbent during boot).</li>
+     * </ol>
+     * The previous order (adopted leader first, then highest watermark) let a deferring node stick to
+     * — or pick, on a watermark tie — a peer that is itself a follower: every fetch/sync addressed to it
+     * was refused ("not the leader"), the deferring node never caught up, and with three members the
+     * cluster wedged in a permanent three-way leader disagreement.
+     */
+    private NodeId deferralFollowTarget(NodeId localId) {
+        NodeId asserting = assertingLeaderPeer(localId);
+        if (asserting != null) {
+            return asserting;
+        }
+        NodeId current = leader.get();
+        if (current != null && !current.equals(localId) && isActiveMember(current)
+                && !Boolean.FALSE.equals(peerAssertsLeadership.get(current))) {
+            return current;
+        }
+        return highestWatermarkActivePeer(localId);
+    }
+
+    /**
      * Triggers an out-of-band leadership recomputation. Called by the {@link
      * dev.nishisan.utils.ngrid.replication.ReplicationManager} when the local node's readiness flips to
      * ready (its applied frontier has reached the incumbent's high-watermark), so the deferred
@@ -859,10 +904,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 boolean withinBootWindow = Instant.now().toEpochMilli() < bootDiscoveryDeadlineMs;
                 boolean hasViableLeaderPeer = highestWatermarkActivePeer(localId) != null;
                 if (withinBootWindow || hasViableLeaderPeer) {
-                    NodeId current = leader.get();
-                    NodeId followTarget = (current != null && !current.equals(localId) && isActiveMember(current))
-                            ? current
-                            : highestWatermarkActivePeer(localId);
+                    NodeId followTarget = deferralFollowTarget(localId);
                     if (followTarget == null) {
                         followTarget = highestAffinityActivePeer(localId);
                     }
@@ -921,11 +963,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 // us leaderless would wedge the sync, never converging). Prefer the current leader if it is
                 // already a distinct active node; else the active peer with the highest watermark (the real
                 // incumbent). Only fall back to "no leader" when neither is known (pure boot discovery).
-                NodeId current = leader.get();
-                NodeId followTarget = (current != null && !current.equals(localId) && isActiveMember(current))
-                        ? current
-                        : highestWatermarkActivePeer(localId);
-                updateLeader(followTarget); // may be null during pure boot discovery (no peer heard yet)
+                // See deferralFollowTarget: a peer that ASSERTS leadership always comes first.
+                updateLeader(deferralFollowTarget(localId)); // may be null during pure boot discovery
                 return;
             }
 
@@ -944,7 +983,13 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 if (weWouldLead && !isLeaderInternal(localId)
                         && current != null && !current.equals(localId) && isActiveMember(current)) {
                     // CANDIDATE side: do not reclaim via watermark; the handshake drives the transition.
-                    updateLeader(current);
+                    // Follow the peer that ASSERTS leadership, not blindly the node adopted during boot
+                    // discovery (a watermark-tie pick that may itself be a follower): the HANDBACK_REQUEST
+                    // is addressed to the adopted leader, and a follower aborts it ("not an eligible
+                    // leader") — with three members the candidate then sat on a 60 s cooldown while the
+                    // cluster disagreed on the leader.
+                    NodeId serving = assertingLeaderPeer(localId);
+                    updateLeader(serving != null ? serving : current);
                     return;
                 }
                 if (isLeaderInternal(localId) && electedId != null && !electedId.equals(localId)
@@ -1006,6 +1051,27 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                             + " ahead (peer=" + electedWatermark + ", local=" + localApplied
                             + "); taking leadership to break the leaderless stalemate (issue tems#9, D9)");
                     updateLeader(localId);
+                    return;
+                }
+            }
+
+            // ── Follow the serving leader until the affinity winner takes over ────────────────────────
+            // A non-leading node whose affinity-elected candidate is NOT asserting leadership (it is a
+            // returning/joining node still deferring behind the watermark gates, or one we have not even
+            // heard from yet) must keep following the peer that IS serving. Adopting the candidate early
+            // pointed this node's stream fetches and snapshot requests at a follower — refused as "not the
+            // leader" — so with three members the cluster split into a stable three-way disagreement
+            // (A follows the candidate, the candidate follows the highest-watermark node, the incumbent
+            // keeps leading) and the candidate's catch-up starved. The candidate asserts leadership the
+            // moment it reclaims (or the handback completes); the next heartbeat flips this node to it.
+            // NON-LEADING nodes only: a serving leader never steps down through this path — a rival
+            // asserting leadership against it is a dual-leader, resolved exclusively by D10c (affinity
+            // order, observation debounce and the yield hook that arms the lineage resync).
+            if (electedId != null && !electedId.equals(localId) && !isLeaderInternal(localId)
+                    && !Boolean.TRUE.equals(peerAssertsLeadership.get(electedId))) {
+                NodeId serving = assertingLeaderPeer(localId);
+                if (serving != null && !serving.equals(electedId)) {
+                    updateLeader(serving);
                     return;
                 }
             }
@@ -1639,13 +1705,9 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             // re-stamping above it, and yield after the debounce — running first keeps the loser
             // from feeding the epoch ladder and lands the post-yield observeEpoch on the follower
             // (adopt) path.
-            if (!source.equals(transport.local().nodeId())) {
+            boolean fromPeer = !source.equals(transport.local().nodeId());
+            if (fromPeer) {
                 observeLeaderAssertion(source, payload.leader());
-                peerAssertsLeadership.put(source, payload.leader());
-                if (payload.leader()) {
-                    // The peer is leading: any refusal it issued while deferring is stale (D9 escape).
-                    leaderRefusalAtMs.remove(source);
-                }
             }
             // Converge the cluster term from every peer heartbeat BEFORE fencing, so a leader
             // whose persisted epoch regressed re-learns the highest term any node has seen and
@@ -1694,20 +1756,38 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             // still broadcasting); leadership itself is still decided by NodeId, not by this filter.
             NodeId currentLeader = leader.get();
             boolean fromAgreedLeader = currentLeader != null && currentLeader.equals(source);
+            boolean assertionChanged = false;
             if (!fromAgreedLeader && heartbeatEpoch > 0 && heartbeatEpoch < trackedLeaderEpoch) {
                 LOGGER.fine(() -> String.format(
                         "Ignoring heartbeat from non-leader %s with stale epoch %d (current: %d)",
                         source, heartbeatEpoch, trackedLeaderEpoch));
-                if (isNewMember[0] || watermarkAdvanced) {
+                // A fenced sender (a partitioned ex-leader still broadcasting a stale term) is NOT a
+                // serving leader, whatever its heartbeat claims: drop any assertion mark so followers
+                // never adopt it through assertingLeaderPeer / deferralFollowTarget.
+                if (fromPeer && Boolean.TRUE.equals(peerAssertsLeadership.remove(source))) {
+                    assertionChanged = true;
+                }
+                if (isNewMember[0] || watermarkAdvanced || assertionChanged) {
                     recomputeLeader();
                 }
                 return;
+            }
+            if (fromPeer) {
+                // Record the assertion only for heartbeats that passed the epoch fence. A peer starting
+                // or stopping to assert leadership changes whom a follower should adopt
+                // (assertingLeaderPeer / deferralFollowTarget): recompute below.
+                Boolean previousAssertion = peerAssertsLeadership.put(source, payload.leader());
+                assertionChanged = previousAssertion == null || previousAssertion != payload.leader();
+                if (payload.leader()) {
+                    // The peer is leading: any refusal it issued while deferring is stale (D9 escape).
+                    leaderRefusalAtMs.remove(source);
+                }
             }
             if (fromAgreedLeader) {
                 trackedLeaderHighWatermark = payload.leaderHighWatermark();
                 trackedLeaderEpoch = payload.leaderEpoch();
             }
-            if (isNewMember[0] || watermarkAdvanced) {
+            if (isNewMember[0] || watermarkAdvanced || assertionChanged) {
                 // A new member, or a peer whose watermark changed: recompute so the watermark gate can
                 // (a) defer our reclaim while a peer is ahead, or (b) release the incumbent's step-down
                 // guard the moment a higher-affinity candidate has caught up to our state.

@@ -1238,7 +1238,12 @@ public class ReplicationManager
                 handler.installSnapshot(payload.data());
 
                 if (payload.hasMore()) {
-                    requestSync(payload.topic(), payload.chunkIndex() + 1);
+                    if (!requestSync(payload.topic(), payload.chunkIndex() + 1)) {
+                        // The chain cannot continue (leader changed, or this node got promoted):
+                        // release the guard so the next apply tick restarts the sync from chunk 0
+                        // against the current leader instead of stalling until the watchdog.
+                        syncingTopics.remove(payload.topic());
+                    }
                 } else {
                     // Last chunk installed: let the handler reassemble/decode a multi-chunk
                     // (byte-sliced) snapshot before the follower is considered caught up.
@@ -1330,31 +1335,44 @@ public class ReplicationManager
         signalRelay(topic);
     }
 
-    private void requestSync(String topic) {
-        requestSync(topic, 0);
+    private boolean requestSync(String topic) {
+        return requestSync(topic, 0);
     }
 
-    private void requestSync(String topic, int chunkIndex) {
-        coordinator.leaderInfo().ifPresent(leader -> {
-            if (leader.nodeId().equals(transport.local().nodeId())) {
-                // Never self-sync (issue tems#9, D8): a continuation chunk requested after this node
-                // got promoted would be addressed to itself and silently die in the transport
-                // ("No route available"), leaving a half-installed state behind.
-                return;
-            }
-            if (chunkIndex == 0) {
-                syncRequestCount.incrementAndGet();
-                LOGGER.info(() -> "Lag detected (" + (coordinator.getTrackedLeaderHighWatermark() - lastAppliedSequence)
-                        + "). Requesting sync for " + topic);
-            }
-            SyncRequestPayload payload = new SyncRequestPayload(topic, chunkIndex);
-            ClusterMessage request = ClusterMessage.request(MessageType.SYNC_REQUEST,
-                    "sync",
-                    transport.local().nodeId(),
-                    leader.nodeId(),
-                    payload);
-            transport.send(request);
-        });
+    /**
+     * Sends a snapshot request for {@code topic} to the adopted leader and returns whether a request
+     * was actually sent. Callers that arm the {@code syncingTopics} guard MUST release it when this
+     * returns {@code false}: a guard armed with no request in flight parks the topic (no stream fetch,
+     * no apply) until the stuck-sync watchdog releases it 16 s later — the "stuck without a chunk"
+     * stall seen after a dual-leader yield, whose bootstrap is armed while this node still answers
+     * {@code isLeader()} and therefore resolves the sync target to itself.
+     *
+     * @return {@code true} if the request was sent to a distinct leader
+     */
+    private boolean requestSync(String topic, int chunkIndex) {
+        NodeInfo leader = coordinator.leaderInfo().orElse(null);
+        if (leader == null) {
+            return false; // no leader adopted yet: nothing to request from
+        }
+        if (leader.nodeId().equals(transport.local().nodeId())) {
+            // Never self-sync (issue tems#9, D8): a continuation chunk requested after this node
+            // got promoted would be addressed to itself and silently die in the transport
+            // ("No route available"), leaving a half-installed state behind.
+            return false;
+        }
+        if (chunkIndex == 0) {
+            syncRequestCount.incrementAndGet();
+            LOGGER.info(() -> "Lag detected (" + (coordinator.getTrackedLeaderHighWatermark() - lastAppliedSequence)
+                    + "). Requesting sync for " + topic);
+        }
+        SyncRequestPayload payload = new SyncRequestPayload(topic, chunkIndex);
+        ClusterMessage request = ClusterMessage.request(MessageType.SYNC_REQUEST,
+                "sync",
+                transport.local().nodeId(),
+                leader.nodeId(),
+                payload);
+        transport.send(request);
+        return true;
     }
 
     // ── Relay-stream ingestion (RELAY_STREAM) ────────────────────────────────────
@@ -1605,8 +1623,8 @@ public class ReplicationManager
             // Below the leader's retained window: bootstrap, then resume streaming from the watermark.
             relayFetchPendingUntilByTopic.put(topic,
                     System.currentTimeMillis() + config.relayStreamFetchTimeout().toMillis());
-            if (syncingTopics.add(topic)) {
-                requestSync(topic);
+            if (syncingTopics.add(topic) && !requestSync(topic)) {
+                syncingTopics.remove(topic); // no request in flight: do not park the topic behind the guard
             }
             return;
         }
@@ -1733,8 +1751,8 @@ public class ReplicationManager
                 // leadership eligibility and the advertised watermark while the sync could still die
                 // silently (e.g. the targeted node stepped down and drops SYNC_REQUEST) — letting a
                 // dead-lineage frontier win the reclaim gate at the end of the boot window.
-                if (syncingTopics.add(topic)) {
-                    requestSync(topic);
+                if (syncingTopics.add(topic) && !requestSync(topic)) {
+                    syncingTopics.remove(topic); // no request in flight: do not park the topic behind the guard
                 }
                 return false;
             } else {
@@ -1882,7 +1900,9 @@ public class ReplicationManager
             signalRelay(topic);
             return;
         }
-        if (coordinator.leaderInfo().isPresent()) {
+        // Follower with a DISTINCT adopted leader (isLeader() was false above, but re-check: a promotion
+        // landing between the two reads would otherwise address the recovery to this node itself).
+        if (coordinator.leaderInfo().isPresent() && !coordinator.isLeader()) {
             if (config.relayExpireAfterWrite() == null || config.relayExpireAfterWrite().isZero()) {
                 // Relay TTL OFF: a "TTL-evicted prefix" is impossible, so the hole is an ingestion
                 // artifact (issue tems#9, D7) or legacy on-disk damage. The missing range still lives
@@ -1919,12 +1939,18 @@ public class ReplicationManager
             }
             // Relay TTL ON (or gap re-pull unavailable): the prefix may genuinely have aged out of the
             // leader's retained window too; the only clean recovery is a snapshot bootstrap. Pause
-            // apply until it installs.
-            snapshotFallbackCount.incrementAndGet();
-            LOGGER.warning(() -> "Relay forward-gap on follower topic=" + topic + " expected=" + want
-                    + " head=" + got + "; requesting snapshot bootstrap");
+            // apply until it installs. Count and log the fallback only when a request actually went
+            // out: when none can be sent (leadership flipped to this node between the checks above,
+            // or the adopted leader vanished) the guard is released and this path re-enters on the
+            // next tick — it must not spin the counter and the warning every ~100 ms meanwhile.
             if (syncingTopics.add(topic)) {
-                requestSync(topic);
+                if (requestSync(topic)) {
+                    snapshotFallbackCount.incrementAndGet();
+                    LOGGER.warning(() -> "Relay forward-gap on follower topic=" + topic + " expected=" + want
+                            + " head=" + got + "; requesting snapshot bootstrap");
+                } else {
+                    syncingTopics.remove(topic); // no request in flight: do not park the topic behind the guard
+                }
             }
             return;
         }
