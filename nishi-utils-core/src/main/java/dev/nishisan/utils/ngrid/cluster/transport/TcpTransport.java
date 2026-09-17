@@ -78,7 +78,8 @@ public final class TcpTransport implements Transport {
     private final Map<UUID, PendingResponse> pendingResponses = new ConcurrentHashMap<>();
     // Use Virtual Threads for per-task execution
     private final ExecutorService workerPool = Executors.newVirtualThreadPerTaskExecutor();
-    private final NetworkRouter router = new NetworkRouter(this::collectLatencies);
+    // A relay must be a peer we currently hold an open connection to (see NetworkRouter.relayCandidate).
+    private final NetworkRouter router = new NetworkRouter(this::collectLatencies, this::isConnected);
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "ngrid-transport-scheduler");
         t.setDaemon(true);
@@ -241,6 +242,19 @@ public final class TcpTransport implements Transport {
                         proxyConn.send(message);
                         return;
                     }
+                }
+            } else {
+                // The PROXY route is unusable (the relay is gone). Before dropping the message, try
+                // the destination DIRECTLY: a route demoted to proxy by one failed dial never got a
+                // second chance here, so every message to a peer that had merely blinked kept going
+                // to a dead relay — its heartbeats included, which evicted a live member.
+                Connection direct = ensureConnection(destination);
+                if (direct != null) {
+                    router.promoteToDirect(destination);
+                    LOGGER.info(() -> "Relay " + target + " unavailable; direct connection to " + destination
+                            + " restored");
+                    direct.send(message);
+                    return;
                 }
             }
             LOGGER.log(Level.WARNING, "No connection available for {0} (via {1}, excluding {2})", new Object[]{destination, target, exclude});

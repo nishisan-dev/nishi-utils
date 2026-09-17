@@ -30,6 +30,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.logging.Logger;
 
@@ -59,9 +60,21 @@ final class NetworkRouter {
     // Key: SourcePeer, Value: Map of (TargetNode -> Latency reported by SourcePeer)
     private final Map<NodeId, Map<NodeId, Double>> reportedLatencies = new ConcurrentHashMap<>();
     private final Supplier<Map<NodeId, Double>> localLatenciesSupplier;
+    /**
+     * Whether a peer can currently relay for us — i.e. we hold an open connection to it. The
+     * reachability map is gossip: it keeps saying that a departed client or a dead node "knows" the
+     * target long after it is gone, and a proxy we cannot even reach silently swallows every message
+     * routed through it (heartbeats included, which evicts live members).
+     */
+    private final Predicate<NodeId> relayCandidate;
 
     NetworkRouter(Supplier<Map<NodeId, Double>> localLatenciesSupplier) {
+        this(localLatenciesSupplier, id -> true);
+    }
+
+    NetworkRouter(Supplier<Map<NodeId, Double>> localLatenciesSupplier, Predicate<NodeId> relayCandidate) {
         this.localLatenciesSupplier = localLatenciesSupplier;
+        this.relayCandidate = relayCandidate;
     }
 
     /**
@@ -184,7 +197,7 @@ final class NetworkRouter {
         Map<NodeId, Double> local = localLatenciesSupplier.get();
 
         List<PathCost> scoredCandidates = candidates.stream()
-                .filter(id -> !id.equals(exclude))
+                .filter(id -> !id.equals(exclude) && relayCandidate.test(id))
                 .map(proxyId -> {
                     Double rttToProxy = local.get(proxyId);
                     Map<NodeId, Double> proxyReported = reportedLatencies.get(proxyId);
