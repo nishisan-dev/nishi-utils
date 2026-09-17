@@ -19,12 +19,17 @@ package dev.nishisan.utils.oss.cluster.protocol;
 
 /**
  * Pedido ao destino para confirmar a integridade dos bytes recebidos e ativar
- * a cópia migrada. Apenas o tipo — o handler é implementado num marco futuro.
+ * a cópia migrada.
  *
  * @param seriesKey   chave lógica da série
  * @param migrationId identificador único da migração
  * @param sha256Hex   hash SHA-256, em hexadecimal, do arquivo completo
  * @param totalBytes  tamanho total esperado, em bytes
+ * @param storageKey  chave física do objeto no {@code BlobStorage} (ex.: {@code series/<seriesKey>.ngrr},
+ *                    conforme o {@code ObjectNaming} da definição) — resolvida pela ORIGEM (que tem a
+ *                    definição YAML em cache, por já servir a série) e repassada ao destino, que nunca
+ *                    viu essa definição antes de receber a migração
  */
-public record MigrateCommitRequest(String seriesKey, String migrationId, String sha256Hex, long totalBytes) {
+public record MigrateCommitRequest(String seriesKey, String migrationId, String sha256Hex, long totalBytes,
+        String storageKey) {
 }

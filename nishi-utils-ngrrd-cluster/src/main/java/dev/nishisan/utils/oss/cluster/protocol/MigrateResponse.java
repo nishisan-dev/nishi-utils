@@ -22,6 +22,14 @@ package dev.nishisan.utils.oss.cluster.protocol;
  *
  * @param status  resultado da operação
  * @param message detalhe legível do erro, ou {@code null}
+ * @param bytes   tamanho total (bytes) da imagem migrada — preenchido pelo destino quando
+ *                {@code status == COMMITTED} (inclusive em resposta a {@code MIGRATE_STATUS});
+ *                {@code 0} nos demais casos, inclusive quando desconhecido
  */
-public record MigrateResponse(MigrateStatus status, String message) {
+public record MigrateResponse(MigrateStatus status, String message, long bytes) {
+
+    /** Atalho para respostas sem tamanho conhecido (tudo exceto {@code COMMITTED}). */
+    public static MigrateResponse of(MigrateStatus status, String message) {
+        return new MigrateResponse(status, message, 0L);
+    }
 }

@@ -262,7 +262,8 @@ class ProtocolCodecTest {
     @Test
     void migrateCommitRequestSobreviveAoRoundTrip() throws IOException {
         MigrateCommitRequest original = new MigrateCommitRequest("series-1", "migration-1",
-                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 1_677_721L);
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 1_677_721L,
+                "series/series-1.ngrr");
         assertEquals(original, roundTripRequestBody(Commands.MIGRATE_COMMIT, original));
     }
 
@@ -274,7 +275,7 @@ class ProtocolCodecTest {
 
     @Test
     void migrateResponseDeHashMismatchSobreviveAoRoundTrip() throws IOException {
-        MigrateResponse original = new MigrateResponse(MigrateStatus.HASH_MISMATCH, "sha256 não confere");
+        MigrateResponse original = new MigrateResponse(MigrateStatus.HASH_MISMATCH, "sha256 não confere", 0L);
         assertEquals(original, roundTripResponseBody(Commands.MIGRATE_COMMIT, original));
     }
 

@@ -43,7 +43,7 @@ import java.util.stream.Collectors;
  * leitura no líder para as decisões que exigem a visão mais recente (ex.: antes
  * de decidir um novo placement).
  */
-public final class CatalogService {
+public final class CatalogService implements CatalogView {
 
     /** Nome do {@link DistributedMap} de placement por série. */
     public static final String CATALOG_MAP = "ngrrd.catalog";
@@ -96,11 +96,13 @@ public final class CatalogService {
     }
 
     /** Leitura forte do placement da série, roteada ao líder quando o nó local não é líder. */
+    @Override
     public Optional<SeriesPlacement> placementStrong(String seriesKey) {
         return catalog.getOptional(seriesKey, Consistency.STRONG);
     }
 
     /** Grava o placement da série; roteado ao líder pelo próprio {@link DistributedMap}. */
+    @Override
     public void putPlacement(String seriesKey, SeriesPlacement placement) {
         catalog.put(seriesKey, placement);
     }
@@ -111,6 +113,7 @@ public final class CatalogService {
     }
 
     /** Cópia imutável do catálogo na visão local (eventual) do nó. */
+    @Override
     public Map<String, SeriesPlacement> placementsLocal() {
         return catalog.entrySet().stream()
                 .collect(Collectors.collectingAndThen(
@@ -139,6 +142,7 @@ public final class CatalogService {
     }
 
     /** Snapshot local (eventual) do status de todos os storage nodes conhecidos. */
+    @Override
     public Collection<StorageNodeStatus> nodesLocal() {
         return nodes.values();
     }
