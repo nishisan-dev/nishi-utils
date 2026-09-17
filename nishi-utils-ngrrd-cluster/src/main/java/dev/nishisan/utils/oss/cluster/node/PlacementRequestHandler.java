@@ -23,6 +23,7 @@ import dev.nishisan.utils.ngrid.cluster.transport.Transport;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
+import dev.nishisan.utils.oss.cluster.catalog.PlacementState;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.placement.PlacementContext;
 import dev.nishisan.utils.oss.cluster.placement.PlacementPolicy;
@@ -74,19 +75,19 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
     private final CatalogService catalog;
     private final LeaderView leaderView;
     private final PlacementPolicy policy;
-    private final Duration statusReportInterval;
+    private final Duration nodeStatusStaleAfter;
     private final Clock clock;
 
     private final Object[] stripeLocks = new Object[LOCK_STRIPES];
     private final ConcurrentMap<String, PendingCounter> pendingByNode = new ConcurrentHashMap<>();
 
     public PlacementRequestHandler(Transport transport, CatalogService catalog, LeaderView leaderView,
-            PlacementPolicy policy, Duration statusReportInterval, Clock clock) {
+            PlacementPolicy policy, Duration nodeStatusStaleAfter, Clock clock) {
         super(transport, Set.of(Commands.PLACE));
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.leaderView = Objects.requireNonNull(leaderView, "leaderView");
         this.policy = Objects.requireNonNull(policy, "policy");
-        this.statusReportInterval = Objects.requireNonNull(statusReportInterval, "statusReportInterval");
+        this.nodeStatusStaleAfter = Objects.requireNonNull(nodeStatusStaleAfter, "nodeStatusStaleAfter");
         this.clock = Objects.requireNonNull(clock, "clock");
         for (int i = 0; i < LOCK_STRIPES; i++) {
             stripeLocks[i] = new Object();
@@ -126,52 +127,105 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
 
     @Override
     public void onLeaderChanged(NodeId newLeader) {
-        // Perdeu (ou nunca teve) a liderança: os placements pendentes desde o último reporte de
-        // status não valem mais para as decisões deste nó — zera para não carregar contagem obsoleta
-        // caso ele volte a ser líder mais tarde.
-        if (!leaderView.isLeader()) {
+        if (leaderView.isLeader()) {
+            // Assumiu a liderança agora (ou de novo): reconstrói pendingByNode a partir do catálogo
+            // local em vez de começar do zero. Sem isso, um handoff logo após uma rajada de PLACEs
+            // feitos pelo líder anterior faz o novo líder enxergar seriesCount desatualizado (ainda
+            // não refletido no próximo StorageNodeStatus) E pending=0 para todo mundo — a rajada
+            // inteira decidiria pelo mesmo "menos carregado" aparente, concentrando tudo num nó só
+            // (achado F2 do Debugger).
+            recomputePendingFromCatalog();
+        } else {
+            // Perdeu (ou nunca teve) a liderança: os placements pendentes desde o último reporte de
+            // status não valem mais para as decisões deste nó — zera para não carregar contagem
+            // obsoleta caso ele volte a ser líder mais tarde.
             pendingByNode.clear();
+        }
+    }
+
+    /**
+     * Reconta, a partir do catálogo local, quantas séries {@code ACTIVE} de cada dono foram colocadas
+     * DEPOIS do último {@code reportedAtEpochMs} conhecido daquele dono — exatamente o que
+     * {@link PendingCounter} rastreia incrementalmente durante o mandato, mas partindo do estado real
+     * em vez de zero.
+     */
+    private void recomputePendingFromCatalog() {
+        Map<String, StorageNodeStatus> statusByNode = catalog.nodesLocal().stream()
+                .collect(Collectors.toMap(StorageNodeStatus::nodeId, status -> status, (a, b) -> a));
+        Map<String, Long> countByOwner = new HashMap<>();
+        for (SeriesPlacement placement : catalog.placementsLocal().values()) {
+            if (placement.state() != PlacementState.ACTIVE) {
+                continue;
+            }
+            StorageNodeStatus ownerStatus = statusByNode.get(placement.ownerNodeId());
+            long reportedAt = ownerStatus != null ? ownerStatus.reportedAtEpochMs() : Long.MIN_VALUE;
+            if (placement.createdAtEpochMs() > reportedAt) {
+                countByOwner.merge(placement.ownerNodeId(), 1L, Long::sum);
+            }
+        }
+
+        pendingByNode.clear();
+        for (Map.Entry<String, Long> entry : countByOwner.entrySet()) {
+            StorageNodeStatus ownerStatus = statusByNode.get(entry.getKey());
+            long reportedAt = ownerStatus != null ? ownerStatus.reportedAtEpochMs() : clock.millis();
+            PendingCounter counter = new PendingCounter();
+            for (long i = 0; i < entry.getValue(); i++) {
+                counter.increment(reportedAt);
+            }
+            pendingByNode.put(entry.getKey(), counter);
         }
     }
 
     private PlaceResponse handlePlace(PlaceRequest request) {
         if (!leaderView.isLeader()) {
-            return new PlaceResponse(SeriesStatus.NOT_LEADER, null, leaderView.leaderId().orElse("no leader"));
+            return notLeaderResponse();
         }
         Object lock = stripeLocks[Math.floorMod(request.seriesKey().hashCode(), LOCK_STRIPES)];
         synchronized (lock) {
             // m4: a liderança pode ter mudado entre a checagem acima e a aquisição do lock de stripe.
             if (!leaderView.isLeader()) {
-                return new PlaceResponse(SeriesStatus.NOT_LEADER, null, leaderView.leaderId().orElse("no leader"));
+                return notLeaderResponse();
             }
             Optional<SeriesPlacement> alreadyPlaced = catalog.placementStrong(request.seriesKey());
             if (alreadyPlaced.isPresent()) {
-                return new PlaceResponse(SeriesStatus.OK, alreadyPlaced.get(), null);
+                return new PlaceResponse(SeriesStatus.OK, alreadyPlaced.get(), null, null);
             }
 
             Collection<StorageNodeStatus> nodes = catalog.nodesLocal();
             long now = clock.millis();
             PlacementContext ctx = new PlacementContext(nodes, leaderView.reachableNodeIds(),
-                    snapshotPending(nodes), now, statusReportInterval, request.preferredOwnerNodeId());
+                    snapshotPending(nodes), now, nodeStatusStaleAfter, request.preferredOwnerNodeId());
 
             Optional<String> chosen = policy.choose(ctx);
             if (chosen.isEmpty()) {
                 return new PlaceResponse(SeriesStatus.NO_STORAGE_NODE_AVAILABLE, null,
-                        "nenhum storage node candidato disponível para a série " + request.seriesKey());
+                        "nenhum storage node candidato disponível para a série " + request.seriesKey(), null);
             }
 
             // m4: re-checa de novo, o mais perto possível da escrita — decidir o placement (leitura do
             // catálogo + policy.choose) pode levar um tempo perceptível; se a liderança já mudou nesse
             // meio tempo, não grava (evita dois nós escreverem placements divergentes para a mesma série).
             if (!leaderView.isLeader()) {
-                return new PlaceResponse(SeriesStatus.NOT_LEADER, null, leaderView.leaderId().orElse("no leader"));
+                return notLeaderResponse();
             }
 
             SeriesPlacement placement = SeriesPlacement.active(chosen.get(), now);
             catalog.putPlacement(request.seriesKey(), placement);
             recordPending(chosen.get(), nodes);
-            return new PlaceResponse(SeriesStatus.OK, placement, null);
+            return new PlaceResponse(SeriesStatus.OK, placement, null, null);
         }
+    }
+
+    /**
+     * B2 (achado do Refuter): {@code leaderNodeId} carrega quem, na visão de {@link #leaderView}, é
+     * o líder atual — {@code null} se nem este nó sabe. O cliente ({@code PlacementResolver}) usa
+     * esse valor para ir direto ao líder indicado na próxima tentativa, em vez de reconsultar
+     * {@code ClusterRpc#leaderId()}.
+     */
+    private PlaceResponse notLeaderResponse() {
+        String leaderId = leaderView.leaderId().orElse(null);
+        return new PlaceResponse(SeriesStatus.NOT_LEADER, null,
+                "este nó não é o líder atual", leaderId);
     }
 
     private Map<String, Long> snapshotPending(Collection<StorageNodeStatus> nodes) {

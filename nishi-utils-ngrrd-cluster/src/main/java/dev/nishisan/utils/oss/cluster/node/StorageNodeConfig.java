@@ -46,6 +46,11 @@ import java.util.Objects;
  * @param initialShardCapacityBytes capacidade inicial (sparse) de cada shard
  * @param capacityBytes             capacidade total declarada do nó, em bytes; {@code <= 0} = desconhecida
  * @param statusReportInterval      intervalo entre publicações de {@code StorageNodeStatus}
+ * @param nodeStatusStaleAfter      prazo completo após o qual o líder considera "velho" o último
+ *                                  status reportado por um nó, para fins de placement
+ *                                  ({@code LeastLoadedPlacementPolicy}) — default
+ *                                  {@code max(5 × statusReportInterval, 15s)}, generoso o bastante
+ *                                  para sobreviver a um handoff de liderança sem descartar nós ativos
  * @param handleIdleTtl             tempo de ociosidade após o qual um handle de série é fechado
  * @param maxOpenHandles            número máximo de handles de série simultaneamente abertos
  * @param requestTimeout            prazo de espera por resposta a um RPC do cluster
@@ -67,6 +72,7 @@ public record StorageNodeConfig(
         long initialShardCapacityBytes,
         long capacityBytes,
         Duration statusReportInterval,
+        Duration nodeStatusStaleAfter,
         Duration handleIdleTtl,
         int maxOpenHandles,
         Duration requestTimeout,
@@ -101,6 +107,10 @@ public record StorageNodeConfig(
         Objects.requireNonNull(statusReportInterval, "statusReportInterval é obrigatório");
         if (statusReportInterval.isNegative() || statusReportInterval.isZero()) {
             throw new IllegalArgumentException("statusReportInterval deve ser > 0");
+        }
+        Objects.requireNonNull(nodeStatusStaleAfter, "nodeStatusStaleAfter é obrigatório");
+        if (nodeStatusStaleAfter.isNegative() || nodeStatusStaleAfter.isZero()) {
+            throw new IllegalArgumentException("nodeStatusStaleAfter deve ser > 0");
         }
         Objects.requireNonNull(handleIdleTtl, "handleIdleTtl é obrigatório");
         if (handleIdleTtl.isNegative() || handleIdleTtl.isZero()) {
@@ -138,6 +148,8 @@ public record StorageNodeConfig(
         private long initialShardCapacityBytes = BlobVolumeConfig.DEFAULT_SEGMENT_BYTES;
         private long capacityBytes = 0L;
         private Duration statusReportInterval = Duration.ofSeconds(10);
+        /** {@code null} = calculado em {@link #build()} a partir de {@link #statusReportInterval}. */
+        private Duration nodeStatusStaleAfter;
         private Duration handleIdleTtl = Duration.ofMinutes(15);
         private int maxOpenHandles = 10_000;
         private Duration requestTimeout = Duration.ofSeconds(20);
@@ -222,6 +234,12 @@ public record StorageNodeConfig(
             return this;
         }
 
+        /** Sobrescreve o prazo de "status velho" para placement; sem chamar isto, {@link #build()} calcula o default. */
+        public Builder nodeStatusStaleAfter(Duration nodeStatusStaleAfter) {
+            this.nodeStatusStaleAfter = nodeStatusStaleAfter;
+            return this;
+        }
+
         public Builder handleIdleTtl(Duration handleIdleTtl) {
             this.handleIdleTtl = handleIdleTtl;
             return this;
@@ -247,11 +265,20 @@ public record StorageNodeConfig(
             return this;
         }
 
+        private static final Duration MIN_NODE_STATUS_STALE_AFTER = Duration.ofSeconds(15);
+
         public StorageNodeConfig build() {
+            Duration resolvedStaleAfter = nodeStatusStaleAfter != null
+                    ? nodeStatusStaleAfter
+                    : maxDuration(statusReportInterval.multipliedBy(5), MIN_NODE_STATUS_STALE_AFTER);
             return new StorageNodeConfig(nodeId, host, port, seed, peers, dataDir, priority, volumeDir,
                     volumeName, shardCount, segmentBytes, initialShardCapacityBytes, capacityBytes,
-                    statusReportInterval, handleIdleTtl, maxOpenHandles, requestTimeout,
+                    statusReportInterval, resolvedStaleAfter, handleIdleTtl, maxOpenHandles, requestTimeout,
                     defaultDurability, defaultOnGeometryChange);
+        }
+
+        private static Duration maxDuration(Duration a, Duration b) {
+            return a.compareTo(b) >= 0 ? a : b;
         }
     }
 }

@@ -46,4 +46,15 @@ public interface ClusterRpc {
 
     /** Identificador do líder atual do cluster, ou vazio se nenhum foi eleito. */
     Optional<NodeId> leaderId();
+
+    /**
+     * B3 (achado do Refuter): indica se o transporte já tem uma conexão estabelecida com
+     * {@code target} — usado pelo cliente para esperar a conexão ficar pronta entre retentativas
+     * após uma falha de transporte, em vez de tentar de novo às cegas enquanto o TCP ainda está no
+     * meio de uma reconexão. Implementações sem noção de conexão persistente (ex.: despacho local em
+     * testes) podem devolver sempre {@code true}.
+     */
+    default boolean isConnected(NodeId target) {
+        return true;
+    }
 }

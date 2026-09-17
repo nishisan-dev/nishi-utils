@@ -231,6 +231,35 @@ class LeastLoadedPlacementPolicyTest {
     }
 
     @Test
+    void quandoTodosOsNosFicamVelhosAoMesmoTempoIgnoraOFiltroDeFrescor() {
+        // F2.3 (Debugger): um handoff de liderança faz o último status visível ao NOVO líder nascer
+        // "velho" para TODOS os nós ao mesmo tempo (nenhum ainda reportou para ele) — isso não deveria
+        // ser tratado como "nenhum nó disponível", e sim cair para os candidatos ACTIVE+alcançáveis
+        // ignorando o frescor, senão o placement fica travado até o próximo ciclo de relatório.
+        long now = 1_000_000L;
+        StorageNodeStatus a = node("node-a", NodeState.ACTIVE, 10, 0, 0, now - 3 * INTERVAL.toMillis());
+        StorageNodeStatus b = node("node-b", NodeState.ACTIVE, 2, 0, 0, now - 3 * INTERVAL.toMillis());
+        PlacementContext ctx = context(List.of(a, b), Set.of("node-a", "node-b"), Map.of(), now, null);
+
+        // Mesmo com os dois "velhos", a decisão continua obedecendo a ordem total normal (carga
+        // efetiva menor vence): node-b (carga 2) em vez de node-a (carga 10).
+        assertEquals(Optional.of("node-b"), policy.choose(ctx));
+    }
+
+    @Test
+    void statusVelhoDeUmSoNoContinuaSendoFiltradoQuandoOutroEstaFresco() {
+        // Garante que a exceção do F2.3 só se aplica quando TODOS os candidatos estão velhos — com
+        // pelo menos um fresco, o filtro de frescor continua excluindo os velhos normalmente (mesmo
+        // caso de filtraStatusVelho, mas reforçando que a exceção não vira uma porta aberta geral).
+        long now = 1_000_000L;
+        StorageNodeStatus stale = node("node-a", NodeState.ACTIVE, 0, 0, 0, now - 3 * INTERVAL.toMillis());
+        StorageNodeStatus fresh = node("node-b", NodeState.ACTIVE, 50, 0, 0, now);
+        PlacementContext ctx = context(List.of(stale, fresh), Set.of("node-a", "node-b"), Map.of(), now, null);
+
+        assertEquals(Optional.of("node-b"), policy.choose(ctx));
+    }
+
+    @Test
     void semCandidatosRetornaVazio() {
         long now = 1_000L;
         StorageNodeStatus draining = node("node-a", NodeState.DRAINING, 0, 0, 0, now);

@@ -47,7 +47,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertNull;
 
 /**
  * Cobre {@link PlacementRequestHandler} sem montar um cluster de vários nós:
@@ -94,6 +94,8 @@ class PlacementRequestHandlerTest {
 
     @Test
     void naoLiderRespondeNotLeaderComOIdDoLiderConhecido() {
+        // B2 (achado do Refuter): o id do líder conhecido vai no campo dedicado leaderNodeId — não
+        // mais dentro de message, que agora é só um texto legível para humano.
         leaderView.leader = false;
         leaderView.leaderId = Optional.of("node-b");
 
@@ -101,11 +103,11 @@ class PlacementRequestHandlerTest {
                 new PlaceRequest("series-1", "hash-1", null), NodeId.of("client"));
 
         assertEquals(SeriesStatus.NOT_LEADER, response.status());
-        assertEquals("node-b", response.message());
+        assertEquals("node-b", response.leaderNodeId());
     }
 
     @Test
-    void naoLiderSemLiderConhecidoRespondeMensagemPadrao() {
+    void naoLiderSemLiderConhecidoRespondeLeaderNodeIdNulo() {
         leaderView.leader = false;
         leaderView.leaderId = Optional.empty();
 
@@ -113,7 +115,7 @@ class PlacementRequestHandlerTest {
                 new PlaceRequest("series-1", "hash-1", null), NodeId.of("client"));
 
         assertEquals(SeriesStatus.NOT_LEADER, response.status());
-        assertEquals("no leader", response.message());
+        assertNull(response.leaderNodeId());
     }
 
     @Test
@@ -222,6 +224,28 @@ class PlacementRequestHandlerTest {
         // Sem o reset em onLeaderChanged, pendingByNode ainda teria node-a=1 (de series-1), então
         // node-a (efetivo 1) perderia para node-b (efetivo 0). Com o reset, os dois voltam a 0 -> empate -> nodeId.
         assertEquals("node-a", response.placement().ownerNodeId());
+    }
+
+    @Test
+    void aoAssumirALiderancaRecomputaPendingByNodeDoCatalogoLocal() {
+        // F2.4 (Debugger): série já colocada em node-a por um líder anterior, DEPOIS do último
+        // status reportado por node-a (createdAt > reportedAt) — o próximo StorageNodeStatus de
+        // node-a ainda não reflete essa série no seriesCount. Ao assumir a liderança, o handler deve
+        // recontar isso a partir do catálogo, não começar pendingByNode do zero.
+        long t0 = clock.millis();
+        putNode("node-a", 0, t0);
+        putNode("node-b", 0, t0);
+        catalog.putPlacement("series-preexistente", SeriesPlacement.active("node-a", t0 + 1));
+
+        leaderView.leader = true;
+        handler.onLeaderChanged(NodeId.of("self"));
+
+        PlaceResponse response = (PlaceResponse) handler.handle(Commands.PLACE,
+                new PlaceRequest("series-nova", "hash-nova", null), NodeId.of("client"));
+        // node-a: seriesCount(0) reportado + pending recomputado(1) = 1; node-b: 0 + 0 = 0 -> node-b
+        // vence, mesmo os dois tendo o mesmo seriesCount reportado (sem o recompute, empatariam por
+        // nodeId e node-a venceria, sobrecarregando o nó que já tinha uma série "invisível").
+        assertEquals("node-b", response.placement().ownerNodeId());
     }
 
     @Test

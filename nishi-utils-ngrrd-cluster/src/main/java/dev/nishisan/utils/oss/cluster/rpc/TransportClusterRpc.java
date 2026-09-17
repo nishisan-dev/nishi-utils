@@ -99,6 +99,11 @@ public final class TransportClusterRpc implements ClusterRpc {
     }
 
     @Override
+    public boolean isConnected(NodeId target) {
+        return transport.isConnected(target);
+    }
+
+    @Override
     public <R> R call(NodeId target, String command, Object body, Class<R> responseType) {
         Objects.requireNonNull(target, "target");
         Objects.requireNonNull(command, "command");

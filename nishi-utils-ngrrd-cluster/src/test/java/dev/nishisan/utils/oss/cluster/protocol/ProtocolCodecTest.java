@@ -101,16 +101,26 @@ class ProtocolCodecTest {
     void placeResponseComPlacementMigrandoSobreviveAoRoundTrip() throws IOException {
         SeriesPlacement placement = new SeriesPlacement("node-a", "node-b", PlacementState.MIGRATING,
                 "migration-1", 1_000L, 2_000L);
-        PlaceResponse original = new PlaceResponse(SeriesStatus.OK, placement, null);
+        PlaceResponse original = new PlaceResponse(SeriesStatus.OK, placement, null, null);
         assertEquals(original, roundTripResponseBody(Commands.PLACE, original));
     }
 
     @Test
     void placeResponseDeErroSemPlacementSobreviveAoRoundTrip() throws IOException {
-        PlaceResponse original = new PlaceResponse(SeriesStatus.NO_STORAGE_NODE_AVAILABLE, null, "sem nós disponíveis");
+        PlaceResponse original = new PlaceResponse(SeriesStatus.NO_STORAGE_NODE_AVAILABLE, null,
+                "sem nós disponíveis", null);
         PlaceResponse roundTripped = roundTripResponseBody(Commands.PLACE, original);
         assertEquals(original, roundTripped);
         assertNull(roundTripped.placement());
+    }
+
+    @Test
+    void placeResponseNotLeaderComLeaderNodeIdSobreviveAoRoundTrip() throws IOException {
+        PlaceResponse original = new PlaceResponse(SeriesStatus.NOT_LEADER, null,
+                "este nó não é o líder atual", "storage-1");
+        PlaceResponse roundTripped = roundTripResponseBody(Commands.PLACE, original);
+        assertEquals(original, roundTripped);
+        assertEquals("storage-1", roundTripped.leaderNodeId());
     }
 
     @Test

@@ -41,6 +41,8 @@ import dev.nishisan.utils.oss.cluster.protocol.WriteBatchRequest;
 import dev.nishisan.utils.oss.cluster.protocol.WriteBatchResponse;
 import dev.nishisan.utils.oss.cluster.rpc.RequestHandlerSupport;
 
+import java.time.Clock;
+import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -79,12 +81,21 @@ import java.util.stream.Collectors;
 public final class StorageRequestHandler extends RequestHandlerSupport {
 
     /**
-     * Consulta de placement local consumida por este handler — isola a
-     * dependência de {@code CatalogService} para permitir testes com fake, sem
-     * subir um {@code NGrid} real.
+     * Consulta de placement consumida por este handler — isola a dependência
+     * de {@code CatalogService} para permitir testes com fake, sem subir um
+     * {@code NGrid} real.
      */
     public interface PlacementLookup {
+        /** Leitura eventual (replicada localmente); pode estar vazia/atrasada logo após um restart. */
         Optional<SeriesPlacement> placementLocal(String seriesKey);
+
+        /**
+         * Leitura forte (round-trip ao líder). Usada como último recurso em
+         * {@link #ownership} quando a réplica local não tem a entrada — nunca
+         * responder {@code WRONG_OWNER} com dono desconhecido só porque a
+         * cópia local ainda não convergiu.
+         */
+        Optional<SeriesPlacement> placementStrong(String seriesKey);
     }
 
     /** Snapshot das métricas mínimas deste handler. O M2 amplia. */
@@ -100,27 +111,33 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
         }
     }
 
+    /** Prazo do cache negativo de {@code placementStrong}: evita martelar o líder por chave. */
+    private static final Duration NEGATIVE_LOOKUP_CACHE_TTL = Duration.ofSeconds(5);
+
     private final PlacementLookup placementLookup;
     private final SeriesHandleRegistry registry;
     private final NodeId self;
     private final Durability defaultDurability;
     private final OnGeometryChange defaultOnGeometryChange;
+    private final Clock clock;
 
     private final LongAdder writeBatchesCount = new LongAdder();
     private final LongAdder samplesWrittenCount = new LongAdder();
     private final LongAdder readsCount = new LongAdder();
     private final LongAdder checkpointsCount = new LongAdder();
     private final ConcurrentMap<SeriesStatus, LongAdder> errorsByStatus = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, Long> negativeLookupCacheExpiryMs = new ConcurrentHashMap<>();
 
     public StorageRequestHandler(Transport transport, PlacementLookup placementLookup,
             SeriesHandleRegistry registry, NodeId self, Durability defaultDurability,
-            OnGeometryChange defaultOnGeometryChange) {
+            OnGeometryChange defaultOnGeometryChange, Clock clock) {
         super(transport, Commands.OWNER_COMMANDS);
         this.placementLookup = Objects.requireNonNull(placementLookup, "placementLookup");
         this.registry = Objects.requireNonNull(registry, "registry");
         this.self = Objects.requireNonNull(self, "self");
         this.defaultDurability = Objects.requireNonNull(defaultDurability, "defaultDurability");
         this.defaultOnGeometryChange = Objects.requireNonNull(defaultOnGeometryChange, "defaultOnGeometryChange");
+        this.clock = Objects.requireNonNull(clock, "clock");
     }
 
     @Override
@@ -338,7 +355,48 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
         if (registry.isOpen(seriesKey)) {
             return new Ownership(SeriesStatus.OK, self.value());
         }
-        return new Ownership(SeriesStatus.WRONG_OWNER, null);
+        // Réplica local vazia (ex.: logo após um restart, antes do catálogo persistido convergir via
+        // replicação) e nem o placementHint nem o registry local confirmam o dono: consulta o líder
+        // (placementStrong) antes de desistir. NUNCA responder WRONG_OWNER(null) só porque a cópia
+        // local está vazia — era exatamente isso que fazia o WriteDispatcher do cliente re-enfileirar
+        // para sempre num nó que, na verdade, é o dono correto (ver F1.2 do achado do Debugger).
+        long now = clock.millis();
+        Long negativeCacheExpiry = negativeLookupCacheExpiryMs.get(seriesKey);
+        if (negativeCacheExpiry != null) {
+            if (now < negativeCacheExpiry) {
+                return new Ownership(SeriesStatus.WRONG_OWNER, null);
+            }
+            // item 7 (achado do Refuter): entrada expirada por tempo — remove já aqui em vez de
+            // deixá-la parada no mapa até uma eventual nova consulta desta MESMA série.
+            negativeLookupCacheExpiryMs.remove(seriesKey, negativeCacheExpiry);
+        }
+        Optional<SeriesPlacement> strong = placementLookup.placementStrong(seriesKey);
+        if (strong.isEmpty()) {
+            // Cache negativo curto: uma série de fato não colocada não deve martelar o líder a cada
+            // requisição enquanto o cliente insiste (backoff dele à parte).
+            putNegativeCacheEntry(seriesKey, now);
+            return new Ownership(SeriesStatus.WRONG_OWNER, null);
+        }
+        negativeLookupCacheExpiryMs.remove(seriesKey);
+        SeriesPlacement current = strong.get();
+        if (!current.isOwnedBy(self.value())) {
+            return new Ownership(SeriesStatus.WRONG_OWNER, current.ownerNodeId());
+        }
+        // Dono confirmado pelo líder, mas ainda sem handle nem definição em cache localmente (registry
+        // não tinha a série aberta) — o self-healing do write/read/checkpoint decide NOT_OPEN a partir
+        // daqui; open() sempre tem a definição YAML no corpo da requisição.
+        return new Ownership(SeriesStatus.OK, current.ownerNodeId());
+    }
+
+    /**
+     * item 7 (achado do Refuter): registra a entrada negativa e, antes disso, varre o mapa removendo
+     * toda entrada já expirada — sem essa varredura, uma série que nunca mais é consultada depois de
+     * expirar ficaria parada no mapa para sempre (o {@code get} de {@link #ownership} só limpa a
+     * própria chave que está olhando, nunca as outras), crescendo sem limite ao longo do tempo.
+     */
+    private void putNegativeCacheEntry(String seriesKey, long now) {
+        negativeLookupCacheExpiryMs.entrySet().removeIf(entry -> entry.getValue() <= now);
+        negativeLookupCacheExpiryMs.put(seriesKey, now + NEGATIVE_LOOKUP_CACHE_TTL.toMillis());
     }
 
     private void recordError(SeriesStatus status) {

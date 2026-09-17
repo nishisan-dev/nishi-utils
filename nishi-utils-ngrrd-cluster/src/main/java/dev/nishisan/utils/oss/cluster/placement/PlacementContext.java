@@ -38,8 +38,13 @@ import java.util.Set;
  *                             novas de uma rajada de placements cairiam no mesmo nó antes do
  *                             próximo relatório. A carga efetiva de um nó é
  *                             {@code seriesCount + pendingSeriesByNode.get(nodeId)}.
- * @param nowEpochMs           instante da decisão
- * @param statusReportInterval intervalo esperado entre relatórios de status dos nós
+ * @param nowEpochMs            instante da decisão
+ * @param nodeStatusStaleAfter  prazo completo além do qual o último status reportado de um nó deixa
+ *                              de ser considerado fresco (ex.: {@code StorageNodeConfig.nodeStatusStaleAfter()},
+ *                              tipicamente {@code max(5 × statusReportInterval, 15s)}) — não é mais o
+ *                              intervalo "cru" entre relatórios: um handoff de liderança faz o status
+ *                              mais recente visível ao NOVO líder já nascer "velho" se o prazo for
+ *                              curto demais (só {@code 2 × interval}), descartando um nó legítimo.
  * @param preferredOwnerNodeId dono preferido (ex.: adoção pelo {@code LocalReconciler}), ou {@code null}
  */
 public record PlacementContext(
@@ -47,13 +52,13 @@ public record PlacementContext(
         Set<String> reachableNodeIds,
         Map<String, Long> pendingSeriesByNode,
         long nowEpochMs,
-        Duration statusReportInterval,
+        Duration nodeStatusStaleAfter,
         String preferredOwnerNodeId) {
 
     public PlacementContext {
         Objects.requireNonNull(nodes, "nodes");
         Objects.requireNonNull(reachableNodeIds, "reachableNodeIds");
-        Objects.requireNonNull(statusReportInterval, "statusReportInterval");
+        Objects.requireNonNull(nodeStatusStaleAfter, "nodeStatusStaleAfter");
         // Cópia defensiva: o chamador (líder) não deve conseguir mutar o contexto depois de
         // construí-lo — a decisão de placement precisa ver sempre o mesmo snapshot.
         nodes = List.copyOf(nodes);

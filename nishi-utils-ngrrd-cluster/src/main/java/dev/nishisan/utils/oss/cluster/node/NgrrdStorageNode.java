@@ -25,6 +25,7 @@ import dev.nishisan.utils.oss.blob.BlobVolume;
 import dev.nishisan.utils.oss.blob.BlobVolumeRegistry;
 import dev.nishisan.utils.oss.blob.NgrrdBlob;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
+import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
 import dev.nishisan.utils.oss.cluster.placement.LeastLoadedPlacementPolicy;
 import dev.nishisan.utils.oss.cluster.rpc.TransportClusterRpc;
 
@@ -32,6 +33,7 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.time.Clock;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -117,13 +119,27 @@ public final class NgrrdStorageNode implements Closeable {
                         cfg.handleIdleTtl(), cfg.maxOpenHandles(), Clock.systemUTC());
 
                 NodeId self = node.transport().local().nodeId();
+                // Adaptador em vez de método de referência: StorageRequestHandler.PlacementLookup agora
+                // também exige placementStrong (round-trip ao líder), usado quando a réplica local do
+                // catálogo ainda está vazia (ex.: logo após um restart) — ver F1.2.
+                StorageRequestHandler.PlacementLookup placementLookup = new StorageRequestHandler.PlacementLookup() {
+                    @Override
+                    public Optional<SeriesPlacement> placementLocal(String seriesKey) {
+                        return catalog.placementLocal(seriesKey);
+                    }
+
+                    @Override
+                    public Optional<SeriesPlacement> placementStrong(String seriesKey) {
+                        return catalog.placementStrong(seriesKey);
+                    }
+                };
                 StorageRequestHandler storageHandler = new StorageRequestHandler(node.transport(),
-                        catalog::placementLocal, registry, self, cfg.defaultDurability(),
-                        cfg.defaultOnGeometryChange());
+                        placementLookup, registry, self, cfg.defaultDurability(),
+                        cfg.defaultOnGeometryChange(), Clock.systemUTC());
                 PlacementRequestHandler.LeaderView leaderView =
                         PlacementRequestHandler.fromCoordinator(node.coordinator(), node.transport());
                 PlacementRequestHandler placementHandler = new PlacementRequestHandler(node.transport(), catalog,
-                        leaderView, new LeastLoadedPlacementPolicy(), cfg.statusReportInterval(), Clock.systemUTC());
+                        leaderView, new LeastLoadedPlacementPolicy(), cfg.nodeStatusStaleAfter(), Clock.systemUTC());
 
                 node.transport().addListener(storageHandler);
                 node.transport().addListener(placementHandler);
@@ -133,6 +149,7 @@ public final class NgrrdStorageNode implements Closeable {
 
                 NodeStatusReporter statusReporter = new NodeStatusReporter(catalog, volume, registry, cfg.nodeId(),
                         cfg.capacityBytes(), cfg.statusReportInterval(), Clock.systemUTC());
+                node.coordinator().addLeadershipListener(statusReporter);
                 statusReporter.start();
 
                 return new NgrrdStorageNode(cfg, volumeRegistry, volume, node, catalog, rpc, registry,
@@ -209,6 +226,7 @@ public final class NgrrdStorageNode implements Closeable {
             node.transport().removeListener(storageHandler);
             node.transport().removeListener(placementHandler);
             node.coordinator().removeLeadershipListener(placementHandler);
+            node.coordinator().removeLeadershipListener(statusReporter);
             rpc.unregisterLocalHandler(storageHandler);
             rpc.unregisterLocalHandler(placementHandler);
         });

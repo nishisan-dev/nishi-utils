@@ -20,11 +20,17 @@ package dev.nishisan.utils.oss.cluster.protocol;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
 
 /**
- * Resposta do líder a um {@link PlaceRequest}.
+ * Resposta do líder (ou de quem pensava ser o líder) a um {@link PlaceRequest}.
  *
- * @param status    {@link SeriesStatus#OK} em caso de sucesso
- * @param placement placement resultante; {@code null} se {@code status != OK}
- * @param message   detalhe legível do erro, ou {@code null}
+ * @param status       {@link SeriesStatus#OK} em caso de sucesso
+ * @param placement    placement resultante; {@code null} se {@code status != OK}
+ * @param message      detalhe legível do erro, ou {@code null}
+ * @param leaderNodeId B2 (achado do Refuter): quando {@code status == NOT_LEADER}, o {@code nodeId}
+ *                     do líder atual segundo quem respondeu — {@code null} se nem quem respondeu
+ *                     sabe quem é o líder. Permite ao cliente ({@code PlacementResolver}) ir direto
+ *                     ao líder indicado na próxima tentativa, em vez de reconsultar
+ *                     {@code ClusterRpc#leaderId()} (que pode estar vazio/desatualizado bem no meio
+ *                     de um handoff).
  */
-public record PlaceResponse(SeriesStatus status, SeriesPlacement placement, String message) {
+public record PlaceResponse(SeriesStatus status, SeriesPlacement placement, String message, String leaderNodeId) {
 }

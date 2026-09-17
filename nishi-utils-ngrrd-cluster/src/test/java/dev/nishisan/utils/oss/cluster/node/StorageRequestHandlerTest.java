@@ -47,6 +47,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -98,7 +99,7 @@ class StorageRequestHandlerTest {
         registry = new SeriesHandleRegistry(volume, "ngrrd", Duration.ofMinutes(15), 10_000, clock);
         placementLookup = new PlacementLookupFake();
         handler = new StorageRequestHandler(new FakeTransport(SELF), placementLookup, registry, SELF,
-                Durability.FSYNC, OnGeometryChange.FAIL);
+                Durability.FSYNC, OnGeometryChange.FAIL, clock);
     }
 
     @AfterEach
@@ -171,6 +172,70 @@ class StorageRequestHandlerTest {
 
         assertEquals(SeriesStatus.WRONG_OWNER, response.status());
         assertNull(response.ownerNodeId());
+    }
+
+    @Test
+    void replicaLocalVaziaMasLiderConfirmaSelfComoDonoRespondeNotOpenEmVezDeWrongOwner() {
+        // Simula o catálogo persistido ainda não convergido após um restart: a réplica LOCAL não tem a
+        // série, mas o líder (placementStrong) confirma que o dono é este próprio nó. Sem handle aberto
+        // nem definição em cache, o self-healing decide NOT_OPEN — nunca WRONG_OWNER(null), que faria o
+        // cliente re-enfileirar para sempre num nó que na verdade é o dono correto (achado do Debugger).
+        String seriesKey = "series-catalogo-nao-convergido";
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.FLUSH,
+                new SeriesCommandRequest(seriesKey), SOURCE);
+
+        assertEquals(SeriesStatus.NOT_OPEN, response.status());
+    }
+
+    @Test
+    void replicaLocalVaziaMasLiderConfirmaOutroDonoRespondeWrongOwnerComODono() {
+        String seriesKey = "series-catalogo-nao-convergido-outro-dono";
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.active(OTHER.value(), 1_000L));
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.FLUSH,
+                new SeriesCommandRequest(seriesKey), SOURCE);
+
+        assertEquals(SeriesStatus.WRONG_OWNER, response.status());
+        assertEquals(OTHER.value(), response.ownerNodeId());
+    }
+
+    @Test
+    void consultaAoLiderEhCacheadaNegativamentePorCincoSegundos() {
+        String seriesKey = "series-nunca-colocada";
+
+        handler.handle(Commands.FLUSH, new SeriesCommandRequest(seriesKey), SOURCE);
+        handler.handle(Commands.FLUSH, new SeriesCommandRequest(seriesKey), SOURCE);
+        assertEquals(1, placementLookup.strongCalls(), "a 2a consulta dentro de 5s deveria usar o cache negativo");
+
+        clock.advance(Duration.ofSeconds(6));
+        handler.handle(Commands.FLUSH, new SeriesCommandRequest(seriesKey), SOURCE);
+        assertEquals(2, placementLookup.strongCalls(), "após o TTL, uma nova consulta ao líder é esperada");
+    }
+
+    @Test
+    void cacheNegativoExpiradoEhVarridoDoMapaAoRegistrarUmaNovaEntrada() throws Exception {
+        // item 7 (achado do Refuter): uma série que recebe um cache negativo e nunca mais é consultada
+        // não pode ficar parada no mapa para sempre — sem alguma varredura, o mapa cresceria sem limite
+        // ao longo da vida do processo. A varredura acontece ao registrar uma nova entrada negativa.
+        String staleKey = "series-nunca-mais-consultada";
+        String freshKey = "series-outra-nunca-colocada";
+
+        handler.handle(Commands.FLUSH, new SeriesCommandRequest(staleKey), SOURCE);
+        assertEquals(1, negativeCacheSize());
+
+        clock.advance(Duration.ofSeconds(6));
+        handler.handle(Commands.FLUSH, new SeriesCommandRequest(freshKey), SOURCE);
+
+        assertEquals(1, negativeCacheSize(),
+                "a entrada expirada de " + staleKey + " deveria ter sido varrida ao inserir " + freshKey);
+    }
+
+    private int negativeCacheSize() throws Exception {
+        Field field = StorageRequestHandler.class.getDeclaredField("negativeLookupCacheExpiryMs");
+        field.setAccessible(true);
+        return ((Map<?, ?>) field.get(handler)).size();
     }
 
     @Test
@@ -387,17 +452,40 @@ class StorageRequestHandlerTest {
         }
     }
 
-    /** Fake de {@link StorageRequestHandler.PlacementLookup}: mapa em memória, sem catálogo distribuído. */
+    /**
+     * Fake de {@link StorageRequestHandler.PlacementLookup}: dois mapas em memória — {@code local}
+     * (réplica eventual, pode ficar vazia mesmo com a série colocada — simula o catálogo logo após um
+     * restart) e {@code strong} (o que o líder responderia num round-trip). {@code strongCalls} conta
+     * as consultas de {@link #placementStrong}, para os testes confirmarem o cache negativo do handler.
+     */
     private static final class PlacementLookupFake implements StorageRequestHandler.PlacementLookup {
-        private final Map<String, SeriesPlacement> placements = new HashMap<>();
+        private final Map<String, SeriesPlacement> local = new HashMap<>();
+        private final Map<String, SeriesPlacement> strong = new HashMap<>();
+        private int strongCalls;
 
         void put(String seriesKey, SeriesPlacement placement) {
-            placements.put(seriesKey, placement);
+            local.put(seriesKey, placement);
+            strong.put(seriesKey, placement);
+        }
+
+        /** Coloca a série apenas na visão forte (líder), simulando réplica local ainda não convergida. */
+        void putStrongOnly(String seriesKey, SeriesPlacement placement) {
+            strong.put(seriesKey, placement);
+        }
+
+        int strongCalls() {
+            return strongCalls;
         }
 
         @Override
         public Optional<SeriesPlacement> placementLocal(String seriesKey) {
-            return Optional.ofNullable(placements.get(seriesKey));
+            return Optional.ofNullable(local.get(seriesKey));
+        }
+
+        @Override
+        public Optional<SeriesPlacement> placementStrong(String seriesKey) {
+            strongCalls++;
+            return Optional.ofNullable(strong.get(seriesKey));
         }
     }
 

@@ -23,6 +23,8 @@ import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 /**
  * Política de placement do estágio 1: escolhe o storage node com menor carga
@@ -35,9 +37,13 @@ import java.util.Optional;
  * ({@link StorageNodeStatus#isFresh}); e, quando a capacidade é conhecida
  * ({@code capacityBytes > 0}), sua {@link StorageNodeStatus#fillRatio()} é
  * menor que {@value #CAPACITY_GUARD_FILL_RATIO} — guarda de capacidade que
- * impede empurrar novas séries para um nó praticamente cheio. Sem
- * candidatos, retorna {@link Optional#empty()} — cabe ao chamador responder
- * {@code NO_STORAGE_NODE_AVAILABLE}.</p>
+ * impede empurrar novas séries para um nó praticamente cheio. <strong>Exceção:</strong>
+ * se o filtro de frescor eliminar TODOS os nós ACTIVE+alcançáveis de uma vez
+ * (sintoma de handoff de liderança, não de queda real), ele é ignorado para
+ * esse ciclo de decisão — do contrário um handoff concentraria 100% das
+ * séries novas no primeiro nó a reportar ao novo líder. Sem candidato algum
+ * (nem ACTIVE+alcançável), retorna {@link Optional#empty()} — cabe ao
+ * chamador responder {@code NO_STORAGE_NODE_AVAILABLE}.</p>
  *
  * <p>Entre os candidatos: se {@code preferredOwnerNodeId} sobreviveu aos
  * filtros acima, ele vence direto (ex.: adoção de série existente pelo
@@ -64,6 +70,8 @@ import java.util.Optional;
  */
 public final class LeastLoadedPlacementPolicy implements PlacementPolicy {
 
+    private static final Logger LOGGER = Logger.getLogger(LeastLoadedPlacementPolicy.class.getName());
+
     /**
      * Acima deste {@code fillRatio} (quando a capacidade é conhecida), o nó
      * deixa de ser candidato a receber novas séries.
@@ -72,12 +80,31 @@ public final class LeastLoadedPlacementPolicy implements PlacementPolicy {
 
     @Override
     public Optional<String> choose(PlacementContext ctx) {
-        List<StorageNodeStatus> candidates = ctx.nodes().stream()
+        List<StorageNodeStatus> activeReachable = ctx.nodes().stream()
                 .filter(node -> node.state() == NodeState.ACTIVE)
                 .filter(node -> ctx.reachableNodeIds().contains(node.nodeId()))
-                .filter(node -> node.isFresh(ctx.nowEpochMs(), ctx.statusReportInterval()))
                 .filter(node -> !(node.capacityBytes() > 0 && node.fillRatio() >= CAPACITY_GUARD_FILL_RATIO))
                 .toList();
+
+        List<StorageNodeStatus> fresh = activeReachable.stream()
+                .filter(node -> node.isFresh(ctx.nowEpochMs(), ctx.nodeStatusStaleAfter()))
+                .toList();
+
+        List<StorageNodeStatus> candidates;
+        if (fresh.isEmpty() && !activeReachable.isEmpty()) {
+            // Todos os candidatos ACTIVE+alcançáveis estão "velhos" ao mesmo tempo — mais provável um
+            // efeito colateral de handoff de liderança (o novo líder só recebe o próximo relatório de
+            // cada nó depois de um ciclo inteiro) do que todo o cluster realmente estar sem reportar.
+            // Cair para esses nós ignorando o frescor evita concentrar 100% das séries num só nó
+            // (achado F2 do Debugger); a ordem total abaixo continua valendo normalmente.
+            LOGGER.log(Level.WARNING,
+                    "Nenhum storage node ACTIVE+alcançável tem status fresco; ignorando o filtro de "
+                            + "frescor para {0} candidato(s) nesta decisão de placement.",
+                    activeReachable.size());
+            candidates = activeReachable;
+        } else {
+            candidates = fresh;
+        }
 
         if (candidates.isEmpty()) {
             return Optional.empty();
