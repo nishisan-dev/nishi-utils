@@ -17,6 +17,7 @@
 
 package dev.nishisan.utils.ngrid.structures;
 
+import dev.nishisan.utils.map.NMapPersistenceMode;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.ngrid.replication.FollowerIngestMode;
@@ -179,6 +180,26 @@ public final class NGridNodeBuilder {
     public NGridNodeBuilder map(String name, boolean leaderLocalByReference) {
         mapConfigs.add(MapConfig.builder(Objects.requireNonNull(name, "map name"))
                 .leaderLocalByReference(leaderLocalByReference)
+                .build());
+        return this;
+    }
+
+    /**
+     * Adds a distributed map with an explicit persistence mode.
+     * <p>
+     * Useful for callers that need the map's on-disk watermark to survive a
+     * process restart with the same {@code nodeId} (e.g. a catalog map whose
+     * local replica must not appear caught-up-but-empty after a restart) or
+     * that must satisfy {@link DeploymentProfile#PRODUCTION}'s guardrail that
+     * every configured map has persistence enabled.
+     *
+     * @param name            the map name
+     * @param persistenceMode the persistence mode for this map
+     * @return this builder
+     */
+    public NGridNodeBuilder map(String name, NMapPersistenceMode persistenceMode) {
+        mapConfigs.add(MapConfig.builder(Objects.requireNonNull(name, "map name"))
+                .persistenceMode(Objects.requireNonNull(persistenceMode, "persistenceMode"))
                 .build());
         return this;
     }
