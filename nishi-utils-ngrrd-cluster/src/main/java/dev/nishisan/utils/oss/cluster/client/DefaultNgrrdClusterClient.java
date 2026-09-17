@@ -33,6 +33,7 @@ import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
 import dev.nishisan.utils.oss.cluster.metrics.LatencySnapshot;
 import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
 import dev.nishisan.utils.oss.cluster.protocol.AdminNodeRequest;
+import dev.nishisan.utils.oss.cluster.protocol.AdminRebalanceResponse;
 import dev.nishisan.utils.oss.cluster.protocol.AdminStatusResponse;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesStatus;
@@ -183,6 +184,11 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
                     cfg.closeTimeout(), seriesKey -> {
                         RemoteSeriesHandle handle = handles.get(seriesKey);
                         return handle != null && handle.reopen();
+                    }, (seriesKey, newOwner) -> {
+                        RemoteSeriesHandle handle = handles.get(seriesKey);
+                        if (handle != null) {
+                            handle.ownerChanged(newOwner);
+                        }
                     }, Clock.systemUTC(), cfg.metricsListener(), metricsSupplier);
             DefaultNgrrdClusterClient client = new DefaultNgrrdClusterClient(cfg, node, dataDir, temporaryDataDir,
                     rpc, resolver, dispatcher, handles);
@@ -217,17 +223,20 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
     }
 
     /**
-     * B3(i) (achado do Refuter): esperar só o líder estar eleito não bastava — o cliente podia ficar
-     * "pronto" antes do {@code Transport} TCP terminar de conectar com algum storage node, e a 1a
-     * chamada RPC para esse nó falhava com "No connection available for storage-N" (o segundo cliente
-     * de {@code DistributedWriteReadClusterTest} chegou a esperar até 60s antes desta correção).
-     * Espera explicitamente {@code transport.isConnected(id)} para TODO membro ativo com papel
-     * {@code "storage"} — não só o líder — antes de liberar o cliente para uso.
+     * B3(i) (achado do Refuter do M1c): esperar só o líder estar eleito não bastava — o cliente podia
+     * ficar "pronto" antes do {@code Transport} TCP terminar de conectar com algum storage node, e a 1a
+     * chamada RPC para esse nó falhava com "No connection available for storage-N".
+     *
+     * <p>M3: passa a exigir só que <strong>ao menos UM</strong> storage node ativo esteja conectado —
+     * não mais todos (nota do checkpoint do M1c: "connect() falha se qualquer storage node ativo
+     * estiver inalcançável dentro de leaderWaitTimeout, sem disponibilidade parcial"). A conectividade
+     * com os demais é responsabilidade da retentativa de transporte por operação
+     * ({@code TransportRetry}); nós ainda inalcançáveis ao final da espera só geram um WARN.</p>
      */
     private static void awaitStorageConnectionsOrThrow(NGridNode node, Duration timeout) {
         long deadline = System.currentTimeMillis() + timeout.toMillis();
-        List<NodeId> disconnected = disconnectedStorageMembers(node);
-        while (!disconnected.isEmpty() && System.currentTimeMillis() < deadline) {
+        boolean anyConnected = hasAnyConnectedStorageMember(node);
+        while (!anyConnected && System.currentTimeMillis() < deadline) {
             try {
                 Thread.sleep(LEADER_POLL_INTERVAL_MS);
             } catch (InterruptedException e) {
@@ -235,19 +244,35 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
                 throw new NgrrdClusterException(ErrorCode.TIMEOUT,
                         "interrompido aguardando conexão de transporte com os storage nodes", e);
             }
-            disconnected = disconnectedStorageMembers(node);
+            anyConnected = hasAnyConnectedStorageMember(node);
         }
-        if (!disconnected.isEmpty()) {
+        if (!anyConnected) {
             throw new NgrrdClusterException(ErrorCode.TIMEOUT,
-                    "conexão de transporte não estabelecida a tempo (" + timeout + ") com os storage nodes "
-                            + disconnected);
+                    "nenhum storage node alcançável via transporte dentro de " + timeout);
+        }
+        List<NodeId> stillDisconnected = disconnectedStorageMembers(node);
+        if (!stillDisconnected.isEmpty()) {
+            LOGGER.log(Level.WARNING, "connect(): " + stillDisconnected.size() + " storage node(s) ainda "
+                    + "inalcançável(is) via transporte após " + timeout + " — prosseguindo com disponibilidade "
+                    + "parcial (as chamadas para eles retentam por conta própria): " + stillDisconnected);
         }
     }
 
-    private static List<NodeId> disconnectedStorageMembers(NGridNode node) {
+    private static boolean hasAnyConnectedStorageMember(NGridNode node) {
+        List<NodeId> storageMembers = storageMemberIds(node);
+        return !storageMembers.isEmpty()
+                && storageMembers.stream().anyMatch(id -> node.transport().isConnected(id));
+    }
+
+    private static List<NodeId> storageMemberIds(NGridNode node) {
         return node.coordinator().activeMembers().stream()
                 .filter(info -> info.roles().contains(STORAGE_ROLE))
                 .map(NodeInfo::nodeId)
+                .toList();
+    }
+
+    private static List<NodeId> disconnectedStorageMembers(NGridNode node) {
+        return storageMemberIds(node).stream()
                 .filter(id -> !node.transport().isConnected(id))
                 .toList();
     }
@@ -349,6 +374,36 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
             // Menor (achado do Refuter): só dorme quando NÃO sabemos já para onde ir — com leaderHint
             // preenchido (a resposta já indicou o líder atual), a próxima tentativa vai direto a ele,
             // sem uma espera artificial de LEADER_POLL_INTERVAL_MS no meio do caminho.
+            if (response.leaderNodeId() != null) {
+                leaderHint = NodeId.of(response.leaderNodeId());
+            } else {
+                sleepQuietly(LEADER_POLL_INTERVAL_MS);
+            }
+        }
+    }
+
+    @Override
+    public void rebalanceNow() {
+        ensureOpen();
+        int attempt = 0;
+        NodeId leaderHint = null;
+        for (;;) {
+            attempt++;
+            NodeId leader = leaderHint != null ? leaderHint : awaitLeaderIdOrThrow();
+            leaderHint = null;
+            AdminRebalanceResponse response =
+                    rpc.call(leader, Commands.ADMIN_REBALANCE, null, AdminRebalanceResponse.class);
+            if (response.status() == SeriesStatus.OK) {
+                return;
+            }
+            if (response.status() != SeriesStatus.NOT_LEADER) {
+                throw new NgrrdClusterException(ErrorCode.REMOTE_ERROR,
+                        "ngrrd.admin.rebalance respondeu " + response.status());
+            }
+            if (attempt >= MAX_NOT_LEADER_ATTEMPTS) {
+                throw new NgrrdClusterException(ErrorCode.NO_LEADER,
+                        "NOT_LEADER persistente ao disparar o rebalanceamento após " + attempt + " tentativas");
+            }
             if (response.leaderNodeId() != null) {
                 leaderHint = NodeId.of(response.leaderNodeId());
             } else {

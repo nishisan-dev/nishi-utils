@@ -65,6 +65,13 @@ public interface NgrrdClusterClient extends Closeable {
     /** Métricas operacionais do storage node {@code nodeId} ({@code ngrrd.admin.metrics}, um RPC direto). */
     NodeMetricsSnapshot nodeMetrics(String nodeId);
 
+    /**
+     * Dispara um ciclo imediato de rebalanceamento no líder ({@code ngrrd.admin.rebalance}), com a
+     * mesma re-resolução automática de {@code NOT_LEADER} de {@link #clusterStatus()}. Não espera as
+     * migrações planejadas completarem — só confirma que o líder aceitou o pedido e planejou um ciclo.
+     */
+    void rebalanceNow();
+
     /** Identificador deste cliente no cluster NGrid. */
     NodeId clientNodeId();
 

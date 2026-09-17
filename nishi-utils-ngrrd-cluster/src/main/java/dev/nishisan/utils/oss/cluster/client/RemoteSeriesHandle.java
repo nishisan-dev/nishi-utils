@@ -173,6 +173,20 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
         dispatcher.enqueue(owner, new SeriesWrite(seriesKey, dsName, sample.tsEpochMs(), sample.value()));
     }
 
+    /**
+     * M3 (nota do Refuter do M1c): callback do {@code WriteDispatcher} quando um {@code WRONG_OWNER}
+     * já traz o dono novo — sem isto, {@link #owner} só mudava via {@link #open()}/{@link #noteWrongOwner},
+     * então {@link #write} continuava enfileirando no dono antigo até a próxima falha explícita numa
+     * operação síncrona (checkpoint/flush/read), invertendo a ordem dos lotes reroteados pelo
+     * dispatcher (o backlog "pula na frente" do lote que acabou de ser reenfileirado). Idempotente e
+     * seguro contra corrida com {@link #noteWrongOwner}: ambos só fazem uma atribuição simples a um
+     * campo {@code volatile}, a pior coisa que pode acontecer é uma delas "vencer" por um instante —
+     * a próxima chamada de qualquer uma delas sempre converge para o dono mais recente conhecido.
+     */
+    void ownerChanged(String newOwnerNodeId) {
+        this.owner = Objects.requireNonNull(newOwnerNodeId, "newOwnerNodeId");
+    }
+
     @Override
     public void flush() {
         ensureOpen();

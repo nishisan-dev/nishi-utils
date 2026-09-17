@@ -51,6 +51,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BiConsumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.logging.Level;
@@ -75,6 +76,8 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     private static final long ENQUEUE_WAIT_POLL_MS = 200L;
     private static final long DRAIN_POLL_MS = 20L;
     private static final int FLUSH_POOL_SIZE = 4;
+    /** Default dos construtores que não recebem {@code ownerChanged} explicitamente (testes antigos). */
+    private static final BiConsumer<String, String> NO_OP_OWNER_CHANGED = (seriesKey, newOwner) -> { };
 
     private final ClusterRpc rpc;
     private final PlacementLookup placementLookup;
@@ -85,6 +88,14 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     private final NgrrdClusterConfig.BufferFullPolicy bufferFullPolicy;
     private final long closeTimeoutMillis;
     private final Function<String, Boolean> reopener;
+    /**
+     * M3 (achado do Refuter do M1c): notifica o {@code RemoteSeriesHandle} da série quando um
+     * {@code WRONG_OWNER} traz um dono novo conhecido — sem isso, {@code RemoteSeriesHandle.owner}
+     * nunca muda por este caminho e cada lote seguinte da MESMA série seria reroteado de novo,
+     * reintroduzindo a inversão de ordem que {@link #extractSeriesFrom} existe para evitar. Recebe
+     * {@code (seriesKey, newOwnerNodeId)}; nunca chamado com {@code newOwnerNodeId == null}.
+     */
+    private final BiConsumer<String, String> ownerChanged;
     private final Clock clock;
     /** {@code null} = nenhuma integração de métricas configurada (ver {@link NgrrdClusterConfig#metricsListener()}). */
     private final NgrrdClusterMetricsListener metricsListener;
@@ -113,7 +124,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             NgrrdClusterConfig.BufferFullPolicy bufferFullPolicy, Duration closeTimeout,
             Function<String, Boolean> reopener, Clock clock) {
         this(rpc, placementLookup, retryPolicy, batchMaxSamples, batchMaxDelay, maxBufferedSamplesPerNode,
-                bufferFullPolicy, closeTimeout, reopener, clock, null, null);
+                bufferFullPolicy, closeTimeout, reopener, NO_OP_OWNER_CHANGED, clock, null, null);
     }
 
     /**
@@ -128,6 +139,22 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             NgrrdClusterConfig.BufferFullPolicy bufferFullPolicy, Duration closeTimeout,
             Function<String, Boolean> reopener, Clock clock, NgrrdClusterMetricsListener metricsListener,
             Supplier<ClientMetricsSnapshot> metricsSupplier) {
+        this(rpc, placementLookup, retryPolicy, batchMaxSamples, batchMaxDelay, maxBufferedSamplesPerNode,
+                bufferFullPolicy, closeTimeout, reopener, NO_OP_OWNER_CHANGED, clock, metricsListener,
+                metricsSupplier);
+    }
+
+    /**
+     * Variante completa (M3), com o callback {@link #ownerChanged} de reroteamento — usada por
+     * {@code DefaultNgrrdClusterClient} para manter {@code RemoteSeriesHandle.owner} em dia após um
+     * {@code WRONG_OWNER}. {@code metricsListener}/{@code metricsSupplier} seguem a mesma regra: ambos
+     * {@code null}, ou nenhum dos dois.
+     */
+    public WriteDispatcher(ClusterRpc rpc, PlacementLookup placementLookup, RetryPolicy retryPolicy,
+            int batchMaxSamples, Duration batchMaxDelay, long maxBufferedSamplesPerNode,
+            NgrrdClusterConfig.BufferFullPolicy bufferFullPolicy, Duration closeTimeout,
+            Function<String, Boolean> reopener, BiConsumer<String, String> ownerChanged, Clock clock,
+            NgrrdClusterMetricsListener metricsListener, Supplier<ClientMetricsSnapshot> metricsSupplier) {
         this.rpc = Objects.requireNonNull(rpc, "rpc");
         this.placementLookup = Objects.requireNonNull(placementLookup, "placementLookup");
         this.retryPolicy = Objects.requireNonNull(retryPolicy, "retryPolicy");
@@ -151,6 +178,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         }
         this.closeTimeoutMillis = closeTimeout.toMillis();
         this.reopener = Objects.requireNonNull(reopener, "reopener");
+        this.ownerChanged = Objects.requireNonNull(ownerChanged, "ownerChanged");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.metricsListener = metricsListener;
         this.metricsSupplier = metricsSupplier;
@@ -490,6 +518,10 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 if (newOwner != null) {
                     logRetryRateLimited(seriesKey, SeriesStatus.WRONG_OWNER, "novo dono informado: " + newOwner);
                     placementLookup.noteOwner(seriesKey, newOwner);
+                    // M3 (nota do Refuter do M1c): sem isto, RemoteSeriesHandle.owner nunca muda por
+                    // este caminho e cada lote SEGUINTE da mesma série seria reroteado de novo — o
+                    // handle continuaria enfileirando no dono antigo até a próxima resposta WRONG_OWNER.
+                    ownerChanged.accept(seriesKey, newOwner);
                     // B4 (achado do Refuter): antes de reenfileirar só o lote que acabou de falhar no
                     // novo dono, extrai TAMBÉM todas as escritas desta MESMA série que ainda estejam na
                     // fila de `owner` (lotes seguintes, ainda não enviados) — sem isso, elas seriam
