@@ -56,7 +56,30 @@ dispatcher (+3 s) e `node.close()` ficam fora do deadline.
 Defeito PRÉ-EXISTENTE confirmado por A/B (falha também sem M2, sob carga): sob churn de liderança o líder pode recolocar
 uma série existente e o nó aceita o hint criando uma série vazia no lugar errado → seção 0 obrigatória da spec do M3.
 
-### M3 — migração e rebalanceamento — Builder em andamento (spec `spec-m3.md`, seção 0 primeiro)
+### M3 — migração e rebalanceamento — EM ANDAMENTO, NÃO commitado (sessão pausada em 2026-09-17)
+Árvore tem ~26 arquivos do M3 sem commit (`rebalance/`, `CatalogView`, ajustes em `node/`, `client/`, `protocol/`,
+testes). Estado real: `mvn -pl nishi-utils-ngrrd-cluster verify` = 228 unitários verdes, cobertura 82%; os quatro
+testes de cluster anteriores verdes; `LeaderFailoverDuringMigrationClusterTest` 3/3 verde (58-68 s);
+`RebalanceClusterTest` intermitente (1 passe em 38 s, 3 rodadas vermelhas: imagem de `device:rb1` apagada no dono
+antigo / `Not the leader`); `PlacementUnderLeaderChurnClusterTest` vermelho, bloqueado (abaixo).
+Defeitos corrigidos nesta etapa (sem commit): `NodeStatusReporter` acumulava cadeias ilimitadas de retentativa a cada
+tick/troca de líder e alimentava o churn (agora cadeia única, 3 tentativas); `MigrationCoordinator.complete/abort`
+gravavam o flip do catálogo uma vez só e `LeaderSyncingException` ao assumir liderança deixava a série `MIGRATING`
+para sempre (agora 20 × 500 ms enquanto líder; sem flip não há `MIGRATE_FINISH`); `MIGRATE_FINISH` usava `discard`
+mantendo o YAML em cache e uma escrita atrasada recriava a série VAZIA na origem (novo `registry.forget`).
+**Próximo passo exato (do agente):** em `StorageRequestHandler.ownership()` (~:389-450), quando a série estiver
+"esquecida" no registry (`registry.isForgotten(key)`, a expor), não confiar em `placementLocal`: exigir
+`placementStrong` antes de autorizar um OPEN que criaria a série (a seção 0 blindou só o caminho do
+`placementHint`; o caminho "réplica local diz que sou dono" continua aberto). Depois testes unitários do gate e
+`RebalanceClusterTest` 3×.
+**Bloqueio no core (decisão pendente):** A/B com NGrid puro mostrou que, depois que um membro `leader-ineligible`
+entra e sai da malha, os nós elegíveis restantes NÃO elegem novo líder quando o incumbente cai (`leader=<none>` nos
+sobreviventes por 90 s; sem o membro inelegível elegem em 0,7-3 s). Como `leader-ineligible` é o role introduzido no
+M0, isso é provavelmente REGRESSÃO do M0 (escape D9 / mutual-deferral em `ClusterCoordinator.recomputeLeader`), não
+defeito pré-existente. Decisão do orquestrador: NÃO enfraquecer o `PlacementUnderLeaderChurnClusterTest`; investigar
+no core com um Debugger (opus) reproduzindo a variante H do A/B como teste do core, corrigir, reinstalar e só então
+voltar ao teste de churn. Fluxo ao retomar: (1) Debugger no core; (2) Builder termina o M3 (gate do `ownership` +
+`RebalanceClusterTest` estável + churn verde); (3) Refuter; (4) commits atômicos; (5) M4.
 
 ## Observações
 - `DualLeaderLivelockE2ETest` falhou uma vez sob carga da suíte completa; 4/4 na main e 3/3 isolado na
