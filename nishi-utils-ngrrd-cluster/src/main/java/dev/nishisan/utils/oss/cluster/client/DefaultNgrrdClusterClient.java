@@ -30,6 +30,13 @@ import dev.nishisan.utils.oss.cluster.api.NgrrdClusterClient;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterConfig;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
+import dev.nishisan.utils.oss.cluster.metrics.LatencySnapshot;
+import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
+import dev.nishisan.utils.oss.cluster.protocol.AdminNodeRequest;
+import dev.nishisan.utils.oss.cluster.protocol.AdminStatusResponse;
+import dev.nishisan.utils.oss.cluster.protocol.Commands;
+import dev.nishisan.utils.oss.cluster.protocol.SeriesStatus;
+import dev.nishisan.utils.oss.cluster.rpc.ClusterRpc;
 import dev.nishisan.utils.oss.cluster.rpc.TransportClusterRpc;
 import dev.nishisan.utils.oss.format.DefinitionHash;
 
@@ -47,6 +54,8 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Stream;
@@ -66,11 +75,18 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
     /** Mesmo papel usado por {@code NgrrdStorageNode} para se anunciar ao cluster. */
     private static final String STORAGE_ROLE = "storage";
 
+    private static final int MAX_NOT_LEADER_ATTEMPTS = 5;
+    /** Placeholder do supplier de métricas do {@code WriteDispatcher} até {@code clientRef} ser publicado em {@link #connect}. */
+    private static final ClientMetricsSnapshot EMPTY_METRICS = new ClientMetricsSnapshot(0L, 0L, 0L, 0L,
+            Map.of(), Map.of(), 0, LatencySnapshot.EMPTY, 0L);
+
     private final NgrrdClusterConfig config;
     private final NGridNode node;
     private final Path dataDir;
     private final boolean temporaryDataDir;
-    private final TransportClusterRpc rpc;
+    private final ClusterRpc rpc;
+    /** Mesma instância de {@link #rpc}, com o tipo concreto — só para expor {@code latencySnapshot()}/{@code placeCount()} em {@link #metrics()}. */
+    private final MetricsTrackingClusterRpc metricsRpc;
     private final PlacementResolver resolver;
     private final WriteDispatcher dispatcher;
     private final ConcurrentMap<String, RemoteSeriesHandle> handles;
@@ -83,13 +99,14 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
     private volatile boolean closed;
 
     private DefaultNgrrdClusterClient(NgrrdClusterConfig config, NGridNode node, Path dataDir,
-            boolean temporaryDataDir, TransportClusterRpc rpc, PlacementResolver resolver,
+            boolean temporaryDataDir, MetricsTrackingClusterRpc rpc, PlacementResolver resolver,
             WriteDispatcher dispatcher, ConcurrentMap<String, RemoteSeriesHandle> handles) {
         this.config = config;
         this.node = node;
         this.dataDir = dataDir;
         this.temporaryDataDir = temporaryDataDir;
         this.rpc = rpc;
+        this.metricsRpc = rpc;
         this.resolver = resolver;
         this.dispatcher = dispatcher;
         this.handles = handles;
@@ -138,22 +155,39 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
             awaitStorageConnectionsOrThrow(node, cfg.leaderWaitTimeout());
 
             CatalogService catalog = CatalogService.from(node);
-            TransportClusterRpc rpc = new TransportClusterRpc(node.transport(), node.coordinator(),
+            TransportClusterRpc transportRpc = new TransportClusterRpc(node.transport(), node.coordinator(),
                     cfg.requestTimeout());
+            MetricsTrackingClusterRpc rpc = new MetricsTrackingClusterRpc(transportRpc);
             RetryPolicy leaderRetry = new RetryPolicy(cfg.leaderWaitTimeout(), cfg.retryBackoffMin(),
                     cfg.retryBackoffMax());
             PlacementResolver resolver = new PlacementResolver(catalog, rpc, leaderRetry, Clock.systemUTC());
 
             ConcurrentMap<String, RemoteSeriesHandle> handles = new ConcurrentHashMap<>();
             RetryPolicy opRetry = new RetryPolicy(cfg.retryTimeout(), cfg.retryBackoffMin(), cfg.retryBackoffMax());
+            // Referência publicada com segurança (AtomicReference = volatile) para a thread do
+            // tickLoop do WriteDispatcher, que só a lê ~METRICS_TICK_INTERVAL ticks depois de criada
+            // (bem depois deste método retornar) — resolve o auto-referenciamento (o supplier de
+            // métricas do cliente precisa do próprio DefaultNgrrdClusterClient, que só existe depois
+            // do WriteDispatcher já estar construído).
+            AtomicReference<DefaultNgrrdClusterClient> clientRef = new AtomicReference<>();
+            Supplier<ClientMetricsSnapshot> metricsSupplier = cfg.metricsListener() == null ? null : () -> {
+                DefaultNgrrdClusterClient client = clientRef.get();
+                return client != null ? client.metrics() : EMPTY_METRICS;
+            };
+            // B1 (achado do Refuter): este era `cfg.requestTimeout()` — o WriteDispatcher usava o
+            // requestTimeout (tipicamente segundos) como se fosse o closeTimeout (tipicamente dezenas
+            // de segundos) em TODO close()/flushAllSync(), truncando o dreno bem antes do que o
+            // cliente anuncia via NgrrdClusterConfig#closeTimeout().
             WriteDispatcher dispatcher = new WriteDispatcher(rpc, resolver, opRetry, cfg.batchMaxSamples(),
                     cfg.batchMaxDelay(), cfg.maxBufferedSamplesPerNode(), cfg.bufferFullPolicy(),
-                    cfg.requestTimeout(), seriesKey -> {
+                    cfg.closeTimeout(), seriesKey -> {
                         RemoteSeriesHandle handle = handles.get(seriesKey);
                         return handle != null && handle.reopen();
-                    }, Clock.systemUTC());
-            return new DefaultNgrrdClusterClient(cfg, node, dataDir, temporaryDataDir, rpc, resolver, dispatcher,
-                    handles);
+                    }, Clock.systemUTC(), cfg.metricsListener(), metricsSupplier);
+            DefaultNgrrdClusterClient client = new DefaultNgrrdClusterClient(cfg, node, dataDir, temporaryDataDir,
+                    rpc, resolver, dispatcher, handles);
+            clientRef.set(client);
+            return client;
         } catch (RuntimeException e) {
             try {
                 node.close();
@@ -272,7 +306,8 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
         RetryPolicy opRetry = new RetryPolicy(config.retryTimeout(), config.retryBackoffMin(),
                 config.retryBackoffMax());
         RemoteSeriesHandle handle = new RemoteSeriesHandle(seriesKey, yaml, definitionHashHex, tags, options,
-                resolver, rpc, dispatcher, opRetry, Clock.systemUTC(), handles::remove);
+                resolver, rpc, dispatcher, opRetry, config.requestTimeout(), config.closeTimeout(),
+                Clock.systemUTC(), handles::remove);
         handle.open();
         return handle;
     }
@@ -287,7 +322,68 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
     public ClientMetricsSnapshot metrics() {
         return new ClientMetricsSnapshot(dispatcher.samplesEnqueued(), dispatcher.samplesSent(),
                 dispatcher.samplesFailed(), dispatcher.batchesSent(), dispatcher.retriesByStatus(),
-                dispatcher.bufferedSamples(), handles.size());
+                dispatcher.bufferedSamples(), handles.size(), metricsRpc.latencySnapshot(), metricsRpc.placeCount());
+    }
+
+    @Override
+    public AdminStatusResponse clusterStatus() {
+        ensureOpen();
+        int attempt = 0;
+        NodeId leaderHint = null;
+        for (;;) {
+            attempt++;
+            NodeId leader = leaderHint != null ? leaderHint : awaitLeaderIdOrThrow();
+            leaderHint = null;
+            AdminStatusResponse response = rpc.call(leader, Commands.ADMIN_STATUS, null, AdminStatusResponse.class);
+            if (response.status() == SeriesStatus.OK) {
+                return response;
+            }
+            if (response.status() != SeriesStatus.NOT_LEADER) {
+                throw new NgrrdClusterException(ErrorCode.REMOTE_ERROR,
+                        "ngrrd.admin.status respondeu " + response.status());
+            }
+            if (attempt >= MAX_NOT_LEADER_ATTEMPTS) {
+                throw new NgrrdClusterException(ErrorCode.NO_LEADER,
+                        "NOT_LEADER persistente ao consultar o status do cluster após " + attempt + " tentativas");
+            }
+            // Menor (achado do Refuter): só dorme quando NÃO sabemos já para onde ir — com leaderHint
+            // preenchido (a resposta já indicou o líder atual), a próxima tentativa vai direto a ele,
+            // sem uma espera artificial de LEADER_POLL_INTERVAL_MS no meio do caminho.
+            if (response.leaderNodeId() != null) {
+                leaderHint = NodeId.of(response.leaderNodeId());
+            } else {
+                sleepQuietly(LEADER_POLL_INTERVAL_MS);
+            }
+        }
+    }
+
+    @Override
+    public NodeMetricsSnapshot nodeMetrics(String nodeId) {
+        ensureOpen();
+        Objects.requireNonNull(nodeId, "nodeId");
+        return rpc.call(NodeId.of(nodeId), Commands.ADMIN_METRICS, new AdminNodeRequest(nodeId, false),
+                NodeMetricsSnapshot.class);
+    }
+
+    /** Mesma lógica de {@link #awaitLeaderOrThrow(NGridNode, Duration)}, mas via {@link #rpc} já conectado. */
+    private NodeId awaitLeaderIdOrThrow() {
+        long deadline = System.currentTimeMillis() + config.leaderWaitTimeout().toMillis();
+        Optional<NodeId> leader = rpc.leaderId();
+        while (leader.isEmpty() && System.currentTimeMillis() < deadline) {
+            sleepQuietly(LEADER_POLL_INTERVAL_MS);
+            leader = rpc.leaderId();
+        }
+        return leader.orElseThrow(() -> new NgrrdClusterException(ErrorCode.NO_LEADER,
+                "nenhum líder eleito para consultar o status do cluster"));
+    }
+
+    private static void sleepQuietly(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new NgrrdClusterException(ErrorCode.CLOSED, "interrompido aguardando retentativa", e);
+        }
     }
 
     @Override
@@ -301,10 +397,9 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
             return;
         }
         closed = true;
-        // Orçamento TOTAL (não por handle) — O1: se houver muitos handles, cada um recebe só o que
-        // sobrou do prazo, em vez de multiplicar closeTimeout pelo número de séries abertas. Um handle
-        // que não coube no orçamento fecha sem flush (log em RemoteSeriesHandle.close); as amostras
-        // pendentes dele ficam a cargo do dispatcher.close() logo abaixo, que loga quantas descartou.
+        // B1 (achado do Refuter): UM ÚNICO deadline alimenta handles -> dispatcher -> node.close, não
+        // um closeTimeout inteiro "renovado" para cada fase — do contrário N handles lentos, mais o
+        // dispatcher, podiam multiplicar o tempo total de close() por várias vezes closeTimeout.
         long deadline = System.currentTimeMillis() + config.closeTimeout().toMillis();
         for (RemoteSeriesHandle handle : List.copyOf(handles.values())) {
             long remainingMs = deadline - System.currentTimeMillis();
@@ -315,8 +410,10 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
                 LOGGER.log(Level.WARNING, "Falha ao fechar a série " + handle.seriesKey() + " durante o close do cliente", e);
             }
         }
+        long dispatcherRemainingMs = deadline - System.currentTimeMillis();
+        Duration dispatcherBudget = dispatcherRemainingMs > 0 ? Duration.ofMillis(dispatcherRemainingMs) : Duration.ZERO;
         try {
-            dispatcher.close();
+            dispatcher.close(dispatcherBudget);
         } catch (RuntimeException e) {
             LOGGER.log(Level.WARNING, "Falha ao fechar o write dispatcher do cliente", e);
         }

@@ -68,6 +68,10 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
     private final ClusterRpc rpc;
     private final WriteBuffer dispatcher;
     private final RetryPolicy retryPolicy;
+    /** Teto de CADA tentativa individual de RPC (ver {@link #callWithTransportRetry}) — nunca o orçamento total. */
+    private final Duration requestTimeout;
+    /** Orçamento TOTAL do {@link #close()} público (achado do Refuter, B1: antes usava {@code retryPolicy.timeout()}). */
+    private final Duration closeTimeout;
     private final Clock clock;
     private final Consumer<String> onClose;
 
@@ -76,7 +80,8 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
 
     public RemoteSeriesHandle(String seriesKey, String yaml, String definitionHashHex, Map<String, String> tags,
             Ngrrd.OpenOptions options, PlacementLookup resolver, ClusterRpc rpc, WriteBuffer dispatcher,
-            RetryPolicy retryPolicy, Clock clock, Consumer<String> onClose) {
+            RetryPolicy retryPolicy, Duration requestTimeout, Duration closeTimeout, Clock clock,
+            Consumer<String> onClose) {
         this.seriesKey = Objects.requireNonNull(seriesKey, "seriesKey");
         this.yaml = Objects.requireNonNull(yaml, "yaml");
         this.definitionHashHex = Objects.requireNonNull(definitionHashHex, "definitionHashHex");
@@ -86,6 +91,8 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
         this.rpc = Objects.requireNonNull(rpc, "rpc");
         this.dispatcher = Objects.requireNonNull(dispatcher, "dispatcher");
         this.retryPolicy = Objects.requireNonNull(retryPolicy, "retryPolicy");
+        this.requestTimeout = Objects.requireNonNull(requestTimeout, "requestTimeout");
+        this.closeTimeout = Objects.requireNonNull(closeTimeout, "closeTimeout");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.onClose = Objects.requireNonNull(onClose, "onClose");
     }
@@ -105,6 +112,10 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
      */
     void open() {
         long startedAt = clock.millis();
+        // Chamadores atuais passam startedAt + retryTimeout — comportamento inalterado em relação a
+        // antes do B1 (achado do Refuter): callWithTransportRetry só ganhou um SEGUNDO critério de
+        // saída (o deadline explícito), não um prazo mais curto para este caminho.
+        long deadlineMs = startedAt + retryPolicy.timeout().toMillis();
         int wrongOwnerAttempts = 0;
         int migratingAttempts = 0;
         for (;;) {
@@ -113,7 +124,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
             OpenRequest request = new OpenRequest(seriesKey, yaml, tags, options.durability(),
                     options.onGeometryChange(), placement);
             SeriesStatusResponse response = callWithTransportRetry(NodeId.of(candidateOwner), Commands.OPEN, request,
-                    SeriesStatusResponse.class);
+                    SeriesStatusResponse.class, deadlineMs);
             if (response.status() == SeriesStatus.OK) {
                 owner = candidateOwner;
                 return;
@@ -190,11 +201,12 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
         ensureOpen();
         ReadRequest request = ReadRequest.of(seriesKey, dsName, query, endExclusiveEpochMs);
         long startedAt = clock.millis();
+        long deadlineMs = startedAt + retryPolicy.timeout().toMillis();
         boolean retriedOnce = false;
         int[] migratingAttempts = {0};
         for (;;) {
             ReadResponse response = callWithTransportRetry(NodeId.of(owner), Commands.READ, request,
-                    ReadResponse.class);
+                    ReadResponse.class, deadlineMs);
             if (response.status() == SeriesStatus.OK) {
                 return response.result();
             }
@@ -217,11 +229,12 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
         ensureOpen();
         ReadPresetRequest request = new ReadPresetRequest(seriesKey, presetName, endExclusiveEpochMs);
         long startedAt = clock.millis();
+        long deadlineMs = startedAt + retryPolicy.timeout().toMillis();
         boolean retriedOnce = false;
         int[] migratingAttempts = {0};
         for (;;) {
             ReadPresetResponse response = callWithTransportRetry(NodeId.of(owner), Commands.READ_PRESET, request,
-                    ReadPresetResponse.class);
+                    ReadPresetResponse.class, deadlineMs);
             if (response.status() == SeriesStatus.OK) {
                 return response.results();
             }
@@ -232,48 +245,64 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
 
     @Override
     public void close() {
-        // Uso direto fora de DefaultNgrrdClusterClient.close() (que sempre chama close(Duration) com o
-        // orçamento restante do fechamento compartilhado — O1): usa o próprio retryTimeout como teto,
-        // generoso o bastante para não truncar um flush legítimo num close() avulso.
-        close(retryPolicy.timeout());
+        // B1 (achado do Refuter): usa closeTimeout da config, não retryTimeout — um close() avulso
+        // (fora de DefaultNgrrdClusterClient.close(), que sempre chama close(Duration) com o orçamento
+        // restante do fechamento compartilhado) segue o mesmo orçamento que o cliente anuncia para
+        // "quanto tempo um close pode levar", não o prazo de retentativa de operações normais.
+        close(closeTimeout);
     }
 
     /**
-     * Fecha a série com um teto explícito para o flush do buffer de escrita — usado por
-     * {@code DefaultNgrrdClusterClient.close()} para respeitar um orçamento TOTAL compartilhado entre
-     * vários handles (O1): se {@code flushBudget} estourar, o flush é abandonado (as amostras
-     * pendentes ficam a cargo do {@code WriteDispatcher.close()} final, que loga quantas foram
-     * descartadas), mas o {@code CLOSE} remoto e a remoção do registro do cliente sempre acontecem.
+     * Fecha a série com um ÚNICO orçamento total para flush + CLOSE remoto — usado por
+     * {@code DefaultNgrrdClusterClient.close()} para respeitar um orçamento compartilhado entre vários
+     * handles (O1).
+     *
+     * <p>B1 (achado do Refuter): antes, o {@code flushBudget} só limitava o flush — o {@code CLOSE}
+     * remoto em seguida usava {@code retryPolicy.timeout()} (minutos, por padrão) como teto próprio,
+     * então fechar várias séries cujo dono está morto podia levar muito mais que {@code flushBudget}
+     * no total. Agora {@code flushBudget} é o prazo de TUDO: se sobrar orçamento depois do flush, o
+     * {@code CLOSE} remoto o usa; se não sobrar (ou se {@link ClusterRpc#isConnected} já disser que o
+     * dono está inalcançável), o {@code CLOSE} remoto é pulado (WARN) — {@link #onClose} sempre roda,
+     * então a referência local do cliente é liberada de qualquer forma.</p>
      *
      * <p>item 12 (achado do Refuter): package-private — só {@code DefaultNgrrdClusterClient.close()}
      * chama esta sobrecarga; o contrato público de {@link NgrrdHandle} continua sendo só {@link #close()}.</p>
      */
-    void close(Duration flushBudget) {
+    void close(Duration budget) {
         if (closed) {
             return;
         }
         closed = true;
+        long deadlineMs = clock.millis() + budget.toMillis();
         try {
-            dispatcher.flushNodeSync(owner, flushBudget);
+            dispatcher.flushNodeSync(owner, budget);
         } catch (RuntimeException e) {
             LOGGER.log(Level.WARNING, "Falha ao drenar buffer de escrita ao fechar a série " + seriesKey, e);
         }
-        try {
-            callWithTransportRetry(NodeId.of(owner), Commands.CLOSE, new SeriesCommandRequest(seriesKey),
-                    SeriesStatusResponse.class);
-        } catch (RuntimeException e) {
-            LOGGER.log(Level.WARNING, "Falha ao fechar remotamente a série " + seriesKey, e);
+        long remainingMs = deadlineMs - clock.millis();
+        NodeId ownerNodeId = NodeId.of(owner);
+        if (remainingMs <= 0 || !rpc.isConnected(ownerNodeId)) {
+            LOGGER.log(Level.WARNING, "Pulando o CLOSE remoto da série " + seriesKey + " em " + owner
+                    + " (orçamento esgotado ou dono inalcançável) — a referência local é liberada mesmo assim");
+        } else {
+            try {
+                callWithTransportRetry(ownerNodeId, Commands.CLOSE, new SeriesCommandRequest(seriesKey),
+                        SeriesStatusResponse.class, deadlineMs);
+            } catch (RuntimeException e) {
+                LOGGER.log(Level.WARNING, "Falha ao fechar remotamente a série " + seriesKey, e);
+            }
         }
         onClose.accept(seriesKey);
     }
 
     private void executeSeriesCommand(String command) {
         long startedAt = clock.millis();
+        long deadlineMs = startedAt + retryPolicy.timeout().toMillis();
         boolean retriedOnce = false;
         int[] migratingAttempts = {0};
         for (;;) {
             SeriesStatusResponse response = callWithTransportRetry(NodeId.of(owner), command,
-                    new SeriesCommandRequest(seriesKey), SeriesStatusResponse.class);
+                    new SeriesCommandRequest(seriesKey), SeriesStatusResponse.class, deadlineMs);
             if (response.status() == SeriesStatus.OK) {
                 return;
             }
@@ -329,23 +358,51 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
 
     /**
      * B3(ii) (achado do Refuter): envolve {@code rpc.call} com retentativa de falha de TRANSPORTE
-     * (não de aplicação) com backoff exponencial até {@code retryPolicy.timeout()} — usado por
-     * {@code open}, {@code executeSeriesCommand} (CHECKPOINT/FLUSH), {@code read}/{@code readPreset} e
-     * {@code close}. Falhas de aplicação (status não-OK do protocolo) continuam subindo normalmente
-     * na resposta, sem passar por aqui.
+     * (não de aplicação) com backoff exponencial — usado por {@code open}, {@code executeSeriesCommand}
+     * (CHECKPOINT/FLUSH), {@code read}/{@code readPreset} e {@code close}. Falhas de aplicação (status
+     * não-OK do protocolo) continuam subindo normalmente na resposta, sem passar por aqui.
+     *
+     * <p>B1 (achado do Refuter): cada tentativa usa {@code min(requestTimeout, restante-até-o-deadline)}
+     * como teto da PRÓPRIA chamada — não o {@code requestTimeout} cheio incondicionalmente — e a
+     * DECISÃO DE RETENTAR (não a de tentar a primeira vez) sai quando {@code retryPolicy.exhausted(...)}
+     * OU {@code now >= deadlineMs}, o que vier primeiro. Antes desta correção, uma única tentativa
+     * contra um nó morto podia consumir o {@code requestTimeout} inteiro mesmo com um
+     * {@code deadlineMs}/{@code retryTimeout} bem mais curto configurado (ex.: {@code close()} com um
+     * orçamento apertado) — o teto "efetivo" real acabava sendo o maior dos dois, não o menor. O
+     * backoff entre tentativas também é clampado ao que resta até {@code deadlineMs}, nunca dorme além
+     * dele.</p>
+     *
+     * <p><strong>De propósito, a PRIMEIRA tentativa nunca é recusada de antemão por
+     * {@code now >= deadlineMs}</strong> (só o teto da própria chamada encolhe, com piso de 1 ms): para
+     * os chamadores existentes (tudo exceto {@code close}), {@code deadlineMs} é sempre
+     * {@code startedAt + retryPolicy.timeout()} — matematicamente o MESMO instante que
+     * {@code retryPolicy.exhausted(startedAt, now)} já testava antes do B1 — então recusar de antemão
+     * mudaria o tipo da exceção (TIMEOUT em vez de MIGRATING/WRONG_OWNER persistente) num laço externo
+     * de retentativa (ex.: MIGRATING em {@link #handleRetryableStatus}) sempre que o backoff entre
+     * chamadas empurrasse {@code now} ligeiramente além do deadline entre uma chamada e outra —
+     * "comportamento inalterado" para esses chamadores, como pedido.</p>
      */
-    private <R> R callWithTransportRetry(NodeId target, String command, Object body, Class<R> responseType) {
+    private <R> R callWithTransportRetry(NodeId target, String command, Object body, Class<R> responseType,
+            long deadlineMs) {
         long startedAt = clock.millis();
         int attempt = 0;
         for (;;) {
+            long remainingMs = deadlineMs - clock.millis();
+            Duration attemptTimeout = Duration.ofMillis(Math.max(1L, Math.min(requestTimeout.toMillis(), remainingMs)));
             try {
-                return rpc.call(target, command, body, responseType);
+                return rpc.call(target, command, body, responseType, attemptTimeout);
             } catch (NgrrdClusterException e) {
                 attempt++;
-                if (!TransportRetry.isTransportFailure(e) || retryPolicy.exhausted(startedAt, clock.millis())) {
+                long now = clock.millis();
+                if (!TransportRetry.isTransportFailure(e) || retryPolicy.exhausted(startedAt, now)
+                        || now >= deadlineMs) {
                     throw e;
                 }
-                TransportRetry.awaitConnectionOrBackoff(rpc, target, retryPolicy.backoffFor(attempt));
+                long backoffCeilingMs = deadlineMs - now;
+                Duration backoff = retryPolicy.backoffFor(attempt);
+                Duration clampedBackoff = backoff.toMillis() > backoffCeilingMs
+                        ? Duration.ofMillis(backoffCeilingMs) : backoff;
+                TransportRetry.awaitConnectionOrBackoff(rpc, target, clampedBackoff);
             }
         }
     }

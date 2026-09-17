@@ -18,10 +18,13 @@
 package dev.nishisan.utils.oss.cluster.client;
 
 import dev.nishisan.utils.ngrid.common.NodeId;
+import dev.nishisan.utils.oss.cluster.api.ClientMetricsSnapshot;
 import dev.nishisan.utils.oss.cluster.api.ErrorCode;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterConfig;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
+import dev.nishisan.utils.oss.cluster.metrics.LatencySnapshot;
+import dev.nishisan.utils.oss.cluster.metrics.NgrrdClusterMetricsListener;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesStatus;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesWrite;
@@ -324,6 +327,62 @@ class WriteDispatcherTest {
 
         assertEquals(10L, dispatcher.samplesSent());
         assertEquals(0L, dispatcher.samplesFailed());
+    }
+
+    @Test
+    void onClientMetricsEhChamadoPeriodicamentePeloTickLoop() {
+        // M4 (achado do Refuter): batchMaxDelay bem curto -> METRICS_TICK_INTERVAL (50) ticks do
+        // tickLoop acontecem em bem menos de um segundo, gatilho testável sem Thread.sleep fixo (só o
+        // polling de Await, que já é o padrão desta suíte).
+        rpc = new RecordingClusterRpc(NodeId.of("client-under-test"));
+        placementLookup = new FakePlacementLookup();
+        RetryPolicy retry = new RetryPolicy(Duration.ofSeconds(5), Duration.ofMillis(10), Duration.ofMillis(200));
+        AtomicInteger onClientMetricsCalls = new AtomicInteger();
+        ClientMetricsSnapshot fixedSnapshot = new ClientMetricsSnapshot(0L, 0L, 0L, 0L, Map.of(), Map.of(), 0,
+                LatencySnapshot.EMPTY, 0L);
+        NgrrdClusterMetricsListener listener = new NgrrdClusterMetricsListener() {
+            @Override
+            public void onClientMetrics(ClientMetricsSnapshot snapshot) {
+                onClientMetricsCalls.incrementAndGet();
+            }
+        };
+        dispatcher = new WriteDispatcher(rpc, placementLookup, retry, 500, Duration.ofMillis(5), 100_000L,
+                NgrrdClusterConfig.BufferFullPolicy.BLOCK, Duration.ofSeconds(5), key -> false, Clock.systemUTC(),
+                listener, () -> fixedSnapshot);
+
+        Await.untilTrue("onClientMetrics chamado ao menos uma vez", AWAIT_TIMEOUT,
+                () -> onClientMetricsCalls.get() >= 1);
+    }
+
+    @Test
+    void onClientMetricsQueLancaErrorNaoImpedeODispatcherDeContinuarDrenando() {
+        // M3 (achado do Refuter): publishMetricsQuietly agora captura Throwable, não só
+        // RuntimeException — o tickLoop chama esse método direto, sem outro try/catch em volta, então
+        // um Error do listener escapando terminaria a thread ngrrd-write-dispatcher silenciosamente.
+        rpc = new RecordingClusterRpc(NodeId.of("client-under-test"));
+        placementLookup = new FakePlacementLookup();
+        rpc.respondDefault((cmd, body) -> okFor((WriteBatchRequest) body));
+        RetryPolicy retry = new RetryPolicy(Duration.ofSeconds(5), Duration.ofMillis(10), Duration.ofMillis(200));
+        NgrrdClusterMetricsListener throwingListener = new NgrrdClusterMetricsListener() {
+            @Override
+            public void onClientMetrics(ClientMetricsSnapshot snapshot) {
+                throw new Error("listener quebrado de propósito (M3)");
+            }
+        };
+        ClientMetricsSnapshot fixedSnapshot = new ClientMetricsSnapshot(0L, 0L, 0L, 0L, Map.of(), Map.of(), 0,
+                LatencySnapshot.EMPTY, 0L);
+        dispatcher = new WriteDispatcher(rpc, placementLookup, retry, 500, Duration.ofMillis(5), 100_000L,
+                NgrrdClusterConfig.BufferFullPolicy.BLOCK, Duration.ofSeconds(5), key -> false, Clock.systemUTC(),
+                throwingListener, () -> fixedSnapshot);
+
+        // Menos amostras que batchMaxSamples (500): só o flush por TEMPO do tickLoop as envia. Se o
+        // Error escapado de onClientMetrics tivesse matado a thread ngrrd-write-dispatcher (o bug
+        // antes desta correção), este lote incompleto nunca seria drenado.
+        dispatcher.enqueue(OWNER_A.value(), write("s1", 1L, 1.0));
+        dispatcher.enqueue(OWNER_A.value(), write("s1", 2L, 2.0));
+
+        Await.untilTrue("lote incompleto drenado mesmo com o listener de métricas lançando Error repetidamente",
+                AWAIT_TIMEOUT, () -> dispatcher.samplesSent() == 2L);
     }
 
     private long countWriteBatchCalls() {

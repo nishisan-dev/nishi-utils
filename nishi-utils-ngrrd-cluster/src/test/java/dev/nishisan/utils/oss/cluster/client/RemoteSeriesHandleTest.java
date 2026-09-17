@@ -65,7 +65,8 @@ class RemoteSeriesHandleTest {
         dispatcher = new NoOpWriteBuffer();
         RetryPolicy retry = new RetryPolicy(retryTimeout, Duration.ofMillis(5), Duration.ofMillis(50));
         return new RemoteSeriesHandle(SERIES_KEY, "yaml: fake", "hash-1", Map.of(), Ngrrd.OpenOptions.defaults(),
-                resolver, rpc, dispatcher, retry, Clock.systemUTC(), key -> { });
+                resolver, rpc, dispatcher, retry, Duration.ofSeconds(5), Duration.ofSeconds(5), Clock.systemUTC(),
+                key -> { });
     }
 
     @Test

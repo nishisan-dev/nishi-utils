@@ -105,13 +105,22 @@ public final class TransportClusterRpc implements ClusterRpc {
 
     @Override
     public <R> R call(NodeId target, String command, Object body, Class<R> responseType) {
+        // B1 (achado do Refuter): a sobrecarga simples delega para a com teto explícito, usando o
+        // requestTimeout configurado — um único caminho de execução, não dois mantidos em paralelo.
+        return call(target, command, body, responseType, requestTimeout);
+    }
+
+    @Override
+    public <R> R call(NodeId target, String command, Object body, Class<R> responseType, Duration timeout) {
         Objects.requireNonNull(target, "target");
         Objects.requireNonNull(command, "command");
         Objects.requireNonNull(responseType, "responseType");
+        Objects.requireNonNull(timeout, "timeout");
         if (target.equals(localId())) {
+            // Despacho local: síncrono, sem espera de rede — o teto explícito não se aplica.
             return callLocal(command, body, responseType);
         }
-        return callRemote(target, command, body, responseType);
+        return callRemote(target, command, body, responseType, timeout);
     }
 
     private <R> R callLocal(String command, Object body, Class<R> responseType) {
@@ -129,14 +138,17 @@ public final class TransportClusterRpc implements ClusterRpc {
                 "nenhum handler local registrado para o comando " + command);
     }
 
-    private <R> R callRemote(NodeId target, String command, Object body, Class<R> responseType) {
+    private <R> R callRemote(NodeId target, String command, Object body, Class<R> responseType, Duration timeout) {
         ClientRequestPayload payload = new ClientRequestPayload(UUID.randomUUID(), command, body);
         ClusterMessage request = ClusterMessage.request(MessageType.CLIENT_REQUEST, command,
                 localId(), target, payload);
 
+        // B1: nunca espera mais que o requestTimeout configurado neste rpc, mas pode esperar MENOS se
+        // o chamador já está sob um orçamento total mais apertado (ver Javadoc de ClusterRpc#call(..., Duration)).
+        long waitMillis = Math.min(requestTimeout.toMillis(), timeout.toMillis());
         ClusterMessage response;
         try {
-            response = transport.sendAndAwait(request).get(requestTimeout.toMillis(), TimeUnit.MILLISECONDS);
+            response = transport.sendAndAwait(request).get(waitMillis, TimeUnit.MILLISECONDS);
         } catch (TimeoutException e) {
             throw new NgrrdClusterException(ErrorCode.TIMEOUT,
                     "tempo esgotado aguardando resposta de " + command + " em " + target, e);

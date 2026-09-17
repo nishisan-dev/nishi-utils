@@ -18,9 +18,11 @@
 package dev.nishisan.utils.oss.cluster.client;
 
 import dev.nishisan.utils.ngrid.common.NodeId;
+import dev.nishisan.utils.oss.cluster.api.ClientMetricsSnapshot;
 import dev.nishisan.utils.oss.cluster.api.ErrorCode;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterConfig;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
+import dev.nishisan.utils.oss.cluster.metrics.NgrrdClusterMetricsListener;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesStatus;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesWrite;
@@ -50,6 +52,7 @@ import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
@@ -83,6 +86,13 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     private final long closeTimeoutMillis;
     private final Function<String, Boolean> reopener;
     private final Clock clock;
+    /** {@code null} = nenhuma integração de métricas configurada (ver {@link NgrrdClusterConfig#metricsListener()}). */
+    private final NgrrdClusterMetricsListener metricsListener;
+    /** {@code null} junto com {@link #metricsListener}; monta o {@code ClientMetricsSnapshot} completo sob demanda. */
+    private final Supplier<ClientMetricsSnapshot> metricsSupplier;
+
+    /** A cada {@value #METRICS_TICK_INTERVAL} ticks (~{@code batchMaxDelay × 50}, ≈10 s por padrão). */
+    private static final int METRICS_TICK_INTERVAL = 50;
 
     private final ConcurrentMap<String, NodeBuffer> buffers = new ConcurrentHashMap<>();
     private final ExecutorService flushPool;
@@ -102,6 +112,22 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             int batchMaxSamples, Duration batchMaxDelay, long maxBufferedSamplesPerNode,
             NgrrdClusterConfig.BufferFullPolicy bufferFullPolicy, Duration closeTimeout,
             Function<String, Boolean> reopener, Clock clock) {
+        this(rpc, placementLookup, retryPolicy, batchMaxSamples, batchMaxDelay, maxBufferedSamplesPerNode,
+                bufferFullPolicy, closeTimeout, reopener, clock, null, null);
+    }
+
+    /**
+     * Variante completa, com integração de métricas: {@code metricsListener}/{@code metricsSupplier}
+     * ou ambos {@code null} (nenhuma integração) — nunca só um dos dois.
+     * {@link NgrrdClusterMetricsListener#onClientMetrics} é chamado a cada
+     * {@value #METRICS_TICK_INTERVAL} execuções do {@code tickLoop} (a mesma thread
+     * {@code ngrrd-write-dispatcher} do flush por tempo), ≈ {@code batchMaxDelay × 50} de distância.
+     */
+    public WriteDispatcher(ClusterRpc rpc, PlacementLookup placementLookup, RetryPolicy retryPolicy,
+            int batchMaxSamples, Duration batchMaxDelay, long maxBufferedSamplesPerNode,
+            NgrrdClusterConfig.BufferFullPolicy bufferFullPolicy, Duration closeTimeout,
+            Function<String, Boolean> reopener, Clock clock, NgrrdClusterMetricsListener metricsListener,
+            Supplier<ClientMetricsSnapshot> metricsSupplier) {
         this.rpc = Objects.requireNonNull(rpc, "rpc");
         this.placementLookup = Objects.requireNonNull(placementLookup, "placementLookup");
         this.retryPolicy = Objects.requireNonNull(retryPolicy, "retryPolicy");
@@ -126,6 +152,8 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         this.closeTimeoutMillis = closeTimeout.toMillis();
         this.reopener = Objects.requireNonNull(reopener, "reopener");
         this.clock = Objects.requireNonNull(clock, "clock");
+        this.metricsListener = metricsListener;
+        this.metricsSupplier = metricsSupplier;
 
         this.flushPool = Executors.newFixedThreadPool(FLUSH_POOL_SIZE, WriteDispatcher::newDaemonFlushThread);
         this.tickThread = new Thread(this::tickLoop, "ngrrd-write-dispatcher");
@@ -234,6 +262,16 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
 
     @Override
     public void close() {
+        close(Duration.ofMillis(closeTimeoutMillis));
+    }
+
+    /**
+     * Como {@link #close()}, mas com um orçamento TOTAL explícito em vez do {@code closeTimeout} do
+     * próprio dispatcher — usado por {@code DefaultNgrrdClusterClient.close()} para que handles e
+     * dispatcher compartilhem um único deadline (B1, achado do Refuter), em vez de cada fase do
+     * fechamento renovar o {@code closeTimeout} inteiro por conta própria.
+     */
+    public void close(Duration budget) {
         if (closed) {
             return;
         }
@@ -248,7 +286,8 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             }
         }
 
-        long deadline = clock.millis() + closeTimeoutMillis;
+        long budgetMillis = Math.max(0L, budget.toMillis());
+        long deadline = clock.millis() + budgetMillis;
         for (Map.Entry<String, NodeBuffer> entry : buffers.entrySet()) {
             NodeBuffer buf = entry.getValue();
             while (clock.millis() < deadline && hasPending(buf)) {
@@ -285,7 +324,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             if (remaining > 0) {
                 samplesFailedCount.add(remaining);
                 LOGGER.log(Level.SEVERE, remaining + " amostra(s) pendente(s) para " + entry.getKey()
-                        + " descartada(s) ao fechar o dispatcher (prazo de " + closeTimeoutMillis + " ms esgotado)");
+                        + " descartada(s) ao fechar o dispatcher (orçamento de " + budgetMillis + " ms esgotado)");
             }
         }
     }
@@ -332,6 +371,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     }
 
     private void tickLoop() {
+        long tickCount = 0L;
         while (!closed) {
             try {
                 Thread.sleep(batchMaxDelayMillis);
@@ -345,6 +385,28 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                     scheduleFlush(entry.getKey(), buf);
                 }
             }
+            tickCount++;
+            if (metricsListener != null && metricsSupplier != null && tickCount % METRICS_TICK_INTERVAL == 0) {
+                publishMetricsQuietly();
+            }
+        }
+    }
+
+    /**
+     * Notifica {@link #metricsListener}; uma falha do listener do chamador não derruba o tickLoop.
+     *
+     * <p>M3 (achado do Refuter): captura {@link Throwable}, não só {@link RuntimeException} — mesmo
+     * raciocínio de {@code NodeStatusReporter.tick()}. {@code tickLoop} chama este método direto, sem
+     * outro try/catch em volta; um {@link Error} do listener (ex.: um bug num exporter de métricas de
+     * terceiros) escaparia daqui, terminaria a thread {@code ngrrd-write-dispatcher} sem aviso, e o
+     * dispatcher pararia de drenar batches por tempo (tick) para sempre — silenciosamente, até o
+     * próximo {@code close()}.</p>
+     */
+    private void publishMetricsQuietly() {
+        try {
+            metricsListener.onClientMetrics(metricsSupplier.get());
+        } catch (Throwable e) {
+            LOGGER.log(Level.WARNING, "Falha ao publicar métricas do cliente via NgrrdClusterMetricsListener", e);
         }
     }
 
