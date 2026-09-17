@@ -72,7 +72,13 @@ mantendo o YAML em cache e uma escrita atrasada recriava a série VAZIA na orige
 `placementStrong` antes de autorizar um OPEN que criaria a série (a seção 0 blindou só o caminho do
 `placementHint`; o caminho "réplica local diz que sou dono" continua aberto). Depois testes unitários do gate e
 `RebalanceClusterTest` 3×.
-**Bloqueio no core (decisão pendente):** A/B com NGrid puro mostrou que, depois que um membro `leader-ineligible`
+**Bloqueio no core — RESOLVIDO (commit "fix(ngrid): maioria de eleição só entre votantes elegíveis"):** o
+Fable provou por bisect que NÃO era regressão do M0: `TcpTransport.knownPeers` nunca esquece peers e a maioria
+dinâmica contava todo peer com porta > 0 no denominador, então cada cliente efêmero inflava o quórum para sempre
+(e uma minoria de votantes podia liderar sustentada por clientes). Correção: maioria só entre votantes elegíveis;
+líder corrente não abdica por peer novo sem watermark; escape D9 só com eleito que de fato não se afirma líder.
+Refuter (opus) aprovou com análise de partições. Suíte do core 562/0/8. Chip aberto para saída graciosa (LEAVE +
+tombstone), janela de bootstrap padrão e prefixo de nodeId nos logs. Histórico da decisão original: A/B com NGrid puro mostrou que, depois que um membro `leader-ineligible`
 entra e sai da malha, os nós elegíveis restantes NÃO elegem novo líder quando o incumbente cai (`leader=<none>` nos
 sobreviventes por 90 s; sem o membro inelegível elegem em 0,7-3 s). Como `leader-ineligible` é o role introduzido no
 M0, isso é provavelmente REGRESSÃO do M0 (escape D9 / mutual-deferral em `ClusterCoordinator.recomputeLeader`), não
