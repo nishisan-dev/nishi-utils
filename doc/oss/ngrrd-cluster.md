@@ -194,6 +194,11 @@ retentativa transparente:
 
 ## 6. Storage node
 
+Para compilar, preparar as dependências, salvar o YAML e iniciar um ou três processos Java,
+siga o [guia de execução passo a passo](ngrrd-cluster-quickstart.md). Ele inclui o comando
+completo de inicialização, a consulta de status e o encerramento. O YAML abaixo é a referência
+das opções; o módulo gera um JAR comum, sem dependências embutidas e sem launcher `java -jar`.
+
 `NgrrdStorageNode` sobe um `NGridNode` (role `storage`), o `BlobVolume` local (via
 `NgrrdBlob.registry()`), o `SeriesHandleRegistry`, o `StorageRequestHandler`, o
 `NodeStatusReporter`, o `LocalReconciler` e, quando líder, os serviços de coordenação
