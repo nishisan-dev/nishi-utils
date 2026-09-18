@@ -18,6 +18,12 @@ mvn test -Dtest=NQueueTest#testMethodName
 # Module-specific build
 mvn -pl nishi-utils-core clean install
 
+# ngrrd cluster module: unit tests (default, no in-process cluster)
+mvn -pl nishi-utils-ngrrd-cluster verify
+
+# ngrrd cluster module: in-process cluster tests (*ClusterTest, timing-sensitive)
+mvn -pl nishi-utils-ngrrd-cluster verify -Pngrrd-cluster
+
 # Resilience tests (in-process cluster simulation)
 mvn test -Presilience -Dsurefire.rerunFailingTestsCount=1
 
@@ -44,6 +50,7 @@ mvn verify -Psecurity-scan -DskipTests
 Multi-module Maven monorepo:
 - **nishi-utils-core** — the library (production code + tests). Only this module is published.
 - **nishi-utils-oss** — independent module implementing the **ngrrd** time-series format (RRD-like, YAML-defined, with local-disk and S3-compatible storage backends). Published separately. See `doc/oss/ngrrd.md`. IT profile: `mvn verify -Pngrrd-integration` (LocalStack via Testcontainers).
+- **nishi-utils-ngrrd-cluster** — distributed storage cluster for the ngrrd format (`dev.nishisan.utils.oss.cluster`), built on top of NGrid (`nishi-utils-core`) and ngrrd (`nishi-utils-oss`); neither of those depends on it. Published separately. See `doc/oss/ngrrd-cluster.md`. Cluster profile: `mvn -pl nishi-utils-ngrrd-cluster verify -Pngrrd-cluster` (in-process `*ClusterTest`, timing-sensitive).
 - **ngrid-test** — support module for Docker-based integration tests and manual scenarios. Not a release artifact.
 
 ## Architecture Overview
@@ -91,6 +98,7 @@ Four main components in `dev.nishisan.utils` (the `core` module):
 - In-process cluster tests in core use `*Test.java` naming (not `*IT.java`). Docker tests in `ngrid-test` use `*IT.java` with Failsafe.
 - Use `ClusterTestUtils.awaitClusterConsensus(...)` to stabilize cluster state in tests.
 - Docker tests depend on log markers (`CURRENT_LEADER_STATUS`, `ACTIVE_MEMBERS_COUNT`, `REACHABLE_NODES_COUNT`) emitted by `ngrid-test/.../Main.java` — don't rename these without updating `NGridNodeContainer`/`NGridMapNodeContainer`.
+- **ngrrd cluster (`nishi-utils-ngrrd-cluster`):** `*ClusterTest` classes spin up multiple real `NGridNode`s in-process (handshake, gossip, real election) and are excluded from the default `mvn test`/`mvn verify` of that module — only the `ngrrd-cluster` profile runs them (same spirit as `-Presilience` for core). Not run by `pr-validation.yml`. Log markers: `NGRRD_STORAGE_NODE_STARTED` (node ready), `NGRRD_NODE_STATUS` (periodic per-node metrics), `NGRRD_REBALANCE`/`NGRRD_REBALANCE_MOVE`/`NGRRD_NODE_DRAINED`, `NGRRD_RECONCILE`/`NGRRD_RECONCILE_ORPHAN_DELETED`/`RECONCILE_UNPLACED`.
 - For new tests with the facade, prefer `NGrid.local(n)` over manual `NGridConfig.Builder` setup.
 - Register distributed maps on participating nodes before traffic to avoid handler-missing errors (see `UnknownMapRequestHandler`).
 - Surefire runs with `forkCount=1`, `reuseForks=false`.

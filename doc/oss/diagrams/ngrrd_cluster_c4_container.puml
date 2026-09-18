@@ -1,0 +1,65 @@
+@startuml ngrrd_cluster_c4_container
+title ngrrd Cluster — C4 Container
+
+skinparam shadowing false
+skinparam componentStyle rectangle
+
+actor "Aplicação consumidora\n(ex.: TEMS/ngrrd-consumer)" as app
+
+package "Cluster ngrrd" {
+  component "Cliente ngrrd cluster\n(NgrrdClusterClient)\nmembro NGrid: client + leader-ineligible" as client
+
+  package "Storage node A\n(NGridNode: role storage)" as nodeA {
+    component "StorageRequestHandler\nSeriesHandleRegistry" as reqA
+    database "BlobVolume A\n(shards + catálogo local)" as volA
+  }
+
+  package "Storage node B\n(NGridNode: role storage)\n[LÍDER = coordenador]" as nodeB {
+    component "StorageRequestHandler\nSeriesHandleRegistry" as reqB
+    component "PlacementRequestHandler\nRebalancer / MigrationCoordinator\nAdminService" as coordB
+    database "BlobVolume B\n(shards + catálogo local)" as volB
+  }
+
+  package "Storage node C\n(NGridNode: role storage)" as nodeC {
+    component "StorageRequestHandler\nSeriesHandleRegistry" as reqC
+    database "BlobVolume C\n(shards + catálogo local)" as volC
+  }
+
+  database "Catálogo replicado (NGrid)\nngrrd.catalog: DistributedMap<seriesKey, SeriesPlacement>\nngrrd.nodes: DistributedMap<nodeId, StorageNodeStatus>" as catalog
+}
+
+actor "Operador" as op
+
+app --> client : write / read / checkpoint\n(NgrrdHandle transparente)
+client --> reqA : ngrrd.open / writeBatch / read\n(RPC ao dono)
+client --> reqB : ngrrd.place\n(RPC ao líder)
+client --> reqC : ngrrd.open / writeBatch / read\n(RPC ao dono)
+
+reqA --> volA : Ngrrd.open / write / read
+reqB --> volB : Ngrrd.open / write / read
+reqC --> volC : Ngrrd.open / write / read
+
+coordB --> catalog : lê/escreve placements\n(leitura local EVENTUAL, escrita só no líder)
+reqA ..> catalog : leitura local (EVENTUAL)
+reqC ..> catalog : leitura local (EVENTUAL)
+client ..> catalog : leitura local (EVENTUAL)\nWRONG_OWNER invalida cache
+
+coordB --> reqA : ngrrd.migrate.* (chunks)\ncoordena migração
+coordB --> reqC : ngrrd.migrate.* (chunks)\ncoordena migração
+
+op --> client : NgrrdClusterAdminCli\n(status / metrics / drain / activate / rebalance)
+
+note right of nodeB
+  Sem réplica: cada série vive em
+  exatamente UM storage node.
+  Queda de nó = séries dele
+  indisponíveis até ele voltar.
+end note
+
+note bottom of client
+  Cliente é membro pleno do NGrid
+  (participa de gossip/handshake),
+  mas role leader-ineligible o
+  exclui de toda eleição de líder.
+end note
+@enduml

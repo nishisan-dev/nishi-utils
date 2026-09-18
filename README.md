@@ -6,6 +6,7 @@ Coleção de utilitários em Java, com foco em:
 - **NQueue**: fila **persistente** (FIFO) baseada em arquivos, segura para múltiplas threads.
 - **NGrid**: infraestrutura **distribuída** via TCP com **fila** (stream/log distribuído) e **mapa** (KV distribuído) — replicação por líder + quorum, consumer lógico com cursor persistente e serialização type-safe de POJOs.
 - **Stats**: utilitários para **métricas/estatísticas** simples (contadores, médias, valores, memória).
+- **ngrrd cluster** (`nishi-utils-ngrrd-cluster`): armazenamento **distribuído** para o formato ngrrd — um cluster de storage nodes (sobre o NGrid) guarda séries temporais, cada uma em exatamente um nó, com coordenador eleito, placement automático, rebalanceamento, drenagem e reconciliação. Ver `doc/oss/ngrrd-cluster.md`.
 
 ### NMap (mapa persistente standalone)
 
@@ -569,6 +570,24 @@ Para detalhes (docs em pt-BR):
 - `doc/nqueue-readme.md`
 - `doc/nqueue-examples.md`
 - `doc/nqueue-agent-guide.md`
+
+## ngrrd Cluster (armazenamento distribuído)
+
+Módulo publicado separadamente, `nishi-utils-ngrrd-cluster` — cluster de storage nodes sobre o
+NGrid para o formato ngrrd: cada série vive em exatamente um nó, sem réplica; o líder eleito entre
+os storage nodes coordena placement, rebalanceamento e drenagem; o cliente (`NgrrdCluster.connect`)
+expõe a mesma interface `NgrrdHandle` de sempre.
+
+```xml
+<dependency>
+  <groupId>dev.nishisan</groupId>
+  <artifactId>nishi-utils-ngrrd-cluster</artifactId>
+  <version>8.3.0</version>
+</dependency>
+```
+
+Documentação completa (modelo, protocolo, configuração YAML, operação e limites conhecidos):
+[`doc/oss/ngrrd-cluster.md`](doc/oss/ngrrd-cluster.md).
 
 ## Stats (métricas)
 

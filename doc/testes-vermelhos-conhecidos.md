@@ -46,6 +46,28 @@ foi investigado a fundo — é trabalho para quem for mexer na replicação.
 
 ---
 
+## `LeaderFailoverDuringMigrationClusterTest`
+
+- **Módulo:** `nishi-utils-ngrrd-cluster` (cluster ngrrd — migração/rebalanceamento)
+- **Falha:** intermitente, ~1 em 4 execuções, com duas assinaturas observadas depois de matar o
+  líder (3 storage nodes + cliente) no meio de uma migração:
+  1. os sobreviventes ficam ~150 s alternando "Direct connection failed / Failing over to proxy
+     ngrrd-client-…" tentando alcançar o líder morto, e a nova eleição demora a assentar;
+  2. "RELAY_STREAM op-log append failed … write not durable" no líder moribundo, e o novo líder não
+     reconverge dentro dos 150 s observados.
+- **Dependente do core:** as duas assinaturas apontam para o caminho de failover/replicação do
+  NGrid (`nishi-utils-core`), não para a lógica de migração deste módulo em si — o
+  `MigrationCoordinator` já resolve corretamente o `resumeInFlight()` quando o novo líder consegue
+  assumir; o problema é o **tempo** até essa assunção acontecer sob essas duas condições.
+- **Não bloqueia CI nem publicação — por desenho**, mesmo motivo do vermelho do NGrid acima: os
+  `*ClusterTest` deste módulo (incluindo este) só rodam com `mvn -pl nishi-utils-ngrrd-cluster
+  verify -Pngrrd-cluster`, fora do `pr-validation.yml` e do `publish.yml` (`-DskipTests`).
+- **Contorno:** re-execute o teste isoladamente — a falha é intermitente, não determinística.
+  Investigação de causa raiz das duas assinaturas é trabalho futuro registrado (fora do escopo da
+  documentação do módulo).
+
+---
+
 ## Como provar que um vermelho é pré-existente
 
 Não confie em "não toquei nesse módulo". Rode na `main` limpa:
