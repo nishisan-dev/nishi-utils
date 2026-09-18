@@ -45,8 +45,10 @@ import java.util.function.Function;
  * membros elegíveis a líder (os storage nodes; clientes {@code leader-ineligible} não
  * contam). Com apenas <b>2</b> storage nodes, a queda de um deles deixa o cluster sem
  * maioria e, portanto, sem líder: os comandos que dependem do líder (placement de séries
- * novas, {@code admin.status}, {@code admin.metrics}, rebalanceamento) param até o nó
- * voltar; escrita e leitura nas séries do nó sobrevivente continuam funcionando. Tolerar
+ * novas, {@code admin.status}, {@code admin.drain}/{@code activate}, rebalanceamento) param
+ * até o nó voltar — {@code admin.metrics} não entra nessa lista: é atendido por qualquer
+ * storage node, líder ou não, com métricas puramente locais. Escrita e leitura nas séries
+ * do nó sobrevivente continuam funcionando. Tolerar
  * a falha de um nó sem indisponibilidade de coordenação exige <b>≥ 3</b> storage nodes.
  * O {@code bootDiscoveryWindow} (default 3 s) faz um nó recém-iniciado esperar por seus
  * peers configurados antes de se eleger, evitando que um nó que volta atrasado assuma a

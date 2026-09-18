@@ -28,8 +28,10 @@ import java.util.Objects;
  * {@link NgrrdClusterMetricsListener#onNodeMetrics}. Sem {@link java.time.Duration}
  * nem tipos não serializáveis pelo codec do NGrid (ver {@code JacksonMessageCodec}).
  *
- * <p>{@code migrationsIn}/{@code migrationsOut} são sempre {@code 0} neste
- * marco (M2) — a migração de séries entre nós é escopo do M3.</p>
+ * <p>{@code migrationsIn}/{@code migrationsOut} são alimentados por
+ * {@code MigrationExecutor.ExecutorMetrics} (migrações de série entre nós, M3);
+ * ficam em {@code 0} apenas enquanto o nó não participou de nenhuma como origem
+ * ou destino.</p>
  *
  * @param nodeId             identificador do storage node
  * @param capturedAtEpochMs  instante em que este snapshot foi montado
@@ -49,8 +51,8 @@ import java.util.Objects;
  * @param readLatency        latência de leitura ({@code read}/{@code readPreset})
  * @param errorsByStatus     respostas de erro emitidas por este nó, agrupadas por {@link SeriesStatus}
  * @param blobStats          resumo dos gauges do volume local (ver {@link BlobVolumeSummary})
- * @param migrationsIn       quantidade de migrações recebidas (sempre {@code 0} no M2)
- * @param migrationsOut      quantidade de migrações enviadas (sempre {@code 0} no M2)
+ * @param migrationsIn       quantidade de migrações recebidas neste nó como destino
+ * @param migrationsOut      quantidade de migrações enviadas por este nó como origem
  * @param reconcileAdopted           M4: séries adotadas (presentes no volume, ausentes do catálogo) no
  *                                   último ciclo do {@code LocalReconciler} (sempre {@code 0} se o nó
  *                                   ainda não rodou nenhum ciclo)
