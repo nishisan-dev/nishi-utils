@@ -127,6 +127,15 @@ public final class MigrationExecutor extends RequestHandlerSupport {
     private final Clock clock;
     private final ExecutorService transferExecutor;
 
+    // Bounded lock stripes serialize local installation/abort for the same series. Network
+    // transfers never hold these locks while waiting for the other executor.
+    private final Object[] seriesLocks = java.util.stream.IntStream.range(0, 64)
+            .mapToObj(ignored -> new Object()).toArray();
+
+    private Object seriesLock(String seriesKey) {
+        return seriesLocks[Math.floorMod(seriesKey.hashCode(), seriesLocks.length)];
+    }
+
     private final ConcurrentMap<String, MigrationState> states = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, StagingBuffer> staging = new ConcurrentHashMap<>();
 
@@ -156,6 +165,19 @@ public final class MigrationExecutor extends RequestHandlerSupport {
 
     @Override
     protected Object handle(String command, Object body, NodeId source) {
+        String seriesKey = switch (body) {
+            case MigrateStartRequest r -> r.seriesKey();
+            case MigrateChunkRequest r -> r.seriesKey();
+            case MigrateCommitRequest r -> r.seriesKey();
+            case MigrateControlRequest r -> r.seriesKey();
+            default -> throw new IllegalArgumentException("Corpo de migração inválido");
+        };
+        synchronized (seriesLock(seriesKey)) {
+            return dispatch(command, body);
+        }
+    }
+
+    private Object dispatch(String command, Object body) {
         return switch (command) {
             case Commands.MIGRATE_START -> handleStart((MigrateStartRequest) body);
             case Commands.MIGRATE_CHUNK -> handleChunk((MigrateChunkRequest) body);
@@ -172,6 +194,15 @@ public final class MigrationExecutor extends RequestHandlerSupport {
     private MigrateResponse handleStart(MigrateStartRequest request) {
         String seriesKey = request.seriesKey();
         String migrationId = request.migrationId();
+        MigrationState previous = states.get(migrationId);
+        if (previous != null) {
+            if (!previous.seriesKey().equals(seriesKey) || previous.role() != Role.SOURCE
+                    || previous.phase() == MigratePhase.ABORTED || previous.phase() == MigratePhase.FINISHED
+                    || previous.phase() == MigratePhase.FAILED) {
+                return MigrateResponse.of(MigrateStatus.ERROR, "migração encerrada ou identidade divergente");
+            }
+            return MigrateResponse.of(MigrateStatus.OK, null);
+        }
         Optional<MigrationState> activeOther = activeSourceStateFor(seriesKey);
         if (activeOther.isPresent()) {
             if (!activeOther.get().migrationId().equals(migrationId)) {
@@ -231,6 +262,9 @@ public final class MigrationExecutor extends RequestHandlerSupport {
         NodeId target = NodeId.of(targetNodeId);
         int total = chunkCount(bytes.length);
         for (int seq = 0; seq < total; seq++) {
+            if (!transferActive(migrationId)) {
+                return;
+            }
             int start = (int) Math.min((long) seq * migrationChunkBytes, bytes.length);
             int end = (int) Math.min((long) start + migrationChunkBytes, bytes.length);
             byte[] chunk = Arrays.copyOfRange(bytes, start, end);
@@ -251,6 +285,9 @@ public final class MigrationExecutor extends RequestHandlerSupport {
                                 + (response.message() != null ? " (" + response.message() + ")" : ""));
                 return;
             }
+        }
+        if (!transferActive(migrationId)) {
+            return;
         }
         MigrateResponse commitResponse;
         try {
@@ -285,28 +322,27 @@ public final class MigrationExecutor extends RequestHandlerSupport {
         };
     }
 
-    /**
-     * Aborta a migração deste lado (origem ou destino) — idempotente.
-     *
-     * <p><b>Residual conhecido, aceito (documentado pelo Refuter):</b> se o {@code MIGRATE_ABORT} chega
-     * ao destino ANTES do primeiro {@code MIGRATE_CHUNK} (ainda não existe entrada em {@link #states}
-     * para este {@code migrationId} — {@code state == null}), este método responde {@code OK} sem
-     * registrar nada: não há {@code MigrationState} nem {@code staging} para marcar como abortado. Se,
-     * por reordenação/atraso de rede, chunks da mesma migração chegarem DEPOIS desse ABORT "adiantado",
-     * {@link #handleChunk} os aceita normalmente — {@code staging.computeIfAbsent} recria o buffer do
-     * zero, sem saber que já foi abortada — e a transferência pode terminar num {@code MIGRATE_COMMIT}
-     * válido, ativando uma cópia ÓRFÃ no destino (o coordenador já desistiu desta migração e não vai
-     * mandar {@code MIGRATE_FINISH} para apagar a origem, mas também não referencia essa cópia). É
-     * seguro — a série continua servida pelo dono correto, a cópia órfã só ocupa espaço — e fica para o
-     * reconciliador de órfãs do M4 (ainda não implementado) limpar; não é o bloqueante de perda de dados
-     * corrigido acima (que era sobre apagar a cópia CERTA).</p>
-     */
+    /** Records even an early abort, so delayed chunks cannot resurrect its staging. */
     private MigrateResponse handleAbort(MigrateControlRequest request) {
         String seriesKey = request.seriesKey();
         String migrationId = request.migrationId();
         MigrationState state = states.get(migrationId);
         if (state == null) {
-            // Nada de local para desfazer — idempotente.
+            updateState(migrationId, seriesKey, Role.TARGET, MigratePhase.ABORTED, null, "abort antecipado");
+            return MigrateResponse.of(MigrateStatus.OK, null);
+        }
+        if (!state.seriesKey().equals(seriesKey)) {
+            return MigrateResponse.of(MigrateStatus.ERROR, "migrationId pertence a outra série");
+        }
+        if (state.phase() == MigratePhase.ABORTED || state.phase() == MigratePhase.FINISHED) {
+            return MigrateResponse.of(MigrateStatus.OK, null);
+        }
+        Optional<SeriesPlacement> current = catalog.placementStrong(seriesKey);
+        if (current.isPresent() && current.get().state() == PlacementState.MIGRATING
+                && !migrationId.equals(current.get().migrationId())) {
+            // A delayed abort must not clear a newer source's guard or delete its target image.
+            staging.remove(migrationId);
+            updateState(migrationId, seriesKey, state.role(), MigratePhase.ABORTED, state.storageKey(), null);
             return MigrateResponse.of(MigrateStatus.OK, null);
         }
         if (state.role() == Role.SOURCE) {
@@ -398,6 +434,14 @@ public final class MigrationExecutor extends RequestHandlerSupport {
     // ---------------------------------------------------------------- destino (TARGET)
 
     private MigrateResponse handleChunk(MigrateChunkRequest request) {
+        MigrationState existing = states.get(request.migrationId());
+        if (existing != null && (!existing.seriesKey().equals(request.seriesKey())
+                || existing.role() != Role.TARGET || isTerminal(existing.phase()))) {
+            return MigrateResponse.of(MigrateStatus.ERROR, "migração encerrada ou identidade divergente");
+        }
+        if (existing == null && !isCurrentTarget(request.seriesKey(), request.migrationId())) {
+            return MigrateResponse.of(MigrateStatus.ERROR, "migração não autorizada pelo catálogo");
+        }
         StagingBuffer buffer = staging.computeIfAbsent(request.migrationId(), id -> new StagingBuffer());
         int chunksReceived;
         int totalExpected;
@@ -432,9 +476,22 @@ public final class MigrationExecutor extends RequestHandlerSupport {
 
     private MigrateResponse handleCommit(MigrateCommitRequest request) {
         MigrationState existing = states.get(request.migrationId());
+        if (existing != null && (!existing.seriesKey().equals(request.seriesKey())
+                || existing.role() != Role.TARGET)) {
+            return MigrateResponse.of(MigrateStatus.ERROR, "migrationId pertence a outra série ou papel");
+        }
         if (existing != null && existing.phase() == MigratePhase.COMMITTED) {
             // Reenvio idempotente do mesmo COMMIT depois de já confirmado.
             return new MigrateResponse(MigrateStatus.COMMITTED, null, existing.bytes());
+        }
+        if (existing != null && isTerminal(existing.phase())) {
+            return MigrateResponse.of(MigrateStatus.ERROR, "migração encerrada");
+        }
+        // Strong validation is required even after tombstone expiry or a process restart.
+        // Under the series lock, no newer local commit can pass this check and install first.
+        if (!isCurrentTarget(request.seriesKey(), request.migrationId())) {
+            staging.remove(request.migrationId());
+            return MigrateResponse.of(MigrateStatus.ERROR, "migração não autorizada pelo catálogo");
         }
         StagingBuffer buffer = staging.get(request.migrationId());
         if (buffer == null) {
@@ -506,11 +563,16 @@ public final class MigrationExecutor extends RequestHandlerSupport {
         int removed = 0;
         for (Map.Entry<String, MigrationState> entry : states.entrySet()) {
             MigrationState state = entry.getValue();
-            if (isTerminal(state.phase()) && state.updatedAtMs() < threshold
-                    && !registry.isMigrating(state.seriesKey())) {
-                if (states.remove(entry.getKey(), state)) {
-                    staging.remove(entry.getKey());
-                    removed++;
+            synchronized (seriesLock(state.seriesKey())) {
+                if (states.get(entry.getKey()) != state) {
+                    continue;
+                }
+                if (isTerminal(state.phase()) && state.updatedAtMs() < threshold
+                        && !registry.isMigrating(state.seriesKey())) {
+                    if (states.remove(entry.getKey(), state)) {
+                        staging.remove(entry.getKey());
+                        removed++;
+                    }
                 }
             }
         }
@@ -555,38 +617,43 @@ public final class MigrationExecutor extends RequestHandlerSupport {
         int healed = 0;
         for (Map.Entry<String, MigrationState> entry : states.entrySet()) {
             MigrationState state = entry.getValue();
-            if (state.role() != Role.SOURCE || !isStuckCandidatePhase(state.phase())
-                    || state.updatedAtMs() >= threshold) {
-                continue;
+            synchronized (seriesLock(state.seriesKey())) {
+                if (states.get(entry.getKey()) != state) {
+                    continue;
+                }
+                if (state.role() != Role.SOURCE || !isStuckCandidatePhase(state.phase())
+                        || state.updatedAtMs() >= threshold) {
+                    continue;
+                }
+                String seriesKey = state.seriesKey();
+                if (!registry.isMigrating(seriesKey)) {
+                    // Já resolvida por outro caminho (ex.: MIGRATE_ABORT/FINISH chegou entre esta varredura
+                    // e a anterior) — nada a curar.
+                    continue;
+                }
+                Optional<SeriesPlacement> strong = catalog.placementStrong(seriesKey);
+                if (strong.isEmpty() || strong.get().state() != PlacementState.ACTIVE) {
+                    // MIGRATING (ainda em curso de verdade, ou outra migração já a sucedeu) ou ausente: o
+                    // desfecho real ainda não está definido — não é seguro agir.
+                    continue;
+                }
+                SeriesPlacement placement = strong.get();
+                String migrationId = entry.getKey();
+                if (placement.isOwnedBy(self.value())) {
+                    LOGGER.log(Level.INFO, "Autocura de " + seriesKey + " (migrationId=" + migrationId + "): presa em "
+                            + "markMigrating há mais de " + timeout + " sem MIGRATE_ABORT — líder confirma "
+                            + "ACTIVE(self), liberando de volta ao serviço normal");
+                    registry.clearMigrating(seriesKey);
+                    updateState(migrationId, seriesKey, Role.SOURCE, MigratePhase.ABORTED, state.storageKey(),
+                            "autocura: MIGRATE_ABORT nunca chegou, placement forte confirma ACTIVE(self)");
+                } else {
+                    LOGGER.log(Level.WARNING, "Autocura de " + seriesKey + " (migrationId=" + migrationId + "): presa "
+                            + "em markMigrating há mais de " + timeout + " sem MIGRATE_FINISH — líder confirma "
+                            + "ACTIVE(" + placement.ownerNodeId() + "), aplicando o FINISH local agora");
+                    applyFinishLocally(seriesKey, migrationId, state.storageKey());
+                }
+                healed++;
             }
-            String seriesKey = state.seriesKey();
-            if (!registry.isMigrating(seriesKey)) {
-                // Já resolvida por outro caminho (ex.: MIGRATE_ABORT/FINISH chegou entre esta varredura
-                // e a anterior) — nada a curar.
-                continue;
-            }
-            Optional<SeriesPlacement> strong = catalog.placementStrong(seriesKey);
-            if (strong.isEmpty() || strong.get().state() != PlacementState.ACTIVE) {
-                // MIGRATING (ainda em curso de verdade, ou outra migração já a sucedeu) ou ausente: o
-                // desfecho real ainda não está definido — não é seguro agir.
-                continue;
-            }
-            SeriesPlacement placement = strong.get();
-            String migrationId = entry.getKey();
-            if (placement.isOwnedBy(self.value())) {
-                LOGGER.log(Level.INFO, "Autocura de " + seriesKey + " (migrationId=" + migrationId + "): presa em "
-                        + "markMigrating há mais de " + timeout + " sem MIGRATE_ABORT — líder confirma "
-                        + "ACTIVE(self), liberando de volta ao serviço normal");
-                registry.clearMigrating(seriesKey);
-                updateState(migrationId, seriesKey, Role.SOURCE, MigratePhase.ABORTED, state.storageKey(),
-                        "autocura: MIGRATE_ABORT nunca chegou, placement forte confirma ACTIVE(self)");
-            } else {
-                LOGGER.log(Level.WARNING, "Autocura de " + seriesKey + " (migrationId=" + migrationId + "): presa "
-                        + "em markMigrating há mais de " + timeout + " sem MIGRATE_FINISH — líder confirma "
-                        + "ACTIVE(" + placement.ownerNodeId() + "), aplicando o FINISH local agora");
-                applyFinishLocally(seriesKey, migrationId, state.storageKey());
-            }
-            healed++;
         }
         return healed;
     }
@@ -601,7 +668,8 @@ public final class MigrationExecutor extends RequestHandlerSupport {
     private Optional<MigrationState> activeSourceStateFor(String seriesKey) {
         return states.values().stream()
                 .filter(state -> state.role() == Role.SOURCE && state.seriesKey().equals(seriesKey)
-                        && !isTerminal(state.phase()))
+                        && (!isTerminal(state.phase())
+                            || state.phase() == MigratePhase.COMMITTED && registry.isMigrating(seriesKey)))
                 .findFirst();
     }
 
@@ -628,10 +696,22 @@ public final class MigrationExecutor extends RequestHandlerSupport {
                 storageKey != null ? storageKey : (old != null ? old.storageKey() : null), message, clock.millis()));
     }
 
+    private boolean isCurrentTarget(String seriesKey, String migrationId) {
+        return catalog.placementStrong(seriesKey).filter(p -> p.state() == PlacementState.MIGRATING
+                && migrationId.equals(p.migrationId()) && self.value().equals(p.targetNodeId())).isPresent();
+    }
+
+    private boolean transferActive(String migrationId) {
+        MigrationState state = states.get(migrationId);
+        return !Thread.currentThread().isInterrupted() && state != null
+                && state.role() == Role.SOURCE && !isTerminal(state.phase());
+    }
+
     private void updatePhase(String migrationId, MigratePhase phase, String message) {
-        states.computeIfPresent(migrationId, (id, old) -> new MigrationState(old.seriesKey(), old.migrationId(),
-                old.role(), phase, old.chunksReceived(), old.chunksExpected(), old.bytes(), old.sha256Hex(),
-                old.storageKey(), message, clock.millis()));
+        states.computeIfPresent(migrationId, (id, old) -> isTerminal(old.phase()) ? old
+                : new MigrationState(old.seriesKey(), old.migrationId(), old.role(), phase,
+                        old.chunksReceived(), old.chunksExpected(), old.bytes(), old.sha256Hex(),
+                        old.storageKey(), message, clock.millis()));
     }
 
     /** Como {@link #resolveStorageKey}, mas devolve {@code null} em vez de lançar (uso best-effort). */

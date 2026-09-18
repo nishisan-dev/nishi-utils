@@ -62,6 +62,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.LongAdder;
 
@@ -112,10 +114,7 @@ class MigrationExecutorTest {
         dstRegistry = new SeriesHandleRegistry(dstVolume, "ngrrd", Duration.ofMinutes(15), 10_000, Clock.systemUTC());
 
         rpc = new RoutingClusterRpc();
-        // Catálogo fake por nó — por padrão vazio (placementStrong ausente), que é o caso comum:
-        // as guardas de handleAbort/handleFinish (Refuter, achado bloqueante) só desviam do caminho
-        // normal quando o líder CONFIRMA ACTIVE(self); testes que não populam o catálogo continuam
-        // exercitando o fluxo de abort/finish original.
+        // Each transfer test publishes the coordinator's MIGRATING placement explicitly.
         srcCatalog = new FakeCatalogView();
         dstCatalog = new FakeCatalogView();
         srcExecutor = newExecutor(SRC, srcRegistry, srcVolume, srcCatalog, 4_096L);
@@ -191,6 +190,7 @@ class MigrationExecutorTest {
         String seriesKey = "series-happy-path";
         byte[] original = writeAndCheckpointSeries(seriesKey);
         String migrationId = UUID.randomUUID().toString();
+        publishMigration(seriesKey, migrationId);
 
         MigrateResponse start = (MigrateResponse) srcExecutor.handleLocal(Commands.MIGRATE_START,
                 new MigrateStartRequest(seriesKey, migrationId, DST.value()));
@@ -210,6 +210,7 @@ class MigrationExecutorTest {
         String seriesKey = "series-hash-mismatch";
         byte[] original = writeAndCheckpointSeries(seriesKey);
         String migrationId = UUID.randomUUID().toString();
+        publishMigration(seriesKey, migrationId);
 
         // Envia os chunks manualmente e faz o commit com um SHA errado.
         byte[] data = original;
@@ -229,6 +230,7 @@ class MigrationExecutorTest {
         String seriesKey = "series-commit-idempotente";
         byte[] original = writeAndCheckpointSeries(seriesKey);
         String migrationId = UUID.randomUUID().toString();
+        publishMigration(seriesKey, migrationId);
 
         String sha = sha256Hex(original);
         dstExecutor.handleLocal(Commands.MIGRATE_CHUNK,
@@ -248,6 +250,7 @@ class MigrationExecutorTest {
         String seriesKey = "series-abort-pos-commit";
         byte[] original = writeAndCheckpointSeries(seriesKey);
         String migrationId = UUID.randomUUID().toString();
+        publishMigration(seriesKey, migrationId);
         String sha = sha256Hex(original);
         dstExecutor.handleLocal(Commands.MIGRATE_CHUNK,
                 new MigrateChunkRequest(seriesKey, migrationId, 0, 1, original));
@@ -270,6 +273,7 @@ class MigrationExecutorTest {
         String seriesKey = "series-abort-pos-commit-ativa";
         byte[] original = writeAndCheckpointSeries(seriesKey);
         String migrationId = UUID.randomUUID().toString();
+        publishMigration(seriesKey, migrationId);
         String sha = sha256Hex(original);
         dstExecutor.handleLocal(Commands.MIGRATE_CHUNK,
                 new MigrateChunkRequest(seriesKey, migrationId, 0, 1, original));
@@ -291,6 +295,7 @@ class MigrationExecutorTest {
         String seriesKey = "series-finish";
         writeAndCheckpointSeries(seriesKey);
         String migrationId = UUID.randomUUID().toString();
+        publishMigration(seriesKey, migrationId);
 
         MigrateResponse start = (MigrateResponse) srcExecutor.handleLocal(Commands.MIGRATE_START,
                 new MigrateStartRequest(seriesKey, migrationId, DST.value()));
@@ -299,6 +304,7 @@ class MigrationExecutorTest {
         assertTrue(srcVolume.storage().exists(objectKey(seriesKey)),
                 "a origem ainda deveria ter a cópia antes do FINISH");
 
+        srcCatalog.put(seriesKey, SeriesPlacement.active(DST.value(), 2L));
         MigrateResponse finish = (MigrateResponse) srcExecutor.handleLocal(Commands.MIGRATE_FINISH,
                 new MigrateControlRequest(seriesKey, migrationId));
 
@@ -320,6 +326,7 @@ class MigrationExecutorTest {
         String seriesKey = "series-finish-ativa";
         writeAndCheckpointSeries(seriesKey);
         String migrationId = UUID.randomUUID().toString();
+        publishMigration(seriesKey, migrationId);
         srcCatalog.put(seriesKey, SeriesPlacement.active(SRC.value(), 1_000L));
 
         MigrateResponse finish = (MigrateResponse) srcExecutor.handleLocal(Commands.MIGRATE_FINISH,
@@ -335,10 +342,12 @@ class MigrationExecutorTest {
         String seriesKey = "series-nao-recria";
         writeAndCheckpointSeries(seriesKey);
         String migrationId = UUID.randomUUID().toString();
+        publishMigration(seriesKey, migrationId);
 
         assertEquals(MigrateStatus.OK, ((MigrateResponse) srcExecutor.handleLocal(Commands.MIGRATE_START,
                 new MigrateStartRequest(seriesKey, migrationId, DST.value()))).status());
         awaitCommittedOnSource(migrationId);
+        srcCatalog.put(seriesKey, SeriesPlacement.active(DST.value(), 2L));
         assertEquals(MigrateStatus.OK, ((MigrateResponse) srcExecutor.handleLocal(Commands.MIGRATE_FINISH,
                 new MigrateControlRequest(seriesKey, migrationId))).status());
 
@@ -356,6 +365,7 @@ class MigrationExecutorTest {
         String seriesKey = "series-bloqueio";
         writeAndCheckpointSeries(seriesKey);
         String migrationId = UUID.randomUUID().toString();
+        publishMigration(seriesKey, migrationId);
 
         MigrateResponse start = (MigrateResponse) srcExecutor.handleLocal(Commands.MIGRATE_START,
                 new MigrateStartRequest(seriesKey, migrationId, DST.value()));
@@ -381,6 +391,7 @@ class MigrationExecutorTest {
         String seriesKey = "series-stuck-abort-perdido";
         writeAndCheckpointSeries(seriesKey);
         String migrationId = UUID.randomUUID().toString();
+        publishMigration(seriesKey, migrationId);
 
         srcRegistry.markMigrating(seriesKey);
         putStuckSourceState(srcExecutor, migrationId, seriesKey, objectKey(seriesKey), 2_000L,
@@ -406,6 +417,7 @@ class MigrationExecutorTest {
         String seriesKey = "series-stuck-finish-perdido";
         writeAndCheckpointSeries(seriesKey);
         String migrationId = UUID.randomUUID().toString();
+        publishMigration(seriesKey, migrationId);
 
         srcRegistry.markMigrating(seriesKey);
         putStuckSourceState(srcExecutor, migrationId, seriesKey, objectKey(seriesKey), 2_000L,
@@ -433,6 +445,7 @@ class MigrationExecutorTest {
         String seriesKey = "series-stuck-committed-abort-perdido";
         writeAndCheckpointSeries(seriesKey);
         String migrationId = UUID.randomUUID().toString();
+        publishMigration(seriesKey, migrationId);
 
         srcRegistry.markMigrating(seriesKey);
         putStuckSourceState(srcExecutor, migrationId, seriesKey, objectKey(seriesKey), 2_000L,
@@ -452,6 +465,7 @@ class MigrationExecutorTest {
         String seriesKey = "series-stuck-committed-finish-perdido";
         writeAndCheckpointSeries(seriesKey);
         String migrationId = UUID.randomUUID().toString();
+        publishMigration(seriesKey, migrationId);
 
         srcRegistry.markMigrating(seriesKey);
         putStuckSourceState(srcExecutor, migrationId, seriesKey, objectKey(seriesKey), 2_000L,
@@ -482,6 +496,7 @@ class MigrationExecutorTest {
         String seriesKey = "series-stuck-failed-abort-perdido";
         writeAndCheckpointSeries(seriesKey);
         String migrationId = UUID.randomUUID().toString();
+        publishMigration(seriesKey, migrationId);
 
         srcRegistry.markMigrating(seriesKey);
         putStuckSourceState(srcExecutor, migrationId, seriesKey, objectKey(seriesKey), 2_000L,
@@ -506,6 +521,7 @@ class MigrationExecutorTest {
         String seriesKey = "series-sweep-ainda-migrating";
         writeAndCheckpointSeries(seriesKey);
         String migrationId = UUID.randomUUID().toString();
+        publishMigration(seriesKey, migrationId);
 
         srcRegistry.markMigrating(seriesKey);
         putStuckSourceState(srcExecutor, migrationId, seriesKey, objectKey(seriesKey),
@@ -543,6 +559,7 @@ class MigrationExecutorTest {
         String seriesKey = "series-conflito";
         writeAndCheckpointSeries(seriesKey);
         String firstMigrationId = UUID.randomUUID().toString();
+        publishMigration(seriesKey, firstMigrationId);
         MigrateResponse first = (MigrateResponse) srcExecutor.handleLocal(Commands.MIGRATE_START,
                 new MigrateStartRequest(seriesKey, firstMigrationId, DST.value()));
         assertEquals(MigrateStatus.OK, first.status());
@@ -558,6 +575,126 @@ class MigrationExecutorTest {
     void statusDeMigracaoDesconhecidaRespondeUnknown() {
         MigrateResponse response = status(srcExecutor, "migracao-que-nunca-existiu");
         assertEquals(MigrateStatus.UNKNOWN, response.status());
+    }
+
+    @Test
+    void earlyAbortRejectsDelayedChunksEvenBeforeCatalogConverges() {
+        String key = "early-abort";
+        byte[] image = writeAndCheckpointSeries(key);
+        publishMigration(key, "old");
+        dstExecutor.handleLocal(Commands.MIGRATE_ABORT, new MigrateControlRequest(key, "old"));
+        assertEquals(MigrateStatus.ERROR, chunk(key, "old", image).status());
+        assertEquals(MigrateStatus.ERROR, commit(key, "old", image).status());
+        assertFalse(dstVolume.storage().exists(objectKey(key)));
+    }
+
+    @Test
+    void staleCommitCannotOverwriteImageFromNewerMigration() {
+        String key = "stale-commit";
+        byte[] old = writeAndCheckpointSeries(key);
+        publishMigration(key, "old");
+        assertEquals(MigrateStatus.OK, chunk(key, "old", old).status());
+        srcRegistry.withHandle(key, handle -> {
+            handle.write("in_octets", new Sample(1_700_000_000_000L + 30 * 300_000L, 50_000d));
+            handle.checkpoint();
+            return true;
+        });
+        byte[] newer = srcVolume.storage().get(objectKey(key)).orElseThrow();
+        assertFalse(java.util.Arrays.equals(old, newer));
+        publishMigration(key, "new");
+        assertEquals(MigrateStatus.OK, chunk(key, "new", newer).status());
+        assertEquals(MigrateStatus.COMMITTED, commit(key, "new", newer).status());
+        dstCatalog.put(key, SeriesPlacement.active(DST.value(), 2L));
+        assertEquals(MigrateStatus.ERROR, commit(key, "old", old).status());
+        assertArrayEquals(newer, dstVolume.storage().get(objectKey(key)).orElseThrow());
+    }
+
+    @Test
+    void expiredAbortStillCannotResurrectAnObsoleteMigration() {
+        String key = "expired-abort";
+        byte[] image = writeAndCheckpointSeries(key);
+        dstExecutor.handleLocal(Commands.MIGRATE_ABORT, new MigrateControlRequest(key, "old"));
+        dstExecutor.sweepExpiredStates(Duration.ofMillis(-1));
+        publishMigration(key, "new");
+        assertEquals(MigrateStatus.ERROR, chunk(key, "old", image).status());
+        dstCatalog.put(key, SeriesPlacement.migrating(SeriesPlacement.active(SRC.value(), 0),
+                "another-target", "new", 1));
+        assertEquals(MigrateStatus.ERROR, chunk(key, "new", image).status());
+        dstCatalog.placements.clear();
+        assertEquals(MigrateStatus.ERROR, chunk(key, "new", image).status());
+        assertFalse(dstVolume.storage().exists(objectKey(key)));
+    }
+
+    @Test
+    void concurrentDuplicateCommitsAreIdempotent() throws Exception {
+        String key = "concurrent-commit";
+        byte[] image = writeAndCheckpointSeries(key);
+        publishMigration(key, "move");
+        assertEquals(MigrateStatus.OK, chunk(key, "move", image).status());
+        var start = new CountDownLatch(1);
+        var first = CompletableFuture.supplyAsync(() -> { await(start); return commit(key, "move", image); });
+        var second = CompletableFuture.supplyAsync(() -> { await(start); return commit(key, "move", image); });
+        start.countDown();
+        assertEquals(MigrateStatus.COMMITTED, first.get(5, TimeUnit.SECONDS).status());
+        assertEquals(MigrateStatus.COMMITTED, second.get(5, TimeUnit.SECONDS).status());
+        assertArrayEquals(image, dstVolume.storage().get(objectKey(key)).orElseThrow());
+    }
+
+    @Test
+    void sourceStopsAfterAbortWhileChunkResponseIsInFlight() throws Exception {
+        String key = "cancel-transfer";
+        writeAndCheckpointSeries(key);
+        publishMigration(key, "move");
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var returned = new CountDownLatch(1);
+        rpc.beforeChunk = () -> { entered.countDown(); await(release); };
+        rpc.afterChunk = returned::countDown;
+        try {
+            srcExecutor.handleLocal(Commands.MIGRATE_START, new MigrateStartRequest(key, "move", DST.value()));
+            assertTrue(entered.await(5, TimeUnit.SECONDS));
+            srcExecutor.handleLocal(Commands.MIGRATE_ABORT, new MigrateControlRequest(key, "move"));
+            release.countDown();
+            assertTrue(returned.await(5, TimeUnit.SECONDS));
+            // Wait for the transfer task to leave the pool, so a late phase update is observable.
+            Field poolField = MigrationExecutor.class.getDeclaredField("transferExecutor");
+            poolField.setAccessible(true);
+            var pool = (java.util.concurrent.ExecutorService) poolField.get(srcExecutor);
+            pool.shutdown();
+            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS));
+            assertEquals(1, rpc.chunkCallCount());
+            assertEquals(MigrateStatus.ERROR, status(srcExecutor, "move").status());
+            assertFalse(srcRegistry.isMigrating(key));
+            assertFalse(dstVolume.storage().exists(objectKey(key)));
+        } finally {
+            release.countDown();
+        }
+    }
+
+    private MigrateResponse chunk(String key, String id, byte[] bytes) {
+        return (MigrateResponse) dstExecutor.handleLocal(Commands.MIGRATE_CHUNK,
+                new MigrateChunkRequest(key, id, 0, 1, bytes));
+    }
+
+    private MigrateResponse commit(String key, String id, byte[] bytes) {
+        return (MigrateResponse) dstExecutor.handleLocal(Commands.MIGRATE_COMMIT,
+                new MigrateCommitRequest(key, id, sha256Hex(bytes), bytes.length, objectKey(key)));
+    }
+
+    private static void await(CountDownLatch latch) {
+        try {
+            assertTrue(latch.await(5, TimeUnit.SECONDS), "latch não liberado");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError(e);
+        }
+    }
+
+    private void publishMigration(String seriesKey, String migrationId) {
+        SeriesPlacement placement = SeriesPlacement.migrating(SeriesPlacement.active(SRC.value(), 0L),
+                DST.value(), migrationId, 1L);
+        srcCatalog.put(seriesKey, placement);
+        dstCatalog.put(seriesKey, placement);
     }
 
     private static String sha256Hex(byte[] data) {
@@ -616,6 +753,8 @@ class MigrationExecutorTest {
     private static final class RoutingClusterRpc implements ClusterRpc {
         private final Map<NodeId, MigrationExecutor> executors = new ConcurrentHashMap<>();
         private final LongAdder chunkCalls = new LongAdder();
+        private Runnable beforeChunk = () -> { };
+        private Runnable afterChunk = () -> { };
 
         void register(NodeId id, MigrationExecutor executor) {
             executors.put(id, executor);
@@ -630,12 +769,17 @@ class MigrationExecutorTest {
         public <R> R call(NodeId target, String command, Object body, Class<R> responseType) {
             if (Commands.MIGRATE_CHUNK.equals(command)) {
                 chunkCalls.increment();
+                beforeChunk.run();
             }
             MigrationExecutor executor = executors.get(target);
             if (executor == null) {
                 throw new NgrrdClusterException(ErrorCode.REMOTE_ERROR, "nó desconhecido: " + target);
             }
-            return (R) executor.handleLocal(command, body);
+            R result = (R) executor.handleLocal(command, body);
+            if (Commands.MIGRATE_CHUNK.equals(command)) {
+                afterChunk.run();
+            }
+            return result;
         }
 
         @Override

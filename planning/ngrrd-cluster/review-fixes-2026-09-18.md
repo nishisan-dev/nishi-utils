@@ -27,4 +27,7 @@ changelog e configuração da IDE; não incluí-las nestes commits.
 
 ## Execução
 
-Plano registrado; implementação em andamento.
+- Achado 1 implementado: autorização forte do destino, locks locais por série, tombstone de
+  abort antecipado e cancelamento da transferência sem sobrescrever fases terminais.
+  `MigrationExecutorTest,RebalanceClusterTest`: 23 testes aprovados (5 novas regressões).
+- Demais achados em andamento.
