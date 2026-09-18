@@ -30,4 +30,7 @@ changelog e configuração da IDE; não incluí-las nestes commits.
 - Achado 1 implementado: autorização forte do destino, locks locais por série, tombstone de
   abort antecipado e cancelamento da transferência sem sobrescrever fases terminais.
   `MigrationExecutorTest,RebalanceClusterTest`: 23 testes aprovados (5 novas regressões).
-- Demais achados em andamento.
+- Achado 3 implementado: rota canônica e lock por série, backlog transferido antes da
+  publicação do dono e revalidação da rota após backpressure.
+  `WriteDispatcherTest,RemoteSeriesHandleTest`: 25 testes aprovados (2 novas regressões).
+- Achados 2 e 4 em andamento.

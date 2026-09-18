@@ -39,6 +39,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -200,6 +202,87 @@ class WriteDispatcherTest {
                 .toList();
         assertEquals(List.of(1L, 2L, 3L), timestampsAtNewOwner,
                 "o novo dono deveria receber as amostras em ordem estritamente crescente de timestamp");
+    }
+
+    @Test
+    void redirectSerializesNewAdmissionsAndIgnoresCapturedOldOwner() throws Exception {
+        rpc = new RecordingClusterRpc(NodeId.of("client"));
+        placementLookup = new FakePlacementLookup();
+        var callbackEntered = new CountDownLatch(1);
+        var releaseCallback = new CountDownLatch(1);
+        var producerStarted = new CountDownLatch(1);
+        dispatcher = new WriteDispatcher(rpc, placementLookup,
+                new RetryPolicy(Duration.ofSeconds(5), Duration.ofMillis(10), Duration.ofMillis(50)),
+                1, Duration.ofMillis(20), 100, NgrrdClusterConfig.BufferFullPolicy.BLOCK,
+                Duration.ofSeconds(5), key -> true, (key, owner) -> {
+                    callbackEntered.countDown();
+                    awaitLatch(releaseCallback);
+                }, Clock.systemUTC(), null, null);
+        rpc.respondNext((cmd, body) -> new WriteBatchResponse(Map.of("s1", SeriesStatus.WRONG_OWNER),
+                Map.of("s1", OWNER_B.value()), Map.of()));
+        rpc.respondDefault((cmd, body) -> okFor((WriteBatchRequest) body));
+        dispatcher.enqueue(OWNER_A.value(), write("s1", 1, 1));
+        try {
+            assertTrue(callbackEntered.await(5, TimeUnit.SECONDS));
+            var producer = CompletableFuture.runAsync(() -> {
+                producerStarted.countDown();
+                dispatcher.enqueue(OWNER_B.value(), write("s1", 2, 2));
+            });
+            assertTrue(producerStarted.await(5, TimeUnit.SECONDS));
+            assertThrows(TimeoutException.class, () -> producer.get(100, TimeUnit.MILLISECONDS),
+                    "a troca de dono ainda não liberou a admissão da série");
+            releaseCallback.countDown();
+            producer.get(5, TimeUnit.SECONDS);
+            // Simulates a producer that captured A before the redirect but enqueues afterwards.
+            dispatcher.enqueue(OWNER_A.value(), write("s1", 3, 3));
+            Await.untilTrue("três escritas confirmadas", AWAIT_TIMEOUT, () -> dispatcher.samplesSent() == 3);
+            assertEquals(List.of(1L, 2L, 3L), timestampsAt(OWNER_B));
+            assertEquals(List.of(1L), timestampsAt(OWNER_A));
+        } finally {
+            releaseCallback.countDown();
+        }
+    }
+
+    @Test
+    void blockedProducerRechecksRouteAfterRedirectFreesOldBuffer() throws Exception {
+        newDispatcher(1, Duration.ofMillis(20), 1, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        var firstEntered = new CountDownLatch(1);
+        var releaseFirst = new CountDownLatch(1);
+        rpc.respondNext((cmd, body) -> {
+            firstEntered.countDown();
+            awaitLatch(releaseFirst);
+            return new WriteBatchResponse(Map.of("s1", SeriesStatus.WRONG_OWNER),
+                    Map.of("s1", OWNER_B.value()), Map.of());
+        });
+        rpc.respondDefault((cmd, body) -> okFor((WriteBatchRequest) body));
+        dispatcher.enqueue(OWNER_A.value(), write("s1", 1, 1));
+        try {
+            assertTrue(firstEntered.await(5, TimeUnit.SECONDS));
+            dispatcher.enqueue(OWNER_A.value(), write("s1", 2, 2));
+            var third = CompletableFuture.runAsync(() -> dispatcher.enqueue(OWNER_A.value(), write("s1", 3, 3)));
+            assertThrows(TimeoutException.class, () -> third.get(100, TimeUnit.MILLISECONDS));
+            releaseFirst.countDown();
+            third.get(5, TimeUnit.SECONDS);
+            Await.untilTrue("backlog e produtor drenados", AWAIT_TIMEOUT, () -> dispatcher.samplesSent() == 3);
+            assertEquals(List.of(1L, 2L, 3L), timestampsAt(OWNER_B));
+        } finally {
+            releaseFirst.countDown();
+        }
+    }
+
+    private List<Long> timestampsAt(NodeId owner) {
+        return rpc.calls().stream().filter(c -> c.target().equals(owner))
+                .flatMap(c -> ((WriteBatchRequest) c.body()).writes().stream())
+                .map(SeriesWrite::tsEpochMs).toList();
+    }
+
+    private static void awaitLatch(CountDownLatch latch) {
+        try {
+            assertTrue(latch.await(5, TimeUnit.SECONDS));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError(e);
+        }
     }
 
     @Test

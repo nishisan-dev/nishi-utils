@@ -106,6 +106,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     private static final int METRICS_TICK_INTERVAL = 50;
 
     private final ConcurrentMap<String, NodeBuffer> buffers = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, SeriesRoute> routes = new ConcurrentHashMap<>();
     private final ExecutorService flushPool;
     private final Thread tickThread;
     private volatile boolean closed;
@@ -199,39 +200,57 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     public void enqueue(String ownerNodeId, SeriesWrite write) {
         Objects.requireNonNull(ownerNodeId, "ownerNodeId");
         Objects.requireNonNull(write, "write");
-        if (closed) {
-            throw new NgrrdClusterException(ErrorCode.CLOSED, "dispatcher fechado");
-        }
-        NodeBuffer buf = buffers.computeIfAbsent(ownerNodeId, id -> new NodeBuffer());
-        boolean triggerFlush;
-        buf.lock.lock();
-        try {
-            while (buf.queue.size() >= maxBufferedSamplesPerNode) {
-                if (bufferFullPolicy == NgrrdClusterConfig.BufferFullPolicy.FAIL) {
-                    throw new NgrrdClusterException(ErrorCode.BUFFER_FULL,
-                            "buffer de escrita cheio para o nó " + ownerNodeId);
-                }
+        SeriesRoute route = routes.computeIfAbsent(write.seriesKey(), key -> new SeriesRoute(ownerNodeId));
+        for (;;) {
+            NodeBuffer buf;
+            String owner;
+            boolean accepted = false;
+            boolean triggerFlush = false;
+            route.lock.lock();
+            try {
                 if (closed) {
-                    throw new NgrrdClusterException(ErrorCode.CLOSED, "dispatcher fechado durante espera por espaço");
+                    throw new NgrrdClusterException(ErrorCode.CLOSED, "dispatcher fechado");
                 }
+                // The caller may have read RemoteSeriesHandle.owner before a concurrent redirect.
+                // Every admission uses the same route as the backlog, under the series lock.
+                owner = route.owner;
+                buf = buffers.computeIfAbsent(owner, id -> new NodeBuffer());
+                buf.lock.lock();
                 try {
-                    buf.notFull.await(ENQUEUE_WAIT_POLL_MS, TimeUnit.MILLISECONDS);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    throw new NgrrdClusterException(ErrorCode.CLOSED, "interrompido aguardando espaço no buffer", e);
+                    if (buf.queue.size() < maxBufferedSamplesPerNode) {
+                        buf.queue.addLast(write);
+                        samplesEnqueuedCount.increment();
+                        accepted = true;
+                        triggerFlush = buf.queue.size() >= batchMaxSamples;
+                    } else if (bufferFullPolicy == NgrrdClusterConfig.BufferFullPolicy.FAIL) {
+                        throw new NgrrdClusterException(ErrorCode.BUFFER_FULL,
+                                "buffer de escrita cheio para o nó " + owner);
+                    }
+                } finally {
+                    buf.lock.unlock();
                 }
-                if (closed) {
-                    throw new NgrrdClusterException(ErrorCode.CLOSED, "dispatcher fechado durante espera por espaço");
-                }
+            } finally {
+                route.lock.unlock();
             }
-            buf.queue.addLast(write);
-            samplesEnqueuedCount.increment();
-            triggerFlush = buf.queue.size() >= batchMaxSamples;
-        } finally {
-            buf.lock.unlock();
-        }
-        if (triggerFlush) {
-            scheduleFlush(ownerNodeId, buf);
+            if (accepted) {
+                if (triggerFlush) {
+                    scheduleFlush(owner, buf);
+                }
+                return;
+            }
+            // Backpressure never holds the series lock: the flush may need it to redirect
+            // this very series and free capacity. Re-read the route after every wake-up.
+            buf.lock.lock();
+            try {
+                if (!closed && buf.queue.size() >= maxBufferedSamplesPerNode) {
+                    buf.notFull.await(ENQUEUE_WAIT_POLL_MS, TimeUnit.MILLISECONDS);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new NgrrdClusterException(ErrorCode.CLOSED, "interrompido aguardando espaço no buffer", e);
+            } finally {
+                buf.lock.unlock();
+            }
         }
     }
 
@@ -517,26 +536,22 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 String newOwner = response.ownerBySeries().get(seriesKey);
                 if (newOwner != null) {
                     logRetryRateLimited(seriesKey, SeriesStatus.WRONG_OWNER, "novo dono informado: " + newOwner);
-                    placementLookup.noteOwner(seriesKey, newOwner);
-                    // M3 (nota do Refuter do M1c): sem isto, RemoteSeriesHandle.owner nunca muda por
-                    // este caminho e cada lote SEGUINTE da mesma série seria reroteado de novo — o
-                    // handle continuaria enfileirando no dono antigo até a próxima resposta WRONG_OWNER.
-                    ownerChanged.accept(seriesKey, newOwner);
-                    // B4 (achado do Refuter): antes de reenfileirar só o lote que acabou de falhar no
-                    // novo dono, extrai TAMBÉM todas as escritas desta MESMA série que ainda estejam na
-                    // fila de `owner` (lotes seguintes, ainda não enviados) — sem isso, elas seriam
-                    // enviadas depois ao dono ERRADO, chegando ao dono novo fora de ordem crescente de
-                    // timestamp (o lote seguinte, mais recente, chegaria antes do backlog reroteado).
-                    List<SeriesWrite> stillQueuedAtOldOwner = newOwner.equals(owner)
-                            ? List.of()
-                            : extractSeriesFrom(buf, seriesKey);
-                    List<SeriesWrite> reordered = writes;
-                    if (!stillQueuedAtOldOwner.isEmpty()) {
-                        reordered = new ArrayList<>(writes.size() + stillQueuedAtOldOwner.size());
-                        reordered.addAll(writes);
-                        reordered.addAll(stillQueuedAtOldOwner);
+                    SeriesRoute route = routes.get(seriesKey);
+                    route.lock.lock();
+                    try {
+                        List<SeriesWrite> reordered = new ArrayList<>(writes);
+                        if (!newOwner.equals(owner)) {
+                            reordered.addAll(extractSeriesFrom(buf, seriesKey));
+                        }
+                        // Publish the new route only after its older writes are queued. New
+                        // admissions (including callers with a stale owner) cannot overtake them.
+                        requeueFrontAt(newOwner, reordered);
+                        route.owner = newOwner;
+                        placementLookup.noteOwner(seriesKey, newOwner);
+                        ownerChanged.accept(seriesKey, newOwner);
+                    } finally {
+                        route.lock.unlock();
                     }
-                    requeueFrontAt(newOwner, reordered);
                     if (!newOwner.equals(owner)) {
                         // O dono novo tem seu próprio NodeBuffer, fora do drainLoop atual (que só itera
                         // o buffer de `owner`) — sem acionar o flush dele aqui, as amostras
@@ -704,6 +719,16 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             Thread.sleep(millis);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        }
+    }
+
+    /** Routing and admission order for one series, independent of the caller's owner hint. */
+    private static final class SeriesRoute {
+        private final ReentrantLock lock = new ReentrantLock();
+        private String owner;
+
+        SeriesRoute(String owner) {
+            this.owner = owner;
         }
     }
 
