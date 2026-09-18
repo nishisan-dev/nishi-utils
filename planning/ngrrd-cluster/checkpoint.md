@@ -72,7 +72,18 @@ leitura final `> 0`; churn com `@Timeout(600 s)`).
 150 s em "Direct connection failed / Failing over to proxy ngrrd-client-…" e elegem tarde. Investigar com Fable
 (autorizado) DEPOIS do M4, uma execução maven por vez.
 
-### M4 — drenagem, reconciliação e CLI — Builder em andamento (spec `spec-m4.md`)
+### M4 — drenagem, reconciliação e CLI — Builder em rodada 3 (spec `spec-m4.md`)
+Refuter r1 reprovou (ALTO: delete de órfã pela réplica eventual sem confirmar posse; nó DRAINING adotava);
+r2 fechou os ALTOs (delete só com `placementStrong` + `ngrrd.series.exists` no dono + `orphanGrace` + não no
+primeiro ciclo + handle fechado) e reprovou por: exempt de adoção nunca limpo; falha da leitura forte no reporter
+desarmando a retentativa; busy-loop no `awaitCatalogStable` após close. Bloqueio do tick do reporter (até 28 s)
+é PRÉ-EXISTENTE (`putNodeStatus` → `invokeLeader` 5×20 s sem líder), confirmado por A/B — publicação vai para
+executor próprio. Decisão: `seriesObjectPrefix` configurável no nó; todas as definições de um cluster usam o
+mesmo prefixo (OPEN rejeita divergente).
+Segunda assinatura do vermelho conhecido do core em `LeaderFailoverDuringMigrationClusterTest`
+(`quedaDoLiderAntesDoStart…`): líder moribundo falha 20× o `putPlacement` com "RELAY_STREAM op-log append
+failed … write not durable in the stream source" e o novo líder (eleito em ~25 s) não reconverte em 150 s.
+Investigar junto com a primeira assinatura (Fable, depois do M4).
 
 ## Observações
 - `DualLeaderLivelockE2ETest` falhou uma vez sob carga da suíte completa; 4/4 na main e 3/3 isolado na
