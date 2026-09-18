@@ -45,6 +45,8 @@ import dev.nishisan.utils.oss.cluster.rpc.ClusterRpc;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
@@ -575,6 +577,51 @@ class MigrationExecutorTest {
     void statusDeMigracaoDesconhecidaRespondeUnknown() {
         MigrateResponse response = status(srcExecutor, "migracao-que-nunca-existiu");
         assertEquals(MigrateStatus.UNKNOWN, response.status());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"series", "tenant/archive"})
+    void persistedSeriesMigratesWithFreshRegistryAndCanMoveAgainWithoutOpen(String prefix) {
+        String key = "device:router/iface:eth0";
+        String physicalKey = prefix + "/" + key + ".ngrr";
+        String definition = yaml.replace("seriesPrefix: \"series\"", "seriesPrefix: \"" + prefix + "\"");
+        NgrrdHandle handle = srcRegistry.open(key, definition, Ngrrd.OpenOptions.defaults());
+        handle.write("in_octets", new Sample(1_700_000_100_000L, 1000));
+        handle.checkpoint();
+        srcRegistry.close();
+        byte[] original = srcVolume.storage().get(physicalKey).orElseThrow();
+        srcExecutor.close();
+        dstExecutor.close();
+        srcRegistry = new SeriesHandleRegistry(srcVolume, "ngrrd", Duration.ofMinutes(15), 100, Clock.systemUTC());
+        srcExecutor = new MigrationExecutor(new FakeTransport(SRC), srcRegistry, srcVolume, rpc, srcCatalog,
+                SRC, prefix, 4096L, MAX_SERIES_BYTES, Clock.systemUTC());
+        dstExecutor = new MigrationExecutor(new FakeTransport(DST), dstRegistry, dstVolume, rpc, dstCatalog,
+                DST, prefix, 4096L, MAX_SERIES_BYTES, Clock.systemUTC());
+        rpc.register(SRC, srcExecutor);
+        rpc.register(DST, dstExecutor);
+        assertTrue(srcRegistry.cachedYaml(key).isEmpty());
+        publishMigration(key, "outbound");
+        assertEquals(MigrateStatus.OK, ((MigrateResponse) srcExecutor.handleLocal(Commands.MIGRATE_START,
+                new MigrateStartRequest(key, "outbound", DST.value()))).status());
+        awaitCommittedOnSource("outbound");
+        srcCatalog.put(key, SeriesPlacement.active(DST.value(), 2L));
+        srcExecutor.handleLocal(Commands.MIGRATE_FINISH, new MigrateControlRequest(key, "outbound"));
+        assertFalse(srcVolume.storage().exists(physicalKey));
+        assertArrayEquals(original, dstVolume.storage().get(physicalKey).orElseThrow());
+        assertTrue(dstRegistry.cachedYaml(key).isEmpty());
+
+        SeriesPlacement returning = SeriesPlacement.migrating(SeriesPlacement.active(DST.value(), 2),
+                SRC.value(), "return", 3);
+        srcCatalog.put(key, returning);
+        dstCatalog.put(key, returning);
+        assertEquals(MigrateStatus.OK, ((MigrateResponse) dstExecutor.handleLocal(Commands.MIGRATE_START,
+                new MigrateStartRequest(key, "return", SRC.value()))).status());
+        long deadline = System.nanoTime() + AWAIT_TIMEOUT.toNanos();
+        while (status(dstExecutor, "return").status() == MigrateStatus.PARTIAL && System.nanoTime() < deadline) {
+            sleepQuietly();
+        }
+        assertEquals(MigrateStatus.COMMITTED, status(dstExecutor, "return").status());
+        assertArrayEquals(original, srcVolume.storage().get(physicalKey).orElseThrow());
     }
 
     @Test

@@ -25,8 +25,7 @@ import dev.nishisan.utils.oss.cluster.catalog.CatalogView;
 import dev.nishisan.utils.oss.cluster.catalog.PlacementState;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
 import dev.nishisan.utils.oss.cluster.node.SeriesHandleRegistry;
-import dev.nishisan.utils.oss.config.NgrrdYamlLoader;
-import dev.nishisan.utils.oss.definition.NgrrdDefinition;
+import dev.nishisan.utils.oss.definition.ObjectNaming;
 import dev.nishisan.utils.oss.storage.StorageKey;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.protocol.MigrateChunkRequest;
@@ -104,7 +103,7 @@ public final class MigrationExecutor extends RequestHandlerSupport {
      * Estado local (de um dos dois lados) de uma migração em curso ou concluída.
      *
      * @param storageKey chave física do objeto no {@code BlobStorage} (ex.: {@code series/<seriesKey>.ngrr})
-     *                   — resolvida pela origem a partir da definição YAML cacheada; {@code null} até
+     *                   — resolvida pela origem a partir do prefixo configurado no nó; {@code null} até
      *                   ser conhecida (origem: desde {@code MIGRATE_START}; destino: só a partir do
      *                   {@code MIGRATE_COMMIT}, que é a primeira mensagem a carregá-la)
      */
@@ -122,6 +121,7 @@ public final class MigrationExecutor extends RequestHandlerSupport {
     private final ClusterRpc rpc;
     private final CatalogView catalog;
     private final NodeId self;
+    private final ObjectNaming objectNaming;
     private final long migrationChunkBytes;
     private final long maxSeriesBytes;
     private final Clock clock;
@@ -141,12 +141,24 @@ public final class MigrationExecutor extends RequestHandlerSupport {
 
     public MigrationExecutor(Transport transport, SeriesHandleRegistry registry, BlobVolume volume, ClusterRpc rpc,
             CatalogView catalog, NodeId self, long migrationChunkBytes, long maxSeriesBytes, Clock clock) {
+        this(transport, registry, volume, rpc, catalog, self, "series", migrationChunkBytes, maxSeriesBytes, clock);
+    }
+
+    /** Uses the node's naming contract, including for series never opened in this process. */
+    public MigrationExecutor(Transport transport, SeriesHandleRegistry registry, BlobVolume volume, ClusterRpc rpc,
+            CatalogView catalog, NodeId self, String seriesObjectPrefix, long migrationChunkBytes,
+            long maxSeriesBytes, Clock clock) {
         super(transport, Commands.MIGRATION_COMMANDS);
         this.registry = Objects.requireNonNull(registry, "registry");
         this.volume = Objects.requireNonNull(volume, "volume");
         this.rpc = Objects.requireNonNull(rpc, "rpc");
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.self = Objects.requireNonNull(self, "self");
+        Objects.requireNonNull(seriesObjectPrefix, "seriesObjectPrefix");
+        if (seriesObjectPrefix.isBlank()) {
+            throw new IllegalArgumentException("seriesObjectPrefix não pode ser vazio");
+        }
+        this.objectNaming = new ObjectNaming(null, null, seriesObjectPrefix);
         if (migrationChunkBytes <= 0) {
             throw new IllegalArgumentException("migrationChunkBytes deve ser > 0: " + migrationChunkBytes);
         }
@@ -241,18 +253,9 @@ public final class MigrationExecutor extends RequestHandlerSupport {
         return MigrateResponse.of(MigrateStatus.OK, null);
     }
 
-    /**
-     * Resolve a chave física do objeto no {@code BlobStorage} a partir da definição YAML cacheada pelo
-     * {@link SeriesHandleRegistry} — a origem sempre serviu a série antes (é o dono ativo), então a
-     * definição está garantidamente em cache neste ponto (logo após {@link SeriesHandleRegistry#markMigrating}).
-     *
-     * @throws IllegalStateException se a definição não está em cache (não deveria acontecer em uso normal)
-     */
+    /** The configured prefix is shared by OPEN, reconciliation and migration; no cached YAML is needed. */
     private String resolveStorageKey(String seriesKey) {
-        String yaml = registry.cachedYaml(seriesKey)
-                .orElseThrow(() -> new IllegalStateException("nenhuma definição em cache para " + seriesKey));
-        NgrrdDefinition definition = NgrrdYamlLoader.parse(yaml, System::getenv);
-        return StorageKey.series(definition.spec().storage().objectNaming(), seriesKey);
+        return StorageKey.series(objectNaming, seriesKey);
     }
 
     /** Roda em {@code ngrrd-migration-src}: envia os chunks em ordem, depois o commit. */
@@ -376,10 +379,8 @@ public final class MigrationExecutor extends RequestHandlerSupport {
         String seriesKey = request.seriesKey();
         String migrationId = request.migrationId();
         MigrationState state = states.get(migrationId);
-        // Preferência pela storageKey já conhecida do próprio estado local (origem sempre a resolveu em
-        // MIGRATE_START); se o estado já foi varrido (TTL) ou este é um processo reiniciado, resolve de
-        // novo a partir do cache do registry — mesma lógica de handleStart.
-        String storageKey = state != null && state.storageKey() != null ? state.storageKey() : resolveStorageKeyQuietly(seriesKey);
+        String storageKey = state != null && state.storageKey() != null
+                ? state.storageKey() : resolveStorageKey(seriesKey);
         // Mesmo achado bloqueante do Refuter que motivou o guard de handleAbort (destino): um FINISH
         // atrasado/duplicado não pode esquecer nem apagar a cópia local se o líder, na leitura FORTE,
         // ainda confirma que ESTE nó é o dono ativo — nesse caso o flip para o destino nunca aconteceu
@@ -475,6 +476,9 @@ public final class MigrationExecutor extends RequestHandlerSupport {
     }
 
     private MigrateResponse handleCommit(MigrateCommitRequest request) {
+        if (!resolveStorageKey(request.seriesKey()).equals(request.storageKey())) {
+            return MigrateResponse.of(MigrateStatus.ERROR, "chave física diverge do prefixo configurado no destino");
+        }
         MigrationState existing = states.get(request.migrationId());
         if (existing != null && (!existing.seriesKey().equals(request.seriesKey())
                 || existing.role() != Role.TARGET)) {
@@ -712,17 +716,6 @@ public final class MigrationExecutor extends RequestHandlerSupport {
                 : new MigrationState(old.seriesKey(), old.migrationId(), old.role(), phase,
                         old.chunksReceived(), old.chunksExpected(), old.bytes(), old.sha256Hex(),
                         old.storageKey(), message, clock.millis()));
-    }
-
-    /** Como {@link #resolveStorageKey}, mas devolve {@code null} em vez de lançar (uso best-effort). */
-    private String resolveStorageKeyQuietly(String seriesKey) {
-        try {
-            return resolveStorageKey(seriesKey);
-        } catch (RuntimeException e) {
-            LOGGER.log(Level.WARNING, "Não foi possível resolver a chave de storage de " + seriesKey
-                    + " para apagar a cópia local em MIGRATE_FINISH", e);
-            return null;
-        }
     }
 
     private static String describe(RuntimeException e) {

@@ -38,4 +38,24 @@ changelog e configuração da IDE; não incluí-las nestes commits.
   Flush global e fechamento acompanham buffers criados durante reroteamento.
   `WriteDispatcherTest,RemoteSeriesHandleTest,WriteBarrierRegressionTest,CloseBudgetRegressionTest`:
   34 testes aprovados (7 novas regressões, incluindo API pública, timeout e erro de escrita).
-- Achado 4 em andamento.
+- Achado 4 implementado: `MigrationExecutor` recebe o prefixo do storage node e usa
+  `StorageKey.series`; origem e FINISH funcionam sem YAML em memória. O destino valida
+  que a chave recebida corresponde ao seu prefixo.
+  `MigrationExecutorTest,ColdSeriesDrainClusterTest`: 25 testes aprovados, incluindo
+  prefixo customizado, reinício e segunda drenagem sem OPEN, com comparação dos bytes.
+- Validação integrada concluída: **361 testes, zero falhas, zero erros, zero skips**, BUILD
+  SUCCESS em 5 min 40 s (344 casos existentes + 17 novos casos de regressão).
+  Comando: `mvn -pl nishi-utils-ngrrd-cluster -am test -Dtest='dev.nishisan.utils.oss.cluster.**.*Test' -Dsurefire.failIfNoSpecifiedTests=false`.
+  Inclui adoção de volume, restart, drenagem, rebalanceamento, churn e failover durante migração.
+  Não foram executados Docker/Testcontainers, soak nem a suíte inteira do monorepo nesta etapa.
+- Hashes dos arquivos que já estavam modificados antes do trabalho: preservados. Essas alterações
+  seguem fora dos commits de correção; os commits foram preparados com paths explícitos.
+
+## Commits de correção
+
+- `73599bf`: achado 1 — migrações obsoletas.
+- `7aab374`: achado 3 — ordem de admissão/reroteamento.
+- `dbb67d4`: achado 2 — barreiras de flush/checkpoint.
+- Achado 4: `fix(ngrrd-cluster): migrate persisted series without cached definitions` (esta etapa).
+
+O commit `0b691b2` registra o plano e a revisão original.

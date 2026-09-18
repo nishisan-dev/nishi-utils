@@ -503,11 +503,8 @@ public final class SeriesHandleRegistry implements Closeable {
     }
 
     /**
-     * YAML da definição cacheada para {@code seriesKey} (de um {@link #open} ou {@link #reopenIfKnown}
-     * anterior neste processo), se houver. Usado pela migração (M3) para resolver a chave física do
-     * objeto no {@code BlobStorage} ({@code StorageKey.series(objectNaming, seriesKey)}) — a origem de
-     * uma migração sempre serviu a série antes (é o dono ativo), então a definição está garantidamente
-     * em cache quando {@code markMigrating} é chamado no início do {@code MIGRATE_START}.
+     * YAML cached by an earlier open in this process, if any. This is an in-memory convenience;
+     * persisted or newly migrated series may exist without an entry in this cache.
      */
     public Optional<String> cachedYaml(String seriesKey) {
         Objects.requireNonNull(seriesKey, "seriesKey");
