@@ -80,11 +80,17 @@ configurável e único por cluster (OPEN rejeita divergente); `migrationsInFligh
 todos os `*ClusterTest` verdes (Drain ~12 s, Adopt ~10 s, AdminCli ~8 s, churn ~275 s). Bloqueio do tick do reporter
 (até 28 s sem líder) é pré-existente do core (`putNodeStatus` → `invokeLeader`), documentado.
 
-### M5 — documentação, diagramas, 8.3.0 e changelog — Builder em andamento (spec `spec-m5.md`)
-Depois do M5: investigação Fable (autorizada) das duas assinaturas do vermelho conhecido de
-`LeaderFailoverDuringMigrationClusterTest` (~1/4): (1) sobreviventes 150 s em "Failing over to proxy ngrrd-client-…"
-para o líder morto; (2) "RELAY_STREAM op-log append failed … write not durable" no líder moribundo e novo líder não
-reconverte em 150 s.
+### M5 — documentação, diagramas, 8.3.0 e changelog — COMMITADO (c3d0c6a, f257a29, 34ff5eb, 585c5e2)
+Refuter da documentação reprovou uma vez (diagrama de migração com a ordem antiga do abort; hint de placement
+atribuído ao writeBatch; vocabulário de processo) — corrigido. Dockerfile do ngrid-test corrigido (copia o módulo);
+`mvn clean install -DskipTests` na raiz passa em todos os módulos. Reactor em 8.3.0; publish.yml publica o módulo.
+
+## Estado geral (2026-09-18): PLANO COMPLETO na branch `feature/ngrrd-cluster` (M0-M5 commitados)
+Pendências fora do plano: (1) investigação Fable do vermelho intermitente `LeaderFailoverDuringMigrationClusterTest`
+(~1/4, duas assinaturas — em andamento); (2) decisão do usuário sobre merge/PR para main e criação da release 8.3.0
+(`gh release create` antes da tag, conforme regra do projeto); (3) chips de core abertos: saída graciosa/janela de
+bootstrap/logs, reclaim cego à linhagem, mapa não persistente após restart, NMapPersistence falhar alto, higiene do
+TcpTransport (reconexão infinita/proxy). 
 
 ## Observações
 - `DualLeaderLivelockE2ETest` falhou uma vez sob carga da suíte completa; 4/4 na main e 3/3 isolado na
