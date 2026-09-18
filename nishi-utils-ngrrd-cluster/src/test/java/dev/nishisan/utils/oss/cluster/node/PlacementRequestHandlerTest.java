@@ -367,6 +367,16 @@ class PlacementRequestHandlerTest {
         }
 
         @Override
+        public Optional<StorageNodeStatus> nodeStatusStrong(String nodeId) {
+            return Optional.ofNullable(nodes.get(nodeId));
+        }
+
+        @Override
+        public void putNodeStatus(StorageNodeStatus status) {
+            nodes.put(status.nodeId(), status);
+        }
+
+        @Override
         public Collection<StorageNodeStatus> nodesLocal() {
             return List.copyOf(nodes.values());
         }

@@ -24,6 +24,7 @@ import dev.nishisan.utils.ngrid.structures.NGridNodeBuilder;
 import dev.nishisan.utils.oss.blob.BlobVolume;
 import dev.nishisan.utils.oss.blob.BlobVolumeRegistry;
 import dev.nishisan.utils.oss.blob.NgrrdBlob;
+import dev.nishisan.utils.oss.cluster.admin.AdminService;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
 import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
@@ -72,12 +73,14 @@ public final class NgrrdStorageNode implements Closeable {
     private final MigrationExecutor migrationExecutor;
     private final MigrationCoordinator migrationCoordinator;
     private final Rebalancer rebalancer;
+    private final LocalReconciler localReconciler;
 
     private NgrrdStorageNode(StorageNodeConfig config, BlobVolumeRegistry volumeRegistry, BlobVolume volume,
             NGridNode node, CatalogService catalog, TransportClusterRpc rpc, SeriesHandleRegistry registry,
             StorageRequestHandler storageHandler, PlacementRequestHandler placementHandler,
             NodeStatusReporter statusReporter, AdminRequestHandler adminHandler,
-            MigrationExecutor migrationExecutor, MigrationCoordinator migrationCoordinator, Rebalancer rebalancer) {
+            MigrationExecutor migrationExecutor, MigrationCoordinator migrationCoordinator, Rebalancer rebalancer,
+            LocalReconciler localReconciler) {
         this.config = config;
         this.volumeRegistry = volumeRegistry;
         this.volume = volume;
@@ -92,6 +95,7 @@ public final class NgrrdStorageNode implements Closeable {
         this.migrationExecutor = migrationExecutor;
         this.migrationCoordinator = migrationCoordinator;
         this.rebalancer = rebalancer;
+        this.localReconciler = localReconciler;
     }
 
     /**
@@ -173,7 +177,7 @@ public final class NgrrdStorageNode implements Closeable {
                     }
                 };
                 StorageRequestHandler storageHandler = new StorageRequestHandler(node.transport(),
-                        placementLookup, registry, self, cfg.defaultDurability(),
+                        placementLookup, registry, volume, cfg.seriesObjectPrefix(), self, cfg.defaultDurability(),
                         cfg.defaultOnGeometryChange(), Clock.systemUTC());
                 PlacementRequestHandler.LeaderView leaderView =
                         PlacementRequestHandler.fromCoordinator(node.coordinator(), node.transport());
@@ -190,13 +194,17 @@ public final class NgrrdStorageNode implements Closeable {
                         cfg.rebalanceTolerance(), cfg.maxMovesPerCycle());
                 Rebalancer rebalancer = new Rebalancer(catalog, leaderView, migrationCoordinator, rebalanceSettings,
                         cfg.rebalanceEnabled(), cfg.rebalanceInterval(), cfg.migrationTimeout(), Clock.systemUTC());
+                AdminService adminService = new AdminService(catalog, rebalancer, Clock.systemUTC());
+                LocalReconciler localReconciler = new LocalReconciler(volume, catalog, rpc, registry, cfg.nodeId(),
+                        cfg.seriesObjectPrefix(), cfg.orphanGrace(), cfg.reconcileInterval(),
+                        node.coordinator()::isLeader, Clock.systemUTC());
 
                 NodeStatusReporter statusReporter = new NodeStatusReporter(catalog, volume, registry, cfg.nodeId(),
                         cfg.capacityBytes(), cfg.statusReportInterval(), Clock.systemUTC(),
                         storageHandler::metricsSnapshot, node.coordinator()::isLeader, cfg.metricsListener(),
-                        migrationExecutor, cfg.migrationTimeout());
+                        migrationExecutor, cfg.migrationTimeout(), localReconciler);
                 AdminRequestHandler adminHandler = new AdminRequestHandler(node.transport(), self, leaderView,
-                        catalog, statusReporter::metricsSnapshot, rpc, rebalancer);
+                        catalog, statusReporter::metricsSnapshot, rpc, rebalancer, adminService, migrationCoordinator);
 
                 node.transport().addListener(storageHandler);
                 node.transport().addListener(placementHandler);
@@ -206,6 +214,7 @@ public final class NgrrdStorageNode implements Closeable {
                 node.coordinator().addLeadershipListener(migrationCoordinator);
                 node.coordinator().addLeadershipListener(rebalancer);
                 node.coordinator().addMembershipListener(rebalancer);
+                node.coordinator().addLeadershipListener(localReconciler);
                 rpc.registerLocalHandler(storageHandler);
                 rpc.registerLocalHandler(placementHandler);
                 rpc.registerLocalHandler(adminHandler);
@@ -213,6 +222,7 @@ public final class NgrrdStorageNode implements Closeable {
 
                 node.coordinator().addLeadershipListener(statusReporter);
                 statusReporter.start();
+                localReconciler.start();
 
                 // Seed: addLeadershipListener não dispara um callback sintético para quem já registra o
                 // listener com o nó JÁ líder — ex.: o primeiro líder eleito de um cluster recém-formado,
@@ -225,7 +235,7 @@ public final class NgrrdStorageNode implements Closeable {
 
                 return new NgrrdStorageNode(cfg, volumeRegistry, volume, node, catalog, rpc, registry,
                         storageHandler, placementHandler, statusReporter, adminHandler, migrationExecutor,
-                        migrationCoordinator, rebalancer);
+                        migrationCoordinator, rebalancer, localReconciler);
             } catch (RuntimeException e) {
                 try {
                     node.close();
@@ -288,24 +298,33 @@ public final class NgrrdStorageNode implements Closeable {
         return rebalancer;
     }
 
+    public LocalReconciler localReconciler() {
+        return localReconciler;
+    }
+
     /** Snapshot completo das métricas operacionais deste nó (ver {@link NodeMetricsSnapshot}). */
     public NodeMetricsSnapshot metricsSnapshot() {
         return statusReporter.metricsSnapshot();
     }
 
     /**
-     * Encerra na ordem: reporter (pede cancelamento e desligamento do scheduler
-     * — {@code shutdownNow()} + espera de até 5 s pela tarefa em andamento, mas
-     * um tick que já estava publicando no catálogo pode terminar de forma
-     * concorrente com as etapas seguintes, best-effort, não uma garantia dura)
-     * → handlers (removidos do transporte/coordenador) → registry
-     * (checkpoint+close de tudo que estiver aberto) → nó NGrid → registro de
-     * volumes. Erros de cada etapa são logados, não propagados — um recurso não
-     * fechado não deve impedir o fechamento dos demais.
+     * Encerra na ordem: <b>statusReporter → localReconciler</b> (cada um espera, com timeout de 5 s,
+     * o(s) próprio(s) executor(es) pararem antes de devolver — {@code NodeStatusReporter} tem DOIS:
+     * o scheduler de manutenção e o executor de publicação dedicado, ver seu Javadoc — de propósito
+     * ANTES de qualquer coisa tocar o volume/registry, para que nenhum tick tardio de
+     * {@code publishMetrics}/reconciliação ainda em voo encontre o volume já fechado) → rebalancer →
+     * migrationCoordinator → migrationExecutor → handlers (removidos do transporte/coordenador, o que
+     * impede qualquer NOVA requisição de entrar — uma já em trânsito ainda pode concluir de forma
+     * concorrente com os passos seguintes: best-effort, não uma garantia dura, por isso
+     * {@code metricsSnapshot()}/{@code NodeStatusReporter} toleram um volume já fechado sem logar
+     * SEVERE) → registry (checkpoint+close de tudo que estiver aberto) → nó NGrid → registro de
+     * volumes. Erros de cada etapa são logados, não propagados — um recurso não fechado não deve
+     * impedir o fechamento dos demais.
      */
     @Override
     public void close() {
         safely("status reporter", statusReporter::close);
+        safely("local reconciler", localReconciler::close);
         safely("rebalancer", rebalancer::close);
         safely("migration coordinator", migrationCoordinator::close);
         safely("migration executor", migrationExecutor::close);
@@ -318,6 +337,7 @@ public final class NgrrdStorageNode implements Closeable {
             node.coordinator().removeLeadershipListener(migrationCoordinator);
             node.coordinator().removeLeadershipListener(rebalancer);
             node.coordinator().removeMembershipListener(rebalancer);
+            node.coordinator().removeLeadershipListener(localReconciler);
             node.coordinator().removeLeadershipListener(statusReporter);
             rpc.unregisterLocalHandler(storageHandler);
             rpc.unregisterLocalHandler(placementHandler);

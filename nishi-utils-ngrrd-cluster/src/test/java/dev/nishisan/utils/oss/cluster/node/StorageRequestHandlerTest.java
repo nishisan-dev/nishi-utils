@@ -36,6 +36,8 @@ import dev.nishisan.utils.oss.cluster.protocol.OpenRequest;
 import dev.nishisan.utils.oss.cluster.protocol.ReadRequest;
 import dev.nishisan.utils.oss.cluster.protocol.ReadResponse;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesCommandRequest;
+import dev.nishisan.utils.oss.cluster.protocol.SeriesExistsRequest;
+import dev.nishisan.utils.oss.cluster.protocol.SeriesExistsResponse;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesStatus;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesStatusResponse;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesWrite;
@@ -83,8 +85,12 @@ class StorageRequestHandlerTest {
     private static final NodeId OTHER = NodeId.of("node-other");
     private static final NodeId SOURCE = NodeId.of("node-client");
 
+    /** Mesmo default programático de {@code StorageNodeConfig} — casa com o {@code seriesPrefix: "series"} do YAML de teste. */
+    private static final String SERIES_OBJECT_PREFIX = "series";
+
     private String yaml;
     private BlobVolumeRegistry volumeRegistry;
+    private BlobVolume volume;
     private SeriesHandleRegistry registry;
     private MutableClock clock;
     private PlacementLookupFake placementLookup;
@@ -94,12 +100,12 @@ class StorageRequestHandlerTest {
     void setUp(@TempDir Path tempDir) throws IOException {
         yaml = Files.readString(Path.of("src/test/resources/iface-traffic-blob.yaml"), StandardCharsets.UTF_8);
         volumeRegistry = NgrrdBlob.registry().basePath(tempDir).volume("ngrrd").build();
-        BlobVolume volume = volumeRegistry.require("ngrrd");
+        volume = volumeRegistry.require("ngrrd");
         clock = new MutableClock(Instant.parse("2026-01-01T00:00:00Z"));
         registry = new SeriesHandleRegistry(volume, "ngrrd", Duration.ofMinutes(15), 10_000, clock);
         placementLookup = new PlacementLookupFake();
-        handler = new StorageRequestHandler(new FakeTransport(SELF), placementLookup, registry, SELF,
-                Durability.FSYNC, OnGeometryChange.FAIL, clock);
+        handler = new StorageRequestHandler(new FakeTransport(SELF), placementLookup, registry, volume,
+                SERIES_OBJECT_PREFIX, SELF, Durability.FSYNC, OnGeometryChange.FAIL, clock);
     }
 
     @AfterEach
@@ -539,6 +545,53 @@ class StorageRequestHandlerTest {
         assertEquals(1L, metrics.checkpointLatency().count());
         assertEquals(1L, metrics.readLatency().count());
         assertEquals(1L, metrics.flushes());
+    }
+
+    @Test
+    void openComPrefixoDivergenteDaDefinicaoRespondeErrorSemAbrir() {
+        // MÉDIO-6 do Refuter: todas as definições servidas por um cluster devem usar o mesmo
+        // storage.objectNaming.seriesPrefix — este nó está configurado com "series" (default), a
+        // definição abaixo declara "legacy-series".
+        String customYaml = yaml.replace("seriesPrefix: \"series\"", "seriesPrefix: \"legacy-series\"");
+        assertTrue(customYaml.contains("legacy-series"), "fixture deveria ter substituído o seriesPrefix");
+        String seriesKey = "series-prefixo-divergente";
+        placementLookup.put(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                new OpenRequest(seriesKey, customYaml, Map.of(), null, null, null), SOURCE);
+
+        assertEquals(SeriesStatus.ERROR, response.status());
+        assertTrue(response.message() != null && response.message().contains("legacy-series"),
+                "mensagem deveria citar o prefixo divergente: " + response.message());
+        assertFalse(registry.isOpen(seriesKey), "não deveria ter aberto a série com prefixo divergente");
+    }
+
+    @Test
+    void seriesExistsRespondeTrueSemLerOObjetoInteiro() {
+        // BAIXO-E do Refuter: bytes é sempre -1 quando exists=true — handleSeriesExists nunca chama
+        // storage().get() (que carregaria o objeto inteiro), só storage().exists().
+        String seriesKey = "series-exists-presente";
+        placementLookup.put(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+        handler.handle(Commands.OPEN, openRequest(seriesKey, null), SOURCE);
+        handler.handle(Commands.WRITE_BATCH, new WriteBatchRequest(List.of(
+                new SeriesWrite(seriesKey, "in_octets", 1_700_000_000_000L, 1_000d))), SOURCE);
+        handler.handle(Commands.CHECKPOINT, new SeriesCommandRequest(seriesKey), SOURCE);
+
+        SeriesExistsResponse response = (SeriesExistsResponse) handler.handle(Commands.SERIES_EXISTS,
+                new SeriesExistsRequest(seriesKey), SOURCE);
+
+        assertTrue(response.exists());
+        assertEquals(-1L, response.bytes(), "bytes deveria ser -1 (sem API barata de tamanho) quando exists=true");
+    }
+
+    @Test
+    void seriesExistsRespondeFalseSemAbrirHandleQuandoAusente() {
+        SeriesExistsResponse response = (SeriesExistsResponse) handler.handle(Commands.SERIES_EXISTS,
+                new SeriesExistsRequest("series-inexistente"), SOURCE);
+
+        assertFalse(response.exists());
+        assertEquals(0L, response.bytes());
+        assertFalse(registry.isOpen("series-inexistente"), "SERIES_EXISTS nunca deveria abrir handle");
     }
 
     /** {@link Clock} determinístico para forçar fechamento por ociosidade via {@link SeriesHandleRegistry#closeIdle()}. */

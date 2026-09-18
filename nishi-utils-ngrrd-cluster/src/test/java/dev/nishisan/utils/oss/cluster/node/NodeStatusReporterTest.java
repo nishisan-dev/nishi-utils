@@ -27,6 +27,10 @@ import dev.nishisan.utils.oss.blob.BlobVolume;
 import dev.nishisan.utils.oss.blob.BlobVolumeRegistry;
 import dev.nishisan.utils.oss.blob.NgrrdBlob;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
+import dev.nishisan.utils.oss.cluster.catalog.CatalogView;
+import dev.nishisan.utils.oss.cluster.catalog.NodeState;
+import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
+import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.metrics.BlobVolumeSummary;
 import dev.nishisan.utils.oss.cluster.metrics.LatencySnapshot;
 import dev.nishisan.utils.oss.cluster.metrics.NgrrdClusterMetricsListener;
@@ -46,13 +50,21 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
+import java.util.Collection;
+import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * Cobre {@link NodeStatusReporter#metricsSnapshot()} sobre um {@link BlobVolume} REAL em
@@ -151,6 +163,187 @@ class NodeStatusReporterTest {
             assertEquals("storage-real", lastSnapshot.get().nodeId());
         } finally {
             reporter.close();
+        }
+    }
+
+    // ---------------------------------------------------------------- MÉDIO-3: leitura forte antes de publicar
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+    void publicaDrainingSegundoALeituraForteMesmoSemReplicaLocalAlgumaAindaConhecida() throws InterruptedException {
+        CatalogViewFake catalog = new CatalogViewFake();
+        // "Líder diz DRAINING": é isto que nodeStatusStrong devolve — o relatório nunca consulta outra
+        // fonte (a antiga réplica "local" nem existe mais neste desenho; ver Javadoc de #report()).
+        catalog.nodeStatuses.put("storage-real", new StorageNodeStatus("storage-real", NodeState.DRAINING, 3, 0, 0, 500L));
+        NodeStatusReporter reporter = reporterWithFakeCatalog(catalog, Duration.ofMillis(30));
+        try {
+            reporter.start();
+            awaitTrue("status DRAINING deveria ter sido publicado", () -> !catalog.published.isEmpty()
+                    && catalog.published.get(catalog.published.size() - 1).state() == NodeState.DRAINING);
+        } finally {
+            reporter.close();
+        }
+    }
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+    void primeiroTickAposRestartPublicaDrainedSegundoOLider() throws InterruptedException {
+        CatalogViewFake catalog = new CatalogViewFake();
+        // Simula um restart: nenhuma réplica local própria ainda, mas o líder (leitura forte) já sabe
+        // que este nó está DRAINED (persistido de antes do restart).
+        catalog.nodeStatuses.put("storage-real", new StorageNodeStatus("storage-real", NodeState.DRAINED, 0, 0, 0, 500L));
+        NodeStatusReporter reporter = reporterWithFakeCatalog(catalog, Duration.ofMillis(30));
+        try {
+            reporter.start();
+            awaitTrue("status DRAINED deveria ter sido publicado logo no primeiro tick", () -> !catalog.published.isEmpty()
+                    && catalog.published.get(catalog.published.size() - 1).state() == NodeState.DRAINED);
+        } finally {
+            reporter.close();
+        }
+    }
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+    void semLiderNaoPublicaNadaNesteTick() throws InterruptedException {
+        CatalogViewFake catalog = new CatalogViewFake();
+        catalog.nodeStatusStrongThrows = true;
+        NodeStatusReporter reporter = reporterWithFakeCatalog(catalog, Duration.ofMillis(20));
+        try {
+            reporter.start();
+            // Espera tempo suficiente para vários ticks terem rodado — nenhum deveria ter publicado.
+            Thread.sleep(300L);
+            assertTrue(catalog.published.isEmpty(), "sem líder, nenhum tick deveria publicar: " + catalog.published);
+        } finally {
+            reporter.close();
+        }
+    }
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+    void leituraForteFalhaNaPrimeiraTentativaEPublicaNaSegunda() throws InterruptedException {
+        // MÉDIO-B do Refuter: a falha agora PROPAGA de report() para reportWithRetry, que aciona o
+        // backoff (200ms na 1ª retentativa) — um intervalo de tick bem mais longo garante que a
+        // publicação observada só pode ter vindo da retentativa, não de um novo tick regular.
+        CatalogViewFake catalog = new CatalogViewFake();
+        catalog.nodeStatuses.put("storage-real", new StorageNodeStatus("storage-real", NodeState.ACTIVE, 1, 0, 0, 500L));
+        catalog.nodeStatusStrongFailuresRemaining.set(1);
+        NodeStatusReporter reporter = reporterWithFakeCatalog(catalog, Duration.ofSeconds(30));
+        try {
+            reporter.start();
+            awaitTrue("status deveria ter sido publicado após a retentativa", () -> !catalog.published.isEmpty());
+            assertEquals(NodeState.ACTIVE, catalog.published.get(0).state());
+        } finally {
+            reporter.close();
+        }
+    }
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+    void schedulerDeManutencaoContinuaTicandoEnquantoPublicacaoBloqueada() throws InterruptedException {
+        // MÉDIO-B do Refuter: publicação isolada no seu próprio executor — mesmo com catalog.putNodeStatus
+        // preso (ver Javadoc de NodeStatusReporter: pode bloquear até 5×requestTimeout sem líder), o
+        // scheduler de manutenção continua chamando publishMetrics()/registry.closeIdle() no seu ritmo.
+        CatalogViewFake catalog = new CatalogViewFake();
+        catalog.nodeStatuses.put("storage-real", new StorageNodeStatus("storage-real", NodeState.ACTIVE, 1, 0, 0, 500L));
+        CountDownLatch releasePut = new CountDownLatch(1);
+        catalog.putBlocksUntil = releasePut;
+        AtomicInteger metricsTicks = new AtomicInteger();
+        NgrrdClusterMetricsListener listener = new NgrrdClusterMetricsListener() {
+            @Override
+            public void onNodeMetrics(NodeMetricsSnapshot snapshot) {
+                metricsTicks.incrementAndGet();
+            }
+        };
+        NodeStatusReporter reporter = reporterWithFakeCatalog(catalog, Duration.ofMillis(30), listener);
+        try {
+            reporter.start();
+            awaitTrue("o scheduler de manutenção deveria continuar tickando mesmo com o put bloqueado",
+                    () -> metricsTicks.get() >= 3);
+            assertTrue(catalog.published.isEmpty(), "put ainda bloqueado — nada deveria ter sido publicado ainda");
+        } finally {
+            releasePut.countDown();
+            reporter.close();
+        }
+    }
+
+    private NodeStatusReporter reporterWithFakeCatalog(CatalogView catalog, Duration interval) {
+        return reporterWithFakeCatalog(catalog, interval, null);
+    }
+
+    private NodeStatusReporter reporterWithFakeCatalog(CatalogView catalog, Duration interval,
+            NgrrdClusterMetricsListener listener) {
+        StorageRequestHandler.StorageHandlerMetrics handlerMetrics = new StorageRequestHandler.StorageHandlerMetrics(
+                0L, 0L, 0L, 0L, 0L, 0L, Map.of(), LatencySnapshot.EMPTY, LatencySnapshot.EMPTY, LatencySnapshot.EMPTY);
+        return new NodeStatusReporter(catalog, volume, registry, "storage-real", 1_000_000L, interval,
+                Clock.systemUTC(), () -> handlerMetrics, () -> true, listener);
+    }
+
+    private static void awaitTrue(String description, BooleanSupplier condition) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 5_000L;
+        while (System.currentTimeMillis() < deadline) {
+            if (condition.getAsBoolean()) {
+                return;
+            }
+            Thread.sleep(20L);
+        }
+        if (!condition.getAsBoolean()) {
+            fail("Condição não satisfeita a tempo: " + description);
+        }
+    }
+
+    /** {@link CatalogView} fake: controla a leitura FORTE do estado do próprio nó e grava o que é publicado. */
+    private static final class CatalogViewFake implements CatalogView {
+        final Map<String, StorageNodeStatus> nodeStatuses = new ConcurrentHashMap<>();
+        final List<StorageNodeStatus> published = new CopyOnWriteArrayList<>();
+        volatile boolean nodeStatusStrongThrows;
+        /** MÉDIO-B: falha as N primeiras chamadas de {@link #nodeStatusStrong}, depois passa a funcionar. */
+        final AtomicInteger nodeStatusStrongFailuresRemaining = new AtomicInteger(0);
+        /** MÉDIO-B: {@link #putNodeStatus} bloqueia até este latch contar — simula um put preso sem líder. */
+        volatile CountDownLatch putBlocksUntil;
+
+        @Override
+        public Optional<SeriesPlacement> placementStrong(String seriesKey) {
+            return Optional.empty();
+        }
+
+        @Override
+        public Optional<StorageNodeStatus> nodeStatusStrong(String nodeId) {
+            if (nodeStatusStrongThrows) {
+                throw new IllegalStateException("sem líder eleito (simulado)");
+            }
+            if (nodeStatusStrongFailuresRemaining.get() > 0) {
+                nodeStatusStrongFailuresRemaining.decrementAndGet();
+                throw new IllegalStateException("leitura forte falhou (simulado, transitório)");
+            }
+            return Optional.ofNullable(nodeStatuses.get(nodeId));
+        }
+
+        @Override
+        public Collection<StorageNodeStatus> nodesLocal() {
+            return List.copyOf(nodeStatuses.values());
+        }
+
+        @Override
+        public Map<String, SeriesPlacement> placementsLocal() {
+            return Map.of();
+        }
+
+        @Override
+        public void putPlacement(String seriesKey, SeriesPlacement placement) {
+            throw new UnsupportedOperationException("não usado por NodeStatusReporter");
+        }
+
+        @Override
+        public void putNodeStatus(StorageNodeStatus status) {
+            CountDownLatch latch = putBlocksUntil;
+            if (latch != null) {
+                try {
+                    latch.await(10, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            published.add(status);
         }
     }
 

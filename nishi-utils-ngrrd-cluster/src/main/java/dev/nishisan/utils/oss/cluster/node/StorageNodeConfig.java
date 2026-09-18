@@ -17,15 +17,23 @@
 
 package dev.nishisan.utils.oss.cluster.node;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import dev.nishisan.utils.oss.api.Durability;
 import dev.nishisan.utils.oss.api.OnGeometryChange;
 import dev.nishisan.utils.oss.blob.BlobVolumeConfig;
+import dev.nishisan.utils.oss.cluster.config.NgrrdYamlSupport;
 import dev.nishisan.utils.oss.cluster.metrics.NgrrdClusterMetricsListener;
+import dev.nishisan.utils.oss.definition.ObjectNaming;
 
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
 import java.util.Objects;
+import java.util.function.Function;
 
 /**
  * Configuração imutável de um {@link NgrrdStorageNode}: parâmetros do
@@ -114,6 +122,24 @@ import java.util.Objects;
  * @param migrationChunkBytes       tamanho de cada {@code MIGRATE_CHUNK} enviado pela origem
  * @param maxSeriesBytes            tamanho máximo de imagem de série aceito para migração
  * @param migrationStatusPollInterval intervalo entre consultas {@code MIGRATE_STATUS} ao destino
+ * @param reconcileInterval        intervalo entre ciclos automáticos do {@code LocalReconciler}
+ * @param orphanGrace              prazo mínimo (desde {@code SeriesPlacement#updatedAtEpochMs}) antes do
+ *                                 {@code LocalReconciler} apagar uma cópia local órfã (placement
+ *                                 {@code ACTIVE} confirmado noutro dono) — evita apagar durante um
+ *                                 {@code MIGRATE_FINISH} atrasado
+ * @param seriesObjectPrefix       prefixo do objeto único da série no {@code BlobStorage}
+ *                                 ({@code {prefix}/{seriesKey}.ngrr}), usado pelo {@code LocalReconciler}
+ *                                 para listar/decodificar chaves do volume e pelo
+ *                                 {@code StorageRequestHandler} para validar, no {@code OPEN}, que a
+ *                                 definição da série usa o mesmo prefixo. Default: o default do próprio
+ *                                 {@code nishi-utils-oss} ({@code ObjectNaming.seriesPrefixOrDefault()},
+ *                                 obtido programaticamente, nunca hardcoded aqui). <b>Todas as definições
+ *                                 servidas por um mesmo cluster ngrrd devem declarar (ou herdar por
+ *                                 omissão) o mesmo {@code storage.objectNaming.seriesPrefix}</b> — o
+ *                                 {@code LocalReconciler} não tem como saber, a partir só da chave física
+ *                                 no volume, qual prefixo uma definição customizada usaria antes de a
+ *                                 abrir; um {@code OPEN} com prefixo divergente do configurado neste nó é
+ *                                 rejeitado com {@code SeriesStatus#ERROR}.
  */
 public record StorageNodeConfig(
         String nodeId,
@@ -149,7 +175,10 @@ public record StorageNodeConfig(
         Duration migrationTimeout,
         long migrationChunkBytes,
         long maxSeriesBytes,
-        Duration migrationStatusPollInterval) {
+        Duration migrationStatusPollInterval,
+        Duration reconcileInterval,
+        Duration orphanGrace,
+        String seriesObjectPrefix) {
 
     public StorageNodeConfig {
         Objects.requireNonNull(nodeId, "nodeId é obrigatório");
@@ -235,10 +264,230 @@ public record StorageNodeConfig(
         if (migrationStatusPollInterval.isNegative() || migrationStatusPollInterval.isZero()) {
             throw new IllegalArgumentException("migrationStatusPollInterval deve ser > 0");
         }
+        Objects.requireNonNull(reconcileInterval, "reconcileInterval é obrigatório");
+        if (reconcileInterval.isNegative() || reconcileInterval.isZero()) {
+            throw new IllegalArgumentException("reconcileInterval deve ser > 0");
+        }
+        Objects.requireNonNull(orphanGrace, "orphanGrace é obrigatório");
+        if (orphanGrace.isNegative()) {
+            throw new IllegalArgumentException("orphanGrace deve ser >= 0");
+        }
+        Objects.requireNonNull(seriesObjectPrefix, "seriesObjectPrefix é obrigatório");
+        // BAIXO-D do Refuter: normaliza (remove barras iniciais/finais) já aqui — "series", "series/" e
+        // "/series/" são o mesmo prefixo; reaproveita a mesma normalização de SeriesObjectKeys (mesmo
+        // pacote), em vez de duplicar a lógica.
+        seriesObjectPrefix = SeriesObjectKeys.normalize(seriesObjectPrefix);
+        if (seriesObjectPrefix.isBlank()) {
+            throw new IllegalArgumentException("seriesObjectPrefix não pode ser vazio");
+        }
     }
+
+    /**
+     * Default de {@code seriesObjectPrefix}: o default do próprio {@code nishi-utils-oss}
+     * ({@link ObjectNaming#seriesPrefixOrDefault()}), obtido programaticamente — nunca um literal
+     * duplicado aqui, para nunca divergir se o default de lá mudar.
+     */
+    private static final String DEFAULT_SERIES_OBJECT_PREFIX = new ObjectNaming(null, null, null)
+            .seriesPrefixOrDefault();
 
     public static Builder builder() {
         return new Builder();
+    }
+
+    /**
+     * Carrega a configuração de um storage node a partir de um arquivo YAML, com interpolação
+     * {@code ${VAR}}/{@code ${VAR:default}} via {@code envResolver} (tipicamente {@code System::getenv}).
+     * Ver o Javadoc da seção 3 da spec do M4 para o esquema completo esperado.
+     *
+     * @throws java.io.UncheckedIOException se o arquivo não puder ser lido
+     * @throws IllegalArgumentException      se o YAML for inválido ou algum campo obrigatório estiver ausente
+     */
+    public static StorageNodeConfig fromYaml(Path path, Function<String, String> envResolver) throws IOException {
+        Objects.requireNonNull(path, "path");
+        Objects.requireNonNull(envResolver, "envResolver");
+        String raw = Files.readString(path, StandardCharsets.UTF_8);
+        return fromYaml(raw, envResolver);
+    }
+
+    /** Como {@link #fromYaml(Path, Function)}, mas a partir do texto YAML já em memória. */
+    public static StorageNodeConfig fromYaml(String yaml, Function<String, String> envResolver) {
+        Objects.requireNonNull(yaml, "yaml");
+        Objects.requireNonNull(envResolver, "envResolver");
+        String interpolated = NgrrdYamlSupport.interpolate(yaml, envResolver);
+        YamlModel model;
+        try {
+            model = NgrrdYamlSupport.mapper().readValue(interpolated, YamlModel.class);
+        } catch (JsonProcessingException e) {
+            throw new IllegalArgumentException(
+                    "YAML de configuração do storage node inválido: " + e.getOriginalMessage(), e);
+        }
+        return model.toConfig();
+    }
+
+    // ---------------------------------------------------------------- YAML DTOs (fromYaml)
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private static final class YamlModel {
+        public NodeSection node;
+        public NgrrdSection ngrrd;
+
+        StorageNodeConfig toConfig() {
+            require(node != null, "seção 'node' é obrigatória");
+            require(node.id != null && !node.id.isBlank(), "node.id é obrigatório");
+            require(node.host != null && !node.host.isBlank(), "node.host é obrigatório");
+            require(node.port != null, "node.port é obrigatório");
+            require(node.dataDir != null && !node.dataDir.isBlank(), "node.dataDir é obrigatório");
+            require(ngrrd != null && ngrrd.volume != null, "seção 'ngrrd.volume' é obrigatória");
+            VolumeSection volume = ngrrd.volume;
+            require(volume.dir != null && !volume.dir.isBlank(), "ngrrd.volume.dir é obrigatório");
+            require(volume.name != null && !volume.name.isBlank(), "ngrrd.volume.name é obrigatório");
+
+            Builder builder = builder()
+                    .nodeId(node.id)
+                    .host(node.host)
+                    .port(node.port)
+                    .dataDir(Path.of(node.dataDir))
+                    .volumeDir(Path.of(volume.dir))
+                    .volumeName(volume.name);
+            if (node.priority != null) {
+                builder.priority(node.priority);
+            }
+            if (node.seed != null && !node.seed.isBlank()) {
+                builder.seed(node.seed);
+            }
+            if (node.peers != null) {
+                builder.peers(node.peers);
+            }
+            if (volume.shardCount != null) {
+                builder.shardCount(volume.shardCount);
+            }
+            if (volume.segmentBytes != null) {
+                builder.segmentBytes(volume.segmentBytes);
+            }
+            if (volume.initialShardCapacityBytes != null) {
+                builder.initialShardCapacityBytes(volume.initialShardCapacityBytes);
+            }
+            if (volume.capacityBytes != null) {
+                builder.capacityBytes(volume.capacityBytes);
+            }
+            applyDuration(ngrrd.statusReportInterval, "ngrrd.statusReportInterval", builder::statusReportInterval);
+            applyDuration(ngrrd.nodeStatusStaleAfter, "ngrrd.nodeStatusStaleAfter", builder::nodeStatusStaleAfter);
+            applyDuration(ngrrd.handleIdleTtl, "ngrrd.handleIdleTtl", builder::handleIdleTtl);
+            if (ngrrd.maxOpenHandles != null) {
+                builder.maxOpenHandles(ngrrd.maxOpenHandles);
+            }
+            applyDuration(ngrrd.requestTimeout, "ngrrd.requestTimeout", builder::requestTimeout);
+            if (ngrrd.defaultDurability != null) {
+                builder.defaultDurability(Durability.from(ngrrd.defaultDurability));
+            }
+            if (ngrrd.defaultOnGeometryChange != null) {
+                builder.defaultOnGeometryChange(OnGeometryChange.from(ngrrd.defaultOnGeometryChange));
+            }
+            if (ngrrd.seriesObjectPrefix != null && !ngrrd.seriesObjectPrefix.isBlank()) {
+                builder.seriesObjectPrefix(ngrrd.seriesObjectPrefix);
+            }
+            RebalanceSection rebalance = ngrrd.rebalance;
+            if (rebalance != null) {
+                if (rebalance.enabled != null) {
+                    builder.rebalanceEnabled(rebalance.enabled);
+                }
+                applyDuration(rebalance.interval, "ngrrd.rebalance.interval", builder::rebalanceInterval);
+                if (rebalance.minDelta != null) {
+                    builder.rebalanceMinDelta(rebalance.minDelta);
+                }
+                if (rebalance.tolerance != null) {
+                    builder.rebalanceTolerance(rebalance.tolerance);
+                }
+                if (rebalance.maxConcurrentMigrations != null) {
+                    builder.maxConcurrentMigrations(rebalance.maxConcurrentMigrations);
+                }
+                if (rebalance.maxMovesPerCycle != null) {
+                    builder.maxMovesPerCycle(rebalance.maxMovesPerCycle);
+                }
+                applyDuration(rebalance.migrationTimeout, "ngrrd.rebalance.migrationTimeout",
+                        builder::migrationTimeout);
+                if (rebalance.chunkBytes != null) {
+                    builder.migrationChunkBytes(rebalance.chunkBytes);
+                }
+                if (rebalance.maxSeriesBytes != null) {
+                    builder.maxSeriesBytes(rebalance.maxSeriesBytes);
+                }
+            }
+            ReconcileSection reconcile = ngrrd.reconcile;
+            if (reconcile != null) {
+                applyDuration(reconcile.interval, "ngrrd.reconcile.interval", builder::reconcileInterval);
+                applyDuration(reconcile.orphanGrace, "ngrrd.reconcile.orphanGrace", builder::orphanGrace);
+            }
+            return builder.build();
+        }
+
+        private static void applyDuration(String raw, String fieldName, java.util.function.Consumer<Duration> setter) {
+            Duration parsed = NgrrdYamlSupport.duration(raw, fieldName);
+            if (parsed != null) {
+                setter.accept(parsed);
+            }
+        }
+
+        private static void require(boolean condition, String message) {
+            if (!condition) {
+                throw new IllegalArgumentException(message);
+            }
+        }
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private static final class NodeSection {
+        public String id;
+        public String host;
+        public Integer port;
+        public Integer priority;
+        public String dataDir;
+        public String seed;
+        public List<String> peers;
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private static final class NgrrdSection {
+        public VolumeSection volume;
+        public String statusReportInterval;
+        public String nodeStatusStaleAfter;
+        public String handleIdleTtl;
+        public Integer maxOpenHandles;
+        public String requestTimeout;
+        public String defaultDurability;
+        public String defaultOnGeometryChange;
+        public String seriesObjectPrefix;
+        public RebalanceSection rebalance;
+        public ReconcileSection reconcile;
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private static final class VolumeSection {
+        public String dir;
+        public String name;
+        public Integer shardCount;
+        public Long segmentBytes;
+        public Long initialShardCapacityBytes;
+        public Long capacityBytes;
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private static final class RebalanceSection {
+        public Boolean enabled;
+        public String interval;
+        public Long minDelta;
+        public Double tolerance;
+        public Integer maxConcurrentMigrations;
+        public Integer maxMovesPerCycle;
+        public String migrationTimeout;
+        public Long chunkBytes;
+        public Long maxSeriesBytes;
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private static final class ReconcileSection {
+        public String interval;
+        public String orphanGrace;
     }
 
     /** Builder fluente de {@link StorageNodeConfig}. */
@@ -279,6 +528,9 @@ public record StorageNodeConfig(
         private long migrationChunkBytes = 256L * 1024L;
         private long maxSeriesBytes = 64L * 1024L * 1024L;
         private Duration migrationStatusPollInterval = Duration.ofMillis(500);
+        private Duration reconcileInterval = Duration.ofMinutes(10);
+        private Duration orphanGrace = Duration.ofMinutes(5);
+        private String seriesObjectPrefix = DEFAULT_SERIES_OBJECT_PREFIX;
 
         private Builder() {
         }
@@ -472,6 +724,28 @@ public record StorageNodeConfig(
             return this;
         }
 
+        /** Intervalo entre ciclos automáticos do {@code LocalReconciler} (default 10 min). */
+        public Builder reconcileInterval(Duration reconcileInterval) {
+            this.reconcileInterval = reconcileInterval;
+            return this;
+        }
+
+        /** Prazo mínimo antes de apagar uma cópia local órfã (default 5 min). */
+        public Builder orphanGrace(Duration orphanGrace) {
+            this.orphanGrace = orphanGrace;
+            return this;
+        }
+
+        /**
+         * Prefixo do objeto único da série no {@code BlobStorage} (default: o default do
+         * {@code nishi-utils-oss}) — ver Javadoc do record. Todas as definições servidas por este nó
+         * devem usar o mesmo prefixo.
+         */
+        public Builder seriesObjectPrefix(String seriesObjectPrefix) {
+            this.seriesObjectPrefix = seriesObjectPrefix;
+            return this;
+        }
+
         private static final Duration MIN_NODE_STATUS_STALE_AFTER = Duration.ofSeconds(15);
 
         public StorageNodeConfig build() {
@@ -485,7 +759,8 @@ public record StorageNodeConfig(
                     affinityHandbackMode, placementGraceAfterLeadership,
                     rebalanceEnabled, rebalanceInterval, rebalanceMinDelta, rebalanceTolerance,
                     maxConcurrentMigrations, maxMovesPerCycle, migrationTimeout, migrationChunkBytes,
-                    maxSeriesBytes, migrationStatusPollInterval);
+                    maxSeriesBytes, migrationStatusPollInterval, reconcileInterval, orphanGrace,
+                    seriesObjectPrefix);
         }
 
         private static Duration maxDuration(Duration a, Duration b) {

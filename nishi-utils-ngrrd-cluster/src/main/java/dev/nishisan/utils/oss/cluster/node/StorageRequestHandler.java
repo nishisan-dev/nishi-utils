@@ -25,6 +25,7 @@ import dev.nishisan.utils.oss.api.Durability;
 import dev.nishisan.utils.oss.api.OnGeometryChange;
 import dev.nishisan.utils.oss.api.Sample;
 import dev.nishisan.utils.oss.api.SeriesResult;
+import dev.nishisan.utils.oss.blob.BlobVolume;
 import dev.nishisan.utils.oss.cluster.catalog.PlacementState;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
 import dev.nishisan.utils.oss.cluster.metrics.LatencyHistogram;
@@ -36,12 +37,17 @@ import dev.nishisan.utils.oss.cluster.protocol.ReadPresetResponse;
 import dev.nishisan.utils.oss.cluster.protocol.ReadRequest;
 import dev.nishisan.utils.oss.cluster.protocol.ReadResponse;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesCommandRequest;
+import dev.nishisan.utils.oss.cluster.protocol.SeriesExistsRequest;
+import dev.nishisan.utils.oss.cluster.protocol.SeriesExistsResponse;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesStatus;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesStatusResponse;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesWrite;
 import dev.nishisan.utils.oss.cluster.protocol.WriteBatchRequest;
 import dev.nishisan.utils.oss.cluster.protocol.WriteBatchResponse;
 import dev.nishisan.utils.oss.cluster.rpc.RequestHandlerSupport;
+import dev.nishisan.utils.oss.config.NgrrdYamlLoader;
+import dev.nishisan.utils.oss.definition.NgrrdDefinition;
+import dev.nishisan.utils.oss.definition.ObjectNaming;
 
 import java.time.Clock;
 import java.time.Duration;
@@ -50,12 +56,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
  * Atende, no dono da série, os comandos {@link Commands#OWNER_COMMANDS}:
@@ -133,8 +141,15 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
     /** Prazo do cache negativo de {@code placementStrong}: evita martelar o líder por chave. */
     private static final Duration NEGATIVE_LOOKUP_CACHE_TTL = Duration.ofSeconds(5);
 
+    /** {@link Commands#SERIES_EXISTS} não passa pela checagem de {@link #ownership} — não tem dono. */
+    private static final Set<String> HANDLED_COMMANDS = Stream
+            .concat(Commands.OWNER_COMMANDS.stream(), Stream.of(Commands.SERIES_EXISTS))
+            .collect(Collectors.toUnmodifiableSet());
+
     private final PlacementLookup placementLookup;
     private final SeriesHandleRegistry registry;
+    private final BlobVolume volume;
+    private final String seriesObjectPrefix;
     private final NodeId self;
     private final Durability defaultDurability;
     private final OnGeometryChange defaultOnGeometryChange;
@@ -153,11 +168,13 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
     private final ConcurrentMap<String, Long> negativeLookupCacheExpiryMs = new ConcurrentHashMap<>();
 
     public StorageRequestHandler(Transport transport, PlacementLookup placementLookup,
-            SeriesHandleRegistry registry, NodeId self, Durability defaultDurability,
-            OnGeometryChange defaultOnGeometryChange, Clock clock) {
-        super(transport, Commands.OWNER_COMMANDS);
+            SeriesHandleRegistry registry, BlobVolume volume, String seriesObjectPrefix, NodeId self,
+            Durability defaultDurability, OnGeometryChange defaultOnGeometryChange, Clock clock) {
+        super(transport, HANDLED_COMMANDS);
         this.placementLookup = Objects.requireNonNull(placementLookup, "placementLookup");
         this.registry = Objects.requireNonNull(registry, "registry");
+        this.volume = Objects.requireNonNull(volume, "volume");
+        this.seriesObjectPrefix = Objects.requireNonNull(seriesObjectPrefix, "seriesObjectPrefix");
         this.self = Objects.requireNonNull(self, "self");
         this.defaultDurability = Objects.requireNonNull(defaultDurability, "defaultDurability");
         this.defaultOnGeometryChange = Objects.requireNonNull(defaultOnGeometryChange, "defaultOnGeometryChange");
@@ -174,8 +191,26 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
             case Commands.READ -> handleRead((ReadRequest) body);
             case Commands.READ_PRESET -> handleReadPreset((ReadPresetRequest) body);
             case Commands.CLOSE -> handleClose((SeriesCommandRequest) body);
+            case Commands.SERIES_EXISTS -> handleSeriesExists((SeriesExistsRequest) body);
             default -> throw new IllegalArgumentException("Comando não suportado por StorageRequestHandler: " + command);
         };
+    }
+
+    /**
+     * ALTO-1 do M4: responde se este nó possui fisicamente o objeto da série no seu volume local, sem
+     * abrir handle nenhum e sem checagem de dono — quem chama já decidiu, via catálogo, que este é o nó
+     * a perguntar (tipicamente o dono forte).
+     *
+     * <p>BAIXO-E do Refuter: só {@code volume.storage().exists(key)} — nunca {@code get(key)}, que
+     * carregaria o objeto inteiro (potencialmente dezenas de MB) na memória só para medir o tamanho.
+     * {@code BlobStorage}/{@code NgrrdStorage} não expõe uma API barata de tamanho (só {@code exists}
+     * booleano ou {@code get} que lê tudo), então {@code bytes} é sempre {@code -1} quando
+     * {@code exists=true} — documentado em {@link SeriesExistsResponse#bytes()}.</p>
+     */
+    private SeriesExistsResponse handleSeriesExists(SeriesExistsRequest request) {
+        String objectKey = SeriesObjectKeys.objectKey(seriesObjectPrefix, request.seriesKey());
+        boolean exists = volume.storage().exists(objectKey);
+        return new SeriesExistsResponse(exists, exists ? -1L : 0L);
     }
 
     /** Snapshot atual das métricas do handler. */
@@ -194,6 +229,15 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
             return new SeriesStatusResponse(ownership.status(), ownership.owner(), null);
         }
         try {
+            String definitionPrefix = seriesPrefixOf(request.yaml());
+            if (!seriesObjectPrefix.equals(definitionPrefix)) {
+                recordError(SeriesStatus.ERROR);
+                return new SeriesStatusResponse(SeriesStatus.ERROR, self.value(),
+                        "definição da série usa storage.objectNaming.seriesPrefix='" + definitionPrefix
+                                + "', mas este nó está configurado com seriesObjectPrefix='" + seriesObjectPrefix
+                                + "' — todas as definições servidas por um cluster ngrrd devem usar o mesmo prefixo "
+                                + "(ver Javadoc de StorageNodeConfig.seriesObjectPrefix)");
+            }
             Durability durability = request.durability() != null ? request.durability() : defaultDurability;
             OnGeometryChange onGeometryChange = request.onGeometryChange() != null
                     ? request.onGeometryChange() : defaultOnGeometryChange;
@@ -203,6 +247,13 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
             recordError(SeriesStatus.ERROR);
             return new SeriesStatusResponse(SeriesStatus.ERROR, self.value(), describe(e));
         }
+    }
+
+    /** {@code storage.objectNaming.seriesPrefix} efetivo (com o default do oss aplicado) da definição YAML. */
+    private static String seriesPrefixOf(String yaml) {
+        NgrrdDefinition definition = NgrrdYamlLoader.parse(yaml, System::getenv);
+        ObjectNaming naming = definition.spec().storage().objectNaming();
+        return naming != null ? naming.seriesPrefixOrDefault() : new ObjectNaming(null, null, null).seriesPrefixOrDefault();
     }
 
     private WriteBatchResponse handleWriteBatch(WriteBatchRequest request) {

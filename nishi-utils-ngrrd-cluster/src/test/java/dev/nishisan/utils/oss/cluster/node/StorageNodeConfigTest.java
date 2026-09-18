@@ -69,4 +69,35 @@ class StorageNodeConfigTest {
         assertThrows(IllegalArgumentException.class,
                 () -> minimal(base).bootDiscoveryWindow(Duration.ofMillis(-1)).build());
     }
+
+    @Test
+    void seriesObjectPrefixDefaultVemDoOssNaoDeUmLiteral(@TempDir Path base) {
+        // MÉDIO-6 do Refuter: o default não pode ser um literal duplicado aqui — precisa vir do próprio
+        // ObjectNaming do oss (que hoje resolve para "series").
+        StorageNodeConfig config = minimal(base).build();
+
+        assertEquals(new dev.nishisan.utils.oss.definition.ObjectNaming(null, null, null).seriesPrefixOrDefault(),
+                config.seriesObjectPrefix());
+    }
+
+    @Test
+    void seriesObjectPrefixConfiguravelERejeitaVazio(@TempDir Path base) {
+        StorageNodeConfig config = minimal(base).seriesObjectPrefix("legacy-series").build();
+        assertEquals("legacy-series", config.seriesObjectPrefix());
+
+        assertThrows(IllegalArgumentException.class, () -> minimal(base).seriesObjectPrefix("").build());
+        assertThrows(NullPointerException.class, () -> minimal(base).seriesObjectPrefix(null).build());
+    }
+
+    @Test
+    void seriesObjectPrefixNormalizaBarrasIniciaisEFinais(@TempDir Path base) {
+        // BAIXO-D do Refuter: "series/" e "/series/" e "series" são o mesmo prefixo — normalizado já na
+        // validação do record, para casar com SeriesObjectKeys/StorageRequestHandler sem surpresas.
+        assertEquals("series", minimal(base).seriesObjectPrefix("series/").build().seriesObjectPrefix());
+        assertEquals("series", minimal(base).seriesObjectPrefix("/series/").build().seriesObjectPrefix());
+        assertEquals("series", minimal(base).seriesObjectPrefix("series").build().seriesObjectPrefix());
+
+        // Só barras (nada sobra após normalizar) continua sendo rejeitado como vazio.
+        assertThrows(IllegalArgumentException.class, () -> minimal(base).seriesObjectPrefix("///").build());
+    }
 }
