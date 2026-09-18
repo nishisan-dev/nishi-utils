@@ -21,6 +21,7 @@ import dev.nishisan.utils.ngrid.cluster.coordination.ClusterCoordinator;
 import dev.nishisan.utils.ngrid.cluster.coordination.LeadershipListener;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
+import dev.nishisan.utils.oss.cluster.catalog.NodeState;
 import dev.nishisan.utils.oss.cluster.catalog.PlacementState;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.node.PlacementRequestHandler;
@@ -169,6 +170,10 @@ public final class Rebalancer implements LeadershipListener, ClusterCoordinator.
         try {
             List<Move> plan = buildPlan();
             if (plan.isEmpty()) {
+                // Nada para mover agora — ainda assim pode haver um nó DRAINING já vazio (ex.: um
+                // segundo drain() sobre um nó que só tinha séries MIGRATING da vez anterior) esperando
+                // a promoção a DRAINED; ver Javadoc de promoteDrainedNodes().
+                promoteDrainedNodes();
                 running.set(false);
                 return new TriggerResult(0, 0);
             }
@@ -183,7 +188,10 @@ public final class Rebalancer implements LeadershipListener, ClusterCoordinator.
                     .toList();
             CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new))
                     .orTimeout(migrationTimeout.toMillis(), TimeUnit.MILLISECONDS)
-                    .whenComplete((ignoredValue, ignoredError) -> running.set(false));
+                    .whenComplete((ignoredValue, ignoredError) -> {
+                        promoteDrainedNodes();
+                        running.set(false);
+                    });
             return new TriggerResult(plan.size(), plan.size());
         } catch (RuntimeException e) {
             running.set(false);
@@ -224,6 +232,7 @@ public final class Rebalancer implements LeadershipListener, ClusterCoordinator.
         }
         List<Move> plan = buildPlan();
         if (plan.isEmpty()) {
+            promoteDrainedNodes();
             return;
         }
         List<CompletableFuture<MigrationResult>> futures = plan.stream()
@@ -252,6 +261,48 @@ public final class Rebalancer implements LeadershipListener, ClusterCoordinator.
         }
         LOGGER.info("NGRRD_REBALANCE moves=" + plan.size() + " completed=" + completed + " failed=" + failed
                 + " skipped=" + skipped);
+        promoteDrainedNodes();
+    }
+
+    /**
+     * Promove {@link NodeState#DRAINING} → {@link NodeState#DRAINED} todo nó que não possui mais
+     * nenhuma série {@link PlacementState#ACTIVE} local ({@code seriesByOwnerLocal()} vazio para ele) e
+     * não é origem de nenhuma migração ativamente conduzida pelo {@link MigrationCoordinator}
+     * ({@link MigrationCoordinator#activeSourceNodeIds()} — não mais uma varredura direta do catálogo,
+     * ver achado MÉDIO-4 do Refuter: um placement {@code MIGRATING} solto, já resolvido por outro líder
+     * mas ainda não convergido no catálogo local, não deveria bloquear a promoção) — chamado ao final de
+     * todo ciclo (agendado ou {@link #triggerNow()}), inclusive quando o plano do ciclo veio vazio (seção
+     * 1 da spec do M4: um nó já sem séries só precisa desta verificação, sem nenhum movimento a fazer).
+     * Best-effort: uma falha ao gravar (ex.: liderança perdida entre a leitura e a escrita) só é logada —
+     * o próximo ciclo tenta de novo.
+     */
+    private void promoteDrainedNodes() {
+        if (!leaderView.isLeader()) {
+            return;
+        }
+        Map<String, List<String>> seriesByOwner = catalog.seriesByOwnerLocal();
+        // MÉDIO-4 (achado do Refuter): fonte de verdade sobre "migração em curso" passa a ser o
+        // MigrationCoordinator (activeMigrationIds, o que ele está de fato conduzindo agora), não uma
+        // varredura do catálogo — um placement MIGRATING solto (ex.: de uma migração já resolvida por
+        // outro líder, catálogo ainda não convergiu) não deveria mais bloquear a promoção a DRAINED.
+        Set<String> migratingSources = coordinator.activeSourceNodeIds();
+        long now = clock.millis();
+        for (StorageNodeStatus status : catalog.nodesLocal()) {
+            if (status.state() != NodeState.DRAINING) {
+                continue;
+            }
+            boolean hasOwnedSeries = !seriesByOwner.getOrDefault(status.nodeId(), List.of()).isEmpty();
+            if (hasOwnedSeries || migratingSources.contains(status.nodeId())) {
+                continue;
+            }
+            try {
+                catalog.putNodeStatus(status.withState(NodeState.DRAINED, now));
+                LOGGER.info("NGRRD_NODE_DRAINED nodeId=" + status.nodeId());
+            } catch (RuntimeException e) {
+                LOGGER.log(Level.FINE, "Falha ao promover " + status.nodeId() + " para DRAINED "
+                        + "(o próximo ciclo tenta de novo)", e);
+            }
+        }
     }
 
     private List<Move> buildPlan() {

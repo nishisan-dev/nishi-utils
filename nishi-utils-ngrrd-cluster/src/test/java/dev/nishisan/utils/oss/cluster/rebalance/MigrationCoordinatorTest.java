@@ -526,6 +526,16 @@ class MigrationCoordinatorTest {
         }
 
         @Override
+        public Optional<dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus> nodeStatusStrong(String nodeId) {
+            return Optional.empty();
+        }
+
+        @Override
+        public void putNodeStatus(dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus status) {
+            // Não usado por MigrationCoordinator — sem estado de nó a manter neste fake.
+        }
+
+        @Override
         public Collection<dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus> nodesLocal() {
             return List.of();
         }

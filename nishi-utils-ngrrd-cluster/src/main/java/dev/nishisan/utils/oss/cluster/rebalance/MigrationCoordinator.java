@@ -49,6 +49,7 @@ import java.util.concurrent.atomic.LongAdder;
 import java.util.function.BooleanSupplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.util.stream.Collectors;
 
 /**
  * Orquestra, no líder, cada movimento de uma série entre dois storage nodes —
@@ -592,6 +593,33 @@ public final class MigrationCoordinator implements LeadershipListener {
                             + (response != null ? response.status() : "INALCANÇÁVEL") + ")",
                     startedAt);
         }
+    }
+
+    // ---------------------------------------------------------------- consulta de migrações ativas
+
+    /**
+     * Nós que são origem de alguma migração que este coordenador está ativamente conduzindo agora
+     * ({@code migrationId} presente em {@link #activeMigrationIds}, cruzado com o placement
+     * {@code MIGRATING} correspondente no catálogo) — usado por {@code Rebalancer#promoteDrainedNodes}
+     * para nunca promover a {@code DRAINED} um nó que ainda está no meio de uma migração de saída.
+     * Devolve um snapshot; nunca lança (uma falha de leitura do catálogo é tratada como "nenhuma",
+     * já que {@code activeMigrationIds} vazio também devolve vazio sem tocar o catálogo).
+     */
+    public Set<String> activeSourceNodeIds() {
+        Set<String> ids = Set.copyOf(activeMigrationIds);
+        if (ids.isEmpty()) {
+            return Set.of();
+        }
+        return catalog.placementsLocal().values().stream()
+                .filter(placement -> placement.state() == PlacementState.MIGRATING
+                        && ids.contains(placement.migrationId()))
+                .map(SeriesPlacement::ownerNodeId)
+                .collect(Collectors.toUnmodifiableSet());
+    }
+
+    /** Quantidade de migrações que este coordenador está ativamente conduzindo agora. */
+    public int activeMigrationCount() {
+        return activeMigrationIds.size();
     }
 
     // ---------------------------------------------------------------- observabilidade

@@ -17,13 +17,20 @@
 
 package dev.nishisan.utils.oss.cluster.api;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import dev.nishisan.utils.oss.cluster.config.NgrrdYamlSupport;
 import dev.nishisan.utils.oss.cluster.metrics.NgrrdClusterMetricsListener;
 
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.function.Function;
 
 /**
  * Configuração imutável de um {@link NgrrdClusterClient}: parâmetros de
@@ -133,6 +140,109 @@ public record NgrrdClusterConfig(
 
     public static Builder builder() {
         return new Builder();
+    }
+
+    /**
+     * Carrega a configuração de um cliente do cluster ngrrd a partir de um arquivo YAML, com
+     * interpolação {@code ${VAR}}/{@code ${VAR:default}} via {@code envResolver} (tipicamente
+     * {@code System::getenv}). Ver a seção 3 da spec do M4 para o esquema completo esperado.
+     *
+     * @throws java.io.UncheckedIOException se o arquivo não puder ser lido
+     * @throws IllegalArgumentException      se o YAML for inválido ou algum campo obrigatório estiver ausente
+     */
+    public static NgrrdClusterConfig fromYaml(Path path, Function<String, String> envResolver) throws IOException {
+        Objects.requireNonNull(path, "path");
+        Objects.requireNonNull(envResolver, "envResolver");
+        String raw = Files.readString(path, StandardCharsets.UTF_8);
+        return fromYaml(raw, envResolver);
+    }
+
+    /** Como {@link #fromYaml(Path, Function)}, mas a partir do texto YAML já em memória. */
+    public static NgrrdClusterConfig fromYaml(String yaml, Function<String, String> envResolver) {
+        Objects.requireNonNull(yaml, "yaml");
+        Objects.requireNonNull(envResolver, "envResolver");
+        String interpolated = NgrrdYamlSupport.interpolate(yaml, envResolver);
+        YamlModel model;
+        try {
+            model = NgrrdYamlSupport.mapper().readValue(interpolated, YamlModel.class);
+        } catch (JsonProcessingException e) {
+            throw new IllegalArgumentException(
+                    "YAML de configuração do cliente ngrrd inválido: " + e.getOriginalMessage(), e);
+        }
+        return model.toConfig();
+    }
+
+    // ---------------------------------------------------------------- YAML DTOs (fromYaml)
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private static final class YamlModel {
+        public ClientSection client;
+
+        NgrrdClusterConfig toConfig() {
+            if (client == null) {
+                throw new IllegalArgumentException("seção 'client' é obrigatória");
+            }
+            if (client.id == null || client.id.isBlank()) {
+                throw new IllegalArgumentException("client.id é obrigatório");
+            }
+            if (client.host == null || client.host.isBlank()) {
+                throw new IllegalArgumentException("client.host é obrigatório");
+            }
+            Builder builder = builder().clientId(client.id).host(client.host);
+            if (client.port != null) {
+                builder.port(client.port);
+            }
+            if (client.dataDir != null && !client.dataDir.isBlank()) {
+                builder.dataDir(Path.of(client.dataDir));
+            }
+            if (client.seed != null && !client.seed.isBlank()) {
+                builder.seed(client.seed);
+            }
+            if (client.peers != null) {
+                builder.peers(client.peers);
+            }
+            if (client.batchMaxSamples != null) {
+                builder.batchMaxSamples(client.batchMaxSamples);
+            }
+            applyDuration(client.batchMaxDelay, "client.batchMaxDelay", builder::batchMaxDelay);
+            if (client.maxBufferedSamplesPerNode != null) {
+                builder.maxBufferedSamplesPerNode(client.maxBufferedSamplesPerNode);
+            }
+            if (client.bufferFullPolicy != null && !client.bufferFullPolicy.isBlank()) {
+                builder.bufferFullPolicy(BufferFullPolicy.valueOf(
+                        client.bufferFullPolicy.trim().toUpperCase(java.util.Locale.ROOT)));
+            }
+            applyDuration(client.requestTimeout, "client.requestTimeout", builder::requestTimeout);
+            applyDuration(client.retryTimeout, "client.retryTimeout", builder::retryTimeout);
+            applyDuration(client.closeTimeout, "client.closeTimeout", builder::closeTimeout);
+            applyDuration(client.leaderWaitTimeout, "client.leaderWaitTimeout", builder::leaderWaitTimeout);
+            return builder.build();
+        }
+
+        private static void applyDuration(String raw, String fieldName, java.util.function.Consumer<Duration> setter) {
+            Duration parsed = NgrrdYamlSupport.duration(raw, fieldName);
+            if (parsed != null) {
+                setter.accept(parsed);
+            }
+        }
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private static final class ClientSection {
+        public String id;
+        public String host;
+        public Integer port;
+        public String dataDir;
+        public String seed;
+        public List<String> peers;
+        public Integer batchMaxSamples;
+        public String batchMaxDelay;
+        public Long maxBufferedSamplesPerNode;
+        public String bufferFullPolicy;
+        public String requestTimeout;
+        public String retryTimeout;
+        public String closeTimeout;
+        public String leaderWaitTimeout;
     }
 
     private static String defaultClientId() {

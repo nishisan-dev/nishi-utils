@@ -30,9 +30,11 @@ import dev.nishisan.utils.oss.cluster.api.NgrrdClusterClient;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterConfig;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
+import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.metrics.LatencySnapshot;
 import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
 import dev.nishisan.utils.oss.cluster.protocol.AdminNodeRequest;
+import dev.nishisan.utils.oss.cluster.protocol.AdminNodeStatusResponse;
 import dev.nishisan.utils.oss.cluster.protocol.AdminRebalanceResponse;
 import dev.nishisan.utils.oss.cluster.protocol.AdminStatusResponse;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
@@ -403,6 +405,48 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
             if (attempt >= MAX_NOT_LEADER_ATTEMPTS) {
                 throw new NgrrdClusterException(ErrorCode.NO_LEADER,
                         "NOT_LEADER persistente ao disparar o rebalanceamento após " + attempt + " tentativas");
+            }
+            if (response.leaderNodeId() != null) {
+                leaderHint = NodeId.of(response.leaderNodeId());
+            } else {
+                sleepQuietly(LEADER_POLL_INTERVAL_MS);
+            }
+        }
+    }
+
+    @Override
+    public StorageNodeStatus drainNode(String nodeId) {
+        return adminTransition(Commands.ADMIN_DRAIN, nodeId, "ngrrd.admin.drain");
+    }
+
+    @Override
+    public StorageNodeStatus activateNode(String nodeId) {
+        return adminTransition(Commands.ADMIN_ACTIVATE, nodeId, "ngrrd.admin.activate");
+    }
+
+    /** Implementação comum de {@link #drainNode(String)}/{@link #activateNode(String)}. */
+    private StorageNodeStatus adminTransition(String command, String nodeId, String commandLabel) {
+        ensureOpen();
+        Objects.requireNonNull(nodeId, "nodeId");
+        int attempt = 0;
+        NodeId leaderHint = null;
+        for (;;) {
+            attempt++;
+            NodeId leader = leaderHint != null ? leaderHint : awaitLeaderIdOrThrow();
+            leaderHint = null;
+            AdminNodeStatusResponse response = rpc.call(leader, command, new AdminNodeRequest(nodeId, false),
+                    AdminNodeStatusResponse.class);
+            if (response.status() == SeriesStatus.OK) {
+                return response.nodeStatus();
+            }
+            if (response.status() != SeriesStatus.NOT_LEADER) {
+                throw new NgrrdClusterException(ErrorCode.REMOTE_ERROR,
+                        commandLabel + " respondeu " + response.status()
+                                + (response.message() != null ? " (" + response.message() + ")" : ""));
+            }
+            if (attempt >= MAX_NOT_LEADER_ATTEMPTS) {
+                throw new NgrrdClusterException(ErrorCode.NO_LEADER,
+                        "NOT_LEADER persistente ao executar " + commandLabel + " após " + attempt + " tentativas");
             }
             if (response.leaderNodeId() != null) {
                 leaderHint = NodeId.of(response.leaderNodeId());

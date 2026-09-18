@@ -587,6 +587,16 @@ class MigrationExecutorTest {
         }
 
         @Override
+        public Optional<StorageNodeStatus> nodeStatusStrong(String nodeId) {
+            return Optional.empty();
+        }
+
+        @Override
+        public void putNodeStatus(StorageNodeStatus status) {
+            // Não usado por MigrationExecutor — sem estado de nó a manter neste fake.
+        }
+
+        @Override
         public Collection<StorageNodeStatus> nodesLocal() {
             return List.of();
         }

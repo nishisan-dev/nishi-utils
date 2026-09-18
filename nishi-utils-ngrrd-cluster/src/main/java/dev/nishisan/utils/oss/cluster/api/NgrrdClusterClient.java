@@ -20,6 +20,7 @@ package dev.nishisan.utils.oss.cluster.api;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.oss.Ngrrd;
 import dev.nishisan.utils.oss.NgrrdHandle;
+import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
 import dev.nishisan.utils.oss.cluster.protocol.AdminStatusResponse;
 
@@ -71,6 +72,23 @@ public interface NgrrdClusterClient extends Closeable {
      * migrações planejadas completarem — só confirma que o líder aceitou o pedido e planejou um ciclo.
      */
     void rebalanceNow();
+
+    /**
+     * Marca {@code nodeId} como {@code DRAINING} no líder ({@code ngrrd.admin.drain}), com a mesma
+     * re-resolução automática de {@code NOT_LEADER} de {@link #clusterStatus()}. Idempotente — chamar de
+     * novo sobre um nó já {@code DRAINING}/{@code DRAINED} apenas redispara o ciclo de rebalanceamento.
+     *
+     * @throws NgrrdClusterException se {@code nodeId} não é conhecido pelo catálogo do líder
+     */
+    StorageNodeStatus drainNode(String nodeId);
+
+    /**
+     * Marca {@code nodeId} como {@code ACTIVE} novamente ({@code ngrrd.admin.activate}) — volta a ser
+     * candidato a novos placements. Idempotente.
+     *
+     * @throws NgrrdClusterException se {@code nodeId} não é conhecido pelo catálogo do líder
+     */
+    StorageNodeStatus activateNode(String nodeId);
 
     /** Identificador deste cliente no cluster NGrid. */
     NodeId clientNodeId();
