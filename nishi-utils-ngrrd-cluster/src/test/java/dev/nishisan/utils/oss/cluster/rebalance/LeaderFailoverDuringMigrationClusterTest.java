@@ -114,7 +114,7 @@ class LeaderFailoverDuringMigrationClusterTest {
             Optional<SeriesPlacement> current = placementStrongOrEmpty(anySurvivor(deadLeaderId), seriesKey);
             return current.isPresent() && current.get().state() == PlacementState.ACTIVE
                     && current.get().ownerNodeId().equals(dst);
-        });
+        }, () -> catalogDiagnostics(seriesKey));
         awaitTrue("imagem apagada na origem " + src, () -> imageAt(src, seriesKey).isEmpty());
 
         byte[] imageAtDst = imageAt(dst, seriesKey).orElseThrow(() ->
@@ -170,7 +170,7 @@ class LeaderFailoverDuringMigrationClusterTest {
             Optional<SeriesPlacement> current = placementStrongOrEmpty(anySurvivor(deadLeaderId), seriesKey);
             return current.isPresent() && current.get().state() == PlacementState.ACTIVE
                     && current.get().ownerNodeId().equals(src);
-        });
+        }, () -> catalogDiagnostics(seriesKey));
 
         byte[] imageAfter = imageAt(src, seriesKey).orElseThrow(() ->
                 new AssertionError("a origem deveria continuar com a imagem íntegra"));
@@ -241,11 +241,39 @@ class LeaderFailoverDuringMigrationClusterTest {
      * predicados já sabem esperar.
      */
     private static Optional<SeriesPlacement> placementStrongOrEmpty(NgrrdStorageNode node, String seriesKey) {
+        long start = System.currentTimeMillis();
         try {
             return node.catalog().placementStrong(seriesKey);
         } catch (IllegalStateException | NgrrdClusterException e) {
+            lastStrongReadFailure = String.format("%s em %s após %d ms: %s", e.getClass().getSimpleName(),
+                    node.nodeId(), System.currentTimeMillis() - start, e.getMessage());
             return Optional.empty();
+        } finally {
+            long elapsed = System.currentTimeMillis() - start;
+            if (elapsed > 5_000L) {
+                slowStrongReads.add(node.nodeId() + ": " + elapsed + " ms");
+            }
         }
+    }
+
+    /** Diagnóstico da leitura forte para a mensagem de falha (última exceção e leituras lentas). */
+    private static volatile String lastStrongReadFailure = "nenhuma";
+    private static final List<String> slowStrongReads = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+    /** Placement na cópia LOCAL (eventual) de cada nó vivo + diagnóstico da leitura forte. */
+    private String catalogDiagnostics(String seriesKey) {
+        StringBuilder sb = new StringBuilder(" — visão local por nó: ");
+        for (NgrrdStorageNode node : harness.nodes()) {
+            try {
+                sb.append('[').append(node.nodeId()).append(" leader=").append(node.isLeader())
+                        .append(" local=").append(node.catalog().placementsLocal().get(seriesKey)).append("] ");
+            } catch (RuntimeException e) {
+                sb.append('[').append(node.nodeId()).append(" indisponível: ").append(e.getMessage()).append("] ");
+            }
+        }
+        sb.append("; última falha de leitura forte: ").append(lastStrongReadFailure)
+                .append("; leituras fortes lentas (>5 s): ").append(slowStrongReads);
+        return sb.toString();
     }
 
     /**
@@ -290,6 +318,11 @@ class LeaderFailoverDuringMigrationClusterTest {
     }
 
     private static void awaitTrue(String description, BooleanSupplier condition) throws InterruptedException {
+        awaitTrue(description, condition, () -> "");
+    }
+
+    private static void awaitTrue(String description, BooleanSupplier condition, Supplier<String> diagnostics)
+            throws InterruptedException {
         long deadline = System.currentTimeMillis() + AWAIT_TIMEOUT.toMillis();
         while (System.currentTimeMillis() < deadline) {
             if (condition.getAsBoolean()) {
@@ -298,7 +331,7 @@ class LeaderFailoverDuringMigrationClusterTest {
             Thread.sleep(150L);
         }
         if (!condition.getAsBoolean()) {
-            fail("Condição não satisfeita a tempo (" + AWAIT_TIMEOUT + "): " + description);
+            fail("Condição não satisfeita a tempo (" + AWAIT_TIMEOUT + "): " + description + diagnostics.get());
         }
     }
 

@@ -477,6 +477,109 @@ class MigrationCoordinatorTest {
                 "o pool/coordenador deveria continuar saudável depois das exceções de placementsLocal()");
     }
 
+    /**
+     * Um coordenador fechado no meio de uma condução (o líder está sendo derrubado) PARA sem efeitos
+     * colaterais: nem {@code MIGRATE_START} nem flip/abort do catálogo — o {@code MIGRATING} fica para o
+     * próximo líder resolver. Antes, o {@code shutdownNow} do {@code close()} interrompia a thread
+     * bloqueada no hook, o hook devolvia e a condução seguia (START, chunks, COMMIT, ACTIVE(dst)) por
+     * cima do encerramento do nó.
+     */
+    @Test
+    void closeDuranteAConducaoParaSemEnviarStartNemTocarOCatalogo() throws Exception {
+        CountDownLatch reachedHook = new CountDownLatch(1);
+        MigrationCoordinator.MigrationHooks blockingHook = new MigrationCoordinator.MigrationHooks() {
+            @Override
+            public void beforeStart(String seriesKey, String migrationId) {
+                reachedHook.countDown();
+                try {
+                    new CountDownLatch(1).await(); // bloqueia até o close() interromper
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        };
+        coordinator = new MigrationCoordinator(catalog, rpc, leaderView, 2, Duration.ofMillis(20),
+                Duration.ofSeconds(5), Clock.systemUTC(), blockingHook);
+        coordinator.onLeaderChanged(NodeId.of("self"));
+        catalog.putPlacement("s1", SeriesPlacement.active(SRC, 1_000L));
+        rpc.respond(SRC, Commands.MIGRATE_START, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+        rpc.respond(SRC, Commands.MIGRATE_ABORT, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+        rpc.respond(DST, Commands.MIGRATE_ABORT, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+
+        CompletableFuture<MigrationResult> future = coordinator.migrate("s1", SRC, DST);
+        assertTrue(reachedHook.await(AWAIT_TIMEOUT.toSeconds(), TimeUnit.SECONDS), "condução deveria chegar ao hook");
+        assertEquals(PlacementState.MIGRATING, catalog.placementStrong("s1").orElseThrow().state());
+
+        coordinator.close();
+
+        awaitTrue("condução encerrada", () -> future.isDone() || future.isCancelled());
+        assertEquals(0L, rpc.callsTo(SRC, Commands.MIGRATE_START), "nenhum MIGRATE_START após o close()");
+        assertEquals(0L, rpc.callsTo(SRC, Commands.MIGRATE_ABORT) + rpc.callsTo(DST, Commands.MIGRATE_ABORT),
+                "nenhum abort após o close(): o próximo líder resolve");
+        SeriesPlacement left = catalog.placementStrong("s1").orElseThrow();
+        assertEquals(PlacementState.MIGRATING, left.state(), "o MIGRATING fica para o próximo líder");
+        if (!future.isCancelled()) {
+            assertEquals(MigrationOutcome.FAILED, future.get().outcome());
+        }
+    }
+
+    /** {@code close()} durante o poll de {@code MIGRATE_STATUS}: nenhum abort e catálogo intocado. */
+    @Test
+    void closeDuranteOPollNaoAbortaNemTocaOCatalogo() throws Exception {
+        newCoordinator(2);
+        catalog.putPlacement("s1", SeriesPlacement.active(SRC, 1_000L));
+        CountDownLatch polling = new CountDownLatch(1);
+        rpc.respond(SRC, Commands.MIGRATE_START, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+        rpc.respond(DST, Commands.MIGRATE_STATUS, (target, body) -> {
+            polling.countDown();
+            return MigrateResponse.of(MigrateStatus.PARTIAL, null);
+        });
+        rpc.respond(SRC, Commands.MIGRATE_ABORT, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+        rpc.respond(DST, Commands.MIGRATE_ABORT, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+
+        CompletableFuture<MigrationResult> future = coordinator.migrate("s1", SRC, DST);
+        assertTrue(polling.await(AWAIT_TIMEOUT.toSeconds(), TimeUnit.SECONDS), "condução deveria estar no poll");
+
+        coordinator.close();
+
+        awaitTrue("condução encerrada", () -> future.isDone() || future.isCancelled());
+        assertEquals(0L, rpc.callsTo(SRC, Commands.MIGRATE_ABORT) + rpc.callsTo(DST, Commands.MIGRATE_ABORT),
+                "nenhum MIGRATE_ABORT após o close()");
+        assertEquals(PlacementState.MIGRATING, catalog.placementStrong("s1").orElseThrow().state(),
+                "catálogo intocado: o MIGRATING fica para o próximo líder");
+    }
+
+    /**
+     * {@code close()} depois do flip para {@code ACTIVE(dst)} e antes do {@code MIGRATE_FINISH}: o FINISH
+     * não é enviado (origem preservada). Nada fica {@code MIGRATING}, então o {@code resumeInFlight} do
+     * próximo líder não a vê; a cópia da origem é uma órfã de migração, apagada pelo
+     * {@code LocalReconciler} (placement forte {@code ACTIVE} noutro dono há mais de {@code orphanGrace}
+     * e {@code SERIES_EXISTS} confirmado no dono).
+     */
+    @Test
+    void closeAposOFlipEAntesDoFinishNaoApagaAOrigem() throws Exception {
+        newCoordinator(2);
+        catalog.putPlacement("s1", SeriesPlacement.active(SRC, 1_000L));
+        rpc.respond(SRC, Commands.MIGRATE_START, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+        rpc.respond(DST, Commands.MIGRATE_STATUS,
+                (target, body) -> new MigrateResponse(MigrateStatus.COMMITTED, null, 1_234L));
+        rpc.respond(SRC, Commands.MIGRATE_FINISH, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+        // O close() acontece exatamente na gravação que flipa o catálogo para ACTIVE(dst).
+        catalog.afterPut = () -> {
+            SeriesPlacement current = catalog.placementStrong("s1").orElseThrow();
+            if (current.state() == PlacementState.ACTIVE && current.ownerNodeId().equals(DST)) {
+                coordinator.close();
+            }
+        };
+
+        MigrationResult result = coordinator.migrate("s1", SRC, DST).get(AWAIT_TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+
+        assertEquals(MigrationOutcome.FAILED, result.outcome());
+        assertEquals(0L, rpc.callsTo(SRC, Commands.MIGRATE_FINISH), "MIGRATE_FINISH não pode ser enviado após o close()");
+        SeriesPlacement flipped = catalog.placementStrong("s1").orElseThrow();
+        assertEquals(DST, flipped.ownerNodeId(), "o flip já gravado permanece (a origem vira órfã do reconciliador)");
+    }
+
     private static void awaitTrue(String description, java.util.function.BooleanSupplier condition) {
         long deadline = System.currentTimeMillis() + AWAIT_TIMEOUT.toMillis();
         while (System.currentTimeMillis() < deadline) {
@@ -571,7 +674,11 @@ class MigrationCoordinatorTest {
             if (events != null) {
                 events.add("CATALOG " + placement.state() + " " + seriesKey);
             }
+            afterPut.run();
         }
+
+        /** Chamado logo DEPOIS de cada gravação bem-sucedida (gancho para simular um close() no meio). */
+        volatile Runnable afterPut = () -> { };
     }
 
     /** {@link PlacementRequestHandler.LeaderView} fake. */

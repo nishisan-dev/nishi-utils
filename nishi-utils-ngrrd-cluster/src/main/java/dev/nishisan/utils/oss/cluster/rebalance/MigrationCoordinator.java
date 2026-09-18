@@ -190,6 +190,8 @@ public final class MigrationCoordinator implements LeadershipListener {
      * {@code RebalanceClusterTest}.</p>
      */
     private final Set<String> activeMigrationIds = ConcurrentHashMap.newKeySet();
+    /** Ligado por {@link #close()}: nenhuma condução prossegue depois disto (ver {@link #driving()}). */
+    private volatile boolean closed;
 
     public MigrationCoordinator(CatalogView catalog, ClusterRpc rpc, PlacementRequestHandler.LeaderView leaderView,
             int maxConcurrentMigrations, Duration migrationStatusPollInterval, Duration migrationTimeout,
@@ -272,6 +274,9 @@ public final class MigrationCoordinator implements LeadershipListener {
                 // MIGRATING, consulta o destino (que nunca ouviu falar desta migração: UNKNOWN) e aborta,
                 // devolvendo o dono original.
                 hooks.beforeStart(seriesKey, migrationId);
+                if (!driving()) {
+                    return stoppedDriving(seriesKey, startedAt, clock);
+                }
 
                 MigrateResponse startResponse;
                 try {
@@ -305,7 +310,7 @@ public final class MigrationCoordinator implements LeadershipListener {
             String dst, String migrationId, long startedAt) {
         long deadline = clock.millis() + migrationTimeout.toMillis();
         for (;;) {
-            if (!leaderView.isLeader()) {
+            if (!driving()) {
                 // Não desfaz nada: a migração pode continuar nos dois nós envolvidos, e o próximo
                 // líder a resolve via resumeInFlight() ao assumir. Abortar aqui poderia contradizer um
                 // COMMIT que já aconteceu (ou vai acontecer) no destino.
@@ -350,6 +355,9 @@ public final class MigrationCoordinator implements LeadershipListener {
     private MigrationResult complete(String seriesKey, SeriesPlacement migratingPlacement, String src, String dst,
             String migrationId, long bytes, long startedAt) {
         hooks.beforeComplete(migrationId);
+        if (!driving()) {
+            return stoppedDriving(seriesKey, startedAt, clock);
+        }
         SeriesPlacement completedPlacement = SeriesPlacement.completed(migratingPlacement, clock.millis());
         // (Refuter r2, item 1) mesma pré-condição de abort(): revalida a CADA tentativa que o placement
         // forte ainda é MIGRATING com este migrationId antes de flipar — sem isto, um complete() atrasado
@@ -365,6 +373,15 @@ public final class MigrationCoordinator implements LeadershipListener {
             return new MigrationResult(MigrationOutcome.FAILED,
                     "COMMITTED no destino " + dst + ", mas o catálogo não pôde ser flipado para ACTIVE(" + dst + ")",
                     0L, clock.millis() - startedAt);
+        }
+        if (!driving()) {
+            // Catálogo já em ACTIVE(dst), mas o coordenador foi fechado/interrompido antes do FINISH: NÃO
+            // apaga a origem daqui. Nada fica MIGRATING para o resumeInFlight (que só olha MIGRATING);
+            // a cópia da origem vira órfã de migração e é apagada pelo LocalReconciler (placement forte
+            // ACTIVE noutro dono há mais de orphanGrace + SERIES_EXISTS confirmado no dono).
+            LOGGER.log(Level.WARNING, "Coordenador fechado após flipar " + seriesKey + " para ACTIVE(" + dst
+                    + ") e antes do MIGRATE_FINISH — a cópia na origem " + src + " fica para o reconciliador");
+            return stoppedDriving(seriesKey, startedAt, clock);
         }
         boolean finished = callWithRetries(NodeId.of(src), Commands.MIGRATE_FINISH,
                 new MigrateControlRequest(seriesKey, migrationId), FINISH_RETRY_ATTEMPTS, FINISH_RETRY_BACKOFF);
@@ -403,6 +420,11 @@ public final class MigrationCoordinator implements LeadershipListener {
      */
     private MigrationResult abort(String seriesKey, SeriesPlacement migratingPlacement, String src, String dst,
             String reason, long startedAt) {
+        if (!driving()) {
+            // Fechado/interrompido: nem reverte o catálogo nem manda MIGRATE_ABORT — o próximo líder
+            // resolve pelo resumeInFlight (o MIGRATING fica).
+            return stoppedDriving(seriesKey, startedAt, clock);
+        }
         String migrationId = migratingPlacement.migrationId();
         boolean reverted = putPlacementWithRetries(seriesKey, SeriesPlacement.aborted(migratingPlacement, clock.millis()),
                 "ACTIVE(" + src + ") de " + seriesKey + " após abort",
@@ -445,8 +467,8 @@ public final class MigrationCoordinator implements LeadershipListener {
             BooleanSupplier precondition) {
         RuntimeException lastFailure = null;
         for (int attempt = 1; attempt <= PLACEMENT_WRITE_ATTEMPTS; attempt++) {
-            if (attempt > 1 && !leaderView.isLeader()) {
-                LOGGER.log(Level.WARNING, "Liderança perdida antes de gravar o placement " + what
+            if (!driving()) {
+                LOGGER.log(Level.WARNING, "Liderança perdida (ou coordenador fechado) antes de gravar o placement " + what
                         + "; o próximo líder resolve via resumeInFlight");
                 return false;
             }
@@ -530,7 +552,7 @@ public final class MigrationCoordinator implements LeadershipListener {
      */
     private void resumeInFlight() {
         for (int attempt = 1; attempt <= RESUME_SCAN_ATTEMPTS; attempt++) {
-            if (!leaderView.isLeader()) {
+            if (!driving()) {
                 return;
             }
             try {
@@ -545,6 +567,9 @@ public final class MigrationCoordinator implements LeadershipListener {
                         continue;
                     }
                     String seriesKey = entry.getKey();
+                    LOGGER.info(() -> "resumeInFlight: retomando a migração de " + seriesKey + " (migrationId="
+                            + placement.migrationId() + ", " + placement.ownerNodeId() + " -> "
+                            + placement.targetNodeId() + ") encontrada MIGRATING na cópia local");
                     pool.execute(() -> {
                         try {
                             resumeOne(seriesKey, placement);
@@ -567,7 +592,7 @@ public final class MigrationCoordinator implements LeadershipListener {
     }
 
     private void resumeOne(String seriesKey, SeriesPlacement placement) {
-        if (!leaderView.isLeader()) {
+        if (!driving()) {
             return;
         }
         long startedAt = clock.millis();
@@ -575,14 +600,14 @@ public final class MigrationCoordinator implements LeadershipListener {
         String src = placement.ownerNodeId();
         String migrationId = placement.migrationId();
         MigrateResponse response = null;
-        for (int attempt = 1; attempt <= RESUME_STATUS_ATTEMPTS && leaderView.isLeader(); attempt++) {
+        for (int attempt = 1; attempt <= RESUME_STATUS_ATTEMPTS && driving(); attempt++) {
             response = pollStatusQuietly(dst, seriesKey, migrationId);
             if (response != null) {
                 break;
             }
             sleepQuietly(Duration.ofMillis(200L * attempt));
         }
-        if (!leaderView.isLeader()) {
+        if (!driving()) {
             return;
         }
         if (response != null && response.status() == MigrateStatus.COMMITTED) {
@@ -636,7 +661,27 @@ public final class MigrationCoordinator implements LeadershipListener {
 
     /** Fecha o pool de coordenação ({@code ngrrd-migration-coord}). */
     public void close() {
+        closed = true;
         pool.shutdownNow();
+    }
+
+    /**
+     * Se este coordenador ainda deve conduzir migrações: não fechado, thread não interrompida (o
+     * {@code shutdownNow} do {@link #close()} interrompe a condução em curso) e nó ainda líder. Depois
+     * de um {@code false} a condução PARA sem efeitos colaterais — nada de RPC nem de escrita no
+     * catálogo: um líder em fechamento que continuasse (START, chunks, COMMIT, flip para ACTIVE(dst))
+     * concluía a migração por cima do próprio encerramento, e o próximo líder encontrava o catálogo
+     * num estado que ele nunca conduziu. O placement MIGRATING que ficou é resolvido pelo próximo
+     * líder via {@link #resumeInFlight()}.
+     */
+    private boolean driving() {
+        return !closed && !Thread.currentThread().isInterrupted() && leaderView.isLeader();
+    }
+
+    private static MigrationResult stoppedDriving(String seriesKey, long startedAt, Clock clock) {
+        return new MigrationResult(MigrationOutcome.FAILED, "condução de " + seriesKey
+                + " interrompida (coordenador fechado ou liderança perdida); o próximo líder resolve via resumeInFlight",
+                0L, clock.millis() - startedAt);
     }
 
     private static void sleepQuietly(Duration duration) {
