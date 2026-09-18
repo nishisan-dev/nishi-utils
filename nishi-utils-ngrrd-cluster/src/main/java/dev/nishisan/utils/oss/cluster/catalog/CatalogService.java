@@ -141,6 +141,12 @@ public final class CatalogService implements CatalogView {
         return nodes.getOptional(nodeId, Consistency.EVENTUAL);
     }
 
+    /** Leitura forte do status de um storage node, roteada ao líder quando o nó local não é líder. */
+    @Override
+    public Optional<StorageNodeStatus> nodeStatusStrong(String nodeId) {
+        return nodes.getOptional(nodeId, Consistency.STRONG);
+    }
+
     /** Snapshot local (eventual) do status de todos os storage nodes conhecidos. */
     @Override
     public Collection<StorageNodeStatus> nodesLocal() {
@@ -148,6 +154,7 @@ public final class CatalogService implements CatalogView {
     }
 
     /** Publica/atualiza o status de um storage node; roteado ao líder pelo próprio {@link DistributedMap}. */
+    @Override
     public void putNodeStatus(StorageNodeStatus status) {
         nodes.put(status.nodeId(), status);
     }

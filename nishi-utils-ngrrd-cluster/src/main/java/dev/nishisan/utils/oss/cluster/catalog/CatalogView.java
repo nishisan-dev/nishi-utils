@@ -33,6 +33,14 @@ public interface CatalogView {
     /** Leitura forte (round-trip ao líder) do placement da série. */
     Optional<SeriesPlacement> placementStrong(String seriesKey);
 
+    /**
+     * Leitura forte (round-trip ao líder) do status de um storage node — usada quando a réplica local
+     * (eventual) não é confiável o bastante (ex.: decidir se {@code self} ainda está {@code ACTIVE}
+     * antes de adotar uma série, ou preservar {@code DRAINING}/{@code DRAINED} ao republicar o próprio
+     * status). Pode lançar se não houver líder alcançável — o chamador decide o que fazer.
+     */
+    Optional<StorageNodeStatus> nodeStatusStrong(String nodeId);
+
     /** Snapshot local (eventual) do status de todos os storage nodes conhecidos. */
     Collection<StorageNodeStatus> nodesLocal();
 
@@ -41,4 +49,11 @@ public interface CatalogView {
 
     /** Grava o placement da série; roteado ao líder pelo próprio {@code DistributedMap}. */
     void putPlacement(String seriesKey, SeriesPlacement placement);
+
+    /**
+     * Publica/atualiza o status de um storage node; roteado ao líder pelo próprio {@code DistributedMap}
+     * — usado por {@code NodeStatusReporter} (isolamento do {@code CatalogService}/{@code DistributedMap}
+     * reais para testes com fake, mesmo padrão dos demais métodos desta interface).
+     */
+    void putNodeStatus(StorageNodeStatus status);
 }

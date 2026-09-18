@@ -51,6 +51,15 @@ import java.util.Objects;
  * @param blobStats          resumo dos gauges do volume local (ver {@link BlobVolumeSummary})
  * @param migrationsIn       quantidade de migrações recebidas (sempre {@code 0} no M2)
  * @param migrationsOut      quantidade de migrações enviadas (sempre {@code 0} no M2)
+ * @param reconcileAdopted           M4: séries adotadas (presentes no volume, ausentes do catálogo) no
+ *                                   último ciclo do {@code LocalReconciler} (sempre {@code 0} se o nó
+ *                                   ainda não rodou nenhum ciclo)
+ * @param reconcileOrphansDeleted    M4: cópias órfãs apagadas no último ciclo
+ * @param reconcileUnplaced          M4: séries adotadas pelo líder noutro dono (este nó não era
+ *                                   candidato) no último ciclo
+ * @param reconcileMissing           M4: séries {@code ACTIVE} no catálogo local mas ausentes do volume,
+ *                                   detectadas no último ciclo
+ * @param reconcileLastDurationMs    M4: duração do último ciclo do {@code LocalReconciler}, em ms
  */
 public record NodeMetricsSnapshot(
         String nodeId,
@@ -72,7 +81,12 @@ public record NodeMetricsSnapshot(
         Map<SeriesStatus, Long> errorsByStatus,
         BlobVolumeSummary blobStats,
         long migrationsIn,
-        long migrationsOut) {
+        long migrationsOut,
+        long reconcileAdopted,
+        long reconcileOrphansDeleted,
+        long reconcileUnplaced,
+        long reconcileMissing,
+        long reconcileLastDurationMs) {
 
     public NodeMetricsSnapshot {
         Objects.requireNonNull(nodeId, "nodeId é obrigatório");

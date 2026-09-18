@@ -280,6 +280,48 @@ class ProtocolCodecTest {
     }
 
     @Test
+    void seriesExistsRequestSobreviveAoRoundTrip() throws IOException {
+        SeriesExistsRequest original = new SeriesExistsRequest("series-1");
+        assertEquals(original, roundTripRequestBody(Commands.SERIES_EXISTS, original));
+    }
+
+    @Test
+    void seriesExistsResponseComExistsTrueSobreviveAoRoundTrip() throws IOException {
+        SeriesExistsResponse original = new SeriesExistsResponse(true, 1_677_721L);
+        assertEquals(original, roundTripResponseBody(Commands.SERIES_EXISTS, original));
+    }
+
+    @Test
+    void seriesExistsResponseComExistsFalseSobreviveAoRoundTrip() throws IOException {
+        SeriesExistsResponse original = new SeriesExistsResponse(false, 0L);
+        SeriesExistsResponse roundTripped = roundTripResponseBody(Commands.SERIES_EXISTS, original);
+        assertEquals(original, roundTripped);
+        assertEquals(0L, roundTripped.bytes());
+    }
+
+    @Test
+    void adminNodeStatusResponseOkComNodeStatusSobreviveAoRoundTrip() throws IOException {
+        StorageNodeStatus status = new StorageNodeStatus("node-a", NodeState.DRAINING, 5, 1_000, 10_000, 5_000L);
+        AdminNodeStatusResponse original = new AdminNodeStatusResponse(SeriesStatus.OK, "node-a", status, null);
+        assertEquals(original, roundTripResponseBody(Commands.ADMIN_DRAIN, original));
+    }
+
+    @Test
+    void adminNodeStatusResponseDeErroSemNodeStatusSobreviveAoRoundTrip() throws IOException {
+        AdminNodeStatusResponse original = new AdminNodeStatusResponse(SeriesStatus.ERROR, "node-a", null,
+                "nó desconhecido pelo catálogo: node-x");
+        AdminNodeStatusResponse roundTripped = roundTripResponseBody(Commands.ADMIN_DRAIN, original);
+        assertEquals(original, roundTripped);
+        assertNull(roundTripped.nodeStatus());
+    }
+
+    @Test
+    void adminNodeStatusResponseNotLeaderSobreviveAoRoundTrip() throws IOException {
+        AdminNodeStatusResponse original = new AdminNodeStatusResponse(SeriesStatus.NOT_LEADER, "storage-1", null, null);
+        assertEquals(original, roundTripResponseBody(Commands.ADMIN_ACTIVATE, original));
+    }
+
+    @Test
     void adminNodeRequestSobreviveAoRoundTrip() throws IOException {
         AdminNodeRequest original = new AdminNodeRequest("node-a", false);
         assertEquals(original, roundTripRequestBody(Commands.ADMIN_DRAIN, original));
@@ -327,7 +369,7 @@ class ProtocolCodecTest {
                 SeriesStatus.ERROR, 2L);
         NodeMetricsSnapshot original = new NodeMetricsSnapshot("storage-0", 1_700_000_000_000L, true, 350L,
                 10_485_760L, 104_857_600L, 12, 120L, 4_800L, 7L, 30L, 5L, 75L, writeBatchLatency, checkpointLatency,
-                readLatency, errorsByStatus, blobStats, 0L, 0L);
+                readLatency, errorsByStatus, blobStats, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
 
         NodeMetricsSnapshot roundTripped = roundTripResponseBody(Commands.ADMIN_METRICS, original);
 

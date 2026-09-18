@@ -43,6 +43,12 @@ public final class Commands {
     public static final String READ_PRESET = "ngrrd.readPreset";
     /** Dono: libera a referência de uma série no registry local. */
     public static final String CLOSE = "ngrrd.close";
+    /**
+     * Qualquer nó: verifica, sem abrir handle, se o objeto físico da série existe no volume local
+     * ({@code volume.storage().exists(key)}) — usado pelo {@code LocalReconciler} para confirmar com o
+     * dono forte que ele de fato possui a cópia antes de apagar uma órfã local (seção 0/ALTO-1 do M4).
+     */
+    public static final String SERIES_EXISTS = "ngrrd.series.exists";
 
     /** Origem: inicia a migração de uma série para outro storage node. */
     public static final String MIGRATE_START = "ngrrd.migrate.start";
