@@ -104,6 +104,21 @@ usa o cluster ngrrd. Cada uma merece destaque próprio:
   quórum por um instante e fazer o líder se demitir sem necessidade; o placeholder de `HEARTBEAT`
   (sem host) podia ser tratado como candidato real. **Por que importa:** reduz demissões de líder por
   ruído transitório de rede — o cenário mais comum de instabilidade percebida pelo cliente.
+- **Protocolo de relay: UM salto por conexão direta aberta e aviso `UNDELIVERABLE` negociado.** Um
+  relay passa a encaminhar só por uma conexão direta e aberta ao destino — nunca disca o destino em
+  nome do remetente nem re-proxya por um terceiro nó (a rota de dois saltos derivada do gossip deixa
+  de ser tentada, deliberadamente: cada mensagem a um nó morto virava uma tempestade de dials
+  falhos executada no read loop dos sobreviventes, que se evictavam entre si no meio do failover).
+  Quando não consegue encaminhar, o relay devolve `UNDELIVERABLE` ao remetente, que falha o
+  request/response pendente na hora em vez de esperar o `requestTimeout`. O aviso só vai a peers que
+  anunciaram `supportsUndeliverable` no handshake (campo novo, `false` para nós anteriores); o
+  decoder passou a tolerar `MessageType` desconhecido (descarta a mensagem, mantém a conexão) —
+  antes, um enum desconhecido derrubava o socket. Um `confirmPeerDisconnect` do coordinator só
+  aceita reachability direta (uma rota de proxy por gossip não mantém vivo um peer cujo socket
+  fechou), enquanto a evicção por heartbeat continua concedendo graça a membros só-por-proxy — as
+  duas políticas de "vivo" coexistem de propósito e estão documentadas no código. **Por que
+  importa:** o failover de um líder morto caiu de ~25 s para 1-3 s e um RPC ao líder recém-morto
+  falha em milissegundos em vez de dezenas de segundos.
 - **Passthroughs de `bootDiscoveryWindow`/`affinityHandbackMode` no `NGridNodeBuilder` (`5b935ca`).**
   Esses dois parâmetros só existiam no `NGridConfig.Builder` cru. **Por que importa:** qualquer
   código (não só o ngrrd cluster) que use a fachada recomendada `NGridNodeBuilder` agora consegue

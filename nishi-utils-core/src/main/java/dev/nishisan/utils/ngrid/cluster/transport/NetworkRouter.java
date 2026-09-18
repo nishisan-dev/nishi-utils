@@ -38,6 +38,14 @@ import java.util.logging.Logger;
  * Manages routing decisions, maintaining direct vs proxy routes (Sticky Fallback).
  * Now supports RTT-based cost estimation for Phase 2.
  */
+/*
+ * Relay policy (8.3.0): a route "via" a proxy is ONE hop over that proxy's direct, open connection to
+ * the destination. The relay never dials the destination on the sender's behalf nor re-proxies
+ * through a third node, so the gossip-derived two-hop routes this router could previously compute
+ * (A → B → C → D) are deliberately no longer attempted: they turned every message to a dead node into
+ * a TTL-bounded storm of failed dials across the survivors. A relay that cannot forward answers
+ * UNDELIVERABLE (negotiated in the handshake) so request/response callers fail fast.
+ */
 final class NetworkRouter {
     private static final Logger LOGGER = Logger.getLogger(NetworkRouter.class.getName());
     private static final double SWITCH_THRESHOLD = 0.15; // 15% improvement required to switch

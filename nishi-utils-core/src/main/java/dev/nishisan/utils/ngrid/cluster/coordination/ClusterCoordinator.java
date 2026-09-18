@@ -1741,7 +1741,20 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      * proxy) — the deferred half of {@link #onPeerDisconnected(NodeId)}.
      */
     private void confirmPeerDisconnect(NodeId peerId) {
-        if (transport.isConnected(peerId) || transport.isProxied(peerId)) {
+        // NOTE — two liveness policies coexist on purpose (technical debt, to be unified): the heartbeat
+        // eviction path (evictDeadMembers) still grants an overdue member the PROXY_REACHABLE_GRACE when
+        // transport.isProxied() says a relay route exists, while this path — reached only after OUR
+        // socket to the peer closed — trusts direct reachability alone. The eviction path protects a
+        // member that is genuinely reachable only through a relay (direct link flapping); this one
+        // must not let a gossip-only route keep a dead peer alive after its socket went away.
+        // Direct reachability only. A PROXY route is gossip (the relay merely "knows" the peer) and the
+        // transport demotes the route to proxy on the very first failed dial after the socket closed —
+        // so a dead leader stayed "reachable via proxy" through a client that could not deliver either,
+        // dodged this confirmation, and was only evicted by the heartbeat-timeout path plus its
+        // proxy-reachable grace (~3× heartbeatTimeout): every failover took ~25 s instead of one
+        // heartbeat interval. A live peer whose direct link merely flapped is re-activated by its next
+        // heartbeat (touch), whichever route delivers it.
+        if (transport.isConnected(peerId)) {
             LOGGER.fine(() -> "Peer " + peerId + " reconnected within the disconnect grace; membership kept");
             return;
         }

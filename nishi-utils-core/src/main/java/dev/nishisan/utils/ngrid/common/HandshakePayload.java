@@ -37,6 +37,12 @@ public final class HandshakePayload {
     private final Set<NodeInfo> peers;
     private final Map<NodeId, Double> latencies;
     private final boolean supportsCompression;
+    /**
+     * Whether this node understands {@link MessageType#UNDELIVERABLE} (relay notice, 8.3.0). Absent in
+     * handshakes of older nodes, hence {@code false} by default: a relay only sends the notice to peers
+     * that announced it — an unknown enum value would otherwise break their decoder.
+     */
+    private final boolean supportsUndeliverable;
 
     /**
      * Creates a handshake payload without latency information.
@@ -74,16 +80,33 @@ public final class HandshakePayload {
      * @param latencies           measured latencies to known peers
      * @param supportsCompression whether this node accepts LZ4-compressed transport frames
      */
+    public HandshakePayload(NodeInfo local, Set<NodeInfo> peers, Map<NodeId, Double> latencies,
+            boolean supportsCompression) {
+        this(local, peers, latencies, supportsCompression, true);
+    }
+
     @JsonCreator
     public HandshakePayload(
             @JsonProperty("local") NodeInfo local,
             @JsonProperty("peers") Set<NodeInfo> peers,
             @JsonProperty("latencies") Map<NodeId, Double> latencies,
-            @JsonProperty("supportsCompression") boolean supportsCompression) {
+            @JsonProperty("supportsCompression") boolean supportsCompression,
+            @JsonProperty("supportsUndeliverable") boolean supportsUndeliverable) {
         this.local = Objects.requireNonNull(local, "local");
         this.peers = Collections.unmodifiableSet(new HashSet<>(Objects.requireNonNull(peers, "peers")));
         this.latencies = Collections.unmodifiableMap(new HashMap<>(Objects.requireNonNull(latencies, "latencies")));
         this.supportsCompression = supportsCompression;
+        this.supportsUndeliverable = supportsUndeliverable;
+    }
+
+    /**
+     * Whether the peer understands {@link MessageType#UNDELIVERABLE}; {@code false} for handshakes that
+     * predate the field.
+     *
+     * @return {@code true} if the relay notice may be sent to this peer
+     */
+    public boolean supportsUndeliverable() {
+        return supportsUndeliverable;
     }
 
     public NodeInfo local() {

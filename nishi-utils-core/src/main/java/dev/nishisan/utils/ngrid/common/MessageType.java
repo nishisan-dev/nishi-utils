@@ -69,5 +69,11 @@ public enum MessageType {
     /** Either side → other: cancel the in-flight handback; the interim leader resumes (D11). */
     HANDBACK_ABORT,
     /** Candidate → interim leader: cut over at W and asserted a higher epoch; demote now (D11). */
-    HANDBACK_COMPLETE
+    HANDBACK_COMPLETE,
+    /**
+     * Relay → original sender: a message routed through this node could not be forwarded because the
+     * relay holds no direct connection to its destination (payload {@code UndeliverablePayload}). Lets
+     * a request/response caller fail fast instead of waiting out the request timeout for a dead peer.
+     */
+    UNDELIVERABLE
 }

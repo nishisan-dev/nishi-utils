@@ -87,6 +87,27 @@ class PeerDisconnectGraceTest {
         }
     }
 
+    /**
+     * A proxy route is gossip, not liveness: after OUR socket to the peer closed, a route "via" some
+     * relay that merely knows the peer must not keep it an active member. Before, a dead leader stayed
+     * "reachable via proxy" through a client and dodged the disconnect confirmation, so it was only
+     * evicted by the heartbeat-timeout path plus its proxy grace — a ~25 s failover instead of one
+     * heartbeat interval.
+     */
+    @Test
+    void aPeerReachableOnlyThroughAGossipProxyRouteIsStillConfirmedGone() throws Exception {
+        Harness h = harness();
+        h.start();
+        h.transport.connected.set(true);
+        h.coord.onPeerConnected(h.transport.peerInfo);
+        awaitTrue(() -> h.coord.getActiveMembersCount() == 2, "peer active");
+
+        h.transport.connected.set(false);
+        h.transport.proxied.set(true); // the router demoted the route to PROXY on the first failed dial
+        h.coord.onPeerDisconnected(PEER);
+        awaitTrue(() -> h.coord.getActiveMembersCount() == 1, "peer declared inactive despite the proxy route");
+    }
+
     @Test
     void disconnectOfAPeerThatStaysGoneIsConfirmedAfterTheGrace() throws Exception {
         Harness h = harness();
@@ -172,6 +193,7 @@ class PeerDisconnectGraceTest {
         private final NodeInfo local;
         final NodeInfo peerInfo;
         final AtomicBoolean connected = new AtomicBoolean(false);
+        final AtomicBoolean proxied = new AtomicBoolean(false);
         private final CopyOnWriteArraySet<TransportListener> listeners = new CopyOnWriteArraySet<>();
 
         LoopbackTransport(NodeInfo local, NodeInfo peerInfo) {
@@ -225,7 +247,12 @@ class PeerDisconnectGraceTest {
 
         @Override
         public boolean isReachable(NodeId nodeId) {
-            return isConnected(nodeId);
+            return isConnected(nodeId) || isProxied(nodeId);
+        }
+
+        @Override
+        public boolean isProxied(NodeId nodeId) {
+            return nodeId.equals(peerInfo.nodeId()) && proxied.get();
         }
 
         @Override
