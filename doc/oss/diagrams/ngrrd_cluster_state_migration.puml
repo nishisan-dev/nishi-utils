@@ -1,0 +1,46 @@
+@startuml ngrrd_cluster_state_migration
+title ngrrd Cluster — estados de SeriesPlacement e do destino em migração (MigrateStatus)
+
+skinparam shadowing false
+
+state "ACTIVE(owner)" as Active
+state "MIGRATING(owner=src, target=dst)" as Migrating
+
+[*] --> Active : ngrrd.place\n(placement inicial)
+
+Active --> Migrating : MigrationCoordinator.migrate(src, dst)\ncatálogo := MIGRATING antes de\nqualquer chamada de rede
+
+Migrating --> Active : complete()\n(COMMITTED confirmado no destino)\nowner passa a ser dst
+note on link
+  complete() só grava se o placement
+  forte ainda for MIGRATING com o
+  MESMO migrationId (revalidado a
+  cada tentativa de escrita).
+end note
+
+Migrating --> Active : abort()\n(falha antes/durante o COMMIT,\nou timeout de migrationTimeout)\nowner permanece src
+note on link
+  Reversão gravada no catálogo
+  ANTES de notificar MIGRATE_ABORT
+  às duas pontas.
+end note
+
+Migrating --> Migrating : líder cai\n(resumeInFlight() do NOVO líder\nconsulta migrate.status no destino)
+
+state "Destino — MigrateStatus" as DstStatus {
+  [*] --> UNKNOWN : estado inicial\n(migrate.start é enviado à ORIGEM, não ao\ndestino — o destino nem sabe da migração ainda)
+  UNKNOWN --> PARTIAL : primeiro migrate.chunk aceito
+  PARTIAL --> PARTIAL : mais chunks\n(nem todos recebidos)
+  PARTIAL --> COMMITTED : migrate.commit\nSHA-256 confere
+  PARTIAL --> HASH_MISMATCH : migrate.commit\nSHA-256 não confere
+  UNKNOWN --> ERROR : falha de aplicação
+  COMMITTED --> [*]
+  HASH_MISMATCH --> [*] : líder aborta a migração
+}
+
+note bottom of DstStatus
+  resumeInFlight() do novo líder decide com base neste status:
+  COMMITTED -> completa (flipa o catálogo, manda MIGRATE_FINISH à origem)
+  PARTIAL/UNKNOWN/ERROR/HASH_MISMATCH/inalcançável -> aborta (devolve à origem)
+end note
+@enduml

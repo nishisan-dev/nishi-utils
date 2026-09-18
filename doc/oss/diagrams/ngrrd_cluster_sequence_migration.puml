@@ -1,0 +1,86 @@
+@startuml ngrrd_cluster_sequence_migration
+title ngrrd Cluster — migração de série entre storage nodes (rebalanceamento)
+
+skinparam shadowing false
+
+participant "Rebalancer\n(líder)" as reb
+participant "MigrationCoordinator\n(líder)" as coord
+database "Catálogo\n(ngrrd.catalog)" as cat
+participant "Origem (src)\nMigrationExecutor" as src
+participant "Destino (dst)\nMigrationExecutor" as dst
+
+reb -> coord : migrate(seriesKey, src, dst)
+coord -> cat : putPlacement(MIGRATING, target=dst)
+coord -> src : ngrrd.migrate.start(seriesKey, migrationId, dst)
+src -> src : quiesce: checkpoint + close do handle\nmarca série MIGRATING localmente\n(rejeita novos writes)
+src --> coord : OK (retorno imediato;\nenvio dos chunks roda em background)
+
+src -> src : lê BlobStorage.get(key)
+
+loop cada chunk de migrationChunkBytes (256 KiB default)
+  src -> dst : ngrrd.migrate.chunk(seq, total, bytes)
+  dst -> dst : acumula bytes recebidos
+  dst --> src : OK
+end
+
+src -> dst : ngrrd.migrate.commit(sha256, totalBytes)
+dst -> dst : valida SHA-256
+dst -> dst : BlobStorage.put(key, bytes)
+dst --> src : OK
+
+note over src, dst
+  A ORIGEM conduz o envio dos chunks e o commit sozinha,
+  sem o coordenador no meio de cada etapa. O coordenador só
+  entra de novo ao consultar migrate.status no destino.
+end note
+
+coord -> dst : ngrrd.migrate.status(migrationId)\n(poll a cada migrationStatusPollInterval, 500ms default)
+dst --> coord : COMMITTED
+
+coord -> cat : putPlacement(ACTIVE, owner=dst)
+coord -> src : ngrrd.migrate.finish(seriesKey, migrationId)
+src -> src : BlobStorage.delete(key)
+src --> coord : OK
+
+note over coord, dst
+  Cliente que tentar operar a série durante MIGRATING
+  recebe status MIGRATING e faz backoff (100ms..2s) até
+  retryTimeout (default 5 min), depois
+  NgrrdClusterException(MIGRATING).
+end note
+
+== Falha antes do COMMIT ==
+coord -> cat : putPlacement(ACTIVE, owner=src)\n(só grava se o placement forte ainda\nfor MIGRATING com este migrationId)
+alt catálogo revertido com sucesso
+  coord -> src : ngrrd.migrate.abort(migrationId)
+  coord -> dst : ngrrd.migrate.abort(migrationId)
+  note right
+    Origem reabre normalmente.
+    ABORT só é enviado às duas pontas
+    DEPOIS que a reversão no catálogo
+    já foi confirmada — nunca antes.
+  end note
+else pré-condição não satisfeita, ou liderança perdida
+  note right
+    Nenhum ABORT é enviado: notificar os
+    nós de uma reversão que não está
+    refletida no catálogo os deixaria
+    desalinhados com a verdade
+    compartilhada. O próximo líder
+    resolve via resumeInFlight().
+  end note
+end
+
+== Líder cai depois do COMMIT mas antes do flip ==
+participant "Novo líder\nMigrationCoordinator.resumeInFlight()" as newLeader
+newLeader -> cat : varre placements MIGRATING (cópia local)
+newLeader -> dst : ngrrd.migrate.status(migrationId)
+dst --> newLeader : COMMITTED
+newLeader -> cat : putPlacement(ACTIVE, owner=dst)
+newLeader -> src : ngrrd.migrate.finish(migrationId)\n(retentativas: 20x 500ms)
+note right
+  Se o destino responder PARTIAL/UNKNOWN
+  em vez de COMMITTED, o novo líder aborta
+  e devolve a série à origem.
+end note
+@enduml

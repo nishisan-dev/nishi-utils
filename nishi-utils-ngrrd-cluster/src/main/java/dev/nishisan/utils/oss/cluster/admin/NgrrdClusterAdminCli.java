@@ -1,0 +1,224 @@
+/*
+ *  Copyright (C) 2020-2025 Lucas Nishimura <lucas.nishimura at gmail.com>
+ *
+ *  This program is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program.  If not, see <https://www.gnu.org/licenses/>
+ */
+
+package dev.nishisan.utils.oss.cluster.admin;
+
+import dev.nishisan.utils.oss.cluster.NgrrdCluster;
+import dev.nishisan.utils.oss.cluster.api.NgrrdClusterClient;
+import dev.nishisan.utils.oss.cluster.api.NgrrdClusterConfig;
+import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
+import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
+import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
+import dev.nishisan.utils.oss.cluster.protocol.AdminStatusResponse;
+import dev.nishisan.utils.oss.cluster.protocol.NodeStatusView;
+
+import java.io.PrintStream;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.UUID;
+import java.util.function.Function;
+
+/**
+ * CLI de administração do cluster ngrrd (seção 4 da spec do M4):
+ * {@code java -cp ... dev.nishisan.utils.oss.cluster.admin.NgrrdClusterAdminCli --seed host:port
+ * [--client-id x] <status|metrics <nodeId>|drain <nodeId>|activate <nodeId>|rebalance>}.
+ *
+ * <p>Entra na malha como cliente transparente ({@code roles client+leader-ineligible}, o mesmo papel de
+ * {@link NgrrdClusterClient}), executa um único comando e sai — sem dependência de nenhuma biblioteca de
+ * CLI, saída em texto tabular simples. {@link #run(String[], PrintStream, PrintStream)} é o método
+ * testável (usado tanto por {@code main} quanto pelos testes, inclusive de cluster real).</p>
+ */
+public final class NgrrdClusterAdminCli {
+
+    private static final String USAGE = "uso: NgrrdClusterAdminCli --seed host:port [--client-id x] "
+            + "<status|metrics <nodeId>|drain <nodeId>|activate <nodeId>|rebalance>";
+
+    public static void main(String[] args) {
+        int exitCode = new NgrrdClusterAdminCli().run(args, System.out, System.err);
+        System.exit(exitCode);
+    }
+
+    /**
+     * Executa um único comando administrativo e devolve o código de saída (0 = sucesso, 1 = falha).
+     * Nunca lança — toda falha (parsing de argumentos, conexão, erro remoto) é reportada em {@code err}.
+     */
+    public int run(String[] args, PrintStream out, PrintStream err) {
+        return run(args, out, err, NgrrdCluster::connect);
+    }
+
+    /**
+     * Como {@link #run(String[], PrintStream, PrintStream)}, mas com a conexão ao cluster injetável —
+     * visível para teste: permite substituir {@link NgrrdCluster#connect} por um {@link NgrrdClusterClient}
+     * fake (sem subir um {@code NGridNode}/rede de verdade) para cobrir parsing de argumentos, formatação
+     * de saída e código de retorno.
+     */
+    int run(String[] args, PrintStream out, PrintStream err,
+            Function<NgrrdClusterConfig, NgrrdClusterClient> clientFactory) {
+        ParsedArgs parsed;
+        try {
+            parsed = ParsedArgs.parse(args);
+        } catch (IllegalArgumentException e) {
+            err.println("erro: " + e.getMessage());
+            err.println(USAGE);
+            return 1;
+        }
+
+        NgrrdClusterConfig config = NgrrdClusterConfig.builder()
+                .clientId(parsed.clientId)
+                .seed(parsed.seed)
+                .build();
+        NgrrdClusterClient client;
+        try {
+            client = clientFactory.apply(config);
+        } catch (RuntimeException e) {
+            err.println("erro ao conectar ao cluster: " + e.getMessage());
+            return 1;
+        }
+        try {
+            return execute(parsed, client, out, err);
+        } finally {
+            client.close();
+        }
+    }
+
+    private int execute(ParsedArgs parsed, NgrrdClusterClient client, PrintStream out, PrintStream err) {
+        try {
+            switch (parsed.command) {
+                case "status" -> {
+                    printStatus(client.clusterStatus(), out);
+                    return 0;
+                }
+                case "metrics" -> {
+                    printMetrics(client.nodeMetrics(parsed.nodeId), out);
+                    return 0;
+                }
+                case "drain" -> {
+                    printNodeStatus("drain", client.drainNode(parsed.nodeId), out);
+                    return 0;
+                }
+                case "activate" -> {
+                    printNodeStatus("activate", client.activateNode(parsed.nodeId), out);
+                    return 0;
+                }
+                case "rebalance" -> {
+                    client.rebalanceNow();
+                    out.println("rebalanceamento disparado");
+                    return 0;
+                }
+                default -> {
+                    err.println("erro: comando desconhecido: " + parsed.command);
+                    err.println(USAGE);
+                    return 1;
+                }
+            }
+        } catch (NgrrdClusterException e) {
+            err.println("erro (" + e.code() + "): " + e.getMessage());
+            return 1;
+        }
+    }
+
+    private void printStatus(AdminStatusResponse response, PrintStream out) {
+        out.println("LIDER: " + response.leaderNodeId());
+        out.printf(Locale.ROOT, "%-24s %-10s %-10s %8s %14s %7s%n", "NODE", "STATE", "REACHABLE", "SERIES",
+                "BYTES", "FILL%");
+        for (NodeStatusView view : response.nodes()) {
+            StorageNodeStatus status = view.status();
+            out.printf(Locale.ROOT, "%-24s %-10s %-10s %8d %14d %6.1f%%%n", status.nodeId(), status.state(),
+                    view.reachable(), status.seriesCount(), status.usedBytes(), status.fillRatio() * 100.0);
+        }
+        out.println("MIGRACOES EM CURSO: " + response.migrationsInFlight());
+    }
+
+    private void printMetrics(NodeMetricsSnapshot snapshot, PrintStream out) {
+        out.println("NODE: " + snapshot.nodeId());
+        out.println("LEADER: " + snapshot.leader());
+        out.println("SERIES: " + snapshot.seriesCount());
+        out.println("USED_BYTES: " + snapshot.usedBytes());
+        out.println("CAPACITY_BYTES: " + snapshot.capacityBytes());
+        out.println("OPEN_HANDLES: " + snapshot.openHandles());
+        out.println("WRITE_BATCHES: " + snapshot.writeBatches());
+        out.println("SAMPLES_WRITTEN: " + snapshot.samplesWritten());
+        out.println("SAMPLES_FAILED: " + snapshot.samplesFailed());
+        out.println("CHECKPOINTS: " + snapshot.checkpoints());
+        out.println("READS: " + snapshot.reads());
+        out.println("MIGRATIONS_IN: " + snapshot.migrationsIn());
+        out.println("MIGRATIONS_OUT: " + snapshot.migrationsOut());
+        out.println("RECONCILE_ADOPTED: " + snapshot.reconcileAdopted());
+        out.println("RECONCILE_ORPHANS_DELETED: " + snapshot.reconcileOrphansDeleted());
+        out.println("RECONCILE_UNPLACED: " + snapshot.reconcileUnplaced());
+        out.println("RECONCILE_MISSING: " + snapshot.reconcileMissing());
+    }
+
+    private void printNodeStatus(String command, StorageNodeStatus status, PrintStream out) {
+        out.println(command + " OK");
+        out.printf(Locale.ROOT, "%-24s %-10s %8s %14s%n", "NODE", "STATE", "SERIES", "BYTES");
+        out.printf(Locale.ROOT, "%-24s %-10s %8d %14d%n", status.nodeId(), status.state(), status.seriesCount(),
+                status.usedBytes());
+    }
+
+    /** Argumentos já parseados e validados de {@link #run(String[], PrintStream, PrintStream)}. */
+    private record ParsedArgs(String seed, String clientId, String command, String nodeId) {
+
+        private static final List<String> NODE_ID_COMMANDS = List.of("metrics", "drain", "activate");
+
+        static ParsedArgs parse(String[] args) {
+            if (args == null) {
+                args = new String[0];
+            }
+            String seed = null;
+            String clientId = null;
+            List<String> positional = new ArrayList<>();
+            int i = 0;
+            while (i < args.length) {
+                String arg = args[i];
+                if ("--seed".equals(arg)) {
+                    seed = requireValue(args, i + 1, "--seed");
+                    i += 2;
+                } else if ("--client-id".equals(arg)) {
+                    clientId = requireValue(args, i + 1, "--client-id");
+                    i += 2;
+                } else {
+                    positional.add(arg);
+                    i += 1;
+                }
+            }
+            if (seed == null || seed.isBlank()) {
+                throw new IllegalArgumentException("--seed é obrigatório");
+            }
+            if (positional.isEmpty()) {
+                throw new IllegalArgumentException("comando é obrigatório: status|metrics|drain|activate|rebalance");
+            }
+            String command = positional.get(0).toLowerCase(Locale.ROOT);
+            String nodeId = positional.size() > 1 ? positional.get(1) : null;
+            if (NODE_ID_COMMANDS.contains(command) && (nodeId == null || nodeId.isBlank())) {
+                throw new IllegalArgumentException("comando '" + command + "' exige <nodeId>");
+            }
+            String resolvedClientId = clientId != null && !clientId.isBlank()
+                    ? clientId
+                    : "ngrrd-cluster-admin-" + UUID.randomUUID().toString().substring(0, 8);
+            return new ParsedArgs(seed, resolvedClientId, command, nodeId);
+        }
+
+        private static String requireValue(String[] args, int index, String flag) {
+            if (index >= args.length) {
+                throw new IllegalArgumentException(flag + " exige um valor");
+            }
+            return args[index];
+        }
+    }
+}

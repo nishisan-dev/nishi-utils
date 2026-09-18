@@ -1,0 +1,61 @@
+@startuml ngrrd_cluster_sequence_write
+title ngrrd Cluster — open, write, checkpoint e read (caminho feliz + WRONG_OWNER/NOT_OPEN)
+
+skinparam shadowing false
+
+actor "Aplicação" as app
+participant "RemoteSeriesHandle\n(cliente)" as handle
+participant "PlacementResolver\n(cliente)" as resolver
+participant "Líder\n(PlacementRequestHandler)" as leader
+participant "Dono\n(StorageRequestHandler)" as owner
+database "BlobVolume\n(dono)" as vol
+
+app -> handle : open(yaml, tags)
+handle -> resolver : resolve(seriesKey)
+resolver -> resolver : catálogo local (EVENTUAL)\nvazio ou desconhecido
+resolver -> leader : ngrrd.place(seriesKey, definitionHash)
+leader -> leader : LeastLoadedPlacementPolicy.choose(ctx)
+leader --> resolver : SeriesPlacement(owner=dono, ACTIVE)
+resolver --> handle : owner = dono
+handle -> owner : ngrrd.open(seriesKey, yaml, tags, placement)
+owner -> owner : ownership check\n(placement.owner==self OU hint do líder)
+owner -> vol : Ngrrd.open(volume, locator, yaml)
+owner --> handle : OK
+
+app -> handle : write(dsName, sample)
+handle -> handle : WriteBuffer.enqueue(owner, sample)
+note right of handle
+  flush por tamanho (batchMaxSamples)
+  ou tempo (batchMaxDelay)
+end note
+handle -> owner : ngrrd.writeBatch([...])
+owner -> vol : write por série
+owner --> handle : status por série (OK)
+
+app -> handle : checkpoint()
+handle -> owner : ngrrd.checkpoint(seriesKey)
+owner -> vol : checkpointAndForce()
+owner --> handle : OK
+
+app -> handle : read(dsName, query)
+handle -> owner : ngrrd.read(seriesKey, dsName, query)
+owner -> vol : ViewQuery
+owner --> handle : SeriesResult
+handle --> app : SeriesResult
+
+== Série migrou para outro nó (WRONG_OWNER) ==
+handle -> owner : ngrrd.writeBatch([...])
+owner --> handle : WRONG_OWNER(newOwner)
+handle -> resolver : noteOwner(seriesKey, newOwner)
+handle -> handle : ownerChanged(newOwner)\n(reroteia o backlog, preserva ordem)
+handle -> owner : ngrrd.writeBatch([...]) (agora no novo dono)
+
+== Handle expirou por ociosidade no dono (NOT_OPEN) ==
+handle -> owner : ngrrd.checkpoint(seriesKey)
+owner --> handle : NOT_OPEN
+handle -> handle : reopen() -> open()
+handle -> owner : ngrrd.open(...)
+owner --> handle : OK
+handle -> owner : ngrrd.checkpoint(seriesKey) (repete uma vez)
+owner --> handle : OK
+@enduml

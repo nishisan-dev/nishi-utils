@@ -10,6 +10,11 @@ Object Storage S3-compatível) e definição declarativa em YAML.
 - **apiVersion no YAML:** `ngrrd/v1`
 - **Kind:** `MetricSeriesDefinition`
 
+> **Modo distribuído.** Este documento cobre o ngrrd standalone (um processo, um volume). Para
+> distribuir séries entre vários nós — com coordenador eleito, placement automático,
+> rebalanceamento e drenagem — ver o módulo `nishi-utils-ngrrd-cluster`, documentado em
+> [`ngrrd-cluster.md`](./ngrrd-cluster.md).
+
 ---
 
 ## Conceitos

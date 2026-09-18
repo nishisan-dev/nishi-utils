@@ -23,6 +23,7 @@ import dev.nishisan.utils.ngrid.common.MessageType;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.ngrid.common.PeerUpdatePayload;
+import dev.nishisan.utils.ngrid.common.UndeliverablePayload;
 import dev.nishisan.utils.ngrid.cluster.transport.codec.CompositeMessageCodec;
 import dev.nishisan.utils.stats.StatsUtils;
 
@@ -78,7 +79,8 @@ public final class TcpTransport implements Transport {
     private final Map<UUID, PendingResponse> pendingResponses = new ConcurrentHashMap<>();
     // Use Virtual Threads for per-task execution
     private final ExecutorService workerPool = Executors.newVirtualThreadPerTaskExecutor();
-    private final NetworkRouter router = new NetworkRouter(this::collectLatencies);
+    // A relay must be a peer we currently hold an open connection to (see NetworkRouter.relayCandidate).
+    private final NetworkRouter router = new NetworkRouter(this::collectLatencies, this::isConnected);
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "ngrid-transport-scheduler");
         t.setDaemon(true);
@@ -241,6 +243,19 @@ public final class TcpTransport implements Transport {
                         proxyConn.send(message);
                         return;
                     }
+                }
+            } else {
+                // The PROXY route is unusable (the relay is gone). Before dropping the message, try
+                // the destination DIRECTLY: a route demoted to proxy by one failed dial never got a
+                // second chance here, so every message to a peer that had merely blinked kept going
+                // to a dead relay — its heartbeats included, which evicted a live member.
+                Connection direct = ensureConnection(destination);
+                if (direct != null) {
+                    router.promoteToDirect(destination);
+                    LOGGER.info(() -> "Relay " + target + " unavailable; direct connection to " + destination
+                            + " restored");
+                    direct.send(message);
+                    return;
                 }
             }
             LOGGER.log(Level.WARNING, "No connection available for {0} (via {1}, excluding {2})", new Object[]{destination, target, exclude});
@@ -567,7 +582,7 @@ public final class TcpTransport implements Transport {
         NodeInfo localInfo = config.local();
         Set<NodeInfo> peers = Set.copyOf(knownPeers.values());
         HandshakePayload payload = new HandshakePayload(localInfo, peers, collectLatencies(),
-                config.compressionEnabled());
+                config.compressionEnabled(), true);
         ClusterMessage message = ClusterMessage.request(MessageType.HANDSHAKE,
                 "hello",
                 localInfo.nodeId(),
@@ -585,6 +600,7 @@ public final class TcpTransport implements Transport {
         // capability. Done before any early return so the connection that ends up winning a
         // simultaneous-open tie-break already has the correct flag.
         connection.setPeerSupportsCompression(payload.supportsCompression());
+        connection.setPeerSupportsUndeliverable(payload.supportsUndeliverable());
         List<NodeId> staleIds = new ArrayList<>();
         for (Map.Entry<NodeId, NodeInfo> entry : knownPeers.entrySet()) {
             NodeInfo existing = entry.getValue();
@@ -715,6 +731,10 @@ public final class TcpTransport implements Transport {
         if (message.type() == MessageType.HANDSHAKE) {
             return;
         }
+        if (message.type() == MessageType.UNDELIVERABLE && config.local().nodeId().equals(message.destination())) {
+            handleUndeliverable(message);
+            return;
+        }
         if (message.type() == MessageType.PEER_UPDATE) {
             handlePeerUpdate(message);
             return;
@@ -727,8 +747,35 @@ public final class TcpTransport implements Transport {
                 LOGGER.fine(() -> "Dropping message with expired TTL from " + message.source());
                 return;
             }
-            // Forwarding - exclude the node that just sent us this message to avoid simple loops
-            send(message.nextHop(), senderId);
+            // Forwarding: ONE hop, over an OPEN direct connection to the destination only. A relay must
+            // never dial the destination on behalf of the sender nor re-proxy through a third node:
+            // when the destination is dead (a killed leader still targeted by every follower's fetches,
+            // heartbeats and client requests) each relayed message turned into a TTL-bounded storm of
+            // failed dials and re-forwards across the survivors, executed INLINE on the read loop of the
+            // connection it arrived on — delaying the sender's own heartbeats past the eviction window,
+            // so two live survivors evicted each other and lost the quorum in the middle of a failover.
+            Connection direct = connections.get(message.destination());
+            if (direct != null && direct.isOpen()) {
+                direct.send(message.nextHop());
+            } else {
+                LOGGER.fine(() -> "Dropping relayed message from " + message.source() + " for "
+                        + message.destination() + ": no direct connection to forward it over");
+                // Tell the original sender right away, so a request/response caller fails fast instead
+                // of waiting out its request timeout on a peer that is gone. Never for a notice itself,
+                // never for a lightweight (fire-and-forget: heartbeat/ping) message, only over a direct
+                // connection back to the sender (no notice storms), and only to a sender that announced
+                // UNDELIVERABLE support in its handshake — an older node would fail to decode it.
+                if (message.type() != MessageType.UNDELIVERABLE && message.source() != null
+                        && !message.source().equals(localId)
+                        && !ClusterMessage.ZERO_UUID.equals(message.messageId())) {
+                    Connection back = connections.get(message.source());
+                    if (back != null && back.isOpen() && back.peerSupportsUndeliverable()) {
+                        back.send(ClusterMessage.lightweight(MessageType.UNDELIVERABLE, "undeliverable", localId,
+                                message.source(),
+                                new UndeliverablePayload(message.messageId(), message.destination())));
+                    }
+                }
+            }
             return;
         }
 
@@ -742,6 +789,27 @@ public final class TcpTransport implements Transport {
             }
         }
         listeners.forEach(listener -> workerPool.submit(() -> listener.onMessage(message)));
+    }
+
+    /**
+     * A relay could not forward one of our messages (no direct connection to its destination): fail
+     * the matching pending request/response now rather than at the request timeout.
+     */
+    private void handleUndeliverable(ClusterMessage notice) {
+        UndeliverablePayload payload = notice.payload(UndeliverablePayload.class);
+        if (payload == null || payload.messageId() == null) {
+            return;
+        }
+        PendingResponse pending = pendingResponses.get(payload.messageId());
+        if (pending == null || !pending.destination.equals(payload.destination())) {
+            return; // unknown, already completed, or a notice about some other destination
+        }
+        if (pendingResponses.remove(payload.messageId(), pending)) {
+            pending.cancelTimeout();
+            pending.future.completeExceptionally(new IOException("Request " + payload.messageId() + " to "
+                    + payload.destination() + " undeliverable: relay " + notice.source()
+                    + " has no connection to it"));
+        }
     }
 
     private void handleDisconnect(Connection connection) {
@@ -820,6 +888,8 @@ public final class TcpTransport implements Transport {
         private final boolean outboundInitiated;
         private volatile NodeInfo remote;
         private volatile boolean peerSupportsCompression;
+        // Negotiated in the handshake (8.3.0): only a peer that announced it receives UNDELIVERABLE.
+        private volatile boolean peerSupportsUndeliverable;
         private volatile boolean open = true;
 
         private Connection(Socket socket, boolean outboundInitiated) throws IOException {
@@ -846,6 +916,14 @@ public final class TcpTransport implements Transport {
         void setPeerSupportsCompression(boolean peerSupports) {
             this.peerSupportsCompression = peerSupports;
             codec.setCompressOutput(config.compressionEnabled() && peerSupports);
+        }
+
+        void setPeerSupportsUndeliverable(boolean peerSupports) {
+            this.peerSupportsUndeliverable = peerSupports;
+        }
+
+        boolean peerSupportsUndeliverable() {
+            return peerSupportsUndeliverable;
         }
 
         Optional<NodeId> remoteId() {
@@ -906,7 +984,24 @@ public final class TcpTransport implements Transport {
                     if (data.length < length) {
                         throw new EOFException("Unexpected end of stream reading frame");
                     }
-                    ClusterMessage message = codec.decode(data);
+                    ClusterMessage message;
+                    try {
+                        message = codec.decode(data);
+                    } catch (IOException e) {
+                        if (e.getCause() instanceof com.fasterxml.jackson.core.JsonProcessingException) {
+                            // One malformed/unknown message (e.g. a type introduced by a newer node) is
+                            // dropped; only framing and I/O errors close the connection.
+                            LOGGER.log(Level.WARNING, "Dropping undecodable message from " + remote + ": "
+                                    + e.getCause().getMessage());
+                            continue;
+                        }
+                        throw e;
+                    }
+                    if (message.type() == null) {
+                        LOGGER.log(Level.WARNING, () -> "Dropping message of unknown type from " + remote
+                                + " (newer protocol?)");
+                        continue;
+                    }
                     if (message.type() == MessageType.HANDSHAKE) {
                         handleHandshake(this, message);
                     } else {

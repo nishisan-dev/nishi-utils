@@ -33,6 +33,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -146,11 +147,109 @@ class LeaderlessStalemateEscapeTest {
         }
     }
 
+    /**
+     * B1 (regression): the same scenario as F3 (local ahead, the affinity-elected peer refused
+     * leadership and is behind) — but the local node carries {@link NodeInfo#ROLE_LEADER_INELIGIBLE}.
+     * The stalemate escape must NEVER promote an ineligible node, even while ahead and even with the
+     * refusal recorded.
+     */
+    @Test
+    @DisplayName("Nó inelegível nunca escapa do impasse se autoelegendo, mesmo à frente e com recusa (B1)")
+    void ineligibleNodeDoesNotEscapeTheStalemateBySelfElecting() throws Exception {
+        Harness h = harness(INCUMBENT, 50, Set.of(NodeInfo.ROLE_LEADER_INELIGIBLE),
+                PREFERRED, 100, Duration.ofMillis(400));
+        h.coord.setReplicationProgressGate(() -> 1000L, 0L); // local ahead (1000), as in F3
+        h.start();
+        h.startPeerHeartbeats(PREFERRED, 7L, 900L); // peer active but BEHIND (900)
+
+        Thread.sleep(600); // boot window elapsed, peer known
+
+        h.coord.noteLeaderRefusal(PREFERRED); // the same refusal that would trigger the escape in F3
+
+        long deadline = System.currentTimeMillis() + 1200;
+        while (System.currentTimeMillis() < deadline) {
+            assertFalse(h.coord.isLeader(),
+                    "an ineligible node should never self-elect via the stalemate escape, even while"
+                            + " ahead and with the elected peer refusing leadership");
+            Thread.sleep(50);
+        }
+    }
+
+    /**
+     * F3 (guard, regression): a refusal is only a stalemate signal while the elected node is NOT
+     * leading. Here the affinity-elected peer ASSERTS leadership in its heartbeats and merely lags the
+     * local applied frontier by the ordinary sub-heartbeat skew (a serving leader's advertised
+     * watermark trails what its followers have already applied); a refusal recorded meanwhile
+     * (issued earlier, while it deferred, or reordered on the wire) must not promote the local node
+     * against a healthy leader — that self-inflicted dual-leader was firing on every membership
+     * recompute (client join/leave) within {@code heartbeatTimeout} of the boot-time refusal.
+     */
+    @Test
+    @DisplayName("Recusa obsoleta não dispara o escape quando o eleito já se afirma líder (guarda do F3)")
+    void staleRefusalDoesNotEscapeOnceElectedAssertsLeadership() throws Exception {
+        Harness h = harness(INCUMBENT, 50, PREFERRED, 100, Duration.ofMillis(400));
+        h.coord.setReplicationProgressGate(() -> 1000L, 0L); // local "ahead" by one op (1000 > 999)
+        h.start();
+        h.startPeerHeartbeats(PREFERRED, 7L, 999L, true); // peer LEADING, trailing by ordinary skew
+
+        Thread.sleep(600); // boot window elapsed, peer known and adopted as leader
+        awaitLeader(h, PREFERRED);
+
+        h.coord.noteLeaderRefusal(PREFERRED); // stale refusal: the elected node is leading now
+
+        long deadline = System.currentTimeMillis() + 1200;
+        while (System.currentTimeMillis() < deadline) {
+            assertFalse(h.coord.isLeader(),
+                    "a refusal from a node whose latest heartbeat asserts leadership is stale and must"
+                            + " never promote the local node against that healthy leader");
+            Thread.sleep(50);
+        }
+    }
+
+    /**
+     * F3 (guard, regression): a refusal only arms the escape once a heartbeat received AFTER it
+     * still denies leadership. Between the elected node taking leadership and its first leader
+     * heartbeat (up to one interval), a just-recorded refusal would otherwise read as a stalemate
+     * and promote this node against a node that had just started serving (a third leader under
+     * D10c, with its tail discarded on yield). With no heartbeat after the refusal the local node
+     * must keep deferring; the next denying heartbeat confirms the signal and the escape runs.
+     */
+    @Test
+    @DisplayName("Recusa só dispara o escape depois de confirmada por heartbeat posterior (guarda do F3)")
+    void refusalEscapesOnlyAfterALaterHeartbeatStillDeniesLeadership() throws Exception {
+        Harness h = harness(INCUMBENT, 50, PREFERRED, 100, Duration.ofMillis(400));
+        h.coord.setReplicationProgressGate(() -> 1000L, 0L); // local ahead (1000)
+        h.start();
+        h.startPeerHeartbeats(PREFERRED, 7L, 900L); // peer active but BEHIND (900), not leading
+
+        Thread.sleep(600); // boot window elapsed, peer known, local deferring by affinity
+        h.stopPeerHeartbeats();
+        h.coord.noteLeaderRefusal(PREFERRED); // refusal with NO heartbeat after it (yet)
+
+        // Well inside heartbeatTimeout (600 ms): the peer is still an active member, and the refusal
+        // is unconfirmed — no escape.
+        long deadline = System.currentTimeMillis() + 300;
+        while (System.currentTimeMillis() < deadline) {
+            assertFalse(h.coord.isLeader(),
+                    "an unconfirmed refusal (no heartbeat received after it) must not promote the local node");
+            Thread.sleep(50);
+        }
+
+        // The elected node keeps denying leadership in its next heartbeats: the refusal is confirmed.
+        h.startPeerHeartbeats(PREFERRED, 7L, 900L);
+        awaitLeader(h, INCUMBENT);
+    }
+
     // ---- harness (espelho do LeaderSyncBeforeReclaimTest) ----
 
     private Harness harness(NodeId localId, int localPriority, NodeId peerId, int peerPriority,
             Duration discoveryWindow) {
-        Harness h = new Harness(localId, localPriority, peerId, peerPriority, discoveryWindow);
+        return harness(localId, localPriority, Collections.emptySet(), peerId, peerPriority, discoveryWindow);
+    }
+
+    private Harness harness(NodeId localId, int localPriority, Set<String> localRoles,
+            NodeId peerId, int peerPriority, Duration discoveryWindow) {
+        Harness h = new Harness(localId, localPriority, localRoles, peerId, peerPriority, discoveryWindow);
         closeables.add(h);
         return h;
     }
@@ -174,8 +273,9 @@ class LeaderlessStalemateEscapeTest {
         final ScheduledExecutorService sched;
         volatile java.util.concurrent.ScheduledFuture<?> peerTask;
 
-        Harness(NodeId localId, int localPriority, NodeId peerId, int peerPriority, Duration discoveryWindow) {
-            NodeInfo localInfo = new NodeInfo(localId, "127.0.0.1", 1, Collections.emptySet(), localPriority);
+        Harness(NodeId localId, int localPriority, Set<String> localRoles, NodeId peerId, int peerPriority,
+                Duration discoveryWindow) {
+            NodeInfo localInfo = new NodeInfo(localId, "127.0.0.1", 1, localRoles, localPriority);
             NodeInfo peerInfo = new NodeInfo(peerId, "127.0.0.1", 2, Collections.emptySet(), peerPriority);
             this.transport = new LoopbackTransport(localInfo, List.of(peerInfo));
             ClusterCoordinatorConfig cfg = ClusterCoordinatorConfig.of(
@@ -192,9 +292,20 @@ class LeaderlessStalemateEscapeTest {
         }
 
         void startPeerHeartbeats(NodeId source, long epoch, long highWatermark) {
+            startPeerHeartbeats(source, epoch, highWatermark, false);
+        }
+
+        void stopPeerHeartbeats() {
+            if (peerTask != null) {
+                peerTask.cancel(true);
+                peerTask = null;
+            }
+        }
+
+        void startPeerHeartbeats(NodeId source, long epoch, long highWatermark, boolean assertsLeadership) {
             peerTask = sched.scheduleAtFixedRate(() -> coord.onMessage(
                     ClusterMessage.lightweight(MessageType.HEARTBEAT, "hb", source, null,
-                            HeartbeatPayload.now(highWatermark, epoch))),
+                            HeartbeatPayload.now(highWatermark, epoch, assertsLeadership))),
                     0, 100, TimeUnit.MILLISECONDS);
         }
 

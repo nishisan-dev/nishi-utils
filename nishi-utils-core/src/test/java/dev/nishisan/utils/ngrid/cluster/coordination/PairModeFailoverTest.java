@@ -37,7 +37,7 @@ import static org.junit.jupiter.api.Assertions.fail;
  * {@code minClusterSize=1}, o nó que perde contato com o peer deve assumir/permanecer líder em vez
  * de fazer step-down por falta de quórum.
  *
- * <p><b>RED→GREEN:</b> sem pair mode, {@code requiredActiveMembersForLeadership()} é
+ * <p><b>RED→GREEN:</b> sem pair mode, {@code hasLeadershipQuorum()} é
  * {@code max(minClusterSize, (peers/2)+1)} = {@code max(1, 2)} = 2 para dois nós, então o
  * sobrevivente nunca alcança o quórum e o cluster fica sem líder ao matar um nó (foi o que travou o
  * HA em pré-prod). Com pair mode a maioria dinâmica é ignorada (split-brain aceito, reconciliado

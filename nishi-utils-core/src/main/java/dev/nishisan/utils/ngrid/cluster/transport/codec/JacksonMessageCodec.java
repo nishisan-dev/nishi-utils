@@ -101,6 +101,11 @@ public final class JacksonMessageCodec implements MessageCodec {
         mapper.setVisibility(PropertyAccessor.IS_GETTER, JsonAutoDetect.Visibility.NONE);
         // Forward compatibility: ignore fields from newer protocol versions
         mapper.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+        // Forward compatibility: a MessageType (or any enum) introduced by a newer node decodes as null
+        // instead of failing the whole frame — the transport then drops that one message and keeps the
+        // connection (see TcpTransport.Connection.readLoop). Before this, an unknown enum value closed
+        // the socket to the newer peer on every such message.
+        mapper.configure(DeserializationFeature.READ_UNKNOWN_ENUM_VALUES_AS_NULL, true);
         // Don't fail on empty beans (some payloads have very few fields)
         mapper.configure(SerializationFeature.FAIL_ON_EMPTY_BEANS, false);
         return mapper;

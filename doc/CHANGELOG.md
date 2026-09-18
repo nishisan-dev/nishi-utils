@@ -4,6 +4,136 @@
 
 ---
 
+## 2026-09-18 — 🟢 Feature: ngrrd cluster (armazenamento distribuído) — release 8.3.0
+
+O `ngrrd-consumer` (TEMS) persiste dezenas de milhares de séries via `nishi-utils-oss` num único
+processo com um único volume blob, e o troubleshooting em produção apontava o disco como limitador
+provável conforme o volume cresce — sem medição precisa. A única saída até aqui era crescer
+verticalmente a máquina. A 8.3.0 introduz o **novo módulo `nishi-utils-ngrrd-cluster`**: um cluster
+de storage nodes sobre o NGrid, com coordenador eleito, que distribui séries horizontalmente sem
+mudar a interface `NgrrdHandle` que o consumer já usa.
+
+**O que entrou, por marco:**
+
+- **M0 (core):** role `leader-ineligible` e roles configuráveis no `NGridNodeBuilder` — pré-requisito
+  para o cliente do cluster participar da malha sem nunca poder liderá-la.
+- **M1 (módulo, protocolo, caminho feliz):** catálogo replicado (`SeriesPlacement`/`StorageNodeStatus`
+  em dois `DistributedMap`), protocolo `ngrrd.*` sobre o transporte do NGrid, storage node com
+  registry de handles e placement no líder, política `LeastLoadedPlacementPolicy`, cliente
+  transparente (`RemoteSeriesHandle`) com a mesma interface `NgrrdHandle` de sempre.
+- **M2 (métricas e admin):** `NodeMetricsSnapshot`/`ClientMetricsSnapshot`, comandos
+  `ngrrd.admin.status`/`ngrrd.admin.metrics`, orçamento total (não por handle) de `close()`.
+- **M3 (migração e rebalanceamento):** `MigrationCoordinator`/`MigrationExecutor` movendo séries
+  entre nós em chunks com verificação SHA-256, `Rebalancer` equilibrando carga automaticamente,
+  resolução de migrações órfãs por troca de liderança.
+- **M4 (drenagem, reconciliação e CLI):** `ngrrd.admin.drain`/`activate`, `LocalReconciler` (adoção
+  de séries órfãs — também o caminho de migração de um ngrrd single-node existente — e deleção
+  segura de cópias órfãs), `NgrrdClusterAdminCli`.
+- **M5 (este release):** documentação (`doc/oss/ngrrd-cluster.md`), quatro diagramas PlantUML,
+  bump de versão e este registro.
+
+**Decisões de arquitetura:**
+
+- **Sem réplica, por desenho.** Cada série vive em exatamente um storage node; redundância é
+  problema de infraestrutura, não do cluster. Queda de nó = séries dele indisponíveis até voltar —
+  não existe (nem faria sentido existir) re-placement automático de uma série de um nó caído.
+- **Líder eleito entre os próprios storage nodes** coordena placement, rebalanceamento, drenagem e
+  admin; não há processo de coordenador dedicado.
+- **Cliente é membro pleno do NGrid, mas `leader-ineligible`** — participa de gossip/handshake para
+  falar com qualquer storage node, nunca disputa liderança.
+- **Dimensionamento mínimo recomendado: 3 storage nodes**, para que a queda de 1 ainda deixe maioria
+  entre os votantes elegíveis e o cluster continue coordenando.
+
+**Defeitos encontrados no caminho:**
+
+- *No core:* sem um jeito de marcar um nó como inelegível a líder, um cliente fino do cluster
+  seria automaticamente candidato a coordenar o NGrid inteiro — corrigido com o role
+  `leader-ineligible`. Sem um jeito de declarar mapas persistentes direto no `NGridNodeBuilder`, o
+  catálogo do cluster (que precisa sobreviver a restart) exigiria descer ao `NGridConfig.Builder`
+  cru em todo storage node — corrigido com `NGridNodeBuilder.map(name, mode)`.
+- *No módulo (bloqueadores pegos em revisão de código, um por linha):* records do catálogo sem
+  `Serializable` faziam o WAL do `NMapPersistence` falhar em silêncio e o catálogo nunca persistir
+  de verdade; nó reiniciado respondia `WRONG_OWNER` sem dono e o cliente reenfileirava em loop
+  silencioso; filtro de frescor de 4 s descartava justo o nó que perdeu a liderança, concentrando
+  toda série nova nele; `close()` usava o `requestTimeout` em vez do orçamento total configurado,
+  então um nó morto custava caro por handle; sob churn de liderança o líder podia recolocar uma
+  série já existente e criar uma cópia vazia no lugar errado; um `abort()` de migração sem
+  revalidação contra o líder podia apagar a única cópia real já commitada por outra via e reverter
+  o catálogo para uma origem vazia; deadlock AB-BA e uso de handle após fechamento por outra thread
+  no registry de handles do storage node.
+
+**Trade-offs e limites:** chunks de migração em JSON+Base64 (adequado até poucos MiB por série);
+churn de bootstrap do NGrid é ruído padrão observado em todo o desenvolvimento, mitigado (não
+eliminado) por `bootDiscoveryWindow`; `close()` do cliente descarta amostras que não couberem no
+orçamento total configurado, logando em `ERROR`; comandos do líder (inclusive o tick do
+`NodeStatusReporter`) bloqueiam sem líder eleito — comportamento pré-existente do core. Ver a seção
+13 de `doc/oss/ngrrd-cluster.md` para a lista completa, inclusive o vermelho conhecido
+`LeaderFailoverDuringMigrationClusterTest` (~1 em 4) e os pontos abertos no core registrados como
+trabalho futuro.
+
+**Como operar:** subir storage nodes via `NgrrdStorageNodeMain --config <yaml>`; conectar clientes
+via `NgrrdCluster.connect(NgrrdClusterConfig.fromYaml(...))`; administrar com
+`NgrrdClusterAdminCli --seed host:port <status|metrics|drain|activate|rebalance>`. Detalhes,
+exemplos de YAML e os quatro diagramas: `doc/oss/ngrrd-cluster.md`.
+
+### Correções e adições no NGrid (core) que vieram junto
+
+Encontradas e resolvidas durante o desenvolvimento do ngrrd cluster, mas são mudanças de
+comportamento do **NGrid em si** — visíveis a qualquer usuário de `nishi-utils-core`, não só a quem
+usa o cluster ngrrd. Cada uma merece destaque próprio:
+
+- **Maioria de eleição só entre votantes elegíveis, líder estável a peers novos (`d521d5e`).**
+  Antes, qualquer peer que passasse pela malha — inclusive um cliente efêmero com porta real —
+  entrava para sempre no denominador da maioria dinâmica; após a queda do líder, os sobreviventes
+  podiam nunca atingir quórum, e uma minoria de votantes de verdade chegava a liderar sustentada por
+  clientes. **Por que importa:** sem essa correção, qualquer cluster com nós não-votantes (o próprio
+  cliente do ngrrd cluster é um) arrisca ficar sem líder eleito mesmo com maioria real saudável.
+- **Seguidores adotam quem de fato lidera; guard de sincronização não fica preso (`3ff1ace`).**
+  Num handoff por afinidade, cada nó podia seguir um alvo diferente (o seguidor adotava um vencedor
+  que ainda não tinha assumido, o eleito deferia a um seguidor, o recém-chegado mandava handback a
+  quem não liderava); um guard de sincronização podia ficar armado sem pedido em curso, travando por
+  16 s. **Por que importa:** elimina uma classe de handoff que nunca convergia (ou convergia tarde
+  demais) só por causa de discordância entre nós sobre quem já é líder de fato.
+- **Relay só por peers conectados, com retorno ao caminho direto (`77177e7`).** O roteador podia
+  escolher um relay a partir do gossip sem exigir conexão aberta, e uma rota rebaixada a proxy nunca
+  voltava a tentar o caminho direto — heartbeats podiam ir por um proxy morto até um nó se enxergar
+  isolado. **Por que importa:** evita que um nó saudável pareça isolado (e dispare eleição
+  desnecessária) só porque o relay escolhido morreu silenciosamente.
+- **Desconexão confirmada com graça; placeholder promovido; escape de stalemate confirmado por
+  heartbeat (`20f4a05`).** Um desempate de conexão duplicada com um peer ainda vivo podia derrubar o
+  quórum por um instante e fazer o líder se demitir sem necessidade; o placeholder de `HEARTBEAT`
+  (sem host) podia ser tratado como candidato real. **Por que importa:** reduz demissões de líder por
+  ruído transitório de rede — o cenário mais comum de instabilidade percebida pelo cliente.
+- **Protocolo de relay: UM salto por conexão direta aberta e aviso `UNDELIVERABLE` negociado.** Um
+  relay passa a encaminhar só por uma conexão direta e aberta ao destino — nunca disca o destino em
+  nome do remetente nem re-proxya por um terceiro nó (a rota de dois saltos derivada do gossip deixa
+  de ser tentada, deliberadamente: cada mensagem a um nó morto virava uma tempestade de dials
+  falhos executada no read loop dos sobreviventes, que se evictavam entre si no meio do failover).
+  Quando não consegue encaminhar, o relay devolve `UNDELIVERABLE` ao remetente, que falha o
+  request/response pendente na hora em vez de esperar o `requestTimeout`. O aviso só vai a peers que
+  anunciaram `supportsUndeliverable` no handshake (campo novo, `false` para nós anteriores); o
+  decoder passou a tolerar `MessageType` desconhecido (descarta a mensagem, mantém a conexão) —
+  antes, um enum desconhecido derrubava o socket. Um `confirmPeerDisconnect` do coordinator só
+  aceita reachability direta (uma rota de proxy por gossip não mantém vivo um peer cujo socket
+  fechou), enquanto a evicção por heartbeat continua concedendo graça a membros só-por-proxy — as
+  duas políticas de "vivo" coexistem de propósito e estão documentadas no código. **Por que
+  importa:** o failover de um líder morto caiu de ~25 s para 1-3 s e um RPC ao líder recém-morto
+  falha em milissegundos em vez de dezenas de segundos.
+- **Passthroughs de `bootDiscoveryWindow`/`affinityHandbackMode` no `NGridNodeBuilder` (`5b935ca`).**
+  Esses dois parâmetros só existiam no `NGridConfig.Builder` cru. **Por que importa:** qualquer
+  código (não só o ngrrd cluster) que use a fachada recomendada `NGridNodeBuilder` agora consegue
+  configurar os dois sem descer ao builder de baixo nível.
+- **Role `leader-ineligible` (`26918ef`, mais roles configuráveis em `6ac1934`).** Honrado em todo
+  ponto de escolha de candidato do `ClusterCoordinator` (afinidade, líder preferido, watermark,
+  escape de stalemate, resolução de dual-leader, quiesce de reclaim, handback). **Por que importa:**
+  é o que permite qualquer cliente fino (não só o do ngrrd cluster) participar de um cluster NGrid
+  sem nunca correr o risco de acabar coordenando-o.
+- **Mapa persistente configurável direto no builder (`6cd744c`).** `NGridNodeBuilder.map(name,
+  NMapPersistenceMode)` evita descer ao `NGridConfig.Builder` para declarar um mapa que precisa
+  sobreviver a restart. **Por que importa:** é o que tornou o catálogo do ngrrd cluster
+  (`ngrrd.catalog`/`ngrrd.nodes`) persistente sem gambiarra — e serve qualquer outro `DistributedMap`
+  do projeto que precise da mesma garantia.
+
 ## 2026-09-04 — 🔴 Fix: leitura descartava as amostras mais recentes da janela — release 8.2.0
 
 O `NgrrdReader.downsample` reduzia a `maxPoints` **amostrando um índice por balde**

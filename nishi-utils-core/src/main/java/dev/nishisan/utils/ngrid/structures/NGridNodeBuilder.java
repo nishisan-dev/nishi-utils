@@ -17,6 +17,7 @@
 
 package dev.nishisan.utils.ngrid.structures;
 
+import dev.nishisan.utils.map.NMapPersistenceMode;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.ngrid.replication.FollowerIngestMode;
@@ -26,9 +27,12 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * Builder for creating a single NGrid node for production usage.
@@ -60,7 +64,10 @@ public final class NGridNodeBuilder {
     private int relayApplyBatchSize = 256;
     private boolean leaderPauseOnJoin = false;
     private boolean leaderPauseOnReclaim = false;
+    private Duration bootDiscoveryWindow;
+    private boolean affinityHandbackMode = false;
     private int priority = 0;
+    private Set<String> roles = Collections.emptySet();
 
     NGridNodeBuilder(String host, int port) {
         this.host = Objects.requireNonNull(host, "host");
@@ -88,6 +95,24 @@ public final class NGridNodeBuilder {
      */
     public NGridNodeBuilder priority(int priority) {
         this.priority = priority;
+        return this;
+    }
+
+    /**
+     * Sets this node's roles, propagated by gossip in {@link NodeInfo#roles()}. Use
+     * {@link NodeInfo#ROLE_LEADER_INELIGIBLE} to mark the node as ineligible for leadership (e.g. a
+     * client-only node that joins the cluster but must never coordinate it). Without calling this,
+     * the node carries no roles. Neither the array nor any of its elements may be {@code null}.
+     *
+     * @param roles the node's roles (must not be {@code null}, nor contain {@code null} elements)
+     * @return this builder
+     */
+    public NGridNodeBuilder roles(String... roles) {
+        Objects.requireNonNull(roles, "roles");
+        for (String role : roles) {
+            Objects.requireNonNull(role, "role");
+        }
+        this.roles = Set.copyOf(List.of(roles));
         return this;
     }
 
@@ -158,6 +183,26 @@ public final class NGridNodeBuilder {
     public NGridNodeBuilder map(String name, boolean leaderLocalByReference) {
         mapConfigs.add(MapConfig.builder(Objects.requireNonNull(name, "map name"))
                 .leaderLocalByReference(leaderLocalByReference)
+                .build());
+        return this;
+    }
+
+    /**
+     * Adds a distributed map with an explicit persistence mode.
+     * <p>
+     * Useful for callers that need the map's on-disk watermark to survive a
+     * process restart with the same {@code nodeId} (e.g. a catalog map whose
+     * local replica must not appear caught-up-but-empty after a restart) or
+     * that must satisfy {@link DeploymentProfile#PRODUCTION}'s guardrail that
+     * every configured map has persistence enabled.
+     *
+     * @param name            the map name
+     * @param persistenceMode the persistence mode for this map
+     * @return this builder
+     */
+    public NGridNodeBuilder map(String name, NMapPersistenceMode persistenceMode) {
+        mapConfigs.add(MapConfig.builder(Objects.requireNonNull(name, "map name"))
+                .persistenceMode(Objects.requireNonNull(persistenceMode, "persistenceMode"))
                 .build());
         return this;
     }
@@ -281,6 +326,36 @@ public final class NGridNodeBuilder {
     }
 
     /**
+     * Sets the boot-discovery window during which a freshly started node defers self-election while it
+     * discovers peers and their replication watermarks (sync-before-reclaim), passed through to
+     * {@link NGridConfig.Builder#bootDiscoveryWindow(Duration)}. {@code null}/{@code ZERO} disables the
+     * deferral (legacy immediate election) — see that method's Javadoc for the full rationale.
+     *
+     * @param bootDiscoveryWindow the deferral window, or {@code null} to disable it
+     * @return this builder
+     */
+    public NGridNodeBuilder bootDiscoveryWindow(Duration bootDiscoveryWindow) {
+        this.bootDiscoveryWindow = bootDiscoveryWindow;
+        return this;
+    }
+
+    /**
+     * Enables the orchestrated affinity handback (issue tems#9, D11), passed through to
+     * {@link NGridConfig.Builder#affinityHandbackMode(boolean)}. When enabled, a returning
+     * highest-affinity follower never reclaims leadership through the watermark gates (a handoff
+     * that, under load, overlaps two producing leaders and discards the loser's tail); the
+     * replication layer drives an explicit stop-the-world snapshot handover instead. Defaults to
+     * {@code false} (legacy watermark reclaim).
+     *
+     * @param enabled {@code true} to use the snapshot-orchestrated handover
+     * @return this builder
+     */
+    public NGridNodeBuilder affinityHandbackMode(boolean enabled) {
+        this.affinityHandbackMode = enabled;
+        return this;
+    }
+
+    /**
      * Builds and starts the node.
      * <p>
      * If no data directory is specified, the build will fail for
@@ -297,7 +372,7 @@ public final class NGridNodeBuilder {
         String effectiveNodeId = nodeId != null ? nodeId : host + ":" + effectivePort;
 
         NodeInfo localInfo = new NodeInfo(NodeId.of(effectiveNodeId), host, effectivePort,
-                java.util.Collections.emptySet(), priority);
+                roles, priority);
 
         NGridConfig.Builder builder = NGridConfig.builder(localInfo)
                 .strictConsistency(strictConsistency)
@@ -306,7 +381,9 @@ public final class NGridNodeBuilder {
                 .persistentResendLog(persistentResendLog)
                 .relayApplyBatchSize(relayApplyBatchSize)
                 .leaderPauseOnJoin(leaderPauseOnJoin)
-                .leaderPauseOnReclaim(leaderPauseOnReclaim);
+                .leaderPauseOnReclaim(leaderPauseOnReclaim)
+                .bootDiscoveryWindow(bootDiscoveryWindow)
+                .affinityHandbackMode(affinityHandbackMode);
 
         if (dataDir != null) {
             builder.dataDirectory(dataDir);
