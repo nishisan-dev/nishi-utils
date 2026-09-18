@@ -33,4 +33,9 @@ changelog e configuração da IDE; não incluí-las nestes commits.
 - Achado 3 implementado: rota canônica e lock por série, backlog transferido antes da
   publicação do dono e revalidação da rota após backpressure.
   `WriteDispatcherTest,RemoteSeriesHandleTest`: 25 testes aprovados (2 novas regressões).
-- Achados 2 e 4 em andamento.
+- Achado 2 implementado: barreira por sequência de admissão/conclusão da série, preservada
+  em múltiplos redirecionamentos; falhas permanentes impedem confirmação de checkpoint.
+  Flush global e fechamento acompanham buffers criados durante reroteamento.
+  `WriteDispatcherTest,RemoteSeriesHandleTest,WriteBarrierRegressionTest,CloseBudgetRegressionTest`:
+  34 testes aprovados (7 novas regressões, incluindo API pública, timeout e erro de escrita).
+- Achado 4 em andamento.

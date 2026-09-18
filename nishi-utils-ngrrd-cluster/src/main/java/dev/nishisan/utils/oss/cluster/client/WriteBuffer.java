@@ -40,4 +40,17 @@ public interface WriteBuffer {
      * TOTAL compartilhado entre vários handles (O1).
      */
     void flushNodeSync(String ownerNodeId, Duration maxWait);
+    /**
+     * Waits for writes already admitted for this series, regardless of redirects. A permanent
+     * write failure must be reported instead of allowing a checkpoint to claim durability.
+     * Implementations without per-series tracking can conservatively drain the whole node.
+     */
+    default void flushSeriesSync(String seriesKey, String ownerNodeId) {
+        flushNodeSync(ownerNodeId);
+    }
+
+    /** Per-series barrier sharing the caller's total timeout budget. */
+    default void flushSeriesSync(String seriesKey, String ownerNodeId, Duration maxWait) {
+        flushNodeSync(ownerNodeId, maxWait);
+    }
 }

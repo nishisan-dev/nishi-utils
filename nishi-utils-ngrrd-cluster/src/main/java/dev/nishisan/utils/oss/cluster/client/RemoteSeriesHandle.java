@@ -190,14 +190,14 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
     @Override
     public void flush() {
         ensureOpen();
-        dispatcher.flushNodeSync(owner);
+        dispatcher.flushSeriesSync(seriesKey, owner);
         executeSeriesCommand(Commands.FLUSH);
     }
 
     @Override
     public void checkpoint() {
         ensureOpen();
-        dispatcher.flushNodeSync(owner);
+        dispatcher.flushSeriesSync(seriesKey, owner);
         executeSeriesCommand(Commands.CHECKPOINT);
     }
 
@@ -289,7 +289,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
         closed = true;
         long deadlineMs = clock.millis() + budget.toMillis();
         try {
-            dispatcher.flushNodeSync(owner, budget);
+            dispatcher.flushSeriesSync(seriesKey, owner, budget);
         } catch (RuntimeException e) {
             LOGGER.log(Level.WARNING, "Falha ao drenar buffer de escrita ao fechar a série " + seriesKey, e);
         }

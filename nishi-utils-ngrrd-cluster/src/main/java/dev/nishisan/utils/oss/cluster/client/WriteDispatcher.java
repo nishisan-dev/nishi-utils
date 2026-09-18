@@ -39,6 +39,8 @@ import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.HashSet;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -219,6 +221,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 try {
                     if (buf.queue.size() < maxBufferedSamplesPerNode) {
                         buf.queue.addLast(write);
+                        route.submitted++;
                         samplesEnqueuedCount.increment();
                         accepted = true;
                         triggerFlush = buf.queue.size() >= batchMaxSamples;
@@ -261,49 +264,79 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
 
     @Override
     public void flushNodeSync(String ownerNodeId, Duration maxWait) {
-        NodeBuffer buf = buffers.get(ownerNodeId);
-        if (buf == null) {
-            return;
-        }
-        // Limitado por maxWait: sem um prazo aqui, uma condição persistente que nunca progride (ex.:
-        // catálogo do dono ainda não convergiu após um restart, ou a conexão cliente→dono ainda não
-        // foi reestabelecida) faria este laço esperar para sempre — o backoff em applyStatus evita o
-        // busy-loop de CPU, mas não por si só um prazo total. De propósito NÃO usa
-        // retryPolicy.timeout() (o retryTimeout do cliente, minutos, pensado para a espera de
-        // MIGRATING): usar esse prazo aqui já causou, na prática, uma chamada síncrona travar por
-        // vários minutos. O prazo padrão (via flushNodeSync(String)) é closeTimeoutMillis; O1 permite
-        // um teto explícito, menor, para respeitar um orçamento TOTAL compartilhado entre vários
-        // handles em DefaultNgrrdClusterClient.close().
-        long startedAt = clock.millis();
-        long maxWaitMillis = Math.max(0L, maxWait.toMillis());
-        while (hasPending(buf)) {
-            if (clock.millis() - startedAt >= maxWaitMillis) {
-                throw new NgrrdClusterException(ErrorCode.TIMEOUT,
-                        "flush do nó " + ownerNodeId + " não completou dentro de " + maxWaitMillis + " ms");
-            }
-            scheduleFlush(ownerNodeId, buf);
-            sleepQuietly(DRAIN_POLL_MS);
-        }
+        awaitBarriers(snapshotBarriers(ownerNodeId), maxWait);
     }
 
-    /**
-     * Força o flush síncrono de todos os nós de destino conhecidos.
-     *
-     * <p>item 11 (achado do Refuter): orçamento TOTAL (não por nó) — antes, cada nó recebia seu
-     * próprio {@code closeTimeoutMillis} inteiro, então {@code N} nós lentos podiam multiplicar o
-     * tempo total de {@code flushAllSync} por {@code N} vezes o prazo de um único nó. Mesmo raciocínio
-     * de {@code DefaultNgrrdClusterClient.close()} (O1): o que sobrar do orçamento vai para o próximo
-     * nó; um nó que não coube no orçamento restante simplesmente não é esperado (suas pendências
-     * continuam no buffer, sujeitas ao próximo flush/close).</p>
-     */
+    @Override
+    public void flushSeriesSync(String seriesKey, String ownerNodeId) {
+        flushSeriesSync(seriesKey, ownerNodeId, Duration.ofMillis(closeTimeoutMillis));
+    }
+
+    @Override
+    public void flushSeriesSync(String seriesKey, String ownerNodeId, Duration maxWait) {
+        SeriesRoute route = routes.get(seriesKey);
+        if (route == null) {
+            return;
+        }
+        long boundary;
+        route.lock.lock();
+        try {
+            boundary = route.submitted;
+        } finally {
+            route.lock.unlock();
+        }
+        awaitBarriers(Map.of(route, boundary), maxWait);
+    }
+
+    /** Waits for all writes admitted before this call, even if they change destination. */
     public void flushAllSync() {
-        long deadline = clock.millis() + closeTimeoutMillis;
-        for (String owner : List.copyOf(buffers.keySet())) {
-            long remainingMs = deadline - clock.millis();
-            if (remainingMs <= 0) {
-                return;
+        awaitBarriers(snapshotBarriers(null), Duration.ofMillis(closeTimeoutMillis));
+    }
+
+    private Map<SeriesRoute, Long> snapshotBarriers(String owner) {
+        Map<SeriesRoute, Long> barriers = new LinkedHashMap<>();
+        for (SeriesRoute route : routes.values()) {
+            route.lock.lock();
+            try {
+                if (owner == null || route.destinations.contains(owner)) {
+                    barriers.put(route, route.submitted);
+                }
+            } finally {
+                route.lock.unlock();
             }
-            flushNodeSync(owner, Duration.ofMillis(remainingMs));
+        }
+        return barriers;
+    }
+
+    private void awaitBarriers(Map<SeriesRoute, Long> barriers, Duration maxWait) {
+        long startedAt = System.nanoTime();
+        long budgetNanos = Math.max(0L, maxWait.toNanos());
+        for (Map.Entry<SeriesRoute, Long> entry : barriers.entrySet()) {
+            SeriesRoute route = entry.getKey();
+            for (;;) {
+                String owner;
+                route.lock.lock();
+                try {
+                    if (route.firstFailedSequence <= entry.getValue()) {
+                        throw new NgrrdClusterException(ErrorCode.REMOTE_ERROR, route.failureMessage);
+                    }
+                    if (route.completed >= entry.getValue()) {
+                        break;
+                    }
+                    owner = route.owner;
+                } finally {
+                    route.lock.unlock();
+                }
+                if (Thread.currentThread().isInterrupted()) {
+                    throw new NgrrdClusterException(ErrorCode.CLOSED, "flush interrompido");
+                }
+                if (System.nanoTime() - startedAt >= budgetNanos) {
+                    throw new NgrrdClusterException(ErrorCode.TIMEOUT,
+                            "escritas anteriores ao flush não confirmadas dentro de " + maxWait);
+                }
+                scheduleFlush(owner, buffers.get(owner));
+                sleepQuietly(DRAIN_POLL_MS);
+            }
         }
     }
 
@@ -335,12 +368,11 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
 
         long budgetMillis = Math.max(0L, budget.toMillis());
         long deadline = clock.millis() + budgetMillis;
-        for (Map.Entry<String, NodeBuffer> entry : buffers.entrySet()) {
-            NodeBuffer buf = entry.getValue();
-            while (clock.millis() < deadline && hasPending(buf)) {
-                scheduleFlush(entry.getKey(), buf);
-                sleepQuietly(DRAIN_POLL_MS);
+        while (clock.millis() < deadline && hasOutstandingWrites()) {
+            for (Map.Entry<String, NodeBuffer> entry : buffers.entrySet()) {
+                scheduleFlush(entry.getKey(), entry.getValue());
             }
+            sleepQuietly(DRAIN_POLL_MS);
         }
 
         flushPool.shutdown();
@@ -530,7 +562,10 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             WriteBatchResponse response) {
         SeriesStatus status = response.statusBySeries().getOrDefault(seriesKey, SeriesStatus.ERROR);
         switch (status) {
-            case OK -> samplesSentCount.add(writes.size());
+            case OK -> {
+                samplesSentCount.add(writes.size());
+                completeWrites(seriesKey, writes.size(), null);
+            }
             case WRONG_OWNER -> {
                 recordRetry(SeriesStatus.WRONG_OWNER);
                 String newOwner = response.ownerBySeries().get(seriesKey);
@@ -547,6 +582,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                         // admissions (including callers with a stale owner) cannot overtake them.
                         requeueFrontAt(newOwner, reordered);
                         route.owner = newOwner;
+                        route.destinations.add(newOwner);
                         placementLookup.noteOwner(seriesKey, newOwner);
                         ownerChanged.accept(seriesKey, newOwner);
                     } finally {
@@ -601,15 +637,48 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             case ERROR -> {
                 recordRetry(SeriesStatus.ERROR);
                 samplesFailedCount.add(writes.size());
+                completeWrites(seriesKey, writes.size(), "WRITE_BATCH falhou para " + seriesKey + ": "
+                        + response.errorBySeries().get(seriesKey));
                 LOGGER.warning("WRITE_BATCH respondeu ERROR para " + seriesKey + ": "
                         + response.errorBySeries().get(seriesKey));
             }
             default -> {
                 recordRetry(status);
                 samplesFailedCount.add(writes.size());
+                completeWrites(seriesKey, writes.size(), "WRITE_BATCH respondeu " + status + " para " + seriesKey);
                 LOGGER.warning("WRITE_BATCH respondeu status inesperado " + status + " para " + seriesKey);
             }
         }
+    }
+
+    // FIFO admission/rerouting ensures completions form a prefix of each series. A failed
+    // prefix remains observable: a later checkpoint cannot certify those lost samples.
+    private void completeWrites(String seriesKey, int count, String failure) {
+        SeriesRoute route = routes.get(seriesKey);
+        route.lock.lock();
+        try {
+            if (failure != null && route.firstFailedSequence == Long.MAX_VALUE) {
+                route.firstFailedSequence = route.completed + 1;
+                route.failureMessage = failure;
+            }
+            route.completed += count;
+        } finally {
+            route.lock.unlock();
+        }
+    }
+
+    private boolean hasOutstandingWrites() {
+        for (SeriesRoute route : routes.values()) {
+            route.lock.lock();
+            try {
+                if (route.submitted > route.completed) {
+                    return true;
+                }
+            } finally {
+                route.lock.unlock();
+            }
+        }
+        return false;
     }
 
     private void requeueFront(NodeBuffer buf, List<SeriesWrite> writes) {
@@ -710,10 +779,6 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         }
     }
 
-    private static boolean hasPending(NodeBuffer buf) {
-        return hasQueued(buf) || buf.inFlight.get();
-    }
-
     private static void sleepQuietly(long millis) {
         try {
             Thread.sleep(millis);
@@ -726,9 +791,15 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     private static final class SeriesRoute {
         private final ReentrantLock lock = new ReentrantLock();
         private String owner;
+        private final Set<String> destinations = new HashSet<>();
+        private long submitted;
+        private long completed;
+        private long firstFailedSequence = Long.MAX_VALUE;
+        private String failureMessage;
 
         SeriesRoute(String owner) {
             this.owner = owner;
+            destinations.add(owner);
         }
     }
 
