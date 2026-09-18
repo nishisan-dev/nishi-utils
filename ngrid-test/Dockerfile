@@ -4,6 +4,7 @@ WORKDIR /workspace
 COPY pom.xml /workspace/pom.xml
 COPY nishi-utils-core /workspace/nishi-utils-core
 COPY nishi-utils-oss /workspace/nishi-utils-oss
+COPY nishi-utils-ngrrd-cluster /workspace/nishi-utils-ngrrd-cluster
 COPY ngrid-test /workspace/ngrid-test
 
 # jacoco.skip: o gate de cobertura é responsabilidade do `mvn verify` no CI, não
