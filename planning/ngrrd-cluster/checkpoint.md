@@ -72,18 +72,19 @@ leitura final `> 0`; churn com `@Timeout(600 s)`).
 150 s em "Direct connection failed / Failing over to proxy ngrrd-client-…" e elegem tarde. Investigar com Fable
 (autorizado) DEPOIS do M4, uma execução maven por vez.
 
-### M4 — drenagem, reconciliação e CLI — Builder em rodada 3 (spec `spec-m4.md`)
-Refuter r1 reprovou (ALTO: delete de órfã pela réplica eventual sem confirmar posse; nó DRAINING adotava);
-r2 fechou os ALTOs (delete só com `placementStrong` + `ngrrd.series.exists` no dono + `orphanGrace` + não no
-primeiro ciclo + handle fechado) e reprovou por: exempt de adoção nunca limpo; falha da leitura forte no reporter
-desarmando a retentativa; busy-loop no `awaitCatalogStable` após close. Bloqueio do tick do reporter (até 28 s)
-é PRÉ-EXISTENTE (`putNodeStatus` → `invokeLeader` 5×20 s sem líder), confirmado por A/B — publicação vai para
-executor próprio. Decisão: `seriesObjectPrefix` configurável no nó; todas as definições de um cluster usam o
-mesmo prefixo (OPEN rejeita divergente).
-Segunda assinatura do vermelho conhecido do core em `LeaderFailoverDuringMigrationClusterTest`
-(`quedaDoLiderAntesDoStart…`): líder moribundo falha 20× o `putPlacement` com "RELAY_STREAM op-log append
-failed … write not durable in the stream source" e o novo líder (eleito em ~25 s) não reconverte em 150 s.
-Investigar junto com a primeira assinatura (Fable, depois do M4).
+### M4 — drenagem, reconciliação e CLI — COMMITADO (2c69274, 483b7d0, d6477b9, 7dd3a9a)
+Três rodadas de Refuter. Decisões: delete de órfã só com `placementStrong` + `ngrrd.series.exists` no dono + `orphanGrace`
++ nunca no primeiro ciclo + handle fechado; nó DRAINING/DRAINED não adota (status vazio conta como ACTIVE); reporter
+publica em executor próprio a partir da leitura forte (não reverte drenagem; falha retenta); `seriesObjectPrefix`
+configurável e único por cluster (OPEN rejeita divergente); `migrationsInFlight` real. 337 unitários, cobertura 84%;
+todos os `*ClusterTest` verdes (Drain ~12 s, Adopt ~10 s, AdminCli ~8 s, churn ~275 s). Bloqueio do tick do reporter
+(até 28 s sem líder) é pré-existente do core (`putNodeStatus` → `invokeLeader`), documentado.
+
+### M5 — documentação, diagramas, 8.3.0 e changelog — Builder em andamento (spec `spec-m5.md`)
+Depois do M5: investigação Fable (autorizada) das duas assinaturas do vermelho conhecido de
+`LeaderFailoverDuringMigrationClusterTest` (~1/4): (1) sobreviventes 150 s em "Failing over to proxy ngrrd-client-…"
+para o líder morto; (2) "RELAY_STREAM op-log append failed … write not durable" no líder moribundo e novo líder não
+reconverte em 150 s.
 
 ## Observações
 - `DualLeaderLivelockE2ETest` falhou uma vez sob carga da suíte completa; 4/4 na main e 3/3 isolado na
