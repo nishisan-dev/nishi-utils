@@ -1,0 +1,38 @@
+{
+  "recordedAt": "2026-09-19T14:21:08.457530-03:00",
+  "java": "21",
+  "command": "mvn -B -pl nishi-utils-oss,nishi-utils-ngrrd-cluster test",
+  "status": "PASS",
+  "suites": [
+    {
+      "module": "nishi-utils-oss",
+      "tests": 236,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    {
+      "module": "nishi-utils-ngrrd-cluster",
+      "tests": 357,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    }
+  ],
+  "installedDependencies": {
+    "nishi-utils-oss": {
+      "matched": true,
+      "checkedClasses": 156,
+      "mismatches": [],
+      "installedJarSha256": "396bf3ce97d034a4bdab003d337966dd8a0fa5472d27a837ee29d8cc96f5aed9"
+    },
+    "nishi-utils-ngrrd-cluster": {
+      "matched": true,
+      "checkedClasses": 124,
+      "mismatches": [],
+      "installedJarSha256": "9b412faa8f1cc1b53be8330ebd25ad56b7b6f030e6a3629a4f0a566b6d1e7301"
+    }
+  },
+  "logSha256": "45fecbdd2d875332236a42705c330e0ed5a85ffdf8306de441e3902c933a7f62",
+  "scope": "Local default test suites for the two changed modules; no remote service operations; previous integration gates documented in TEMS"
+}

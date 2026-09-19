@@ -46,6 +46,7 @@ import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Random;
 import java.util.concurrent.CountDownLatch;
@@ -418,6 +419,59 @@ class SeriesHandleRegistryTest {
             Throwable observed = failure.get();
             if (observed != null) {
                 throw new AssertionError("Falha durante a rajada de concorrência: " + observed, observed);
+            }
+        }
+    }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    @SuppressWarnings("unchecked")
+    void closeIdleToleraAtualizacaoConcorrenteDosHorariosEmMuitasEntradas() throws Exception {
+        // Large cache without allocating thousands of on-disk series. Null handles are
+        // legitimate entries whose OPEN is still in progress; sorting also includes them.
+        try (SeriesHandleRegistry registry = registry(Duration.ofHours(1), 65_536,
+                Clock.fixed(Instant.ofEpochMilli(1_000_000), ZoneOffset.UTC))) {
+            var entriesField = SeriesHandleRegistry.class.getDeclaredField("entries");
+            entriesField.setAccessible(true);
+            Map<String, Object> entries = (Map<String, Object>) entriesField.get(registry);
+            Class<?> entryType = Class.forName(SeriesHandleRegistry.class.getName() + "$HandleEntry");
+            var constructor = entryType.getDeclaredConstructor();
+            constructor.setAccessible(true);
+            var lastAccess = entryType.getDeclaredField("lastAccessMs");
+            lastAccess.setAccessible(true);
+            Object[] values = new Object[32_768];
+            Random initial = new Random(721);
+            for (int i = 0; i < values.length; i++) {
+                values[i] = constructor.newInstance();
+                lastAccess.setLong(values[i], initial.nextInt(1_000_000));
+                entries.put("concurrent-" + i, values[i]);
+            }
+
+            AtomicBoolean running = new AtomicBoolean(true);
+            CountDownLatch started = new CountDownLatch(1);
+            ExecutorService executor = Executors.newSingleThreadExecutor();
+            Future<?> touches = executor.submit(() -> {
+                Random random = new Random(918);
+                long now = 1_000_000;
+                try {
+                    while (running.get()) {
+                        lastAccess.setLong(values[random.nextInt(values.length)], ++now);
+                        started.countDown();
+                    }
+                } catch (IllegalAccessException e) {
+                    throw new AssertionError(e);
+                }
+            });
+            try {
+                assertTrue(started.await(5, TimeUnit.SECONDS));
+                for (int i = 0; i < 100; i++) {
+                    assertEquals(0, registry.closeIdle());
+                }
+                assertEquals(values.length, entries.size());
+            } finally {
+                running.set(false);
+                executor.shutdownNow();
+                touches.get(5, TimeUnit.SECONDS);
             }
         }
     }

@@ -54,7 +54,15 @@ final class TransportRetry {
         if (e.code() == ErrorCode.TIMEOUT) {
             return true;
         }
-        return e.code() == ErrorCode.REMOTE_ERROR && e.getCause() instanceof IOException;
+        if (e.code() != ErrorCode.REMOTE_ERROR) return false;
+        var seen = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<Throwable, Boolean>());
+        for (Throwable cause = e.getCause(); cause != null && seen.add(cause); cause = cause.getCause()) {
+            if (cause instanceof IOException
+                    || cause instanceof dev.nishisan.utils.ngrid.cluster.transport.PeerDisconnectedException) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

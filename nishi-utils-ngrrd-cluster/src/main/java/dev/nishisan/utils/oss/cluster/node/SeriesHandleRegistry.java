@@ -393,9 +393,9 @@ public final class SeriesHandleRegistry implements Closeable {
         long now = clock.millis();
         long ttlMillis = idleTtl.toMillis();
         int closedCount = 0;
-        for (Map.Entry<String, HandleEntry> candidate : snapshotByLastAccess()) {
-            String seriesKey = candidate.getKey();
-            HandleEntry entry = candidate.getValue();
+        for (AccessSnapshot candidate : snapshotByLastAccess()) {
+            String seriesKey = candidate.seriesKey();
+            HandleEntry entry = candidate.entry();
             if (now - entry.lastAccessMs < ttlMillis) {
                 continue;
             }
@@ -427,12 +427,12 @@ public final class SeriesHandleRegistry implements Closeable {
     public void evictIfOverLimit() {
         while (entries.size() > maxOpenHandles) {
             boolean evictedOne = false;
-            for (Map.Entry<String, HandleEntry> candidate : snapshotByLastAccess()) {
+            for (AccessSnapshot candidate : snapshotByLastAccess()) {
                 if (entries.size() <= maxOpenHandles) {
                     return;
                 }
-                String seriesKey = candidate.getKey();
-                HandleEntry entry = candidate.getValue();
+                String seriesKey = candidate.seriesKey();
+                HandleEntry entry = candidate.entry();
                 if (!entry.lock.tryLock()) {
                     continue;
                 }
@@ -532,11 +532,20 @@ public final class SeriesHandleRegistry implements Closeable {
         }
     }
 
-    /** Snapshot estável (sem lock) das entradas, ordenado por {@code lastAccess} crescente. */
-    private List<Map.Entry<String, HandleEntry>> snapshotByLastAccess() {
-        List<Map.Entry<String, HandleEntry>> snapshot = new ArrayList<>(entries.entrySet());
-        snapshot.sort(Comparator.comparingLong(entry -> entry.getValue().lastAccessMs));
+    /**
+     * Congela os horários antes de ordenar: ler lastAccessMs durante a comparação
+     * viola a transitividade quando withHandle/open toca a entrada em paralelo.
+     * O snapshot é aproximado; identidade, uso e TTL são reconferidos sob o lock
+     * da entrada antes do fechamento.
+     */
+    private List<AccessSnapshot> snapshotByLastAccess() {
+        List<AccessSnapshot> snapshot = new ArrayList<>(entries.size());
+        entries.forEach((key, entry) -> snapshot.add(new AccessSnapshot(key, entry, entry.lastAccessMs)));
+        snapshot.sort(Comparator.comparingLong(AccessSnapshot::lastAccessMs));
         return snapshot;
+    }
+
+    private record AccessSnapshot(String seriesKey, HandleEntry entry, long lastAccessMs) {
     }
 
     private void cacheDefinition(String seriesKey, String yaml, Ngrrd.OpenOptions options) {

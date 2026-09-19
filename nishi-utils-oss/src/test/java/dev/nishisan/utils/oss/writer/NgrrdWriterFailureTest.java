@@ -55,11 +55,33 @@ class NgrrdWriterFailureTest {
         }
     }
 
+    @Test
+    void asynchronousWriteFailureRemainsVisibleAtCheckpoint() throws Exception {
+        FailingStorage storage = new FailingStorage();
+        try (NgrrdWriter writer = new NgrrdWriter(definition(), storage, "device:r1/iface:eth0")) {
+            storage.failWrite = true;
+            for (int i = 0; i < 5; i++) {
+                try {
+                    writer.write("in_octets", new Sample(START_MS + i * 300_000L, 1000L + i * 100L));
+                } catch (IllegalStateException expectedAfterFailure) {
+                    break;
+                }
+            }
+            assertTimeoutPreemptively(Duration.ofSeconds(5),
+                    () -> assertThrows(RuntimeException.class, writer::checkpoint));
+            storage.failWrite = false;
+            assertThrows(IllegalStateException.class, writer::checkpoint);
+            assertThrows(IllegalStateException.class,
+                    () -> writer.write("in_octets", new Sample(START_MS + 1_800_000L, 2000)));
+        }
+    }
+
     /** Storage em memória cujo {@code force()} pode ser configurado para falhar. */
     private static final class FailingStorage implements NgrrdStorage, SeriesChannelProvider {
 
         private final Map<String, byte[]> objects = new HashMap<>();
         volatile boolean failForce = false;
+        volatile boolean failWrite = false;
 
         @Override
         public void put(String key, byte[] data) {
@@ -139,6 +161,7 @@ class NgrrdWriterFailureTest {
 
             @Override
             public void writeRegion(long offset, byte[] data) {
+                if (failWrite) throw new NgrrdStorageException("simulated asynchronous write failure");
                 int off = (int) offset;
                 int end = off + data.length;
                 if (end > image.length) {

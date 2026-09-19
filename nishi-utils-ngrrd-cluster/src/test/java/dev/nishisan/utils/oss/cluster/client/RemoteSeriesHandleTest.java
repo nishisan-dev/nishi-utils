@@ -177,6 +177,19 @@ class RemoteSeriesHandleTest {
     }
 
     @Test
+    void peerDisconnectDuringOpenIsRetried() {
+        RemoteSeriesHandle handle = newHandle();
+        rpc.respondNext((cmd, body) -> {
+            throw new NgrrdClusterException(ErrorCode.REMOTE_ERROR, "peer disconnected",
+                    new dev.nishisan.utils.ngrid.cluster.transport.PeerDisconnectedException(
+                            OWNER_A, java.util.UUID.randomUUID()));
+        });
+        rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
+        handle.open();
+        assertEquals(2, rpc.calls().size());
+    }
+
+    @Test
     void erroDeAplicacaoNaoEhRetentadoComoFalhaDeTransporte() {
         // Um REMOTE_ERROR de aplicação (sem IOException como causa — o próprio storage node reportou um
         // erro de verdade) não é falha de transporte: deve subir direto, sem retentativa.
