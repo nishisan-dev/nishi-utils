@@ -4,6 +4,10 @@
 > `dev.nishisan.utils.oss.cluster`. Depende de `nishi-utils-core` (NGrid) e `nishi-utils-oss`
 > (ngrrd); nenhum dos dois passa a depender dele.
 
+Para começar, veja o [quickstart](ngrrd-cluster-quickstart.md). Para expansão com tráfego,
+exemplos de balanceamento, drenagem e recuperação, consulte o
+[guia de operação](ngrrd-cluster-operacao.md).
+
 ## 1. Visão geral e motivação
 
 O `ngrrd-consumer` (TEMS) persiste dezenas de milhares de séries via `nishi-utils-oss` num único
@@ -346,8 +350,14 @@ interface — trocável em teste.
 
 ## 8. Rebalanceamento e migração
 
+Procedimentos e exemplos numéricos estão no [guia de operação](ngrrd-cluster-operacao.md).
+O rebalanceamento acontece online, com espera temporária para operações da série em migração.
+A entrada de um nó não obriga a mover séries: a diferença de contagens precisa superar o
+limite configurado. Por exemplo, `20 / 20 / 0` não gera migração com os defaults.
+
 `Rebalancer` roda no líder a cada `rebalanceInterval` (default 60 s; também disparado por
-`MembershipListener` e por `ngrrd.admin.rebalance`). O planejamento (`RebalancePlanner`) é puro,
+`MembershipListener`, com debounce de 5 s, e por `ngrrd.admin.rebalance`). O intervalo periódico
+conta a partir do término do ciclo anterior. O planejamento (`RebalancePlanner`) é puro,
 determinístico e ordena por chave antes de decidir, para nunca depender de ordem de iteração:
 
 1. Nós `DRAINING`: todas as séries entram na fila de saída para o nó `ACTIVE` alcançável de menor

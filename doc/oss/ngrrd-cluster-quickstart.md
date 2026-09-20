@@ -172,7 +172,12 @@ nodes. O shutdown hook fecha o nó e o volume; o log informa `NGRRD_STORAGE_NODE
 Executar novamente o mesmo comando e YAML reabre os dados persistidos.
 
 Em um cluster em uso, remover um nó permanentemente exige drenagem prévia e confirmação
-de `DRAINED`, conforme o [procedimento de manutenção](ngrrd-cluster.md#9-drenagem-e-manutenção).
+de `DRAINED`, conforme o [procedimento de manutenção](ngrrd-cluster-operacao.md#6-retirar-um-storage-para-manutenção).
+
+Para continuar este laboratório, o [guia de operação](ngrrd-cluster-operacao.md) mostra como
+adicionar um quarto storage, interpretar a distribuição das séries, ajustar o rebalanceamento
+para poucas séries e retirar o novo nó com drenagem. Também cobre o impacto nos produtores,
+reinícios e diagnóstico de falhas.
 
 ## Problemas comuns
 

@@ -586,8 +586,11 @@ expõe a mesma interface `NgrrdHandle` de sempre.
 </dependency>
 ```
 
-Documentação completa (modelo, protocolo, configuração YAML, operação e limites conhecidos):
-[`doc/oss/ngrrd-cluster.md`](doc/oss/ngrrd-cluster.md).
+Guias do ngrrd cluster:
+
+- [Execução passo a passo](doc/oss/ngrrd-cluster-quickstart.md): build, configuração e inicialização dos storages.
+- [Exemplos e situações de operação](doc/oss/ngrrd-cluster-operacao.md): expansão online, limites de rebalanceamento, drenagem, reinícios e diagnóstico.
+- [Referência técnica](doc/oss/ngrrd-cluster.md): modelo, protocolo, configuração YAML e limites conhecidos.
 
 ## Stats (métricas)
 
