@@ -6,6 +6,7 @@ import dev.nishisan.utils.oss.format.SeriesFileCodec;
 import dev.nishisan.utils.oss.format.SeriesGeometry;
 import dev.nishisan.utils.oss.format.SeriesHeader;
 import dev.nishisan.utils.oss.storage.NgrrdStorage;
+import dev.nishisan.utils.oss.storage.SeriesChannelProvider;
 
 import java.util.Arrays;
 import java.util.Objects;
@@ -13,10 +14,10 @@ import java.util.Optional;
 
 /**
  * Reconcilia a geometria gravada de uma série com a geometria nova <strong>antes</strong>
- * de o writer abrir o objeto para escrita. Idempotente: opera sobre a imagem
- * completa via {@link NgrrdStorage#get}/{@link NgrrdStorage#atomicReplace} (tudo
- * ou nada) e, após retornar, o objeto está com a geometria nova — o writer apenas
- * reidrata.
+ * de o writer abrir o objeto para escrita. Geometria idêntica exige apenas o
+ * cabeçalho nos backends com canal. Mudanças operam sobre a imagem completa via
+ * {@link NgrrdStorage#get}/{@link NgrrdStorage#atomicReplace} (tudo ou nada) e,
+ * após retornar, o objeto está com a geometria nova — o writer apenas reidrata.
  *
  * <p>Decisão:</p>
  * <ul>
@@ -38,15 +39,17 @@ public final class GeometryReconciler {
         Objects.requireNonNull(storage, "storage é obrigatório");
         Objects.requireNonNull(policy, "onGeometryChange é obrigatório");
 
-        Optional<byte[]> existing = storage.get(storageKey);
+        // Reopening an unchanged series only needs its fixed header. Loading all
+        // archive rows here turns handle-cache churn into full-history I/O and
+        // allocations, even though the writer subsequently reads just live-state.
+        Optional<byte[]> existing = fixedHeader(storage, storageKey);
         if (existing.isEmpty() || existing.get().length < SeriesFileCodec.FIXED_HEADER_BYTES) {
             return; // série inexistente: o writer fará createFresh.
         }
-        byte[] image = existing.get();
 
         SeriesHeader header;
         try {
-            header = SeriesFileCodec.decodeFixedHeader(image);
+            header = SeriesFileCodec.decodeFixedHeader(existing.get());
         } catch (NgrrdFormatException e) {
             // Arquivo ilegível: não há geometria antiga para migrar.
             if (policy == OnGeometryChange.RECREATE) {
@@ -65,6 +68,8 @@ public final class GeometryReconciler {
             return; // geometria idêntica: nada a reconciliar.
         }
 
+        byte[] image = storage.get(storageKey).orElseThrow(() ->
+                new NgrrdGeometryChangeException("Série desapareceu durante reconciliação: " + storageKey));
         SeriesGeometry oldGeo = SeriesGeometry.fromPersisted(header, image);
         GeometryDiff diff = GeometryDiff.between(oldGeo, newGeo);
         String report = GeometryChangeReport.render(storageKey, diff,
@@ -96,5 +101,16 @@ public final class GeometryReconciler {
                         GeometryMigrator.migrate(oldGeo, newGeo, image, newHash, newRevision));
             }
         }
+    }
+
+    private static Optional<byte[]> fixedHeader(NgrrdStorage storage, String key) {
+        if (storage instanceof SeriesChannelProvider provider) {
+            if (!provider.seriesExists(key)) return Optional.empty();
+            try (var channel = provider.openSeries(key)) {
+                if (channel.size() < SeriesFileCodec.FIXED_HEADER_BYTES) return Optional.empty();
+                return Optional.of(channel.readRegion(0, SeriesFileCodec.FIXED_HEADER_BYTES));
+            }
+        }
+        return storage.get(key);
     }
 }

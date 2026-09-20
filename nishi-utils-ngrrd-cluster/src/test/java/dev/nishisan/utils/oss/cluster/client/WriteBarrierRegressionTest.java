@@ -43,6 +43,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiFunction;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -204,6 +205,161 @@ class WriteBarrierRegressionTest {
                 () -> dispatcher.flushSeriesSync("s", "A", Duration.ofMillis(80)));
         assertEquals(ErrorCode.TIMEOUT, error.code());
         assertEquals(0, dispatcher.samplesSent());
+    }
+
+    @Test
+    void globalBarrierDoesNotLockAlreadyAcknowledgedHistory() throws Exception {
+        rpc.writes = (owner, request) -> ok();
+        open();
+        handle.write("ds", new Sample(1, 1));
+        dispatcher.flushAllSync();
+        // An unrelated operation on a fully acknowledged route must not delay a
+        // global ACK barrier. Deterministic regression for scanning all history.
+        var field = WriteDispatcher.class.getDeclaredField("routes");
+        field.setAccessible(true);
+        Object route = ((Map<?, ?>) field.get(dispatcher)).get("s");
+        var lockField = route.getClass().getDeclaredField("lock");
+        lockField.setAccessible(true);
+        ReentrantLock lock = (ReentrantLock) lockField.get(route);
+        CompletableFuture<Void> flush;
+        lock.lock();
+        try {
+            flush = CompletableFuture.runAsync(dispatcher::flushAllSync);
+            flush.get(1, TimeUnit.SECONDS);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Test
+    void reusedAcknowledgedRouteBecomesPendingAgainAndWakesAllWaiters() throws Exception {
+        rpc.writes = (owner, request) -> ok();
+        open();
+        handle.write("ds", new Sample(1, 1));
+        dispatcher.flushAllSync();
+        var entered = gate();
+        var release = gate();
+        rpc.writes = (owner, request) -> {
+            entered.countDown();
+            await(release);
+            return ok();
+        };
+        handle.write("ds", new Sample(2, 2));
+        assertTrue(entered.await(5, TimeUnit.SECONDS));
+        var global = CompletableFuture.runAsync(dispatcher::flushAllSync);
+        var node = CompletableFuture.runAsync(() -> dispatcher.flushNodeSync("A"));
+        assertThrows(TimeoutException.class, () -> global.get(100, TimeUnit.MILLISECONDS));
+        assertThrows(TimeoutException.class, () -> node.get(100, TimeUnit.MILLISECONDS));
+        release.countDown();
+        global.get(5, TimeUnit.SECONDS);
+        node.get(5, TimeUnit.SECONDS);
+        assertEquals(2, dispatcher.samplesSent());
+    }
+
+    @Test
+    void globalBarrierRetainsFailureEvenAfterLaterAck() {
+        rpc.writes = (owner, request) -> new WriteBatchResponse(Map.of("s", SeriesStatus.ERROR),
+                Map.of(), Map.of("s", "disk failure"));
+        open();
+        handle.write("ds", new Sample(1, 1));
+        assertEquals(ErrorCode.REMOTE_ERROR,
+                assertThrows(NgrrdClusterException.class, dispatcher::flushAllSync).code());
+        rpc.writes = (owner, request) -> ok();
+        handle.write("ds", new Sample(2, 2));
+        Await.untilTrue("later sample acknowledged", Duration.ofSeconds(5), () -> dispatcher.samplesSent() == 1);
+        assertEquals(ErrorCode.REMOTE_ERROR,
+                assertThrows(NgrrdClusterException.class, dispatcher::flushAllSync).code());
+        assertEquals(ErrorCode.REMOTE_ERROR,
+                assertThrows(NgrrdClusterException.class, () -> dispatcher.flushNodeSync("A")).code());
+    }
+
+    @Test
+    void globalBarrierWaitsForEarlierWriteDespiteAckOnAnotherNode() throws Exception {
+        var slowEntered = gate();
+        var releaseSlow = gate();
+        rpc.writes = (owner, request) -> {
+            if (owner.equals("A")) {
+                slowEntered.countDown();
+                await(releaseSlow);
+            }
+            var statuses = new java.util.HashMap<String, SeriesStatus>();
+            request.writes().forEach(write -> statuses.put(write.seriesKey(), SeriesStatus.OK));
+            return new WriteBatchResponse(statuses, Map.of(), Map.of());
+        };
+        open();
+        handle.write("ds", new Sample(1, 1));
+        assertTrue(slowEntered.await(5, TimeUnit.SECONDS));
+        dispatcher.enqueue("B", new dev.nishisan.utils.oss.cluster.protocol.SeriesWrite("fast", "ds", 2, 2));
+        Await.untilTrue("other node acknowledged", Duration.ofSeconds(5), () -> dispatcher.samplesSent() == 1);
+        var flush = CompletableFuture.runAsync(dispatcher::flushAllSync);
+        assertThrows(TimeoutException.class, () -> flush.get(100, TimeUnit.MILLISECONDS));
+        releaseSlow.countDown();
+        flush.get(5, TimeUnit.SECONDS);
+        assertEquals(2, dispatcher.samplesSent());
+    }
+
+    @Test
+    void globalBarrierFollowsRedirectAndDoesNotWaitForLaterAdmissions() throws Exception {
+        var entered = gate();
+        var release = gate();
+        var laterEntered = gate();
+        var releaseLater = gate();
+        rpc.writes = (owner, request) -> {
+            if (owner.equals("A")) return moved("B");
+            if (request.writes().getFirst().tsEpochMs() == 1) {
+                entered.countDown();
+                await(release);
+            } else {
+                laterEntered.countDown();
+                await(releaseLater);
+            }
+            return ok();
+        };
+        open();
+        handle.write("ds", new Sample(1, 1));
+        assertTrue(entered.await(5, TimeUnit.SECONDS));
+        var thread = new java.util.concurrent.atomic.AtomicReference<Thread>();
+        var flush = CompletableFuture.runAsync(() -> {
+            thread.set(Thread.currentThread());
+            dispatcher.flushAllSync();
+        });
+        Await.untilTrue("barrier captured its boundary", Duration.ofSeconds(5), () -> thread.get() != null
+                && java.util.Arrays.stream(thread.get().getStackTrace()).anyMatch(frame ->
+                frame.getClassName().equals(WriteDispatcher.class.getName()) && frame.getMethodName().equals("awaitBarriers")));
+        handle.write("ds", new Sample(2, 2));
+        release.countDown();
+        assertTrue(laterEntered.await(5, TimeUnit.SECONDS));
+        flush.get(5, TimeUnit.SECONDS);
+        assertEquals(1, dispatcher.samplesSent());
+    }
+
+    @Test
+    void concurrentAdmissionsAndAckRemovalNeverSkipCompletedEnqueues() throws Exception {
+        rpc.writes = (owner, request) -> ok();
+        open();
+        var admitted = new AtomicInteger();
+        try (var producers = java.util.concurrent.Executors.newFixedThreadPool(4)) {
+            var tasks = new java.util.ArrayList<java.util.concurrent.Future<?>>();
+            for (int p = 0; p < 4; p++) {
+                tasks.add(producers.submit(() -> {
+                    for (int i = 0; i < 300; i++) {
+                        handle.write("ds", new Sample(i, i));
+                        admitted.incrementAndGet();
+                        if (i % 7 == 0) Thread.yield();
+                    }
+                }));
+            }
+            for (int i = 0; i < 100; i++) {
+                int beforeBarrier = admitted.get();
+                dispatcher.flushAllSync();
+                assertTrue(dispatcher.samplesSent() >= beforeBarrier,
+                        "every completed enqueue before the barrier must have an ACK");
+            }
+            for (var task : tasks) task.get(10, TimeUnit.SECONDS);
+        }
+        dispatcher.flushAllSync();
+        assertEquals(1200, admitted.get());
+        assertEquals(1200, dispatcher.samplesSent());
     }
 
     private static WriteBatchResponse moved(String owner) {

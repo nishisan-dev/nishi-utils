@@ -37,6 +37,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -109,6 +110,11 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
 
     private final ConcurrentMap<String, NodeBuffer> buffers = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, SeriesRoute> routes = new ConcurrentHashMap<>();
+    // Only outstanding or permanently failed routes participate in global ACK barriers.
+    // A linked set keeps snapshots proportional to pending work, even after a large burst.
+    // Mutations hold route.lock first; snapshots release pendingLock BEFORE locking routes.
+    private final Object pendingLock = new Object();
+    private final Set<SeriesRoute> pendingRoutes = new LinkedHashSet<>();
     private final ExecutorService flushPool;
     private final Thread tickThread;
     private volatile boolean closed;
@@ -221,6 +227,11 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 try {
                     if (buf.queue.size() < maxBufferedSamplesPerNode) {
                         buf.queue.addLast(write);
+                        if (route.submitted == route.completed && route.firstFailedSequence == Long.MAX_VALUE) {
+                            synchronized (pendingLock) {
+                                pendingRoutes.add(route);
+                            }
+                        }
                         route.submitted++;
                         samplesEnqueuedCount.increment();
                         accepted = true;
@@ -295,7 +306,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
 
     private Map<SeriesRoute, Long> snapshotBarriers(String owner) {
         Map<SeriesRoute, Long> barriers = new LinkedHashMap<>();
-        for (SeriesRoute route : routes.values()) {
+        for (SeriesRoute route : snapshotPendingRoutes()) {
             route.lock.lock();
             try {
                 if (owner == null || route.destinations.contains(owner)) {
@@ -308,13 +319,18 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         return barriers;
     }
 
+    private List<SeriesRoute> snapshotPendingRoutes() {
+        synchronized (pendingLock) {
+            return List.copyOf(pendingRoutes);
+        }
+    }
+
     private void awaitBarriers(Map<SeriesRoute, Long> barriers, Duration maxWait) {
         long startedAt = System.nanoTime();
         long budgetNanos = Math.max(0L, maxWait.toNanos());
         for (Map.Entry<SeriesRoute, Long> entry : barriers.entrySet()) {
             SeriesRoute route = entry.getKey();
             for (;;) {
-                String owner;
                 route.lock.lock();
                 try {
                     if (route.firstFailedSequence <= entry.getValue()) {
@@ -323,19 +339,25 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                     if (route.completed >= entry.getValue()) {
                         break;
                     }
-                    owner = route.owner;
+                    if (Thread.currentThread().isInterrupted()) {
+                        throw new NgrrdClusterException(ErrorCode.CLOSED, "flush interrompido");
+                    }
+                    long remaining = budgetNanos - (System.nanoTime() - startedAt);
+                    if (remaining <= 0) {
+                        throw new NgrrdClusterException(ErrorCode.TIMEOUT,
+                                "escritas anteriores ao flush não confirmadas dentro de " + maxWait);
+                    }
+                    scheduleFlush(route.owner, buffers.get(route.owner));
+                    // ACK/error signals wake waiters immediately. Keep a bounded retry
+                    // fallback for transport backoff/rerouting when no final ACK exists yet.
+                    // await releases route.lock atomically, so an ACK cannot be missed.
+                    route.progress.awaitNanos(Math.min(remaining, TimeUnit.MILLISECONDS.toNanos(DRAIN_POLL_MS)));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new NgrrdClusterException(ErrorCode.CLOSED, "flush interrompido", e);
                 } finally {
                     route.lock.unlock();
                 }
-                if (Thread.currentThread().isInterrupted()) {
-                    throw new NgrrdClusterException(ErrorCode.CLOSED, "flush interrompido");
-                }
-                if (System.nanoTime() - startedAt >= budgetNanos) {
-                    throw new NgrrdClusterException(ErrorCode.TIMEOUT,
-                            "escritas anteriores ao flush não confirmadas dentro de " + maxWait);
-                }
-                scheduleFlush(owner, buffers.get(owner));
-                sleepQuietly(DRAIN_POLL_MS);
             }
         }
     }
@@ -662,12 +684,23 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 route.failureMessage = failure;
             }
             route.completed += count;
+            if (route.completed == route.submitted && route.firstFailedSequence == Long.MAX_VALUE) {
+                synchronized (pendingLock) {
+                    pendingRoutes.remove(route);
+                }
+            }
+            // Failed routes stay indexed: subsequent successful writes cannot erase
+            // an earlier failure and allow a Kafka commit to certify a lost prefix.
+            route.progress.signalAll();
         } finally {
             route.lock.unlock();
         }
     }
 
     private boolean hasOutstandingWrites() {
+        // Shutdown also synchronizes with an admission that passed the closed check
+        // but has not entered the pending index yet. Keep the history scan off the
+        // hot path, here only, so close cannot overlook that in-progress admission.
         for (SeriesRoute route : routes.values()) {
             route.lock.lock();
             try {
@@ -790,6 +823,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     /** Routing and admission order for one series, independent of the caller's owner hint. */
     private static final class SeriesRoute {
         private final ReentrantLock lock = new ReentrantLock();
+        private final Condition progress = lock.newCondition();
         private String owner;
         private final Set<String> destinations = new HashSet<>();
         private long submitted;

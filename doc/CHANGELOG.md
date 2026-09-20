@@ -4,6 +4,25 @@
 
 ---
 
+## 2026-09-19 — Correções de escrita e desempenho do ngrrd — release 8.3.1
+
+- **Falhas de escrita preservadas:** uma falha assíncrona deixa o `NgrrdWriter`
+  em erro e é propagada a novas escritas e checkpoints. Escritas posteriores
+  não podem ocultar uma falha anterior nem confirmar um prefixo incompleto.
+- **Barreiras ACK mais eficientes:** o `WriteDispatcher` acompanha apenas rotas
+  pendentes ou com falha e acorda por sinais de conclusão/erro, preservando as
+  garantias das barreiras durante redirecionamentos e encerramento.
+- **Retry após desconexão:** o cliente reconhece `IOException` e desconexões de
+  peers em toda a cadeia de causas, inclusive quando encapsuladas, sem entrar
+  em loop se a cadeia de exceções for cíclica.
+- **LRU estável sob concorrência:** o registry captura os horários de acesso
+  antes de ordenar candidatos à remoção e revalida as entradas sob lock antes
+  de fechar os handles.
+- **Reabertura com menos I/O:** séries com geometria inalterada leem apenas o
+  cabeçalho nos backends com canal; migrações continuam usando a imagem completa.
+- Regressões cobertas por testes de barreiras ACK, retry, LRU, reconciliação de
+  geometria e propagação de falhas de escrita.
+
 ## 2026-09-18 — 🟢 Feature: ngrrd cluster (armazenamento distribuído) — release 8.3.0
 
 O `ngrrd-consumer` (TEMS) persiste dezenas de milhares de séries via `nishi-utils-oss` num único

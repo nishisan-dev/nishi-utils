@@ -96,6 +96,9 @@ public final class NgrrdWriter implements AutoCloseable {
     private final AtomicBoolean scheduled = new AtomicBoolean(false);
 
     private volatile boolean closed;
+    // A failed asynchronous write poisons this handle: a later checkpoint must
+    // never acknowledge a prefix containing a sample that was not persisted.
+    private volatile RuntimeException writeFailure;
 
     public NgrrdWriter(NgrrdDefinition definition, NgrrdStorage storage, String seriesKey) {
         this(definition, storage, seriesKey, null);
@@ -241,6 +244,7 @@ public final class NgrrdWriter implements AutoCloseable {
         if (!rawDefByName.containsKey(dsName)) {
             throw new IllegalArgumentException("DS desconhecido: " + dsName);
         }
+        throwIfWriteFailed();
         // Carimba o instante do recebimento no enfileiramento (relógio injetável):
         // base do ingest_lag_sec, calculado quando a worker processa a sample.
         enqueue(new Command.Write(dsName, sample, nowEpochMs.getAsLong()));
@@ -348,6 +352,7 @@ public final class NgrrdWriter implements AutoCloseable {
         try {
             switch (cmd) {
                 case Command.Write w -> {
+                    throwIfWriteFailed();
                     writeLock.lock();
                     try {
                         handleWrite(w);
@@ -363,6 +368,7 @@ public final class NgrrdWriter implements AutoCloseable {
                 case Command.Sync s -> {
                     // Sempre libera o latch; uma falha vai para o chamador via error ref.
                     try {
+                        throwIfWriteFailed();
                         checkpointAndForce();
                     } catch (RuntimeException e) {
                         s.error().set(e);
@@ -372,6 +378,7 @@ public final class NgrrdWriter implements AutoCloseable {
                 }
                 case Command.Shutdown s -> {
                     try {
+                        throwIfWriteFailed();
                         checkpointAndForce();
                     } catch (RuntimeException e) {
                         System.err.println("ngrrd-writer: falha no checkpoint final: " + e);
@@ -383,10 +390,19 @@ public final class NgrrdWriter implements AutoCloseable {
                 }
             }
         } catch (RuntimeException e) {
-            // erro de uma amostra individual não pode derrubar o drain.
-            System.err.println("ngrrd-writer error: " + e);
+            if (writeFailure == null) {
+                writeFailure = e;
+                System.err.println("ngrrd-writer: asynchronous write failed: " + e);
+            }
         }
         return false;
+    }
+
+    private void throwIfWriteFailed() {
+        RuntimeException failure = writeFailure;
+        if (failure != null) {
+            throw new IllegalStateException("An earlier asynchronous write failed; reopen after recovery", failure);
+        }
     }
 
     private void handleWrite(Command.Write w) {
