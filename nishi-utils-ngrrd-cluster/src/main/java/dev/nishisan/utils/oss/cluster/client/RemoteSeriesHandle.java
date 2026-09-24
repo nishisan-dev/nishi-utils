@@ -62,6 +62,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
     private final String seriesKey;
     private final String yaml;
     private final String definitionHashHex;
+    private final dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor geometry;
     private final Map<String, String> tags;
     private final Ngrrd.OpenOptions options;
     private final PlacementLookup resolver;
@@ -82,8 +83,17 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
             Ngrrd.OpenOptions options, PlacementLookup resolver, ClusterRpc rpc, WriteBuffer dispatcher,
             RetryPolicy retryPolicy, Duration requestTimeout, Duration closeTimeout, Clock clock,
             Consumer<String> onClose) {
+        this(seriesKey, yaml, definitionHashHex, tags, options, resolver, rpc, dispatcher, retryPolicy,
+                requestTimeout, closeTimeout, clock, onClose, null);
+    }
+
+    public RemoteSeriesHandle(String seriesKey, String yaml, String definitionHashHex, Map<String, String> tags,
+            Ngrrd.OpenOptions options, PlacementLookup resolver, ClusterRpc rpc, WriteBuffer dispatcher,
+            RetryPolicy retryPolicy, Duration requestTimeout, Duration closeTimeout, Clock clock,
+            Consumer<String> onClose, dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor geometry) {
         this.seriesKey = Objects.requireNonNull(seriesKey, "seriesKey");
         this.yaml = Objects.requireNonNull(yaml, "yaml");
+        this.geometry = geometry;
         this.definitionHashHex = Objects.requireNonNull(definitionHashHex, "definitionHashHex");
         this.tags = Map.copyOf(Objects.requireNonNullElse(tags, Map.of()));
         this.options = options != null ? options : Ngrrd.OpenOptions.defaults();
@@ -119,7 +129,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
         int wrongOwnerAttempts = 0;
         int migratingAttempts = 0;
         for (;;) {
-            SeriesPlacement placement = resolver.resolve(seriesKey, definitionHashHex);
+            SeriesPlacement placement = resolver.resolve(seriesKey, definitionHashHex, geometry);
             String candidateOwner = placement.ownerNodeId();
             OpenRequest request = new OpenRequest(seriesKey, yaml, tags, options.durability(),
                     options.onGeometryChange(), placement);
@@ -128,6 +138,13 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
             if (response.status() == SeriesStatus.OK) {
                 owner = candidateOwner;
                 return;
+            }
+            if (response.status() == SeriesStatus.NOT_LEADER) {
+                if (retryPolicy.exhausted(startedAt, clock.millis())) {
+                    throw new NgrrdClusterException(ErrorCode.NO_LEADER, "geometry publication has no stable leader");
+                }
+                sleepQuietly(retryPolicy.backoffFor(++migratingAttempts));
+                continue;
             }
             if (response.status() == SeriesStatus.WRONG_OWNER) {
                 wrongOwnerAttempts++;
@@ -427,7 +444,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
             owner = newOwnerNodeId;
         } else {
             resolver.invalidate(seriesKey);
-            owner = resolver.resolve(seriesKey, definitionHashHex).ownerNodeId();
+            owner = resolver.resolve(seriesKey, definitionHashHex, geometry).ownerNodeId();
         }
     }
 

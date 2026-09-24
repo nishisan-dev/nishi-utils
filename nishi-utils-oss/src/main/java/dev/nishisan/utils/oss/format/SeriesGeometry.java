@@ -29,7 +29,7 @@ import java.util.Set;
 public final class SeriesGeometry {
 
     /** Coluna de dado: um DS derivado e o DS raw que o origina. */
-    public record Column(String derivedName, String rawName, DataSourceType rawType) {
+    public record Column(String derivedName, String rawName, DataSourceType rawType) implements java.io.Serializable {
     }
 
     /** Archive físico: um par {@code (rra, cf)} com seu ring buffer próprio. */
@@ -42,7 +42,7 @@ public final class SeriesGeometry {
      * são derivados): forma de entrada para construir a geometria a partir da
      * definição ou de um arquivo persistido.
      */
-    public record ArchiveDef(String rraName, ConsolidationFunction cf, int stepSec, int rows, double xff) {
+    public record ArchiveDef(String rraName, ConsolidationFunction cf, int stepSec, int rows, double xff) implements java.io.Serializable {
     }
 
     private final int baseStepSec;
@@ -58,6 +58,11 @@ public final class SeriesGeometry {
 
     public SeriesGeometry(NgrrdDefinition definition) {
         this(baseStepOf(definition), columnsOf(definition), archiveDefsOf(definition));
+    }
+
+    /** Reconstructs a geometry from its immutable physical description. */
+    public static SeriesGeometry fromComponents(int baseStepSec, List<Column> columns, List<ArchiveDef> archives) {
+        return new SeriesGeometry(baseStepSec, columns, archives);
     }
 
     /**

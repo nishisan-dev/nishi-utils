@@ -134,14 +134,16 @@ public final class NgrrdClusterAdminCli {
 
     private void printStatus(AdminStatusResponse response, PrintStream out) {
         out.println("LIDER: " + response.leaderNodeId());
-        out.printf(Locale.ROOT, "%-24s %-10s %-10s %8s %14s %7s%n", "NODE", "STATE", "REACHABLE", "SERIES",
-                "BYTES", "FILL%");
+        out.printf(Locale.ROOT, "%-24s %-10s %-10s %8s %14s %7s %10s %10s %14s%n", "NODE", "STATE", "REACHABLE", "SERIES",
+                "BYTES", "FILL%", "MODE", "WEIGHT", "RESERVED");
         for (NodeStatusView view : response.nodes()) {
             StorageNodeStatus status = view.status();
-            out.printf(Locale.ROOT, "%-24s %-10s %-10s %8d %14d %6.1f%%%n", status.nodeId(), status.state(),
-                    view.reachable(), status.seriesCount(), status.usedBytes(), status.fillRatio() * 100.0);
+            out.printf(Locale.ROOT, "%-24s %-10s %-10s %8d %14d %6.1f%% %10s %10.3f %14d%n", status.nodeId(), status.state(),
+                    view.reachable(), status.seriesCount(), status.usedBytes(), status.fillRatio() * 100.0,
+                    status.distributionMode(), status.weight(), status.reservedBytes());
         }
         out.println("MIGRACOES EM CURSO: " + response.migrationsInFlight());
+        out.println("GEOMETRIAS PENDENTES: " + response.geometriesPending());
     }
 
     private void printMetrics(NodeMetricsSnapshot snapshot, PrintStream out) {

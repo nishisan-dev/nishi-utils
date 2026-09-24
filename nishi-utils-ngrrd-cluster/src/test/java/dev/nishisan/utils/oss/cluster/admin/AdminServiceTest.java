@@ -17,6 +17,11 @@
 
 package dev.nishisan.utils.oss.cluster.admin;
 
+import java.nio.file.Path;
+import java.nio.file.Files;
+import dev.nishisan.utils.oss.config.NgrrdYamlLoader;
+import dev.nishisan.utils.oss.format.SeriesGeometry;
+import dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.structures.NGrid;
 import dev.nishisan.utils.ngrid.structures.NGridCluster;
@@ -65,6 +70,7 @@ class AdminServiceTest {
 
     private NGridCluster cluster;
     private CatalogService catalog;
+    private String geometryId;
     private LeaderViewFake leaderView;
     private MigrationCoordinator coordinator;
     private Rebalancer rebalancer;
@@ -75,9 +81,16 @@ class AdminServiceTest {
         cluster = NGrid.local(1)
                 .map(CatalogService.CATALOG_MAP)
                 .map(CatalogService.NODES_MAP)
+                .map(CatalogService.GEOMETRIES_MAP)
                 .start();
         NGridNode node = cluster.node(0);
         catalog = CatalogService.from(node);
+        var geometry = GeometryDescriptor.from(
+                new SeriesGeometry(NgrrdYamlLoader.parse(
+                        Files.readString(Path.of("src/test/resources/iface-traffic-blob.yaml")),
+                        ignored -> null)));
+        catalog.putGeometry(geometry);
+        geometryId = geometry.id();
         leaderView = new LeaderViewFake();
         leaderView.leader = true;
         leaderView.reachable.add("storage-a");
@@ -114,7 +127,7 @@ class AdminServiceTest {
         // direto a DRAINED (nada a esvaziar) — este teste cobre especificamente a transição para
         // DRAINING em si, então mantém ao menos uma série ACTIVE nele.
         catalog.putNodeStatus(new StorageNodeStatus("storage-a", NodeState.ACTIVE, 1, 0, 0, 1_000L));
-        catalog.putPlacement("series-0", SeriesPlacement.active("storage-a", 1_000L));
+        catalog.putPlacement("series-0", SeriesPlacement.active("storage-a", 1_000L).withGeometry(geometryId, true, 1_000L));
 
         StorageNodeStatus result = adminService.drain("storage-a");
 
@@ -158,7 +171,7 @@ class AdminServiceTest {
     void drainDisparaUmCicloDeRebalanceamentoQueEsvaziaONo() throws InterruptedException {
         catalog.putNodeStatus(new StorageNodeStatus("storage-a", NodeState.ACTIVE, 1, 0, 0, 1_000L));
         catalog.putNodeStatus(new StorageNodeStatus("storage-b", NodeState.ACTIVE, 0, 0, 0, 1_000L));
-        catalog.putPlacement("series-0", SeriesPlacement.active("storage-a", 1_000L));
+        catalog.putPlacement("series-0", SeriesPlacement.active("storage-a", 1_000L).withGeometry(geometryId, true, 1_000L));
 
         adminService.drain("storage-a");
 

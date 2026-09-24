@@ -43,9 +43,6 @@ final class BlobSeriesChannel implements SeriesChannel {
 
     @Override
     public void allocate(long totalBytes) {
-        if (shard != null && length == BlobStorage.alignToPage(totalBytes)) {
-            return; // idempotente: já alocado no mesmo tamanho
-        }
         BlobStorage.Region region = storage.allocateRegion(key, totalBytes);
         this.shard = region.shard();
         this.baseOffset = region.offset();

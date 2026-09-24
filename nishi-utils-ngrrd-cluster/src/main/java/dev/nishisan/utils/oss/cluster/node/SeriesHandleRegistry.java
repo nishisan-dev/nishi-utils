@@ -80,6 +80,9 @@ public final class SeriesHandleRegistry implements Closeable {
     private final String volumeName;
     private final Duration idleTtl;
     private final int maxOpenHandles;
+    private final Object[] operationLocks = java.util.stream.IntStream.range(0, 256).mapToObj(i -> new Object()).toArray();
+    /** Serializes OPEN, metadata inspection and migration for a local series. */
+    public Object operationLock(String key) { return operationLocks[Math.floorMod(key.hashCode(), operationLocks.length)]; }
     private final Clock clock;
 
     private final ConcurrentMap<String, HandleEntry> entries = new ConcurrentHashMap<>();

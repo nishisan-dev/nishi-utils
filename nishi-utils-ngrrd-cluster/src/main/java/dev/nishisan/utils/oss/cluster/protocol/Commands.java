@@ -28,6 +28,9 @@ import java.util.Set;
 public final class Commands {
 
     /** Coordenador (líder): cria/idempotentemente retorna o placement de uma série. */
+    /** Leader: publish or invalidate a series geometry. */
+    public static final String GEOMETRY_UPDATE = "ngrrd.geometry.update";
+
     public static final String PLACE = "ngrrd.place";
     /** Dono: abre (ou confirma aberta) uma série local. */
     public static final String OPEN = "ngrrd.open";
@@ -51,6 +54,9 @@ public final class Commands {
     public static final String SERIES_EXISTS = "ngrrd.series.exists";
 
     /** Origem: inicia a migração de uma série para outro storage node. */
+    /** Destination: reserve exact bytes before receiving a transfer. */
+    public static final String MIGRATE_PREPARE = "ngrrd.migrate.prepare";
+
     public static final String MIGRATE_START = "ngrrd.migrate.start";
     /** Destino: recebe um chunk de bytes da série em migração. */
     public static final String MIGRATE_CHUNK = "ngrrd.migrate.chunk";
@@ -82,7 +88,7 @@ public final class Commands {
      * qualquer storage node — líder ou não — responde por si mesmo.</p>
      */
     public static final Set<String> LEADER_COMMANDS = Set.of(
-            PLACE, ADMIN_DRAIN, ADMIN_ACTIVATE, ADMIN_STATUS, ADMIN_REBALANCE);
+            PLACE, GEOMETRY_UPDATE, ADMIN_DRAIN, ADMIN_ACTIVATE, ADMIN_STATUS, ADMIN_REBALANCE);
 
     /** Comandos atendidos pelo dono da série. */
     public static final Set<String> OWNER_COMMANDS = Set.of(
@@ -90,7 +96,7 @@ public final class Commands {
 
     /** Comandos do protocolo de migração, atendidos pela origem e/ou pelo destino. */
     public static final Set<String> MIGRATION_COMMANDS = Set.of(
-            MIGRATE_START, MIGRATE_CHUNK, MIGRATE_COMMIT, MIGRATE_ABORT, MIGRATE_FINISH, MIGRATE_STATUS);
+            MIGRATE_START, MIGRATE_PREPARE, MIGRATE_CHUNK, MIGRATE_COMMIT, MIGRATE_ABORT, MIGRATE_FINISH, MIGRATE_STATUS);
 
     private Commands() {
     }

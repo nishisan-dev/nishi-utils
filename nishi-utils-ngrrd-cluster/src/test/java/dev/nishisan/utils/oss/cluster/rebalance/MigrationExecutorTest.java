@@ -31,11 +31,13 @@ import dev.nishisan.utils.oss.blob.NgrrdBlob;
 import dev.nishisan.utils.oss.cluster.api.ErrorCode;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogView;
+import dev.nishisan.utils.oss.cluster.catalog.NodeState;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.node.SeriesHandleRegistry;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.protocol.MigrateChunkRequest;
+import dev.nishisan.utils.oss.cluster.protocol.MigratePrepareRequest;
 import dev.nishisan.utils.oss.cluster.protocol.MigrateCommitRequest;
 import dev.nishisan.utils.oss.cluster.protocol.MigrateControlRequest;
 import dev.nishisan.utils.oss.cluster.protocol.MigrateResponse;
@@ -216,8 +218,7 @@ class MigrationExecutorTest {
 
         // Envia os chunks manualmente e faz o commit com um SHA errado.
         byte[] data = original;
-        dstExecutor.handleLocal(Commands.MIGRATE_CHUNK,
-                new MigrateChunkRequest(seriesKey, migrationId, 0, 1, data));
+        chunk(seriesKey, migrationId, data);
         String wrongSha = "0".repeat(64);
         MigrateResponse commit = (MigrateResponse) dstExecutor.handleLocal(Commands.MIGRATE_COMMIT,
                 new MigrateCommitRequest(seriesKey, migrationId, wrongSha, data.length, objectKey(seriesKey)));
@@ -235,8 +236,7 @@ class MigrationExecutorTest {
         publishMigration(seriesKey, migrationId);
 
         String sha = sha256Hex(original);
-        dstExecutor.handleLocal(Commands.MIGRATE_CHUNK,
-                new MigrateChunkRequest(seriesKey, migrationId, 0, 1, original));
+        chunk(seriesKey, migrationId, original);
         MigrateResponse first = (MigrateResponse) dstExecutor.handleLocal(Commands.MIGRATE_COMMIT,
                 new MigrateCommitRequest(seriesKey, migrationId, sha, original.length, objectKey(seriesKey)));
         assertEquals(MigrateStatus.COMMITTED, first.status());
@@ -254,8 +254,7 @@ class MigrationExecutorTest {
         String migrationId = UUID.randomUUID().toString();
         publishMigration(seriesKey, migrationId);
         String sha = sha256Hex(original);
-        dstExecutor.handleLocal(Commands.MIGRATE_CHUNK,
-                new MigrateChunkRequest(seriesKey, migrationId, 0, 1, original));
+        chunk(seriesKey, migrationId, original);
         dstExecutor.handleLocal(Commands.MIGRATE_COMMIT,
                 new MigrateCommitRequest(seriesKey, migrationId, sha, original.length, objectKey(seriesKey)));
         assertTrue(dstVolume.storage().exists(objectKey(seriesKey)));
@@ -277,8 +276,7 @@ class MigrationExecutorTest {
         String migrationId = UUID.randomUUID().toString();
         publishMigration(seriesKey, migrationId);
         String sha = sha256Hex(original);
-        dstExecutor.handleLocal(Commands.MIGRATE_CHUNK,
-                new MigrateChunkRequest(seriesKey, migrationId, 0, 1, original));
+        chunk(seriesKey, migrationId, original);
         dstExecutor.handleLocal(Commands.MIGRATE_COMMIT,
                 new MigrateCommitRequest(seriesKey, migrationId, sha, original.length, objectKey(seriesKey)));
         assertTrue(dstVolume.storage().exists(objectKey(seriesKey)));
@@ -718,7 +716,92 @@ class MigrationExecutorTest {
         }
     }
 
+    @Test
+    void rejectsBeforeChunksWhenActualImageExceedsCapacityAndPreservesSource() {
+        String key = "capacity-series";
+        String id = "capacity-move";
+        byte[] original = writeAndCheckpointSeries(key);
+        publishMigration(key, id);
+        dstVolume.storage().configureCapacity(4096, () -> Long.MAX_VALUE);
+        var response = (MigrateResponse) srcExecutor.handleLocal(Commands.MIGRATE_START,
+                new MigrateStartRequest(key, id, DST.value()));
+        assertEquals(MigrateStatus.ERROR, response.status());
+        assertArrayEquals(original, srcVolume.storage().get(objectKey(key)).orElseThrow());
+        assertFalse(dstVolume.storage().exists(objectKey(key)));
+        assertEquals(0, dstVolume.storage().reservedBytes());
+        assertFalse(srcRegistry.isMigrating(key));
+    }
+
+    @Test
+    void destinationEnteringDrainAfterPreparationRejectsCommitAndReleasesReservation() {
+        String key = "draining-target";
+        byte[] original = writeAndCheckpointSeries(key);
+        publishMigration(key, "drain-move");
+        assertEquals(MigrateStatus.OK, chunk(key, "drain-move", original).status());
+        assertTrue(dstVolume.storage().reservedBytes() > 0);
+        dstCatalog.status = new StorageNodeStatus(DST.value(), NodeState.DRAINING, 0, 0, 0, 0);
+        assertEquals(MigrateStatus.ERROR, commit(key, "drain-move", original).status());
+        assertEquals(0, dstVolume.storage().reservedBytes());
+        assertFalse(dstVolume.storage().exists(objectKey(key)));
+        assertArrayEquals(original, srcVolume.storage().get(objectKey(key)).orElseThrow());
+    }
+
+    @Test
+    void reservationBlocksOtherAllocationsAndAbortReleasesIt() {
+        String key = "reserved";
+        publishMigration(key, "reservation");
+        dstVolume.storage().configureCapacity(9000, () -> Long.MAX_VALUE);
+        assertEquals(MigrateStatus.OK, prepare(key, "reservation", 8192).status());
+        assertEquals(MigrateStatus.OK, prepare(key, "reservation", 8192).status());
+        assertEquals(8192, dstVolume.storage().reservedBytes());
+        assertThrows(dev.nishisan.utils.oss.storage.blob.BlobCapacityException.class,
+                () -> dstVolume.storage().put("another", new byte[4096]));
+        dstExecutor.handleLocal(Commands.MIGRATE_ABORT, new MigrateControlRequest(key, "reservation"));
+        assertEquals(0, dstVolume.storage().reservedBytes());
+        dstVolume.storage().put("another", new byte[4096]);
+    }
+
+    @Test
+    void chunksRequirePreparationAndOversizedChunkReleasesReservation() {
+        String key = "prepared";
+        publishMigration(key, "prep");
+        var chunk = new MigrateChunkRequest(key, "prep", 0, 1, new byte[8192]);
+        assertEquals(MigrateStatus.ERROR,
+                ((MigrateResponse) dstExecutor.handleLocal(Commands.MIGRATE_CHUNK, chunk)).status());
+        assertEquals(MigrateStatus.OK, prepare(key, "prep", 4096).status());
+        assertEquals(MigrateStatus.ERROR,
+                ((MigrateResponse) dstExecutor.handleLocal(Commands.MIGRATE_CHUNK, chunk)).status());
+        assertEquals(0, dstVolume.storage().reservedBytes());
+    }
+
+    @Test
+    void expiryAndRestartRequireANewReservation() throws InterruptedException {
+        String key = "expire";
+        publishMigration(key, "expired");
+        assertEquals(MigrateStatus.OK, prepare(key, "expired", 4096).status());
+        Thread.sleep(5);
+        dstExecutor.expireReservations(Duration.ZERO);
+        assertEquals(0, dstVolume.storage().reservedBytes());
+        assertEquals(MigrateStatus.ERROR, prepare(key, "expired", 4096).status());
+        publishMigration(key, "restart");
+        assertEquals(MigrateStatus.OK, prepare(key, "restart", 4096).status());
+        dstExecutor.close();
+        assertEquals(0, dstVolume.storage().reservedBytes());
+        dstExecutor = newExecutor(DST, dstRegistry, dstVolume, dstCatalog, 4096);
+        rpc.register(DST, dstExecutor);
+        var chunk = new MigrateChunkRequest(key, "restart", 0, 1, new byte[4096]);
+        assertEquals(MigrateStatus.ERROR, ((MigrateResponse) dstExecutor.handleLocal(Commands.MIGRATE_CHUNK, chunk)).status());
+        assertEquals(MigrateStatus.OK, prepare(key, "restart", 4096).status());
+    }
+
+    private MigrateResponse prepare(String key, String id, long bytes) {
+        return (MigrateResponse) dstExecutor.handleLocal(Commands.MIGRATE_PREPARE,
+                new MigratePrepareRequest(key, id, objectKey(key), bytes));
+    }
+
     private MigrateResponse chunk(String key, String id, byte[] bytes) {
+        MigrateResponse prepared = prepare(key, id, bytes.length);
+        if (prepared.status() != MigrateStatus.OK) { return prepared; }
         return (MigrateResponse) dstExecutor.handleLocal(Commands.MIGRATE_CHUNK,
                 new MigrateChunkRequest(key, id, 0, 1, bytes));
     }
@@ -760,6 +843,7 @@ class MigrationExecutorTest {
      */
     private static final class FakeCatalogView implements CatalogView {
         private final Map<String, SeriesPlacement> placements = new ConcurrentHashMap<>();
+        private StorageNodeStatus status;
 
         void put(String seriesKey, SeriesPlacement placement) {
             placements.put(seriesKey, placement);
@@ -772,7 +856,7 @@ class MigrationExecutorTest {
 
         @Override
         public Optional<StorageNodeStatus> nodeStatusStrong(String nodeId) {
-            return Optional.empty();
+            return Optional.ofNullable(status);
         }
 
         @Override

@@ -347,7 +347,13 @@ class StorageNodeClusterTest {
         // Segundo PLACE da mesma chave é idempotente.
         PlaceResponse secondPlace = clientRpc.call(currentLeaderId, Commands.PLACE,
                 new PlaceRequest(someSeries, "hash-" + someSeries, null), PlaceResponse.class);
-        assertEquals(somePlacement, secondPlace.placement());
+        // OPEN confirms physical metadata after the original PLACE; identity and owner stay stable.
+        assertEquals(somePlacement.ownerNodeId(), secondPlace.placement().ownerNodeId());
+        assertEquals(somePlacement.createdAtEpochMs(), secondPlace.placement().createdAtEpochMs());
+        assertEquals(somePlacement.state(), secondPlace.placement().state());
+        assertTrue(secondPlace.placement().geometryConfirmed());
+        assertEquals(secondPlace.placement(), clientRpc.call(currentLeaderId, Commands.PLACE,
+                new PlaceRequest(someSeries, "hash-original", null), PlaceResponse.class).placement());
 
         // READ de série nunca aberta no dono (após CLOSE) -> NOT_OPEN; novo OPEN restaura o funcionamento.
         NodeId someOwner = NodeId.of(somePlacement.ownerNodeId());

@@ -56,4 +56,26 @@ public interface CatalogView {
      * reais para testes com fake, mesmo padrão dos demais métodos desta interface).
      */
     void putNodeStatus(StorageNodeStatus status);
+    /** Whether this catalog persists geometry references. */
+    default boolean geometryTrackingEnabled() { return false; }
+
+    /** Shared leader-side serialization for updates of a series. */
+    default Object placementLock(String seriesKey) { return this; }
+
+    /** Registers a validated, immutable geometry before its reference is published. */
+    default void putGeometry(GeometryDescriptor geometry) { }
+
+    /** Local replicated geometry lookup. */
+    default Optional<GeometryDescriptor> geometryLocal(String id) { return Optional.empty(); }
+
+    /** Strong geometry lookup used before acknowledging a reference. */
+    default Optional<GeometryDescriptor> geometryStrong(String id) { return geometryLocal(id); }
+    /** Rebuilds leader-local admission tracking after a leadership change. */
+    default void resetAdmissionTracking() { }
+
+    /** Pending allocated bytes not yet reflected in node reports. */
+    default Map<String, Long> pendingBytesByNode() { return Map.of(); }
+
+    /** Incoming migrations whose destination has not yet become the catalog owner. */
+    default Map<String, Long> pendingMigrationSeriesByNode() { return Map.of(); }
 }

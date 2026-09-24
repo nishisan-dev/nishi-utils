@@ -17,6 +17,8 @@
 
 package dev.nishisan.utils.oss.cluster.node;
 
+import dev.nishisan.utils.oss.cluster.placement.DistributionMode;
+
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import dev.nishisan.utils.oss.api.Durability;
@@ -142,6 +144,8 @@ import java.util.function.Function;
  *                                 no volume, qual prefixo uma definição customizada usaria antes de a
  *                                 abrir; um {@code OPEN} com prefixo divergente do configurado neste nó é
  *                                 rejeitado com {@code SeriesStatus#ERROR}.
+ * @param distributionMode strategy shared by placement and rebalance; defaults to COUNT
+ * @param weight positive finite relative weight used in WEIGHT mode
  */
 public record StorageNodeConfig(
         String nodeId,
@@ -180,9 +184,64 @@ public record StorageNodeConfig(
         Duration migrationStatusPollInterval,
         Duration reconcileInterval,
         Duration orphanGrace,
+        String seriesObjectPrefix,
+        DistributionMode distributionMode,
+        double weight) {
+
+    /** Compatibility constructor with equal-count distribution. */
+    public StorageNodeConfig(
+        String nodeId,
+        String host,
+        int port,
+        String seed,
+        List<String> peers,
+        Path dataDir,
+        int priority,
+        Path volumeDir,
+        String volumeName,
+        int shardCount,
+        long segmentBytes,
+        long initialShardCapacityBytes,
+        long capacityBytes,
+        Duration statusReportInterval,
+        Duration nodeStatusStaleAfter,
+        Duration handleIdleTtl,
+        int maxOpenHandles,
+        Duration requestTimeout,
+        Durability defaultDurability,
+        OnGeometryChange defaultOnGeometryChange,
+        NgrrdClusterMetricsListener metricsListener,
+        Duration bootDiscoveryWindow,
+        boolean affinityHandbackMode,
+        Duration placementGraceAfterLeadership,
+        boolean rebalanceEnabled,
+        Duration rebalanceInterval,
+        long rebalanceMinDelta,
+        double rebalanceTolerance,
+        int maxConcurrentMigrations,
+        int maxMovesPerCycle,
+        Duration migrationTimeout,
+        long migrationChunkBytes,
+        long maxSeriesBytes,
+        Duration migrationStatusPollInterval,
+        Duration reconcileInterval,
+        Duration orphanGrace,
         String seriesObjectPrefix) {
+        this(nodeId, host, port, seed, peers, dataDir, priority, volumeDir, volumeName, shardCount, segmentBytes,
+                initialShardCapacityBytes, capacityBytes, statusReportInterval, nodeStatusStaleAfter,
+                handleIdleTtl, maxOpenHandles, requestTimeout, defaultDurability, defaultOnGeometryChange,
+                metricsListener, bootDiscoveryWindow, affinityHandbackMode, placementGraceAfterLeadership,
+                rebalanceEnabled, rebalanceInterval, rebalanceMinDelta, rebalanceTolerance,
+                maxConcurrentMigrations, maxMovesPerCycle, migrationTimeout, migrationChunkBytes, maxSeriesBytes,
+                migrationStatusPollInterval, reconcileInterval, orphanGrace, seriesObjectPrefix,
+                DistributionMode.COUNT, 1.0);
+    }
 
     public StorageNodeConfig {
+        Objects.requireNonNull(distributionMode, "distributionMode");
+        if (!Double.isFinite(weight) || weight <= 0) {
+            throw new IllegalArgumentException("weight must be positive and finite");
+        }
         Objects.requireNonNull(nodeId, "nodeId é obrigatório");
         if (nodeId.isBlank()) {
             throw new IllegalArgumentException("nodeId não pode ser vazio");
@@ -243,7 +302,7 @@ public record StorageNodeConfig(
         if (rebalanceMinDelta < 0) {
             throw new IllegalArgumentException("rebalanceMinDelta deve ser >= 0: " + rebalanceMinDelta);
         }
-        if (rebalanceTolerance < 0) {
+        if (!Double.isFinite(rebalanceTolerance) || rebalanceTolerance < 0) {
             throw new IllegalArgumentException("rebalanceTolerance deve ser >= 0: " + rebalanceTolerance);
         }
         if (maxConcurrentMigrations <= 0) {
@@ -388,6 +447,10 @@ public record StorageNodeConfig(
             if (ngrrd.seriesObjectPrefix != null && !ngrrd.seriesObjectPrefix.isBlank()) {
                 builder.seriesObjectPrefix(ngrrd.seriesObjectPrefix);
             }
+            if (ngrrd.distribution != null && ngrrd.distribution.mode != null) {
+                builder.distributionMode(ngrrd.distribution.mode);
+            }
+            if (ngrrd.weight != null) { builder.weight(ngrrd.weight); }
             RebalanceSection rebalance = ngrrd.rebalance;
             if (rebalance != null) {
                 if (rebalance.enabled != null) {
@@ -460,6 +523,8 @@ public record StorageNodeConfig(
         public String defaultOnGeometryChange;
         public String seriesObjectPrefix;
         public RebalanceSection rebalance;
+        public DistributionSection distribution;
+        public Double weight;
         public ReconcileSection reconcile;
     }
 
@@ -471,6 +536,11 @@ public record StorageNodeConfig(
         public Long segmentBytes;
         public Long initialShardCapacityBytes;
         public Long capacityBytes;
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private static final class DistributionSection {
+        public DistributionMode mode;
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
@@ -508,6 +578,8 @@ public record StorageNodeConfig(
         private long segmentBytes = BlobVolumeConfig.DEFAULT_SEGMENT_BYTES;
         private long initialShardCapacityBytes = BlobVolumeConfig.DEFAULT_SEGMENT_BYTES;
         private long capacityBytes = 0L;
+        private DistributionMode distributionMode = DistributionMode.COUNT;
+        private double weight = 1.0;
         private Duration statusReportInterval = Duration.ofSeconds(10);
         /** {@code null} = calculado em {@link #build()} a partir de {@link #statusReportInterval}. */
         private Duration nodeStatusStaleAfter;
@@ -750,6 +822,11 @@ public record StorageNodeConfig(
 
         private static final Duration MIN_NODE_STATUS_STALE_AFTER = Duration.ofSeconds(15);
 
+        /** Distribution mode, shared by placement and rebalance (default COUNT). */
+        public Builder distributionMode(DistributionMode mode) { this.distributionMode = mode; return this; }
+        /** Explicit relative node weight (default 1). */
+        public Builder weight(double weight) { this.weight = weight; return this; }
+
         public StorageNodeConfig build() {
             Duration resolvedStaleAfter = nodeStatusStaleAfter != null
                     ? nodeStatusStaleAfter
@@ -762,7 +839,7 @@ public record StorageNodeConfig(
                     rebalanceEnabled, rebalanceInterval, rebalanceMinDelta, rebalanceTolerance,
                     maxConcurrentMigrations, maxMovesPerCycle, migrationTimeout, migrationChunkBytes,
                     maxSeriesBytes, migrationStatusPollInterval, reconcileInterval, orphanGrace,
-                    seriesObjectPrefix);
+                    seriesObjectPrefix, distributionMode, weight);
         }
 
         private static Duration maxDuration(Duration a, Duration b) {

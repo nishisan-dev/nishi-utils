@@ -46,6 +46,8 @@ import java.util.Set;
  *                              mais recente visível ao NOVO líder já nascer "velho" se o prazo for
  *                              curto demais (só {@code 2 × interval}), descartando um nó legítimo.
  * @param preferredOwnerNodeId dono preferido (ex.: adoção pelo {@code LocalReconciler}), ou {@code null}
+ * @param requestedBytes aligned allocation size of the new series
+ * @param pendingBytesByNode incoming bytes not yet reflected in node reports
  */
 public record PlacementContext(
         Collection<StorageNodeStatus> nodes,
@@ -53,9 +55,17 @@ public record PlacementContext(
         Map<String, Long> pendingSeriesByNode,
         long nowEpochMs,
         Duration nodeStatusStaleAfter,
-        String preferredOwnerNodeId) {
+        String preferredOwnerNodeId, long requestedBytes, Map<String, Long> pendingBytesByNode) {
+
+    public PlacementContext(Collection<StorageNodeStatus> nodes, Set<String> reachableNodeIds,
+            Map<String, Long> pendingSeriesByNode, long nowEpochMs, Duration nodeStatusStaleAfter,
+            String preferredOwnerNodeId) {
+        this(nodes, reachableNodeIds, pendingSeriesByNode, nowEpochMs, nodeStatusStaleAfter, preferredOwnerNodeId, 0, Map.of());
+    }
 
     public PlacementContext {
+        if (requestedBytes < 0) { throw new IllegalArgumentException("negative requested bytes"); }
+        pendingBytesByNode = Map.copyOf(pendingBytesByNode);
         Objects.requireNonNull(nodes, "nodes");
         Objects.requireNonNull(reachableNodeIds, "reachableNodeIds");
         Objects.requireNonNull(nodeStatusStaleAfter, "nodeStatusStaleAfter");

@@ -51,14 +51,11 @@ import java.util.stream.Collectors;
  * Atende, apenas no líder, o comando {@link Commands#PLACE}: cria (ou confirma,
  * idempotentemente) o placement de uma série nova via {@link PlacementPolicy}.
  *
- * <p>Serializa decisões por {@code seriesKey} com 64 locks em stripe — chaves
- * diferentes decidem em paralelo, a mesma chave nunca decide duas vezes ao
- * mesmo tempo (evita corrida entre dois {@code PLACE} concorrentes para a mesma
- * série nova).</p>
+ * <p>Serializa a admissão de novos placements para contabilizar pendências antes
+ * da decisão seguinte. O lock de cada série no catálogo também coordena mudanças
+ * de geometria e migrações, evitando atualizações concorrentes do mesmo registro.</p>
  */
 public final class PlacementRequestHandler extends RequestHandlerSupport implements LeadershipListener {
-
-    private static final int LOCK_STRIPES = 64;
 
     /**
      * Visão do líder e da malha consumida por este handler — isola a
@@ -80,7 +77,7 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
     private final Duration placementGraceAfterLeadership;
     private final Clock clock;
 
-    private final Object[] stripeLocks = new Object[LOCK_STRIPES];
+    private volatile boolean needsAdmissionRebuild = true;
     private final ConcurrentMap<String, PendingCounter> pendingByNode = new ConcurrentHashMap<>();
     /**
      * Instante em que este nó percebeu ter assumido a liderança pela última vez — {@code 0}
@@ -127,9 +124,6 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
         this.placementGraceAfterLeadership =
                 Objects.requireNonNull(placementGraceAfterLeadership, "placementGraceAfterLeadership");
         this.clock = Objects.requireNonNull(clock, "clock");
-        for (int i = 0; i < LOCK_STRIPES; i++) {
-            stripeLocks[i] = new Object();
-        }
     }
 
     /** {@link LeaderView} de produção, sobre o {@code ClusterCoordinator}/{@code Transport} reais do nó. */
@@ -160,7 +154,8 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
 
     @Override
     protected Object handle(String command, Object body, NodeId source) {
-        return handlePlace((PlaceRequest) body);
+        // One admission decision at a time also serializes pending-count updates across keys.
+        synchronized (pendingByNode) { return handlePlace((PlaceRequest) body); }
     }
 
     @Override
@@ -182,6 +177,7 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
             // Perdeu (ou nunca teve) a liderança: os placements pendentes desde o último reporte de
             // status não valem mais para as decisões deste nó — zera para não carregar contagem
             // obsoleta caso ele volte a ser líder mais tarde.
+            needsAdmissionRebuild = true;
             pendingByNode.clear();
         }
     }
@@ -207,6 +203,7 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
             }
         }
 
+        needsAdmissionRebuild = true;
         pendingByNode.clear();
         for (Map.Entry<String, Long> entry : countByOwner.entrySet()) {
             StorageNodeStatus ownerStatus = statusByNode.get(entry.getKey());
@@ -223,7 +220,7 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
         if (!leaderView.isLeader()) {
             return notLeaderResponse();
         }
-        Object lock = stripeLocks[Math.floorMod(request.seriesKey().hashCode(), LOCK_STRIPES)];
+        Object lock = catalog.placementLock(request.seriesKey());
         synchronized (lock) {
             // m4: a liderança pode ter mudado entre a checagem acima e a aquisição do lock de stripe.
             if (!leaderView.isLeader()) {
@@ -243,10 +240,15 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
                 return notLeaderResponse();
             }
 
+            if (needsAdmissionRebuild) {
+                catalog.resetAdmissionTracking();
+                needsAdmissionRebuild = false;
+            }
             Collection<StorageNodeStatus> nodes = catalog.nodesLocal();
             long now = clock.millis();
             PlacementContext ctx = new PlacementContext(nodes, leaderView.reachableNodeIds(),
-                    snapshotPending(nodes), now, nodeStatusStaleAfter, request.preferredOwnerNodeId());
+                    snapshotPending(nodes), now, nodeStatusStaleAfter, request.preferredOwnerNodeId(),
+                    request.geometry() == null ? 0 : request.geometry().regionBytes(), catalog.pendingBytesByNode());
 
             Optional<String> chosen = policy.choose(ctx);
             if (chosen.isEmpty()) {
@@ -262,6 +264,10 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
             }
 
             SeriesPlacement placement = SeriesPlacement.active(chosen.get(), now);
+            if (request.geometry() != null) {
+                catalog.putGeometry(request.geometry());
+                placement = placement.withGeometry(request.geometry().id(), false, now);
+            }
             try {
                 catalog.putPlacement(request.seriesKey(), placement);
             } catch (RuntimeException e) {
@@ -289,7 +295,7 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
     }
 
     private Map<String, Long> snapshotPending(Collection<StorageNodeStatus> nodes) {
-        Map<String, Long> pending = new HashMap<>();
+        Map<String, Long> pending = new HashMap<>(catalog.pendingMigrationSeriesByNode());
         for (StorageNodeStatus node : nodes) {
             PendingCounter counter = pendingByNode.get(node.nodeId());
             if (counter == null) {
@@ -297,7 +303,7 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
             }
             long count = counter.peek(node.reportedAtEpochMs());
             if (count > 0) {
-                pending.put(node.nodeId(), count);
+                pending.merge(node.nodeId(), count, Long::sum);
             }
         }
         return pending;

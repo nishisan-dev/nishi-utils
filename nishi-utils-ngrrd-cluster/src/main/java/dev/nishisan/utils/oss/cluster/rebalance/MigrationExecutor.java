@@ -33,6 +33,7 @@ import dev.nishisan.utils.oss.cluster.protocol.MigrateCommitRequest;
 import dev.nishisan.utils.oss.cluster.protocol.MigrateControlRequest;
 import dev.nishisan.utils.oss.cluster.protocol.MigrateResponse;
 import dev.nishisan.utils.oss.cluster.protocol.MigrateStartRequest;
+import dev.nishisan.utils.oss.cluster.protocol.MigratePrepareRequest;
 import dev.nishisan.utils.oss.cluster.protocol.MigrateStatus;
 import dev.nishisan.utils.oss.cluster.rpc.ClusterRpc;
 import dev.nishisan.utils.oss.cluster.rpc.RequestHandlerSupport;
@@ -127,13 +128,9 @@ public final class MigrationExecutor extends RequestHandlerSupport {
     private final Clock clock;
     private final ExecutorService transferExecutor;
 
-    // Bounded lock stripes serialize local installation/abort for the same series. Network
-    // transfers never hold these locks while waiting for the other executor.
-    private final Object[] seriesLocks = java.util.stream.IntStream.range(0, 64)
-            .mapToObj(ignored -> new Object()).toArray();
-
+    // Shared with OPEN and physical metadata inspection; transfers release it before network chunks.
     private Object seriesLock(String seriesKey) {
-        return seriesLocks[Math.floorMod(seriesKey.hashCode(), seriesLocks.length)];
+        return registry.operationLock(seriesKey);
     }
 
     private final ConcurrentMap<String, MigrationState> states = new ConcurrentHashMap<>();
@@ -179,6 +176,7 @@ public final class MigrationExecutor extends RequestHandlerSupport {
     protected Object handle(String command, Object body, NodeId source) {
         String seriesKey = switch (body) {
             case MigrateStartRequest r -> r.seriesKey();
+            case MigratePrepareRequest r -> r.seriesKey();
             case MigrateChunkRequest r -> r.seriesKey();
             case MigrateCommitRequest r -> r.seriesKey();
             case MigrateControlRequest r -> r.seriesKey();
@@ -191,6 +189,7 @@ public final class MigrationExecutor extends RequestHandlerSupport {
 
     private Object dispatch(String command, Object body) {
         return switch (command) {
+            case Commands.MIGRATE_PREPARE -> handlePrepare((MigratePrepareRequest) body);
             case Commands.MIGRATE_START -> handleStart((MigrateStartRequest) body);
             case Commands.MIGRATE_CHUNK -> handleChunk((MigrateChunkRequest) body);
             case Commands.MIGRATE_COMMIT -> handleCommit((MigrateCommitRequest) body);
@@ -224,16 +223,17 @@ public final class MigrationExecutor extends RequestHandlerSupport {
             // Reenvio idempotente do mesmo START — já em andamento (ou concluído) sob este id.
             return MigrateResponse.of(MigrateStatus.OK, null);
         }
-        registry.markMigrating(seriesKey);
         String storageKey;
+        Optional<byte[]> image;
         try {
+            registry.markMigrating(seriesKey);
             storageKey = resolveStorageKey(seriesKey);
+            image = volume.storage().get(storageKey);
         } catch (RuntimeException e) {
             registry.clearMigrating(seriesKey);
             return MigrateResponse.of(MigrateStatus.ERROR,
-                    "falha ao resolver a chave de storage de " + seriesKey + ": " + describe(e));
+                    "falha ao preparar a imagem de " + seriesKey + ": " + describe(e));
         }
-        Optional<byte[]> image = volume.storage().get(storageKey);
         if (image.isEmpty()) {
             registry.clearMigrating(seriesKey);
             return MigrateResponse.of(MigrateStatus.ERROR, "série ausente no volume local: " + seriesKey);
@@ -243,6 +243,17 @@ public final class MigrationExecutor extends RequestHandlerSupport {
             registry.clearMigrating(seriesKey);
             return MigrateResponse.of(MigrateStatus.ERROR,
                     "série (" + bytes.length + " bytes) excede maxSeriesBytes (" + maxSeriesBytes + ")");
+        }
+        try {
+            MigrateResponse prepared = rpc.call(NodeId.of(request.targetNodeId()), Commands.MIGRATE_PREPARE,
+                    new MigratePrepareRequest(seriesKey, migrationId, storageKey, bytes.length), MigrateResponse.class);
+            if (prepared.status() != MigrateStatus.OK) {
+                registry.clearMigrating(seriesKey);
+                return MigrateResponse.of(MigrateStatus.ERROR, "destination reservation refused: " + prepared.message());
+            }
+        } catch (RuntimeException e) {
+            registry.clearMigrating(seriesKey);
+            return MigrateResponse.of(MigrateStatus.ERROR, "destination reservation failed: " + describe(e));
         }
         String sha256Hex = sha256Hex(bytes);
         int totalChunks = chunkCount(bytes.length);
@@ -345,6 +356,7 @@ public final class MigrationExecutor extends RequestHandlerSupport {
                 && !migrationId.equals(current.get().migrationId())) {
             // A delayed abort must not clear a newer source's guard or delete its target image.
             staging.remove(migrationId);
+            volume.storage().releaseReservation(migrationId);
             updateState(migrationId, seriesKey, state.role(), MigratePhase.ABORTED, state.storageKey(), null);
             return MigrateResponse.of(MigrateStatus.OK, null);
         }
@@ -353,6 +365,7 @@ public final class MigrationExecutor extends RequestHandlerSupport {
             updateState(migrationId, seriesKey, Role.SOURCE, MigratePhase.ABORTED, state.storageKey(), null);
         } else {
             staging.remove(migrationId);
+            volume.storage().releaseReservation(migrationId);
             if (state.phase() == MigratePhase.COMMITTED && state.storageKey() != null) {
                 // Achado bloqueante do Refuter (perda de dados): um ABORT pode chegar depois que esta
                 // migração já foi dada como concluída de verdade por outro líder (dual-leader/partição —
@@ -434,6 +447,58 @@ public final class MigrationExecutor extends RequestHandlerSupport {
 
     // ---------------------------------------------------------------- destino (TARGET)
 
+    private MigrateResponse handlePrepare(MigratePrepareRequest request) {
+        MigrationState previous = states.get(request.migrationId());
+        if (previous != null && (!previous.seriesKey().equals(request.seriesKey()) || previous.role() != Role.TARGET
+                || isTerminal(previous.phase()))) {
+            return MigrateResponse.of(MigrateStatus.ERROR, "migration ended or identity mismatch");
+        }
+        if (!isCurrentTarget(request.seriesKey(), request.migrationId())
+                || !resolveStorageKey(request.seriesKey()).equals(request.storageKey())) {
+            return MigrateResponse.of(MigrateStatus.ERROR, "reservation not authorized by catalog");
+        }
+        if (!destinationActive()) {
+            return failTarget(request.seriesKey(), request.migrationId(), "destination is not ACTIVE");
+        }
+        if (request.totalBytes() <= 0 || request.totalBytes() > maxSeriesBytes) {
+            return failTarget(request.seriesKey(), request.migrationId(), "invalid migration size");
+        }
+        for (MigrationState other : states.values()) {
+            if (other.role() == Role.TARGET && other.seriesKey().equals(request.seriesKey())
+                    && !other.migrationId().equals(request.migrationId()) && !isTerminal(other.phase())) {
+                failTarget(other.seriesKey(), other.migrationId(), "superseded by current catalog migration");
+            }
+        }
+        StagingBuffer old = staging.get(request.migrationId());
+        if (old != null) {
+            return old.expectedBytes == request.totalBytes() && old.storageKey.equals(request.storageKey())
+                    ? MigrateResponse.of(MigrateStatus.OK, null)
+                    : MigrateResponse.of(MigrateStatus.ERROR, "reservation identity mismatch");
+        }
+        try {
+            volume.storage().reserve(request.migrationId(), request.storageKey(), request.totalBytes());
+        } catch (RuntimeException e) {
+            return failTarget(request.seriesKey(), request.migrationId(), describe(e));
+        }
+        staging.put(request.migrationId(), new StagingBuffer(request.totalBytes(), request.storageKey(), clock.millis()));
+        states.put(request.migrationId(), new MigrationState(request.seriesKey(), request.migrationId(), Role.TARGET,
+                MigratePhase.STARTED, 0, 0, request.totalBytes(), null, request.storageKey(), null, clock.millis()));
+        return MigrateResponse.of(MigrateStatus.OK, null);
+    }
+
+    private boolean destinationActive() {
+        var status = catalog.nodeStatusStrong(self.value());
+        return !(catalog.geometryTrackingEnabled() && status.isEmpty())
+                && status.filter(n -> n.state() != dev.nishisan.utils.oss.cluster.catalog.NodeState.ACTIVE).isEmpty();
+    }
+
+    private MigrateResponse failTarget(String seriesKey, String migrationId, String message) {
+        staging.remove(migrationId);
+        volume.storage().releaseReservation(migrationId);
+        updateState(migrationId, seriesKey, Role.TARGET, MigratePhase.FAILED, null, message);
+        return MigrateResponse.of(MigrateStatus.ERROR, message);
+    }
+
     private MigrateResponse handleChunk(MigrateChunkRequest request) {
         MigrationState existing = states.get(request.migrationId());
         if (existing != null && (!existing.seriesKey().equals(request.seriesKey())
@@ -443,24 +508,30 @@ public final class MigrationExecutor extends RequestHandlerSupport {
         if (existing == null && !isCurrentTarget(request.seriesKey(), request.migrationId())) {
             return MigrateResponse.of(MigrateStatus.ERROR, "migração não autorizada pelo catálogo");
         }
-        StagingBuffer buffer = staging.computeIfAbsent(request.migrationId(), id -> new StagingBuffer());
+        StagingBuffer buffer = staging.get(request.migrationId());
+        if (buffer == null) {
+            return MigrateResponse.of(MigrateStatus.ERROR, "MIGRATE_PREPARE required before chunks");
+        }
+        if (request.total() <= 0 || request.seq() < 0 || request.seq() >= request.total() || request.data() == null) {
+            return failTarget(request.seriesKey(), request.migrationId(), "invalid chunk");
+        }
         int chunksReceived;
         int totalExpected;
         int bufferedBytes;
         synchronized (buffer) {
             if (request.seq() != buffer.chunksReceived) {
-                return MigrateResponse.of(MigrateStatus.ERROR,
+                return failTarget(request.seriesKey(), request.migrationId(),
                         "chunk fora de ordem para " + request.migrationId() + ": esperado "
                                 + buffer.chunksReceived + ", recebido " + request.seq());
             }
             if (buffer.totalExpected < 0) {
                 buffer.totalExpected = request.total();
             } else if (buffer.totalExpected != request.total()) {
-                return MigrateResponse.of(MigrateStatus.ERROR,
+                return failTarget(request.seriesKey(), request.migrationId(),
                         "total de chunks inconsistente para " + request.migrationId());
             }
-            if ((long) buffer.out.size() + request.data().length > maxSeriesBytes) {
-                return MigrateResponse.of(MigrateStatus.ERROR,
+            if ((long) buffer.out.size() + request.data().length > buffer.expectedBytes) {
+                return failTarget(request.seriesKey(), request.migrationId(),
                         "staging de " + request.migrationId() + " excede maxSeriesBytes (" + maxSeriesBytes + ")");
             }
             buffer.out.write(request.data(), 0, request.data().length);
@@ -476,9 +547,6 @@ public final class MigrationExecutor extends RequestHandlerSupport {
     }
 
     private MigrateResponse handleCommit(MigrateCommitRequest request) {
-        if (!resolveStorageKey(request.seriesKey()).equals(request.storageKey())) {
-            return MigrateResponse.of(MigrateStatus.ERROR, "chave física diverge do prefixo configurado no destino");
-        }
         MigrationState existing = states.get(request.migrationId());
         if (existing != null && (!existing.seriesKey().equals(request.seriesKey())
                 || existing.role() != Role.TARGET)) {
@@ -495,6 +563,7 @@ public final class MigrationExecutor extends RequestHandlerSupport {
         // Under the series lock, no newer local commit can pass this check and install first.
         if (!isCurrentTarget(request.seriesKey(), request.migrationId())) {
             staging.remove(request.migrationId());
+            volume.storage().releaseReservation(request.migrationId());
             return MigrateResponse.of(MigrateStatus.ERROR, "migração não autorizada pelo catálogo");
         }
         StagingBuffer buffer = staging.get(request.migrationId());
@@ -502,12 +571,17 @@ public final class MigrationExecutor extends RequestHandlerSupport {
             return MigrateResponse.of(MigrateStatus.ERROR,
                     "nenhum staging em andamento para " + request.migrationId());
         }
+        if (!buffer.storageKey.equals(request.storageKey())) {
+            return failTarget(request.seriesKey(), request.migrationId(), "physical key differs from reservation");
+        }
         byte[] bytes;
         synchronized (buffer) {
             bytes = buffer.out.toByteArray();
         }
-        if (bytes.length != request.totalBytes()) {
+        if (bytes.length != request.totalBytes() || bytes.length != buffer.expectedBytes
+                || buffer.chunksReceived != buffer.totalExpected) {
             staging.remove(request.migrationId());
+            volume.storage().releaseReservation(request.migrationId());
             updateState(request.migrationId(), request.seriesKey(), Role.TARGET, MigratePhase.FAILED,
                     request.storageKey(), "tamanho recebido (" + bytes.length + ") difere do esperado ("
                             + request.totalBytes() + ")");
@@ -516,16 +590,25 @@ public final class MigrationExecutor extends RequestHandlerSupport {
         String actualSha256Hex = sha256Hex(bytes);
         if (!actualSha256Hex.equalsIgnoreCase(request.sha256Hex())) {
             staging.remove(request.migrationId());
+            volume.storage().releaseReservation(request.migrationId());
             updateState(request.migrationId(), request.seriesKey(), Role.TARGET, MigratePhase.FAILED,
                     request.storageKey(), "SHA-256 divergente");
             return MigrateResponse.of(MigrateStatus.HASH_MISMATCH, "SHA-256 divergente");
         }
+        if (!destinationActive()) {
+            return failTarget(request.seriesKey(), request.migrationId(), "destination stopped accepting migrations");
+        }
         // Descarta qualquer handle antigo desta série ANTES de sobrescrever a imagem por baixo — nunca
         // deixar um NgrrdHandle em memória sobreviver à substituição do arquivo (ver Javadoc de
         // SeriesHandleRegistry#discard).
-        registry.discard(request.seriesKey());
-        volume.storage().atomicReplace(request.storageKey(), bytes);
+        try {
+            registry.discard(request.seriesKey());
+            volume.storage().atomicReplaceReserved(request.storageKey(), bytes, request.migrationId());
+        } catch (RuntimeException e) {
+            return failTarget(request.seriesKey(), request.migrationId(), describe(e));
+        }
         staging.remove(request.migrationId());
+        volume.storage().releaseReservation(request.migrationId());
         states.put(request.migrationId(), new MigrationState(request.seriesKey(), request.migrationId(),
                 Role.TARGET, MigratePhase.COMMITTED, 0, 0, bytes.length, actualSha256Hex, request.storageKey(), null,
                 clock.millis()));
@@ -546,6 +629,20 @@ public final class MigrationExecutor extends RequestHandlerSupport {
             }
         }
         return new ExecutorMetrics(in, out);
+    }
+
+    /** Expires even unfinished transfers, releasing their admission reservations. */
+    public void expireReservations(Duration timeout) {
+        long threshold = clock.millis() - timeout.toMillis();
+        for (var entry : states.entrySet()) {
+            MigrationState state = entry.getValue();
+            synchronized (seriesLock(state.seriesKey())) {
+                StagingBuffer buffer = staging.get(entry.getKey());
+                if (buffer != null && buffer.createdAtMs < threshold) {
+                    failTarget(state.seriesKey(), entry.getKey(), "migration reservation expired");
+                }
+            }
+        }
     }
 
     /**
@@ -575,6 +672,7 @@ public final class MigrationExecutor extends RequestHandlerSupport {
                         && !registry.isMigrating(state.seriesKey())) {
                     if (states.remove(entry.getKey(), state)) {
                         staging.remove(entry.getKey());
+                        volume.storage().releaseReservation(entry.getKey());
                         removed++;
                     }
                 }
@@ -664,6 +762,8 @@ public final class MigrationExecutor extends RequestHandlerSupport {
 
     /** Fecha o pool de transferência ({@code ngrrd-migration-src}). Não fecha o volume nem o registry. */
     public void close() {
+        staging.keySet().forEach(volume.storage()::releaseReservation);
+        staging.clear();
         transferExecutor.shutdownNow();
     }
 
@@ -741,6 +841,14 @@ public final class MigrationExecutor extends RequestHandlerSupport {
 
     /** Acumulador de chunks recebidos por uma migração em curso no destino. */
     private static final class StagingBuffer {
+        private final long expectedBytes;
+        private final String storageKey;
+        private final long createdAtMs;
+        private StagingBuffer(long expectedBytes, String storageKey, long createdAtMs) {
+            this.expectedBytes = expectedBytes;
+            this.storageKey = storageKey;
+            this.createdAtMs = createdAtMs;
+        }
         private final ByteArrayOutputStream out = new ByteArrayOutputStream();
         private int chunksReceived;
         private int totalExpected = -1;

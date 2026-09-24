@@ -16,7 +16,7 @@ Depois de compilar e copiar as dependências conforme o quickstart, defina no te
 administração:
 
 ```bash
-NGRRD_CP='nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.3.1.jar:nishi-utils-ngrrd-cluster/target/lib/*'
+NGRRD_CP='nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.4.0.jar:nishi-utils-ngrrd-cluster/target/lib/*'
 NGRRD_SEED='127.0.0.1:7101'
 
 ngrrd_admin() {
@@ -86,7 +86,7 @@ YAML
 Em um terminal separado, mantenha o novo processo em primeiro plano:
 
 ```bash
-java -cp 'nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.3.1.jar:nishi-utils-ngrrd-cluster/target/lib/*' \
+java -cp 'nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.4.0.jar:nishi-utils-ngrrd-cluster/target/lib/*' \
   dev.nishisan.utils.oss.cluster.node.NgrrdStorageNodeMain \
   --config target/ngrrd-demo/storage-4.yaml
 ```
@@ -106,9 +106,10 @@ configuração original, incluindo `shardCount`.
 ### Quando o novo nó começa a receber séries?
 
 - **Séries novas:** assim que estiver elegível no catálogo, o nó participa do placement.
-  A política padrão prioriza a menor carga efetiva (`seriesCount` mais placements pendentes),
-  com desempate por ocupação e ID. Nós fora de `ACTIVE`, inalcançáveis ou com capacidade
-  conhecida ocupada em 95% ou mais não recebem novos placements.
+  A política prioriza a menor carga efetiva (`seriesCount` mais placements pendentes) dividida
+  pelo peso resolvido, com desempate por ocupação e ID. Em `COUNT`, os pesos são iguais.
+  Nós fora de `ACTIVE`, inalcançáveis, em 95% da capacidade conhecida ou sem orçamento para
+  a próxima série não recebem novos placements.
 - **Séries existentes:** o líder agenda um ciclo após mudanças de membership, esperando
   5 segundos sem novo evento para agrupar mudanças. Há também um ciclo periódico, com
   intervalo padrão de 60 segundos após o término do ciclo anterior.
@@ -120,7 +121,7 @@ influenciam o progresso. O seed não fixa a liderança, que pode mudar durante a
 
 ## 3. Entender por que o rebalanceamento move ou não move séries
 
-O planejador equilibra a **quantidade de séries ACTIVE no catálogo** entre storages
+No modo padrão `COUNT`, o planejador equilibra a **quantidade de séries ACTIVE no catálogo** entre storages
 `ACTIVE` e alcançáveis. Não equilibra diretamente bytes, IOPS ou taxa de escrita.
 Enquanto houver séries elegíveis e orçamento no ciclo, move uma série inteira do nó mais
 carregado para o menos carregado quando:
@@ -131,6 +132,8 @@ maior quantidade - menor quantidade > max(minDelta, tolerance × média)
 
 Uma série tem um único dono; a migração não a divide nem cria uma réplica permanente.
 O objetivo é entrar na tolerância configurada, não necessariamente deixar todos os nós iguais.
+Em `CAPACITY` ou `WEIGHT`, as metas são proporcionais aos pesos; veja
+[capacidade e distribuição ponderada](#capacidade-e-distribuição-ponderada-issue-167-itens-1-e-2).
 
 Exemplos numéricos, sem novas séries nem migrações anteriores em andamento:
 
@@ -179,9 +182,9 @@ ngrrd:
 
 Esse ajuste torna movimentações pequenas observáveis; não é uma configuração universal de
 produção. Para reduzir o impacto de transferências, limite concorrência e movimentos por
-ciclo e acompanhe latência e backlog. O planejador de migração atual não aplica a guarda de
-95% usada no placement de séries novas: confira espaço disponível nos destinos antes de
-rebalancear ou drenar. Contagens parecidas não garantem ocupação de disco parecida.
+ciclo e acompanhe latência e backlog. Placement, rebalance e drenagem aplicam a guarda de
+95%, incluindo tamanhos confirmados e entradas pendentes. O destino revalida a admissão e
+reserva espaço antes de receber a imagem. Contagens parecidas não garantem ocupação de disco parecida.
 
 ## 4. O que a aplicação percebe durante uma migração
 
@@ -189,8 +192,9 @@ O fluxo de uma série é:
 
 1. O catálogo marca `MIGRATING`, com origem e destino.
 2. A origem bloqueia novas operações locais da série, faz checkpoint e fecha o handle.
-3. Transfere a imagem em chunks; o destino valida o SHA-256 e confirma a cópia.
-4. O catálogo passa a `ACTIVE` no destino e a origem recebe a ordem de apagar sua cópia.
+3. O destino valida seu estado e reserva o tamanho real da imagem, antes do primeiro chunk.
+4. A origem transfere a imagem; o destino valida tamanho e SHA-256, consumindo a reserva no commit.
+5. O catálogo passa a `ACTIVE` no destino e a origem recebe a ordem de apagar sua cópia.
 
 O cliente trata `MIGRATING` com espera e retentativa; ao receber `WRONG_OWNER`, atualiza
 o roteamento. As escritas pendentes são reenfileiradas. Não é necessário reabrir manualmente
@@ -348,3 +352,102 @@ Nos logs, procure `NGRRD_REBALANCE` (resultado agregado dos ciclos agendados),
 - [Placement de séries novas](../../nishi-utils-ngrrd-cluster/src/main/java/dev/nishisan/utils/oss/cluster/placement/LeastLoadedPlacementPolicy.java).
 - [Gatilhos e ciclos](../../nishi-utils-ngrrd-cluster/src/main/java/dev/nishisan/utils/oss/cluster/rebalance/Rebalancer.java) e [planejamento dos movimentos](../../nishi-utils-ngrrd-cluster/src/main/java/dev/nishisan/utils/oss/cluster/rebalance/RebalancePlanner.java).
 - [Comandos administrativos](../../nishi-utils-ngrrd-cluster/src/main/java/dev/nishisan/utils/oss/cluster/admin/NgrrdClusterAdminCli.java) e [API do cliente](../../nishi-utils-ngrrd-cluster/src/main/java/dev/nishisan/utils/oss/cluster/api/NgrrdClusterClient.java).
+
+
+## Capacidade e distribuição ponderada (issue #167, itens 1 e 2)
+
+A proteção de capacidade vale para placement, rebalance e drenagem, inclusive no modo
+`COUNT`. O orçamento admitido é `floor(capacityBytes × 0,95)`: um nó já nesse limite não
+recebe novas séries, e uma entrada cuja projeção ultrapasse o limite é recusada. O destino
+reserva o tamanho real antes do primeiro chunk; reservas e alocações de novos `OPEN`
+compartilham o mesmo orçamento no `BlobStorage`. Saídas só liberam espaço quando a região
+local é efetivamente removida. Escritas em regiões existentes continuam disponíveis.
+
+`capacityBytes <= 0` mantém a capacidade declarada desconhecida/sem teto lógico. O storage
+consulta também o espaço utilizável do filesystem antes de novas alocações. `usedBytes`
+representa regiões vivas, incluindo alinhamento de 4 KiB, e não blocos físicos ocupados no
+filesystem. A consulta de espaço livre não reserva blocos contra outros processos nem substitui
+o monitoramento de disco; mantenha espaço para WAL, catálogos e demais consumidores.
+
+### Escolha do modo
+
+```yaml
+ngrrd:
+  volume:
+    dir: /var/ngrrd/volume
+    name: ngrrd
+    capacityBytes: 3500000000000
+  distribution:
+    mode: CAPACITY
+  weight: 1.0
+  rebalance:
+    enabled: true
+    minDelta: 50
+    tolerance: 0.10
+    maxConcurrentMigrations: 2
+    maxMovesPerCycle: 50
+```
+
+| Modo | Critério | Padrão/fallback |
+|---|---|---|
+| `COUNT` | Igualar contagens de séries | Padrão; preserva o limiar histórico |
+| `CAPACITY` | Contagens proporcionais a `volume.capacityBytes` | Se algum nó ACTIVE alcançável tiver capacidade desconhecida, todos usam pesos iguais |
+| `WEIGHT` | Contagens proporcionais a `ngrrd.weight` | Peso omitido = 1; zero, negativos, NaN e infinito são inválidos |
+
+Todos os participantes devem declarar o mesmo modo. Divergência faz placement e rebalance
+usarem `COUNT`, com marker `NGRRD_DISTRIBUTION` e motivo `conflicting_modes`.
+Capacidade desconhecida em `CAPACITY` produz o motivo `unknown_capacity`.
+
+Para os SSDs da issue, declarar 3,5 TB, 1,7 TB e 744 GB resulta em participações aproximadas
+de **58,9%, 28,6% e 12,5% das séries**, respectivamente. Configure o orçamento realmente
+disponível para o volume, descontando outros usos do disco. Uma alternativa é `WEIGHT` com
+pesos `3.5`, `1.7` e `0.744`; estes pesos apenas definem proporções, não alteram o teto de bytes.
+
+Placement compara `(seriesCount + pendências) / peso`. Nos modos ponderados, rebalance
+calcula `meta = totalDeSeries × peso / somaDosPesos`; um doador precisa superar sua meta em
+`max(minDelta, tolerance × meta)`, e cada movimento deve reduzir o desvio total das metas.
+A ponderação é por **contagem de séries**; geometrias de tamanhos diferentes continuam
+respeitando a admissão exata em bytes. Isso não promete igualar ocupação física em discos com
+misturas diferentes de geometrias.
+
+### Catálogo de geometria e recuperação
+
+O mapa replicado e persistente `ngrrd.geometries` guarda uma descrição física por geometria:
+versão, hash, step, colunas, archives e tamanhos. O placement referencia essa descrição.
+Novos clientes enviam a geometria calculada da definição; o dono confirma a geometria
+**efetivamente persistida** depois do `OPEN`. O líder usa `SeriesGeometry.fileTotalBytes()`
+e o mesmo alinhamento do storage para projetar as entradas.
+
+Registros antigos são lidos sem conversão destrutiva. Um worker por nó preenche referências
+pendentes em lotes de até 256 séries, lendo somente o cabeçalho e os dicionários. Falhas são
+retentadas; uma série sem geometria confirmada não é migrada. O novo mapa e as referências
+sobrevivem ao reinício e à eleição de outro líder. Alterações de geometria invalidam a
+confirmação anterior até que o dono publique o resultado físico.
+
+A migração usa `ngrrd.migrate.prepare` antes dos chunks. A reserva é idempotente por
+`migrationId`; commit a consome, abort/falha/timeout a liberam. Após reiniciar o destino, chunks
+sem nova preparação são recusados e o coordenador resolve a transferência pendente pelos
+caminhos normais de recuperação. Uma recusa de capacidade preserva a origem e aparece no
+resultado da migração (`CAPACITY_EXCEEDED` ou `FILESYSTEM_CAPACITY_EXCEEDED`).
+
+O comando `status` mostra `MODE`, `WEIGHT` e `RESERVED`, além da carga e do total de
+`GEOMETRIAS PENDENTES` (ainda sem confirmação do dono). Uma drenagem sem
+movimentos admissíveis permanece `DRAINING` e emite `NGRRD_DRAIN_PENDING`; verifique espaço,
+conectividade e confirmação de geometria antes de redisparar. Uma série grande sem destino
+não impede o planejamento das menores que ainda cabem.
+
+### Atualização coordenada
+
+1. Interrompa o tráfego, desabilite rebalance automático e espere as migrações em andamento
+   terminarem. Não dispare drain/rebalance manual durante a atualização.
+2. Atualize **todos os storages e clientes Java** antes de reconectar. O mapa novo precisa ser
+   declarado por todos os participantes; esta entrega não suporta operação com versões mistas.
+3. Suba os participantes em `COUNT`, confirme consenso e carga dos catálogos. Aguarde a
+   confirmação das geometrias antes de depender de rebalance ou drain das séries antigas.
+4. Retome o tráfego. Para ativar ponderação, configure uniformemente `CAPACITY` ou `WEIGHT`
+   nos storages em uma janela coordenada e reabilite o rebalance.
+5. Acompanhe ocupação, reservas, recusas e movimentos. Para voltar à distribuição anterior,
+   retorne uniformemente a `COUNT`; a proteção de capacidade permanece ativa.
+
+Reverter o modo não significa fazer downgrade dos binários. Cotas de séries/bytes e regras de
+afinidade (item 3 da issue) não fazem parte desta entrega.

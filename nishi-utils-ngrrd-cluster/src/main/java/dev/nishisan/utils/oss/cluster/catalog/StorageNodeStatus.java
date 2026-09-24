@@ -18,6 +18,7 @@
 package dev.nishisan.utils.oss.cluster.catalog;
 
 import java.io.Serializable;
+import dev.nishisan.utils.oss.cluster.placement.DistributionMode;
 import java.time.Duration;
 import java.util.Objects;
 
@@ -30,7 +31,10 @@ import java.util.Objects;
  * @param seriesCount      quantidade de séries que o nó possui hoje
  * @param usedBytes        bytes ocupados no volume local
  * @param capacityBytes    capacidade configurada do volume; {@code <= 0} = desconhecida/sem limite
- * @param reportedAtEpochMs instante em que este status foi publicado
+ * @param reportedAtEpochMs instante da coleta da carga deste status
+ * @param distributionMode configured distribution strategy
+ * @param weight explicit positive relative weight
+ * @param reservedBytes incoming allocation bytes reserved locally
  */
 public record StorageNodeStatus(
         String nodeId,
@@ -38,12 +42,23 @@ public record StorageNodeStatus(
         long seriesCount,
         long usedBytes,
         long capacityBytes,
-        long reportedAtEpochMs) implements Serializable {
+        long reportedAtEpochMs,
+        DistributionMode distributionMode, double weight, long reservedBytes) implements Serializable {
 
     /** B1 (achado do Debugger): ver Javadoc de {@code SeriesPlacement#serialVersionUID}. */
     private static final long serialVersionUID = 1L;
 
+    public StorageNodeStatus(String nodeId, NodeState state, long seriesCount, long usedBytes,
+            long capacityBytes, long reportedAtEpochMs) {
+        this(nodeId, state, seriesCount, usedBytes, capacityBytes, reportedAtEpochMs, DistributionMode.COUNT, 1, 0);
+    }
+
     public StorageNodeStatus {
+        // Missing fields in the old persistent record are null/zero.
+        if (distributionMode == null) { distributionMode = DistributionMode.COUNT; weight = 1; }
+        if (!Double.isFinite(weight) || weight <= 0 || reservedBytes < 0) {
+            throw new IllegalArgumentException("invalid node weight or reservation");
+        }
         Objects.requireNonNull(nodeId, "nodeId é obrigatório");
         Objects.requireNonNull(state, "state é obrigatório");
     }
@@ -55,12 +70,12 @@ public record StorageNodeStatus(
 
     /** Atualiza a carga reportada, preservando {@code nodeId} e {@code state}. */
     public StorageNodeStatus withLoad(long seriesCount, long usedBytes, long capacityBytes, long now) {
-        return new StorageNodeStatus(nodeId, state, seriesCount, usedBytes, capacityBytes, now);
+        return new StorageNodeStatus(nodeId, state, seriesCount, usedBytes, capacityBytes, now, distributionMode, weight, reservedBytes);
     }
 
     /** Transiciona o nó para outro {@link NodeState}, preservando a carga reportada. */
     public StorageNodeStatus withState(NodeState newState, long now) {
-        return new StorageNodeStatus(nodeId, newState, seriesCount, usedBytes, capacityBytes, now);
+        return new StorageNodeStatus(nodeId, newState, seriesCount, usedBytes, capacityBytes, now, distributionMode, weight, reservedBytes);
     }
 
     /** Fração ocupada da capacidade; {@code 0} se a capacidade não é conhecida ({@code capacityBytes <= 0}). */
