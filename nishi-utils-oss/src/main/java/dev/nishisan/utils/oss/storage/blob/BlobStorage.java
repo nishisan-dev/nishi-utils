@@ -61,6 +61,12 @@ public final class BlobStorage implements NgrrdStorage, SeriesChannelProvider, A
     private CatalogJournal journal;
     private long generation;
     private boolean closed;
+    private long declaredCapacity;
+    private long liveBytes;
+    private java.util.function.LongSupplier usableSpace = () -> Long.MAX_VALUE;
+    private final java.util.Map<String, Reservation> reservations = new java.util.HashMap<>();
+
+    private record Reservation(String key, long objectBytes, long growthBytes, long physicalBytes) { }
 
     private BlobStorage(Path volumeDir, int shardCount, UUID volumeUuid, long segmentBytes,
                         MappedShard[] shards, ShardAllocator[] allocators,
@@ -73,6 +79,7 @@ public final class BlobStorage implements NgrrdStorage, SeriesChannelProvider, A
         this.shards = shards;
         this.allocators = allocators;
         this.catalog = catalog;
+        this.liveBytes = catalog.values().stream().mapToLong(CatalogEntry::regionBytes).sum();
         this.journal = journal;
         this.generation = generation;
         this.volumeMetrics = volumeMetrics == null ? NO_OP : volumeMetrics;
@@ -216,16 +223,158 @@ public final class BlobStorage implements NgrrdStorage, SeriesChannelProvider, A
 
     // ---------------------------------------------------------------- alocação
 
-    /** Aloca (ou reaproveita) a região da série {@code key}, ajustando o tamanho se mudou. */
-    Region allocateRegion(String key, long totalBytes) {
+    /** Enables declared-capacity and filesystem admission for this volume. */
+    public void configureCapacity(long capacityBytes) {
+        configureCapacity(capacityBytes, () -> {
+            try {
+                return Files.getFileStore(volumeDir).getUsableSpace();
+            } catch (IOException e) {
+                throw new BlobVolumeException("cannot inspect usable space for " + volumeDir, e);
+            }
+        });
+    }
+
+    /** Same admission policy with an injectable filesystem gauge. */
+    public void configureCapacity(long capacityBytes, java.util.function.LongSupplier usableSpace) {
         structuralLock.lock();
         try {
-            long regionBytes = alignToPage(totalBytes);
+            this.declaredCapacity = capacityBytes;
+            this.usableSpace = Objects.requireNonNull(usableSpace, "usableSpace");
+        } finally {
+            structuralLock.unlock();
+        }
+    }
+
+    /** Reserves a destination allocation without changing its data or catalog. Idempotent by id. */
+    public void reserve(String id, String key, long objectBytes) {
+        Objects.requireNonNull(id, "id");
+        Objects.requireNonNull(key, "key");
+        structuralLock.lock();
+        try {
+            Reservation old = reservations.get(id);
+            if (old != null) {
+                if (!old.key().equals(key) || old.objectBytes() != objectBytes) {
+                    throw new BlobCapacityException("reservation identity mismatch: " + id);
+                }
+                return;
+            }
+            checkKeyReservation(key, null);
+            long region = alignedRegionBytes(objectBytes);
+            if (region > segmentBytes) {
+                throw new BlobCapacityException("series exceeds segmentBytes");
+            }
+            CatalogEntry existing = catalog.get(key);
+            long growth = Math.max(0, region - (existing == null ? 0 : existing.regionBytes()));
+            long physical = existing != null && existing.regionBytes() == region ? 0 : region;
+            checkAdmission(growth, physical, null, true);
+            reservations.put(id, new Reservation(key, objectBytes, growth, physical));
+        } finally {
+            structuralLock.unlock();
+        }
+    }
+
+    /** Releases an unused reservation; repeated release is harmless. */
+    public void releaseReservation(String id) {
+        structuralLock.lock();
+        try {
+            reservations.remove(id);
+        } finally {
+            structuralLock.unlock();
+        }
+    }
+
+    /** Outstanding logical bytes, used by the node status reporter. */
+    public long reservedBytes() {
+        structuralLock.lock();
+        try {
+            return reservations.values().stream().mapToLong(Reservation::growthBytes).sum();
+        } finally {
+            structuralLock.unlock();
+        }
+    }
+
+    private void checkKeyReservation(String key, String reservationId) {
+        for (var entry : reservations.entrySet()) {
+            if (entry.getValue().key().equals(key) && !entry.getKey().equals(reservationId)) {
+                throw new BlobCapacityException("series has a migration reservation: " + key);
+            }
+        }
+    }
+
+    private void checkAdmission(long growth, long physical, String excluding, boolean migration) {
+        long reserved = 0;
+        long reservedPhysical = 0;
+        for (var entry : reservations.entrySet()) {
+            if (!entry.getKey().equals(excluding)) {
+                reserved = Math.addExact(reserved, entry.getValue().growthBytes());
+                reservedPhysical = Math.addExact(reservedPhysical, entry.getValue().physicalBytes());
+            }
+        }
+        if ((growth > 0 || migration) && !CapacityBudget.fits(declaredCapacity, liveBytes, reserved, growth)) {
+            throw new BlobCapacityException("CAPACITY_EXCEEDED used=" + liveBytes + " reserved=" + reserved
+                    + " additional=" + growth + " limit=" + CapacityBudget.limit(declaredCapacity));
+        }
+        if (physical > 0) {
+            long free = usableSpace.getAsLong();
+            if (reservedPhysical > free || physical > free - reservedPhysical) {
+                throw new BlobCapacityException("FILESYSTEM_CAPACITY_EXCEEDED available=" + free);
+            }
+        }
+    }
+
+    /** Size of a blob allocation, including page alignment. */
+    public static long alignedRegionBytes(long objectBytes) {
+        if (objectBytes <= 0 || objectBytes > Long.MAX_VALUE - (PAGE - 1)) {
+            throw new IllegalArgumentException("invalid object size: " + objectBytes);
+        }
+        return alignToPage(objectBytes);
+    }
+
+    /** Reads only the immutable header/dictionaries, never the time-series rings. */
+    public Optional<byte[]> seriesStaticSection(String key) {
+        structuralLock.lock();
+        try {
+            CatalogEntry entry = catalog.get(key);
+            if (entry == null) {
+                return Optional.empty();
+            }
+            var codecHeader = dev.nishisan.utils.oss.format.SeriesFileCodec.decodeFixedHeader(
+                    shards[entry.shardId()].readAt(entry.regionOffset(),
+                            dev.nishisan.utils.oss.format.SeriesFileCodec.FIXED_HEADER_BYTES));
+            if (codecHeader.staticSectionBytes() > entry.objectBytes()
+                    || codecHeader.staticSectionBytes() > Integer.MAX_VALUE) {
+                throw new BlobVolumeException("invalid static section size: " + key);
+            }
+            return Optional.of(shards[entry.shardId()].readAt(entry.regionOffset(),
+                    (int) codecHeader.staticSectionBytes()));
+        } finally {
+            structuralLock.unlock();
+        }
+    }
+
+    /** Aloca (ou reaproveita) a região da série {@code key}, ajustando o tamanho se mudou. */
+    Region allocateRegion(String key, long totalBytes) {
+        return allocateRegion(key, totalBytes, null);
+    }
+
+    private Region allocateRegion(String key, long totalBytes, String reservationId) {
+        structuralLock.lock();
+        try {
+            checkKeyReservation(key, reservationId);
+            Reservation reservation = reservationId == null ? null : reservations.get(reservationId);
+            if (reservationId != null && (reservation == null || !reservation.key().equals(key)
+                    || reservation.objectBytes() != totalBytes)) {
+                throw new BlobCapacityException("missing or mismatching migration reservation");
+            }
+            long regionBytes = alignedRegionBytes(totalBytes);
             if (regionBytes > segmentBytes) {
                 throw new BlobVolumeException("objeto (" + totalBytes + " bytes) maior que o segmento ("
                         + segmentBytes + "); aumente segmentBytes do volume");
             }
             CatalogEntry existing = catalog.get(key);
+            long growth = Math.max(0, regionBytes - (existing == null ? 0 : existing.regionBytes()));
+            long physical = existing != null && existing.regionBytes() == regionBytes ? 0 : regionBytes;
+            checkAdmission(growth, physical, reservationId, reservationId != null);
             if (existing != null && existing.regionBytes() == regionBytes) {
                 if (existing.objectBytes() != totalBytes) {
                     CatalogEntry updated = new CatalogEntry(key, existing.shardId(), existing.regionOffset(),
@@ -233,12 +382,14 @@ public final class BlobStorage implements NgrrdStorage, SeriesChannelProvider, A
                     journal.appendAlloc(++generation, updated);
                     catalog.put(key, updated);
                 }
+                reservations.remove(reservationId);
                 return new Region(shards[existing.shardId()], existing.regionOffset(), regionBytes);
             }
             if (existing != null) {
                 allocators[existing.shardId()].free(existing.regionOffset(), existing.regionBytes());
                 journal.appendFree(++generation, existing);
                 catalog.remove(key);
+                liveBytes -= existing.regionBytes();
                 volumeMetrics.onRegionFree(existing.shardId(), existing.regionBytes());
             }
             int shardId = BlobRouting.shardFor(key, shardCount);
@@ -246,6 +397,8 @@ public final class BlobStorage implements NgrrdStorage, SeriesChannelProvider, A
             CatalogEntry entry = new CatalogEntry(key, shardId, offset, regionBytes, totalBytes, State.LIVE);
             journal.appendAlloc(++generation, entry);
             catalog.put(key, entry);
+            liveBytes += regionBytes;
+            reservations.remove(reservationId);
             volumeMetrics.onRegionAllocate(shardId, regionBytes);
             return new Region(shards[shardId], offset, regionBytes);
         } finally {
@@ -307,6 +460,13 @@ public final class BlobStorage implements NgrrdStorage, SeriesChannelProvider, A
         writeObject(key, data);
     }
 
+    /** Installs bytes using a previously accepted migration reservation. */
+    public void atomicReplaceReserved(String key, byte[] data, String reservationId) {
+        Region region = allocateRegion(key, data.length, reservationId);
+        region.shard().writeAt(region.offset(), data);
+        region.shard().forceRange(region.offset(), data.length);
+    }
+
     private void writeObject(String key, byte[] data) {
         Region region = allocateRegion(key, data.length);
         region.shard().writeAt(region.offset(), data);
@@ -333,6 +493,7 @@ public final class BlobStorage implements NgrrdStorage, SeriesChannelProvider, A
         try {
             CatalogEntry e = catalog.remove(key);
             if (e != null) {
+                liveBytes -= e.regionBytes();
                 allocators[e.shardId()].free(e.regionOffset(), e.regionBytes());
                 journal.appendFree(++generation, e);
                 volumeMetrics.onRegionFree(e.shardId(), e.regionBytes());

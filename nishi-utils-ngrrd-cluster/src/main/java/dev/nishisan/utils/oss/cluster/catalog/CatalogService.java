@@ -31,9 +31,9 @@ import java.util.Optional;
 import java.util.stream.Collectors;
 
 /**
- * Fachada sobre os dois {@link DistributedMap} do catálogo do cluster ngrrd:
- * {@value #CATALOG_MAP} (placement por série) e {@value #NODES_MAP} (status dos
- * storage nodes).
+ * Fachada sobre os três {@link DistributedMap} do catálogo do cluster ngrrd:
+ * {@value #CATALOG_MAP} (placement por série), {@value #NODES_MAP} (status dos
+ * storage nodes) e {@value #GEOMETRIES_MAP} (geometrias físicas compartilhadas).
  *
  * <p>Escrita sempre passa pelo líder — comportamento herdado de
  * {@link DistributedMap#put}/{@code remove}, que já encaminha automaticamente ao
@@ -53,15 +53,28 @@ public final class CatalogService implements CatalogView {
 
     private final DistributedMap<String, SeriesPlacement> catalog;
     private final DistributedMap<String, StorageNodeStatus> nodes;
+    /** Physical geometry registry, replicated and persisted with the catalog. */
+    public static final String GEOMETRIES_MAP = "ngrrd.geometries";
+    private final DistributedMap<String, GeometryDescriptor> geometries;
+    private final java.util.concurrent.ConcurrentMap<String, SeriesPlacement> admissionEntries = new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.concurrent.ConcurrentMap<String, GeometryDescriptor> geometryCache = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Object[] placementLocks = java.util.stream.IntStream.range(0, 256)
+            .mapToObj(i -> new Object()).toArray();
 
     public CatalogService(DistributedMap<String, SeriesPlacement> catalog,
             DistributedMap<String, StorageNodeStatus> nodes) {
+        this(catalog, nodes, null);
+    }
+
+    public CatalogService(DistributedMap<String, SeriesPlacement> catalog,
+            DistributedMap<String, StorageNodeStatus> nodes, DistributedMap<String, GeometryDescriptor> geometries) {
+        this.geometries = geometries;
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.nodes = Objects.requireNonNull(nodes, "nodes");
     }
 
     /**
-     * Registra os dois mapas do catálogo no builder do nó. Necessário porque o
+     * Registra os três mapas do catálogo no builder do nó. Necessário porque o
      * NGrid exige que todo mapa usado por um nó esteja declarado em todos os
      * participantes do cluster, sob pena de {@code UnknownMapRequestHandler}.
      *
@@ -78,7 +91,8 @@ public final class CatalogService implements CatalogView {
      */
     public static void declareMaps(NGridNodeBuilder builder) {
         builder.map(CATALOG_MAP, NMapPersistenceMode.ASYNC_WITH_FSYNC)
-                .map(NODES_MAP, NMapPersistenceMode.ASYNC_WITH_FSYNC);
+                .map(NODES_MAP, NMapPersistenceMode.ASYNC_WITH_FSYNC)
+                .map(GEOMETRIES_MAP, NMapPersistenceMode.ASYNC_WITH_FSYNC);
     }
 
     /** Constrói o serviço a partir dos mapas já registrados e iniciados em {@code node}. */
@@ -87,7 +101,8 @@ public final class CatalogService implements CatalogView {
                 node.getMap(CATALOG_MAP, String.class, SeriesPlacement.class);
         DistributedMap<String, StorageNodeStatus> nodesMap =
                 node.getMap(NODES_MAP, String.class, StorageNodeStatus.class);
-        return new CatalogService(catalogMap, nodesMap);
+        return new CatalogService(catalogMap, nodesMap,
+                node.getMap(GEOMETRIES_MAP, String.class, GeometryDescriptor.class));
     }
 
     /** Leitura eventual do placement da série, a partir da cópia replicada local. */
@@ -105,11 +120,13 @@ public final class CatalogService implements CatalogView {
     @Override
     public void putPlacement(String seriesKey, SeriesPlacement placement) {
         catalog.put(seriesKey, placement);
+        admissionEntries.put(seriesKey, placement);
     }
 
     /** Remove o placement da série; roteado ao líder pelo próprio {@link DistributedMap}. */
     public void removePlacement(String seriesKey) {
         catalog.remove(seriesKey);
+        admissionEntries.remove(seriesKey);
     }
 
     /** Cópia imutável do catálogo na visão local (eventual) do nó. */
@@ -157,5 +174,70 @@ public final class CatalogService implements CatalogView {
     @Override
     public void putNodeStatus(StorageNodeStatus status) {
         nodes.put(status.nodeId(), status);
+    }
+    @Override
+    public boolean geometryTrackingEnabled() { return geometries != null; }
+
+    @Override
+    public Object placementLock(String key) {
+        return placementLocks[Math.floorMod(key.hashCode(), placementLocks.length)];
+    }
+
+    @Override
+    public void putGeometry(GeometryDescriptor geometry) {
+        if (geometries != null) {
+            var old = geometries.getOptional(geometry.id(), Consistency.STRONG);
+            if (old.isPresent() && !old.get().equals(geometry)) {
+                throw new IllegalArgumentException("geometry id collision");
+            }
+            if (old.isEmpty()) { geometries.put(geometry.id(), geometry); }
+            geometryCache.put(geometry.id(), geometry);
+        }
+    }
+
+    @Override
+    public Optional<GeometryDescriptor> geometryLocal(String id) {
+        if (geometries == null || id == null) { return Optional.empty(); }
+        GeometryDescriptor cached = geometryCache.get(id);
+        if (cached != null) { return Optional.of(cached); }
+        var found = geometries.getOptional(id, Consistency.EVENTUAL);
+        found.ifPresent(g -> geometryCache.put(id, g));
+        return found;
+    }
+
+    @Override
+    public Optional<GeometryDescriptor> geometryStrong(String id) {
+        return geometries == null || id == null ? Optional.empty() : geometries.getOptional(id, Consistency.STRONG);
+    }
+    @Override
+    public void resetAdmissionTracking() {
+        admissionEntries.clear();
+        admissionEntries.putAll(placementsLocal());
+        pendingBytesByNode();
+    }
+
+    @Override
+    public Map<String, Long> pendingBytesByNode() {
+        Map<String, Long> reported = new java.util.HashMap<>();
+        nodesLocal().forEach(n -> reported.put(n.nodeId(), n.reportedAtEpochMs()));
+        Map<String, Long> result = new java.util.HashMap<>();
+        admissionEntries.forEach((key, placement) -> {
+            String target = placement.targetNodeId() != null ? placement.targetNodeId() : placement.ownerNodeId();
+            if (placement.targetNodeId() == null && placement.geometryConfirmed()
+                    && placement.updatedAtEpochMs() < reported.getOrDefault(target, 0L)) {
+                admissionEntries.remove(key, placement);
+            } else {
+                geometryLocal(placement.geometryId()).ifPresent(g -> result.merge(target, g.regionBytes(), Math::addExact));
+            }
+        });
+        return result;
+    }
+
+    @Override
+    public Map<String, Long> pendingMigrationSeriesByNode() {
+        Map<String, Long> result = new java.util.HashMap<>();
+        admissionEntries.values().stream().filter(p -> p.state() == PlacementState.MIGRATING)
+                .forEach(p -> result.merge(p.targetNodeId(), 1L, Long::sum));
+        return result;
     }
 }

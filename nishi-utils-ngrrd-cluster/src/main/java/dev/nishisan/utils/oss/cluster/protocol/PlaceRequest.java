@@ -25,6 +25,11 @@ package dev.nishisan.utils.oss.cluster.protocol;
  * @param definitionHashHex   hash hexadecimal da definição YAML da série
  * @param preferredOwnerNodeId dono preferido, ou {@code null}; usado por adoção
  *                             ({@code LocalReconciler}) e por retomada após migração abortada
+ * @param geometry exact requested geometry, or null for legacy/adoption requests
  */
-public record PlaceRequest(String seriesKey, String definitionHashHex, String preferredOwnerNodeId) {
+public record PlaceRequest(String seriesKey, String definitionHashHex, String preferredOwnerNodeId,
+        dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor geometry) {
+    public PlaceRequest(String seriesKey, String definitionHashHex, String preferredOwnerNodeId) {
+        this(seriesKey, definitionHashHex, preferredOwnerNodeId, null);
+    }
 }

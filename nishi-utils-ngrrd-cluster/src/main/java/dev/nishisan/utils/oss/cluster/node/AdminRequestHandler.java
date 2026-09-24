@@ -144,7 +144,8 @@ public final class AdminRequestHandler extends RequestHandlerSupport {
         Map<String, Long> seriesCountByNode = catalog.seriesByOwnerLocal().entrySet().stream()
                 .collect(Collectors.toMap(Map.Entry::getKey, entry -> (long) entry.getValue().size()));
         return new AdminStatusResponse(SeriesStatus.OK, self.value(), views,
-                migrationCoordinator.activeMigrationCount(), seriesCountByNode);
+                migrationCoordinator.activeMigrationCount(), seriesCountByNode,
+                catalog.placementsLocal().values().stream().filter(p -> !p.geometryConfirmed()).count());
     }
 
     private NodeMetricsSnapshot handleMetrics(AdminNodeRequest request) {

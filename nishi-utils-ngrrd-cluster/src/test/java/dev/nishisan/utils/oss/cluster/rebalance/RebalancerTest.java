@@ -17,6 +17,11 @@
 
 package dev.nishisan.utils.oss.cluster.rebalance;
 
+import java.nio.file.Path;
+import java.nio.file.Files;
+import dev.nishisan.utils.oss.config.NgrrdYamlLoader;
+import dev.nishisan.utils.oss.format.SeriesGeometry;
+import dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.structures.NGrid;
 import dev.nishisan.utils.ngrid.structures.NGridCluster;
@@ -69,6 +74,7 @@ class RebalancerTest {
 
     private NGridCluster cluster;
     private CatalogService catalog;
+    private String geometryId;
     private LeaderViewFake leaderView;
 
     @BeforeEach
@@ -76,9 +82,16 @@ class RebalancerTest {
         cluster = NGrid.local(1)
                 .map(CatalogService.CATALOG_MAP)
                 .map(CatalogService.NODES_MAP)
+                .map(CatalogService.GEOMETRIES_MAP)
                 .start();
         NGridNode node = cluster.node(0);
         catalog = CatalogService.from(node);
+        var geometry = GeometryDescriptor.from(
+                new SeriesGeometry(NgrrdYamlLoader.parse(
+                        Files.readString(Path.of("src/test/resources/iface-traffic-blob.yaml")),
+                        ignored -> null)));
+        catalog.putGeometry(geometry);
+        geometryId = geometry.id();
         leaderView = new LeaderViewFake();
         leaderView.leader = true;
         leaderView.reachable.add("storage-a");
@@ -103,8 +116,10 @@ class RebalancerTest {
     void triggerNowNaoPlanejaNovoCicloEnquantoOAnteriorAindaNaoResolveu() throws Exception {
         catalog.putNodeStatus(new StorageNodeStatus("storage-a", NodeState.ACTIVE, 2, 0, 0, 1_000L));
         catalog.putNodeStatus(new StorageNodeStatus("storage-b", NodeState.ACTIVE, 0, 0, 0, 1_000L));
-        catalog.putPlacement("series-0", SeriesPlacement.active("storage-a", 1_000L));
-        catalog.putPlacement("series-1", SeriesPlacement.active("storage-a", 1_000L));
+        catalog.putPlacement("series-0", SeriesPlacement.active("storage-a", 1_000L)
+                .withGeometry(geometryId, true, 1_000L));
+        catalog.putPlacement("series-1", SeriesPlacement.active("storage-a", 1_000L)
+                .withGeometry(geometryId, true, 1_000L));
 
         CountDownLatch releaseStart = new CountDownLatch(1);
         AtomicInteger startCalls = new AtomicInteger();
@@ -147,8 +162,10 @@ class RebalancerTest {
     void triggerNowLiberaRunningMesmoSeMigrateLancarAoSubmeter() {
         catalog.putNodeStatus(new StorageNodeStatus("storage-a", NodeState.ACTIVE, 2, 0, 0, 1_000L));
         catalog.putNodeStatus(new StorageNodeStatus("storage-b", NodeState.ACTIVE, 0, 0, 0, 1_000L));
-        catalog.putPlacement("series-0", SeriesPlacement.active("storage-a", 1_000L));
-        catalog.putPlacement("series-1", SeriesPlacement.active("storage-a", 1_000L));
+        catalog.putPlacement("series-0", SeriesPlacement.active("storage-a", 1_000L)
+                .withGeometry(geometryId, true, 1_000L));
+        catalog.putPlacement("series-1", SeriesPlacement.active("storage-a", 1_000L)
+                .withGeometry(geometryId, true, 1_000L));
 
         MigrationCoordinator coordinator = new MigrationCoordinator(catalog,
                 new BlockingMigrationRpc(new CountDownLatch(0), new AtomicInteger()), leaderView, 2,

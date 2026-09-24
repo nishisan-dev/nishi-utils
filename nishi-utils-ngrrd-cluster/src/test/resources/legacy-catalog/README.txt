@@ -1,0 +1,1 @@
+Java serialization fixtures generated from the unmodified catalog records in commit f413f67 (v8.3.1). Node legacy: ACTIVE, 42 series, 4096 used bytes, 100000 capacity, timestamp 1234. Placement legacy: ACTIVE, timestamps 1234. Tests must read these existing bytes, not regenerate them with the new record definitions.

@@ -331,7 +331,7 @@ virar líder (só reconcilia o **próprio** volume). Reconhece objetos de série
 Ordem total e determinística — o resultado nunca depende da ordem de iteração do catálogo local:
 
 1. **Candidatos:** `state == ACTIVE`, membro alcançável do `ClusterCoordinator`, e (quando a
-   capacidade é conhecida) `fillRatio < 0.95` — acima disso o nó para de receber séries novas.
+   capacidade é conhecida) `fillRatio < 0.95`, incluindo a projeção dos bytes da nova geometria e das entradas pendentes.
    **Exceção de frescor:** se o filtro de "status não velho" (`isFresh`, dentro de
    `nodeStatusStaleAfter`) eliminar **todos** os candidatos ACTIVE+alcançáveis de uma vez — sintoma
    típico de handoff de liderança recente, não de queda real — o filtro é ignorado para aquele
@@ -339,7 +339,7 @@ Ordem total e determinística — o resultado nunca depende da ordem de iteraç�
    novo líder.
 2. Se `preferredOwnerNodeId` (adoção do `LocalReconciler`, ou reafirmação de um dono já existente)
    sobreviver aos filtros acima, ele vence direto, sem passar pelo desempate.
-3. Caso contrário, desempate em ordem: **(a)** menor carga efetiva = `seriesCount` reportado +
+3. Caso contrário, desempate em ordem: **(a)** menor carga efetiva dividida pelo peso (`COUNT` usa peso 1). A carga efetiva soma `seriesCount` reportado +
    placements feitos pelo líder desde o último reporte daquele nó (`pendingSeriesByNode` — sem
    isso, uma rajada de séries novas cairia inteira no mesmo nó até o próximo status); **(b)** menor
    `fillRatio` (capacidade desconhecida conta como `0.0`); **(c)** menor `nodeId` — sempre decide,
@@ -363,10 +363,15 @@ determinístico e ordena por chave antes de decidir, para nunca depender de orde
 1. Nós `DRAINING`: todas as séries entram na fila de saída para o nó `ACTIVE` alcançável de menor
    carga corrente (recalculada a cada movimento). Sem destino disponível, nenhum movimento de
    drenagem é planejado neste ciclo.
-2. Nós `ACTIVE`: enquanto `max − min > max(rebalanceMinDelta, rebalanceTolerance × média)`, move a
+2. Nós `ACTIVE`, em `COUNT`: enquanto `max − min > max(rebalanceMinDelta, rebalanceTolerance × média)`, move a
    série de menor chave do nó mais carregado para o menos carregado.
 3. Respeita `maxConcurrentMigrations` (default 2, no cluster inteiro) e `maxMovesPerCycle`
    (default 50, por ciclo).
+
+Em `CAPACITY` e `WEIGHT`, placement e rebalance compartilham pesos e metas proporcionais.
+Drenagem e rebalance só movem séries com geometria confirmada para destinos que comportem os
+bytes reais, incluindo reservas; saídas ainda pendentes não liberam orçamento.
+Veja [configuração e atualização coordenada](ngrrd-cluster-operacao.md#capacidade-e-distribuição-ponderada-issue-167-itens-1-e-2).
 
 `MigrationCoordinator` executa cada movimento como máquina de estados idempotente por
 `migrationId` (UUID):
@@ -374,6 +379,7 @@ determinístico e ordena por chave antes de decidir, para nunca depender de orde
 ```
 ACTIVE(src) --[migrate()]--> catálogo := MIGRATING(owner=src, target=dst)
     --> src: migrate.start           (src faz quiesce: checkpoint + close + marca MIGRATING local)
+    --> src -> dst: migrate.prepare  (dst verifica capacidade e reserva os bytes reais)
     --> src -> dst: migrate.chunk*   (256 KiB por chunk default; src lê BlobStorage.get, envia N chunks)
     --> src -> dst: migrate.commit   (dst valida SHA-256, ativa a cópia)
     --> catálogo := ACTIVE(owner=dst)

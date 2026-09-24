@@ -17,6 +17,11 @@
 
 package dev.nishisan.utils.oss.cluster.node;
 
+import java.nio.file.Path;
+import java.nio.file.Files;
+import dev.nishisan.utils.oss.config.NgrrdYamlLoader;
+import dev.nishisan.utils.oss.format.SeriesGeometry;
+import dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.structures.NGrid;
 import dev.nishisan.utils.ngrid.structures.NGridCluster;
@@ -83,6 +88,7 @@ class AdminRequestHandlerTest {
     private NGridCluster cluster;
     private NGridNode node;
     private CatalogService catalog;
+    private String geometryId;
     private LeaderViewFake leaderView;
     private RecordingRpc rpc;
     private NodeMetricsSnapshot localSnapshot;
@@ -96,9 +102,16 @@ class AdminRequestHandlerTest {
         cluster = NGrid.local(1)
                 .map(CatalogService.CATALOG_MAP)
                 .map(CatalogService.NODES_MAP)
+                .map(CatalogService.GEOMETRIES_MAP)
                 .start();
         node = cluster.node(0);
         catalog = CatalogService.from(node);
+        var geometry = GeometryDescriptor.from(
+                new SeriesGeometry(NgrrdYamlLoader.parse(
+                        Files.readString(Path.of("src/test/resources/iface-traffic-blob.yaml")),
+                        ignored -> null)));
+        catalog.putGeometry(geometry);
+        geometryId = geometry.id();
         leaderView = new LeaderViewFake();
         rpc = new RecordingRpc();
         localSnapshot = fixedSnapshot(SELF.value());
@@ -156,6 +169,7 @@ class AdminRequestHandlerTest {
         assertTrue(byNode.get("storage-a").reachable());
         assertFalse(byNode.get("storage-b").reachable());
         assertEquals(Map.of("storage-a", 2L, "storage-b", 1L), response.seriesCountByNode());
+        assertEquals(3, response.geometriesPending());
         assertEquals(0, response.migrationsInFlight(), "MÉDIO-5: em repouso, nenhuma migração ativa no coordenador");
     }
 
@@ -167,8 +181,10 @@ class AdminRequestHandlerTest {
         leaderView.leader = true;
         catalog.putNodeStatus(new StorageNodeStatus("storage-a", NodeState.ACTIVE, 2, 0, 0, 1_000L));
         catalog.putNodeStatus(new StorageNodeStatus("storage-b", NodeState.ACTIVE, 0, 0, 0, 1_000L));
-        catalog.putPlacement("series-x", SeriesPlacement.active("storage-a", 1_000L));
-        catalog.putPlacement("series-y", SeriesPlacement.active("storage-a", 1_000L));
+        catalog.putPlacement("series-x", SeriesPlacement.active("storage-a", 1_000L)
+                .withGeometry(geometryId, true, 1_000L));
+        catalog.putPlacement("series-y", SeriesPlacement.active("storage-a", 1_000L)
+                .withGeometry(geometryId, true, 1_000L));
 
         CountDownLatch releaseStart = new CountDownLatch(1);
         BlockingMigrationRpc migrationRpc = new BlockingMigrationRpc(releaseStart);

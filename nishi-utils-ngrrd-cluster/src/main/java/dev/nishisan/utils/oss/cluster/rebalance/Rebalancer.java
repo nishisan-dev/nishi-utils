@@ -313,7 +313,31 @@ public final class Rebalancer implements LeadershipListener, ClusterCoordinator.
                 .filter(entry -> entry.getValue().state() == PlacementState.MIGRATING)
                 .map(Map.Entry::getKey)
                 .collect(Collectors.toUnmodifiableSet());
-        return RebalancePlanner.plan(nodes, seriesByOwner, reachable, migratingKeys, settings);
+        if (!catalog.geometryTrackingEnabled()) {
+            return RebalancePlanner.plan(nodes, seriesByOwner, reachable, migratingKeys, settings);
+        }
+        Map<String, Long> sizes = new java.util.HashMap<>();
+        Map<String, Long> pendingBytes = new java.util.HashMap<>();
+        Map<String, Long> pendingSeries = new java.util.HashMap<>();
+        Map<String, Long> reported = new java.util.HashMap<>();
+        nodes.forEach(n -> reported.put(n.nodeId(), n.reportedAtEpochMs()));
+        catalog.placementsLocal().forEach((key, placement) -> {
+            var geometry = catalog.geometryLocal(placement.geometryId());
+            if (placement.geometryConfirmed()) { geometry.ifPresent(g -> sizes.put(key, g.regionBytes())); }
+            String target = placement.targetNodeId() != null ? placement.targetNodeId() : placement.ownerNodeId();
+            if (placement.targetNodeId() != null) { pendingSeries.merge(target, 1L, Long::sum); }
+            if (placement.targetNodeId() != null || !placement.geometryConfirmed()
+                    || placement.updatedAtEpochMs() >= reported.getOrDefault(target, 0L)) {
+                geometry.ifPresent(g -> pendingBytes.merge(target, g.regionBytes(), Math::addExact));
+            }
+        });
+        var plan = RebalancePlanner.plan(nodes, seriesByOwner, reachable, migratingKeys, settings,
+                sizes, pendingBytes, pendingSeries);
+        if (plan.isEmpty() && nodes.stream().anyMatch(n -> n.state() == NodeState.DRAINING
+                && !seriesByOwner.getOrDefault(n.nodeId(), List.of()).isEmpty())) {
+            LOGGER.info("NGRRD_DRAIN_PENDING reason=no_admissible_destination_or_confirmed_geometry");
+        }
+        return plan;
     }
 
     @Override

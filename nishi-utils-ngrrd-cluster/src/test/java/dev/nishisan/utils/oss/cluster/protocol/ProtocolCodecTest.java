@@ -242,6 +242,20 @@ class ProtocolCodecTest {
     }
 
     @Test
+    void geometryAndReservationProtocolSurviveTheWire() throws IOException {
+        String yaml = java.nio.file.Files.readString(java.nio.file.Path.of("src/test/resources/iface-traffic-blob.yaml"));
+        var geometry = dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor.from(
+                new dev.nishisan.utils.oss.format.SeriesGeometry(
+                        dev.nishisan.utils.oss.config.NgrrdYamlLoader.parse(yaml, ignored -> null)));
+        var place = new PlaceRequest("series", "definition", null, geometry);
+        assertEquals(place, roundTripRequestBody(Commands.PLACE, place));
+        var update = new GeometryUpdateRequest("series", "owner", geometry);
+        assertEquals(update, roundTripRequestBody(Commands.GEOMETRY_UPDATE, update));
+        var prepare = new MigratePrepareRequest("series", "move", "series/series.ngrr", geometry.objectBytes());
+        assertEquals(prepare, roundTripRequestBody(Commands.MIGRATE_PREPARE, prepare));
+    }
+
+    @Test
     void migrateStartRequestSobreviveAoRoundTrip() throws IOException {
         MigrateStartRequest original = new MigrateStartRequest("series-1", "migration-1", "node-b");
         assertEquals(original, roundTripRequestBody(Commands.MIGRATE_START, original));

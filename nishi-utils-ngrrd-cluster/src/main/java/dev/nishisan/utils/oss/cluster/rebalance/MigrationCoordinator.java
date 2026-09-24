@@ -250,6 +250,9 @@ public final class MigrationCoordinator implements LeadershipListener {
                         "placement de " + seriesKey + " não está ACTIVE em " + src, 0L, 0L);
             }
             SeriesPlacement activePlacement = current.get();
+            if (catalog.geometryTrackingEnabled() && !activePlacement.geometryConfirmed()) {
+                return new MigrationResult(MigrationOutcome.SKIPPED, "geometry is not confirmed", 0L, 0L);
+            }
             String migrationId = UUID.randomUUID().toString();
             // Reivindica o id ANTES de qualquer escrita — se por acaso já estiver reivindicado (não
             // deveria, é recém-gerado por UUID, mas o Javadoc de activeMigrationIds explica por que a
@@ -263,7 +266,8 @@ public final class MigrationCoordinator implements LeadershipListener {
                 // (LeaderSyncingException) e, sem retentar, a migração era descartada como SKIPPED por uma
                 // condição puramente transitória. Nada foi gravado se todas falharem, então SKIPPED
                 // continua sendo o resultado seguro.
-                if (!putPlacementWithRetries(seriesKey, migratingPlacement, "MIGRATING de " + seriesKey)) {
+                if (!putPlacementWithRetries(seriesKey, migratingPlacement, "MIGRATING de " + seriesKey,
+                        () -> catalog.placementStrong(seriesKey).filter(activePlacement::equals).isPresent())) {
                     return new MigrationResult(MigrationOutcome.SKIPPED,
                             "falha ao gravar placement MIGRATING de " + seriesKey, 0L, clock.millis() - startedAt);
                 }
@@ -472,13 +476,15 @@ public final class MigrationCoordinator implements LeadershipListener {
                         + "; o próximo líder resolve via resumeInFlight");
                 return false;
             }
-            if (!precondition.getAsBoolean()) {
-                LOGGER.log(Level.INFO, "Pré-condição não satisfeita mais — desistindo de gravar " + what);
-                return false;
-            }
             try {
-                catalog.putPlacement(seriesKey, placement);
-                return true;
+                synchronized (catalog.placementLock(seriesKey)) {
+                    if (!driving() || !precondition.getAsBoolean()) {
+                        LOGGER.log(Level.INFO, "Pré-condição não satisfeita mais — desistindo de gravar " + what);
+                        return false;
+                    }
+                    catalog.putPlacement(seriesKey, placement);
+                    return true;
+                }
             } catch (RuntimeException e) {
                 lastFailure = e;
                 if (attempt < PLACEMENT_WRITE_ATTEMPTS) {

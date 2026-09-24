@@ -35,6 +35,8 @@ import java.util.Objects;
  * @param migrationId      identificador da migração em curso; {@code null} fora de migração
  * @param createdAtEpochMs instante em que a série foi colocada pela primeira vez
  * @param updatedAtEpochMs instante da última transição desta entrada
+ * @param geometryId reference to the immutable physical descriptor, or null for legacy records
+ * @param geometryConfirmed whether the current owner confirmed the persisted geometry
  */
 public record SeriesPlacement(
         String ownerNodeId,
@@ -42,7 +44,8 @@ public record SeriesPlacement(
         PlacementState state,
         String migrationId,
         long createdAtEpochMs,
-        long updatedAtEpochMs) implements Serializable {
+        long updatedAtEpochMs,
+        String geometryId, boolean geometryConfirmed) implements Serializable {
 
     /**
      * B1 (achado do Debugger): o {@code NMapPersistence} do core grava o WAL via
@@ -52,7 +55,20 @@ public record SeriesPlacement(
      */
     private static final long serialVersionUID = 1L;
 
+    public SeriesPlacement(String ownerNodeId, String targetNodeId, PlacementState state, String migrationId,
+            long createdAtEpochMs, long updatedAtEpochMs) {
+        this(ownerNodeId, targetNodeId, state, migrationId, createdAtEpochMs, updatedAtEpochMs, null, false);
+    }
+
+    /** Changes only geometry metadata; ownership and migration identity are preserved. */
+    public SeriesPlacement withGeometry(String id, boolean confirmed, long now) {
+        return new SeriesPlacement(ownerNodeId, targetNodeId, state, migrationId, createdAtEpochMs, now, id, confirmed);
+    }
+
     public SeriesPlacement {
+        if (geometryConfirmed && geometryId == null) {
+            throw new IllegalArgumentException("confirmed geometry requires an id");
+        }
         Objects.requireNonNull(ownerNodeId, "ownerNodeId é obrigatório");
         Objects.requireNonNull(state, "state é obrigatório");
         // Switch expression (não statement) de propósito: é exaustiva sobre PlacementState sem
@@ -87,7 +103,7 @@ public record SeriesPlacement(
                     "migrating() exige um placement ACTIVE; estado atual: " + current.state());
         }
         return new SeriesPlacement(current.ownerNodeId(), target, PlacementState.MIGRATING, migrationId,
-                current.createdAtEpochMs(), now);
+                current.createdAtEpochMs(), now, current.geometryId(), current.geometryConfirmed());
     }
 
     /**
@@ -101,7 +117,7 @@ public record SeriesPlacement(
                     "completed() exige um placement MIGRATING; estado atual: " + migrating.state());
         }
         return new SeriesPlacement(migrating.targetNodeId(), null, PlacementState.ACTIVE, null,
-                migrating.createdAtEpochMs(), now);
+                migrating.createdAtEpochMs(), now, migrating.geometryId(), migrating.geometryConfirmed());
     }
 
     /**
@@ -115,7 +131,7 @@ public record SeriesPlacement(
                     "aborted() exige um placement MIGRATING; estado atual: " + migrating.state());
         }
         return new SeriesPlacement(migrating.ownerNodeId(), null, PlacementState.ACTIVE, null,
-                migrating.createdAtEpochMs(), now);
+                migrating.createdAtEpochMs(), now, migrating.geometryId(), migrating.geometryConfirmed());
     }
 
     /** Indica se {@code nodeId} é o dono atual desta série. */

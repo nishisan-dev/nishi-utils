@@ -74,13 +74,14 @@ public final class NgrrdStorageNode implements Closeable {
     private final MigrationCoordinator migrationCoordinator;
     private final Rebalancer rebalancer;
     private final LocalReconciler localReconciler;
+    private final GeometryService geometryService;
 
     private NgrrdStorageNode(StorageNodeConfig config, BlobVolumeRegistry volumeRegistry, BlobVolume volume,
             NGridNode node, CatalogService catalog, TransportClusterRpc rpc, SeriesHandleRegistry registry,
             StorageRequestHandler storageHandler, PlacementRequestHandler placementHandler,
             NodeStatusReporter statusReporter, AdminRequestHandler adminHandler,
             MigrationExecutor migrationExecutor, MigrationCoordinator migrationCoordinator, Rebalancer rebalancer,
-            LocalReconciler localReconciler) {
+            LocalReconciler localReconciler, GeometryService geometryService) {
         this.config = config;
         this.volumeRegistry = volumeRegistry;
         this.volume = volume;
@@ -96,6 +97,7 @@ public final class NgrrdStorageNode implements Closeable {
         this.migrationCoordinator = migrationCoordinator;
         this.rebalancer = rebalancer;
         this.localReconciler = localReconciler;
+        this.geometryService = geometryService;
     }
 
     /**
@@ -130,6 +132,7 @@ public final class NgrrdStorageNode implements Closeable {
                 .build();
         try {
             BlobVolume volume = volumeRegistry.require(cfg.volumeName());
+            volume.storage().configureCapacity(cfg.capacityBytes());
 
             NGridNodeBuilder builder = NGrid.node(cfg.host(), cfg.port())
                     .id(cfg.nodeId())
@@ -185,6 +188,9 @@ public final class NgrrdStorageNode implements Closeable {
                         leaderView, new LeastLoadedPlacementPolicy(), cfg.nodeStatusStaleAfter(),
                         cfg.placementGraceAfterLeadership(), Clock.systemUTC());
 
+                GeometryService geometryService = new GeometryService(node.transport(), catalog, volume, rpc,
+                        leaderView, registry, cfg.seriesObjectPrefix(), Clock.systemUTC());
+                storageHandler.geometryService(geometryService);
                 MigrationExecutor migrationExecutor = new MigrationExecutor(node.transport(), registry, volume, rpc,
                         catalog, self, cfg.seriesObjectPrefix(), cfg.migrationChunkBytes(), cfg.maxSeriesBytes(),
                         Clock.systemUTC());
@@ -207,6 +213,9 @@ public final class NgrrdStorageNode implements Closeable {
                 AdminRequestHandler adminHandler = new AdminRequestHandler(node.transport(), self, leaderView,
                         catalog, statusReporter::metricsSnapshot, rpc, rebalancer, adminService, migrationCoordinator);
 
+                statusReporter.distribution(cfg.distributionMode(), cfg.weight());
+                node.transport().addListener(geometryService);
+                rpc.registerLocalHandler(geometryService);
                 node.transport().addListener(storageHandler);
                 node.transport().addListener(placementHandler);
                 node.transport().addListener(adminHandler);
@@ -224,6 +233,7 @@ public final class NgrrdStorageNode implements Closeable {
                 node.coordinator().addLeadershipListener(statusReporter);
                 statusReporter.start();
                 localReconciler.start();
+                geometryService.start();
 
                 // Seed: addLeadershipListener não dispara um callback sintético para quem já registra o
                 // listener com o nó JÁ líder — ex.: o primeiro líder eleito de um cluster recém-formado,
@@ -236,7 +246,7 @@ public final class NgrrdStorageNode implements Closeable {
 
                 return new NgrrdStorageNode(cfg, volumeRegistry, volume, node, catalog, rpc, registry,
                         storageHandler, placementHandler, statusReporter, adminHandler, migrationExecutor,
-                        migrationCoordinator, rebalancer, localReconciler);
+                        migrationCoordinator, rebalancer, localReconciler, geometryService);
             } catch (RuntimeException e) {
                 try {
                     node.close();
@@ -324,12 +334,15 @@ public final class NgrrdStorageNode implements Closeable {
      */
     @Override
     public void close() {
+        safely("geometry service", geometryService::close);
         safely("status reporter", statusReporter::close);
         safely("local reconciler", localReconciler::close);
         safely("rebalancer", rebalancer::close);
         safely("migration coordinator", migrationCoordinator::close);
         safely("migration executor", migrationExecutor::close);
         safely("handlers", () -> {
+            node.transport().removeListener(geometryService);
+            rpc.unregisterLocalHandler(geometryService);
             node.transport().removeListener(storageHandler);
             node.transport().removeListener(placementHandler);
             node.transport().removeListener(adminHandler);

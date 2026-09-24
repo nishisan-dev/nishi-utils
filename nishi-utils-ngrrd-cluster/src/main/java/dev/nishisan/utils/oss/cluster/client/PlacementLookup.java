@@ -34,6 +34,10 @@ public interface PlacementLookup {
      */
     SeriesPlacement resolve(String seriesKey, String definitionHashHex);
 
+    /** Placement with exact requested physical geometry. */
+    default SeriesPlacement resolve(String key, String hash,
+            dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor geometry) { return resolve(key, hash); }
+
     /** Descarta o override local conhecido para {@code seriesKey}, se houver. */
     void invalidate(String seriesKey);
 

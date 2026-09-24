@@ -334,7 +334,9 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
                 config.retryBackoffMax());
         RemoteSeriesHandle handle = new RemoteSeriesHandle(seriesKey, yaml, definitionHashHex, tags, options,
                 resolver, rpc, dispatcher, opRetry, config.requestTimeout(), config.closeTimeout(),
-                Clock.systemUTC(), handles::remove);
+                Clock.systemUTC(), handles::remove, dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor.from(
+                        new dev.nishisan.utils.oss.format.SeriesGeometry(
+                                dev.nishisan.utils.oss.config.NgrrdYamlLoader.parse(yaml, System::getenv))));
         handle.open();
         return handle;
     }

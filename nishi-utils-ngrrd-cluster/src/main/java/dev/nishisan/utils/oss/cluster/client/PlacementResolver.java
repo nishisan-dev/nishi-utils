@@ -68,6 +68,12 @@ public final class PlacementResolver implements PlacementLookup {
 
     @Override
     public SeriesPlacement resolve(String seriesKey, String definitionHashHex) {
+        return resolve(seriesKey, definitionHashHex, null);
+    }
+
+    @Override
+    public SeriesPlacement resolve(String seriesKey, String definitionHashHex,
+            dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor geometry) {
         Objects.requireNonNull(seriesKey, "seriesKey");
         // Override e catálogo local coexistem — nenhum tem precedência absoluta: um WRONG_OWNER
         // recente pode ter atualizado o override depois da última replicação do catálogo local (ou
@@ -79,7 +85,7 @@ public final class PlacementResolver implements PlacementLookup {
         if (freshest != null && freshest.state() == PlacementState.ACTIVE) {
             return freshest;
         }
-        return placeAtLeader(seriesKey, definitionHashHex);
+        return placeAtLeader(seriesKey, definitionHashHex, geometry);
     }
 
     private static SeriesPlacement freshest(SeriesPlacement a, SeriesPlacement b) {
@@ -104,7 +110,8 @@ public final class PlacementResolver implements PlacementLookup {
         overrides.put(seriesKey, SeriesPlacement.active(ownerNodeId, clock.millis()));
     }
 
-    private SeriesPlacement placeAtLeader(String seriesKey, String definitionHashHex) {
+    private SeriesPlacement placeAtLeader(String seriesKey, String definitionHashHex,
+            dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor geometry) {
         int attempt = 0;
         long startedAt = clock.millis();
         // B2 (achado do Refuter): quando o nó consultado responde NOT_LEADER indicando quem é o líder
@@ -119,7 +126,7 @@ public final class PlacementResolver implements PlacementLookup {
             PlaceResponse response;
             try {
                 response = rpc.call(leader, Commands.PLACE,
-                        new PlaceRequest(seriesKey, definitionHashHex, null), PlaceResponse.class);
+                        new PlaceRequest(seriesKey, definitionHashHex, null, geometry), PlaceResponse.class);
             } catch (NgrrdClusterException e) {
                 // B3 (achado do Refuter): falha de TRANSPORTE (não de aplicação) ao chamar o líder —
                 // retenta com backoff até o prazo de retry.timeout(), esperando a conexão voltar em vez

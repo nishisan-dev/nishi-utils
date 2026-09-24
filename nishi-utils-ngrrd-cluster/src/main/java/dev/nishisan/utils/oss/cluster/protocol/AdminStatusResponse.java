@@ -34,13 +34,19 @@ import java.util.Objects;
  * @param nodes               status de cada storage node conhecido, com alcançabilidade; nunca {@code null}
  * @param migrationsInFlight  quantidade de migrações em curso
  * @param seriesCountByNode   quantidade de séries por nó, segundo o catálogo; nunca {@code null}
+ * @param geometriesPending placements whose physical geometry still needs owner confirmation
  */
 public record AdminStatusResponse(
         SeriesStatus status,
         String leaderNodeId,
         List<NodeStatusView> nodes,
         int migrationsInFlight,
-        Map<String, Long> seriesCountByNode) {
+        Map<String, Long> seriesCountByNode, long geometriesPending) {
+
+    public AdminStatusResponse(SeriesStatus status, String leaderNodeId, List<NodeStatusView> nodes,
+            int migrationsInFlight, Map<String, Long> seriesCountByNode) {
+        this(status, leaderNodeId, nodes, migrationsInFlight, seriesCountByNode, 0);
+    }
 
     public AdminStatusResponse {
         Objects.requireNonNull(status, "status é obrigatório");

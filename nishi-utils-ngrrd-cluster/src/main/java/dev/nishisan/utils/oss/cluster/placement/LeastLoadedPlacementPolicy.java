@@ -52,7 +52,7 @@ import java.util.logging.Logger;
  * (nenhum ramo condicional entra no comparador em si) e o desempate segue,
  * em ordem:</p>
  * <ol>
- *   <li>menor carga efetiva ({@code seriesCount + pendente});</li>
+ *   <li>menor carga efetiva ({@code seriesCount + pendente}) dividida pelo peso resolvido;</li>
  *   <li>menor {@link StorageNodeStatus#fillRatio()}, valendo {@code 0.0}
  *       quando a capacidade não é conhecida ({@code capacityBytes <= 0});</li>
  *   <li>menor {@code nodeId} (ordem natural de {@link String} — sempre
@@ -76,14 +76,17 @@ public final class LeastLoadedPlacementPolicy implements PlacementPolicy {
      * Acima deste {@code fillRatio} (quando a capacidade é conhecida), o nó
      * deixa de ser candidato a receber novas séries.
      */
-    private static final double CAPACITY_GUARD_FILL_RATIO = 0.95;
+    private static final double CAPACITY_GUARD_FILL_RATIO = dev.nishisan.utils.oss.storage.blob.CapacityBudget.FILL_RATIO;
 
     @Override
     public Optional<String> choose(PlacementContext ctx) {
+        DistributionWeights weights = DistributionWeights.resolve(ctx.nodes(), ctx.reachableNodeIds());
         List<StorageNodeStatus> activeReachable = ctx.nodes().stream()
                 .filter(node -> node.state() == NodeState.ACTIVE)
                 .filter(node -> ctx.reachableNodeIds().contains(node.nodeId()))
-                .filter(node -> !(node.capacityBytes() > 0 && node.fillRatio() >= CAPACITY_GUARD_FILL_RATIO))
+                .filter(node -> dev.nishisan.utils.oss.storage.blob.CapacityBudget.fits(node.capacityBytes(),
+                        node.usedBytes(), Math.max(node.reservedBytes(), ctx.pendingBytesByNode().getOrDefault(node.nodeId(), 0L)),
+                        ctx.requestedBytes()))
                 .toList();
 
         List<StorageNodeStatus> fresh = activeReachable.stream()
@@ -115,12 +118,12 @@ public final class LeastLoadedPlacementPolicy implements PlacementPolicy {
             return Optional.of(preferred);
         }
 
-        Comparator<Candidate> byTotalOrder = Comparator.comparingLong(Candidate::effectiveLoad)
+        Comparator<Candidate> byTotalOrder = Comparator.comparingDouble(Candidate::effectiveLoad)
                 .thenComparingDouble(Candidate::sortableFillRatio)
                 .thenComparing(Candidate::nodeId);
 
         return candidates.stream()
-                .map(node -> new Candidate(node.nodeId(), effectiveLoad(node, ctx), sortableFillRatio(node)))
+                .map(node -> new Candidate(node.nodeId(), effectiveLoad(node, ctx) / weights.weight(node.nodeId()), sortableFillRatio(node)))
                 .min(byTotalOrder)
                 .map(Candidate::nodeId);
     }
@@ -142,6 +145,6 @@ public final class LeastLoadedPlacementPolicy implements PlacementPolicy {
      * sem nenhum {@code if} par-a-par — a única decisão condicional
      * ({@link #sortableFillRatio}) acontece uma vez, ao montar a chave.
      */
-    private record Candidate(String nodeId, long effectiveLoad, double sortableFillRatio) {
+    private record Candidate(String nodeId, double effectiveLoad, double sortableFillRatio) {
     }
 }

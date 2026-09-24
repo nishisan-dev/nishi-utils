@@ -146,6 +146,9 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
             .concat(Commands.OWNER_COMMANDS.stream(), Stream.of(Commands.SERIES_EXISTS))
             .collect(Collectors.toUnmodifiableSet());
 
+    private GeometryService geometryService;
+    /** Enables replicated geometry tracking in a fully wired storage node. */
+    public void geometryService(GeometryService service) { this.geometryService = service; }
     private final PlacementLookup placementLookup;
     private final SeriesHandleRegistry registry;
     private final BlobVolume volume;
@@ -223,6 +226,12 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
     }
 
     private SeriesStatusResponse handleOpen(OpenRequest request) {
+        synchronized (registry.operationLock(request.seriesKey())) {
+            return openWithMetadata(request);
+        }
+    }
+
+    private SeriesStatusResponse openWithMetadata(OpenRequest request) {
         Ownership ownership = ownership(request.seriesKey(), request.placementHint());
         if (ownership.status() != SeriesStatus.OK) {
             recordError(ownership.status());
@@ -241,8 +250,13 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
             Durability durability = request.durability() != null ? request.durability() : defaultDurability;
             OnGeometryChange onGeometryChange = request.onGeometryChange() != null
                     ? request.onGeometryChange() : defaultOnGeometryChange;
+            if (geometryService != null) { geometryService.beforeOpen(request.seriesKey()); }
             registry.open(request.seriesKey(), request.yaml(), Ngrrd.OpenOptions.of(durability, onGeometryChange));
+            if (geometryService != null) { geometryService.afterOpen(request.seriesKey()); }
             return new SeriesStatusResponse(SeriesStatus.OK, self.value(), null);
+        } catch (GeometryService.PublicationException e) {
+            recordError(e.response().status());
+            return e.response();
         } catch (RuntimeException e) {
             recordError(SeriesStatus.ERROR);
             return new SeriesStatusResponse(SeriesStatus.ERROR, self.value(), describe(e));

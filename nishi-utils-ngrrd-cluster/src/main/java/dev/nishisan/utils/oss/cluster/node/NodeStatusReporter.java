@@ -104,6 +104,14 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
     private final SeriesHandleRegistry registry;
     private final String nodeId;
     private final long capacityBytes;
+    private dev.nishisan.utils.oss.cluster.placement.DistributionMode distributionMode =
+            dev.nishisan.utils.oss.cluster.placement.DistributionMode.COUNT;
+    private double weight = 1;
+    /** Sets the distribution configuration published with every node status. */
+    public void distribution(dev.nishisan.utils.oss.cluster.placement.DistributionMode mode, double weight) {
+        this.distributionMode = mode;
+        this.weight = weight;
+    }
     private final Duration interval;
     private final Clock clock;
     private final Supplier<StorageRequestHandler.StorageHandlerMetrics> handlerMetricsSupplier;
@@ -226,6 +234,7 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
         }
         if (migrationExecutor != null) {
             try {
+                migrationExecutor.expireReservations(migrationTimeout);
                 migrationExecutor.sweepExpiredStates(MIGRATION_STATE_TTL);
             } catch (Throwable e) {
                 LOGGER.log(Level.SEVERE, "Falha ao varrer migrações expiradas do nó " + nodeId, e);
@@ -407,6 +416,7 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
             return;
         }
         try {
+            long now = clock.millis();
             BlobVolumeStats stats = volume.stats();
             long seriesCount = stats.catalogEntryCount();
             long usedBytes = sum(stats.shardUsedBytes());
@@ -415,8 +425,8 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
             // assumir ACTIVE por omissão — não é "a réplica", é a confirmação forte de que não há
             // histórico algum.
             NodeState state = strong.map(StorageNodeStatus::state).orElse(NodeState.ACTIVE);
-            long now = clock.millis();
-            catalog.putNodeStatus(new StorageNodeStatus(nodeId, state, seriesCount, usedBytes, capacityBytes, now));
+            catalog.putNodeStatus(new StorageNodeStatus(nodeId, state, seriesCount, usedBytes, capacityBytes, now,
+                    distributionMode, weight, volume.storage().reservedBytes()));
         } finally {
             publishing.set(false);
         }

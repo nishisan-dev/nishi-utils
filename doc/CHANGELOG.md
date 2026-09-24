@@ -4,6 +4,36 @@
 
 ---
 
+## 2026-09-24 — Capacidade e distribuição ponderada do ngrrd — release 8.4.0
+
+Atende os itens 1 e 2 da [issue #167](https://github.com/nishisan-dev/nishi-utils/issues/167).
+Cotas e afinidade por nó (item 3) permanecem para uma entrega futura.
+
+- **Admissão por capacidade:** placement, rebalance e drain respeitam 95% da capacidade
+  declarada, incluindo tamanho alinhado da próxima série, entradas planejadas e reservas.
+  A origem só libera orçamento quando sua região é removida após a migração.
+- **Distribuição consistente:** `ngrrd.distribution.mode` aceita `COUNT` (padrão), `CAPACITY`
+  e `WEIGHT`. Placement e rebalance usam os mesmos pesos; `ngrrd.weight` deve ser positivo
+  e finito. Capacidade desconhecida em `CAPACITY` ou modos divergentes levam a `COUNT`,
+  com diagnóstico.
+- **Geometria replicada:** `ngrrd.geometries` persiste descritores compartilhados por hash
+  e versão. O dono confirma a geometria física após `OPEN`; mudanças suspendem a confirmação.
+  Séries antigas são identificadas em lotes de até 256, lendo apenas cabeçalho e seção estática.
+  Séries sem confirmação ficam fora das migrações até o preenchimento dos metadados.
+- **Reserva antes da transferência:** `MIGRATE_PREPARE` usa o tamanho real da imagem e
+  compartilha o orçamento do `BlobStorage` com novos `OPEN`. Commit consome a reserva;
+  abort, falha e expiração a liberam. Após reinício é necessária nova preparação.
+- **Operação:** status mostra modo, peso, reservas e geometrias pendentes. Drenagens sem
+  espaço permanecem pendentes e procuram outras séries/destinos admissíveis. A entrada de
+  um nó dispara avaliação automática quando o rebalance está habilitado.
+- **Filesystem:** além do teto de regiões vivas, a admissão consulta o espaço utilizável.
+  Essa consulta não reserva blocos contra consumo externo ao processo.
+
+**Atualização coordenada obrigatória:** interromper tráfego e rebalance, aguardar migrações,
+atualizar todos os storages e clientes Java e validar catálogo/metadados antes da retomada.
+Iniciar em `COUNT`; habilitar ponderação explicitamente e com configuração uniforme.
+Detalhes no [guia operacional](oss/ngrrd-cluster-operacao.md#atualização-coordenada).
+
 ## 2026-09-19 — Correções de escrita e desempenho do ngrrd — release 8.3.1
 
 - **Falhas de escrita preservadas:** uma falha assíncrona deixa o `NgrrdWriter`

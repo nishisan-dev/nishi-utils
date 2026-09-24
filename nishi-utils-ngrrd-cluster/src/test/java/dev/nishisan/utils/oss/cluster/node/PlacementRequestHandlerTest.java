@@ -80,6 +80,7 @@ class PlacementRequestHandlerTest {
         cluster = NGrid.local(1)
                 .map(CatalogService.CATALOG_MAP)
                 .map(CatalogService.NODES_MAP)
+                .map(CatalogService.GEOMETRIES_MAP)
                 .start();
         NGridNode node = cluster.node(0);
         catalog = CatalogService.from(node);
@@ -135,6 +136,20 @@ class PlacementRequestHandlerTest {
 
         assertEquals(SeriesStatus.NO_STORAGE_NODE_AVAILABLE, response.status());
         assertNotNull(response.message());
+    }
+
+    @Test
+    void placementCountsIncomingMigrationsBeforeTheirDestinationReportsThem() {
+        leaderView.leader = true;
+        putNode("node-a", 0, clock.millis());
+        putNode("node-b", 1, clock.millis());
+        for (int i = 0; i < 2; i++) {
+            catalog.putPlacement("moving-" + i, SeriesPlacement.migrating(
+                    SeriesPlacement.active("node-b", 1), "node-a", "migration-" + i, clock.millis()));
+        }
+        PlaceResponse response = (PlaceResponse) handler.handle(Commands.PLACE,
+                new PlaceRequest("series-new", "hash-new", null), NodeId.of("client"));
+        assertEquals("node-b", response.placement().ownerNodeId());
     }
 
     @Test

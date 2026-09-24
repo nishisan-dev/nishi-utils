@@ -33,7 +33,7 @@ public record RebalanceSettings(long rebalanceMinDelta, double rebalanceToleranc
         if (rebalanceMinDelta < 0) {
             throw new IllegalArgumentException("rebalanceMinDelta deve ser >= 0: " + rebalanceMinDelta);
         }
-        if (rebalanceTolerance < 0) {
+        if (!Double.isFinite(rebalanceTolerance) || rebalanceTolerance < 0) {
             throw new IllegalArgumentException("rebalanceTolerance deve ser >= 0: " + rebalanceTolerance);
         }
         if (maxMovesPerCycle <= 0) {
