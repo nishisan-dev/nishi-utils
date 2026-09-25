@@ -89,9 +89,9 @@ import java.util.stream.Stream;
  * ociosidade/LRU tentando {@link SeriesHandleRegistry#reopenIfKnown} antes de
  * desistir. Isso não reabre uma série fechada por {@code CLOSE} explícito: essa
  * semântica ({@code NOT_OPEN} até um novo {@code open}) já é garantida pelo
- * próprio registro — {@link SeriesHandleRegistry#reopenIfKnown} recusa reabrir
- * uma série marcada {@code closedByClient}, então a auto-cura aqui só se aplica
- * ao caso de ociosidade/LRU.</p>
+ * próprio registro — {@link SeriesHandleRegistry#close(String)} descarta a
+ * definição em cache e {@link SeriesHandleRegistry#reopenIfKnown} não reabre
+ * sem ela, então a auto-cura aqui só se aplica ao caso de ociosidade/LRU.</p>
  */
 public final class StorageRequestHandler extends RequestHandlerSupport {
 

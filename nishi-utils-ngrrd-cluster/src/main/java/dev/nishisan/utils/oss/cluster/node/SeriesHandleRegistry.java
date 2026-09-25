@@ -87,16 +87,18 @@ public final class SeriesHandleRegistry implements Closeable {
     private final Clock clock;
 
     private final ConcurrentMap<String, HandleEntry> entries = new ConcurrentHashMap<>();
+    /**
+     * Definição (hash do YAML) de cada série aberta neste processo e ainda não fechada pelo cliente nem
+     * esquecida — é o que permite a {@link #reopenIfKnown} reabrir sem o cliente reenviar o YAML. A
+     * PRESENÇA da chave aqui é também a autorização de reabertura automática: {@link #close(String)} e
+     * {@link #forget(String)} removem a chave, e só um novo {@link #open} a devolve. Assim o fechamento
+     * explícito não deixa marca nenhuma por série (issue #174: um conjunto de "fechadas pelo cliente"
+     * crescia sem limite).
+     */
     private final ConcurrentMap<String, String> hashBySeriesKey = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, DefinitionRecord> definitionByHash = new ConcurrentHashMap<>();
     private final Set<String> migrating = ConcurrentHashMap.newKeySet();
     private final Set<String> copying = ConcurrentHashMap.newKeySet();
-    /**
-     * Séries fechadas por {@link #close(String)} explícito do cliente —
-     * {@link #reopenIfKnown} não as reabre sozinho (ao contrário de um
-     * fechamento por ociosidade/LRU); só um novo {@link #open} limpa a marca.
-     */
-    private final Set<String> closedByClient = ConcurrentHashMap.newKeySet();
     /**
      * Séries esquecidas por {@link #forget(String)} — a origem de uma migração concluída
      * ({@code MIGRATE_FINISH}) marca aqui a chave para fechar em definitivo a corrida "réplica local
@@ -104,7 +106,7 @@ public final class SeriesHandleRegistry implements Closeable {
      * mais a réplica LOCAL do catálogo (que ainda pode dizer {@code ACTIVE(self)} por um instante depois
      * do FINISH) nem o {@code placementHint} do cliente, e sim uma confirmação forte do líder — ver
      * {@code StorageRequestHandler#ownership}. Só {@link #open} limpa a marca (a mesma reabertura
-     * legítima que já limpa {@link #closedByClient}), nunca {@link #reopenIfKnown} sozinho.
+     * legítima que volta a cachear a definição), nunca {@link #reopenIfKnown} sozinho.
      */
     private final Set<String> forgotten = ConcurrentHashMap.newKeySet();
 
@@ -121,9 +123,9 @@ public final class SeriesHandleRegistry implements Closeable {
     }
 
     /**
-     * Abre (ou confirma já aberta, atualizando {@code lastAccess}) a série.
-     * Limpa a marca de {@link #close fechado pelo cliente}, se houver — um novo
-     * {@code open} é o único jeito de reabrir uma série fechada explicitamente.
+     * Abre (ou confirma já aberta, atualizando {@code lastAccess}) a série e
+     * cacheia sua definição — um novo {@code open} é o único jeito de reabrir
+     * uma série {@link #close fechada pelo cliente} ou {@link #forget esquecida}.
      *
      * @throws IllegalStateException se a série está marcada como
      *                                 {@link #markMigrating migrating}
@@ -161,7 +163,6 @@ public final class SeriesHandleRegistry implements Closeable {
                     }
                     cacheDefinition(seriesKey, yaml, options);
                 }
-                closedByClient.remove(seriesKey);
                 // Reabertura legítima: quem chama open() já passou pela checagem forte de dono em
                 // StorageRequestHandler#ownership (isForgotten força placementStrong antes de chegar
                 // aqui) — é o único lugar que limpa a marca de esquecida.
@@ -256,7 +257,7 @@ public final class SeriesHandleRegistry implements Closeable {
      */
     public Optional<NgrrdHandle> reopenIfKnown(String seriesKey) {
         Objects.requireNonNull(seriesKey, "seriesKey");
-        if (isMigrationFrozen(seriesKey) || closedByClient.contains(seriesKey)) {
+        if (isMigrationFrozen(seriesKey)) {
             return Optional.empty();
         }
         String hash = hashBySeriesKey.get(seriesKey);
@@ -275,7 +276,10 @@ public final class SeriesHandleRegistry implements Closeable {
                 if (entries.get(seriesKey) != entry) {
                     continue;
                 }
-                if (isMigrationFrozen(seriesKey) || closedByClient.contains(seriesKey)) {
+                // A definição é reconferida sob o lock: um close()/forget() concorrente a remove ANTES de
+                // procurar a entrada, então ou ele já a removeu (e aqui não se reabre) ou ainda vai achar
+                // e fechar a entrada que este método abrir — a série nunca termina aberta depois dele.
+                if (isMigrationFrozen(seriesKey) || !hashBySeriesKey.containsKey(seriesKey)) {
                     // Só remove se ainda vazia E ainda a corrente — nunca apaga um handle que outra
                     // thread já tenha aberto de verdade nesta mesma entrada nesse meio-tempo (o bug
                     // que o Refuter pegou: remover incondicionalmente fora do lock podia derrubar do
@@ -316,30 +320,20 @@ public final class SeriesHandleRegistry implements Closeable {
     }
 
     /**
-     * Libera a referência local da série (CLOSE do cliente): checkpoint+close
-     * do handle, se aberto, e remove a entrada — marca a série como fechada
-     * pelo cliente ({@link #reopenIfKnown} deixa de reabri-la sozinha).
-     * Idempotente.
+     * Libera a referência local da série (CLOSE do cliente): descarta a
+     * definição em cache — {@link #reopenIfKnown} deixa de reabri-la sozinha,
+     * mesmo que o handle já tenha sido fechado antes por ociosidade/LRU — e faz
+     * checkpoint+close do handle, se aberto. Idempotente.
      */
     public void close(String seriesKey) {
         Objects.requireNonNull(seriesKey, "seriesKey");
-        HandleEntry entry = entries.get(seriesKey);
-        if (entry == null) {
-            return;
-        }
-        entry.lock.lock();
-        try {
-            if (entries.remove(seriesKey, entry)) {
-                closeQuietly(seriesKey, entry.handle);
-                closedByClient.add(seriesKey);
-            }
-        } finally {
-            entry.lock.unlock();
-        }
+        // Primeiro a definição, depois a entrada: ver a reconferência sob o lock em reopenIfKnown.
+        hashBySeriesKey.remove(seriesKey);
+        discard(seriesKey);
     }
 
     /**
-     * Libera a referência local da série SEM marcar {@link #closedByClient}: checkpoint+close do
+     * Libera a referência local da série SEM descartar a definição em cache: checkpoint+close do
      * handle, se aberto, e remove a entrada — {@link #reopenIfKnown} continua livre para reabri-la
      * depois. Usado pela migração (M3): o destino chama antes de gravar a imagem recebida (garante
      * que nenhum handle antigo desta série sobrevive à substituição do arquivo por baixo); a origem
@@ -383,17 +377,16 @@ public final class SeriesHandleRegistry implements Closeable {
      */
     public void forget(String seriesKey) {
         Objects.requireNonNull(seriesKey, "seriesKey");
-        // Reaproveita o mesmo bloqueio de reabertura automática de close(): o conjunto é consultado
-        // DENTRO do lock da entrada por open()/reopenIfKnown, então não há janela em que uma
-        // reabertura concorrente escape. hashBySeriesKey só é limpo por último — definitionByHash é
-        // compartilhado por todas as séries do mesmo YAML e nunca pode ser removido por uma delas.
-        closedByClient.add(seriesKey);
-        // Marca separada de closedByClient: além de bloquear reopenIfKnown, isForgotten é consultada
-        // por StorageRequestHandler#ownership para nunca confiar na réplica local (nem no hint) de
-        // dono enquanto esta série não for reaberta com confirmação forte do líder.
+        // isForgotten é consultada por StorageRequestHandler#ownership para nunca confiar na réplica
+        // local (nem no hint) de dono enquanto esta série não for reaberta com confirmação forte do
+        // líder ou a réplica local não convergir para outro dono (ver pruneForgotten).
         forgotten.add(seriesKey);
-        discard(seriesKey);
+        // Mesmo bloqueio de reabertura automática de close(): a definição sai antes da entrada e é
+        // reconferida DENTRO do lock por reopenIfKnown, então nenhuma reabertura concorrente escapa.
+        // Só o vínculo série→hash sai — definitionByHash é compartilhado por todas as séries do mesmo
+        // YAML e nunca pode ser removido por uma delas.
         hashBySeriesKey.remove(seriesKey);
+        discard(seriesKey);
     }
 
     /**

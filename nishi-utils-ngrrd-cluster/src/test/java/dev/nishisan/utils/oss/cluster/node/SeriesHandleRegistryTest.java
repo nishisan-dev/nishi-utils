@@ -289,6 +289,75 @@ class SeriesHandleRegistryTest {
     }
 
     @Test
+    void closeAposFechamentoPorOciosidadeTambemImpedeReopenIfKnown() {
+        // O CLOSE do cliente pode chegar depois de o handle já ter sido fechado por ociosidade: mesmo sem
+        // handle aberto, a reabertura automática precisa ficar bloqueada até um novo open explícito.
+        MutableClock clock = new MutableClock(Instant.parse("2026-01-01T00:00:00Z"));
+        try (SeriesHandleRegistry registry = registry(Duration.ofMinutes(10), 10, clock)) {
+            String seriesKey = "series-fechada-depois-de-ociosa";
+            registry.open(seriesKey, yaml, Ngrrd.OpenOptions.defaults());
+            clock.advance(Duration.ofMinutes(11));
+            assertEquals(1, registry.closeIdle());
+
+            registry.close(seriesKey);
+
+            assertTrue(registry.reopenIfKnown(seriesKey).isEmpty(),
+                    "reopenIfKnown não deveria reabrir uma série fechada pelo cliente depois da ociosidade");
+        }
+    }
+
+    @Test
+    void closeDescartaADefinicaoEmCacheEOpenARestaura() {
+        // O fechamento explícito não deixa marca por série: a própria definição em cache sai, e é a
+        // ausência dela que impede a reabertura automática — nada cresce com o número de séries fechadas.
+        try (SeriesHandleRegistry registry = registry(Duration.ofMinutes(10), 10, Clock.systemUTC())) {
+            String seriesKey = "series-definicao-descartada";
+            registry.open(seriesKey, yaml, Ngrrd.OpenOptions.defaults());
+            assertTrue(registry.cachedYaml(seriesKey).isPresent());
+
+            registry.close(seriesKey);
+            assertTrue(registry.cachedYaml(seriesKey).isEmpty(), "close() deveria descartar a definição em cache");
+
+            registry.open(seriesKey, yaml, Ngrrd.OpenOptions.defaults());
+            assertTrue(registry.cachedYaml(seriesKey).isPresent(), "open() deveria voltar a cachear a definição");
+        }
+    }
+
+    @Test
+    void closeConcorrenteComReopenIfKnownNuncaDeixaASerieAberta() throws Exception {
+        // A reconferência da definição sob o lock da entrada substitui a antiga marca closedByClient: não
+        // importa a ordem entre close() e reopenIfKnown(), a série termina fechada.
+        MutableClock clock = new MutableClock(Instant.parse("2026-01-01T00:00:00Z"));
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try (SeriesHandleRegistry registry = registry(Duration.ofMinutes(10), 10, clock)) {
+            for (int i = 0; i < 100; i++) {
+                String seriesKey = "series-corrida-close-reopen-" + i;
+                registry.open(seriesKey, yaml, Ngrrd.OpenOptions.defaults());
+                clock.advance(Duration.ofMinutes(11));
+                registry.closeIdle();
+                CountDownLatch start = new CountDownLatch(1);
+                Future<?> reopen = executor.submit(() -> {
+                    start.await();
+                    return registry.reopenIfKnown(seriesKey);
+                });
+                Future<?> close = executor.submit(() -> {
+                    start.await();
+                    registry.close(seriesKey);
+                    return null;
+                });
+                start.countDown();
+                reopen.get(10, TimeUnit.SECONDS);
+                close.get(10, TimeUnit.SECONDS);
+
+                assertTrue(registry.existing(seriesKey).isEmpty(), "a série deveria terminar fechada: " + seriesKey);
+                assertTrue(registry.reopenIfKnown(seriesKey).isEmpty());
+            }
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
     void forgetMarcaASerieComoEsquecidaEFechaOHandleSemMantelaAberta() {
         // MIGRATE_FINISH (M3): a origem chama forget() depois de apagar a imagem local — a série deve
         // sair do registry (como discard) e ficar marcada isForgotten até um novo open() legítimo.
