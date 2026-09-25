@@ -500,10 +500,20 @@ public final class TcpTransport implements Transport {
         }
     }
 
+    // One lock per peer id, serializing dials to it and publication of its live connection. An
+    // entry must outlive disconnects: dropping it while a dial still holds the old lock let the
+    // next caller create a fresh one and dial the same peer concurrently. Entries are removed only
+    // on close(); a future "forget peer" path (peer removed from knownPeers for good) is the one
+    // place that may also drop that peer's entry.
     private final Map<NodeId, ReentrantLock> connectionLocks = new ConcurrentHashMap<>();
 
     private ReentrantLock getLockFor(NodeId nodeId) {
         return connectionLocks.computeIfAbsent(nodeId, id -> new ReentrantLock());
+    }
+
+    // Visible for tests in this package: the per-peer lock serializing dials/publication.
+    ReentrantLock connectionLockFor(NodeId nodeId) {
+        return getLockFor(nodeId);
     }
 
     private Connection registerConnection(Socket socket, NodeInfo preResolved) throws IOException {
@@ -918,9 +928,7 @@ public final class TcpTransport implements Transport {
                 return;
             }
             LOGGER.info(() -> "Disconnect confirmed for " + nodeId + "; failing pending responses");
-            // Best-effort cleanup: if the peer is no longer connected, drop the per-peer lock.
-            // It will be recreated if we reconnect.
-            connectionLocks.remove(nodeId);
+            // The per-peer connection lock is deliberately kept (see connectionLocks).
             List<Map.Entry<UUID, PendingResponse>> toFail = new ArrayList<>();
             for (Map.Entry<UUID, PendingResponse> entry : pendingResponses.entrySet()) {
                 if (nodeId.equals(entry.getValue().destination)) {

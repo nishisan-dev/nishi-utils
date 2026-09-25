@@ -40,6 +40,7 @@ import java.util.concurrent.TimeUnit;
 import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -316,6 +317,45 @@ class TcpTransportConcurrentMeshTest {
             }
         } finally {
             closeQuietly(transport, peerB);
+        }
+    }
+
+    /**
+     * O lock de conexão por peer serializa as discagens para ele. Se o disconnect o descartasse,
+     * uma discagem ainda em curso seguiria segurando o lock antigo enquanto a próxima criaria um
+     * novo — duas discagens simultâneas para o mesmo peer. O lock vive enquanto o peer é conhecido.
+     */
+    @Test
+    void peerConnectionLockSurvivesDisconnect() throws Exception {
+        int portA = allocateFreeLocalPort(Set.of());
+        int portB = allocateFreeLocalPort(Set.of(portA));
+        NodeInfo a = new NodeInfo(NodeId.of("a-node"), "127.0.0.1", portA);
+        NodeInfo b = new NodeInfo(NodeId.of("b-node"), "127.0.0.1", portB);
+        TcpTransport transportA = new TcpTransport(meshConfig(a, b));
+        TcpTransport transportB = new TcpTransport(meshConfig(b, a));
+        var disconnected = new CountDownLatch(1);
+        transportA.addListener(new TransportListener() {
+            public void onPeerConnected(NodeInfo peer) { }
+            public void onPeerDisconnected(NodeId peer) {
+                if (peer.equals(b.nodeId())) {
+                    disconnected.countDown();
+                }
+            }
+            public void onMessage(ClusterMessage message) { }
+        });
+        try {
+            transportA.start();
+            transportB.start();
+            awaitFullDirectMesh(List.of(transportA, transportB), List.of(a, b), Duration.ofSeconds(10));
+            var lockBefore = transportA.connectionLockFor(b.nodeId());
+
+            transportB.close();
+            assertTrue(disconnected.await(5, TimeUnit.SECONDS), "disconnect de b-node não foi confirmado");
+
+            assertSame(lockBefore, transportA.connectionLockFor(b.nodeId()),
+                    "o disconnect não pode trocar o lock de conexão do peer");
+        } finally {
+            closeQuietly(transportA, transportB);
         }
     }
 
