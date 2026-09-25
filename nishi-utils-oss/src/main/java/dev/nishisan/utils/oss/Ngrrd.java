@@ -346,7 +346,12 @@ public final class Ngrrd {
      *                        Quando {@code false}, nenhum objeto é criado/pré-alocado:
      *                        série ausente faz o {@code open} lançar
      *                        {@link SeriesNotFoundException} em vez de
-     *                        materializar uma série vazia.
+     *                        materializar uma série vazia. No modo local, o
+     *                        handle de uma série existente abre normalmente
+     *                        (leitura e escrita). No cluster
+     *                        ({@code NgrrdClusterClient.open}), {@code false}
+     *                        abre um handle SOMENTE LEITURA — escrita, flush e
+     *                        checkpoint lançam {@link IllegalStateException}.
      */
     public record OpenOptions(Durability durability, OnGeometryChange onGeometryChange, boolean createIfMissing) {
 

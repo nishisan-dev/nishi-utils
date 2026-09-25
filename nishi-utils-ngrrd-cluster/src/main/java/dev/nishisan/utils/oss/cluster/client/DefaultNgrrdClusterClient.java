@@ -17,7 +17,6 @@
 
 package dev.nishisan.utils.oss.cluster.client;
 
-import dev.nishisan.utils.oss.cluster.rpc.CoordinationLocks;
 
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
@@ -59,8 +58,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import java.util.logging.Level;
@@ -97,18 +94,14 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
     private final PlacementResolver resolver;
     private final SeriesExistence existence;
     private final WriteDispatcher dispatcher;
-    private final ConcurrentMap<String, RemoteSeriesHandle> handles;
-    /**
-     * item 10 (achado do Refuter): lock por {@code seriesKey} usado só para serializar aberturas
-     * concorrentes DA MESMA série — ver {@link #open(String, Map, Ngrrd.OpenOptions)}.
-     */
-    private final ConcurrentMap<String, Object> openLocks;
+    /** Handles abertos, com as regras de reaproveitamento e promoção de {@link #open(String, Map, Ngrrd.OpenOptions)}. */
+    private final SeriesHandleCache handles;
 
     private volatile boolean closed;
 
     private DefaultNgrrdClusterClient(NgrrdClusterConfig config, NGridNode node, Path dataDir,
             boolean temporaryDataDir, MetricsTrackingClusterRpc rpc, PlacementResolver resolver,
-            SeriesExistence existence, WriteDispatcher dispatcher, ConcurrentMap<String, RemoteSeriesHandle> handles) {
+            SeriesExistence existence, WriteDispatcher dispatcher, SeriesHandleCache handles) {
         this.config = config;
         this.node = node;
         this.dataDir = dataDir;
@@ -119,7 +112,6 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
         this.existence = existence;
         this.dispatcher = dispatcher;
         this.handles = handles;
-        this.openLocks = new ConcurrentHashMap<>();
     }
 
     /** Conecta ao cluster ngrrd e devolve um cliente pronto para {@link #open}. */
@@ -175,7 +167,7 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
                     catalogLookupClient);
             SeriesExistence existence = new SeriesExistence(resolver, catalogLookupClient);
 
-            ConcurrentMap<String, RemoteSeriesHandle> handles = new ConcurrentHashMap<>();
+            SeriesHandleCache handles = new SeriesHandleCache();
             RetryPolicy opRetry = new RetryPolicy(cfg.retryTimeout(), cfg.retryBackoffMin(), cfg.retryBackoffMax());
             // Referência publicada com segurança (AtomicReference = volatile) para a thread do
             // tickLoop do WriteDispatcher, que só a lê ~METRICS_TICK_INTERVAL ticks depois de criada
@@ -301,32 +293,9 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
         Objects.requireNonNull(tags, "tags");
         String template = SeriesKeyTemplate.templateOf(yaml);
         String seriesKey = SeriesKeyTemplate.resolve(template, tags);
-        RemoteSeriesHandle existing = handles.get(seriesKey);
-        if (existing != null && existing.isOpen()) {
-            return existing;
-        }
-        // item 10 (achado do Refuter): nunca fazer RPC dentro de computeIfAbsent — isso mantinha o bin
-        // lock interno do ConcurrentHashMap preso durante toda a chamada de rede de openNewHandle
-        // (OPEN no dono), bloqueando get()/put() de QUALQUER OUTRA série neste mesmo mapa até a rede
-        // responder. Em vez disso, um lock por seriesKey (openLocks, construído sem I/O) serializa só
-        // as aberturas concorrentes DA MESMA série; handles só é tocado com get/put simples.
-        Object lock = openLocks.computeIfAbsent(seriesKey, key -> new Object());
-        try {
-            try (var guard = CoordinationLocks.acquire(lock)) {
-                existing = handles.get(seriesKey);
-                // Um handle em cache já fechado/marcado inexistente (ex.: onClose ainda não rodou, ou
-                // perdeu a corrida de remoção condicional contra um handle mais novo) nunca é devolvido
-                // — substituído por um novo abaixo, que refaz o open do zero.
-                if (existing != null && existing.isOpen()) {
-                    return existing;
-                }
-                RemoteSeriesHandle handle = openNewHandle(seriesKey, yaml, tags, options);
-                handles.put(seriesKey, handle);
-                return handle;
-            }
-        } finally {
-            openLocks.remove(seriesKey, lock);
-        }
+        Ngrrd.OpenOptions effective = options != null ? options : Ngrrd.OpenOptions.defaults();
+        return handles.open(seriesKey, effective.createIfMissing(),
+                () -> openNewHandle(seriesKey, yaml, tags, effective));
     }
 
     @Override
@@ -536,7 +505,7 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
         // um closeTimeout inteiro "renovado" para cada fase — do contrário N handles lentos, mais o
         // dispatcher, podiam multiplicar o tempo total de close() por várias vezes closeTimeout.
         long deadline = System.currentTimeMillis() + config.closeTimeout().toMillis();
-        for (RemoteSeriesHandle handle : List.copyOf(handles.values())) {
+        for (RemoteSeriesHandle handle : handles.snapshot()) {
             long remainingMs = deadline - System.currentTimeMillis();
             Duration flushBudget = remainingMs > 0 ? Duration.ofMillis(remainingMs) : Duration.ZERO;
             try {

@@ -20,6 +20,7 @@ package dev.nishisan.utils.oss.cluster.api;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.oss.Ngrrd;
 import dev.nishisan.utils.oss.NgrrdHandle;
+import dev.nishisan.utils.oss.api.SeriesNotFoundException;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
 import dev.nishisan.utils.oss.cluster.protocol.AdminStatusResponse;
@@ -46,7 +47,28 @@ public interface NgrrdClusterClient extends Closeable {
     /** Abre (ou devolve o já aberto) o handle da série identificada por {@code tags} na definição {@code yaml}. */
     NgrrdHandle open(String yaml, Map<String, String> tags);
 
-    /** Variante de {@link #open(String, Map)} com {@link Ngrrd.OpenOptions} explícitas. */
+    /**
+     * Variante de {@link #open(String, Map)} com {@link Ngrrd.OpenOptions} explícitas.
+     *
+     * <p><b>{@code createIfMissing=false} abre um handle SOMENTE LEITURA.</b> O cliente nunca posiciona
+     * a série ({@code ngrrd.place}): o dono vem do catálogo e o storage recusa abrir série inexistente.
+     * Série ausente faz o {@code open} (ou uma leitura posterior, se ela deixar de existir) lançar
+     * {@link SeriesNotFoundException}; nesse caso o handle se fecha e sai do
+     * cache do cliente. {@code write}, {@code flush} e {@code checkpoint} lançam
+     * {@link IllegalStateException}. O {@code close()} desse handle é local: não drena buffers nem envia
+     * {@code CLOSE} ao storage, que fecha a série por ociosidade.</p>
+     *
+     * <p><b>Cache de handles</b> (um por chave de série):</p>
+     * <ul>
+     *   <li>sem criar, com um handle aberto em cache (somente leitura ou gravável): devolve o existente;</li>
+     *   <li>com criação, com um handle somente leitura aberto em cache: promove esse mesmo handle a
+     *       gravável, que passa a se comportar em tudo como aberto com criação (inclusive o
+     *       {@code close()} com {@code CLOSE} remoto) — um handle gravável nunca é rebaixado;</li>
+     *   <li>handle em cache fechado (ou fechando durante a promoção): um novo é aberto no lugar.</li>
+     * </ul>
+     * <p>Como o handle é compartilhado entre quem abre a mesma chave, {@code close()} por um chamador o
+     * fecha para todos.</p>
+     */
     NgrrdHandle open(String yaml, Map<String, String> tags, Ngrrd.OpenOptions options);
 
     /** Variante de {@link #open(String, Map)} que lê a definição YAML de um arquivo. */
@@ -62,8 +84,8 @@ public interface NgrrdClusterClient extends Closeable {
      * <ul>
      *   <li>Depois de um {@code open}/{@code PLACE} feito por outro cliente: se a réplica local ainda
      *       não o viu, o miss é confirmado no líder, que já tem o placement — devolve {@code true}.</li>
-     *   <li>Durante migração ({@code MIGRATING}): devolve {@code true}; {@code open} sem criar segue o
-     *       fluxo normal de espera/redirect.</li>
+     *   <li>Durante migração ({@code MIGRATING}): devolve {@code true}; {@code open} sem criar (somente
+     *       leitura) segue o fluxo normal de espera/redirect.</li>
      *   <li>{@code false} significa "o líder atual não tem placement para a chave no momento da
      *       consulta" — não é atômico com um {@code open} concorrente de outro cliente que crie a
      *       série logo em seguida.</li>
