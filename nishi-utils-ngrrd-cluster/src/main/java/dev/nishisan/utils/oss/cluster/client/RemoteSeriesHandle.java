@@ -28,6 +28,7 @@ import dev.nishisan.utils.oss.cluster.api.ErrorCode;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
+import dev.nishisan.utils.oss.cluster.catalog.StorageCapabilities;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.protocol.OpenRequest;
 import dev.nishisan.utils.oss.cluster.protocol.ReadPresetRequest;
@@ -94,6 +95,8 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
      * mesma chave.
      */
     private final BiConsumer<String, RemoteSeriesHandle> onClose;
+    /** Confere {@code open.createIfMissing} no dono antes de todo {@code OPEN} de handle somente leitura. */
+    private final NodeCapabilities capabilities;
 
     private volatile String owner;
     /**
@@ -131,15 +134,15 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
     public RemoteSeriesHandle(String seriesKey, String yaml, String definitionHashHex, Map<String, String> tags,
             Ngrrd.OpenOptions options, PlacementLookup resolver, ClusterRpc rpc, WriteBuffer dispatcher,
             RetryPolicy retryPolicy, Duration requestTimeout, Duration closeTimeout, Clock clock,
-            BiConsumer<String, RemoteSeriesHandle> onClose) {
+            BiConsumer<String, RemoteSeriesHandle> onClose, NodeCapabilities capabilities) {
         this(seriesKey, yaml, definitionHashHex, tags, options, resolver, rpc, dispatcher, retryPolicy,
-                requestTimeout, closeTimeout, clock, onClose, null);
+                requestTimeout, closeTimeout, clock, onClose, capabilities, null);
     }
 
     public RemoteSeriesHandle(String seriesKey, String yaml, String definitionHashHex, Map<String, String> tags,
             Ngrrd.OpenOptions options, PlacementLookup resolver, ClusterRpc rpc, WriteBuffer dispatcher,
             RetryPolicy retryPolicy, Duration requestTimeout, Duration closeTimeout, Clock clock,
-            BiConsumer<String, RemoteSeriesHandle> onClose,
+            BiConsumer<String, RemoteSeriesHandle> onClose, NodeCapabilities capabilities,
             GeometryDescriptor geometry) {
         this.seriesKey = Objects.requireNonNull(seriesKey, "seriesKey");
         this.yaml = Objects.requireNonNull(yaml, "yaml");
@@ -155,6 +158,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
         this.closeTimeout = Objects.requireNonNull(closeTimeout, "closeTimeout");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.onClose = Objects.requireNonNull(onClose, "onClose");
+        this.capabilities = Objects.requireNonNull(capabilities, "capabilities");
         this.state = new AtomicReference<>(State.opened(this.options.createIfMissing()));
     }
 
@@ -180,6 +184,10 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
             boolean writable = state.get().writable();
             SeriesPlacement placement = resolvePlacement(writable, retry.remaining());
             String candidateOwner = placement.ownerNodeId();
+            if (!writable) {
+                // Dono de versão anterior ignoraria createIfMissing=false e criaria a série.
+                capabilities.require(candidateOwner, StorageCapabilities.OPEN_CREATE_IF_MISSING);
+            }
             OpenRequest request = new OpenRequest(seriesKey, yaml, tags, options.durability(),
                     options.onGeometryChange(), placement, writable ? null : Boolean.FALSE);
             retry.remaining();

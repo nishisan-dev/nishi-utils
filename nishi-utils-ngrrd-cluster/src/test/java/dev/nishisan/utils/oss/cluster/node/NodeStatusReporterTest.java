@@ -30,6 +30,7 @@ import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogView;
 import dev.nishisan.utils.oss.cluster.catalog.NodeState;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
+import dev.nishisan.utils.oss.cluster.catalog.StorageCapabilities;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.metrics.BlobVolumeSummary;
 import dev.nishisan.utils.oss.cluster.metrics.LatencySnapshot;
@@ -197,6 +198,20 @@ class NodeStatusReporterTest {
             reporter.start();
             awaitTrue("status DRAINED deveria ter sido publicado logo no primeiro tick", () -> !catalog.published.isEmpty()
                     && catalog.published.get(catalog.published.size() - 1).state() == NodeState.DRAINED);
+        } finally {
+            reporter.close();
+        }
+    }
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+    void statusPublicadoAnunciaAsCapacidadesDoStorage() throws InterruptedException {
+        CatalogViewFake catalog = new CatalogViewFake();
+        NodeStatusReporter reporter = reporterWithFakeCatalog(catalog, Duration.ofMillis(30));
+        try {
+            reporter.start();
+            awaitTrue("status deveria ter sido publicado", () -> !catalog.published.isEmpty());
+            assertEquals(StorageCapabilities.ALL, catalog.published.get(0).capabilities());
         } finally {
             reporter.close();
         }

@@ -32,10 +32,12 @@ import dev.nishisan.utils.oss.api.ViewQuery;
 import dev.nishisan.utils.oss.cluster.catalog.NodeState;
 import dev.nishisan.utils.oss.cluster.catalog.PlacementState;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
+import dev.nishisan.utils.oss.cluster.catalog.StorageCapabilities;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.metrics.BlobVolumeSummary;
 import dev.nishisan.utils.oss.cluster.metrics.LatencySnapshot;
 import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
+import dev.nishisan.utils.oss.cluster.placement.DistributionMode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 
@@ -334,6 +336,29 @@ class ProtocolCodecTest {
         StorageNodeStatus status = new StorageNodeStatus("node-a", NodeState.DRAINING, 5, 1_000, 10_000, 5_000L);
         AdminNodeStatusResponse original = new AdminNodeStatusResponse(SeriesStatus.OK, "node-a", status, null);
         assertEquals(original, roundTripResponseBody(Commands.ADMIN_DRAIN, original));
+    }
+
+    @Test
+    void adminNodeStatusResponseComCapacidadesSobreviveAoRoundTrip() throws IOException {
+        StorageNodeStatus status = new StorageNodeStatus("node-a", NodeState.ACTIVE, 5, 1_000, 10_000, 5_000L,
+                DistributionMode.COUNT, 1, 0, StorageCapabilities.ALL);
+        AdminNodeStatusResponse original = new AdminNodeStatusResponse(SeriesStatus.OK, "node-a", status, null);
+
+        AdminNodeStatusResponse roundTripped = roundTripResponseBody(Commands.ADMIN_ACTIVATE, original);
+
+        assertEquals(original, roundTripped);
+        assertEquals(StorageCapabilities.ALL, roundTripped.nodeStatus().capabilities());
+    }
+
+    @Test
+    void statusDeNoSemCapacidadesNoJsonDesserializaComCapacidadesVazias() throws IOException {
+        StorageNodeStatus legacy = JacksonMessageCodec.createDefaultMapper().readValue(
+                "{\"nodeId\":\"node-a\",\"state\":\"ACTIVE\",\"seriesCount\":5,\"usedBytes\":1000,"
+                        + "\"capacityBytes\":10000,\"reportedAtEpochMs\":5000,\"distributionMode\":\"COUNT\","
+                        + "\"weight\":1.0,\"reservedBytes\":0}", StorageNodeStatus.class);
+
+        assertEquals("node-a", legacy.nodeId());
+        assertEquals(Set.of(), legacy.capabilities());
     }
 
     @Test

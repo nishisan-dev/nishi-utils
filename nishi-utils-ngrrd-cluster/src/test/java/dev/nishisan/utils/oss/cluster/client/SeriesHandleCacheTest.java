@@ -340,7 +340,7 @@ class SeriesHandleCacheTest {
         RetryPolicy retry = new RetryPolicy(Duration.ofSeconds(2), Duration.ofMillis(5), Duration.ofMillis(50));
         RemoteSeriesHandle handle = new RemoteSeriesHandle(SERIES_KEY, "yaml: fake", "hash-1", Map.of(),
                 options, new FixedPlacementLookup(), rpc, dispatcher, retry, Duration.ofSeconds(5),
-                Duration.ofSeconds(5), Clock.systemUTC(), onClose);
+                Duration.ofSeconds(5), Clock.systemUTC(), onClose, CapabilityFixtures.advertisingAll());
         handle.open();
         opened.incrementAndGet();
         return handle;

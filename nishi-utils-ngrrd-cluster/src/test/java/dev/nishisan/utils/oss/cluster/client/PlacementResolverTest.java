@@ -27,6 +27,7 @@ import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
 import dev.nishisan.utils.oss.cluster.catalog.PlacementState;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
+import dev.nishisan.utils.oss.cluster.catalog.StorageCapabilities;
 import dev.nishisan.utils.oss.cluster.protocol.CatalogLookupResponse;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.protocol.PlaceRequest;
@@ -81,7 +82,9 @@ class PlacementResolverTest {
         rpc = new RecordingClusterRpc(CLIENT);
         rpc.leader(LEADER);
         RetryPolicy retry = new RetryPolicy(Duration.ofSeconds(2), Duration.ofMillis(10), Duration.ofMillis(100));
-        CatalogLookupClient lookupClient = new CatalogLookupClient(rpc, retry, Clock.systemUTC(), 2000);
+        catalog.putNodeStatus(CapabilityFixtures.status(LEADER.value(), StorageCapabilities.ALL));
+        CatalogLookupClient lookupClient = new CatalogLookupClient(rpc, retry, Clock.systemUTC(), 2000,
+                NodeCapabilities.from(catalog));
         resolver = new PlacementResolver(catalog, rpc, retry, Clock.systemUTC(), lookupClient);
     }
 
@@ -270,7 +273,7 @@ class PlacementResolverTest {
         };
         RetryPolicy boundedRetry = new RetryPolicy(Duration.ofSeconds(2), Duration.ofMillis(1), Duration.ofMillis(2));
         var bounded = new PlacementResolver(catalog, boundedRpc, boundedRetry, clock,
-                new CatalogLookupClient(boundedRpc, boundedRetry, clock, 2000));
+                new CatalogLookupClient(boundedRpc, boundedRetry, clock, 2000, NodeCapabilities.from(catalog)));
 
         assertEquals(ErrorCode.TIMEOUT, assertThrows(NgrrdClusterException.class,
                 () -> bounded.resolve("uncached", "hash", null, Duration.ofMillis(100))).code());
@@ -348,7 +351,8 @@ class PlacementResolverTest {
         RetryPolicy retry = new RetryPolicy(Duration.ofSeconds(2), Duration.ofMillis(1), Duration.ofMillis(5));
         RemoteSeriesHandle handle = new RemoteSeriesHandle("series-1", "yaml: fake", "hash-1", Map.of(),
                 Ngrrd.OpenOptions.defaults().withCreateIfMissing(false), resolver, rpc, new UnusedWriteBuffer(),
-                retry, Duration.ofSeconds(1), Duration.ofSeconds(1), Clock.systemUTC(), (key, h) -> { });
+                retry, Duration.ofSeconds(1), Duration.ofSeconds(1), Clock.systemUTC(), (key, h) -> { },
+                CapabilityFixtures.advertisingAll());
 
         SeriesNotFoundException ex = assertThrows(SeriesNotFoundException.class, handle::open);
 
@@ -370,7 +374,8 @@ class PlacementResolverTest {
         RetryPolicy retry = new RetryPolicy(Duration.ofSeconds(5), Duration.ofMillis(1), Duration.ofMillis(5));
         RemoteSeriesHandle handle = new RemoteSeriesHandle("series-1", "yaml: fake", "hash-1", Map.of(),
                 Ngrrd.OpenOptions.defaults().withCreateIfMissing(false), resolver, rpc, new UnusedWriteBuffer(),
-                retry, Duration.ofSeconds(1), Duration.ofSeconds(1), Clock.systemUTC(), (key, h) -> { });
+                retry, Duration.ofSeconds(1), Duration.ofSeconds(1), Clock.systemUTC(), (key, h) -> { },
+                CapabilityFixtures.advertisingAll());
         long start = System.nanoTime();
 
         SeriesNotFoundException ex = assertThrows(SeriesNotFoundException.class, handle::open);
@@ -401,7 +406,8 @@ class PlacementResolverTest {
         RetryPolicy retry = new RetryPolicy(Duration.ofSeconds(5), Duration.ofMillis(1), Duration.ofMillis(5));
         RemoteSeriesHandle handle = new RemoteSeriesHandle("series-1", "yaml: fake", "hash-1", Map.of(),
                 Ngrrd.OpenOptions.defaults().withCreateIfMissing(false), resolver, rpc, new UnusedWriteBuffer(),
-                retry, Duration.ofSeconds(1), Duration.ofSeconds(1), Clock.systemUTC(), (key, h) -> { });
+                retry, Duration.ofSeconds(1), Duration.ofSeconds(1), Clock.systemUTC(), (key, h) -> { },
+                CapabilityFixtures.advertisingAll());
 
         handle.open();
 

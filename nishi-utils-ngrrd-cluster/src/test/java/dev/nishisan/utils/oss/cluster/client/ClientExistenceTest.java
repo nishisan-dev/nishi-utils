@@ -23,6 +23,7 @@ import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.api.SeriesInfo;
 import dev.nishisan.utils.oss.cluster.catalog.PlacementState;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
+import dev.nishisan.utils.oss.cluster.catalog.StorageCapabilities;
 import dev.nishisan.utils.oss.cluster.protocol.CatalogLookupRequest;
 import dev.nishisan.utils.oss.cluster.protocol.CatalogLookupResponse;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
@@ -36,6 +37,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -57,12 +59,59 @@ class ClientExistenceTest {
     private SeriesExistence existence;
 
     private void newExistence(int batchSize) {
+        newExistence(batchSize, CapabilityFixtures.advertisingAll());
+    }
+
+    private void newExistence(int batchSize, NodeCapabilities capabilities) {
         rpc = new RecordingClusterRpc(NodeId.of("client-under-test"));
         rpc.leader(LEADER);
         placementLookup = new FakePlacementLookup();
         RetryPolicy retry = new RetryPolicy(Duration.ofSeconds(5), Duration.ofMillis(5), Duration.ofMillis(50));
-        CatalogLookupClient catalogLookupClient = new CatalogLookupClient(rpc, retry, Clock.systemUTC(), batchSize);
+        CatalogLookupClient catalogLookupClient = new CatalogLookupClient(rpc, retry, Clock.systemUTC(), batchSize,
+                capabilities);
         existence = new SeriesExistence(placementLookup, catalogLookupClient);
+    }
+
+    @Test
+    void existsEFindComLiderSemCatalogLookupFalhamRapidoSemRpc() {
+        newExistence(2_000, CapabilityFixtures.advertising(Set.of(StorageCapabilities.OPEN_CREATE_IF_MISSING)));
+
+        NgrrdClusterException onExists = assertThrows(NgrrdClusterException.class,
+                () -> existence.exists("m1", MAX_WAIT));
+        NgrrdClusterException onBatch = assertThrows(NgrrdClusterException.class,
+                () -> existence.exists(List.of("m1", "m2"), MAX_WAIT));
+        NgrrdClusterException onFind = assertThrows(NgrrdClusterException.class,
+                () -> existence.find("m1", MAX_WAIT));
+
+        for (NgrrdClusterException ex : List.of(onExists, onBatch, onFind)) {
+            assertEquals(ErrorCode.UNSUPPORTED_BY_NODE, ex.code());
+            assertTrue(ex.getMessage().contains(LEADER.value()), ex.getMessage());
+            assertTrue(ex.getMessage().contains(StorageCapabilities.CATALOG_LOOKUP), ex.getMessage());
+        }
+        assertTrue(rpc.calls().isEmpty(), "nenhum CATALOG_LOOKUP a um líder que não o anuncia");
+    }
+
+    @Test
+    void existsComStatusDoLiderAusenteLocalmenteConfereNaLeituraForteESegue() {
+        AtomicInteger strongReads = new AtomicInteger();
+        newExistence(2_000, new NodeCapabilities(nodeId -> Optional.empty(), nodeId -> {
+            strongReads.incrementAndGet();
+            return Optional.of(CapabilityFixtures.status(nodeId, StorageCapabilities.ALL));
+        }));
+        rpc.respondDefault((cmd, body) -> CatalogLookupResponse.ok(Map.of("m1", SeriesPlacement.active("storage-a", 1L))));
+
+        assertTrue(existence.exists("m1", MAX_WAIT));
+        assertEquals(1, strongReads.get());
+        assertEquals(1, rpc.calls().size());
+    }
+
+    @Test
+    void existsSoComHitsLocaisNaoConfereCapacidade() {
+        newExistence(2_000, CapabilityFixtures.unused());
+        placementLookup.cache("s1", SeriesPlacement.active("storage-a", 1L));
+
+        assertTrue(existence.exists("s1", MAX_WAIT));
+        assertTrue(existence.find("s1", MAX_WAIT).isPresent());
     }
 
     @Test

@@ -21,6 +21,7 @@ import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.oss.cluster.api.ErrorCode;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
+import dev.nishisan.utils.oss.cluster.catalog.StorageCapabilities;
 import dev.nishisan.utils.oss.cluster.protocol.CatalogLookupRequest;
 import dev.nishisan.utils.oss.cluster.protocol.CatalogLookupResponse;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
@@ -36,6 +37,7 @@ import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -52,6 +54,7 @@ class CatalogLookupClientTest {
 
     private RecordingClusterRpc rpc;
     private RetryPolicy retry;
+    private final NodeCapabilities capabilities = CapabilityFixtures.advertisingAll();
 
     @BeforeEach
     void setUp() {
@@ -82,7 +85,7 @@ class CatalogLookupClientTest {
             assertEquals(new CatalogLookupRequest(expectedPage3), body);
             return CatalogLookupResponse.ok(Map.of());
         });
-        CatalogLookupClient client = new CatalogLookupClient(rpc, retry, Clock.systemUTC(), 2000);
+        CatalogLookupClient client = new CatalogLookupClient(rpc, retry, Clock.systemUTC(), 2000, capabilities);
 
         Map<String, SeriesPlacement> found = client.lookup(keys, Duration.ofSeconds(1));
 
@@ -94,13 +97,28 @@ class CatalogLookupClientTest {
     }
 
     @Test
+    void pistaDeNotLeaderParaNoSemCatalogLookupFalhaSemChamarONovoLider() {
+        NodeId oldLeader = NodeId.of("leader-2");
+        rpc.respondNext((cmd, body) -> CatalogLookupResponse.notLeader(oldLeader.value()));
+        CatalogLookupClient client = new CatalogLookupClient(rpc, retry, Clock.systemUTC(), 2000,
+                CapabilityFixtures.advertisingByNode(Map.of(LEADER.value(), StorageCapabilities.ALL,
+                        oldLeader.value(), Set.of())));
+
+        NgrrdClusterException ex = assertThrows(NgrrdClusterException.class,
+                () -> client.lookup(List.of("series-1"), Duration.ofSeconds(1)));
+
+        assertEquals(ErrorCode.UNSUPPORTED_BY_NODE, ex.code());
+        assertEquals(1, rpc.calls().size(), "só o primeiro líder, que anuncia a capacidade, recebe o RPC");
+    }
+
+    @Test
     void deduplicaChaves() {
         SeriesPlacement placed = SeriesPlacement.active("storage-a", 1_000L);
         rpc.respondNext((cmd, body) -> {
             assertEquals(new CatalogLookupRequest(List.of("a", "b", "c")), body);
             return CatalogLookupResponse.ok(Map.of("a", placed));
         });
-        CatalogLookupClient client = new CatalogLookupClient(rpc, retry, Clock.systemUTC(), 10);
+        CatalogLookupClient client = new CatalogLookupClient(rpc, retry, Clock.systemUTC(), 10, capabilities);
 
         Map<String, SeriesPlacement> found = client.lookup(List.of("a", "b", "a", "c", "b"), Duration.ofSeconds(1));
 
@@ -114,7 +132,7 @@ class CatalogLookupClientTest {
         SeriesPlacement placed = SeriesPlacement.active("storage-a", 1_000L);
         rpc.respondNext((cmd, body) -> CatalogLookupResponse.notLeader(secondLeader.value()));
         rpc.respondNext((cmd, body) -> CatalogLookupResponse.ok(Map.of("series-1", placed)));
-        CatalogLookupClient client = new CatalogLookupClient(rpc, retry, Clock.systemUTC(), 2000);
+        CatalogLookupClient client = new CatalogLookupClient(rpc, retry, Clock.systemUTC(), 2000, capabilities);
 
         Map<String, SeriesPlacement> found = client.lookup(List.of("series-1"), Duration.ofSeconds(1));
 
@@ -131,7 +149,7 @@ class CatalogLookupClientTest {
             throw new NgrrdClusterException(ErrorCode.TIMEOUT, "timeout simulado");
         });
         rpc.respondNext((cmd, body) -> CatalogLookupResponse.ok(Map.of("series-1", placed)));
-        CatalogLookupClient client = new CatalogLookupClient(rpc, retry, Clock.systemUTC(), 2000);
+        CatalogLookupClient client = new CatalogLookupClient(rpc, retry, Clock.systemUTC(), 2000, capabilities);
 
         Map<String, SeriesPlacement> found = client.lookup(List.of("series-1"), Duration.ofSeconds(1));
 
@@ -145,7 +163,7 @@ class CatalogLookupClientTest {
     @Timeout(2)
     void semLiderLancaNoLeader() {
         rpc.leader(null);
-        CatalogLookupClient client = new CatalogLookupClient(rpc, retry, Clock.systemUTC(), 2000);
+        CatalogLookupClient client = new CatalogLookupClient(rpc, retry, Clock.systemUTC(), 2000, capabilities);
 
         NgrrdClusterException failure = assertThrows(NgrrdClusterException.class,
                 () -> client.lookup(List.of("series-1"), Duration.ofMillis(30)));
@@ -157,7 +175,7 @@ class CatalogLookupClientTest {
     @Test
     void erroDoLiderLancaRemoteError() {
         rpc.respondNext((cmd, body) -> CatalogLookupResponse.error("lote maior que o permitido"));
-        CatalogLookupClient client = new CatalogLookupClient(rpc, retry, Clock.systemUTC(), 2000);
+        CatalogLookupClient client = new CatalogLookupClient(rpc, retry, Clock.systemUTC(), 2000, capabilities);
 
         NgrrdClusterException ex = assertThrows(NgrrdClusterException.class,
                 () -> client.lookup(List.of("series-1"), Duration.ofSeconds(1)));
@@ -170,7 +188,7 @@ class CatalogLookupClientTest {
         SeriesPlacement placed = SeriesPlacement.active("storage-a", 1_000L);
         rpc.respondNext((cmd, body) -> CatalogLookupResponse.ok(Map.of("k1", placed, "k2", placed)));
         rpc.respondNext((cmd, body) -> CatalogLookupResponse.error("falha simulada na segunda página"));
-        CatalogLookupClient client = new CatalogLookupClient(rpc, retry, Clock.systemUTC(), 2);
+        CatalogLookupClient client = new CatalogLookupClient(rpc, retry, Clock.systemUTC(), 2, capabilities);
 
         NgrrdClusterException ex = assertThrows(NgrrdClusterException.class,
                 () -> client.lookup(List.of("k1", "k2", "k3", "k4"), Duration.ofSeconds(1)));
@@ -181,7 +199,7 @@ class CatalogLookupClientTest {
 
     @Test
     void listaVaziaNaoFazRpc() {
-        CatalogLookupClient client = new CatalogLookupClient(rpc, retry, Clock.systemUTC(), 2000);
+        CatalogLookupClient client = new CatalogLookupClient(rpc, retry, Clock.systemUTC(), 2000, capabilities);
 
         Map<String, SeriesPlacement> found = client.lookup(List.of(), Duration.ofSeconds(1));
 
@@ -192,7 +210,7 @@ class CatalogLookupClientTest {
     @Test
     void respostaNulaDoLiderLancaRemoteError() {
         rpc.respondNext((cmd, body) -> null);
-        CatalogLookupClient client = new CatalogLookupClient(rpc, retry, Clock.systemUTC(), 2000);
+        CatalogLookupClient client = new CatalogLookupClient(rpc, retry, Clock.systemUTC(), 2000, capabilities);
 
         NgrrdClusterException ex = assertThrows(NgrrdClusterException.class,
                 () -> client.lookup(List.of("series-1"), Duration.ofSeconds(1)));
@@ -204,7 +222,7 @@ class CatalogLookupClientTest {
     void statusDesconhecidoNaRespostaLancaRemoteError() {
         // O codec lê um enum desconhecido (ex.: líder de versão mais nova) como status == null.
         rpc.respondNext((cmd, body) -> new CatalogLookupResponse(null, null, null, null));
-        CatalogLookupClient client = new CatalogLookupClient(rpc, retry, Clock.systemUTC(), 2000);
+        CatalogLookupClient client = new CatalogLookupClient(rpc, retry, Clock.systemUTC(), 2000, capabilities);
 
         NgrrdClusterException ex = assertThrows(NgrrdClusterException.class,
                 () -> client.lookup(List.of("series-1"), Duration.ofSeconds(1)));
@@ -221,7 +239,7 @@ class CatalogLookupClientTest {
             return CatalogLookupResponse.notLeader(null);
         });
         rpc.respondNext((cmd, body) -> CatalogLookupResponse.ok(Map.of("series-1", placed)));
-        CatalogLookupClient client = new CatalogLookupClient(rpc, retry, Clock.systemUTC(), 2000);
+        CatalogLookupClient client = new CatalogLookupClient(rpc, retry, Clock.systemUTC(), 2000, capabilities);
 
         Map<String, SeriesPlacement> found = client.lookup(List.of("series-1"), Duration.ofSeconds(1));
 
@@ -246,7 +264,7 @@ class CatalogLookupClientTest {
             now[0] += 100;
             return CatalogLookupResponse.ok(Map.of("k1", placed));
         });
-        CatalogLookupClient client = new CatalogLookupClient(rpc, retry, clock, 2);
+        CatalogLookupClient client = new CatalogLookupClient(rpc, retry, clock, 2, capabilities);
 
         NgrrdClusterException ex = assertThrows(NgrrdClusterException.class,
                 () -> client.lookup(List.of("k1", "k2", "k3", "k4"), Duration.ofMillis(100)));

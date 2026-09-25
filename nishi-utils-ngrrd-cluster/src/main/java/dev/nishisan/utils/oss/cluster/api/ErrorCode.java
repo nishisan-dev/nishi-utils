@@ -47,5 +47,14 @@ public enum ErrorCode {
     BUFFER_FULL,
 
     /** O cliente ou o handle já foi fechado. */
-    CLOSED
+    CLOSED,
+
+    /**
+     * O storage node envolvido não anuncia a capacidade de protocolo que a operação exige (ver
+     * {@code StorageCapabilities}) — tipicamente um nó de versão anterior durante uma atualização. A
+     * operação falha na hora, antes de qualquer RPC a esse nó: {@code exists}/{@code find} nunca devolvem
+     * {@code false} e {@code open} sem criar nunca é enviado a um nó que poderia criar a série. Atualize
+     * os storages antes dos clientes.
+     */
+    UNSUPPORTED_BY_NODE
 }

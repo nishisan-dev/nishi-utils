@@ -21,6 +21,7 @@ import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.oss.cluster.api.ErrorCode;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
+import dev.nishisan.utils.oss.cluster.catalog.StorageCapabilities;
 import dev.nishisan.utils.oss.cluster.protocol.CatalogLookupRequest;
 import dev.nishisan.utils.oss.cluster.protocol.CatalogLookupResponse;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
@@ -50,8 +51,13 @@ public final class CatalogLookupClient {
     private final RetryPolicy retry;
     private final Clock clock;
     private final int batchSize;
+    private final NodeCapabilities capabilities;
 
-    public CatalogLookupClient(ClusterRpc rpc, RetryPolicy retry, Clock clock, int batchSize) {
+    /**
+     * @param capabilities confere {@code catalog.lookup} no líder antes de cada chamada a ele
+     */
+    public CatalogLookupClient(ClusterRpc rpc, RetryPolicy retry, Clock clock, int batchSize,
+            NodeCapabilities capabilities) {
         this.rpc = Objects.requireNonNull(rpc, "rpc");
         this.retry = Objects.requireNonNull(retry, "retry");
         this.clock = Objects.requireNonNull(clock, "clock");
@@ -59,6 +65,7 @@ public final class CatalogLookupClient {
             throw new IllegalArgumentException("batchSize deve ser > 0: " + batchSize);
         }
         this.batchSize = batchSize;
+        this.capabilities = Objects.requireNonNull(capabilities, "capabilities");
     }
 
     /**
@@ -97,6 +104,9 @@ public final class CatalogLookupClient {
             NodeId leader = leaderHint != null ? leaderHint
                     : LeaderCalls.awaitLeaderOrThrow(rpc, clock, deadline, description);
             leaderHint = null;
+            // Líder de versão anterior não responde CATALOG_LOOKUP: falha na hora, antes do RPC, em vez de
+            // esperar o prazo se esgotar em TIMEOUT.
+            capabilities.require(leader.value(), StorageCapabilities.CATALOG_LOOKUP);
             CatalogLookupResponse response;
             try {
                 response = rpc.call(leader, Commands.CATALOG_LOOKUP, new CatalogLookupRequest(page),

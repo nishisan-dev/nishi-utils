@@ -27,6 +27,7 @@ import dev.nishisan.utils.oss.api.ViewQuery;
 import dev.nishisan.utils.oss.cluster.api.ErrorCode;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
+import dev.nishisan.utils.oss.cluster.catalog.StorageCapabilities;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.protocol.OpenRequest;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesStatus;
@@ -45,6 +46,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -75,6 +77,8 @@ class RemoteSeriesHandleTest {
     private FakePlacementLookup resolver;
     private NoOpWriteBuffer dispatcher;
     private final List<String> onCloseCalls = new CopyOnWriteArrayList<>();
+    /** Capacidades anunciadas pelos storages aos handles criados por {@link #newHandle}. */
+    private NodeCapabilities capabilities = CapabilityFixtures.advertisingAll();
 
     private RemoteSeriesHandle newHandle() {
         return newHandle(Duration.ofSeconds(2), Ngrrd.OpenOptions.defaults());
@@ -95,7 +99,7 @@ class RemoteSeriesHandleTest {
         RetryPolicy retry = new RetryPolicy(retryTimeout, Duration.ofMillis(5), Duration.ofMillis(50));
         return new RemoteSeriesHandle(SERIES_KEY, "yaml: fake", "hash-1", Map.of(), options,
                 resolver, rpc, dispatcher, retry, Duration.ofSeconds(5), Duration.ofSeconds(5), Clock.systemUTC(),
-                (key, handle) -> onCloseCalls.add(key));
+                (key, handle) -> onCloseCalls.add(key), capabilities);
     }
 
     @Test
@@ -364,6 +368,48 @@ class RemoteSeriesHandleTest {
     }
 
     @Test
+    void openSemCriarComDonoSemCapacidadeFalhaSemEnviarOpen() {
+        capabilities = CapabilityFixtures.advertising(Set.of(StorageCapabilities.CATALOG_LOOKUP));
+        RemoteSeriesHandle handle = newHandle(Ngrrd.OpenOptions.defaults().withCreateIfMissing(false));
+
+        NgrrdClusterException ex = assertThrows(NgrrdClusterException.class, handle::open);
+
+        assertEquals(ErrorCode.UNSUPPORTED_BY_NODE, ex.code());
+        assertTrue(ex.getMessage().contains(OWNER_A.value()), ex.getMessage());
+        assertTrue(ex.getMessage().contains(StorageCapabilities.OPEN_CREATE_IF_MISSING), ex.getMessage());
+        assertTrue(rpc.calls().isEmpty(), "nenhum OPEN a um dono que não anuncia open.createIfMissing");
+    }
+
+    @Test
+    void reaberturaSomenteLeituraEmDonoNovoSemCapacidadeFalhaSemEnviarOpen() {
+        capabilities = CapabilityFixtures.advertisingByNode(Map.of(OWNER_A.value(), StorageCapabilities.ALL,
+                OWNER_B.value(), Set.of(StorageCapabilities.CATALOG_LOOKUP)));
+        RemoteSeriesHandle handle = readOnlyOpenedHandle();
+        rpc.respondNext((cmd, body) -> response(cmd, SeriesStatus.WRONG_OWNER, OWNER_B.value()));
+        rpc.respondNext((cmd, body) -> response(cmd, SeriesStatus.NOT_OPEN, OWNER_B.value()));
+
+        NgrrdClusterException ex = assertThrows(NgrrdClusterException.class, () -> handle.read("daily"));
+
+        assertEquals(ErrorCode.UNSUPPORTED_BY_NODE, ex.code());
+        assertEquals(List.of(Commands.OPEN, Commands.READ_PRESET, Commands.READ_PRESET), commands(),
+                "o redirecionamento não envia OPEN ao dono novo sem a capacidade");
+    }
+
+    @Test
+    void handleComCriarNaoConfereCapacidade() {
+        capabilities = CapabilityFixtures.unused();
+        RemoteSeriesHandle handle = newHandle();
+        rpc.respondNext((cmd, body) -> openOk(OWNER_A.value()));
+        handle.open();
+        rpc.respondNext((cmd, body) -> response(cmd, SeriesStatus.NOT_OPEN, OWNER_A.value()));
+        rpc.respondDefault((cmd, body) -> response(cmd, SeriesStatus.OK, OWNER_A.value()));
+
+        handle.checkpoint();
+
+        assertEquals(List.of(Commands.OPEN, Commands.CHECKPOINT, Commands.OPEN, Commands.CHECKPOINT), commands());
+    }
+
+    @Test
     void escritaEmHandleSomenteLeituraLancaIllegalStateSemTocarODispatcher() {
         RemoteSeriesHandle handle = readOnlyOpenedHandle();
 
@@ -517,7 +563,7 @@ class RemoteSeriesHandleTest {
         RemoteSeriesHandle handleA = new RemoteSeriesHandle(SERIES_KEY, "yaml: fake", "hash-1", Map.of(),
                 Ngrrd.OpenOptions.defaults().withCreateIfMissing(false), resolverA, rpcA, new NoOpWriteBuffer(),
                 retry, Duration.ofSeconds(5), Duration.ofSeconds(5), Clock.systemUTC(),
-                (key, handle) -> handles.remove(key, handle));
+                (key, handle) -> handles.remove(key, handle), CapabilityFixtures.advertisingAll());
         handles.put(SERIES_KEY, handleA);
         rpcA.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
         handleA.open();
@@ -540,7 +586,7 @@ class RemoteSeriesHandleTest {
                 Ngrrd.OpenOptions.defaults(), new FakePlacementLookup(OWNER_A.value()),
                 new RecordingClusterRpc(NodeId.of("client-under-test")), new NoOpWriteBuffer(), retry,
                 Duration.ofSeconds(5), Duration.ofSeconds(5), Clock.systemUTC(),
-                (key, handle) -> handles.remove(key, handle));
+                (key, handle) -> handles.remove(key, handle), CapabilityFixtures.advertisingAll());
         handles.put(SERIES_KEY, handleB);
 
         openGate.countDown();
@@ -626,7 +672,7 @@ class RemoteSeriesHandleTest {
                     }, "test-reader-on-close");
                     reader.start();
                     joinQuietly(reader);
-                });
+                }, capabilities);
         self.set(handle);
         rpc.respondNext((cmd, body) -> openOk(OWNER_A.value()));
         handle.open();
