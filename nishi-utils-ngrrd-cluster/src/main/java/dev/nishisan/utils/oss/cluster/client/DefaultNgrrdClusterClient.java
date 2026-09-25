@@ -17,6 +17,8 @@
 
 package dev.nishisan.utils.oss.cluster.client;
 
+import dev.nishisan.utils.oss.cluster.rpc.CoordinationLocks;
+
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.ngrid.structures.NGrid;
@@ -302,7 +304,7 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
         // as aberturas concorrentes DA MESMA série; handles só é tocado com get/put simples.
         Object lock = openLocks.computeIfAbsent(seriesKey, key -> new Object());
         try {
-            synchronized (lock) {
+            try (var guard = CoordinationLocks.acquire(lock)) {
                 existing = handles.get(seriesKey);
                 if (existing != null) {
                     return existing;

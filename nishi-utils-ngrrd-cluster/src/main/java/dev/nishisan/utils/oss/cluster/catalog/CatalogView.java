@@ -59,7 +59,7 @@ public interface CatalogView {
     /** Whether this catalog persists geometry references. */
     default boolean geometryTrackingEnabled() { return false; }
 
-    /** Shared leader-side serialization for updates of a series. */
+    /** Shared leader-side lock identity; acquire through {@code CoordinationLocks.acquire}. */
     default Object placementLock(String seriesKey) { return this; }
 
     /** Registers a validated, immutable geometry before its reference is published. */

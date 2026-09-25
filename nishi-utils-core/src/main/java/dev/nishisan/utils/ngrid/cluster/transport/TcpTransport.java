@@ -31,7 +31,7 @@ import java.io.Closeable;
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.DataInputStream;
-import java.io.DataOutputStream;
+import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -57,6 +57,7 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.TimeoutException;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -464,7 +465,9 @@ public final class TcpTransport implements Transport {
         if (nodeInfo.port() <= 0) {
             return null;
         }
-        synchronized (getLockFor(nodeId)) {
+        ReentrantLock peerLock = getLockFor(nodeId);
+        peerLock.lock();
+        try {
             current = connections.get(nodeId);
             if (current != null && current.isOpen()) {
                 return current;
@@ -490,13 +493,15 @@ public final class TcpTransport implements Transport {
                 LOGGER.log(Level.FINE, "Unable to connect to {0}: {1}", new Object[]{nodeInfo, e.getMessage()});
                 return null;
             }
+        } finally {
+            peerLock.unlock();
         }
     }
 
-    private final Map<NodeId, Object> connectionLocks = new ConcurrentHashMap<>();
+    private final Map<NodeId, ReentrantLock> connectionLocks = new ConcurrentHashMap<>();
 
-    private Object getLockFor(NodeId nodeId) {
-        return connectionLocks.computeIfAbsent(nodeId, id -> new Object());
+    private ReentrantLock getLockFor(NodeId nodeId) {
+        return connectionLocks.computeIfAbsent(nodeId, id -> new ReentrantLock());
     }
 
     private Connection registerConnection(Socket socket, NodeInfo preResolved) throws IOException {
@@ -525,7 +530,9 @@ public final class TcpTransport implements Transport {
      *         candidate lost the tie-break; the candidate is closed in that case)
      */
     private Connection registerLiveConnection(NodeId remoteId, Connection candidate) {
-        synchronized (getLockFor(remoteId)) {
+        ReentrantLock peerLock = getLockFor(remoteId);
+        peerLock.lock();
+        try {
             Connection existing = connections.get(remoteId);
             if (existing == candidate) {
                 return candidate;
@@ -544,6 +551,8 @@ public final class TcpTransport implements Transport {
             }
             candidate.closeQuietly();
             return existing;
+        } finally {
+            peerLock.unlock();
         }
     }
 
@@ -878,7 +887,7 @@ public final class TcpTransport implements Transport {
 
     private final class Connection implements Closeable {
         private final Socket socket;
-        private final DataOutputStream outputStream;
+        private final OutputStream outputStream;
         private final DataInputStream inputStream;
         // Per-connection codec: outbound compression is negotiated per-peer in the handshake, so
         // each connection owns its codec and toggles its compress-output flag once the peer
@@ -896,7 +905,7 @@ public final class TcpTransport implements Transport {
             this.socket = socket;
             this.outboundInitiated = outboundInitiated;
             this.codec = new CompositeMessageCodec(config.compressionMinSize());
-            this.outputStream = new DataOutputStream(socket.getOutputStream());
+            this.outputStream = socket.getOutputStream();
             this.outputStream.flush();
             this.inputStream = new DataInputStream(socket.getInputStream());
             // Use Virtual Thread for writing (one per connection to ensure order)
@@ -950,18 +959,23 @@ public final class TcpTransport implements Transport {
         }
 
         private void drainOutbound() {
+            byte[] lengthPrefix = new byte[Integer.BYTES];
             try {
                 while (isOpen()) {
                     ClusterMessage message = outbound.poll(1, TimeUnit.SECONDS);
                     if (message == null) {
                         continue; // timeout — recheck isOpen()
                     }
-                    synchronized (outputStream) {
-                        byte[] data = codec.encode(message);
-                        outputStream.writeInt(data.length);
-                        outputStream.write(data);
-                        outputStream.flush();
-                    }
+                    // One writer owns this raw socket stream. DataOutputStream.write(byte[])
+                    // itself is synchronized on Java 21 and would pin a slow socket writer.
+                    byte[] data = codec.encode(message);
+                    lengthPrefix[0] = (byte) (data.length >>> 24);
+                    lengthPrefix[1] = (byte) (data.length >>> 16);
+                    lengthPrefix[2] = (byte) (data.length >>> 8);
+                    lengthPrefix[3] = (byte) data.length;
+                    outputStream.write(lengthPrefix);
+                    outputStream.write(data);
+                    outputStream.flush();
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();

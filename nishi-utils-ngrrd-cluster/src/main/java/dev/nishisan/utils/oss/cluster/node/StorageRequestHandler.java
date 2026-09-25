@@ -17,6 +17,8 @@
 
 package dev.nishisan.utils.oss.cluster.node;
 
+import dev.nishisan.utils.oss.cluster.rpc.CoordinationLocks;
+
 import dev.nishisan.utils.ngrid.cluster.transport.Transport;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.oss.Ngrrd;
@@ -226,7 +228,10 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
     }
 
     private SeriesStatusResponse handleOpen(OpenRequest request) {
-        synchronized (registry.operationLock(request.seriesKey())) {
+        try (var guard = CoordinationLocks.acquire(registry.operationLock(request.seriesKey()))) {
+            if (registry.isMigrating(request.seriesKey())) {
+                return new SeriesStatusResponse(SeriesStatus.MIGRATING, self.value(), null);
+            }
             return openWithMetadata(request);
         }
     }
@@ -452,7 +457,7 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
     }
 
     private Ownership ownership(String seriesKey, SeriesPlacement placementHint) {
-        if (registry.isMigrating(seriesKey)) {
+        if (registry.isMigrationFrozen(seriesKey)) {
             return new Ownership(SeriesStatus.MIGRATING, null);
         }
         if (registry.isForgotten(seriesKey)) {
@@ -462,6 +467,9 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
         if (placement.isPresent()) {
             SeriesPlacement current = placement.get();
             if (current.state() == PlacementState.MIGRATING) {
+                if (self.value().equals(current.ownerNodeId()) && registry.isCopying(seriesKey)) {
+                    return new Ownership(SeriesStatus.OK, current.ownerNodeId());
+                }
                 return new Ownership(SeriesStatus.MIGRATING, current.ownerNodeId());
             }
             if (!current.isOwnedBy(self.value())) {

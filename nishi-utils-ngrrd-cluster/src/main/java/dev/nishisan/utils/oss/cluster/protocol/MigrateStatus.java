@@ -25,6 +25,9 @@ public enum MigrateStatus {
     /** Operação concluída com sucesso. */
     OK,
 
+    /** The destination reserved the image and supports live-copy patches. */
+    COPY_READY,
+
     /** A migração foi confirmada e a cópia no destino está ativa. */
     COMMITTED,
 

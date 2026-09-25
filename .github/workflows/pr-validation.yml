@@ -38,8 +38,10 @@ jobs:
       - name: Run unit tests with coverage (NGrid resilience suite excluded)
         run: mvn -B verify -pl nishi-utils-core,nishi-utils-oss,nishi-utils-ngrrd-cluster -am -DexcludeNgrid=true -Dsurefire.rerunFailingTestsCount=1
 
-      - name: Verify checkpoint recovery after migration
-        run: mvn -B test -pl nishi-utils-ngrrd-cluster -am -Pngrrd-cluster -Dtest=CheckpointAfterMigrationClusterTest -Dsurefire.failIfNoSpecifiedTests=false
+      - name: Verify migration with continuous ingestion and checkpoint recovery
+        env:
+          JAVA_TOOL_OPTIONS: -Djdk.virtualThreadScheduler.parallelism=2
+        run: mvn -B test -pl nishi-utils-ngrrd-cluster -am -Pngrrd-cluster -Dtest=CheckpointAfterMigrationClusterTest,ContinuousIngestionRebalanceClusterTest -Dsurefire.failIfNoSpecifiedTests=false
 
       - name: Upload coverage report
         if: always()

@@ -37,6 +37,7 @@ import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.node.SeriesHandleRegistry;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.protocol.MigrateChunkRequest;
+import dev.nishisan.utils.oss.cluster.protocol.MigratePatchRequest;
 import dev.nishisan.utils.oss.cluster.protocol.MigratePrepareRequest;
 import dev.nishisan.utils.oss.cluster.protocol.MigrateCommitRequest;
 import dev.nishisan.utils.oss.cluster.protocol.MigrateControlRequest;
@@ -187,6 +188,104 @@ class MigrationExecutorTest {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+    }
+
+    @Test
+    void writesDuringTheBaseCopyAndCatchupReachTheFinalImage() throws Exception {
+        String key = "online-hot-series", id = "online-hot-move";
+        byte[] before = writeAndCheckpointSeries(key);
+        publishMigration(key, id);
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var first = new java.util.concurrent.atomic.AtomicBoolean(true);
+        rpc.beforeChunk = () -> { if (first.getAndSet(false)) { entered.countDown(); await(release); } };
+        var patched = new java.util.concurrent.atomic.AtomicBoolean();
+        long step = 300_000L, t0 = 1_700_000_000_000L - 1_700_000_000_000L % step;
+        rpc.afterPatch = () -> {
+            if (patched.compareAndSet(false, true)) {
+                assertTrue(srcRegistry.withHandle(key, h -> {
+                    h.write("in_octets", new Sample(t0 + 21 * step, 8000));
+                    h.checkpoint();
+                    return true;
+                }).orElse(false), "pre-cutover catch-up must also allow ingestion");
+            }
+        };
+        assertEquals(MigrateStatus.OK, ((MigrateResponse) srcExecutor.handleLocal(Commands.MIGRATE_START,
+                new MigrateStartRequest(key, id, DST.value()))).status());
+        try {
+            assertTrue(entered.await(2, TimeUnit.SECONDS));
+            assertTrue(srcRegistry.isCopying(key));
+            assertTrue(srcRegistry.withHandle(key, h -> {
+                h.write("in_octets", new Sample(t0 + 20 * step, 5000));
+                h.checkpoint();
+                return true;
+            }).orElse(false), "writes/checkpoints must finish before releasing the base transfer");
+        } finally { release.countDown(); }
+        awaitCommittedOnSource(id);
+        assertTrue(patched.get(), "the test must exercise incremental transfer");
+        byte[] current = srcVolume.storage().get(objectKey(key)).orElseThrow();
+        assertFalse(java.util.Arrays.equals(before, current));
+        assertArrayEquals(current, dstVolume.storage().get(objectKey(key)).orElseThrow());
+        assertTrue(srcRegistry.isMigrationFrozen(key), "cutover stays fenced until the catalog switches owner");
+    }
+
+    @Test
+    void patchesAreIdempotentAndCannotOutliveAbortOrTheirReservation() {
+        String key = "patches", id = "patch-id";
+        publishMigration(key, id);
+        var prepare = new MigratePrepareRequest(key, id, objectKey(key), 8192, true);
+        assertEquals(MigrateStatus.COPY_READY, ((MigrateResponse) dstExecutor.handleLocal(Commands.MIGRATE_PREPARE, prepare)).status());
+        assertEquals(MigrateStatus.COPY_READY, ((MigrateResponse) dstExecutor.handleLocal(Commands.MIGRATE_PREPARE, prepare)).status());
+        byte[] bytes = new byte[8192];
+        assertEquals(MigrateStatus.OK, ((MigrateResponse) dstExecutor.handleLocal(Commands.MIGRATE_CHUNK,
+                new MigrateChunkRequest(key, id, 0, 1, bytes))).status());
+        var patch = new MigratePatchRequest(key, id, 0, 4096, new byte[]{7, 8, 9});
+        assertEquals(MigrateStatus.OK, ((MigrateResponse) dstExecutor.handleLocal(Commands.MIGRATE_PATCH, patch)).status());
+        assertEquals(MigrateStatus.OK, ((MigrateResponse) dstExecutor.handleLocal(Commands.MIGRATE_PATCH, patch)).status());
+        bytes[4096] = 7; bytes[4097] = 8; bytes[4098] = 9;
+        assertEquals(MigrateStatus.COMMITTED, commit(key, id, bytes).status());
+        assertEquals(MigrateStatus.COMMITTED, commit(key, id, bytes).status());
+        assertArrayEquals(bytes, dstVolume.storage().get(objectKey(key)).orElseThrow());
+        dstExecutor.handleLocal(Commands.MIGRATE_ABORT, new MigrateControlRequest(key, id));
+        assertEquals(MigrateStatus.ERROR, ((MigrateResponse) dstExecutor.handleLocal(Commands.MIGRATE_PATCH, patch)).status());
+        assertEquals(0, dstVolume.storage().reservedBytes());
+    }
+
+    @Test
+    void invalidPatchesReleaseReservationWithoutInstallingPartialImage() {
+        for (int scenario = 0; scenario < 3; scenario++) {
+            String key = "invalid-patch-" + scenario, id = "invalid-" + scenario;
+            publishMigration(key, id);
+            assertEquals(MigrateStatus.COPY_READY, ((MigrateResponse) dstExecutor.handleLocal(Commands.MIGRATE_PREPARE,
+                    new MigratePrepareRequest(key, id, objectKey(key), 8192, true))).status());
+            if (scenario != 0) {
+                assertEquals(MigrateStatus.OK, ((MigrateResponse) dstExecutor.handleLocal(Commands.MIGRATE_CHUNK,
+                        new MigrateChunkRequest(key, id, 0, 1, new byte[8192]))).status());
+            }
+            // Incomplete base, skipped sequence, and out-of-bounds patch respectively.
+            var patch = new MigratePatchRequest(key, id, scenario == 1 ? 1 : 0,
+                    scenario == 2 ? 8192 : 0, new byte[]{42});
+            assertEquals(MigrateStatus.ERROR, ((MigrateResponse) dstExecutor.handleLocal(Commands.MIGRATE_PATCH, patch)).status());
+            assertEquals(MigrateStatus.ERROR, status(dstExecutor, id).status());
+            assertEquals(0, dstVolume.storage().reservedBytes());
+            assertTrue(dstVolume.storage().get(objectKey(key)).isEmpty());
+            assertEquals(MigrateStatus.ERROR, commit(key, id, new byte[8192]).status());
+        }
+    }
+
+    @Test
+    void unsupportedLiveCopyLeavesTheSourceWritableAndDoesNotSendChunks() {
+        String key = "old-target", id = "unsupported";
+        byte[] original = writeAndCheckpointSeries(key);
+        publishMigration(key, id);
+        rpc.prepareOverride = MigrateResponse.of(MigrateStatus.OK, null); // 8.4.x destination
+        var result = (MigrateResponse) srcExecutor.handleLocal(Commands.MIGRATE_START,
+                new MigrateStartRequest(key, id, DST.value()));
+        assertEquals(MigrateStatus.ERROR, result.status());
+        assertFalse(srcRegistry.isMigrating(key));
+        assertTrue(srcRegistry.isOpen(key));
+        assertEquals(0, rpc.chunkCallCount());
+        assertArrayEquals(original, srcVolume.storage().get(objectKey(key)).orElseThrow());
     }
 
     @Test
@@ -886,6 +985,8 @@ class MigrationExecutorTest {
         private final LongAdder chunkCalls = new LongAdder();
         private Runnable beforeChunk = () -> { };
         private Runnable afterChunk = () -> { };
+        private Runnable afterPatch = () -> { };
+        private MigrateResponse prepareOverride;
 
         void register(NodeId id, MigrationExecutor executor) {
             executors.put(id, executor);
@@ -898,6 +999,9 @@ class MigrationExecutorTest {
         @Override
         @SuppressWarnings("unchecked")
         public <R> R call(NodeId target, String command, Object body, Class<R> responseType) {
+            if (Commands.MIGRATE_PREPARE.equals(command) && prepareOverride != null) {
+                return (R) prepareOverride;
+            }
             if (Commands.MIGRATE_CHUNK.equals(command)) {
                 chunkCalls.increment();
                 beforeChunk.run();
@@ -910,6 +1014,7 @@ class MigrationExecutorTest {
             if (Commands.MIGRATE_CHUNK.equals(command)) {
                 afterChunk.run();
             }
+            if (Commands.MIGRATE_PATCH.equals(command)) { afterPatch.run(); }
             return result;
         }
 

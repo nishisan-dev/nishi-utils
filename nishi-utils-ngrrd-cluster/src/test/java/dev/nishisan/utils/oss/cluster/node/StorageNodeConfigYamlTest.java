@@ -73,6 +73,7 @@ class StorageNodeConfigYamlTest {
                     maxMovesPerCycle: 100
                     migrationTimeout: 5m
                     chunkBytes: 131072
+                    maxBytesPerSecond: 8388608
                     maxSeriesBytes: 33554432
                   reconcile:
                     interval: 15m
@@ -109,6 +110,7 @@ class StorageNodeConfigYamlTest {
         assertEquals(100, config.maxMovesPerCycle());
         assertEquals(Duration.ofMinutes(5), config.migrationTimeout());
         assertEquals(131_072L, config.migrationChunkBytes());
+        assertEquals(8_388_608L, config.migrationBytesPerSecond());
         assertEquals(33_554_432L, config.maxSeriesBytes());
         assertEquals(Duration.ofMinutes(15), config.reconcileInterval());
         assertEquals(Duration.ofMinutes(10), config.orphanGrace());

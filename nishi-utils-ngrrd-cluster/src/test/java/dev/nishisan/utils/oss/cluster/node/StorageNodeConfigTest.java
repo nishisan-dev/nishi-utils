@@ -45,6 +45,14 @@ class StorageNodeConfigTest {
     }
 
     @Test
+    void migrationBudgetIsPositiveAndConfigurable(@TempDir Path base) {
+        assertEquals(16L * 1024 * 1024, minimal(base).build().migrationBytesPerSecond());
+        assertEquals(12345, minimal(base).migrationBytesPerSecond(12345).build().migrationBytesPerSecond());
+        assertThrows(IllegalArgumentException.class, () -> minimal(base).migrationBytesPerSecond(0).build());
+        assertThrows(IllegalArgumentException.class, () -> minimal(base).migrationBytesPerSecond(-1).build());
+    }
+
+    @Test
     void defaultsDeCoordenacaoSaoJanelaDeTresSegundosEHandbackLigado(@TempDir Path base) {
         StorageNodeConfig config = minimal(base).build();
 

@@ -26,7 +26,7 @@ O primeiro comando Maven compila e instala localmente o módulo e os módulos do
 depende. O segundo copia as dependências para `nishi-utils-ngrrd-cluster/target/lib`.
 Os testes são omitidos neste procedimento de preparação; isso não substitui os gates de release.
 
-Os comandos abaixo usam a versão `8.4.1` do POM desta branch. Se a versão mudar, ajuste o nome
+Os comandos abaixo usam a versão `8.5.0` do POM desta branch. Se a versão mudar, ajuste o nome
 do JAR. A pasta `lib` deve conter as dependências do mesmo build; ao trocar versões, prepare
 o pacote em um diretório de build limpo para não misturar JARs antigos e novos.
 
@@ -70,7 +70,7 @@ reduzido para abrir um volume existente: preserve sua configuração, incluindo 
 No terminal 1, na raiz do repositório:
 
 ```bash
-java -cp 'nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.4.1.jar:nishi-utils-ngrrd-cluster/target/lib/*' \
+java -cp 'nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.5.0.jar:nishi-utils-ngrrd-cluster/target/lib/*' \
   dev.nishisan.utils.oss.cluster.node.NgrrdStorageNodeMain \
   --config target/ngrrd-demo/storage-1.yaml
 ```
@@ -91,7 +91,7 @@ protocolo TCP do NGrid.
 Em outro terminal, também na raiz do repositório:
 
 ```bash
-java -cp 'nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.4.1.jar:nishi-utils-ngrrd-cluster/target/lib/*' \
+java -cp 'nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.5.0.jar:nishi-utils-ngrrd-cluster/target/lib/*' \
   dev.nishisan.utils.oss.cluster.admin.NgrrdClusterAdminCli \
   --seed 127.0.0.1:7101 status
 ```
@@ -103,7 +103,7 @@ cria séries nem gera amostras. A CLI executa a consulta e encerra.
 Para consultar as métricas locais:
 
 ```bash
-java -cp 'nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.4.1.jar:nishi-utils-ngrrd-cluster/target/lib/*' \
+java -cp 'nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.5.0.jar:nishi-utils-ngrrd-cluster/target/lib/*' \
   dev.nishisan.utils.oss.cluster.admin.NgrrdClusterAdminCli \
   --seed 127.0.0.1:7101 metrics storage-1
 ```
@@ -138,7 +138,7 @@ done
 No terminal 2, execute:
 
 ```bash
-java -cp 'nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.4.1.jar:nishi-utils-ngrrd-cluster/target/lib/*' \
+java -cp 'nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.5.0.jar:nishi-utils-ngrrd-cluster/target/lib/*' \
   dev.nishisan.utils.oss.cluster.node.NgrrdStorageNodeMain \
   --config target/ngrrd-demo/storage-2.yaml
 ```
@@ -146,7 +146,7 @@ java -cp 'nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.4.1.jar:n
 No terminal 3, execute:
 
 ```bash
-java -cp 'nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.4.1.jar:nishi-utils-ngrrd-cluster/target/lib/*' \
+java -cp 'nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.5.0.jar:nishi-utils-ngrrd-cluster/target/lib/*' \
   dev.nishisan.utils.oss.cluster.node.NgrrdStorageNodeMain \
   --config target/ngrrd-demo/storage-3.yaml
 ```

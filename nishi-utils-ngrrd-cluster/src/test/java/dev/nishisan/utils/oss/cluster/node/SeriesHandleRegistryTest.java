@@ -189,6 +189,39 @@ class SeriesHandleRegistryTest {
     }
 
     @Test
+    void failedCutoverCheckpointKeepsTheWriterForAbortRecovery() throws Exception {
+        try (SeriesHandleRegistry registry = registry(Duration.ofMinutes(10), 10, Clock.systemUTC())) {
+            String key = "checkpoint-failure";
+            NgrrdHandle original = registry.open(key, yaml, Ngrrd.OpenOptions.defaults());
+            var entriesField = SeriesHandleRegistry.class.getDeclaredField("entries");
+            entriesField.setAccessible(true);
+            Object entry = ((Map<?, ?>) entriesField.get(registry)).get(key);
+            var handleField = entry.getClass().getDeclaredField("handle");
+            handleField.setAccessible(true);
+            var failCheckpoint = new AtomicBoolean(true);
+            NgrrdHandle failing = (NgrrdHandle) java.lang.reflect.Proxy.newProxyInstance(
+                    NgrrdHandle.class.getClassLoader(), new Class<?>[]{NgrrdHandle.class}, (proxy, method, args) -> {
+                        if (method.getName().equals("checkpoint") && failCheckpoint.getAndSet(false)) {
+                            throw new IllegalStateException("injected checkpoint failure");
+                        }
+                        try { return method.invoke(original, args); }
+                        catch (java.lang.reflect.InvocationTargetException e) { throw e.getCause(); }
+                    });
+            handleField.set(entry, failing);
+            registry.beginMigrationCopy(key);
+            assertThrows(IllegalStateException.class, () -> registry.markMigrating(key));
+            assertTrue(registry.isMigrationFrozen(key));
+            assertEquals(1, registry.openCount(), "a failed checkpoint must not discard the writer");
+            registry.clearMigrating(key);
+            assertTrue(registry.withHandle(key, h -> {
+                h.write("in_octets", new Sample(1_700_000_100_000L, 123));
+                h.checkpoint();
+                return true;
+            }).orElse(false));
+        }
+    }
+
+    @Test
     void closeDoRegistryFechaTodosOsHandlesAbertos() {
         SeriesHandleRegistry registry = registry(Duration.ofMinutes(10), 10, Clock.systemUTC());
         registry.open("series-1", yaml, Ngrrd.OpenOptions.defaults());

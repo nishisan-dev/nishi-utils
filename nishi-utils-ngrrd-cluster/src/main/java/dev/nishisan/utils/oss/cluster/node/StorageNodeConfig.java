@@ -145,6 +145,7 @@ import java.util.function.Function;
  *                                 abrir; um {@code OPEN} com prefixo divergente do configurado neste nó é
  *                                 rejeitado com {@code SeriesStatus#ERROR}.
  * @param distributionMode strategy shared by placement and rebalance; defaults to COUNT
+ * @param migrationBytesPerSecond aggregate outgoing migration budget per source node, in payload bytes/s
  * @param weight positive finite relative weight used in WEIGHT mode
  */
 public record StorageNodeConfig(
@@ -186,7 +187,59 @@ public record StorageNodeConfig(
         Duration orphanGrace,
         String seriesObjectPrefix,
         DistributionMode distributionMode,
+        double weight,
+        long migrationBytesPerSecond) {
+
+    /** Compatibility constructor using the default aggregate migration bandwidth (16 MiB/s per source). */
+    public StorageNodeConfig(
+        String nodeId,
+        String host,
+        int port,
+        String seed,
+        List<String> peers,
+        Path dataDir,
+        int priority,
+        Path volumeDir,
+        String volumeName,
+        int shardCount,
+        long segmentBytes,
+        long initialShardCapacityBytes,
+        long capacityBytes,
+        Duration statusReportInterval,
+        Duration nodeStatusStaleAfter,
+        Duration handleIdleTtl,
+        int maxOpenHandles,
+        Duration requestTimeout,
+        Durability defaultDurability,
+        OnGeometryChange defaultOnGeometryChange,
+        NgrrdClusterMetricsListener metricsListener,
+        Duration bootDiscoveryWindow,
+        boolean affinityHandbackMode,
+        Duration placementGraceAfterLeadership,
+        boolean rebalanceEnabled,
+        Duration rebalanceInterval,
+        long rebalanceMinDelta,
+        double rebalanceTolerance,
+        int maxConcurrentMigrations,
+        int maxMovesPerCycle,
+        Duration migrationTimeout,
+        long migrationChunkBytes,
+        long maxSeriesBytes,
+        Duration migrationStatusPollInterval,
+        Duration reconcileInterval,
+        Duration orphanGrace,
+        String seriesObjectPrefix,
+        DistributionMode distributionMode,
         double weight) {
+        this(nodeId, host, port, seed, peers, dataDir, priority, volumeDir, volumeName, shardCount, segmentBytes,
+                initialShardCapacityBytes, capacityBytes, statusReportInterval, nodeStatusStaleAfter,
+                handleIdleTtl, maxOpenHandles, requestTimeout, defaultDurability, defaultOnGeometryChange,
+                metricsListener, bootDiscoveryWindow, affinityHandbackMode, placementGraceAfterLeadership,
+                rebalanceEnabled, rebalanceInterval, rebalanceMinDelta, rebalanceTolerance,
+                maxConcurrentMigrations, maxMovesPerCycle, migrationTimeout, migrationChunkBytes, maxSeriesBytes,
+                migrationStatusPollInterval, reconcileInterval, orphanGrace, seriesObjectPrefix,
+                distributionMode, weight, 16L * 1024 * 1024);
+    }
 
     /** Compatibility constructor with equal-count distribution. */
     public StorageNodeConfig(
@@ -238,6 +291,7 @@ public record StorageNodeConfig(
     }
 
     public StorageNodeConfig {
+        if (migrationBytesPerSecond <= 0) { throw new IllegalArgumentException("migrationBytesPerSecond must be > 0"); }
         Objects.requireNonNull(distributionMode, "distributionMode");
         if (!Double.isFinite(weight) || weight <= 0) {
             throw new IllegalArgumentException("weight must be positive and finite");
@@ -471,6 +525,9 @@ public record StorageNodeConfig(
                 }
                 applyDuration(rebalance.migrationTimeout, "ngrrd.rebalance.migrationTimeout",
                         builder::migrationTimeout);
+                if (rebalance.maxBytesPerSecond != null) {
+                    builder.migrationBytesPerSecond(rebalance.maxBytesPerSecond);
+                }
                 if (rebalance.chunkBytes != null) {
                     builder.migrationChunkBytes(rebalance.chunkBytes);
                 }
@@ -553,6 +610,7 @@ public record StorageNodeConfig(
         public Integer maxMovesPerCycle;
         public String migrationTimeout;
         public Long chunkBytes;
+        public Long maxBytesPerSecond;
         public Long maxSeriesBytes;
     }
 
@@ -600,6 +658,7 @@ public record StorageNodeConfig(
         private int maxMovesPerCycle = 50;
         private Duration migrationTimeout = Duration.ofMinutes(10);
         private long migrationChunkBytes = 256L * 1024L;
+        private long migrationBytesPerSecond = 16L * 1024L * 1024L;
         private long maxSeriesBytes = 64L * 1024L * 1024L;
         private Duration migrationStatusPollInterval = Duration.ofMillis(500);
         private Duration reconcileInterval = Duration.ofMinutes(10);
@@ -783,6 +842,12 @@ public record StorageNodeConfig(
             return this;
         }
 
+        /** Sets the aggregate outgoing migration payload budget in bytes/s (default 16 MiB/s). */
+        public Builder migrationBytesPerSecond(long bytesPerSecond) {
+            this.migrationBytesPerSecond = bytesPerSecond;
+            return this;
+        }
+
         public Builder migrationChunkBytes(long migrationChunkBytes) {
             this.migrationChunkBytes = migrationChunkBytes;
             return this;
@@ -839,7 +904,7 @@ public record StorageNodeConfig(
                     rebalanceEnabled, rebalanceInterval, rebalanceMinDelta, rebalanceTolerance,
                     maxConcurrentMigrations, maxMovesPerCycle, migrationTimeout, migrationChunkBytes,
                     maxSeriesBytes, migrationStatusPollInterval, reconcileInterval, orphanGrace,
-                    seriesObjectPrefix, distributionMode, weight);
+                    seriesObjectPrefix, distributionMode, weight, migrationBytesPerSecond);
         }
 
         private static Duration maxDuration(Duration a, Duration b) {

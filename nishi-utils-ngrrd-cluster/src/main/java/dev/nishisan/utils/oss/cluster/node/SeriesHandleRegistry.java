@@ -81,7 +81,7 @@ public final class SeriesHandleRegistry implements Closeable {
     private final Duration idleTtl;
     private final int maxOpenHandles;
     private final Object[] operationLocks = java.util.stream.IntStream.range(0, 256).mapToObj(i -> new Object()).toArray();
-    /** Serializes OPEN, metadata inspection and migration for a local series. */
+    /** Lock identity shared by OPEN, metadata inspection and migration; use {@code CoordinationLocks.acquire}. */
     public Object operationLock(String key) { return operationLocks[Math.floorMod(key.hashCode(), operationLocks.length)]; }
     private final Clock clock;
 
@@ -89,6 +89,7 @@ public final class SeriesHandleRegistry implements Closeable {
     private final ConcurrentMap<String, String> hashBySeriesKey = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, DefinitionRecord> definitionByHash = new ConcurrentHashMap<>();
     private final Set<String> migrating = ConcurrentHashMap.newKeySet();
+    private final Set<String> copying = ConcurrentHashMap.newKeySet();
     /**
      * Séries fechadas por {@link #close(String)} explícito do cliente —
      * {@link #reopenIfKnown} não as reabre sozinho (ao contrário de um
@@ -196,7 +197,7 @@ public final class SeriesHandleRegistry implements Closeable {
     public <R> Optional<R> withHandle(String seriesKey, Function<NgrrdHandle, R> fn) {
         Objects.requireNonNull(seriesKey, "seriesKey");
         Objects.requireNonNull(fn, "fn");
-        if (migrating.contains(seriesKey)) {
+        if (isMigrationFrozen(seriesKey)) {
             return Optional.empty();
         }
         HandleEntry entry = entries.get(seriesKey);
@@ -242,7 +243,7 @@ public final class SeriesHandleRegistry implements Closeable {
      */
     public Optional<NgrrdHandle> reopenIfKnown(String seriesKey) {
         Objects.requireNonNull(seriesKey, "seriesKey");
-        if (migrating.contains(seriesKey) || closedByClient.contains(seriesKey)) {
+        if (isMigrationFrozen(seriesKey) || closedByClient.contains(seriesKey)) {
             return Optional.empty();
         }
         String hash = hashBySeriesKey.get(seriesKey);
@@ -261,7 +262,7 @@ public final class SeriesHandleRegistry implements Closeable {
                 if (entries.get(seriesKey) != entry) {
                     continue;
                 }
-                if (migrating.contains(seriesKey) || closedByClient.contains(seriesKey)) {
+                if (isMigrationFrozen(seriesKey) || closedByClient.contains(seriesKey)) {
                     // Só remove se ainda vazia E ainda a corrente — nunca apaga um handle que outra
                     // thread já tenha aberto de verdade nesta mesma entrada nesse meio-tempo (o bug
                     // que o Refuter pegou: remover incondicionalmente fora do lock podia derrubar do
@@ -475,18 +476,22 @@ public final class SeriesHandleRegistry implements Closeable {
      * Marca a série como em migração: faz checkpoint+close do handle aberto (se
      * houver) e impede reaberturas — {@link #open} passa a lançar
      * {@link IllegalStateException}; {@link #withHandle}/{@link #reopenIfKnown}
-     * passam a devolver {@link Optional#empty()}. Preparação para o M3
-     * (nenhum handler de migração neste marco).
+     * passam a devolver {@link Optional#empty()}. Na cópia online, este bloqueio
+     * só começa na troca final de dono; uma falha no checkpoint impede o commit.
      */
     public void markMigrating(String seriesKey) {
         Objects.requireNonNull(seriesKey, "seriesKey");
         migrating.add(seriesKey);
+        copying.remove(seriesKey);
         HandleEntry entry = entries.get(seriesKey);
         if (entry == null) {
             return;
         }
         entry.lock.lock();
         try {
+            // An acknowledged write must reach the image before migration closes its writer.
+            // A failed checkpoint leaves the handle available for a safe abort/retry.
+            if (entries.get(seriesKey) == entry && entry.handle != null) { entry.handle.checkpoint(); }
             if (entries.remove(seriesKey, entry)) {
                 closeQuietly(seriesKey, entry.handle);
             }
@@ -498,6 +503,37 @@ public final class SeriesHandleRegistry implements Closeable {
     /** Remove a marca de migração, permitindo {@link #open} novamente. */
     public void clearMigrating(String seriesKey) {
         migrating.remove(seriesKey);
+        copying.remove(seriesKey);
+    }
+
+    /** Marks an online copy; existing same-geometry handles remain writable until markMigrating. */
+    public void beginMigrationCopy(String seriesKey) {
+        migrating.add(seriesKey);
+        copying.add(seriesKey);
+    }
+
+    /** True only for the short cutover, not the initial online copy. */
+    public boolean isMigrationFrozen(String seriesKey) {
+        return migrating.contains(seriesKey) && !copying.contains(seriesKey);
+    }
+
+    /** Whether this source still accepts writes while copying an image. */
+    public boolean isCopying(String seriesKey) { return copying.contains(seriesKey); }
+
+    /** Checkpoints and snapshots one series under its write lock, then immediately releases writers. */
+    public byte[] migrationSnapshot(String seriesKey, java.util.function.Supplier<byte[]> image) {
+        for (;;) {
+            HandleEntry entry = entries.computeIfAbsent(seriesKey, key -> new HandleEntry());
+            entry.lock.lock();
+            try {
+                if (entries.get(seriesKey) != entry) { continue; }
+                if (entry.handle != null) { entry.handle.checkpoint(); }
+                return image.get();
+            } finally {
+                if (entry.handle == null) { entries.remove(seriesKey, entry); }
+                entry.lock.unlock();
+            }
+        }
     }
 
     /** Indica se a série está marcada como em migração. */

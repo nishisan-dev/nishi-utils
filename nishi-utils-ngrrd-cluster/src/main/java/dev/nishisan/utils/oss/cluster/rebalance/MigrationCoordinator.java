@@ -17,6 +17,8 @@
 
 package dev.nishisan.utils.oss.cluster.rebalance;
 
+import dev.nishisan.utils.oss.cluster.rpc.CoordinationLocks;
+
 import dev.nishisan.utils.ngrid.cluster.coordination.LeadershipListener;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
@@ -336,6 +338,13 @@ public final class MigrationCoordinator implements LeadershipListener {
                 }
                 // PARTIAL/UNKNOWN: continua o poll até COMMITTED, um status terminal, ou o timeout.
             }
+            // A source may already have failed a chunk while the target remains PARTIAL.
+            // Destination COMMITTED above always wins, including a lost COMMIT response.
+            MigrateResponse sourceResponse = pollStatusQuietly(src, seriesKey, migrationId);
+            if (sourceResponse != null && sourceResponse.status() == MigrateStatus.ERROR) {
+                return abort(seriesKey, migratingPlacement, src, dst,
+                        "origem reportou falha: " + sourceResponse.message(), startedAt);
+            }
             // Falha de transporte no poll conta como uma tentativa e o laço continua até o timeout.
             if (clock.millis() >= deadline) {
                 return abort(seriesKey, migratingPlacement, src, dst,
@@ -477,7 +486,7 @@ public final class MigrationCoordinator implements LeadershipListener {
                 return false;
             }
             try {
-                synchronized (catalog.placementLock(seriesKey)) {
+                try (var guard = CoordinationLocks.acquire(catalog.placementLock(seriesKey))) {
                     if (!driving() || !precondition.getAsBoolean()) {
                         LOGGER.log(Level.INFO, "Pré-condição não satisfeita mais — desistindo de gravar " + what);
                         return false;

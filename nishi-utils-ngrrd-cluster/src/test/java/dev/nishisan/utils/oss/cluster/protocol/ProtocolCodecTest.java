@@ -90,6 +90,20 @@ class ProtocolCodecTest {
     }
 
     @Test
+    void liveCopyNegotiationAndPatchesSurviveTheWire() throws IOException {
+        var prepare = new MigratePrepareRequest("series", "move", "series/series.ngrr", 16384, true);
+        assertEquals(prepare, roundTripRequestBody(Commands.MIGRATE_PREPARE, prepare));
+        var ready = MigrateResponse.of(MigrateStatus.COPY_READY, null);
+        assertEquals(ready, roundTripResponseBody(Commands.MIGRATE_PREPARE, ready));
+        var patch = new MigratePatchRequest("series", "move", 2, 4096, new byte[]{1, 2, 3});
+        assertEquals(patch, roundTripRequestBody(Commands.MIGRATE_PATCH, patch));
+        var legacy = new com.fasterxml.jackson.databind.ObjectMapper().readValue(
+                "{\"seriesKey\":\"s\",\"migrationId\":\"m\",\"storageKey\":\"series/s.ngrr\",\"totalBytes\":4096}",
+                MigratePrepareRequest.class);
+        assertEquals(false, legacy.liveCopy());
+    }
+
+    @Test
     void placeRequestComPreferredOwnerSobreviveAoRoundTrip() throws IOException {
         PlaceRequest original = new PlaceRequest("series-1", "abc123def456", "node-a");
         assertEquals(original, roundTripRequestBody(Commands.PLACE, original));

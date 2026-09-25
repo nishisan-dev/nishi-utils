@@ -1,5 +1,7 @@
 package dev.nishisan.utils.oss.cluster.node;
 
+import dev.nishisan.utils.oss.cluster.rpc.CoordinationLocks;
+
 import dev.nishisan.utils.ngrid.cluster.transport.Transport;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.oss.blob.BlobVolume;
@@ -56,7 +58,7 @@ public final class GeometryService extends RequestHandlerSupport implements Auto
     @Override
     protected Object handle(String command, Object body, NodeId source) {
         GeometryUpdateRequest request = (GeometryUpdateRequest) body;
-        synchronized (catalog.placementLock(request.seriesKey())) {
+        try (var guard = CoordinationLocks.acquire(catalog.placementLock(request.seriesKey()))) {
             if (!leader.isLeader()) {
                 return new SeriesStatusResponse(SeriesStatus.NOT_LEADER, leader.leaderId().orElse(null), "not leader");
             }
@@ -125,7 +127,7 @@ public final class GeometryService extends RequestHandlerSupport implements Auto
             }
             for (int count = 0; count < 256 && pending.hasNext() && !closed; count++) {
                 String key = pending.next();
-                synchronized (registry.operationLock(key)) {
+                try (var guard = CoordinationLocks.acquire(registry.operationLock(key))) {
                     if (!registry.isMigrating(key)) {
                         try { afterOpen(key); }
                         catch (RuntimeException e) { LOG.log(Level.FINE, "Geometry backfill deferred for " + key, e); }

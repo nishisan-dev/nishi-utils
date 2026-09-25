@@ -17,6 +17,8 @@
 
 package dev.nishisan.utils.oss.cluster.node;
 
+import dev.nishisan.utils.oss.cluster.rpc.CoordinationLocks;
+
 import dev.nishisan.utils.ngrid.cluster.coordination.ClusterCoordinator;
 import dev.nishisan.utils.ngrid.cluster.coordination.LeadershipListener;
 import dev.nishisan.utils.ngrid.cluster.transport.Transport;
@@ -78,6 +80,7 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
     private final Clock clock;
 
     private volatile boolean needsAdmissionRebuild = true;
+    private final java.util.concurrent.locks.ReentrantLock admissionLock = new java.util.concurrent.locks.ReentrantLock();
     private final ConcurrentMap<String, PendingCounter> pendingByNode = new ConcurrentHashMap<>();
     /**
      * Instante em que este nó percebeu ter assumido a liderança pela última vez — {@code 0}
@@ -155,7 +158,12 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
     @Override
     protected Object handle(String command, Object body, NodeId source) {
         // One admission decision at a time also serializes pending-count updates across keys.
-        synchronized (pendingByNode) { return handlePlace((PlaceRequest) body); }
+        admissionLock.lock();
+        try {
+            return handlePlace((PlaceRequest) body);
+        } finally {
+            admissionLock.unlock();
+        }
     }
 
     @Override
@@ -221,7 +229,7 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
             return notLeaderResponse();
         }
         Object lock = catalog.placementLock(request.seriesKey());
-        synchronized (lock) {
+        try (var guard = CoordinationLocks.acquire(lock)) {
             // m4: a liderança pode ter mudado entre a checagem acima e a aquisição do lock de stripe.
             if (!leaderView.isLeader()) {
                 return notLeaderResponse();
