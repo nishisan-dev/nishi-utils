@@ -48,6 +48,95 @@ import static org.junit.jupiter.api.Assertions.fail;
  */
 class TcpTransportConcurrentMeshTest {
 
+    @Test
+    void closeAlsoClosesAcceptedSocketsWithoutAPeerIdentity() throws Exception {
+        int port = allocateFreeLocalPort(Set.of());
+        NodeInfo local = new NodeInfo(NodeId.of("closing-server"), "127.0.0.1", port);
+        var received = new CountDownLatch(1);
+        try (TcpTransport server = new TcpTransport(meshConfig(local))) {
+            server.addListener(new TransportListener() {
+                public void onPeerConnected(NodeInfo peer) { }
+                public void onPeerDisconnected(NodeId peer) { }
+                public void onMessage(dev.nishisan.utils.ngrid.common.ClusterMessage message) { received.countDown(); }
+            });
+            server.start();
+            try (var socket = new java.net.Socket(local.host(), port)) {
+                socket.setSoTimeout(2_000);
+                // A frame without source/handshake proves acceptance without publishing a peer.
+                var frame = dev.nishisan.utils.ngrid.common.ClusterMessage.request(
+                        dev.nishisan.utils.ngrid.common.MessageType.CLIENT_REQUEST, "unidentified",
+                        null, local.nodeId(), "probe");
+                byte[] bytes = new dev.nishisan.utils.ngrid.cluster.transport.codec.CompositeMessageCodec(1024).encode(frame);
+                var out = new java.io.DataOutputStream(socket.getOutputStream());
+                out.writeInt(bytes.length);
+                out.write(bytes);
+                out.flush();
+                assertTrue(received.await(5, TimeUnit.SECONDS));
+                server.close();
+                assertEquals(-1, socket.getInputStream().read(), "shutdown must close unidentified sockets too");
+            }
+        }
+    }
+
+    @Test
+    void dialAlreadyInProgressCannotPublishAConnectionAfterClose() throws Exception {
+        int portA = allocateFreeLocalPort(Set.of());
+        int portB = allocateFreeLocalPort(Set.of(portA));
+        NodeInfo a = new NodeInfo(NodeId.of("a-closing"), "127.0.0.1", portA);
+        NodeInfo b = new NodeInfo(NodeId.of("z-peer"), "127.0.0.1", portB);
+        TcpTransport client = new TcpTransport(meshConfig(a, b));
+        TcpTransport server = new TcpTransport(meshConfig(b));
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var dialer = new java.util.concurrent.atomic.AtomicReference<Thread>();
+        client.setBeforeDialHook(ignored -> {
+            dialer.compareAndSet(null, Thread.currentThread());
+            entered.countDown();
+            // Simulate a connect that returns only AFTER shutdown's bounded wait.
+            boolean released = false;
+            while (!released) {
+                try { release.await(); released = true; }
+                catch (InterruptedException expectedDuringClose) { }
+            }
+        });
+        try {
+            server.start();
+            client.start();
+            assertTrue(entered.await(5, TimeUnit.SECONDS));
+            client.close();
+            release.countDown();
+            dialer.get().join(5_000);
+            assertTrue(!dialer.get().isAlive(), "the outstanding dial must terminate");
+            assertTrue(!client.isConnected(b.nodeId()), "shutdown must fence an already-started dial");
+        } finally {
+            release.countDown();
+            closeQuietly(client, server);
+        }
+    }
+
+    @Test
+    void seedAliasBecomesCanonicalWithoutClosingItsOwnConnection() throws Exception {
+        int portA = allocateFreeLocalPort(Set.of());
+        int portB = allocateFreeLocalPort(Set.of(portA));
+        NodeInfo a = new NodeInfo(NodeId.of("a-client"), "127.0.0.1", portA);
+        NodeInfo b = new NodeInfo(NodeId.of("z-storage"), "127.0.0.1", portB);
+        NodeInfo seed = new NodeInfo(NodeId.of("127.0.0.1:" + portB), b.host(), b.port());
+        TcpTransport client = new TcpTransport(meshConfig(a, seed));
+        TcpTransport server = new TcpTransport(meshConfig(b));
+        var dials = new java.util.concurrent.atomic.AtomicInteger();
+        client.setBeforeDialHook(ignored -> dials.incrementAndGet());
+        try {
+            server.start();
+            client.start();
+            awaitDiscovery(client, b.nodeId());
+            awaitFullDirectMesh(List.of(client, server), List.of(a, b), Duration.ofSeconds(10));
+            assertEquals(1, dials.get(), "learning the seed's real ID must preserve the established socket");
+            assertTrue(client.peers().stream().noneMatch(peer -> peer.nodeId().equals(seed.nodeId())));
+        } finally {
+            closeQuietly(client, server);
+        }
+    }
+
     /**
      * Três transports full-mesh iniciados o mais simultaneamente possível devem
      * convergir para uma malha totalmente direta (6 conexões direcionais) e

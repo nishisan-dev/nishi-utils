@@ -41,6 +41,14 @@ jobs:
       - name: Verify checkpoint recovery after migration
         run: mvn -B test -pl nishi-utils-ngrrd-cluster -am -Pngrrd-cluster -Dtest=CheckpointAfterMigrationClusterTest -Dsurefire.failIfNoSpecifiedTests=false
 
+      - name: Verify seed discovery and TCP routing
+        run: mvn -B test -pl nishi-utils-core -Dtest=TcpTransportConcurrentMeshTest,ProxyRoutingIntegrationTest,UndeliverableRequestIntegrationTest,TransportCompressionClusterTest
+
+      - name: Verify continuous ingestion with two virtual-thread carriers
+        env:
+          JAVA_TOOL_OPTIONS: -Djdk.virtualThreadScheduler.parallelism=2
+        run: mvn -B test -pl nishi-utils-ngrrd-cluster -am -Pngrrd-cluster -Dtest=ContinuousIngestionRebalanceClusterTest -Dsurefire.failIfNoSpecifiedTests=false
+
       - name: Upload coverage report
         if: always()
         uses: actions/upload-artifact@v4

@@ -17,6 +17,8 @@
 
 package dev.nishisan.utils.oss.cluster.rebalance;
 
+import dev.nishisan.utils.oss.cluster.rpc.CoordinationLocks;
+
 import dev.nishisan.utils.ngrid.cluster.transport.Transport;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.oss.blob.BlobVolume;
@@ -29,6 +31,7 @@ import dev.nishisan.utils.oss.definition.ObjectNaming;
 import dev.nishisan.utils.oss.storage.StorageKey;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.protocol.MigrateChunkRequest;
+import dev.nishisan.utils.oss.cluster.protocol.MigratePatchRequest;
 import dev.nishisan.utils.oss.cluster.protocol.MigrateCommitRequest;
 import dev.nishisan.utils.oss.cluster.protocol.MigrateControlRequest;
 import dev.nishisan.utils.oss.cluster.protocol.MigrateResponse;
@@ -126,6 +129,7 @@ public final class MigrationExecutor extends RequestHandlerSupport {
     private final long migrationChunkBytes;
     private final long maxSeriesBytes;
     private final Clock clock;
+    private final MigrationBandwidth bandwidth;
     private final ExecutorService transferExecutor;
 
     // Shared with OPEN and physical metadata inspection; transfers release it before network chunks.
@@ -145,7 +149,16 @@ public final class MigrationExecutor extends RequestHandlerSupport {
     public MigrationExecutor(Transport transport, SeriesHandleRegistry registry, BlobVolume volume, ClusterRpc rpc,
             CatalogView catalog, NodeId self, String seriesObjectPrefix, long migrationChunkBytes,
             long maxSeriesBytes, Clock clock) {
+        this(transport, registry, volume, rpc, catalog, self, seriesObjectPrefix, migrationChunkBytes,
+                maxSeriesBytes, MigrationBandwidth.DEFAULT_BYTES_PER_SECOND, clock);
+    }
+
+    /** Uses an aggregate byte budget for all outgoing transfers on this node. */
+    public MigrationExecutor(Transport transport, SeriesHandleRegistry registry, BlobVolume volume, ClusterRpc rpc,
+            CatalogView catalog, NodeId self, String seriesObjectPrefix, long migrationChunkBytes,
+            long maxSeriesBytes, long migrationBytesPerSecond, Clock clock) {
         super(transport, Commands.MIGRATION_COMMANDS);
+        this.bandwidth = new MigrationBandwidth(migrationBytesPerSecond);
         this.registry = Objects.requireNonNull(registry, "registry");
         this.volume = Objects.requireNonNull(volume, "volume");
         this.rpc = Objects.requireNonNull(rpc, "rpc");
@@ -178,11 +191,12 @@ public final class MigrationExecutor extends RequestHandlerSupport {
             case MigrateStartRequest r -> r.seriesKey();
             case MigratePrepareRequest r -> r.seriesKey();
             case MigrateChunkRequest r -> r.seriesKey();
+            case MigratePatchRequest r -> r.seriesKey();
             case MigrateCommitRequest r -> r.seriesKey();
             case MigrateControlRequest r -> r.seriesKey();
             default -> throw new IllegalArgumentException("Corpo de migração inválido");
         };
-        synchronized (seriesLock(seriesKey)) {
+        try (var guard = CoordinationLocks.acquire(seriesLock(seriesKey))) {
             return dispatch(command, body);
         }
     }
@@ -192,6 +206,7 @@ public final class MigrationExecutor extends RequestHandlerSupport {
             case Commands.MIGRATE_PREPARE -> handlePrepare((MigratePrepareRequest) body);
             case Commands.MIGRATE_START -> handleStart((MigrateStartRequest) body);
             case Commands.MIGRATE_CHUNK -> handleChunk((MigrateChunkRequest) body);
+            case Commands.MIGRATE_PATCH -> handlePatch((MigratePatchRequest) body);
             case Commands.MIGRATE_COMMIT -> handleCommit((MigrateCommitRequest) body);
             case Commands.MIGRATE_ABORT -> handleAbort((MigrateControlRequest) body);
             case Commands.MIGRATE_FINISH -> handleFinish((MigrateControlRequest) body);
@@ -226,9 +241,10 @@ public final class MigrationExecutor extends RequestHandlerSupport {
         String storageKey;
         Optional<byte[]> image;
         try {
-            registry.markMigrating(seriesKey);
+            registry.beginMigrationCopy(seriesKey);
             storageKey = resolveStorageKey(seriesKey);
-            image = volume.storage().get(storageKey);
+            image = Optional.ofNullable(registry.migrationSnapshot(seriesKey,
+                    () -> volume.storage().get(storageKey).orElse(null)));
         } catch (RuntimeException e) {
             registry.clearMigrating(seriesKey);
             return MigrateResponse.of(MigrateStatus.ERROR,
@@ -246,10 +262,10 @@ public final class MigrationExecutor extends RequestHandlerSupport {
         }
         try {
             MigrateResponse prepared = rpc.call(NodeId.of(request.targetNodeId()), Commands.MIGRATE_PREPARE,
-                    new MigratePrepareRequest(seriesKey, migrationId, storageKey, bytes.length), MigrateResponse.class);
-            if (prepared.status() != MigrateStatus.OK) {
+                    new MigratePrepareRequest(seriesKey, migrationId, storageKey, bytes.length, true), MigrateResponse.class);
+            if (prepared.status() != MigrateStatus.COPY_READY) {
                 registry.clearMigrating(seriesKey);
-                return MigrateResponse.of(MigrateStatus.ERROR, "destination reservation refused: " + prepared.message());
+                return MigrateResponse.of(MigrateStatus.ERROR, "destination must support live copy: " + prepared.status() + " " + prepared.message());
             }
         } catch (RuntimeException e) {
             registry.clearMigrating(seriesKey);
@@ -259,8 +275,10 @@ public final class MigrationExecutor extends RequestHandlerSupport {
         int totalChunks = chunkCount(bytes.length);
         states.put(migrationId, new MigrationState(seriesKey, migrationId, Role.SOURCE, MigratePhase.STARTED,
                 0, totalChunks, bytes.length, sha256Hex, storageKey, null, clock.millis()));
-        transferExecutor.execute(() ->
-                transfer(request.targetNodeId(), seriesKey, migrationId, bytes, sha256Hex, storageKey));
+        // The runnable must not retain the initial full image after catch-up replaces it.
+        var pendingImage = new java.util.concurrent.atomic.AtomicReference<>(bytes);
+        transferExecutor.execute(() -> transfer(request.targetNodeId(), seriesKey, migrationId,
+                pendingImage.getAndSet(null), sha256Hex, storageKey));
         return MigrateResponse.of(MigrateStatus.OK, null);
     }
 
@@ -281,6 +299,7 @@ public final class MigrationExecutor extends RequestHandlerSupport {
             }
             int start = (int) Math.min((long) seq * migrationChunkBytes, bytes.length);
             int end = (int) Math.min((long) start + migrationChunkBytes, bytes.length);
+            if (!bandwidth.acquire(end - start, () -> transferActive(migrationId))) { return; }
             byte[] chunk = Arrays.copyOfRange(bytes, start, end);
             MigrateResponse response;
             try {
@@ -303,6 +322,30 @@ public final class MigrationExecutor extends RequestHandlerSupport {
         if (!transferActive(migrationId)) {
             return;
         }
+        // Catch up once while writes are still admitted, then freeze only the final dirty ranges.
+        try {
+            byte[] current = snapshotWhileCopying(seriesKey, migrationId, storageKey);
+            int patchSequence = sendPatches(target, seriesKey, migrationId, bytes, current, 0);
+            bytes = current;
+            byte[] frozen;
+            try (var guard = CoordinationLocks.acquire(seriesLock(seriesKey))) {
+                if (!transferActive(migrationId)) { return; }
+                registry.markMigrating(seriesKey);
+                frozen = volume.storage().get(storageKey).orElseThrow();
+            }
+            var finalRanges = changedRanges(current, frozen);
+            long finalBytes = finalRanges.stream().mapToLong(PatchRange::length).sum();
+            if (finalBytes > 256 * 1024L) {
+                throw new IllegalStateException("series changed too fast for a bounded cutover; retry migration later");
+            }
+            sendPatches(target, seriesKey, migrationId, current, frozen, patchSequence);
+            bytes = frozen;
+            sha256Hex = sha256Hex(frozen);
+        } catch (RuntimeException e) {
+            updatePhase(migrationId, MigratePhase.FAILED, "live-copy catch-up failed: " + describe(e));
+            return;
+        }
+        if (!transferActive(migrationId)) { return; }
         MigrateResponse commitResponse;
         try {
             commitResponse = rpc.call(target, Commands.MIGRATE_COMMIT,
@@ -321,6 +364,50 @@ public final class MigrationExecutor extends RequestHandlerSupport {
                     "commit recusado pelo destino: " + commitResponse.status()
                             + (commitResponse.message() != null ? " (" + commitResponse.message() + ")" : ""));
         }
+    }
+
+    private byte[] snapshotWhileCopying(String key, String migrationId, String storageKey) {
+        try (var guard = CoordinationLocks.acquire(seriesLock(key))) {
+            if (!transferActive(migrationId)) { throw new IllegalStateException("migration ended"); }
+            return registry.migrationSnapshot(key, () -> volume.storage().get(storageKey).orElseThrow());
+        }
+    }
+
+    private record PatchRange(int offset, int length) { }
+
+    private java.util.List<PatchRange> changedRanges(byte[] before, byte[] after) {
+        if (before.length != after.length) { throw new IllegalStateException("geometry changed during live copy"); }
+        var ranges = new java.util.ArrayList<PatchRange>();
+        int block = (int) Math.min(4096, migrationChunkBytes);
+        for (int offset = 0; offset < after.length; offset += block) {
+            int end = Math.min(after.length, offset + block);
+            if (Arrays.mismatch(before, offset, end, after, offset, end) >= 0) {
+                if (!ranges.isEmpty()) {
+                    PatchRange last = ranges.getLast();
+                    if (last.offset() + last.length() == offset && end - last.offset() <= migrationChunkBytes) {
+                        ranges.set(ranges.size() - 1, new PatchRange(last.offset(), end - last.offset()));
+                        continue;
+                    }
+                }
+                ranges.add(new PatchRange(offset, end - offset));
+            }
+        }
+        return ranges;
+    }
+
+    private int sendPatches(NodeId target, String key, String id, byte[] before, byte[] after, int sequence) {
+        for (PatchRange range : changedRanges(before, after)) {
+            if (!bandwidth.acquire(range.length(), () -> transferActive(id))) {
+                throw new IllegalStateException("migration ended while pacing patches");
+            }
+            byte[] changed = Arrays.copyOfRange(after, range.offset(), range.offset() + range.length());
+            MigrateResponse response = rpc.call(target, Commands.MIGRATE_PATCH,
+                    new MigratePatchRequest(key, id, sequence++, range.offset(), changed), MigrateResponse.class);
+            if (response.status() != MigrateStatus.OK) {
+                throw new IllegalStateException("patch refused: " + response.status() + " " + response.message());
+            }
+        }
+        return sequence;
     }
 
     private MigrateResponse handleStatus(MigrateControlRequest request) {
@@ -472,7 +559,8 @@ public final class MigrationExecutor extends RequestHandlerSupport {
         StagingBuffer old = staging.get(request.migrationId());
         if (old != null) {
             return old.expectedBytes == request.totalBytes() && old.storageKey.equals(request.storageKey())
-                    ? MigrateResponse.of(MigrateStatus.OK, null)
+                    && old.liveCopy == request.liveCopy()
+                    ? MigrateResponse.of(old.liveCopy ? MigrateStatus.COPY_READY : MigrateStatus.OK, null)
                     : MigrateResponse.of(MigrateStatus.ERROR, "reservation identity mismatch");
         }
         try {
@@ -480,10 +568,10 @@ public final class MigrationExecutor extends RequestHandlerSupport {
         } catch (RuntimeException e) {
             return failTarget(request.seriesKey(), request.migrationId(), describe(e));
         }
-        staging.put(request.migrationId(), new StagingBuffer(request.totalBytes(), request.storageKey(), clock.millis()));
+        staging.put(request.migrationId(), new StagingBuffer(request.totalBytes(), request.storageKey(), request.liveCopy(), clock.millis()));
         states.put(request.migrationId(), new MigrationState(request.seriesKey(), request.migrationId(), Role.TARGET,
                 MigratePhase.STARTED, 0, 0, request.totalBytes(), null, request.storageKey(), null, clock.millis()));
-        return MigrateResponse.of(MigrateStatus.OK, null);
+        return MigrateResponse.of(request.liveCopy() ? MigrateStatus.COPY_READY : MigrateStatus.OK, null);
     }
 
     private boolean destinationActive() {
@@ -511,6 +599,9 @@ public final class MigrationExecutor extends RequestHandlerSupport {
         StagingBuffer buffer = staging.get(request.migrationId());
         if (buffer == null) {
             return MigrateResponse.of(MigrateStatus.ERROR, "MIGRATE_PREPARE required before chunks");
+        }
+        if (buffer.image != null) {
+            return MigrateResponse.of(MigrateStatus.ERROR, "base image is already complete");
         }
         if (request.total() <= 0 || request.seq() < 0 || request.seq() >= request.total() || request.data() == null) {
             return failTarget(request.seriesKey(), request.migrationId(), "invalid chunk");
@@ -546,6 +637,34 @@ public final class MigrationExecutor extends RequestHandlerSupport {
         return MigrateResponse.of(MigrateStatus.OK, null);
     }
 
+    private MigrateResponse handlePatch(MigratePatchRequest request) {
+        MigrationState state = states.get(request.migrationId());
+        if (state == null || state.role() != Role.TARGET || !state.seriesKey().equals(request.seriesKey())
+                || isTerminal(state.phase())) {
+            return MigrateResponse.of(MigrateStatus.ERROR, "patch identity is not active");
+        }
+        StagingBuffer buffer = staging.get(request.migrationId());
+        if (buffer == null || !buffer.liveCopy || buffer.totalExpected < 0
+                || buffer.chunksReceived != buffer.totalExpected || request.data() == null
+                || request.data().length == 0 || request.offset() < 0
+                || (long) request.offset() + request.data().length > buffer.expectedBytes) {
+            return failTarget(request.seriesKey(), request.migrationId(), "invalid patch or incomplete base image");
+        }
+        if (request.sequence() == buffer.patchSequence - 1 && buffer.lastPatch != null
+                && request.offset() == buffer.lastPatch.offset()
+                && Arrays.equals(request.data(), buffer.lastPatch.data())) {
+            return MigrateResponse.of(MigrateStatus.OK, null);
+        }
+        if (request.sequence() != buffer.patchSequence) {
+            return failTarget(request.seriesKey(), request.migrationId(), "patch out of order");
+        }
+        System.arraycopy(request.data(), 0, buffer.image(), request.offset(), request.data().length);
+        buffer.lastPatch = new MigratePatchRequest(request.seriesKey(), request.migrationId(), request.sequence(),
+                request.offset(), request.data().clone());
+        buffer.patchSequence++;
+        return MigrateResponse.of(MigrateStatus.OK, null);
+    }
+
     private MigrateResponse handleCommit(MigrateCommitRequest request) {
         MigrationState existing = states.get(request.migrationId());
         if (existing != null && (!existing.seriesKey().equals(request.seriesKey())
@@ -576,7 +695,7 @@ public final class MigrationExecutor extends RequestHandlerSupport {
         }
         byte[] bytes;
         synchronized (buffer) {
-            bytes = buffer.out.toByteArray();
+            bytes = buffer.image();
         }
         if (bytes.length != request.totalBytes() || bytes.length != buffer.expectedBytes
                 || buffer.chunksReceived != buffer.totalExpected) {
@@ -636,7 +755,7 @@ public final class MigrationExecutor extends RequestHandlerSupport {
         long threshold = clock.millis() - timeout.toMillis();
         for (var entry : states.entrySet()) {
             MigrationState state = entry.getValue();
-            synchronized (seriesLock(state.seriesKey())) {
+            try (var guard = CoordinationLocks.acquire(seriesLock(state.seriesKey()))) {
                 StagingBuffer buffer = staging.get(entry.getKey());
                 if (buffer != null && buffer.createdAtMs < threshold) {
                     failTarget(state.seriesKey(), entry.getKey(), "migration reservation expired");
@@ -664,7 +783,7 @@ public final class MigrationExecutor extends RequestHandlerSupport {
         int removed = 0;
         for (Map.Entry<String, MigrationState> entry : states.entrySet()) {
             MigrationState state = entry.getValue();
-            synchronized (seriesLock(state.seriesKey())) {
+            try (var guard = CoordinationLocks.acquire(seriesLock(state.seriesKey()))) {
                 if (states.get(entry.getKey()) != state) {
                     continue;
                 }
@@ -719,7 +838,7 @@ public final class MigrationExecutor extends RequestHandlerSupport {
         int healed = 0;
         for (Map.Entry<String, MigrationState> entry : states.entrySet()) {
             MigrationState state = entry.getValue();
-            synchronized (seriesLock(state.seriesKey())) {
+            try (var guard = CoordinationLocks.acquire(seriesLock(state.seriesKey()))) {
                 if (states.get(entry.getKey()) != state) {
                     continue;
                 }
@@ -844,12 +963,24 @@ public final class MigrationExecutor extends RequestHandlerSupport {
         private final long expectedBytes;
         private final String storageKey;
         private final long createdAtMs;
-        private StagingBuffer(long expectedBytes, String storageKey, long createdAtMs) {
+        private final boolean liveCopy;
+        private byte[] image;
+        private int patchSequence;
+        private MigratePatchRequest lastPatch;
+        private StagingBuffer(long expectedBytes, String storageKey, boolean liveCopy, long createdAtMs) {
             this.expectedBytes = expectedBytes;
             this.storageKey = storageKey;
             this.createdAtMs = createdAtMs;
+            this.liveCopy = liveCopy;
         }
-        private final ByteArrayOutputStream out = new ByteArrayOutputStream();
+        private byte[] image() {
+            if (image == null) {
+                image = out.toByteArray();
+                out = null;
+            }
+            return image;
+        }
+        private ByteArrayOutputStream out = new ByteArrayOutputStream();
         private int chunksReceived;
         private int totalExpected = -1;
     }

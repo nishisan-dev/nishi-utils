@@ -193,7 +193,7 @@ public final class NgrrdStorageNode implements Closeable {
                 storageHandler.geometryService(geometryService);
                 MigrationExecutor migrationExecutor = new MigrationExecutor(node.transport(), registry, volume, rpc,
                         catalog, self, cfg.seriesObjectPrefix(), cfg.migrationChunkBytes(), cfg.maxSeriesBytes(),
-                        Clock.systemUTC());
+                        cfg.migrationBytesPerSecond(), Clock.systemUTC());
                 MigrationCoordinator migrationCoordinator = new MigrationCoordinator(catalog, rpc, leaderView,
                         cfg.maxConcurrentMigrations(), cfg.migrationStatusPollInterval(), cfg.migrationTimeout(),
                         Clock.systemUTC(), migrationHooks);

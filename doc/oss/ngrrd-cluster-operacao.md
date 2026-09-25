@@ -158,6 +158,7 @@ As opções ficam em `ngrrd.rebalance` no YAML de **cada storage node**:
 | `maxMovesPerCycle` | `50` | Limita movimentos planejados por ciclo. |
 | `migrationTimeout` | `10m` | Prazo usado pelo coordenador para aguardar a migração. |
 | `chunkBytes` | `262144` | Tamanho dos chunks de transferência: 256 KiB. |
+| `maxBytesPerSecond` | `16777216` | Orçamento agregado de payload de migração por nó de origem: 16 MiB/s, compartilhado entre todas as transferências. Deve ser positivo. |
 | `maxSeriesBytes` | `67108864` | Tamanho máximo aceito para uma imagem de série em migração: 64 MiB. |
 
 O líder usa sua própria configuração para planejar. Mantenha os parâmetros alinhados entre
@@ -191,10 +192,18 @@ reserva espaço antes de receber a imagem. Contagens parecidas não garantem ocu
 O fluxo de uma série é:
 
 1. O catálogo marca `MIGRATING`, com origem e destino.
-2. A origem bloqueia novas operações locais da série, faz checkpoint e fecha o handle.
-3. O destino valida seu estado e reserva o tamanho real da imagem, antes do primeiro chunk.
-4. A origem transfere a imagem; o destino valida tamanho e SHA-256, consumindo a reserva no commit.
-5. O catálogo passa a `ACTIVE` no destino e a origem recebe a ordem de apagar sua cópia.
+2. A origem faz checkpoint e captura uma imagem consistente sob o lock da série. O handle
+   permanece aberto: escritas, leituras e checkpoints continuam durante a transferência.
+   Um `OPEN` explícito aguarda a migração, impedindo mudanças de geometria durante a cópia.
+3. O destino confirma suporte à cópia online e reserva o tamanho real antes do primeiro chunk.
+4. A origem envia a imagem inicial e depois os blocos alterados enquanto copiava. Cada captura
+   bloqueia apenas essa série durante o checkpoint e a leitura local da imagem.
+5. Na troca final, a origem faz checkpoint e fecha o handle. Envia os últimos blocos alterados,
+   limitados a 256 KiB por tentativa, e o destino valida tamanho e SHA-256 antes do commit.
+   Se o último delta exceder o limite, a tentativa falha e é revertida, preservando a origem;
+   o diagnóstico `series changed too fast for a bounded cutover` identifica essa condição.
+6. O catálogo passa a `ACTIVE` no destino e a origem recebe a ordem de apagar sua cópia.
+   As escritas acumuladas durante essa troca seguem para o novo dono, na ordem original.
 
 O cliente trata `MIGRATING` com espera e retentativa; ao receber `WRONG_OWNER`, atualiza
 o roteamento. As escritas pendentes são reenfileiradas. Não é necessário reabrir manualmente
@@ -212,8 +221,50 @@ Para quem já usa a **8.4.0**, a correção é no cliente Java: atualizar a depe
 recompilar/reiniciar a aplicação consumidora. Os storages 8.4.0 são compatíveis com esse
 cliente; a 8.4.1 não altera o protocolo nem o catálogo. Atualizações vindas de versões
 anteriores à 8.4.0 continuam exigindo a janela coordenada descrita neste guia.
-A observação sobre falhas de transporte com 32 migrações simultâneas na issue #169
-não foi isolada e não é considerada resolvida por este hotfix.
+A 8.4.1 não corrigia o bloqueio da fila de ingestão nem as esperas de transporte sob carga,
+também reproduzidos com oito migrações simultâneas na issue #169.
+
+**Ingestão contínua durante rebalance (8.5.0):** o dispatcher mantém FIFO por série e intercala as
+séries prontas. `MIGRATING` e reabertura pendente suspendem somente a série afetada; novas
+amostras dela permanecem ordenadas no buffer. Uma reabertura lenta ou outro nó indisponível
+não ocupa os executores que drenam as séries saudáveis. As barreiras continuam exigindo
+confirmação de todas as amostras anteriores da série, inclusive após redirecionamento.
+
+Os handlers e a escrita TCP evitam monitores durante esperas de rede, para liberar as
+threads de suporte do Java 21. O handshake também preserva o socket ao substituir o
+endereço provisório do seed pelo ID real do nó, evitando desconexões nessa descoberta.
+Ao encerrar um nó, o transporte fecha inclusive sockets ainda sem identidade e impede
+que conexões em abertura reapareçam depois do fechamento.
+O coordenador consulta também a origem: se ela já falhou,
+resolve a migração preservando a cópia original, sem esperar desnecessariamente o prazo
+completo. Um `COMMITTED` confirmado no destino tem precedência sobre a falha da origem.
+
+O limite `ngrrd.rebalance.maxBytesPerSecond` reduz a competição com a ingestão. O orçamento
+é por **origem**, agregado entre seus destinos e transferências, com rajada de até um chunk.
+Conta bytes da imagem e dos blocos incrementais; framing, JSON/base64 e compressão mudam
+os bytes efetivos na rede. O padrão é 16 MiB/s por origem.
+Por exemplo, oito migrações em uma origem com `maxBytesPerSecond: 8388608` compartilham
+8 MiB/s. Duas origens podem enviar, juntas, 16 MiB/s ao mesmo destino. Em Java, configure
+`StorageNodeConfig.Builder.migrationBytesPerSecond(...)`.
+
+Dimensione esse valor pela folga de rede, CPU e disco do destino, considerando todas as
+origens. Um limite menor alonga a cópia e a espera pelos últimos blocos; confira
+`migrationTimeout`, a capacidade do buffer e a latência das barreiras. A pausa final também
+depende do commit e da confirmação do catálogo: o limite de 256 KiB não é um prazo em tempo.
+A cópia usa recursos compartilhados: o orçamento não reserva CPU/disco nem garante impacto
+zero em qualquer carga. Na origem, reserve memória para até duas imagens por migração em
+curso, além dos chunks e estruturas de protocolo; o destino mantém a imagem em staging.
+O limite padrão de imagem continua sendo 64 MiB. Não é necessário parar a ingestão para
+rebalancear dentro da capacidade dimensionada.
+
+Atualize storages e clientes para receber os dois lados da correção. A cópia online adiciona
+negociação `liveCopy`/`COPY_READY` e o comando `ngrrd.migrate.patch`, sem alterar mapas ou o
+formato persistido das séries. Uma origem nova recusa migrar para um destino antigo antes
+do primeiro chunk, preservando sua cópia. Um destino novo ainda recebe o fluxo legado de
+uma origem antiga, que bloqueia a série durante a cópia. Mantenha o rebalance automático
+desabilitado durante a atualização, aguarde as migrações existentes e só o reative quando
+todos os storages estiverem atualizados. Atualizações anteriores à 8.4.0 ainda exigem a
+janela coordenada de catálogo descrita no final deste guia.
 
 Durante essa janela:
 
@@ -224,8 +275,10 @@ Durante essa janela:
   `migrationTimeout` de 10 minutos do storage.
 - O buffer padrão comporta 100.000 amostras **por nó de destino**. Quando enche, a política
   `BLOCK` bloqueia o produtor; `FAIL` lança `BUFFER_FULL`. O buffer é em memória.
-- Como o buffer e seu backoff são por destino, outras séries que compartilham esse destino
-  também podem perceber atraso. Acompanhe a aplicação inteira, além das séries migradas.
+- O limite de memória permanece por destino e inclui as séries em espera. Se esse limite
+  encher, a política de backpressure ainda se aplica. Falhas de transporte suspendem o
+  destino; `MIGRATING` e reabertura suspendem apenas a série afetada. Acompanhe amostras
+  confirmadas, tamanho dos buffers e latência das barreiras, além da taxa de entrada.
 
 Uma queda do cliente perde o buffer ainda não enviado. Antes de encerrar produtores em uma
 manutenção, pare a entrada de novas amostras e conclua as barreiras necessárias. O `close()`
@@ -343,7 +396,8 @@ equilíbrio: também pode não haver movimentos elegíveis, haver falhas ou falt
 | `rebalance` respondeu, mas não mudou a distribuição | Veja se já havia ciclo em andamento, se o plano ficou vazio ou se movimentos falharam. Aguarde os relatórios e consulte os logs antes de redisparar. |
 | Drenagem permanece em `DRAINING` | Verifique origem/destinos acessíveis, espaço, erros e limite por ciclo. Com `enabled: false`, faça novos acionamentos após cada ciclo. |
 | Série não migra e o log cita `maxSeriesBytes` | Compare o tamanho da imagem com o limite padrão de 64 MiB. Ajuste somente após dimensionar memória e transferência nos participantes; uma imagem maior pode impedir a drenagem completa. |
-| Latência ou backlog aumentam na expansão | Confira disco/rede, concorrência de migrações, `bufferedSamples` e retentativas do cliente. Reduza a pressão de produção ou planeje limites menores para os próximos ciclos. |
+| Latência ou backlog aumentam na expansão | Confira disco/rede, `bufferedSamples` e latência das confirmações. Dimensione `maxBytesPerSecond` pela folga disponível e reduza a concorrência para limitar memória e I/O das cópias; não é necessário parar a ingestão para rebalancear. |
+| `series changed too fast for a bounded cutover` | A cópia incremental acumulou mais de 256 KiB para a troca final. A tentativa preserva a origem. Ajuste banda de migração e concorrência conforme a folga do destino e acompanhe a próxima tentativa; não aumente a carga além da capacidade física disponível. |
 | `MIGRATING` dura além do esperado | Confira logs de origem, destino e líder, conectividade e prazos do storage e cliente. Não há duração fixa garantida por série. |
 | Administração não responde durante uma queda | Verifique maioria e eleição. `status`, `drain`, `activate` e `rebalance` dependem do líder. O protocolo de métricas do nó é local, mas a descoberta/conexão da ferramenta também precisa funcionar. |
 

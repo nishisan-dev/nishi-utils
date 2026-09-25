@@ -99,6 +99,145 @@ class WriteDispatcherTest {
     }
 
     @Test
+    void fourSlowNodesCannotStarveAnotherNode() throws Exception {
+        newDispatcher(1, Duration.ofMillis(10), 100, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        var started = new CountDownLatch(4);
+        var release = new CountDownLatch(1);
+        rpc.respondDefault((cmd, body) -> {
+            var request = (WriteBatchRequest) body;
+            if (request.writes().getFirst().seriesKey().startsWith("slow")) {
+                started.countDown();
+                awaitLatch(release);
+            }
+            return okFor(request);
+        });
+        try {
+            for (int i = 0; i < 4; i++) { dispatcher.enqueue("node-" + i, write("slow-" + i, 1, 1)); }
+            assertTrue(started.await(2, TimeUnit.SECONDS));
+            dispatcher.enqueue("healthy-node", write("healthy", 1, 1));
+            dispatcher.flushSeriesSync("healthy", "healthy-node", Duration.ofSeconds(2));
+            assertEquals(1, dispatcher.samplesSent());
+        } finally { release.countDown(); }
+        dispatcher.flushAllSync();
+        assertEquals(5, dispatcher.samplesSent());
+    }
+
+    @Test
+    void pausedSeriesStillCountsAgainstBufferCapacity() throws Exception {
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        AtomicBoolean open = new AtomicBoolean();
+        newDispatcher(1, Duration.ofMillis(10), 2, NgrrdClusterConfig.BufferFullPolicy.FAIL, key -> {
+            entered.countDown(); awaitLatch(release); open.set(true); return true;
+        });
+        rpc.respondDefault((cmd, body) -> open.get() ? okFor((WriteBatchRequest) body)
+                : new WriteBatchResponse(Map.of("s1", SeriesStatus.NOT_OPEN), Map.of(), Map.of()));
+        try {
+            dispatcher.enqueue(OWNER_A.value(), write("s1", 1, 1));
+            assertTrue(entered.await(2, TimeUnit.SECONDS));
+            dispatcher.enqueue(OWNER_A.value(), write("s1", 2, 2));
+            assertEquals(2L, dispatcher.bufferedSamples().get(OWNER_A.value()));
+            assertEquals(ErrorCode.BUFFER_FULL, assertThrows(NgrrdClusterException.class,
+                    () -> dispatcher.enqueue(OWNER_A.value(), write("s1", 3, 3))).code());
+        } finally { release.countDown(); }
+        dispatcher.flushAllSync();
+        assertEquals(2, dispatcher.samplesSent());
+    }
+
+    @Test
+    void redirectCannotWakeSeriesWhileItsTargetOpenIsStillPending() throws Exception {
+        rpc = new RecordingClusterRpc(NodeId.of("client"));
+        placementLookup = new FakePlacementLookup();
+        var redirected = new CountDownLatch(1);
+        var releaseRedirect = new CountDownLatch(1);
+        var reopening = new CountDownLatch(1);
+        var releaseOpen = new CountDownLatch(1);
+        var open = new AtomicBoolean();
+        var opens = new AtomicInteger();
+        dispatcher = new WriteDispatcher(rpc, placementLookup,
+                new RetryPolicy(Duration.ofSeconds(5), Duration.ofMillis(10), Duration.ofMillis(100)),
+                1, Duration.ofMillis(10), 100, NgrrdClusterConfig.BufferFullPolicy.BLOCK, Duration.ofSeconds(5),
+                key -> { opens.incrementAndGet(); reopening.countDown(); awaitLatch(releaseOpen); open.set(true); return true; },
+                (key, owner) -> { redirected.countDown(); awaitLatch(releaseRedirect); }, Clock.systemUTC(), null, null);
+        rpc.respondNext((cmd, body) -> new WriteBatchResponse(Map.of("s1", SeriesStatus.WRONG_OWNER),
+                Map.of("s1", OWNER_B.value()), Map.of()));
+        rpc.respondDefault((cmd, body) -> open.get() ? okFor((WriteBatchRequest) body)
+                : new WriteBatchResponse(Map.of("s1", SeriesStatus.NOT_OPEN), Map.of(), Map.of()));
+        try {
+            dispatcher.enqueue(OWNER_A.value(), write("s1", 1, 1));
+            assertTrue(redirected.await(2, TimeUnit.SECONDS));
+            assertTrue(reopening.await(2, TimeUnit.SECONDS));
+            releaseRedirect.countDown();
+            Thread.sleep(150);
+            assertEquals(1, opens.get(), "a delayed redirect must not overwrite the target's OPEN wait");
+        } finally { releaseRedirect.countDown(); releaseOpen.countDown(); }
+        dispatcher.flushAllSync();
+        assertEquals(1, dispatcher.samplesSent());
+    }
+
+    @Test
+    void migratingSeriesDoesNotBlockHealthySeriesAndRetainsItsFifo() throws Exception {
+        newDispatcher(2, Duration.ofMillis(10), 1_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        AtomicBoolean migrating = new AtomicBoolean(true);
+        CountDownLatch started = new CountDownLatch(1), release = new CountDownLatch(1);
+        AtomicBoolean first = new AtomicBoolean(true);
+        List<Long> acceptedMoving = new CopyOnWriteArrayList<>();
+        rpc.respondDefault((cmd, body) -> {
+            if (first.compareAndSet(true, false)) { started.countDown(); awaitLatch(release); }
+            var req = (WriteBatchRequest) body;
+            Map<String, SeriesStatus> statuses = new LinkedHashMap<>();
+            for (var write : req.writes()) {
+                boolean blocked = write.seriesKey().equals("moving") && migrating.get();
+                statuses.put(write.seriesKey(), blocked ? SeriesStatus.MIGRATING : SeriesStatus.OK);
+                if (write.seriesKey().equals("moving") && !blocked) { acceptedMoving.add(write.tsEpochMs()); }
+            }
+            return new WriteBatchResponse(statuses, Map.of(), Map.of());
+        });
+        try {
+            dispatcher.enqueue(OWNER_A.value(), write("moving", 1, 1));
+            dispatcher.enqueue(OWNER_A.value(), write("moving", 2, 2));
+            assertTrue(started.await(2, TimeUnit.SECONDS));
+            for (int i = 1; i <= 100; i++) {
+                dispatcher.enqueue(OWNER_A.value(), write("healthy", i, i));
+                dispatcher.enqueue(OWNER_A.value(), write("moving", i + 2, i));
+            }
+            release.countDown();
+            dispatcher.flushSeriesSync("healthy", OWNER_A.value(), Duration.ofSeconds(2));
+            assertEquals(100, dispatcher.samplesSent(), "healthy series must drain before migration ends");
+            assertEquals(0, dispatcher.samplesFailed());
+            assertThrows(NgrrdClusterException.class, () -> dispatcher.flushSeriesSync(
+                    "moving", OWNER_A.value(), Duration.ofMillis(30)), "unacknowledged writes cannot pass a checkpoint");
+            migrating.set(false);
+            dispatcher.flushAllSync();
+            assertEquals(java.util.stream.LongStream.rangeClosed(1, 102).boxed().toList(), acceptedMoving);
+            assertEquals(202, dispatcher.samplesSent());
+        } finally { migrating.set(false); release.countDown(); }
+    }
+
+    @Test
+    void slowReopenDoesNotOccupyTheNodeDrain() throws Exception {
+        CountDownLatch reopening = new CountDownLatch(1), release = new CountDownLatch(1);
+        AtomicBoolean open = new AtomicBoolean(false);
+        newDispatcher(1, Duration.ofMillis(10), 100, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> {
+            reopening.countDown(); awaitLatch(release); open.set(true); return true;
+        });
+        rpc.respondDefault((cmd, body) -> {
+            var req = (WriteBatchRequest) body;
+            return req.writes().getFirst().seriesKey().equals("cold") && !open.get()
+                    ? new WriteBatchResponse(Map.of("cold", SeriesStatus.NOT_OPEN), Map.of(), Map.of()) : okFor(req);
+        });
+        try {
+            dispatcher.enqueue(OWNER_A.value(), write("cold", 1, 1));
+            assertTrue(reopening.await(2, TimeUnit.SECONDS));
+            dispatcher.enqueue(OWNER_A.value(), write("healthy", 1, 1));
+            dispatcher.flushSeriesSync("healthy", OWNER_A.value(), Duration.ofSeconds(2));
+            assertEquals(1, dispatcher.samplesSent());
+        } finally { release.countDown(); }
+        dispatcher.flushAllSync();
+        assertEquals(2, dispatcher.samplesSent());
+    }
+
+    @Test
     void enviaLotePorTamanhoAssimQueAtingeBatchMaxSamples() {
         newDispatcher(3, Duration.ofSeconds(30), 1_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
         rpc.respondDefault((cmd, body) -> okFor((WriteBatchRequest) body));

@@ -119,6 +119,27 @@ class StorageRequestHandlerTest {
     }
 
     @Test
+    void onlineCopyServesWritesAndBarriersUntilTheFinalFreeze() {
+        String key = "live-copy";
+        var active = SeriesPlacement.active(SELF.value(), 1000);
+        placementLookup.put(key, active);
+        assertEquals(SeriesStatus.OK, ((SeriesStatusResponse) handler.handle(
+                Commands.OPEN, openRequest(key, null), SOURCE)).status());
+        placementLookup.put(key, SeriesPlacement.migrating(active, OTHER.value(), "migration", 2000));
+        registry.beginMigrationCopy(key);
+        var writes = new WriteBatchRequest(List.of(new SeriesWrite(key, "in_octets", 1_700_000_100_000L, 1000)));
+        assertEquals(SeriesStatus.OK, ((WriteBatchResponse) handler.handle(
+                Commands.WRITE_BATCH, writes, SOURCE)).statusBySeries().get(key));
+        assertEquals(SeriesStatus.OK, ((SeriesStatusResponse) handler.handle(
+                Commands.CHECKPOINT, new SeriesCommandRequest(key), SOURCE)).status());
+        assertEquals(SeriesStatus.MIGRATING, ((SeriesStatusResponse) handler.handle(
+                Commands.OPEN, openRequest(key, null), SOURCE)).status(), "geometry changes cannot race the copy");
+        registry.markMigrating(key);
+        assertEquals(SeriesStatus.MIGRATING, ((WriteBatchResponse) handler.handle(
+                Commands.WRITE_BATCH, writes, SOURCE)).statusBySeries().get(key));
+    }
+
+    @Test
     void donoConfirmadoNoCatalogoAbreEscreveFazCheckpointELe() {
         String seriesKey = "series-1";
         placementLookup.put(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));

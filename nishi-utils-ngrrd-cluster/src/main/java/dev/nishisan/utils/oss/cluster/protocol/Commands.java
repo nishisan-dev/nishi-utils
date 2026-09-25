@@ -60,6 +60,8 @@ public final class Commands {
     public static final String MIGRATE_START = "ngrrd.migrate.start";
     /** Destino: recebe um chunk de bytes da série em migração. */
     public static final String MIGRATE_CHUNK = "ngrrd.migrate.chunk";
+    /** Incremental image changes during live migration. */
+    public static final String MIGRATE_PATCH = "ngrrd.migrate.patch";
     /** Destino: confirma a integridade dos bytes recebidos e ativa a cópia. */
     public static final String MIGRATE_COMMIT = "ngrrd.migrate.commit";
     /** Origem/destino: aborta uma migração em curso. */
@@ -96,7 +98,7 @@ public final class Commands {
 
     /** Comandos do protocolo de migração, atendidos pela origem e/ou pelo destino. */
     public static final Set<String> MIGRATION_COMMANDS = Set.of(
-            MIGRATE_START, MIGRATE_PREPARE, MIGRATE_CHUNK, MIGRATE_COMMIT, MIGRATE_ABORT, MIGRATE_FINISH, MIGRATE_STATUS);
+            MIGRATE_START, MIGRATE_PREPARE, MIGRATE_CHUNK, MIGRATE_PATCH, MIGRATE_COMMIT, MIGRATE_ABORT, MIGRATE_FINISH, MIGRATE_STATUS);
 
     private Commands() {
     }

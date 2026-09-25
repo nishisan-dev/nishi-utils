@@ -4,6 +4,34 @@
 
 ---
 
+## 2026-09-24 — Rebalance com ingestão contínua — release 8.5.0
+
+Continuação da [issue #169](https://github.com/nishisan-dev/nishi-utils/issues/169).
+
+- A origem continua recebendo escritas durante a cópia principal e transfere blocos
+  incrementais antes da troca de dono. O checkpoint final precisa ter sucesso, e o delta
+  final é limitado a 256 KiB por tentativa; exceder esse limite aborta preservando a origem.
+- O cliente mantém FIFO por série e intercala séries prontas. Migrações e reaberturas
+  pendentes deixam de bloquear todas as séries de um nó; barreiras continuam esperando ACKs.
+- Esperas de RPC, abertura de conexão e escrita TCP usam caminhos compatíveis com as
+  virtual threads do Java 21, evitando prender suas threads de suporte em monitores.
+- O handshake preserva a conexão aberta pelo endereço do seed ao descobrir o ID real
+  do nó. A limpeza do alias provisório deixava de reutilizar o socket e o fechava.
+- O encerramento do transporte fecha também sockets sem handshake e impede que uma
+  conexão iniciada antes do fechamento seja publicada depois dele.
+- `ngrrd.rebalance.maxBytesPerSecond` limita o tráfego de imagem e patches por origem,
+  somando todas as migrações; padrão 16 MiB/s. O coordenador também consulta falhas na origem.
+- A cópia online negocia `liveCopy`/`COPY_READY` antes dos chunks e usa `ngrrd.migrate.patch`.
+  Destinos antigos são recusados pela origem nova; destinos novos aceitam o fluxo legado.
+  Atualize todos os storages antes de reativar rebalance e atualize os clientes para isolar
+  retentativas por série. Não há mudança de mapas ou formato persistido.
+- Regressões incluem transferência com escritas concorrentes, integridade e ordem de
+  100 mil amostras a 5 mil/s com oito migrações, reservas, patches inválidos, reabertura
+  lenta, checkpoint com falha e Java 21 com apenas duas threads de suporte.
+- Banda, CPU, memória e disco continuam compartilhados; dimensione concorrência e orçamento
+  pela folga disponível. A pausa final depende do commit e do catálogo, e não é uma garantia
+  de latência zero. O guia operacional descreve os limites e a atualização.
+
 ## 2026-09-24 — Checkpoint após migração — release 8.4.1
 
 Corrige a falha principal da [issue #169](https://github.com/nishisan-dev/nishi-utils/issues/169).

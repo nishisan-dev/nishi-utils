@@ -35,7 +35,8 @@ import java.time.Clock;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Iterator;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -43,12 +44,14 @@ import java.util.Map;
 import java.util.Set;
 import java.util.HashSet;
 import java.util.Objects;
+import java.util.PriorityQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.LongAdder;
@@ -68,7 +71,7 @@ import java.util.stream.Collectors;
  * em voo por nó e retentativa transparente para {@code WRONG_OWNER},
  * {@code NOT_OPEN} e {@code MIGRATING}.
  *
- * <p>Cada nó de destino tem seu próprio buffer FIFO limitado
+ * <p>Cada nó de destino tem seu próprio buffer limitado, com FIFO por série
  * ({@code maxBufferedSamplesPerNode}); ao encher, {@link #enqueue} bloqueia
  * ({@link NgrrdClusterConfig.BufferFullPolicy#BLOCK}) ou lança
  * {@link ErrorCode#BUFFER_FULL} ({@link NgrrdClusterConfig.BufferFullPolicy#FAIL}).</p>
@@ -78,7 +81,6 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     private static final Logger LOGGER = Logger.getLogger(WriteDispatcher.class.getName());
     private static final long ENQUEUE_WAIT_POLL_MS = 200L;
     private static final long DRAIN_POLL_MS = 20L;
-    private static final int FLUSH_POOL_SIZE = 4;
     /** Default dos construtores que não recebem {@code ownerChanged} explicitamente (testes antigos). */
     private static final BiConsumer<String, String> NO_OP_OWNER_CHANGED = (seriesKey, newOwner) -> { };
 
@@ -116,6 +118,9 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     private final Object pendingLock = new Object();
     private final Set<SeriesRoute> pendingRoutes = new LinkedHashSet<>();
     private final ExecutorService flushPool;
+    // Bound OPEN traffic independently of WRITE_BATCH; mass cold starts must not flood the leader.
+    private final ExecutorService recoveryPool = Executors.newFixedThreadPool(4,
+            Thread.ofPlatform().daemon(true).name("ngrrd-write-reopen-", 0).factory());
     private final Thread tickThread;
     private volatile boolean closed;
 
@@ -192,16 +197,11 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         this.metricsListener = metricsListener;
         this.metricsSupplier = metricsSupplier;
 
-        this.flushPool = Executors.newFixedThreadPool(FLUSH_POOL_SIZE, WriteDispatcher::newDaemonFlushThread);
+        this.flushPool = Executors.newThreadPerTaskExecutor(
+                Thread.ofVirtual().name("ngrrd-write-flush-", 0).factory());
         this.tickThread = new Thread(this::tickLoop, "ngrrd-write-dispatcher");
         this.tickThread.setDaemon(true);
         this.tickThread.start();
-    }
-
-    private static Thread newDaemonFlushThread(Runnable task) {
-        Thread thread = new Thread(task, "ngrrd-write-flush");
-        thread.setDaemon(true);
-        return thread;
     }
 
     @Override
@@ -397,6 +397,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             sleepQuietly(DRAIN_POLL_MS);
         }
 
+        recoveryPool.shutdownNow();
         flushPool.shutdown();
         try {
             if (!flushPool.awaitTermination(2, TimeUnit.SECONDS)) {
@@ -516,16 +517,17 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         // as pendências (dentro do próprio prazo de closeTimeout) — um guard aqui impediria
         // exatamente o flush final que close() precisa disparar. O pool só é encerrado depois
         // desse dreno (ver close()), então agendar continua seguro até lá.
-        if (!buf.inFlight.compareAndSet(false, true)) {
+        if (buf == null || flushPool.isShutdown() || !buf.inFlight.compareAndSet(false, true)) {
             return;
         }
-        flushPool.execute(() -> {
-            try {
-                drainLoop(owner, buf);
-            } finally {
-                buf.inFlight.set(false);
-            }
-        });
+        try {
+            flushPool.execute(() -> {
+                try { drainLoop(owner, buf); }
+                finally { buf.inFlight.set(false); }
+            });
+        } catch (RejectedExecutionException closing) {
+            buf.inFlight.set(false);
+        }
     }
 
     private void drainLoop(String owner, NodeBuffer buf) {
@@ -550,7 +552,9 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             }
             List<SeriesWrite> batch = new ArrayList<>(n);
             for (int i = 0; i < n; i++) {
-                batch.add(buf.queue.pollFirst());
+                SeriesWrite write = buf.queue.pollFirst(clock.millis());
+                if (write == null) { break; }
+                batch.add(write);
             }
             buf.notFull.signalAll();
             return batch;
@@ -585,6 +589,9 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         SeriesStatus status = response.statusBySeries().getOrDefault(seriesKey, SeriesStatus.ERROR);
         switch (status) {
             case OK -> {
+                buf.lock.lock();
+                try { buf.queue.succeeded(seriesKey); }
+                finally { buf.lock.unlock(); }
                 samplesSentCount.add(writes.size());
                 completeWrites(seriesKey, writes.size(), null);
             }
@@ -602,7 +609,14 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                         }
                         // Publish the new route only after its older writes are queued. New
                         // admissions (including callers with a stale owner) cannot overtake them.
-                        requeueFrontAt(newOwner, reordered);
+                        NodeBuffer target = buffers.computeIfAbsent(newOwner, id -> new NodeBuffer());
+                        target.lock.lock();
+                        try {
+                            requeueFront(target, reordered);
+                            if (!newOwner.equals(owner)) {
+                                target.queue.defer(seriesKey, clock.millis() + retryPolicy.backoffMin().toMillis());
+                            }
+                        } finally { target.lock.unlock(); }
                         route.owner = newOwner;
                         route.destinations.add(newOwner);
                         placementLookup.noteOwner(seriesKey, newOwner);
@@ -619,7 +633,6 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                         // ping-pong sem NENHUMA pausa se o retry fosse imediato. Agendado explicitamente
                         // (não só via backoffUntilMs) para não depender do próximo tick — que pode estar
                         // a até batchMaxDelay de distância, bem mais que o backoffMin desejado aqui.
-                        markBackoff(newOwner, retryPolicy.backoffMin());
                         triggerRetryAfter(newOwner, retryPolicy.backoffMin());
                     }
                 } else {
@@ -631,30 +644,19 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                     logRetryRateLimited(seriesKey, SeriesStatus.WRONG_OWNER,
                             "dono desconhecido — invalidando placement e reabrindo");
                     placementLookup.invalidate(seriesKey);
-                    Boolean reopened = reopener.apply(seriesKey);
-                    requeueFrontAt(owner, writes);
-                    if (reopened == null || !reopened) {
-                        buf.backoffUntilMs = clock.millis() + retryPolicy.backoffFor(buf.nextBackoffAttempt()).toMillis();
-                    }
+                    reopenAsync(owner, buf, seriesKey, writes);
                 }
             }
             case NOT_OPEN -> {
                 recordRetry(SeriesStatus.NOT_OPEN);
                 logRetryRateLimited(seriesKey, SeriesStatus.NOT_OPEN, "reabrindo via reopener");
-                Boolean reopened = reopener.apply(seriesKey);
-                requeueFrontAt(owner, writes);
-                if (reopened == null || !reopened) {
-                    // Mesmo raciocínio do WRONG_OWNER acima: sem backoff, uma reabertura que continua
-                    // falhando (ex.: dono temporariamente inalcançável logo após um restart) vira
-                    // busy-loop em vez de esperar e tentar de novo.
-                    buf.backoffUntilMs = clock.millis() + retryPolicy.backoffFor(buf.nextBackoffAttempt()).toMillis();
-                }
+                reopenAsync(owner, buf, seriesKey, writes);
             }
             case MIGRATING -> {
                 recordRetry(SeriesStatus.MIGRATING);
                 logRetryRateLimited(seriesKey, SeriesStatus.MIGRATING, "aguardando fim da migração");
                 requeueFrontAt(owner, writes);
-                buf.backoffUntilMs = clock.millis() + retryPolicy.backoffFor(buf.nextBackoffAttempt()).toMillis();
+                deferSeries(buf, seriesKey, -1);
             }
             case ERROR -> {
                 recordRetry(SeriesStatus.ERROR);
@@ -737,15 +739,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     private static List<SeriesWrite> extractSeriesFrom(NodeBuffer buf, String seriesKey) {
         buf.lock.lock();
         try {
-            List<SeriesWrite> extracted = new ArrayList<>();
-            Iterator<SeriesWrite> it = buf.queue.iterator();
-            while (it.hasNext()) {
-                SeriesWrite write = it.next();
-                if (write.seriesKey().equals(seriesKey)) {
-                    extracted.add(write);
-                    it.remove();
-                }
-            }
+            List<SeriesWrite> extracted = buf.queue.extract(seriesKey);
             if (!extracted.isEmpty()) {
                 buf.notFull.signalAll();
             }
@@ -763,10 +757,35 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         requeueFront(target, writes);
     }
 
-    /** Marca o buffer de {@code ownerNodeId} (criando-o se preciso) com um backoff mínimo de {@code duration}. */
-    private void markBackoff(String ownerNodeId, Duration duration) {
-        NodeBuffer buf = buffers.computeIfAbsent(ownerNodeId, id -> new NodeBuffer());
-        buf.backoffUntilMs = clock.millis() + duration.toMillis();
+    // Only this series waits. Node-wide backoff is reserved for transport failures.
+    private void deferSeries(NodeBuffer buf, String key, long delayMillis) {
+        buf.lock.lock();
+        try {
+            long delay = delayMillis >= 0 ? delayMillis
+                    : retryPolicy.backoffFor(buf.queue.nextAttempt(key)).toMillis();
+            buf.queue.defer(key, clock.millis() + delay);
+        } finally { buf.lock.unlock(); }
+    }
+
+    private void reopenAsync(String owner, NodeBuffer buf, String key, List<SeriesWrite> writes) {
+        buf.lock.lock();
+        try {
+            for (int i = writes.size() - 1; i >= 0; i--) { buf.queue.addFirst(writes.get(i)); }
+            buf.queue.defer(key, Long.MAX_VALUE);
+        } finally { buf.lock.unlock(); }
+        try {
+            recoveryPool.execute(() -> {
+                boolean opened = false;
+                try { opened = Boolean.TRUE.equals(reopener.apply(key)); }
+                catch (RuntimeException e) { LOGGER.log(Level.FINE, "Reabertura pendente de " + key, e); }
+                finally {
+                    deferSeries(buf, key, opened ? 0 : -1);
+                    scheduleFlush(owner, buf);
+                }
+            });
+        } catch (RejectedExecutionException closing) {
+            deferSeries(buf, key, -1);
+        }
     }
 
     /**
@@ -837,9 +856,65 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         }
     }
 
+    /** All access is under NodeBuffer.lock. FIFO within a series; round-robin between ready series. */
+    private static final class PendingWrites {
+        private final Map<String, ArrayDeque<SeriesWrite>> series = new HashMap<>();
+        private final LinkedHashSet<String> ready = new LinkedHashSet<>();
+        private final Map<String, Delay> paused = new HashMap<>();
+        private final PriorityQueue<Delay> wakeups = new PriorityQueue<>(Comparator.comparingLong(Delay::until));
+        private final Map<String, Integer> attempts = new HashMap<>();
+        private int size;
+        private record Delay(String key, long until) { }
+
+        int size() { return size; }
+        boolean isEmpty() { return size == 0; }
+        void addLast(SeriesWrite write) { add(write, false); }
+        void addFirst(SeriesWrite write) { add(write, true); }
+        private void add(SeriesWrite write, boolean first) {
+            var queue = series.computeIfAbsent(write.seriesKey(), ignored -> new ArrayDeque<>());
+            if (first) { queue.addFirst(write); } else { queue.addLast(write); }
+            size++;
+            if (!paused.containsKey(write.seriesKey())) { ready.add(write.seriesKey()); }
+        }
+        SeriesWrite pollFirst(long now) {
+            while (!wakeups.isEmpty() && wakeups.peek().until() <= now) {
+                Delay delay = wakeups.remove();
+                if (paused.remove(delay.key(), delay) && series.containsKey(delay.key())) {
+                    ready.add(delay.key());
+                }
+            }
+            if (ready.isEmpty()) { return null; }
+            String key = ready.removeFirst();
+            var queue = series.get(key);
+            SeriesWrite write = queue.removeFirst();
+            size--;
+            if (queue.isEmpty()) { series.remove(key); } else { ready.add(key); }
+            return write;
+        }
+        void defer(String key, long until) {
+            Delay old = paused.put(key, new Delay(key, until));
+            if (old != null) { wakeups.remove(old); }
+            wakeups.add(paused.get(key));
+            ready.remove(key);
+        }
+        int nextAttempt(String key) { return attempts.merge(key, 1, Integer::sum); }
+        void succeeded(String key) { attempts.remove(key); }
+        List<SeriesWrite> extract(String key) {
+            var queue = series.remove(key);
+            ready.remove(key);
+            Delay delay = paused.remove(key);
+            if (delay != null) { wakeups.remove(delay); }
+            attempts.remove(key);
+            if (queue == null) { return List.of(); }
+            size -= queue.size();
+            return new ArrayList<>(queue);
+        }
+        void clear() { series.clear(); ready.clear(); paused.clear(); wakeups.clear(); attempts.clear(); size = 0; }
+    }
+
     /** Buffer FIFO de um nó de destino, com controle de backoff e de flush em voo. */
     private static final class NodeBuffer {
-        private final ArrayDeque<SeriesWrite> queue = new ArrayDeque<>();
+        private final PendingWrites queue = new PendingWrites();
         private final ReentrantLock lock = new ReentrantLock();
         private final Condition notFull = lock.newCondition();
         private final AtomicBoolean inFlight = new AtomicBoolean(false);

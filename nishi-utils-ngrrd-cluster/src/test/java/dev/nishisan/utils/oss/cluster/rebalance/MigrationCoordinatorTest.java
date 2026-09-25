@@ -78,6 +78,7 @@ class MigrationCoordinatorTest {
     void setUp() {
         catalog = new FakeCatalog();
         rpc = new FakeClusterRpc();
+        rpc.respond(SRC, Commands.MIGRATE_STATUS, (target, body) -> MigrateResponse.of(MigrateStatus.PARTIAL, null));
         leaderView = new LeaderViewFake();
         leaderView.leader = true;
     }
@@ -93,6 +94,37 @@ class MigrationCoordinatorTest {
         if (coordinator != null) {
             coordinator.close();
         }
+    }
+
+    @Test
+    void sourceFailureResolvesPartialTargetWithoutWaitingForTheMigrationTimeout() throws Exception {
+        newCoordinator(8);
+        catalog.putPlacement("s1", SeriesPlacement.active(SRC, 1_000L));
+        rpc.respond(SRC, Commands.MIGRATE_START, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+        rpc.respond(DST, Commands.MIGRATE_STATUS, (target, body) -> MigrateResponse.of(MigrateStatus.PARTIAL, null));
+        rpc.respond(SRC, Commands.MIGRATE_STATUS, (target, body) -> MigrateResponse.of(MigrateStatus.ERROR, "chunk failed"));
+        rpc.respond(SRC, Commands.MIGRATE_ABORT, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+        rpc.respond(DST, Commands.MIGRATE_ABORT, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+        var result = coordinator.migrate("s1", SRC, DST).get(2, TimeUnit.SECONDS);
+        assertEquals(MigrationOutcome.FAILED, result.outcome());
+        assertTrue(result.reason().contains("chunk failed"));
+        assertTrue(catalog.placementStrong("s1").orElseThrow().isOwnedBy(SRC));
+        assertEquals(1, rpc.callsTo(SRC, Commands.MIGRATE_ABORT));
+        assertEquals(1, rpc.callsTo(DST, Commands.MIGRATE_ABORT));
+    }
+
+    @Test
+    void committedDestinationWinsEvenWhenSourceLostTheCommitResponse() throws Exception {
+        newCoordinator(8);
+        catalog.putPlacement("s1", SeriesPlacement.active(SRC, 1_000L));
+        rpc.respond(SRC, Commands.MIGRATE_START, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+        rpc.respond(SRC, Commands.MIGRATE_STATUS, (target, body) -> MigrateResponse.of(MigrateStatus.ERROR, "commit timeout"));
+        rpc.respond(DST, Commands.MIGRATE_STATUS, (target, body) -> new MigrateResponse(MigrateStatus.COMMITTED, null, 10));
+        rpc.respond(SRC, Commands.MIGRATE_FINISH, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+        var result = coordinator.migrate("s1", SRC, DST).get(2, TimeUnit.SECONDS);
+        assertEquals(MigrationOutcome.COMPLETED, result.outcome());
+        assertTrue(catalog.placementStrong("s1").orElseThrow().isOwnedBy(DST));
+        assertEquals(0, rpc.callsTo(SRC, Commands.MIGRATE_ABORT));
     }
 
     @Test
