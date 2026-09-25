@@ -54,7 +54,6 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.lang.reflect.Field;
-import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -335,14 +334,12 @@ class MigrationExecutorTest {
     /**
      * A checagem de {@code transferActive} antes de cada {@code acquireUrgent} (ver Javadoc de {@code
      * sendPatches}) tem de interromper o envio dos patches finais do cutover assim que a migração for
-     * abortada — em vez de continuar mandando RPCs para um destino que já não espera por elas. Testa
-     * {@code sendPatches} isoladamente (via reflexão, com um {@link ClusterRpc} fake): {@code before}/
-     * {@code after} têm dois ranges BEM separados (blocos de 4096 bytes, longe demais para mesclar), o
-     * fake aborta a migração (mutando {@code states} para {@code ABORTED}, como {@code handleAbort}
-     * faria) logo depois de responder ao 1º patch, e só então o 2º patch seria tentado — a exceção
-     * esperada é a mesma que {@code transfer()} captura e converte em {@code updatePhase(FAILED, ...)},
-     * reproduzida aqui para confirmar que essa chamada NÃO sobrescreve a fase já terminal ({@code
-     * ABORTED}), graças à guarda existente em {@code updatePhase} (só substitui uma fase não-terminal).
+     * abortada — em vez de continuar mandando RPCs para um destino que já não espera por elas. Chama
+     * {@code sendPatches} diretamente (visibilidade de pacote), com um {@link ClusterRpc} fake: {@code
+     * before}/{@code after} têm dois ranges BEM separados (blocos de 4096 bytes, longe demais para
+     * mesclar); o fake, ao responder ao 1º patch, dispara um {@code MIGRATE_ABORT} de verdade via
+     * {@code handleAbort} (seguro aqui porque {@code sendPatches} não segura o lock da série) — e só
+     * então o 2º patch seria tentado.
      */
     @Test
     void abortDuranteOsPatchesFinaisDoCutoverInterrompeOEnvioSemSobrescreverAFaseTerminal() throws Exception {
@@ -357,8 +354,8 @@ class MigrationExecutorTest {
                 int n = patchCalls.incrementAndGet();
                 if (n == 1) {
                     // Simula um MIGRATE_ABORT concorrente chegando logo após o 1º patch final ser
-                    // entregue -- mesmo efeito de handleAbort (papel SOURCE): marca ABORTED.
-                    setSourceState(executorRef.get(), id, key, MigrationExecutor.MigratePhase.ABORTED);
+                    // entregue -- via handleAbort de verdade (papel SOURCE).
+                    executorRef.get().handleLocal(Commands.MIGRATE_ABORT, new MigrateControlRequest(key, id));
                 }
                 return (R) MigrateResponse.of(MigrateStatus.OK, null);
             }
@@ -386,26 +383,15 @@ class MigrationExecutorTest {
             after[0] = 1;
             after[8_000] = 1;
 
-            Method sendPatches = MigrationExecutor.class.getDeclaredMethod("sendPatches", NodeId.class,
-                    String.class, String.class, byte[].class, byte[].class, int.class, boolean.class);
-            sendPatches.setAccessible(true);
             try {
-                sendPatches.invoke(executor, DST, key, id, before, after, 0, true);
+                executor.sendPatches(DST, key, id, before, after, 0, true);
                 fail("deveria ter lançado IllegalStateException ao tentar o 2º patch após o abort");
-            } catch (java.lang.reflect.InvocationTargetException e) {
-                assertTrue(e.getCause() instanceof IllegalStateException,
-                        "causa inesperada: " + e.getCause());
+            } catch (IllegalStateException expected) {
+                // esperado: transferActive() barra o 2º patch depois do handleAbort disparado acima.
             }
             assertEquals(1, patchCalls.get(), "nenhum patch urgente adicional deveria ser enviado depois do abort");
-
-            // Reproduz exatamente o que transfer() faz ao capturar essa exceção: updatePhase(FAILED, ...).
-            Method updatePhase = MigrationExecutor.class.getDeclaredMethod("updatePhase", String.class,
-                    MigrationExecutor.MigratePhase.class, String.class);
-            updatePhase.setAccessible(true);
-            updatePhase.invoke(executor, id, MigrationExecutor.MigratePhase.FAILED, "live-copy catch-up failed");
-
             assertEquals(MigrationExecutor.MigratePhase.ABORTED, readState(executor, id).phase(),
-                    "a fase terminal (ABORTED) não pode ser sobrescrita pela falha subsequente do laço de patches");
+                    "a fase terminal (ABORTED) não pode ser sobrescrita");
         } finally {
             executor.close();
         }

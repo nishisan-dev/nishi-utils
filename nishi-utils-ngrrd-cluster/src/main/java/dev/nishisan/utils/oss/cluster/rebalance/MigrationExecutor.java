@@ -405,8 +405,11 @@ public final class MigrationExecutor extends RequestHandlerSupport {
      * a banda em pé de igualdade via {@link MigrationBandwidth#acquire}); {@code true} só para os
      * patches enviados DEPOIS de {@code markMigrating} (série já congelada), que usam {@link
      * MigrationBandwidth#acquireUrgent} — furam a fila sem esperar, mas continuam debitando o orçamento.
+     *
+     * <p>Visibilidade de pacote (não {@code private}) só para {@code MigrationExecutorTest} poder
+     * exercitar o laço isoladamente, com um {@link ClusterRpc} fake; não é API estável do cliente.</p>
      */
-    private int sendPatches(NodeId target, String key, String id, byte[] before, byte[] after, int sequence,
+    int sendPatches(NodeId target, String key, String id, byte[] before, byte[] after, int sequence,
             boolean urgent) {
         for (PatchRange range : changedRanges(before, after)) {
             if (urgent) {
