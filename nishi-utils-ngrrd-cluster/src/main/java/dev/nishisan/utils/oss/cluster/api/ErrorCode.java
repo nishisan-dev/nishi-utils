@@ -50,11 +50,18 @@ public enum ErrorCode {
     CLOSED,
 
     /**
-     * O storage node envolvido não anuncia a capacidade de protocolo que a operação exige (ver
-     * {@code StorageCapabilities}) — tipicamente um nó de versão anterior durante uma atualização. A
-     * operação falha na hora, antes de qualquer RPC a esse nó: {@code exists}/{@code find} nunca devolvem
-     * {@code false} e {@code open} sem criar nunca é enviado a um nó que poderia criar a série. Atualize
-     * os storages antes dos clientes.
+     * O storage node envolvido não suporta o que a operação exige — tipicamente um nó de versão anterior
+     * durante uma atualização. Dois casos:
+     * <ul>
+     *   <li>antes do RPC: o nó não anuncia a capacidade de protocolo exigida (ver
+     *       {@code StorageCapabilities}), ou não há status publicado dele dentro do prazo — a operação falha
+     *       sem enviar nada a esse nó: {@code exists}/{@code find} nunca devolvem {@code false} e
+     *       {@code open} sem criar nunca é enviado a um nó que poderia criar a série;</li>
+     *   <li>depois do {@code OPEN}: o storage respondeu {@code OK} a um {@code OPEN} sem criar sem confirmar
+     *       que honrou {@code createIfMissing=false} — detectado depois do fato, então o storage já pode ter
+     *       criado a série; o handle somente leitura se fecha e relança esta falha.</li>
+     * </ul>
+     * Atualize os storages antes dos clientes.
      */
     UNSUPPORTED_BY_NODE
 }

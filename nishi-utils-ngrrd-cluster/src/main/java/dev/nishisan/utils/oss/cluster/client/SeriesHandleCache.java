@@ -48,9 +48,10 @@ import java.util.function.Supplier;
  * <p>Nunca faz RPC dentro de {@code computeIfAbsent} — isso manteria o bin lock interno do
  * {@link ConcurrentHashMap} preso durante a chamada de rede do {@code OPEN}, bloqueando qualquer outra
  * série do mapa. O lock por chave ({@code openLocks}, construído sem I/O, adquirido via
- * {@link CoordinationLocks}) só serializa as decisões de abertura DA MESMA série, para que aberturas
- * concorrentes não abram vários handles; a correção não depende dele — depende da publicação
- * condicional.</p>
+ * {@link CoordinationLocks}) serializa as aberturas DA MESMA série, e o {@code OPEN} remoto do handle novo
+ * roda sob ele, como na 8.5.0 — é um {@code ReentrantLock}, que libera o carrier de uma virtual thread
+ * durante a espera, e só bloqueia quem abre a mesma chave. Ele evita que aberturas concorrentes abram
+ * vários handles; a correção não depende dele — depende da publicação condicional.</p>
  */
 final class SeriesHandleCache {
 

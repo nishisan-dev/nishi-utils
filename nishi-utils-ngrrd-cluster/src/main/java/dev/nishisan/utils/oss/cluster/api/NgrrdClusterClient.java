@@ -40,9 +40,10 @@ import java.util.Optional;
  * <p>Um único handle principal é mantido por {@code seriesKey}: chamar {@link #open}
  * duas vezes com as mesmas tags e o mesmo modo devolve o mesmo {@link NgrrdHandle}
  * (referência compartilhada, sem contagem de referências) — {@link #close()}
- * do cliente fecha esse handle para todos os chamadores que o obtiveram. As
- * combinações entre abertura com e sem criação estão em
- * {@link #open(String, Map, Ngrrd.OpenOptions)}.</p>
+ * do cliente fecha esse handle para todos os chamadores que o obtiveram. A
+ * exceção é abrir sem criar uma chave cujo principal é gravável: cada chamada
+ * recebe uma vista somente leitura NOVA sobre ele. As combinações entre abertura
+ * com e sem criação estão em {@link #open(String, Map, Ngrrd.OpenOptions)}.</p>
  */
 public interface NgrrdClusterClient extends Closeable {
 
