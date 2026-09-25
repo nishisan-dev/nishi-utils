@@ -3,12 +3,14 @@ package dev.nishisan.utils.oss;
 import dev.nishisan.utils.oss.api.Durability;
 import dev.nishisan.utils.oss.api.OnGeometryChange;
 import dev.nishisan.utils.oss.api.Sample;
+import dev.nishisan.utils.oss.api.SeriesNotFoundException;
 import dev.nishisan.utils.oss.api.SeriesResult;
 import dev.nishisan.utils.oss.api.StorageBackendType;
 import dev.nishisan.utils.oss.api.ViewQuery;
 import dev.nishisan.utils.oss.blob.BlobVolume;
 import dev.nishisan.utils.oss.blob.BlobVolumeRegistry;
 import dev.nishisan.utils.oss.blob.NgrrdUri;
+import dev.nishisan.utils.oss.config.NgrrdDefinitionValidator;
 import dev.nishisan.utils.oss.config.NgrrdYamlLoader;
 import dev.nishisan.utils.oss.definition.NgrrdDefinition;
 import dev.nishisan.utils.oss.definition.StorageSpec;
@@ -17,7 +19,9 @@ import dev.nishisan.utils.oss.metrics.NgrrdMetricsListener;
 import dev.nishisan.utils.oss.reader.NgrrdReader;
 import dev.nishisan.utils.oss.reader.ViewExecutor;
 import dev.nishisan.utils.oss.storage.NgrrdStorage;
+import dev.nishisan.utils.oss.storage.SeriesChannelProvider;
 import dev.nishisan.utils.oss.storage.StorageFactory;
+import dev.nishisan.utils.oss.storage.StorageKey;
 import dev.nishisan.utils.oss.writer.NgrrdWriter;
 
 import java.io.IOException;
@@ -160,6 +164,80 @@ public final class Ngrrd {
         return buildHandle(def, volume.bindings(), locator.seriesPath(), volume.qualityListener(), options);
     }
 
+    // ------------------------------------------------------------ exists
+
+    /**
+     * Indica se a série existe no volume, sem I/O de criação: equivalente a
+     * {@link #open(BlobVolumeRegistry, NgrrdUri, String)}, mas apenas consulta.
+     */
+    public static boolean exists(BlobVolumeRegistry registry, NgrrdUri locator, String yamlContent) {
+        Objects.requireNonNull(registry, "registry é obrigatório");
+        Objects.requireNonNull(locator, "locator é obrigatório");
+        return exists(registry.require(locator.volume()), locator, yamlContent);
+    }
+
+    /**
+     * Indica se a série existe no volume, sem I/O de criação: equivalente a
+     * {@link #open(BlobVolume, NgrrdUri, String)}, mas apenas consulta. No
+     * backend sharded blob é um lookup no catálogo em memória do volume (sem
+     * acessar disco).
+     */
+    public static boolean exists(BlobVolume volume, NgrrdUri locator, String yamlContent) {
+        Objects.requireNonNull(volume, "volume é obrigatório");
+        Objects.requireNonNull(locator, "locator é obrigatório");
+        Objects.requireNonNull(yamlContent, "yamlContent é obrigatório");
+        NgrrdDefinition def = NgrrdYamlLoader.parse(yamlContent, System::getenv);
+        NgrrdDefinitionValidator.validate(def);
+        return existsInStorage(def.spec().storage(), volume.bindings(), locator.seriesPath());
+    }
+
+    /**
+     * Indica se a série existe, sem I/O de criação: equivalente a
+     * {@link #fromYaml(String, StorageFactory.StorageBindings, Map, NgrrdMetricsListener)},
+     * mas apenas consulta. O YAML é necessário só para derivar o
+     * {@code seriesPrefix} e resolver o {@code seriesKey} a partir das tags.
+     */
+    public static boolean exists(String yamlContent, StorageFactory.StorageBindings bindings,
+                                 Map<String, String> tags) {
+        Objects.requireNonNull(yamlContent, "yamlContent é obrigatório");
+        Objects.requireNonNull(bindings, "bindings é obrigatório");
+        Objects.requireNonNull(tags, "tags é obrigatório");
+        NgrrdDefinition def = NgrrdYamlLoader.parse(yamlContent, System::getenv);
+        NgrrdDefinitionValidator.validate(def);
+        String seriesKey = resolveSeriesKey(def.spec().identity().seriesKeyTemplate(), tags);
+        return existsInStorage(def.spec().storage(), bindings, seriesKey);
+    }
+
+    /**
+     * Resolve a chave física via {@link StorageKey#series} e responde via
+     * {@link SeriesChannelProvider#seriesExists} quando o backend suporta
+     * (todos os backends atuais suportam); sem esse fallback, cai para
+     * {@link NgrrdStorage#exists}. Nenhum objeto é criado, aberto ou
+     * pré-alocado. Fecha o storage recém-instanciado quando ele não é
+     * compartilhado (mesma regra de {@code DefaultHandle.close}: volumes
+     * {@code SHARDED_BLOB} são geridos pelo {@link BlobVolumeRegistry}).
+     */
+    private static boolean existsInStorage(StorageSpec storageSpec, StorageFactory.StorageBindings bindings,
+                                           String seriesKey) {
+        NgrrdStorage storage = StorageFactory.from(storageSpec, bindings);
+        boolean ownsStorage = storageSpec.backend() != StorageBackendType.SHARDED_BLOB;
+        try {
+            String storageKey = StorageKey.series(storageSpec.objectNaming(), seriesKey);
+            if (storage instanceof SeriesChannelProvider provider) {
+                return provider.seriesExists(storageKey);
+            }
+            return storage.exists(storageKey);
+        } finally {
+            if (ownsStorage && storage instanceof AutoCloseable ac) {
+                try {
+                    ac.close();
+                } catch (Exception e) {
+                    // log opcional — não bloqueia o consumidor.
+                }
+            }
+        }
+    }
+
     private static NgrrdHandle buildHandle(NgrrdDefinition def, StorageFactory.StorageBindings bindings,
                                            String seriesKey, NgrrdMetricsListener metricsListener,
                                            OpenOptions options) {
@@ -186,7 +264,7 @@ public final class Ngrrd {
         // contrato de 1 writer + N readers do NgrrdHandle.
         ReadWriteLock seriesLock = new ReentrantReadWriteLock();
         NgrrdWriter writer = new NgrrdWriter(def, storage, seriesKey, metrics, seriesLock,
-                durability, onGeometryChange);
+                durability, onGeometryChange, System::currentTimeMillis, options.createIfMissing());
 
         // O volume SHARDED_BLOB é compartilhado entre handles; quem o fecha é o
         // BlobVolumeRegistry, não o handle individual.
@@ -218,14 +296,25 @@ public final class Ngrrd {
      * Opções de abertura de um {@link NgrrdHandle}. Independem da forma da série
      * (descrita no YAML) e variam por deployment/execução.
      *
-     * <p>Campos {@code null} significam "usar o default do YAML"
-     * ({@code spec.storage.*}), que por sua vez recaem nos defaults globais
-     * ({@link Durability#FSYNC}, {@link OnGeometryChange#FAIL}). Um valor não-nulo
-     * sobrescreve o YAML — permitindo, por exemplo, abrir em produção com
-     * {@link OnGeometryChange#FAIL} e rodar um job de manutenção com
+     * <p>{@code durability}/{@code onGeometryChange} {@code null} significam
+     * "usar o default do YAML" ({@code spec.storage.*}), que por sua vez recaem
+     * nos defaults globais ({@link Durability#FSYNC}, {@link OnGeometryChange#FAIL}).
+     * Um valor não-nulo sobrescreve o YAML — permitindo, por exemplo, abrir em
+     * produção com {@link OnGeometryChange#FAIL} e rodar um job de manutenção com
      * {@link OnGeometryChange#MIGRATE}.</p>
+     *
+     * @param createIfMissing quando {@code true} (default), abrir uma série
+     *                        inexistente a cria do zero — comportamento atual.
+     *                        Quando {@code false}, nenhum objeto é criado/pré-alocado:
+     *                        série ausente faz o {@code open} lançar
+     *                        {@link SeriesNotFoundException} em vez de
+     *                        materializar uma série vazia.
      */
-    public record OpenOptions(Durability durability, OnGeometryChange onGeometryChange) {
+    public record OpenOptions(Durability durability, OnGeometryChange onGeometryChange, boolean createIfMissing) {
+
+        public OpenOptions(Durability durability, OnGeometryChange onGeometryChange) {
+            this(durability, onGeometryChange, true);
+        }
 
         public static OpenOptions defaults() {
             return new OpenOptions(null, null);
@@ -241,6 +330,11 @@ public final class Ngrrd {
 
         public static OpenOptions of(Durability durability, OnGeometryChange onGeometryChange) {
             return new OpenOptions(durability, onGeometryChange);
+        }
+
+        /** Devolve uma cópia com {@code createIfMissing} alterado; demais campos preservados. */
+        public OpenOptions withCreateIfMissing(boolean createIfMissing) {
+            return new OpenOptions(durability, onGeometryChange, createIfMissing);
         }
     }
 

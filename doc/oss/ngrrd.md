@@ -540,6 +540,44 @@ S3Settings s3 = S3Settings.forEndpoint(
 var bindings = StorageFactory.StorageBindings.forS3(s3);
 ```
 
+### Abrir sem criar e consultar existência
+
+Por padrão, `open`/`fromYaml` criam a série do zero quando ela ainda não
+existe no storage. Em cenários de catálogo externo (ex.: um sistema que
+percorre milhares de chaves e não sabe de antemão quais têm dados), isso faz
+uma entrada sem arquivo virar uma série vazia pré-alocada no primeiro acesso.
+
+`Ngrrd.OpenOptions.withCreateIfMissing(false)` desliga essa criação implícita:
+se a série não existir, a abertura lança
+`dev.nishisan.utils.oss.api.SeriesNotFoundException` sem alocar nada (sem
+arquivo `.ngrr`, sem entrada no catálogo do blob). O default
+(`createIfMissing = true`) preserva o comportamento atual.
+
+```java
+import dev.nishisan.utils.oss.api.SeriesNotFoundException;
+
+Ngrrd.OpenOptions options = Ngrrd.OpenOptions.defaults().withCreateIfMissing(false);
+try (NgrrdHandle handle = Ngrrd.fromYaml(yaml, bindings, tags, options)) {
+    // série já existia — segue o fluxo normal de write/read.
+} catch (SeriesNotFoundException e) {
+    // e.seriesKey() identifica a série ausente; nada foi criado.
+    // ponto natural para remover a entrada de um catálogo externo.
+}
+```
+
+`Ngrrd.exists(...)` responde a mesma pergunta sem abrir a série — útil para
+uma varredura de catálogo que só precisa saber quais chaves têm dados. É
+apenas consulta: resolve a chave física (`StorageKey.series`) e pergunta ao
+storage, sem I/O de criação. No backend `blob` é um lookup no catálogo em
+memória do volume (sem tocar em disco):
+
+```java
+boolean present = Ngrrd.exists(yaml, bindings, tags);
+
+// modo locator (blob volume)
+boolean presentInVolume = Ngrrd.exists(registry, locator, yaml);
+```
+
 ### Leitura via Python (`ngrrd-python`)
 
 O subprojeto `python/ngrrd-python/` traz um reader read-only que espelha o

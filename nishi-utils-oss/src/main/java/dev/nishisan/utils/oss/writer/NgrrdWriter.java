@@ -4,6 +4,7 @@ import dev.nishisan.utils.oss.api.ConsolidationFunction;
 import dev.nishisan.utils.oss.api.Durability;
 import dev.nishisan.utils.oss.api.OnGeometryChange;
 import dev.nishisan.utils.oss.api.Sample;
+import dev.nishisan.utils.oss.api.SeriesNotFoundException;
 import dev.nishisan.utils.oss.definition.DataSourceDef;
 import dev.nishisan.utils.oss.definition.NgrrdDefinition;
 import dev.nishisan.utils.oss.engine.CounterDeriver;
@@ -151,11 +152,26 @@ public final class NgrrdWriter implements AutoCloseable {
      * usado para medir {@code ingest_lag_sec} (diferença entre o instante do
      * recebimento da sample e o seu timestamp). O default é
      * {@code System::currentTimeMillis}; os testes injetam um relógio fixo.
+     * {@code createIfMissing} segue o default {@code true} (comportamento atual).
      */
     public NgrrdWriter(NgrrdDefinition definition, NgrrdStorage storage, String seriesKey,
                        NgrrdMetricsListener metrics, ReadWriteLock seriesLock,
                        Durability durability, OnGeometryChange onGeometryChange,
                        LongSupplier nowEpochMs) {
+        this(definition, storage, seriesKey, metrics, seriesLock, durability, onGeometryChange,
+                nowEpochMs, true);
+    }
+
+    /**
+     * Variante completa com {@code createIfMissing}: quando {@code false} e a
+     * série ainda não existir no storage ({@link SeriesChannelProvider#seriesExists}),
+     * lança {@link SeriesNotFoundException} antes de reconciliar geometria ou
+     * abrir o canal — nenhum objeto é criado/pré-alocado.
+     */
+    public NgrrdWriter(NgrrdDefinition definition, NgrrdStorage storage, String seriesKey,
+                       NgrrdMetricsListener metrics, ReadWriteLock seriesLock,
+                       Durability durability, OnGeometryChange onGeometryChange,
+                       LongSupplier nowEpochMs, boolean createIfMissing) {
         this.nowEpochMs = Objects.requireNonNull(nowEpochMs, "nowEpochMs é obrigatório");
         this.definition = Objects.requireNonNull(definition, "definition é obrigatório");
         Objects.requireNonNull(storage, "storage é obrigatório");
@@ -187,6 +203,9 @@ public final class NgrrdWriter implements AutoCloseable {
         }
 
         this.storageKey = StorageKey.series(definition.spec().storage().objectNaming(), seriesKey);
+        if (!createIfMissing && !provider.seriesExists(storageKey)) {
+            throw new SeriesNotFoundException(seriesKey);
+        }
         // Reconcilia a geometria gravada com a nova antes de abrir o canal de
         // escrita: aplica onGeometryChange (FAIL/RECREATE/MIGRATE) ou no-op.
         GeometryReconciler.reconcile(storage, storageKey, geo, geometryHash, schemaRevision,
