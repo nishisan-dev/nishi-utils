@@ -330,6 +330,22 @@ public final class MigrationCoordinator implements LeadershipListener {
         }
     }
 
+    /**
+     * Poll periódico de {@code MIGRATE_STATUS} ao destino (e, quando necessário, à origem) até o
+     * cutover se resolver, respeitando a seguinte ordem de prioridade a cada iteração:
+     * <ol>
+     *   <li>Destino responde {@code COMMITTED} → completa. Sempre vence, mesmo com a origem em erro.</li>
+     *   <li>Destino responde (não-nulo) {@code ERROR}/{@code HASH_MISMATCH} → aborta na hora.</li>
+     *   <li>Destino responde {@code PARTIAL}/{@code UNKNOWN} e a origem reporta erro → aborta na hora
+     *       (não espera o {@code migrationTimeout}).</li>
+     *   <li>Destino não responde (falha de transporte) e a origem reporta erro → dá a carência de
+     *       {@link #SOURCE_FAILURE_DESTINATION_GRACE} antes de reconsultar o destino uma última vez e
+     *       decidir (completa se {@code COMMITTED}, aborta caso contrário).</li>
+     *   <li>Nenhuma das condições acima e o {@code migrationTimeout} estoura → reconsulta o destino uma
+     *       última vez antes de abortar (mesmo racional do caso anterior: um {@code COMMITTED} tardio
+     *       ainda vence).</li>
+     * </ol>
+     */
     private MigrationResult pollUntilResolved(String seriesKey, SeriesPlacement migratingPlacement, String src,
             String dst, String migrationId, long startedAt) {
         long deadline = clock.millis() + migrationTimeout.toMillis();
@@ -390,10 +406,16 @@ public final class MigrationCoordinator implements LeadershipListener {
                             return complete(seriesKey, migratingPlacement, src, dst, migrationId,
                                     finalPoll.bytes(), startedAt);
                         }
-                        return abort(seriesKey, migratingPlacement, src, dst,
-                                "origem em erro (" + sourceResponse.message() + ") e destino não respondeu "
-                                        + "dentro da carência de " + SOURCE_FAILURE_DESTINATION_GRACE
-                                        + " após a falha da origem", startedAt);
+                        // Com um migrationTimeout curto (< SOURCE_FAILURE_DESTINATION_GRACE), o
+                        // Math.min acima já corta a carência no próprio deadline — quem realmente
+                        // esgotou foi o migrationTimeout, não a carência, então o motivo cita o timeout.
+                        String reason = graceDeadline < deadline
+                                ? "origem em erro (" + sourceResponse.message() + ") e destino não "
+                                        + "respondeu dentro da carência de " + SOURCE_FAILURE_DESTINATION_GRACE
+                                        + " após a falha da origem"
+                                : "timeout (" + migrationTimeout + ") aguardando COMMITTED no destino " + dst
+                                        + " (origem em erro: " + sourceResponse.message() + ")";
+                        return abort(seriesKey, migratingPlacement, src, dst, reason, startedAt);
                     }
                 }
             }
