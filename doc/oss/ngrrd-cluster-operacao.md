@@ -233,6 +233,8 @@ confirmação de todas as amostras anteriores da série, inclusive após redirec
 Os handlers e a escrita TCP evitam monitores durante esperas de rede, para liberar as
 threads de suporte do Java 21. O handshake também preserva o socket ao substituir o
 endereço provisório do seed pelo ID real do nó, evitando desconexões nessa descoberta.
+Ao encerrar um nó, o transporte fecha inclusive sockets ainda sem identidade e impede
+que conexões em abertura reapareçam depois do fechamento.
 O coordenador consulta também a origem: se ela já falhou,
 resolve a migração preservando a cópia original, sem esperar desnecessariamente o prazo
 completo. Um `COMMITTED` confirmado no destino tem precedência sobre a falha da origem.

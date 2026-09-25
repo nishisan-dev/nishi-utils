@@ -76,6 +76,9 @@ public final class TcpTransport implements Transport {
     private final StatsUtils stats;
     private final Map<NodeId, NodeInfo> knownPeers = new ConcurrentHashMap<>();
     private final Map<NodeId, Connection> connections = new ConcurrentHashMap<>();
+    // Includes accepted sockets that have not supplied a handshake/peer identity yet.
+    private final Set<Connection> liveSockets = ConcurrentHashMap.newKeySet();
+    private final ReentrantLock lifecycleLock = new ReentrantLock();
     private final Set<TransportListener> listeners = new CopyOnWriteArraySet<>();
     private final Map<UUID, PendingResponse> pendingResponses = new ConcurrentHashMap<>();
     // Use Virtual Threads for per-task execution
@@ -505,14 +508,23 @@ public final class TcpTransport implements Transport {
     }
 
     private Connection registerConnection(Socket socket, NodeInfo preResolved) throws IOException {
-        socket.setTcpNoDelay(true);
-        Connection connection = new Connection(socket, preResolved != null);
-        if (preResolved != null) {
-            connection.setRemote(preResolved);
-            // NOTE: do not publish into `connections` here. Both the outbound path and the
-            // inbound handshake go through registerLiveConnection (under the per-peer lock),
-            // the single place that decides which connection is live — preventing an outbound
-            // dial from clobbering a canonical inbound connection (or vice-versa).
+        Connection connection;
+        lifecycleLock.lock();
+        try {
+            if (!running) { throw new IOException("Transport closed during connect"); }
+            socket.setTcpNoDelay(true);
+            connection = new Connection(socket, preResolved != null);
+            liveSockets.add(connection);
+            if (preResolved != null) {
+                connection.setRemote(preResolved);
+            }
+            // Peer publication still goes through registerLiveConnection. Track the socket
+            // immediately so shutdown also closes a reader waiting for its first handshake.
+        } catch (IOException e) {
+            try { socket.close(); } catch (IOException suppressed) { e.addSuppressed(suppressed); }
+            throw e;
+        } finally {
+            lifecycleLock.unlock();
         }
         // Use Virtual Thread for reading
         Thread.ofVirtual().name("ngrid-transport-reader").start(connection::readLoop);
@@ -527,12 +539,18 @@ public final class TcpTransport implements Transport {
      * endpoints compute the same winner, so they converge on a single physical connection.
      *
      * @return the connection that is now live for the peer (may be a pre-existing one if the
-     *         candidate lost the tie-break; the candidate is closed in that case)
+     *         candidate lost the tie-break; the candidate is closed in that case), or null
+     *         when shutdown or a closed socket prevents publication
      */
     private Connection registerLiveConnection(NodeId remoteId, Connection candidate) {
         ReentrantLock peerLock = getLockFor(remoteId);
         peerLock.lock();
+        lifecycleLock.lock();
         try {
+            if (!running || !candidate.isOpen()) {
+                candidate.closeQuietly();
+                return null;
+            }
             Connection existing = connections.get(remoteId);
             if (existing == candidate) {
                 return candidate;
@@ -552,6 +570,7 @@ public final class TcpTransport implements Transport {
             candidate.closeQuietly();
             return existing;
         } finally {
+            lifecycleLock.unlock();
             peerLock.unlock();
         }
     }
@@ -636,6 +655,7 @@ public final class TcpTransport implements Transport {
         // already drives this peer.
         NodeId remoteNodeId = remoteInfo.nodeId();
         Connection live = registerLiveConnection(remoteNodeId, connection);
+        if (live == null) { return; }
         if (live != connection) {
             router.updateReachability(remoteNodeId, payload.peers(), payload.latencies());
             return;
@@ -862,7 +882,19 @@ public final class TcpTransport implements Transport {
 
     @Override
     public void close() throws IOException {
-        running = false;
+        List<Connection> socketsToClose;
+        lifecycleLock.lock();
+        try {
+            running = false;
+            socketsToClose = List.copyOf(liveSockets);
+            liveSockets.clear();
+            connections.clear();
+        } finally {
+            lifecycleLock.unlock();
+        }
+        // Closing sockets outside the lifecycle guard avoids nesting disconnect callbacks
+        // under it. A dial/accept finishing later is fenced by registerConnection.
+        socketsToClose.forEach(Connection::closeQuietly);
         if (serverSocket != null) {
             serverSocket.close();
         }
@@ -875,10 +907,6 @@ public final class TcpTransport implements Transport {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
-        for (Connection connection : connections.values()) {
-            connection.close();
-        }
-        connections.clear();
         connectionLocks.clear();
         pendingResponses.values().forEach(pending -> {
             pending.cancelTimeout();
@@ -1027,7 +1055,7 @@ public final class TcpTransport implements Transport {
                                     socket.getInetAddress().getHostAddress(),
                                     socket.getPort());
                             remote = inferred;
-                            connections.putIfAbsent(inferred.nodeId(), this);
+                            if (registerLiveConnection(inferred.nodeId(), this) != this) { return; }
                         }
                         handleMessage(remoteId().orElse(null), message);
                     }
@@ -1049,6 +1077,7 @@ public final class TcpTransport implements Transport {
                 LOGGER.fine(() -> "Closing connection to " + remote);
             }
             open = false;
+            liveSockets.remove(this);
             // No need to shutdown writer executor anymore, the flag + socket close will kill it
             socket.close();
         }
@@ -1058,6 +1087,7 @@ public final class TcpTransport implements Transport {
                 LOGGER.fine(() -> "Quietly closing connection to " + remote);
             }
             open = false;
+            liveSockets.remove(this);
             try {
                 socket.close();
             } catch (IOException ignored) {

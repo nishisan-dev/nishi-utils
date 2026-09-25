@@ -17,6 +17,8 @@ Continuação da [issue #169](https://github.com/nishisan-dev/nishi-utils/issues
   virtual threads do Java 21, evitando prender suas threads de suporte em monitores.
 - O handshake preserva a conexão aberta pelo endereço do seed ao descobrir o ID real
   do nó. A limpeza do alias provisório deixava de reutilizar o socket e o fechava.
+- O encerramento do transporte fecha também sockets sem handshake e impede que uma
+  conexão iniciada antes do fechamento seja publicada depois dele.
 - `ngrrd.rebalance.maxBytesPerSecond` limita o tráfego de imagem e patches por origem,
   somando todas as migrações; padrão 16 MiB/s. O coordenador também consulta falhas na origem.
 - A cópia online negocia `liveCopy`/`COPY_READY` antes dos chunks e usa `ngrrd.migrate.patch`.
