@@ -53,4 +53,18 @@ public interface WriteBuffer {
     default void flushSeriesSync(String seriesKey, String ownerNodeId, Duration maxWait) {
         flushNodeSync(ownerNodeId, maxWait);
     }
+
+    /**
+     * Falha, de imediato, qualquer escrita de {@code seriesKey} ainda no buffer (não enviada) — usado
+     * por {@link RemoteSeriesHandle} quando descobre {@code SeriesNotFoundException} por um caminho
+     * síncrono (fora da reabertura assíncrona do dispatcher em {@code NOT_OPEN}), depois de já ter se
+     * removido do mapa do cliente. Sem isto, uma escrita que ainda estivesse no buffer seguiria seu
+     * ciclo normal, receberia {@code NOT_OPEN} mais tarde e tentaria reabrir via o reopener do
+     * dispatcher — que não encontra mais o handle (já removido) e devolve {@code false} sem nunca
+     * sinalizar série inexistente, entrando em retentativa para sempre. Idempotente: chamar sem nada
+     * pendente para a chave é um no-op. Implementações sem rastreamento por série (fakes de teste)
+     * podem ignorar.
+     */
+    default void failSeries(String seriesKey, Throwable cause) {
+    }
 }

@@ -209,14 +209,25 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     public void enqueue(String ownerNodeId, SeriesWrite write) {
         Objects.requireNonNull(ownerNodeId, "ownerNodeId");
         Objects.requireNonNull(write, "write");
-        SeriesRoute route = routes.computeIfAbsent(write.seriesKey(), key -> new SeriesRoute(ownerNodeId));
         for (;;) {
+            SeriesRoute route = routes.computeIfAbsent(write.seriesKey(), key -> new SeriesRoute(ownerNodeId));
             NodeBuffer buf;
             String owner;
             boolean accepted = false;
             boolean triggerFlush = false;
             route.lock.lock();
             try {
+                // discardRoute troca a entrada de routes por uma instância nova enquanto detém o MESMO
+                // lock que acabamos de conseguir — se perdemos essa corrida, a rota que travamos já foi
+                // aposentada (e nunca mais vai receber submitted++/completeWrites de ninguém): solta e
+                // tenta de novo, para cair na rota atual em vez de admitir numa órfã.
+                // discardRoute troca a entrada de routes por uma instância nova enquanto detém o MESMO
+                // lock que acabamos de conseguir — se perdemos essa corrida, a rota que travamos já foi
+                // aposentada (e nunca mais vai receber submitted++/completeWrites de ninguém): solta e
+                // tenta de novo, para cair na rota atual em vez de admitir numa órfã.
+                if (routes.get(write.seriesKey()) != route) {
+                    continue;
+                }
                 if (closed) {
                     throw new NgrrdClusterException(ErrorCode.CLOSED, "dispatcher fechado");
                 }
@@ -447,6 +458,16 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         return samplesFailedCount.sum();
     }
 
+    /**
+     * Só para teste: identidade da rota atual de {@code seriesKey} ({@code null} se nenhuma). Usado
+     * para esperar deterministicamente a troca feita por {@code discardRoute} (assíncrona em relação a
+     * {@link #samplesFailed()}, que já reflete a falha antes da troca acontecer) em vez de prosseguir
+     * com uma nova escrita para a mesma chave logo após o contador mudar.
+     */
+    Object routeIdentityForTest(String seriesKey) {
+        return routes.get(seriesKey);
+    }
+
     /** Total de lotes {@code WRITE_BATCH} efetivamente enviados (sucesso de transporte). */
     public long batchesSent() {
         return batchesSentCount.sum();
@@ -601,6 +622,9 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 String newOwner = response.ownerBySeries().get(seriesKey);
                 if (newOwner != null) {
                     logRetryRateLimited(seriesKey, SeriesStatus.WRONG_OWNER, "novo dono informado: " + newOwner);
+                    // Mesma garantia de completeWrites: estas escritas ainda estão outstanding (não
+                    // passaram por completeWrites), então routes.get(seriesKey) só pode resolver para a
+                    // rota que as admitiu — discardRoute não troca uma rota com nada em voo.
                     SeriesRoute route = routes.get(seriesKey);
                     route.lock.lock();
                     try {
@@ -678,6 +702,11 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
 
     // FIFO admission/rerouting ensures completions form a prefix of each series. A failed
     // prefix remains observable: a later checkpoint cannot certify those lost samples.
+    //
+    // routes.get(seriesKey) sempre resolve para a instância que admitiu a escrita que está
+    // completando: enqueue nunca admite numa rota já trocada (ver discardRoute) e uma escrita
+    // outstanding (submitted > completed, exatamente o que ainda não passou por completeWrites)
+    // bloqueia qualquer troca da MESMA rota até ela ser resolvida aqui.
     private void completeWrites(String seriesKey, int count, String failure) {
         SeriesRoute route = routes.get(seriesKey);
         route.lock.lock();
@@ -801,17 +830,60 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
 
     /** Descarta, como falha, todas as escritas pendentes de {@code key} — série confirmada inexistente. */
     private void failSeriesNotFound(NodeBuffer buf, String key, SeriesNotFoundException cause) {
-        List<SeriesWrite> lost = extractSeriesFrom(buf, key);
-        if (!lost.isEmpty()) {
-            samplesFailedCount.add(lost.size());
-            // Notifica quem já espera (route.progress.signalAll()) ANTES de descartar a rota — a ordem
-            // importa: descartar primeiro apagaria o rastro da falha para um waiter que ainda não
-            // reagiu.
-            completeWrites(key, lost.size(), "série inexistente: " + key);
-        }
+        long lost = failPendingWritesIn(buf, key);
+        // Notifica quem já espera (route.progress.signalAll(), dentro de failPendingWritesIn) ANTES de
+        // descartar a rota — a ordem importa: descartar primeiro apagaria o rastro da falha para um
+        // waiter que ainda não reagiu.
         discardRoute(key);
         LOGGER.log(Level.WARNING, "Série " + key + " inexistente ao reabrir — descartando "
-                + lost.size() + " escrita(s) pendente(s), sem novas tentativas", cause);
+                + lost + " escrita(s) pendente(s), sem novas tentativas", cause);
+    }
+
+    /**
+     * Caminho síncrono (fora da reabertura assíncrona em {@code NOT_OPEN}): {@link RemoteSeriesHandle}
+     * chama isto ao descobrir {@code SeriesNotFoundException} diretamente (ex.: {@code read}/
+     * {@code checkpoint} síncronos), depois de já remover o handle do mapa do cliente. Falha qualquer
+     * escrita ainda no buffer de QUALQUER nó já associado à série ({@link SeriesRoute#destinations},
+     * não só o dono atual — um {@code WRONG_OWNER} em andamento pode ter deixado backlog em dois nós)
+     * antes que ela chegue a ser enviada e vire um {@code NOT_OPEN} sem handle nenhum para reabrir.
+     * Idempotente: sem nada pendente para a chave, é um no-op barato.
+     */
+    @Override
+    public void failSeries(String seriesKey, Throwable cause) {
+        SeriesRoute route = routes.get(seriesKey);
+        if (route == null) {
+            return;
+        }
+        Set<String> destinations;
+        route.lock.lock();
+        try {
+            destinations = Set.copyOf(route.destinations);
+        } finally {
+            route.lock.unlock();
+        }
+        long lost = 0;
+        for (String ownerNodeId : destinations) {
+            NodeBuffer buf = buffers.get(ownerNodeId);
+            if (buf != null) {
+                lost += failPendingWritesIn(buf, seriesKey);
+            }
+        }
+        discardRoute(seriesKey);
+        if (lost > 0) {
+            LOGGER.log(Level.WARNING, "Série " + seriesKey + " inexistente (descoberta fora da reabertura "
+                    + "assíncrona) — descartando " + lost + " escrita(s) pendente(s) do buffer", cause);
+        }
+    }
+
+    /** Extrai e falha, via {@link #completeWrites}, toda escrita de {@code key} ainda em {@code buf}; devolve quantas. */
+    private long failPendingWritesIn(NodeBuffer buf, String key) {
+        List<SeriesWrite> lost = extractSeriesFrom(buf, key);
+        if (lost.isEmpty()) {
+            return 0;
+        }
+        samplesFailedCount.add(lost.size());
+        completeWrites(key, lost.size(), "série inexistente: " + key);
+        return lost.size();
     }
 
     /**
@@ -822,10 +894,15 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
      *
      * <p>O objeto antigo nunca é mutado depois da troca: quem já chamou {@link #flushSeriesSync} antes
      * dela capturou a referência antiga e continua observando a falha corretamente, sem corrida com
-     * este método. Só troca se nenhuma escrita nova foi admitida nesta rota desde a falha
-     * ({@code submitted == completed}, verificado sob o mesmo lock que {@link #enqueue} usa para
-     * admitir) — uma escrita já admitida continua pertencendo à rota antiga, e trocar a deixaria sem
-     * dono.</p>
+     * este método. A troca só acontece sob o {@code lock} da própria rota antiga ({@code oldRoute.lock},
+     * o MESMO que {@link #enqueue} precisa para admitir uma escrita) e só se {@code submitted ==
+     * completed} — ou seja, sem nada em voo para ela. {@link #enqueue}, por sua vez, confere logo após
+     * travar se a rota que pegou ainda é a atual em {@link #routes} e refaz a busca se não for: as duas
+     * pontas dessa exclusão mútua garantem que nenhuma escrita nova é admitida numa rota já trocada, e
+     * que {@link #completeWrites}/o ramo {@code WRONG_OWNER} de {@link #applyStatus} — que resolvem a
+     * rota de uma escrita por {@link #routes}{@code .get(seriesKey)} no momento da conclusão, não por
+     * uma referência guardada na admissão — sempre encontram a MESMA instância que admitiu aquela
+     * escrita.</p>
      */
     private void discardRoute(String seriesKey) {
         SeriesRoute oldRoute = routes.get(seriesKey);
@@ -834,9 +911,11 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         }
         oldRoute.lock.lock();
         try {
-            // Uma escrita nova admitida bem nesta janela (entre a falha e este lock) fica na rota
-            // antiga sem limpeza — sem dado perdido, só sem a troca por uma rota limpa desta vez; a
-            // próxima falha confirmada para a mesma chave tenta de novo.
+            // Uma escrita já admitida (submitted > completed) continua pertencendo a esta rota — trocar
+            // agora a deixaria sem dono. Não é uma corrida: o mesmo lock usado aqui é o que enqueue
+            // precisa para admitir, então "nada em voo" observado aqui é uma verdade estável até
+            // soltarmos o lock (e, a partir daí, a troca já publicada em routes é o que qualquer nova
+            // admissão vai ver).
             if (oldRoute.submitted != oldRoute.completed) {
                 return;
             }

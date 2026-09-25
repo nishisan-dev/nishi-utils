@@ -636,6 +636,8 @@ class StorageRequestHandlerTest {
         assertFalse(registry.isOpen(seriesKey), "OPEN sem criar não deveria ter aberto a série");
         assertFalse(volume.storage().exists(SeriesObjectKeys.objectKey(SERIES_OBJECT_PREFIX, seriesKey)),
                 "OPEN sem criar não deveria ter criado o objeto físico");
+        assertEquals(1, placementLookup.strongCalls(),
+                "NOT_FOUND precisa confirmar com o líder antes de responder, mesmo com a réplica local ACTIVE(self)");
     }
 
     @Test
@@ -741,6 +743,7 @@ class StorageRequestHandlerTest {
 
         assertEquals(SeriesStatus.NOT_FOUND, response.status());
         assertFalse(registry.isOpen(seriesKey));
+        assertEquals(1, placementLookup.strongCalls(), "NOT_FOUND precisa ter consultado o líder");
     }
 
     @Test

@@ -34,6 +34,8 @@ import dev.nishisan.utils.oss.cluster.protocol.WriteBatchResponse;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.LinkedHashMap;
@@ -48,6 +50,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiConsumer;
 import java.util.function.Function;
 
@@ -624,10 +627,14 @@ class WriteDispatcherTest {
         });
 
         dispatcher.enqueue(OWNER_A.value(), write("gone", 1L, 1.0));
+        Object routeDuringFailure = dispatcher.routeIdentityForTest("gone");
         Await.untilTrue("série declarada inexistente", AWAIT_TIMEOUT, () -> dispatcher.samplesFailed() == 1L);
+        // samplesFailed já reflete a falha antes de discardRoute trocar a rota (a notificação vem
+        // primeiro) — espera a troca de fato, senão a rota antiga (ainda em pendingRoutes) pode
+        // envenenar este flushAllSync por uma corrida de teste.
+        Await.untilTrue("rota de \"gone\" trocada por discardRoute", AWAIT_TIMEOUT,
+                () -> dispatcher.routeIdentityForTest("gone") != routeDuringFailure);
 
-        // Sem discardRoute, flushAllSync() jamais devolveria — a rota de "gone" continuaria em
-        // pendingRoutes com firstFailedSequence marcado para sempre.
         dispatcher.enqueue(OWNER_A.value(), write("healthy", 1L, 2.0));
         dispatcher.flushAllSync();
 
@@ -650,13 +657,78 @@ class WriteDispatcherTest {
         });
 
         dispatcher.enqueue(OWNER_A.value(), write("gone", 1L, 1.0));
+        Object routeDuringFailure = dispatcher.routeIdentityForTest("gone");
         Await.untilTrue("série declarada inexistente", AWAIT_TIMEOUT, () -> dispatcher.samplesFailed() == 1L);
+        // Espera a troca de fato (discardRoute), não só o contador — uma escrita nova para a MESMA
+        // chave logo após samplesFailed mudar pode chegar antes da troca e ficar presa na rota antiga
+        // (ainda envenenada), fazendo o flushSeriesSync abaixo lançar por uma corrida de teste.
+        Await.untilTrue("rota de \"gone\" trocada por discardRoute", AWAIT_TIMEOUT,
+                () -> dispatcher.routeIdentityForTest("gone") != routeDuringFailure);
 
         dispatcher.enqueue(OWNER_A.value(), write("gone", 2L, 9.0));
         dispatcher.flushSeriesSync("gone", OWNER_A.value(), AWAIT_TIMEOUT); // não deve lançar
 
         assertEquals(1L, dispatcher.samplesSent());
         assertEquals(1L, dispatcher.samplesFailed());
+    }
+
+    @Test
+    void escritaTardiaAposTrocaDeRotaEntraNaRotaNovaENuncaNaAntiga() throws Exception {
+        // Reproduz a corrida de enqueue com discardRoute: pega a rota, mas trava DEPOIS que ela já foi
+        // trocada por outra — a versão antiga do enqueue admitia a escrita ali mesmo, na rota errada
+        // (que nunca mais seria vista por completeWrites). Simula a troca diretamente via reflexão (sem
+        // subir todo o fluxo de série inexistente) enquanto segura o lock da rota antiga, para forçar a
+        // escrita tardia a bloquear exatamente no ponto que a corrida exige.
+        newDispatcher(1, Duration.ofSeconds(30), 1_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        rpc.respondDefault((cmd, body) -> okFor((WriteBatchRequest) body));
+
+        dispatcher.enqueue(OWNER_A.value(), write("s1", 1L, 1.0));
+        Await.untilTrue("primeira escrita confirmada", AWAIT_TIMEOUT, () -> dispatcher.samplesSent() == 1L);
+
+        Field routesField = WriteDispatcher.class.getDeclaredField("routes");
+        routesField.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        Map<String, Object> routes = (Map<String, Object>) routesField.get(dispatcher);
+        Object oldRoute = routes.get("s1");
+        Field lockField = oldRoute.getClass().getDeclaredField("lock");
+        lockField.setAccessible(true);
+        ReentrantLock oldRouteLock = (ReentrantLock) lockField.get(oldRoute);
+        Constructor<?> routeConstructor = oldRoute.getClass().getDeclaredConstructor(String.class);
+        routeConstructor.setAccessible(true);
+        Object newRoute = routeConstructor.newInstance(OWNER_A.value());
+
+        Thread lateEnqueue = new Thread(() -> dispatcher.enqueue(OWNER_A.value(), write("s1", 2L, 2.0)),
+                "test-late-enqueue");
+        oldRouteLock.lock();
+        try {
+            lateEnqueue.start();
+            Await.untilTrue("escrita tardia bloqueada tentando travar a rota antiga", AWAIT_TIMEOUT,
+                    () -> lateEnqueue.getState() == Thread.State.BLOCKED
+                            || lateEnqueue.getState() == Thread.State.WAITING);
+            // O que discardRoute faria de verdade (sob o mesmo lock) — aqui feito à mão para controlar
+            // exatamente o instante da troca em relação ao bloqueio acima.
+            routes.put("s1", newRoute);
+        } finally {
+            oldRouteLock.unlock();
+        }
+        lateEnqueue.join(AWAIT_TIMEOUT.toMillis());
+        assertFalse(lateEnqueue.isAlive(), "escrita tardia deveria ter terminado");
+
+        Field submittedField = oldRoute.getClass().getDeclaredField("submitted");
+        submittedField.setAccessible(true);
+        Field completedField = oldRoute.getClass().getDeclaredField("completed");
+        completedField.setAccessible(true);
+        assertEquals(1L, ((Number) submittedField.get(oldRoute)).longValue(),
+                "a rota antiga não pode ter recebido a escrita tardia");
+
+        // A barreira do handle novo (a rota atual) só libera depois do ACK da escrita tardia: se ela
+        // tivesse sido admitida na rota antiga por engano, submitted/completed da rota NOVA nunca
+        // bateriam e isto travaria até o timeout.
+        dispatcher.flushSeriesSync("s1", OWNER_A.value(), AWAIT_TIMEOUT);
+        assertEquals(1L, ((Number) submittedField.get(newRoute)).longValue());
+        assertEquals(1L, ((Number) completedField.get(newRoute)).longValue(),
+                "o ACK da escrita tardia precisa ter completado a rota nova, não a antiga");
+        assertEquals(2L, dispatcher.samplesSent());
     }
 
     @Test

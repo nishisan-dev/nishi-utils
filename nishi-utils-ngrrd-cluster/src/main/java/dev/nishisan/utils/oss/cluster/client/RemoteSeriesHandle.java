@@ -26,6 +26,7 @@ import dev.nishisan.utils.oss.api.SeriesResult;
 import dev.nishisan.utils.oss.api.ViewQuery;
 import dev.nishisan.utils.oss.cluster.api.ErrorCode;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
+import dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.protocol.OpenRequest;
@@ -62,7 +63,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
     private final String seriesKey;
     private final String yaml;
     private final String definitionHashHex;
-    private final dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor geometry;
+    private final GeometryDescriptor geometry;
     private final Map<String, String> tags;
     private final Ngrrd.OpenOptions options;
     private final PlacementLookup resolver;
@@ -100,7 +101,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
             Ngrrd.OpenOptions options, PlacementLookup resolver, ClusterRpc rpc, WriteBuffer dispatcher,
             RetryPolicy retryPolicy, Duration requestTimeout, Duration closeTimeout, Clock clock,
             BiConsumer<String, RemoteSeriesHandle> onClose,
-            dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor geometry) {
+            GeometryDescriptor geometry) {
         this.seriesKey = Objects.requireNonNull(seriesKey, "seriesKey");
         this.yaml = Objects.requireNonNull(yaml, "yaml");
         this.geometry = geometry;
@@ -207,7 +208,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
         try {
             return action.get();
         } catch (SeriesNotFoundException e) {
-            markSeriesNotFound();
+            markSeriesNotFound(e);
             throw e;
         }
     }
@@ -215,16 +216,22 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
     /**
      * Marca a série como definitivamente inexistente: {@code write}/{@code flush}/{@code checkpoint}/
      * {@code read} passam a lançar {@link SeriesNotFoundException} e o handle se remove do mapa do
-     * cliente ({@link #onClose}), de modo que um {@code open} posterior refaz o fluxo do zero.
-     * Idempotente via {@link AtomicBoolean#compareAndSet} — só a chamada que vence a corrida executa o
-     * corpo (nunca dois {@code onClose.accept} para o mesmo handle).
+     * cliente ({@link #onClose}), de modo que um {@code open} posterior refaz o fluxo do zero. Também
+     * avisa o {@link #dispatcher} ({@link WriteBuffer#failSeries}) — sem isso, uma escrita já enfileirada
+     * (mas ainda não enviada) para esta série seguiria seu ciclo normal, chegaria a {@code NOT_OPEN}
+     * mais tarde e tentaria reabrir via o reopener do {@code WriteDispatcher}, que não encontra mais o
+     * handle (já removido aqui) e nunca saberia que a série está definitivamente inexistente —
+     * retentativa para sempre. Idempotente via {@link AtomicBoolean#compareAndSet} — só a chamada que
+     * vence a corrida executa o corpo (nunca dois {@code onClose.accept}/{@code failSeries} para o mesmo
+     * handle).
      */
-    private void markSeriesNotFound() {
+    private void markSeriesNotFound(SeriesNotFoundException cause) {
         if (!notFound.compareAndSet(false, true)) {
             return;
         }
         closed = true;
         onClose.accept(seriesKey, this);
+        dispatcher.failSeries(seriesKey, cause);
     }
 
     /** Se o handle ainda pode ser reaproveitado por um {@code open} futuro da mesma chave. */
