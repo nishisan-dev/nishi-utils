@@ -26,7 +26,9 @@ import dev.nishisan.utils.oss.cluster.protocol.AdminStatusResponse;
 
 import java.io.Closeable;
 import java.nio.file.Path;
+import java.util.Collection;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * Cliente transparente do cluster ngrrd: entra na malha NGrid como membro sem
@@ -49,6 +51,47 @@ public interface NgrrdClusterClient extends Closeable {
 
     /** Variante de {@link #open(String, Map)} que lê a definição YAML de um arquivo. */
     NgrrdHandle open(Path yamlFile, Map<String, String> tags);
+
+    /**
+     * Indica se a série existe no cluster: existência é presença de placement no catálogo
+     * ({@code ngrrd.catalog}) — {@code MIGRATING} conta como existente. Um hit na réplica local
+     * responde sem RPC; um miss local é confirmado em lote no líder antes de responder {@code false}.
+     *
+     * <p><b>Contrato de consistência:</b></p>
+     * <ul>
+     *   <li>Depois de um {@code open}/{@code PLACE} feito por outro cliente: se a réplica local ainda
+     *       não o viu, o miss é confirmado no líder, que já tem o placement — devolve {@code true}.</li>
+     *   <li>Durante migração ({@code MIGRATING}): devolve {@code true}; {@code open} sem criar segue o
+     *       fluxo normal de espera/redirect.</li>
+     *   <li>{@code false} significa "o líder atual não tem placement para a chave no momento da
+     *       consulta" — não é atômico com um {@code open} concorrente de outro cliente que crie a
+     *       série logo em seguida.</li>
+     *   <li>Não lê o storage: um placement sem arquivo (cliente caiu entre {@code PLACE} e
+     *       {@code OPEN}, ou disco perdido) aparece como {@code true}.</li>
+     * </ul>
+     *
+     * @throws NgrrdClusterException se não foi possível confirmar com o líder (sem líder, timeout,
+     *         falha de transporte, resposta inválida) — uma falha ao consultar nunca vira {@code false}
+     */
+    boolean exists(String seriesKey);
+
+    /**
+     * Variante em lote de {@link #exists(String)}: devolve um mapa com TODAS as chaves pedidas — nunca
+     * uma resposta parcial; qualquer falha ao consultar propaga {@link NgrrdClusterException} em vez de
+     * um mapa incompleto. Consultas de misses ao líder são paginadas em
+     * {@link NgrrdClusterConfig#catalogLookupBatchSize()} chaves por chamada, sequenciais.
+     *
+     * @see #exists(String)
+     */
+    Map<String, Boolean> exists(Collection<String> seriesKeys);
+
+    /**
+     * Informações de placement da série, se ela existir — mesma semântica de existência e o mesmo
+     * contrato de consistência de {@link #exists(String)}; um hit no cache local não faz RPC.
+     *
+     * @see #exists(String)
+     */
+    Optional<SeriesInfo> find(String seriesKey);
 
     /** Drena os buffers de escrita de todos os nós de destino conhecidos, de forma síncrona. */
     void flushAll();

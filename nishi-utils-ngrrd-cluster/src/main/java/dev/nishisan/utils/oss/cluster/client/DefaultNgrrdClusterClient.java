@@ -31,6 +31,7 @@ import dev.nishisan.utils.oss.cluster.api.ErrorCode;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterClient;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterConfig;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
+import dev.nishisan.utils.oss.cluster.api.SeriesInfo;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.metrics.LatencySnapshot;
@@ -39,7 +40,6 @@ import dev.nishisan.utils.oss.cluster.protocol.AdminNodeRequest;
 import dev.nishisan.utils.oss.cluster.protocol.AdminNodeStatusResponse;
 import dev.nishisan.utils.oss.cluster.protocol.AdminRebalanceResponse;
 import dev.nishisan.utils.oss.cluster.protocol.AdminStatusResponse;
-import dev.nishisan.utils.oss.cluster.protocol.CatalogLookupRequest;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesStatus;
 import dev.nishisan.utils.oss.cluster.rpc.ClusterRpc;
@@ -53,6 +53,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
@@ -82,11 +83,6 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
     private static final String STORAGE_ROLE = "storage";
 
     private static final int MAX_NOT_LEADER_ATTEMPTS = 5;
-    /**
-     * Tamanho de página padrão de {@code ngrrd.catalog.lookup} — bem abaixo do teto
-     * {@link CatalogLookupRequest#MAX_KEYS} aceito pelo líder.
-     */
-    private static final int DEFAULT_CATALOG_LOOKUP_BATCH_SIZE = 2_000;
     /** Placeholder do supplier de métricas do {@code WriteDispatcher} até {@code clientRef} ser publicado em {@link #connect}. */
     private static final ClientMetricsSnapshot EMPTY_METRICS = new ClientMetricsSnapshot(0L, 0L, 0L, 0L,
             Map.of(), Map.of(), 0, LatencySnapshot.EMPTY, 0L);
@@ -99,6 +95,7 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
     /** Mesma instância de {@link #rpc}, com o tipo concreto — só para expor {@code latencySnapshot()}/{@code placeCount()} em {@link #metrics()}. */
     private final MetricsTrackingClusterRpc metricsRpc;
     private final PlacementResolver resolver;
+    private final SeriesExistence existence;
     private final WriteDispatcher dispatcher;
     private final ConcurrentMap<String, RemoteSeriesHandle> handles;
     /**
@@ -111,7 +108,7 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
 
     private DefaultNgrrdClusterClient(NgrrdClusterConfig config, NGridNode node, Path dataDir,
             boolean temporaryDataDir, MetricsTrackingClusterRpc rpc, PlacementResolver resolver,
-            WriteDispatcher dispatcher, ConcurrentMap<String, RemoteSeriesHandle> handles) {
+            SeriesExistence existence, WriteDispatcher dispatcher, ConcurrentMap<String, RemoteSeriesHandle> handles) {
         this.config = config;
         this.node = node;
         this.dataDir = dataDir;
@@ -119,6 +116,7 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
         this.rpc = rpc;
         this.metricsRpc = rpc;
         this.resolver = resolver;
+        this.existence = existence;
         this.dispatcher = dispatcher;
         this.handles = handles;
         this.openLocks = new ConcurrentHashMap<>();
@@ -172,9 +170,10 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
             RetryPolicy leaderRetry = new RetryPolicy(cfg.leaderWaitTimeout(), cfg.retryBackoffMin(),
                     cfg.retryBackoffMax());
             CatalogLookupClient catalogLookupClient = new CatalogLookupClient(rpc, leaderRetry, Clock.systemUTC(),
-                    DEFAULT_CATALOG_LOOKUP_BATCH_SIZE);
+                    cfg.catalogLookupBatchSize());
             PlacementResolver resolver = new PlacementResolver(catalog, rpc, leaderRetry, Clock.systemUTC(),
                     catalogLookupClient);
+            SeriesExistence existence = new SeriesExistence(resolver, catalogLookupClient);
 
             ConcurrentMap<String, RemoteSeriesHandle> handles = new ConcurrentHashMap<>();
             RetryPolicy opRetry = new RetryPolicy(cfg.retryTimeout(), cfg.retryBackoffMin(), cfg.retryBackoffMax());
@@ -204,7 +203,7 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
                         }
                     }, Clock.systemUTC(), cfg.metricsListener(), metricsSupplier);
             DefaultNgrrdClusterClient client = new DefaultNgrrdClusterClient(cfg, node, dataDir, temporaryDataDir,
-                    rpc, resolver, dispatcher, handles);
+                    rpc, resolver, existence, dispatcher, handles);
             clientRef.set(client);
             return client;
         } catch (RuntimeException e) {
@@ -336,6 +335,27 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
         } catch (IOException e) {
             throw new UncheckedIOException("falha ao ler a definição YAML: " + yamlFile, e);
         }
+    }
+
+    @Override
+    public boolean exists(String seriesKey) {
+        ensureOpen();
+        Objects.requireNonNull(seriesKey, "seriesKey");
+        return existence.exists(seriesKey, config.retryTimeout());
+    }
+
+    @Override
+    public Map<String, Boolean> exists(Collection<String> seriesKeys) {
+        ensureOpen();
+        Objects.requireNonNull(seriesKeys, "seriesKeys");
+        return existence.exists(seriesKeys, config.retryTimeout());
+    }
+
+    @Override
+    public Optional<SeriesInfo> find(String seriesKey) {
+        ensureOpen();
+        Objects.requireNonNull(seriesKey, "seriesKey");
+        return existence.find(seriesKey, config.retryTimeout());
     }
 
     private RemoteSeriesHandle openNewHandle(String seriesKey, String yaml, Map<String, String> tags,

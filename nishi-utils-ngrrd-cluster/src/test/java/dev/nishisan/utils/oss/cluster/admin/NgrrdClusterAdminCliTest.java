@@ -25,6 +25,7 @@ import dev.nishisan.utils.oss.cluster.api.ErrorCode;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterClient;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterConfig;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
+import dev.nishisan.utils.oss.cluster.api.SeriesInfo;
 import dev.nishisan.utils.oss.cluster.catalog.NodeState;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.metrics.BlobVolumeSummary;
@@ -38,8 +39,10 @@ import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
@@ -223,6 +226,21 @@ class NgrrdClusterAdminCliTest {
 
         @Override
         public NgrrdHandle open(Path yamlFile, Map<String, String> tags) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public boolean exists(String seriesKey) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public Map<String, Boolean> exists(Collection<String> seriesKeys) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public Optional<SeriesInfo> find(String seriesKey) {
             throw new UnsupportedOperationException();
         }
 

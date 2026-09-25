@@ -54,6 +54,7 @@ class NgrrdClusterConfigYamlTest {
                   retryTimeout: 2m
                   closeTimeout: 45s
                   leaderWaitTimeout: 20s
+                  catalogLookupBatchSize: 500
                 """;
 
         NgrrdClusterConfig config = NgrrdClusterConfig.fromYaml(yaml, NO_ENV);
@@ -72,6 +73,7 @@ class NgrrdClusterConfigYamlTest {
         assertEquals(Duration.ofMinutes(2), config.retryTimeout());
         assertEquals(Duration.ofSeconds(45), config.closeTimeout());
         assertEquals(Duration.ofSeconds(20), config.leaderWaitTimeout());
+        assertEquals(500, config.catalogLookupBatchSize());
     }
 
     @Test
@@ -94,6 +96,8 @@ class NgrrdClusterConfigYamlTest {
         assertEquals(defaults.bufferFullPolicy(), config.bufferFullPolicy());
         assertEquals(defaults.closeTimeout(), config.closeTimeout());
         assertEquals(defaults.leaderWaitTimeout(), config.leaderWaitTimeout());
+        assertEquals(2_000, config.catalogLookupBatchSize());
+        assertEquals(defaults.catalogLookupBatchSize(), config.catalogLookupBatchSize());
     }
 
     @Test
@@ -134,5 +138,25 @@ class NgrrdClusterConfigYamlTest {
         IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
                 () -> NgrrdClusterConfig.fromYaml(yaml, NO_ENV));
         assertTrue(e.getMessage().contains("client"), "mensagem: " + e.getMessage());
+    }
+
+    @Test
+    void catalogLookupBatchSizeZeroERejeitadoPeloBuilder() {
+        assertThrows(IllegalArgumentException.class, () -> NgrrdClusterConfig.builder()
+                .clientId("ngrrd-client-1")
+                .host("127.0.0.1")
+                .seed("127.0.0.1:9000")
+                .catalogLookupBatchSize(0)
+                .build());
+    }
+
+    @Test
+    void catalogLookupBatchSizeAcimaDoTetoERejeitadoPeloBuilder() {
+        assertThrows(IllegalArgumentException.class, () -> NgrrdClusterConfig.builder()
+                .clientId("ngrrd-client-1")
+                .host("127.0.0.1")
+                .seed("127.0.0.1:9000")
+                .catalogLookupBatchSize(10_001)
+                .build());
     }
 }
