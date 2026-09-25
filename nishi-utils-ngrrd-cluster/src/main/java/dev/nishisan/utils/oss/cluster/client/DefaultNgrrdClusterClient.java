@@ -39,6 +39,7 @@ import dev.nishisan.utils.oss.cluster.protocol.AdminNodeRequest;
 import dev.nishisan.utils.oss.cluster.protocol.AdminNodeStatusResponse;
 import dev.nishisan.utils.oss.cluster.protocol.AdminRebalanceResponse;
 import dev.nishisan.utils.oss.cluster.protocol.AdminStatusResponse;
+import dev.nishisan.utils.oss.cluster.protocol.CatalogLookupRequest;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesStatus;
 import dev.nishisan.utils.oss.cluster.rpc.ClusterRpc;
@@ -82,9 +83,8 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
 
     private static final int MAX_NOT_LEADER_ATTEMPTS = 5;
     /**
-     * Tamanho de página padrão de {@code ngrrd.catalog.lookup} — mesmo default documentado em
-     * {@link dev.nishisan.utils.oss.cluster.protocol.CatalogLookupRequest#MAX_KEYS}, bem abaixo do
-     * teto aceito pelo líder.
+     * Tamanho de página padrão de {@code ngrrd.catalog.lookup} — bem abaixo do teto
+     * {@link CatalogLookupRequest#MAX_KEYS} aceito pelo líder.
      */
     private static final int DEFAULT_CATALOG_LOOKUP_BATCH_SIZE = 2_000;
     /** Placeholder do supplier de métricas do {@code WriteDispatcher} até {@code clientRef} ser publicado em {@link #connect}. */

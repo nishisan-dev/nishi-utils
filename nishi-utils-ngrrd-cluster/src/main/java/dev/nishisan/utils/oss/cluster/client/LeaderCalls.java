@@ -30,8 +30,7 @@ import java.util.Optional;
  * Lógica de prazo/backoff/espera por líder compartilhada entre {@link PlacementResolver#placeAtLeader}
  * (PLACE) e {@link CatalogLookupClient} (CATALOG_LOOKUP): as duas operam sob um {@code deadline} único
  * (epoch millis, de {@link Clock#millis()}), fazem polling de {@link ClusterRpc#leaderId()} até um
- * líder aparecer e limitam qualquer backoff ao tempo restante até o prazo — extraída para evitar a
- * duplicação que existia entre elas.
+ * líder aparecer e limitam qualquer backoff ao tempo restante até o prazo.
  */
 final class LeaderCalls {
 

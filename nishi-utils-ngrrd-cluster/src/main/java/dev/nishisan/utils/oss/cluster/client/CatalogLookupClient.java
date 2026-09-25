@@ -103,8 +103,12 @@ public final class CatalogLookupClient {
                         CatalogLookupResponse.class, LeaderCalls.remainingUntil(clock, deadline, description));
             } catch (NgrrdClusterException e) {
                 // Falha de TRANSPORTE (não de aplicação) ao chamar o líder — retenta com backoff até o
-                // prazo, esperando a conexão voltar em vez de tentar de novo às cegas. Qualquer outra
-                // falha (ex.: líder antigo sem handler para o comando) propaga como está.
+                // prazo, esperando a conexão voltar em vez de tentar de novo às cegas. Um líder antigo
+                // sem handler para o comando cai neste mesmo ramo: ninguém responde, a chamada expira
+                // com TIMEOUT (que TransportRetry.isTransportFailure trata como falha de transporte),
+                // é retentada até o prazo se esgotar e termina em NgrrdClusterException(TIMEOUT).
+                // Qualquer outra falha de aplicação (REMOTE_ERROR sem causa de transporte) propaga
+                // imediatamente, sem retentativa.
                 if (!TransportRetry.isTransportFailure(e) || clock.millis() >= deadline) {
                     throw e;
                 }

@@ -78,8 +78,8 @@ class PlacementResolverTest {
         rpc = new RecordingClusterRpc(CLIENT);
         rpc.leader(LEADER);
         RetryPolicy retry = new RetryPolicy(Duration.ofSeconds(2), Duration.ofMillis(10), Duration.ofMillis(100));
-        CatalogLookupClient lookupClient = new CatalogLookupClient(rpc, retry, java.time.Clock.systemUTC(), 2000);
-        resolver = new PlacementResolver(catalog, rpc, retry, java.time.Clock.systemUTC(), lookupClient);
+        CatalogLookupClient lookupClient = new CatalogLookupClient(rpc, retry, Clock.systemUTC(), 2000);
+        resolver = new PlacementResolver(catalog, rpc, retry, Clock.systemUTC(), lookupClient);
     }
 
     @AfterEach
@@ -336,16 +336,40 @@ class PlacementResolverTest {
         });
 
         SeriesPlacement resolved = resolver.resolveExisting("series-1", Duration.ofSeconds(1));
+        // Placement ACTIVE devolvido pelo líder deveria ter sido gravado como override — uma segunda
+        // chamada não repete a consulta ao líder.
+        SeriesPlacement resolvedAgain = resolver.resolveExisting("series-1", Duration.ofSeconds(1));
 
         assertEquals(completed, resolved);
-        assertEquals(1, rpc.calls().size());
+        assertEquals(completed, resolvedAgain);
+        assertEquals(1, rpc.calls().size(), "placement ACTIVE devolvido pelo líder deveria virar override");
     }
 
     @Test
+    void resolveExistingComPlacementMigrandoNoLiderNaoGravaOverride() {
+        SeriesPlacement before = SeriesPlacement.active("storage-a", 1_000L);
+        SeriesPlacement migratingAtLeader = SeriesPlacement.migrating(before, "storage-b", "mig-1", 2_000L);
+        rpc.respondDefault((cmd, body) -> {
+            assertEquals(Commands.CATALOG_LOOKUP, cmd);
+            return CatalogLookupResponse.ok(Map.of("series-1", migratingAtLeader));
+        });
+
+        SeriesPlacement first = resolver.resolveExisting("series-1", Duration.ofSeconds(1));
+        // Sem override gravado (placement não ACTIVE), a segunda chamada consulta o líder de novo.
+        SeriesPlacement second = resolver.resolveExisting("series-1", Duration.ofSeconds(1));
+
+        assertEquals(migratingAtLeader, first);
+        assertEquals(migratingAtLeader, second);
+        assertEquals(2, rpc.calls().size(), "placement MIGRATING não deveria ser cacheado como override");
+    }
+
+    @Test
+    @Timeout(2)
     void resolveExistingSemLiderLancaNgrrdClusterExceptionENaoSeriesNotFound() {
         rpc.leader(null);
 
         assertThrows(NgrrdClusterException.class,
                 () -> resolver.resolveExisting("series-1", Duration.ofMillis(30)));
+        assertTrue(rpc.calls().isEmpty(), "sem líder eleito, nenhuma chamada deveria ter sido feita");
     }
 }
