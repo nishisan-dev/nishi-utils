@@ -238,9 +238,12 @@ public final class NgrrdStorageNode implements Closeable {
                 // Seed: addLeadershipListener não dispara um callback sintético para quem já registra o
                 // listener com o nó JÁ líder — ex.: o primeiro líder eleito de um cluster recém-formado,
                 // decidido durante builder.start() acima, ANTES deste registro. Sem isto,
-                // migrationCoordinator/rebalancer deste nó nunca saberiam que já são líder até a PRÓXIMA
-                // troca de liderança (se houver alguma) — nenhuma migração nem rebalanceamento automático
-                // rodaria nele enquanto ele seguisse líder ininterruptamente desde o início.
+                // placementHandler/migrationCoordinator/rebalancer deste nó nunca saberiam que já são
+                // líder até a PRÓXIMA troca de liderança (se houver alguma) — placementHandler ficaria
+                // sem becameLeaderAtMs (janela de graça de PLACE e CATALOG_LOOKUP nunca se abriria para
+                // este mandato) e nenhuma migração nem rebalanceamento automático rodaria nele enquanto
+                // ele seguisse líder ininterruptamente desde o início.
+                placementHandler.onLeaderChanged(self);
                 migrationCoordinator.onLeaderChanged(self);
                 rebalancer.onLeaderChanged(self);
 
