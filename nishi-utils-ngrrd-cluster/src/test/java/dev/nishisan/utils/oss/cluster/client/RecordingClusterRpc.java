@@ -46,12 +46,18 @@ final class RecordingClusterRpc implements ClusterRpc {
     record Recorded(NodeId target, String command, Object body) {
     }
 
+    /** Resposta que depende também do nó de destino da chamada. */
+    @FunctionalInterface
+    interface TargetResponder {
+        Object respond(NodeId target, String command, Object body);
+    }
+
     private final NodeId localId;
     private final List<Recorded> calls = new CopyOnWriteArrayList<>();
     private final Queue<BiFunction<String, Object, Object>> queuedResponders = new ArrayDeque<>();
 
     private volatile Optional<NodeId> leaderId = Optional.empty();
-    private volatile BiFunction<String, Object, Object> defaultResponder;
+    private volatile TargetResponder defaultResponder;
     /** B3 (achado do Refuter): estado de conexão simulado por alvo — ausente aqui = conectado. */
     private final ConcurrentMap<NodeId, Boolean> connected = new ConcurrentHashMap<>();
 
@@ -71,6 +77,11 @@ final class RecordingClusterRpc implements ClusterRpc {
 
     /** Programa a resposta usada quando não há mais respostas enfileiradas por {@link #respondNext}. */
     void respondDefault(BiFunction<String, Object, Object> responder) {
+        this.defaultResponder = responder == null ? null : (target, command, body) -> responder.apply(command, body);
+    }
+
+    /** Como {@link #respondDefault}, mas a resposta pode depender do nó de destino. */
+    void respondByTarget(TargetResponder responder) {
         this.defaultResponder = responder;
     }
 
@@ -82,14 +93,17 @@ final class RecordingClusterRpc implements ClusterRpc {
     @Override
     public <R> R call(NodeId target, String command, Object body, Class<R> responseType) {
         calls.add(new Recorded(target, command, body));
-        BiFunction<String, Object, Object> responder = pollResponder();
-        if (responder == null) {
-            responder = defaultResponder;
+        BiFunction<String, Object, Object> queued = pollResponder();
+        Object result;
+        if (queued != null) {
+            result = queued.apply(command, body);
+        } else {
+            TargetResponder responder = defaultResponder;
+            if (responder == null) {
+                throw new IllegalStateException("nenhuma resposta programada para " + command + " em " + target);
+            }
+            result = responder.respond(target, command, body);
         }
-        if (responder == null) {
-            throw new IllegalStateException("nenhuma resposta programada para " + command + " em " + target);
-        }
-        Object result = responder.apply(command, body);
         return responseType.cast(result);
     }
 

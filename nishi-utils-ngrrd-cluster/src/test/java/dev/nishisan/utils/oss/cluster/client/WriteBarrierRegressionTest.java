@@ -42,9 +42,11 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiFunction;
+import java.util.function.Function;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -53,12 +55,18 @@ class WriteBarrierRegressionTest {
     private final Rpc rpc = new Rpc();
     private WriteDispatcher dispatcher;
     private RemoteSeriesHandle handle;
+    /** Resposta do líder a {@code resolveExistingAtLeader}; por padrão, o mesmo dono inicial "A". */
+    private volatile Function<String, SeriesPlacement> atLeader = key -> SeriesPlacement.active("A", 0);
+    private final AtomicInteger atLeaderCalls = new AtomicInteger();
 
     private void open() {
         PlacementLookup lookup = new PlacementLookup() {
             public SeriesPlacement resolve(String key, String hash) { return SeriesPlacement.active("A", 0); }
             public SeriesPlacement resolveExisting(String key, Duration maxWait) { return resolve(key, null); }
-            public SeriesPlacement resolveExistingAtLeader(String key, Duration maxWait) { return resolve(key, null); }
+            public SeriesPlacement resolveExistingAtLeader(String key, Duration maxWait) {
+                atLeaderCalls.incrementAndGet();
+                return atLeader.apply(key);
+            }
             public Optional<SeriesPlacement> placementCached(String key) { return Optional.of(resolve(key, null)); }
             public void invalidate(String key) { }
             public void noteOwner(String key, String owner) { }
@@ -135,6 +143,33 @@ class WriteBarrierRegressionTest {
         operation.get(5, TimeUnit.SECONDS);
         assertEquals(1, dispatcher.samplesSent());
         assertTrue(rpc.commands.contains(command + "@C"));
+        assertEquals(0, atLeaderCalls.get(), "a cadeia legítima A→B→C não consulta o líder");
+    }
+
+    @Test
+    void checkpointConcluiApesarDeDicasContraditorias() {
+        // #177: a origem A (já sem a série) aponta o destino C, e C (réplica do catálogo atrasada) aponta
+        // de volta A. Só a consulta ao líder desfaz o pingue-pongue dentro do prazo de retentativa (5 s).
+        var lookedUp = new AtomicBoolean();
+        atLeader = key -> {
+            lookedUp.set(true);
+            return SeriesPlacement.active("C", 1);
+        };
+        rpc.writes = (owner, request) -> {
+            if (owner.equals("A")) {
+                return moved("C");
+            }
+            return lookedUp.get() ? ok() : moved("A");
+        };
+        open();
+        handle.write("ds", new Sample(1, 1));
+        handle.write("ds", new Sample(2, 2));
+
+        handle.checkpoint();
+
+        assertEquals(2, dispatcher.samplesSent());
+        assertTrue(atLeaderCalls.get() >= 1, "a contradição deveria ter consultado o líder");
+        assertTrue(rpc.commands.contains(Commands.CHECKPOINT + "@C"));
     }
 
     @Test

@@ -35,6 +35,8 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Clock;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -65,6 +67,8 @@ class WriteDispatcherTest {
     private static final Duration AWAIT_TIMEOUT = Duration.ofSeconds(10);
     private static final NodeId OWNER_A = NodeId.of("storage-a");
     private static final NodeId OWNER_B = NodeId.of("storage-b");
+    private static final NodeId OWNER_C = NodeId.of("storage-c");
+    private static final NodeId OWNER_D = NodeId.of("storage-d");
 
     private RecordingClusterRpc rpc;
     private FakePlacementLookup placementLookup;
@@ -79,9 +83,14 @@ class WriteDispatcherTest {
 
     private WriteDispatcher newDispatcher(int batchMaxSamples, Duration batchMaxDelay, long maxBufferedPerNode,
             NgrrdClusterConfig.BufferFullPolicy policy, Function<String, Boolean> reopener) {
+        return newDispatcher(batchMaxSamples, batchMaxDelay, maxBufferedPerNode, policy, reopener,
+                new RetryPolicy(Duration.ofSeconds(5), Duration.ofMillis(10), Duration.ofMillis(200)));
+    }
+
+    private WriteDispatcher newDispatcher(int batchMaxSamples, Duration batchMaxDelay, long maxBufferedPerNode,
+            NgrrdClusterConfig.BufferFullPolicy policy, Function<String, Boolean> reopener, RetryPolicy retry) {
         rpc = new RecordingClusterRpc(NodeId.of("client-under-test"));
         placementLookup = new FakePlacementLookup();
-        RetryPolicy retry = new RetryPolicy(Duration.ofSeconds(5), Duration.ofMillis(10), Duration.ofMillis(200));
         dispatcher = new WriteDispatcher(rpc, placementLookup, retry, batchMaxSamples, batchMaxDelay,
                 maxBufferedPerNode, policy, Duration.ofSeconds(5), reopener, Clock.systemUTC());
         return dispatcher;
@@ -637,14 +646,233 @@ class WriteDispatcherTest {
                 AWAIT_TIMEOUT, () -> dispatcher.samplesSent() == 2L);
     }
 
+    @Test
+    void dicasAlternadasAeCDisparamConsultaAoLiderEConvergem() {
+        newDispatcher(1, Duration.ofMillis(10), 1_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        AtomicInteger callsBeforeLookup = new AtomicInteger(-1);
+        AtomicBoolean lookedUp = new AtomicBoolean();
+        placementLookup.atLeader = keys -> {
+            callsBeforeLookup.compareAndSet(-1, rpc.calls().size());
+            lookedUp.set(true);
+            return Map.of("s1", SeriesPlacement.active(OWNER_C.value(), 1L));
+        };
+        // storage-a (origem, já esquecida) aponta o destino; storage-c (réplica atrasada) aponta a origem —
+        // o pingue-pongue da #177, que só termina quando o cliente pergunta ao líder.
+        rpc.respondByTarget((target, cmd, body) -> {
+            WriteBatchRequest req = (WriteBatchRequest) body;
+            if (target.equals(OWNER_A)) {
+                return moved(req, OWNER_C);
+            }
+            return lookedUp.get() ? okFor(req) : moved(req, OWNER_A);
+        });
+
+        for (int i = 1; i <= 5; i++) {
+            dispatcher.enqueue(OWNER_A.value(), write("s1", i, i));
+        }
+
+        Await.untilTrue("todas as amostras confirmadas", AWAIT_TIMEOUT, () -> dispatcher.samplesSent() == 5L);
+        assertTrue(placementLookup.atLeaderCalls.get() >= 1, "deveria ter consultado o líder");
+        assertEquals(0L, dispatcher.samplesFailed());
+        List<RecordingClusterRpc.Recorded> afterLookup = rpc.calls().subList(callsBeforeLookup.get(), rpc.calls().size());
+        assertTrue(afterLookup.stream().noneMatch(c -> c.target().equals(OWNER_A)),
+                "depois da resposta do líder nenhum WRITE_BATCH volta a storage-a");
+        assertEquals(List.of(1L, 2L, 3L, 4L, 5L), afterLookup.stream()
+                .flatMap(c -> ((WriteBatchRequest) c.body()).writes().stream()).map(SeriesWrite::tsEpochMs).toList(),
+                "a série chega ao dono confirmado em ordem");
+        assertTrue(dispatcher.ownerLookups() >= 1);
+        assertTrue(dispatcher.redirectCycles() >= 1);
+    }
+
+    @Test
+    void wrongOwnerApontandoOProprioNoNaoGiraEmLoop() throws Exception {
+        newDispatcher(1, Duration.ofMillis(10), 1_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        placementLookup.atLeader = keys -> Map.of("s1", SeriesPlacement.active(OWNER_A.value(), 1L));
+        AtomicBoolean accept = new AtomicBoolean();
+        rpc.respondByTarget((target, cmd, body) -> accept.get() ? okFor((WriteBatchRequest) body)
+                : moved((WriteBatchRequest) body, OWNER_A));
+
+        dispatcher.enqueue(OWNER_A.value(), write("s1", 1, 1));
+        Thread.sleep(500);
+
+        long batches = countWriteBatchCalls();
+        assertTrue(batches <= 8, "WRONG_OWNER apontando o próprio nó não pode virar laço quente: " + batches);
+        assertTrue(placementLookup.atLeaderCalls.get() >= 1, "a contradição deveria consultar o líder");
+        accept.set(true);
+        dispatcher.flushAllSync();
+        assertEquals(1L, dispatcher.samplesSent());
+    }
+
+    @Test
+    void backoffCresceEntreSaltos() {
+        newDispatcher(1, Duration.ofSeconds(30), 1_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true,
+                new RetryPolicy(Duration.ofSeconds(5), Duration.ofMillis(40), Duration.ofSeconds(2)));
+        List<Long> sentAtNanos = new CopyOnWriteArrayList<>();
+        rpc.respondByTarget((target, cmd, body) -> {
+            sentAtNanos.add(System.nanoTime());
+            WriteBatchRequest req = (WriteBatchRequest) body;
+            if (target.equals(OWNER_A)) return moved(req, OWNER_B);
+            if (target.equals(OWNER_B)) return moved(req, OWNER_C);
+            if (target.equals(OWNER_C)) return moved(req, OWNER_D);
+            return okFor(req);
+        });
+
+        dispatcher.enqueue(OWNER_A.value(), write("s1", 1, 1));
+        dispatcher.flushAllSync();
+
+        assertEquals(1L, dispatcher.samplesSent());
+        assertEquals(4, sentAtNanos.size());
+        List<Long> gapsMs = new ArrayList<>();
+        for (int i = 1; i < sentAtNanos.size(); i++) {
+            gapsMs.add(Duration.ofNanos(sentAtNanos.get(i) - sentAtNanos.get(i - 1)).toMillis());
+        }
+        assertTrue(gapsMs.get(0) >= 35 && gapsMs.get(1) >= 75 && gapsMs.get(2) >= 155,
+                "backoff por série deveria dobrar a cada salto (40/80/160 ms): " + gapsMs);
+        assertEquals(0, placementLookup.atLeaderCalls.get(), "cadeia com nós distintos não consulta o líder");
+    }
+
+    @Test
+    void consultaFalhaMantemSeriePausadaSemBloquearOutras() throws Exception {
+        newDispatcher(1, Duration.ofMillis(10), 1_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        CountDownLatch lookupEntered = new CountDownLatch(1);
+        CountDownLatch releaseLookup = new CountDownLatch(1);
+        placementLookup.atLeader = keys -> {
+            lookupEntered.countDown();
+            awaitLatch(releaseLookup);
+            throw new NgrrdClusterException(ErrorCode.NO_LEADER, "sem líder (simulado)");
+        };
+        AtomicBoolean stuckAccepted = new AtomicBoolean();
+        rpc.respondByTarget((target, cmd, body) -> {
+            WriteBatchRequest req = (WriteBatchRequest) body;
+            String key = req.writes().getFirst().seriesKey();
+            return key.equals("stuck") && !stuckAccepted.get() ? moved(req, OWNER_A) : okFor(req);
+        });
+        try {
+            dispatcher.enqueue(OWNER_A.value(), write("stuck", 1, 1));
+            assertTrue(lookupEntered.await(5, TimeUnit.SECONDS), "a contradição deveria consultar o líder");
+            dispatcher.enqueue(OWNER_A.value(), write("healthy", 1, 1));
+            dispatcher.flushSeriesSync("healthy", OWNER_A.value(), Duration.ofSeconds(2));
+            assertEquals(1L, dispatcher.samplesSent(), "a série saudável no mesmo nó é confirmada");
+            assertEquals(1L, writeBatchesFor("stuck"), "com a consulta em andamento, a série fica pausada");
+        } finally {
+            releaseLookup.countDown();
+        }
+        // Falha da consulta: a série continua no dono atual, com backoff, e volta a tentar.
+        Await.untilTrue("série volta a ser tentada após a falha da consulta", AWAIT_TIMEOUT,
+                () -> writeBatchesFor("stuck") >= 2);
+        stuckAccepted.set(true);
+        dispatcher.flushAllSync();
+        assertEquals(2L, dispatcher.samplesSent());
+        assertEquals(0L, dispatcher.samplesFailed());
+    }
+
+    @Test
+    void cadeiaLegitimaABCNaoConsultaOLider() {
+        newDispatcher(1, Duration.ofMillis(10), 1_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        rpc.respondByTarget((target, cmd, body) -> {
+            WriteBatchRequest req = (WriteBatchRequest) body;
+            if (target.equals(OWNER_A)) return moved(req, OWNER_B);
+            if (target.equals(OWNER_B)) return moved(req, OWNER_C);
+            return okFor(req);
+        });
+
+        dispatcher.enqueue(OWNER_A.value(), write("s1", 1, 1));
+
+        Await.untilTrue("confirmada em storage-c", AWAIT_TIMEOUT, () -> dispatcher.samplesSent() == 1L);
+        assertEquals(0, placementLookup.atLeaderCalls.get());
+        assertEquals(List.of(OWNER_A, OWNER_B, OWNER_C),
+                rpc.calls().stream().map(RecordingClusterRpc.Recorded::target).toList());
+    }
+
+    @Test
+    void okZeraOEpisodio() {
+        newDispatcher(1, Duration.ofMillis(10), 1_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        rpc.respondByTarget((target, cmd, body) -> {
+            WriteBatchRequest req = (WriteBatchRequest) body;
+            long ts = req.writes().getFirst().tsEpochMs();
+            if (target.equals(OWNER_A)) return ts == 1 ? moved(req, OWNER_C) : okFor(req);
+            // Depois do OK em storage-c, uma migração legítima de volta a storage-a é um episódio novo.
+            return ts == 1 ? okFor(req) : moved(req, OWNER_A);
+        });
+
+        dispatcher.enqueue(OWNER_A.value(), write("s1", 1, 1));
+        Await.untilTrue("primeira amostra confirmada em storage-c", AWAIT_TIMEOUT, () -> dispatcher.samplesSent() == 1L);
+        dispatcher.enqueue(OWNER_A.value(), write("s1", 2, 2));
+        Await.untilTrue("segunda amostra confirmada em storage-a", AWAIT_TIMEOUT, () -> dispatcher.samplesSent() == 2L);
+
+        assertEquals(0, placementLookup.atLeaderCalls.get(),
+                "o OK encerra o episódio: voltar a storage-a não é contradição");
+        assertEquals(List.of(OWNER_A, OWNER_C, OWNER_C, OWNER_A),
+                rpc.calls().stream().map(RecordingClusterRpc.Recorded::target).toList());
+    }
+
+    @Test
+    void redirecionamentoPreservaAsTentativasDeMigracaoDaSerie() {
+        newDispatcher(1, Duration.ofSeconds(30), 1_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true,
+                new RetryPolicy(Duration.ofSeconds(5), Duration.ofMillis(20), Duration.ofSeconds(2)));
+        List<Long> sentAtNanos = new CopyOnWriteArrayList<>();
+        AtomicInteger atA = new AtomicInteger();
+        rpc.respondByTarget((target, cmd, body) -> {
+            sentAtNanos.add(System.nanoTime());
+            WriteBatchRequest req = (WriteBatchRequest) body;
+            if (target.equals(OWNER_A)) {
+                // Duas respostas MIGRATING (backoff por série 20 e 40 ms), depois a migração termina.
+                return atA.incrementAndGet() <= 2
+                        ? new WriteBatchResponse(Map.of("s1", SeriesStatus.MIGRATING), Map.of(), Map.of())
+                        : moved(req, OWNER_B);
+            }
+            return sentAtNanos.size() <= 4
+                    ? new WriteBatchResponse(Map.of("s1", SeriesStatus.MIGRATING), Map.of(), Map.of())
+                    : okFor(req);
+        });
+
+        dispatcher.enqueue(OWNER_A.value(), write("s1", 1, 1));
+        dispatcher.flushAllSync();
+
+        assertEquals(1L, dispatcher.samplesSent());
+        assertEquals(5, sentAtNanos.size());
+        long lastGapMs = Duration.ofNanos(sentAtNanos.get(4) - sentAtNanos.get(3)).toMillis();
+        // As tentativas da série em storage-a (2) acompanham o salto: o MIGRATING seguinte em storage-b é a
+        // 3a tentativa (80 ms), não a 1a (20 ms) de um contador zerado.
+        assertTrue(lastGapMs >= 75, "o backoff de MIGRATING não pode zerar a cada salto: " + lastGapMs + " ms");
+    }
+
+    private long writeBatchesFor(String seriesKey) {
+        return rpc.calls().stream().filter(c -> c.command().equals(Commands.WRITE_BATCH))
+                .filter(c -> ((WriteBatchRequest) c.body()).writes().getFirst().seriesKey().equals(seriesKey))
+                .count();
+    }
+
+    private static WriteBatchResponse moved(WriteBatchRequest request, NodeId newOwner) {
+        Map<String, SeriesStatus> status = new LinkedHashMap<>();
+        Map<String, String> owners = new LinkedHashMap<>();
+        for (SeriesWrite w : request.writes()) {
+            status.put(w.seriesKey(), SeriesStatus.WRONG_OWNER);
+            owners.put(w.seriesKey(), newOwner.value());
+        }
+        return new WriteBatchResponse(status, owners, Map.of());
+    }
+
     private long countWriteBatchCalls() {
         return rpc.calls().stream().filter(c -> c.command().equals(Commands.WRITE_BATCH)).count();
     }
 
-    /** {@link PlacementLookup} fake: só grava as chamadas de {@code noteOwner}/{@code invalidate}. */
+    /**
+     * {@link PlacementLookup} fake: grava as chamadas de {@code noteOwner}/{@code invalidate} e responde a
+     * consulta em lote ao líder com {@link #atLeader} (contando as chamadas).
+     */
     private static final class FakePlacementLookup implements PlacementLookup {
         final List<String> notedOwners = new CopyOnWriteArrayList<>();
         final List<String> invalidated = new CopyOnWriteArrayList<>();
+        final AtomicInteger atLeaderCalls = new AtomicInteger();
+        volatile Function<Collection<String>, Map<String, SeriesPlacement>> atLeader = keys -> {
+            throw new UnsupportedOperationException("consulta ao líder não esperada neste teste");
+        };
+
+        @Override
+        public Map<String, SeriesPlacement> resolveExistingAtLeader(Collection<String> seriesKeys, Duration maxWait) {
+            atLeaderCalls.incrementAndGet();
+            return atLeader.apply(seriesKeys);
+        }
 
         @Override
         public SeriesPlacement resolve(String seriesKey, String definitionHashHex) {
