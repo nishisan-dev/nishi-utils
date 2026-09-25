@@ -733,17 +733,20 @@ class StorageRequestHandlerTest {
     }
 
     @Test
-    void openSemCriarComReplicaLocalDesatualizadaEForteAusenteConfirmaNotFound() {
-        // Sem placement nenhum no líder: a série realmente não existe no cluster — NOT_FOUND confirmado.
+    void openSemCriarComReplicaLocalDesatualizadaEForteAusenteRespondeWrongOwnerSemDono() {
+        // Sem placement nenhum no líder: não cabe a este nó responder pela série. WRONG_OWNER sem dono
+        // faz o cliente re-resolver pelo catálogo e reportar a ausência como NOT_PLACED; NOT_FOUND fica
+        // reservado para "o líder diz que a série é minha e o arquivo não existe".
         String seriesKey = "series-not-found-strong-ausente";
         placementLookup.putLocalOnly(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
 
         SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
                 openRequestNoCreate(seriesKey, null), SOURCE);
 
-        assertEquals(SeriesStatus.NOT_FOUND, response.status());
+        assertEquals(SeriesStatus.WRONG_OWNER, response.status());
+        assertNull(response.ownerNodeId());
         assertFalse(registry.isOpen(seriesKey));
-        assertEquals(1, placementLookup.strongCalls(), "NOT_FOUND precisa ter consultado o líder");
+        assertEquals(1, placementLookup.strongCalls(), "a resposta precisa ter consultado o líder");
     }
 
     @Test

@@ -112,7 +112,7 @@ public final class PlacementResolver implements PlacementLookup {
         Map<String, SeriesPlacement> found = catalogLookupClient.lookup(List.of(seriesKey), maxWait);
         SeriesPlacement placement = found.get(seriesKey);
         if (placement == null) {
-            throw new SeriesNotFoundException(seriesKey);
+            throw new SeriesNotFoundException(seriesKey, SeriesNotFoundException.Reason.NOT_PLACED);
         }
         if (placement.state() == PlacementState.ACTIVE) {
             overrides.put(seriesKey, placement);

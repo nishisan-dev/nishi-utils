@@ -348,12 +348,14 @@ class RemoteSeriesHandleTest {
 
         SeriesNotFoundException ex = assertThrows(SeriesNotFoundException.class, () -> handle.open());
         assertEquals(SERIES_KEY, ex.seriesKey());
+        assertEquals(SeriesNotFoundException.Reason.MISSING_ON_OWNER, ex.reason());
     }
 
     @Test
     void openSemCriarSemPlacementLancaSeriesNotFound() {
         RemoteSeriesHandle handle = newHandle(Ngrrd.OpenOptions.defaults().withCreateIfMissing(false));
-        resolver.resolveExistingFailure = new SeriesNotFoundException(SERIES_KEY);
+        resolver.resolveExistingFailure = new SeriesNotFoundException(SERIES_KEY,
+                SeriesNotFoundException.Reason.NOT_PLACED);
 
         assertThrows(SeriesNotFoundException.class, () -> handle.open());
         assertTrue(rpc.calls().isEmpty(), "sem placement, o handle nunca chega a chamar OPEN no dono");
@@ -413,10 +415,13 @@ class RemoteSeriesHandleTest {
         SeriesNotFoundException ex = assertThrows(SeriesNotFoundException.class,
                 () -> handle.read("in_bps", new ViewQuery(Duration.ofHours(1), 300, ConsolidationFunction.AVERAGE, 100)));
         assertEquals(SERIES_KEY, ex.seriesKey());
+        assertEquals(SeriesNotFoundException.Reason.MISSING_ON_OWNER, ex.reason());
         assertEquals(List.of(SERIES_KEY), onCloseCalls, "handle deve se remover do mapa do cliente");
         assertFalse(handle.isOpen());
 
-        assertThrows(SeriesNotFoundException.class, () -> handle.read("daily"));
+        SeriesNotFoundException again = assertThrows(SeriesNotFoundException.class, () -> handle.read("daily"));
+        assertEquals(SeriesNotFoundException.Reason.MISSING_ON_OWNER, again.reason(),
+                "depois de fechado pela ausência, o handle repete a mesma causa");
         assertEquals(0, dispatcher.calls.get());
     }
 
@@ -424,9 +429,11 @@ class RemoteSeriesHandleTest {
     void wrongOwnerSemDonoInformadoQueDescobreSerieAusenteFechaHandleSomenteLeitura() {
         RemoteSeriesHandle handle = readOnlyOpenedHandle();
         rpc.respondNext((cmd, body) -> response(cmd, SeriesStatus.WRONG_OWNER, null));
-        resolver.resolveExistingFailure = new SeriesNotFoundException(SERIES_KEY);
+        resolver.resolveExistingFailure = new SeriesNotFoundException(SERIES_KEY,
+                SeriesNotFoundException.Reason.NOT_PLACED);
 
-        assertThrows(SeriesNotFoundException.class, () -> handle.read("daily"));
+        SeriesNotFoundException ex = assertThrows(SeriesNotFoundException.class, () -> handle.read("daily"));
+        assertEquals(SeriesNotFoundException.Reason.NOT_PLACED, ex.reason());
         assertEquals(List.of(SERIES_KEY), onCloseCalls);
         assertFalse(handle.isOpen());
         assertEquals(0, resolver.resolveCalls.get(), "reposicionamento de handle somente leitura nunca posiciona");

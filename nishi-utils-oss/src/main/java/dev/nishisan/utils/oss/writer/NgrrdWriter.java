@@ -204,7 +204,7 @@ public final class NgrrdWriter implements AutoCloseable {
 
         this.storageKey = StorageKey.series(definition.spec().storage().objectNaming(), seriesKey);
         if (!createIfMissing && !provider.seriesExists(storageKey)) {
-            throw new SeriesNotFoundException(seriesKey);
+            throw new SeriesNotFoundException(seriesKey, SeriesNotFoundException.Reason.ABSENT);
         }
         // Reconcilia a geometria gravada com a nova antes de abrir o canal de
         // escrita: aplica onGeometryChange (FAIL/RECREATE/MIGRATE) ou no-op.

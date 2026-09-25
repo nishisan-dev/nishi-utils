@@ -145,7 +145,7 @@ class SeriesHandleCacheTest {
     @Test
     void openQueFalhaNaoPublicaHandle() {
         assertThrows(SeriesNotFoundException.class, () -> cache.open(SERIES_KEY, false, () -> {
-            throw new SeriesNotFoundException(SERIES_KEY);
+            throw new SeriesNotFoundException(SERIES_KEY, SeriesNotFoundException.Reason.NOT_PLACED);
         }));
 
         assertNull(cache.get(SERIES_KEY));

@@ -72,6 +72,7 @@ class NgrrdCreateIfMissingTest {
             SeriesNotFoundException ex = assertThrows(SeriesNotFoundException.class,
                     () -> Ngrrd.open(registry, locator, yaml, options));
             assertEquals(locator.seriesPath(), ex.seriesKey());
+            assertEquals(SeriesNotFoundException.Reason.ABSENT, ex.reason());
 
             BlobVolume volume = registry.require("ifaceStats");
             assertFalse(volume.storage().exists("series/device:r1/iface:eth0.ngrr"));
@@ -123,6 +124,7 @@ class NgrrdCreateIfMissingTest {
         SeriesNotFoundException ex = assertThrows(SeriesNotFoundException.class,
                 () -> Ngrrd.fromYaml(yaml, bindings, tags, null, options));
         assertEquals("device:r1/iface:eth0", ex.seriesKey());
+        assertEquals(SeriesNotFoundException.Reason.ABSENT, ex.reason());
 
         assertNoNgrFilesUnder(tempDir);
         assertFalse(Ngrrd.exists(yaml, bindings, tags));

@@ -53,8 +53,10 @@ public interface NgrrdClusterClient extends Closeable {
      * <p><b>{@code createIfMissing=false} abre um handle SOMENTE LEITURA.</b> O cliente nunca posiciona
      * a série ({@code ngrrd.place}): o dono vem do catálogo e o storage recusa abrir série inexistente.
      * Série ausente faz o {@code open} (ou uma leitura posterior, se ela deixar de existir) lançar
-     * {@link SeriesNotFoundException}; nesse caso o handle se fecha e sai do
-     * cache do cliente. {@code write}, {@code flush} e {@code checkpoint} lançam
+     * {@link SeriesNotFoundException}; nesse caso o handle se fecha e sai do cache do cliente.
+     * {@link SeriesNotFoundException#reason()} distingue {@code NOT_PLACED} (o líder não tem placement:
+     * a série não existe no cluster) de {@code MISSING_ON_OWNER} (há placement, mas o dono confirmou
+     * que o arquivo não existe — inconsistência do cluster, não ausência no catálogo). {@code write}, {@code flush} e {@code checkpoint} lançam
      * {@link IllegalStateException}. O {@code close()} desse handle é local: não drena buffers nem envia
      * {@code CLOSE} ao storage, que fecha a série por ociosidade.</p>
      *
@@ -90,7 +92,9 @@ public interface NgrrdClusterClient extends Closeable {
      *       consulta" — não é atômico com um {@code open} concorrente de outro cliente que crie a
      *       série logo em seguida.</li>
      *   <li>Não lê o storage: um placement sem arquivo (cliente caiu entre {@code PLACE} e
-     *       {@code OPEN}, ou disco perdido) aparece como {@code true}.</li>
+     *       {@code OPEN}, ou disco perdido) aparece como {@code true} — e o {@code open} sem criar dessa
+     *       série lança {@link SeriesNotFoundException} com
+     *       {@link SeriesNotFoundException.Reason#MISSING_ON_OWNER}.</li>
      * </ul>
      *
      * @throws NgrrdClusterException se não foi possível confirmar com o líder (sem líder, timeout,

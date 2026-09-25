@@ -20,6 +20,7 @@ package dev.nishisan.utils.oss.cluster.client;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.structures.NGrid;
 import dev.nishisan.utils.ngrid.structures.NGridCluster;
+import dev.nishisan.utils.oss.Ngrrd;
 import dev.nishisan.utils.oss.api.SeriesNotFoundException;
 import dev.nishisan.utils.oss.cluster.api.ErrorCode;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
@@ -31,6 +32,8 @@ import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.protocol.PlaceRequest;
 import dev.nishisan.utils.oss.cluster.protocol.PlaceResponse;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesStatus;
+import dev.nishisan.utils.oss.cluster.protocol.SeriesStatusResponse;
+import dev.nishisan.utils.oss.cluster.protocol.SeriesWrite;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -322,6 +325,36 @@ class PlacementResolverTest {
                 () -> resolver.resolveExisting("series-1", Duration.ofSeconds(1)));
 
         assertEquals("series-1", ex.seriesKey());
+        assertEquals(SeriesNotFoundException.Reason.NOT_PLACED, ex.reason());
+    }
+
+    @Test
+    void handleSomenteLeituraComWrongOwnerSemDonoTerminaEmNotPlaced() {
+        // Ponta a ponta no cliente: o dono responde WRONG_OWNER sem dono (o líder não tem placement), o
+        // handle re-resolve por resolveExisting, o líder confirma a ausência e a exceção sai NOT_PLACED.
+        SeriesPlacement placed = SeriesPlacement.active("storage-a", 1_000L);
+        rpc.respondNext((cmd, body) -> {
+            assertEquals(Commands.CATALOG_LOOKUP, cmd);
+            return CatalogLookupResponse.ok(Map.of("series-1", placed));
+        });
+        rpc.respondNext((cmd, body) -> {
+            assertEquals(Commands.OPEN, cmd);
+            return new SeriesStatusResponse(SeriesStatus.WRONG_OWNER, null, null);
+        });
+        rpc.respondNext((cmd, body) -> {
+            assertEquals(Commands.CATALOG_LOOKUP, cmd);
+            return CatalogLookupResponse.ok(Map.of());
+        });
+        RetryPolicy retry = new RetryPolicy(Duration.ofSeconds(2), Duration.ofMillis(1), Duration.ofMillis(5));
+        RemoteSeriesHandle handle = new RemoteSeriesHandle("series-1", "yaml: fake", "hash-1", Map.of(),
+                Ngrrd.OpenOptions.defaults().withCreateIfMissing(false), resolver, rpc, new UnusedWriteBuffer(),
+                retry, Duration.ofSeconds(1), Duration.ofSeconds(1), Clock.systemUTC(), (key, h) -> { });
+
+        SeriesNotFoundException ex = assertThrows(SeriesNotFoundException.class, handle::open);
+
+        assertEquals(SeriesNotFoundException.Reason.NOT_PLACED, ex.reason());
+        assertTrue(rpc.calls().stream().noneMatch(c -> c.command().equals(Commands.PLACE)),
+                "handle somente leitura nunca posiciona");
     }
 
     @Test
@@ -371,5 +404,23 @@ class PlacementResolverTest {
         assertThrows(NgrrdClusterException.class,
                 () -> resolver.resolveExisting("series-1", Duration.ofMillis(30)));
         assertTrue(rpc.calls().isEmpty(), "sem líder eleito, nenhuma chamada deveria ter sido feita");
+    }
+
+    /** {@link WriteBuffer} que falha se for usado: um handle somente leitura nunca escreve. */
+    private static final class UnusedWriteBuffer implements WriteBuffer {
+        @Override
+        public void enqueue(String ownerNodeId, SeriesWrite write) {
+            throw new AssertionError("handle somente leitura não deveria enfileirar escritas");
+        }
+
+        @Override
+        public void flushNodeSync(String ownerNodeId) {
+            throw new AssertionError("handle somente leitura não deveria drenar o buffer");
+        }
+
+        @Override
+        public void flushNodeSync(String ownerNodeId, Duration maxWait) {
+            throw new AssertionError("handle somente leitura não deveria drenar o buffer");
+        }
     }
 }

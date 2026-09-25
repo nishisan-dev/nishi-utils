@@ -306,13 +306,13 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
      * {@code NOT_FOUND} — a réplica local pode estar atrasada logo após um restart, já que a marca
      * {@link SeriesHandleRegistry#isForgotten} é só em memória: se a origem de uma migração reiniciar
      * pouco depois do {@code FINISH}, a réplica local ainda pode dizer {@code ACTIVE(self)} com o
-     * objeto já apagado, e um {@code NOT_FOUND} baseado só nela seria falso — o cliente marcaria a
-     * série como definitivamente inexistente e descartaria escritas de uma série que, na verdade,
-     * mudou de dono. {@code NOT_FOUND} só é autoritativo depois desta consulta forte: presente e
-     * {@code ACTIVE(self)} confirma; presente e outro dono redireciona ({@code WRONG_OWNER});
-     * presente e {@code MIGRATING} redireciona ({@code MIGRATING}); ausente confirma (não há
-     * placement — a série não existe mesmo no cluster); falha da consulta nunca vira {@code NOT_FOUND}
-     * ({@code ERROR}).
+     * objeto já apagado, e um {@code NOT_FOUND} baseado só nela seria falso. {@code NOT_FOUND}
+     * (que o cliente reporta como {@code MISSING_ON_OWNER}) só sai quando o líder confirma
+     * {@code ACTIVE(self)}: a série é deste nó e o arquivo não existe. Presente com outro dono
+     * redireciona ({@code WRONG_OWNER} com o dono); presente em {@code MIGRATING} redireciona
+     * ({@code MIGRATING}); ausente no líder responde {@code WRONG_OWNER} SEM dono — não cabe a este nó
+     * responder por uma série sem placement: o cliente re-resolve pelo catálogo e reporta
+     * {@code NOT_PLACED}. Falha da consulta nunca vira {@code NOT_FOUND} ({@code ERROR}).
      */
     private SeriesStatusResponse confirmSeriesNotFound(String seriesKey) {
         Optional<SeriesPlacement> strong;
@@ -323,8 +323,8 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
             return new SeriesStatusResponse(SeriesStatus.ERROR, self.value(), describe(e));
         }
         if (strong.isEmpty()) {
-            recordError(SeriesStatus.NOT_FOUND);
-            return new SeriesStatusResponse(SeriesStatus.NOT_FOUND, self.value(), "série inexistente: " + seriesKey);
+            recordError(SeriesStatus.WRONG_OWNER);
+            return new SeriesStatusResponse(SeriesStatus.WRONG_OWNER, null, null);
         }
         SeriesPlacement current = strong.get();
         if (current.state() == PlacementState.MIGRATING) {

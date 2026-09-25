@@ -187,7 +187,9 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
                         noteWrongOwner(response.ownerNodeId(), retry);
                     }
                 }
-                case NOT_FOUND -> throw new SeriesNotFoundException(seriesKey);
+                // NOT_FOUND: o dono confirmou com o líder que a série é dele e o arquivo não existe.
+                case NOT_FOUND -> throw new SeriesNotFoundException(seriesKey,
+                        SeriesNotFoundException.Reason.MISSING_ON_OWNER);
                 default -> throw new NgrrdClusterException(ErrorCode.REMOTE_ERROR,
                         response.message() != null ? response.message() : ("OPEN respondeu " + response.status()));
             }
@@ -569,8 +571,9 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
     }
 
     private void ensureOpen() {
-        if (notFound != null) {
-            throw new SeriesNotFoundException(seriesKey);
+        SeriesNotFoundException absence = notFound;
+        if (absence != null) {
+            throw new SeriesNotFoundException(seriesKey, absence.reason());
         }
         if (mode.get() == Mode.CLOSED) {
             throw new NgrrdClusterException(ErrorCode.CLOSED, "handle fechado: " + seriesKey);

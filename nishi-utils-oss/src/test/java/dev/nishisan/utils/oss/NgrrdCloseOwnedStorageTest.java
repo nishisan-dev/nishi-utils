@@ -72,7 +72,7 @@ class NgrrdCloseOwnedStorageTest {
     @Test
     void fechaStorageProprioUmaVezAposSeriesNotFoundException() {
         CountingStorage storage = new CountingStorage();
-        SeriesNotFoundException primary = new SeriesNotFoundException("device:r1/iface:eth0");
+        SeriesNotFoundException primary = new SeriesNotFoundException("device:r1/iface:eth0", SeriesNotFoundException.Reason.ABSENT);
 
         Ngrrd.closeOwnedStorage(storage, true, primary);
 
@@ -86,7 +86,7 @@ class NgrrdCloseOwnedStorageTest {
 
         // ownsStorage=false: caso do backend SHARDED_BLOB, gerido pelo
         // BlobVolumeRegistry — nunca deve ser fechado por este helper.
-        Ngrrd.closeOwnedStorage(storage, false, new SeriesNotFoundException("k"));
+        Ngrrd.closeOwnedStorage(storage, false, new SeriesNotFoundException("k", SeriesNotFoundException.Reason.ABSENT));
 
         assertEquals(0, storage.closeCount.get());
     }
@@ -95,7 +95,7 @@ class NgrrdCloseOwnedStorageTest {
     void falhaAoFecharVaiComoSuprimidaNaFalhaPrimaria() {
         CountingStorage storage = new CountingStorage();
         storage.failOnClose = new IllegalStateException("close falhou");
-        SeriesNotFoundException primary = new SeriesNotFoundException("k");
+        SeriesNotFoundException primary = new SeriesNotFoundException("k", SeriesNotFoundException.Reason.ABSENT);
 
         Ngrrd.closeOwnedStorage(storage, true, primary);
 
