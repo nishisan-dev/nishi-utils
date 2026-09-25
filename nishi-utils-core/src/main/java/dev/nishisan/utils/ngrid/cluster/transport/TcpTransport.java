@@ -105,6 +105,9 @@ public final class TcpTransport implements Transport {
     // or stuck connect for a given peer (e.g. a node that just died) without relying on real
     // network timeouts. No-op in production.
     private volatile java.util.function.Consumer<NodeId> beforeDialHook = id -> { };
+    // Test seam: runs in handleHandshake between identifying the connection and publishing it, so a
+    // test can hold a second connection of the same peer in that window. No-op in production.
+    private volatile java.util.function.Consumer<NodeId> handshakeIdentityHook = id -> { };
 
     private volatile boolean running;
     private ServerSocket serverSocket;
@@ -131,6 +134,12 @@ public final class TcpTransport implements Transport {
     // Visible for tests in this package: hook invoked right before each outbound dial.
     void setBeforeDialHook(java.util.function.Consumer<NodeId> hook) {
         this.beforeDialHook = Objects.requireNonNull(hook, "hook");
+    }
+
+    // Visible for tests in this package: hook invoked once an incoming handshake has set the
+    // connection's remote identity, before the connection is published for that peer.
+    void setHandshakeIdentityHook(java.util.function.Consumer<NodeId> hook) {
+        this.handshakeIdentityHook = Objects.requireNonNull(hook, "hook");
     }
 
     @Override
@@ -658,6 +667,7 @@ public final class TcpTransport implements Transport {
         // simultaneous-open tie-break already has the correct flag.
         connection.setPeerSupportsCompression(payload.supportsCompression());
         connection.setPeerSupportsUndeliverable(payload.supportsUndeliverable());
+        handshakeIdentityHook.accept(remoteInfo.nodeId());
         // A direct handshake is first-hand and authoritative: whatever other id we held for the
         // remote's listen address (typically the provisional "host:port" seed alias) is replaced
         // by the canonical one, which becomes verified.
@@ -912,6 +922,25 @@ public final class TcpTransport implements Transport {
         }
     }
 
+    /**
+     * Publishes, for {@code nodeId}, another open socket whose remote identity is that peer.
+     *
+     * @return the connection now live for the peer, or {@code null} when there is none
+     */
+    private Connection adoptOpenConnection(NodeId nodeId, Connection closed) {
+        for (Connection candidate : liveSockets) {
+            if (candidate == closed || !candidate.isOpen()
+                    || !nodeId.equals(candidate.remoteId().orElse(null))) {
+                continue;
+            }
+            Connection live = registerLiveConnection(nodeId, candidate);
+            if (live != null && live.isOpen()) {
+                return live;
+            }
+        }
+        return null;
+    }
+
     private void handleDisconnect(Connection connection) {
         connection.remoteId().ifPresent(nodeId -> {
             LOGGER.info(() -> "Handling disconnect from " + nodeId + " (remote=" + connection.remote + ", open=" + connection.isOpen() + ")");
@@ -925,6 +954,14 @@ public final class TcpTransport implements Transport {
                 return;
             }
             if (current != null && current.isOpen()) {
+                return;
+            }
+            // Pending responses are global, not per connection. Before failing them, adopt any other
+            // open connection already identified as this peer but not published for it (one in the
+            // middle of its own handshake, or a dial registered but not yet published): the peer is
+            // still reachable and the responses will arrive through that connection.
+            if (adoptOpenConnection(nodeId, connection) != null) {
+                LOGGER.info(() -> "Disconnect from " + nodeId + " absorbed: another open connection to it took over");
                 return;
             }
             LOGGER.info(() -> "Disconnect confirmed for " + nodeId + "; failing pending responses");
