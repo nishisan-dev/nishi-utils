@@ -25,6 +25,7 @@ import dev.nishisan.utils.oss.cluster.api.ErrorCode;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterClient;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterConfig;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
+import dev.nishisan.utils.oss.cluster.api.RebalanceTrigger;
 import dev.nishisan.utils.oss.cluster.api.SeriesInfo;
 import dev.nishisan.utils.oss.cluster.api.SeriesVerification;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogReplicaStatus;
@@ -243,6 +244,32 @@ class NgrrdClusterAdminCliTest {
     }
 
     @Test
+    void rebalanceImprimePlanejadosIniciadosEExclusoes() {
+        ClientFake client = new ClientFake();
+        client.rebalanceTrigger = new RebalanceTrigger(4, 3, Map.of("storage-c", "lag=12345>1000",
+                "storage-b", "sincronizando"));
+
+        Capture capture = run(new String[] {"--seed", "127.0.0.1:9000", "rebalance"}, cfg -> client);
+
+        assertEquals(0, capture.exitCode);
+        List<String> lines = capture.out.lines().toList();
+        assertEquals("rebalanceamento disparado: planejados=4 iniciados=3", lines.get(0));
+        assertEquals("destino excluído: storage-b (sincronizando)", lines.get(1));
+        assertEquals("destino excluído: storage-c (lag=12345>1000)", lines.get(2));
+    }
+
+    @Test
+    void rebalanceContraClienteSemContagensImprimeSoAConfirmacao() {
+        ClientFake client = new ClientFake();
+
+        Capture capture = run(new String[] {"--seed", "127.0.0.1:9000", "rebalance"}, cfg -> client);
+
+        assertEquals(0, capture.exitCode);
+        assertTrue(client.rebalanceCalled.get());
+        assertEquals(List.of("rebalanceamento disparado"), capture.out.lines().toList());
+    }
+
+    @Test
     void comandoDesconhecidoFalhaComCodigoUm() {
         Capture capture = run(new String[] {"--seed", "127.0.0.1:9000", "chute"}, cfg -> new ClientFake());
 
@@ -294,6 +321,8 @@ class NgrrdClusterAdminCliTest {
         String drainRequestedNodeId;
         String activateRequestedNodeId;
         final AtomicBoolean rebalanceCalled = new AtomicBoolean();
+        /** {@code null} = usa o default de {@link NgrrdClusterClient#triggerRebalance()}. */
+        RebalanceTrigger rebalanceTrigger;
         final AtomicBoolean closed = new AtomicBoolean();
 
         @Override
@@ -354,6 +383,15 @@ class NgrrdClusterAdminCliTest {
         @Override
         public void rebalanceNow() {
             rebalanceCalled.set(true);
+        }
+
+        @Override
+        public RebalanceTrigger triggerRebalance() {
+            if (rebalanceTrigger == null) {
+                return NgrrdClusterClient.super.triggerRebalance();
+            }
+            rebalanceCalled.set(true);
+            return rebalanceTrigger;
         }
 
         @Override

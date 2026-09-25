@@ -44,6 +44,14 @@ public interface CatalogView {
     /** Snapshot local (eventual) do status de todos os storage nodes conhecidos. */
     Collection<StorageNodeStatus> nodesLocal();
 
+    /**
+     * Status de um storage node na visão local (eventual) — no líder, a autoritativa. O default procura em
+     * {@link #nodesLocal()}; {@link CatalogService} lê direto do mapa.
+     */
+    default Optional<StorageNodeStatus> nodeStatusLocal(String nodeId) {
+        return nodesLocal().stream().filter(status -> status.nodeId().equals(nodeId)).findFirst();
+    }
+
     /** Cópia imutável do catálogo na visão local (eventual) do nó. */
     Map<String, SeriesPlacement> placementsLocal();
 

@@ -27,14 +27,18 @@ import dev.nishisan.utils.ngrid.structures.NGrid;
 import dev.nishisan.utils.ngrid.structures.NGridCluster;
 import dev.nishisan.utils.ngrid.structures.NGridNode;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
+import dev.nishisan.utils.oss.cluster.catalog.CatalogReplicaStatus;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
 import dev.nishisan.utils.oss.cluster.catalog.NodeState;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
+import dev.nishisan.utils.oss.cluster.catalog.StorageCapabilities;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.node.PlacementRequestHandler;
+import dev.nishisan.utils.oss.cluster.placement.DistributionMode;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.protocol.MigrateControlRequest;
 import dev.nishisan.utils.oss.cluster.protocol.MigrateResponse;
+import dev.nishisan.utils.oss.cluster.protocol.MigrateStartRequest;
 import dev.nishisan.utils.oss.cluster.protocol.MigrateStatus;
 import dev.nishisan.utils.oss.cluster.rpc.ClusterRpc;
 import org.junit.jupiter.api.AfterEach;
@@ -45,6 +49,8 @@ import org.junit.jupiter.api.Timeout;
 import java.lang.reflect.Field;
 import java.time.Clock;
 import java.time.Duration;
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -183,6 +189,79 @@ class RebalancerTest {
         rebalancer.close();
     }
 
+    /**
+     * Issue #177: nó com a réplica do catálogo atrasada, sincronizando ou com lag desconhecido nunca é
+     * escolhido como destino; nó sem o campo (8.6.0, em rolling upgrade) continua elegível. As exclusões
+     * voltam no {@link Rebalancer.TriggerResult}.
+     */
+    @Test
+    void triggerNowNaoEscolheDestinoComReplicaDoCatalogoAtrasada() throws Exception {
+        leaderView.reachable.addAll(Set.of("storage-lag", "storage-sync", "storage-unknown", "storage-legacy"));
+        catalog.putNodeStatus(withReplica("storage-a", 3, CatalogReplicaStatus.ofLeader()));
+        catalog.putNodeStatus(withReplica("storage-lag", 0,
+                new CatalogReplicaStatus(false, 12_345L, 20_000L, 7_656L, false, false, true)));
+        catalog.putNodeStatus(withReplica("storage-sync", 0,
+                new CatalogReplicaStatus(false, 0L, 20_000L, 1L, true, false, false)));
+        catalog.putNodeStatus(withReplica("storage-unknown", 0, CatalogReplicaStatus.from(false, null)));
+        catalog.putNodeStatus(new StorageNodeStatus("storage-legacy", NodeState.ACTIVE, 0, 0, 0, 1_000L));
+        for (int i = 0; i < 3; i++) {
+            catalog.putPlacement("series-" + i, SeriesPlacement.active("storage-a", 1_000L)
+                    .withGeometry(geometryId, true, 1_000L));
+        }
+
+        BlockingMigrationRpc rpc = new BlockingMigrationRpc(new CountDownLatch(0), new AtomicInteger());
+        MigrationCoordinator coordinator = new MigrationCoordinator(catalog, rpc, leaderView, 2,
+                Duration.ofMillis(20), Duration.ofSeconds(5), Clock.systemUTC());
+        Rebalancer rebalancer = new Rebalancer(catalog, leaderView, coordinator,
+                new RebalanceSettings(1L, 0.0, 50), false, Duration.ofSeconds(60), Duration.ofSeconds(5),
+                Clock.systemUTC());
+        try {
+            Rebalancer.TriggerResult result = rebalancer.triggerNow();
+
+            assertEquals(Map.of(
+                    "storage-lag", "lag=12345>1000",
+                    "storage-sync", "sincronizando",
+                    "storage-unknown", "lag desconhecido"), result.excludedDestinations());
+            assertEquals(1, result.planned(), "só storage-legacy é destino elegível");
+            awaitTrue("migração planejada iniciada", () -> !rpc.startTargets().isEmpty());
+            assertEquals(List.of("storage-legacy"), rpc.startTargets());
+        } finally {
+            rebalancer.close();
+            coordinator.close();
+        }
+    }
+
+    @Test
+    void triggerNowComPortaDesligadaIgnoraOLagDaReplica() {
+        catalog.putNodeStatus(withReplica("storage-a", 2, CatalogReplicaStatus.ofLeader()));
+        catalog.putNodeStatus(withReplica("storage-b", 0,
+                new CatalogReplicaStatus(false, 99_999L, 100_000L, 2L, false, false, true)));
+        for (int i = 0; i < 2; i++) {
+            catalog.putPlacement("series-" + i, SeriesPlacement.active("storage-a", 1_000L)
+                    .withGeometry(geometryId, true, 1_000L));
+        }
+        MigrationCoordinator coordinator = new MigrationCoordinator(catalog,
+                new BlockingMigrationRpc(new CountDownLatch(0), new AtomicInteger()), leaderView, 2,
+                Duration.ofMillis(20), Duration.ofSeconds(5), Clock.systemUTC());
+        Rebalancer rebalancer = new Rebalancer(catalog, leaderView, coordinator,
+                new RebalanceSettings(1L, 0.0, 50, -1L), false, Duration.ofSeconds(60), Duration.ofSeconds(5),
+                Clock.systemUTC());
+        try {
+            Rebalancer.TriggerResult result = rebalancer.triggerNow();
+
+            assertEquals(Map.of(), result.excludedDestinations());
+            assertEquals(1, result.planned());
+        } finally {
+            rebalancer.close();
+            coordinator.close();
+        }
+    }
+
+    private static StorageNodeStatus withReplica(String nodeId, long seriesCount, CatalogReplicaStatus replica) {
+        return new StorageNodeStatus(nodeId, NodeState.ACTIVE, seriesCount, 0, 0, 1_000L, DistributionMode.COUNT, 1,
+                0, StorageCapabilities.ALL, replica);
+    }
+
     private static boolean runningField(Rebalancer rebalancer) {
         try {
             Field field = Rebalancer.class.getDeclaredField("running");
@@ -239,10 +318,16 @@ class RebalancerTest {
         private final CountDownLatch releaseStart;
         private final AtomicInteger startCalls;
         private final java.util.List<String> commands = new java.util.concurrent.CopyOnWriteArrayList<>();
+        private final java.util.List<String> startTargets = new java.util.concurrent.CopyOnWriteArrayList<>();
 
         BlockingMigrationRpc(CountDownLatch releaseStart, AtomicInteger startCalls) {
             this.releaseStart = releaseStart;
             this.startCalls = startCalls;
+        }
+
+        /** Destinos de cada {@code MIGRATE_START} recebido, na ordem. */
+        List<String> startTargets() {
+            return List.copyOf(startTargets);
         }
 
         long callsTo(String command) {
@@ -256,6 +341,9 @@ class RebalancerTest {
             return (R) switch (command) {
                 case Commands.MIGRATE_START -> {
                     startCalls.incrementAndGet();
+                    if (body instanceof MigrateStartRequest start) {
+                        startTargets.add(start.targetNodeId());
+                    }
                     try {
                         if (!releaseStart.await(AWAIT_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)) {
                             throw new NgrrdClusterException(dev.nishisan.utils.oss.cluster.api.ErrorCode.TIMEOUT,

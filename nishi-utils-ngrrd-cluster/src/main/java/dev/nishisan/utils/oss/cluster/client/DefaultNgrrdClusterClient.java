@@ -29,6 +29,7 @@ import dev.nishisan.utils.oss.cluster.api.ErrorCode;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterClient;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterConfig;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
+import dev.nishisan.utils.oss.cluster.api.RebalanceTrigger;
 import dev.nishisan.utils.oss.cluster.api.SeriesInfo;
 import dev.nishisan.utils.oss.cluster.api.SeriesVerification;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
@@ -410,6 +411,11 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
 
     @Override
     public void rebalanceNow() {
+        triggerRebalance();
+    }
+
+    @Override
+    public RebalanceTrigger triggerRebalance() {
         ensureOpen();
         int attempt = 0;
         NodeId leaderHint = null;
@@ -420,7 +426,8 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
             AdminRebalanceResponse response =
                     rpc.call(leader, Commands.ADMIN_REBALANCE, null, AdminRebalanceResponse.class);
             if (response.status() == SeriesStatus.OK) {
-                return;
+                return new RebalanceTrigger(response.planned(), response.started(),
+                        response.excludedDestinations());
             }
             if (response.status() != SeriesStatus.NOT_LEADER) {
                 throw new NgrrdClusterException(ErrorCode.REMOTE_ERROR,

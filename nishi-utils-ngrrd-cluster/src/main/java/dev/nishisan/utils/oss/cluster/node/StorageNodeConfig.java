@@ -18,6 +18,7 @@
 package dev.nishisan.utils.oss.cluster.node;
 
 import dev.nishisan.utils.oss.cluster.placement.DistributionMode;
+import dev.nishisan.utils.oss.cluster.rebalance.RebalanceSettings;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -147,6 +148,12 @@ import java.util.function.Function;
  * @param distributionMode strategy shared by placement and rebalance; defaults to COUNT
  * @param migrationBytesPerSecond aggregate outgoing migration budget per source node, in payload bytes/s
  * @param weight positive finite relative weight used in WEIGHT mode
+ * @param maxDestinationCatalogLag lag máximo da réplica do catálogo de um destino de migração
+ *                                 ({@code ngrrd.rebalance.maxDestinationCatalogLag}, issue #177): o
+ *                                 {@code Rebalancer} não escolhe como destino um nó com a réplica mais
+ *                                 atrasada que isso, sincronizando ou com lag desconhecido, e o
+ *                                 {@code MigrationCoordinator} recheca na execução. Default 1000; {@code -1}
+ *                                 desliga; {@code 0} exige a réplica em dia
  */
 public record StorageNodeConfig(
         String nodeId,
@@ -188,7 +195,61 @@ public record StorageNodeConfig(
         String seriesObjectPrefix,
         DistributionMode distributionMode,
         double weight,
+        long migrationBytesPerSecond,
+        long maxDestinationCatalogLag) {
+
+    /** Construtor de compatibilidade (forma da 8.6.0), com {@code maxDestinationCatalogLag} no default. */
+    public StorageNodeConfig(
+        String nodeId,
+        String host,
+        int port,
+        String seed,
+        List<String> peers,
+        Path dataDir,
+        int priority,
+        Path volumeDir,
+        String volumeName,
+        int shardCount,
+        long segmentBytes,
+        long initialShardCapacityBytes,
+        long capacityBytes,
+        Duration statusReportInterval,
+        Duration nodeStatusStaleAfter,
+        Duration handleIdleTtl,
+        int maxOpenHandles,
+        Duration requestTimeout,
+        Durability defaultDurability,
+        OnGeometryChange defaultOnGeometryChange,
+        NgrrdClusterMetricsListener metricsListener,
+        Duration bootDiscoveryWindow,
+        boolean affinityHandbackMode,
+        Duration placementGraceAfterLeadership,
+        boolean rebalanceEnabled,
+        Duration rebalanceInterval,
+        long rebalanceMinDelta,
+        double rebalanceTolerance,
+        int maxConcurrentMigrations,
+        int maxMovesPerCycle,
+        Duration migrationTimeout,
+        long migrationChunkBytes,
+        long maxSeriesBytes,
+        Duration migrationStatusPollInterval,
+        Duration reconcileInterval,
+        Duration orphanGrace,
+        String seriesObjectPrefix,
+        DistributionMode distributionMode,
+        double weight,
         long migrationBytesPerSecond) {
+        this(nodeId, host, port, seed, peers, dataDir, priority, volumeDir, volumeName, shardCount, segmentBytes,
+                initialShardCapacityBytes, capacityBytes, statusReportInterval, nodeStatusStaleAfter,
+                handleIdleTtl, maxOpenHandles, requestTimeout, defaultDurability, defaultOnGeometryChange,
+                metricsListener, bootDiscoveryWindow, affinityHandbackMode, placementGraceAfterLeadership,
+                rebalanceEnabled, rebalanceInterval, rebalanceMinDelta, rebalanceTolerance,
+                maxConcurrentMigrations, maxMovesPerCycle, migrationTimeout, migrationChunkBytes, maxSeriesBytes,
+                migrationStatusPollInterval, reconcileInterval, orphanGrace, seriesObjectPrefix,
+                distributionMode, weight, migrationBytesPerSecond,
+                RebalanceSettings.DEFAULT_MAX_DESTINATION_CATALOG_LAG);
+    }
 
     /** Compatibility constructor using the default aggregate migration bandwidth (16 MiB/s per source). */
     public StorageNodeConfig(
@@ -292,6 +353,9 @@ public record StorageNodeConfig(
 
     public StorageNodeConfig {
         if (migrationBytesPerSecond <= 0) { throw new IllegalArgumentException("migrationBytesPerSecond must be > 0"); }
+        if (maxDestinationCatalogLag < -1) {
+            throw new IllegalArgumentException("maxDestinationCatalogLag deve ser >= -1: " + maxDestinationCatalogLag);
+        }
         Objects.requireNonNull(distributionMode, "distributionMode");
         if (!Double.isFinite(weight) || weight <= 0) {
             throw new IllegalArgumentException("weight must be positive and finite");
@@ -534,6 +598,9 @@ public record StorageNodeConfig(
                 if (rebalance.maxSeriesBytes != null) {
                     builder.maxSeriesBytes(rebalance.maxSeriesBytes);
                 }
+                if (rebalance.maxDestinationCatalogLag != null) {
+                    builder.maxDestinationCatalogLag(rebalance.maxDestinationCatalogLag);
+                }
             }
             ReconcileSection reconcile = ngrrd.reconcile;
             if (reconcile != null) {
@@ -612,6 +679,7 @@ public record StorageNodeConfig(
         public Long chunkBytes;
         public Long maxBytesPerSecond;
         public Long maxSeriesBytes;
+        public Long maxDestinationCatalogLag;
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
@@ -660,6 +728,7 @@ public record StorageNodeConfig(
         private long migrationChunkBytes = 256L * 1024L;
         private long migrationBytesPerSecond = 16L * 1024L * 1024L;
         private long maxSeriesBytes = 64L * 1024L * 1024L;
+        private long maxDestinationCatalogLag = RebalanceSettings.DEFAULT_MAX_DESTINATION_CATALOG_LAG;
         private Duration migrationStatusPollInterval = Duration.ofMillis(500);
         private Duration reconcileInterval = Duration.ofMinutes(10);
         private Duration orphanGrace = Duration.ofMinutes(5);
@@ -858,6 +927,15 @@ public record StorageNodeConfig(
             return this;
         }
 
+        /**
+         * Lag máximo da réplica do catálogo de um destino de migração (default 1000; {@code -1} desliga,
+         * {@code 0} exige a réplica em dia) — ver Javadoc do record.
+         */
+        public Builder maxDestinationCatalogLag(long maxDestinationCatalogLag) {
+            this.maxDestinationCatalogLag = maxDestinationCatalogLag;
+            return this;
+        }
+
         public Builder migrationStatusPollInterval(Duration migrationStatusPollInterval) {
             this.migrationStatusPollInterval = migrationStatusPollInterval;
             return this;
@@ -904,7 +982,7 @@ public record StorageNodeConfig(
                     rebalanceEnabled, rebalanceInterval, rebalanceMinDelta, rebalanceTolerance,
                     maxConcurrentMigrations, maxMovesPerCycle, migrationTimeout, migrationChunkBytes,
                     maxSeriesBytes, migrationStatusPollInterval, reconcileInterval, orphanGrace,
-                    seriesObjectPrefix, distributionMode, weight, migrationBytesPerSecond);
+                    seriesObjectPrefix, distributionMode, weight, migrationBytesPerSecond, maxDestinationCatalogLag);
         }
 
         private static Duration maxDuration(Duration a, Duration b) {

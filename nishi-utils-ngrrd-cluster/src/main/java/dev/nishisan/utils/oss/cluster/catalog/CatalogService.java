@@ -155,6 +155,7 @@ public final class CatalogService implements CatalogView {
     }
 
     /** Leitura eventual do status de um storage node específico. */
+    @Override
     public Optional<StorageNodeStatus> nodeStatusLocal(String nodeId) {
         return nodes.getOptional(nodeId, Consistency.EVENTUAL);
     }

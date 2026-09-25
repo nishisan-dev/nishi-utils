@@ -435,6 +435,25 @@ class ProtocolCodecTest {
     }
 
     @Test
+    void adminRebalanceResponseComExclusoesSobreviveAoRoundTrip() throws IOException {
+        AdminRebalanceResponse original = new AdminRebalanceResponse(SeriesStatus.OK, "node-a", 3, 3,
+                Map.of("node-c", "lag=12345>1000", "node-d", "sincronizando"));
+
+        assertEquals(original, roundTripResponseBody(Commands.ADMIN_REBALANCE, original));
+    }
+
+    @Test
+    void adminRebalanceResponseDeUmLiderAnteriorSemExclusoesLeMapaVazio() throws IOException {
+        AdminRebalanceResponse legacy = new ObjectMapper().readValue(
+                "{\"status\":\"OK\",\"leaderNodeId\":\"node-a\",\"planned\":2,\"started\":2}",
+                AdminRebalanceResponse.class);
+
+        assertEquals(Map.of(), legacy.excludedDestinations());
+        assertEquals(2, legacy.planned());
+        assertEquals(Map.of(), new AdminRebalanceResponse(SeriesStatus.OK, "node-a", 1, 1).excludedDestinations());
+    }
+
+    @Test
     void adminStatusResponseComListasEMapasNulosViramVazios() throws IOException {
         AdminStatusResponse original = new AdminStatusResponse(SeriesStatus.NOT_LEADER, null, null, 0, null);
         AdminStatusResponse roundTripped = roundTripResponseBody(Commands.ADMIN_STATUS, original);

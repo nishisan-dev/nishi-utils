@@ -117,6 +117,7 @@ class MigrationSourceRestartClusterTest {
 
         // 2) Migra a série da origem para o destino e espera o placement forte convergir e o objeto
         // sumir do volume da origem.
+        harness.awaitCatalogReplicaCaughtUp(destinationId);
         MigrationResult result0 = harness.leaderNode().migrationCoordinator()
                 .migrate(seriesKey, sourceId, destinationId)
                 .get(60, TimeUnit.SECONDS);

@@ -34,7 +34,9 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
@@ -137,8 +139,33 @@ public final class Rebalancer implements LeadershipListener, ClusterCoordinator.
         }
     }
 
-    /** Resultado síncrono de um disparo imediato ({@code ngrrd.admin.rebalance}). */
-    public record TriggerResult(int planned, int started) {
+    /**
+     * Resultado síncrono de um disparo imediato ({@code ngrrd.admin.rebalance}).
+     *
+     * @param planned              movimentos planejados
+     * @param started              movimentos submetidos ao {@link MigrationCoordinator}
+     * @param excludedDestinations nós excluídos como destino neste ciclo por causa da réplica do catálogo
+     *                             (issue #177), com o motivo ({@link CatalogLagGate}); nunca {@code null}
+     */
+    public record TriggerResult(int planned, int started, Map<String, String> excludedDestinations) {
+
+        public TriggerResult {
+            excludedDestinations = Map.copyOf(Objects.requireNonNullElse(excludedDestinations, Map.of()));
+        }
+
+        /** Resultado sem exclusões de destino. */
+        public TriggerResult(int planned, int started) {
+            this(planned, started, Map.of());
+        }
+    }
+
+    /**
+     * Plano de um ciclo e os destinos que ficaram de fora dele.
+     *
+     * @param moves                movimentos, na ordem de submissão
+     * @param excludedDestinations nó → motivo da exclusão como destino
+     */
+    private record CyclePlan(List<Move> moves, Map<String, String> excludedDestinations) {
     }
 
     /**
@@ -168,14 +195,15 @@ public final class Rebalancer implements LeadershipListener, ClusterCoordinator.
         // running=true para sempre, travando todo ciclo futuro (agendado ou outro
         // ngrrd.admin.rebalance) — pior que o defeito original.
         try {
-            List<Move> plan = buildPlan();
+            CyclePlan cyclePlan = buildPlan();
+            List<Move> plan = cyclePlan.moves();
             if (plan.isEmpty()) {
                 // Nada para mover agora — ainda assim pode haver um nó DRAINING já vazio (ex.: um
                 // segundo drain() sobre um nó que só tinha séries MIGRATING da vez anterior) esperando
                 // a promoção a DRAINED; ver Javadoc de promoteDrainedNodes().
                 promoteDrainedNodes();
                 running.set(false);
-                return new TriggerResult(0, 0);
+                return new TriggerResult(0, 0, cyclePlan.excludedDestinations());
             }
             List<CompletableFuture<MigrationResult>> futures = plan.stream()
                     // Ao contrário de runCycle() (ciclo agendado, que loga um resumo agregado ao esperar
@@ -192,7 +220,7 @@ public final class Rebalancer implements LeadershipListener, ClusterCoordinator.
                         promoteDrainedNodes();
                         running.set(false);
                     });
-            return new TriggerResult(plan.size(), plan.size());
+            return new TriggerResult(plan.size(), plan.size(), cyclePlan.excludedDestinations());
         } catch (RuntimeException e) {
             running.set(false);
             throw e;
@@ -230,7 +258,7 @@ public final class Rebalancer implements LeadershipListener, ClusterCoordinator.
         if (!leaderView.isLeader()) {
             return;
         }
-        List<Move> plan = buildPlan();
+        List<Move> plan = buildPlan().moves();
         if (plan.isEmpty()) {
             promoteDrainedNodes();
             return;
@@ -305,7 +333,13 @@ public final class Rebalancer implements LeadershipListener, ClusterCoordinator.
         }
     }
 
-    private List<Move> buildPlan() {
+    /**
+     * Monta o plano do ciclo sobre a visão local do líder — usado pelo ciclo agendado, pelo disparo por
+     * membership e por {@link #triggerNow()}. Destinos com a réplica do catálogo atrasada
+     * ({@link CatalogLagGate}, limite {@link RebalanceSettings#maxDestinationCatalogLag()}) ficam de fora e
+     * são logados em {@code NGRRD_REBALANCE_DEST_EXCLUDED}.
+     */
+    private CyclePlan buildPlan() {
         Collection<StorageNodeStatus> nodes = catalog.nodesLocal();
         Map<String, List<String>> seriesByOwner = catalog.seriesByOwnerLocal();
         Set<String> reachable = leaderView.reachableNodeIds();
@@ -313,8 +347,39 @@ public final class Rebalancer implements LeadershipListener, ClusterCoordinator.
                 .filter(entry -> entry.getValue().state() == PlacementState.MIGRATING)
                 .map(Map.Entry::getKey)
                 .collect(Collectors.toUnmodifiableSet());
+        Map<String, String> excluded = excludedDestinations(nodes, reachable);
+        return new CyclePlan(planMoves(nodes, seriesByOwner, reachable, migratingKeys, excluded.keySet()), excluded);
+    }
+
+    /**
+     * Destinos candidatos ({@code ACTIVE} e alcançáveis) excluídos pela réplica do catálogo, em ordem de
+     * {@code nodeId}. O próprio líder nunca é excluído: a réplica dele é a fonte, mesmo que o último status
+     * que publicou seja de antes de assumir.
+     */
+    private Map<String, String> excludedDestinations(Collection<StorageNodeStatus> nodes, Set<String> reachable) {
+        Optional<String> leaderId = leaderView.leaderId();
+        Map<String, String> excluded = new TreeMap<>();
+        for (StorageNodeStatus node : nodes) {
+            if (node.state() != NodeState.ACTIVE || !reachable.contains(node.nodeId())
+                    || leaderId.map(node.nodeId()::equals).orElse(false)) {
+                continue;
+            }
+            CatalogLagGate.exclusionReason(node, settings.maxDestinationCatalogLag())
+                    .ifPresent(reason -> excluded.put(node.nodeId(), reason));
+        }
+        if (!excluded.isEmpty()) {
+            LOGGER.info("NGRRD_REBALANCE_DEST_EXCLUDED nodes=" + excluded.entrySet().stream()
+                    .map(entry -> entry.getKey() + "(" + entry.getValue() + ")")
+                    .collect(Collectors.joining(",")));
+        }
+        return excluded;
+    }
+
+    private List<Move> planMoves(Collection<StorageNodeStatus> nodes, Map<String, List<String>> seriesByOwner,
+            Set<String> reachable, Set<String> migratingKeys, Set<String> excludedDestinations) {
         if (!catalog.geometryTrackingEnabled()) {
-            return RebalancePlanner.plan(nodes, seriesByOwner, reachable, migratingKeys, settings);
+            return RebalancePlanner.plan(nodes, seriesByOwner, reachable, migratingKeys, settings,
+                    excludedDestinations);
         }
         Map<String, Long> sizes = new java.util.HashMap<>();
         Map<String, Long> pendingBytes = new java.util.HashMap<>();
@@ -332,7 +397,7 @@ public final class Rebalancer implements LeadershipListener, ClusterCoordinator.
             }
         });
         var plan = RebalancePlanner.plan(nodes, seriesByOwner, reachable, migratingKeys, settings,
-                sizes, pendingBytes, pendingSeries);
+                sizes, pendingBytes, pendingSeries, excludedDestinations);
         if (plan.isEmpty() && nodes.stream().anyMatch(n -> n.state() == NodeState.DRAINING
                 && !seriesByOwner.getOrDefault(n.nodeId(), List.of()).isEmpty())) {
             LOGGER.info("NGRRD_DRAIN_PENDING reason=no_admissible_destination_or_confirmed_geometry");

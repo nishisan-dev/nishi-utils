@@ -26,8 +26,20 @@ package dev.nishisan.utils.oss.cluster.rebalance;
  * @param rebalanceTolerance  diferença mínima relativa (fração da média) entre o nó mais e o menos
  *                            carregado para disparar um movimento
  * @param maxMovesPerCycle    teto de movimentos planejados neste ciclo
+ * @param maxDestinationCatalogLag lag máximo da réplica do catálogo de um destino de migração (issue #177,
+ *                            ver {@link CatalogLagGate}); {@code -1} desliga a porta, {@code 0} exige a
+ *                            réplica em dia
  */
-public record RebalanceSettings(long rebalanceMinDelta, double rebalanceTolerance, int maxMovesPerCycle) {
+public record RebalanceSettings(long rebalanceMinDelta, double rebalanceTolerance, int maxMovesPerCycle,
+        long maxDestinationCatalogLag) {
+
+    /** Padrão de {@code ngrrd.rebalance.maxDestinationCatalogLag}. */
+    public static final long DEFAULT_MAX_DESTINATION_CATALOG_LAG = 1_000L;
+
+    /** Parâmetros sem a porta de lag explícita — usa {@link #DEFAULT_MAX_DESTINATION_CATALOG_LAG}. */
+    public RebalanceSettings(long rebalanceMinDelta, double rebalanceTolerance, int maxMovesPerCycle) {
+        this(rebalanceMinDelta, rebalanceTolerance, maxMovesPerCycle, DEFAULT_MAX_DESTINATION_CATALOG_LAG);
+    }
 
     public RebalanceSettings {
         if (rebalanceMinDelta < 0) {
@@ -38,6 +50,9 @@ public record RebalanceSettings(long rebalanceMinDelta, double rebalanceToleranc
         }
         if (maxMovesPerCycle <= 0) {
             throw new IllegalArgumentException("maxMovesPerCycle deve ser > 0: " + maxMovesPerCycle);
+        }
+        if (maxDestinationCatalogLag < -1) {
+            throw new IllegalArgumentException("maxDestinationCatalogLag deve ser >= -1: " + maxDestinationCatalogLag);
         }
     }
 }

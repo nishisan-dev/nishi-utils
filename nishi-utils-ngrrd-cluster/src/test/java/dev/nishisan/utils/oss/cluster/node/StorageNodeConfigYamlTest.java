@@ -75,6 +75,7 @@ class StorageNodeConfigYamlTest {
                     chunkBytes: 131072
                     maxBytesPerSecond: 8388608
                     maxSeriesBytes: 33554432
+                    maxDestinationCatalogLag: 250
                   reconcile:
                     interval: 15m
                     orphanGrace: 10m
@@ -112,6 +113,7 @@ class StorageNodeConfigYamlTest {
         assertEquals(131_072L, config.migrationChunkBytes());
         assertEquals(8_388_608L, config.migrationBytesPerSecond());
         assertEquals(33_554_432L, config.maxSeriesBytes());
+        assertEquals(250L, config.maxDestinationCatalogLag());
         assertEquals(Duration.ofMinutes(15), config.reconcileInterval());
         assertEquals(Duration.ofMinutes(10), config.orphanGrace());
     }
@@ -162,6 +164,7 @@ class StorageNodeConfigYamlTest {
         assertEquals(defaults.rebalanceEnabled(), config.rebalanceEnabled());
         assertEquals(defaults.reconcileInterval(), config.reconcileInterval());
         assertEquals(defaults.orphanGrace(), config.orphanGrace());
+        assertEquals(1_000L, config.maxDestinationCatalogLag());
         assertEquals(List.of(), config.peers());
     }
 
@@ -228,6 +231,29 @@ class StorageNodeConfigYamlTest {
         IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
                 () -> StorageNodeConfig.fromYaml(yaml, NO_ENV));
         assertTrue(e.getMessage().contains("volume.dir"), "mensagem: " + e.getMessage());
+    }
+
+    @Test
+    void maxDestinationCatalogLagMenosUmDesligaEAbaixoDissoFalha() {
+        String yaml = """
+                node:
+                  id: storage-0
+                  host: 127.0.0.1
+                  port: 9100
+                  dataDir: /var/ngrrd/storage-0/data
+                ngrrd:
+                  volume:
+                    dir: /var/ngrrd/storage-0/volume
+                    name: ngrrd
+                  rebalance:
+                    maxDestinationCatalogLag: %d
+                """;
+
+        assertEquals(-1L, StorageNodeConfig.fromYaml(yaml.formatted(-1), NO_ENV).maxDestinationCatalogLag());
+        assertEquals(0L, StorageNodeConfig.fromYaml(yaml.formatted(0), NO_ENV).maxDestinationCatalogLag());
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                () -> StorageNodeConfig.fromYaml(yaml.formatted(-2), NO_ENV));
+        assertTrue(e.getMessage().contains("maxDestinationCatalogLag"), "mensagem: " + e.getMessage());
     }
 
     @Test

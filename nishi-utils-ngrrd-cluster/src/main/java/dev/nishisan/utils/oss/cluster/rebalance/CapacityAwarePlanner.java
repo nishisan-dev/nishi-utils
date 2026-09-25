@@ -19,12 +19,18 @@ final class CapacityAwarePlanner {
     private final DistributionWeights weights;
     private final List<Move> moves = new ArrayList<>();
     private final List<String> active;
+    /**
+     * Nós que não podem receber séries neste ciclo (issue #177: réplica do catálogo atrasada). Continuam em
+     * {@link #active} — contam na distribuição alvo e podem ser origem —, só saem de {@link #destinations()}.
+     */
+    private final Set<String> excludedDestinations;
 
     CapacityAwarePlanner(Collection<StorageNodeStatus> statuses, Map<String, List<String>> series,
             Set<String> reachable, Set<String> migrating, RebalanceSettings settings, Map<String, Long> sizes,
-            Map<String, Long> pendingBytes, Map<String, Long> pendingSeries) {
+            Map<String, Long> pendingBytes, Map<String, Long> pendingSeries, Set<String> excludedDestinations) {
         this.settings = settings;
         this.sizes = sizes;
+        this.excludedDestinations = Set.copyOf(excludedDestinations);
         statuses.forEach(n -> {
             nodes.put(n.nodeId(), n);
             loads.put(n.nodeId(), pendingSeries.getOrDefault(n.nodeId(), 0L));
@@ -59,6 +65,9 @@ final class CapacityAwarePlanner {
         while (!full()) {
             boolean moved = false;
             List<String> receivers = destinations();
+            if (receivers.isEmpty()) {
+                break;
+            }
             List<String> sources = active.stream().sorted(Comparator
                     .comparingDouble((String id) -> relativeLoad(id)).reversed().thenComparing(id -> id)).toList();
             search:
@@ -98,7 +107,8 @@ final class CapacityAwarePlanner {
     private double relativeLoad(String id) { return loads.getOrDefault(id, 0L) / weights.weight(id); }
 
     private List<String> destinations() {
-        return active.stream().sorted(Comparator.comparingDouble(this::relativeLoad).thenComparing(id -> id)).toList();
+        return active.stream().filter(id -> !excludedDestinations.contains(id))
+                .sorted(Comparator.comparingDouble(this::relativeLoad).thenComparing(id -> id)).toList();
     }
 
     private boolean fits(String key, String target) {

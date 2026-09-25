@@ -21,6 +21,7 @@ import dev.nishisan.utils.oss.cluster.NgrrdCluster;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterClient;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterConfig;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
+import dev.nishisan.utils.oss.cluster.api.RebalanceTrigger;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogReplicaStatus;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
@@ -31,6 +32,7 @@ import java.io.PrintStream;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.TreeMap;
 import java.util.UUID;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -118,8 +120,7 @@ public final class NgrrdClusterAdminCli {
                     return 0;
                 }
                 case "rebalance" -> {
-                    client.rebalanceNow();
-                    out.println("rebalanceamento disparado");
+                    printRebalance(client.triggerRebalance(), out);
                     return 0;
                 }
                 default -> {
@@ -183,6 +184,21 @@ public final class NgrrdClusterAdminCli {
         out.println("REDIRECT_OVERRIDES: " + snapshot.redirectOverrides());
         out.println("REDIRECT_CONFIRMATION_FAILURES: " + snapshot.redirectConfirmationFailures());
         out.println("REDIRECT_CACHE_HITS: " + snapshot.redirectCacheHits());
+    }
+
+    /**
+     * Confirmação do disparo com as contagens do líder e uma linha por destino excluído pela réplica do
+     * catálogo (issue #177), em ordem de {@code nodeId}; só a confirmação quando as contagens são
+     * desconhecidas.
+     */
+    private void printRebalance(RebalanceTrigger trigger, PrintStream out) {
+        if (!trigger.countsKnown()) {
+            out.println("rebalanceamento disparado");
+            return;
+        }
+        out.println("rebalanceamento disparado: planejados=" + trigger.planned() + " iniciados=" + trigger.started());
+        new TreeMap<>(trigger.excludedDestinations()).forEach((nodeId, reason) ->
+                out.println("destino excluído: " + nodeId + " (" + reason + ")"));
     }
 
     private void printNodeStatus(String command, StorageNodeStatus status, PrintStream out) {
