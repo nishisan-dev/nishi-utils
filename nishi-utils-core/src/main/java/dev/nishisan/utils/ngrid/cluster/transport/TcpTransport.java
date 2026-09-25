@@ -41,6 +41,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -82,6 +83,8 @@ public final class TcpTransport implements Transport {
     // merges), so a concurrent handshake and gossip merge cannot interleave half-way. In-memory
     // only: never held across I/O.
     private final ReentrantLock peerTableLock = new ReentrantLock();
+    // Ids of the configured bootstrap peers; until verified they are not gossiped (gossipablePeers).
+    private final Set<NodeId> initialPeerIds;
     private final Map<NodeId, Connection> connections = new ConcurrentHashMap<>();
     // Includes accepted sockets that have not supplied a handshake/peer identity yet.
     private final Set<Connection> liveSockets = ConcurrentHashMap.newKeySet();
@@ -115,6 +118,9 @@ public final class TcpTransport implements Transport {
         this.stats = stats;
         knownPeers.put(config.local().nodeId(), config.local());
         config.initialPeers().forEach(p -> knownPeers.putIfAbsent(p.nodeId(), p));
+        Set<NodeId> seedIds = new HashSet<>();
+        config.initialPeers().forEach(p -> seedIds.add(p.nodeId()));
+        this.initialPeerIds = Collections.unmodifiableSet(seedIds);
     }
 
     // For testing purposes
@@ -599,9 +605,29 @@ public final class TcpTransport implements Transport {
         }
     }
 
+    /**
+     * Peers this node vouches for in its handshake and PEER_UPDATE gossip: every known peer except
+     * bootstrap entries from the configuration ({@link TcpTransportConfig#initialPeers()}) not yet
+     * confirmed by a direct handshake. Such an entry is usually a provisional seed alias
+     * ({@code host:port}, {@code seed-host:port}) whose real id is still unknown; gossiping it made
+     * receivers replace the canonical id of that same process with the alias (issue #169). Once
+     * the seed answers, the alias is replaced by its verified canonical id, which is gossiped.
+     */
+    private Set<NodeInfo> gossipablePeers() {
+        Set<NodeInfo> peers = new HashSet<>();
+        for (NodeInfo peer : knownPeers.values()) {
+            NodeId id = peer.nodeId();
+            if (initialPeerIds.contains(id) && !verifiedPeers.contains(id)) {
+                continue;
+            }
+            peers.add(peer);
+        }
+        return peers;
+    }
+
     private void sendHandshake(Connection connection) {
         NodeInfo localInfo = config.local();
-        Set<NodeInfo> peers = Set.copyOf(knownPeers.values());
+        Set<NodeInfo> peers = gossipablePeers();
         HandshakePayload payload = new HandshakePayload(localInfo, peers, collectLatencies(),
                 config.compressionEnabled(), true);
         ClusterMessage message = ClusterMessage.request(MessageType.HANDSHAKE,
@@ -684,7 +710,7 @@ public final class TcpTransport implements Transport {
     }
 
     private void broadcastPeerList() {
-        PeerUpdatePayload payload = new PeerUpdatePayload(Set.copyOf(knownPeers.values()), collectLatencies());
+        PeerUpdatePayload payload = new PeerUpdatePayload(gossipablePeers(), collectLatencies());
         ClusterMessage update = ClusterMessage.request(MessageType.PEER_UPDATE,
                 "peer-update",
                 config.local().nodeId(),

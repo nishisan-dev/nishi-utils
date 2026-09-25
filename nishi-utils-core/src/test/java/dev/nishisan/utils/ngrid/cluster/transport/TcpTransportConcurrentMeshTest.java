@@ -266,6 +266,63 @@ class TcpTransportConcurrentMeshTest {
         }
     }
 
+    /**
+     * Um seed ainda não resolvido ({@code host:port} sem handshake direto) não entra no handshake
+     * nem no PEER_UPDATE: quem o recebesse trocaria o id canônico daquele processo pelo alias.
+     * Um peer inicial já verificado por handshake continua sendo propagado.
+     */
+    @Test
+    void unresolvedSeedAliasIsNotGossiped() throws Exception {
+        int portT = allocateFreeLocalPort(Set.of());
+        int portB = allocateFreeLocalPort(Set.of(portT));
+        int deadPort = allocateFreeLocalPort(Set.of(portT, portB));
+        NodeInfo t = new NodeInfo(NodeId.of("t-node"), "127.0.0.1", portT);
+        NodeInfo b = new NodeInfo(NodeId.of("z-peer"), "127.0.0.1", portB);
+        NodeInfo deadAlias = new NodeInfo(NodeId.of("127.0.0.1:" + deadPort), "127.0.0.1", deadPort);
+        NodeInfo observer = new NodeInfo(NodeId.of("raw-observer"), "127.0.0.1", 1);
+        TcpTransport transport = new TcpTransport(meshConfig(t, b, deadAlias));
+        TcpTransport peerB = new TcpTransport(meshConfig(b));
+        try {
+            peerB.start();
+            transport.start();
+            awaitFullDirectMesh(List.of(transport, peerB), List.of(t, b), Duration.ofSeconds(10));
+            assertTrue(transport.peers().stream().anyMatch(p -> p.nodeId().equals(deadAlias.nodeId())),
+                    "precondição: o alias não resolvido segue conhecido localmente");
+
+            try (RawPeer raw = new RawPeer(t.host(), t.port())) {
+                raw.send(ClusterMessage.request(MessageType.HANDSHAKE, "hello", observer.nodeId(), t.nodeId(),
+                        new HandshakePayload(observer, Set.of(), Map.of(), false, true)));
+                long deadline = System.currentTimeMillis() + 5_000;
+                while (System.currentTimeMillis() < deadline && !(receivedType(raw, MessageType.HANDSHAKE)
+                        && receivedType(raw, MessageType.PEER_UPDATE))) {
+                    Thread.sleep(50);
+                }
+                List<Set<NodeInfo>> gossiped = new ArrayList<>();
+                for (ClusterMessage message : raw.received()) {
+                    if (message.type() == MessageType.HANDSHAKE) {
+                        gossiped.add(message.payload(HandshakePayload.class).peers());
+                    } else if (message.type() == MessageType.PEER_UPDATE) {
+                        gossiped.add(message.payload(PeerUpdatePayload.class).peers());
+                    }
+                }
+                assertTrue(receivedType(raw, MessageType.HANDSHAKE), "handshake de resposta não chegou");
+                assertTrue(receivedType(raw, MessageType.PEER_UPDATE), "PEER_UPDATE não chegou");
+                for (Set<NodeInfo> peers : gossiped) {
+                    assertFalse(peers.stream().anyMatch(p -> p.nodeId().equals(deadAlias.nodeId())),
+                            "alias de seed não resolvido foi propagado: " + peers);
+                    assertTrue(peers.stream().anyMatch(p -> p.nodeId().equals(b.nodeId())),
+                            "peer inicial verificado deveria ser propagado: " + peers);
+                }
+            }
+        } finally {
+            closeQuietly(transport, peerB);
+        }
+    }
+
+    private static boolean receivedType(RawPeer raw, MessageType type) {
+        return raw.received().stream().anyMatch(m -> m.type() == type);
+    }
+
     /** Responde ao request {@code slow} só depois que {@code release} abrir. */
     private static TransportListener slowResponder(TcpTransport self, CountDownLatch release) {
         return new TransportListener() {
