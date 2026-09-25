@@ -30,6 +30,7 @@ import dev.nishisan.utils.oss.cluster.api.NgrrdClusterClient;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterConfig;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.api.SeriesInfo;
+import dev.nishisan.utils.oss.cluster.api.SeriesVerification;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
 import dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
@@ -95,6 +96,7 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
     private final MetricsTrackingClusterRpc metricsRpc;
     private final PlacementResolver resolver;
     private final SeriesExistence existence;
+    private final SeriesVerifier verifier;
     private final WriteDispatcher dispatcher;
     /** Handles principais abertos, com as regras de reaproveitamento de {@link #open(String, Map, Ngrrd.OpenOptions)}. */
     private final SeriesHandleCache handles;
@@ -105,8 +107,8 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
 
     private DefaultNgrrdClusterClient(NgrrdClusterConfig config, NGridNode node, Path dataDir,
             boolean temporaryDataDir, MetricsTrackingClusterRpc rpc, PlacementResolver resolver,
-            SeriesExistence existence, WriteDispatcher dispatcher, SeriesHandleCache handles,
-            NodeCapabilities capabilities) {
+            SeriesExistence existence, SeriesVerifier verifier, WriteDispatcher dispatcher,
+            SeriesHandleCache handles, NodeCapabilities capabilities) {
         this.config = config;
         this.node = node;
         this.dataDir = dataDir;
@@ -115,6 +117,7 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
         this.metricsRpc = rpc;
         this.resolver = resolver;
         this.existence = existence;
+        this.verifier = verifier;
         this.dispatcher = dispatcher;
         this.handles = handles;
         this.capabilities = capabilities;
@@ -173,6 +176,8 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
             PlacementResolver resolver = new PlacementResolver(catalog, rpc, leaderRetry, Clock.systemUTC(),
                     catalogLookupClient);
             SeriesExistence existence = new SeriesExistence(resolver, catalogLookupClient);
+            SeriesVerifier verifier = new SeriesVerifier(resolver, catalogLookupClient, rpc, capabilities,
+                    cfg.requestTimeout(), cfg.retryTimeout(), cfg.catalogLookupBatchSize());
 
             SeriesHandleCache handles = new SeriesHandleCache();
             RetryPolicy opRetry = new RetryPolicy(cfg.retryTimeout(), cfg.retryBackoffMin(), cfg.retryBackoffMax());
@@ -202,7 +207,7 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
                         }
                     }, Clock.systemUTC(), cfg.metricsListener(), metricsSupplier);
             DefaultNgrrdClusterClient client = new DefaultNgrrdClusterClient(cfg, node, dataDir, temporaryDataDir,
-                    rpc, resolver, existence, dispatcher, handles, capabilities);
+                    rpc, resolver, existence, verifier, dispatcher, handles, capabilities);
             clientRef.set(client);
             return client;
         } catch (RuntimeException e) {
@@ -335,6 +340,13 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
         ensureOpen();
         Objects.requireNonNull(seriesKey, "seriesKey");
         return existence.find(seriesKey, config.retryTimeout());
+    }
+
+    @Override
+    public Map<String, SeriesVerification> verify(Collection<String> seriesKeys) {
+        ensureOpen();
+        Objects.requireNonNull(seriesKeys, "seriesKeys");
+        return verifier.verify(seriesKeys);
     }
 
     private RemoteSeriesHandle openNewHandle(String seriesKey, String yaml, Map<String, String> tags,

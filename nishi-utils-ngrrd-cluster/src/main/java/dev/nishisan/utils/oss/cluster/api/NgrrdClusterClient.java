@@ -154,6 +154,30 @@ public interface NgrrdClusterClient extends Closeable {
      */
     Optional<SeriesInfo> find(String seriesKey);
 
+    /**
+     * Verificação FÍSICA em lote: confirma no dono de cada série se o objeto existe de fato no volume,
+     * diferente de {@link #exists(Collection)}, que só olha o catálogo. Devolve TODAS as chaves pedidas,
+     * nunca uma resposta parcial — cada uma com um {@link SeriesVerification}:
+     * <ul>
+     *   <li>{@link SeriesVerification#PRESENT}: o dono confirmou o objeto;</li>
+     *   <li>{@link SeriesVerification#MISSING_ON_OWNER}: há placement no catálogo, mas o dono confirmou
+     *       que o objeto não existe (inconsistência do cluster);</li>
+     *   <li>{@link SeriesVerification#NOT_PLACED}: não há placement no catálogo — a série não existe;</li>
+     *   <li>{@link SeriesVerification#UNVERIFIED}: não foi possível confirmar com o dono (capacidade
+     *       ausente, RPC ou status de erro) — nunca interpretado como ausência.</li>
+     * </ul>
+     *
+     * <p>Usado num relatório de conciliação sob demanda: uma falha ao consultar o LÍDER (catálogo)
+     * propaga {@link NgrrdClusterException}, como em {@link #exists(Collection)}; já uma falha ao
+     * consultar um DONO específico marca só as chaves daquele dono como {@code UNVERIFIED}, sem afetar
+     * os demais. Consultas ao líder e ao(s) dono(s) são paginadas em
+     * {@link NgrrdClusterConfig#catalogLookupBatchSize()} chaves por chamada, sequenciais.</p>
+     *
+     * @throws NgrrdClusterException se não foi possível confirmar o placement com o líder (sem líder,
+     *         timeout, falha de transporte, resposta inválida)
+     */
+    Map<String, SeriesVerification> verify(Collection<String> seriesKeys);
+
     /** Drena os buffers de escrita de todos os nós de destino conhecidos, de forma síncrona. */
     void flushAll();
 

@@ -26,6 +26,7 @@ import dev.nishisan.utils.oss.cluster.api.NgrrdClusterClient;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterConfig;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.api.SeriesInfo;
+import dev.nishisan.utils.oss.cluster.api.SeriesVerification;
 import dev.nishisan.utils.oss.cluster.catalog.NodeState;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.metrics.BlobVolumeSummary;
@@ -241,6 +242,11 @@ class NgrrdClusterAdminCliTest {
 
         @Override
         public Optional<SeriesInfo> find(String seriesKey) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public Map<String, SeriesVerification> verify(Collection<String> seriesKeys) {
             throw new UnsupportedOperationException();
         }
 
