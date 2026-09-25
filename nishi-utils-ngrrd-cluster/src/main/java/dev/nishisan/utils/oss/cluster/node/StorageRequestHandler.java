@@ -227,8 +227,8 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
 
     /**
      * Variante em lote de {@link #handleSeriesExists}: mesma checagem barata ({@code exists}, sem
-     * {@code get}), sem abrir handle e sem checagem de dono, usada pelo {@code verify} do cliente
-     * (Tarefa 7). Pedidos acima de {@link SeriesExistsBatchRequest#MAX_KEYS} são recusados com
+     * {@code get}), sem abrir handle e sem checagem de dono, usada pela verificação física em lote do
+     * cliente. Pedidos acima de {@link SeriesExistsBatchRequest#MAX_KEYS} são recusados com
      * {@link SeriesStatus#ERROR} em vez de processados parcialmente.
      */
     private SeriesExistsBatchResponse handleSeriesExistsBatch(SeriesExistsBatchRequest request) {

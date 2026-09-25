@@ -713,16 +713,16 @@ class StorageRequestHandlerTest {
     @Test
     void openSemCriarComRegistryLancandoSeriesNotFoundExceptionRespondeNotFound(@TempDir Path checkOnlyDir)
             throws IOException {
-        // Fix round 1 (item 2, promovido): cobre o catch(SeriesNotFoundException) de openWithMetadata —
-        // a corrida em que o objeto existe no instante do pré-check, mas sumiu quando registry.open()
-        // de fato tenta abrir (ex.: apagado por um reconciler entre as duas chamadas). Não há hook de
-        // produção para pausar exatamente entre o pré-check e o registry.open() dentro do mesmo método
-        // síncrono, então a divergência é obtida por um seam JÁ EXISTENTE no construtor de
-        // StorageRequestHandler: `volume` (usado só pelo pré-check e por SERIES_EXISTS/BATCH) é um
-        // parâmetro INDEPENDENTE do volume interno da SeriesHandleRegistry (usado pelo open de fato).
-        // Aqui o "volume de checagem" tem o objeto (pré-check vê exists=true); o registry real (do
-        // setUp, compartilhado com este handler racy) nunca teve o objeto — registry.open() lança
-        // SeriesNotFoundException de verdade, capturada pelo catch adicionado na Tarefa 4.
+        // Cobre o catch(SeriesNotFoundException) de openWithMetadata — a corrida em que o objeto existe
+        // no instante do pré-check, mas sumiu quando registry.open() de fato tenta abrir (ex.: apagado
+        // por um reconciler entre as duas chamadas). Não há hook de produção para pausar exatamente
+        // entre o pré-check e o registry.open() dentro do mesmo método síncrono, então a divergência é
+        // obtida por um seam JÁ EXISTENTE no construtor de StorageRequestHandler: `volume` (usado só
+        // pelo pré-check e por SERIES_EXISTS/BATCH) é um parâmetro INDEPENDENTE do volume interno da
+        // SeriesHandleRegistry (usado pelo open de fato). Aqui o "volume de checagem" tem o objeto
+        // (pré-check vê exists=true); o registry real (do setUp, compartilhado com este handler racy)
+        // nunca teve o objeto — registry.open() lança SeriesNotFoundException de verdade, capturada
+        // pelo catch de openWithMetadata.
         String seriesKey = "series-corrida-check-open";
         placementLookup.put(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
 

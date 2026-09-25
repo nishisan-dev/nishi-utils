@@ -582,9 +582,8 @@ class SeriesHandleRegistryTest {
 
     @Test
     void reopenIfKnownAposObjetoRemovidoDevolveVazioENaoRecriaOObjeto() {
-        // Fix round 1 (item 1, promovido): reopenIfKnown nunca deve recriar o objeto físico, mesmo que
-        // a definição cacheada (por hash de YAML) tenha createIfMissing=true por ter sido a opção usada
-        // no open() original desta MESMA série.
+        // reopenIfKnown nunca deve recriar o objeto físico, mesmo que a definição cacheada (por hash de
+        // YAML) tenha createIfMissing=true por ter sido a opção usada no open() original desta MESMA série.
         MutableClock clock = new MutableClock(Instant.parse("2026-01-01T00:00:00Z"));
         try (SeriesHandleRegistry registry = registry(Duration.ofMinutes(10), 10, clock)) {
             String seriesKey = "series-objeto-removido";
@@ -607,10 +606,10 @@ class SeriesHandleRegistryTest {
 
     @Test
     void reopenIfKnownNuncaCriaMesmoComDefinicaoCompartilhadaPorOutraSerieComCreateIfMissingTrue() {
-        // Fix round 1 (item 1, promovido): definitionByHash é compartilhado por YAML, não por
-        // seriesKey — uma série aberta com createIfMissing=false não pode ser recriada pela
-        // auto-cura só porque outra série com o MESMO YAML foi aberta depois com createIfMissing=true
-        // (options.createIfMissing sobrescrito no DefinitionRecord compartilhado).
+        // definitionByHash é compartilhado por YAML, não por seriesKey — uma série aberta com
+        // createIfMissing=false não pode ser recriada pela auto-cura só porque outra série com o MESMO
+        // YAML foi aberta depois com createIfMissing=true (options.createIfMissing sobrescrito no
+        // DefinitionRecord compartilhado).
         MutableClock clock = new MutableClock(Instant.parse("2026-01-01T00:00:00Z"));
         try (SeriesHandleRegistry registry = registry(Duration.ofMinutes(10), 10, clock)) {
             String seriesFalse = "series-sem-criar-compartilhada";
@@ -646,9 +645,8 @@ class SeriesHandleRegistryTest {
 
     @Test
     void reopenIfKnownComObjetoPresenteContinuaSeAutoCurandoNormalmente() {
-        // Fix round 1 (item 1c): a auto-cura normal (objeto físico presente) não pode quebrar com a
-        // mudança para createIfMissing=false forçado — createIfMissing só impede CRIAR, nunca impede
-        // abrir um objeto que já existe.
+        // A auto-cura normal (objeto físico presente) não pode quebrar com createIfMissing=false forçado
+        // na reabertura — createIfMissing só impede CRIAR, nunca impede abrir um objeto que já existe.
         MutableClock clock = new MutableClock(Instant.parse("2026-01-01T00:00:00Z"));
         try (SeriesHandleRegistry registry = registry(Duration.ofMinutes(10), 10, clock)) {
             String seriesKey = "series-autocura-normal";
