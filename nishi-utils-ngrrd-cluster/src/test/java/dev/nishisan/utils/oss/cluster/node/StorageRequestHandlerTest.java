@@ -874,6 +874,114 @@ class StorageRequestHandlerTest {
     }
 
     @Test
+    void openCriandoComReplicaAtrasadaAposReinicioRespondeWrongOwnerENaoRecria() {
+        // Issue #174: a origem de uma migração reinicia logo após o MIGRATE_FINISH. A marca forgotten
+        // (só em memória) se perdeu — o registry deste teste nasce limpo, como num processo novo — e a
+        // réplica local ainda diz ACTIVE(self), mas o objeto já foi apagado. Um OPEN com criação ligada
+        // não pode recriar a série vazia aqui: o líder já aponta para o novo dono.
+        String seriesKey = "series-origem-reiniciada";
+        placementLookup.putLocalOnly(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.active(OTHER.value(), 2_000L));
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequest(seriesKey, null), SOURCE);
+
+        assertEquals(SeriesStatus.WRONG_OWNER, response.status());
+        assertEquals(OTHER.value(), response.ownerNodeId());
+        assertFalse(registry.isOpen(seriesKey));
+        assertFalse(volume.storage().exists(SeriesObjectKeys.objectKey(SERIES_OBJECT_PREFIX, seriesKey)),
+                "o OPEN não deveria ter recriado o objeto no dono antigo");
+        assertEquals(1, placementLookup.strongCalls(), "a criação precisa ter sido confirmada no líder");
+    }
+
+    @Test
+    void openCriandoComReplicaAtrasadaEForteMigrandoRespondeMigratingENaoCria() {
+        String seriesKey = "series-criar-strong-migrando";
+        placementLookup.putLocalOnly(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.migrating(
+                SeriesPlacement.active(SELF.value(), 1_000L), OTHER.value(), "mig-1", 2_000L));
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequest(seriesKey, null), SOURCE);
+
+        assertEquals(SeriesStatus.MIGRATING, response.status());
+        assertFalse(volume.storage().exists(SeriesObjectKeys.objectKey(SERIES_OBJECT_PREFIX, seriesKey)));
+    }
+
+    @Test
+    void openCriandoComReplicaAtrasadaEForteAusenteRespondeWrongOwnerSemDonoENaoCria() {
+        String seriesKey = "series-criar-strong-ausente";
+        placementLookup.putLocalOnly(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequest(seriesKey, null), SOURCE);
+
+        assertEquals(SeriesStatus.WRONG_OWNER, response.status());
+        assertNull(response.ownerNodeId());
+        assertFalse(volume.storage().exists(SeriesObjectKeys.objectKey(SERIES_OBJECT_PREFIX, seriesKey)));
+    }
+
+    @Test
+    void openCriandoComFalhaNaConsultaForteRespondeErroENaoCria() {
+        String seriesKey = "series-criar-strong-falha";
+        placementLookup.putLocalOnly(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+        placementLookup.failStrongWith(new RuntimeException("líder inalcançável"));
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequest(seriesKey, null), SOURCE);
+
+        assertEquals(SeriesStatus.ERROR, response.status());
+        assertFalse(registry.isOpen(seriesKey));
+        assertFalse(volume.storage().exists(SeriesObjectKeys.objectKey(SERIES_OBJECT_PREFIX, seriesKey)),
+                "sem confirmação do líder a série nunca é criada às cegas");
+    }
+
+    @Test
+    void openCriandoSerieNovaConfirmadaPeloLiderCriaComUmaLeituraForte() {
+        String seriesKey = "series-nova-replica-convergida";
+        placementLookup.put(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequest(seriesKey, null), SOURCE);
+
+        assertEquals(SeriesStatus.OK, response.status());
+        assertTrue(volume.storage().exists(SeriesObjectKeys.objectKey(SERIES_OBJECT_PREFIX, seriesKey)));
+        assertEquals(1, placementLookup.strongCalls());
+    }
+
+    @Test
+    void openCriandoComReplicaVaziaEHintNaoRepeteALeituraForte() {
+        // Réplica local ainda sem o placement recém-feito: ownership() já confirmou no líder pelo hint,
+        // então a criação não paga uma segunda leitura forte.
+        String seriesKey = "series-nova-replica-vazia";
+        SeriesPlacement hint = SeriesPlacement.active(SELF.value(), 1_000L);
+        placementLookup.putStrongOnly(seriesKey, hint);
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequest(seriesKey, hint), SOURCE);
+
+        assertEquals(SeriesStatus.OK, response.status());
+        assertEquals(1, placementLookup.strongCalls());
+    }
+
+    @Test
+    void openCriandoComObjetoExistenteOuSerieAbertaNaoConsultaOLider() {
+        String seriesKey = "series-existente";
+        placementLookup.put(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+        handler.handle(Commands.OPEN, openRequest(seriesKey, null), SOURCE);
+        int afterCreate = placementLookup.strongCalls();
+
+        handler.handle(Commands.OPEN, openRequest(seriesKey, null), SOURCE);
+        assertEquals(afterCreate, placementLookup.strongCalls(), "série já aberta não consulta o líder");
+
+        handler.handle(Commands.CLOSE, new SeriesCommandRequest(seriesKey), SOURCE);
+        SeriesStatusResponse reopened = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequest(seriesKey, null), SOURCE);
+        assertEquals(SeriesStatus.OK, reopened.status());
+        assertEquals(afterCreate, placementLookup.strongCalls(), "objeto presente no volume não consulta o líder");
+    }
+
+    @Test
     void seriesExistsBatchDevolveSoAsPresentes() {
         String present = "series-batch-presente";
         String absent = "series-batch-ausente";

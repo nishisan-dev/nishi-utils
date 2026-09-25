@@ -276,9 +276,21 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
                                 + "' — todas as definições servidas por um cluster ngrrd devem usar o mesmo prefixo "
                                 + "(ver Javadoc de StorageNodeConfig.seriesObjectPrefix)");
             }
-            if (!request.createIfMissingOrDefault() && !registry.isOpen(request.seriesKey())
+            if (!registry.isOpen(request.seriesKey())
                     && !volume.storage().exists(SeriesObjectKeys.objectKey(seriesObjectPrefix, request.seriesKey()))) {
-                return confirmSeriesNotFound(request.seriesKey());
+                if (!request.createIfMissingOrDefault()) {
+                    return confirmSeriesNotFound(request.seriesKey());
+                }
+                if (!ownership.confirmedByLeader()) {
+                    // Issue #174: réplica local ACTIVE(self) com o objeto ausente tem a mesma assinatura de
+                    // "série recém-colocada" e de "origem de migração reiniciada com a réplica atrasada" —
+                    // só o líder distingue. Sem esta confirmação, o OPEN recriaria a série vazia no dono
+                    // antigo e as escritas da janela iriam para uma órfã.
+                    Optional<SeriesStatusResponse> redirect = confirmOwnerWithLeader(request.seriesKey());
+                    if (redirect.isPresent()) {
+                        return redirect.get();
+                    }
+                }
             }
             Durability durability = request.durability() != null ? request.durability() : defaultDurability;
             // Handle somente leitura (sem criar) nunca migra nem recria a série: com geometria divergente
@@ -314,41 +326,56 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
     }
 
     /**
-     * Confirma com o líder ({@link PlacementLookup#placementStrong}) antes de responder
-     * {@code NOT_FOUND} — a réplica local pode estar atrasada logo após um restart, já que a marca
-     * {@link SeriesHandleRegistry#isForgotten} é só em memória: se a origem de uma migração reiniciar
-     * pouco depois do {@code FINISH}, a réplica local ainda pode dizer {@code ACTIVE(self)} com o
-     * objeto já apagado, e um {@code NOT_FOUND} baseado só nela seria falso. {@code NOT_FOUND}
-     * (que o cliente reporta como {@code MISSING_ON_OWNER}) só sai quando o líder confirma
-     * {@code ACTIVE(self)}: a série é deste nó e o arquivo não existe. Presente com outro dono
-     * redireciona ({@code WRONG_OWNER} com o dono); presente em {@code MIGRATING} redireciona
-     * ({@code MIGRATING}); ausente no líder responde {@code WRONG_OWNER} SEM dono — não cabe a este nó
-     * responder por uma série sem placement: o cliente re-resolve pelo catálogo e reporta
-     * {@code NOT_PLACED}. Falha da consulta nunca vira {@code NOT_FOUND} ({@code ERROR}).
+     * Responde {@code NOT_FOUND} a um {@code OPEN} sem criar só depois de {@link #confirmOwnerWithLeader}
+     * confirmar {@code ACTIVE(self)}: a série é deste nó e o arquivo não existe. {@code NOT_FOUND} (que o
+     * cliente reporta como {@code MISSING_ON_OWNER}) nunca sai com base só na réplica local, que pode
+     * estar atrasada logo após um restart.
      */
     private SeriesStatusResponse confirmSeriesNotFound(String seriesKey) {
+        Optional<SeriesStatusResponse> redirect = confirmOwnerWithLeader(seriesKey);
+        if (redirect.isPresent()) {
+            return redirect.get();
+        }
+        recordError(SeriesStatus.NOT_FOUND);
+        return new SeriesStatusResponse(SeriesStatus.NOT_FOUND, self.value(), "série inexistente: " + seriesKey);
+    }
+
+    /**
+     * Confirma com o líder ({@link PlacementLookup#placementStrong}) que a série é deste nó antes de
+     * agir sobre um objeto ausente no volume — responder {@code NOT_FOUND} a um {@code OPEN} sem criar
+     * ou criar a série num {@code OPEN} com criação. A réplica local pode estar atrasada logo após um
+     * restart: a marca {@link SeriesHandleRegistry#isForgotten} é só em memória, então se a origem de
+     * uma migração reiniciar pouco depois do {@code FINISH}, a réplica local ainda pode dizer
+     * {@code ACTIVE(self)} com o objeto já apagado (issue #174).
+     *
+     * @return vazio quando o líder confirma {@code ACTIVE(self)}; senão a resposta de redirecionamento:
+     *         outro dono → {@code WRONG_OWNER} com o dono; {@code MIGRATING} → {@code MIGRATING};
+     *         ausente no líder → {@code WRONG_OWNER} SEM dono (não cabe a este nó responder por uma
+     *         série sem placement: o cliente re-resolve pelo catálogo); falha da consulta →
+     *         {@code ERROR} (nunca vira {@code NOT_FOUND} nem criação às cegas)
+     */
+    private Optional<SeriesStatusResponse> confirmOwnerWithLeader(String seriesKey) {
         Optional<SeriesPlacement> strong;
         try {
             strong = placementLookup.placementStrong(seriesKey);
         } catch (RuntimeException e) {
             recordError(SeriesStatus.ERROR);
-            return new SeriesStatusResponse(SeriesStatus.ERROR, self.value(), describe(e));
+            return Optional.of(new SeriesStatusResponse(SeriesStatus.ERROR, self.value(), describe(e)));
         }
         if (strong.isEmpty()) {
             recordError(SeriesStatus.WRONG_OWNER);
-            return new SeriesStatusResponse(SeriesStatus.WRONG_OWNER, null, null);
+            return Optional.of(new SeriesStatusResponse(SeriesStatus.WRONG_OWNER, null, null));
         }
         SeriesPlacement current = strong.get();
         if (current.state() == PlacementState.MIGRATING) {
             recordError(SeriesStatus.MIGRATING);
-            return new SeriesStatusResponse(SeriesStatus.MIGRATING, current.ownerNodeId(), null);
+            return Optional.of(new SeriesStatusResponse(SeriesStatus.MIGRATING, current.ownerNodeId(), null));
         }
         if (!current.isOwnedBy(self.value())) {
             recordError(SeriesStatus.WRONG_OWNER);
-            return new SeriesStatusResponse(SeriesStatus.WRONG_OWNER, current.ownerNodeId(), null);
+            return Optional.of(new SeriesStatusResponse(SeriesStatus.WRONG_OWNER, current.ownerNodeId(), null));
         }
-        recordError(SeriesStatus.NOT_FOUND);
-        return new SeriesStatusResponse(SeriesStatus.NOT_FOUND, self.value(), "série inexistente: " + seriesKey);
+        return Optional.empty();
     }
 
     /** {@code storage.objectNaming.seriesPrefix} efetivo (com o default do oss aplicado) da definição YAML. */
@@ -541,7 +568,7 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
 
     private Ownership ownership(String seriesKey, SeriesPlacement placementHint) {
         if (registry.isMigrationFrozen(seriesKey)) {
-            return new Ownership(SeriesStatus.MIGRATING, null);
+            return Ownership.local(SeriesStatus.MIGRATING, null);
         }
         if (registry.isForgotten(seriesKey)) {
             return ownershipForgotten(seriesKey);
@@ -551,17 +578,17 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
             SeriesPlacement current = placement.get();
             if (current.state() == PlacementState.MIGRATING) {
                 if (self.value().equals(current.ownerNodeId()) && registry.isCopying(seriesKey)) {
-                    return new Ownership(SeriesStatus.OK, current.ownerNodeId());
+                    return Ownership.local(SeriesStatus.OK, current.ownerNodeId());
                 }
-                return new Ownership(SeriesStatus.MIGRATING, current.ownerNodeId());
+                return Ownership.local(SeriesStatus.MIGRATING, current.ownerNodeId());
             }
             if (!current.isOwnedBy(self.value())) {
-                return new Ownership(SeriesStatus.WRONG_OWNER, current.ownerNodeId());
+                return Ownership.local(SeriesStatus.WRONG_OWNER, current.ownerNodeId());
             }
-            return new Ownership(SeriesStatus.OK, current.ownerNodeId());
+            return Ownership.local(SeriesStatus.OK, current.ownerNodeId());
         }
         if (registry.isOpen(seriesKey)) {
-            return new Ownership(SeriesStatus.OK, self.value());
+            return Ownership.local(SeriesStatus.OK, self.value());
         }
         // Seção 0 do M3 (achado do Refuter do M2, reproduzido A/B): sob churn de liderança, o líder
         // pode não encontrar no catálogo uma série já colocada (réplica local do novo líder ainda
@@ -574,11 +601,11 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
             Optional<SeriesPlacement> strong = placementLookup.placementStrong(seriesKey);
             if (strong.isPresent() && strong.get().isOwnedBy(self.value())) {
                 negativeLookupCacheExpiryMs.remove(seriesKey);
-                return new Ownership(SeriesStatus.OK, strong.get().ownerNodeId());
+                return Ownership.leader(SeriesStatus.OK, strong.get().ownerNodeId());
             }
             // Sem confirmação do líder (nem para o hint, nem para outro dono) — WRONG_OWNER com o dono
             // que o líder de fato conhece (pode ser null, se a série realmente ainda não existe lá).
-            return new Ownership(SeriesStatus.WRONG_OWNER, strong.map(SeriesPlacement::ownerNodeId).orElse(null));
+            return Ownership.leader(SeriesStatus.WRONG_OWNER, strong.map(SeriesPlacement::ownerNodeId).orElse(null));
         }
         // Réplica local vazia (ex.: logo após um restart, antes do catálogo persistido convergir via
         // replicação) e o registry local não confirma o dono: consulta o líder (placementStrong) antes
@@ -589,7 +616,7 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
         Long negativeCacheExpiry = negativeLookupCacheExpiryMs.get(seriesKey);
         if (negativeCacheExpiry != null) {
             if (now < negativeCacheExpiry) {
-                return new Ownership(SeriesStatus.WRONG_OWNER, null);
+                return Ownership.local(SeriesStatus.WRONG_OWNER, null);
             }
             // item 7 (achado do Refuter): entrada expirada por tempo — remove já aqui em vez de
             // deixá-la parada no mapa até uma eventual nova consulta desta MESMA série.
@@ -600,17 +627,17 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
             // Cache negativo curto: uma série de fato não colocada não deve martelar o líder a cada
             // requisição enquanto o cliente insiste (backoff dele à parte).
             putNegativeCacheEntry(seriesKey, now);
-            return new Ownership(SeriesStatus.WRONG_OWNER, null);
+            return Ownership.leader(SeriesStatus.WRONG_OWNER, null);
         }
         negativeLookupCacheExpiryMs.remove(seriesKey);
         SeriesPlacement current = strong.get();
         if (!current.isOwnedBy(self.value())) {
-            return new Ownership(SeriesStatus.WRONG_OWNER, current.ownerNodeId());
+            return Ownership.leader(SeriesStatus.WRONG_OWNER, current.ownerNodeId());
         }
         // Dono confirmado pelo líder, mas ainda sem handle nem definição em cache localmente (registry
         // não tinha a série aberta) — o self-healing do write/read/checkpoint decide NOT_OPEN a partir
         // daqui; open() sempre tem a definição YAML no corpo da requisição.
-        return new Ownership(SeriesStatus.OK, current.ownerNodeId());
+        return Ownership.leader(SeriesStatus.OK, current.ownerNodeId());
     }
 
     /**
@@ -629,9 +656,9 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
         Optional<SeriesPlacement> strong = placementLookup.placementStrong(seriesKey);
         if (strong.isPresent() && strong.get().isOwnedBy(self.value())) {
             negativeLookupCacheExpiryMs.remove(seriesKey);
-            return new Ownership(SeriesStatus.OK, strong.get().ownerNodeId());
+            return Ownership.leader(SeriesStatus.OK, strong.get().ownerNodeId());
         }
-        return new Ownership(SeriesStatus.WRONG_OWNER, strong.map(SeriesPlacement::ownerNodeId).orElse(null));
+        return Ownership.leader(SeriesStatus.WRONG_OWNER, strong.map(SeriesPlacement::ownerNodeId).orElse(null));
     }
 
     /**
@@ -657,7 +684,22 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
         return e.getClass().getSimpleName() + (message != null ? ": " + message : "");
     }
 
-    /** Resultado da checagem de dono: status a responder e o dono conhecido (pode ser {@code null}). */
-    private record Ownership(SeriesStatus status, String owner) {
+    /**
+     * Resultado da checagem de dono: status a responder e o dono conhecido (pode ser {@code null}).
+     *
+     * @param confirmedByLeader {@code true} quando a decisão veio de {@link PlacementLookup#placementStrong}
+     *                          (round-trip ao líder) — o {@code OPEN} com criação não repete a consulta
+     */
+    private record Ownership(SeriesStatus status, String owner, boolean confirmedByLeader) {
+
+        /** Decisão tomada só com informação local (réplica eventual ou registry). */
+        static Ownership local(SeriesStatus status, String owner) {
+            return new Ownership(status, owner, false);
+        }
+
+        /** Decisão confirmada pelo líder. */
+        static Ownership leader(SeriesStatus status, String owner) {
+            return new Ownership(status, owner, true);
+        }
     }
 }
