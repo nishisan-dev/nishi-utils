@@ -32,10 +32,9 @@ paginado (`ngrrd.catalog.lookup`) e verificação física opcional por nó (`ngr
   (status `ERROR`) pedido com mais de 10000 chaves.
 - Versão final: **8.6.0**.
 - Testes:
-  - oss: `mvn -pl nishi-utils-oss test`
-  - cluster unit: `mvn -pl nishi-utils-ngrrd-cluster -am install -DskipTests -q` (uma vez, após a
-    tarefa 1, para o cluster enxergar o oss novo) e depois `mvn -pl nishi-utils-ngrrd-cluster verify`
-  - cluster in-process: `mvn -pl nishi-utils-ngrrd-cluster verify -Pngrrd-cluster -Dtest=<Classe>`
+  - oss: `JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 mvn -pl nishi-utils-oss test`
+  - cluster unit: `JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 mvn -pl nishi-utils-ngrrd-cluster -am verify -DexcludeNgrid=true` (NUNCA `mvn install`: ~/.m2 compartilhado)
+  - cluster in-process: `JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 mvn -pl nishi-utils-ngrrd-cluster -am verify -Pngrrd-cluster -DexcludeNgrid=true -Dtest=<Classe> -Dsurefire.failIfNoSpecifiedTests=false`
   - Relatar contagem real de testes (Tests run/Failures/Errors), não só BUILD SUCCESS.
 
 ---
