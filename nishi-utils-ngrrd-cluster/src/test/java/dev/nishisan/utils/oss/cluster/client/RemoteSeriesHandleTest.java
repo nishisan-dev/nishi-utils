@@ -49,6 +49,7 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -421,6 +422,59 @@ class RemoteSeriesHandleTest {
     }
 
     @Test
+    void openDeHandleNovoLiberaAChaveNoDispatcherMasReaberturaNao() {
+        // Só a abertura de um handle NOVO (open() chamado pelo cliente) desfaz a marca de série
+        // inexistente deixada por um handle anterior da mesma chave; a reabertura de um handle já em uso
+        // (reopen(), NOT_OPEN síncrono) nunca mexe nela.
+        RemoteSeriesHandle handle = newHandle(Ngrrd.OpenOptions.defaults().withCreateIfMissing(false));
+        rpc.respondDefault((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_B.value(), null));
+        resolver.owner = OWNER_B.value();
+
+        handle.open();
+        assertEquals(List.of(SERIES_KEY + "@" + OWNER_B.value()), dispatcher.resetSeries);
+
+        assertTrue(handle.reopen());
+        assertEquals(1, dispatcher.resetSeries.size(), "reopen() não desfaz marca alguma");
+    }
+
+    @Test
+    void openQueFalhaNaoLiberaAChaveNoDispatcher() {
+        RemoteSeriesHandle handle = newHandle(Ngrrd.OpenOptions.defaults().withCreateIfMissing(false));
+        rpc.respondDefault((cmd, body) -> new SeriesStatusResponse(SeriesStatus.NOT_FOUND, OWNER_A.value(), null));
+
+        assertThrows(SeriesNotFoundException.class, handle::open);
+        assertTrue(dispatcher.resetSeries.isEmpty());
+    }
+
+    @Test
+    void marcacaoFalhaAsEscritasNoDispatcherAntesDeLiberarOHandleParaUmOpenNovo() {
+        // Enquanto o dispatcher marca a série (failSeries), o handle ainda não pode parecer reaproveitável
+        // nem sair do mapa do cliente: se saísse antes, um open concorrente criaria um handle novo da
+        // mesma chave antes da marca existir, e a marcação atrasada do handle antigo falharia as escritas
+        // do novo.
+        List<String> events = new CopyOnWriteArrayList<>();
+        AtomicReference<RemoteSeriesHandle> self = new AtomicReference<>();
+        rpc = new RecordingClusterRpc(NodeId.of("client-under-test"));
+        resolver = new FakePlacementLookup(OWNER_A.value());
+        dispatcher = new NoOpWriteBuffer();
+        RetryPolicy retry = new RetryPolicy(Duration.ofSeconds(2), Duration.ofMillis(5), Duration.ofMillis(50));
+        RemoteSeriesHandle handle = new RemoteSeriesHandle(SERIES_KEY, "yaml: fake", "hash-1", Map.of(),
+                Ngrrd.OpenOptions.defaults().withCreateIfMissing(false), resolver, rpc, dispatcher, retry,
+                Duration.ofSeconds(5), Duration.ofSeconds(5), Clock.systemUTC(),
+                (key, closing) -> events.add("onClose:isOpen=" + closing.isOpen()));
+        self.set(handle);
+        dispatcher.onFailSeries = () -> events.add("failSeries:isOpen=" + self.get().isOpen());
+        rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
+        handle.open();
+
+        rpc.respondDefault((cmd, body) -> new SeriesStatusResponse(SeriesStatus.NOT_FOUND, OWNER_A.value(), null));
+        assertThrows(SeriesNotFoundException.class, handle::reopen);
+
+        assertEquals(List.of("failSeries:isOpen=true", "onClose:isOpen=false"), events);
+        assertThrows(SeriesNotFoundException.class, () -> handle.write("in_octets", new Sample(1L, 1.0)));
+    }
+
+    @Test
     void corridaNaRemocaoNuncaApagaUmHandleNovoDaMesmaChave() throws InterruptedException {
         // Reproduz o wiring real de DefaultNgrrdClusterClient.open: onClose remove do mapa
         // condicionalmente por instância (Map#remove(key, value)), nunca por chave sozinha. O handle A
@@ -528,10 +582,24 @@ class RemoteSeriesHandleTest {
         }
 
         final List<Enqueued> enqueued = new CopyOnWriteArrayList<>();
+        final List<String> failedSeries = new CopyOnWriteArrayList<>();
+        final List<String> resetSeries = new CopyOnWriteArrayList<>();
+        volatile Runnable onFailSeries = () -> { };
 
         @Override
         public void enqueue(String ownerNodeId, SeriesWrite write) {
             enqueued.add(new Enqueued(ownerNodeId, write));
+        }
+
+        @Override
+        public void failSeries(String seriesKey, Throwable cause) {
+            failedSeries.add(seriesKey);
+            onFailSeries.run();
+        }
+
+        @Override
+        public void resetSeries(String seriesKey, String ownerNodeId) {
+            resetSeries.add(seriesKey + "@" + ownerNodeId);
         }
 
         @Override

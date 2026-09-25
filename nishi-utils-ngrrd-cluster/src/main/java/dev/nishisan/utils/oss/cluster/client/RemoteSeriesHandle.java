@@ -85,7 +85,14 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
     private final BiConsumer<String, RemoteSeriesHandle> onClose;
 
     private volatile String owner;
+    /** Visível a {@link #isOpen()}/{@link #ensureOpen()}: o handle não é mais reaproveitável. */
     private volatile boolean closed;
+    /**
+     * Quem encerra o handle — {@link #close(Duration)} ou {@link #markSeriesNotFound} — conquista este
+     * flag primeiro; só o vencedor executa o próprio encerramento. Separado de {@link #closed} porque a
+     * marcação precisa manter o handle "aberto" para o cliente até avisar o dispatcher.
+     */
+    private final AtomicBoolean closing = new AtomicBoolean(false);
     /** {@code true} depois que o dono confirmou {@code NOT_FOUND} para esta série ({@code createIfMissing=false}). */
     private final AtomicBoolean notFound = new AtomicBoolean(false);
 
@@ -125,14 +132,20 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
 
     /**
      * Resolve o dono e abre a série nele. Chamado uma vez por
-     * {@code DefaultNgrrdClusterClient.open}; {@link #reopen()} o reexecuta
-     * quando um dono sinaliza {@code NOT_OPEN}.
+     * {@code DefaultNgrrdClusterClient.open}, para um handle novo; {@link #reopen()} reexecuta só a
+     * abertura remota quando um dono sinaliza {@code NOT_OPEN}.
+     *
+     * <p>Aberto com sucesso, avisa o {@link #dispatcher} ({@link WriteBuffer#resetSeries}) — antes de o
+     * cliente publicar este handle — para desfazer a marca de série inexistente que um handle anterior
+     * da mesma chave possa ter deixado: sem isso, as escritas deste handle seriam recusadas pela marca
+     * do antigo. A reabertura de um handle já em uso nunca mexe na marca.</p>
      *
      * <p>item 12 (achado do Refuter): package-private de propósito — só {@code DefaultNgrrdClusterClient}
      * e o próprio {@code client} chamam isto; não faz parte do contrato público de {@link NgrrdHandle}.</p>
      */
     void open() {
         open(new OperationRetry(Commands.OPEN));
+        dispatcher.resetSeries(seriesKey, owner);
     }
 
     private void open(OperationRetry retry) {
@@ -174,16 +187,20 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
     }
 
     /**
-     * Reexecuta {@link #open()}, absorvendo qualquer falha genérica — usado como callback pelo
+     * Reexecuta a abertura remota (sem {@link WriteBuffer#resetSeries} — reabrir um handle em uso nunca
+     * desfaz marca de série inexistente), absorvendo qualquer falha genérica — usado como callback pelo
      * {@code WriteDispatcher} quando um dono responde {@code NOT_OPEN} a um lote. {@link SeriesNotFoundException}
      * NÃO é absorvida ({@code markingSeriesNotFound}): marca o handle e relança, para que o
      * {@code WriteDispatcher} falhe as escritas pendentes em vez de adiá-las para sempre (uma série
-     * apagada nunca vai reabrir sozinha).
+     * apagada nunca vai reabrir sozinha). Num handle já marcado inexistente, lança de imediato, sem RPC.
      */
     boolean reopen() {
+        if (notFound.get()) {
+            throw new SeriesNotFoundException(seriesKey);
+        }
         try {
             markingSeriesNotFound(() -> {
-                open();
+                open(new OperationRetry(Commands.OPEN));
                 return null;
             });
             return true;
@@ -217,21 +234,31 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
      * Marca a série como definitivamente inexistente: {@code write}/{@code flush}/{@code checkpoint}/
      * {@code read} passam a lançar {@link SeriesNotFoundException} e o handle se remove do mapa do
      * cliente ({@link #onClose}), de modo que um {@code open} posterior refaz o fluxo do zero. Também
-     * avisa o {@link #dispatcher} ({@link WriteBuffer#failSeries}) — sem isso, uma escrita já enfileirada
-     * (mas ainda não enviada) para esta série seguiria seu ciclo normal, chegaria a {@code NOT_OPEN}
-     * mais tarde e tentaria reabrir via o reopener do {@code WriteDispatcher}, que não encontra mais o
-     * handle (já removido aqui) e nunca saberia que a série está definitivamente inexistente —
-     * retentativa para sempre. Idempotente via {@link AtomicBoolean#compareAndSet} — só a chamada que
-     * vence a corrida executa o corpo (nunca dois {@code onClose.accept}/{@code failSeries} para o mesmo
-     * handle).
+     * marca a série no {@link #dispatcher} ({@link WriteBuffer#failSeries}) — sem isso, uma escrita já
+     * enfileirada, em voo ou ainda a caminho do {@code enqueue} chegaria a {@code NOT_OPEN} mais tarde e
+     * o reopener do {@code WriteDispatcher}, sem handle para a chave, a retentaria para sempre.
+     *
+     * <p>Ordem: {@code failSeries} roda ANTES de o handle deixar de ser reaproveitável ({@link #closed})
+     * e de sair do mapa do cliente. O cliente só cria um handle novo da mesma chave depois disso, e esse
+     * handle novo desfaz a marca ao abrir ({@link #open()}) — então a marca deste handle nunca alcança
+     * a rota do novo. Na ordem inversa, um handle novo poderia abrir e escrever entre a saída do mapa e
+     * a marcação, e ter as próprias escritas falhadas pela marca deste.</p>
+     *
+     * <p>Se um {@link #close(Duration)} normal já estava em andamento, ele é o dono do encerramento e as
+     * escritas dele: a série só fica marcada no handle (operações lançam
+     * {@link SeriesNotFoundException}), sem {@code failSeries} — o cliente pode já ter aberto um handle
+     * novo da mesma chave, e a marca pela chave alcançaria a rota dele. Idempotente via
+     * {@link AtomicBoolean#compareAndSet}.</p>
      */
     private void markSeriesNotFound(SeriesNotFoundException cause) {
         if (!notFound.compareAndSet(false, true)) {
             return;
         }
+        if (closing.compareAndSet(false, true)) {
+            dispatcher.failSeries(seriesKey, cause);
+        }
         closed = true;
         onClose.accept(seriesKey, this);
-        dispatcher.failSeries(seriesKey, cause);
     }
 
     /** Se o handle ainda pode ser reaproveitado por um {@code open} futuro da mesma chave. */
@@ -355,7 +382,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
      * chama esta sobrecarga; o contrato público de {@link NgrrdHandle} continua sendo só {@link #close()}.</p>
      */
     void close(Duration budget) {
-        if (closed) {
+        if (!closing.compareAndSet(false, true)) {
             return;
         }
         closed = true;

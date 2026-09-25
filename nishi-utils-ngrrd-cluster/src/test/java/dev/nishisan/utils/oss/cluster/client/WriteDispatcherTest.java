@@ -572,8 +572,8 @@ class WriteDispatcherTest {
     @Test
     void esperaBloqueadaNoFlushDaSerieInexistenteRecebeAFalha() throws InterruptedException {
         // Quem já chamou flushSeriesSync ANTES da série ser confirmada inexistente (e está bloqueado
-        // esperando) precisa receber a falha — mesmo depois que a rota é trocada por uma limpa para não
-        // envenenar chamadas futuras (ver discardRoute).
+        // esperando) precisa receber a falha — mesmo que a rota marcada saia do índice de pendências
+        // logo em seguida para não envenenar chamadas futuras de flushAll.
         CountDownLatch reopenerGate = new CountDownLatch(1);
         newDispatcher(1, Duration.ofSeconds(30), 1_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> {
             awaitLatch(reopenerGate);
@@ -627,13 +627,9 @@ class WriteDispatcherTest {
         });
 
         dispatcher.enqueue(OWNER_A.value(), write("gone", 1L, 1.0));
-        Object routeDuringFailure = dispatcher.routeIdentityForTest("gone");
+        // samplesFailed só muda depois que a rota marcada já saiu do índice de pendências (a conclusão
+        // da última escrita dela vem antes do contador): o flushAllSync abaixo não tem corrida com isso.
         Await.untilTrue("série declarada inexistente", AWAIT_TIMEOUT, () -> dispatcher.samplesFailed() == 1L);
-        // samplesFailed já reflete a falha antes de discardRoute trocar a rota (a notificação vem
-        // primeiro) — espera a troca de fato, senão a rota antiga (ainda em pendingRoutes) pode
-        // envenenar este flushAllSync por uma corrida de teste.
-        Await.untilTrue("rota de \"gone\" trocada por discardRoute", AWAIT_TIMEOUT,
-                () -> dispatcher.routeIdentityForTest("gone") != routeDuringFailure);
 
         dispatcher.enqueue(OWNER_A.value(), write("healthy", 1L, 2.0));
         dispatcher.flushAllSync();
@@ -657,14 +653,14 @@ class WriteDispatcherTest {
         });
 
         dispatcher.enqueue(OWNER_A.value(), write("gone", 1L, 1.0));
-        Object routeDuringFailure = dispatcher.routeIdentityForTest("gone");
+        // A marca da rota é gravada antes de as escritas pendentes falharem, então quando samplesFailed
+        // muda a série já está marcada — o handle novo que abre agora é necessariamente posterior a ela.
         Await.untilTrue("série declarada inexistente", AWAIT_TIMEOUT, () -> dispatcher.samplesFailed() == 1L);
-        // Espera a troca de fato (discardRoute), não só o contador — uma escrita nova para a MESMA
-        // chave logo após samplesFailed mudar pode chegar antes da troca e ficar presa na rota antiga
-        // (ainda envenenada), fazendo o flushSeriesSync abaixo lançar por uma corrida de teste.
-        Await.untilTrue("rota de \"gone\" trocada por discardRoute", AWAIT_TIMEOUT,
-                () -> dispatcher.routeIdentityForTest("gone") != routeDuringFailure);
+        assertThrows(SeriesNotFoundException.class, () -> dispatcher.enqueue(OWNER_A.value(), write("gone", 2L, 9.0)),
+                "enquanto nenhum handle novo abrir, a chave segue marcada");
 
+        // O que RemoteSeriesHandle.open() faz ao abrir com sucesso um handle novo da mesma chave.
+        dispatcher.resetSeries("gone", OWNER_A.value());
         dispatcher.enqueue(OWNER_A.value(), write("gone", 2L, 9.0));
         dispatcher.flushSeriesSync("gone", OWNER_A.value(), AWAIT_TIMEOUT); // não deve lançar
 
@@ -674,9 +670,9 @@ class WriteDispatcherTest {
 
     @Test
     void escritaTardiaAposTrocaDeRotaEntraNaRotaNovaENuncaNaAntiga() throws Exception {
-        // Reproduz a corrida de enqueue com discardRoute: pega a rota, mas trava DEPOIS que ela já foi
-        // trocada por outra — a versão antiga do enqueue admitia a escrita ali mesmo, na rota errada
-        // (que nunca mais seria vista por completeWrites). Simula a troca diretamente via reflexão (sem
+        // Reproduz a corrida de enqueue com resetSeries: pega a rota, mas trava DEPOIS que ela já foi
+        // trocada por outra — sem a reconferência de identidade sob o lock, o enqueue admitiria a escrita
+        // na rota aposentada (a de outra geração da série). Simula a troca diretamente via reflexão (sem
         // subir todo o fluxo de série inexistente) enquanto segura o lock da rota antiga, para forçar a
         // escrita tardia a bloquear exatamente no ponto que a corrida exige.
         newDispatcher(1, Duration.ofSeconds(30), 1_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
@@ -702,10 +698,9 @@ class WriteDispatcherTest {
         oldRouteLock.lock();
         try {
             lateEnqueue.start();
-            Await.untilTrue("escrita tardia bloqueada tentando travar a rota antiga", AWAIT_TIMEOUT,
-                    () -> lateEnqueue.getState() == Thread.State.BLOCKED
-                            || lateEnqueue.getState() == Thread.State.WAITING);
-            // O que discardRoute faria de verdade (sob o mesmo lock) — aqui feito à mão para controlar
+            Await.untilTrue("escrita tardia na fila do lock da rota antiga", AWAIT_TIMEOUT,
+                    () -> oldRouteLock.hasQueuedThread(lateEnqueue));
+            // O que resetSeries faz de verdade (sob o mesmo lock) — aqui feito à mão para controlar
             // exatamente o instante da troca em relação ao bloqueio acima.
             routes.put("s1", newRoute);
         } finally {
@@ -729,6 +724,128 @@ class WriteDispatcherTest {
         assertEquals(1L, ((Number) completedField.get(newRoute)).longValue(),
                 "o ACK da escrita tardia precisa ter completado a rota nova, não a antiga");
         assertEquals(2L, dispatcher.samplesSent());
+    }
+
+    @Test
+    void loteEmVooDeSerieMarcadaComNotOpenFalhaSemReabrirENaoEnvenenaFlushAll() throws InterruptedException {
+        assertInFlightBatchOfMarkedSeriesFails(SeriesStatus.NOT_OPEN, null);
+    }
+
+    @Test
+    void loteEmVooDeSerieMarcadaComWrongOwnerSemDonoFalhaSemReabrirENaoEnvenenaFlushAll() throws InterruptedException {
+        assertInFlightBatchOfMarkedSeriesFails(SeriesStatus.WRONG_OWNER, null);
+    }
+
+    @Test
+    void loteEmVooDeSerieMarcadaComWrongOwnerComDonoFalhaSemMoverENaoEnvenenaFlushAll() throws InterruptedException {
+        assertInFlightBatchOfMarkedSeriesFails(SeriesStatus.WRONG_OWNER, OWNER_B.value());
+    }
+
+    @Test
+    void loteEmVooDeSerieMarcadaComMigratingFalhaSemReenfileirarENaoEnvenenaFlushAll() throws InterruptedException {
+        assertInFlightBatchOfMarkedSeriesFails(SeriesStatus.MIGRATING, null);
+    }
+
+    /**
+     * O lote de "gone" fica preso dentro do RPC (já fora de qualquer buffer, portanto fora do alcance
+     * da extração de {@code failSeries}) enquanto a série é marcada inexistente. A resposta que chega
+     * depois precisa falhar o lote — sem reabrir, reenfileirar nem mover para o dono sugerido — e a
+     * rota marcada precisa sair do índice de pendências, senão {@code flushAllSync} lançaria para
+     * sempre.
+     */
+    private void assertInFlightBatchOfMarkedSeriesFails(SeriesStatus status, String ownerHint)
+            throws InterruptedException {
+        rpc = new RecordingClusterRpc(NodeId.of("client-under-test"));
+        placementLookup = new FakePlacementLookup();
+        RetryPolicy retry = new RetryPolicy(Duration.ofSeconds(5), Duration.ofMillis(10), Duration.ofMillis(200));
+        AtomicInteger reopenCalls = new AtomicInteger();
+        List<String> ownerChanges = new CopyOnWriteArrayList<>();
+        dispatcher = new WriteDispatcher(rpc, placementLookup, retry, 1, Duration.ofSeconds(30), 1_000,
+                NgrrdClusterConfig.BufferFullPolicy.BLOCK, Duration.ofSeconds(5), key -> {
+                    reopenCalls.incrementAndGet();
+                    return false;
+                }, (key, newOwner) -> ownerChanges.add(key + "=" + newOwner), Clock.systemUTC(), null, null);
+        CountDownLatch batchInFlight = new CountDownLatch(1);
+        CountDownLatch releaseBatch = new CountDownLatch(1);
+        AtomicInteger goneBatches = new AtomicInteger();
+        rpc.respondDefault((cmd, body) -> {
+            WriteBatchRequest request = (WriteBatchRequest) body;
+            String key = request.writes().getFirst().seriesKey();
+            if (key.equals("gone") && goneBatches.getAndIncrement() == 0) {
+                batchInFlight.countDown();
+                awaitLatch(releaseBatch);
+                Map<String, String> owners = ownerHint == null ? Map.of() : Map.of(key, ownerHint);
+                return new WriteBatchResponse(Map.of(key, status), owners, Map.of());
+            }
+            return okFor(request);
+        });
+
+        dispatcher.enqueue(OWNER_A.value(), write("gone", 1L, 1.0));
+        assertTrue(batchInFlight.await(AWAIT_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS), "lote de gone em voo");
+        dispatcher.failSeries("gone", new SeriesNotFoundException("gone"));
+        releaseBatch.countDown();
+
+        Await.untilTrue("lote em voo da série marcada contabilizado como falha", AWAIT_TIMEOUT,
+                () -> dispatcher.samplesFailed() == 1L);
+        dispatcher.enqueue(OWNER_A.value(), write("healthy", 1L, 2.0));
+        dispatcher.flushAllSync();
+
+        assertEquals(1L, dispatcher.samplesSent(), "só a série saudável é entregue");
+        assertEquals(1, goneBatches.get(), "o lote da série marcada nunca é reenviado");
+        assertEquals(0, reopenCalls.get(), "série marcada nunca aciona o reopener");
+        assertTrue(ownerChanges.isEmpty(), "série marcada nunca é reposicionada");
+        assertTrue(placementLookup.notedOwners.isEmpty(), "série marcada nunca atualiza o placement conhecido");
+        assertTrue(rpc.calls().stream().noneMatch(c -> c.target().equals(OWNER_B)),
+                "nada é enviado ao dono sugerido pela resposta");
+    }
+
+    @Test
+    void escritaAposMarcacaoDaSerieFalhaNaHoraSemAdmissao() {
+        newDispatcher(1, Duration.ofSeconds(30), 1_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        rpc.respondDefault((cmd, body) -> okFor((WriteBatchRequest) body));
+
+        dispatcher.enqueue(OWNER_A.value(), write("gone", 1L, 1.0));
+        Await.untilTrue("primeira escrita confirmada", AWAIT_TIMEOUT, () -> dispatcher.samplesSent() == 1L);
+
+        // Rota já existente: marcada depois de ter entregue escritas.
+        dispatcher.failSeries("gone", new SeriesNotFoundException("gone"));
+        SeriesNotFoundException ex = assertThrows(SeriesNotFoundException.class,
+                () -> dispatcher.enqueue(OWNER_A.value(), write("gone", 2L, 2.0)));
+        assertEquals("gone", ex.seriesKey());
+
+        // Série sem rota alguma (nenhuma escrita antes da marcação): a marca também precisa valer.
+        dispatcher.failSeries("never-written", new SeriesNotFoundException("never-written"));
+        assertThrows(SeriesNotFoundException.class,
+                () -> dispatcher.enqueue(OWNER_A.value(), write("never-written", 1L, 1.0)));
+
+        assertEquals(1L, dispatcher.samplesEnqueued(), "nenhuma escrita posterior à marcação é admitida");
+        assertEquals(0L, dispatcher.samplesFailed());
+        dispatcher.flushAllSync();
+    }
+
+    @Test
+    void escritasJaMovidasPorWrongOwnerAntesDaMarcacaoTambemFalham() {
+        // backoffMin longo: as escritas movidas ficam paradas no buffer do dono novo (adiadas por
+        // backoffMin) — a marcação tem que alcançá-las lá, não só no buffer do dono antigo.
+        rpc = new RecordingClusterRpc(NodeId.of("client-under-test"));
+        placementLookup = new FakePlacementLookup();
+        RetryPolicy retry = new RetryPolicy(Duration.ofSeconds(60), Duration.ofSeconds(30), Duration.ofSeconds(30));
+        dispatcher = new WriteDispatcher(rpc, placementLookup, retry, 1, Duration.ofSeconds(30), 1_000,
+                NgrrdClusterConfig.BufferFullPolicy.BLOCK, Duration.ofSeconds(5), key -> true, Clock.systemUTC());
+        rpc.respondNext((cmd, body) -> new WriteBatchResponse(Map.of("gone", SeriesStatus.WRONG_OWNER),
+                Map.of("gone", OWNER_B.value()), Map.of()));
+        rpc.respondDefault((cmd, body) -> okFor((WriteBatchRequest) body));
+
+        dispatcher.enqueue(OWNER_A.value(), write("gone", 1L, 1.0));
+        Await.untilTrue("escrita movida para o dono novo", AWAIT_TIMEOUT,
+                () -> placementLookup.notedOwners.contains("gone=" + OWNER_B.value()));
+
+        dispatcher.failSeries("gone", new SeriesNotFoundException("gone"));
+
+        assertEquals(1L, dispatcher.samplesFailed(), "a escrita parada no buffer do dono novo falha na marcação");
+        assertEquals(0L, dispatcher.samplesSent());
+        assertTrue(rpc.calls().stream().noneMatch(c -> c.target().equals(OWNER_B)));
+        dispatcher.flushAllSync();
     }
 
     @Test

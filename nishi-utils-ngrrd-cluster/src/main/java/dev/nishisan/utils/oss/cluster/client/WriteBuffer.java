@@ -55,16 +55,25 @@ public interface WriteBuffer {
     }
 
     /**
-     * Falha, de imediato, qualquer escrita de {@code seriesKey} ainda no buffer (não enviada) — usado
-     * por {@link RemoteSeriesHandle} quando descobre {@code SeriesNotFoundException} por um caminho
-     * síncrono (fora da reabertura assíncrona do dispatcher em {@code NOT_OPEN}), depois de já ter se
-     * removido do mapa do cliente. Sem isto, uma escrita que ainda estivesse no buffer seguiria seu
-     * ciclo normal, receberia {@code NOT_OPEN} mais tarde e tentaria reabrir via o reopener do
-     * dispatcher — que não encontra mais o handle (já removido) e devolve {@code false} sem nunca
-     * sinalizar série inexistente, entrando em retentativa para sempre. Idempotente: chamar sem nada
-     * pendente para a chave é um no-op. Implementações sem rastreamento por série (fakes de teste)
+     * Marca {@code seriesKey} como confirmadamente inexistente — chamado por {@link RemoteSeriesHandle}
+     * ao descobrir {@code SeriesNotFoundException} fora da reabertura assíncrona do dispatcher, ANTES de
+     * sair do mapa do cliente. Falha as escritas pendentes da série (em buffer agora; em voo, na
+     * resposta), recusa com {@code SeriesNotFoundException} qualquer {@link #enqueue} posterior da chave
+     * e nunca reabre nem retenta essas escritas: sem isto, uma escrita receberia {@code NOT_OPEN} mais
+     * tarde e o reopener, sem handle para a chave, devolveria {@code false} para sempre. A marca vale
+     * até {@link #resetSeries}. Idempotente. Implementações sem rastreamento por série (fakes de teste)
      * podem ignorar.
      */
     default void failSeries(String seriesKey, Throwable cause) {
+    }
+
+    /**
+     * Desfaz a marca de {@link #failSeries} para {@code seriesKey} — chamado quando um handle NOVO da
+     * mesma chave abre com sucesso (a série existe de novo, ou foi recriada). As escritas desse handle
+     * passam a usar uma rota nova, com dono {@code ownerNodeId}; escritas da geração marcada ainda em
+     * voo continuam sendo concluídas (como falha, salvo {@code OK}) na rota antiga, sem afetar a nova.
+     * No-op se a chave não estiver marcada. Implementações sem rastreamento por série podem ignorar.
+     */
+    default void resetSeries(String seriesKey, String ownerNodeId) {
     }
 }

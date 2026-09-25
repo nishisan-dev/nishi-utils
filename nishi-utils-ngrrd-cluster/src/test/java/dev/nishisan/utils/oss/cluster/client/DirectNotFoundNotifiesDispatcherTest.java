@@ -41,34 +41,39 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Cobre o caminho direto (fora da reabertura assíncrona do {@link WriteDispatcher} em {@code NOT_OPEN}):
- * {@link RemoteSeriesHandle} descobrindo {@link SeriesNotFoundException} numa operação síncrona
- * ({@code read}) precisa avisar o dispatcher para falhar escritas ainda no buffer — sem isso, uma
- * escrita bufferizada chegaria a {@code NOT_OPEN} mais tarde e tentaria reabrir via o reopener, que não
- * encontra mais o handle (já removido do mapa do cliente) e entraria em retentativa para sempre.
+ * Integra {@link RemoteSeriesHandle} e {@link WriteDispatcher} reais (com o mesmo wiring de
+ * {@code DefaultNgrrdClusterClient}: mapa de handles, reopener e remoção condicional) para cobrir a
+ * série confirmada inexistente fora da reabertura assíncrona do dispatcher: a marca da série falha as
+ * escritas pendentes e as que chegam atrasadas, e um handle novo da mesma chave volta a escrever,
+ * fazer checkpoint e {@code flushAll} normalmente.
  */
 class DirectNotFoundNotifiesDispatcherTest {
 
     private static final String SERIES_KEY = "gone";
     private static final NodeId OWNER_A = NodeId.of("storage-a");
+    private static final Duration AWAIT_TIMEOUT = Duration.ofSeconds(10);
+    private static final ViewQuery ANY_QUERY =
+            new ViewQuery(Duration.ofHours(1), 300, ConsolidationFunction.AVERAGE, 100);
 
-    @Test
-    void readDescobreNotFoundDiretoFalhaEscritaNoBufferSemNovasTentativasEFlushAllDasDemaisSeriesSegue() {
-        RecordingClusterRpc rpc = new RecordingClusterRpc(NodeId.of("client-under-test"));
-        ConcurrentMap<String, RemoteSeriesHandle> handles = new ConcurrentHashMap<>();
-        FakePlacementLookup lookup = new FakePlacementLookup(OWNER_A.value());
-        RetryPolicy retry = new RetryPolicy(Duration.ofSeconds(5), Duration.ofMillis(5), Duration.ofMillis(50));
+    private final RecordingClusterRpc rpc = new RecordingClusterRpc(NodeId.of("client-under-test"));
+    private final ConcurrentMap<String, RemoteSeriesHandle> handles = new ConcurrentHashMap<>();
+    private final FakePlacementLookup lookup = new FakePlacementLookup(OWNER_A.value());
+    private final RetryPolicy retry = new RetryPolicy(Duration.ofSeconds(5), Duration.ofMillis(5), Duration.ofMillis(50));
 
-        // batchMaxSamples alto e batchMaxDelay bem longo: a única escrita de "gone" fica no buffer, sem
-        // ser drenada sozinha, até o read() síncrono descobrir a série inexistente.
-        WriteDispatcher dispatcher = new WriteDispatcher(rpc, lookup, retry, 10, Duration.ofSeconds(30), 1_000,
+    /** Mesmo wiring de {@code DefaultNgrrdClusterClient.connect()} para reopener e troca de dono. */
+    private WriteDispatcher newDispatcher(int batchMaxSamples) {
+        return new WriteDispatcher(rpc, lookup, retry, batchMaxSamples, Duration.ofSeconds(30), 1_000,
                 NgrrdClusterConfig.BufferFullPolicy.BLOCK, Duration.ofSeconds(5),
                 key -> {
                     RemoteSeriesHandle handle = handles.get(key);
@@ -80,10 +85,21 @@ class DirectNotFoundNotifiesDispatcherTest {
                         handle.ownerChanged(newOwner);
                     }
                 }, Clock.systemUTC(), null, null);
+    }
+
+    private RemoteSeriesHandle newHandle(WriteBuffer buffer) {
+        return new RemoteSeriesHandle(SERIES_KEY, "yaml: fake", "hash-1", Map.of(),
+                Ngrrd.OpenOptions.defaults().withCreateIfMissing(false), lookup, rpc, buffer, retry,
+                Duration.ofSeconds(5), Duration.ofSeconds(5), Clock.systemUTC(), handles::remove);
+    }
+
+    @Test
+    void readDescobreNotFoundDiretoFalhaEscritaNoBufferSemNovasTentativasEFlushAllDasDemaisSeriesSegue() {
+        // batchMaxSamples alto e batchMaxDelay bem longo: a única escrita de "gone" fica no buffer, sem
+        // ser drenada sozinha, até o read() síncrono descobrir a série inexistente.
+        WriteDispatcher dispatcher = newDispatcher(10);
         try {
-            RemoteSeriesHandle handle = new RemoteSeriesHandle(SERIES_KEY, "yaml: fake", "hash-1", Map.of(),
-                    Ngrrd.OpenOptions.defaults().withCreateIfMissing(false), lookup, rpc, dispatcher, retry,
-                    Duration.ofSeconds(5), Duration.ofSeconds(5), Clock.systemUTC(), handles::remove);
+            RemoteSeriesHandle handle = newHandle(dispatcher);
             handles.put(SERIES_KEY, handle);
 
             rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
@@ -94,8 +110,8 @@ class DirectNotFoundNotifiesDispatcherTest {
 
             handle.write("in_octets", new Sample(1L, 1.0));
 
-            SeriesNotFoundException ex = assertThrows(SeriesNotFoundException.class, () -> handle.read("in_octets",
-                    new ViewQuery(Duration.ofHours(1), 300, ConsolidationFunction.AVERAGE, 100)));
+            SeriesNotFoundException ex = assertThrows(SeriesNotFoundException.class,
+                    () -> handle.read("in_octets", ANY_QUERY));
             assertEquals(SERIES_KEY, ex.seriesKey());
 
             assertNull(handles.get(SERIES_KEY), "handle deveria ter se removido do mapa do cliente");
@@ -105,21 +121,176 @@ class DirectNotFoundNotifiesDispatcherTest {
                     "a escrita nunca deveria ter chegado a ser enviada — falhou direto no buffer");
 
             // flushAll de outras séries no mesmo dispatcher (mesmo nó) continua funcionando — a rota
-            // descartada de "gone" não pode ter ficado presa em pendingRoutes nem no buffer do nó.
-            rpc.respondDefault((cmd, body) -> {
-                WriteBatchRequest request = (WriteBatchRequest) body;
-                Map<String, SeriesStatus> status = new LinkedHashMap<>();
-                for (SeriesWrite write : request.writes()) {
-                    status.put(write.seriesKey(), SeriesStatus.OK);
-                }
-                return new WriteBatchResponse(status, Map.of(), Map.of());
-            });
+            // marcada de "gone" não pode ter ficado presa em pendingRoutes nem no buffer do nó.
+            rpc.respondDefault((cmd, body) -> okFor((WriteBatchRequest) body));
             dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("healthy", "in_octets", 2L, 2.0));
             dispatcher.flushAllSync();
 
             assertEquals(1L, dispatcher.samplesSent());
         } finally {
             dispatcher.close();
+        }
+    }
+
+    @Test
+    void writeQueCruzaComAMarcacaoDoHandleLancaSeriesNotFoundSemAdmissao() {
+        // O write() já passou pelo ensureOpen() quando outra operação do mesmo handle confirma a série
+        // inexistente; a escrita só chega ao dispatcher depois da marcação — e não pode ser admitida
+        // (senão chegaria a NOT_OPEN sem handle nenhum para reabrir e ficaria em retentativa para sempre).
+        WriteDispatcher dispatcher = newDispatcher(10);
+        try {
+            AtomicReference<Runnable> beforeEnqueue = new AtomicReference<>();
+            RemoteSeriesHandle handle = newHandle(new InterceptingWriteBuffer(dispatcher, beforeEnqueue));
+            handles.put(SERIES_KEY, handle);
+
+            rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
+            handle.open();
+
+            rpc.respondNext((cmd, body) -> new ReadResponse(SeriesStatus.NOT_OPEN, null, null, null));
+            rpc.respondDefault((cmd, body) -> new SeriesStatusResponse(SeriesStatus.NOT_FOUND, OWNER_A.value(), null));
+            beforeEnqueue.set(() -> assertThrows(SeriesNotFoundException.class,
+                    () -> handle.read("in_octets", ANY_QUERY)));
+
+            SeriesNotFoundException ex = assertThrows(SeriesNotFoundException.class,
+                    () -> handle.write("in_octets", new Sample(1L, 1.0)));
+            assertEquals(SERIES_KEY, ex.seriesKey());
+
+            assertNull(handles.get(SERIES_KEY), "a marcação aconteceu antes da escrita chegar ao dispatcher");
+            assertEquals(0L, dispatcher.samplesEnqueued(), "a escrita atrasada não pode ter sido admitida");
+            assertEquals(0L, dispatcher.samplesFailed());
+            dispatcher.flushAllSync();
+            assertTrue(rpc.calls().stream().noneMatch(c -> c.command().equals(Commands.WRITE_BATCH)));
+        } finally {
+            dispatcher.close();
+        }
+    }
+
+    @Test
+    void handleNovoDaMesmaChaveAposMarcacaoComLoteEmVooEscreveFazCheckpointEFlushAllVolta() throws Exception {
+        // batchMaxSamples=1: a escrita do handle A sai do buffer na hora e fica presa no RPC (em voo)
+        // enquanto A é marcado inexistente e um handle B da MESMA chave abre (a série foi recriada) e
+        // escreve. Quando o lote de A finalmente responde NOT_OPEN, só ele falha: nada de reabrir (nem
+        // via B), e a escrita de B, o checkpoint de B e o flushAll seguem normalmente.
+        WriteDispatcher dispatcher = newDispatcher(1);
+        CountDownLatch batchInFlight = new CountDownLatch(1);
+        CountDownLatch releaseBatch = new CountDownLatch(1);
+        try {
+            AtomicReference<SeriesStatus> openStatus = new AtomicReference<>(SeriesStatus.OK);
+            rpc.respondDefault((cmd, body) -> {
+                if (cmd.equals(Commands.WRITE_BATCH)) {
+                    WriteBatchRequest request = (WriteBatchRequest) body;
+                    if (request.writes().getFirst().tsEpochMs() == 1L) {
+                        batchInFlight.countDown();
+                        awaitLatch(releaseBatch);
+                        return new WriteBatchResponse(Map.of(SERIES_KEY, SeriesStatus.NOT_OPEN), Map.of(), Map.of());
+                    }
+                    return okFor(request);
+                }
+                if (cmd.equals(Commands.READ)) {
+                    return new ReadResponse(SeriesStatus.NOT_OPEN, null, null, null);
+                }
+                if (cmd.equals(Commands.OPEN)) {
+                    return new SeriesStatusResponse(openStatus.get(), OWNER_A.value(), null);
+                }
+                return new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null);
+            });
+
+            RemoteSeriesHandle handleA = newHandle(dispatcher);
+            handleA.open();
+            handles.put(SERIES_KEY, handleA);
+
+            openStatus.set(SeriesStatus.NOT_FOUND);
+            handleA.write("in_octets", new Sample(1L, 1.0));
+            assertTrue(batchInFlight.await(AWAIT_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS), "lote de A em voo");
+            assertThrows(SeriesNotFoundException.class, () -> handleA.read("in_octets", ANY_QUERY));
+            assertNull(handles.get(SERIES_KEY));
+
+            // Escrita atrasada da geração antiga (ex.: um write() de A que passou pelo ensureOpen antes da
+            // marcação): recusada, sem admissão.
+            assertThrows(SeriesNotFoundException.class, () -> dispatcher.enqueue(OWNER_A.value(),
+                    new SeriesWrite(SERIES_KEY, "in_octets", 99L, 9.0)));
+
+            openStatus.set(SeriesStatus.OK);
+            RemoteSeriesHandle handleB = newHandle(dispatcher);
+            handleB.open();
+            handles.put(SERIES_KEY, handleB);
+            handleB.write("in_octets", new Sample(2L, 2.0));
+
+            releaseBatch.countDown();
+            handleB.checkpoint();
+            dispatcher.flushAllSync();
+
+            assertSame(handleB, handles.get(SERIES_KEY));
+            assertEquals(1L, dispatcher.samplesFailed(), "só o lote em voo do handle A falha");
+            assertEquals(1L, dispatcher.samplesSent(), "a escrita do handle B é entregue");
+            assertEquals(2L, dispatcher.samplesEnqueued(), "a escrita atrasada da geração antiga nunca foi admitida");
+            assertEquals(3L, rpc.calls().stream().filter(c -> c.command().equals(Commands.OPEN)).count(),
+                    "OPEN de A, reabertura de A (NOT_FOUND) e OPEN de B — o lote de A nunca aciona reabertura");
+            assertEquals(2L, rpc.calls().stream().filter(c -> c.command().equals(Commands.WRITE_BATCH)).count(),
+                    "o lote de A nunca é reenviado");
+        } finally {
+            releaseBatch.countDown();
+            dispatcher.close();
+        }
+    }
+
+    private static WriteBatchResponse okFor(WriteBatchRequest request) {
+        Map<String, SeriesStatus> status = new LinkedHashMap<>();
+        for (SeriesWrite write : request.writes()) {
+            status.put(write.seriesKey(), SeriesStatus.OK);
+        }
+        return new WriteBatchResponse(status, Map.of(), Map.of());
+    }
+
+    private static void awaitLatch(CountDownLatch latch) {
+        try {
+            assertTrue(latch.await(AWAIT_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError(e);
+        }
+    }
+
+    /**
+     * Delegação completa ao dispatcher real, com um gancho executado uma única vez logo antes de um
+     * {@code enqueue} — o ponto exato entre o {@code ensureOpen()} e a admissão de {@code write()}.
+     */
+    private static final class InterceptingWriteBuffer implements WriteBuffer {
+        private final WriteBuffer delegate;
+        private final AtomicReference<Runnable> beforeEnqueue;
+
+        InterceptingWriteBuffer(WriteBuffer delegate, AtomicReference<Runnable> beforeEnqueue) {
+            this.delegate = delegate;
+            this.beforeEnqueue = beforeEnqueue;
+        }
+
+        @Override
+        public void enqueue(String ownerNodeId, SeriesWrite write) {
+            Runnable hook = beforeEnqueue.getAndSet(null);
+            if (hook != null) {
+                hook.run();
+            }
+            delegate.enqueue(ownerNodeId, write);
+        }
+
+        @Override
+        public void flushNodeSync(String ownerNodeId) {
+            delegate.flushNodeSync(ownerNodeId);
+        }
+
+        @Override
+        public void flushNodeSync(String ownerNodeId, Duration maxWait) {
+            delegate.flushNodeSync(ownerNodeId, maxWait);
+        }
+
+        @Override
+        public void flushSeriesSync(String seriesKey, String ownerNodeId, Duration maxWait) {
+            delegate.flushSeriesSync(seriesKey, ownerNodeId, maxWait);
+        }
+
+        @Override
+        public void failSeries(String seriesKey, Throwable cause) {
+            delegate.failSeries(seriesKey, cause);
         }
     }
 
