@@ -74,9 +74,9 @@ class MigrationBandwidthTest {
     }
 
     /**
-     * Achado 2: {@code acquireUrgent} continua contando no orçamento — não é grátis, só prioritário.
-     * Depois de um {@code acquireUrgent} de N bytes, o próximo {@code acquire} espera pelo custo desses
-     * N bytes (tolerância generosa para evitar flakiness de CI).
+     * {@code acquireUrgent} continua contando no orçamento — não é grátis, só prioritário. Depois de
+     * um {@code acquireUrgent} de N bytes, o próximo {@code acquire} espera pelo custo desses N bytes
+     * (tolerância generosa para evitar flakiness de CI).
      */
     @Test void acquireUrgentDebitaOrcamento() throws Exception {
         long bytesPerSecond = 10L * 1024; // 10 KiB/s

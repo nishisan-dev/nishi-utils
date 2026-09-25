@@ -52,6 +52,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiFunction;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -352,9 +353,9 @@ class MigrationCoordinatorTest {
     }
 
     /**
-     * Comportamento preservado (achado 1): quando o poll do destino RESPONDE (não falha de transporte)
-     * com um status não-{@code COMMITTED} na mesma iteração em que a origem reporta erro, o abort
-     * continua imediato — não é preciso esperar o {@code migrationTimeout}.
+     * Quando o poll do destino RESPONDE (não falha de transporte) com um status não-{@code COMMITTED}
+     * na mesma iteração em que a origem reporta erro, o abort é imediato — não é preciso esperar o
+     * {@code migrationTimeout}.
      */
     @Test
     void erroDaOrigemComDestinoRespondendoNaoCommittedAborta() throws Exception {
@@ -376,9 +377,9 @@ class MigrationCoordinatorTest {
     }
 
     /**
-     * Achado 1: ao estourar o {@code migrationTimeout}, o coordenador reconsulta o destino uma última
-     * vez ANTES de abortar — se essa reconsulta final confirmar {@code COMMITTED}, completa em vez de
-     * abortar. Usa um {@link Clock} manual para controlar deterministicamente quando o prazo estoura,
+     * Ao estourar o {@code migrationTimeout}, o coordenador reconsulta o destino uma última vez ANTES
+     * de abortar — se essa reconsulta final confirmar {@code COMMITTED}, completa em vez de abortar.
+     * Usa um {@link Clock} manual para controlar deterministicamente quando o prazo estoura,
      * sem depender de sleeps/tolerâncias de tempo real: os 3 primeiros polls do destino (dentro do
      * laço normal) respondem {@code PARTIAL} e avançam o relógio manual 20 ms cada um, superando o
      * prazo de 50 ms na 3ª iteração; só a reconsulta final (4º poll) responde {@code COMMITTED}.
@@ -461,12 +462,11 @@ class MigrationCoordinatorTest {
      *
      * <p>O destino só confirma {@code COMMITTED} quando o relógio manual cruza os 14 s (mesma carência
      * de 10 s computada a partir da 1ª falha da origem, observada em 4 s — ver cálculo em {@link
-     * #origemEmErroEDestinoNuncaRespondePorMaisQueACarenciaAbortaPertoDela}) — amarrado de propósito ao
-     * ÚNICO mecanismo que avança esse relógio: o poll da origem, que só a carência dispara enquanto o
-     * destino falha. Sem a carência, a origem nunca é consultada enquanto o destino falha, o relógio
-     * nunca avança, e o destino nunca chega a confirmar {@code COMMITTED} — a migração trava até o
-     * {@code migrationTimeout}, o que este teste prova ao falhar por timeout do próprio teste (RED) se
-     * a carência for removida.</p>
+     * #origemEmErroEDestinoNuncaRespondePorMaisQueACarenciaAbortaPertoDela}), amarrado de propósito ao
+     * poll da origem — o único evento que avança esse relógio no teste. Isso garante que é
+     * especificamente a reconsulta disparada pela expiração da carência (não um poll normal anterior,
+     * que sempre vê o destino falhando enquanto o relógio está abaixo de 14 s) que encontra e aceita o
+     * {@code COMMITTED} tardio.</p>
      */
     @Test
     void origemEmErroEDestinoCommittedDentroDaCarenciaCompleta() throws Exception {
@@ -904,15 +904,17 @@ class MigrationCoordinatorTest {
     }
 
     /**
-     * {@link Clock} com avanço manual — usado só por {@code timeoutReconsultaDestinoAntesDeAbortar}
-     * para tornar o estouro do {@code migrationTimeout} determinístico (sem depender de sleeps/tempo
-     * real): cada poll programado do teste avança o relógio explicitamente via {@link #advance}.
+     * {@link Clock} com avanço manual — usado por {@code timeoutReconsultaDestinoAntesDeAbortar},
+     * {@code origemEmErroEDestinoNuncaRespondePorMaisQueACarenciaAbortaPertoDela} e {@code
+     * origemEmErroEDestinoCommittedDentroDaCarenciaCompleta} para tornar o estouro do {@code
+     * migrationTimeout} (ou da carência) determinístico, sem depender de sleeps/tempo real: cada poll
+     * programado do teste avança o relógio explicitamente via {@link #advance}.
      */
     private static final class ManualClock extends Clock {
-        private final java.util.concurrent.atomic.AtomicLong millis;
+        private final AtomicLong millis;
 
         ManualClock(long startMillis) {
-            this.millis = new java.util.concurrent.atomic.AtomicLong(startMillis);
+            this.millis = new AtomicLong(startMillis);
         }
 
         long advance(long deltaMillis) {
