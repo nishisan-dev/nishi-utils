@@ -93,18 +93,21 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
     /**
      * Instante em que este nó percebeu ter assumido a liderança pela última vez — {@code 0}
      * (epoch) enquanto não visto nenhuma vez, para tratar como "fora da janela de graça" por
-     * default. Deliberadamente NÃO {@link Long#MIN_VALUE}: {@code clock.millis() - Long.MIN_VALUE}
-     * estoura o {@code long} (o resultado matematicamente correto excede {@link Long#MAX_VALUE}) e
-     * <em>wrap-around</em> vira um número NEGATIVO — menor que qualquer {@code placementGraceAfterLeadership}
-     * positivo — fazendo {@code handlePlace} enxergar "dentro da janela de graça" para sempre, mesmo
-     * décadas depois de qualquer liderança real (bug pego pelos testes existentes de
-     * {@code PlacementRequestHandlerTest}, que nunca chamam {@code onLeaderChanged}). {@code 0}
-     * evita o overflow: {@code clock.millis()} de qualquer relógio real (ou fake baseado numa data
-     * real) é sempre muitas ordens de grandeza maior que a janela de graça, então o subtraendo nunca
-     * é confundido com "recém-eleito". Só {@link #onLeaderChanged}
-     * escreve; {@link #handlePlace} só lê — não precisa de lock próprio, um valor um pouco atrasado
-     * só alarga/encolhe a janela por uma chamada, nunca quebra a invariante de segurança (seção 0 da
-     * spec do M3).
+     * default; {@link Long#MAX_VALUE} depois de um callback de perda (ou ausência) de liderança,
+     * para que tudo fique "dentro da janela" até o callback da próxima posse
+     * ({@code clock.millis() - Long.MAX_VALUE} é negativo, sem overflow, pois {@code clock.millis()}
+     * nunca é negativo). Deliberadamente NÃO {@link Long#MIN_VALUE} como valor inicial:
+     * {@code clock.millis() - Long.MIN_VALUE} estoura o {@code long} (o resultado matematicamente
+     * correto excede {@link Long#MAX_VALUE}) e <em>wrap-around</em> vira um número NEGATIVO — menor
+     * que qualquer {@code placementGraceAfterLeadership} positivo — fazendo {@code handlePlace}
+     * enxergar "dentro da janela de graça" para sempre, mesmo décadas depois de qualquer liderança
+     * real (bug pego pelos testes existentes de {@code PlacementRequestHandlerTest}, que nunca chamam
+     * {@code onLeaderChanged}). {@code 0} evita o overflow: {@code clock.millis()} de qualquer relógio
+     * real (ou fake baseado numa data real) é sempre muitas ordens de grandeza maior que a janela de
+     * graça, então o subtraendo nunca é confundido com "recém-eleito". Só {@link #onLeaderChanged}
+     * escreve; {@link #handlePlace} e {@link #handleCatalogLookup} só leem — não precisa de lock
+     * próprio, um valor um pouco atrasado só alarga/encolhe a janela por uma chamada, nunca quebra a
+     * invariante de segurança (seção 0 da spec do M3).
      */
     private volatile long becameLeaderAtMs = 0L;
 
@@ -216,6 +219,18 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
             // obsoleta caso ele volte a ser líder mais tarde.
             needsAdmissionRebuild = true;
             pendingByNode.clear();
+            // O coordenador troca o líder (e persiste a época, com I/O síncrono) ANTES de chamar os
+            // listeners: se este nó voltar a ser líder, há um intervalo em que isLeader() já é true e
+            // o callback de posse ainda não rodou. Long.MAX_VALUE deixa "agora - becameLeaderAtMs"
+            // negativo (sem overflow: clock.millis() >= 0), ou seja, dentro da janela de graça —
+            // PLACE de série nova e miss de CATALOG_LOOKUP respondem NOT_LEADER até a posse ser vista.
+            becameLeaderAtMs = Long.MAX_VALUE;
+            // Reconferência: este callback pode ter lido "não líder" concorrendo com a posse (ex.: o
+            // seed do boot e o callback do coordenador) — sem isto, um líder real ficaria preso em
+            // NOT_LEADER até a próxima troca de liderança.
+            if (leaderView.isLeader()) {
+                becameLeaderAtMs = clock.millis();
+            }
         }
     }
 

@@ -251,6 +251,13 @@ class PlacementRequestHandlerTest {
         leaderView.leader = false;
         handler.onLeaderChanged(NodeId.of("node-b"));
         leaderView.leader = true;
+        // Sem o callback de posse, a série nova ainda é recusada (a liderança pode ter acabado de voltar
+        // sem que o handler saiba — ver catalogLookupComMissAntesDoCallbackDeLiderancaRespondeNotLeader).
+        PlaceResponse beforeCallback = (PlaceResponse) handler.handle(Commands.PLACE,
+                new PlaceRequest("series-2", "hash-2", null), NodeId.of("client"));
+        assertEquals(SeriesStatus.NOT_LEADER, beforeCallback.status());
+        handler.onLeaderChanged(NodeId.of("self"));
+        clock.advance(GRACE.plusSeconds(1));
 
         PlaceResponse response = (PlaceResponse) handler.handle(Commands.PLACE,
                 new PlaceRequest("series-2", "hash-2", null), NodeId.of("client"));
@@ -486,6 +493,42 @@ class PlacementRequestHandlerTest {
 
         assertEquals(SeriesStatus.OK, response.status());
         assertEquals(Map.of("series-1", placement), response.found());
+    }
+
+    @Test
+    void catalogLookupComMissAntesDoCallbackDeLiderancaRespondeNotLeader() {
+        // O coordenador troca o líder (e persiste a época, com I/O síncrono) antes de chamar os
+        // listeners: nesse intervalo isLeader() já é true, mas este handler só viu a perda da
+        // liderança. Um miss aqui não pode virar "não existe" — mesmo muito depois da última posse.
+        leaderView.leader = false;
+        leaderView.leaderId = Optional.of("node-self");
+        handler.onLeaderChanged(NodeId.of("node-b"));
+        leaderView.leader = true;
+        clock.advance(GRACE.multipliedBy(100));
+
+        CatalogLookupResponse response = (CatalogLookupResponse) handler.handle(Commands.CATALOG_LOOKUP,
+                new CatalogLookupRequest(List.of("series-inexistente")), NodeId.of("client"));
+
+        assertEquals(SeriesStatus.NOT_LEADER, response.status());
+        assertEquals("node-self", response.leaderNodeId());
+    }
+
+    @Test
+    void callbackQueLeuNaoLiderConcorrendoComAPosseNaoPrendeOLiderEmNotLeader() {
+        // O seed leu "não líder", mas a liderança chegou logo em seguida (o callback de posse pode já
+        // ter rodado antes): a reconferência ao final do ramo "não líder" marca a posse e o líder
+        // volta a responder normalmente depois da janela de graça.
+        FlippingLeaderView flipping = new FlippingLeaderView();
+        PlacementRequestHandler seededHandler = new PlacementRequestHandler(cluster.node(0).transport(), catalog,
+                flipping, leaderSyncing::get, new LeastLoadedPlacementPolicy(), INTERVAL, GRACE, clock);
+        seededHandler.onLeaderChanged(NodeId.of("self"));
+        clock.advance(GRACE.plusSeconds(1));
+
+        CatalogLookupResponse response = (CatalogLookupResponse) seededHandler.handle(Commands.CATALOG_LOOKUP,
+                new CatalogLookupRequest(List.of("series-inexistente")), NodeId.of("client"));
+
+        assertEquals(SeriesStatus.OK, response.status());
+        assertTrue(response.found().isEmpty());
     }
 
     @Test
@@ -761,6 +804,29 @@ class PlacementRequestHandlerTest {
         @Override
         public Set<String> reachableNodeIds() {
             return Set.copyOf(reachable);
+        }
+    }
+
+    /**
+     * {@link PlacementRequestHandler.LeaderView} cuja primeira leitura de {@code isLeader()} diz "não
+     * líder" e as seguintes "líder" — simula o callback que leu o estado antigo concorrendo com a posse.
+     */
+    private static final class FlippingLeaderView implements PlacementRequestHandler.LeaderView {
+        private int isLeaderCalls;
+
+        @Override
+        public boolean isLeader() {
+            return isLeaderCalls++ > 0;
+        }
+
+        @Override
+        public Optional<String> leaderId() {
+            return Optional.of("self");
+        }
+
+        @Override
+        public Set<String> reachableNodeIds() {
+            return Set.of();
         }
     }
 
