@@ -54,6 +54,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -230,14 +231,14 @@ class MigrationExecutorTest {
     }
 
     /**
-     * Achado 2 da revisão pós-merge da PR #172: com a série já congelada ({@code markMigrating}), o
-     * patch final do cutover não pode esperar atrás de chunks/patches de outras cópias na mesma banda
-     * do nó — só ele usa {@code acquireUrgent}. Simula a fila cheia reservando, sincronamente, um slot
-     * de banda "de outra cópia" bem no instante em que o patch final fica pronto (mesmo efeito de um
-     * chunk concorrente real: o orçamento compartilhado fica ocupado por ~2 s) e mede o tempo até a
-     * entrega do patch — comportamento observado, não a chamada de método em si. (Fix round 1, item 4:
-     * folga maior entre a reserva (~2 s) e o limite da asserção (1 s) para reduzir sensibilidade a
-     * jitter de CI, mantendo uma margem clara acima do que o código antigo levaria.)
+     * Com a série já congelada ({@code markMigrating}), o patch final do cutover não pode esperar
+     * atrás de chunks/patches de outras cópias na mesma banda do nó — só ele usa {@code acquireUrgent}.
+     * Simula a fila cheia reservando, sincronamente, um slot de banda "de outra cópia" bem no instante
+     * em que o patch final fica pronto (mesmo efeito de um chunk concorrente real: o orçamento
+     * compartilhado fica ocupado por ~2 s) e mede o tempo até a entrega do patch — comportamento
+     * observado, não a chamada de método em si. Folga grande entre a reserva (~2 s) e o limite da
+     * asserção (1 s) para reduzir sensibilidade a jitter de CI, mantendo uma margem clara acima do que
+     * o código sem a prioridade urgente levaria.
      */
     @Test
     void patchesFinaisDoCutoverUsamPrioridadeUrgenteNaBanda() throws Exception {
@@ -329,6 +330,111 @@ class MigrationExecutorTest {
         } finally {
             slowSrcExecutor.close();
         }
+    }
+
+    /**
+     * A checagem de {@code transferActive} antes de cada {@code acquireUrgent} (ver Javadoc de {@code
+     * sendPatches}) tem de interromper o envio dos patches finais do cutover assim que a migração for
+     * abortada — em vez de continuar mandando RPCs para um destino que já não espera por elas. Testa
+     * {@code sendPatches} isoladamente (via reflexão, com um {@link ClusterRpc} fake): {@code before}/
+     * {@code after} têm dois ranges BEM separados (blocos de 4096 bytes, longe demais para mesclar), o
+     * fake aborta a migração (mutando {@code states} para {@code ABORTED}, como {@code handleAbort}
+     * faria) logo depois de responder ao 1º patch, e só então o 2º patch seria tentado — a exceção
+     * esperada é a mesma que {@code transfer()} captura e converte em {@code updatePhase(FAILED, ...)},
+     * reproduzida aqui para confirmar que essa chamada NÃO sobrescreve a fase já terminal ({@code
+     * ABORTED}), graças à guarda existente em {@code updatePhase} (só substitui uma fase não-terminal).
+     */
+    @Test
+    void abortDuranteOsPatchesFinaisDoCutoverInterrompeOEnvioSemSobrescreverAFaseTerminal() throws Exception {
+        String key = "aborted-cutover-series", id = "aborted-cutover-move";
+        var patchCalls = new java.util.concurrent.atomic.AtomicInteger();
+        var executorRef = new java.util.concurrent.atomic.AtomicReference<MigrationExecutor>();
+        ClusterRpc fakeRpc = new ClusterRpc() {
+            @Override
+            @SuppressWarnings("unchecked")
+            public <R> R call(NodeId target, String command, Object body, Class<R> responseType) {
+                assertEquals(Commands.MIGRATE_PATCH, command, "só o patch final deveria disparar RPC aqui");
+                int n = patchCalls.incrementAndGet();
+                if (n == 1) {
+                    // Simula um MIGRATE_ABORT concorrente chegando logo após o 1º patch final ser
+                    // entregue -- mesmo efeito de handleAbort (papel SOURCE): marca ABORTED.
+                    setSourceState(executorRef.get(), id, key, MigrationExecutor.MigratePhase.ABORTED);
+                }
+                return (R) MigrateResponse.of(MigrateStatus.OK, null);
+            }
+
+            @Override
+            public NodeId localId() {
+                return SRC;
+            }
+
+            @Override
+            public Optional<NodeId> leaderId() {
+                return Optional.empty();
+            }
+        };
+        MigrationExecutor executor = new MigrationExecutor(new FakeTransport(SRC), srcRegistry, srcVolume, fakeRpc,
+                srcCatalog, SRC, 4_096L, MAX_SERIES_BYTES, Clock.systemUTC());
+        executorRef.set(executor);
+        try {
+            setSourceState(executor, id, key, MigrationExecutor.MigratePhase.TRANSFERRING);
+
+            // Dois ranges separados por um bloco inteiro (4096 bytes) -- muito além do limite de
+            // mesclagem de sendPatches, garantindo DOIS patches se o laço não for interrompido.
+            byte[] before = new byte[8192];
+            byte[] after = before.clone();
+            after[0] = 1;
+            after[8_000] = 1;
+
+            Method sendPatches = MigrationExecutor.class.getDeclaredMethod("sendPatches", NodeId.class,
+                    String.class, String.class, byte[].class, byte[].class, int.class, boolean.class);
+            sendPatches.setAccessible(true);
+            try {
+                sendPatches.invoke(executor, DST, key, id, before, after, 0, true);
+                fail("deveria ter lançado IllegalStateException ao tentar o 2º patch após o abort");
+            } catch (java.lang.reflect.InvocationTargetException e) {
+                assertTrue(e.getCause() instanceof IllegalStateException,
+                        "causa inesperada: " + e.getCause());
+            }
+            assertEquals(1, patchCalls.get(), "nenhum patch urgente adicional deveria ser enviado depois do abort");
+
+            // Reproduz exatamente o que transfer() faz ao capturar essa exceção: updatePhase(FAILED, ...).
+            Method updatePhase = MigrationExecutor.class.getDeclaredMethod("updatePhase", String.class,
+                    MigrationExecutor.MigratePhase.class, String.class);
+            updatePhase.setAccessible(true);
+            updatePhase.invoke(executor, id, MigrationExecutor.MigratePhase.FAILED, "live-copy catch-up failed");
+
+            assertEquals(MigrationExecutor.MigratePhase.ABORTED, readState(executor, id).phase(),
+                    "a fase terminal (ABORTED) não pode ser sobrescrita pela falha subsequente do laço de patches");
+        } finally {
+            executor.close();
+        }
+    }
+
+    /** Substitui (ou cria) a entrada de {@code migrationId} em {@code states} com o papel SOURCE. */
+    private static void setSourceState(MigrationExecutor executor, String migrationId, String seriesKey,
+            MigrationExecutor.MigratePhase phase) {
+        try {
+            Field statesField = MigrationExecutor.class.getDeclaredField("states");
+            statesField.setAccessible(true);
+            @SuppressWarnings("unchecked")
+            Map<String, MigrationExecutor.MigrationState> states =
+                    (Map<String, MigrationExecutor.MigrationState>) statesField.get(executor);
+            states.put(migrationId, new MigrationExecutor.MigrationState(seriesKey, migrationId,
+                    MigrationExecutor.Role.SOURCE, phase, 0, 0, 0L, null, null, null, 0L));
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    private static MigrationExecutor.MigrationState readState(MigrationExecutor executor, String migrationId)
+            throws ReflectiveOperationException {
+        Field statesField = MigrationExecutor.class.getDeclaredField("states");
+        statesField.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        Map<String, MigrationExecutor.MigrationState> states =
+                (Map<String, MigrationExecutor.MigrationState>) statesField.get(executor);
+        return states.get(migrationId);
     }
 
     @Test
