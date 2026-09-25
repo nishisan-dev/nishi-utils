@@ -336,17 +336,31 @@ public final class MigrationCoordinator implements LeadershipListener {
                                     + (pollResponse.message() != null ? " (" + pollResponse.message() + ")" : ""),
                             startedAt);
                 }
-                // PARTIAL/UNKNOWN: continua o poll até COMMITTED, um status terminal, ou o timeout.
+                // PARTIAL/UNKNOWN: o destino respondeu (não-nulo) e não é COMMITTED — só agora vale a
+                // pena checar se a origem já falhou, para abortar sem esperar o migrationTimeout inteiro.
+                // A source may already have failed a chunk while the target remains PARTIAL.
+                // Destination COMMITTED above always wins, including a lost COMMIT response.
+                MigrateResponse sourceResponse = pollStatusQuietly(src, seriesKey, migrationId);
+                if (sourceResponse != null && sourceResponse.status() == MigrateStatus.ERROR) {
+                    return abort(seriesKey, migratingPlacement, src, dst,
+                            "origem reportou falha: " + sourceResponse.message(), startedAt);
+                }
             }
-            // A source may already have failed a chunk while the target remains PARTIAL.
-            // Destination COMMITTED above always wins, including a lost COMMIT response.
-            MigrateResponse sourceResponse = pollStatusQuietly(src, seriesKey, migrationId);
-            if (sourceResponse != null && sourceResponse.status() == MigrateStatus.ERROR) {
-                return abort(seriesKey, migratingPlacement, src, dst,
-                        "origem reportou falha: " + sourceResponse.message(), startedAt);
-            }
-            // Falha de transporte no poll conta como uma tentativa e o laço continua até o timeout.
+            // (Achado 1 da revisão pós-merge da PR #172) Se o poll do destino FALHOU (transporte), NÃO
+            // consulta a origem nem aborta por erro dela nesta iteração: o destino segura o lock da
+            // série durante o commit (fsync) e o mesmo lock atende MIGRATE_STATUS, então um timeout de
+            // transporte no poll do destino bem na iteração em que a origem já expirou é o caso comum,
+            // não o raro — abortar aqui podia contradizer um COMMITTED que o destino já tem, só ainda
+            // não confirmado a este líder. O laço apenas continua; o próximo poll do destino tenta de
+            // novo, respeitando o migrationTimeout.
             if (clock.millis() >= deadline) {
+                // Antes de desistir, reconsulta o destino uma última vez: um COMMITTED aqui ainda vence
+                // sobre o timeout, pelo mesmo motivo do parágrafo acima.
+                MigrateResponse finalPoll = pollStatusQuietly(dst, seriesKey, migrationId);
+                if (finalPoll != null && finalPoll.status() == MigrateStatus.COMMITTED) {
+                    return complete(seriesKey, migratingPlacement, src, dst, migrationId, finalPoll.bytes(),
+                            startedAt);
+                }
                 return abort(seriesKey, migratingPlacement, src, dst,
                         "timeout (" + migrationTimeout + ") aguardando COMMITTED no destino " + dst, startedAt);
             }
