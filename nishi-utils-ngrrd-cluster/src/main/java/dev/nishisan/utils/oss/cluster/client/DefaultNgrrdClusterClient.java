@@ -320,8 +320,9 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
                 if (existing != null && existing.isOpen()) {
                     return existing;
                 }
-                // openNewHandle publica o handle em handles (dentro de resetSeries), só se o OPEN der certo.
-                return openNewHandle(seriesKey, yaml, tags, options);
+                RemoteSeriesHandle handle = openNewHandle(seriesKey, yaml, tags, options);
+                handles.put(seriesKey, handle);
+                return handle;
             }
         } finally {
             openLocks.remove(seriesKey, lock);
@@ -370,7 +371,7 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
                 Clock.systemUTC(), handles::remove, dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor.from(
                         new dev.nishisan.utils.oss.format.SeriesGeometry(
                                 dev.nishisan.utils.oss.config.NgrrdYamlLoader.parse(yaml, System::getenv))));
-        handle.open(opened -> handles.put(seriesKey, opened));
+        handle.open();
         return handle;
     }
 

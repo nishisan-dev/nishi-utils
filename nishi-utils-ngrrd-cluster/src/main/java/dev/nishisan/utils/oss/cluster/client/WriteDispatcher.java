@@ -18,7 +18,6 @@
 package dev.nishisan.utils.oss.cluster.client;
 
 import dev.nishisan.utils.ngrid.common.NodeId;
-import dev.nishisan.utils.oss.api.SeriesNotFoundException;
 import dev.nishisan.utils.oss.cluster.api.ClientMetricsSnapshot;
 import dev.nishisan.utils.oss.cluster.api.ErrorCode;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterConfig;
@@ -76,20 +75,6 @@ import java.util.stream.Collectors;
  * ({@code maxBufferedSamplesPerNode}); ao encher, {@link #enqueue} bloqueia
  * ({@link NgrrdClusterConfig.BufferFullPolicy#BLOCK}) ou lança
  * {@link ErrorCode#BUFFER_FULL} ({@link NgrrdClusterConfig.BufferFullPolicy#FAIL}).</p>
- *
- * <p>Série confirmada inexistente ({@link #failSeries}, ou o reopener lançando
- * {@link SeriesNotFoundException}): a rota da chave fica marcada — admissões recusadas com
- * {@link SeriesNotFoundException}, pendências falhadas sem reabrir nem retentar — até um handle novo da
- * mesma chave abrir ({@link #resetSeries}, que troca a rota marcada por uma nova). Cada escrita
- * enfileirada carrega a rota que a admitiu e é concluída nela, de modo que a marca de uma geração da
- * série nunca alcança as escritas da seguinte.</p>
- *
- * <p>Uma rota não marcada nunca é trocada: todas as escritas válidas da chave, de qualquer handle,
- * compartilham a mesma rota e a mesma ordem FIFO (toda a proteção de ordem — reenfileiramento na frente,
- * reposicionamento por {@code WRONG_OWNER} com o backlog junto — é por rota). A abertura de um handle
- * novo publica o handle e, depois, avança a geração da rota ({@link SeriesRoute#generation}), as duas
- * coisas sob o lock da rota; uma reabertura assíncrona que descobre {@link SeriesNotFoundException} só
- * marca a rota se nenhum handle novo tiver aberto a chave enquanto ela estava em voo.</p>
  */
 public final class WriteDispatcher implements WriteBuffer, Closeable {
 
@@ -147,8 +132,6 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     /** Marca de tempo do último log de retry por série, para o rate limit de {@link #logRetryRateLimited}. */
     private final ConcurrentMap<String, Long> lastRetryLogMs = new ConcurrentHashMap<>();
     private static final long RETRY_LOG_INTERVAL_MS = 10_000L;
-    /** {@link #failRoute} sem conferência de geração (marcação síncrona pelo handle, via {@link #failSeries}). */
-    private static final long ANY_GENERATION = -1L;
 
     public WriteDispatcher(ClusterRpc rpc, PlacementLookup placementLookup, RetryPolicy retryPolicy,
             int batchMaxSamples, Duration batchMaxDelay, long maxBufferedSamplesPerNode,
@@ -225,28 +208,16 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     public void enqueue(String ownerNodeId, SeriesWrite write) {
         Objects.requireNonNull(ownerNodeId, "ownerNodeId");
         Objects.requireNonNull(write, "write");
+        SeriesRoute route = routes.computeIfAbsent(write.seriesKey(), key -> new SeriesRoute(ownerNodeId));
         for (;;) {
-            SeriesRoute route = routes.computeIfAbsent(write.seriesKey(), key -> new SeriesRoute(ownerNodeId));
             NodeBuffer buf;
             String owner;
             boolean accepted = false;
             boolean triggerFlush = false;
             route.lock.lock();
             try {
-                // resetSeries troca a entrada de routes por uma instância nova enquanto detém o MESMO
-                // lock que acabamos de conseguir — se perdemos essa corrida, a rota que travamos já foi
-                // aposentada (marcada inexistente, de um handle anterior): solta e tenta de novo, para
-                // cair na rota atual em vez de ser recusada pela marca dela.
-                if (routes.get(write.seriesKey()) != route) {
-                    continue;
-                }
                 if (closed) {
                     throw new NgrrdClusterException(ErrorCode.CLOSED, "dispatcher fechado");
-                }
-                // Série confirmada inexistente: recusa na hora, sem admitir. Uma escrita admitida aqui
-                // receberia NOT_OPEN sem handle algum para reabrir e ficaria em retentativa para sempre.
-                if (route.notFound) {
-                    throw new SeriesNotFoundException(write.seriesKey());
                 }
                 // The caller may have read RemoteSeriesHandle.owner before a concurrent redirect.
                 // Every admission uses the same route as the backlog, under the series lock.
@@ -255,7 +226,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 buf.lock.lock();
                 try {
                     if (buf.queue.size() < maxBufferedSamplesPerNode) {
-                        buf.queue.addLast(new PendingWrite(route, write));
+                        buf.queue.addLast(write);
                         if (route.submitted == route.completed && route.firstFailedSequence == Long.MAX_VALUE) {
                             synchronized (pendingLock) {
                                 pendingRoutes.add(route);
@@ -376,9 +347,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                         throw new NgrrdClusterException(ErrorCode.TIMEOUT,
                                 "escritas anteriores ao flush não confirmadas dentro de " + maxWait);
                     }
-                    if (route.owner != null) {
-                        scheduleFlush(route.owner, buffers.get(route.owner));
-                    }
+                    scheduleFlush(route.owner, buffers.get(route.owner));
                     // ACK/error signals wake waiters immediately. Keep a bounded retry
                     // fallback for transport backoff/rerouting when no final ACK exists yet.
                     // await releases route.lock atomically, so an ACK cannot be missed.
@@ -566,7 +535,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             if (clock.millis() < buf.backoffUntilMs) {
                 return;
             }
-            List<PendingWrite> batch = takeBatch(buf);
+            List<SeriesWrite> batch = takeBatch(buf);
             if (batch.isEmpty()) {
                 return;
             }
@@ -574,18 +543,18 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         }
     }
 
-    private List<PendingWrite> takeBatch(NodeBuffer buf) {
+    private List<SeriesWrite> takeBatch(NodeBuffer buf) {
         buf.lock.lock();
         try {
             int n = Math.min(batchMaxSamples, buf.queue.size());
             if (n == 0) {
                 return List.of();
             }
-            List<PendingWrite> batch = new ArrayList<>(n);
+            List<SeriesWrite> batch = new ArrayList<>(n);
             for (int i = 0; i < n; i++) {
-                PendingWrite pending = buf.queue.pollFirst(clock.millis());
-                if (pending == null) { break; }
-                batch.add(pending);
+                SeriesWrite write = buf.queue.pollFirst(clock.millis());
+                if (write == null) { break; }
+                batch.add(write);
             }
             buf.notFull.signalAll();
             return batch;
@@ -594,18 +563,13 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         }
     }
 
-    private void sendBatch(String owner, NodeBuffer buf, List<PendingWrite> batch) {
-        List<SeriesWrite> writes = new ArrayList<>(batch.size());
-        for (PendingWrite pending : batch) {
-            writes.add(pending.write());
-        }
+    private void sendBatch(String owner, NodeBuffer buf, List<SeriesWrite> batch) {
         WriteBatchResponse response;
         try {
-            response = rpc.call(NodeId.of(owner), Commands.WRITE_BATCH, new WriteBatchRequest(writes),
+            response = rpc.call(NodeId.of(owner), Commands.WRITE_BATCH, new WriteBatchRequest(batch),
                     WriteBatchResponse.class);
         } catch (NgrrdClusterException e) {
             requeueFront(buf, batch);
-            failMarkedRoutesIn(buf, batch);
             buf.backoffUntilMs = clock.millis() + retryPolicy.backoffFor(buf.nextBackoffAttempt()).toMillis();
             LOGGER.log(Level.WARNING, "Falha de transporte ao enviar WRITE_BATCH para " + owner, e);
             return;
@@ -613,77 +577,52 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         batchesSentCount.increment();
         buf.resetBackoffAttempts();
 
-        // Agrupa por rota, não só por chave: escritas da mesma série podem pertencer a gerações
-        // diferentes (a rota marcada inexistente de um handle antigo e a rota nova de um handle
-        // reaberto) e cada uma é concluída na rota que a admitiu.
-        Map<SeriesRoute, List<PendingWrite>> byRoute = new LinkedHashMap<>();
-        for (PendingWrite pending : batch) {
-            byRoute.computeIfAbsent(pending.route(), ignored -> new ArrayList<>()).add(pending);
-        }
-        for (Map.Entry<SeriesRoute, List<PendingWrite>> entry : byRoute.entrySet()) {
+        Map<String, List<SeriesWrite>> bySeries = batch.stream()
+                .collect(Collectors.groupingBy(SeriesWrite::seriesKey, LinkedHashMap::new, Collectors.toList()));
+        for (Map.Entry<String, List<SeriesWrite>> entry : bySeries.entrySet()) {
             applyStatus(owner, buf, entry.getKey(), entry.getValue(), response);
         }
     }
 
-    private void applyStatus(String owner, NodeBuffer buf, SeriesRoute route, List<PendingWrite> pendings,
+    private void applyStatus(String owner, NodeBuffer buf, String seriesKey, List<SeriesWrite> writes,
             WriteBatchResponse response) {
-        String seriesKey = pendings.getFirst().write().seriesKey();
         SeriesStatus status = response.statusBySeries().getOrDefault(seriesKey, SeriesStatus.ERROR);
-        if (status != SeriesStatus.OK && route.notFound) {
-            // Série confirmada inexistente enquanto este lote estava em voo: qualquer resposta que não
-            // seja OK encerra as escritas como falha — reabrir, reenfileirar ou mover só levaria a uma
-            // retentativa sem fim (não há handle para reabrir uma série que não existe).
-            LOGGER.log(Level.FINE, () -> "WRITE_BATCH respondeu " + status + " para " + seriesKey
-                    + " (marcada inexistente) — " + pendings.size() + " escrita(s) falhada(s)");
-            failWrites(route, seriesKey, pendings.size());
-            return;
-        }
         switch (status) {
             case OK -> {
                 buf.lock.lock();
                 try { buf.queue.succeeded(seriesKey); }
                 finally { buf.lock.unlock(); }
-                samplesSentCount.add(pendings.size());
-                completeWrites(route, pendings.size(), null);
+                samplesSentCount.add(writes.size());
+                completeWrites(seriesKey, writes.size(), null);
             }
             case WRONG_OWNER -> {
                 recordRetry(SeriesStatus.WRONG_OWNER);
                 String newOwner = response.ownerBySeries().get(seriesKey);
                 if (newOwner != null) {
                     logRetryRateLimited(seriesKey, SeriesStatus.WRONG_OWNER, "novo dono informado: " + newOwner);
-                    boolean moved = false;
+                    SeriesRoute route = routes.get(seriesKey);
                     route.lock.lock();
                     try {
-                        // A marca é conferida sob o MESMO lock que failRoute usa para marcar e para
-                        // fotografar destinations: ou a marca vem antes e nada é movido, ou o movimento
-                        // vem antes e o dono novo já está em destinations quando failRoute extrai.
-                        if (!route.notFound) {
-                            List<PendingWrite> reordered = new ArrayList<>(pendings);
-                            if (!newOwner.equals(owner)) {
-                                reordered.addAll(extractSeriesFrom(buf, seriesKey, route));
-                            }
-                            // Publish the new route only after its older writes are queued. New
-                            // admissions (including callers with a stale owner) cannot overtake them.
-                            NodeBuffer target = buffers.computeIfAbsent(newOwner, id -> new NodeBuffer());
-                            target.lock.lock();
-                            try {
-                                requeueFront(target, reordered);
-                                if (!newOwner.equals(owner)) {
-                                    target.queue.defer(seriesKey, clock.millis() + retryPolicy.backoffMin().toMillis());
-                                }
-                            } finally { target.lock.unlock(); }
-                            route.owner = newOwner;
-                            route.destinations.add(newOwner);
-                            placementLookup.noteOwner(seriesKey, newOwner);
-                            ownerChanged.accept(seriesKey, newOwner);
-                            moved = true;
+                        List<SeriesWrite> reordered = new ArrayList<>(writes);
+                        if (!newOwner.equals(owner)) {
+                            reordered.addAll(extractSeriesFrom(buf, seriesKey));
                         }
+                        // Publish the new route only after its older writes are queued. New
+                        // admissions (including callers with a stale owner) cannot overtake them.
+                        NodeBuffer target = buffers.computeIfAbsent(newOwner, id -> new NodeBuffer());
+                        target.lock.lock();
+                        try {
+                            requeueFront(target, reordered);
+                            if (!newOwner.equals(owner)) {
+                                target.queue.defer(seriesKey, clock.millis() + retryPolicy.backoffMin().toMillis());
+                            }
+                        } finally { target.lock.unlock(); }
+                        route.owner = newOwner;
+                        route.destinations.add(newOwner);
+                        placementLookup.noteOwner(seriesKey, newOwner);
+                        ownerChanged.accept(seriesKey, newOwner);
                     } finally {
                         route.lock.unlock();
-                    }
-                    if (!moved) {
-                        failWrites(route, seriesKey, pendings.size());
-                        return;
                     }
                     if (!newOwner.equals(owner)) {
                         // O dono novo tem seu próprio NodeBuffer, fora do drainLoop atual (que só itera
@@ -705,37 +644,32 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                     logRetryRateLimited(seriesKey, SeriesStatus.WRONG_OWNER,
                             "dono desconhecido — invalidando placement e reabrindo");
                     placementLookup.invalidate(seriesKey);
-                    reopenAsync(owner, buf, route, seriesKey, pendings);
+                    reopenAsync(owner, buf, seriesKey, writes);
                 }
             }
             case NOT_OPEN -> {
                 recordRetry(SeriesStatus.NOT_OPEN);
                 logRetryRateLimited(seriesKey, SeriesStatus.NOT_OPEN, "reabrindo via reopener");
-                reopenAsync(owner, buf, route, seriesKey, pendings);
+                reopenAsync(owner, buf, seriesKey, writes);
             }
             case MIGRATING -> {
                 recordRetry(SeriesStatus.MIGRATING);
                 logRetryRateLimited(seriesKey, SeriesStatus.MIGRATING, "aguardando fim da migração");
-                requeueFrontAt(owner, pendings);
+                requeueFrontAt(owner, writes);
                 deferSeries(buf, seriesKey, -1);
-                // Marcada entre a checagem acima e o reenfileiramento: failRoute pode ter extraído o
-                // buffer antes destas escritas voltarem — recolhe-as aqui.
-                if (route.notFound) {
-                    failPendingIn(buf, route, seriesKey);
-                }
             }
             case ERROR -> {
                 recordRetry(SeriesStatus.ERROR);
-                samplesFailedCount.add(pendings.size());
-                completeWrites(route, pendings.size(), "WRITE_BATCH falhou para " + seriesKey + ": "
+                samplesFailedCount.add(writes.size());
+                completeWrites(seriesKey, writes.size(), "WRITE_BATCH falhou para " + seriesKey + ": "
                         + response.errorBySeries().get(seriesKey));
                 LOGGER.warning("WRITE_BATCH respondeu ERROR para " + seriesKey + ": "
                         + response.errorBySeries().get(seriesKey));
             }
             default -> {
                 recordRetry(status);
-                samplesFailedCount.add(pendings.size());
-                completeWrites(route, pendings.size(), "WRITE_BATCH respondeu " + status + " para " + seriesKey);
+                samplesFailedCount.add(writes.size());
+                completeWrites(seriesKey, writes.size(), "WRITE_BATCH respondeu " + status + " para " + seriesKey);
                 LOGGER.warning("WRITE_BATCH respondeu status inesperado " + status + " para " + seriesKey);
             }
         }
@@ -743,10 +677,8 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
 
     // FIFO admission/rerouting ensures completions form a prefix of each series. A failed
     // prefix remains observable: a later checkpoint cannot certify those lost samples.
-    //
-    // A rota é sempre a que admitiu as escritas (carregada em PendingWrite), nunca routes.get(chave):
-    // depois de um resetSeries, a chave aponta para a rota de outra geração.
-    private void completeWrites(SeriesRoute route, int count, String failure) {
+    private void completeWrites(String seriesKey, int count, String failure) {
+        SeriesRoute route = routes.get(seriesKey);
         route.lock.lock();
         try {
             if (failure != null && route.firstFailedSequence == Long.MAX_VALUE) {
@@ -754,17 +686,13 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 route.failureMessage = failure;
             }
             route.completed += count;
-            // Failed routes stay indexed: subsequent successful writes cannot erase
-            // an earlier failure and allow a Kafka commit to certify a lost prefix.
-            // Exceção: rota marcada inexistente sai do índice quando nada mais está em voo — ninguém
-            // mais admite nela, quem já esperava recebe a falha pelo signalAll abaixo, e mantê-la
-            // envenenaria flushAll para sempre.
-            if (route.completed == route.submitted
-                    && (route.firstFailedSequence == Long.MAX_VALUE || route.notFound)) {
+            if (route.completed == route.submitted && route.firstFailedSequence == Long.MAX_VALUE) {
                 synchronized (pendingLock) {
                     pendingRoutes.remove(route);
                 }
             }
+            // Failed routes stay indexed: subsequent successful writes cannot erase
+            // an earlier failure and allow a Kafka commit to certify a lost prefix.
             route.progress.signalAll();
         } finally {
             route.lock.unlock();
@@ -775,11 +703,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         // Shutdown also synchronizes with an admission that passed the closed check
         // but has not entered the pending index yet. Keep the history scan off the
         // hot path, here only, so close cannot overlook that in-progress admission.
-        // O índice de pendências cobre as rotas marcadas já trocadas por resetSeries que ainda têm
-        // escritas em voo, que já não estão em routes.
-        List<SeriesRoute> candidates = new ArrayList<>(routes.values());
-        candidates.addAll(snapshotPendingRoutes());
-        for (SeriesRoute route : candidates) {
+        for (SeriesRoute route : routes.values()) {
             route.lock.lock();
             try {
                 if (route.submitted > route.completed) {
@@ -792,14 +716,14 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         return false;
     }
 
-    private void requeueFront(NodeBuffer buf, List<PendingWrite> pendings) {
-        if (pendings.isEmpty()) {
+    private void requeueFront(NodeBuffer buf, List<SeriesWrite> writes) {
+        if (writes.isEmpty()) {
             return;
         }
         buf.lock.lock();
         try {
-            for (int i = pendings.size() - 1; i >= 0; i--) {
-                buf.queue.addFirst(pendings.get(i));
+            for (int i = writes.size() - 1; i >= 0; i--) {
+                buf.queue.addFirst(writes.get(i));
             }
         } finally {
             buf.lock.unlock();
@@ -807,17 +731,15 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     }
 
     /**
-     * Remove de {@code buf}, na ordem em que estão, as escritas de
-     * {@code seriesKey} admitidas por {@code route} ainda enfileiradas — usado ao rerotear uma série
-     * por {@code WRONG_OWNER} para levar junto qualquer backlog da MESMA série que ainda estivesse atrás
-     * na fila do dono antigo, em vez de deixá-lo ser enviado depois ao dono errado, e ao falhar as
-     * pendências de uma rota marcada inexistente. Escritas da mesma chave admitidas por outra rota
-     * (outra geração da série) ficam onde estão.
+     * B4 (achado do Refuter): remove de {@code buf}, na ordem em que estão, TODAS as escritas de
+     * {@code seriesKey} ainda enfileiradas — usado ao rerotear uma série por {@code WRONG_OWNER} para
+     * levar junto qualquer backlog da MESMA série que ainda estivesse atrás na fila do dono antigo, em
+     * vez de deixá-lo ser enviado depois ao dono errado.
      */
-    private static List<PendingWrite> extractSeriesFrom(NodeBuffer buf, String seriesKey, SeriesRoute route) {
+    private static List<SeriesWrite> extractSeriesFrom(NodeBuffer buf, String seriesKey) {
         buf.lock.lock();
         try {
-            List<PendingWrite> extracted = buf.queue.extract(seriesKey, route);
+            List<SeriesWrite> extracted = buf.queue.extract(seriesKey);
             if (!extracted.isEmpty()) {
                 buf.notFull.signalAll();
             }
@@ -827,12 +749,12 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         }
     }
 
-    private void requeueFrontAt(String ownerNodeId, List<PendingWrite> pendings) {
-        if (pendings.isEmpty()) {
+    private void requeueFrontAt(String ownerNodeId, List<SeriesWrite> writes) {
+        if (writes.isEmpty()) {
             return;
         }
         NodeBuffer target = buffers.computeIfAbsent(ownerNodeId, id -> new NodeBuffer());
-        requeueFront(target, pendings);
+        requeueFront(target, writes);
     }
 
     // Only this series waits. Node-wide backoff is reserved for transport failures.
@@ -845,235 +767,24 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         } finally { buf.lock.unlock(); }
     }
 
-    private void reopenAsync(String owner, NodeBuffer buf, SeriesRoute route, String key,
-            List<PendingWrite> pendings) {
+    private void reopenAsync(String owner, NodeBuffer buf, String key, List<SeriesWrite> writes) {
         buf.lock.lock();
         try {
-            for (int i = pendings.size() - 1; i >= 0; i--) { buf.queue.addFirst(pendings.get(i)); }
+            for (int i = writes.size() - 1; i >= 0; i--) { buf.queue.addFirst(writes.get(i)); }
             buf.queue.defer(key, Long.MAX_VALUE);
         } finally { buf.lock.unlock(); }
         try {
             recoveryPool.execute(() -> {
-                // Marcada depois da checagem de applyStatus (ex.: por um read/checkpoint síncrono do
-                // handle): o reopener não acharia handle algum e devolveria false para sempre.
-                if (route.notFound) {
-                    settleMarkedRoute(owner, buf, route, key);
-                    return;
+                boolean opened = false;
+                try { opened = Boolean.TRUE.equals(reopener.apply(key)); }
+                catch (RuntimeException e) { LOGGER.log(Level.FINE, "Reabertura pendente de " + key, e); }
+                finally {
+                    deferSeries(buf, key, opened ? 0 : -1);
+                    scheduleFlush(owner, buf);
                 }
-                // Capturada ANTES do reopener: se um handle novo abrir a chave enquanto a reabertura
-                // está em voo, a SeriesNotFoundException que ela trouxer é anterior a essa abertura.
-                long generation = route.generation;
-                boolean opened;
-                try {
-                    opened = Boolean.TRUE.equals(reopener.apply(key));
-                } catch (SeriesNotFoundException e) {
-                    // A série sumiu (createIfMissing=false) e nunca vai reabrir sozinha — diferente das
-                    // demais falhas de reabertura, deferSeries(-1) aqui adiaria para sempre. Marca a
-                    // rota destas escritas e falha tudo que está pendente nela em vez de retentar.
-                    if (failRoute(key, route, generation, e)) {
-                        settleMarkedRoute(owner, buf, route, key);
-                        return;
-                    }
-                    // Um handle novo abriu a chave (a série existe de novo) enquanto a reabertura estava
-                    // em voo: a descoberta ficou velha. Sem marcar, libera a pausa e retenta já — o
-                    // próximo NOT_OPEN leva o reopener ao handle novo.
-                    LOGGER.log(Level.FINE, () -> "Reabertura de " + key + " descobriu série inexistente, mas"
-                            + " um handle novo abriu a chave nesse meio tempo — retentando sem marcar");
-                    opened = true;
-                } catch (RuntimeException e) {
-                    LOGGER.log(Level.FINE, "Reabertura pendente de " + key, e);
-                    opened = false;
-                }
-                if (route.notFound) {
-                    settleMarkedRoute(owner, buf, route, key);
-                    return;
-                }
-                deferSeries(buf, key, opened ? 0 : -1);
-                scheduleFlush(owner, buf);
             });
         } catch (RejectedExecutionException closing) {
             deferSeries(buf, key, -1);
-        }
-    }
-
-    /**
-     * Encerra uma reabertura cuja rota está marcada inexistente: falha o que ainda estiver em
-     * {@code buf} para ela e desfaz a pausa da chave — escritas da mesma série admitidas pela rota de
-     * um handle novo podem estar atrás na fila e não podem ficar presas na pausa da reabertura antiga.
-     */
-    private void settleMarkedRoute(String owner, NodeBuffer buf, SeriesRoute route, String key) {
-        failPendingIn(buf, route, key);
-        deferSeries(buf, key, 0);
-        scheduleFlush(owner, buf);
-    }
-
-    /**
-     * Marca a série como confirmadamente inexistente ({@link SeriesNotFoundException} descoberta pelo
-     * {@link RemoteSeriesHandle} num caminho síncrono, depois de já ter parado de aceitar operações) e
-     * falha as escritas pendentes dela. A marca vale para a rota atual da chave — criada já marcada, se
-     * a série nunca teve escrita — e tem três efeitos:
-     * <ul>
-     *   <li>{@link #enqueue} passa a recusar na hora, com {@link SeriesNotFoundException}, qualquer
-     *       escrita da chave (inclusive a de um {@code write()} que passou pelo {@code ensureOpen()} do
-     *       handle antes da marcação);</li>
-     *   <li>as escritas ainda em buffer, em QUALQUER nó já associado à rota
-     *       ({@link SeriesRoute#destinations}), falham agora;</li>
-     *   <li>as escritas em voo (lote já enviado, RPC pendente) falham na resposta, seja ela qual for
-     *       exceto {@code OK} — sem reabrir, reenfileirar ou mover — e, concluída a última delas, a rota
-     *       sai de {@link #pendingRoutes}, liberando {@code flushAll()}.</li>
-     * </ul>
-     * A marca só é desfeita por {@link #resetSeries}, quando um handle novo da mesma chave abre com
-     * sucesso. Idempotente.
-     */
-    @Override
-    public void failSeries(String seriesKey, Throwable cause) {
-        failRoute(seriesKey, routes.computeIfAbsent(seriesKey, key -> new SeriesRoute(null)), ANY_GENERATION,
-                cause);
-    }
-
-    /**
-     * Registra a abertura de um handle novo de {@code seriesKey}, com dono {@code ownerNodeId} —
-     * {@code RemoteSeriesHandle.open()} chama isto quando um handle novo da mesma chave abre com
-     * sucesso. Sob o lock da rota da chave (criada agora, se ainda não existir; o mesmo lock que
-     * {@link #enqueue} confere antes de admitir e que {@link #failRoute} usa para marcar), nesta ordem:
-     * <ul>
-     *   <li>{@code publish} torna o handle novo visível (no cliente, ao reopener);</li>
-     *   <li>só depois a geração da rota avança ({@link SeriesRoute#generation}). Publica, depois avança
-     *       a geração: quem enxerga a geração nova já enxerga o handle novo. Uma reabertura assíncrona
-     *       em voo, que capturou a geração anterior, não marca mais a rota se descobrir
-     *       {@code NOT_FOUND} — a descoberta é anterior à abertura deste handle, e a série existe; e uma
-     *       reabertura que capture a geração nova chama o reopener com o handle novo já publicado, nunca
-     *       com o antigo;</li>
-     *   <li>rota não marcada: continua sendo a rota da chave, com as escritas em voo de handles
-     *       anteriores — as escritas do handle novo entram atrás delas, na mesma ordem FIFO. Duas rotas
-     *       válidas para a mesma série separariam escritas que precisam chegar ao dono em ordem. Sem
-     *       nada em voo, o dono da rota passa a ser {@code ownerNodeId} (evita um redirecionamento por
-     *       {@code WRONG_OWNER} na primeira escrita do handle novo);</li>
-     *   <li>rota marcada inexistente: troca por uma rota nova e limpa, com dono {@code ownerNodeId}.
-     *       Toda escrita posterior cai na rota nova e nunca herda a marca; as escritas da geração marcada
-     *       ainda em voo carregam a própria rota ({@link PendingWrite}) e são concluídas nela (falham na
-     *       resposta, salvo {@code OK}), e a rota antiga sai de {@link #pendingRoutes} ao concluir a
-     *       última delas.</li>
-     * </ul>
-     */
-    @Override
-    public void resetSeries(String seriesKey, String ownerNodeId, Runnable publish) {
-        Objects.requireNonNull(ownerNodeId, "ownerNodeId");
-        Objects.requireNonNull(publish, "publish");
-        for (;;) {
-            SeriesRoute route = routes.computeIfAbsent(seriesKey, key -> new SeriesRoute(ownerNodeId));
-            boolean replaced = false;
-            route.lock.lock();
-            try {
-                // Mesma reconferência de enqueue: a rota travada pode ter sido trocada nesse meio tempo.
-                if (routes.get(seriesKey) != route) {
-                    continue;
-                }
-                publish.run();
-                route.generation++;
-                if (route.notFound) {
-                    replaced = routes.replace(seriesKey, route, new SeriesRoute(ownerNodeId));
-                } else if (route.submitted == route.completed) {
-                    route.owner = ownerNodeId;
-                    route.destinations.add(ownerNodeId);
-                }
-            } finally {
-                route.lock.unlock();
-            }
-            if (replaced) {
-                retireIfDrained(route);
-            }
-            return;
-        }
-    }
-
-    /**
-     * Marca {@code route} (a rota de {@code key} cujas escritas estão sendo falhadas) e falha tudo que
-     * ela tem em buffer. A marca e a foto de {@code destinations} acontecem sob {@code route.lock}, o
-     * mesmo lock que o reposicionamento por {@code WRONG_OWNER} usa para mover escritas: nenhuma escrita
-     * escapa para um nó fora da foto. A extração de cada buffer acontece depois, sem {@code route.lock}.
-     *
-     * <p>{@code expectedGeneration} diferente de {@link #ANY_GENERATION}: só marca se a geração da rota
-     * ainda for essa, conferida sob o mesmo lock em que {@link #resetSeries} a avança — ou a marca vem
-     * antes da abertura do handle novo (que então troca a rota marcada), ou a abertura vem antes e nada
-     * é marcado. Devolve se a rota ficou marcada.</p>
-     */
-    private boolean failRoute(String key, SeriesRoute route, long expectedGeneration, Throwable cause) {
-        boolean firstMark;
-        Set<String> destinations;
-        route.lock.lock();
-        try {
-            if (expectedGeneration != ANY_GENERATION && route.generation != expectedGeneration) {
-                return false;
-            }
-            firstMark = !route.notFound;
-            route.notFound = true;
-            destinations = Set.copyOf(route.destinations);
-        } finally {
-            route.lock.unlock();
-        }
-        long lost = 0;
-        for (String ownerNodeId : destinations) {
-            NodeBuffer buf = buffers.get(ownerNodeId);
-            if (buf != null) {
-                lost += failPendingIn(buf, route, key);
-            }
-        }
-        retireIfDrained(route);
-        if (firstMark) {
-            LOGGER.log(Level.WARNING, "Série " + key + " confirmada inexistente — " + lost + " escrita(s) "
-                    + "pendente(s) descartada(s) do buffer; escritas em voo falham na resposta, sem novas "
-                    + "tentativas", cause);
-        }
-        return true;
-    }
-
-    /** Falha, via {@link #completeWrites}, toda escrita de {@code route} ainda em {@code buf}; devolve quantas. */
-    private long failPendingIn(NodeBuffer buf, SeriesRoute route, String key) {
-        List<PendingWrite> lost = extractSeriesFrom(buf, key, route);
-        if (lost.isEmpty()) {
-            return 0;
-        }
-        failWrites(route, key, lost.size());
-        return lost.size();
-    }
-
-    /**
-     * Conclui {@code count} escritas de {@code route} como falha de série inexistente. O contador
-     * {@link #samplesFailed()} só é atualizado depois de {@link #completeWrites} — quem observa o
-     * contador já encontra a rota fora de {@link #pendingRoutes} se nada mais estiver em voo.
-     */
-    private void failWrites(SeriesRoute route, String key, int count) {
-        completeWrites(route, count, "série inexistente: " + key);
-        samplesFailedCount.add(count);
-    }
-
-    /** Após falha de transporte, falha (em vez de reenviar) o que acabou de voltar para {@code buf} de rotas marcadas. */
-    private void failMarkedRoutesIn(NodeBuffer buf, List<PendingWrite> batch) {
-        Map<SeriesRoute, String> marked = new LinkedHashMap<>();
-        for (PendingWrite pending : batch) {
-            if (pending.route().notFound) {
-                marked.putIfAbsent(pending.route(), pending.write().seriesKey());
-            }
-        }
-        for (Map.Entry<SeriesRoute, String> entry : marked.entrySet()) {
-            failPendingIn(buf, entry.getKey(), entry.getValue());
-        }
-    }
-
-    /** Tira de {@link #pendingRoutes} uma rota marcada sem nada em voo (nenhuma admissão nova é possível nela). */
-    private void retireIfDrained(SeriesRoute route) {
-        boolean drained;
-        route.lock.lock();
-        try {
-            drained = route.submitted == route.completed;
-        } finally {
-            route.lock.unlock();
-        }
-        if (drained) {
-            synchronized (pendingLock) {
-                pendingRoutes.remove(route);
-            }
         }
     }
 
@@ -1132,42 +843,22 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     private static final class SeriesRoute {
         private final ReentrantLock lock = new ReentrantLock();
         private final Condition progress = lock.newCondition();
-        /** {@code null} só numa rota criada já marcada por {@link #failSeries}, que nunca admite escrita. */
         private String owner;
         private final Set<String> destinations = new HashSet<>();
         private long submitted;
         private long completed;
         private long firstFailedSequence = Long.MAX_VALUE;
         private String failureMessage;
-        /**
-         * Série confirmada inexistente (ver {@link #failSeries}). Escrito sob {@link #lock}; lido também
-         * fora dele nas decisões do caminho de resposta, que reconferem depois de devolver escritas a um
-         * buffer. Nunca volta a {@code false}: {@link #resetSeries} troca a rota inteira.
-         */
-        private volatile boolean notFound;
-        /**
-         * Quantos handles novos da chave abriram nesta rota ({@link #resetSeries}). Escrito só sob
-         * {@link #lock}; a reabertura assíncrona captura o valor sem o lock, antes do reopener (o lock
-         * pode estar com o reposicionamento por {@code WRONG_OWNER}, que chama o callback de troca de
-         * dono), e {@link #failRoute} só marca a rota se ele não tiver mudado, conferindo sob o lock.
-         */
-        private volatile long generation;
 
         SeriesRoute(String owner) {
             this.owner = owner;
-            if (owner != null) {
-                destinations.add(owner);
-            }
+            destinations.add(owner);
         }
-    }
-
-    /** Escrita enfileirada junto com a rota que a admitiu — é nela que a escrita é concluída. */
-    private record PendingWrite(SeriesRoute route, SeriesWrite write) {
     }
 
     /** All access is under NodeBuffer.lock. FIFO within a series; round-robin between ready series. */
     private static final class PendingWrites {
-        private final Map<String, ArrayDeque<PendingWrite>> series = new HashMap<>();
+        private final Map<String, ArrayDeque<SeriesWrite>> series = new HashMap<>();
         private final LinkedHashSet<String> ready = new LinkedHashSet<>();
         private final Map<String, Delay> paused = new HashMap<>();
         private final PriorityQueue<Delay> wakeups = new PriorityQueue<>(Comparator.comparingLong(Delay::until));
@@ -1177,16 +868,15 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
 
         int size() { return size; }
         boolean isEmpty() { return size == 0; }
-        void addLast(PendingWrite pending) { add(pending, false); }
-        void addFirst(PendingWrite pending) { add(pending, true); }
-        private void add(PendingWrite pending, boolean first) {
-            String key = pending.write().seriesKey();
-            var queue = series.computeIfAbsent(key, ignored -> new ArrayDeque<>());
-            if (first) { queue.addFirst(pending); } else { queue.addLast(pending); }
+        void addLast(SeriesWrite write) { add(write, false); }
+        void addFirst(SeriesWrite write) { add(write, true); }
+        private void add(SeriesWrite write, boolean first) {
+            var queue = series.computeIfAbsent(write.seriesKey(), ignored -> new ArrayDeque<>());
+            if (first) { queue.addFirst(write); } else { queue.addLast(write); }
             size++;
-            if (!paused.containsKey(key)) { ready.add(key); }
+            if (!paused.containsKey(write.seriesKey())) { ready.add(write.seriesKey()); }
         }
-        PendingWrite pollFirst(long now) {
+        SeriesWrite pollFirst(long now) {
             while (!wakeups.isEmpty() && wakeups.peek().until() <= now) {
                 Delay delay = wakeups.remove();
                 if (paused.remove(delay.key(), delay) && series.containsKey(delay.key())) {
@@ -1196,10 +886,10 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             if (ready.isEmpty()) { return null; }
             String key = ready.removeFirst();
             var queue = series.get(key);
-            PendingWrite pending = queue.removeFirst();
+            SeriesWrite write = queue.removeFirst();
             size--;
             if (queue.isEmpty()) { series.remove(key); } else { ready.add(key); }
-            return pending;
+            return write;
         }
         void defer(String key, long until) {
             Delay old = paused.put(key, new Delay(key, until));
@@ -1209,32 +899,15 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         }
         int nextAttempt(String key) { return attempts.merge(key, 1, Integer::sum); }
         void succeeded(String key) { attempts.remove(key); }
-        /**
-         * Remove, na ordem, as escritas de {@code key} admitidas por {@code route}; as de outra rota da
-         * mesma chave continuam na fila, com a pausa/estado de prontidão da chave intactos. Sem mais nada
-         * da chave na fila, todo o estado dela (pausa, prontidão, tentativas) é descartado.
-         */
-        List<PendingWrite> extract(String key, SeriesRoute route) {
-            var queue = series.get(key);
-            List<PendingWrite> extracted = new ArrayList<>();
-            if (queue != null) {
-                for (var it = queue.iterator(); it.hasNext(); ) {
-                    PendingWrite pending = it.next();
-                    if (pending.route() == route) {
-                        extracted.add(pending);
-                        it.remove();
-                    }
-                }
-                size -= extracted.size();
-            }
-            if (queue == null || queue.isEmpty()) {
-                series.remove(key);
-                ready.remove(key);
-                Delay delay = paused.remove(key);
-                if (delay != null) { wakeups.remove(delay); }
-                attempts.remove(key);
-            }
-            return extracted;
+        List<SeriesWrite> extract(String key) {
+            var queue = series.remove(key);
+            ready.remove(key);
+            Delay delay = paused.remove(key);
+            if (delay != null) { wakeups.remove(delay); }
+            attempts.remove(key);
+            if (queue == null) { return List.of(); }
+            size -= queue.size();
+            return new ArrayList<>(queue);
         }
         void clear() { series.clear(); ready.clear(); paused.clear(); wakeups.clear(); attempts.clear(); size = 0; }
     }

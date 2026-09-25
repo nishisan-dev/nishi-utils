@@ -53,33 +53,4 @@ public interface WriteBuffer {
     default void flushSeriesSync(String seriesKey, String ownerNodeId, Duration maxWait) {
         flushNodeSync(ownerNodeId, maxWait);
     }
-
-    /**
-     * Marca {@code seriesKey} como confirmadamente inexistente — chamado por {@link RemoteSeriesHandle}
-     * ao descobrir {@code SeriesNotFoundException} fora da reabertura assíncrona do dispatcher, ANTES de
-     * sair do mapa do cliente. Falha as escritas pendentes da série (em buffer agora; em voo, na
-     * resposta), recusa com {@code SeriesNotFoundException} qualquer {@link #enqueue} posterior da chave
-     * e nunca reabre nem retenta essas escritas: sem isto, uma escrita receberia {@code NOT_OPEN} mais
-     * tarde e o reopener, sem handle para a chave, devolveria {@code false} para sempre. A marca vale
-     * até {@link #resetSeries}. Idempotente. Implementações sem rastreamento por série (fakes de teste)
-     * podem ignorar.
-     */
-    default void failSeries(String seriesKey, Throwable cause) {
-    }
-
-    /**
-     * Chamado quando um handle NOVO de {@code seriesKey} abre com sucesso; {@code publish} torna esse
-     * handle visível (no cliente, o coloca no mapa de handles) e é executado aqui, exatamente uma vez.
-     * Publica, depois avança a geração da rota — as duas coisas atômicas em relação à marcação da rota:
-     * uma reabertura assíncrona que veja a geração nova já encontra o handle novo, e uma que tenha
-     * capturado a geração anterior e descubra a série inexistente não marca a rota (as escritas dela são
-     * retentadas). Se a chave estiver marcada por {@link #failSeries}, as escritas do handle novo passam
-     * a usar uma rota nova, sem a marca, com dono {@code ownerNodeId}; as escritas da rota marcada ainda
-     * em voo continuam sendo concluídas nela. Sem marca, a rota continua a mesma — escritas em voo de um
-     * handle anterior e as do novo seguem na mesma ordem FIFO. Implementações sem rastreamento por série
-     * só publicam.
-     */
-    default void resetSeries(String seriesKey, String ownerNodeId, Runnable publish) {
-        publish.run();
-    }
 }

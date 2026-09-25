@@ -174,7 +174,7 @@ class RemoteSeriesRetryBudgetTest {
         var handle = new RemoteSeriesHandle("series", "yaml", "hash", Map.of(), Ngrrd.OpenOptions.defaults(),
                 lookup, rpc, buffer, new RetryPolicy(Duration.ofMillis(100), Duration.ofMillis(1), Duration.ofMillis(2)),
                 Duration.ofSeconds(5), Duration.ofSeconds(5), clock, (key, handle2) -> { });
-        handle.open(h -> { });
+        handle.open();
         initialOpen = false;
         return handle;
     }
