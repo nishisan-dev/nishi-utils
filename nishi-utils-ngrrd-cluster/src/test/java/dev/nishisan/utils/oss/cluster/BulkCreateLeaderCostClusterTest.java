@@ -163,6 +163,7 @@ class BulkCreateLeaderCostClusterTest {
                     + " throughputPerSec=" + String.format(Locale.ROOT, "%.2f", throughputPerSecond)
                     + " openP50Us=" + openP50Us + " openP99Us=" + openP99Us + " openMaxUs=" + openMaxUs
                     + " placeCount=" + placeCount
+                    + " retriesByStatus=" + client.metrics().retriesByStatus()
                     + " leaderConfirmations=" + leaderConfirmations
                     + " leaderConfirmationsPerSeries=" + String.format(Locale.ROOT, "%.4f", leaderConfirmationsPerSeries)
                     + " leaderConfirmationLatencyByNode=[" + perNodeConfirmationLatency + "]");

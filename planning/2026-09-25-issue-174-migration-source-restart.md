@@ -139,3 +139,24 @@ Sempre com `JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64`:
 - `mvn -pl nishi-utils-ngrrd-cluster verify -Pngrrd-cluster` (inclui reinício da origem e a medição;
   rodar a medição também no worktree em `a3f8e1a` para A/B).
 - `mvn test` no raiz para garantir que nada fora do módulo quebrou.
+
+## Execução (registro)
+
+Desvios em relação ao plano, todos decorrentes da revisão adversarial:
+
+- A varredura de marcas de série esquecida roda no fim do ciclo do `LocalReconciler` (e não no
+  `tick()` do `NodeStatusReporter`), lendo a réplica local por chave na hora
+  (`CatalogView.placementLocal`, novo método `default`). O reconciliador já cruza estado local ×
+  catálogo e dispensa nova injeção de dependência.
+- `ownership()` decidido pelo líder (réplica vazia, hint, série esquecida) passou a responder
+  `MIGRATING` para placement em migração com dono = este nó, fora da cópia online — mesmo
+  critério da réplica local (achado BAIXO-1, anterior a esta issue).
+- `reopenIfKnown` lê a definição em cache sob o lock da entrada (achado BAIXO-4, anterior).
+- `ReconcileReport` ganhou `forgottenPruned`; construtores antigos de `ReconcileReport`,
+  `StorageHandlerMetrics` e `NodeMetricsSnapshot` mantidos.
+
+Medição (detalhes em `doc/oss/ngrrd-cluster-operacao.md`, seção "Confirmação do dono antes de
+criar"): 0,34–0,36 confirmação por série nova, ≈ 97 % delas no próprio líder (leitura local);
+50–110 RPCs extras por 5 000 séries nos storages não líderes. Sem diferença mensurável no tempo
+de criação em massa: a variância (modo lento de 40–60 s em 2–3 de cada 8 execuções, nos dois
+lados) vem do `fsync` da pré-alocação, confirmado por dump de threads durante o episódio.

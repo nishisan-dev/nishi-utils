@@ -1,5 +1,5 @@
 @startuml ngrrd_cluster_sequence_write
-title ngrrd Cluster — open, write, checkpoint e read (caminho feliz + WRONG_OWNER/NOT_OPEN)
+title ngrrd Cluster — open, write, checkpoint e read (caminho feliz, WRONG_OWNER, origem reiniciada e NOT_OPEN)
 
 skinparam shadowing false
 
@@ -18,7 +18,15 @@ leader -> leader : LeastLoadedPlacementPolicy.choose(ctx)
 leader --> resolver : SeriesPlacement(owner=dono, ACTIVE)
 resolver --> handle : owner = dono
 handle -> owner : ngrrd.open(seriesKey, yaml, tags, placement)
-owner -> owner : ownership check\n(placement.owner==self OU hint do líder)
+owner -> owner : ownership check\n(réplica local; vazia → placementStrong com o hint)
+alt série fechada e objeto ausente no volume, dono decidido só pela réplica local
+  owner -> leader : placementStrong(seriesKey)
+  note right of owner
+    issue #174: mesma assinatura de série recém-colocada
+    e de origem de migração reiniciada com réplica atrasada
+  end note
+  leader --> owner : ACTIVE(self)
+end
 owner -> vol : Ngrrd.open(volume, locator, yaml)
 owner --> handle : OK
 
@@ -49,6 +57,15 @@ owner --> handle : WRONG_OWNER(newOwner)
 handle -> resolver : noteOwner(seriesKey, newOwner)
 handle -> handle : ownerChanged(newOwner)\n(reroteia o backlog, preserva ordem)
 handle -> owner : ngrrd.writeBatch([...]) (agora no novo dono)
+
+== Origem de migração reiniciada com a réplica local atrasada (issue #174) ==
+handle -> owner : ngrrd.open(seriesKey, yaml, createIfMissing=true)
+owner -> owner : réplica local ainda ACTIVE(self),\nobjeto já apagado pelo migrate.finish
+owner -> leader : placementStrong(seriesKey)
+leader --> owner : ACTIVE(newOwner)
+owner --> handle : WRONG_OWNER(newOwner) (nada é criado)
+handle -> resolver : noteOwner(seriesKey, newOwner)
+handle -> owner : ngrrd.open(...) (agora no novo dono)
 
 == Handle expirou por ociosidade no dono (NOT_OPEN) ==
 handle -> owner : ngrrd.checkpoint(seriesKey)

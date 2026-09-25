@@ -7,7 +7,8 @@
 ## 2026-09-25 — Consultar existência e abrir sem criar — release 8.6.0
 
 Atende a [issue #171](https://github.com/nishisan-dev/nishi-utils/issues/171), nos dois modos do
-ngrrd (local e cluster). **Inclui as correções da 8.5.1** (rebalance com ingestão contínua, ver
+ngrrd (local e cluster), e a [issue #174](https://github.com/nishisan-dev/nishi-utils/issues/174)
+(origem de migração reiniciada recriando a série vazia). **Inclui as correções da 8.5.1** (rebalance com ingestão contínua, ver
 seção abaixo) — a 8.5.1 não teve release/tag própria; ela é publicada junto com esta versão.
 
 - `Ngrrd.OpenOptions.withCreateIfMissing(false)` (novo campo `createIfMissing`, default `true`)
@@ -77,9 +78,32 @@ seção abaixo) — a 8.5.1 não teve release/tag própria; ela é publicada jun
   - `PLACE` de séries novas aguarda `placementGraceAfterLeadership` (3 s por padrão) depois que
     o primeiro líder do boot assume, porque a janela de graça agora também se abre nesse
     mandato — a criação das primeiras séries logo após subir o cluster atrasa até esse prazo.
+- **Issue #174 — origem de migração reiniciada não recria mais a série vazia.** Um `OPEN` com
+  criação (padrão da ingestão) de uma série fechada, sem objeto no volume e com o dono decidido só
+  pela réplica local do catálogo, agora confirma o dono no líder (`placementStrong`) antes de
+  criar: outro dono → `WRONG_OWNER(dono)`, `MIGRATING` → `MIGRATING`, sem placement →
+  `WRONG_OWNER` sem dono, falha da consulta → `ERROR`. Antes, a origem reiniciada logo após o
+  `migrate.finish` com a réplica ainda em `ACTIVE(origem)` recriava a série vazia, e as escritas
+  dessa janela se perdiam quando o `LocalReconciler` apagava a órfã. Custo: a criação de uma série
+  nova paga até uma leitura forte no líder além do `PLACE` (nada a mais quando a réplica do dono
+  ainda não recebeu o placement) — medição em `doc/oss/ngrrd-cluster-operacao.md`.
+- A decisão de dono tomada pelo líder no storage (réplica local vazia, hint do cliente ou série
+  esquecida) passa a responder `MIGRATING` quando o placement forte está em migração com dono =
+  este nó, salvo durante a cópia online da própria origem — antes respondia `OK` e a série podia
+  ser aberta ou escrita durante a troca de dono.
+- Marcas por série em memória no storage passam a ter limite (issue #174): a marca de série
+  esquecida da origem de uma migração é descartada quando a réplica local já mostra outro dono
+  (na requisição ou no ciclo do `LocalReconciler`); o `CLOSE` explícito do cliente não guarda mais
+  marca — descarta a definição em cache, o que também passa a bloquear a reabertura automática de
+  uma série cujo handle já tinha sido fechado por ociosidade antes do `CLOSE`.
+- Novas métricas `leaderConfirmations`/`leaderConfirmationLatency` em `NodeMetricsSnapshot` e
+  `StorageRequestHandler.StorageHandlerMetrics` (também na linha `NGRRD_NODE_STATUS`) e
+  `forgottenPruned` em `LocalReconciler.ReconcileReport` (linha `NGRRD_RECONCILE`); os
+  construtores com a assinatura anterior continuam disponíveis e zeram os campos novos.
 - Documentação: `doc/oss/ngrrd.md` (modo local), `doc/oss/ngrrd-cluster.md` (contrato de
-  consistência, cache de handles, reconciliação de catálogo externo) e
-  `doc/oss/ngrrd-cluster-operacao.md` (ordem de atualização — storages antes dos clientes).
+  consistência, cache de handles, reconciliação de catálogo externo, origem após o `finish`) e
+  `doc/oss/ngrrd-cluster-operacao.md` (ordem de atualização — storages antes dos clientes;
+  confirmação do dono antes de criar e seu custo).
 
 ## 2026-09-25 — Correções no rebalance com ingestão contínua — release 8.5.1 (não publicada — incorporada na 8.6.0)
 

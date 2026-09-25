@@ -433,7 +433,9 @@ Mapa `seriesKey → NgrrdHandle` aberto localmente via `Ngrrd.open(volume, locat
 Fecha handles ociosos após `handleIdleTtl` (LRU) e limita `maxOpenHandles`. Toda operação passa por
 `withHandle`, que serializa contra fechamento concorrente; `withHandleSelfHealing` tenta
 `reopenIfKnown` antes de devolver `NOT_OPEN` — mas **não** reabre uma série fechada por `CLOSE`
-explícito do cliente (`closedByClient` distingue os dois casos). Migração de uma série faz
+explícito do cliente: o `CLOSE` descarta a definição em cache da série (mesmo que o handle já
+tenha sido fechado por ociosidade), e sem ela `reopenIfKnown` não reabre; só um novo `open` a
+devolve. Nenhuma marca por série fechada fica em memória. Migração de uma série faz
 `checkpoint` + `close` do handle local e marca a série `MIGRATING` (rejeita writes locais nesse
 meio-tempo).
 
@@ -546,6 +548,15 @@ ACTIVE(src) --[migrate()]--> catálogo := MIGRATING(owner=src, target=dst)
   confirmada, nunca antes.
 - **`finish` perdido:** a cópia órfã na origem é apagada pelo `LocalReconciler` dela, seguindo as
   salvaguardas da seção 6.4.
+- **Origem depois do `finish`:** a origem marca a série como esquecida (`forget`: solta o handle,
+  descarta a definição em cache) e apaga a cópia local. Enquanto a réplica local do catálogo dela
+  ainda disser `ACTIVE(src)`, a marca faz toda requisição da série ser decidida pelo líder; quando
+  a réplica mostra o novo dono, a marca é descartada (na própria requisição ou no ciclo seguinte do
+  `LocalReconciler`). A marca é só em memória: se a origem **reiniciar** logo após o `finish` com a
+  réplica ainda atrasada, um `open` com criação encontra `ACTIVE(src)` e nenhum objeto no volume — e
+  aí o storage confirma o dono no líder antes de criar, respondendo `WRONG_OWNER(dst)` em vez de
+  recriar a série vazia na origem (issue #174). Custo em
+  [operação](ngrrd-cluster-operacao.md#confirmação-do-dono-antes-de-criar-issue-174).
 - **Cliente durante `MIGRATING`:** vê o status por poucos segundos (série típica ≈ 1,6 MiB em rede
   local) e retenta com backoff — ver seção 5.
 
@@ -575,17 +586,22 @@ líder): `leader` (se este nó é líder agora), `seriesCount`, `usedBytes`/`cap
 `flushes`/`reads`, histogramas de latência (`writeBatchLatency`, `checkpointLatency`,
 `readLatency`), `errorsByStatus` (por `SeriesStatus`), `blobStats` (resumo de
 `BlobVolumeStats`), `migrationsIn`/`migrationsOut` e, desde o M4, `reconcileAdopted`/
-`reconcileOrphansDeleted`/`reconcileUnplaced`/`reconcileMissing`/`reconcileLastDurationMs`.
+`reconcileOrphansDeleted`/`reconcileUnplaced`/`reconcileMissing`/`reconcileLastDurationMs`
+e, desde a 8.6.0, `leaderConfirmations`/`leaderConfirmationLatency` (leituras fortes no líder para
+confirmar o dono de uma série sem objeto no volume antes de criá-la ou de responder `NOT_FOUND`).
 
 `ClientMetricsSnapshot` (no cliente): `samplesEnqueued`/`samplesSent`/`samplesFailed`,
 `batchesSent`, `retriesByStatus`, `bufferedSamples` por nó de destino, `openHandles`,
 `rpcLatency` (agregada, não quebrada por comando) e `placeCount`.
 
 Integração opcional via `NgrrdClusterMetricsListener` (storage node e cliente); log periódico
-`NGRRD_NODE_STATUS` (marker de log do projeto — base para futuros Docker ITs), `NGRRD_REBALANCE`/
+`NGRRD_NODE_STATUS` (marker de log do projeto — base para futuros Docker ITs; inclui
+`leaderConfirmations`/`leaderConfirmationP99us`, as confirmações de dono no líder antes de criar
+uma série ou responder `NOT_FOUND`), `NGRRD_REBALANCE`/
 `NGRRD_REBALANCE_MOVE` a cada ciclo de rebalanceamento, `NGRRD_NODE_DRAINED` quando o `Rebalancer`
 promove um nó a `DRAINED`, `NGRRD_RECONCILE`/`NGRRD_RECONCILE_ORPHAN_DELETED`/`RECONCILE_UNPLACED`
-a cada ciclo do reconciliador, e `NGRRD_STORAGE_NODE_STARTED` (processo pronto, emitido por
+a cada ciclo do reconciliador (com `forgottenPruned`, marcas de série esquecida descartadas no
+ciclo), e `NGRRD_STORAGE_NODE_STARTED` (processo pronto, emitido por
 `NgrrdStorageNodeMain`).
 
 ## 11. CLI de administração
