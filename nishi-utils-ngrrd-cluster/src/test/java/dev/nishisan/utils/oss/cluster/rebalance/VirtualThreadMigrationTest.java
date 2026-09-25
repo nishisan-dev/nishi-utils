@@ -13,6 +13,7 @@ import dev.nishisan.utils.oss.cluster.protocol.MigrateResponse;
 import dev.nishisan.utils.oss.cluster.protocol.MigrateStartRequest;
 import dev.nishisan.utils.oss.cluster.protocol.MigrateStatus;
 import dev.nishisan.utils.oss.cluster.rpc.ClusterRpc;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -32,6 +33,13 @@ import static org.junit.jupiter.api.Assertions.*;
 public class VirtualThreadMigrationTest {
     @Test
     void migrationHandlersReleaseCarriersWhileWaitingForRpc(@TempDir Path base) throws Exception {
+        // Achado 3 da revisão pós-merge da PR #172: a partir do JDK 24 (JEP 491), synchronized deixa
+        // de prender a carrier thread da virtual thread — a regressão que este teste cobre (handlers de
+        // migração presos num monitor enquanto esperam RPC) some por si só nesse JDK, então o teste
+        // passaria mesmo com a regressão de volta, sem cobrir nada. O CI roda em JDK 21; pula em vez de
+        // dar falso positivo de cobertura em JDK 24+.
+        Assumptions.assumeTrue(Runtime.version().feature() < 24,
+                "JEP 491 (JDK 24+) faz synchronized não prender mais a carrier thread — o teste ficaria inócuo");
         // Scheduler parallelism is fixed at initialization, so this regression needs a fresh JVM.
         var process = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
                 "-Djdk.virtualThreadScheduler.parallelism=2", "-Djdk.virtualThreadScheduler.maxPoolSize=2",
