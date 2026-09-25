@@ -25,12 +25,9 @@ import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
 import org.junit.jupiter.api.Test;
 
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
-import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
@@ -121,53 +118,6 @@ class ProtocolCompatibilityIntegrationTest {
                         "the connection must survive an undecodable message; delivered=" + delivered);
                 assertTrue(transport.isConnected(oldInfo.nodeId()), "connection must still be tracked as open");
             }
-        }
-    }
-
-    /** A bare TCP client speaking the legacy JSON framing (int length + JSON bytes). */
-    private final class RawPeer implements AutoCloseable {
-        private final Socket socket;
-        private final DataOutputStream out;
-        private final List<ClusterMessage> received = new CopyOnWriteArrayList<>();
-        private final Thread reader;
-
-        RawPeer(int port) throws IOException {
-            socket = new Socket();
-            socket.connect(new InetSocketAddress("localhost", port), 5_000);
-            out = new DataOutputStream(socket.getOutputStream());
-            DataInputStream in = new DataInputStream(socket.getInputStream());
-            reader = Thread.ofVirtual().start(() -> {
-                try {
-                    while (true) {
-                        int length = in.readInt();
-                        byte[] data = in.readNBytes(length);
-                        int offset = data.length > 0 && data[0] == 0x00 ? 1 : 0; // JSON-with-marker frames
-                        if (data.length - offset > 0 && data[offset] == '{') {
-                            received.add(json.decode(java.util.Arrays.copyOfRange(data, offset, data.length)));
-                        }
-                    }
-                } catch (IOException ignored) {
-                    // socket closed
-                }
-            });
-        }
-
-        void writeFrame(byte[] jsonBytes) throws IOException {
-            synchronized (out) {
-                out.writeInt(jsonBytes.length);
-                out.write(jsonBytes);
-                out.flush();
-            }
-        }
-
-        List<ClusterMessage> received() {
-            return received;
-        }
-
-        @Override
-        public void close() throws IOException {
-            socket.close();
-            reader.interrupt();
         }
     }
 
