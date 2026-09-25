@@ -29,6 +29,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
+import java.io.IOException;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -37,7 +38,9 @@ import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -109,6 +112,26 @@ class CatalogLookupClientTest {
 
         assertEquals(ErrorCode.UNSUPPORTED_BY_NODE, ex.code());
         assertEquals(1, rpc.calls().size(), "só o primeiro líder, que anuncia a capacidade, recebe o RPC");
+    }
+
+    @Test
+    void falhaDeTransporteNaLeituraDoStatusDoLiderEhRetentadaDentroDoPrazo() {
+        AtomicInteger strongReads = new AtomicInteger();
+        NodeCapabilities flaky = new NodeCapabilities(nodeId -> Optional.empty(), nodeId -> {
+            if (strongReads.incrementAndGet() == 1) {
+                throw new IllegalStateException("falha ao chamar o líder", new IOException("conexão caiu"));
+            }
+            return Optional.of(CapabilityFixtures.status(nodeId, StorageCapabilities.ALL));
+        });
+        SeriesPlacement placed = SeriesPlacement.active("storage-a", 1_000L);
+        rpc.respondNext((cmd, body) -> CatalogLookupResponse.ok(Map.of("series-1", placed)));
+        CatalogLookupClient client = new CatalogLookupClient(rpc, retry, Clock.systemUTC(), 2000, flaky);
+
+        Map<String, SeriesPlacement> found = client.lookup(List.of("series-1"), Duration.ofSeconds(1));
+
+        assertEquals(Map.of("series-1", placed), found);
+        assertEquals(2, strongReads.get(), "a falha de transporte não vira REMOTE_ERROR imediato");
+        assertEquals(1, rpc.calls().size());
     }
 
     @Test

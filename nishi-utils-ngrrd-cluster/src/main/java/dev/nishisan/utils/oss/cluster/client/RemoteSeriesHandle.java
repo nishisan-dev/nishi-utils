@@ -194,7 +194,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
             String candidateOwner = placement.ownerNodeId();
             if (!writable) {
                 // Dono de versão anterior ignoraria createIfMissing=false e criaria a série.
-                capabilities.require(candidateOwner, StorageCapabilities.OPEN_CREATE_IF_MISSING);
+                capabilities.require(candidateOwner, StorageCapabilities.OPEN_CREATE_IF_MISSING, retry.remaining());
             }
             OpenRequest request = new OpenRequest(seriesKey, yaml, tags, options.durability(),
                     options.onGeometryChange(), placement, writable ? null : Boolean.FALSE);

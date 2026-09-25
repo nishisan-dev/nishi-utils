@@ -111,8 +111,10 @@ public final class CatalogLookupClient {
                     : LeaderCalls.awaitLeaderOrThrow(rpc, clock, deadline, description);
             leaderHint = null;
             // Líder de versão anterior não responde CATALOG_LOOKUP: falha na hora, antes do RPC, em vez de
-            // esperar o prazo se esgotar em TIMEOUT.
-            capabilities.require(leader.value(), StorageCapabilities.CATALOG_LOOKUP);
+            // esperar o prazo se esgotar em TIMEOUT. Status ainda não publicado e falha de transporte na
+            // leitura do status são transitórios: retentados dentro do prazo restante desta consulta.
+            capabilities.require(leader.value(), StorageCapabilities.CATALOG_LOOKUP,
+                    LeaderCalls.remainingUntil(clock, deadline, description));
             CatalogLookupResponse response;
             try {
                 response = rpc.call(leader, Commands.CATALOG_LOOKUP, new CatalogLookupRequest(page),

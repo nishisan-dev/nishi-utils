@@ -27,8 +27,8 @@ import java.util.Optional;
 import java.util.Set;
 
 /**
- * {@link NodeCapabilities} prontos para os testes do cliente: todo nó anuncia as capacidades pedidas na
- * réplica local, sem leitura forte. Não é uma classe de teste.
+ * {@link NodeCapabilities} prontos para os testes do cliente: a réplica local e o líder concordam sobre
+ * o que cada nó anuncia. Não é uma classe de teste.
  */
 final class CapabilityFixtures {
 
@@ -40,18 +40,20 @@ final class CapabilityFixtures {
         return advertising(StorageCapabilities.ALL);
     }
 
-    /** Todo nó anuncia exatamente {@code capabilities} na réplica local. */
+    /** Todo nó anuncia exatamente {@code capabilities}, na réplica local e no líder. */
     static NodeCapabilities advertising(Set<String> capabilities) {
-        return new NodeCapabilities(nodeId -> Optional.of(status(nodeId, capabilities)), nodeId -> {
-            throw new AssertionError("status local presente: não deveria haver leitura forte de " + nodeId);
-        });
+        return new NodeCapabilities(nodeId -> Optional.of(status(nodeId, capabilities)),
+                nodeId -> Optional.of(status(nodeId, capabilities)));
     }
 
-    /** Cada nó anuncia o que {@code byNode} disser; nó ausente do mapa não tem status publicado. */
+    /**
+     * Cada nó anuncia o que {@code byNode} disser, na réplica local e no líder; nó ausente do mapa não tem
+     * status publicado.
+     */
     static NodeCapabilities advertisingByNode(Map<String, Set<String>> byNode) {
         return new NodeCapabilities(
                 nodeId -> Optional.ofNullable(byNode.get(nodeId)).map(caps -> status(nodeId, caps)),
-                nodeId -> Optional.empty());
+                nodeId -> Optional.ofNullable(byNode.get(nodeId)).map(caps -> status(nodeId, caps)));
     }
 
     /** Falha se for consultado — para caminhos que nunca podem conferir capacidade. */
