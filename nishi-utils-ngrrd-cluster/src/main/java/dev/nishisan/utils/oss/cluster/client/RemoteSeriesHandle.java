@@ -136,10 +136,12 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
      * abertura remota quando um dono sinaliza {@code NOT_OPEN}.
      *
      * <p>Aberto com sucesso, avisa o {@link #dispatcher} ({@link WriteBuffer#resetSeries}) — antes de o
-     * cliente publicar este handle — para que as escritas deste handle usem uma geração própria da rota
-     * sempre que um handle anterior da mesma chave tiver deixado marca de série inexistente ou escritas
-     * em voo: sem isso, elas seriam recusadas pela marca do antigo, ou falhadas por uma marcação tardia
-     * da rota dele. A reabertura de um handle já em uso nunca mexe na rota.</p>
+     * cliente publicar este handle — de que a chave tem um handle novo: se um handle anterior deixou a
+     * série marcada inexistente, as escritas deste handle passam a usar uma rota nova, sem a marca; se
+     * não, continuam na mesma rota (e na mesma ordem) das escritas ainda em voo do anterior, e a
+     * geração da rota avança para que uma reabertura pendente do handle anterior, que descubra
+     * {@code NOT_FOUND} depois desta abertura, não marque a rota. A reabertura de um handle já em uso
+     * nunca mexe na rota.</p>
      *
      * <p>item 12 (achado do Refuter): package-private de propósito — só {@code DefaultNgrrdClusterClient}
      * e o próprio {@code client} chamam isto; não faz parte do contrato público de {@link NgrrdHandle}.</p>
@@ -240,20 +242,26 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
      * o reopener do {@code WriteDispatcher}, sem handle para a chave, a retentaria para sempre.
      *
      * <p>Ordem: {@code failSeries} roda ANTES de o handle deixar de ser reaproveitável ({@link #closed})
-     * e de sair do mapa do cliente. O cliente só cria um handle novo da mesma chave depois disso, e esse
-     * handle novo desfaz a marca ao abrir ({@link #open()}) — então a marca deste handle nunca alcança
-     * a rota do novo. Na ordem inversa, um handle novo poderia abrir e escrever entre a saída do mapa e
-     * a marcação, e ter as próprias escritas falhadas pela marca deste.</p>
+     * e de sair do mapa do cliente. O cliente só cria um handle novo da mesma chave quando o atual não
+     * está mais aberto, ou seja, depois disso — e esse handle novo troca a rota marcada por uma limpa ao
+     * abrir ({@link #open()}). Por isso esta marcação, que não confere geração, nunca alcança a rota de
+     * um handle novo: quando ela acontece, um handle novo ainda não pode existir. Na ordem inversa, um
+     * handle novo poderia abrir e escrever entre a saída do mapa e a marcação, e ter as próprias
+     * escritas falhadas pela marca deste.</p>
      *
      * <p>Se um {@link #close(Duration)} normal já estava em andamento, ele é o dono do encerramento: a
      * série só fica marcada no handle (operações e {@link #reopen()} lançam
-     * {@link SeriesNotFoundException}), sem {@code failSeries} — o cliente pode já ter aberto um handle
-     * novo da mesma chave, e a marca pela chave alcançaria a rota dele — e sem {@code onClose}, que o
-     * próprio close chama ao terminar. O handle continua visível ao reopener do {@code WriteDispatcher}
-     * até lá: as escritas pendentes dele que receberem {@code NOT_OPEN} encontram este handle, o
-     * {@link #reopen()} lança e o dispatcher marca exatamente a rota delas. Se saísse do mapa agora, o
-     * reopener não acharia handle algum e essas escritas ficariam em retentativa até o close esgotar o
-     * orçamento. Idempotente via {@link AtomicBoolean#compareAndSet}.</p>
+     * {@link SeriesNotFoundException}), sem {@code failSeries} — como este handle já não está aberto, o
+     * cliente pode já ter aberto um handle novo da mesma chave, e uma marca pela chave alcançaria a rota
+     * dele — e sem {@code onClose}, que o próprio close chama ao terminar. O handle continua visível ao
+     * reopener do {@code WriteDispatcher} até lá (ou até um handle novo ocupar a chave): as escritas
+     * pendentes dele que receberem {@code NOT_OPEN} encontram este handle, o {@link #reopen()} lança e o
+     * dispatcher marca a rota delas — mas só se nenhum handle novo tiver aberto a chave desde que a
+     * reabertura começou (geração da rota, ver {@link WriteBuffer#resetSeries}). Se um handle novo abriu,
+     * a descoberta é anterior a ele: a rota não é marcada e as escritas são retentadas, agora pelo handle
+     * novo. Se este handle saísse do mapa agora, o reopener não acharia handle algum e essas escritas
+     * ficariam em retentativa até o close esgotar o orçamento. Idempotente via
+     * {@link AtomicBoolean#compareAndSet}.</p>
      */
     private void markSeriesNotFound(SeriesNotFoundException cause) {
         if (!notFound.compareAndSet(false, true)) {

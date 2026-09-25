@@ -68,12 +68,13 @@ public interface WriteBuffer {
     }
 
     /**
-     * Chamado quando um handle NOVO de {@code seriesKey} abre com sucesso: se a chave estiver marcada por
-     * {@link #failSeries}, ou ainda tiver escritas de um handle anterior em voo, as escritas do handle
-     * novo passam a usar uma rota nova (geração nova), com dono {@code ownerNodeId}. Escritas da geração
-     * anterior continuam sendo concluídas na rota delas, e nem a marca antiga nem uma marcação tardia
-     * dessa rota alcançam o handle novo. No-op se a chave não estiver marcada nem tiver nada em voo.
-     * Implementações sem rastreamento por série podem ignorar.
+     * Chamado quando um handle NOVO de {@code seriesKey} abre com sucesso, antes de ele ser publicado.
+     * Se a chave estiver marcada por {@link #failSeries}, as escritas do handle novo passam a usar uma
+     * rota nova, sem a marca, com dono {@code ownerNodeId}; as escritas da rota marcada ainda em voo
+     * continuam sendo concluídas nela. Sem marca, a rota continua a mesma — escritas em voo de um handle
+     * anterior e as do novo seguem na mesma ordem FIFO — e só avança de geração: uma reabertura
+     * assíncrona do handle anterior que descubra a série inexistente depois desta abertura não marca a
+     * rota, e as escritas dela são retentadas. Implementações sem rastreamento por série podem ignorar.
      */
     default void resetSeries(String seriesKey, String ownerNodeId) {
     }

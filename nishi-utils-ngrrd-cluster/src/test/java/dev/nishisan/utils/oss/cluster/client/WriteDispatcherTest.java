@@ -669,6 +669,73 @@ class WriteDispatcherTest {
     }
 
     @Test
+    void reaberturaQueDescobreSerieInexistenteDepoisDeUmHandleNovoAbrirNaoMarcaARotaEEntregaAEscrita() {
+        // A reabertura da escrita w1 está em voo quando um handle novo da mesma chave abre com sucesso
+        // (resetSeries) e escreve w2. Só depois a reabertura antiga descobre NOT_FOUND: a série existe
+        // de novo, então a rota não pode ser marcada — w1 é retentada e entregue, antes de w2.
+        CountDownLatch reopenerEntered = new CountDownLatch(1);
+        CountDownLatch reopenerGate = new CountDownLatch(1);
+        AtomicInteger reopenCalls = new AtomicInteger();
+        newDispatcher(1, Duration.ofSeconds(30), 1_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> {
+            if (reopenCalls.getAndIncrement() == 0) {
+                reopenerEntered.countDown();
+                awaitLatch(reopenerGate);
+                throw new SeriesNotFoundException(key);
+            }
+            return true;
+        });
+        AtomicInteger writeBatchCalls = new AtomicInteger();
+        List<Long> delivered = new CopyOnWriteArrayList<>();
+        rpc.respondDefault((cmd, body) -> {
+            WriteBatchRequest req = (WriteBatchRequest) body;
+            if (writeBatchCalls.getAndIncrement() == 0) {
+                return new WriteBatchResponse(Map.of("s1", SeriesStatus.NOT_OPEN), Map.of(), Map.of());
+            }
+            req.writes().forEach(w -> delivered.add(w.tsEpochMs()));
+            return okFor(req);
+        });
+
+        dispatcher.enqueue(OWNER_A.value(), write("s1", 1L, 1.0));
+        awaitLatch(reopenerEntered);
+        // O que RemoteSeriesHandle.open() faz ao abrir com sucesso um handle novo da mesma chave.
+        dispatcher.resetSeries("s1", OWNER_A.value());
+        dispatcher.enqueue(OWNER_A.value(), write("s1", 2L, 2.0));
+        reopenerGate.countDown();
+
+        dispatcher.flushSeriesSync("s1", OWNER_A.value(), AWAIT_TIMEOUT); // não deve lançar
+        assertEquals(List.of(1L, 2L), delivered, "w1 entregue, e antes de w2");
+        assertEquals(0L, dispatcher.samplesFailed());
+        assertEquals(2L, dispatcher.samplesSent());
+        dispatcher.enqueue(OWNER_A.value(), write("s1", 3L, 3.0));
+        dispatcher.flushAllSync();
+        assertEquals(3L, dispatcher.samplesSent(), "a chave nunca ficou marcada");
+    }
+
+    @Test
+    void reaberturaQueDescobreSerieInexistenteSemHandleNovoMarcaARota() {
+        // Mesma corrida, sem handle novo no meio: SeriesNotFoundException da reabertura marca a rota,
+        // falha a escrita pendente e passa a recusar escritas da chave.
+        CountDownLatch reopenerEntered = new CountDownLatch(1);
+        CountDownLatch reopenerGate = new CountDownLatch(1);
+        newDispatcher(1, Duration.ofSeconds(30), 1_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> {
+            reopenerEntered.countDown();
+            awaitLatch(reopenerGate);
+            throw new SeriesNotFoundException(key);
+        });
+        rpc.respondDefault((cmd, body) ->
+                new WriteBatchResponse(Map.of("s1", SeriesStatus.NOT_OPEN), Map.of(), Map.of()));
+
+        dispatcher.enqueue(OWNER_A.value(), write("s1", 1L, 1.0));
+        awaitLatch(reopenerEntered);
+        reopenerGate.countDown();
+
+        Await.untilTrue("escrita pendente falhada", AWAIT_TIMEOUT, () -> dispatcher.samplesFailed() == 1L);
+        assertThrows(SeriesNotFoundException.class, () -> dispatcher.enqueue(OWNER_A.value(), write("s1", 2L, 2.0)));
+        assertEquals(0L, dispatcher.samplesSent());
+        dispatcher.flushAllSync();
+    }
+
+    @Test
     void escritaTardiaAposTrocaDeRotaEntraNaRotaNovaENuncaNaAntiga() throws Exception {
         // Reproduz a corrida de enqueue com resetSeries: pega a rota, mas trava DEPOIS que ela já foi
         // trocada por outra — sem a reconferência de identidade sob o lock, o enqueue admitiria a escrita

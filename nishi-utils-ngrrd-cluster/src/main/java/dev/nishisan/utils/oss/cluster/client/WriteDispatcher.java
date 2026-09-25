@@ -80,9 +80,16 @@ import java.util.stream.Collectors;
  * <p>Série confirmada inexistente ({@link #failSeries}, ou o reopener lançando
  * {@link SeriesNotFoundException}): a rota da chave fica marcada — admissões recusadas com
  * {@link SeriesNotFoundException}, pendências falhadas sem reabrir nem retentar — até um handle novo da
- * mesma chave abrir ({@link #resetSeries}, que também inaugura rota nova se a anterior ainda tem escritas
- * em voo). Cada escrita enfileirada carrega a rota que a admitiu e é
- * concluída nela, de modo que a marca de uma geração da série nunca alcança as escritas da seguinte.</p>
+ * mesma chave abrir ({@link #resetSeries}, que troca a rota marcada por uma nova). Cada escrita
+ * enfileirada carrega a rota que a admitiu e é concluída nela, de modo que a marca de uma geração da
+ * série nunca alcança as escritas da seguinte.</p>
+ *
+ * <p>Uma rota não marcada nunca é trocada: todas as escritas válidas da chave, de qualquer handle,
+ * compartilham a mesma rota e a mesma ordem FIFO (toda a proteção de ordem — reenfileiramento na frente,
+ * reposicionamento por {@code WRONG_OWNER} com o backlog junto — é por rota). A abertura de um handle
+ * novo só avança a geração da rota ({@link SeriesRoute#generation}); uma reabertura assíncrona que
+ * descobre {@link SeriesNotFoundException} só marca a rota se nenhum handle novo tiver aberto a chave
+ * enquanto ela estava em voo.</p>
  */
 public final class WriteDispatcher implements WriteBuffer, Closeable {
 
@@ -140,6 +147,8 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     /** Marca de tempo do último log de retry por série, para o rate limit de {@link #logRetryRateLimited}. */
     private final ConcurrentMap<String, Long> lastRetryLogMs = new ConcurrentHashMap<>();
     private static final long RETRY_LOG_INTERVAL_MS = 10_000L;
+    /** {@link #failRoute} sem conferência de geração (marcação síncrona pelo handle, via {@link #failSeries}). */
+    private static final long ANY_GENERATION = -1L;
 
     public WriteDispatcher(ClusterRpc rpc, PlacementLookup placementLookup, RetryPolicy retryPolicy,
             int batchMaxSamples, Duration batchMaxDelay, long maxBufferedSamplesPerNode,
@@ -226,8 +235,8 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             try {
                 // resetSeries troca a entrada de routes por uma instância nova enquanto detém o MESMO
                 // lock que acabamos de conseguir — se perdemos essa corrida, a rota que travamos já foi
-                // aposentada (geração de um handle anterior, marcada ou não): solta e tenta de novo, para
-                // cair na rota atual em vez de admitir na geração antiga ou ser recusada pela marca dela.
+                // aposentada (marcada inexistente, de um handle anterior): solta e tenta de novo, para
+                // cair na rota atual em vez de ser recusada pela marca dela.
                 if (routes.get(write.seriesKey()) != route) {
                     continue;
                 }
@@ -766,8 +775,8 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         // Shutdown also synchronizes with an admission that passed the closed check
         // but has not entered the pending index yet. Keep the history scan off the
         // hot path, here only, so close cannot overlook that in-progress admission.
-        // O índice de pendências cobre as rotas de gerações anteriores (trocadas por resetSeries com
-        // escritas ainda em voo), que já não estão em routes.
+        // O índice de pendências cobre as rotas marcadas já trocadas por resetSeries que ainda têm
+        // escritas em voo, que já não estão em routes.
         List<SeriesRoute> candidates = new ArrayList<>(routes.values());
         candidates.addAll(snapshotPendingRoutes());
         for (SeriesRoute route : candidates) {
@@ -851,6 +860,9 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                     settleMarkedRoute(owner, buf, route, key);
                     return;
                 }
+                // Capturada ANTES do reopener: se um handle novo abrir a chave enquanto a reabertura
+                // está em voo, a SeriesNotFoundException que ela trouxer é anterior a essa abertura.
+                long generation = route.generation;
                 boolean opened;
                 try {
                     opened = Boolean.TRUE.equals(reopener.apply(key));
@@ -858,9 +870,16 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                     // A série sumiu (createIfMissing=false) e nunca vai reabrir sozinha — diferente das
                     // demais falhas de reabertura, deferSeries(-1) aqui adiaria para sempre. Marca a
                     // rota destas escritas e falha tudo que está pendente nela em vez de retentar.
-                    failRoute(key, route, e);
-                    settleMarkedRoute(owner, buf, route, key);
-                    return;
+                    if (failRoute(key, route, generation, e)) {
+                        settleMarkedRoute(owner, buf, route, key);
+                        return;
+                    }
+                    // Um handle novo abriu a chave (a série existe de novo) enquanto a reabertura estava
+                    // em voo: a descoberta ficou velha. Sem marcar, libera a pausa e retenta já — o
+                    // próximo NOT_OPEN leva o reopener ao handle novo.
+                    LOGGER.log(Level.FINE, () -> "Reabertura de " + key + " descobriu série inexistente, mas"
+                            + " um handle novo abriu a chave nesse meio tempo — retentando sem marcar");
+                    opened = true;
                 } catch (RuntimeException e) {
                     LOGGER.log(Level.FINE, "Reabertura pendente de " + key, e);
                     opened = false;
@@ -908,27 +927,29 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
      */
     @Override
     public void failSeries(String seriesKey, Throwable cause) {
-        failRoute(seriesKey, routes.computeIfAbsent(seriesKey, key -> new SeriesRoute(null)), cause);
+        failRoute(seriesKey, routes.computeIfAbsent(seriesKey, key -> new SeriesRoute(null)), ANY_GENERATION,
+                cause);
     }
 
     /**
-     * Inaugura, se preciso, uma geração nova da rota de {@code seriesKey}, com dono {@code ownerNodeId} —
+     * Registra a abertura de um handle novo de {@code seriesKey}, com dono {@code ownerNodeId} —
      * {@code RemoteSeriesHandle.open()} chama isto quando um handle novo da mesma chave abre com
-     * sucesso, ANTES de o handle ficar visível a quem escreve. Semântica:
+     * sucesso, ANTES de o handle ficar visível a quem escreve. Sob o lock da rota atual (o mesmo que
+     * {@link #enqueue} confere antes de admitir e que {@link #failRoute} usa para marcar):
      * <ul>
-     *   <li>chave sem rota, ou com rota não marcada e sem escrita em voo: nada muda (o caminho de
-     *       sempre);</li>
-     *   <li>rota marcada inexistente OU com escritas de um handle anterior ainda em voo
-     *       ({@code submitted > completed}): troca por uma rota nova e limpa. A troca acontece sob o lock
-     *       da rota antiga, o mesmo que {@link #enqueue} confere antes de admitir — toda escrita posterior
-     *       cai na rota nova e nunca herda a marca antiga, nem uma marca tardia da rota antiga (ex.: a
-     *       reabertura pendente do handle anterior descobrindo {@code NOT_FOUND} depois desta
-     *       abertura);</li>
-     *   <li>as escritas da geração anterior carregam a própria rota ({@link PendingWrite}) e são
-     *       concluídas nela. A rota antiga continua em {@link #pendingRoutes} enquanto tiver escrita em
-     *       voo ou falha registrada — {@code flushAll()} segue vendo-a — e sai quando marcada e drenada,
-     *       como qualquer rota marcada. Barreiras por série ({@link #flushSeriesSync}) de quem resolve a
-     *       chave depois da troca só veem a rota nova.</li>
+     *   <li>chave sem rota: nada a fazer;</li>
+     *   <li>a geração da rota avança ({@link SeriesRoute#generation}): uma reabertura assíncrona em voo,
+     *       que capturou a geração anterior, não marca mais a rota se descobrir {@code NOT_FOUND} — a
+     *       descoberta é anterior à abertura deste handle, e a série existe;</li>
+     *   <li>rota não marcada: continua sendo a rota da chave, com as escritas em voo de handles
+     *       anteriores e o dono atual — as escritas do handle novo entram atrás delas, na mesma ordem
+     *       FIFO. Duas rotas válidas para a mesma série separariam escritas que precisam chegar ao dono
+     *       em ordem;</li>
+     *   <li>rota marcada inexistente: troca por uma rota nova e limpa, com dono {@code ownerNodeId}.
+     *       Toda escrita posterior cai na rota nova e nunca herda a marca; as escritas da geração marcada
+     *       ainda em voo carregam a própria rota ({@link PendingWrite}) e são concluídas nela (falham na
+     *       resposta, salvo {@code OK}), e a rota antiga sai de {@link #pendingRoutes} ao concluir a
+     *       última delas.</li>
      * </ul>
      */
     @Override
@@ -941,28 +962,37 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         boolean replaced = false;
         route.lock.lock();
         try {
-            if (route.notFound || route.submitted > route.completed) {
+            route.generation++;
+            if (route.notFound) {
                 replaced = routes.replace(seriesKey, route, new SeriesRoute(ownerNodeId));
             }
         } finally {
             route.lock.unlock();
         }
-        if (replaced && route.notFound) {
+        if (replaced) {
             retireIfDrained(route);
         }
     }
 
     /**
-     * Marca {@code route} (a geração de {@code key} cujas escritas estão sendo falhadas) e falha tudo que
+     * Marca {@code route} (a rota de {@code key} cujas escritas estão sendo falhadas) e falha tudo que
      * ela tem em buffer. A marca e a foto de {@code destinations} acontecem sob {@code route.lock}, o
      * mesmo lock que o reposicionamento por {@code WRONG_OWNER} usa para mover escritas: nenhuma escrita
      * escapa para um nó fora da foto. A extração de cada buffer acontece depois, sem {@code route.lock}.
+     *
+     * <p>{@code expectedGeneration} diferente de {@link #ANY_GENERATION}: só marca se a geração da rota
+     * ainda for essa, conferida sob o mesmo lock em que {@link #resetSeries} a avança — ou a marca vem
+     * antes da abertura do handle novo (que então troca a rota marcada), ou a abertura vem antes e nada
+     * é marcado. Devolve se a rota ficou marcada.</p>
      */
-    private void failRoute(String key, SeriesRoute route, Throwable cause) {
+    private boolean failRoute(String key, SeriesRoute route, long expectedGeneration, Throwable cause) {
         boolean firstMark;
         Set<String> destinations;
         route.lock.lock();
         try {
+            if (expectedGeneration != ANY_GENERATION && route.generation != expectedGeneration) {
+                return false;
+            }
             firstMark = !route.notFound;
             route.notFound = true;
             destinations = Set.copyOf(route.destinations);
@@ -982,6 +1012,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                     + "pendente(s) descartada(s) do buffer; escritas em voo falham na resposta, sem novas "
                     + "tentativas", cause);
         }
+        return true;
     }
 
     /** Falha, via {@link #completeWrites}, toda escrita de {@code route} ainda em {@code buf}; devolve quantas. */
@@ -1101,6 +1132,13 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
          * buffer. Nunca volta a {@code false}: {@link #resetSeries} troca a rota inteira.
          */
         private volatile boolean notFound;
+        /**
+         * Quantos handles novos da chave abriram nesta rota ({@link #resetSeries}). Escrito só sob
+         * {@link #lock}; a reabertura assíncrona captura o valor sem o lock, antes do reopener (o lock
+         * pode estar com o reposicionamento por {@code WRONG_OWNER}, que chama o callback de troca de
+         * dono), e {@link #failRoute} só marca a rota se ele não tiver mudado, conferindo sob o lock.
+         */
+        private volatile long generation;
 
         SeriesRoute(String owner) {
             this.owner = owner;

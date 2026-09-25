@@ -37,12 +37,16 @@ import org.junit.jupiter.api.Test;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -62,6 +66,7 @@ class DirectNotFoundNotifiesDispatcherTest {
 
     private static final String SERIES_KEY = "gone";
     private static final NodeId OWNER_A = NodeId.of("storage-a");
+    private static final NodeId OWNER_B = NodeId.of("storage-b");
     private static final Duration AWAIT_TIMEOUT = Duration.ofSeconds(10);
     private static final ViewQuery ANY_QUERY =
             new ViewQuery(Duration.ofHours(1), 300, ConsolidationFunction.AVERAGE, 100);
@@ -328,22 +333,27 @@ class DirectNotFoundNotifiesDispatcherTest {
     }
 
     @Test
-    void marcacaoTardiaDaRotaDoHandleAntigoNaoAtingeOHandleNovoAbertoDepois() throws Exception {
+    void reaberturaDoHandleAntigoQueDescobreNotFoundDepoisDoHandleNovoAbrirEntregaAEscritaViaHandleNovo()
+            throws Exception {
         // A (sem criar) está fechando com uma escrita pendente; o NOT_OPEN dela leva o reopener a chamar
-        // A.reopen(), cujo OPEN fica em voo. Nesse meio tempo o usuário abre B na mesma chave (A já não é
-        // reaproveitável) e B escreve. Só depois o OPEN de A volta NOT_FOUND e a rota das escritas de A é
-        // marcada — isso não pode atingir B: a abertura de B inaugura uma geração nova da rota.
+        // A.reopen(), cujo OPEN fica em voo. Nesse meio tempo o usuário abre B na mesma chave
+        // (createIfMissing=true, recria a série) e B escreve. Só depois o OPEN de A volta NOT_FOUND: a
+        // descoberta é anterior à abertura de B e não pode marcar a rota — a série existe, a escrita de
+        // A é retentada (o reopener agora acha B) e entregue antes das de B.
         WriteDispatcher dispatcher = newDispatcher(1);
         RecordingClusterRpc rpcA = new RecordingClusterRpc(NodeId.of("client-under-test"));
         RecordingClusterRpc rpcB = new RecordingClusterRpc(NodeId.of("client-under-test"));
         CountDownLatch reopenInFlight = new CountDownLatch(1);
         CountDownLatch releaseReopen = new CountDownLatch(1);
+        AtomicBoolean seriesOnNode = new AtomicBoolean(false);
+        List<Long> delivered = new CopyOnWriteArrayList<>();
         try {
             rpc.respondDefault((cmd, body) -> {
                 WriteBatchRequest request = (WriteBatchRequest) body;
-                if (request.writes().getFirst().tsEpochMs() == 1L) {
+                if (!seriesOnNode.get()) {
                     return new WriteBatchResponse(Map.of(SERIES_KEY, SeriesStatus.NOT_OPEN), Map.of(), Map.of());
                 }
+                request.writes().forEach(w -> delivered.add(w.tsEpochMs()));
                 return okFor(request);
             });
             rpcA.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
@@ -355,7 +365,12 @@ class DirectNotFoundNotifiesDispatcherTest {
                 }
                 return new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null);
             });
-            rpcB.respondDefault((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
+            rpcB.respondDefault((cmd, body) -> {
+                if (cmd.equals(Commands.OPEN)) {
+                    seriesOnNode.set(true);
+                }
+                return new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null);
+            });
 
             RemoteSeriesHandle handleA = newHandle(dispatcher, rpcA, Ngrrd.OpenOptions.defaults().withCreateIfMissing(false),
                     Duration.ofSeconds(30));
@@ -376,7 +391,7 @@ class DirectNotFoundNotifiesDispatcherTest {
             handleB.write("in_octets", new Sample(2L, 2.0));
 
             releaseReopen.countDown();
-            Await.untilTrue("escrita pendente de A falhou", AWAIT_TIMEOUT, () -> dispatcher.samplesFailed() == 1L);
+            Await.untilTrue("escritas de A e B entregues", AWAIT_TIMEOUT, () -> dispatcher.samplesSent() == 2L);
 
             handleB.write("in_octets", new Sample(3L, 3.0));
             handleB.checkpoint();
@@ -385,10 +400,92 @@ class DirectNotFoundNotifiesDispatcherTest {
 
             assertTrue(!closer.isAlive(), "close de A terminou");
             assertSame(handleB, handles.get(SERIES_KEY));
-            assertEquals(1L, dispatcher.samplesFailed(), "só a escrita de A falha");
-            assertEquals(2L, dispatcher.samplesSent(), "as duas escritas de B são entregues");
+            assertEquals(List.of(1L, 2L, 3L), delivered, "a escrita de A chega ao nó antes das de B");
+            assertEquals(0L, dispatcher.samplesFailed(), "a rota nunca foi marcada");
+            assertEquals(3L, dispatcher.samplesSent());
         } finally {
             releaseReopen.countDown();
+            dispatcher.close();
+        }
+    }
+
+    @Test
+    void handleNovoComEscritaDoAntigoEmVooPreservaAOrdemQuandoOLoteVoltaNotOpen() throws Exception {
+        assertOrderAcrossHandlesOfSameKey(SeriesStatus.NOT_OPEN, null);
+    }
+
+    @Test
+    void handleNovoComEscritaDoAntigoEmVooPreservaAOrdemQuandoOLoteVoltaWrongOwnerParaOutroDono()
+            throws Exception {
+        assertOrderAcrossHandlesOfSameKey(SeriesStatus.WRONG_OWNER, OWNER_B.value());
+    }
+
+    /**
+     * A escreve w1 e fecha: o flush do close envia w1 sozinho, preso no RPC (em voo). B abre a mesma
+     * chave (createIfMissing=true) e escreve w2 enquanto w1 está em voo. w1 volta NOT_OPEN, o reopener
+     * reabre via B e o lote seguinte leva [w1, w2] e recebe {@code retryStatus} (com {@code newOwner},
+     * se houver). O nó tem de receber w1 antes de w2 — o contrário gera NaN silencioso no deriver.
+     */
+    private void assertOrderAcrossHandlesOfSameKey(SeriesStatus retryStatus, String newOwner) throws Exception {
+        WriteDispatcher dispatcher = newDispatcher(2);
+        RecordingClusterRpc rpcA = new RecordingClusterRpc(NodeId.of("client-under-test"));
+        RecordingClusterRpc rpcB = new RecordingClusterRpc(NodeId.of("client-under-test"));
+        CountDownLatch firstBatchInFlight = new CountDownLatch(1);
+        CountDownLatch releaseFirstBatch = new CountDownLatch(1);
+        AtomicInteger writeBatchCalls = new AtomicInteger();
+        List<Long> delivered = new CopyOnWriteArrayList<>();
+        try {
+            rpc.respondDefault((cmd, body) -> {
+                WriteBatchRequest request = (WriteBatchRequest) body;
+                int call = writeBatchCalls.incrementAndGet();
+                if (call == 1) {
+                    firstBatchInFlight.countDown();
+                    awaitLatch(releaseFirstBatch);
+                    return new WriteBatchResponse(Map.of(SERIES_KEY, SeriesStatus.NOT_OPEN), Map.of(), Map.of());
+                }
+                if (call == 2) {
+                    return new WriteBatchResponse(Map.of(SERIES_KEY, retryStatus),
+                            newOwner == null ? Map.of() : Map.of(SERIES_KEY, newOwner), Map.of());
+                }
+                request.writes().forEach(w -> delivered.add(w.tsEpochMs()));
+                return okFor(request);
+            });
+            rpcA.respondDefault((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
+            rpcB.respondDefault((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
+
+            RemoteSeriesHandle handleA = newHandle(dispatcher, rpcA, Ngrrd.OpenOptions.defaults(), Duration.ofSeconds(30));
+            handleA.open();
+            handles.put(SERIES_KEY, handleA);
+            handleA.write("in_octets", new Sample(1L, 1.0));
+
+            Thread closer = new Thread(handleA::close, "test-close-A");
+            closer.start();
+            assertTrue(firstBatchInFlight.await(AWAIT_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS),
+                    "o flush do close de A enviou w1, em voo");
+
+            RemoteSeriesHandle handleB = newHandle(dispatcher, rpcB, Ngrrd.OpenOptions.defaults(), Duration.ofSeconds(5));
+            handleB.open();
+            handles.put(SERIES_KEY, handleB);
+            handleB.write("in_octets", new Sample(2L, 2.0));
+
+            releaseFirstBatch.countDown();
+            Await.untilTrue("w1 e w2 entregues", AWAIT_TIMEOUT, () -> dispatcher.samplesSent() == 2L);
+            handleB.checkpoint();
+            closer.join(AWAIT_TIMEOUT.toMillis());
+            dispatcher.flushAllSync();
+
+            assertTrue(!closer.isAlive(), "close de A terminou");
+            assertEquals(List.of(1L, 2L), delivered, "w1 (handle A) chega ao nó antes de w2 (handle B)");
+            assertEquals(0L, dispatcher.samplesFailed());
+            if (newOwner != null) {
+                assertTrue(rpc.calls().stream()
+                                .filter(c -> c.command().equals(Commands.WRITE_BATCH))
+                                .skip(2)
+                                .allMatch(c -> c.target().value().equals(newOwner)),
+                        "o reenvio vai ao dono novo");
+            }
+        } finally {
+            releaseFirstBatch.countDown();
             dispatcher.close();
         }
     }
