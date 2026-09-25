@@ -62,8 +62,10 @@ import java.util.logging.Logger;
  * {@link PlacementLookup#resolveExisting} (nunca posiciona) e toda (re)abertura vai com
  * {@code createIfMissing=false}; se a série não existir mais, a leitura lança
  * {@link SeriesNotFoundException} e o handle se fecha localmente, saindo do mapa do cliente. O
- * {@link #close()} desse handle é local (ver {@link #close(Duration)}). Um {@code open} com criação da
- * mesma chave pode promovê-lo a gravável ({@link #tryPromoteToWritable()}); a promoção nunca se desfaz.</p>
+ * {@link #close()} desse handle é local (ver {@link #close(Duration)}). O modo (somente leitura ou
+ * gravável) é fixo: um {@code open} com criação da mesma chave abre um handle gravável NOVO, que
+ * substitui este no mapa do cliente; este fica destacado — continua lendo para quem o tem, e seu
+ * {@code close()} continua local e não afeta o gravável (a remoção condicional do mapa vira no-op).</p>
  */
 public final class RemoteSeriesHandle implements NgrrdHandle {
 
@@ -204,8 +206,8 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
     }
 
     /**
-     * Placement usado para posicionar o {@code OPEN}: num handle gravável (aberto com criação ou
-     * promovido), cria a série se preciso ({@code ngrrd.place}); num handle somente leitura, nunca cria —
+     * Placement usado para posicionar o {@code OPEN}: num handle gravável (aberto com criação), cria a
+     * série se preciso ({@code ngrrd.place}); num handle somente leitura, nunca cria —
      * exige que a série já exista ({@link PlacementLookup#resolveExisting}), lançando
      * {@link SeriesNotFoundException} se o líder confirmar que não há placement.
      */
@@ -255,9 +257,8 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
      * Fecha localmente o handle somente leitura cuja série se confirmou ausente: as operações passam a
      * lançar {@link SeriesNotFoundException} e o handle sai do mapa do cliente ({@link #onClose}, remoção
      * condicional à instância), de modo que um {@code open} posterior refaz o fluxo do zero. Sem
-     * {@code CLOSE} remoto: a série não está aberta no dono. Não faz nada num handle já fechado nem num
-     * handle promovido a gravável no meio da leitura — este segue aberto, e só a leitura em curso recebe
-     * a exceção.
+     * {@code CLOSE} remoto: a série não está aberta no dono. Não faz nada num handle já fechado (a leitura
+     * em curso recebe a exceção, mas o estado fechado pelo chamador é preservado) nem num gravável.
      */
     private void markSeriesNotFound(SeriesNotFoundException cause) {
         for (;;) {
@@ -272,32 +273,29 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
         }
     }
 
-    /**
-     * Promove um handle somente leitura a gravável, de forma atômica em relação ao fechamento — usado
-     * pelo cliente quando um {@code open} com criação encontra este handle no cache. Depois da promoção,
-     * o handle se comporta como um aberto com criação em tudo: escreve, reabre posicionando com criação e
-     * fecha com {@code CLOSE} remoto. Num handle já gravável, devolve {@code true} sem mudar nada.
-     *
-     * @return {@code false} se o handle já estiver fechado (ou fechando) — o chamador deve abrir um novo
-     */
-    boolean tryPromoteToWritable() {
-        for (;;) {
-            State current = state.get();
-            if (current.closed()) {
-                return false;
-            }
-            if (current.writable()) {
-                return true;
-            }
-            if (state.compareAndSet(current, State.opened(true))) {
-                return true;
-            }
-        }
-    }
-
     /** Se o handle ainda pode ser reaproveitado por um {@code open} futuro da mesma chave. */
     boolean isOpen() {
         return !state.get().closed();
+    }
+
+    /** Se o handle aceita escrita — aberto com criação; fixo desde a construção. */
+    boolean isWritable() {
+        return state.get().writable();
+    }
+
+    /**
+     * Fecha localmente um handle que nunca foi publicado no mapa do cliente — o perdedor de uma abertura
+     * concorrente da mesma chave. Sem flush, sem {@code CLOSE} remoto e sem {@link #onClose}: nenhuma
+     * escrita passou por ele, e um {@code CLOSE} fecharia no storage a série que o handle vencedor usa.
+     */
+    void discard() {
+        closeLocally();
+    }
+
+    /** Recusa de escrita em handle (ou vista) somente leitura; mensagem única para os dois. */
+    static IllegalStateException readOnlyViolation(String seriesKey) {
+        return new IllegalStateException("série " + seriesKey + " aberta somente leitura (createIfMissing=false);"
+                + " abra com criação para escrever");
     }
 
     @Override
@@ -410,7 +408,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
      * {@code CLOSE} remoto, sem checkpoint, sem tocar o {@link WriteBuffer}. A série continua aberta no
      * storage até ser fechada pela ociosidade do próprio storage.
      *
-     * <p>Num handle gravável (aberto com criação ou promovido), fecha a série com um ÚNICO orçamento total
+     * <p>Num handle gravável (aberto com criação), fecha a série com um ÚNICO orçamento total
      * para flush + CLOSE remoto — usado por {@code DefaultNgrrdClusterClient.close()} para respeitar um
      * orçamento compartilhado entre vários handles (O1).</p>
      *
@@ -458,8 +456,8 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
 
     /**
      * Leva o handle a fechado e devolve o estado de onde saiu, ou {@code null} se outro encerramento
-     * (inclusive a descoberta de série ausente) já tinha vencido. Atômico com a promoção: um handle
-     * promovido antes daqui fecha como gravável; um fechado antes da promoção a faz falhar.
+     * (inclusive a descoberta de série ausente) já tinha vencido — só um encerramento executa o
+     * fechamento.
      */
     private State closeLocally() {
         for (;;) {
@@ -601,8 +599,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
     private void ensureWritable() {
         State current = state.get();
         if (!current.writable()) {
-            throw new IllegalStateException("série " + seriesKey + " aberta somente leitura (createIfMissing=false);"
-                    + " abra com criação para escrever");
+            throw readOnlyViolation(seriesKey);
         }
         ensureOpen(current);
     }

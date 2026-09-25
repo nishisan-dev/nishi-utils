@@ -466,50 +466,25 @@ class RemoteSeriesHandleTest {
     }
 
     @Test
-    void promocaoTornaHandleSomenteLeituraGravavelComCloseRemoto() {
-        RemoteSeriesHandle handle = readOnlyOpenedHandle();
-        rpc.respondDefault((cmd, body) -> response(cmd, SeriesStatus.OK, OWNER_A.value()));
-
-        assertTrue(handle.tryPromoteToWritable());
-        assertTrue(handle.tryPromoteToWritable(), "promover de novo é idempotente");
-        handle.write("in_octets", new Sample(1L, 1.0));
-        handle.close();
-
-        assertEquals(1, dispatcher.enqueued.size());
-        assertEquals(List.of(Commands.OPEN, Commands.CLOSE), commands(), "promovido, o close envia CLOSE");
-        assertTrue(dispatcher.calls.get() > 1, "promovido, o close drena o dispatcher");
-    }
-
-    @Test
-    void reaberturaDeHandlePromovidoPosicionaComCriacao() {
-        RemoteSeriesHandle handle = readOnlyOpenedHandle();
-        assertTrue(handle.tryPromoteToWritable());
-        rpc.respondNext((cmd, body) -> response(cmd, SeriesStatus.NOT_OPEN, OWNER_A.value()));
-        rpc.respondDefault((cmd, body) -> response(cmd, SeriesStatus.OK, OWNER_A.value()));
-
-        handle.checkpoint();
-
-        assertEquals(List.of(Commands.OPEN, Commands.CHECKPOINT, Commands.OPEN, Commands.CHECKPOINT), commands());
-        assertEquals(1, resolver.resolveCalls.get(), "promovido, a reabertura posiciona (cria se preciso)");
-        assertNull(((OpenRequest) rpc.calls().get(2).body()).createIfMissing());
-    }
-
-    @Test
-    void promocaoDeHandleFechadoFalha() {
-        RemoteSeriesHandle handle = readOnlyOpenedHandle();
-        handle.close();
-
-        assertFalse(handle.tryPromoteToWritable());
-        assertFalse(handle.isOpen());
-    }
-
-    @Test
-    void handleComCriacaoJaEhGravavel() {
+    void descarteDeHandleNaoPublicadoELocalSemRpcNemOnClose() {
         RemoteSeriesHandle handle = openedHandle();
+        onCloseCalls.clear();
 
-        assertTrue(handle.tryPromoteToWritable());
-        handle.write("in_octets", new Sample(1L, 1.0));
-        assertEquals(1, dispatcher.enqueued.size());
+        handle.discard();
+
+        assertFalse(handle.isOpen());
+        assertEquals(List.of(Commands.OPEN), commands(), "o descarte não envia CLOSE");
+        assertEquals(0, dispatcher.calls.get(), "o descarte não drena o dispatcher");
+        assertTrue(onCloseCalls.isEmpty(), "um handle descartado nunca esteve no mapa do cliente");
+        NgrrdClusterException closed = assertThrows(NgrrdClusterException.class,
+                () -> handle.write("in_octets", new Sample(1L, 1.0)));
+        assertEquals(ErrorCode.CLOSED, closed.code());
+    }
+
+    @Test
+    void modoDoHandleEhFixoDesdeAConstrucao() {
+        assertTrue(openedHandle().isWritable());
+        assertFalse(readOnlyOpenedHandle().isWritable());
     }
 
     @Test

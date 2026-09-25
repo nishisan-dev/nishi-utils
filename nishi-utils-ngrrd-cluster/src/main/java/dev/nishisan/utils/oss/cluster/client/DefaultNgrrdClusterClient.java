@@ -94,7 +94,7 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
     private final PlacementResolver resolver;
     private final SeriesExistence existence;
     private final WriteDispatcher dispatcher;
-    /** Handles abertos, com as regras de reaproveitamento e promoção de {@link #open(String, Map, Ngrrd.OpenOptions)}. */
+    /** Handles principais abertos, com as regras de reaproveitamento de {@link #open(String, Map, Ngrrd.OpenOptions)}. */
     private final SeriesHandleCache handles;
 
     private volatile boolean closed;

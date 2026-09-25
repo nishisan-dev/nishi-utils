@@ -37,10 +37,12 @@ import java.util.Optional;
  * {@link NgrrdHandle} que roteiam cada operação ao storage node dono da série,
  * com placement, retentativa e batching de escrita transparentes ao chamador.
  *
- * <p>Um único handle é mantido por {@code seriesKey}: chamar {@link #open}
- * duas vezes com as mesmas tags devolve o mesmo {@link NgrrdHandle}
+ * <p>Um único handle principal é mantido por {@code seriesKey}: chamar {@link #open}
+ * duas vezes com as mesmas tags e o mesmo modo devolve o mesmo {@link NgrrdHandle}
  * (referência compartilhada, sem contagem de referências) — {@link #close()}
- * do cliente fecha esse handle para todos os chamadores que o obtiveram.</p>
+ * do cliente fecha esse handle para todos os chamadores que o obtiveram. As
+ * combinações entre abertura com e sem criação estão em
+ * {@link #open(String, Map, Ngrrd.OpenOptions)}.</p>
  */
 public interface NgrrdClusterClient extends Closeable {
 
@@ -60,16 +62,24 @@ public interface NgrrdClusterClient extends Closeable {
      * {@link IllegalStateException}. O {@code close()} desse handle é local: não drena buffers nem envia
      * {@code CLOSE} ao storage, que fecha a série por ociosidade.</p>
      *
-     * <p><b>Cache de handles</b> (um por chave de série):</p>
+     * <p><b>Cache de handles</b> — no máximo um handle principal por chave de série:</p>
      * <ul>
-     *   <li>sem criar, com um handle aberto em cache (somente leitura ou gravável): devolve o existente;</li>
-     *   <li>com criação, com um handle somente leitura aberto em cache: promove esse mesmo handle a
-     *       gravável, que passa a se comportar em tudo como aberto com criação (inclusive o
-     *       {@code close()} com {@code CLOSE} remoto) — um handle gravável nunca é rebaixado;</li>
-     *   <li>handle em cache fechado (ou fechando durante a promoção): um novo é aberto no lugar.</li>
+     *   <li>com criação, com um gravável aberto em cache: devolve o existente (compartilhado);</li>
+     *   <li>com criação, com um somente leitura aberto em cache: abre um gravável NOVO, com as opções
+     *       ({@code durability}, {@code onGeometryChange}, YAML e tags) de quem pediu criar, e o coloca no
+     *       lugar do somente leitura. O somente leitura antigo fica destacado do cache: continua lendo
+     *       para quem já o tem, e o {@code close()} dele segue local, sem afetar o gravável;</li>
+     *   <li>sem criar, com um gravável aberto em cache: devolve uma VISTA somente leitura sobre ele — as
+     *       leituras delegam ao gravável, escrita lança {@link IllegalStateException}, e o
+     *       {@code close()} fecha só a vista (nunca o gravável, que continua escrevendo); cada chamada
+     *       recebe a sua vista;</li>
+     *   <li>sem criar, com um somente leitura aberto em cache: devolve o existente (compartilhado);</li>
+     *   <li>handle em cache fechado, ou nenhum: um novo é aberto no lugar.</li>
      * </ul>
-     * <p>Como o handle é compartilhado entre quem abre a mesma chave, {@code close()} por um chamador o
-     * fecha para todos.</p>
+     * <p>Handles devolvidos a mais de um chamador (o gravável para quem abre com criação, o somente
+     * leitura para quem abre sem criar) são compartilhados, sem contagem de referências: o
+     * {@code close()} de um gravável por um chamador o fecha para todos (contrato da 8.5.0); o de um
+     * somente leitura é local, mas também vale para todos que o compartilham.</p>
      */
     NgrrdHandle open(String yaml, Map<String, String> tags, Ngrrd.OpenOptions options);
 

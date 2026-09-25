@@ -17,6 +17,7 @@
 
 package dev.nishisan.utils.oss.cluster.client;
 
+import dev.nishisan.utils.oss.NgrrdHandle;
 import dev.nishisan.utils.oss.cluster.rpc.CoordinationLocks;
 
 import java.util.List;
@@ -26,20 +27,30 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.function.Supplier;
 
 /**
- * Handles abertos pelo cliente, um por chave de série, com as regras de reaproveitamento de
- * {@code DefaultNgrrdClusterClient.open}:
+ * Handles abertos pelo cliente — no máximo UM handle principal por chave de série — com as regras de
+ * reaproveitamento de {@code DefaultNgrrdClusterClient.open}:
  * <ul>
- *   <li>{@code open} sem criar devolve o handle aberto em cache, seja somente leitura ou gravável;</li>
- *   <li>{@code open} com criação devolve o handle gravável em cache ou PROMOVE o somente leitura aberto
- *       ({@link RemoteSeriesHandle#tryPromoteToWritable()}) — nunca rebaixa um gravável;</li>
- *   <li>um handle fechado (ou cuja promoção falhou por estar fechando) nunca é devolvido: um novo é
- *       aberto no lugar.</li>
+ *   <li>{@code open} com criação: principal gravável aberto → devolve-o; principal somente leitura
+ *       aberto → abre um gravável NOVO (com as opções de quem pediu criar) e o publica no lugar do
+ *       somente leitura, que fica destacado do mapa (segue válido para quem o tem, com close local);
+ *       sem principal ou principal fechado → abre um gravável e o publica;</li>
+ *   <li>{@code open} sem criar: principal gravável aberto → devolve uma {@link ReadOnlyHandleView} sobre
+ *       ele (o close da vista nunca fecha o gravável; a vista não entra no mapa); principal somente
+ *       leitura aberto → devolve-o (compartilhado); sem principal ou principal fechado → abre um somente
+ *       leitura e o publica.</li>
  * </ul>
+ *
+ * <p>Toda publicação e remoção é condicional à instância ({@code putIfAbsent}, {@code replace(key, antigo,
+ * novo)}, {@code remove(key, handle)}): se o principal mudou entre a decisão e a publicação, a decisão é
+ * refeita com o handle já aberto — ele é publicado sobre o principal novo ou, se este já servir ao
+ * chamador, descartado localmente ({@link RemoteSeriesHandle#discard()}), sem nenhum RPC a mais.</p>
  *
  * <p>Nunca faz RPC dentro de {@code computeIfAbsent} — isso manteria o bin lock interno do
  * {@link ConcurrentHashMap} preso durante a chamada de rede do {@code OPEN}, bloqueando qualquer outra
- * série do mapa. Um lock por chave ({@code openLocks}, construído sem I/O) serializa só as aberturas
- * concorrentes DA MESMA série. A remoção é sempre condicional à instância ({@link #remove}).</p>
+ * série do mapa. O lock por chave ({@code openLocks}, construído sem I/O, adquirido via
+ * {@link CoordinationLocks}) só serializa as decisões de abertura DA MESMA série, para que aberturas
+ * concorrentes não abram vários handles; a correção não depende dele — depende da publicação
+ * condicional.</p>
  */
 final class SeriesHandleCache {
 
@@ -47,29 +58,41 @@ final class SeriesHandleCache {
     private final ConcurrentMap<String, Object> openLocks = new ConcurrentHashMap<>();
 
     /**
-     * Devolve um handle reaproveitável de {@code seriesKey} ou abre um novo com {@code opener} (que faz o
-     * {@code OPEN} remoto), publicando-o só se a abertura der certo.
+     * Devolve o handle de {@code seriesKey} segundo as regras da classe, abrindo um novo com
+     * {@code opener} (que faz o {@code OPEN} remoto) quando nada no mapa serve — o handle novo só é
+     * publicado se a abertura der certo.
      *
-     * @param createIfMissing se o chamador pediu criação — decide entre promover ou só reaproveitar
-     * @param opener          cria e abre um handle novo; o que ele lançar sobe ao chamador
+     * @param createIfMissing se o chamador pediu criação
+     * @param opener          cria e abre um handle novo com as opções do chamador; o que ele lançar sobe
+     *                        ao chamador
      */
-    RemoteSeriesHandle open(String seriesKey, boolean createIfMissing, Supplier<RemoteSeriesHandle> opener) {
+    NgrrdHandle open(String seriesKey, boolean createIfMissing, Supplier<RemoteSeriesHandle> opener) {
         Objects.requireNonNull(seriesKey, "seriesKey");
         Objects.requireNonNull(opener, "opener");
-        RemoteSeriesHandle reusable = reusable(handles.get(seriesKey), createIfMissing);
+        NgrrdHandle reusable = reusable(handles.get(seriesKey), createIfMissing);
         if (reusable != null) {
             return reusable;
         }
         Object lock = openLocks.computeIfAbsent(seriesKey, key -> new Object());
         try {
             try (var guard = CoordinationLocks.acquire(lock)) {
-                reusable = reusable(handles.get(seriesKey), createIfMissing);
-                if (reusable != null) {
-                    return reusable;
+                RemoteSeriesHandle opened = null;
+                for (;;) {
+                    RemoteSeriesHandle current = handles.get(seriesKey);
+                    reusable = reusable(current, createIfMissing);
+                    if (reusable != null) {
+                        if (opened != null) {
+                            opened.discard();
+                        }
+                        return reusable;
+                    }
+                    if (opened == null) {
+                        opened = opener.get();
+                    }
+                    if (publish(seriesKey, current, opened)) {
+                        return opened;
+                    }
                 }
-                RemoteSeriesHandle handle = opener.get();
-                handles.put(seriesKey, handle);
-                return handle;
             }
         } finally {
             openLocks.remove(seriesKey, lock);
@@ -77,17 +100,26 @@ final class SeriesHandleCache {
     }
 
     /**
-     * {@code cached} se puder ser devolvido a um {@code open} com (ou sem) criação, promovendo-o quando
-     * preciso; {@code null} se não houver handle ou se ele estiver fechado.
+     * O que um {@code open} com (ou sem) criação recebe do principal {@code current}: o próprio handle,
+     * uma vista somente leitura sobre ele, ou {@code null} se for preciso abrir um novo (sem principal,
+     * principal fechado, ou somente leitura diante de um pedido de criação).
      */
-    private static RemoteSeriesHandle reusable(RemoteSeriesHandle cached, boolean createIfMissing) {
-        if (cached == null) {
+    private static NgrrdHandle reusable(RemoteSeriesHandle current, boolean createIfMissing) {
+        if (current == null || !current.isOpen()) {
             return null;
         }
-        if (createIfMissing) {
-            return cached.tryPromoteToWritable() ? cached : null;
+        if (current.isWritable()) {
+            return createIfMissing ? current : new ReadOnlyHandleView(current);
         }
-        return cached.isOpen() ? cached : null;
+        return createIfMissing ? null : current;
+    }
+
+    /** Publica {@code opened} no lugar de {@code current} só se o principal ainda for {@code current}. */
+    private boolean publish(String seriesKey, RemoteSeriesHandle current, RemoteSeriesHandle opened) {
+        if (current == null) {
+            return handles.putIfAbsent(seriesKey, opened) == null;
+        }
+        return handles.replace(seriesKey, current, opened);
     }
 
     /** Remove {@code handle} de {@code seriesKey} só se ainda for ele o registrado (nunca um handle mais novo). */
@@ -95,17 +127,17 @@ final class SeriesHandleCache {
         handles.remove(seriesKey, handle);
     }
 
-    /** Handle registrado para {@code seriesKey}, aberto ou não; {@code null} se não houver. */
+    /** Handle principal registrado para {@code seriesKey}, aberto ou não; {@code null} se não houver. */
     RemoteSeriesHandle get(String seriesKey) {
         return handles.get(seriesKey);
     }
 
-    /** Quantidade de handles registrados. */
+    /** Quantidade de handles principais registrados. */
     int size() {
         return handles.size();
     }
 
-    /** Cópia dos handles registrados neste instante. */
+    /** Cópia dos handles principais registrados neste instante. */
     List<RemoteSeriesHandle> snapshot() {
         return List.copyOf(handles.values());
     }
