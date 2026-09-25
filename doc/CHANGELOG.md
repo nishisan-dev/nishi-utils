@@ -4,6 +4,38 @@
 
 ---
 
+## 2026-09-25 — Correções no rebalance com ingestão contínua — release 8.5.1
+
+Correções aplicadas ao módulo `nishi-utils-ngrrd-cluster`, complementando o trabalho da
+[PR #172](https://github.com/nishisan-dev/nishi-utils/pull/172) (rebalance com ingestão contínua, 8.5.0).
+
+- `MigrationCoordinator#pollUntilResolved` abortava a migração quando o poll de
+  `MIGRATE_STATUS` ao destino falhava por transporte na mesma iteração em que a origem já
+  reportava erro — mesmo com o destino já `COMMITTED` (ele segura o lock da série durante
+  o commit/fsync, e o mesmo lock atende `MIGRATE_STATUS`, então esse timeout é o caso
+  comum, não o raro). Agora só aborta por erro da origem quando o destino respondeu
+  (não-nulo) e não é `COMMITTED` na mesma iteração. Se o poll do destino falhar por
+  transporte com a origem já em erro, `SOURCE_FAILURE_DESTINATION_GRACE` (10 s, contados
+  da primeira falha da origem observada) dá uma carência limitada antes de reconsultar o
+  destino uma última vez e decidir — **trade-off aceito:** até 10 s de congelamento extra
+  da série nesse cenário específico, em vez de esperar o `migrationTimeout` inteiro
+  (10 min por padrão) sempre que o destino realmente caísse durante o cutover. Se a
+  origem nunca reportar erro (ou o poll do destino nunca falhar), o coordenador continua
+  tentando até o `migrationTimeout`, reconsultando o destino uma última vez antes de
+  desistir.
+- Com a série já congelada (clientes recebendo `MIGRATING`), cada patch final do delta
+  esperava na mesma fila dos chunks de 256 KiB de outras cópias — medido em até 252 ms por
+  rodada a 1 MiB/s com sete transferências concorrentes. `MigrationBandwidth` ganha
+  `acquireUrgent(bytes)`: debita o orçamento imediatamente, sem esperar a vez. Só os
+  patches enviados depois de `markMigrating` (cutover final) usam o modo urgente; os
+  patches de catch-up continuam disputando a banda em pé de igualdade. O delta final
+  continua contando no orçamento — a média de bytes/s por origem é preservada. A rajada do
+  orçamento (`ngrrd.rebalance.maxBytesPerSecond`) deixa de ser só "até um chunk": pode
+  incluir também os deltas finais de cutovers simultâneos.
+- `VirtualThreadMigrationTest` pula a partir do JDK 24: o JEP 491 faz `synchronized` deixar
+  de prender a carrier thread, tornando o teste inócuo (passaria mesmo com a regressão de
+  volta). O CI roda em JDK 21.
+
 ## 2026-09-24 — Rebalance com ingestão contínua — release 8.5.0
 
 Continuação da [issue #169](https://github.com/nishisan-dev/nishi-utils/issues/169).

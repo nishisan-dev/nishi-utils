@@ -16,7 +16,7 @@ Depois de compilar e copiar as dependências conforme o quickstart, defina no te
 administração:
 
 ```bash
-NGRRD_CP='nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.4.1.jar:nishi-utils-ngrrd-cluster/target/lib/*'
+NGRRD_CP='nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.5.1.jar:nishi-utils-ngrrd-cluster/target/lib/*'
 NGRRD_SEED='127.0.0.1:7101'
 
 ngrrd_admin() {
@@ -86,7 +86,7 @@ YAML
 Em um terminal separado, mantenha o novo processo em primeiro plano:
 
 ```bash
-java -cp 'nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.4.1.jar:nishi-utils-ngrrd-cluster/target/lib/*' \
+java -cp 'nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.5.1.jar:nishi-utils-ngrrd-cluster/target/lib/*' \
   dev.nishisan.utils.oss.cluster.node.NgrrdStorageNodeMain \
   --config target/ngrrd-demo/storage-4.yaml
 ```
@@ -237,15 +237,35 @@ Ao encerrar um nó, o transporte fecha inclusive sockets ainda sem identidade e 
 que conexões em abertura reapareçam depois do fechamento.
 O coordenador consulta também a origem: se ela já falhou,
 resolve a migração preservando a cópia original, sem esperar desnecessariamente o prazo
-completo. Um `COMMITTED` confirmado no destino tem precedência sobre a falha da origem.
+completo. Um `COMMITTED` confirmado no destino tem precedência sobre a falha da origem —
+inclusive quando o próprio poll ao destino falha por transporte (o destino segura o lock
+da série durante o commit/fsync, e o mesmo lock atende à consulta de status, então esse
+timeout é comum, não raro): a correção da 8.5.1 só aborta por falha da origem quando o
+destino respondeu e não confirmou `COMMITTED` na mesma rodada. Se o poll do destino falhar
+com a origem já em erro, o coordenador dá uma carência limitada de 10 s (contada da primeira
+falha da origem observada, sem renovar a cada rodada) antes de reconsultar o destino uma
+última vez e decidir — **trade-off aceito**: até 10 s de congelamento extra da série (clientes
+recebendo `MIGRATING`) nesse cenário específico, em troca de não esperar o `migrationTimeout`
+inteiro (10 min por padrão) sempre que o destino realmente cair durante o cutover. Se a origem
+nunca reportar erro (ou o poll do destino nunca falhar), o comportamento anterior se mantém: o
+coordenador tenta de novo até o `migrationTimeout`, reconsultando o destino uma última vez
+antes de desistir.
 
 O limite `ngrrd.rebalance.maxBytesPerSecond` reduz a competição com a ingestão. O orçamento
-é por **origem**, agregado entre seus destinos e transferências, com rajada de até um chunk.
+é por **origem**, agregado entre seus destinos e transferências, com rajada de até um chunk
+normal em trânsito mais os deltas finais (≤ 256 KiB cada) de cutovers simultâneos, que furam
+a fila de banda (ver abaixo).
 Conta bytes da imagem e dos blocos incrementais; framing, JSON/base64 e compressão mudam
 os bytes efetivos na rede. O padrão é 16 MiB/s por origem.
 Por exemplo, oito migrações em uma origem com `maxBytesPerSecond: 8388608` compartilham
 8 MiB/s. Duas origens podem enviar, juntas, 16 MiB/s ao mesmo destino. Em Java, configure
 `StorageNodeConfig.Builder.migrationBytesPerSecond(...)`.
+Os patches finais do cutover (enviados depois que a série já está congelada, com os
+clientes recebendo `MIGRATING`) têm prioridade nessa fila desde a 8.5.1: não esperam atrás
+dos chunks de 256 KiB de outras cópias — os chunks concorrentes absorvem o atraso — mas
+continuam contando no mesmo orçamento, então a média de bytes/s por origem não muda. Só o
+delta final é prioritário; os patches de catch-up, enviados enquanto a série ainda recebe
+escrita, continuam disputando a banda em pé de igualdade com os chunks.
 
 Dimensione esse valor pela folga de rede, CPU e disco do destino, considerando todas as
 origens. Um limite menor alonga a cópia e a espera pelos últimos blocos; confira

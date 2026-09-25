@@ -229,6 +229,200 @@ class MigrationExecutorTest {
         assertTrue(srcRegistry.isMigrationFrozen(key), "cutover stays fenced until the catalog switches owner");
     }
 
+    /**
+     * Com a série já congelada ({@code markMigrating}), o patch final do cutover não pode esperar
+     * atrás de chunks/patches de outras cópias na mesma banda do nó — só ele usa {@code acquireUrgent}.
+     * Simula a fila cheia reservando, sincronamente, um slot de banda "de outra cópia" bem no instante
+     * em que o patch final fica pronto (mesmo efeito de um chunk concorrente real: o orçamento
+     * compartilhado fica ocupado por ~2 s) e mede o tempo até a entrega do patch — comportamento
+     * observado, não a chamada de método em si. Folga grande entre a reserva (~2 s) e o limite da
+     * asserção (1 s) para reduzir sensibilidade a jitter de CI, mantendo uma margem clara acima do que
+     * o código sem a prioridade urgente levaria.
+     */
+    @Test
+    void patchesFinaisDoCutoverUsamPrioridadeUrgenteNaBanda() throws Exception {
+        String key = "urgent-cutover-series", id = "urgent-cutover-move";
+        // Banda alta o bastante para a cópia base/catch-up (imagem real da série) não ficar lenta —
+        // a contenção que este teste mede vem só da reserva síncrona de "outra cópia" logo abaixo,
+        // não da taxa configurada aqui.
+        long bytesPerSecond = 256L * 1024;
+        MigrationExecutor slowSrcExecutor = new MigrationExecutor(new FakeTransport(SRC), srcRegistry, srcVolume,
+                rpc, srcCatalog, SRC, "series", 4_096L, MAX_SERIES_BYTES, bytesPerSecond, Clock.systemUTC());
+        rpc.register(SRC, slowSrcExecutor);
+        try {
+            byte[] before = writeAndCheckpointSeries(key);
+            publishMigration(key, id);
+
+            Field bandwidthField = MigrationExecutor.class.getDeclaredField("bandwidth");
+            bandwidthField.setAccessible(true);
+            MigrationBandwidth bandwidth = (MigrationBandwidth) bandwidthField.get(slowSrcExecutor);
+
+            long step = 300_000L, t0 = 1_700_000_000_000L - 1_700_000_000_000L % step;
+            var caughtUp = new java.util.concurrent.atomic.AtomicBoolean();
+            // Um único write pode gerar mais de um range mudado (níveis de RRA distintos no NGRR) — em
+            // vez de contar patches, classifica cada um pelo estado REAL da série no instante em que é
+            // entregue: srcRegistry.isMigrationFrozen(key) só vira true depois de markMigrating, que só
+            // roda depois que TODO o catch-up já foi enviado — não há corrida, é sequencial na mesma
+            // thread de transferência.
+            var occupierClaimed = new java.util.concurrent.atomic.AtomicBoolean();
+            var finalPatchStartedAt = new java.util.concurrent.atomic.AtomicLong();
+            var finalPatchDeliveredAt = new java.util.concurrent.atomic.AtomicLong();
+            rpc.afterChunk = () -> {
+                if (caughtUp.compareAndSet(false, true)) {
+                    assertTrue(srcRegistry.withHandle(key, h -> {
+                        h.write("in_octets", new Sample(t0 + 20 * step, 5_000));
+                        h.checkpoint();
+                        return true;
+                    }).orElse(false), "escrita durante a cópia base deve continuar admitida");
+                }
+            };
+            rpc.afterPatch = () -> {
+                if (!srcRegistry.isMigrationFrozen(key)) {
+                    // Ainda em catch-up: na primeira vez, cria o range que só vai existir no cutover
+                    // final (write depois do snapshot de catch-up, antes da leitura congelada).
+                    if (occupierClaimed.compareAndSet(false, true)) {
+                        assertTrue(srcRegistry.withHandle(key, h -> {
+                            h.write("in_octets", new Sample(t0 + 21 * step, 8_000));
+                            h.checkpoint();
+                            return true;
+                        }).orElse(false), "escrita entre o catch-up e o freeze deve continuar admitida");
+                    }
+                    // Reserva um slot da banda como se fosse um chunk concorrente de outra cópia — a
+                    // CADA patch de catch-up observado (um único write pode gerar mais de um range
+                    // mudado, então não dá pra saber de antemão qual é o último). Só a reserva feita no
+                    // último patch de catch-up é que efetivamente sobrevive até o primeiro patch final;
+                    // as anteriores só atrasam os próprios patches de catch-up restantes (esperado, não
+                    // são urgentes) — por isso finalPatchStartedAt é sempre sobrescrito com a mais recente.
+                    assertTrue(bandwidth.acquire(524_288, () -> true)); // ~2 s a 256 KiB/s
+                    finalPatchStartedAt.set(System.nanoTime());
+                } else if (finalPatchDeliveredAt.get() == 0L) {
+                    // Primeiro patch entregue já com a série congelada -- é o patch final do cutover.
+                    finalPatchDeliveredAt.set(System.nanoTime());
+                }
+            };
+
+            assertEquals(MigrateStatus.OK, ((MigrateResponse) slowSrcExecutor.handleLocal(Commands.MIGRATE_START,
+                    new MigrateStartRequest(key, id, DST.value()))).status());
+
+            long deadline = System.currentTimeMillis() + AWAIT_TIMEOUT.toMillis();
+            MigrateResponse last = null;
+            while (System.currentTimeMillis() < deadline) {
+                last = status(slowSrcExecutor, id);
+                if (last.status() == MigrateStatus.COMMITTED) {
+                    break;
+                }
+                if (last.status() == MigrateStatus.ERROR) {
+                    fail("migração falhou: " + last.message());
+                }
+                sleepQuietly();
+            }
+            assertEquals(MigrateStatus.COMMITTED, last != null ? last.status() : null, "migração não completou a tempo");
+
+            assertTrue(finalPatchStartedAt.get() > 0L, "deveria ter reservado o slot concorrente antes do freeze");
+            assertTrue(finalPatchDeliveredAt.get() > 0L, "deveria ter observado pelo menos um patch final pós-freeze");
+            long deliveryMs = TimeUnit.NANOSECONDS.toMillis(finalPatchDeliveredAt.get() - finalPatchStartedAt.get());
+            assertTrue(deliveryMs < 1_000L,
+                    "o patch final do cutover deveria furar a fila de banda (levou " + deliveryMs + " ms)");
+            byte[] current = srcVolume.storage().get(objectKey(key)).orElseThrow();
+            assertFalse(java.util.Arrays.equals(before, current));
+            assertArrayEquals(current, dstVolume.storage().get(objectKey(key)).orElseThrow());
+        } finally {
+            slowSrcExecutor.close();
+        }
+    }
+
+    /**
+     * A checagem de {@code transferActive} antes de cada {@code acquireUrgent} (ver Javadoc de {@code
+     * sendPatches}) tem de interromper o envio dos patches finais do cutover assim que a migração for
+     * abortada — em vez de continuar mandando RPCs para um destino que já não espera por elas. Chama
+     * {@code sendPatches} diretamente (visibilidade de pacote), com um {@link ClusterRpc} fake: {@code
+     * before}/{@code after} têm dois ranges BEM separados (blocos de 4096 bytes, longe demais para
+     * mesclar); o fake, ao responder ao 1º patch, dispara um {@code MIGRATE_ABORT} de verdade via
+     * {@code handleAbort} (seguro aqui porque {@code sendPatches} não segura o lock da série) — e só
+     * então o 2º patch seria tentado.
+     */
+    @Test
+    void abortDuranteOsPatchesFinaisDoCutoverInterrompeOEnvioSemSobrescreverAFaseTerminal() throws Exception {
+        String key = "aborted-cutover-series", id = "aborted-cutover-move";
+        var patchCalls = new java.util.concurrent.atomic.AtomicInteger();
+        var executorRef = new java.util.concurrent.atomic.AtomicReference<MigrationExecutor>();
+        ClusterRpc fakeRpc = new ClusterRpc() {
+            @Override
+            @SuppressWarnings("unchecked")
+            public <R> R call(NodeId target, String command, Object body, Class<R> responseType) {
+                assertEquals(Commands.MIGRATE_PATCH, command, "só o patch final deveria disparar RPC aqui");
+                int n = patchCalls.incrementAndGet();
+                if (n == 1) {
+                    // Simula um MIGRATE_ABORT concorrente chegando logo após o 1º patch final ser
+                    // entregue -- via handleAbort de verdade (papel SOURCE).
+                    executorRef.get().handleLocal(Commands.MIGRATE_ABORT, new MigrateControlRequest(key, id));
+                }
+                return (R) MigrateResponse.of(MigrateStatus.OK, null);
+            }
+
+            @Override
+            public NodeId localId() {
+                return SRC;
+            }
+
+            @Override
+            public Optional<NodeId> leaderId() {
+                return Optional.empty();
+            }
+        };
+        MigrationExecutor executor = new MigrationExecutor(new FakeTransport(SRC), srcRegistry, srcVolume, fakeRpc,
+                srcCatalog, SRC, 4_096L, MAX_SERIES_BYTES, Clock.systemUTC());
+        executorRef.set(executor);
+        try {
+            setSourceState(executor, id, key, MigrationExecutor.MigratePhase.TRANSFERRING);
+
+            // Dois ranges separados por um bloco inteiro (4096 bytes) -- muito além do limite de
+            // mesclagem de sendPatches, garantindo DOIS patches se o laço não for interrompido.
+            byte[] before = new byte[8192];
+            byte[] after = before.clone();
+            after[0] = 1;
+            after[8_000] = 1;
+
+            try {
+                executor.sendPatches(DST, key, id, before, after, 0, true);
+                fail("deveria ter lançado IllegalStateException ao tentar o 2º patch após o abort");
+            } catch (IllegalStateException expected) {
+                // esperado: transferActive() barra o 2º patch depois do handleAbort disparado acima.
+            }
+            assertEquals(1, patchCalls.get(), "nenhum patch urgente adicional deveria ser enviado depois do abort");
+            assertEquals(MigrationExecutor.MigratePhase.ABORTED, readState(executor, id).phase(),
+                    "a fase terminal (ABORTED) não pode ser sobrescrita");
+        } finally {
+            executor.close();
+        }
+    }
+
+    /** Substitui (ou cria) a entrada de {@code migrationId} em {@code states} com o papel SOURCE. */
+    private static void setSourceState(MigrationExecutor executor, String migrationId, String seriesKey,
+            MigrationExecutor.MigratePhase phase) {
+        try {
+            Field statesField = MigrationExecutor.class.getDeclaredField("states");
+            statesField.setAccessible(true);
+            @SuppressWarnings("unchecked")
+            Map<String, MigrationExecutor.MigrationState> states =
+                    (Map<String, MigrationExecutor.MigrationState>) statesField.get(executor);
+            states.put(migrationId, new MigrationExecutor.MigrationState(seriesKey, migrationId,
+                    MigrationExecutor.Role.SOURCE, phase, 0, 0, 0L, null, null, null, 0L));
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    private static MigrationExecutor.MigrationState readState(MigrationExecutor executor, String migrationId)
+            throws ReflectiveOperationException {
+        Field statesField = MigrationExecutor.class.getDeclaredField("states");
+        statesField.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        Map<String, MigrationExecutor.MigrationState> states =
+                (Map<String, MigrationExecutor.MigrationState>) statesField.get(executor);
+        return states.get(migrationId);
+    }
+
     @Test
     void patchesAreIdempotentAndCannotOutliveAbortOrTheirReservation() {
         String key = "patches", id = "patch-id";

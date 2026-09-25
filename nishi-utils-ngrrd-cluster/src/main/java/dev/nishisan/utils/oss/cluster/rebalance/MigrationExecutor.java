@@ -325,7 +325,7 @@ public final class MigrationExecutor extends RequestHandlerSupport {
         // Catch up once while writes are still admitted, then freeze only the final dirty ranges.
         try {
             byte[] current = snapshotWhileCopying(seriesKey, migrationId, storageKey);
-            int patchSequence = sendPatches(target, seriesKey, migrationId, bytes, current, 0);
+            int patchSequence = sendPatches(target, seriesKey, migrationId, bytes, current, 0, false);
             bytes = current;
             byte[] frozen;
             try (var guard = CoordinationLocks.acquire(seriesLock(seriesKey))) {
@@ -338,7 +338,11 @@ public final class MigrationExecutor extends RequestHandlerSupport {
             if (finalBytes > 256 * 1024L) {
                 throw new IllegalStateException("series changed too fast for a bounded cutover; retry migration later");
             }
-            sendPatches(target, seriesKey, migrationId, current, frozen, patchSequence);
+            // A série já está congelada aqui (clientes recebendo MIGRATING): estes são os ÚNICOS
+            // patches urgentes — não podem esperar atrás dos chunks de 256 KiB de outras cópias na
+            // mesma banda do nó. Continuam contando no orçamento (acquireUrgent debita, só não espera
+            // a vez); os chunks concorrentes absorvem o atraso.
+            sendPatches(target, seriesKey, migrationId, current, frozen, patchSequence, true);
             bytes = frozen;
             sha256Hex = sha256Hex(frozen);
         } catch (RuntimeException e) {
@@ -395,9 +399,30 @@ public final class MigrationExecutor extends RequestHandlerSupport {
         return ranges;
     }
 
-    private int sendPatches(NodeId target, String key, String id, byte[] before, byte[] after, int sequence) {
+    /**
+     * Envia os patches de {@code before} para {@code after}. {@code urgent} distingue os dois momentos
+     * do cutover: {@code false} para o catch-up (série ainda recebendo escrita, chunks/patches disputam
+     * a banda em pé de igualdade via {@link MigrationBandwidth#acquire}); {@code true} só para os
+     * patches enviados DEPOIS de {@code markMigrating} (série já congelada), que usam {@link
+     * MigrationBandwidth#acquireUrgent} — furam a fila sem esperar, mas continuam debitando o orçamento.
+     *
+     * <p>Visibilidade de pacote (não {@code private}) só para {@code MigrationExecutorTest} poder
+     * exercitar o laço isoladamente, com um {@link ClusterRpc} fake; não é API estável do cliente.</p>
+     */
+    int sendPatches(NodeId target, String key, String id, byte[] before, byte[] after, int sequence,
+            boolean urgent) {
         for (PatchRange range : changedRanges(before, after)) {
-            if (!bandwidth.acquire(range.length(), () -> transferActive(id))) {
+            if (urgent) {
+                // acquireUrgent nunca espera, então não há ponto natural de checagem de "migração ainda
+                // ativa" como no acquire (que recebe transferActive como BooleanSupplier do laço de
+                // espera) — sem esta checagem explícita, um abort concorrente durante o cutover final
+                // não interrompia o envio dos patches restantes, gastando RPCs inúteis contra um destino
+                // que já não espera por eles.
+                if (!transferActive(id)) {
+                    throw new IllegalStateException("migration ended while pacing patches");
+                }
+                bandwidth.acquireUrgent(range.length());
+            } else if (!bandwidth.acquire(range.length(), () -> transferActive(id))) {
                 throw new IllegalStateException("migration ended while pacing patches");
             }
             byte[] changed = Arrays.copyOfRange(after, range.offset(), range.offset() + range.length());

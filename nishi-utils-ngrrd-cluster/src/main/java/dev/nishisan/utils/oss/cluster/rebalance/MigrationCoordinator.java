@@ -149,6 +149,24 @@ public final class MigrationCoordinator implements LeadershipListener {
     private static final int PLACEMENT_WRITE_ATTEMPTS = 20;
     private static final Duration PLACEMENT_WRITE_BACKOFF = Duration.ofMillis(500L);
 
+    /**
+     * Carência aplicada em {@link #pollUntilResolved} quando a origem já reportou erro, mas o poll de
+     * {@code MIGRATE_STATUS} ao destino continua falhando por transporte (destino segurando o lock da
+     * série no commit/fsync, o mesmo lock que atende {@code MIGRATE_STATUS} — ver Javadoc de {@link
+     * #pollUntilResolved}).
+     *
+     * <p>Sem esta carência, a série ficaria presa em {@code MIGRATING} (clientes recebendo {@code
+     * MIGRATING}) até o {@code migrationTimeout} inteiro (10 min por padrão) sempre que o destino
+     * realmente caísse durante o cutover — mesmo sem nenhuma chance real de um {@code COMMITTED} chegar
+     * depois. Trade-off aceito: até {@link #SOURCE_FAILURE_DESTINATION_GRACE} de congelamento extra da
+     * série nesse cenário específico (destino cai bem no cutover), documentado no CHANGELOG 8.5.1 e no
+     * guia operacional. A carência é contada a partir da PRIMEIRA iteração em que a origem reportou erro
+     * (não é renovada a cada iteração) e é sempre limitada pelo {@code migrationTimeout} — nunca estende
+     * o prazo total da migração, só evita esperar o prazo inteiro quando já não há dúvida de que a
+     * origem falhou.</p>
+     */
+    private static final Duration SOURCE_FAILURE_DESTINATION_GRACE = Duration.ofSeconds(10);
+
     private final CatalogView catalog;
     private final ClusterRpc rpc;
     private final PlacementRequestHandler.LeaderView leaderView;
@@ -312,9 +330,29 @@ public final class MigrationCoordinator implements LeadershipListener {
         }
     }
 
+    /**
+     * Poll periódico de {@code MIGRATE_STATUS} ao destino (e, quando necessário, à origem) até o
+     * cutover se resolver, respeitando a seguinte ordem de prioridade a cada iteração:
+     * <ol>
+     *   <li>Destino responde {@code COMMITTED} → completa. Sempre vence, mesmo com a origem em erro.</li>
+     *   <li>Destino responde (não-nulo) {@code ERROR}/{@code HASH_MISMATCH} → aborta na hora.</li>
+     *   <li>Destino responde {@code PARTIAL}/{@code UNKNOWN} e a origem reporta erro → aborta na hora
+     *       (não espera o {@code migrationTimeout}).</li>
+     *   <li>Destino não responde (falha de transporte) e a origem reporta erro → dá a carência de
+     *       {@link #SOURCE_FAILURE_DESTINATION_GRACE} antes de reconsultar o destino uma última vez e
+     *       decidir (completa se {@code COMMITTED}, aborta caso contrário).</li>
+     *   <li>Nenhuma das condições acima e o {@code migrationTimeout} estoura → reconsulta o destino uma
+     *       última vez antes de abortar (mesmo racional do caso anterior: um {@code COMMITTED} tardio
+     *       ainda vence).</li>
+     * </ol>
+     */
     private MigrationResult pollUntilResolved(String seriesKey, SeriesPlacement migratingPlacement, String src,
             String dst, String migrationId, long startedAt) {
         long deadline = clock.millis() + migrationTimeout.toMillis();
+        // Marca a PRIMEIRA iteração em que a origem reportou erro enquanto o poll do destino falhava
+        // por transporte — dispara a carência de SOURCE_FAILURE_DESTINATION_GRACE (ver Javadoc da
+        // constante). -1 enquanto isso nunca aconteceu.
+        long sourceFailureObservedAtMillis = -1L;
         for (;;) {
             if (!driving()) {
                 // Não desfaz nada: a migração pode continuar nos dois nós envolvidos, e o próximo
@@ -336,17 +374,61 @@ public final class MigrationCoordinator implements LeadershipListener {
                                     + (pollResponse.message() != null ? " (" + pollResponse.message() + ")" : ""),
                             startedAt);
                 }
-                // PARTIAL/UNKNOWN: continua o poll até COMMITTED, um status terminal, ou o timeout.
+                // PARTIAL/UNKNOWN: o destino respondeu (não-nulo) e não é COMMITTED — só agora vale a
+                // pena checar se a origem já falhou, para abortar sem esperar o migrationTimeout inteiro
+                // (destino COMMITTED sempre venceria antes deste ponto, inclusive um COMMIT perdido).
+                MigrateResponse sourceResponse = pollStatusQuietly(src, seriesKey, migrationId);
+                if (sourceResponse != null && sourceResponse.status() == MigrateStatus.ERROR) {
+                    return abort(seriesKey, migratingPlacement, src, dst,
+                            "origem reportou falha: " + sourceResponse.message(), startedAt);
+                }
+            } else {
+                // O poll do destino FALHOU (transporte): o destino segura o lock da série durante o
+                // commit (fsync) e o mesmo lock atende MIGRATE_STATUS, então esse timeout bem na
+                // iteração em que a origem já expirou é o caso comum, não o raro — abortar direto aqui
+                // podia contradizer um COMMITTED que o destino já tem, só ainda não confirmado a este
+                // líder. Mas sem NENHUM limite, isso deixaria a série MIGRATING até o migrationTimeout
+                // inteiro sempre que o destino realmente tivesse caído no cutover — daí a carência:
+                // consulta a origem só para saber SE ela já falhou (não para abortar por conta disso
+                // agora); ao primeiro erro observado da origem, arma o relógio da carência, e só quando
+                // ela se esgota é que reconsulta o destino uma ÚLTIMA vez antes de decidir.
+                MigrateResponse sourceResponse = pollStatusQuietly(src, seriesKey, migrationId);
+                if (sourceResponse != null && sourceResponse.status() == MigrateStatus.ERROR) {
+                    long now = clock.millis();
+                    if (sourceFailureObservedAtMillis < 0) {
+                        sourceFailureObservedAtMillis = now;
+                    }
+                    long graceDeadline = Math.min(deadline,
+                            sourceFailureObservedAtMillis + SOURCE_FAILURE_DESTINATION_GRACE.toMillis());
+                    if (now >= graceDeadline) {
+                        MigrateResponse finalPoll = pollStatusQuietly(dst, seriesKey, migrationId);
+                        if (finalPoll != null && finalPoll.status() == MigrateStatus.COMMITTED) {
+                            return complete(seriesKey, migratingPlacement, src, dst, migrationId,
+                                    finalPoll.bytes(), startedAt);
+                        }
+                        // Com um migrationTimeout curto (< SOURCE_FAILURE_DESTINATION_GRACE), o
+                        // Math.min acima já corta a carência no próprio deadline — quem realmente
+                        // esgotou foi o migrationTimeout, não a carência, então o motivo cita o timeout.
+                        String reason = graceDeadline < deadline
+                                ? "origem em erro (" + sourceResponse.message() + ") e destino não "
+                                        + "respondeu dentro da carência de " + SOURCE_FAILURE_DESTINATION_GRACE
+                                        + " após a falha da origem"
+                                : "timeout (" + migrationTimeout + ") aguardando COMMITTED no destino " + dst
+                                        + " (origem em erro: " + sourceResponse.message() + ")";
+                        return abort(seriesKey, migratingPlacement, src, dst, reason, startedAt);
+                    }
+                }
             }
-            // A source may already have failed a chunk while the target remains PARTIAL.
-            // Destination COMMITTED above always wins, including a lost COMMIT response.
-            MigrateResponse sourceResponse = pollStatusQuietly(src, seriesKey, migrationId);
-            if (sourceResponse != null && sourceResponse.status() == MigrateStatus.ERROR) {
-                return abort(seriesKey, migratingPlacement, src, dst,
-                        "origem reportou falha: " + sourceResponse.message(), startedAt);
-            }
-            // Falha de transporte no poll conta como uma tentativa e o laço continua até o timeout.
+            // O laço apenas continua; o próximo poll do destino tenta de novo, respeitando o
+            // migrationTimeout (e a carência acima, quando aplicável).
             if (clock.millis() >= deadline) {
+                // Antes de desistir, reconsulta o destino uma última vez: um COMMITTED aqui ainda vence
+                // sobre o timeout, pelo mesmo motivo dos comentários acima.
+                MigrateResponse finalPoll = pollStatusQuietly(dst, seriesKey, migrationId);
+                if (finalPoll != null && finalPoll.status() == MigrateStatus.COMMITTED) {
+                    return complete(seriesKey, migratingPlacement, src, dst, migrationId, finalPoll.bytes(),
+                            startedAt);
+                }
                 return abort(seriesKey, migratingPlacement, src, dst,
                         "timeout (" + migrationTimeout + ") aguardando COMMITTED no destino " + dst, startedAt);
             }

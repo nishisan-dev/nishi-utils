@@ -37,6 +37,8 @@ import org.junit.jupiter.api.Timeout;
 
 import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneId;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -50,6 +52,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiFunction;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -312,6 +315,193 @@ class MigrationCoordinatorTest {
         SeriesPlacement current = catalog.placementStrong("s1").orElseThrow();
         assertEquals(PlacementState.MIGRATING, current.state());
         assertEquals("outro-id", current.migrationId(), "não deveria ter tocado no placement de outra migração");
+    }
+
+    /**
+     * O destino segura o lock da série durante o commit (fsync) e o mesmo lock atende {@code
+     * MIGRATE_STATUS} — é comum, não raro, que o poll do destino estoure timeout de transporte bem na
+     * iteração em que a origem já responde erro. {@code pollUntilResolved} não pode abortar nesse caso
+     * se o destino já estiver {@code COMMITTED} (só ainda não confirmado pelo poll que falhou). Aqui o
+     * 1º poll do destino lança falha de transporte (devolve {@code null}) na mesma iteração em que a
+     * origem responde erro; o laço deve continuar em vez de abortar, e o 2º poll do destino confirma
+     * {@code COMMITTED}.
+     */
+    @Test
+    void commitNoDestinoVenceMesmoComPollDoDestinoFalhandoEOrigemEmErro() throws Exception {
+        newCoordinator(2);
+        catalog.putPlacement("s1", SeriesPlacement.active(SRC, 1_000L));
+        rpc.respond(SRC, Commands.MIGRATE_START, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+        AtomicInteger dstCalls = new AtomicInteger();
+        rpc.respond(DST, Commands.MIGRATE_STATUS, (target, body) -> {
+            if (dstCalls.incrementAndGet() == 1) {
+                throw new NgrrdClusterException(ErrorCode.TIMEOUT, "falha de transporte simulada no poll do destino");
+            }
+            return new MigrateResponse(MigrateStatus.COMMITTED, null, 777L);
+        });
+        rpc.respond(SRC, Commands.MIGRATE_STATUS, (target, body) -> MigrateResponse.of(MigrateStatus.ERROR, "falha simulada na origem"));
+        rpc.respond(SRC, Commands.MIGRATE_FINISH, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+        rpc.respond(SRC, Commands.MIGRATE_ABORT, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+        rpc.respond(DST, Commands.MIGRATE_ABORT, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+
+        MigrationResult result = coordinator.migrate("s1", SRC, DST).get(AWAIT_TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+
+        assertEquals(MigrationOutcome.COMPLETED, result.outcome());
+        assertEquals(777L, result.bytes());
+        assertEquals(DST, catalog.placementStrong("s1").orElseThrow().ownerNodeId());
+        assertEquals(0L, rpc.callsTo(DST, Commands.MIGRATE_ABORT), "COMMITTED no destino não pode virar ABORT");
+        assertEquals(0L, rpc.callsTo(SRC, Commands.MIGRATE_ABORT), "COMMITTED no destino não pode virar ABORT");
+    }
+
+    /**
+     * Quando o poll do destino RESPONDE (não falha de transporte) com um status não-{@code COMMITTED}
+     * na mesma iteração em que a origem reporta erro, o abort é imediato — não é preciso esperar o
+     * {@code migrationTimeout}.
+     */
+    @Test
+    void erroDaOrigemComDestinoRespondendoNaoCommittedAborta() throws Exception {
+        newCoordinator(2);
+        catalog.putPlacement("s1", SeriesPlacement.active(SRC, 1_000L));
+        rpc.respond(SRC, Commands.MIGRATE_START, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+        rpc.respond(DST, Commands.MIGRATE_STATUS, (target, body) -> MigrateResponse.of(MigrateStatus.PARTIAL, null));
+        rpc.respond(SRC, Commands.MIGRATE_STATUS, (target, body) -> MigrateResponse.of(MigrateStatus.ERROR, "falha simulada na origem"));
+        rpc.respond(SRC, Commands.MIGRATE_ABORT, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+        rpc.respond(DST, Commands.MIGRATE_ABORT, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+
+        MigrationResult result = coordinator.migrate("s1", SRC, DST).get(AWAIT_TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+
+        assertEquals(MigrationOutcome.FAILED, result.outcome());
+        assertTrue(result.reason().contains("falha simulada na origem"));
+        assertEquals(SRC, catalog.placementStrong("s1").orElseThrow().ownerNodeId());
+        assertEquals(1, rpc.callsTo(SRC, Commands.MIGRATE_ABORT));
+        assertEquals(1, rpc.callsTo(DST, Commands.MIGRATE_ABORT));
+    }
+
+    /**
+     * Ao estourar o {@code migrationTimeout}, o coordenador reconsulta o destino uma última vez ANTES
+     * de abortar — se essa reconsulta final confirmar {@code COMMITTED}, completa em vez de abortar.
+     * Usa um {@link Clock} manual para controlar deterministicamente quando o prazo estoura,
+     * sem depender de sleeps/tolerâncias de tempo real: os 3 primeiros polls do destino (dentro do
+     * laço normal) respondem {@code PARTIAL} e avançam o relógio manual 20 ms cada um, superando o
+     * prazo de 50 ms na 3ª iteração; só a reconsulta final (4º poll) responde {@code COMMITTED}.
+     */
+    @Test
+    void timeoutReconsultaDestinoAntesDeAbortar() throws Exception {
+        ManualClock clock = new ManualClock(0L);
+        coordinator = new MigrationCoordinator(catalog, rpc, leaderView, 2, Duration.ofMillis(5),
+                Duration.ofMillis(50), clock);
+        coordinator.onLeaderChanged(NodeId.of("self"));
+        catalog.putPlacement("s1", SeriesPlacement.active(SRC, 1_000L));
+        rpc.respond(SRC, Commands.MIGRATE_START, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+        rpc.respond(SRC, Commands.MIGRATE_STATUS, (target, body) -> MigrateResponse.of(MigrateStatus.PARTIAL, null));
+        AtomicInteger dstCalls = new AtomicInteger();
+        rpc.respond(DST, Commands.MIGRATE_STATUS, (target, body) -> {
+            int n = dstCalls.incrementAndGet();
+            clock.advance(20L);
+            if (n <= 3) {
+                return MigrateResponse.of(MigrateStatus.PARTIAL, null);
+            }
+            return new MigrateResponse(MigrateStatus.COMMITTED, null, 4_321L);
+        });
+        rpc.respond(SRC, Commands.MIGRATE_FINISH, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+        rpc.respond(SRC, Commands.MIGRATE_ABORT, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+        rpc.respond(DST, Commands.MIGRATE_ABORT, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+
+        MigrationResult result = coordinator.migrate("s1", SRC, DST).get(AWAIT_TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+
+        assertEquals(MigrationOutcome.COMPLETED, result.outcome());
+        assertEquals(4_321L, result.bytes());
+        assertEquals(DST, catalog.placementStrong("s1").orElseThrow().ownerNodeId());
+        assertEquals(0L, rpc.callsTo(DST, Commands.MIGRATE_ABORT));
+        assertTrue(dstCalls.get() >= 4, "deveria ter reconsultado o destino após o timeout");
+    }
+
+    /**
+     * Sem limite algum, a série ficaria presa em {@code MIGRATING} até o {@code migrationTimeout}
+     * inteiro sempre que o destino realmente tivesse caído durante o cutover (poll sempre falhando por
+     * transporte) com a origem já em erro. Aqui o {@code migrationTimeout} é bem maior que a carência de
+     * {@code SOURCE_FAILURE_DESTINATION_GRACE} (10 s) — cada poll da origem (sempre {@code ERROR})
+     * avança o relógio manual 4 s, cruzando a carência bem antes do timeout completo. O destino nunca
+     * responde (falha de transporte em todo poll, inclusive na reconsulta final da carência): o
+     * coordenador deve abortar perto da carência, não esperar o {@code migrationTimeout}.
+     */
+    @Test
+    void origemEmErroEDestinoNuncaRespondePorMaisQueACarenciaAbortaPertoDela() throws Exception {
+        ManualClock clock = new ManualClock(0L);
+        coordinator = new MigrationCoordinator(catalog, rpc, leaderView, 2, Duration.ofMillis(5),
+                Duration.ofMinutes(5), clock);
+        coordinator.onLeaderChanged(NodeId.of("self"));
+        catalog.putPlacement("s1", SeriesPlacement.active(SRC, 1_000L));
+        rpc.respond(SRC, Commands.MIGRATE_START, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+        AtomicInteger srcCalls = new AtomicInteger();
+        rpc.respond(SRC, Commands.MIGRATE_STATUS, (target, body) -> {
+            srcCalls.incrementAndGet();
+            clock.advance(4_000L); // cruza os 10s de carência em poucas chamadas, sem sleep real.
+            return MigrateResponse.of(MigrateStatus.ERROR, "falha simulada na origem");
+        });
+        rpc.respond(DST, Commands.MIGRATE_STATUS,
+                (target, body) -> { throw new NgrrdClusterException(ErrorCode.TIMEOUT, "destino inalcançável simulado"); });
+        rpc.respond(SRC, Commands.MIGRATE_ABORT, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+        rpc.respond(DST, Commands.MIGRATE_ABORT, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+
+        MigrationResult result = coordinator.migrate("s1", SRC, DST).get(AWAIT_TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+
+        assertEquals(MigrationOutcome.FAILED, result.outcome());
+        assertTrue(result.reason().contains("carência"),
+                "deveria abortar citando a carência, não o timeout completo: " + result.reason());
+        assertEquals(SRC, catalog.placementStrong("s1").orElseThrow().ownerNodeId());
+        assertTrue(srcCalls.get() >= 3 && srcCalls.get() <= 6,
+                "deveria abortar logo após cruzar a carência de 10s, não esperar o migrationTimeout de 5 min: "
+                        + srcCalls.get() + " polls da origem");
+    }
+
+    /**
+     * Dentro da mesma carência, se a reconsulta final ao destino (disparada quando a carência se
+     * esgota) confirmar {@code COMMITTED}, a migração completa — mesma prioridade de sempre entre um
+     * {@code COMMITTED} confirmado e a falha da origem, só que agora alcançada via a reconsulta da
+     * carência em vez da reconsulta do {@code migrationTimeout}.
+     *
+     * <p>O destino só confirma {@code COMMITTED} quando o relógio manual cruza os 14 s (mesma carência
+     * de 10 s computada a partir da 1ª falha da origem, observada em 4 s — ver cálculo em {@link
+     * #origemEmErroEDestinoNuncaRespondePorMaisQueACarenciaAbortaPertoDela}), amarrado de propósito ao
+     * poll da origem — o único evento que avança esse relógio no teste. Isso garante que é
+     * especificamente a reconsulta disparada pela expiração da carência (não um poll normal anterior,
+     * que sempre vê o destino falhando enquanto o relógio está abaixo de 14 s) que encontra e aceita o
+     * {@code COMMITTED} tardio.</p>
+     */
+    @Test
+    void origemEmErroEDestinoCommittedDentroDaCarenciaCompleta() throws Exception {
+        ManualClock clock = new ManualClock(0L);
+        coordinator = new MigrationCoordinator(catalog, rpc, leaderView, 2, Duration.ofMillis(5),
+                Duration.ofMinutes(5), clock);
+        coordinator.onLeaderChanged(NodeId.of("self"));
+        catalog.putPlacement("s1", SeriesPlacement.active(SRC, 1_000L));
+        rpc.respond(SRC, Commands.MIGRATE_START, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+        AtomicInteger srcCalls = new AtomicInteger();
+        rpc.respond(SRC, Commands.MIGRATE_STATUS, (target, body) -> {
+            srcCalls.incrementAndGet();
+            clock.advance(4_000L); // 1ª chamada arma a carência em 4s + 10s = 14s (ver Javadoc acima).
+            return MigrateResponse.of(MigrateStatus.ERROR, "falha simulada na origem");
+        });
+        rpc.respond(DST, Commands.MIGRATE_STATUS, (target, body) -> {
+            if (clock.millis() >= 14_000L) {
+                return new MigrateResponse(MigrateStatus.COMMITTED, null, 999L);
+            }
+            throw new NgrrdClusterException(ErrorCode.TIMEOUT, "destino inalcançável simulado");
+        });
+        rpc.respond(SRC, Commands.MIGRATE_FINISH, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+        rpc.respond(SRC, Commands.MIGRATE_ABORT, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+        rpc.respond(DST, Commands.MIGRATE_ABORT, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+
+        MigrationResult result = coordinator.migrate("s1", SRC, DST).get(AWAIT_TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+
+        assertEquals(MigrationOutcome.COMPLETED, result.outcome());
+        assertEquals(999L, result.bytes());
+        assertEquals(DST, catalog.placementStrong("s1").orElseThrow().ownerNodeId());
+        assertEquals(0L, rpc.callsTo(SRC, Commands.MIGRATE_ABORT));
+        assertEquals(0L, rpc.callsTo(DST, Commands.MIGRATE_ABORT));
+        assertTrue(srcCalls.get() >= 3,
+                "deveria ter consultado a origem múltiplas vezes até a carência avançar o relógio o "
+                        + "bastante: " + srcCalls.get() + " polls");
     }
 
     @Test
@@ -711,6 +901,40 @@ class MigrationCoordinatorTest {
 
         /** Chamado logo DEPOIS de cada gravação bem-sucedida (gancho para simular um close() no meio). */
         volatile Runnable afterPut = () -> { };
+    }
+
+    /**
+     * {@link Clock} com avanço manual — usado por {@code timeoutReconsultaDestinoAntesDeAbortar},
+     * {@code origemEmErroEDestinoNuncaRespondePorMaisQueACarenciaAbortaPertoDela} e {@code
+     * origemEmErroEDestinoCommittedDentroDaCarenciaCompleta} para tornar o estouro do {@code
+     * migrationTimeout} (ou da carência) determinístico, sem depender de sleeps/tempo real: cada poll
+     * programado do teste avança o relógio explicitamente via {@link #advance}.
+     */
+    private static final class ManualClock extends Clock {
+        private final AtomicLong millis;
+
+        ManualClock(long startMillis) {
+            this.millis = new AtomicLong(startMillis);
+        }
+
+        long advance(long deltaMillis) {
+            return millis.addAndGet(deltaMillis);
+        }
+
+        @Override
+        public ZoneId getZone() {
+            return ZoneId.of("UTC");
+        }
+
+        @Override
+        public Clock withZone(ZoneId zone) {
+            return this;
+        }
+
+        @Override
+        public Instant instant() {
+            return Instant.ofEpochMilli(millis.get());
+        }
     }
 
     /** {@link PlacementRequestHandler.LeaderView} fake. */
