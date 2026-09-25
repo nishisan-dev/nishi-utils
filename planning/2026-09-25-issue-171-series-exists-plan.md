@@ -1,7 +1,5 @@
 # Issue #171 — Existência de série e abertura sem criar: plano de implementação
 
-> **Para agentes:** executar tarefa a tarefa (subagent-driven). Passos em checkbox (`- [ ]`).
-
 **Objetivo:** permitir perguntar se uma série existe sem criá-la e abrir uma série só se ela existir,
 nos modos local (`nishi-utils-oss`) e cluster (`nishi-utils-ngrrd-cluster`).
 
@@ -20,7 +18,7 @@ paginado (`ngrrd.catalog.lookup`) e verificação física opcional por nó (`ngr
 - Identificadores em inglês; Javadoc, comentários, mensagens de exceção, docs e commits em PT-BR.
   Nomes de métodos `@Test` em PT-BR (padrão do módulo, ex.: `placeRequestComPreferredOwnerSobreviveAoRoundTrip`).
 - Commits atômicos, mensagem em PT-BR no formato `tipo(escopo): descrição` (ex.:
-  `feat(ngrrd): ...`), **sem** qualquer menção a IA/agente/Co-Authored-By. Nunca `git add -A`/`git add .`
+  `feat(ngrrd): ...`), sem trailers de coautoria. Nunca `git add -A`/`git add .`
   — adicionar arquivos explicitamente.
 - Imports: sem imports não usados, sem FQN inline em código novo (o código existente tem alguns FQN
   inline; não replicar).
@@ -35,7 +33,7 @@ paginado (`ngrrd.catalog.lookup`) e verificação física opcional por nó (`ngr
   - oss: `JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 mvn -pl nishi-utils-oss test`
   - cluster unit: `JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 mvn -pl nishi-utils-ngrrd-cluster -am verify -DexcludeNgrid=true` (NUNCA `mvn install`: ~/.m2 compartilhado)
   - cluster in-process: `JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 mvn -pl nishi-utils-ngrrd-cluster -am verify -Pngrrd-cluster -DexcludeNgrid=true -Dtest=<Classe> -Dsurefire.failIfNoSpecifiedTests=false`
-  - Relatar contagem real de testes (Tests run/Failures/Errors), não só BUILD SUCCESS.
+  - Conferir a contagem real de testes (Tests run/Failures/Errors), não só BUILD SUCCESS.
 
 ---
 
@@ -110,7 +108,7 @@ public static boolean exists(String yamlContent, StorageFactory.StorageBindings 
     `ownsStorage`. `objectNaming` nulo segue o mesmo default que o writer usa.
   - Javadoc de `OpenOptions.createIfMissing` e de `exists` (contrato: sem I/O de criação; no blob é
     lookup no catálogo em memória).
-- [ ] **Passo 4:** `mvn -pl nishi-utils-oss test` → tudo verde; relatar contagem.
+- [ ] **Passo 4:** `mvn -pl nishi-utils-oss test` → tudo verde; conferir a contagem.
 - [ ] **Passo 5:** doc em `doc/oss/ngrrd.md`: subseção "Abrir sem criar e consultar existência" com
   exemplo de `withCreateIfMissing(false)` + `catch (SeriesNotFoundException e)` e `Ngrrd.exists`.
 - [ ] **Passo 6: commit** `feat(ngrrd): abertura sem criar e consulta de existência no modo local (#171)`.
@@ -166,7 +164,7 @@ public static final String SERIES_EXISTS_BATCH = "ngrrd.series.exists.batch";
   módulo (usar grep) — o construtor de 6 args continua válido, então só mudar onde for necessário.
   Conferir `switch` exaustivos sobre `SeriesStatus` no módulo (`grep -rn "switch (.*status" main`) e
   tratar `NOT_FOUND` onde o compilador exigir (sem `default` novo que engula o caso).
-- [ ] **Passo 4:** `mvn -pl nishi-utils-ngrrd-cluster verify` → verde; relatar contagem.
+- [ ] **Passo 4:** `mvn -pl nishi-utils-ngrrd-cluster verify` → verde; conferir a contagem.
 - [ ] **Passo 5: commit** `feat(ngrrd-cluster): protocolo de consulta de catálogo e existência em lote (#171)`.
 
 ---
@@ -452,8 +450,8 @@ final class SeriesVerifier {
 
 - [ ] **Passo 1:** escrever os testes.
 - [ ] **Passo 2:** `mvn -pl nishi-utils-ngrrd-cluster verify -Pngrrd-cluster -Dtest=SeriesExistenceClusterTest`
-  → verde (rodar 3 vezes para checar estabilidade; relatar as 3).
-- [ ] **Passo 3:** suíte completa `mvn -pl nishi-utils-ngrrd-cluster verify -Pngrrd-cluster` → relatar
+  → verde (rodar 3 vezes para checar estabilidade; registrar as 3).
+- [ ] **Passo 3:** suíte completa `mvn -pl nishi-utils-ngrrd-cluster verify -Pngrrd-cluster` → conferir a
   contagem; falhas pré-existentes devem ser comparadas com `main` antes de concluir.
 - [ ] **Passo 4: commit** `test(ngrrd-cluster): cenários in-process de existência e abertura sem criar (#171)`.
 
