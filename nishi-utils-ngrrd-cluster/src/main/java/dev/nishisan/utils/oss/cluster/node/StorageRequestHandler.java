@@ -287,7 +287,10 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
             registry.open(request.seriesKey(), request.yaml(), Ngrrd.OpenOptions.of(durability, onGeometryChange)
                     .withCreateIfMissing(request.createIfMissingOrDefault()));
             if (geometryService != null) { geometryService.afterOpen(request.seriesKey()); }
-            return new SeriesStatusResponse(SeriesStatus.OK, self.value(), null);
+            // Confirma ao cliente que um OPEN sem criar foi honrado — um storage anterior responderia OK
+            // sem este campo, e o cliente saberia que o createIfMissing=false pode ter sido ignorado.
+            return new SeriesStatusResponse(SeriesStatus.OK, self.value(), null,
+                    request.createIfMissingOrDefault() ? null : Boolean.TRUE);
         } catch (SeriesNotFoundException e) {
             // Defesa em profundidade: o objeto sumiu entre a checagem acima e o open() propriamente dito
             // (corrida com uma limpeza externa, por exemplo) — o writer recusa criar e sinaliza aqui.

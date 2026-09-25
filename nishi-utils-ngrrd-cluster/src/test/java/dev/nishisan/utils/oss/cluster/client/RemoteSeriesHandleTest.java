@@ -198,6 +198,9 @@ class RemoteSeriesHandleTest {
         return switch (command) {
             case Commands.READ -> new ReadResponse(status, owner, result, null);
             case Commands.READ_PRESET -> new ReadPresetResponse(status, owner, Map.of("in_bps", result), null);
+            // Storage atual: OPEN OK confirma que honrou createIfMissing=false (ignorado por graváveis).
+            case Commands.OPEN -> status == SeriesStatus.OK ? openOk(owner)
+                    : new SeriesStatusResponse(status, owner, null);
             default -> new SeriesStatusResponse(status, owner, null);
         };
     }
@@ -324,7 +327,7 @@ class RemoteSeriesHandleTest {
     @Test
     void openSemCriarNaoFazPlaceEEnviaFlag() {
         RemoteSeriesHandle handle = newHandle(Ngrrd.OpenOptions.defaults().withCreateIfMissing(false));
-        rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
+        rpc.respondNext((cmd, body) -> openOk(OWNER_A.value()));
 
         handle.open();
 
@@ -393,6 +396,42 @@ class RemoteSeriesHandleTest {
         assertEquals(ErrorCode.UNSUPPORTED_BY_NODE, ex.code());
         assertEquals(List.of(Commands.OPEN, Commands.READ_PRESET, Commands.READ_PRESET), commands(),
                 "o redirecionamento não envia OPEN ao dono novo sem a capacidade");
+    }
+
+    @Test
+    void openSemCriarComOkSemConfirmacaoDoStorageLancaUnsupportedByNode() {
+        RemoteSeriesHandle handle = newHandle(Ngrrd.OpenOptions.defaults().withCreateIfMissing(false));
+        rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
+
+        NgrrdClusterException ex = assertThrows(NgrrdClusterException.class, handle::open);
+
+        assertEquals(ErrorCode.UNSUPPORTED_BY_NODE, ex.code());
+        assertTrue(ex.getMessage().contains(OWNER_A.value()), ex.getMessage());
+        assertEquals(List.of(Commands.OPEN), commands());
+    }
+
+    @Test
+    void reaberturaSomenteLeituraComOkSemConfirmacaoLancaUnsupportedByNode() {
+        RemoteSeriesHandle handle = readOnlyOpenedHandle();
+        rpc.respondNext((cmd, body) -> response(cmd, SeriesStatus.NOT_OPEN, OWNER_A.value()));
+        rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
+
+        NgrrdClusterException ex = assertThrows(NgrrdClusterException.class, () -> handle.read("daily"));
+
+        assertEquals(ErrorCode.UNSUPPORTED_BY_NODE, ex.code());
+        assertEquals(List.of(Commands.OPEN, Commands.READ_PRESET, Commands.OPEN), commands(),
+                "a leitura não segue depois de um OPEN sem confirmação");
+    }
+
+    @Test
+    void openComCriarAceitaOkSemConfirmacao() {
+        RemoteSeriesHandle handle = newHandle();
+        rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
+
+        handle.open();
+
+        assertTrue(handle.isOpen());
+        assertEquals(List.of(Commands.OPEN), commands());
     }
 
     @Test
@@ -565,7 +604,7 @@ class RemoteSeriesHandleTest {
                 retry, Duration.ofSeconds(5), Duration.ofSeconds(5), Clock.systemUTC(),
                 (key, handle) -> handles.remove(key, handle), CapabilityFixtures.advertisingAll());
         handles.put(SERIES_KEY, handleA);
-        rpcA.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
+        rpcA.respondNext((cmd, body) -> openOk(OWNER_A.value()));
         handleA.open();
 
         rpcA.respondNext((cmd, body) -> response(cmd, SeriesStatus.NOT_OPEN, OWNER_A.value()));
@@ -735,7 +774,7 @@ class RemoteSeriesHandleTest {
 
     private RemoteSeriesHandle readOnlyOpenedHandle() {
         RemoteSeriesHandle handle = newHandle(Ngrrd.OpenOptions.defaults().withCreateIfMissing(false));
-        rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
+        rpc.respondNext((cmd, body) -> openOk(OWNER_A.value()));
         handle.open();
         onCloseCalls.clear();
         return handle;
@@ -745,9 +784,9 @@ class RemoteSeriesHandleTest {
         return rpc.calls().stream().map(RecordingClusterRpc.Recorded::command).toList();
     }
 
-    /** Resposta {@code OK} de um {@code OPEN}. */
+    /** Resposta {@code OK} de um {@code OPEN} por um storage atual, que confirma honrar createIfMissing=false. */
     private static SeriesStatusResponse openOk(String owner) {
-        return new SeriesStatusResponse(SeriesStatus.OK, owner, null);
+        return new SeriesStatusResponse(SeriesStatus.OK, owner, null, Boolean.TRUE);
     }
 
     private static void joinQuietly(Thread thread) {

@@ -21,10 +21,21 @@ package dev.nishisan.utils.oss.cluster.protocol;
  * Resposta genérica de operações sobre uma série já aberta: {@code open},
  * {@code checkpoint}, {@code flush} e {@code close}.
  *
- * @param status       resultado da operação
- * @param ownerNodeId  dono atual da série segundo o respondente; útil quando
- *                     {@code status == WRONG_OWNER} para o cliente redirecionar
- * @param message      detalhe legível do erro, ou {@code null}
+ * @param status                 resultado da operação
+ * @param ownerNodeId            dono atual da série segundo o respondente; útil quando
+ *                               {@code status == WRONG_OWNER} para o cliente redirecionar
+ * @param message                detalhe legível do erro, ou {@code null}
+ * @param createIfMissingHonored {@code true} quando o storage abriu a série num {@code OPEN} com
+ *                               {@code createIfMissing=false} honrando o campo (sem criar); {@code null}
+ *                               nas demais respostas e em respostas de storages anteriores a ele — o
+ *                               cliente trata {@code OK} sem a confirmação a um {@code OPEN} sem criar
+ *                               como storage que não suporta o campo
  */
-public record SeriesStatusResponse(SeriesStatus status, String ownerNodeId, String message) {
+public record SeriesStatusResponse(SeriesStatus status, String ownerNodeId, String message,
+        Boolean createIfMissingHonored) {
+
+    /** Resposta sem a confirmação de {@code createIfMissing} — a forma usada por todas as outras operações. */
+    public SeriesStatusResponse(SeriesStatus status, String ownerNodeId, String message) {
+        this(status, ownerNodeId, message, null);
+    }
 }

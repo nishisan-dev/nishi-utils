@@ -85,7 +85,7 @@ class SeriesHandleCacheTest {
         rpc = new RecordingClusterRpc(NodeId.of("client-under-test"));
         rpc.respondDefault((cmd, body) -> Commands.READ_PRESET.equals(cmd)
                 ? new ReadPresetResponse(SeriesStatus.OK, OWNER.value(), Map.of("in_bps", result()), null)
-                : new SeriesStatusResponse(SeriesStatus.OK, OWNER.value(), null));
+                : new SeriesStatusResponse(SeriesStatus.OK, OWNER.value(), null, Boolean.TRUE));
         dispatcher = new RecordingWriteBuffer();
         opened = new AtomicInteger();
     }

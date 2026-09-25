@@ -654,6 +654,7 @@ class StorageRequestHandlerTest {
                 openRequestNoCreate(seriesKey, null), SOURCE);
 
         assertEquals(SeriesStatus.OK, response.status());
+        assertEquals(Boolean.TRUE, response.createIfMissingHonored(), "OPEN sem criar confirma que não criou");
         assertTrue(registry.isOpen(seriesKey));
     }
 
@@ -666,6 +667,7 @@ class StorageRequestHandlerTest {
                 new OpenRequest(seriesKey, yaml, Map.of(), null, null, null, null), SOURCE);
 
         assertEquals(SeriesStatus.OK, response.status());
+        assertNull(response.createIfMissingHonored(), "OPEN com criação não precisa de confirmação");
         assertTrue(registry.isOpen(seriesKey));
         assertTrue(volume.storage().exists(SeriesObjectKeys.objectKey(SERIES_OBJECT_PREFIX, seriesKey)));
     }
@@ -681,6 +683,7 @@ class StorageRequestHandlerTest {
                 openRequestNoCreate(seriesKey, null), SOURCE);
 
         assertEquals(SeriesStatus.OK, response.status());
+        assertEquals(Boolean.TRUE, response.createIfMissingHonored());
     }
 
     @Test

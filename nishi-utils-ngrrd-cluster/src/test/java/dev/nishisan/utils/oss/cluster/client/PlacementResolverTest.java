@@ -401,7 +401,7 @@ class PlacementResolverTest {
         });
         rpc.respondNext((cmd, body) -> {
             assertEquals(Commands.OPEN, cmd);
-            return new SeriesStatusResponse(SeriesStatus.OK, "storage-b", null);
+            return new SeriesStatusResponse(SeriesStatus.OK, "storage-b", null, Boolean.TRUE);
         });
         RetryPolicy retry = new RetryPolicy(Duration.ofSeconds(5), Duration.ofMillis(1), Duration.ofMillis(5));
         RemoteSeriesHandle handle = new RemoteSeriesHandle("series-1", "yaml: fake", "hash-1", Map.of(),

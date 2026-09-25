@@ -194,6 +194,11 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
             SeriesStatusResponse response = callWithTransportRetry(NodeId.of(candidateOwner), Commands.OPEN, request,
                     SeriesStatusResponse.class, retry.deadlineMs);
             if (response.status() == SeriesStatus.OK) {
+                if (!writable && !Boolean.TRUE.equals(response.createIfMissingHonored())) {
+                    throw new NgrrdClusterException(ErrorCode.UNSUPPORTED_BY_NODE, candidateOwner
+                            + " abriu " + seriesKey + " sem confirmar createIfMissing=false (storage de versão"
+                            + " anterior?); a série pode ter sido criada por ele");
+                }
                 owner = candidateOwner;
                 return;
             }

@@ -488,6 +488,26 @@ class ProtocolCodecTest {
     }
 
     @Test
+    void seriesStatusResponseComConfirmacaoDeCreateIfMissingSobreviveAoRoundTrip() throws IOException {
+        SeriesStatusResponse original = new SeriesStatusResponse(SeriesStatus.OK, "node-a", null, Boolean.TRUE);
+
+        SeriesStatusResponse roundTripped = roundTripResponseBody(Commands.OPEN, original);
+
+        assertEquals(original, roundTripped);
+        assertEquals(Boolean.TRUE, roundTripped.createIfMissingHonored());
+    }
+
+    @Test
+    void seriesStatusResponseSemConfirmacaoDesserializaComoNula() throws IOException {
+        SeriesStatusResponse legacy = JacksonMessageCodec.createDefaultMapper().readValue(
+                "{\"status\":\"OK\",\"ownerNodeId\":\"node-a\"}", SeriesStatusResponse.class);
+
+        assertEquals(SeriesStatus.OK, legacy.status());
+        assertNull(legacy.createIfMissingHonored(), "resposta de storage anterior não traz a confirmação");
+        assertNull(new SeriesStatusResponse(SeriesStatus.OK, "node-a", null).createIfMissingHonored());
+    }
+
+    @Test
     void openRequestSemCreateIfMissingDesserializaComoCriar() throws IOException {
         OpenRequest legacy = new ObjectMapper().readValue(
                 "{\"seriesKey\":\"series-1\",\"yaml\":\"ds: [in_octets]\"}", OpenRequest.class);
