@@ -278,9 +278,7 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
             }
             if (!request.createIfMissingOrDefault() && !registry.isOpen(request.seriesKey())
                     && !volume.storage().exists(SeriesObjectKeys.objectKey(seriesObjectPrefix, request.seriesKey()))) {
-                recordError(SeriesStatus.NOT_FOUND);
-                return new SeriesStatusResponse(SeriesStatus.NOT_FOUND, self.value(),
-                        "série inexistente: " + request.seriesKey());
+                return confirmSeriesNotFound(request.seriesKey());
             }
             Durability durability = request.durability() != null ? request.durability() : defaultDurability;
             OnGeometryChange onGeometryChange = request.onGeometryChange() != null
@@ -293,9 +291,7 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
         } catch (SeriesNotFoundException e) {
             // Defesa em profundidade: o objeto sumiu entre a checagem acima e o open() propriamente dito
             // (corrida com uma limpeza externa, por exemplo) — o writer recusa criar e sinaliza aqui.
-            recordError(SeriesStatus.NOT_FOUND);
-            return new SeriesStatusResponse(SeriesStatus.NOT_FOUND, self.value(),
-                    "série inexistente: " + e.seriesKey());
+            return confirmSeriesNotFound(e.seriesKey());
         } catch (GeometryService.PublicationException e) {
             recordError(e.response().status());
             return e.response();
@@ -303,6 +299,44 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
             recordError(SeriesStatus.ERROR);
             return new SeriesStatusResponse(SeriesStatus.ERROR, self.value(), describe(e));
         }
+    }
+
+    /**
+     * Confirma com o líder ({@link PlacementLookup#placementStrong}) antes de responder
+     * {@code NOT_FOUND} — a réplica local pode estar atrasada logo após um restart, já que a marca
+     * {@link SeriesHandleRegistry#isForgotten} é só em memória: se a origem de uma migração reiniciar
+     * pouco depois do {@code FINISH}, a réplica local ainda pode dizer {@code ACTIVE(self)} com o
+     * objeto já apagado, e um {@code NOT_FOUND} baseado só nela seria falso — o cliente marcaria a
+     * série como definitivamente inexistente e descartaria escritas de uma série que, na verdade,
+     * mudou de dono. {@code NOT_FOUND} só é autoritativo depois desta consulta forte: presente e
+     * {@code ACTIVE(self)} confirma; presente e outro dono redireciona ({@code WRONG_OWNER});
+     * presente e {@code MIGRATING} redireciona ({@code MIGRATING}); ausente confirma (não há
+     * placement — a série não existe mesmo no cluster); falha da consulta nunca vira {@code NOT_FOUND}
+     * ({@code ERROR}).
+     */
+    private SeriesStatusResponse confirmSeriesNotFound(String seriesKey) {
+        Optional<SeriesPlacement> strong;
+        try {
+            strong = placementLookup.placementStrong(seriesKey);
+        } catch (RuntimeException e) {
+            recordError(SeriesStatus.ERROR);
+            return new SeriesStatusResponse(SeriesStatus.ERROR, self.value(), describe(e));
+        }
+        if (strong.isEmpty()) {
+            recordError(SeriesStatus.NOT_FOUND);
+            return new SeriesStatusResponse(SeriesStatus.NOT_FOUND, self.value(), "série inexistente: " + seriesKey);
+        }
+        SeriesPlacement current = strong.get();
+        if (current.state() == PlacementState.MIGRATING) {
+            recordError(SeriesStatus.MIGRATING);
+            return new SeriesStatusResponse(SeriesStatus.MIGRATING, current.ownerNodeId(), null);
+        }
+        if (!current.isOwnedBy(self.value())) {
+            recordError(SeriesStatus.WRONG_OWNER);
+            return new SeriesStatusResponse(SeriesStatus.WRONG_OWNER, current.ownerNodeId(), null);
+        }
+        recordError(SeriesStatus.NOT_FOUND);
+        return new SeriesStatusResponse(SeriesStatus.NOT_FOUND, self.value(), "série inexistente: " + seriesKey);
     }
 
     /** {@code storage.objectNaming.seriesPrefix} efetivo (com o default do oss aplicado) da definição YAML. */

@@ -696,6 +696,67 @@ class StorageRequestHandlerTest {
     }
 
     @Test
+    void openSemCriarComReplicaLocalDesatualizadaEForteOutroDonoRedirecionaWrongOwner() {
+        // A réplica local pode continuar dizendo ACTIVE(self) por um instante depois de um restart logo
+        // após o FINISH de uma migração (a marca forgotten é só em memória) — NOT_FOUND baseado só nela
+        // seria falso. O líder (placementStrong) é quem decide de fato: aqui ele já sabe que o dono
+        // mudou.
+        String seriesKey = "series-not-found-strong-outro-dono";
+        long now = 1_000L;
+        placementLookup.putLocalOnly(seriesKey, SeriesPlacement.active(SELF.value(), now));
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.active(OTHER.value(), now));
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequestNoCreate(seriesKey, null), SOURCE);
+
+        assertEquals(SeriesStatus.WRONG_OWNER, response.status());
+        assertEquals(OTHER.value(), response.ownerNodeId());
+        assertFalse(registry.isOpen(seriesKey));
+    }
+
+    @Test
+    void openSemCriarComReplicaLocalDesatualizadaEForteMigrandoRedirecionaMigrating() {
+        String seriesKey = "series-not-found-strong-migrando";
+        long now = 1_000L;
+        placementLookup.putLocalOnly(seriesKey, SeriesPlacement.active(SELF.value(), now));
+        SeriesPlacement migrating = SeriesPlacement.migrating(
+                SeriesPlacement.active(SELF.value(), now), OTHER.value(), "mig-1", now + 1);
+        placementLookup.putStrongOnly(seriesKey, migrating);
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequestNoCreate(seriesKey, null), SOURCE);
+
+        assertEquals(SeriesStatus.MIGRATING, response.status());
+        assertFalse(registry.isOpen(seriesKey));
+    }
+
+    @Test
+    void openSemCriarComReplicaLocalDesatualizadaEForteAusenteConfirmaNotFound() {
+        // Sem placement nenhum no líder: a série realmente não existe no cluster — NOT_FOUND confirmado.
+        String seriesKey = "series-not-found-strong-ausente";
+        placementLookup.putLocalOnly(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequestNoCreate(seriesKey, null), SOURCE);
+
+        assertEquals(SeriesStatus.NOT_FOUND, response.status());
+        assertFalse(registry.isOpen(seriesKey));
+    }
+
+    @Test
+    void openSemCriarComFalhaNaConsultaForteNuncaRespondeNotFound() {
+        String seriesKey = "series-not-found-strong-falha";
+        placementLookup.putLocalOnly(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+        placementLookup.failStrongWith(new RuntimeException("líder inalcançável"));
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequestNoCreate(seriesKey, null), SOURCE);
+
+        assertEquals(SeriesStatus.ERROR, response.status());
+        assertFalse(registry.isOpen(seriesKey));
+    }
+
+    @Test
     void seriesExistsBatchDevolveSoAsPresentes() {
         String present = "series-batch-presente";
         String absent = "series-batch-ausente";
@@ -802,6 +863,7 @@ class StorageRequestHandlerTest {
         private final Map<String, SeriesPlacement> local = new HashMap<>();
         private final Map<String, SeriesPlacement> strong = new HashMap<>();
         private int strongCalls;
+        private RuntimeException strongFailure;
 
         void put(String seriesKey, SeriesPlacement placement) {
             local.put(seriesKey, placement);
@@ -811,6 +873,16 @@ class StorageRequestHandlerTest {
         /** Coloca a série apenas na visão forte (líder), simulando réplica local ainda não convergida. */
         void putStrongOnly(String seriesKey, SeriesPlacement placement) {
             strong.put(seriesKey, placement);
+        }
+
+        /** Coloca a série apenas na réplica local, simulando o líder com uma visão diferente (ou vazia). */
+        void putLocalOnly(String seriesKey, SeriesPlacement placement) {
+            local.put(seriesKey, placement);
+        }
+
+        /** Toda consulta de {@link #placementStrong} seguinte lança {@code failure} em vez de responder. */
+        void failStrongWith(RuntimeException failure) {
+            this.strongFailure = failure;
         }
 
         int strongCalls() {
@@ -825,6 +897,9 @@ class StorageRequestHandlerTest {
         @Override
         public Optional<SeriesPlacement> placementStrong(String seriesKey) {
             strongCalls++;
+            if (strongFailure != null) {
+                throw strongFailure;
+            }
             return Optional.ofNullable(strong.get(seriesKey));
         }
     }
