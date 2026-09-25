@@ -410,6 +410,14 @@ public final class MigrationExecutor extends RequestHandlerSupport {
             boolean urgent) {
         for (PatchRange range : changedRanges(before, after)) {
             if (urgent) {
+                // (Fix round 1, item 3) acquireUrgent nunca espera, então não há ponto natural de
+                // checagem de "migração ainda ativa" como no acquire (que recebe transferActive como
+                // BooleanSupplier do laço de espera) — sem esta checagem explícita, um abort concorrente
+                // durante o cutover final não interrompia o envio dos patches restantes, gastando RPCs
+                // inúteis contra um destino que já não espera por eles.
+                if (!transferActive(id)) {
+                    throw new IllegalStateException("migration ended while pacing patches");
+                }
                 bandwidth.acquireUrgent(range.length());
             } else if (!bandwidth.acquire(range.length(), () -> transferActive(id))) {
                 throw new IllegalStateException("migration ended while pacing patches");
