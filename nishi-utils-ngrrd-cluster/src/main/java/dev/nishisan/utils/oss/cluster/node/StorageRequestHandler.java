@@ -287,7 +287,12 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
             OnGeometryChange onGeometryChange = !request.createIfMissingOrDefault()
                     ? OnGeometryChange.FAIL
                     : request.onGeometryChange() != null ? request.onGeometryChange() : defaultOnGeometryChange;
-            if (geometryService != null) { geometryService.beforeOpen(request.seriesKey()); }
+            // Só um OPEN que pode criar (ou reescrever) o objeto invalida a confirmação de geometria antes
+            // de abrir; sem criar, a geometria gravada nunca muda (FAIL acima), então um leitor não
+            // derruba a confirmação nem gera uma escrita replicada extra — só confirma depois do sucesso.
+            if (geometryService != null && request.createIfMissingOrDefault()) {
+                geometryService.beforeOpen(request.seriesKey());
+            }
             registry.open(request.seriesKey(), request.yaml(), Ngrrd.OpenOptions.of(durability, onGeometryChange)
                     .withCreateIfMissing(request.createIfMissingOrDefault()));
             if (geometryService != null) { geometryService.afterOpen(request.seriesKey()); }

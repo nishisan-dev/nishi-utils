@@ -32,6 +32,7 @@ import dev.nishisan.utils.oss.blob.NgrrdBlob;
 import dev.nishisan.utils.oss.cluster.catalog.PlacementState;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
+import dev.nishisan.utils.oss.cluster.protocol.GeometryUpdateRequest;
 import dev.nishisan.utils.oss.cluster.protocol.OpenRequest;
 import dev.nishisan.utils.oss.cluster.protocol.ReadRequest;
 import dev.nishisan.utils.oss.cluster.protocol.ReadResponse;
@@ -45,6 +46,7 @@ import dev.nishisan.utils.oss.cluster.protocol.SeriesStatusResponse;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesWrite;
 import dev.nishisan.utils.oss.cluster.protocol.WriteBatchRequest;
 import dev.nishisan.utils.oss.cluster.protocol.WriteBatchResponse;
+import dev.nishisan.utils.oss.cluster.rpc.ClusterRpc;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -60,6 +62,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
@@ -742,6 +745,56 @@ class StorageRequestHandlerTest {
     }
 
     @Test
+    void openSemCriarNaoInvalidaAConfirmacaoDeGeometria() {
+        // Leitor não derruba a confirmação de geometria no catálogo: sem criar, nada de publicação
+        // "geometria desconhecida" antes do open (só a confirmação depois do sucesso).
+        String seriesKey = "series-sem-criar-geometria-confirmada";
+        placementLookup.put(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+        GeometryRecordingRpc rpc = new GeometryRecordingRpc();
+        try (GeometryService geometryService = geometryService(rpc)) {
+            handler.geometryService(geometryService);
+            handler.handle(Commands.OPEN, openRequest(seriesKey, null), SOURCE);
+            handler.handle(Commands.CLOSE, new SeriesCommandRequest(seriesKey), SOURCE);
+            rpc.updates.clear();
+
+            SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                    openRequestNoCreate(seriesKey, null), SOURCE);
+
+            assertEquals(SeriesStatus.OK, response.status());
+            assertEquals(1, rpc.updates.size(), "só a confirmação pós-open deveria ser publicada: " + rpc.updates);
+            assertNotNull(rpc.updates.get(0).geometry(), "a única publicação é a confirmação da geometria");
+        }
+    }
+
+    @Test
+    void openComCriacaoInvalidaAConfirmacaoAntesDeAbrirEConfirmaDepois() {
+        String seriesKey = "series-com-criacao-geometria";
+        placementLookup.put(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+        GeometryRecordingRpc rpc = new GeometryRecordingRpc();
+        try (GeometryService geometryService = geometryService(rpc)) {
+            handler.geometryService(geometryService);
+
+            SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                    openRequest(seriesKey, null), SOURCE);
+
+            assertEquals(SeriesStatus.OK, response.status());
+            assertEquals(2, rpc.updates.size(), rpc.updates.toString());
+            assertNull(rpc.updates.get(0).geometry(), "antes do open a confirmação é invalidada");
+            assertNotNull(rpc.updates.get(1).geometry(), "depois do open a geometria é confirmada");
+        }
+    }
+
+    /**
+     * {@link GeometryService} só para publicar via {@code rpc}: o caminho de OPEN
+     * ({@code beforeOpen}/{@code afterOpen}) não usa o catálogo nem a visão de liderança, que por isso
+     * ficam nulos; o backfill nunca é iniciado.
+     */
+    private GeometryService geometryService(GeometryRecordingRpc rpc) {
+        return new GeometryService(new FakeTransport(SELF), null, volume, rpc, null, registry, SERIES_OBJECT_PREFIX,
+                clock);
+    }
+
+    @Test
     void openSemCriarDeNaoDonoContinuaRespondendoWrongOwner() {
         // Ownership é decidido ANTES do NOT_FOUND: mesmo com createIfMissing=false, um nó que não é
         // dono continua respondendo WRONG_OWNER, nunca NOT_FOUND.
@@ -887,6 +940,28 @@ class StorageRequestHandlerTest {
 
         assertEquals(SeriesStatus.ERROR, response.status());
         assertTrue(response.present().isEmpty());
+    }
+
+    /** {@link ClusterRpc} que registra cada {@code GEOMETRY_UPDATE} publicado e responde {@code OK}. */
+    private static final class GeometryRecordingRpc implements ClusterRpc {
+        private final List<GeometryUpdateRequest> updates = new ArrayList<>();
+
+        @Override
+        public <R> R call(NodeId target, String command, Object body, Class<R> responseType) {
+            assertEquals(Commands.GEOMETRY_UPDATE, command);
+            updates.add((GeometryUpdateRequest) body);
+            return responseType.cast(new SeriesStatusResponse(SeriesStatus.OK, SELF.value(), null));
+        }
+
+        @Override
+        public NodeId localId() {
+            return SELF;
+        }
+
+        @Override
+        public Optional<NodeId> leaderId() {
+            return Optional.of(SELF);
+        }
     }
 
     /** {@link Clock} determinístico para forçar fechamento por ociosidade via {@link SeriesHandleRegistry#closeIdle()}. */
