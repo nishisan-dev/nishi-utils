@@ -95,28 +95,35 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
 
     private volatile String owner;
     /**
-     * Estado do handle. Toda transição é um {@code compareAndSet}: quem leva o handle a {@link Mode#CLOSED}
-     * ({@link #close(Duration)} ou {@link #markSeriesNotFound}) é o único a executar o encerramento, e a
-     * promoção ({@link #tryPromoteToWritable()}) só vence se o handle ainda estiver aberto.
+     * Estado do handle, num único valor imutável: toda transição é um {@code compareAndSet} de um
+     * {@link State} inteiro para outro, de modo que nenhuma thread observa uma combinação intermediária
+     * (ex.: fechado sem a causa da ausência). Quem leva o handle a fechado ({@link #close(Duration)} ou
+     * {@link #markSeriesNotFound}) é o único a executar o encerramento.
      */
-    private final AtomicReference<Mode> mode;
-    /**
-     * {@code true} se o handle foi aberto com criação ou promovido — nunca volta a {@code false}.
-     * Decide se a (re)abertura posiciona com criação ({@code ngrrd.place}) ou exige a série existente, e
-     * se escritas são aceitas. Separado de {@link #mode} porque continua valendo depois do fechamento.
-     */
-    private volatile boolean writable;
-    /** Causa guardada depois que o handle somente leitura descobriu a série ausente; {@code null} até lá. */
-    private volatile SeriesNotFoundException notFound;
+    private final AtomicReference<State> state;
 
-    /** Estados do handle; a única transição que não fecha é {@link #READ_ONLY} para {@link #WRITABLE}. */
-    private enum Mode {
-        /** Aberto com {@code createIfMissing=false}: só lê, e o close é local. */
-        READ_ONLY,
-        /** Aberto com criação, ou promovido: lê, escreve e fecha com {@code CLOSE} remoto. */
-        WRITABLE,
-        /** Fechado: nunca mais reaproveitável. */
-        CLOSED
+    /**
+     * Foto do estado do handle.
+     *
+     * @param writable {@code true} se o handle aceita escrita (aberto com criação): decide se a
+     *                 (re)abertura posiciona com criação ({@code ngrrd.place}) ou exige a série existente
+     * @param closed   {@code true} depois do fechamento — nunca mais reaproveitável
+     * @param notFound causa da ausência quando o fechamento veio da descoberta de que a série não existe;
+     *                 {@code null} num handle aberto ou fechado pelo chamador
+     */
+    private record State(boolean writable, boolean closed, SeriesNotFoundException notFound) {
+
+        static State opened(boolean writable) {
+            return new State(writable, false, null);
+        }
+
+        State closedByCaller() {
+            return new State(writable, true, null);
+        }
+
+        State closedBySeriesNotFound(SeriesNotFoundException cause) {
+            return new State(writable, true, cause);
+        }
     }
 
     public RemoteSeriesHandle(String seriesKey, String yaml, String definitionHashHex, Map<String, String> tags,
@@ -146,8 +153,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
         this.closeTimeout = Objects.requireNonNull(closeTimeout, "closeTimeout");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.onClose = Objects.requireNonNull(onClose, "onClose");
-        this.writable = this.options.createIfMissing();
-        this.mode = new AtomicReference<>(writable ? Mode.WRITABLE : Mode.READ_ONLY);
+        this.state = new AtomicReference<>(State.opened(this.options.createIfMissing()));
     }
 
     @Override
@@ -169,7 +175,8 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
 
     private void open(OperationRetry retry) {
         for (;;) {
-            SeriesPlacement placement = resolvePlacement(retry.remaining());
+            boolean writable = state.get().writable();
+            SeriesPlacement placement = resolvePlacement(writable, retry.remaining());
             String candidateOwner = placement.ownerNodeId();
             OpenRequest request = new OpenRequest(seriesKey, yaml, tags, options.durability(),
                     options.onGeometryChange(), placement, writable ? null : Boolean.FALSE);
@@ -202,7 +209,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
      * exige que a série já exista ({@link PlacementLookup#resolveExisting}), lançando
      * {@link SeriesNotFoundException} se o líder confirmar que não há placement.
      */
-    private SeriesPlacement resolvePlacement(Duration maxWait) {
+    private SeriesPlacement resolvePlacement(boolean writable, Duration maxWait) {
         return writable ? resolver.resolve(seriesKey, definitionHashHex, geometry, maxWait)
                 : resolver.resolveExisting(seriesKey, maxWait);
     }
@@ -217,7 +224,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
      * chave ainda estiverem pendentes quando este ocupou o mapa do cliente.</p>
      */
     boolean reopen() {
-        if (!writable) {
+        if (!state.get().writable()) {
             return false;
         }
         try {
@@ -253,9 +260,15 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
      * a exceção.
      */
     private void markSeriesNotFound(SeriesNotFoundException cause) {
-        if (mode.compareAndSet(Mode.READ_ONLY, Mode.CLOSED)) {
-            notFound = cause;
-            onClose.accept(seriesKey, this);
+        for (;;) {
+            State current = state.get();
+            if (current.closed() || current.writable()) {
+                return;
+            }
+            if (state.compareAndSet(current, current.closedBySeriesNotFound(cause))) {
+                onClose.accept(seriesKey, this);
+                return;
+            }
         }
     }
 
@@ -269,15 +282,14 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
      */
     boolean tryPromoteToWritable() {
         for (;;) {
-            Mode current = mode.get();
-            if (current == Mode.WRITABLE) {
-                return true;
-            }
-            if (current == Mode.CLOSED) {
+            State current = state.get();
+            if (current.closed()) {
                 return false;
             }
-            if (mode.compareAndSet(Mode.READ_ONLY, Mode.WRITABLE)) {
-                writable = true;
+            if (current.writable()) {
+                return true;
+            }
+            if (state.compareAndSet(current, State.opened(true))) {
                 return true;
             }
         }
@@ -285,7 +297,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
 
     /** Se o handle ainda pode ser reaproveitado por um {@code open} futuro da mesma chave. */
     boolean isOpen() {
-        return mode.get() != Mode.CLOSED;
+        return !state.get().closed();
     }
 
     @Override
@@ -414,12 +426,12 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
      * chama esta sobrecarga; o contrato público de {@link NgrrdHandle} continua sendo só {@link #close()}.</p>
      */
     void close(Duration budget) {
-        Mode closedFrom = closeLocally();
-        if (closedFrom == Mode.READ_ONLY) {
-            onClose.accept(seriesKey, this);
+        State closedFrom = closeLocally();
+        if (closedFrom == null) {
             return;
         }
-        if (closedFrom != Mode.WRITABLE) {
+        if (!closedFrom.writable()) {
+            onClose.accept(seriesKey, this);
             return;
         }
         long deadlineMs = clock.millis() + budget.toMillis();
@@ -445,17 +457,17 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
     }
 
     /**
-     * Leva o handle a {@link Mode#CLOSED} e devolve o estado de onde saiu, ou {@code null} se outro
-     * encerramento já tinha vencido. Atômico com a promoção: um handle promovido antes daqui fecha como
-     * gravável; um fechado antes da promoção a faz falhar.
+     * Leva o handle a fechado e devolve o estado de onde saiu, ou {@code null} se outro encerramento
+     * (inclusive a descoberta de série ausente) já tinha vencido. Atômico com a promoção: um handle
+     * promovido antes daqui fecha como gravável; um fechado antes da promoção a faz falhar.
      */
-    private Mode closeLocally() {
+    private State closeLocally() {
         for (;;) {
-            Mode current = mode.get();
-            if (current == Mode.CLOSED) {
+            State current = state.get();
+            if (current.closed()) {
                 return null;
             }
-            if (mode.compareAndSet(current, Mode.CLOSED)) {
+            if (state.compareAndSet(current, current.closedByCaller())) {
                 return current;
             }
         }
@@ -566,27 +578,33 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
             owner = newOwnerNodeId;
         } else {
             resolver.invalidate(seriesKey);
-            owner = markingSeriesNotFound(() -> resolvePlacement(retry.remaining())).ownerNodeId();
+            boolean writable = state.get().writable();
+            owner = markingSeriesNotFound(() -> resolvePlacement(writable, retry.remaining())).ownerNodeId();
         }
     }
 
     private void ensureOpen() {
-        SeriesNotFoundException absence = notFound;
-        if (absence != null) {
-            throw new SeriesNotFoundException(seriesKey, absence.reason());
+        ensureOpen(state.get());
+    }
+
+    /** Recusa operações num handle fechado, a partir de uma única leitura do estado. */
+    private void ensureOpen(State current) {
+        if (current.notFound() != null) {
+            throw new SeriesNotFoundException(seriesKey, current.notFound().reason());
         }
-        if (mode.get() == Mode.CLOSED) {
+        if (current.closed()) {
             throw new NgrrdClusterException(ErrorCode.CLOSED, "handle fechado: " + seriesKey);
         }
     }
 
     /** Recusa, antes de qualquer outra checagem, operações de escrita em handle somente leitura. */
     private void ensureWritable() {
-        if (!writable) {
+        State current = state.get();
+        if (!current.writable()) {
             throw new IllegalStateException("série " + seriesKey + " aberta somente leitura (createIfMissing=false);"
                     + " abra com criação para escrever");
         }
-        ensureOpen();
+        ensureOpen(current);
     }
 
     private static void sleepQuietly(Duration duration) {

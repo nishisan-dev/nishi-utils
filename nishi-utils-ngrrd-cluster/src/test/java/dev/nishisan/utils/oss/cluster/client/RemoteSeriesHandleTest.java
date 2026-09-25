@@ -41,6 +41,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import java.io.IOException;
 import java.time.Clock;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -49,6 +50,7 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -560,6 +562,142 @@ class RemoteSeriesHandleTest {
         assertSame(handleB, handles.get(SERIES_KEY), "a remoção condicional de A não pode apagar o handle B");
     }
 
+    @Test
+    void leituraConcorrenteComDescobertaDeAusenciaNuncaVeClosedEspurio() throws InterruptedException {
+        for (int iteration = 0; iteration < 300; iteration++) {
+            RemoteSeriesHandle handle = readOnlyOpenedHandle();
+            AtomicReference<Thread> discoverer = new AtomicReference<>();
+            rpc.respondDefault((cmd, body) -> {
+                boolean discovering = Thread.currentThread() == discoverer.get();
+                if (discovering && Commands.READ_PRESET.equals(cmd)) {
+                    return response(cmd, SeriesStatus.NOT_OPEN, OWNER_A.value());
+                }
+                if (Commands.OPEN.equals(cmd)) {
+                    return new SeriesStatusResponse(SeriesStatus.NOT_FOUND, OWNER_A.value(), null);
+                }
+                return response(cmd, SeriesStatus.OK, OWNER_A.value());
+            });
+            CountDownLatch start = new CountDownLatch(1);
+            List<Throwable> outcomes = new CopyOnWriteArrayList<>();
+            List<Thread> readers = new ArrayList<>();
+            for (int r = 0; r < 3; r++) {
+                readers.add(new Thread(() -> {
+                    awaitLatch(start);
+                    for (;;) {
+                        try {
+                            handle.read("daily");
+                        } catch (RuntimeException e) {
+                            outcomes.add(e);
+                            return;
+                        }
+                    }
+                }, "test-reader-" + r));
+            }
+            Thread discovering = new Thread(() -> {
+                awaitLatch(start);
+                assertThrows(SeriesNotFoundException.class, () -> handle.read("daily"));
+            }, "test-discoverer");
+            discoverer.set(discovering);
+            readers.forEach(Thread::start);
+            discovering.start();
+            start.countDown();
+            discovering.join(AWAIT_TIMEOUT.toMillis());
+            for (Thread reader : readers) {
+                reader.join(AWAIT_TIMEOUT.toMillis());
+            }
+
+            assertEquals(readers.size(), outcomes.size(), "todo leitor precisa terminar com uma exceção");
+            for (Throwable outcome : outcomes) {
+                assertTrue(outcome instanceof SeriesNotFoundException,
+                        "iteração " + iteration + ": leitura concorrente viu " + outcome);
+                assertEquals(SeriesNotFoundException.Reason.MISSING_ON_OWNER,
+                        ((SeriesNotFoundException) outcome).reason());
+            }
+        }
+    }
+
+    @Test
+    void leituraDuranteONotificacaoDeAusenciaJaVeSeriesNotFound() {
+        AtomicReference<RemoteSeriesHandle> self = new AtomicReference<>();
+        AtomicReference<Throwable> seenInsideOnClose = new AtomicReference<>();
+        rpc = new RecordingClusterRpc(NodeId.of("client-under-test"));
+        resolver = new FakePlacementLookup(OWNER_A.value());
+        dispatcher = new NoOpWriteBuffer();
+        RetryPolicy retry = new RetryPolicy(Duration.ofSeconds(2), Duration.ofMillis(5), Duration.ofMillis(50));
+        RemoteSeriesHandle handle = new RemoteSeriesHandle(SERIES_KEY, "yaml: fake", "hash-1", Map.of(),
+                Ngrrd.OpenOptions.defaults().withCreateIfMissing(false), resolver, rpc, dispatcher, retry,
+                Duration.ofSeconds(5), Duration.ofSeconds(5), Clock.systemUTC(), (key, h) -> {
+                    // Outra thread lê no instante em que o handle é retirado do mapa do cliente.
+                    Thread reader = new Thread(() -> {
+                        try {
+                            self.get().read("daily");
+                        } catch (RuntimeException e) {
+                            seenInsideOnClose.set(e);
+                        }
+                    }, "test-reader-on-close");
+                    reader.start();
+                    joinQuietly(reader);
+                });
+        self.set(handle);
+        rpc.respondNext((cmd, body) -> openOk(OWNER_A.value()));
+        handle.open();
+        rpc.respondNext((cmd, body) -> response(cmd, SeriesStatus.NOT_OPEN, OWNER_A.value()));
+        rpc.respondDefault((cmd, body) -> new SeriesStatusResponse(SeriesStatus.NOT_FOUND, OWNER_A.value(), null));
+
+        assertThrows(SeriesNotFoundException.class, () -> handle.read("daily"));
+
+        Throwable seen = seenInsideOnClose.get();
+        assertTrue(seen instanceof SeriesNotFoundException, "leitura concorrente viu " + seen);
+        assertEquals(SeriesNotFoundException.Reason.MISSING_ON_OWNER, ((SeriesNotFoundException) seen).reason());
+    }
+
+    @Test
+    void closeDepoisDaDescobertaDeAusenciaPreservaACausa() {
+        RemoteSeriesHandle handle = readOnlyOpenedHandle();
+        rpc.respondNext((cmd, body) -> response(cmd, SeriesStatus.NOT_OPEN, OWNER_A.value()));
+        rpc.respondDefault((cmd, body) -> new SeriesStatusResponse(SeriesStatus.NOT_FOUND, OWNER_A.value(), null));
+        assertThrows(SeriesNotFoundException.class, () -> handle.read("daily"));
+
+        handle.close();
+
+        SeriesNotFoundException again = assertThrows(SeriesNotFoundException.class, () -> handle.read("daily"));
+        assertEquals(SeriesNotFoundException.Reason.MISSING_ON_OWNER, again.reason());
+        assertEquals(List.of(SERIES_KEY), onCloseCalls, "sai do mapa uma única vez");
+    }
+
+    @Test
+    void descobertaDeAusenciaDepoisDoCloseNaoTrocaOEstadoFechado() throws InterruptedException {
+        RemoteSeriesHandle handle = readOnlyOpenedHandle();
+        CountDownLatch readInFlight = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        rpc.respondNext((cmd, body) -> {
+            readInFlight.countDown();
+            awaitLatch(release);
+            return response(cmd, SeriesStatus.NOT_OPEN, OWNER_A.value());
+        });
+        rpc.respondDefault((cmd, body) -> new SeriesStatusResponse(SeriesStatus.NOT_FOUND, OWNER_A.value(), null));
+        AtomicReference<Throwable> inFlightOutcome = new AtomicReference<>();
+        Thread reader = new Thread(() -> {
+            try {
+                handle.read("daily");
+            } catch (RuntimeException e) {
+                inFlightOutcome.set(e);
+            }
+        }, "test-read-in-flight");
+        reader.start();
+        awaitLatch(readInFlight);
+
+        handle.close();
+        release.countDown();
+        reader.join(AWAIT_TIMEOUT.toMillis());
+
+        assertTrue(inFlightOutcome.get() instanceof SeriesNotFoundException,
+                "leitura em voo viu " + inFlightOutcome.get());
+        NgrrdClusterException closed = assertThrows(NgrrdClusterException.class, () -> handle.read("daily"));
+        assertEquals(ErrorCode.CLOSED, closed.code(), "fechado pelo chamador antes da descoberta continua CLOSED");
+        assertEquals(List.of(SERIES_KEY), onCloseCalls, "sai do mapa uma única vez");
+    }
+
     private RemoteSeriesHandle readOnlyOpenedHandle() {
         RemoteSeriesHandle handle = newHandle(Ngrrd.OpenOptions.defaults().withCreateIfMissing(false));
         rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
@@ -570,6 +708,20 @@ class RemoteSeriesHandleTest {
 
     private List<String> commands() {
         return rpc.calls().stream().map(RecordingClusterRpc.Recorded::command).toList();
+    }
+
+    /** Resposta {@code OK} de um {@code OPEN}. */
+    private static SeriesStatusResponse openOk(String owner) {
+        return new SeriesStatusResponse(SeriesStatus.OK, owner, null);
+    }
+
+    private static void joinQuietly(Thread thread) {
+        try {
+            thread.join(AWAIT_TIMEOUT.toMillis());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(e);
+        }
     }
 
     private static void awaitLatch(CountDownLatch latch) {
