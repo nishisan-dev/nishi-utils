@@ -376,6 +376,37 @@ class SeriesHandleRegistryTest {
     }
 
     @Test
+    void pruneForgottenDescartaSoAsMarcasIndicadasPeloPredicado() {
+        try (SeriesHandleRegistry registry = registry(Duration.ofMinutes(10), 10, Clock.systemUTC())) {
+            registry.forget("series-convergida");
+            registry.forget("series-ainda-atrasada");
+            assertEquals(2, registry.forgottenCount());
+
+            int pruned = registry.pruneForgotten("series-convergida"::equals);
+
+            assertEquals(1, pruned);
+            assertFalse(registry.isForgotten("series-convergida"));
+            assertTrue(registry.isForgotten("series-ainda-atrasada"));
+            assertEquals(1, registry.forgottenCount());
+        }
+    }
+
+    @Test
+    void dropForgottenDescartaAMarcaSemReabrirASerie() {
+        try (SeriesHandleRegistry registry = registry(Duration.ofMinutes(10), 10, Clock.systemUTC())) {
+            String seriesKey = "series-marca-descartada";
+            registry.open(seriesKey, yaml, Ngrrd.OpenOptions.defaults());
+            registry.forget(seriesKey);
+
+            registry.dropForgotten(seriesKey);
+
+            assertFalse(registry.isForgotten(seriesKey));
+            assertTrue(registry.reopenIfKnown(seriesKey).isEmpty(),
+                    "descartar a marca não devolve a definição esquecida");
+        }
+    }
+
+    @Test
     void openAposForgetLimpaAMarcaDeEsquecida() {
         // "confirmação forte" no StorageRequestHandler só chama registry.open() depois de o líder
         // confirmar ACTIVE(self) — é esse open() legítimo que precisa limpar isForgotten, senão a

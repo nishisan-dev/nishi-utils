@@ -121,6 +121,28 @@ class LocalReconcilerTest {
         return "series/" + seriesKey + ".ngrr";
     }
 
+    // ---------------------------------------------------------------- marcas de esquecida
+
+    @Test
+    void cicloDescartaMarcasDeEsquecidaDeSeriesJaConvergidasParaOutroDono() {
+        // Issue #174: sem esta varredura, uma série migrada para fora e nunca mais pedida a este nó
+        // deixaria a marca de esquecida em memória para sempre.
+        handleRegistry.forget("migrada-convergida");
+        handleRegistry.forget("migrada-atrasada");
+        handleRegistry.forget("migrada-sem-placement-local");
+        catalog.placements.put("migrada-convergida", SeriesPlacement.active("storage-other", 1_000L));
+        catalog.placements.put("migrada-atrasada", SeriesPlacement.active(SELF, 1_000L));
+
+        LocalReconciler.ReconcileReport report = reconciler(Clock.systemUTC()).reconcileOnce();
+
+        assertEquals(1, report.forgottenPruned());
+        assertFalse(handleRegistry.isForgotten("migrada-convergida"));
+        assertTrue(handleRegistry.isForgotten("migrada-atrasada"),
+                "com a réplica local ainda em ACTIVE(self) a marca continua protegendo");
+        assertTrue(handleRegistry.isForgotten("migrada-sem-placement-local"),
+                "sem placement local não há sinal de convergência");
+    }
+
     // ---------------------------------------------------------------- adoção
 
     @Test

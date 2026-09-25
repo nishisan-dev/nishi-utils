@@ -84,6 +84,11 @@ import java.util.logging.Logger;
  *       novo ao GC de órfã caso uma migração legítima a mova para fora depois.</li>
  * </ul>
  *
+ * <p>Ao fim de cada ciclo, descarta as marcas de {@link SeriesHandleRegistry#isForgotten esquecida} das
+ * séries cuja réplica local já mostra outro dono ({@link SeriesHandleRegistry#pruneForgotten}) — a marca
+ * só protege enquanto a réplica ainda pode dizer {@code ACTIVE(self)} logo após o {@code FINISH} de uma
+ * migração, e sem esta varredura cresceria sem limite (issue #174).</p>
+ *
  * <p>Executa no start do nó (após {@link #awaitCatalogStable} — líder eleito, uma leitura forte bem
  * sucedida e a réplica local estável por 2 ticks seguidos ou até 30 s), a cada {@code reconcileInterval}
  * (agendamento próprio), e imediatamente ao este nó virar líder (só reconcilia o próprio volume — nunca
@@ -110,9 +115,15 @@ public final class LocalReconciler implements Closeable, LeadershipListener {
     private static final String STABLE_PROBE_KEY = "__ngrrd_reconciler_probe__";
 
     /** Resultado de um ciclo de reconciliação — ver Javadoc da classe. */
-    public record ReconcileReport(int adopted, int orphansDeleted, int unplaced, int missing, long durationMs) {
+    public record ReconcileReport(int adopted, int orphansDeleted, int unplaced, int missing, long durationMs,
+            int forgottenPruned) {
 
-        static final ReconcileReport EMPTY = new ReconcileReport(0, 0, 0, 0, 0L);
+        static final ReconcileReport EMPTY = new ReconcileReport(0, 0, 0, 0, 0L, 0);
+
+        /** Assinatura anterior à 8.6.0, sem {@code forgottenPruned} (zerado). */
+        public ReconcileReport(int adopted, int orphansDeleted, int unplaced, int missing, long durationMs) {
+            this(adopted, orphansDeleted, unplaced, missing, durationMs, 0);
+        }
     }
 
     private final BlobVolume volume;
@@ -325,12 +336,22 @@ public final class LocalReconciler implements Closeable, LeadershipListener {
             }
         }
 
+        // Issue #174: marcas de esquecida de séries cuja réplica local já mostra outro dono não protegem
+        // mais nada (ver SeriesHandleRegistry#pruneForgotten) — sem placement local não há sinal de
+        // convergência e a marca fica.
+        int forgottenPruned = registry.pruneForgotten(seriesKey -> {
+            SeriesPlacement placement = placements.get(seriesKey);
+            return placement != null && !placement.isOwnedBy(self);
+        });
+
         firstCycleDone = true;
         long durationMs = clock.millis() - startedAt;
-        ReconcileReport report = new ReconcileReport(adopted, orphansDeleted, unplaced, missing, durationMs);
+        ReconcileReport report = new ReconcileReport(adopted, orphansDeleted, unplaced, missing, durationMs,
+                forgottenPruned);
         LOGGER.log(Level.INFO, () -> "NGRRD_RECONCILE nodeId=" + self + " adopted=" + report.adopted()
                 + " orphansDeleted=" + report.orphansDeleted() + " unplaced=" + report.unplaced()
-                + " missing=" + report.missing() + " durationMs=" + report.durationMs());
+                + " missing=" + report.missing() + " forgottenPruned=" + report.forgottenPruned()
+                + " durationMs=" + report.durationMs());
         return report;
     }
 

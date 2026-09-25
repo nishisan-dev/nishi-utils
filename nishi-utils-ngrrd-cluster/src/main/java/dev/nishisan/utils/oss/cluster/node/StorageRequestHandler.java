@@ -593,10 +593,16 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
         if (registry.isMigrationFrozen(seriesKey)) {
             return Ownership.local(SeriesStatus.MIGRATING, null);
         }
-        if (registry.isForgotten(seriesKey)) {
-            return ownershipForgotten(seriesKey);
-        }
         Optional<SeriesPlacement> placement = placementLookup.placementLocal(seriesKey);
+        if (registry.isForgotten(seriesKey)) {
+            if (placement.isEmpty() || placement.get().isOwnedBy(self.value())) {
+                return ownershipForgotten(seriesKey);
+            }
+            // Issue #174: a réplica local já mostra outro dono — convergiu para além do FINISH, então a
+            // marca não protege mais nada. Descarta e segue pelo caminho normal (WRONG_OWNER com o dono
+            // local, sem ir ao líder).
+            registry.dropForgotten(seriesKey);
+        }
         if (placement.isPresent()) {
             SeriesPlacement current = placement.get();
             if (current.state() == PlacementState.MIGRATING) {
@@ -673,7 +679,9 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
      * placementLocal} nem o hint são consultados: só {@code placementStrong} (round-trip real ao líder)
      * decide. Se o líder confirmar {@code ACTIVE(self)}, o {@code OPEN} pode prosseguir — a marca é
      * limpa por {@link SeriesHandleRegistry#open} quando o handler efetivamente reabre a série; qualquer
-     * outro resultado responde {@code WRONG_OWNER} com o dono que o líder de fato conhece.
+     * outro resultado responde {@code WRONG_OWNER} com o dono que o líder de fato conhece. Só é chamado
+     * enquanto a réplica local está vazia ou ainda diz que o dono é este nó — com outro dono nela, a
+     * marca é descartada em {@link #ownership}.
      */
     private Ownership ownershipForgotten(String seriesKey) {
         Optional<SeriesPlacement> strong = placementLookup.placementStrong(seriesKey);

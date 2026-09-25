@@ -409,6 +409,42 @@ class StorageRequestHandlerTest {
     }
 
     @Test
+    void serieEsquecidaComReplicaLocalJaConvergidaDescartaAMarcaSemConsultarOLider() {
+        // Issue #174: a marca de esquecida só protege enquanto a réplica local pode ainda dizer
+        // ACTIVE(self). Quando ela já mostra o novo dono, a marca sai e a escrita atrasada é redirecionada
+        // pela réplica local, sem ir ao líder.
+        String seriesKey = "series-migrada-replica-convergida";
+        placementLookup.put(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+        handler.handle(Commands.OPEN, openRequest(seriesKey, null), SOURCE);
+        registry.forget(seriesKey);
+        placementLookup.put(seriesKey, SeriesPlacement.active(OTHER.value(), 2_000L));
+        int strongCallsBefore = placementLookup.strongCalls();
+
+        WriteBatchResponse response = (WriteBatchResponse) handler.handle(Commands.WRITE_BATCH,
+                new WriteBatchRequest(List.of(new SeriesWrite(seriesKey, "in_octets", 1_700_000_000_000L, 1d))),
+                SOURCE);
+
+        assertEquals(SeriesStatus.WRONG_OWNER, response.statusBySeries().get(seriesKey));
+        assertEquals(OTHER.value(), response.ownerBySeries().get(seriesKey));
+        assertEquals(strongCallsBefore, placementLookup.strongCalls());
+        assertFalse(registry.isForgotten(seriesKey), "a marca deveria sair com a réplica local já convergida");
+    }
+
+    @Test
+    void serieEsquecidaComReplicaLocalAindaEmSelfMantemAMarca() {
+        String seriesKey = "series-migrada-replica-atrasada-mantem-marca";
+        placementLookup.put(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+        handler.handle(Commands.OPEN, openRequest(seriesKey, null), SOURCE);
+        registry.forget(seriesKey);
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.active(OTHER.value(), 2_000L));
+
+        handler.handle(Commands.WRITE_BATCH, new WriteBatchRequest(List.of(
+                new SeriesWrite(seriesKey, "in_octets", 1_700_000_000_000L, 1d))), SOURCE);
+
+        assertTrue(registry.isForgotten(seriesKey), "sem a réplica local convergida a marca continua valendo");
+    }
+
+    @Test
     void writeBatchComVariasSeriesDevolveStatusMistoPorSerie() {
         String owned = "series-dono-aberta";
         String ownedButClosed = "series-dono-fechada";

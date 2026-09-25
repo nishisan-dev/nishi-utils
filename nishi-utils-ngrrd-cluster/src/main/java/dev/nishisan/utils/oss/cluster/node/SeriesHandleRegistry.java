@@ -38,6 +38,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
@@ -105,8 +106,9 @@ public final class SeriesHandleRegistry implements Closeable {
      * atrasada": enquanto marcada, quem decide se um {@code OPEN} pode (re)criar a série neste nó não é
      * mais a réplica LOCAL do catálogo (que ainda pode dizer {@code ACTIVE(self)} por um instante depois
      * do FINISH) nem o {@code placementHint} do cliente, e sim uma confirmação forte do líder — ver
-     * {@code StorageRequestHandler#ownership}. Só {@link #open} limpa a marca (a mesma reabertura
-     * legítima que volta a cachear a definição), nunca {@link #reopenIfKnown} sozinho.
+     * {@code StorageRequestHandler#ownership}. {@link #open} limpa a marca (a mesma reabertura
+     * legítima que volta a cachear a definição), nunca {@link #reopenIfKnown} sozinho; e ela perde a
+     * validade quando a réplica local converge para outro dono ({@link #pruneForgotten}).
      */
     private final Set<String> forgotten = ConcurrentHashMap.newKeySet();
 
@@ -390,11 +392,46 @@ public final class SeriesHandleRegistry implements Closeable {
     }
 
     /**
-     * Indica se {@code seriesKey} está {@link #forget esquecida} neste nó — só {@link #open} (uma
-     * reabertura legítima, já validada por confirmação forte do dono) limpa a marca.
+     * Indica se {@code seriesKey} está {@link #forget esquecida} neste nó. A marca sai com {@link #open}
+     * (uma reabertura legítima, já validada por confirmação forte do dono) ou quando a réplica local do
+     * catálogo converge para outro dono ({@link #dropForgotten}/{@link #pruneForgotten}).
      */
     public boolean isForgotten(String seriesKey) {
         return forgotten.contains(seriesKey);
+    }
+
+    /**
+     * Descarta a marca de {@link #forget esquecida} de {@code seriesKey}, sem devolver a definição nem
+     * reabrir nada. Para quem já viu a réplica local do catálogo apontar outro dono: a marca só existe
+     * para não confiar numa réplica que ainda diga {@code ACTIVE(self)} logo após o {@code FINISH}.
+     * Idempotente.
+     */
+    public void dropForgotten(String seriesKey) {
+        forgotten.remove(seriesKey);
+    }
+
+    /**
+     * Descarta as marcas de {@link #forget esquecida} para as quais {@code ownedElsewhere} responde
+     * {@code true} (tipicamente: a réplica local do catálogo já mostra outro dono). Sem esta varredura,
+     * uma série migrada para fora e nunca mais pedida a este nó deixaria a marca em memória para sempre
+     * (issue #174).
+     *
+     * @return quantas marcas foram descartadas
+     */
+    public int pruneForgotten(Predicate<String> ownedElsewhere) {
+        Objects.requireNonNull(ownedElsewhere, "ownedElsewhere");
+        int pruned = 0;
+        for (String seriesKey : forgotten) {
+            if (ownedElsewhere.test(seriesKey) && forgotten.remove(seriesKey)) {
+                pruned++;
+            }
+        }
+        return pruned;
+    }
+
+    /** Quantidade de séries marcadas como {@link #forget esquecidas} agora. */
+    public int forgottenCount() {
+        return forgotten.size();
     }
 
     /**
