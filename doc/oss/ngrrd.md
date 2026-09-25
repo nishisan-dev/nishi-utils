@@ -551,7 +551,11 @@ uma entrada sem arquivo virar uma série vazia pré-alocada no primeiro acesso.
 se a série não existir, a abertura lança
 `dev.nishisan.utils.oss.api.SeriesNotFoundException` sem alocar nada (sem
 arquivo `.ngrr`, sem entrada no catálogo do blob). O default
-(`createIfMissing = true`) preserva o comportamento atual.
+(`createIfMissing = true`) preserva o comportamento atual. No modo local, o
+handle de uma série existente abre normalmente para leitura e escrita — a
+flag só afeta a criação, não o modo de abertura (diferente do cluster, onde
+`createIfMissing=false` sempre abre um handle somente leitura; ver
+[`doc/oss/ngrrd-cluster.md`](ngrrd-cluster.md)).
 
 ```java
 import dev.nishisan.utils.oss.api.SeriesNotFoundException;
@@ -560,7 +564,8 @@ Ngrrd.OpenOptions options = Ngrrd.OpenOptions.defaults().withCreateIfMissing(fal
 try (NgrrdHandle handle = Ngrrd.fromYaml(yaml, bindings, tags, null, options)) {
     // série já existia — segue o fluxo normal de write/read.
 } catch (SeriesNotFoundException e) {
-    // e.seriesKey() identifica a série ausente; nada foi criado.
+    // e.seriesKey() identifica a série ausente; e.reason() é sempre ABSENT
+    // no modo local (o objeto não existe no storage); nada foi criado.
     // ponto natural para remover a entrada de um catálogo externo.
 }
 ```

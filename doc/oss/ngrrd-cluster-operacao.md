@@ -425,7 +425,10 @@ Métricas úteis por storage: `MIGRATIONS_IN`, `MIGRATIONS_OUT`, `SAMPLES_FAILED
 `USED_BYTES`, `CAPACITY_BYTES` e `RECONCILE_MISSING`, expostas por `ngrrd_admin metrics <nodeId>`.
 Capacidade omitida/desconhecida não significa disco livre: `FILL%` não substitui o monitoramento
 do filesystem. Pela API, `NodeMetricsSnapshot` também inclui histogramas de latência e erros
-por status; a CLI imprime apenas um subconjunto.
+por status; a CLI imprime apenas um subconjunto. **`errorsByStatus[NOT_FOUND]` inclui os `OPEN`
+sem criar legítimos de uma varredura de catálogo** — um consumidor que consulta muitas chaves
+ausentes com `createIfMissing=false` infla essa contagem sem indicar um problema; não trate
+sozinha como sinal de degradação.
 
 Na aplicação, acompanhe `client.metrics()`: `bufferedSamples` por destino, `retriesByStatus`,
 `samplesSent` e `samplesFailed`. As métricas de um novo cliente administrativo não representam
@@ -540,3 +543,55 @@ não impede o planejamento das menores que ainda cabem.
 
 Reverter o modo não significa fazer downgrade dos binários. Cotas de séries/bytes e regras de
 afinidade (item 3 da issue) não fazem parte desta entrega.
+
+## Consultar existência e abrir sem criar (issue #171)
+
+### Ordem de atualização
+
+**Atualize TODOS os storages antes dos clientes que usam `exists`, `find`, `verify` ou `open`
+com `createIfMissing=false`.** Diferente da atualização coordenada da seção anterior, esta
+entrega tolera um período com versões mistas — mas só na direção storage-primeiro:
+
+1. Um storage novo aceita clientes antigos sem alteração: `OpenRequest.createIfMissing` chega
+   `null` de um cliente antigo e o storage trata como `true` (cria), igual a hoje.
+2. Um storage antigo (anterior a esta entrega) não conhece `createIfMissing` nem publica
+   capacidades no status (`StorageNodeStatus.capabilities`). Um cliente novo detecta a ausência
+   da capacidade exigida (`catalog.lookup` no líder para `exists`/`find`/`verify`;
+   `open.createIfMissing` no dono para `open` sem criar) **antes de enviar qualquer RPC** e
+   falha com `NgrrdClusterException` de código `ErrorCode.UNSUPPORTED_BY_NODE` — nunca `false`,
+   nunca cria a série por engano. Como defesa extra, um `OPEN` sem criar que receba `OK` sem a
+   confirmação do storage (campo que só um storage desta versão preenche) também vira
+   `UNSUPPORTED_BY_NODE` depois do fato — isso detecta um storage antigo que ignorou o pedido,
+   mas não desfaz uma criação que ele já tenha feito; o handle somente leitura se fecha.
+3. **Durante a janela de versões mistas, se o líder eleito ainda for um storage na versão
+   anterior**, `ngrrd.admin.drain`/`ngrrd.admin.activate` regravam o status do nó afetado
+   (`StorageNodeStatus.withState`) sem o campo `capabilities`, que essa versão do líder não
+   conhece — as capacidades daquele nó somem do catálogo até o próximo relatório periódico dele
+   (`statusReportInterval`, default 10 s) as republicar. Uma consulta que caia exatamente nessa
+   janela vê `UNSUPPORTED_BY_NODE` em vez de operar normalmente; nunca uma resposta incorreta.
+   Evite `drain`/`activate` durante a janela de atualização, e não dependa de
+   `exists`/`find`/`verify`/`open` sem criar até confirmar (via `status`) que todos os storages já
+   reportam as capacidades novas.
+4. Depois que todos os storages reportam capacidades, atualize os clientes normalmente — sem
+   necessidade de parar o tráfego, diferente da migração `COUNT`/`CAPACITY`/`WEIGHT`.
+
+### Custo e limites operacionais
+
+- **`NOT_FOUND` no `OPEN` custa uma leitura forte ao líder.** O storage nunca responde
+  `NOT_FOUND` só com base na réplica local do catálogo (pode estar atrasada logo após um
+  restart) — confirma antes com uma leitura forte de placement (`placementStrong`) no líder. Uma
+  varredura de catálogo com muitas chaves ausentes gera esse RPC extra por chave ausente;
+  dimensione o `catalogLookupBatchSize` do lado do cliente (`exists`/`find`/`verify` já são
+  paginados e sequenciais) e evite paralelizar `open` sem criar sem controle de concorrência.
+- **A confirmação de capacidade pode consumir o prazo da chamada se o líder mudar no meio.** A
+  releitura de status ausente usa backoff curto (10 ms a 200 ms) dentro do `retryTimeout`
+  restante da operação; numa troca de liderança em curso, esse laço pode não convergir a tempo e
+  a chamada falha com `TIMEOUT` (leitura forte que só falhou no transporte) ou
+  `UNSUPPORTED_BY_NODE` (nenhum status publicado até o fim do prazo) em vez de completar — trate
+  como transitório e retente.
+- **Limitação conhecida (issue #174):** o estado "esquecida" (`isForgotten`) que o storage usa
+  para não confundir uma reconciliação em andamento com uma série realmente ausente é só em
+  memória. Se a origem de uma migração reiniciar logo depois de concluir o `FINISH`, a marca se
+  perde e a checagem volta a depender só da confirmação forte do líder — sem impacto de
+  corretude (o líder continua sendo a fonte de verdade), mas a janela de proteção contra um
+  `NOT_FOUND` prematuro fica menor até o próximo ciclo de reconciliação.

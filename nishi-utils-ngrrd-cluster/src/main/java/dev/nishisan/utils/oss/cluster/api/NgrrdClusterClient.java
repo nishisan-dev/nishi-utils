@@ -121,11 +121,17 @@ public interface NgrrdClusterClient extends Closeable {
      *       {@link SeriesNotFoundException.Reason#MISSING_ON_OWNER}.</li>
      * </ul>
      *
-     * <p>Confirmar um miss exige que o líder anuncie a capacidade {@code catalog.lookup} no status
-     * publicado em {@code ngrrd.nodes} (réplica local; ausente, uma leitura forte). Um líder de versão
-     * anterior não responde a consulta: o cliente falha na hora com
-     * {@link ErrorCode#UNSUPPORTED_BY_NODE}, sem RPC — nunca {@code false}, nunca espera o prazo até um
-     * {@code TIMEOUT}. Atualize os storages antes dos clientes.</p>
+     * <p>Confirmar um miss exige que o líder anuncie a capacidade {@code catalog.lookup}: a réplica
+     * local do status ({@code ngrrd.nodes}) resolve sem RPC quando já traz a capacidade; em qualquer
+     * outro caso — status local ausente ou sem a capacidade (a réplica pode estar atrasada logo após
+     * uma atualização do nó) — uma leitura forte confirma no líder, relida com backoff curto dentro do
+     * prazo restante da consulta enquanto não houver status (ex.: o líder mudou antes de publicar o
+     * seu). Confirmado sem a capacidade — inclusive a de um líder de versão anterior, que publica o
+     * status sem capacidades — o cliente falha na hora com {@link ErrorCode#UNSUPPORTED_BY_NODE}, sem
+     * enviar o {@code CATALOG_LOOKUP}; sem status até o fim do prazo, também
+     * {@link ErrorCode#UNSUPPORTED_BY_NODE}; uma leitura forte que só falhou no transporte vira
+     * {@link ErrorCode#TIMEOUT} com a causa. Nunca {@code false} nesses casos. Atualize os storages
+     * antes dos clientes.</p>
      *
      * @throws NgrrdClusterException se não foi possível confirmar com o líder (sem líder, timeout,
      *         falha de transporte, resposta inválida) — uma falha ao consultar nunca vira {@code false};

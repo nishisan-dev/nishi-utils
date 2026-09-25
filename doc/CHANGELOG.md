@@ -4,7 +4,51 @@
 
 ---
 
-## 2026-09-25 — Correções no rebalance com ingestão contínua — release 8.5.1
+## 2026-09-25 — Consultar existência e abrir sem criar — release 8.6.0
+
+Atende a [issue #171](https://github.com/nishisan-dev/nishi-utils/issues/171), nos dois modos do
+ngrrd (local e cluster). **Inclui as correções da 8.5.1** (rebalance com ingestão contínua, ver
+seção abaixo) — a 8.5.1 não teve release/tag própria; ela é publicada junto com esta versão.
+
+- `Ngrrd.OpenOptions.withCreateIfMissing(false)` (novo campo `createIfMissing`, default `true`)
+  desliga a criação implícita de `open`/`fromYaml`: série ausente lança
+  `dev.nishisan.utils.oss.api.SeriesNotFoundException` sem alocar nada, nos dois modos. No modo
+  local o handle de uma série existente segue gravável normalmente. `SeriesNotFoundException`
+  não herda de `NgrrdClusterException` (falha de transporte nunca a captura por engano) e expõe
+  `reason()` — `ABSENT` no modo local; `NOT_PLACED`/`MISSING_ON_OWNER` no cluster.
+- `Ngrrd.exists(...)` (três overloads, espelhando `open`/`fromYaml`) consulta a existência de uma
+  série no volume sem I/O de criação — resolve a chave física e pergunta ao storage.
+- `NgrrdClusterClient` ganha `exists(String)`, `exists(Collection<String>)`,
+  `find(String) → Optional<SeriesInfo>` e `verify(Collection<String>) → Map<String,
+  SeriesVerification>` (`PRESENT`/`MISSING_ON_OWNER`/`NOT_PLACED`/`UNVERIFIED`). Existência no
+  cluster é presença de placement no catálogo (`MIGRATING` conta como existente); um hit local
+  responde sem RPC, um miss é confirmado em lote no líder (`ngrrd.catalog.lookup`, novo comando,
+  paginado em `NgrrdClusterConfig.catalogLookupBatchSize`, default 2000, sequencial). Falha ao
+  confirmar (sem líder, timeout, transporte, líder sem o comando) nunca vira `false` — sempre
+  `NgrrdClusterException`. `verify` é a única verificação física (`ngrrd.series.exists.batch` no
+  dono, também novo).
+- `NgrrdClusterClient.open(..., createIfMissing=false)` abre um handle SOMENTE LEITURA: o cliente
+  nunca posiciona (`ngrrd.place`), o storage recusa criar (`SeriesStatus.NOT_FOUND` sem
+  ownership) e `write`/`flush`/`checkpoint` lançam `IllegalStateException`. Cache de handles sem
+  contagem de referências: abrir com criação sobre um somente leitura em cache o substitui por
+  um gravável novo (o antigo continua válido para quem já o tinha); abrir sem criar sobre um
+  gravável em cache devolve uma vista somente leitura nova a cada chamada, cujo `close()` nunca
+  fecha o gravável.
+- Storages anunciam capacidades de protocolo em `StorageNodeStatus.capabilities`
+  (`catalog.lookup`, `open.createIfMissing`, `series.exists.batch`); o cliente confere a
+  capacidade antes de enviar uma operação nova e falha com `ErrorCode.UNSUPPORTED_BY_NODE` — sem
+  RPC — contra um storage/líder de versão anterior, em vez de arriscar `false` ou criar a série
+  por engano. Status local sem a capacidade é confirmado por leitura forte no líder antes de
+  recusar, relida com backoff curto dentro do prazo restante quando ausente.
+- Corrige o líder recém-eleito sem peers (cluster de um único nó) que não semeava a liderança no
+  `placementHandler` no boot: sem o seed, a janela de graça pós-eleição de `PLACE` e
+  `ngrrd.catalog.lookup` nunca se abria naquele mandato, e um miss logo após o boot podia virar
+  "não existe" definitivo antes da réplica local do catálogo convergir.
+- Documentação: `doc/oss/ngrrd.md` (modo local), `doc/oss/ngrrd-cluster.md` (contrato de
+  consistência, cache de handles, reconciliação de catálogo externo) e
+  `doc/oss/ngrrd-cluster-operacao.md` (ordem de atualização — storages antes dos clientes).
+
+## 2026-09-25 — Correções no rebalance com ingestão contínua — release 8.5.1 (não publicada — incorporada na 8.6.0)
 
 Correções aplicadas ao módulo `nishi-utils-ngrrd-cluster`, complementando o trabalho da
 [PR #172](https://github.com/nishisan-dev/nishi-utils/pull/172) (rebalance com ingestão contínua, 8.5.0).
