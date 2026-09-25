@@ -32,11 +32,21 @@ import dev.nishisan.utils.oss.cluster.protocol.SeriesStatus;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
+import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+import dev.nishisan.utils.oss.cluster.rpc.ClusterRpc;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Cobre {@link PlacementResolver} com {@link RecordingClusterRpc} fake — sem
@@ -222,5 +232,54 @@ class PlacementResolverTest {
 
         assertEquals(placed, resolved);
         assertEquals(1, rpc.calls().size());
+    }
+
+    @Test
+    void leaderRedirectAndTransportFailureUseOnlyTheCallersRemainingBudget() {
+        long[] now = {0};
+        Clock clock = new Clock() {
+            public ZoneId getZone() { return ZoneOffset.UTC; }
+            public Clock withZone(ZoneId zone) { return this; }
+            public Instant instant() { return Instant.ofEpochMilli(now[0]); }
+            public long millis() { return now[0]; }
+        };
+        List<Duration> budgets = new ArrayList<>();
+        ClusterRpc boundedRpc = new ClusterRpc() {
+            public <R> R call(NodeId target, String command, Object body, Class<R> type) {
+                throw new AssertionError("placement RPC must be bounded");
+            }
+            public <R> R call(NodeId target, String command, Object body, Class<R> type, Duration timeout) {
+                budgets.add(timeout);
+                if (budgets.size() == 1) {
+                    now[0] += 70;
+                    return type.cast(new PlaceResponse(SeriesStatus.NOT_LEADER, null, null, "leader-2"));
+                }
+                assertEquals(NodeId.of("leader-2"), target);
+                now[0] += timeout.toMillis();
+                throw new NgrrdClusterException(ErrorCode.TIMEOUT, "slow leader");
+            }
+            public NodeId localId() { return CLIENT; }
+            public Optional<NodeId> leaderId() { return Optional.of(LEADER); }
+        };
+        var bounded = new PlacementResolver(catalog, boundedRpc,
+                new RetryPolicy(Duration.ofSeconds(2), Duration.ofMillis(1), Duration.ofMillis(2)), clock);
+
+        assertEquals(ErrorCode.TIMEOUT, assertThrows(NgrrdClusterException.class,
+                () -> bounded.resolve("uncached", "hash", null, Duration.ofMillis(100))).code());
+
+        assertEquals(List.of(Duration.ofMillis(100), Duration.ofMillis(30)), budgets);
+        assertEquals(100, now[0]);
+    }
+
+    @Test
+    @Timeout(2)
+    void waitingForLeaderDoesNotRestartTheFullRetryTimeout() {
+        rpc.leader(null);
+        long start = System.nanoTime();
+        NgrrdClusterException failure = assertThrows(NgrrdClusterException.class,
+                () -> resolver.resolve("uncached", "hash", null, Duration.ofMillis(30)));
+        assertTrue(failure.code() == ErrorCode.NO_LEADER || failure.code() == ErrorCode.TIMEOUT);
+        assertTrue(Duration.ofNanos(System.nanoTime() - start).toMillis() < 500);
+        assertTrue(rpc.calls().isEmpty());
     }
 }

@@ -76,8 +76,12 @@ final class TransportRetry {
             return;
         }
         long deadline = System.currentTimeMillis() + backoff.toMillis();
-        while (!rpc.isConnected(target) && System.currentTimeMillis() < deadline) {
-            sleepQuietly(CONNECTION_POLL_INTERVAL);
+        while (!rpc.isConnected(target)) {
+            long remaining = deadline - System.currentTimeMillis();
+            if (remaining <= 0) {
+                return;
+            }
+            sleepQuietly(Duration.ofMillis(Math.min(CONNECTION_POLL_INTERVAL.toMillis(), remaining)));
         }
     }
 

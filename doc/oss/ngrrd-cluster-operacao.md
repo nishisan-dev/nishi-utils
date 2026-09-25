@@ -16,7 +16,7 @@ Depois de compilar e copiar as dependências conforme o quickstart, defina no te
 administração:
 
 ```bash
-NGRRD_CP='nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.4.0.jar:nishi-utils-ngrrd-cluster/target/lib/*'
+NGRRD_CP='nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.4.1.jar:nishi-utils-ngrrd-cluster/target/lib/*'
 NGRRD_SEED='127.0.0.1:7101'
 
 ngrrd_admin() {
@@ -86,7 +86,7 @@ YAML
 Em um terminal separado, mantenha o novo processo em primeiro plano:
 
 ```bash
-java -cp 'nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.4.0.jar:nishi-utils-ngrrd-cluster/target/lib/*' \
+java -cp 'nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.4.1.jar:nishi-utils-ngrrd-cluster/target/lib/*' \
   dev.nishisan.utils.oss.cluster.node.NgrrdStorageNodeMain \
   --config target/ngrrd-demo/storage-4.yaml
 ```
@@ -199,6 +199,21 @@ O fluxo de uma série é:
 O cliente trata `MIGRATING` com espera e retentativa; ao receber `WRONG_OWNER`, atualiza
 o roteamento. As escritas pendentes são reenfileiradas. Não é necessário reabrir manualmente
 todos os handles a cada mudança de dono.
+
+**Correção na 8.4.1 (issue #169):** checkpoint, flush e leituras recuperam a sequência
+`WRONG_OWNER` → `NOT_OPEN` → `OPEN` e novas mudanças de dono durante a reabertura.
+As tentativas compartilham o prazo original de `retryTimeout`; erros reais do storage
+continuam sendo propagados. Para diagnosticar as tentativas, habilite `FINE` (JUL) ou
+`DEBUG` no logger `dev.nishisan.utils.oss.cluster.client.RemoteSeriesHandle`, conforme
+a ponte de logging da aplicação. Cada registro informa série, comando, destino, status,
+dono indicado, tentativa e tempo restante.
+
+Para quem já usa a **8.4.0**, a correção é no cliente Java: atualizar a dependência e
+recompilar/reiniciar a aplicação consumidora. Os storages 8.4.0 são compatíveis com esse
+cliente; a 8.4.1 não altera o protocolo nem o catálogo. Atualizações vindas de versões
+anteriores à 8.4.0 continuam exigindo a janela coordenada descrita neste guia.
+A observação sobre falhas de transporte com 32 migrações simultâneas na issue #169
+não foi isolada e não é considerada resolvida por este hotfix.
 
 Durante essa janela:
 

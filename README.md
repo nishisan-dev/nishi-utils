@@ -582,7 +582,7 @@ expõe a mesma interface `NgrrdHandle` de sempre.
 <dependency>
   <groupId>dev.nishisan</groupId>
   <artifactId>nishi-utils-ngrrd-cluster</artifactId>
-  <version>8.4.0</version>
+  <version>8.4.1</version>
 </dependency>
 ```
 

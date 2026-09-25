@@ -36,12 +36,18 @@ jobs:
       # resource sensitive and does not pass reliably on hosted runners. Run it locally with
       # `mvn test -Presilience` / `mvn verify -Pdocker-resilience`.
       - name: Run unit tests with coverage (NGrid resilience suite excluded)
-        run: mvn -B verify -pl nishi-utils-core -DexcludeNgrid=true -Dsurefire.rerunFailingTestsCount=1
+        run: mvn -B verify -pl nishi-utils-core,nishi-utils-oss,nishi-utils-ngrrd-cluster -am -DexcludeNgrid=true -Dsurefire.rerunFailingTestsCount=1
+
+      - name: Verify checkpoint recovery after migration
+        run: mvn -B test -pl nishi-utils-ngrrd-cluster -am -Pngrrd-cluster -Dtest=CheckpointAfterMigrationClusterTest -Dsurefire.failIfNoSpecifiedTests=false
 
       - name: Upload coverage report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: jacoco-report
-          path: nishi-utils-core/target/site/jacoco/
+          path: |
+            nishi-utils-core/target/site/jacoco/
+            nishi-utils-oss/target/site/jacoco/
+            nishi-utils-ngrrd-cluster/target/site/jacoco/
           retention-days: 14

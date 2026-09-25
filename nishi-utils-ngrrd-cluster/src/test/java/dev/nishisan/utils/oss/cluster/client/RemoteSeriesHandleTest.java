@@ -20,6 +20,9 @@ package dev.nishisan.utils.oss.cluster.client;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.oss.Ngrrd;
 import dev.nishisan.utils.oss.api.Sample;
+import dev.nishisan.utils.oss.api.ConsolidationFunction;
+import dev.nishisan.utils.oss.api.SeriesResult;
+import dev.nishisan.utils.oss.api.ViewQuery;
 import dev.nishisan.utils.oss.cluster.api.ErrorCode;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
@@ -27,7 +30,11 @@ import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesStatus;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesStatusResponse;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesWrite;
+import dev.nishisan.utils.oss.cluster.protocol.ReadResponse;
+import dev.nishisan.utils.oss.cluster.protocol.ReadPresetResponse;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.time.Clock;
@@ -97,6 +104,87 @@ class RemoteSeriesHandleTest {
 
         List<String> commands = rpc.calls().stream().map(RecordingClusterRpc.Recorded::command).toList();
         assertEquals(List.of(Commands.OPEN, Commands.CHECKPOINT, Commands.OPEN, Commands.CHECKPOINT), commands);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {Commands.CHECKPOINT, Commands.FLUSH, Commands.READ, Commands.READ_PRESET})
+    void redirectDoesNotConsumeReopenAttempt(String command) {
+        RemoteSeriesHandle handle = openedHandle();
+        rpc.respondNext((cmd, body) -> response(cmd, SeriesStatus.WRONG_OWNER, OWNER_B.value()));
+        rpc.respondNext((cmd, body) -> response(cmd, SeriesStatus.NOT_OPEN, OWNER_B.value()));
+        rpc.respondDefault((cmd, body) -> response(cmd, SeriesStatus.OK, OWNER_B.value()));
+
+        invoke(handle, command);
+
+        assertEquals(List.of(Commands.OPEN, command, command, Commands.OPEN, command),
+                rpc.calls().stream().map(RecordingClusterRpc.Recorded::command).toList());
+        assertEquals(List.of(OWNER_A, OWNER_A, OWNER_B, OWNER_B, OWNER_B),
+                rpc.calls().stream().map(RecordingClusterRpc.Recorded::target).toList());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {Commands.CHECKPOINT, Commands.FLUSH, Commands.READ, Commands.READ_PRESET})
+    void migrationAfterReopenAllowsAnotherRedirectAndReopen(String command) {
+        RemoteSeriesHandle handle = openedHandle();
+        rpc.respondNext((cmd, body) -> response(cmd, SeriesStatus.NOT_OPEN, OWNER_A.value()));
+        rpc.respondNext((cmd, body) -> response(cmd, SeriesStatus.OK, OWNER_A.value()));
+        rpc.respondNext((cmd, body) -> response(cmd, SeriesStatus.WRONG_OWNER, OWNER_B.value()));
+        rpc.respondNext((cmd, body) -> response(cmd, SeriesStatus.NOT_OPEN, OWNER_B.value()));
+        rpc.respondDefault((cmd, body) -> response(cmd, SeriesStatus.OK, OWNER_B.value()));
+
+        invoke(handle, command);
+
+        assertEquals(List.of(Commands.OPEN, command, Commands.OPEN, command, command, Commands.OPEN, command),
+                rpc.calls().stream().map(RecordingClusterRpc.Recorded::command).toList());
+        assertEquals(OWNER_B, rpc.calls().getLast().target());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {Commands.CHECKPOINT, Commands.FLUSH, Commands.READ, Commands.READ_PRESET})
+    void ownerUpdatedByWriterStillAllowsSecondNotOpen(String command) {
+        RemoteSeriesHandle handle = openedHandle();
+        rpc.respondNext((cmd, body) -> response(cmd, SeriesStatus.NOT_OPEN, OWNER_A.value()));
+        rpc.respondNext((cmd, body) -> response(cmd, SeriesStatus.OK, OWNER_A.value()));
+        rpc.respondNext((cmd, body) -> {
+            // A write response may update the handle while this RPC is in flight.
+            resolver.noteOwner(SERIES_KEY, OWNER_B.value());
+            handle.ownerChanged(OWNER_B.value());
+            return response(cmd, SeriesStatus.NOT_OPEN, OWNER_A.value());
+        });
+        rpc.respondDefault((cmd, body) -> response(cmd, SeriesStatus.OK, OWNER_B.value()));
+
+        invoke(handle, command);
+
+        assertEquals(List.of(Commands.OPEN, command, Commands.OPEN, command, Commands.OPEN, command),
+                rpc.calls().stream().map(RecordingClusterRpc.Recorded::command).toList());
+        assertEquals(OWNER_B, rpc.calls().getLast().target());
+    }
+
+    private RemoteSeriesHandle openedHandle() {
+        RemoteSeriesHandle handle = newHandle();
+        rpc.respondNext((cmd, body) -> response(cmd, SeriesStatus.OK, OWNER_A.value()));
+        handle.open();
+        return handle;
+    }
+
+    private static Object response(String command, SeriesStatus status, String owner) {
+        var result = new SeriesResult("in_bps", "rra", ConsolidationFunction.AVERAGE, 300, List.of());
+        return switch (command) {
+            case Commands.READ -> new ReadResponse(status, owner, result, null);
+            case Commands.READ_PRESET -> new ReadPresetResponse(status, owner, Map.of("in_bps", result), null);
+            default -> new SeriesStatusResponse(status, owner, null);
+        };
+    }
+
+    private static void invoke(RemoteSeriesHandle handle, String command) {
+        switch (command) {
+            case Commands.CHECKPOINT -> handle.checkpoint();
+            case Commands.FLUSH -> handle.flush();
+            case Commands.READ -> assertEquals("in_bps", handle.read("in_bps",
+                    new ViewQuery(Duration.ofHours(1), 300, ConsolidationFunction.AVERAGE, 100)).dsName());
+            case Commands.READ_PRESET -> assertEquals(1, handle.read("preset").size());
+            default -> throw new AssertionError(command);
+        }
     }
 
     @Test

@@ -133,7 +133,9 @@ Status de série (`SeriesStatus`): `OK`, `WRONG_OWNER`, `MIGRATING`, `NOT_OPEN`,
 
 - **`NOT_OPEN`:** o dono não tem o handle/definição em memória (ex.: reiniciou e ainda não recebeu
   o `ngrrd.open`, ou o `SeriesHandleRegistry` fechou por ociosidade e a auto-cura falhou). O cliente
-  reabre e repete a operação uma vez.
+  reabre e repete a operação. Desde a 8.4.1, checkpoint, flush e leituras toleram
+  `WRONG_OWNER` seguido de `NOT_OPEN`, inclusive novas migrações durante a reabertura,
+  compartilhando um único `retryTimeout` com o `OPEN` e a consulta ao líder.
 - **`WRONG_OWNER`:** o nó contatado não é (mais) o dono segundo seu catálogo local — normalmente
   logo após uma migração. O cliente invalida o cache de placement, releitura (ou pergunta ao
   líder) e reenfileira.
@@ -175,7 +177,8 @@ retentativa transparente:
   política default é `BLOCK` (o `write()` do chamador bloqueia até haver espaço — backpressure real
   para quem produz via Kafka, por exemplo) ou `FAIL` (lança `BUFFER_FULL` imediatamente). Não existe
   política `DROP`.
-- **`flush`/`checkpoint`:** drenam sincronamente o buffer do nó dono antes de enviar o comando.
+- **`flush`/`checkpoint`:** aguardam as escritas pendentes da série, inclusive as redirecionadas,
+  antes de enviar o comando. A espera e a recuperação usam o mesmo `retryTimeout`.
 - **`read`/`readPreset`:** RPC direto ao dono; `Consistency` não se aplica (dono único da série).
 - **`WRONG_OWNER` com dono já conhecido na resposta:** o handle atualiza `owner` imediatamente
   (`ownerChanged`), sem esperar um novo `open()` — isso preserva a ordem do backlog reenfileirado

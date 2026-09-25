@@ -56,9 +56,6 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
 
     private static final Logger LOGGER = Logger.getLogger(RemoteSeriesHandle.class.getName());
 
-    /** Máximo de retentativas consecutivas de {@code WRONG_OWNER} ao abrir, antes de desistir. */
-    private static final int MAX_WRONG_OWNER_ATTEMPTS_ON_OPEN = 5;
-
     private final String seriesKey;
     private final String yaml;
     private final String definitionHashHex;
@@ -121,50 +118,32 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
      * e o próprio {@code client} chamam isto; não faz parte do contrato público de {@link NgrrdHandle}.</p>
      */
     void open() {
-        long startedAt = clock.millis();
-        // Chamadores atuais passam startedAt + retryTimeout — comportamento inalterado em relação a
-        // antes do B1 (achado do Refuter): callWithTransportRetry só ganhou um SEGUNDO critério de
-        // saída (o deadline explícito), não um prazo mais curto para este caminho.
-        long deadlineMs = startedAt + retryPolicy.timeout().toMillis();
-        int wrongOwnerAttempts = 0;
-        int migratingAttempts = 0;
+        open(new OperationRetry(Commands.OPEN));
+    }
+
+    private void open(OperationRetry retry) {
         for (;;) {
-            SeriesPlacement placement = resolver.resolve(seriesKey, definitionHashHex, geometry);
+            SeriesPlacement placement = resolver.resolve(seriesKey, definitionHashHex, geometry, retry.remaining());
             String candidateOwner = placement.ownerNodeId();
             OpenRequest request = new OpenRequest(seriesKey, yaml, tags, options.durability(),
                     options.onGeometryChange(), placement);
+            retry.remaining();
             SeriesStatusResponse response = callWithTransportRetry(NodeId.of(candidateOwner), Commands.OPEN, request,
-                    SeriesStatusResponse.class, deadlineMs);
+                    SeriesStatusResponse.class, retry.deadlineMs);
             if (response.status() == SeriesStatus.OK) {
                 owner = candidateOwner;
                 return;
             }
-            if (response.status() == SeriesStatus.NOT_LEADER) {
-                if (retryPolicy.exhausted(startedAt, clock.millis())) {
-                    throw new NgrrdClusterException(ErrorCode.NO_LEADER, "geometry publication has no stable leader");
+            switch (response.status()) {
+                case WRONG_OWNER, MIGRATING, NOT_LEADER -> {
+                    retry.pause(Commands.OPEN, candidateOwner, response.status(), response.ownerNodeId());
+                    if (response.status() == SeriesStatus.WRONG_OWNER) {
+                        noteWrongOwner(response.ownerNodeId(), retry);
+                    }
                 }
-                sleepQuietly(retryPolicy.backoffFor(++migratingAttempts));
-                continue;
+                default -> throw new NgrrdClusterException(ErrorCode.REMOTE_ERROR,
+                        response.message() != null ? response.message() : ("OPEN respondeu " + response.status()));
             }
-            if (response.status() == SeriesStatus.WRONG_OWNER) {
-                wrongOwnerAttempts++;
-                noteWrongOwner(response.ownerNodeId());
-                if (wrongOwnerAttempts >= MAX_WRONG_OWNER_ATTEMPTS_ON_OPEN) {
-                    throw new NgrrdClusterException(ErrorCode.WRONG_OWNER,
-                            "WRONG_OWNER persistente ao abrir a série " + seriesKey);
-                }
-                continue;
-            }
-            if (response.status() == SeriesStatus.MIGRATING) {
-                if (retryPolicy.exhausted(startedAt, clock.millis())) {
-                    throw new NgrrdClusterException(ErrorCode.MIGRATING,
-                            "série em migração além do prazo ao abrir: " + seriesKey);
-                }
-                sleepQuietly(retryPolicy.backoffFor(++migratingAttempts));
-                continue;
-            }
-            throw new NgrrdClusterException(ErrorCode.REMOTE_ERROR,
-                    response.message() != null ? response.message() : ("OPEN respondeu " + response.status()));
         }
     }
 
@@ -207,15 +186,17 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
     @Override
     public void flush() {
         ensureOpen();
-        dispatcher.flushSeriesSync(seriesKey, owner);
-        executeSeriesCommand(Commands.FLUSH);
+        OperationRetry retry = new OperationRetry(Commands.FLUSH);
+        dispatcher.flushSeriesSync(seriesKey, owner, retry.remaining());
+        executeSeriesCommand(Commands.FLUSH, retry);
     }
 
     @Override
     public void checkpoint() {
         ensureOpen();
-        dispatcher.flushSeriesSync(seriesKey, owner);
-        executeSeriesCommand(Commands.CHECKPOINT);
+        OperationRetry retry = new OperationRetry(Commands.CHECKPOINT);
+        dispatcher.flushSeriesSync(seriesKey, owner, retry.remaining());
+        executeSeriesCommand(Commands.CHECKPOINT, retry);
     }
 
     @Override
@@ -231,18 +212,17 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
     private SeriesResult read(String dsName, ViewQuery query, Long endExclusiveEpochMs) {
         ensureOpen();
         ReadRequest request = ReadRequest.of(seriesKey, dsName, query, endExclusiveEpochMs);
-        long startedAt = clock.millis();
-        long deadlineMs = startedAt + retryPolicy.timeout().toMillis();
-        boolean retriedOnce = false;
-        int[] migratingAttempts = {0};
+        OperationRetry retry = new OperationRetry(Commands.READ);
         for (;;) {
-            ReadResponse response = callWithTransportRetry(NodeId.of(owner), Commands.READ, request,
-                    ReadResponse.class, deadlineMs);
+            retry.remaining();
+            String target = owner;
+            ReadResponse response = callWithTransportRetry(NodeId.of(target), Commands.READ, request,
+                    ReadResponse.class, retry.deadlineMs);
             if (response.status() == SeriesStatus.OK) {
                 return response.result();
             }
-            retriedOnce = handleRetryableStatus(Commands.READ, response.status(), response.ownerNodeId(),
-                    response.message(), startedAt, retriedOnce, migratingAttempts);
+            handleRetryableStatus(Commands.READ, target, response.status(), response.ownerNodeId(),
+                    response.message(), retry);
         }
     }
 
@@ -259,18 +239,17 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
     private Map<String, SeriesResult> readPreset(String presetName, Long endExclusiveEpochMs) {
         ensureOpen();
         ReadPresetRequest request = new ReadPresetRequest(seriesKey, presetName, endExclusiveEpochMs);
-        long startedAt = clock.millis();
-        long deadlineMs = startedAt + retryPolicy.timeout().toMillis();
-        boolean retriedOnce = false;
-        int[] migratingAttempts = {0};
+        OperationRetry retry = new OperationRetry(Commands.READ_PRESET);
         for (;;) {
-            ReadPresetResponse response = callWithTransportRetry(NodeId.of(owner), Commands.READ_PRESET, request,
-                    ReadPresetResponse.class, deadlineMs);
+            retry.remaining();
+            String target = owner;
+            ReadPresetResponse response = callWithTransportRetry(NodeId.of(target), Commands.READ_PRESET, request,
+                    ReadPresetResponse.class, retry.deadlineMs);
             if (response.status() == SeriesStatus.OK) {
                 return response.results();
             }
-            retriedOnce = handleRetryableStatus(Commands.READ_PRESET, response.status(), response.ownerNodeId(),
-                    response.message(), startedAt, retriedOnce, migratingAttempts);
+            handleRetryableStatus(Commands.READ_PRESET, target, response.status(), response.ownerNodeId(),
+                    response.message(), retry);
         }
     }
 
@@ -326,99 +305,83 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
         onClose.accept(seriesKey);
     }
 
-    private void executeSeriesCommand(String command) {
-        long startedAt = clock.millis();
-        long deadlineMs = startedAt + retryPolicy.timeout().toMillis();
-        boolean retriedOnce = false;
-        int[] migratingAttempts = {0};
+    private void executeSeriesCommand(String command, OperationRetry retry) {
         for (;;) {
-            SeriesStatusResponse response = callWithTransportRetry(NodeId.of(owner), command,
-                    new SeriesCommandRequest(seriesKey), SeriesStatusResponse.class, deadlineMs);
+            retry.remaining();
+            String target = owner;
+            SeriesStatusResponse response = callWithTransportRetry(NodeId.of(target), command,
+                    new SeriesCommandRequest(seriesKey), SeriesStatusResponse.class, retry.deadlineMs);
             if (response.status() == SeriesStatus.OK) {
                 return;
             }
-            retriedOnce = handleRetryableStatus(command, response.status(), response.ownerNodeId(),
-                    response.message(), startedAt, retriedOnce, migratingAttempts);
+            handleRetryableStatus(command, target, response.status(), response.ownerNodeId(), response.message(), retry);
         }
     }
 
-    /**
-     * Trata os status não-OK comuns a {@code checkpoint}/{@code flush}/
-     * {@code read}/{@code readPreset}: {@code WRONG_OWNER} e {@code NOT_OPEN}
-     * repetem uma única vez; {@code MIGRATING} faz backoff até
-     * {@code retryTimeout}; qualquer outro status vira {@link NgrrdClusterException}.
-     *
-     * @param migratingAttempts contador de tentativas de MIGRATING do chamador (posição 0), mutado
-     *                          aqui — item 6 (achado do Refuter): sem isso, cada MIGRATING dormia
-     *                          sempre {@code backoffFor(1)} em vez de crescer exponencialmente
-     * @return o novo valor de {@code retriedOnce} para a próxima iteração do chamador
-     */
-    private boolean handleRetryableStatus(String command, SeriesStatus status, String ownerNodeId, String message,
-            long startedAt, boolean retriedOnce, int[] migratingAttempts) {
-        if (status == SeriesStatus.WRONG_OWNER) {
-            if (retriedOnce) {
-                throw new NgrrdClusterException(ErrorCode.WRONG_OWNER,
-                        "WRONG_OWNER persistente em " + command + " de " + seriesKey);
+    /** Redirects and reopens can alternate during migration; all share the original deadline. */
+    private void handleRetryableStatus(String command, String target, SeriesStatus status, String ownerNodeId,
+            String message, OperationRetry retry) {
+        switch (status) {
+            case WRONG_OWNER, NOT_OPEN, MIGRATING -> {
+                retry.pause(command, target, status, ownerNodeId);
+                if (status == SeriesStatus.WRONG_OWNER) {
+                    noteWrongOwner(ownerNodeId, retry);
+                } else if (status == SeriesStatus.NOT_OPEN) {
+                    // Unlike the dispatcher's boolean callback, preserve failures and the caller's budget.
+                    open(retry);
+                }
             }
-            noteWrongOwner(ownerNodeId);
-            return true;
+            default -> throw new NgrrdClusterException(ErrorCode.REMOTE_ERROR,
+                    message != null ? message : (command + " respondeu " + status));
         }
-        if (status == SeriesStatus.NOT_OPEN) {
-            if (retriedOnce) {
-                throw new NgrrdClusterException(ErrorCode.REMOTE_ERROR,
-                        "NOT_OPEN persistente em " + command + " de " + seriesKey);
-            }
-            if (!reopen()) {
-                throw new NgrrdClusterException(ErrorCode.REMOTE_ERROR,
-                        "falha ao reabrir a série " + seriesKey + " após NOT_OPEN em " + command);
-            }
-            return true;
-        }
-        if (status == SeriesStatus.MIGRATING) {
-            if (retryPolicy.exhausted(startedAt, clock.millis())) {
-                throw new NgrrdClusterException(ErrorCode.MIGRATING,
-                        "série em migração além do prazo em " + command + ": " + seriesKey);
-            }
-            migratingAttempts[0]++;
-            sleepQuietly(retryPolicy.backoffFor(migratingAttempts[0]));
-            return retriedOnce;
-        }
-        throw new NgrrdClusterException(ErrorCode.REMOTE_ERROR,
-                message != null ? message : (command + " respondeu " + status));
     }
 
-    /**
-     * B3(ii) (achado do Refuter): envolve {@code rpc.call} com retentativa de falha de TRANSPORTE
-     * (não de aplicação) com backoff exponencial — usado por {@code open}, {@code executeSeriesCommand}
-     * (CHECKPOINT/FLUSH), {@code read}/{@code readPreset} e {@code close}. Falhas de aplicação (status
-     * não-OK do protocolo) continuam subindo normalmente na resposta, sem passar por aqui.
-     *
-     * <p>B1 (achado do Refuter): cada tentativa usa {@code min(requestTimeout, restante-até-o-deadline)}
-     * como teto da PRÓPRIA chamada — não o {@code requestTimeout} cheio incondicionalmente — e a
-     * DECISÃO DE RETENTAR (não a de tentar a primeira vez) sai quando {@code retryPolicy.exhausted(...)}
-     * OU {@code now >= deadlineMs}, o que vier primeiro. Antes desta correção, uma única tentativa
-     * contra um nó morto podia consumir o {@code requestTimeout} inteiro mesmo com um
-     * {@code deadlineMs}/{@code retryTimeout} bem mais curto configurado (ex.: {@code close()} com um
-     * orçamento apertado) — o teto "efetivo" real acabava sendo o maior dos dois, não o menor. O
-     * backoff entre tentativas também é clampado ao que resta até {@code deadlineMs}, nunca dorme além
-     * dele.</p>
-     *
-     * <p><strong>De propósito, a PRIMEIRA tentativa nunca é recusada de antemão por
-     * {@code now >= deadlineMs}</strong> (só o teto da própria chamada encolhe, com piso de 1 ms): para
-     * os chamadores existentes (tudo exceto {@code close}), {@code deadlineMs} é sempre
-     * {@code startedAt + retryPolicy.timeout()} — matematicamente o MESMO instante que
-     * {@code retryPolicy.exhausted(startedAt, now)} já testava antes do B1 — então recusar de antemão
-     * mudaria o tipo da exceção (TIMEOUT em vez de MIGRATING/WRONG_OWNER persistente) num laço externo
-     * de retentativa (ex.: MIGRATING em {@link #handleRetryableStatus}) sempre que o backoff entre
-     * chamadas empurrasse {@code now} ligeiramente além do deadline entre uma chamada e outra —
-     * "comportamento inalterado" para esses chamadores, como pedido.</p>
-     */
+    /** Per-invocation state, also used by nested OPENs. Never shared between concurrent callers. */
+    private final class OperationRetry {
+        private final String operation;
+        private final long deadlineMs = clock.millis() + retryPolicy.timeout().toMillis();
+        private int attempts;
+        private SeriesStatus lastStatus;
+
+        private OperationRetry(String operation) {
+            this.operation = operation;
+        }
+
+        private Duration remaining() {
+            long remainingMs = deadlineMs - clock.millis();
+            if (remainingMs <= 0) {
+                ErrorCode code = lastStatus == SeriesStatus.MIGRATING ? ErrorCode.MIGRATING
+                        : lastStatus == SeriesStatus.WRONG_OWNER ? ErrorCode.WRONG_OWNER
+                        : lastStatus == SeriesStatus.NOT_LEADER ? ErrorCode.NO_LEADER : ErrorCode.TIMEOUT;
+                throw new NgrrdClusterException(code, "prazo de retentativa esgotado em " + operation
+                        + " de " + seriesKey + " (último status: " + lastStatus + ")");
+            }
+            return Duration.ofMillis(remainingMs);
+        }
+
+        private void pause(String command, String target, SeriesStatus status, String ownerHint) {
+            lastStatus = status;
+            attempts++;
+            LOGGER.log(Level.FINE, () -> "Retry " + operation + " series=" + seriesKey + " command=" + command
+                    + " target=" + target + " status=" + status + " ownerHint=" + ownerHint
+                    + " attempt=" + attempts + " remainingMs=" + Math.max(0L, deadlineMs - clock.millis()));
+            Duration remaining = remaining();
+            Duration backoff = retryPolicy.backoffFor(attempts);
+            sleepQuietly(backoff.compareTo(remaining) > 0 ? remaining : backoff);
+            remaining();
+        }
+    }
+
+    /** Retries transport failures without letting an RPC or backoff exceed the caller's deadline. */
     private <R> R callWithTransportRetry(NodeId target, String command, Object body, Class<R> responseType,
             long deadlineMs) {
         long startedAt = clock.millis();
         int attempt = 0;
         for (;;) {
             long remainingMs = deadlineMs - clock.millis();
+            if (remainingMs <= 0) {
+                throw new NgrrdClusterException(ErrorCode.TIMEOUT, "prazo esgotado em " + command + " de " + seriesKey);
+            }
             Duration attemptTimeout = Duration.ofMillis(Math.max(1L, Math.min(requestTimeout.toMillis(), remainingMs)));
             try {
                 return rpc.call(target, command, body, responseType, attemptTimeout);
@@ -438,13 +401,13 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
         }
     }
 
-    private void noteWrongOwner(String newOwnerNodeId) {
+    private void noteWrongOwner(String newOwnerNodeId, OperationRetry retry) {
         if (newOwnerNodeId != null) {
             resolver.noteOwner(seriesKey, newOwnerNodeId);
             owner = newOwnerNodeId;
         } else {
             resolver.invalidate(seriesKey);
-            owner = resolver.resolve(seriesKey, definitionHashHex, geometry).ownerNodeId();
+            owner = resolver.resolve(seriesKey, definitionHashHex, geometry, retry.remaining()).ownerNodeId();
         }
     }
 
