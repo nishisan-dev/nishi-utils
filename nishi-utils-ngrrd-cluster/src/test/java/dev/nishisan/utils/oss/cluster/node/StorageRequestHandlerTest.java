@@ -711,6 +711,47 @@ class StorageRequestHandlerTest {
     }
 
     @Test
+    void openSemCriarComRegistryLancandoSeriesNotFoundExceptionRespondeNotFound(@TempDir Path checkOnlyDir)
+            throws IOException {
+        // Fix round 1 (item 2, promovido): cobre o catch(SeriesNotFoundException) de openWithMetadata —
+        // a corrida em que o objeto existe no instante do pré-check, mas sumiu quando registry.open()
+        // de fato tenta abrir (ex.: apagado por um reconciler entre as duas chamadas). Não há hook de
+        // produção para pausar exatamente entre o pré-check e o registry.open() dentro do mesmo método
+        // síncrono, então a divergência é obtida por um seam JÁ EXISTENTE no construtor de
+        // StorageRequestHandler: `volume` (usado só pelo pré-check e por SERIES_EXISTS/BATCH) é um
+        // parâmetro INDEPENDENTE do volume interno da SeriesHandleRegistry (usado pelo open de fato).
+        // Aqui o "volume de checagem" tem o objeto (pré-check vê exists=true); o registry real (do
+        // setUp, compartilhado com este handler racy) nunca teve o objeto — registry.open() lança
+        // SeriesNotFoundException de verdade, capturada pelo catch adicionado na Tarefa 4.
+        String seriesKey = "series-corrida-check-open";
+        placementLookup.put(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+
+        try (BlobVolumeRegistry checkVolumeRegistry = NgrrdBlob.registry().basePath(checkOnlyDir).volume("ngrrd").build()) {
+            BlobVolume checkVolume = checkVolumeRegistry.require("ngrrd");
+            try (SeriesHandleRegistry checkOnlyRegistry = new SeriesHandleRegistry(
+                    checkVolume, "ngrrd", Duration.ofMinutes(15), 10_000, clock)) {
+                checkOnlyRegistry.open(seriesKey, yaml, Ngrrd.OpenOptions.defaults());
+                checkOnlyRegistry.close(seriesKey);
+            }
+            String objectKey = SeriesObjectKeys.objectKey(SERIES_OBJECT_PREFIX, seriesKey);
+            assertTrue(checkVolume.storage().exists(objectKey),
+                    "setup deveria ter deixado o objeto físico só no volume de checagem");
+            assertFalse(volume.storage().exists(objectKey),
+                    "o volume real do registry nunca deveria ter recebido este objeto");
+
+            StorageRequestHandler racyHandler = new StorageRequestHandler(new FakeTransport(SELF), placementLookup,
+                    registry, checkVolume, SERIES_OBJECT_PREFIX, SELF, Durability.FSYNC, OnGeometryChange.FAIL, clock);
+
+            SeriesStatusResponse response = (SeriesStatusResponse) racyHandler.handle(Commands.OPEN,
+                    openRequestNoCreate(seriesKey, null), SOURCE);
+
+            assertEquals(SeriesStatus.NOT_FOUND, response.status());
+            assertFalse(registry.isOpen(seriesKey),
+                    "não deveria ter aberto a série real após a SeriesNotFoundException do registry.open()");
+        }
+    }
+
+    @Test
     void seriesExistsBatchAcimaDoLimiteRespondeErro() {
         List<String> tooMany = IntStream.rangeClosed(1, SeriesExistsBatchRequest.MAX_KEYS + 1)
                 .mapToObj(i -> "series-batch-" + i)

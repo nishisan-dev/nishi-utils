@@ -19,6 +19,7 @@ package dev.nishisan.utils.oss.cluster.node;
 
 import dev.nishisan.utils.oss.Ngrrd;
 import dev.nishisan.utils.oss.NgrrdHandle;
+import dev.nishisan.utils.oss.api.SeriesNotFoundException;
 import dev.nishisan.utils.oss.blob.BlobVolume;
 import dev.nishisan.utils.oss.blob.NgrrdUri;
 import dev.nishisan.utils.oss.format.DefinitionHash;
@@ -240,6 +241,18 @@ public final class SeriesHandleRegistry implements Closeable {
      * aberta neste processo, está {@link #markMigrating migrating}, ou foi
      * {@link #close fechada explicitamente pelo cliente} (essa só volta com um
      * novo {@link #open}).
+     *
+     * <p><strong>Reabertura automática NUNCA cria.</strong> O {@link DefinitionRecord} cacheado é
+     * compartilhado por hash da definição YAML, não por {@code seriesKey} — duas séries com o mesmo
+     * YAML dividem a mesma entrada em {@code definitionByHash}, então {@code createIfMissing} do
+     * {@link DefinitionRecord} reflete apenas a ÚLTIMA série que passou por {@link #open} com aquele
+     * YAML, não necessariamente esta. Por isso a reabertura aqui sempre força
+     * {@code definition.options().withCreateIfMissing(false)}, ignorando o valor cacheado: se o objeto
+     * físico sumiu entre o fechamento por ociosidade/LRU e esta tentativa de auto-cura, {@code
+     * Ngrrd.open} lança {@link SeriesNotFoundException}, tratada aqui como {@link Optional#empty()}
+     * (o chamador em {@code StorageRequestHandler} responde {@code NOT_OPEN}) em vez de propagada —
+     * só um novo {@link #open} explícito do cliente, que decide {@code createIfMissing} por si,
+     * recria a série.</p>
      */
     public Optional<NgrrdHandle> reopenIfKnown(String seriesKey) {
         Objects.requireNonNull(seriesKey, "seriesKey");
@@ -279,7 +292,13 @@ public final class SeriesHandleRegistry implements Closeable {
                     }
                     try {
                         entry.handle = Ngrrd.open(volume, NgrrdUri.of(volumeName, seriesKey),
-                                definition.yaml(), definition.options());
+                                definition.yaml(), definition.options().withCreateIfMissing(false));
+                    } catch (SeriesNotFoundException e) {
+                        // Reabertura automática nunca cria: o objeto sumiu entre o fechamento por
+                        // ociosidade/LRU e esta tentativa de auto-cura — devolve vazio (o chamador decide
+                        // NOT_OPEN) em vez de propagar; só um novo open() explícito do cliente recria.
+                        entries.remove(seriesKey, entry);
+                        return Optional.empty();
                     } catch (RuntimeException e) {
                         entries.remove(seriesKey, entry);
                         throw e;
