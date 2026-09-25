@@ -834,6 +834,9 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         }
         oldRoute.lock.lock();
         try {
+            // Uma escrita nova admitida bem nesta janela (entre a falha e este lock) fica na rota
+            // antiga sem limpeza — sem dado perdido, só sem a troca por uma rota limpa desta vez; a
+            // próxima falha confirmada para a mesma chave tenta de novo.
             if (oldRoute.submitted != oldRoute.completed) {
                 return;
             }

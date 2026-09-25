@@ -399,6 +399,28 @@ class RemoteSeriesHandleTest {
     }
 
     @Test
+    void wrongOwnerSemDonoInformadoQueDescobreNotFoundMarcaHandleInexistente() {
+        // Terceiro caminho (além de reopen() e do NOT_OPEN direto): WRONG_OWNER sem dono informado
+        // reposiciona via noteWrongOwner, que também pode descobrir SeriesNotFoundException sem
+        // createIfMissing — o handle precisa ficar marcado aqui também.
+        RemoteSeriesHandle handle = newHandle(Ngrrd.OpenOptions.defaults().withCreateIfMissing(false));
+        rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
+        handle.open();
+        onCloseCalls.clear();
+
+        rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.WRONG_OWNER, null, null));
+        resolver.resolveExistingFailure = new SeriesNotFoundException(SERIES_KEY);
+
+        SeriesNotFoundException ex = assertThrows(SeriesNotFoundException.class, handle::checkpoint);
+        assertEquals(SERIES_KEY, ex.seriesKey());
+        assertEquals(List.of(SERIES_KEY), onCloseCalls, "handle deve se remover do mapa do cliente também neste caminho");
+
+        SeriesNotFoundException ex2 = assertThrows(SeriesNotFoundException.class,
+                () -> handle.write("in_octets", new Sample(1L, 1.0)));
+        assertEquals(SERIES_KEY, ex2.seriesKey());
+    }
+
+    @Test
     void corridaNaRemocaoNuncaApagaUmHandleNovoDaMesmaChave() throws InterruptedException {
         // Reproduz o wiring real de DefaultNgrrdClusterClient.open: onClose remove do mapa
         // condicionalmente por instância (Map#remove(key, value)), nunca por chave sozinha. O handle A

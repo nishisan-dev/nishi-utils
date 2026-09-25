@@ -45,6 +45,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiConsumer;
+import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -174,20 +175,40 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
     /**
      * Reexecuta {@link #open()}, absorvendo qualquer falha genérica — usado como callback pelo
      * {@code WriteDispatcher} quando um dono responde {@code NOT_OPEN} a um lote. {@link SeriesNotFoundException}
-     * NÃO é absorvida: marca o handle como definitivamente inexistente ({@link #markSeriesNotFound()})
-     * e relança, para que o {@code WriteDispatcher} falhe as escritas pendentes em vez de adiá-las para
-     * sempre (uma série apagada nunca vai reabrir sozinha).
+     * NÃO é absorvida ({@code markingSeriesNotFound}): marca o handle e relança, para que o
+     * {@code WriteDispatcher} falhe as escritas pendentes em vez de adiá-las para sempre (uma série
+     * apagada nunca vai reabrir sozinha).
      */
     boolean reopen() {
         try {
-            open();
+            markingSeriesNotFound(() -> {
+                open();
+                return null;
+            });
             return true;
         } catch (SeriesNotFoundException e) {
-            markSeriesNotFound();
             throw e;
         } catch (RuntimeException e) {
             LOGGER.log(Level.WARNING, "Falha ao reabrir a série " + seriesKey, e);
             return false;
+        }
+    }
+
+    /**
+     * Executa {@code action}; se ela descobrir {@link SeriesNotFoundException}, marca o handle como
+     * definitivamente inexistente antes de relançar. Único ponto usado pelos três caminhos que podem
+     * descobrir isso ao reabrir/reposicionar a série sem {@code createIfMissing}: {@link #reopen()}
+     * (callback assíncrono do {@code WriteDispatcher}), {@link #handleRetryableStatus} em
+     * {@code NOT_OPEN} (autocura síncrona de uma operação como {@code checkpoint}/{@code flush}/
+     * {@code read}) e {@link #noteWrongOwner} em {@code WRONG_OWNER} sem dono informado
+     * (reposicionamento).
+     */
+    private <T> T markingSeriesNotFound(Supplier<T> action) {
+        try {
+            return action.get();
+        } catch (SeriesNotFoundException e) {
+            markSeriesNotFound();
+            throw e;
         }
     }
 
@@ -376,15 +397,10 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
                     noteWrongOwner(ownerNodeId, retry);
                 } else if (status == SeriesStatus.NOT_OPEN) {
                     // Unlike the dispatcher's boolean callback, preserve failures and the caller's budget.
-                    // Mesmo tratamento de série sumida que reopen() dá ao caminho assíncrono do
-                    // WriteDispatcher: sem createIfMissing, um NOT_OPEN pode descobrir que a série não
-                    // existe mais — o handle precisa ficar marcado, não só propagar a exceção desta vez.
-                    try {
+                    markingSeriesNotFound(() -> {
                         open(retry);
-                    } catch (SeriesNotFoundException e) {
-                        markSeriesNotFound();
-                        throw e;
-                    }
+                        return null;
+                    });
                 }
             }
             default -> throw new NgrrdClusterException(ErrorCode.REMOTE_ERROR,
@@ -463,7 +479,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
             owner = newOwnerNodeId;
         } else {
             resolver.invalidate(seriesKey);
-            owner = resolvePlacement(retry.remaining()).ownerNodeId();
+            owner = markingSeriesNotFound(() -> resolvePlacement(retry.remaining())).ownerNodeId();
         }
     }
 
