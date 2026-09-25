@@ -18,6 +18,12 @@
 package dev.nishisan.utils.oss.cluster.node;
 
 import dev.nishisan.utils.ngrid.common.NodeId;
+import dev.nishisan.utils.ngrid.structures.NGrid;
+import dev.nishisan.utils.ngrid.structures.NGridCluster;
+import dev.nishisan.utils.oss.cluster.catalog.CatalogView;
+import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
+import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
+import dev.nishisan.utils.oss.cluster.placement.LeastLoadedPlacementPolicy;
 import dev.nishisan.utils.oss.cluster.protocol.CatalogLookupRequest;
 import dev.nishisan.utils.oss.cluster.protocol.CatalogLookupResponse;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
@@ -29,8 +35,14 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.nio.file.Path;
+import java.time.Clock;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 
@@ -42,8 +54,8 @@ import static org.junit.jupiter.api.Assertions.fail;
  * durante {@code builder.start()}, ANTES de {@code placementHandler} ser registrado como
  * {@code LeadershipListener} logo em seguida. {@code addLeadershipListener} não dispara um callback
  * sintético para quem já registra o listener com o coordenador JÁ líder — sem o seed explícito
- * ({@code placementHandler.onLeaderChanged(self)}, chamado junto dos seeds já existentes de
- * {@code migrationCoordinator}/{@code rebalancer}), {@code becameLeaderAtMs} ficaria em {@code 0}
+ * ({@code placementHandler.onLeaderChanged(self)}, feito por {@code NgrrdStorageNode#wirePlacementHandler}
+ * antes de o handler atender requisições), {@code becameLeaderAtMs} ficaria em {@code 0}
  * (epoch) para sempre neste mandato, e a janela de graça pós-liderança (seção 0 do M3) nunca se
  * abriria — um miss de {@link Commands#CATALOG_LOOKUP} logo após o boot viraria {@code OK} sem a
  * chave ("não existe" definitivo) mesmo a réplica local do catálogo podendo não ter convergido ainda.
@@ -81,6 +93,28 @@ class NgrrdStorageNodeLeaderSeedTest {
         }
     }
 
+    @Test
+    void placementHandlerEhSemeadoAntesDeAtenderRequisicoes() throws Exception {
+        // O seed precisa marcar becameLeaderAtMs ANTES de o handler ficar alcançável por rede ou pelo
+        // caminho local — senão um CATALOG_LOOKUP que chegue nesse intervalo vê a marca em 0, acha a
+        // janela de graça expirada e responde o miss como "não existe" definitivo. E o listener de
+        // liderança vem antes do seed, para nenhuma troca de líder posterior ao seed se perder.
+        List<String> events = new ArrayList<>();
+        try (NGridCluster cluster = NGrid.local(1).start()) {
+            PlacementRequestHandler handler = new PlacementRequestHandler(cluster.node(0).transport(),
+                    new SeedRecordingCatalog(events), new AlwaysLeaderView(), () -> false,
+                    new LeastLoadedPlacementPolicy(), Duration.ofSeconds(10), Duration.ofSeconds(3),
+                    Clock.systemUTC());
+
+            NgrrdStorageNode.wirePlacementHandler(handler, NodeId.of("self"),
+                    listener -> events.add("leadership-listener"),
+                    listener -> events.add("transport-listener"),
+                    localHandler -> events.add("local-handler"));
+        }
+
+        assertEquals(List.of("leadership-listener", "seed", "transport-listener", "local-handler"), events);
+    }
+
     private static int allocateFreeLocalPort() throws IOException {
         try (ServerSocket socket = new ServerSocket(0)) {
             socket.setReuseAddress(true);
@@ -99,6 +133,67 @@ class NgrrdStorageNodeLeaderSeedTest {
         }
         if (!condition.getAsBoolean()) {
             fail("Condição não satisfeita a tempo (" + timeout + "): " + description);
+        }
+    }
+
+    /** Líder sempre — o seed entra no ramo "virei líder" e recalcula as pendências pelo catálogo. */
+    private static final class AlwaysLeaderView implements PlacementRequestHandler.LeaderView {
+        @Override
+        public boolean isLeader() {
+            return true;
+        }
+
+        @Override
+        public Optional<String> leaderId() {
+            return Optional.of("self");
+        }
+
+        @Override
+        public Set<String> reachableNodeIds() {
+            return Set.of();
+        }
+    }
+
+    /**
+     * {@link CatalogView} que registra {@code "seed"} quando a recontagem de pendências do ramo "virei
+     * líder" de {@code onLeaderChanged} lê o catálogo local — o sinal observável de que o seed rodou.
+     */
+    private static final class SeedRecordingCatalog implements CatalogView {
+        private final List<String> events;
+
+        SeedRecordingCatalog(List<String> events) {
+            this.events = events;
+        }
+
+        @Override
+        public Optional<SeriesPlacement> placementStrong(String seriesKey) {
+            return Optional.empty();
+        }
+
+        @Override
+        public Optional<StorageNodeStatus> nodeStatusStrong(String nodeId) {
+            return Optional.empty();
+        }
+
+        @Override
+        public Collection<StorageNodeStatus> nodesLocal() {
+            return List.of();
+        }
+
+        @Override
+        public Map<String, SeriesPlacement> placementsLocal() {
+            events.add("seed");
+            return Map.of();
+        }
+
+        @Override
+        public void putPlacement(String seriesKey, SeriesPlacement placement) {
+            throw new UnsupportedOperationException("não usado neste teste");
+        }
+
+        @Override
+        public void putNodeStatus(StorageNodeStatus status) {
+            throw new UnsupportedOperationException("não usado neste teste");
         }
     }
 }

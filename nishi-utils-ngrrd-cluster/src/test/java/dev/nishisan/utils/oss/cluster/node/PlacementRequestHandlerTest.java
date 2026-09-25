@@ -50,6 +50,9 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
@@ -78,6 +81,8 @@ class PlacementRequestHandlerTest {
     private NGridCluster cluster;
     private CatalogService catalog;
     private LeaderViewFake leaderView;
+    /** Estado de sincronização (catch-up) da réplica do líder, controlado pelo teste. */
+    private final AtomicBoolean leaderSyncing = new AtomicBoolean(false);
     private MutableClock clock;
     private PlacementRequestHandler handler;
 
@@ -92,7 +97,7 @@ class PlacementRequestHandlerTest {
         catalog = CatalogService.from(node);
         leaderView = new LeaderViewFake();
         clock = new MutableClock(Instant.parse("2026-01-01T00:00:00Z"));
-        handler = new PlacementRequestHandler(node.transport(), catalog, leaderView,
+        handler = new PlacementRequestHandler(node.transport(), catalog, leaderView, leaderSyncing::get,
                 new LeastLoadedPlacementPolicy(), INTERVAL, GRACE, clock);
     }
 
@@ -362,7 +367,8 @@ class PlacementRequestHandlerTest {
         leaderView.leader = true;
         leaderView.reachable.add("node-a");
         PlacementRequestHandler throwingHandler = new PlacementRequestHandler(cluster.node(0).transport(),
-                fakeCatalog, leaderView, new LeastLoadedPlacementPolicy(), INTERVAL, Duration.ZERO, clock);
+                fakeCatalog, leaderView, leaderSyncing::get, new LeastLoadedPlacementPolicy(), INTERVAL,
+                Duration.ZERO, clock);
 
         PlaceResponse response = (PlaceResponse) throwingHandler.handle(Commands.PLACE,
                 new PlaceRequest("series-1", "hash-1", null), NodeId.of("client"));
@@ -449,6 +455,40 @@ class PlacementRequestHandlerTest {
     }
 
     @Test
+    void catalogLookupComLiderSincronizandoEMissRespondeNotLeader() {
+        leaderView.leader = true;
+        leaderView.leaderId = Optional.of("node-self");
+        handler.onLeaderChanged(NodeId.of("self"));
+        clock.advance(GRACE.plusSeconds(1));
+        leaderSyncing.set(true);
+        // Janela de graça já passou, mas a réplica do líder ainda está em catch-up de um mandato
+        // anterior: o miss pode ser só atraso da réplica, não pode virar "não existe" definitivo.
+
+        CatalogLookupResponse response = (CatalogLookupResponse) handler.handle(Commands.CATALOG_LOOKUP,
+                new CatalogLookupRequest(List.of("series-inexistente")), NodeId.of("client"));
+
+        assertEquals(SeriesStatus.NOT_LEADER, response.status());
+        assertEquals("node-self", response.leaderNodeId());
+    }
+
+    @Test
+    void catalogLookupComLiderSincronizandoSemMissRespondeOk() {
+        leaderView.leader = true;
+        SeriesPlacement placement = SeriesPlacement.active("node-a", clock.millis());
+        catalog.putPlacement("series-1", placement);
+        handler.onLeaderChanged(NodeId.of("self"));
+        clock.advance(GRACE.plusSeconds(1));
+        leaderSyncing.set(true);
+        // Todas as chaves encontradas: não há miss a desconfiar, a sincronização não importa.
+
+        CatalogLookupResponse response = (CatalogLookupResponse) handler.handle(Commands.CATALOG_LOOKUP,
+                new CatalogLookupRequest(List.of("series-1")), NodeId.of("client"));
+
+        assertEquals(SeriesStatus.OK, response.status());
+        assertEquals(Map.of("series-1", placement), response.found());
+    }
+
+    @Test
     void catalogLookupNaoCriaPlacement() {
         leaderView.leader = true;
 
@@ -477,7 +517,7 @@ class PlacementRequestHandlerTest {
         leaderView.leader = true;
         LeaderFlippingCatalogFake fakeCatalog = new LeaderFlippingCatalogFake(leaderView);
         PlacementRequestHandler flippingHandler = new PlacementRequestHandler(cluster.node(0).transport(),
-                fakeCatalog, leaderView, new LeastLoadedPlacementPolicy(), INTERVAL, GRACE, clock);
+                fakeCatalog, leaderView, leaderSyncing::get, new LeastLoadedPlacementPolicy(), INTERVAL, GRACE, clock);
 
         CatalogLookupResponse response = (CatalogLookupResponse) flippingHandler.handle(Commands.CATALOG_LOOKUP,
                 new CatalogLookupRequest(List.of("series-1", "series-2", "series-3")), NodeId.of("client"));
@@ -494,13 +534,90 @@ class PlacementRequestHandlerTest {
     void catalogLookupComFalhaAoConsultarPropagaExcecaoNuncaViraOk() {
         leaderView.leader = true;
         PlacementRequestHandler throwingHandler = new PlacementRequestHandler(cluster.node(0).transport(),
-                new ThrowingOnLookupCatalogFake(), leaderView, new LeastLoadedPlacementPolicy(), INTERVAL, GRACE,
-                clock);
+                new ThrowingOnLookupCatalogFake(), leaderView, leaderSyncing::get, new LeastLoadedPlacementPolicy(),
+                INTERVAL, GRACE, clock);
 
         // Falha ao consultar o catálogo (ex.: DistributedMap indisponível) nunca pode virar uma
         // resposta OK com a chave simplesmente ausente — o cliente trataria isso como "não existe".
         assertThrows(RuntimeException.class, () -> throwingHandler.handle(Commands.CATALOG_LOOKUP,
                 new CatalogLookupRequest(List.of("series-1")), NodeId.of("client")));
+    }
+
+    @Test
+    void catalogLookupComMissDuranteARecontagemDaPosseRespondeNotLeader() throws Exception {
+        // O coordenador troca o líder ANTES de chamar os listeners: nessa janela isLeader() já é true,
+        // mas onLeaderChanged ainda está recontando as pendências a partir do catálogo (cópia inteira,
+        // lenta com centenas de milhares de séries). Um miss aqui não pode virar "não existe".
+        leaderView.leader = true;
+        leaderView.leaderId = Optional.of("node-self");
+        BlockingRecountCatalogFake fakeCatalog = new BlockingRecountCatalogFake();
+        PlacementRequestHandler slowHandler = new PlacementRequestHandler(cluster.node(0).transport(),
+                fakeCatalog, leaderView, leaderSyncing::get, new LeastLoadedPlacementPolicy(), INTERVAL, GRACE, clock);
+        Thread takeover = new Thread(() -> slowHandler.onLeaderChanged(NodeId.of("self")));
+        takeover.start();
+        try {
+            assertTrue(fakeCatalog.recountStarted.await(5, TimeUnit.SECONDS),
+                    "onLeaderChanged deveria ter começado a recontagem");
+
+            CatalogLookupResponse response = (CatalogLookupResponse) slowHandler.handle(Commands.CATALOG_LOOKUP,
+                    new CatalogLookupRequest(List.of("series-inexistente")), NodeId.of("client"));
+
+            assertEquals(SeriesStatus.NOT_LEADER, response.status(),
+                    "miss com a posse ainda em andamento não pode ser respondido como OK sem a chave");
+            assertEquals("node-self", response.leaderNodeId());
+        } finally {
+            fakeCatalog.releaseRecount.countDown();
+            takeover.join(TimeUnit.SECONDS.toMillis(5));
+        }
+    }
+
+    /**
+     * {@link CatalogView} fake cujo {@code placementsLocal} (usado pela recontagem de pendências em
+     * {@code onLeaderChanged}) sinaliza que começou e bloqueia até ser liberado — simula a cópia lenta
+     * do catálogo inteiro logo após assumir a liderança.
+     */
+    private static final class BlockingRecountCatalogFake implements CatalogView {
+        private final CountDownLatch recountStarted = new CountDownLatch(1);
+        private final CountDownLatch releaseRecount = new CountDownLatch(1);
+
+        @Override
+        public Optional<SeriesPlacement> placementStrong(String seriesKey) {
+            return Optional.empty();
+        }
+
+        @Override
+        public Optional<StorageNodeStatus> nodeStatusStrong(String nodeId) {
+            return Optional.empty();
+        }
+
+        @Override
+        public void putNodeStatus(StorageNodeStatus status) {
+            throw new UnsupportedOperationException("não usado neste teste");
+        }
+
+        @Override
+        public Collection<StorageNodeStatus> nodesLocal() {
+            return List.of();
+        }
+
+        @Override
+        public Map<String, SeriesPlacement> placementsLocal() {
+            recountStarted.countDown();
+            try {
+                if (!releaseRecount.await(10, TimeUnit.SECONDS)) {
+                    throw new IllegalStateException("recontagem não foi liberada a tempo");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("interrompido esperando a liberação da recontagem", e);
+            }
+            return Map.of();
+        }
+
+        @Override
+        public void putPlacement(String seriesKey, SeriesPlacement placement) {
+            throw new UnsupportedOperationException("não usado neste teste");
+        }
     }
 
     /**

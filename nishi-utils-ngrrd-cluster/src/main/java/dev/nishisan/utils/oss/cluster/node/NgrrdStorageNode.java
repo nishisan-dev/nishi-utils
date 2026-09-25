@@ -17,6 +17,8 @@
 
 package dev.nishisan.utils.oss.cluster.node;
 
+import dev.nishisan.utils.ngrid.cluster.coordination.LeadershipListener;
+import dev.nishisan.utils.ngrid.cluster.transport.TransportListener;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.structures.NGrid;
 import dev.nishisan.utils.ngrid.structures.NGridNode;
@@ -33,6 +35,7 @@ import dev.nishisan.utils.oss.cluster.rebalance.MigrationCoordinator;
 import dev.nishisan.utils.oss.cluster.rebalance.MigrationExecutor;
 import dev.nishisan.utils.oss.cluster.rebalance.RebalanceSettings;
 import dev.nishisan.utils.oss.cluster.rebalance.Rebalancer;
+import dev.nishisan.utils.oss.cluster.rpc.LocalRequestHandler;
 import dev.nishisan.utils.oss.cluster.rpc.TransportClusterRpc;
 
 import java.io.Closeable;
@@ -40,6 +43,7 @@ import java.io.IOException;
 import java.time.Clock;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.Consumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -185,8 +189,10 @@ public final class NgrrdStorageNode implements Closeable {
                 PlacementRequestHandler.LeaderView leaderView =
                         PlacementRequestHandler.fromCoordinator(node.coordinator(), node.transport());
                 PlacementRequestHandler placementHandler = new PlacementRequestHandler(node.transport(), catalog,
-                        leaderView, new LeastLoadedPlacementPolicy(), cfg.nodeStatusStaleAfter(),
-                        cfg.placementGraceAfterLeadership(), Clock.systemUTC());
+                        leaderView, node.replicationManager()::isLeaderSyncing, new LeastLoadedPlacementPolicy(),
+                        cfg.nodeStatusStaleAfter(), cfg.placementGraceAfterLeadership(), Clock.systemUTC());
+                wirePlacementHandler(placementHandler, self, node.coordinator()::addLeadershipListener,
+                        node.transport()::addListener, rpc::registerLocalHandler);
 
                 GeometryService geometryService = new GeometryService(node.transport(), catalog, volume, rpc,
                         leaderView, registry, cfg.seriesObjectPrefix(), Clock.systemUTC());
@@ -217,16 +223,13 @@ public final class NgrrdStorageNode implements Closeable {
                 node.transport().addListener(geometryService);
                 rpc.registerLocalHandler(geometryService);
                 node.transport().addListener(storageHandler);
-                node.transport().addListener(placementHandler);
                 node.transport().addListener(adminHandler);
                 node.transport().addListener(migrationExecutor);
-                node.coordinator().addLeadershipListener(placementHandler);
                 node.coordinator().addLeadershipListener(migrationCoordinator);
                 node.coordinator().addLeadershipListener(rebalancer);
                 node.coordinator().addMembershipListener(rebalancer);
                 node.coordinator().addLeadershipListener(localReconciler);
                 rpc.registerLocalHandler(storageHandler);
-                rpc.registerLocalHandler(placementHandler);
                 rpc.registerLocalHandler(adminHandler);
                 rpc.registerLocalHandler(migrationExecutor);
 
@@ -236,14 +239,12 @@ public final class NgrrdStorageNode implements Closeable {
                 geometryService.start();
 
                 // Seed: addLeadershipListener não dispara um callback sintético para quem já registra o
-                // listener com o nó JÁ líder — ex.: o primeiro líder eleito de um cluster recém-formado,
-                // decidido durante builder.start() acima, ANTES deste registro. Sem isto,
-                // placementHandler/migrationCoordinator/rebalancer deste nó nunca saberiam que já são
-                // líder até a PRÓXIMA troca de liderança (se houver alguma) — placementHandler ficaria
-                // sem becameLeaderAtMs (janela de graça de PLACE e CATALOG_LOOKUP nunca se abriria para
-                // este mandato) e nenhuma migração nem rebalanceamento automático rodaria nele enquanto
-                // ele seguisse líder ininterruptamente desde o início.
-                placementHandler.onLeaderChanged(self);
+                // listener com o nó JÁ líder — ex.: o primeiro líder eleito, decidido durante
+                // builder.start() acima, ANTES deste registro. Sem isto, migrationCoordinator/rebalancer
+                // deste nó nunca saberiam que já são líder até a PRÓXIMA troca de liderança (se houver
+                // alguma) — nenhuma migração nem rebalanceamento automático rodaria nele enquanto ele
+                // seguisse líder ininterruptamente desde o início. O placementHandler já foi semeado em
+                // wirePlacementHandler, antes de atender requisições.
                 migrationCoordinator.onLeaderChanged(self);
                 rebalancer.onLeaderChanged(self);
 
@@ -266,6 +267,26 @@ public final class NgrrdStorageNode implements Closeable {
             }
             throw e;
         }
+    }
+
+    /**
+     * Liga o {@link PlacementRequestHandler} ao nó numa ordem que fecha a janela do "não existe" falso
+     * logo após o boot: (1) listener de liderança, para nenhuma troca de líder posterior se perder;
+     * (2) seed ({@code onLeaderChanged(self)}), que marca o início da janela de graça se o nó já for o
+     * líder — {@code addLeadershipListener} não dispara callback sintético para quem registra com o nó
+     * JÁ líder, o que vale para qualquer primeiro líder eleito durante {@code builder.start()}; (3) só
+     * então os caminhos de requisição (rede e local). Com a ordem invertida, um {@code CATALOG_LOOKUP}
+     * que chegasse entre o registro e o seed veria a janela como expirada e responderia um miss como
+     * "não existe" definitivo.
+     */
+    static void wirePlacementHandler(PlacementRequestHandler handler, NodeId self,
+            Consumer<? super LeadershipListener> leadershipRegistrar,
+            Consumer<? super TransportListener> transportRegistrar,
+            Consumer<? super LocalRequestHandler> localRegistrar) {
+        leadershipRegistrar.accept(handler);
+        handler.onLeaderChanged(self);
+        transportRegistrar.accept(handler);
+        localRegistrar.accept(handler);
     }
 
     public String nodeId() {
