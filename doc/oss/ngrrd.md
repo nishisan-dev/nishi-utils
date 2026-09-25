@@ -557,7 +557,7 @@ arquivo `.ngrr`, sem entrada no catálogo do blob). O default
 import dev.nishisan.utils.oss.api.SeriesNotFoundException;
 
 Ngrrd.OpenOptions options = Ngrrd.OpenOptions.defaults().withCreateIfMissing(false);
-try (NgrrdHandle handle = Ngrrd.fromYaml(yaml, bindings, tags, options)) {
+try (NgrrdHandle handle = Ngrrd.fromYaml(yaml, bindings, tags, null, options)) {
     // série já existia — segue o fluxo normal de write/read.
 } catch (SeriesNotFoundException e) {
     // e.seriesKey() identifica a série ausente; nada foi criado.
