@@ -22,7 +22,6 @@ import dev.nishisan.utils.oss.cluster.api.ErrorCode;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.api.SeriesVerification;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
-import dev.nishisan.utils.oss.cluster.catalog.StorageCapabilities;
 import dev.nishisan.utils.oss.cluster.protocol.CatalogLookupRequest;
 import dev.nishisan.utils.oss.cluster.protocol.CatalogLookupResponse;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
