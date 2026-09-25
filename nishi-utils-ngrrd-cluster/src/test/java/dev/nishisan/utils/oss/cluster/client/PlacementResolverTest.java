@@ -20,11 +20,13 @@ package dev.nishisan.utils.oss.cluster.client;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.structures.NGrid;
 import dev.nishisan.utils.ngrid.structures.NGridCluster;
+import dev.nishisan.utils.oss.api.SeriesNotFoundException;
 import dev.nishisan.utils.oss.cluster.api.ErrorCode;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
 import dev.nishisan.utils.oss.cluster.catalog.PlacementState;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
+import dev.nishisan.utils.oss.cluster.protocol.CatalogLookupResponse;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.protocol.PlaceRequest;
 import dev.nishisan.utils.oss.cluster.protocol.PlaceResponse;
@@ -41,6 +43,7 @@ import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import dev.nishisan.utils.oss.cluster.rpc.ClusterRpc;
 
@@ -75,7 +78,8 @@ class PlacementResolverTest {
         rpc = new RecordingClusterRpc(CLIENT);
         rpc.leader(LEADER);
         RetryPolicy retry = new RetryPolicy(Duration.ofSeconds(2), Duration.ofMillis(10), Duration.ofMillis(100));
-        resolver = new PlacementResolver(catalog, rpc, retry, java.time.Clock.systemUTC());
+        CatalogLookupClient lookupClient = new CatalogLookupClient(rpc, retry, java.time.Clock.systemUTC(), 2000);
+        resolver = new PlacementResolver(catalog, rpc, retry, java.time.Clock.systemUTC(), lookupClient);
     }
 
     @AfterEach
@@ -261,8 +265,9 @@ class PlacementResolverTest {
             public NodeId localId() { return CLIENT; }
             public Optional<NodeId> leaderId() { return Optional.of(LEADER); }
         };
-        var bounded = new PlacementResolver(catalog, boundedRpc,
-                new RetryPolicy(Duration.ofSeconds(2), Duration.ofMillis(1), Duration.ofMillis(2)), clock);
+        RetryPolicy boundedRetry = new RetryPolicy(Duration.ofSeconds(2), Duration.ofMillis(1), Duration.ofMillis(2));
+        var bounded = new PlacementResolver(catalog, boundedRpc, boundedRetry, clock,
+                new CatalogLookupClient(boundedRpc, boundedRetry, clock, 2000));
 
         assertEquals(ErrorCode.TIMEOUT, assertThrows(NgrrdClusterException.class,
                 () -> bounded.resolve("uncached", "hash", null, Duration.ofMillis(100))).code());
@@ -281,5 +286,66 @@ class PlacementResolverTest {
         assertTrue(failure.code() == ErrorCode.NO_LEADER || failure.code() == ErrorCode.TIMEOUT);
         assertTrue(Duration.ofNanos(System.nanoTime() - start).toMillis() < 500);
         assertTrue(rpc.calls().isEmpty());
+    }
+
+    @Test
+    void resolveExistingComPlacementLocalAtivoNaoFazRpc() {
+        SeriesPlacement active = SeriesPlacement.active("storage-a", 1_000L);
+        catalog.putPlacement("series-1", active);
+
+        SeriesPlacement resolved = resolver.resolveExisting("series-1", Duration.ofSeconds(1));
+
+        assertEquals(active, resolved);
+        assertEquals(0, rpc.calls().size(), "placement ACTIVE local não deveria consultar o líder");
+    }
+
+    @Test
+    void resolveExistingComMissConsultaLiderENuncaFazPlace() {
+        SeriesPlacement placed = SeriesPlacement.active("storage-a", 1_000L);
+        rpc.respondNext((cmd, body) -> {
+            assertEquals(Commands.CATALOG_LOOKUP, cmd);
+            return CatalogLookupResponse.ok(Map.of("series-1", placed));
+        });
+
+        SeriesPlacement resolved = resolver.resolveExisting("series-1", Duration.ofSeconds(1));
+
+        assertEquals(placed, resolved);
+        assertTrue(rpc.calls().stream().noneMatch(c -> c.command().equals(Commands.PLACE)),
+                "resolveExisting nunca deveria disparar PLACE");
+    }
+
+    @Test
+    void resolveExistingAusenteNoLiderLancaSeriesNotFound() {
+        rpc.respondNext((cmd, body) -> CatalogLookupResponse.ok(Map.of()));
+
+        SeriesNotFoundException ex = assertThrows(SeriesNotFoundException.class,
+                () -> resolver.resolveExisting("series-1", Duration.ofSeconds(1)));
+
+        assertEquals("series-1", ex.seriesKey());
+    }
+
+    @Test
+    void resolveExistingMigrandoConsultaLider() {
+        SeriesPlacement before = SeriesPlacement.active("storage-a", 1_000L);
+        SeriesPlacement migrating = SeriesPlacement.migrating(before, "storage-b", "mig-1", 2_000L);
+        catalog.putPlacement("series-1", migrating);
+        SeriesPlacement completed = SeriesPlacement.active("storage-b", 3_000L);
+        rpc.respondNext((cmd, body) -> {
+            assertEquals(Commands.CATALOG_LOOKUP, cmd);
+            return CatalogLookupResponse.ok(Map.of("series-1", completed));
+        });
+
+        SeriesPlacement resolved = resolver.resolveExisting("series-1", Duration.ofSeconds(1));
+
+        assertEquals(completed, resolved);
+        assertEquals(1, rpc.calls().size());
+    }
+
+    @Test
+    void resolveExistingSemLiderLancaNgrrdClusterExceptionENaoSeriesNotFound() {
+        rpc.leader(null);
+
+        assertThrows(NgrrdClusterException.class,
+                () -> resolver.resolveExisting("series-1", Duration.ofMillis(30)));
     }
 }

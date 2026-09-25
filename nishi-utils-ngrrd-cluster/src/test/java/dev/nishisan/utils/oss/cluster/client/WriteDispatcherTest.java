@@ -38,6 +38,7 @@ import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeoutException;
@@ -647,6 +648,16 @@ class WriteDispatcherTest {
 
         @Override
         public SeriesPlacement resolve(String seriesKey, String definitionHashHex) {
+            throw new UnsupportedOperationException("não usado pelo WriteDispatcher");
+        }
+
+        @Override
+        public SeriesPlacement resolveExisting(String seriesKey, Duration maxWait) {
+            throw new UnsupportedOperationException("não usado pelo WriteDispatcher");
+        }
+
+        @Override
+        public Optional<SeriesPlacement> placementCached(String seriesKey) {
             throw new UnsupportedOperationException("não usado pelo WriteDispatcher");
         }
 

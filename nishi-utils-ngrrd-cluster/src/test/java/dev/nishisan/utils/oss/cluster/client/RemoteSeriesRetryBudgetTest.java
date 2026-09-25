@@ -145,6 +145,8 @@ class RemoteSeriesRetryBudgetTest {
                 if (!initialOpen) lookupBudgets.add(maxWait);
                 return resolve(key, hash);
             }
+            public SeriesPlacement resolveExisting(String key, Duration maxWait) { return resolve(key, null); }
+            public Optional<SeriesPlacement> placementCached(String key) { return Optional.of(resolve(key, null)); }
             public void invalidate(String key) { }
             public void noteOwner(String key, String newOwner) { owner = newOwner; }
         };

@@ -19,6 +19,9 @@ package dev.nishisan.utils.oss.cluster.client;
 
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
 
+import java.time.Duration;
+import java.util.Optional;
+
 /**
  * Resolução e correção de placement consumida por {@link RemoteSeriesHandle} e
  * {@link WriteDispatcher} — isola a dependência de {@link PlacementResolver}
@@ -47,6 +50,26 @@ public interface PlacementLookup {
             dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor geometry, java.time.Duration maxWait) {
         return resolve(key, hash, geometry);
     }
+
+    /**
+     * Placement existente de {@code seriesKey}, resolvendo com o líder ({@code ngrrd.catalog.lookup})
+     * quando o cache local não confirma um placement {@code ACTIVE} — nunca cria posicionamento novo
+     * (nunca dispara {@code ngrrd.place}). Um miss verdadeiro (a série não existe) é diferente de uma
+     * falha ao consultar: só o primeiro caso vira {@code SeriesNotFoundException}.
+     *
+     * @throws dev.nishisan.utils.oss.api.SeriesNotFoundException se o líder confirmar que não há
+     *         placement para {@code seriesKey}
+     * @throws dev.nishisan.utils.oss.cluster.api.NgrrdClusterException se não foi possível confirmar
+     *         com o líder (sem líder, timeout, falha de transporte, resposta inválida) — nunca
+     *         interpretado como ausência da série
+     */
+    SeriesPlacement resolveExisting(String seriesKey, Duration maxWait);
+
+    /**
+     * Placement mais recente conhecido localmente (override em cache ou catálogo replicado), sem
+     * nenhum RPC ao líder — {@link Optional#empty()} se nada estiver disponível localmente.
+     */
+    Optional<SeriesPlacement> placementCached(String seriesKey);
 
     /** Descarta o override local conhecido para {@code seriesKey}, se houver. */
     void invalidate(String seriesKey);

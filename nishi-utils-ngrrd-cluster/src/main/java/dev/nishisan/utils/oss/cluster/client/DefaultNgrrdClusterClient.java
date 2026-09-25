@@ -81,6 +81,12 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
     private static final String STORAGE_ROLE = "storage";
 
     private static final int MAX_NOT_LEADER_ATTEMPTS = 5;
+    /**
+     * Tamanho de página padrão de {@code ngrrd.catalog.lookup} — mesmo default documentado em
+     * {@link dev.nishisan.utils.oss.cluster.protocol.CatalogLookupRequest#MAX_KEYS}, bem abaixo do
+     * teto aceito pelo líder.
+     */
+    private static final int DEFAULT_CATALOG_LOOKUP_BATCH_SIZE = 2_000;
     /** Placeholder do supplier de métricas do {@code WriteDispatcher} até {@code clientRef} ser publicado em {@link #connect}. */
     private static final ClientMetricsSnapshot EMPTY_METRICS = new ClientMetricsSnapshot(0L, 0L, 0L, 0L,
             Map.of(), Map.of(), 0, LatencySnapshot.EMPTY, 0L);
@@ -165,7 +171,10 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
             MetricsTrackingClusterRpc rpc = new MetricsTrackingClusterRpc(transportRpc);
             RetryPolicy leaderRetry = new RetryPolicy(cfg.leaderWaitTimeout(), cfg.retryBackoffMin(),
                     cfg.retryBackoffMax());
-            PlacementResolver resolver = new PlacementResolver(catalog, rpc, leaderRetry, Clock.systemUTC());
+            CatalogLookupClient catalogLookupClient = new CatalogLookupClient(rpc, leaderRetry, Clock.systemUTC(),
+                    DEFAULT_CATALOG_LOOKUP_BATCH_SIZE);
+            PlacementResolver resolver = new PlacementResolver(catalog, rpc, leaderRetry, Clock.systemUTC(),
+                    catalogLookupClient);
 
             ConcurrentMap<String, RemoteSeriesHandle> handles = new ConcurrentHashMap<>();
             RetryPolicy opRetry = new RetryPolicy(cfg.retryTimeout(), cfg.retryBackoffMin(), cfg.retryBackoffMax());

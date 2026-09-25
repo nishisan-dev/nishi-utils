@@ -41,6 +41,7 @@ import java.time.Clock;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -308,6 +309,16 @@ class RemoteSeriesHandleTest {
         public SeriesPlacement resolve(String seriesKey, String definitionHashHex) {
             resolveCalls.incrementAndGet();
             return SeriesPlacement.active(owner, 0L);
+        }
+
+        @Override
+        public SeriesPlacement resolveExisting(String seriesKey, Duration maxWait) {
+            return resolve(seriesKey, null);
+        }
+
+        @Override
+        public Optional<SeriesPlacement> placementCached(String seriesKey) {
+            return Optional.of(SeriesPlacement.active(owner, 0L));
         }
 
         @Override

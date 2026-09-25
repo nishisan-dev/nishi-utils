@@ -225,6 +225,16 @@ class CloseBudgetRegressionTest {
         }
 
         @Override
+        public SeriesPlacement resolveExisting(String seriesKey, Duration maxWait) {
+            throw new UnsupportedOperationException("não usado neste teste (só close())");
+        }
+
+        @Override
+        public Optional<SeriesPlacement> placementCached(String seriesKey) {
+            throw new UnsupportedOperationException("não usado neste teste (só close())");
+        }
+
+        @Override
         public void invalidate(String seriesKey) {
         }
 

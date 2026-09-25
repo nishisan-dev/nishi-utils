@@ -18,6 +18,7 @@
 package dev.nishisan.utils.oss.cluster.client;
 
 import dev.nishisan.utils.ngrid.common.NodeId;
+import dev.nishisan.utils.oss.api.SeriesNotFoundException;
 import dev.nishisan.utils.oss.cluster.api.ErrorCode;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
@@ -30,6 +31,8 @@ import dev.nishisan.utils.oss.cluster.rpc.ClusterRpc;
 
 import java.time.Clock;
 import java.time.Duration;
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
@@ -46,21 +49,21 @@ import java.util.concurrent.ConcurrentMap;
  */
 public final class PlacementResolver implements PlacementLookup {
 
-    /** Intervalo de polling à espera de um líder eleito — curto de propósito, nunca o único fator de prazo. */
-    private static final Duration LEADER_POLL_INTERVAL = Duration.ofMillis(50);
-
     private final CatalogService catalog;
     private final ClusterRpc rpc;
     private final RetryPolicy retry;
     private final Clock clock;
+    private final CatalogLookupClient catalogLookupClient;
 
     private final ConcurrentMap<String, SeriesPlacement> overrides = new ConcurrentHashMap<>();
 
-    public PlacementResolver(CatalogService catalog, ClusterRpc rpc, RetryPolicy retry, Clock clock) {
+    public PlacementResolver(CatalogService catalog, ClusterRpc rpc, RetryPolicy retry, Clock clock,
+            CatalogLookupClient catalogLookupClient) {
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.rpc = Objects.requireNonNull(rpc, "rpc");
         this.retry = Objects.requireNonNull(retry, "retry");
         this.clock = Objects.requireNonNull(clock, "clock");
+        this.catalogLookupClient = Objects.requireNonNull(catalogLookupClient, "catalogLookupClient");
     }
 
     @Override
@@ -80,7 +83,7 @@ public final class PlacementResolver implements PlacementLookup {
         Objects.requireNonNull(seriesKey, "seriesKey");
         Objects.requireNonNull(maxWait, "maxWait");
         long deadline = clock.millis() + Math.min(retry.timeout().toMillis(), maxWait.toMillis());
-        remainingUntil(deadline, seriesKey);
+        LeaderCalls.remainingUntil(clock, deadline, "posicionar a série " + seriesKey);
         // Override e catálogo local coexistem — nenhum tem precedência absoluta: um WRONG_OWNER
         // recente pode ter atualizado o override depois da última replicação do catálogo local (ou
         // vice-versa, se o override estiver simplesmente desatualizado). Vence quem tiver o
@@ -92,6 +95,35 @@ public final class PlacementResolver implements PlacementLookup {
             return freshest;
         }
         return placeAtLeader(seriesKey, definitionHashHex, geometry, deadline);
+    }
+
+    @Override
+    public SeriesPlacement resolveExisting(String seriesKey, Duration maxWait) {
+        Objects.requireNonNull(seriesKey, "seriesKey");
+        Objects.requireNonNull(maxWait, "maxWait");
+        SeriesPlacement cached = overrides.get(seriesKey);
+        SeriesPlacement local = catalog.placementLocal(seriesKey).orElse(null);
+        SeriesPlacement freshest = freshest(cached, local);
+        if (freshest != null && freshest.state() == PlacementState.ACTIVE) {
+            return freshest;
+        }
+        // Ausente ou em MIGRATING: o catálogo local pode estar desatualizado ou ainda não ter
+        // recebido a entrada por replicação — só o líder confirma com autoridade se a série existe.
+        Map<String, SeriesPlacement> found = catalogLookupClient.lookup(List.of(seriesKey), maxWait);
+        SeriesPlacement placement = found.get(seriesKey);
+        if (placement == null) {
+            throw new SeriesNotFoundException(seriesKey);
+        }
+        if (placement.state() == PlacementState.ACTIVE) {
+            overrides.put(seriesKey, placement);
+        }
+        return placement;
+    }
+
+    @Override
+    public Optional<SeriesPlacement> placementCached(String seriesKey) {
+        Objects.requireNonNull(seriesKey, "seriesKey");
+        return Optional.ofNullable(freshest(overrides.get(seriesKey), catalog.placementLocal(seriesKey).orElse(null)));
     }
 
     private static SeriesPlacement freshest(SeriesPlacement a, SeriesPlacement b) {
@@ -124,15 +156,17 @@ public final class PlacementResolver implements PlacementLookup {
         // estar vazio/desatualizado bem no meio de um handoff) quando a resposta não trouxe essa
         // indicação.
         NodeId leaderHint = null;
+        String description = "posicionar a série " + seriesKey;
         for (;;) {
             attempt++;
-            NodeId leader = leaderHint != null ? leaderHint : awaitLeaderOrThrow(seriesKey, deadline);
+            NodeId leader = leaderHint != null ? leaderHint
+                    : LeaderCalls.awaitLeaderOrThrow(rpc, clock, deadline, description);
             leaderHint = null;
             PlaceResponse response;
             try {
                 response = rpc.call(leader, Commands.PLACE,
                         new PlaceRequest(seriesKey, definitionHashHex, null, geometry), PlaceResponse.class,
-                        remainingUntil(deadline, seriesKey));
+                        LeaderCalls.remainingUntil(clock, deadline, description));
             } catch (NgrrdClusterException e) {
                 // B3 (achado do Refuter): falha de TRANSPORTE (não de aplicação) ao chamar o líder —
                 // retenta com backoff até o prazo de retry.timeout(), esperando a conexão voltar em vez
@@ -141,7 +175,7 @@ public final class PlacementResolver implements PlacementLookup {
                     throw e;
                 }
                 TransportRetry.awaitConnectionOrBackoff(rpc, leader,
-                        cappedBackoff(retry.backoffFor(attempt), deadline, seriesKey));
+                        LeaderCalls.cappedBackoff(clock, retry.backoffFor(attempt), deadline, description));
                 continue;
             }
             switch (response.status()) {
@@ -153,45 +187,14 @@ public final class PlacementResolver implements PlacementLookup {
                     if (response.leaderNodeId() != null) {
                         leaderHint = NodeId.of(response.leaderNodeId());
                     }
-                    sleepQuietly(cappedBackoff(retry.backoffFor(attempt), deadline, seriesKey));
+                    LeaderCalls.sleepQuietly(LeaderCalls.cappedBackoff(clock, retry.backoffFor(attempt), deadline,
+                            description));
                 }
                 case NO_STORAGE_NODE_AVAILABLE -> throw new NgrrdClusterException(
                         ErrorCode.NO_STORAGE_NODE_AVAILABLE, response.message());
                 default -> throw new NgrrdClusterException(ErrorCode.REMOTE_ERROR,
                         "PLACE respondeu " + response.status() + " para " + seriesKey);
             }
-        }
-    }
-
-    private NodeId awaitLeaderOrThrow(String seriesKey, long deadline) {
-        Optional<NodeId> leader = rpc.leaderId();
-        while (leader.isEmpty() && clock.millis() < deadline) {
-            sleepQuietly(cappedBackoff(LEADER_POLL_INTERVAL, deadline, seriesKey));
-            leader = rpc.leaderId();
-        }
-        return leader.orElseThrow(() -> new NgrrdClusterException(ErrorCode.NO_LEADER,
-                "nenhum líder eleito para posicionar a série " + seriesKey));
-    }
-
-    private Duration remainingUntil(long deadline, String seriesKey) {
-        long remaining = deadline - clock.millis();
-        if (remaining <= 0) {
-            throw new NgrrdClusterException(ErrorCode.TIMEOUT, "prazo de placement esgotado para " + seriesKey);
-        }
-        return Duration.ofMillis(remaining);
-    }
-
-    private Duration cappedBackoff(Duration backoff, long deadline, String seriesKey) {
-        Duration remaining = remainingUntil(deadline, seriesKey);
-        return backoff.compareTo(remaining) > 0 ? remaining : backoff;
-    }
-
-    private static void sleepQuietly(Duration duration) {
-        try {
-            Thread.sleep(Math.max(1L, duration.toMillis()));
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new NgrrdClusterException(ErrorCode.CLOSED, "interrompido aguardando retentativa de placement", e);
         }
     }
 }
