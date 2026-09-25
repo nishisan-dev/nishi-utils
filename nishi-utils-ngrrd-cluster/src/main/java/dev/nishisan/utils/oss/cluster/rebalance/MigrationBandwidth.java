@@ -34,4 +34,21 @@ final class MigrationBandwidth {
             return false;
         } finally { lock.unlock(); }
     }
+
+    /**
+     * Debita {@code bytes} do orçamento imediatamente, sem esperar a vez — para o patch final do
+     * cutover (série já congelada, clientes recebendo {@code MIGRATING}), que não pode ficar preso na
+     * mesma fila dos chunks de 256 KiB de outras cópias. O delta final continua contando no orçamento
+     * (a média de bytes/s por origem é preservada): só empurra o próximo slot, nunca "pula" o custo.
+     * Os chunks concorrentes é que absorvem o atraso, acordados por {@link #changed}.
+     */
+    void acquireUrgent(int bytes) {
+        lock.lock();
+        try {
+            long now = System.nanoTime();
+            long cost = Math.max(1L, (long) Math.ceil(bytes * 1_000_000_000.0 / bytesPerSecond));
+            nextNanos = Math.max(nextNanos, now) + cost;
+            changed.signalAll();
+        } finally { lock.unlock(); }
+    }
 }
