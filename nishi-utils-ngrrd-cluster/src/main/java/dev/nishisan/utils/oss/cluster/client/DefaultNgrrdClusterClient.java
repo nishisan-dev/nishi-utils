@@ -31,6 +31,7 @@ import dev.nishisan.utils.oss.cluster.api.NgrrdClusterConfig;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.api.SeriesInfo;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
+import dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.metrics.LatencySnapshot;
 import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
@@ -42,7 +43,9 @@ import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesStatus;
 import dev.nishisan.utils.oss.cluster.rpc.ClusterRpc;
 import dev.nishisan.utils.oss.cluster.rpc.TransportClusterRpc;
+import dev.nishisan.utils.oss.config.NgrrdYamlLoader;
 import dev.nishisan.utils.oss.format.DefinitionHash;
+import dev.nishisan.utils.oss.format.SeriesGeometry;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -339,11 +342,11 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
         String definitionHashHex = DefinitionHash.hex(yaml);
         RetryPolicy opRetry = new RetryPolicy(config.retryTimeout(), config.retryBackoffMin(),
                 config.retryBackoffMax());
+        GeometryDescriptor geometry = GeometryDescriptor.from(
+                new SeriesGeometry(NgrrdYamlLoader.parse(yaml, System::getenv)));
         RemoteSeriesHandle handle = new RemoteSeriesHandle(seriesKey, yaml, definitionHashHex, tags, options,
                 resolver, rpc, dispatcher, opRetry, config.requestTimeout(), config.closeTimeout(),
-                Clock.systemUTC(), handles::remove, capabilities, () -> closed, dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor.from(
-                        new dev.nishisan.utils.oss.format.SeriesGeometry(
-                                dev.nishisan.utils.oss.config.NgrrdYamlLoader.parse(yaml, System::getenv))));
+                Clock.systemUTC(), handles::remove, capabilities, () -> closed, geometry);
         handle.open();
         return handle;
     }
