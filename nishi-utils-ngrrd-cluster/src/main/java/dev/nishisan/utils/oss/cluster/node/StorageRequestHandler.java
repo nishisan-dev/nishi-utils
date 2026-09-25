@@ -26,6 +26,7 @@ import dev.nishisan.utils.oss.NgrrdHandle;
 import dev.nishisan.utils.oss.api.Durability;
 import dev.nishisan.utils.oss.api.OnGeometryChange;
 import dev.nishisan.utils.oss.api.Sample;
+import dev.nishisan.utils.oss.api.SeriesNotFoundException;
 import dev.nishisan.utils.oss.api.SeriesResult;
 import dev.nishisan.utils.oss.blob.BlobVolume;
 import dev.nishisan.utils.oss.cluster.catalog.PlacementState;
@@ -39,6 +40,8 @@ import dev.nishisan.utils.oss.cluster.protocol.ReadPresetResponse;
 import dev.nishisan.utils.oss.cluster.protocol.ReadRequest;
 import dev.nishisan.utils.oss.cluster.protocol.ReadResponse;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesCommandRequest;
+import dev.nishisan.utils.oss.cluster.protocol.SeriesExistsBatchRequest;
+import dev.nishisan.utils.oss.cluster.protocol.SeriesExistsBatchResponse;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesExistsRequest;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesExistsResponse;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesStatus;
@@ -143,9 +146,12 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
     /** Prazo do cache negativo de {@code placementStrong}: evita martelar o líder por chave. */
     private static final Duration NEGATIVE_LOOKUP_CACHE_TTL = Duration.ofSeconds(5);
 
-    /** {@link Commands#SERIES_EXISTS} não passa pela checagem de {@link #ownership} — não tem dono. */
+    /**
+     * {@link Commands#SERIES_EXISTS} e {@link Commands#SERIES_EXISTS_BATCH} não passam pela checagem de
+     * {@link #ownership} — não têm dono.
+     */
     private static final Set<String> HANDLED_COMMANDS = Stream
-            .concat(Commands.OWNER_COMMANDS.stream(), Stream.of(Commands.SERIES_EXISTS))
+            .concat(Commands.OWNER_COMMANDS.stream(), Stream.of(Commands.SERIES_EXISTS, Commands.SERIES_EXISTS_BATCH))
             .collect(Collectors.toUnmodifiableSet());
 
     private GeometryService geometryService;
@@ -197,6 +203,7 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
             case Commands.READ_PRESET -> handleReadPreset((ReadPresetRequest) body);
             case Commands.CLOSE -> handleClose((SeriesCommandRequest) body);
             case Commands.SERIES_EXISTS -> handleSeriesExists((SeriesExistsRequest) body);
+            case Commands.SERIES_EXISTS_BATCH -> handleSeriesExistsBatch((SeriesExistsBatchRequest) body);
             default -> throw new IllegalArgumentException("Comando não suportado por StorageRequestHandler: " + command);
         };
     }
@@ -216,6 +223,23 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
         String objectKey = SeriesObjectKeys.objectKey(seriesObjectPrefix, request.seriesKey());
         boolean exists = volume.storage().exists(objectKey);
         return new SeriesExistsResponse(exists, exists ? -1L : 0L);
+    }
+
+    /**
+     * Variante em lote de {@link #handleSeriesExists}: mesma checagem barata ({@code exists}, sem
+     * {@code get}), sem abrir handle e sem checagem de dono, usada pelo {@code verify} do cliente
+     * (Tarefa 7). Pedidos acima de {@link SeriesExistsBatchRequest#MAX_KEYS} são recusados com
+     * {@link SeriesStatus#ERROR} em vez de processados parcialmente.
+     */
+    private SeriesExistsBatchResponse handleSeriesExistsBatch(SeriesExistsBatchRequest request) {
+        if (request.seriesKeys().size() > SeriesExistsBatchRequest.MAX_KEYS) {
+            return SeriesExistsBatchResponse.error("lote com " + request.seriesKeys().size()
+                    + " chaves excede o máximo de " + SeriesExistsBatchRequest.MAX_KEYS);
+        }
+        Set<String> present = request.seriesKeys().stream()
+                .filter(seriesKey -> volume.storage().exists(SeriesObjectKeys.objectKey(seriesObjectPrefix, seriesKey)))
+                .collect(Collectors.toUnmodifiableSet());
+        return SeriesExistsBatchResponse.ok(present);
     }
 
     /** Snapshot atual das métricas do handler. */
@@ -252,13 +276,26 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
                                 + "' — todas as definições servidas por um cluster ngrrd devem usar o mesmo prefixo "
                                 + "(ver Javadoc de StorageNodeConfig.seriesObjectPrefix)");
             }
+            if (!request.createIfMissingOrDefault() && !registry.isOpen(request.seriesKey())
+                    && !volume.storage().exists(SeriesObjectKeys.objectKey(seriesObjectPrefix, request.seriesKey()))) {
+                recordError(SeriesStatus.NOT_FOUND);
+                return new SeriesStatusResponse(SeriesStatus.NOT_FOUND, self.value(),
+                        "série inexistente: " + request.seriesKey());
+            }
             Durability durability = request.durability() != null ? request.durability() : defaultDurability;
             OnGeometryChange onGeometryChange = request.onGeometryChange() != null
                     ? request.onGeometryChange() : defaultOnGeometryChange;
             if (geometryService != null) { geometryService.beforeOpen(request.seriesKey()); }
-            registry.open(request.seriesKey(), request.yaml(), Ngrrd.OpenOptions.of(durability, onGeometryChange));
+            registry.open(request.seriesKey(), request.yaml(), Ngrrd.OpenOptions.of(durability, onGeometryChange)
+                    .withCreateIfMissing(request.createIfMissingOrDefault()));
             if (geometryService != null) { geometryService.afterOpen(request.seriesKey()); }
             return new SeriesStatusResponse(SeriesStatus.OK, self.value(), null);
+        } catch (SeriesNotFoundException e) {
+            // Defesa em profundidade: o objeto sumiu entre a checagem acima e o open() propriamente dito
+            // (corrida com uma limpeza externa, por exemplo) — o writer recusa criar e sinaliza aqui.
+            recordError(SeriesStatus.NOT_FOUND);
+            return new SeriesStatusResponse(SeriesStatus.NOT_FOUND, self.value(),
+                    "série inexistente: " + e.seriesKey());
         } catch (GeometryService.PublicationException e) {
             recordError(e.response().status());
             return e.response();

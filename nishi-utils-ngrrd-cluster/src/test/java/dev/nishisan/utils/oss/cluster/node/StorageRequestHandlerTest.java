@@ -36,6 +36,8 @@ import dev.nishisan.utils.oss.cluster.protocol.OpenRequest;
 import dev.nishisan.utils.oss.cluster.protocol.ReadRequest;
 import dev.nishisan.utils.oss.cluster.protocol.ReadResponse;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesCommandRequest;
+import dev.nishisan.utils.oss.cluster.protocol.SeriesExistsBatchRequest;
+import dev.nishisan.utils.oss.cluster.protocol.SeriesExistsBatchResponse;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesExistsRequest;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesExistsResponse;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesStatus;
@@ -63,7 +65,10 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -116,6 +121,10 @@ class StorageRequestHandlerTest {
 
     private OpenRequest openRequest(String seriesKey, SeriesPlacement hint) {
         return new OpenRequest(seriesKey, yaml, Map.of(), null, null, hint);
+    }
+
+    private OpenRequest openRequestNoCreate(String seriesKey, SeriesPlacement hint) {
+        return new OpenRequest(seriesKey, yaml, Map.of(), null, null, hint, false);
     }
 
     @Test
@@ -613,6 +622,105 @@ class StorageRequestHandlerTest {
         assertFalse(response.exists());
         assertEquals(0L, response.bytes());
         assertFalse(registry.isOpen("series-inexistente"), "SERIES_EXISTS nunca deveria abrir handle");
+    }
+
+    @Test
+    void openSemCriarComObjetoAusenteRespondeNotFoundENadaCria() {
+        String seriesKey = "series-sem-criar-ausente";
+        placementLookup.put(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequestNoCreate(seriesKey, null), SOURCE);
+
+        assertEquals(SeriesStatus.NOT_FOUND, response.status());
+        assertFalse(registry.isOpen(seriesKey), "OPEN sem criar não deveria ter aberto a série");
+        assertFalse(volume.storage().exists(SeriesObjectKeys.objectKey(SERIES_OBJECT_PREFIX, seriesKey)),
+                "OPEN sem criar não deveria ter criado o objeto físico");
+    }
+
+    @Test
+    void openSemCriarComObjetoPresenteAbre() {
+        String seriesKey = "series-sem-criar-presente";
+        placementLookup.put(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+        handler.handle(Commands.OPEN, openRequest(seriesKey, null), SOURCE);
+        handler.handle(Commands.CLOSE, new SeriesCommandRequest(seriesKey), SOURCE);
+        assertTrue(volume.storage().exists(SeriesObjectKeys.objectKey(SERIES_OBJECT_PREFIX, seriesKey)),
+                "setup deveria ter deixado o objeto físico no volume após o close");
+        assertFalse(registry.isOpen(seriesKey), "setup deveria ter fechado o handle antes do OPEN sem criar");
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequestNoCreate(seriesKey, null), SOURCE);
+
+        assertEquals(SeriesStatus.OK, response.status());
+        assertTrue(registry.isOpen(seriesKey));
+    }
+
+    @Test
+    void openSemFlagContinuaCriando() {
+        String seriesKey = "series-sem-flag-cria";
+        placementLookup.put(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                new OpenRequest(seriesKey, yaml, Map.of(), null, null, null, null), SOURCE);
+
+        assertEquals(SeriesStatus.OK, response.status());
+        assertTrue(registry.isOpen(seriesKey));
+        assertTrue(volume.storage().exists(SeriesObjectKeys.objectKey(SERIES_OBJECT_PREFIX, seriesKey)));
+    }
+
+    @Test
+    void openSemCriarComSerieJaAbertaRespondeOk() {
+        String seriesKey = "series-sem-criar-ja-aberta";
+        placementLookup.put(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+        handler.handle(Commands.OPEN, openRequest(seriesKey, null), SOURCE);
+        assertTrue(registry.isOpen(seriesKey));
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequestNoCreate(seriesKey, null), SOURCE);
+
+        assertEquals(SeriesStatus.OK, response.status());
+    }
+
+    @Test
+    void openSemCriarDeNaoDonoContinuaRespondendoWrongOwner() {
+        // Ownership é decidido ANTES do NOT_FOUND: mesmo com createIfMissing=false, um nó que não é
+        // dono continua respondendo WRONG_OWNER, nunca NOT_FOUND.
+        String seriesKey = "series-sem-criar-nao-dono";
+        placementLookup.put(seriesKey, SeriesPlacement.active(OTHER.value(), 1_000L));
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequestNoCreate(seriesKey, null), SOURCE);
+
+        assertEquals(SeriesStatus.WRONG_OWNER, response.status());
+        assertEquals(OTHER.value(), response.ownerNodeId());
+    }
+
+    @Test
+    void seriesExistsBatchDevolveSoAsPresentes() {
+        String present = "series-batch-presente";
+        String absent = "series-batch-ausente";
+        placementLookup.put(present, SeriesPlacement.active(SELF.value(), 1_000L));
+        handler.handle(Commands.OPEN, openRequest(present, null), SOURCE);
+        handler.handle(Commands.CHECKPOINT, new SeriesCommandRequest(present), SOURCE);
+
+        SeriesExistsBatchResponse response = (SeriesExistsBatchResponse) handler.handle(
+                Commands.SERIES_EXISTS_BATCH, new SeriesExistsBatchRequest(List.of(present, absent)), SOURCE);
+
+        assertEquals(SeriesStatus.OK, response.status());
+        assertEquals(Set.of(present), response.present());
+    }
+
+    @Test
+    void seriesExistsBatchAcimaDoLimiteRespondeErro() {
+        List<String> tooMany = IntStream.rangeClosed(1, SeriesExistsBatchRequest.MAX_KEYS + 1)
+                .mapToObj(i -> "series-batch-" + i)
+                .collect(Collectors.toList());
+
+        SeriesExistsBatchResponse response = (SeriesExistsBatchResponse) handler.handle(
+                Commands.SERIES_EXISTS_BATCH, new SeriesExistsBatchRequest(tooMany), SOURCE);
+
+        assertEquals(SeriesStatus.ERROR, response.status());
+        assertTrue(response.present().isEmpty());
     }
 
     /** {@link Clock} determinístico para forçar fechamento por ociosidade via {@link SeriesHandleRegistry#closeIdle()}. */
