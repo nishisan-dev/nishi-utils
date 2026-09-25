@@ -15,6 +15,8 @@ Continuação da [issue #169](https://github.com/nishisan-dev/nishi-utils/issues
   pendentes deixam de bloquear todas as séries de um nó; barreiras continuam esperando ACKs.
 - Esperas de RPC, abertura de conexão e escrita TCP usam caminhos compatíveis com as
   virtual threads do Java 21, evitando prender suas threads de suporte em monitores.
+- O handshake preserva a conexão aberta pelo endereço do seed ao descobrir o ID real
+  do nó. A limpeza do alias provisório deixava de reutilizar o socket e o fechava.
 - `ngrrd.rebalance.maxBytesPerSecond` limita o tráfego de imagem e patches por origem,
   somando todas as migrações; padrão 16 MiB/s. O coordenador também consulta falhas na origem.
 - A cópia online negocia `liveCopy`/`COPY_READY` antes dos chunks e usa `ngrrd.migrate.patch`.

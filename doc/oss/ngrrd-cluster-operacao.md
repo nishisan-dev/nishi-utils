@@ -231,7 +231,9 @@ não ocupa os executores que drenam as séries saudáveis. As barreiras continua
 confirmação de todas as amostras anteriores da série, inclusive após redirecionamento.
 
 Os handlers e a escrita TCP evitam monitores durante esperas de rede, para liberar as
-threads de suporte do Java 21. O coordenador consulta também a origem: se ela já falhou,
+threads de suporte do Java 21. O handshake também preserva o socket ao substituir o
+endereço provisório do seed pelo ID real do nó, evitando desconexões nessa descoberta.
+O coordenador consulta também a origem: se ela já falhou,
 resolve a migração preservando a cópia original, sem esperar desnecessariamente o prazo
 completo. Um `COMMITTED` confirmado no destino tem precedência sobre a falha da origem.
 

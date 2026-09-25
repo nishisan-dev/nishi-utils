@@ -48,6 +48,29 @@ import static org.junit.jupiter.api.Assertions.fail;
  */
 class TcpTransportConcurrentMeshTest {
 
+    @Test
+    void seedAliasBecomesCanonicalWithoutClosingItsOwnConnection() throws Exception {
+        int portA = allocateFreeLocalPort(Set.of());
+        int portB = allocateFreeLocalPort(Set.of(portA));
+        NodeInfo a = new NodeInfo(NodeId.of("a-client"), "127.0.0.1", portA);
+        NodeInfo b = new NodeInfo(NodeId.of("z-storage"), "127.0.0.1", portB);
+        NodeInfo seed = new NodeInfo(NodeId.of("127.0.0.1:" + portB), b.host(), b.port());
+        TcpTransport client = new TcpTransport(meshConfig(a, seed));
+        TcpTransport server = new TcpTransport(meshConfig(b));
+        var dials = new java.util.concurrent.atomic.AtomicInteger();
+        client.setBeforeDialHook(ignored -> dials.incrementAndGet());
+        try {
+            server.start();
+            client.start();
+            awaitDiscovery(client, b.nodeId());
+            awaitFullDirectMesh(List.of(client, server), List.of(a, b), Duration.ofSeconds(10));
+            assertEquals(1, dials.get(), "learning the seed's real ID must preserve the established socket");
+            assertTrue(client.peers().stream().noneMatch(peer -> peer.nodeId().equals(seed.nodeId())));
+        } finally {
+            closeQuietly(client, server);
+        }
+    }
+
     /**
      * Três transports full-mesh iniciados o mais simultaneamente possível devem
      * convergir para uma malha totalmente direta (6 conexões direcionais) e

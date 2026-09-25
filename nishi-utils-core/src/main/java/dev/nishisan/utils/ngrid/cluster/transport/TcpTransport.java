@@ -622,7 +622,9 @@ public final class TcpTransport implements Transport {
         for (NodeId staleId : staleIds) {
             knownPeers.remove(staleId);
             Connection staleConn = connections.remove(staleId);
-            if (staleConn != null) {
+            // An outbound seed connection is initially indexed by host:port. Learning
+            // its canonical ID moves that same socket; it must not close itself here.
+            if (staleConn != null && staleConn != connection) {
                 staleConn.closeQuietly();
             }
         }
