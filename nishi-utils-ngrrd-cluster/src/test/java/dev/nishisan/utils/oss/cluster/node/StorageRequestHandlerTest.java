@@ -1018,6 +1018,50 @@ class StorageRequestHandlerTest {
     }
 
     @Test
+    void openComReplicaVaziaEHintComLiderEmMigracaoDeSelfRespondeMigrating() {
+        // Achado do Refuter: a decisão pelo líder tratava MIGRATING(dono=self) como OK e deixava o OPEN
+        // criar/abrir durante a troca de dono. Mesmo critério da réplica local: só a cópia online
+        // (isCopying) atende; fora dela, MIGRATING.
+        String seriesKey = "series-strong-migrando-self";
+        SeriesPlacement active = SeriesPlacement.active(SELF.value(), 1_000L);
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.migrating(active, OTHER.value(), "mig-1", 2_000L));
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequest(seriesKey, active), SOURCE);
+
+        assertEquals(SeriesStatus.MIGRATING, response.status());
+        assertFalse(volume.storage().exists(SeriesObjectKeys.objectKey(SERIES_OBJECT_PREFIX, seriesKey)));
+    }
+
+    @Test
+    void flushComReplicaVaziaELiderEmMigracaoDeSelfRespondeMigrating() {
+        String seriesKey = "series-strong-migrando-self-flush";
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.migrating(
+                SeriesPlacement.active(SELF.value(), 1_000L), OTHER.value(), "mig-1", 2_000L));
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.FLUSH,
+                new SeriesCommandRequest(seriesKey), SOURCE);
+
+        assertEquals(SeriesStatus.MIGRATING, response.status());
+    }
+
+    @Test
+    void serieEsquecidaComLiderEmMigracaoDeSelfRespondeMigrating() {
+        String seriesKey = "series-esquecida-strong-migrando-self";
+        placementLookup.put(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+        handler.handle(Commands.OPEN, openRequest(seriesKey, null), SOURCE);
+        registry.forget(seriesKey);
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.migrating(
+                SeriesPlacement.active(SELF.value(), 1_000L), OTHER.value(), "mig-1", 2_000L));
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequest(seriesKey, null), SOURCE);
+
+        assertEquals(SeriesStatus.MIGRATING, response.status());
+        assertTrue(registry.isForgotten(seriesKey));
+    }
+
+    @Test
     void confirmacoesNoLiderSaoContadasNasMetricas() {
         String created = "series-metrica-criada";
         String missing = "series-metrica-ausente";
