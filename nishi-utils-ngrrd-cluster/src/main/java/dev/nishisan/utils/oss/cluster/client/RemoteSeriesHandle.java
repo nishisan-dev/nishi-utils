@@ -21,6 +21,7 @@ import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.oss.Ngrrd;
 import dev.nishisan.utils.oss.NgrrdHandle;
 import dev.nishisan.utils.oss.api.Sample;
+import dev.nishisan.utils.oss.api.SeriesNotFoundException;
 import dev.nishisan.utils.oss.api.SeriesResult;
 import dev.nishisan.utils.oss.api.ViewQuery;
 import dev.nishisan.utils.oss.cluster.api.ErrorCode;
@@ -75,6 +76,8 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
 
     private volatile String owner;
     private volatile boolean closed;
+    /** {@code true} depois que o dono confirmou {@code NOT_FOUND} para esta série ({@code createIfMissing=false}). */
+    private volatile boolean notFound;
 
     public RemoteSeriesHandle(String seriesKey, String yaml, String definitionHashHex, Map<String, String> tags,
             Ngrrd.OpenOptions options, PlacementLookup resolver, ClusterRpc rpc, WriteBuffer dispatcher,
@@ -123,10 +126,10 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
 
     private void open(OperationRetry retry) {
         for (;;) {
-            SeriesPlacement placement = resolver.resolve(seriesKey, definitionHashHex, geometry, retry.remaining());
+            SeriesPlacement placement = resolvePlacement(retry.remaining());
             String candidateOwner = placement.ownerNodeId();
             OpenRequest request = new OpenRequest(seriesKey, yaml, tags, options.durability(),
-                    options.onGeometryChange(), placement);
+                    options.onGeometryChange(), placement, options.createIfMissing() ? null : Boolean.FALSE);
             retry.remaining();
             SeriesStatusResponse response = callWithTransportRetry(NodeId.of(candidateOwner), Commands.OPEN, request,
                     SeriesStatusResponse.class, retry.deadlineMs);
@@ -141,6 +144,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
                         noteWrongOwner(response.ownerNodeId(), retry);
                     }
                 }
+                case NOT_FOUND -> throw new SeriesNotFoundException(seriesKey);
                 default -> throw new NgrrdClusterException(ErrorCode.REMOTE_ERROR,
                         response.message() != null ? response.message() : ("OPEN respondeu " + response.status()));
             }
@@ -148,19 +152,48 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
     }
 
     /**
-     * Reexecuta {@link #open()}, absorvendo qualquer falha — usado como
-     * callback pelo {@code WriteDispatcher} quando um dono responde
-     * {@code NOT_OPEN} a um lote. Nunca lança: o chamador só precisa saber se
-     * deu certo.
+     * Placement usado para posicionar o {@code OPEN}: com {@code createIfMissing=true} (default),
+     * cria a série se preciso ({@code ngrrd.place}); com {@code createIfMissing=false}, nunca cria —
+     * exige que a série já exista ({@link PlacementLookup#resolveExisting}), lançando
+     * {@link SeriesNotFoundException} se o líder confirmar que não há placement.
+     */
+    private SeriesPlacement resolvePlacement(Duration maxWait) {
+        return options.createIfMissing() ? resolver.resolve(seriesKey, definitionHashHex, geometry, maxWait)
+                : resolver.resolveExisting(seriesKey, maxWait);
+    }
+
+    /**
+     * Reexecuta {@link #open()}, absorvendo qualquer falha genérica — usado como callback pelo
+     * {@code WriteDispatcher} quando um dono responde {@code NOT_OPEN} a um lote. {@link SeriesNotFoundException}
+     * NÃO é absorvida: marca o handle como definitivamente inexistente ({@link #markSeriesNotFound()})
+     * e relança, para que o {@code WriteDispatcher} falhe as escritas pendentes em vez de adiá-las para
+     * sempre (uma série apagada nunca vai reabrir sozinha).
      */
     boolean reopen() {
         try {
             open();
             return true;
+        } catch (SeriesNotFoundException e) {
+            markSeriesNotFound();
+            throw e;
         } catch (RuntimeException e) {
             LOGGER.log(Level.WARNING, "Falha ao reabrir a série " + seriesKey, e);
             return false;
         }
+    }
+
+    /**
+     * Marca a série como definitivamente inexistente: {@code write}/{@code flush}/{@code checkpoint}/
+     * {@code read} passam a lançar {@link SeriesNotFoundException} e o handle se remove do mapa do
+     * cliente ({@link #onClose}), de modo que um {@code open} posterior refaz o fluxo do zero. Idempotente.
+     */
+    private void markSeriesNotFound() {
+        if (notFound) {
+            return;
+        }
+        notFound = true;
+        closed = true;
+        onClose.accept(seriesKey);
     }
 
     @Override
@@ -407,11 +440,14 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
             owner = newOwnerNodeId;
         } else {
             resolver.invalidate(seriesKey);
-            owner = resolver.resolve(seriesKey, definitionHashHex, geometry, retry.remaining()).ownerNodeId();
+            owner = resolvePlacement(retry.remaining()).ownerNodeId();
         }
     }
 
     private void ensureOpen() {
+        if (notFound) {
+            throw new SeriesNotFoundException(seriesKey);
+        }
         if (closed) {
             throw new NgrrdClusterException(ErrorCode.CLOSED, "handle fechado: " + seriesKey);
         }

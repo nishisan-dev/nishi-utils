@@ -18,6 +18,7 @@
 package dev.nishisan.utils.oss.cluster.client;
 
 import dev.nishisan.utils.ngrid.common.NodeId;
+import dev.nishisan.utils.oss.api.SeriesNotFoundException;
 import dev.nishisan.utils.oss.cluster.api.ClientMetricsSnapshot;
 import dev.nishisan.utils.oss.cluster.api.ErrorCode;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterConfig;
@@ -775,17 +776,38 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         } finally { buf.lock.unlock(); }
         try {
             recoveryPool.execute(() -> {
-                boolean opened = false;
-                try { opened = Boolean.TRUE.equals(reopener.apply(key)); }
-                catch (RuntimeException e) { LOGGER.log(Level.FINE, "Reabertura pendente de " + key, e); }
-                finally {
-                    deferSeries(buf, key, opened ? 0 : -1);
-                    scheduleFlush(owner, buf);
+                boolean opened;
+                try {
+                    opened = Boolean.TRUE.equals(reopener.apply(key));
+                } catch (SeriesNotFoundException e) {
+                    // A série sumiu (createIfMissing=false) e nunca vai reabrir sozinha — diferente das
+                    // demais falhas de reabertura, deferSeries(-1) aqui adiaria para sempre. Descarta
+                    // tudo que está pendente para esta série (as que acabaram de ser reenfileiradas
+                    // acima e qualquer outra chegada enquanto a reabertura estava em voo) em vez de
+                    // retentar.
+                    failSeriesNotFound(buf, key, e);
+                    return;
+                } catch (RuntimeException e) {
+                    LOGGER.log(Level.FINE, "Reabertura pendente de " + key, e);
+                    opened = false;
                 }
+                deferSeries(buf, key, opened ? 0 : -1);
+                scheduleFlush(owner, buf);
             });
         } catch (RejectedExecutionException closing) {
             deferSeries(buf, key, -1);
         }
+    }
+
+    /** Descarta, como falha, todas as escritas pendentes de {@code key} — série confirmada inexistente. */
+    private void failSeriesNotFound(NodeBuffer buf, String key, SeriesNotFoundException cause) {
+        List<SeriesWrite> lost = extractSeriesFrom(buf, key);
+        if (!lost.isEmpty()) {
+            samplesFailedCount.add(lost.size());
+            completeWrites(key, lost.size(), "série inexistente: " + key);
+        }
+        LOGGER.log(Level.WARNING, "Série " + key + " inexistente ao reabrir — descartando "
+                + lost.size() + " escrita(s) pendente(s), sem novas tentativas", cause);
     }
 
     /**

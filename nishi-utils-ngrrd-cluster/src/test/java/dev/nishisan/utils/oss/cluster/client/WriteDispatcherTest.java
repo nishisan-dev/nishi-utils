@@ -18,6 +18,7 @@
 package dev.nishisan.utils.oss.cluster.client;
 
 import dev.nishisan.utils.ngrid.common.NodeId;
+import dev.nishisan.utils.oss.api.SeriesNotFoundException;
 import dev.nishisan.utils.oss.cluster.api.ClientMetricsSnapshot;
 import dev.nishisan.utils.oss.cluster.api.ErrorCode;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterConfig;
@@ -498,6 +499,42 @@ class WriteDispatcherTest {
         Await.untilTrue("reenviado após NOT_OPEN", AWAIT_TIMEOUT, () -> dispatcher.samplesSent() == 1L);
         assertEquals(1, reopenCalls.get());
         assertTrue(dispatcher.retriesByStatus().getOrDefault(SeriesStatus.NOT_OPEN, 0L) >= 1L);
+    }
+
+    @Test
+    void reopenerLancaSeriesNotFoundExceptionDescartaEscritasPendentesEMantemOutrasSeries() {
+        // Regressão da T6 (achado do Debugger na T4): quando reopen() falha porque a série sumiu
+        // (createIfMissing=false), deferSeries(-1) reagendaria a série para sempre — um loop infinito
+        // para uma série que nunca vai reabrir sozinha. O reopener deve poder sinalizar esse caso
+        // específico via SeriesNotFoundException e o dispatcher deve falhar o que está pendente em vez
+        // de adiar.
+        AtomicInteger reopenCalls = new AtomicInteger();
+        newDispatcher(1, Duration.ofSeconds(30), 1_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> {
+            reopenCalls.incrementAndGet();
+            throw new SeriesNotFoundException(key);
+        });
+        rpc.respondDefault((cmd, body) -> {
+            WriteBatchRequest req = (WriteBatchRequest) body;
+            Map<String, SeriesStatus> status = new LinkedHashMap<>();
+            for (SeriesWrite w : req.writes()) {
+                status.put(w.seriesKey(), w.seriesKey().equals("gone") ? SeriesStatus.NOT_OPEN : SeriesStatus.OK);
+            }
+            return new WriteBatchResponse(status, Map.of(), Map.of());
+        });
+
+        dispatcher.enqueue(OWNER_A.value(), write("gone", 1L, 1.0));
+        dispatcher.enqueue(OWNER_A.value(), write("healthy", 1L, 2.0));
+
+        Await.untilTrue("escrita da série inexistente contabilizada como falha", AWAIT_TIMEOUT,
+                () -> dispatcher.samplesFailed() == 1L);
+        Await.untilTrue("escrita da série saudável, no mesmo nó, segue entregue", AWAIT_TIMEOUT,
+                () -> dispatcher.samplesSent() == 1L);
+        assertEquals(1, reopenCalls.get(), "sem novas tentativas de reabertura para a série inexistente");
+
+        NgrrdClusterException ex = assertThrows(NgrrdClusterException.class,
+                () -> dispatcher.flushSeriesSync("gone", OWNER_A.value(), AWAIT_TIMEOUT),
+                "flush/barreira de quem espera pela série inexistente recebe a falha");
+        assertTrue(ex.getMessage().contains("gone"), "mensagem: " + ex.getMessage());
     }
 
     @Test

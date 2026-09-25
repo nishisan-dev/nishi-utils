@@ -21,12 +21,14 @@ import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.oss.Ngrrd;
 import dev.nishisan.utils.oss.api.Sample;
 import dev.nishisan.utils.oss.api.ConsolidationFunction;
+import dev.nishisan.utils.oss.api.SeriesNotFoundException;
 import dev.nishisan.utils.oss.api.SeriesResult;
 import dev.nishisan.utils.oss.api.ViewQuery;
 import dev.nishisan.utils.oss.cluster.api.ErrorCode;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
+import dev.nishisan.utils.oss.cluster.protocol.OpenRequest;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesStatus;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesStatusResponse;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesWrite;
@@ -47,6 +49,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Cobre {@link RemoteSeriesHandle} com {@link RecordingClusterRpc} fake e um
@@ -62,19 +65,28 @@ class RemoteSeriesHandleTest {
     private RecordingClusterRpc rpc;
     private FakePlacementLookup resolver;
     private NoOpWriteBuffer dispatcher;
+    private final List<String> onCloseCalls = new CopyOnWriteArrayList<>();
 
     private RemoteSeriesHandle newHandle() {
-        return newHandle(Duration.ofSeconds(2));
+        return newHandle(Duration.ofSeconds(2), Ngrrd.OpenOptions.defaults());
     }
 
     private RemoteSeriesHandle newHandle(Duration retryTimeout) {
+        return newHandle(retryTimeout, Ngrrd.OpenOptions.defaults());
+    }
+
+    private RemoteSeriesHandle newHandle(Ngrrd.OpenOptions options) {
+        return newHandle(Duration.ofSeconds(2), options);
+    }
+
+    private RemoteSeriesHandle newHandle(Duration retryTimeout, Ngrrd.OpenOptions options) {
         rpc = new RecordingClusterRpc(NodeId.of("client-under-test"));
         resolver = new FakePlacementLookup(OWNER_A.value());
         dispatcher = new NoOpWriteBuffer();
         RetryPolicy retry = new RetryPolicy(retryTimeout, Duration.ofMillis(5), Duration.ofMillis(50));
-        return new RemoteSeriesHandle(SERIES_KEY, "yaml: fake", "hash-1", Map.of(), Ngrrd.OpenOptions.defaults(),
+        return new RemoteSeriesHandle(SERIES_KEY, "yaml: fake", "hash-1", Map.of(), options,
                 resolver, rpc, dispatcher, retry, Duration.ofSeconds(5), Duration.ofSeconds(5), Clock.systemUTC(),
-                key -> { });
+                onCloseCalls::add);
     }
 
     @Test
@@ -296,10 +308,73 @@ class RemoteSeriesHandleTest {
         assertEquals(List.of(Commands.OPEN, Commands.CHECKPOINT), commands, "não deveria ter retentado");
     }
 
+    @Test
+    void openSemCriarNaoFazPlaceEEnviaFlag() {
+        RemoteSeriesHandle handle = newHandle(Ngrrd.OpenOptions.defaults().withCreateIfMissing(false));
+        rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
+
+        handle.open();
+
+        assertEquals(0, resolver.resolveCalls.get(), "open sem criar nunca posiciona (ngrrd.place)");
+        assertEquals(1, resolver.resolveExistingCalls.get());
+        OpenRequest request = (OpenRequest) rpc.calls().get(0).body();
+        assertEquals(Boolean.FALSE, request.createIfMissing());
+    }
+
+    @Test
+    void openPadraoEnviaFlagNula() {
+        RemoteSeriesHandle handle = newHandle();
+        rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
+
+        handle.open();
+
+        assertEquals(1, resolver.resolveCalls.get());
+        assertEquals(0, resolver.resolveExistingCalls.get());
+        OpenRequest request = (OpenRequest) rpc.calls().get(0).body();
+        assertEquals(null, request.createIfMissing(), "createIfMissing=true não deve viajar no request (compat)");
+    }
+
+    @Test
+    void openSemCriarComNotFoundDoStorageLancaSeriesNotFound() {
+        RemoteSeriesHandle handle = newHandle(Ngrrd.OpenOptions.defaults().withCreateIfMissing(false));
+        rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.NOT_FOUND, OWNER_A.value(), null));
+
+        SeriesNotFoundException ex = assertThrows(SeriesNotFoundException.class, handle::open);
+        assertEquals(SERIES_KEY, ex.seriesKey());
+    }
+
+    @Test
+    void openSemCriarSemPlacementLancaSeriesNotFound() {
+        RemoteSeriesHandle handle = newHandle(Ngrrd.OpenOptions.defaults().withCreateIfMissing(false));
+        resolver.resolveExistingFailure = new SeriesNotFoundException(SERIES_KEY);
+
+        assertThrows(SeriesNotFoundException.class, handle::open);
+        assertTrue(rpc.calls().isEmpty(), "sem placement, o handle nunca chega a chamar OPEN no dono");
+    }
+
+    @Test
+    void reopenSemCriarComNotFoundRelancaEMarcaHandleInexistente() {
+        RemoteSeriesHandle handle = newHandle(Ngrrd.OpenOptions.defaults().withCreateIfMissing(false));
+        rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
+        handle.open();
+        onCloseCalls.clear();
+
+        rpc.respondDefault((cmd, body) -> new SeriesStatusResponse(SeriesStatus.NOT_FOUND, OWNER_A.value(), null));
+
+        assertThrows(SeriesNotFoundException.class, handle::reopen);
+        assertEquals(List.of(SERIES_KEY), onCloseCalls, "handle deve se remover do mapa do cliente");
+
+        SeriesNotFoundException ex = assertThrows(SeriesNotFoundException.class,
+                () -> handle.write("in_octets", new Sample(1L, 1.0)));
+        assertEquals(SERIES_KEY, ex.seriesKey());
+    }
+
     /** {@link PlacementLookup} fake: sempre devolve o dono atual configurado, sem RPC ao líder. */
     private static final class FakePlacementLookup implements PlacementLookup {
         private volatile String owner;
         private final AtomicInteger resolveCalls = new AtomicInteger();
+        private final AtomicInteger resolveExistingCalls = new AtomicInteger();
+        private volatile RuntimeException resolveExistingFailure;
 
         FakePlacementLookup(String initialOwner) {
             this.owner = initialOwner;
@@ -313,7 +388,11 @@ class RemoteSeriesHandleTest {
 
         @Override
         public SeriesPlacement resolveExisting(String seriesKey, Duration maxWait) {
-            return resolve(seriesKey, null);
+            resolveExistingCalls.incrementAndGet();
+            if (resolveExistingFailure != null) {
+                throw resolveExistingFailure;
+            }
+            return SeriesPlacement.active(owner, 0L);
         }
 
         @Override
