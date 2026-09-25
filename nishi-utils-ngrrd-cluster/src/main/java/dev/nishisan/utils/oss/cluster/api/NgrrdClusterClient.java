@@ -174,7 +174,8 @@ public interface NgrrdClusterClient extends Closeable {
      * {@link NgrrdClusterConfig#catalogLookupBatchSize()} chaves por chamada, sequenciais.</p>
      *
      * @throws NgrrdClusterException se não foi possível confirmar o placement com o líder (sem líder,
-     *         timeout, falha de transporte, resposta inválida)
+     *         timeout, falha de transporte, resposta inválida); com {@link ErrorCode#UNSUPPORTED_BY_NODE}
+     *         se o líder não anuncia {@code catalog.lookup}
      */
     Map<String, SeriesVerification> verify(Collection<String> seriesKeys);
 

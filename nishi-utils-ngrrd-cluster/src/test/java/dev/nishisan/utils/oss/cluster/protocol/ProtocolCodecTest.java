@@ -478,6 +478,16 @@ class ProtocolCodecTest {
     }
 
     @Test
+    void seriesExistsBatchResponseOkSemPresentNoJsonDesserializaComPresentNulo() throws IOException {
+        SeriesExistsBatchResponse response = JacksonMessageCodec.createDefaultMapper()
+                .readValue("{\"status\":\"OK\",\"message\":null}", SeriesExistsBatchResponse.class);
+
+        assertEquals(SeriesStatus.OK, response.status());
+        assertNull(response.present(), "sem o campo present no JSON, present() precisa continuar null — "
+                + "nunca virar Set.of() (que o cliente confundiria com \"nenhuma chave presente\")");
+    }
+
+    @Test
     void openRequestComCreateIfMissingFalseSobreviveAoRoundTrip() throws IOException {
         SeriesPlacement placement = SeriesPlacement.active("node-a", 1_000L);
         OpenRequest original = new OpenRequest("series-1", "ds: [in_octets]", Map.of(), Durability.FSYNC,

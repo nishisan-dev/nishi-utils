@@ -18,6 +18,7 @@
 package dev.nishisan.utils.oss.cluster.client;
 
 import dev.nishisan.utils.ngrid.common.NodeId;
+import dev.nishisan.utils.oss.cluster.api.ErrorCode;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterClient;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.api.SeriesVerification;
@@ -52,9 +53,11 @@ import java.util.Set;
  * <p>Duas falhas têm tratamento bem diferente: uma falha ao consultar o LÍDER (catálogo, via
  * {@link CatalogLookupClient}) sempre propaga {@link NgrrdClusterException} — nada é presumido; já uma
  * falha ao consultar um DONO (capacidade ausente, RPC ou status de erro numa página) marca só as chaves
- * daquela página/nó como {@link SeriesVerification#UNVERIFIED}, sem interromper as demais páginas ou
- * nós — usado só num relatório de conciliação sob demanda, nunca pode transformar uma falha pontual em
- * ausência.</p>
+ * daquela página como {@link SeriesVerification#UNVERIFIED}, sem interromper as demais páginas ou nós —
+ * usado só num relatório de conciliação sob demanda, nunca pode transformar uma falha pontual em
+ * ausência. Exceção: um {@code TIMEOUT} interrompe as páginas RESTANTES do mesmo nó (o nó pode estar
+ * travado) — as demais ficam {@code UNVERIFIED} sem RPC, em vez de pagar N x {@code requestTimeout}
+ * esperando um único nó lento; falhas que não são {@code TIMEOUT} continuam isoladas por página.</p>
  */
 final class SeriesVerifier {
 
@@ -191,27 +194,41 @@ final class SeriesVerifier {
         Map<String, Boolean> presence = new LinkedHashMap<>();
         for (int start = 0; start < keys.size(); start += batchSize) {
             List<String> page = keys.subList(start, Math.min(start + batchSize, keys.size()));
-            queryPage(owner, page, presence);
+            if (!queryPage(owner, page, presence)) {
+                // TIMEOUT nesta página: o nó pode estar travado — as páginas restantes DESTE nó ficam
+                // UNVERIFIED sem RPC, em vez de pagar N x requestTimeout esperando um nó só. Falhas que
+                // não são TIMEOUT (ERROR, resposta malformada) continuam isoladas por página.
+                break;
+            }
         }
         return presence;
     }
 
-    private void queryPage(NodeId owner, List<String> page, Map<String, Boolean> presence) {
+    /**
+     * Confirma uma página no dono. Devolve {@code false} só quando a falha foi
+     * {@link ErrorCode#TIMEOUT} — sinal para {@link #queryOwner} cortar as páginas restantes deste
+     * mesmo nó; qualquer outra falha (ERROR, resposta nula, {@code present} ausente) devolve
+     * {@code true}: só esta página fica de fora do mapa, as demais deste nó seguem normalmente.
+     */
+    private boolean queryPage(NodeId owner, List<String> page, Map<String, Boolean> presence) {
         SeriesExistsBatchResponse response;
         try {
             response = rpc.call(owner, Commands.SERIES_EXISTS_BATCH, new SeriesExistsBatchRequest(page),
                     SeriesExistsBatchResponse.class, requestTimeout);
         } catch (NgrrdClusterException e) {
             // Falha nesta página (transporte, timeout, erro remoto): as chaves ficam de fora do mapa —
-            // o chamador as trata como UNVERIFIED. As demais páginas/nós seguem normalmente.
-            return;
+            // o chamador as trata como UNVERIFIED.
+            return e.code() != ErrorCode.TIMEOUT;
         }
-        if (response == null || response.status() != SeriesStatus.OK) {
-            return;
+        if (response == null || response.status() != SeriesStatus.OK || response.present() == null) {
+            // Status de erro/desconhecido ou um OK malformado (sem present) nunca vira "todas ausentes":
+            // as chaves ficam de fora do mapa, iguais a uma falha de RPC.
+            return true;
         }
         Set<String> present = response.present();
         for (String key : page) {
             presence.put(key, present.contains(key));
         }
+        return true;
     }
 }

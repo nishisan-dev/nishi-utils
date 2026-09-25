@@ -28,6 +28,7 @@ import dev.nishisan.utils.oss.cluster.protocol.CatalogLookupResponse;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesExistsBatchRequest;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesExistsBatchResponse;
+import dev.nishisan.utils.oss.cluster.protocol.SeriesStatus;
 import org.junit.jupiter.api.Test;
 
 import java.time.Clock;
@@ -88,11 +89,19 @@ class SeriesVerifierTest {
         Map<String, SeriesVerification> result = verifier.verify(
                 List.of("nodeA-0", "nodeA-1", "nodeA-2", "nodeA-3", "nodeA-4", "nodeB-0"));
 
-        assertEquals(SeriesVerification.PRESENT, result.get("nodeA-0"));
-        assertEquals(SeriesVerification.PRESENT, result.get("nodeB-0"));
-        long callsToNodeA = rpc.calls().stream().filter(call -> call.target().equals(NODE_A)).count();
+        assertEquals(Map.of(
+                "nodeA-0", SeriesVerification.PRESENT,
+                "nodeA-1", SeriesVerification.PRESENT,
+                "nodeA-2", SeriesVerification.PRESENT,
+                "nodeA-3", SeriesVerification.PRESENT,
+                "nodeA-4", SeriesVerification.PRESENT,
+                "nodeB-0", SeriesVerification.PRESENT), result);
+        List<Integer> pageSizesForNodeA = rpc.calls().stream()
+                .filter(call -> call.target().equals(NODE_A))
+                .map(call -> ((SeriesExistsBatchRequest) call.body()).seriesKeys().size())
+                .toList();
+        assertEquals(List.of(2, 2, 1), pageSizesForNodeA, "5 chaves em páginas de 2 -> tamanhos 2,2,1");
         long callsToNodeB = rpc.calls().stream().filter(call -> call.target().equals(NODE_B)).count();
-        assertEquals(3, callsToNodeA, "5 chaves em páginas de 2 -> 3 chamadas");
         assertEquals(1, callsToNodeB);
         for (var call : rpc.calls()) {
             assertEquals(Commands.SERIES_EXISTS_BATCH, call.command());
@@ -178,6 +187,91 @@ class SeriesVerifierTest {
     }
 
     @Test
+    void falhaNumaPaginaDoMeioMarcaSoAquelaPaginaComoUnverified() {
+        newVerifier(2);
+        for (int i = 0; i < 5; i++) {
+            placementLookup.cache("p-" + i, SeriesPlacement.active(NODE_A.value(), 1L));
+        }
+        // Falha NÃO-timeout (status ERROR) na página do meio — prova o isolamento por página, sem
+        // cortar a página seguinte (diferente de um TIMEOUT, ver timeoutNumaPaginaCortaAsPaginasRestantesDoMesmoNo).
+        rpc.respondNext((cmd, body) ->
+                SeriesExistsBatchResponse.ok(Set.copyOf(((SeriesExistsBatchRequest) body).seriesKeys())));
+        rpc.respondNext((cmd, body) -> SeriesExistsBatchResponse.error("falha simulada na página do meio"));
+        rpc.respondNext((cmd, body) ->
+                SeriesExistsBatchResponse.ok(Set.copyOf(((SeriesExistsBatchRequest) body).seriesKeys())));
+
+        Map<String, SeriesVerification> result =
+                verifier.verify(List.of("p-0", "p-1", "p-2", "p-3", "p-4"));
+
+        assertEquals(SeriesVerification.PRESENT, result.get("p-0"));
+        assertEquals(SeriesVerification.PRESENT, result.get("p-1"));
+        assertEquals(SeriesVerification.UNVERIFIED, result.get("p-2"));
+        assertEquals(SeriesVerification.UNVERIFIED, result.get("p-3"));
+        assertEquals(SeriesVerification.PRESENT, result.get("p-4"), "a 3a página segue normalmente após a falha isolada da 2a");
+        assertEquals(3, rpc.calls().size(), "as 3 páginas foram todas chamadas — falha ERROR não corta o nó");
+    }
+
+    @Test
+    void timeoutNumaPaginaCortaAsPaginasRestantesDoMesmoNo() {
+        newVerifier(2);
+        for (int i = 0; i < 5; i++) {
+            placementLookup.cache("p-" + i, SeriesPlacement.active(NODE_A.value(), 1L));
+        }
+        placementLookup.cache("nodeB-0", SeriesPlacement.active(NODE_B.value(), 1L));
+        rpc.respondNext((cmd, body) ->
+                SeriesExistsBatchResponse.ok(Set.copyOf(((SeriesExistsBatchRequest) body).seriesKeys())));
+        rpc.respondNext((cmd, body) -> {
+            throw new NgrrdClusterException(ErrorCode.TIMEOUT, "timeout simulado no dono");
+        });
+        // Sem 3a resposta programada: se a implementação chamar a 3a página do mesmo nó, o
+        // RecordingClusterRpc lança IllegalStateException ("nenhuma resposta programada") e o teste falha.
+        rpc.respondDefault((cmd, body) -> SeriesExistsBatchResponse.ok(Set.of("nodeB-0")));
+
+        Map<String, SeriesVerification> result =
+                verifier.verify(List.of("p-0", "p-1", "p-2", "p-3", "p-4", "nodeB-0"));
+
+        assertEquals(SeriesVerification.PRESENT, result.get("p-0"));
+        assertEquals(SeriesVerification.PRESENT, result.get("p-1"));
+        assertEquals(SeriesVerification.UNVERIFIED, result.get("p-2"), "página que sofreu o TIMEOUT");
+        assertEquals(SeriesVerification.UNVERIFIED, result.get("p-3"), "mesma página do TIMEOUT");
+        assertEquals(SeriesVerification.UNVERIFIED, result.get("p-4"),
+                "página seguinte do MESMO nó, cortada sem RPC depois do TIMEOUT");
+        assertEquals(SeriesVerification.PRESENT, result.get("nodeB-0"), "outro nó segue normalmente");
+        long callsToNodeA = rpc.calls().stream().filter(call -> call.target().equals(NODE_A)).count();
+        assertEquals(2, callsToNodeA, "só as 2 primeiras páginas do nó A foram chamadas — a 3a foi cortada");
+    }
+
+    @Test
+    void respostaComStatusDeErroNaoViraAusencia() {
+        newVerifier(2_000);
+        placementLookup.cache("erro", SeriesPlacement.active(NODE_A.value(), 1L));
+        placementLookup.cache("statusNulo", SeriesPlacement.active(NODE_B.value(), 1L));
+        rpc.respondNext((cmd, body) -> SeriesExistsBatchResponse.error("falha simulada"));
+        rpc.respondNext((cmd, body) -> new SeriesExistsBatchResponse(null, Set.of(), null));
+
+        Map<String, SeriesVerification> result = verifier.verify(List.of("erro", "statusNulo"));
+
+        assertEquals(SeriesVerification.UNVERIFIED, result.get("erro"));
+        assertEquals(SeriesVerification.UNVERIFIED, result.get("statusNulo"));
+        assertEquals(2, rpc.calls().size(), "nenhuma reconfirmação no líder para chaves UNVERIFIED");
+        for (var call : rpc.calls()) {
+            assertEquals(Commands.SERIES_EXISTS_BATCH, call.command());
+        }
+    }
+
+    @Test
+    void respostaOkSemPresentNaoViraTodasAusentes() {
+        newVerifier(2_000);
+        placementLookup.cache("s1", SeriesPlacement.active(NODE_A.value(), 1L));
+        rpc.respondNext((cmd, body) -> new SeriesExistsBatchResponse(SeriesStatus.OK, null, null));
+
+        Map<String, SeriesVerification> result = verifier.verify(List.of("s1"));
+
+        assertEquals(SeriesVerification.UNVERIFIED, result.get("s1"));
+        assertEquals(1, rpc.calls().size(), "um OK sem present é tratado como falha da página, não como ausência");
+    }
+
+    @Test
     void semCapacidadeNoDonoMarcaChavesComoUnverifiedSemRpc() {
         newVerifier(2_000, CapabilityFixtures.advertisingByNode(Map.of(NODE_A.value(), Set.of())));
         placementLookup.cache("s1", SeriesPlacement.active(NODE_A.value(), 1L));
@@ -195,6 +289,19 @@ class SeriesVerifierTest {
 
         NgrrdClusterException ex = assertThrows(NgrrdClusterException.class,
                 () -> verifier.verify(List.of("inexistente")));
+
+        assertEquals(ErrorCode.REMOTE_ERROR, ex.code());
+    }
+
+    @Test
+    void falhaNoLookupDeReconfirmacaoDosAusentesLancaExcecao() {
+        newVerifier(2_000);
+        placementLookup.cache("s1", SeriesPlacement.active(NODE_A.value(), 1L));
+        rpc.respondNext((cmd, body) -> SeriesExistsBatchResponse.ok(Set.of())); // ausente no dono
+        rpc.respondNext((cmd, body) -> CatalogLookupResponse.error("falha simulada na reconfirmação"));
+
+        NgrrdClusterException ex = assertThrows(NgrrdClusterException.class,
+                () -> verifier.verify(List.of("s1")));
 
         assertEquals(ErrorCode.REMOTE_ERROR, ex.code());
     }

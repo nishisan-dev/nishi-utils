@@ -25,20 +25,19 @@ import java.util.Set;
  *
  * @param status  {@link SeriesStatus#OK} em caso de sucesso; {@link SeriesStatus#ERROR} para falha
  *                de aplicação
- * @param present chaves do pedido que existem fisicamente no volume local do respondente; nunca
- *                {@code null} (vazio quando ausente); uma chave do pedido ausente deste conjunto
- *                significa que o respondente não a possui
+ * @param present chaves do pedido que existem fisicamente no volume local do respondente; uma chave do
+ *                pedido ausente deste conjunto significa que o respondente não a possui. {@code null}
+ *                só ocorre numa resposta malformada (ex.: campo ausente na deserialização de um payload
+ *                de outra versão) — nunca produzido por {@link #ok(Set)}, e o cliente trata esse caso
+ *                como falha da página, nunca como "todas as chaves ausentes"
  * @param message detalhe legível do erro, ou {@code null}
  */
 public record SeriesExistsBatchResponse(SeriesStatus status, Set<String> present, String message) {
 
-    public SeriesExistsBatchResponse {
-        present = Set.copyOf(Objects.requireNonNullElse(present, Set.of()));
-    }
-
-    /** Resposta de sucesso, com o subconjunto de chaves presentes no volume local. */
+    /** Resposta de sucesso, com o subconjunto de chaves presentes no volume local; {@code present} nunca {@code null}. */
     public static SeriesExistsBatchResponse ok(Set<String> present) {
-        return new SeriesExistsBatchResponse(SeriesStatus.OK, present, null);
+        return new SeriesExistsBatchResponse(SeriesStatus.OK, Set.copyOf(Objects.requireNonNull(present, "present")),
+                null);
     }
 
     /** Resposta de falha de aplicação. */
