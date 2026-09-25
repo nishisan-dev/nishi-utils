@@ -62,6 +62,10 @@ import java.util.Objects;
  * @param reconcileMissing           M4: séries {@code ACTIVE} no catálogo local mas ausentes do volume,
  *                                   detectadas no último ciclo
  * @param reconcileLastDurationMs    M4: duração do último ciclo do {@code LocalReconciler}, em ms
+ * @param leaderConfirmations        leituras fortes de placement feitas no líder para confirmar o dono
+ *                                   de uma série sem objeto no volume antes de criá-la ou de responder
+ *                                   {@code NOT_FOUND} a um {@code OPEN} (issue #174)
+ * @param leaderConfirmationLatency  latência dessas leituras fortes
  */
 public record NodeMetricsSnapshot(
         String nodeId,
@@ -88,7 +92,9 @@ public record NodeMetricsSnapshot(
         long reconcileOrphansDeleted,
         long reconcileUnplaced,
         long reconcileMissing,
-        long reconcileLastDurationMs) {
+        long reconcileLastDurationMs,
+        long leaderConfirmations,
+        LatencySnapshot leaderConfirmationLatency) {
 
     public NodeMetricsSnapshot {
         Objects.requireNonNull(nodeId, "nodeId é obrigatório");
@@ -96,5 +102,21 @@ public record NodeMetricsSnapshot(
         writeBatchLatency = Objects.requireNonNullElse(writeBatchLatency, LatencySnapshot.EMPTY);
         checkpointLatency = Objects.requireNonNullElse(checkpointLatency, LatencySnapshot.EMPTY);
         readLatency = Objects.requireNonNullElse(readLatency, LatencySnapshot.EMPTY);
+        leaderConfirmationLatency = Objects.requireNonNullElse(leaderConfirmationLatency, LatencySnapshot.EMPTY);
+    }
+
+    /** Assinatura anterior à 8.6.0, sem as métricas de confirmação no líder (zeradas). */
+    public NodeMetricsSnapshot(String nodeId, long capturedAtEpochMs, boolean leader, long seriesCount,
+            long usedBytes, long capacityBytes, int openHandles, long writeBatches, long samplesWritten,
+            long samplesFailed, long checkpoints, long flushes, long reads, LatencySnapshot writeBatchLatency,
+            LatencySnapshot checkpointLatency, LatencySnapshot readLatency, Map<SeriesStatus, Long> errorsByStatus,
+            BlobVolumeSummary blobStats, long migrationsIn, long migrationsOut, long reconcileAdopted,
+            long reconcileOrphansDeleted, long reconcileUnplaced, long reconcileMissing,
+            long reconcileLastDurationMs) {
+        this(nodeId, capturedAtEpochMs, leader, seriesCount, usedBytes, capacityBytes, openHandles, writeBatches,
+                samplesWritten, samplesFailed, checkpoints, flushes, reads, writeBatchLatency, checkpointLatency,
+                readLatency, errorsByStatus, blobStats, migrationsIn, migrationsOut, reconcileAdopted,
+                reconcileOrphansDeleted, reconcileUnplaced, reconcileMissing, reconcileLastDurationMs, 0L,
+                LatencySnapshot.EMPTY);
     }
 }

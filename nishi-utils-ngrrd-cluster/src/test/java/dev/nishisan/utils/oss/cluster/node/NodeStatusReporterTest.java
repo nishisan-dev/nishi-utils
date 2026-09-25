@@ -76,6 +76,7 @@ import static org.junit.jupiter.api.Assertions.fail;
 class NodeStatusReporterTest {
 
     private static final String VOLUME_NAME = "ngrrd";
+    private static final LatencySnapshot LEADER_CONFIRMATION_LATENCY = new LatencySnapshot(5L, 400L, 900L, 1_200L);
 
     private NGridCluster cluster;
     private BlobVolumeRegistry volumeRegistry;
@@ -107,7 +108,7 @@ class NodeStatusReporterTest {
         CatalogService catalog = CatalogService.from(node);
         StorageRequestHandler.StorageHandlerMetrics handlerMetrics = new StorageRequestHandler.StorageHandlerMetrics(
                 7L, 42L, 1L, 3L, 2L, 1L, Map.of(SeriesStatus.ERROR, 1L), LatencySnapshot.EMPTY, LatencySnapshot.EMPTY,
-                LatencySnapshot.EMPTY);
+                LatencySnapshot.EMPTY, 5L, LEADER_CONFIRMATION_LATENCY);
         return new NodeStatusReporter(catalog, volume, registry, "storage-real", 1_000_000L, interval, clock,
                 () -> handlerMetrics, () -> true, listener);
     }
@@ -136,6 +137,8 @@ class NodeStatusReporterTest {
         assertEquals(3L, snapshot.reads());
         assertEquals(2L, snapshot.checkpoints());
         assertEquals(1L, snapshot.flushes());
+        assertEquals(5L, snapshot.leaderConfirmations());
+        assertEquals(LEADER_CONFIRMATION_LATENCY, snapshot.leaderConfirmationLatency());
         assertEquals(1L, snapshot.errorsByStatus().get(SeriesStatus.ERROR));
         assertEquals(0L, snapshot.migrationsIn());
         assertEquals(0L, snapshot.migrationsOut());

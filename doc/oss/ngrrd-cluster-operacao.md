@@ -397,6 +397,7 @@ funciona como cancelamento imediato das migrações em curso.
 | Queda sem drenagem | Restaure o processo, conectividade e volume originais. O cluster não transfere automaticamente séries de um nó caído para um nó vazio: elas não têm réplica. |
 | Disco/volume perdido | A recuperação depende de backup ou reprocessamento da fonte. Subir um nó vazio com o mesmo ID não recupera o histórico. |
 | Mudar host ou porta mantendo o storage | Pare a instância antiga, preserve os diretórios e a identidade, ajuste endereço e seed/peers e inicie a nova instância. O catálogo referencia o ID; o NGrid divulga o novo endereço. Não execute simultaneamente duas instâncias com o mesmo ID/volume. Atualize seeds de clientes que apontavam ao endereço antigo. |
+| Reinício de uma origem logo após concluir migrações | Sem procedimento especial. Enquanto a réplica local do catálogo do nó reiniciado ainda aponta para ele, um `open` com criação de uma série que já saiu dali é confirmado no líder e redirecionado ao novo dono — nada é recriado no nó reiniciado ([issue #174](#confirmação-do-dono-antes-de-criar-issue-174)). |
 | Líder cai durante migração | Restaure maioria e aguarde a nova eleição. O novo líder consulta o destino: confirma a troca se a cópia estiver commitada ou tenta reverter a migração. Acompanhe catálogo, erros e backlog; não remova cópias manualmente durante a resolução. |
 
 Com três storage nodes, a queda de um permite manter a maioria de coordenação; com dois,
@@ -608,9 +609,87 @@ Valem para todos os clientes depois de atualizar os storages, mesmo sem usar as 
   a chamada falha com `TIMEOUT` (leitura forte que só falhou no transporte) ou
   `UNSUPPORTED_BY_NODE` (nenhum status publicado até o fim do prazo) em vez de completar — trate
   como transitório e retente.
-- **Limitação conhecida (issue #174):** o estado "esquecida" (`isForgotten`) que o storage usa
-  para não confundir uma reconciliação em andamento com uma série realmente ausente é só em
-  memória. Se a origem de uma migração reiniciar logo depois de concluir o `FINISH`, a marca se
-  perde e a checagem volta a depender só da confirmação forte do líder — sem impacto de
-  corretude (o líder continua sendo a fonte de verdade), mas a janela de proteção contra um
-  `NOT_FOUND` prematuro fica menor até o próximo ciclo de reconciliação.
+- **`NOT_FOUND` e criação compartilham a confirmação.** A mesma leitura forte vale para o
+  `OPEN` com criação quando a série não tem objeto no volume do dono — ver a seção seguinte.
+
+## Confirmação do dono antes de criar (issue #174)
+
+### O que muda
+
+Ao concluir uma migração, a origem marca a série como esquecida e apaga a cópia local. A marca é
+só em memória: se a origem **reiniciar** logo após o `finish` com a réplica local do catálogo ainda
+em `ACTIVE(origem)`, um `open` com criação (o caminho padrão da ingestão) chegava ali com dono
+confirmado pela réplica local e **recriava a série vazia** no dono antigo; as escritas dessa janela
+iam para a cópia órfã e se perdiam quando o `LocalReconciler` a removia.
+
+Um storage recém-reiniciado aceita `OPEN` enquanto a réplica do catálogo ainda está em catch-up: o
+`NGridNode` não espera a réplica convergir para subir, e a leitura local do catálogo não tem gate de
+sincronização. A janela é real e o storage passou a tratar o caso na origem:
+
+- **`OPEN` com criação, série fechada e objeto ausente no volume, dono decidido só pela réplica
+  local** → o storage confirma o dono no líder (`placementStrong`) antes de criar. Outro dono →
+  `WRONG_OWNER(dono)` (o cliente segue direto para ele); `MIGRATING` → `MIGRATING`; sem placement →
+  `WRONG_OWNER` sem dono (o cliente re-resolve no líder); falha da consulta → `ERROR` (nunca cria
+  às cegas). Nenhuma mudança de protocolo nem de cliente.
+- **Marcas em memória com limite.** A marca de série esquecida sai quando a réplica local já mostra
+  outro dono — na própria requisição (a escrita atrasada é redirecionada sem ir ao líder) ou no
+  ciclo seguinte do `LocalReconciler` (`forgottenPruned` na linha `NGRRD_RECONCILE`). O `CLOSE`
+  explícito do cliente não guarda mais marca por série: descarta a definição em cache, e sem ela a
+  reabertura automática não acontece.
+
+### Custo
+
+Série nova e série de origem reiniciada têm a mesma assinatura no dono (placement `ACTIVE(self)`,
+objeto ainda inexistente), então **a criação de uma série nova paga até uma leitura forte no líder
+além do `PLACE`**. Não paga nada a mais quando a réplica local do dono ainda não recebeu o placement
+recém-feito — esse caso já confirmava o dono no líder antes desta versão. Séries já existentes no
+volume ou já abertas não pagam nada.
+
+Acompanhe pelas métricas `leaderConfirmations`/`leaderConfirmationLatency` do
+`NodeMetricsSnapshot` (também em `NGRRD_NODE_STATUS`: `leaderConfirmations`,
+`leaderConfirmationP99us`). Medição em criação em massa:
+
+`BulkCreateLeaderCostClusterTest` (perfil `ngrrd-cluster`): 3 storages in-process, 5 000 séries
+novas, 16 `open` concorrentes, JDK 21, uma máquina (NVMe, ext4). Linha de base = `a3f8e1a`
+(8.6.0 sem esta correção), 8 execuções seguidas de cada lado:
+
+| | Linha de base | Com a confirmação |
+|---|---|---|
+| Tempo total (mediana; faixa) | 16,6 s (11,1–59,4 s) | 10,5 s (9,9–51,8 s) |
+| `open` p99 (mediana das execuções) | 73 ms | 46 ms |
+| `PLACE` por execução | 5 048–5 064 | 5 048–5 064 |
+| Retentativas do cliente | nenhuma | nenhuma |
+| Confirmações no líder por série nova | — | 0,34–0,36 |
+| … feitas no próprio líder (leitura local) | — | ≈ 1 667 por execução, p99 ≤ 6 µs |
+| … feitas por RPC de um storage não líder | — | 50–110 por execução (≈ 1–2 % das séries), p50 0,6–1,3 ms, p99 ≤ 9 ms |
+
+Leitura dos números:
+
+- A confirmação só acontece quando a réplica local do dono já tem o placement. No líder isso é
+  sempre verdade (foi ele que gravou), mas a leitura forte ali é local. Num storage não líder, o
+  `OPEN` que chega logo depois do `PLACE` quase sempre encontra a réplica ainda sem o placement e
+  já confirmava no líder pelo hint antes desta versão — por isso só ~1–2 % das séries pagam um RPC
+  a mais. A fração depende do atraso de replicação em relação ao `PLACE`→`OPEN` do cliente; com mais
+  storages, a parcela do líder (confirmação local) diminui e a dos demais aumenta.
+- A variação do tempo total é dominada pelo disco, igual nos dois lados: 2 a 3 de cada 8
+  execuções caíram num modo lento (40–60 s, p99 ≈ 1 s). Um dump de threads (incluindo virtual
+  threads) tirado durante o modo lento mostrou os handlers de `OPEN` em `fsync` da pré-alocação
+  (`MappedShard.forceRange`, `CatalogJournal.append`) e na fila do lock de alocação do volume —
+  nenhum na confirmação no líder. As medianas acima não indicam custo mensurável da confirmação.
+- Extrapolação para uma carga inicial de ~357 mil séries com 3 storages: ~120 mil confirmações, a
+  maior parte local no líder, e da ordem de 4–7 mil RPCs extras ao líder somando os demais
+  storages. O `PLACE` (um por série) continua sendo o custo dominante no líder.
+
+Numa carga inicial grande, dimensione a concorrência de `open` do cliente considerando que o
+líder atende, além dos `PLACE`, uma leitura forte por série nova.
+
+**Disponibilidade:** a criação passa a depender do líder também no dono. Uma série já colocada mas
+ainda sem objeto no volume (o cliente caiu entre o `PLACE` e o `OPEN`, por exemplo) não é criada
+enquanto não houver líder alcançável: o `OPEN` responde `ERROR` e o cliente retenta dentro do
+`retryTimeout`. Séries com objeto no volume continuam abrindo sem o líder, como antes. Séries novas
+já dependiam do líder para o `PLACE`, então nada muda para elas.
+
+**Migração em curso:** uma decisão de dono tomada pelo líder (réplica local vazia, hint do cliente
+ou série esquecida) que encontre a série em `MIGRATING` com dono = este nó responde `MIGRATING`,
+salvo durante a cópia online da própria origem — mesmo critério que já valia para a réplica local.
+Antes, esse caminho respondia `OK` e a série podia ser aberta ou escrita durante a troca de dono.

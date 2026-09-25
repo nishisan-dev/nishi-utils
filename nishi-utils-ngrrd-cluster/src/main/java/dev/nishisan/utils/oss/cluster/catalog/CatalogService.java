@@ -106,6 +106,7 @@ public final class CatalogService implements CatalogView {
     }
 
     /** Leitura eventual do placement da série, a partir da cópia replicada local. */
+    @Override
     public Optional<SeriesPlacement> placementLocal(String seriesKey) {
         return catalog.getOptional(seriesKey, Consistency.EVENTUAL);
     }
