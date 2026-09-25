@@ -20,6 +20,7 @@ package dev.nishisan.utils.oss.cluster.node;
 import dev.nishisan.utils.ngrid.cluster.coordination.LeadershipListener;
 import dev.nishisan.utils.ngrid.cluster.transport.TransportListener;
 import dev.nishisan.utils.ngrid.common.NodeId;
+import dev.nishisan.utils.ngrid.map.MapClusterService;
 import dev.nishisan.utils.ngrid.structures.NGrid;
 import dev.nishisan.utils.ngrid.structures.NGridNode;
 import dev.nishisan.utils.ngrid.structures.NGridNodeBuilder;
@@ -27,6 +28,7 @@ import dev.nishisan.utils.oss.blob.BlobVolume;
 import dev.nishisan.utils.oss.blob.BlobVolumeRegistry;
 import dev.nishisan.utils.oss.blob.NgrrdBlob;
 import dev.nishisan.utils.oss.cluster.admin.AdminService;
+import dev.nishisan.utils.oss.cluster.catalog.CatalogReplicaStatus;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
 import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
@@ -220,6 +222,10 @@ public final class NgrrdStorageNode implements Closeable {
                         catalog, statusReporter::metricsSnapshot, rpc, rebalancer, adminService, migrationCoordinator);
 
                 statusReporter.distribution(cfg.distributionMode(), cfg.weight());
+                // Issue #177: lag POR TÓPICO do catálogo (o lag global do snapshot operacional não serve).
+                String catalogTopic = MapClusterService.topicFor(CatalogService.CATALOG_MAP);
+                statusReporter.catalogReplication(() -> CatalogReplicaStatus.from(node.coordinator().isLeader(),
+                        node.replicationManager().getTopicReplicationStatuses().get(catalogTopic)));
                 node.transport().addListener(geometryService);
                 rpc.registerLocalHandler(geometryService);
                 node.transport().addListener(storageHandler);

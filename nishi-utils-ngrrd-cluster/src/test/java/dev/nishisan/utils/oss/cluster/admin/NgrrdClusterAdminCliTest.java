@@ -27,6 +27,7 @@ import dev.nishisan.utils.oss.cluster.api.NgrrdClusterConfig;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.api.SeriesInfo;
 import dev.nishisan.utils.oss.cluster.api.SeriesVerification;
+import dev.nishisan.utils.oss.cluster.catalog.CatalogReplicaStatus;
 import dev.nishisan.utils.oss.cluster.catalog.NodeState;
 import dev.nishisan.utils.oss.cluster.catalog.StorageCapabilities;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
@@ -136,6 +137,47 @@ class NgrrdClusterAdminCliTest {
         assertTrue(node0.endsWith("catalog.lookup,open.createIfMissing,series.exists.batch"), node0);
         String node1 = lineOf(capture.out, "storage-1");
         assertTrue(node1.endsWith(" -"), "nó sem capacidades anunciadas deveria mostrar '-': " + node1);
+    }
+
+    @Test
+    void statusImprimeOLagDaReplicaDoCatalogoPorNo() {
+        ClientFake client = new ClientFake();
+        client.statusResponse = new AdminStatusResponse(SeriesStatus.OK, "storage-lider",
+                List.of(
+                        viewWithReplica("storage-lider", CatalogReplicaStatus.ofLeader()),
+                        viewWithReplica("storage-emdia", new CatalogReplicaStatus(false, 12L, 500L, 489L, false, false,
+                                true)),
+                        viewWithReplica("storage-sync", new CatalogReplicaStatus(false, 0L, 500L, 1L, true, false,
+                                false)),
+                        viewWithReplica("storage-boot", new CatalogReplicaStatus(false, 0L, 500L, 1L, false, true,
+                                false)),
+                        viewWithReplica("storage-desconh", CatalogReplicaStatus.from(false, null)),
+                        viewWithReplica("storage-antigo", null)),
+                0, Map.of());
+
+        Capture capture = run(new String[] {"--seed", "127.0.0.1:9000", "status"}, cfg -> client);
+
+        assertEquals(0, capture.exitCode);
+        String header = capture.out.lines().filter(line -> line.startsWith("NODE ")).findFirst().orElseThrow();
+        assertTrue(header.contains(" CAT_LAG "), header);
+        assertTrue(header.indexOf("CAT_LAG") < header.indexOf("CAPABILITIES"), header);
+        assertEquals("lider", catLagOf(capture.out, "storage-lider"));
+        assertEquals("12", catLagOf(capture.out, "storage-emdia"));
+        assertEquals("sync", catLagOf(capture.out, "storage-sync"));
+        assertEquals("boot", catLagOf(capture.out, "storage-boot"));
+        assertEquals("?", catLagOf(capture.out, "storage-desconh"));
+        assertEquals("-", catLagOf(capture.out, "storage-antigo"));
+    }
+
+    private static NodeStatusView viewWithReplica(String nodeId, CatalogReplicaStatus replica) {
+        return new NodeStatusView(new StorageNodeStatus(nodeId, NodeState.ACTIVE, 1, 10, 100, 1L,
+                DistributionMode.COUNT, 1, 0, StorageCapabilities.ALL, replica), true);
+    }
+
+    /** Penúltima coluna da linha do nó (a última é CAPABILITIES, sem espaços). */
+    private static String catLagOf(String output, String nodeId) {
+        String[] columns = lineOf(output, nodeId).trim().split("\\s+");
+        return columns[columns.length - 2];
     }
 
     private static String lineOf(String output, String nodeId) {

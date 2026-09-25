@@ -26,6 +26,7 @@ import dev.nishisan.utils.oss.api.Sample;
 import dev.nishisan.utils.oss.blob.BlobVolume;
 import dev.nishisan.utils.oss.blob.BlobVolumeRegistry;
 import dev.nishisan.utils.oss.blob.NgrrdBlob;
+import dev.nishisan.utils.oss.cluster.catalog.CatalogReplicaStatus;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogView;
 import dev.nishisan.utils.oss.cluster.catalog.NodeState;
@@ -64,6 +65,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -215,6 +217,57 @@ class NodeStatusReporterTest {
             reporter.start();
             awaitTrue("status deveria ter sido publicado", () -> !catalog.published.isEmpty());
             assertEquals(StorageCapabilities.ALL, catalog.published.get(0).capabilities());
+        } finally {
+            reporter.close();
+        }
+    }
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+    void statusPublicadoLevaOLagDaReplicaDoCatalogo() throws InterruptedException {
+        CatalogViewFake catalog = new CatalogViewFake();
+        CatalogReplicaStatus replica = new CatalogReplicaStatus(false, 42L, 1_000L, 959L, false, false, true);
+        NodeStatusReporter reporter = reporterWithFakeCatalog(catalog, Duration.ofMillis(30));
+        reporter.catalogReplication(() -> replica);
+        try {
+            reporter.start();
+            awaitTrue("status deveria ter sido publicado", () -> !catalog.published.isEmpty());
+            assertEquals(replica, catalog.published.get(0).catalogReplica());
+        } finally {
+            reporter.close();
+        }
+    }
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+    void falhaAoLerAReplicaDoCatalogoAindaPublicaOStatusSemOCampo() throws InterruptedException {
+        CatalogViewFake catalog = new CatalogViewFake();
+        AtomicInteger supplierCalls = new AtomicInteger();
+        NodeStatusReporter reporter = reporterWithFakeCatalog(catalog, Duration.ofMillis(30));
+        reporter.catalogReplication(() -> {
+            supplierCalls.incrementAndGet();
+            throw new IllegalStateException("replicação ainda não inicializada (simulado)");
+        });
+        try {
+            reporter.start();
+            awaitTrue("status deveria ter sido publicado mesmo com o supplier falhando",
+                    () -> !catalog.published.isEmpty());
+            assertNull(catalog.published.get(0).catalogReplica());
+            assertTrue(supplierCalls.get() >= 1, "o supplier deveria ter sido consultado");
+        } finally {
+            reporter.close();
+        }
+    }
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+    void semSupplierDeReplicaPublicaOStatusSemOCampo() throws InterruptedException {
+        CatalogViewFake catalog = new CatalogViewFake();
+        NodeStatusReporter reporter = reporterWithFakeCatalog(catalog, Duration.ofMillis(30));
+        try {
+            reporter.start();
+            awaitTrue("status deveria ter sido publicado", () -> !catalog.published.isEmpty());
+            assertNull(catalog.published.get(0).catalogReplica());
         } finally {
             reporter.close();
         }

@@ -21,6 +21,7 @@ import dev.nishisan.utils.oss.cluster.NgrrdCluster;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterClient;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterConfig;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
+import dev.nishisan.utils.oss.cluster.catalog.CatalogReplicaStatus;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
 import dev.nishisan.utils.oss.cluster.protocol.AdminStatusResponse;
@@ -135,14 +136,14 @@ public final class NgrrdClusterAdminCli {
 
     private void printStatus(AdminStatusResponse response, PrintStream out) {
         out.println("LIDER: " + response.leaderNodeId());
-        out.printf(Locale.ROOT, "%-24s %-10s %-10s %8s %14s %7s %10s %10s %14s %s%n", "NODE", "STATE", "REACHABLE",
-                "SERIES", "BYTES", "FILL%", "MODE", "WEIGHT", "RESERVED", "CAPABILITIES");
+        out.printf(Locale.ROOT, "%-24s %-10s %-10s %8s %14s %7s %10s %10s %14s %8s %s%n", "NODE", "STATE",
+                "REACHABLE", "SERIES", "BYTES", "FILL%", "MODE", "WEIGHT", "RESERVED", "CAT_LAG", "CAPABILITIES");
         for (NodeStatusView view : response.nodes()) {
             StorageNodeStatus status = view.status();
-            out.printf(Locale.ROOT, "%-24s %-10s %-10s %8d %14d %6.1f%% %10s %10.3f %14d %s%n", status.nodeId(),
+            out.printf(Locale.ROOT, "%-24s %-10s %-10s %8d %14d %6.1f%% %10s %10.3f %14d %8s %s%n", status.nodeId(),
                     status.state(), view.reachable(), status.seriesCount(), status.usedBytes(),
                     status.fillRatio() * 100.0, status.distributionMode(), status.weight(), status.reservedBytes(),
-                    formatCapabilities(status));
+                    CatalogReplicaStatus.describeLag(status.catalogReplica()), formatCapabilities(status));
         }
         out.println("MIGRACOES EM CURSO: " + response.migrationsInFlight());
         out.println("GEOMETRIAS PENDENTES: " + response.geometriesPending());

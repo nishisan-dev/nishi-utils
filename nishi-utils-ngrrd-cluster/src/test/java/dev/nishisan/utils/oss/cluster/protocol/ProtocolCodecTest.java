@@ -29,6 +29,7 @@ import dev.nishisan.utils.oss.api.Durability;
 import dev.nishisan.utils.oss.api.OnGeometryChange;
 import dev.nishisan.utils.oss.api.SeriesResult;
 import dev.nishisan.utils.oss.api.ViewQuery;
+import dev.nishisan.utils.oss.cluster.catalog.CatalogReplicaStatus;
 import dev.nishisan.utils.oss.cluster.catalog.NodeState;
 import dev.nishisan.utils.oss.cluster.catalog.PlacementState;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
@@ -398,6 +399,25 @@ class ProtocolCodecTest {
                 List.of(new NodeStatusView(nodeA, true), new NodeStatusView(nodeB, false)), 1,
                 Map.of("node-a", 120L, "node-b", 80L));
         assertEquals(original, roundTripResponseBody(Commands.ADMIN_STATUS, original));
+    }
+
+    @Test
+    void adminStatusResponseComReplicaDoCatalogoSobreviveAoRoundTrip() throws IOException {
+        StorageNodeStatus leader = new StorageNodeStatus("node-a", NodeState.ACTIVE, 1, 2, 3, 4L,
+                DistributionMode.COUNT, 1, 0, StorageCapabilities.ALL, CatalogReplicaStatus.ofLeader());
+        StorageNodeStatus follower = new StorageNodeStatus("node-b", NodeState.ACTIVE, 1, 2, 3, 4L,
+                DistributionMode.COUNT, 1, 0, StorageCapabilities.ALL,
+                new CatalogReplicaStatus(false, 7L, 900L, 894L, false, false, true));
+        StorageNodeStatus legacy = new StorageNodeStatus("node-c", NodeState.ACTIVE, 1, 2, 3, 4L);
+        AdminStatusResponse original = new AdminStatusResponse(SeriesStatus.OK, "node-a",
+                List.of(new NodeStatusView(leader, true), new NodeStatusView(follower, true),
+                        new NodeStatusView(legacy, true)), 0, Map.of());
+
+        AdminStatusResponse roundTripped = roundTripResponseBody(Commands.ADMIN_STATUS, original);
+
+        assertEquals(original, roundTripped);
+        assertEquals(follower.catalogReplica(), roundTripped.nodes().get(1).status().catalogReplica());
+        assertNull(roundTripped.nodes().get(2).status().catalogReplica());
     }
 
     @Test

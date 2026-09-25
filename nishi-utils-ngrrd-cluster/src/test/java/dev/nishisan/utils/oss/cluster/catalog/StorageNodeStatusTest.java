@@ -34,6 +34,7 @@ import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -221,6 +222,81 @@ class StorageNodeStatusTest {
         assertEquals("open.createIfMissing", StorageCapabilities.OPEN_CREATE_IF_MISSING);
         assertEquals("series.exists.batch", StorageCapabilities.SERIES_EXISTS_BATCH);
         assertEquals(Set.of("catalog.lookup", "open.createIfMissing", "series.exists.batch"), StorageCapabilities.ALL);
+    }
+
+    @Test
+    void statusSerializadoPelaVersao860SemReplicaDoCatalogoLeReplicaNula() throws Exception {
+        try (ObjectInputStream in = new ObjectInputStream(
+                getClass().getResourceAsStream("/legacy-catalog/node-8.6.0.ser"))) {
+            StorageNodeStatus status = (StorageNodeStatus) in.readObject();
+
+            assertEquals("legacy-860", status.nodeId());
+            assertEquals(11, status.seriesCount());
+            assertEquals(StorageCapabilities.ALL, status.capabilities());
+            assertNull(status.catalogReplica());
+        }
+    }
+
+    @Test
+    void statusReplicadoPelaVersao860SemReplicaDoCatalogoLeReplicaNula() {
+        // Bytes produzidos pelo MapReplicationCodec com o record de 10 componentes da 8.6.0.
+        String legacy = "{\"type\":\"PUT\",\"key\":\"legacy-860\",\"value\":{\"@class\":"
+                + "\"dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus\",\"nodeId\":\"legacy-860\","
+                + "\"state\":\"ACTIVE\",\"seriesCount\":11,\"usedBytes\":3072,\"capacityBytes\":60000,"
+                + "\"reportedAtEpochMs\":9876,\"distributionMode\":\"WEIGHT\",\"weight\":1.5,\"reservedBytes\":200,"
+                + "\"capabilities\":[\"java.util.ImmutableCollections$Set12\",[\"catalog.lookup\"]]}}";
+
+        MapReplicationCommand command = MapReplicationCodec.decode(legacy.getBytes(StandardCharsets.UTF_8));
+
+        StorageNodeStatus status = (StorageNodeStatus) command.value();
+        assertEquals("legacy-860", status.nodeId());
+        assertEquals(Set.of(StorageCapabilities.CATALOG_LOOKUP), status.capabilities());
+        assertNull(status.catalogReplica());
+    }
+
+    @Test
+    void replicaDoCatalogoSobreviveAReplicacaoDoMapa() {
+        StorageNodeStatus original = withCatalogReplica(
+                new CatalogReplicaStatus(false, 12L, 5_000L, 4_989L, false, false, true));
+
+        MapReplicationCommand decoded = MapReplicationCodec.decode(
+                MapReplicationCodec.encode(MapReplicationCommand.put(original.nodeId(), original)));
+
+        assertEquals(original, decoded.value());
+        assertEquals(original.catalogReplica(), ((StorageNodeStatus) decoded.value()).catalogReplica());
+    }
+
+    @Test
+    void replicaDoCatalogoSobreviveAoObjectOutputStream() throws IOException, ClassNotFoundException {
+        StorageNodeStatus original = withCatalogReplica(CatalogReplicaStatus.ofLeader());
+
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (ObjectOutputStream out = new ObjectOutputStream(bytes)) {
+            out.writeObject(original);
+        }
+        try (ObjectInputStream in = new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray()))) {
+            assertEquals(original, in.readObject());
+        }
+    }
+
+    @Test
+    void construtoresAnterioresDeixamAReplicaDoCatalogoNula() {
+        assertNull(new StorageNodeStatus("node-a", NodeState.ACTIVE, 0, 0, 0, 1L).catalogReplica());
+        assertNull(withCapabilities(StorageCapabilities.ALL).catalogReplica());
+    }
+
+    @Test
+    void transicoesPreservamAReplicaDoCatalogo() {
+        CatalogReplicaStatus replica = new CatalogReplicaStatus(false, 3L, 100L, 98L, false, false, true);
+        StorageNodeStatus status = withCatalogReplica(replica);
+
+        assertEquals(replica, status.withLoad(1, 2, 3, 4L).catalogReplica());
+        assertEquals(replica, status.withState(NodeState.DRAINING, 4L).catalogReplica());
+    }
+
+    private static StorageNodeStatus withCatalogReplica(CatalogReplicaStatus replica) {
+        return new StorageNodeStatus("node-a", NodeState.ACTIVE, 1, 2, 3, 4L, DistributionMode.COUNT, 1, 0,
+                StorageCapabilities.ALL, replica);
     }
 
     private static StorageNodeStatus withCapabilities(Set<String> capabilities) {

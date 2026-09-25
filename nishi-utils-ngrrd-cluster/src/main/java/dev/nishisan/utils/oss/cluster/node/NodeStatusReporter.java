@@ -20,6 +20,7 @@ package dev.nishisan.utils.oss.cluster.node;
 import dev.nishisan.utils.ngrid.cluster.coordination.LeadershipListener;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.oss.blob.BlobVolume;
+import dev.nishisan.utils.oss.cluster.catalog.CatalogReplicaStatus;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogView;
 import dev.nishisan.utils.oss.cluster.catalog.NodeState;
 import dev.nishisan.utils.oss.cluster.catalog.StorageCapabilities;
@@ -112,6 +113,20 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
     public void distribution(dev.nishisan.utils.oss.cluster.placement.DistributionMode mode, double weight) {
         this.distributionMode = mode;
         this.weight = weight;
+    }
+    /**
+     * Fonte do estado da réplica local do catálogo publicado em {@link StorageNodeStatus#catalogReplica()}
+     * (issue #177); {@code null} = não configurada (o campo sai {@code null}).
+     */
+    private volatile Supplier<CatalogReplicaStatus> catalogReplication;
+
+    /**
+     * Configura a fonte do estado da réplica local do catálogo publicado a cada status e logado no
+     * {@code NGRRD_NODE_STATUS} ({@code catalogLag=}). Uma falha do supplier nunca impede a publicação:
+     * o status sai com o campo {@code null}.
+     */
+    public void catalogReplication(Supplier<CatalogReplicaStatus> supplier) {
+        this.catalogReplication = supplier;
     }
     private final Duration interval;
     private final Clock clock;
@@ -263,11 +278,12 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
         LOGGER.info(String.format(Locale.ROOT,
                 "NGRRD_NODE_STATUS nodeId=%s leader=%s series=%d usedBytes=%d openHandles=%d samples/s=%.1f "
                         + "writeBatchP99us=%d checkpointP99us=%d readP99us=%d leaderConfirmations=%d "
-                        + "leaderConfirmationP99us=%d",
+                        + "leaderConfirmationP99us=%d catalogLag=%s",
                 snapshot.nodeId(), snapshot.leader(), snapshot.seriesCount(), snapshot.usedBytes(),
                 snapshot.openHandles(), samplesPerSecond, snapshot.writeBatchLatency().p99Micros(),
                 snapshot.checkpointLatency().p99Micros(), snapshot.readLatency().p99Micros(),
-                snapshot.leaderConfirmations(), snapshot.leaderConfirmationLatency().p99Micros()));
+                snapshot.leaderConfirmations(), snapshot.leaderConfirmationLatency().p99Micros(),
+                CatalogReplicaStatus.describeLag(safeCatalogReplica())));
         if (metricsListener != null) {
             metricsListener.onNodeMetrics(snapshot);
         }
@@ -431,7 +447,8 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
             // histórico algum.
             NodeState state = strong.map(StorageNodeStatus::state).orElse(NodeState.ACTIVE);
             catalog.putNodeStatus(new StorageNodeStatus(nodeId, state, seriesCount, usedBytes, capacityBytes, now,
-                    distributionMode, weight, volume.storage().reservedBytes(), StorageCapabilities.ALL));
+                    distributionMode, weight, volume.storage().reservedBytes(), StorageCapabilities.ALL,
+                    safeCatalogReplica()));
         } finally {
             publishing.set(false);
         }
@@ -450,6 +467,24 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
             LOGGER.log(Level.FINE, "Falha ao ler estatísticas do volume do nó " + nodeId
                     + " (provavelmente já fechado) — snapshot de métricas degradado", e);
             return EMPTY_VOLUME_STATS;
+        }
+    }
+
+    /**
+     * Estado atual da réplica do catálogo, ou {@code null} sem supplier configurado ou se ele falhar (log
+     * FINE) — a publicação do status nunca depende dele.
+     */
+    private CatalogReplicaStatus safeCatalogReplica() {
+        Supplier<CatalogReplicaStatus> supplier = catalogReplication;
+        if (supplier == null) {
+            return null;
+        }
+        try {
+            return supplier.get();
+        } catch (RuntimeException e) {
+            LOGGER.log(Level.FINE, "Falha ao ler o estado da réplica do catálogo do nó " + nodeId
+                    + " — status publicado sem o campo", e);
+            return null;
         }
     }
 
