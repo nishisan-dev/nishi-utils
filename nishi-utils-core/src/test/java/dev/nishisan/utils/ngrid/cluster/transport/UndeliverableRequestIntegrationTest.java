@@ -73,7 +73,10 @@ class UndeliverableRequestIntegrationTest {
             // C dies (closing it here; the try-with-resources close at the end is idempotent). A still
             // routes to C via B: the gossip route survives the death.
             transC.close();
-            await(() -> !transB.isConnected(infoC.nodeId()), "B sees C gone");
+            // send() prefers an open direct socket even when the router says PROXY.
+            // Wait for both readers to observe EOF before testing the relay-only path.
+            await(() -> !transB.isConnected(infoC.nodeId()) && !transA.isConnected(infoC.nodeId()),
+                    "A and B see C gone");
             transA.getRouter().markDirectFailure(infoC.nodeId());
             Optional<NodeId> hop = transA.getRouter().nextHop(infoC.nodeId());
             assertTrue(hop.isPresent());
