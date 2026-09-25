@@ -973,14 +973,14 @@ public final class TcpTransport implements Transport {
 
     private void handleDisconnect(Connection connection) {
         connection.remoteId().ifPresent(nodeId -> {
-            LOGGER.info(() -> "Handling disconnect from " + nodeId + " (remote=" + connection.remote + ", open=" + connection.isOpen() + ")");
+            LOGGER.info(() -> "Handling disconnect from " + nodeId + " on " + config.local().nodeId() + " (remote=" + connection.remote + ", open=" + connection.isOpen() + ")");
             // Only treat the peer as disconnected when the currently tracked connection goes away.
             // In rare races, nodes can end up with multiple TCP connections; a stale connection closing
             // must NOT fail in-flight request/response calls if there is still an active connection.
             boolean removedActive = connections.remove(nodeId, connection);
             Connection current = connections.get(nodeId);
             if (!removedActive && current != null && current.isOpen()) {
-                LOGGER.info(() -> "Ignoring disconnect for " + nodeId + " because an active connection remains");
+                LOGGER.info(() -> "Ignoring disconnect for " + nodeId + " on " + config.local().nodeId() + " because an active connection remains");
                 return;
             }
             if (current != null && current.isOpen()) {
@@ -991,10 +991,10 @@ public final class TcpTransport implements Transport {
             // middle of its own handshake, or a dial registered but not yet published): the peer is
             // still reachable and the responses will arrive through that connection.
             if (adoptOpenConnection(nodeId, connection) != null) {
-                LOGGER.info(() -> "Disconnect from " + nodeId + " absorbed: another open connection to it took over");
+                LOGGER.info(() -> "Disconnect from " + nodeId + " on " + config.local().nodeId() + " absorbed: another open connection to it took over");
                 return;
             }
-            LOGGER.info(() -> "Disconnect confirmed for " + nodeId + "; failing pending responses");
+            LOGGER.info(() -> "Disconnect confirmed for " + nodeId + " on " + config.local().nodeId() + "; failing pending responses");
             // The per-peer connection lock is deliberately kept (see connectionLocks).
             List<Map.Entry<UUID, PendingResponse>> toFail = new ArrayList<>();
             for (Map.Entry<UUID, PendingResponse> entry : pendingResponses.entrySet()) {
