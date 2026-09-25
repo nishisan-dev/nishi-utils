@@ -27,6 +27,8 @@ import dev.nishisan.utils.oss.cluster.catalog.NodeState;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.placement.LeastLoadedPlacementPolicy;
+import dev.nishisan.utils.oss.cluster.protocol.CatalogLookupRequest;
+import dev.nishisan.utils.oss.cluster.protocol.CatalogLookupResponse;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.protocol.PlaceRequest;
 import dev.nishisan.utils.oss.cluster.protocol.PlaceResponse;
@@ -48,8 +50,11 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -364,6 +369,87 @@ class PlacementRequestHandlerTest {
         assertEquals(SeriesStatus.NOT_LEADER, response.status());
         assertTrue(fakeCatalog.putAttempted, "putPlacement deveria ter sido tentado");
         assertTrue(fakeCatalog.placementsLocal().isEmpty(), "nenhum placement deveria ter sido gravado após a falha");
+    }
+
+    // ---------------------------------------------------------------- ngrrd.catalog.lookup
+
+    @Test
+    void catalogLookupNoLiderDevolvePresentesEOmiteAusentes() {
+        leaderView.leader = true;
+        SeriesPlacement placement = SeriesPlacement.active("node-a", clock.millis());
+        catalog.putPlacement("series-1", placement);
+
+        CatalogLookupResponse response = (CatalogLookupResponse) handler.handle(Commands.CATALOG_LOOKUP,
+                new CatalogLookupRequest(List.of("series-1", "series-ausente")), NodeId.of("client"));
+
+        assertEquals(SeriesStatus.OK, response.status());
+        assertEquals(Map.of("series-1", placement), response.found());
+        assertFalse(response.found().containsKey("series-ausente"));
+    }
+
+    @Test
+    void catalogLookupForaDoLiderRespondeNotLeaderComHint() {
+        leaderView.leader = false;
+        leaderView.leaderId = Optional.of("node-b");
+
+        CatalogLookupResponse response = (CatalogLookupResponse) handler.handle(Commands.CATALOG_LOOKUP,
+                new CatalogLookupRequest(List.of("series-1")), NodeId.of("client"));
+
+        assertEquals(SeriesStatus.NOT_LEADER, response.status());
+        assertEquals("node-b", response.leaderNodeId());
+    }
+
+    @Test
+    void catalogLookupNaJanelaDeGracaComMissRespondeNotLeader() {
+        leaderView.leader = true;
+        handler.onLeaderChanged(NodeId.of("self"));
+        // Ainda dentro de GRACE (o clock não avançou desde onLeaderChanged) e a chave consultada não
+        // tem placement -> não pode virar "não existe" enquanto a réplica local pode não ter convergido.
+
+        CatalogLookupResponse response = (CatalogLookupResponse) handler.handle(Commands.CATALOG_LOOKUP,
+                new CatalogLookupRequest(List.of("series-inexistente")), NodeId.of("client"));
+
+        assertEquals(SeriesStatus.NOT_LEADER, response.status());
+    }
+
+    @Test
+    void catalogLookupNaJanelaDeGracaSemMissRespondeOk() {
+        leaderView.leader = true;
+        SeriesPlacement placement = SeriesPlacement.active("node-a", clock.millis());
+        catalog.putPlacement("series-1", placement);
+        handler.onLeaderChanged(NodeId.of("self"));
+        // Ainda dentro de GRACE, mas todas as chaves pedidas foram encontradas -> não há miss para
+        // desconfiar, responde OK normalmente.
+
+        CatalogLookupResponse response = (CatalogLookupResponse) handler.handle(Commands.CATALOG_LOOKUP,
+                new CatalogLookupRequest(List.of("series-1")), NodeId.of("client"));
+
+        assertEquals(SeriesStatus.OK, response.status());
+        assertEquals(Map.of("series-1", placement), response.found());
+    }
+
+    @Test
+    void catalogLookupNaoCriaPlacement() {
+        leaderView.leader = true;
+
+        handler.handle(Commands.CATALOG_LOOKUP, new CatalogLookupRequest(List.of("series-ausente")),
+                NodeId.of("client"));
+
+        assertEquals(Optional.empty(), catalog.placementStrong("series-ausente"),
+                "a consulta de uma chave ausente não deveria criar placement");
+    }
+
+    @Test
+    void catalogLookupAcimaDoLimiteRespondeErro() {
+        leaderView.leader = true;
+        List<String> tooManyKeys = IntStream.rangeClosed(1, CatalogLookupRequest.MAX_KEYS + 1)
+                .mapToObj(i -> "series-" + i)
+                .collect(Collectors.toList());
+
+        CatalogLookupResponse response = (CatalogLookupResponse) handler.handle(Commands.CATALOG_LOOKUP,
+                new CatalogLookupRequest(tooManyKeys), NodeId.of("client"));
+
+        assertEquals(SeriesStatus.ERROR, response.status());
     }
 
     /** {@link CatalogView} fake cujo {@code putPlacement} sempre lança (simula {@code LeaderSyncingException}). */

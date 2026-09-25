@@ -30,6 +30,8 @@ import dev.nishisan.utils.oss.cluster.catalog.PlacementState;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.placement.PlacementContext;
 import dev.nishisan.utils.oss.cluster.placement.PlacementPolicy;
+import dev.nishisan.utils.oss.cluster.protocol.CatalogLookupRequest;
+import dev.nishisan.utils.oss.cluster.protocol.CatalogLookupResponse;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.protocol.PlaceRequest;
 import dev.nishisan.utils.oss.cluster.protocol.PlaceResponse;
@@ -50,12 +52,16 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.stream.Collectors;
 
 /**
- * Atende, apenas no líder, o comando {@link Commands#PLACE}: cria (ou confirma,
- * idempotentemente) o placement de uma série nova via {@link PlacementPolicy}.
+ * Atende, apenas no líder, os comandos {@link Commands#PLACE} e {@link Commands#CATALOG_LOOKUP}.
  *
- * <p>Serializa a admissão de novos placements para contabilizar pendências antes
- * da decisão seguinte. O lock de cada série no catálogo também coordena mudanças
- * de geometria e migrações, evitando atualizações concorrentes do mesmo registro.</p>
+ * <p>{@link Commands#PLACE} cria (ou confirma, idempotentemente) o placement de uma série nova via
+ * {@link PlacementPolicy}, serializando a admissão de novos placements para contabilizar pendências
+ * antes da decisão seguinte. O lock de cada série no catálogo também coordena mudanças de geometria e
+ * migrações, evitando atualizações concorrentes do mesmo registro.</p>
+ *
+ * <p>{@link Commands#CATALOG_LOOKUP} é leitura pura — confirma em lote, no líder, o placement de
+ * séries que a réplica local do cliente não tinha (miss) — e por isso não disputa o
+ * {@link #admissionLock} do {@code PLACE}.</p>
  */
 public final class PlacementRequestHandler extends RequestHandlerSupport implements LeadershipListener {
 
@@ -119,7 +125,7 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
     PlacementRequestHandler(Transport transport, CatalogView catalog, LeaderView leaderView,
             PlacementPolicy policy, Duration nodeStatusStaleAfter, Duration placementGraceAfterLeadership,
             Clock clock) {
-        super(transport, Set.of(Commands.PLACE));
+        super(transport, Set.of(Commands.PLACE, Commands.CATALOG_LOOKUP));
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.leaderView = Objects.requireNonNull(leaderView, "leaderView");
         this.policy = Objects.requireNonNull(policy, "policy");
@@ -157,6 +163,10 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
 
     @Override
     protected Object handle(String command, Object body, NodeId source) {
+        if (Commands.CATALOG_LOOKUP.equals(command)) {
+            // Leitura pura: não disputa o admissionLock do PLACE.
+            return handleCatalogLookup((CatalogLookupRequest) body);
+        }
         // One admission decision at a time also serializes pending-count updates across keys.
         admissionLock.lock();
         try {
@@ -300,6 +310,44 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
         String leaderId = leaderView.leaderId().orElse(null);
         return new PlaceResponse(SeriesStatus.NOT_LEADER, null,
                 "este nó não é o líder atual", leaderId);
+    }
+
+    /**
+     * Atende {@link Commands#CATALOG_LOOKUP}: confirma em lote, no líder, o placement de séries que a
+     * réplica local do cliente não tinha (miss). Nunca cria placement — um miss aqui só pode virar
+     * "não existe" definitivo do lado do cliente quando esta resposta é {@link SeriesStatus#OK} e a
+     * chave está ausente de {@link CatalogLookupResponse#found()}.
+     */
+    private CatalogLookupResponse handleCatalogLookup(CatalogLookupRequest request) {
+        if (!leaderView.isLeader()) {
+            return CatalogLookupResponse.notLeader(leaderView.leaderId().orElse(null));
+        }
+        if (request.seriesKeys().size() > CatalogLookupRequest.MAX_KEYS) {
+            return CatalogLookupResponse.error("lote de " + request.seriesKeys().size()
+                    + " chaves excede o máximo de " + CatalogLookupRequest.MAX_KEYS);
+        }
+
+        Map<String, SeriesPlacement> found = new HashMap<>();
+        boolean anyMiss = false;
+        for (String key : request.seriesKeys()) {
+            Optional<SeriesPlacement> placement = catalog.placementStrong(key);
+            if (placement.isPresent()) {
+                found.put(key, placement.get());
+            } else {
+                anyMiss = true;
+            }
+        }
+
+        // Mesma janela de graça do PLACE (seção 0 do M3): a réplica do líder recém-eleito pode não
+        // ter convergido ainda; um miss dentro dessa janela não pode virar "não existe" definitivo.
+        if (anyMiss && clock.millis() - becameLeaderAtMs < placementGraceAfterLeadership.toMillis()) {
+            return CatalogLookupResponse.notLeader(leaderView.leaderId().orElse(null));
+        }
+        if (!leaderView.isLeader()) {
+            // Perdeu a liderança durante a consulta.
+            return CatalogLookupResponse.notLeader(leaderView.leaderId().orElse(null));
+        }
+        return CatalogLookupResponse.ok(found);
     }
 
     private Map<String, Long> snapshotPending(Collection<StorageNodeStatus> nodes) {
