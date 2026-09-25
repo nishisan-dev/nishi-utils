@@ -57,6 +57,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -402,6 +403,7 @@ class PlacementRequestHandlerTest {
     @Test
     void catalogLookupNaJanelaDeGracaComMissRespondeNotLeader() {
         leaderView.leader = true;
+        leaderView.leaderId = Optional.of("node-self");
         handler.onLeaderChanged(NodeId.of("self"));
         // Ainda dentro de GRACE (o clock não avançou desde onLeaderChanged) e a chave consultada não
         // tem placement -> não pode virar "não existe" enquanto a réplica local pode não ter convergido.
@@ -410,11 +412,13 @@ class PlacementRequestHandlerTest {
                 new CatalogLookupRequest(List.of("series-inexistente")), NodeId.of("client"));
 
         assertEquals(SeriesStatus.NOT_LEADER, response.status());
+        assertEquals("node-self", response.leaderNodeId());
     }
 
     @Test
     void catalogLookupNaJanelaDeGracaSemMissRespondeOk() {
         leaderView.leader = true;
+        leaderView.leaderId = Optional.of("node-self");
         SeriesPlacement placement = SeriesPlacement.active("node-a", clock.millis());
         catalog.putPlacement("series-1", placement);
         handler.onLeaderChanged(NodeId.of("self"));
@@ -426,6 +430,22 @@ class PlacementRequestHandlerTest {
 
         assertEquals(SeriesStatus.OK, response.status());
         assertEquals(Map.of("series-1", placement), response.found());
+        assertNull(response.leaderNodeId(), "resposta OK não carrega hint de líder");
+    }
+
+    @Test
+    void catalogLookupAposAJanelaDeGracaComMissRespondeOkSemAChave() {
+        leaderView.leader = true;
+        handler.onLeaderChanged(NodeId.of("self"));
+        clock.advance(GRACE.plusSeconds(1));
+        // A janela de graça já passou -> um miss agora É definitivo, responde OK com a chave ausente
+        // do mapa (a réplica local já teve tempo de convergir desde que este nó assumiu a liderança).
+
+        CatalogLookupResponse response = (CatalogLookupResponse) handler.handle(Commands.CATALOG_LOOKUP,
+                new CatalogLookupRequest(List.of("series-inexistente")), NodeId.of("client"));
+
+        assertEquals(SeriesStatus.OK, response.status());
+        assertTrue(response.found().isEmpty());
     }
 
     @Test
@@ -450,6 +470,117 @@ class PlacementRequestHandlerTest {
                 new CatalogLookupRequest(tooManyKeys), NodeId.of("client"));
 
         assertEquals(SeriesStatus.ERROR, response.status());
+    }
+
+    @Test
+    void catalogLookupPerdeLiderancaNoMeioDoLoteRespondeNotLeaderSemConsultarAsDemais() {
+        leaderView.leader = true;
+        LeaderFlippingCatalogFake fakeCatalog = new LeaderFlippingCatalogFake(leaderView);
+        PlacementRequestHandler flippingHandler = new PlacementRequestHandler(cluster.node(0).transport(),
+                fakeCatalog, leaderView, new LeastLoadedPlacementPolicy(), INTERVAL, GRACE, clock);
+
+        CatalogLookupResponse response = (CatalogLookupResponse) flippingHandler.handle(Commands.CATALOG_LOOKUP,
+                new CatalogLookupRequest(List.of("series-1", "series-2", "series-3")), NodeId.of("client"));
+
+        assertEquals(SeriesStatus.NOT_LEADER, response.status());
+        // A liderança cai durante a consulta de series-1 -> a checagem a cada chave deve pegar isso
+        // antes de sequer tentar series-2/series-3 (cada uma seria um RPC ao novo líder se não parasse
+        // cedo, que a rechecagem final descartaria de qualquer jeito).
+        assertEquals(1, fakeCatalog.placementStrongCalls,
+                "deveria parar assim que perder a liderança, sem consultar as chaves restantes");
+    }
+
+    @Test
+    void catalogLookupComFalhaAoConsultarPropagaExcecaoNuncaViraOk() {
+        leaderView.leader = true;
+        PlacementRequestHandler throwingHandler = new PlacementRequestHandler(cluster.node(0).transport(),
+                new ThrowingOnLookupCatalogFake(), leaderView, new LeastLoadedPlacementPolicy(), INTERVAL, GRACE,
+                clock);
+
+        // Falha ao consultar o catálogo (ex.: DistributedMap indisponível) nunca pode virar uma
+        // resposta OK com a chave simplesmente ausente — o cliente trataria isso como "não existe".
+        assertThrows(RuntimeException.class, () -> throwingHandler.handle(Commands.CATALOG_LOOKUP,
+                new CatalogLookupRequest(List.of("series-1")), NodeId.of("client")));
+    }
+
+    /**
+     * {@link CatalogView} fake cujo {@code placementStrong} derruba {@link LeaderViewFake#leader} para
+     * {@code false} assim que é chamado a primeira vez — simula a liderança caindo no meio de um lote
+     * de {@code CATALOG_LOOKUP}.
+     */
+    private static final class LeaderFlippingCatalogFake implements CatalogView {
+        private final LeaderViewFake leaderView;
+        private int placementStrongCalls;
+
+        LeaderFlippingCatalogFake(LeaderViewFake leaderView) {
+            this.leaderView = leaderView;
+        }
+
+        @Override
+        public Optional<SeriesPlacement> placementStrong(String seriesKey) {
+            placementStrongCalls++;
+            leaderView.leader = false;
+            return Optional.empty();
+        }
+
+        @Override
+        public Optional<StorageNodeStatus> nodeStatusStrong(String nodeId) {
+            return Optional.empty();
+        }
+
+        @Override
+        public void putNodeStatus(StorageNodeStatus status) {
+            throw new UnsupportedOperationException("não usado neste teste");
+        }
+
+        @Override
+        public Collection<StorageNodeStatus> nodesLocal() {
+            return List.of();
+        }
+
+        @Override
+        public Map<String, SeriesPlacement> placementsLocal() {
+            return Map.of();
+        }
+
+        @Override
+        public void putPlacement(String seriesKey, SeriesPlacement placement) {
+            throw new UnsupportedOperationException("não usado neste teste");
+        }
+    }
+
+    /** {@link CatalogView} fake cujo {@code placementStrong} sempre lança (simula falha de transporte/RPC). */
+    private static final class ThrowingOnLookupCatalogFake implements CatalogView {
+
+        @Override
+        public Optional<SeriesPlacement> placementStrong(String seriesKey) {
+            throw new IllegalStateException("simulando falha ao consultar o catálogo");
+        }
+
+        @Override
+        public Optional<StorageNodeStatus> nodeStatusStrong(String nodeId) {
+            return Optional.empty();
+        }
+
+        @Override
+        public void putNodeStatus(StorageNodeStatus status) {
+            throw new UnsupportedOperationException("não usado neste teste");
+        }
+
+        @Override
+        public Collection<StorageNodeStatus> nodesLocal() {
+            return List.of();
+        }
+
+        @Override
+        public Map<String, SeriesPlacement> placementsLocal() {
+            return Map.of();
+        }
+
+        @Override
+        public void putPlacement(String seriesKey, SeriesPlacement placement) {
+            throw new UnsupportedOperationException("não usado neste teste");
+        }
     }
 
     /** {@link CatalogView} fake cujo {@code putPlacement} sempre lança (simula {@code LeaderSyncingException}). */

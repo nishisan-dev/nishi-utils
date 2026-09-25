@@ -61,7 +61,7 @@ import java.util.stream.Collectors;
  *
  * <p>{@link Commands#CATALOG_LOOKUP} é leitura pura — confirma em lote, no líder, o placement de
  * séries que a réplica local do cliente não tinha (miss) — e por isso não disputa o
- * {@link #admissionLock} do {@code PLACE}.</p>
+ * {@code admissionLock} do {@code PLACE}.</p>
  */
 public final class PlacementRequestHandler extends RequestHandlerSupport implements LeadershipListener {
 
@@ -330,6 +330,12 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
         Map<String, SeriesPlacement> found = new HashMap<>();
         boolean anyMiss = false;
         for (String key : request.seriesKeys()) {
+            // Checagem barata a cada chave: se a liderança caiu no meio do lote, sai imediatamente em
+            // vez de continuar gastando um round-trip de placementStrong por chave restante (pode ser
+            // um RPC ao "novo" líder) só para a rechecagem final abaixo descartar tudo de qualquer jeito.
+            if (!leaderView.isLeader()) {
+                return CatalogLookupResponse.notLeader(leaderView.leaderId().orElse(null));
+            }
             Optional<SeriesPlacement> placement = catalog.placementStrong(key);
             if (placement.isPresent()) {
                 found.put(key, placement.get());
