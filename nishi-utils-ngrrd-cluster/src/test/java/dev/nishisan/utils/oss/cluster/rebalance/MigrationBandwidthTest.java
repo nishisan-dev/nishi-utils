@@ -39,14 +39,14 @@ class MigrationBandwidthTest {
     }
 
     /**
-     * Achado 2 da revisão pós-merge da PR #172: {@code acquireUrgent} não pode esperar a vez, mesmo
-     * com a fila de chunks concorrentes já saturada — quem chama é o patch final do cutover, com a
-     * série já congelada (clientes recebendo {@code MIGRATING}).
+     * {@code acquireUrgent} não pode esperar a vez, mesmo com a fila de chunks concorrentes já
+     * saturada — quem chama é o patch final do cutover, com a série já congelada (clientes recebendo
+     * {@code MIGRATING}).
      *
-     * <p>Fix round 1, item 4: a fila é saturada por uma SEGUNDA THREAD de fato parada dentro de
-     * {@code acquire} (não só por uma reserva síncrona feita pela própria thread de teste) — mais
-     * fiel ao cenário real de um chunk concorrente em voo — e o limite de tempo é mais folgado
-     * (200 ms) para reduzir sensibilidade a jitter de CI.</p>
+     * <p>A fila é saturada por uma SEGUNDA THREAD de fato parada dentro de {@code acquire} (não só por
+     * uma reserva síncrona feita pela própria thread de teste) — mais fiel ao cenário real de um chunk
+     * concorrente em voo — e o limite de tempo é folgado (200 ms) para reduzir sensibilidade a jitter
+     * de CI.</p>
      */
     @Test void acquireUrgentNaoEsperaComFilaCheia() throws Exception {
         var limiter = new MigrationBandwidth(1024); // 1 KiB/s: um chunk normal já satura por ~4 s.

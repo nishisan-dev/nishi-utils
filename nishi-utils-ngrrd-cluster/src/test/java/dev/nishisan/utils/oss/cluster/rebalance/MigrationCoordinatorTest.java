@@ -317,13 +317,13 @@ class MigrationCoordinatorTest {
     }
 
     /**
-     * Achado 1 da revisão pós-merge da PR #172: o destino segura o lock da série durante o commit
-     * (fsync) e o mesmo lock atende {@code MIGRATE_STATUS} — é comum, não raro, que o poll do destino
-     * estoure timeout de transporte bem na iteração em que a origem já responde erro. Antes desta
-     * correção, {@code pollUntilResolved} abortava mesmo com o destino já {@code COMMITTED} (só ainda
-     * não confirmado pelo poll que falhou). Aqui o 1º poll do destino lança falha de transporte
-     * (devolve {@code null}) na mesma iteração em que a origem responde erro; o laço deve continuar em
-     * vez de abortar, e o 2º poll do destino confirma {@code COMMITTED}.
+     * O destino segura o lock da série durante o commit (fsync) e o mesmo lock atende {@code
+     * MIGRATE_STATUS} — é comum, não raro, que o poll do destino estoure timeout de transporte bem na
+     * iteração em que a origem já responde erro. {@code pollUntilResolved} não pode abortar nesse caso
+     * se o destino já estiver {@code COMMITTED} (só ainda não confirmado pelo poll que falhou). Aqui o
+     * 1º poll do destino lança falha de transporte (devolve {@code null}) na mesma iteração em que a
+     * origem responde erro; o laço deve continuar em vez de abortar, e o 2º poll do destino confirma
+     * {@code COMMITTED}.
      */
     @Test
     void commitNoDestinoVenceMesmoComPollDoDestinoFalhandoEOrigemEmErro() throws Exception {
@@ -415,14 +415,13 @@ class MigrationCoordinatorTest {
     }
 
     /**
-     * Fix round 1, item 1 (decisão do controlador): sem NENHUM limite, a correção do achado 1 deixava a
-     * série presa em {@code MIGRATING} até o {@code migrationTimeout} inteiro sempre que o destino
-     * realmente tivesse caído durante o cutover (poll sempre falhando por transporte) com a origem já em
-     * erro. Aqui o {@code migrationTimeout} é bem maior que a carência de {@code
-     * SOURCE_FAILURE_DESTINATION_GRACE} (10 s) — cada poll da origem (sempre {@code ERROR}) avança o
-     * relógio manual 4 s, cruzando a carência bem antes do timeout completo. O destino nunca responde
-     * (falha de transporte em todo poll, inclusive na reconsulta final da carência): o coordenador deve
-     * abortar perto da carência, não esperar o {@code migrationTimeout}.
+     * Sem limite algum, a série ficaria presa em {@code MIGRATING} até o {@code migrationTimeout}
+     * inteiro sempre que o destino realmente tivesse caído durante o cutover (poll sempre falhando por
+     * transporte) com a origem já em erro. Aqui o {@code migrationTimeout} é bem maior que a carência de
+     * {@code SOURCE_FAILURE_DESTINATION_GRACE} (10 s) — cada poll da origem (sempre {@code ERROR})
+     * avança o relógio manual 4 s, cruzando a carência bem antes do timeout completo. O destino nunca
+     * responde (falha de transporte em todo poll, inclusive na reconsulta final da carência): o
+     * coordenador deve abortar perto da carência, não esperar o {@code migrationTimeout}.
      */
     @Test
     void origemEmErroEDestinoNuncaRespondePorMaisQueACarenciaAbortaPertoDela() throws Exception {
@@ -455,19 +454,19 @@ class MigrationCoordinatorTest {
     }
 
     /**
-     * Fix round 1, item 1: dentro da mesma carência, se a reconsulta final ao destino (disparada quando
-     * a carência se esgota) confirmar {@code COMMITTED}, a migração completa — mesma prioridade do
-     * achado 1 original, só que agora alcançada via a reconsulta da carência em vez da reconsulta do
-     * {@code migrationTimeout}.
+     * Dentro da mesma carência, se a reconsulta final ao destino (disparada quando a carência se
+     * esgota) confirmar {@code COMMITTED}, a migração completa — mesma prioridade de sempre entre um
+     * {@code COMMITTED} confirmado e a falha da origem, só que agora alcançada via a reconsulta da
+     * carência em vez da reconsulta do {@code migrationTimeout}.
      *
      * <p>O destino só confirma {@code COMMITTED} quando o relógio manual cruza os 14 s (mesma carência
      * de 10 s computada a partir da 1ª falha da origem, observada em 4 s — ver cálculo em {@link
      * #origemEmErroEDestinoNuncaRespondePorMaisQueACarenciaAbortaPertoDela}) — amarrado de propósito ao
      * ÚNICO mecanismo que avança esse relógio: o poll da origem, que só a carência dispara enquanto o
-     * destino falha. No código sem a carência (achado 1 isolado), a origem nunca é consultada enquanto o
-     * destino falha, o relógio nunca avança, e o destino nunca chega a confirmar {@code COMMITTED} — a
-     * migração trava até o {@code migrationTimeout}, o que este teste prova ao falhar por timeout do
-     * próprio teste (RED) se a carência for removida.</p>
+     * destino falha. Sem a carência, a origem nunca é consultada enquanto o destino falha, o relógio
+     * nunca avança, e o destino nunca chega a confirmar {@code COMMITTED} — a migração trava até o
+     * {@code migrationTimeout}, o que este teste prova ao falhar por timeout do próprio teste (RED) se
+     * a carência for removida.</p>
      */
     @Test
     void origemEmErroEDestinoCommittedDentroDaCarenciaCompleta() throws Exception {

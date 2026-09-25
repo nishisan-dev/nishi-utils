@@ -4,10 +4,10 @@
 
 ---
 
-## 2026-09-25 — Correções da revisão pós-merge da PR #172 — release 8.5.1
+## 2026-09-25 — Correções no rebalance com ingestão contínua — release 8.5.1
 
-Achados confirmados na revisão pós-merge da [PR #172](https://github.com/nishisan-dev/nishi-utils/pull/172)
-(rebalance com ingestão contínua, 8.5.0), no módulo `nishi-utils-ngrrd-cluster`.
+Correções aplicadas ao módulo `nishi-utils-ngrrd-cluster`, complementando o trabalho da
+[PR #172](https://github.com/nishisan-dev/nishi-utils/pull/172) (rebalance com ingestão contínua, 8.5.0).
 
 - `MigrationCoordinator#pollUntilResolved` abortava a migração quando o poll de
   `MIGRATE_STATUS` ao destino falhava por transporte na mesma iteração em que a origem já
@@ -16,12 +16,12 @@ Achados confirmados na revisão pós-merge da [PR #172](https://github.com/nishi
   comum, não o raro). Agora só aborta por erro da origem quando o destino respondeu
   (não-nulo) e não é `COMMITTED` na mesma iteração; se o poll do destino falhar, o laço
   continua até o timeout, e ao estourá-lo reconsulta o destino uma última vez antes de
-  abortar. Correção de acompanhamento (fix round 1): sem limite algum, isso deixava a
-  série `MIGRATING` até o `migrationTimeout` inteiro (10 min por padrão) sempre que o
-  destino realmente caísse durante o cutover. `SOURCE_FAILURE_DESTINATION_GRACE` (10 s,
-  contados da primeira falha da origem observada) dá uma carência limitada antes da
-  reconsulta final — **trade-off aceito:** até 10 s de congelamento extra da série nesse
-  cenário específico, em troca de não esperar o prazo inteiro.
+  abortar. Sem limite algum, isso deixaria a série `MIGRATING` até o `migrationTimeout`
+  inteiro (10 min por padrão) sempre que o destino realmente caísse durante o cutover.
+  `SOURCE_FAILURE_DESTINATION_GRACE` (10 s, contados da primeira falha da origem
+  observada) dá uma carência limitada antes da reconsulta final — **trade-off aceito:**
+  até 10 s de congelamento extra da série nesse cenário específico, em troca de não
+  esperar o prazo inteiro.
 - Com a série já congelada (clientes recebendo `MIGRATING`), cada patch final do delta
   esperava na mesma fila dos chunks de 256 KiB de outras cópias — medido em até 252 ms por
   rodada a 1 MiB/s com sete transferências concorrentes. `MigrationBandwidth` ganha
