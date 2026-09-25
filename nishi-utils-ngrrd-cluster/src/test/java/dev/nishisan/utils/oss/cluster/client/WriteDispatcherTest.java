@@ -657,6 +657,11 @@ class WriteDispatcherTest {
         }
 
         @Override
+        public SeriesPlacement resolveExistingAtLeader(String seriesKey, Duration maxWait) {
+            throw new UnsupportedOperationException("não usado pelo WriteDispatcher");
+        }
+
+        @Override
         public Optional<SeriesPlacement> placementCached(String seriesKey) {
             throw new UnsupportedOperationException("não usado pelo WriteDispatcher");
         }

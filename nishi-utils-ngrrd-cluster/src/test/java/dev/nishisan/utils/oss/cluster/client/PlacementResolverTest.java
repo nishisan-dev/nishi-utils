@@ -358,6 +358,74 @@ class PlacementResolverTest {
     }
 
     @Test
+    void handleSomenteLeituraComReplicaLocalAtrasadaEWrongOwnerSemDonoTerminaRapidoEmNotPlaced() {
+        // A réplica local ainda diz ACTIVE(storage-a), mas o líder já não tem placement: o dono responde
+        // WRONG_OWNER sem dono e o handle precisa confirmar direto com o líder, sem voltar à réplica.
+        catalog.putPlacement("series-1", SeriesPlacement.active("storage-a", 1_000L));
+        rpc.respondDefault((cmd, body) -> switch (cmd) {
+            case Commands.OPEN -> new SeriesStatusResponse(SeriesStatus.WRONG_OWNER, null, null);
+            case Commands.CATALOG_LOOKUP -> CatalogLookupResponse.ok(Map.of());
+            default -> throw new AssertionError("comando inesperado: " + cmd);
+        });
+        RetryPolicy retry = new RetryPolicy(Duration.ofSeconds(5), Duration.ofMillis(1), Duration.ofMillis(5));
+        RemoteSeriesHandle handle = new RemoteSeriesHandle("series-1", "yaml: fake", "hash-1", Map.of(),
+                Ngrrd.OpenOptions.defaults().withCreateIfMissing(false), resolver, rpc, new UnusedWriteBuffer(),
+                retry, Duration.ofSeconds(1), Duration.ofSeconds(1), Clock.systemUTC(), (key, h) -> { });
+        long start = System.nanoTime();
+
+        SeriesNotFoundException ex = assertThrows(SeriesNotFoundException.class, handle::open);
+
+        long elapsedMs = Duration.ofNanos(System.nanoTime() - start).toMillis();
+        assertEquals(SeriesNotFoundException.Reason.NOT_PLACED, ex.reason());
+        assertTrue(elapsedMs < 2_000, "deveria terminar sem esperar o retryTimeout; levou " + elapsedMs + " ms");
+        assertEquals(List.of(Commands.OPEN, Commands.CATALOG_LOOKUP),
+                rpc.calls().stream().map(RecordingClusterRpc.Recorded::command).toList());
+    }
+
+    @Test
+    void handleSomenteLeituraComReplicaLocalAtrasadaEWrongOwnerSemDonoSegueComODonoDoLider() {
+        catalog.putPlacement("series-1", SeriesPlacement.active("storage-a", 1_000L));
+        SeriesPlacement atLeader = SeriesPlacement.active("storage-b", 2_000L);
+        rpc.respondNext((cmd, body) -> {
+            assertEquals(Commands.OPEN, cmd);
+            return new SeriesStatusResponse(SeriesStatus.WRONG_OWNER, null, null);
+        });
+        rpc.respondNext((cmd, body) -> {
+            assertEquals(Commands.CATALOG_LOOKUP, cmd);
+            return CatalogLookupResponse.ok(Map.of("series-1", atLeader));
+        });
+        rpc.respondNext((cmd, body) -> {
+            assertEquals(Commands.OPEN, cmd);
+            return new SeriesStatusResponse(SeriesStatus.OK, "storage-b", null);
+        });
+        RetryPolicy retry = new RetryPolicy(Duration.ofSeconds(5), Duration.ofMillis(1), Duration.ofMillis(5));
+        RemoteSeriesHandle handle = new RemoteSeriesHandle("series-1", "yaml: fake", "hash-1", Map.of(),
+                Ngrrd.OpenOptions.defaults().withCreateIfMissing(false), resolver, rpc, new UnusedWriteBuffer(),
+                retry, Duration.ofSeconds(1), Duration.ofSeconds(1), Clock.systemUTC(), (key, h) -> { });
+
+        handle.open();
+
+        List<RecordingClusterRpc.Recorded> calls = rpc.calls();
+        assertEquals(3, calls.size());
+        assertEquals(NodeId.of("storage-a"), calls.get(0).target());
+        assertEquals(NodeId.of("storage-b"), calls.get(2).target(), "segue com o dono informado pelo líder");
+    }
+
+    @Test
+    void resolveExistingAtLeaderIgnoraReplicaLocalEOverride() {
+        catalog.putPlacement("series-1", SeriesPlacement.active("storage-a", 1_000L));
+        resolver.noteOwner("series-1", "storage-c");
+        rpc.respondNext((cmd, body) -> CatalogLookupResponse.ok(Map.of()));
+
+        SeriesNotFoundException ex = assertThrows(SeriesNotFoundException.class,
+                () -> resolver.resolveExistingAtLeader("series-1", Duration.ofSeconds(1)));
+
+        assertEquals(SeriesNotFoundException.Reason.NOT_PLACED, ex.reason());
+        assertEquals(List.of(Commands.CATALOG_LOOKUP),
+                rpc.calls().stream().map(RecordingClusterRpc.Recorded::command).toList());
+    }
+
+    @Test
     void resolveExistingMigrandoConsultaLider() {
         SeriesPlacement before = SeriesPlacement.active("storage-a", 1_000L);
         SeriesPlacement migrating = SeriesPlacement.migrating(before, "storage-b", "mig-1", 2_000L);

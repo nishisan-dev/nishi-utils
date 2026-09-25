@@ -570,14 +570,25 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
         }
     }
 
+    /**
+     * Redireciona depois de um {@code WRONG_OWNER}. Com o dono informado, segue com ele. Sem dono, um
+     * handle gravável re-resolve como sempre ({@link PlacementLookup#resolve}); um handle somente leitura
+     * confirma direto com o líder ({@link PlacementLookup#resolveExistingAtLeader}) — a réplica local pode
+     * estar atrasada e devolveria o mesmo dono até o prazo se esgotar. Ausente no líder, a leitura termina
+     * em {@link SeriesNotFoundException} com {@code NOT_PLACED} e o handle se fecha.
+     */
     private void noteWrongOwner(String newOwnerNodeId, OperationRetry retry) {
         if (newOwnerNodeId != null) {
             resolver.noteOwner(seriesKey, newOwnerNodeId);
             owner = newOwnerNodeId;
+            return;
+        }
+        resolver.invalidate(seriesKey);
+        if (state.get().writable()) {
+            owner = resolvePlacement(true, retry.remaining()).ownerNodeId();
         } else {
-            resolver.invalidate(seriesKey);
-            boolean writable = state.get().writable();
-            owner = markingSeriesNotFound(() -> resolvePlacement(writable, retry.remaining())).ownerNodeId();
+            owner = markingSeriesNotFound(() -> resolver.resolveExistingAtLeader(seriesKey, retry.remaining()))
+                    .ownerNodeId();
         }
     }
 

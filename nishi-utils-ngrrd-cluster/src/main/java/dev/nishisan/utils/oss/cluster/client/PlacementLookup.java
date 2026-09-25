@@ -66,6 +66,20 @@ public interface PlacementLookup {
     SeriesPlacement resolveExisting(String seriesKey, Duration maxWait);
 
     /**
+     * Como {@link #resolveExisting}, mas SEMPRE confirma com o líder ({@code ngrrd.catalog.lookup}),
+     * ignorando a réplica local e o override em cache — usado quando um dono respondeu
+     * {@code WRONG_OWNER} sem informar o dono novo a um handle somente leitura: a réplica local pode
+     * estar atrasada (ainda {@code ACTIVE} num nó que já não tem a série) e voltaria ao mesmo dono até o
+     * prazo de retentativa se esgotar. Nunca cria posicionamento.
+     *
+     * @throws dev.nishisan.utils.oss.api.SeriesNotFoundException com
+     *         {@code NOT_PLACED} se o líder confirmar que não há placement para {@code seriesKey}
+     * @throws dev.nishisan.utils.oss.cluster.api.NgrrdClusterException se não foi possível confirmar
+     *         com o líder — nunca interpretado como ausência da série
+     */
+    SeriesPlacement resolveExistingAtLeader(String seriesKey, Duration maxWait);
+
+    /**
      * Placement mais recente conhecido localmente (override em cache ou catálogo replicado), sem
      * nenhum RPC ao líder — {@link Optional#empty()} se nada estiver disponível localmente.
      */

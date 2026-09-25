@@ -58,6 +58,7 @@ class WriteBarrierRegressionTest {
         PlacementLookup lookup = new PlacementLookup() {
             public SeriesPlacement resolve(String key, String hash) { return SeriesPlacement.active("A", 0); }
             public SeriesPlacement resolveExisting(String key, Duration maxWait) { return resolve(key, null); }
+            public SeriesPlacement resolveExistingAtLeader(String key, Duration maxWait) { return resolve(key, null); }
             public Optional<SeriesPlacement> placementCached(String key) { return Optional.of(resolve(key, null)); }
             public void invalidate(String key) { }
             public void noteOwner(String key, String owner) { }

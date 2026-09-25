@@ -376,6 +376,11 @@ class SeriesHandleCacheTest {
         }
 
         @Override
+        public SeriesPlacement resolveExistingAtLeader(String seriesKey, Duration maxWait) {
+            return SeriesPlacement.active(OWNER.value(), 0L);
+        }
+
+        @Override
         public Optional<SeriesPlacement> placementCached(String seriesKey) {
             return Optional.of(SeriesPlacement.active(OWNER.value(), 0L));
         }

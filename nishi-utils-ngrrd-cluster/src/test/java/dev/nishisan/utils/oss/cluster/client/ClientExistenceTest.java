@@ -191,6 +191,11 @@ class ClientExistenceTest {
         }
 
         @Override
+        public SeriesPlacement resolveExistingAtLeader(String seriesKey, Duration maxWait) {
+            throw new UnsupportedOperationException("não usado por SeriesExistence");
+        }
+
+        @Override
         public Optional<SeriesPlacement> placementCached(String seriesKey) {
             return Optional.ofNullable(cached.get(seriesKey));
         }

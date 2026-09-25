@@ -109,9 +109,26 @@ public final class PlacementResolver implements PlacementLookup {
         }
         // Ausente ou em MIGRATING: o catálogo local pode estar desatualizado ou ainda não ter
         // recebido a entrada por replicação — só o líder confirma com autoridade se a série existe.
+        return lookupAtLeader(seriesKey, maxWait);
+    }
+
+    @Override
+    public SeriesPlacement resolveExistingAtLeader(String seriesKey, Duration maxWait) {
+        Objects.requireNonNull(seriesKey, "seriesKey");
+        Objects.requireNonNull(maxWait, "maxWait");
+        return lookupAtLeader(seriesKey, maxWait);
+    }
+
+    /**
+     * Placement de {@code seriesKey} segundo o líder. Presente e {@code ACTIVE}, vira o override local
+     * (mais recente que uma réplica atrasada); ausente, descarta o override e lança
+     * {@link SeriesNotFoundException} com {@code NOT_PLACED}.
+     */
+    private SeriesPlacement lookupAtLeader(String seriesKey, Duration maxWait) {
         Map<String, SeriesPlacement> found = catalogLookupClient.lookup(List.of(seriesKey), maxWait);
         SeriesPlacement placement = found.get(seriesKey);
         if (placement == null) {
+            overrides.remove(seriesKey);
             throw new SeriesNotFoundException(seriesKey, SeriesNotFoundException.Reason.NOT_PLACED);
         }
         if (placement.state() == PlacementState.ACTIVE) {

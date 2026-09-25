@@ -439,6 +439,20 @@ class RemoteSeriesHandleTest {
         assertEquals(List.of(SERIES_KEY), onCloseCalls);
         assertFalse(handle.isOpen());
         assertEquals(0, resolver.resolveCalls.get(), "reposicionamento de handle somente leitura nunca posiciona");
+        assertEquals(1, resolver.resolveExistingAtLeaderCalls.get(), "WRONG_OWNER sem dono confirma no líder");
+    }
+
+    @Test
+    void handleGravavelComWrongOwnerSemDonoReResolveSemConsultarOLider() {
+        RemoteSeriesHandle handle = openedHandle();
+        rpc.respondNext((cmd, body) -> response(cmd, SeriesStatus.WRONG_OWNER, null));
+        rpc.respondDefault((cmd, body) -> response(cmd, SeriesStatus.OK, OWNER_A.value()));
+
+        handle.read("daily");
+
+        assertEquals(2, resolver.resolveCalls.get(), "gravável re-resolve pelo caminho de sempre");
+        assertEquals(0, resolver.resolveExistingAtLeaderCalls.get());
+        assertEquals(0, resolver.resolveExistingCalls.get());
     }
 
     @Test
@@ -713,6 +727,7 @@ class RemoteSeriesHandleTest {
         private volatile String owner;
         private final AtomicInteger resolveCalls = new AtomicInteger();
         private final AtomicInteger resolveExistingCalls = new AtomicInteger();
+        private final AtomicInteger resolveExistingAtLeaderCalls = new AtomicInteger();
         private volatile RuntimeException resolveExistingFailure;
 
         FakePlacementLookup(String initialOwner) {
@@ -728,6 +743,15 @@ class RemoteSeriesHandleTest {
         @Override
         public SeriesPlacement resolveExisting(String seriesKey, Duration maxWait) {
             resolveExistingCalls.incrementAndGet();
+            if (resolveExistingFailure != null) {
+                throw resolveExistingFailure;
+            }
+            return SeriesPlacement.active(owner, 0L);
+        }
+
+        @Override
+        public SeriesPlacement resolveExistingAtLeader(String seriesKey, Duration maxWait) {
+            resolveExistingAtLeaderCalls.incrementAndGet();
             if (resolveExistingFailure != null) {
                 throw resolveExistingFailure;
             }
