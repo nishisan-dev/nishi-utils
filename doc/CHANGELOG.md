@@ -28,8 +28,11 @@ seção abaixo) — a 8.5.1 não teve release/tag própria; ela é publicada jun
   `NgrrdClusterException`. `verify` é a única verificação física (`ngrrd.series.exists.batch` no
   dono, também novo).
 - `NgrrdClusterClient.open(..., createIfMissing=false)` abre um handle SOMENTE LEITURA: o cliente
-  nunca posiciona (`ngrrd.place`), o storage recusa criar (`SeriesStatus.NOT_FOUND` sem
-  ownership) e `write`/`flush`/`checkpoint` lançam `IllegalStateException`. Cache de handles sem
+  nunca posiciona (`ngrrd.place`), o storage recusa criar — responde `SeriesStatus.NOT_FOUND`
+  só depois de o líder confirmar `ACTIVE(self)`, isto é, com ownership: a série é dele e o
+  arquivo não existe — e `write`/`flush`/`checkpoint` lançam `IllegalStateException`. O storage
+  abre sem criar sempre com `OnGeometryChange.FAIL`, qualquer que seja a política pedida:
+  geometria divergente vira erro ao leitor e nada é migrado nem recriado. Cache de handles sem
   contagem de referências: abrir com criação sobre um somente leitura em cache o substitui por
   um gravável novo (o antigo continua válido para quem já o tinha); abrir sem criar sobre um
   gravável em cache devolve uma vista somente leitura nova a cada chamada, cujo `close()` nunca
@@ -40,10 +43,30 @@ seção abaixo) — a 8.5.1 não teve release/tag própria; ela é publicada jun
   RPC — contra um storage/líder de versão anterior, em vez de arriscar `false` ou criar a série
   por engano. Status local sem a capacidade é confirmado por leitura forte no líder antes de
   recusar, relida com backoff curto dentro do prazo restante quando ausente.
-- Corrige o líder recém-eleito sem peers (cluster de um único nó) que não semeava a liderança no
-  `placementHandler` no boot: sem o seed, a janela de graça pós-eleição de `PLACE` e
-  `ngrrd.catalog.lookup` nunca se abria naquele mandato, e um miss logo após o boot podia virar
-  "não existe" definitivo antes da réplica local do catálogo convergir.
+- Corrige o seed da liderança do `placementHandler` no boot: vale para qualquer primeiro líder
+  eleito durante `builder.start()`, antes do registro dos listeners (não só para um cluster de
+  um nó) — `addLeadershipListener` não dispara callback sintético para quem já é líder. Sem o
+  seed, a janela de graça pós-eleição de `PLACE` e `ngrrd.catalog.lookup` nunca se abria naquele
+  mandato, e um miss logo após o boot podia virar "não existe" definitivo antes da réplica local
+  do catálogo convergir. O seed agora acontece antes de o handler ser registrado para atender
+  requisições (rede e caminho local).
+- Corrige o "não existe" falso logo após uma eleição: o coordenador troca o líder antes de
+  notificar os listeners, e o novo líder recontava as pendências a partir do catálogo inteiro
+  (centenas de ms com ~357 mil séries) antes de marcar o início da janela de graça — nesse
+  intervalo, um miss de `ngrrd.catalog.lookup` era respondido como `OK` sem a chave. A marca
+  agora é gravada antes de qualquer trabalho pesado, e um miss enquanto a réplica do líder ainda
+  sincroniza (`ReplicationManager.isLeaderSyncing()`) responde `NOT_LEADER` (o cliente retenta).
+- `NgrrdClusterAdminCli status` mostra as capacidades anunciadas por nó (coluna `CAPABILITIES`;
+  `-` quando o status não traz nenhuma).
+- Mudanças de comportamento no caminho que cria:
+  - `open` durante um `close()` lento do mesmo handle agora abre um handle novo (a 8.5.0
+    devolvia o handle que estava fechando);
+  - a reabertura automática de uma série no storage (após fechamento por ociosidade/LRU) nunca
+    cria: se o objeto sumiu, o storage responde `NOT_OPEN` e o `OPEN` do cliente o recria — um
+    round-trip a mais;
+  - `PLACE` de séries novas aguarda `placementGraceAfterLeadership` (3 s por padrão) depois que
+    o primeiro líder do boot assume, porque a janela de graça agora também se abre nesse
+    mandato — a criação das primeiras séries logo após subir o cluster atrasa até esse prazo.
 - Documentação: `doc/oss/ngrrd.md` (modo local), `doc/oss/ngrrd-cluster.md` (contrato de
   consistência, cache de handles, reconciliação de catálogo externo) e
   `doc/oss/ngrrd-cluster-operacao.md` (ordem de atualização — storages antes dos clientes).

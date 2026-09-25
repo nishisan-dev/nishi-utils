@@ -210,11 +210,11 @@ public final class Ngrrd {
 
     /**
      * Resolve a chave física via {@link StorageKey#series} e responde via
-     * {@link SeriesChannelProvider#seriesExists} quando o backend suporta
-     * (todos os backends atuais suportam); sem esse fallback, cai para
-     * {@link NgrrdStorage#exists}. Nenhum objeto é criado, aberto ou
-     * pré-alocado. Fecha o storage recém-instanciado quando ele não é
-     * compartilhado (mesma regra de {@code DefaultHandle.close}: volumes
+     * {@link SeriesChannelProvider#seriesExists} quando o backend o implementa
+     * (todos os backends atuais implementam); quando o backend não implementa
+     * {@link SeriesChannelProvider}, usa {@link NgrrdStorage#exists}. Nenhum
+     * objeto é criado, aberto ou pré-alocado. Fecha o storage recém-instanciado
+     * quando ele não é compartilhado (mesma regra de {@code DefaultHandle.close}: volumes
      * {@code SHARDED_BLOB} são geridos pelo {@link BlobVolumeRegistry}).
      */
     private static boolean existsInStorage(StorageSpec storageSpec, StorageFactory.StorageBindings bindings,

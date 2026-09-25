@@ -277,7 +277,11 @@ dono vem do catálogo e o storage recusa abrir série inexistente. `write`, `flu
 `checkpoint` lançam `IllegalStateException`; o `close()` é local (sem `CLOSE` remoto nem
 drenagem de buffers — o storage fecha a série por ociosidade). Série ausente faz o `open` (ou
 uma leitura posterior, se ela deixar de existir) lançar `SeriesNotFoundException`; o handle se
-fecha e sai do cache do cliente.
+fecha e sai do cache do cliente. Um handle somente leitura nunca dispara migração nem recriação
+de geometria: o storage abre sem criar sempre com `OnGeometryChange.FAIL`, ignorando o
+`onGeometryChange` pedido — se a definição do leitor diverge da geometria gravada, o `open`
+falha com erro e o arquivo não é regravado. Se a série já estiver aberta no storage (por um
+gravável, por exemplo), o handle existente é reaproveitado e nada muda.
 
 No máximo um handle principal por `seriesKey` fica em cache. As combinações entre abrir com e
 sem criação:
@@ -291,7 +295,7 @@ sem criação:
   só a vista (nunca o gravável, que segue escrevendo);
 - **sem criar + somente leitura já em cache:** devolve o existente (compartilhado).
 
-Um `open` com um gravável compartilhado fecha o handle para **todos** os chamadores que o
+O `close()` de um gravável compartilhado fecha o handle para **todos** os chamadores que o
 obtiveram (contrato desde a 8.5.0); um somente leitura compartilhado tem o mesmo
 comportamento entre quem o recebeu, mas uma vista aberta sobre um gravável é sempre exclusiva
 de quem a pediu.
@@ -310,6 +314,18 @@ operação falhar com `NgrrdClusterException` de código `ErrorCode.UNSUPPORTED_
 de qualquer RPC — nunca arriscando criar a série ou devolver `false` por engano. Atualize todos
 os storages antes de usar `exists`, `find`, `verify` ou `open` sem criar nos clientes (ordem
 detalhada no [guia de operação](ngrrd-cluster-operacao.md)).
+
+**Mudanças no caminho que cria (8.6.0).** Mesmo quem não usa as APIs novas percebe três
+diferenças em relação à 8.5.0:
+
+- `open` durante um `close()` lento do mesmo handle abre um handle **novo** — a 8.5.0 devolvia
+  o handle que estava fechando.
+- A reabertura automática de uma série no storage (depois de um fechamento por ociosidade/LRU)
+  **nunca cria**: se o objeto sumiu nesse meio-tempo, o storage responde `NOT_OPEN` e o `OPEN`
+  do cliente, que decide `createIfMissing` por si, recria a série — um round-trip a mais.
+- `PLACE` de séries novas aguarda `placementGraceAfterLeadership` (3 s por padrão) também depois
+  que o **primeiro** líder do boot assume: a criação das primeiras séries logo após subir o
+  cluster atrasa até esse prazo (o cliente retenta `NOT_LEADER` dentro do `retryTimeout`).
 
 ## 6. Storage node
 
@@ -403,7 +419,10 @@ Repassados ao `NGridNodeBuilder` por baixo do `StorageNodeConfig`:
   assumir a liderança durante a qual `PlacementRequestHandler` recusa criar placements **novos**
   (responde `NOT_LEADER`, o cliente retenta) — dá tempo da réplica local do catálogo convergir
   antes de decidir sobre séries que já podem existir. Placements **já existentes** continuam
-  respondidos normalmente, sem passar por essa janela.
+  respondidos normalmente, sem passar por essa janela. A mesma janela vale para os misses de
+  `ngrrd.catalog.lookup` (`exists`/`find`/`verify`), que também respondem `NOT_LEADER` enquanto
+  a réplica do líder ainda sincroniza um mandato anterior. A janela é marcada antes de qualquer
+  outro trabalho da posse, e também no primeiro líder eleito durante o boot.
 
 ### 6.3. `SeriesHandleRegistry`
 

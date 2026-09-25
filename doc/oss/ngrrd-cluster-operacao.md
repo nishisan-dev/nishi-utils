@@ -577,6 +577,23 @@ entrega tolera um período com versões mistas — mas só na direção storage-
 4. Depois que todos os storages reportam capacidades, atualize os clientes normalmente — sem
    necessidade de parar o tráfego, diferente da migração `COUNT`/`CAPACITY`/`WEIGHT`.
 
+### Mudanças de comportamento no caminho que cria
+
+Valem para todos os clientes depois de atualizar os storages, mesmo sem usar as APIs novas:
+
+- `open` durante um `close()` lento do mesmo handle abre um handle novo (a 8.5.0 devolvia o
+  handle que estava fechando).
+- A reabertura automática de uma série no storage (após fechamento por ociosidade/LRU) nunca
+  cria: se o objeto sumiu do volume, o storage responde `NOT_OPEN` e o `OPEN` do cliente recria a
+  série — um round-trip a mais nesse caso.
+- `PLACE` de séries novas aguarda `placementGraceAfterLeadership` (3 s por padrão) depois que o
+  primeiro líder do boot assume. Logo após subir o cluster, a criação das primeiras séries
+  atrasa até esse prazo; o cliente retenta `NOT_LEADER` dentro do `retryTimeout`.
+- Um `open` sem criar nunca migra nem recria a geometria de uma série: o storage usa
+  `OnGeometryChange.FAIL` para ele, qualquer que seja a política pedida, e uma definição
+  divergente vira erro ao leitor. Migrações de geometria continuam exigindo um `open` com
+  criação (ou o `NgrrdMigrateCli`).
+
 ### Custo e limites operacionais
 
 - **`NOT_FOUND` no `OPEN` custa uma leitura forte ao líder.** O storage nunca responde

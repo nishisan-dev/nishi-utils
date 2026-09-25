@@ -557,6 +557,14 @@ flag só afeta a criação, não o modo de abertura (diferente do cluster, onde
 `createIfMissing=false` sempre abre um handle somente leitura; ver
 [`doc/oss/ngrrd-cluster.md`](ngrrd-cluster.md)).
 
+A checagem de `createIfMissing=false` é de existência do objeto, não de
+integridade: um arquivo `.ngrr` presente mas truncado (menor que o header
+fixo) passa na checagem e o writer o reinicializa como uma série vazia, como
+faria na criação. É um caso raro (escrita interrompida no momento da criação,
+ou corrupção externa); para diagnosticar um arquivo suspeito antes de abri-lo,
+use o reader Python descrito abaixo, que valida o header e os CRC32 sem
+gravar nada.
+
 ```java
 import dev.nishisan.utils.oss.api.SeriesNotFoundException;
 
