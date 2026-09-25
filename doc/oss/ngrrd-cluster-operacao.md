@@ -237,7 +237,13 @@ Ao encerrar um nó, o transporte fecha inclusive sockets ainda sem identidade e 
 que conexões em abertura reapareçam depois do fechamento.
 O coordenador consulta também a origem: se ela já falhou,
 resolve a migração preservando a cópia original, sem esperar desnecessariamente o prazo
-completo. Um `COMMITTED` confirmado no destino tem precedência sobre a falha da origem.
+completo. Um `COMMITTED` confirmado no destino tem precedência sobre a falha da origem —
+inclusive quando o próprio poll ao destino falha por transporte (o destino segura o lock
+da série durante o commit/fsync, e o mesmo lock atende à consulta de status, então esse
+timeout é comum, não raro): a correção da 8.5.1 só aborta por falha da origem quando o
+destino respondeu e não confirmou `COMMITTED` na mesma rodada; se o poll do destino falhar,
+o coordenador tenta de novo até o `migrationTimeout`, reconsultando o destino uma última
+vez antes de desistir.
 
 O limite `ngrrd.rebalance.maxBytesPerSecond` reduz a competição com a ingestão. O orçamento
 é por **origem**, agregado entre seus destinos e transferências, com rajada de até um chunk.
@@ -246,6 +252,12 @@ os bytes efetivos na rede. O padrão é 16 MiB/s por origem.
 Por exemplo, oito migrações em uma origem com `maxBytesPerSecond: 8388608` compartilham
 8 MiB/s. Duas origens podem enviar, juntas, 16 MiB/s ao mesmo destino. Em Java, configure
 `StorageNodeConfig.Builder.migrationBytesPerSecond(...)`.
+Os patches finais do cutover (enviados depois que a série já está congelada, com os
+clientes recebendo `MIGRATING`) têm prioridade nessa fila desde a 8.5.1: não esperam atrás
+dos chunks de 256 KiB de outras cópias — os chunks concorrentes absorvem o atraso — mas
+continuam contando no mesmo orçamento, então a média de bytes/s por origem não muda. Só o
+delta final é prioritário; os patches de catch-up, enviados enquanto a série ainda recebe
+escrita, continuam disputando a banda em pé de igualdade com os chunks.
 
 Dimensione esse valor pela folga de rede, CPU e disco do destino, considerando todas as
 origens. Um limite menor alonga a cópia e a espera pelos últimos blocos; confira
