@@ -213,6 +213,66 @@ class TcpTransportConcurrentMeshTest {
         }
     }
 
+    /**
+     * O nó que entra aprende o id canônico de um seed por gossip de outro nó antes de a resposta do
+     * handshake desse seed chegar. Ele não pode discar de novo para o mesmo processo: a conexão ao
+     * alias já leva até lá. A discagem duplicada era resolvida pelo desempate de forma diferente em
+     * cada ponta (cada uma registra as duas conexões em ordem diferente) e derrubava o link.
+     */
+    @Test
+    void seedLinkStillResolvingServesCanonicalPeerWithoutRedial() throws Exception {
+        int portA = allocateFreeLocalPort(Set.of());
+        int portC = allocateFreeLocalPort(Set.of(portA));
+        int portClient = allocateFreeLocalPort(Set.of(portA, portC));
+        NodeInfo a = new NodeInfo(NodeId.of("storage-a"), "127.0.0.1", portA);
+        NodeInfo c = new NodeInfo(NodeId.of("storage-c"), "127.0.0.1", portC);
+        NodeInfo client = new NodeInfo(NodeId.of("client-1"), "127.0.0.1", portClient);
+        NodeInfo aliasA = new NodeInfo(NodeId.of("127.0.0.1:" + portA), a.host(), a.port());
+        NodeInfo aliasC = new NodeInfo(NodeId.of("127.0.0.1:" + portC), c.host(), c.port());
+
+        TcpTransport storageA = new TcpTransport(meshConfig(a, c));
+        TcpTransport storageC = new TcpTransport(meshConfig(c, a));
+        TcpTransport clientTransport = new TcpTransport(meshConfig(client, aliasA, aliasC));
+        var holdingSeedReply = new CountDownLatch(1);
+        var releaseSeedReply = new CountDownLatch(1);
+        var seenFromC = new java.util.concurrent.atomic.AtomicInteger();
+        clientTransport.setHandshakeIdentityHook(id -> {
+            if (id.equals(c.nodeId()) && seenFromC.incrementAndGet() == 1) {
+                holdingSeedReply.countDown();
+                awaitUninterruptibly(releaseSeedReply);
+            }
+        });
+        Set<NodeId> dialedByClient = ConcurrentHashMap.newKeySet();
+        clientTransport.setBeforeDialHook(dialedByClient::add);
+        List<NodeId> clientLostPeers = new java.util.concurrent.CopyOnWriteArrayList<>();
+        clientTransport.addListener(new TransportListener() {
+            public void onPeerConnected(NodeInfo peer) { }
+            public void onPeerDisconnected(NodeId peer) { clientLostPeers.add(peer); }
+            public void onMessage(ClusterMessage message) { }
+        });
+        try {
+            storageA.start();
+            storageC.start();
+            awaitFullDirectMesh(List.of(storageA, storageC), List.of(a, c), Duration.ofSeconds(10));
+
+            clientTransport.start();
+            assertTrue(holdingSeedReply.await(5, TimeUnit.SECONDS), "resposta do seed C não chegou");
+            // storage-a's handshake reply teaches the client storage-c's canonical id.
+            awaitDiscovery(clientTransport, c.nodeId());
+            Thread.sleep(1_000); // past the 100 ms dial scheduled for a newly learned peer
+            assertFalse(dialedByClient.contains(c.nodeId()),
+                    "o cliente discou de novo para storage-c apesar da conexão ao seed aberta: " + dialedByClient);
+
+            releaseSeedReply.countDown();
+            awaitFullDirectMesh(List.of(storageA, storageC, clientTransport), List.of(a, c, client),
+                    Duration.ofSeconds(15));
+            assertTrue(clientLostPeers.isEmpty(), "o cliente perdeu links durante a entrada: " + clientLostPeers);
+        } finally {
+            releaseSeedReply.countDown();
+            closeQuietly(clientTransport, storageA, storageC);
+        }
+    }
+
     /** Variante: o alias chega a storage-a por PEER_UPDATE de um terceiro, não por handshake. */
     @Test
     void seedAliasGossipedByPeerUpdateKeepsEstablishedLinks() throws Exception {

@@ -483,6 +483,10 @@ public final class TcpTransport implements Transport {
             if (current != null && current.isOpen()) {
                 return current;
             }
+            Connection unpublished = unpublishedLinkTo(nodeInfo);
+            if (unpublished != null) {
+                return unpublished;
+            }
             try {
                 beforeDialHook.accept(nodeId);
                 LOGGER.fine(() -> "Initiating connection to " + nodeInfo);
@@ -515,6 +519,32 @@ public final class TcpTransport implements Transport {
     // on close(); a future "forget peer" path (peer removed from knownPeers for good) is the one
     // place that may also drop that peer's entry.
     private final Map<NodeId, ReentrantLock> connectionLocks = new ConcurrentHashMap<>();
+
+    /**
+     * An open socket that already leads to {@code target}'s process but is not published under its
+     * id: the link to a bootstrap seed whose handshake reply has not resolved the seed's provisional
+     * alias yet (same listen address), or a link to that very id still in the middle of its own
+     * handshake. Messages sent over it reach the right process. Dialing again instead opened a
+     * duplicate connection that each endpoint registered in a different order (the dialer re-keys
+     * the seed link only when the reply arrives), so the tie-break in registerLiveConnection kept a
+     * different socket on each side and the link dropped.
+     */
+    private Connection unpublishedLinkTo(NodeInfo target) {
+        for (Connection candidate : liveSockets) {
+            NodeInfo remote = candidate.remote;
+            if (remote == null || !candidate.isOpen()) {
+                continue;
+            }
+            if (remote.nodeId().equals(target.nodeId())) {
+                return candidate;
+            }
+            if (sameAddress(remote, target) && initialPeerIds.contains(remote.nodeId())
+                    && !verifiedPeers.contains(remote.nodeId())) {
+                return candidate;
+            }
+        }
+        return null;
+    }
 
     private ReentrantLock getLockFor(NodeId nodeId) {
         return connectionLocks.computeIfAbsent(nodeId, id -> new ReentrantLock());
