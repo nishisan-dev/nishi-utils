@@ -98,7 +98,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
     /**
      * Recebe {@code (seriesKey, this)} — a instância, não só a chave — para que quem remove do mapa do
      * cliente use remoção condicional ({@code Map#remove(key, value)}), nunca um {@code remove(key)}
-     * incondicional: sem isso, o {@link #close(Duration)}/{@link #markSeriesNotFound} de um handle
+     * incondicional: sem isso, o {@link #close(Duration)}/{@link #markTerminal} de um handle
      * ANTIGO (ex.: um close lento em andamento) poderia remover um handle NOVO já registrado para a
      * mesma chave.
      */
@@ -110,8 +110,8 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
     /**
      * Estado do handle, num único valor imutável: toda transição é um {@code compareAndSet} de um
      * {@link State} inteiro para outro, de modo que nenhuma thread observa uma combinação intermediária
-     * (ex.: fechado sem a causa da ausência). Quem leva o handle a fechado ({@link #close(Duration)} ou
-     * {@link #markSeriesNotFound}) é o único a executar o encerramento.
+     * (ex.: fechado sem a causa terminal). Quem leva o handle a fechado ({@link #close(Duration)} ou
+     * {@link #markTerminal}) é o único a executar o encerramento.
      */
     private final AtomicReference<State> state;
 
@@ -121,10 +121,13 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
      * @param writable {@code true} se o handle aceita escrita (aberto com criação): decide se a
      *                 (re)abertura posiciona com criação ({@code ngrrd.place}) ou exige a série existente
      * @param closed   {@code true} depois do fechamento — nunca mais reaproveitável
-     * @param notFound causa da ausência quando o fechamento veio da descoberta de que a série não existe;
-     *                 {@code null} num handle aberto ou fechado pelo chamador
+     * @param terminalCause causa quando o fechamento veio de uma falha definitiva de um handle somente
+     *                 leitura — {@link SeriesNotFoundException} (série ausente) ou
+     *                 {@link NgrrdClusterException} com {@link ErrorCode#UNSUPPORTED_BY_NODE} (storage que
+     *                 não confirmou {@code createIfMissing=false}); {@code null} num handle aberto ou fechado
+     *                 pelo chamador. Toda operação posterior relança essa causa.
      */
-    private record State(boolean writable, boolean closed, SeriesNotFoundException notFound) {
+    private record State(boolean writable, boolean closed, RuntimeException terminalCause) {
 
         static State opened(boolean writable) {
             return new State(writable, false, null);
@@ -134,7 +137,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
             return new State(writable, true, null);
         }
 
-        State closedBySeriesNotFound(SeriesNotFoundException cause) {
+        State closedByTerminalFailure(RuntimeException cause) {
             return new State(writable, true, cause);
         }
     }
@@ -182,9 +185,17 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
      *
      * <p>item 12 (achado do Refuter): package-private de propósito — só {@code DefaultNgrrdClusterClient}
      * e o próprio {@code client} chamam isto; não faz parte do contrato público de {@link NgrrdHandle}.</p>
+     *
+     * <p>Se a abertura falhar, o handle é descartado localmente ({@link #discard()}): nunca chegou ao mapa
+     * do cliente e não pode ser reaproveitado.</p>
      */
     void open() {
-        open(new OperationRetry(Commands.OPEN));
+        try {
+            open(new OperationRetry(Commands.OPEN));
+        } catch (RuntimeException e) {
+            discard();
+            throw e;
+        }
     }
 
     private void open(OperationRetry retry) {
@@ -203,9 +214,13 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
                     SeriesStatusResponse.class, retry.deadlineMs);
             if (response.status() == SeriesStatus.OK) {
                 if (!writable && !Boolean.TRUE.equals(response.createIfMissingHonored())) {
-                    throw new NgrrdClusterException(ErrorCode.UNSUPPORTED_BY_NODE, candidateOwner
-                            + " abriu " + seriesKey + " sem confirmar createIfMissing=false (storage de versão"
-                            + " anterior?); a série pode ter sido criada por ele");
+                    // Terminal: o dono é um storage que não honra createIfMissing=false; o handle sai do mapa
+                    // do cliente em vez de continuar funcional contra ele.
+                    NgrrdClusterException unsupported = new NgrrdClusterException(ErrorCode.UNSUPPORTED_BY_NODE,
+                            candidateOwner + " abriu " + seriesKey + " sem confirmar createIfMissing=false (storage"
+                                    + " de versão anterior?); a série pode ter sido criada por ele");
+                    markTerminal(unsupported);
+                    throw unsupported;
                 }
                 owner = candidateOwner;
                 return;
@@ -261,7 +276,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
 
     /**
      * Executa {@code action}; se ela descobrir {@link SeriesNotFoundException}, fecha o handle somente
-     * leitura ({@link #markSeriesNotFound}) antes de relançar. Usado pelos dois caminhos em que uma leitura
+     * leitura ({@link #markTerminal}) antes de relançar. Usado pelos dois caminhos em que uma leitura
      * pode descobrir isso ao reabrir/reposicionar a série sem criar: {@link #handleRetryableStatus} em
      * {@code NOT_OPEN} e {@link #noteWrongOwner} em {@code WRONG_OWNER} sem dono informado.
      */
@@ -269,25 +284,26 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
         try {
             return action.get();
         } catch (SeriesNotFoundException e) {
-            markSeriesNotFound(e);
+            markTerminal(e);
             throw e;
         }
     }
 
     /**
-     * Fecha localmente o handle somente leitura cuja série se confirmou ausente: as operações passam a
-     * lançar {@link SeriesNotFoundException} e o handle sai do mapa do cliente ({@link #onClose}, remoção
-     * condicional à instância), de modo que um {@code open} posterior refaz o fluxo do zero. Sem
-     * {@code CLOSE} remoto: a série não está aberta no dono. Não faz nada num handle já fechado (a leitura
-     * em curso recebe a exceção, mas o estado fechado pelo chamador é preservado) nem num gravável.
+     * Fecha localmente o handle somente leitura depois de uma falha definitiva — série confirmada ausente
+     * ({@link SeriesNotFoundException}) ou dono que não confirmou {@code createIfMissing=false}
+     * ({@link ErrorCode#UNSUPPORTED_BY_NODE}): as operações passam a relançar a causa e o handle sai do
+     * mapa do cliente ({@link #onClose}, remoção condicional à instância), de modo que um {@code open}
+     * posterior refaz o fluxo do zero. Sem {@code CLOSE} remoto. Não faz nada num handle já fechado (a
+     * operação em curso recebe a exceção, mas o estado fechado pelo chamador é preservado) nem num gravável.
      */
-    private void markSeriesNotFound(SeriesNotFoundException cause) {
+    private void markTerminal(RuntimeException cause) {
         for (;;) {
             State current = state.get();
             if (current.closed() || current.writable()) {
                 return;
             }
-            if (state.compareAndSet(current, current.closedBySeriesNotFound(cause))) {
+            if (state.compareAndSet(current, current.closedByTerminalFailure(cause))) {
                 onClose.accept(seriesKey, this);
                 return;
             }
@@ -619,8 +635,12 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
 
     /** Recusa operações num handle fechado, a partir de uma única leitura do estado. */
     private void ensureOpen(State current) {
-        if (current.notFound() != null) {
-            throw new SeriesNotFoundException(seriesKey, current.notFound().reason());
+        RuntimeException terminal = current.terminalCause();
+        if (terminal instanceof SeriesNotFoundException notFound) {
+            throw new SeriesNotFoundException(seriesKey, notFound.reason());
+        }
+        if (terminal instanceof NgrrdClusterException failure) {
+            throw new NgrrdClusterException(failure.code(), failure.getMessage(), failure);
         }
         if (current.closed()) {
             throw new NgrrdClusterException(ErrorCode.CLOSED, "handle fechado: " + seriesKey);

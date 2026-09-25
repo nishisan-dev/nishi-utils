@@ -408,6 +408,22 @@ class RemoteSeriesHandleTest {
         assertEquals(ErrorCode.UNSUPPORTED_BY_NODE, ex.code());
         assertTrue(ex.getMessage().contains(OWNER_A.value()), ex.getMessage());
         assertEquals(List.of(Commands.OPEN), commands());
+        assertFalse(handle.isOpen(), "a abertura que falhou deixa o handle fechado");
+        NgrrdClusterException again = assertThrows(NgrrdClusterException.class, () -> handle.read("daily"));
+        assertEquals(ErrorCode.UNSUPPORTED_BY_NODE, again.code());
+        assertEquals(List.of(Commands.OPEN), commands(), "nenhum RPC depois da falha terminal");
+    }
+
+    @Test
+    void aberturaInicialQueFalhaDescartaOHandle() {
+        RemoteSeriesHandle handle = newHandle(Ngrrd.OpenOptions.defaults().withCreateIfMissing(false));
+        rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.NOT_FOUND, OWNER_A.value(), null));
+
+        assertThrows(SeriesNotFoundException.class, handle::open);
+
+        assertFalse(handle.isOpen());
+        assertThrows(NgrrdClusterException.class, () -> handle.read("daily"));
+        assertEquals(List.of(Commands.OPEN), commands());
     }
 
     @Test
@@ -421,6 +437,11 @@ class RemoteSeriesHandleTest {
         assertEquals(ErrorCode.UNSUPPORTED_BY_NODE, ex.code());
         assertEquals(List.of(Commands.OPEN, Commands.READ_PRESET, Commands.OPEN), commands(),
                 "a leitura não segue depois de um OPEN sem confirmação");
+        assertFalse(handle.isOpen(), "falha terminal: o handle não segue funcional contra o storage antigo");
+        assertEquals(List.of(SERIES_KEY), onCloseCalls, "sai do mapa do cliente (remoção condicional)");
+        NgrrdClusterException again = assertThrows(NgrrdClusterException.class, () -> handle.read("daily"));
+        assertEquals(ErrorCode.UNSUPPORTED_BY_NODE, again.code(), "operações seguintes relançam a causa");
+        assertEquals(3, commands().size(), "sem RPC depois da falha terminal");
     }
 
     @Test
