@@ -80,7 +80,8 @@ import java.util.stream.Collectors;
  * <p>Série confirmada inexistente ({@link #failSeries}, ou o reopener lançando
  * {@link SeriesNotFoundException}): a rota da chave fica marcada — admissões recusadas com
  * {@link SeriesNotFoundException}, pendências falhadas sem reabrir nem retentar — até um handle novo da
- * mesma chave abrir ({@link #resetSeries}). Cada escrita enfileirada carrega a rota que a admitiu e é
+ * mesma chave abrir ({@link #resetSeries}, que também inaugura rota nova se a anterior ainda tem escritas
+ * em voo). Cada escrita enfileirada carrega a rota que a admitiu e é
  * concluída nela, de modo que a marca de uma geração da série nunca alcança as escritas da seguinte.</p>
  */
 public final class WriteDispatcher implements WriteBuffer, Closeable {
@@ -225,8 +226,8 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             try {
                 // resetSeries troca a entrada de routes por uma instância nova enquanto detém o MESMO
                 // lock que acabamos de conseguir — se perdemos essa corrida, a rota que travamos já foi
-                // aposentada (marcada inexistente, geração anterior): solta e tenta de novo, para cair na
-                // rota atual em vez de ser recusada pela marca de outra geração.
+                // aposentada (geração de um handle anterior, marcada ou não): solta e tenta de novo, para
+                // cair na rota atual em vez de admitir na geração antiga ou ser recusada pela marca dela.
                 if (routes.get(write.seriesKey()) != route) {
                     continue;
                 }
@@ -765,7 +766,11 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         // Shutdown also synchronizes with an admission that passed the closed check
         // but has not entered the pending index yet. Keep the history scan off the
         // hot path, here only, so close cannot overlook that in-progress admission.
-        for (SeriesRoute route : routes.values()) {
+        // O índice de pendências cobre as rotas de gerações anteriores (trocadas por resetSeries com
+        // escritas ainda em voo), que já não estão em routes.
+        List<SeriesRoute> candidates = new ArrayList<>(routes.values());
+        candidates.addAll(snapshotPendingRoutes());
+        for (SeriesRoute route : candidates) {
             route.lock.lock();
             try {
                 if (route.submitted > route.completed) {
@@ -907,17 +912,23 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     }
 
     /**
-     * Troca a rota marcada de {@code seriesKey} por uma rota nova e limpa, com dono
-     * {@code ownerNodeId} — {@code RemoteSeriesHandle.open()} chama isto quando um handle novo da mesma
-     * chave abre com sucesso, ANTES de o handle ficar visível a quem escreve. Semântica:
+     * Inaugura, se preciso, uma geração nova da rota de {@code seriesKey}, com dono {@code ownerNodeId} —
+     * {@code RemoteSeriesHandle.open()} chama isto quando um handle novo da mesma chave abre com
+     * sucesso, ANTES de o handle ficar visível a quem escreve. Semântica:
      * <ul>
-     *   <li>chave sem rota, ou com rota não marcada: nada muda (o caminho de séries nunca marcadas é o
-     *       de sempre);</li>
-     *   <li>chave marcada: a troca acontece sob o lock da rota antiga, o mesmo que {@link #enqueue}
-     *       confere antes de admitir — toda escrita posterior cai na rota nova e nunca herda a marca;</li>
-     *   <li>escritas da geração marcada ainda em voo carregam a própria rota ({@link PendingWrite}) e
-     *       são concluídas nela: falham na resposta (salvo {@code OK}) sem tocar a rota nova, e a rota
-     *       antiga sai de {@link #pendingRoutes} ao concluir a última delas.</li>
+     *   <li>chave sem rota, ou com rota não marcada e sem escrita em voo: nada muda (o caminho de
+     *       sempre);</li>
+     *   <li>rota marcada inexistente OU com escritas de um handle anterior ainda em voo
+     *       ({@code submitted > completed}): troca por uma rota nova e limpa. A troca acontece sob o lock
+     *       da rota antiga, o mesmo que {@link #enqueue} confere antes de admitir — toda escrita posterior
+     *       cai na rota nova e nunca herda a marca antiga, nem uma marca tardia da rota antiga (ex.: a
+     *       reabertura pendente do handle anterior descobrindo {@code NOT_FOUND} depois desta
+     *       abertura);</li>
+     *   <li>as escritas da geração anterior carregam a própria rota ({@link PendingWrite}) e são
+     *       concluídas nela. A rota antiga continua em {@link #pendingRoutes} enquanto tiver escrita em
+     *       voo ou falha registrada — {@code flushAll()} segue vendo-a — e sai quando marcada e drenada,
+     *       como qualquer rota marcada. Barreiras por série ({@link #flushSeriesSync}) de quem resolve a
+     *       chave depois da troca só veem a rota nova.</li>
      * </ul>
      */
     @Override
@@ -930,13 +941,13 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         boolean replaced = false;
         route.lock.lock();
         try {
-            if (route.notFound) {
+            if (route.notFound || route.submitted > route.completed) {
                 replaced = routes.replace(seriesKey, route, new SeriesRoute(ownerNodeId));
             }
         } finally {
             route.lock.unlock();
         }
-        if (replaced) {
+        if (replaced && route.notFound) {
             retireIfDrained(route);
         }
     }

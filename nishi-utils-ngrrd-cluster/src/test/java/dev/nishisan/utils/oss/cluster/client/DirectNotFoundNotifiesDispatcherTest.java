@@ -88,9 +88,13 @@ class DirectNotFoundNotifiesDispatcherTest {
     }
 
     private RemoteSeriesHandle newHandle(WriteBuffer buffer) {
-        return new RemoteSeriesHandle(SERIES_KEY, "yaml: fake", "hash-1", Map.of(),
-                Ngrrd.OpenOptions.defaults().withCreateIfMissing(false), lookup, rpc, buffer, retry,
-                Duration.ofSeconds(5), Duration.ofSeconds(5), Clock.systemUTC(), handles::remove);
+        return newHandle(buffer, rpc, Ngrrd.OpenOptions.defaults().withCreateIfMissing(false), Duration.ofSeconds(5));
+    }
+
+    private RemoteSeriesHandle newHandle(WriteBuffer buffer, RecordingClusterRpc handleRpc, Ngrrd.OpenOptions options,
+            Duration closeTimeout) {
+        return new RemoteSeriesHandle(SERIES_KEY, "yaml: fake", "hash-1", Map.of(), options, lookup, handleRpc,
+                buffer, retry, Duration.ofSeconds(5), closeTimeout, Clock.systemUTC(), handles::remove);
     }
 
     @Test
@@ -234,6 +238,161 @@ class DirectNotFoundNotifiesDispatcherTest {
         }
     }
 
+    @Test
+    void closeEmAndamentoComNotFoundDescobertoPorOperacaoSincronaFalhaEscritasPendentesEConcluiOClose()
+            throws Exception {
+        // T1 fecha A (e espera o flush da escrita em voo); T2 é um read() de A que passou pelo
+        // ensureOpen() antes do close e só descobre NOT_FOUND depois. O close é o dono do encerramento,
+        // mas A precisa continuar visível ao reopener até terminar: quando o lote em voo responder
+        // NOT_OPEN, o reopener acha A, que lança SeriesNotFoundException, e a rota é marcada. Sem isso o
+        // reopener acharia null, a escrita ficaria em retentativa para sempre e o close consumiria todo
+        // o orçamento (30 s aqui).
+        WriteDispatcher dispatcher = newDispatcher(1);
+        CountDownLatch batchInFlight = new CountDownLatch(1);
+        CountDownLatch releaseBatch = new CountDownLatch(1);
+        CountDownLatch readInFlight = new CountDownLatch(1);
+        CountDownLatch releaseRead = new CountDownLatch(1);
+        CountDownLatch flushEntered = new CountDownLatch(1);
+        try {
+            AtomicReference<SeriesStatus> openStatus = new AtomicReference<>(SeriesStatus.OK);
+            rpc.respondDefault((cmd, body) -> {
+                if (cmd.equals(Commands.WRITE_BATCH)) {
+                    batchInFlight.countDown();
+                    awaitLatch(releaseBatch);
+                    return new WriteBatchResponse(Map.of(SERIES_KEY, SeriesStatus.NOT_OPEN), Map.of(), Map.of());
+                }
+                if (cmd.equals(Commands.READ)) {
+                    readInFlight.countDown();
+                    awaitLatch(releaseRead);
+                    return new ReadResponse(SeriesStatus.NOT_OPEN, null, null, null);
+                }
+                if (cmd.equals(Commands.OPEN)) {
+                    return new SeriesStatusResponse(openStatus.get(), OWNER_A.value(), null);
+                }
+                return new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null);
+            });
+            InterceptingWriteBuffer buffer = new InterceptingWriteBuffer(dispatcher, new AtomicReference<>());
+            buffer.onFlushSeries = flushEntered::countDown;
+            RemoteSeriesHandle handleA = newHandle(buffer, rpc, Ngrrd.OpenOptions.defaults().withCreateIfMissing(false),
+                    Duration.ofSeconds(30));
+            handleA.open();
+            handles.put(SERIES_KEY, handleA);
+            openStatus.set(SeriesStatus.NOT_FOUND);
+
+            handleA.write("in_octets", new Sample(1L, 1.0));
+            assertTrue(batchInFlight.await(AWAIT_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS), "lote de A em voo");
+
+            AtomicReference<Throwable> readFailure = new AtomicReference<>();
+            Thread reader = new Thread(() -> {
+                try {
+                    handleA.read("in_octets", ANY_QUERY);
+                } catch (Throwable t) {
+                    readFailure.set(t);
+                }
+            }, "test-read-A");
+            reader.start();
+            assertTrue(readInFlight.await(AWAIT_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS), "read de A em voo");
+
+            AtomicReference<Throwable> closeFailure = new AtomicReference<>();
+            Thread closer = new Thread(() -> {
+                try {
+                    handleA.close();
+                } catch (Throwable t) {
+                    closeFailure.set(t);
+                }
+            }, "test-close-A");
+            closer.start();
+            assertTrue(flushEntered.await(AWAIT_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS), "close de A no flush");
+
+            releaseRead.countDown();
+            reader.join(AWAIT_TIMEOUT.toMillis());
+            assertTrue(readFailure.get() instanceof SeriesNotFoundException, "read: " + readFailure.get());
+            assertSame(handleA, handles.get(SERIES_KEY), "com o close em andamento, A continua visível ao reopener");
+
+            releaseBatch.countDown();
+            closer.join(AWAIT_TIMEOUT.toMillis());
+
+            assertTrue(!closer.isAlive(), "o close termina sem consumir o orçamento inteiro");
+            assertNull(closeFailure.get());
+            assertNull(handles.get(SERIES_KEY), "o próprio close tira A do mapa ao terminar");
+            assertEquals(1L, dispatcher.samplesFailed(), "a escrita pendente de A falha");
+            assertEquals(0L, dispatcher.samplesSent());
+            assertEquals(1L, rpc.calls().stream().filter(c -> c.command().equals(Commands.WRITE_BATCH)).count(),
+                    "sem retentativa da escrita de A");
+            dispatcher.flushAllSync();
+        } finally {
+            releaseRead.countDown();
+            releaseBatch.countDown();
+            dispatcher.close();
+        }
+    }
+
+    @Test
+    void marcacaoTardiaDaRotaDoHandleAntigoNaoAtingeOHandleNovoAbertoDepois() throws Exception {
+        // A (sem criar) está fechando com uma escrita pendente; o NOT_OPEN dela leva o reopener a chamar
+        // A.reopen(), cujo OPEN fica em voo. Nesse meio tempo o usuário abre B na mesma chave (A já não é
+        // reaproveitável) e B escreve. Só depois o OPEN de A volta NOT_FOUND e a rota das escritas de A é
+        // marcada — isso não pode atingir B: a abertura de B inaugura uma geração nova da rota.
+        WriteDispatcher dispatcher = newDispatcher(1);
+        RecordingClusterRpc rpcA = new RecordingClusterRpc(NodeId.of("client-under-test"));
+        RecordingClusterRpc rpcB = new RecordingClusterRpc(NodeId.of("client-under-test"));
+        CountDownLatch reopenInFlight = new CountDownLatch(1);
+        CountDownLatch releaseReopen = new CountDownLatch(1);
+        try {
+            rpc.respondDefault((cmd, body) -> {
+                WriteBatchRequest request = (WriteBatchRequest) body;
+                if (request.writes().getFirst().tsEpochMs() == 1L) {
+                    return new WriteBatchResponse(Map.of(SERIES_KEY, SeriesStatus.NOT_OPEN), Map.of(), Map.of());
+                }
+                return okFor(request);
+            });
+            rpcA.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
+            rpcA.respondDefault((cmd, body) -> {
+                if (cmd.equals(Commands.OPEN)) {
+                    reopenInFlight.countDown();
+                    awaitLatch(releaseReopen);
+                    return new SeriesStatusResponse(SeriesStatus.NOT_FOUND, OWNER_A.value(), null);
+                }
+                return new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null);
+            });
+            rpcB.respondDefault((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
+
+            RemoteSeriesHandle handleA = newHandle(dispatcher, rpcA, Ngrrd.OpenOptions.defaults().withCreateIfMissing(false),
+                    Duration.ofSeconds(30));
+            handleA.open();
+            handles.put(SERIES_KEY, handleA);
+            handleA.write("in_octets", new Sample(1L, 1.0));
+            assertTrue(reopenInFlight.await(AWAIT_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS),
+                    "reopener chamou A.reopen() e o OPEN está em voo");
+
+            Thread closer = new Thread(handleA::close, "test-close-A");
+            closer.start();
+            Await.untilTrue("A não é mais reaproveitável", AWAIT_TIMEOUT, () -> !handleA.isOpen());
+
+            // O que DefaultNgrrdClusterClient.open faz ao ver A fechado: abre um handle novo e o publica.
+            RemoteSeriesHandle handleB = newHandle(dispatcher, rpcB, Ngrrd.OpenOptions.defaults(), Duration.ofSeconds(5));
+            handleB.open();
+            handles.put(SERIES_KEY, handleB);
+            handleB.write("in_octets", new Sample(2L, 2.0));
+
+            releaseReopen.countDown();
+            Await.untilTrue("escrita pendente de A falhou", AWAIT_TIMEOUT, () -> dispatcher.samplesFailed() == 1L);
+
+            handleB.write("in_octets", new Sample(3L, 3.0));
+            handleB.checkpoint();
+            closer.join(AWAIT_TIMEOUT.toMillis());
+            dispatcher.flushAllSync();
+
+            assertTrue(!closer.isAlive(), "close de A terminou");
+            assertSame(handleB, handles.get(SERIES_KEY));
+            assertEquals(1L, dispatcher.samplesFailed(), "só a escrita de A falha");
+            assertEquals(2L, dispatcher.samplesSent(), "as duas escritas de B são entregues");
+        } finally {
+            releaseReopen.countDown();
+            dispatcher.close();
+        }
+    }
+
     private static WriteBatchResponse okFor(WriteBatchRequest request) {
         Map<String, SeriesStatus> status = new LinkedHashMap<>();
         for (SeriesWrite write : request.writes()) {
@@ -258,6 +417,8 @@ class DirectNotFoundNotifiesDispatcherTest {
     private static final class InterceptingWriteBuffer implements WriteBuffer {
         private final WriteBuffer delegate;
         private final AtomicReference<Runnable> beforeEnqueue;
+        /** Executado ao entrar em {@link #flushSeriesSync(String, String, Duration)}, antes de delegar. */
+        volatile Runnable onFlushSeries = () -> { };
 
         InterceptingWriteBuffer(WriteBuffer delegate, AtomicReference<Runnable> beforeEnqueue) {
             this.delegate = delegate;
@@ -285,12 +446,18 @@ class DirectNotFoundNotifiesDispatcherTest {
 
         @Override
         public void flushSeriesSync(String seriesKey, String ownerNodeId, Duration maxWait) {
+            onFlushSeries.run();
             delegate.flushSeriesSync(seriesKey, ownerNodeId, maxWait);
         }
 
         @Override
         public void failSeries(String seriesKey, Throwable cause) {
             delegate.failSeries(seriesKey, cause);
+        }
+
+        @Override
+        public void resetSeries(String seriesKey, String ownerNodeId) {
+            delegate.resetSeries(seriesKey, ownerNodeId);
         }
     }
 
