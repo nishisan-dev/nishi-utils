@@ -79,6 +79,8 @@ class RemoteSeriesHandleTest {
     private final List<String> onCloseCalls = new CopyOnWriteArrayList<>();
     /** Capacidades anunciadas pelos storages aos handles criados por {@link #newHandle}. */
     private NodeCapabilities capabilities = CapabilityFixtures.advertisingAll();
+    /** Estado de fechamento do cliente visto pelos handles criados por {@link #newHandle}. */
+    private volatile boolean clientClosed;
 
     private RemoteSeriesHandle newHandle() {
         return newHandle(Duration.ofSeconds(2), Ngrrd.OpenOptions.defaults());
@@ -99,7 +101,7 @@ class RemoteSeriesHandleTest {
         RetryPolicy retry = new RetryPolicy(retryTimeout, Duration.ofMillis(5), Duration.ofMillis(50));
         return new RemoteSeriesHandle(SERIES_KEY, "yaml: fake", "hash-1", Map.of(), options,
                 resolver, rpc, dispatcher, retry, Duration.ofSeconds(5), Duration.ofSeconds(5), Clock.systemUTC(),
-                (key, handle) -> onCloseCalls.add(key), capabilities);
+                (key, handle) -> onCloseCalls.add(key), capabilities, () -> clientClosed);
     }
 
     @Test
@@ -445,6 +447,29 @@ class RemoteSeriesHandleTest {
     }
 
     @Test
+    void handleDepoisDoCloseDoClienteFalhaNaHoraComClosed() {
+        RemoteSeriesHandle readOnly = readOnlyOpenedHandle();
+        clientClosed = true;
+
+        NgrrdClusterException onRead = assertThrows(NgrrdClusterException.class, () -> readOnly.read("daily"));
+
+        assertEquals(ErrorCode.CLOSED, onRead.code());
+        assertEquals(List.of(Commands.OPEN), commands(), "nenhuma retentativa sobre o transporte fechado");
+    }
+
+    @Test
+    void handleGravavelDepoisDoCloseDoClienteRecusaEscritaComClosed() {
+        RemoteSeriesHandle writable = openedHandle();
+        clientClosed = true;
+
+        NgrrdClusterException onWrite = assertThrows(NgrrdClusterException.class,
+                () -> writable.write("in_octets", new Sample(1L, 1.0)));
+
+        assertEquals(ErrorCode.CLOSED, onWrite.code());
+        assertTrue(dispatcher.enqueued.isEmpty());
+    }
+
+    @Test
     void openComCriarAceitaOkSemConfirmacao() {
         RemoteSeriesHandle handle = newHandle();
         rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
@@ -623,7 +648,7 @@ class RemoteSeriesHandleTest {
         RemoteSeriesHandle handleA = new RemoteSeriesHandle(SERIES_KEY, "yaml: fake", "hash-1", Map.of(),
                 Ngrrd.OpenOptions.defaults().withCreateIfMissing(false), resolverA, rpcA, new NoOpWriteBuffer(),
                 retry, Duration.ofSeconds(5), Duration.ofSeconds(5), Clock.systemUTC(),
-                (key, handle) -> handles.remove(key, handle), CapabilityFixtures.advertisingAll());
+                (key, handle) -> handles.remove(key, handle), CapabilityFixtures.advertisingAll(), () -> false);
         handles.put(SERIES_KEY, handleA);
         rpcA.respondNext((cmd, body) -> openOk(OWNER_A.value()));
         handleA.open();
@@ -646,7 +671,7 @@ class RemoteSeriesHandleTest {
                 Ngrrd.OpenOptions.defaults(), new FakePlacementLookup(OWNER_A.value()),
                 new RecordingClusterRpc(NodeId.of("client-under-test")), new NoOpWriteBuffer(), retry,
                 Duration.ofSeconds(5), Duration.ofSeconds(5), Clock.systemUTC(),
-                (key, handle) -> handles.remove(key, handle), CapabilityFixtures.advertisingAll());
+                (key, handle) -> handles.remove(key, handle), CapabilityFixtures.advertisingAll(), () -> false);
         handles.put(SERIES_KEY, handleB);
 
         openGate.countDown();
@@ -732,7 +757,7 @@ class RemoteSeriesHandleTest {
                     }, "test-reader-on-close");
                     reader.start();
                     joinQuietly(reader);
-                }, capabilities);
+                }, capabilities, () -> false);
         self.set(handle);
         rpc.respondNext((cmd, body) -> openOk(OWNER_A.value()));
         handle.open();

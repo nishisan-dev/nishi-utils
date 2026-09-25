@@ -78,6 +78,8 @@ class SeriesHandleCacheTest {
     private RecordingClusterRpc rpc;
     private RecordingWriteBuffer dispatcher;
     private AtomicInteger opened;
+    /** Fechamento do cliente visto pelos handles abertos por este teste. */
+    private volatile boolean clientClosed;
 
     @BeforeEach
     void setUp() {
@@ -170,6 +172,22 @@ class SeriesHandleCacheTest {
         assertSame(writable, cache.get(SERIES_KEY));
         NgrrdClusterException closed = assertThrows(NgrrdClusterException.class, () -> view.read("daily"));
         assertEquals(ErrorCode.CLOSED, closed.code());
+    }
+
+    @Test
+    void somenteLeituraDestacadoEVistaDepoisDoCloseDoClienteFalhamNaHoraComClosed() {
+        NgrrdHandle detached = open(false);
+        open(true);
+        NgrrdHandle view = open(false);
+        int rpcsBefore = rpc.calls().size();
+
+        clientClosed = true;
+
+        assertEquals(ErrorCode.CLOSED, assertThrows(NgrrdClusterException.class,
+                () -> detached.read("daily")).code());
+        assertEquals(ErrorCode.CLOSED, assertThrows(NgrrdClusterException.class,
+                () -> view.read("daily")).code());
+        assertEquals(rpcsBefore, rpc.calls().size(), "nenhuma retentativa sobre o transporte fechado");
     }
 
     @Test
@@ -340,7 +358,8 @@ class SeriesHandleCacheTest {
         RetryPolicy retry = new RetryPolicy(Duration.ofSeconds(2), Duration.ofMillis(5), Duration.ofMillis(50));
         RemoteSeriesHandle handle = new RemoteSeriesHandle(SERIES_KEY, "yaml: fake", "hash-1", Map.of(),
                 options, new FixedPlacementLookup(), rpc, dispatcher, retry, Duration.ofSeconds(5),
-                Duration.ofSeconds(5), Clock.systemUTC(), onClose, CapabilityFixtures.advertisingAll());
+                Duration.ofSeconds(5), Clock.systemUTC(), onClose, CapabilityFixtures.advertisingAll(),
+                () -> clientClosed);
         handle.open();
         opened.incrementAndGet();
         return handle;

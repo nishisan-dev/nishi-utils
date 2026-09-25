@@ -47,6 +47,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
+import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -105,6 +106,12 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
     private final BiConsumer<String, RemoteSeriesHandle> onClose;
     /** Confere {@code open.createIfMissing} no dono antes de todo {@code OPEN} de handle somente leitura. */
     private final NodeCapabilities capabilities;
+    /**
+     * {@code true} depois do {@code close()} do cliente: qualquer operação falha na hora com
+     * {@link ErrorCode#CLOSED} — inclusive num handle que não estava no mapa do cliente (somente leitura
+     * destacado, ou o gravável por trás de uma vista), em vez de retentar sobre um transporte fechado.
+     */
+    private final BooleanSupplier clientClosed;
 
     private volatile String owner;
     /**
@@ -145,16 +152,17 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
     public RemoteSeriesHandle(String seriesKey, String yaml, String definitionHashHex, Map<String, String> tags,
             Ngrrd.OpenOptions options, PlacementLookup resolver, ClusterRpc rpc, WriteBuffer dispatcher,
             RetryPolicy retryPolicy, Duration requestTimeout, Duration closeTimeout, Clock clock,
-            BiConsumer<String, RemoteSeriesHandle> onClose, NodeCapabilities capabilities) {
+            BiConsumer<String, RemoteSeriesHandle> onClose, NodeCapabilities capabilities,
+            BooleanSupplier clientClosed) {
         this(seriesKey, yaml, definitionHashHex, tags, options, resolver, rpc, dispatcher, retryPolicy,
-                requestTimeout, closeTimeout, clock, onClose, capabilities, null);
+                requestTimeout, closeTimeout, clock, onClose, capabilities, clientClosed, null);
     }
 
     public RemoteSeriesHandle(String seriesKey, String yaml, String definitionHashHex, Map<String, String> tags,
             Ngrrd.OpenOptions options, PlacementLookup resolver, ClusterRpc rpc, WriteBuffer dispatcher,
             RetryPolicy retryPolicy, Duration requestTimeout, Duration closeTimeout, Clock clock,
             BiConsumer<String, RemoteSeriesHandle> onClose, NodeCapabilities capabilities,
-            GeometryDescriptor geometry) {
+            BooleanSupplier clientClosed, GeometryDescriptor geometry) {
         this.seriesKey = Objects.requireNonNull(seriesKey, "seriesKey");
         this.yaml = Objects.requireNonNull(yaml, "yaml");
         this.geometry = geometry;
@@ -170,6 +178,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
         this.clock = Objects.requireNonNull(clock, "clock");
         this.onClose = Objects.requireNonNull(onClose, "onClose");
         this.capabilities = Objects.requireNonNull(capabilities, "capabilities");
+        this.clientClosed = Objects.requireNonNull(clientClosed, "clientClosed");
         this.state = new AtomicReference<>(State.opened(this.options.createIfMissing()));
     }
 
@@ -633,8 +642,11 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
         ensureOpen(state.get());
     }
 
-    /** Recusa operações num handle fechado, a partir de uma única leitura do estado. */
+    /** Recusa operações num handle (ou cliente) fechado, a partir de uma única leitura do estado. */
     private void ensureOpen(State current) {
+        if (clientClosed.getAsBoolean()) {
+            throw new NgrrdClusterException(ErrorCode.CLOSED, "cliente do cluster ngrrd já foi fechado: " + seriesKey);
+        }
         RuntimeException terminal = current.terminalCause();
         if (terminal instanceof SeriesNotFoundException notFound) {
             throw new SeriesNotFoundException(seriesKey, notFound.reason());

@@ -121,7 +121,8 @@ class CloseBudgetRegressionTest {
             String seriesKey = "series-" + i;
             RemoteSeriesHandle handle = new RemoteSeriesHandle(seriesKey, "yaml: fake", "hash-" + i, Map.of(),
                     Ngrrd.OpenOptions.defaults(), resolver, rpc, new NoOpWriteBuffer(), retryPolicy, requestTimeout,
-                    closeTimeout, Clock.systemUTC(), (key, h) -> { }, CapabilityFixtures.advertisingAll());
+                    closeTimeout, Clock.systemUTC(), (key, h) -> { }, CapabilityFixtures.advertisingAll(),
+                    () -> false);
             // open() não é usado de propósito: o fake de RPC nunca responde OK a nada, então open()
             // ficaria preso na própria retentativa dele. O dono é o que interessa testar aqui (close);
             // setado direto via reflexão, mesmo padrão já usado em StorageRequestHandlerTest.

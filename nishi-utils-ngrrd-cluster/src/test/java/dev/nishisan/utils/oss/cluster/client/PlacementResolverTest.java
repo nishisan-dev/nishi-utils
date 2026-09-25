@@ -352,7 +352,7 @@ class PlacementResolverTest {
         RemoteSeriesHandle handle = new RemoteSeriesHandle("series-1", "yaml: fake", "hash-1", Map.of(),
                 Ngrrd.OpenOptions.defaults().withCreateIfMissing(false), resolver, rpc, new UnusedWriteBuffer(),
                 retry, Duration.ofSeconds(1), Duration.ofSeconds(1), Clock.systemUTC(), (key, h) -> { },
-                CapabilityFixtures.advertisingAll());
+                CapabilityFixtures.advertisingAll(), () -> false);
 
         SeriesNotFoundException ex = assertThrows(SeriesNotFoundException.class, handle::open);
 
@@ -375,7 +375,7 @@ class PlacementResolverTest {
         RemoteSeriesHandle handle = new RemoteSeriesHandle("series-1", "yaml: fake", "hash-1", Map.of(),
                 Ngrrd.OpenOptions.defaults().withCreateIfMissing(false), resolver, rpc, new UnusedWriteBuffer(),
                 retry, Duration.ofSeconds(1), Duration.ofSeconds(1), Clock.systemUTC(), (key, h) -> { },
-                CapabilityFixtures.advertisingAll());
+                CapabilityFixtures.advertisingAll(), () -> false);
         long start = System.nanoTime();
 
         SeriesNotFoundException ex = assertThrows(SeriesNotFoundException.class, handle::open);
@@ -407,7 +407,7 @@ class PlacementResolverTest {
         RemoteSeriesHandle handle = new RemoteSeriesHandle("series-1", "yaml: fake", "hash-1", Map.of(),
                 Ngrrd.OpenOptions.defaults().withCreateIfMissing(false), resolver, rpc, new UnusedWriteBuffer(),
                 retry, Duration.ofSeconds(1), Duration.ofSeconds(1), Clock.systemUTC(), (key, h) -> { },
-                CapabilityFixtures.advertisingAll());
+                CapabilityFixtures.advertisingAll(), () -> false);
 
         handle.open();
 
