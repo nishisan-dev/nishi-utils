@@ -21,8 +21,8 @@ import dev.nishisan.utils.oss.cluster.catalog.PlacementState;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
 
 /**
- * Placement de uma série existente, devolvido por {@link NgrrdClusterClient#find}: espelha o
- * {@link SeriesPlacement} do catálogo sem expor o tipo interno do pacote {@code catalog}.
+ * Placement de uma série existente, devolvido por {@link NgrrdClusterClient#find}: espelha os campos
+ * relevantes do {@link SeriesPlacement} do catálogo, sem o {@code migrationId} interno.
  *
  * @param seriesKey        chave lógica da série
  * @param ownerNodeId      nó dono atual da série

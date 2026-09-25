@@ -161,6 +161,7 @@ class ClientExistenceTest {
         assertEquals("storage-a", info.ownerNodeId());
         assertEquals(PlacementState.MIGRATING, info.state());
         assertEquals("storage-b", info.targetNodeId());
+        assertTrue(rpc.calls().isEmpty(), "hit local não deveria disparar RPC nenhum");
     }
 
     @Test

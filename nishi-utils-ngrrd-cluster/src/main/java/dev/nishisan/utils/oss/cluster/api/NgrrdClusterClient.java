@@ -54,8 +54,9 @@ public interface NgrrdClusterClient extends Closeable {
 
     /**
      * Indica se a série existe no cluster: existência é presença de placement no catálogo
-     * ({@code ngrrd.catalog}) — {@code MIGRATING} conta como existente. Um hit na réplica local
-     * responde sem RPC; um miss local é confirmado em lote no líder antes de responder {@code false}.
+     * ({@code ngrrd.catalog}) — {@code MIGRATING} conta como existente. Um hit local — na réplica do
+     * catálogo replicado OU num override recente (ex.: de um {@code WRONG_OWNER}) — responde sem RPC;
+     * só um miss nos dois é confirmado em lote no líder antes de responder {@code false}.
      *
      * <p><b>Contrato de consistência:</b></p>
      * <ul>

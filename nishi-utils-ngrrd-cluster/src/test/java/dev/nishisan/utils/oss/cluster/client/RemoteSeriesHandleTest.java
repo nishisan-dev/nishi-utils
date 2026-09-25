@@ -44,10 +44,15 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -59,6 +64,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class RemoteSeriesHandleTest {
 
     private static final String SERIES_KEY = "device:r1/iface:eth0";
+    private static final Duration AWAIT_TIMEOUT = Duration.ofSeconds(10);
     private static final NodeId OWNER_A = NodeId.of("storage-a");
     private static final NodeId OWNER_B = NodeId.of("storage-b");
 
@@ -86,7 +92,7 @@ class RemoteSeriesHandleTest {
         RetryPolicy retry = new RetryPolicy(retryTimeout, Duration.ofMillis(5), Duration.ofMillis(50));
         return new RemoteSeriesHandle(SERIES_KEY, "yaml: fake", "hash-1", Map.of(), options,
                 resolver, rpc, dispatcher, retry, Duration.ofSeconds(5), Duration.ofSeconds(5), Clock.systemUTC(),
-                onCloseCalls::add);
+                (key, handle) -> onCloseCalls.add(key));
     }
 
     @Test
@@ -331,7 +337,7 @@ class RemoteSeriesHandleTest {
         assertEquals(1, resolver.resolveCalls.get());
         assertEquals(0, resolver.resolveExistingCalls.get());
         OpenRequest request = (OpenRequest) rpc.calls().get(0).body();
-        assertEquals(null, request.createIfMissing(), "createIfMissing=true não deve viajar no request (compat)");
+        assertNull(request.createIfMissing(), "createIfMissing=true não deve viajar no request (compat)");
     }
 
     @Test
@@ -367,6 +373,89 @@ class RemoteSeriesHandleTest {
         SeriesNotFoundException ex = assertThrows(SeriesNotFoundException.class,
                 () -> handle.write("in_octets", new Sample(1L, 1.0)));
         assertEquals(SERIES_KEY, ex.seriesKey());
+    }
+
+    @Test
+    void checkpointComNotOpenSemCriarQueDescobreNotFoundMarcaHandleInexistente() {
+        // Caminho direto (fora do WriteDispatcher): handleRetryableStatus reabre via open(retry) quando
+        // um NOT_OPEN aparece numa operação síncrona (checkpoint/flush/read). Sem createIfMissing, essa
+        // reabertura pode descobrir SeriesNotFoundException — o handle precisa ficar marcado aqui
+        // também, não só no caminho assíncrono do reopener do dispatcher.
+        RemoteSeriesHandle handle = newHandle(Ngrrd.OpenOptions.defaults().withCreateIfMissing(false));
+        rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
+        handle.open();
+        onCloseCalls.clear();
+
+        rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.NOT_OPEN, null, null));
+        rpc.respondDefault((cmd, body) -> new SeriesStatusResponse(SeriesStatus.NOT_FOUND, OWNER_A.value(), null));
+
+        SeriesNotFoundException ex = assertThrows(SeriesNotFoundException.class, handle::checkpoint);
+        assertEquals(SERIES_KEY, ex.seriesKey());
+        assertEquals(List.of(SERIES_KEY), onCloseCalls, "handle deve se remover do mapa do cliente também neste caminho");
+
+        SeriesNotFoundException ex2 = assertThrows(SeriesNotFoundException.class,
+                () -> handle.write("in_octets", new Sample(1L, 1.0)));
+        assertEquals(SERIES_KEY, ex2.seriesKey());
+    }
+
+    @Test
+    void corridaNaRemocaoNuncaApagaUmHandleNovoDaMesmaChave() throws InterruptedException {
+        // Reproduz o wiring real de DefaultNgrrdClusterClient.open: onClose remove do mapa
+        // condicionalmente por instância (Map#remove(key, value)), nunca por chave sozinha. O handle A
+        // fica bloqueado no meio do RPC que vai descobrir NOT_FOUND (e por isso vai chamar onClose bem
+        // mais tarde); enquanto ele está preso, um handle B "abre" na mesma chave (simulando um open()
+        // concorrente do cliente). Quando A finalmente terminar e chamar onClose, B precisa sobreviver.
+        ConcurrentMap<String, RemoteSeriesHandle> handles = new ConcurrentHashMap<>();
+        CountDownLatch openGate = new CountDownLatch(1);
+        RecordingClusterRpc rpcA = new RecordingClusterRpc(NodeId.of("client-under-test"));
+        FakePlacementLookup resolverA = new FakePlacementLookup(OWNER_A.value());
+        RetryPolicy retry = new RetryPolicy(Duration.ofSeconds(5), Duration.ofMillis(5), Duration.ofMillis(50));
+
+        RemoteSeriesHandle handleA = new RemoteSeriesHandle(SERIES_KEY, "yaml: fake", "hash-1", Map.of(),
+                Ngrrd.OpenOptions.defaults().withCreateIfMissing(false), resolverA, rpcA, new NoOpWriteBuffer(),
+                retry, Duration.ofSeconds(5), Duration.ofSeconds(5), Clock.systemUTC(),
+                (key, handle) -> handles.remove(key, handle));
+        handles.put(SERIES_KEY, handleA);
+        rpcA.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
+        handleA.open();
+
+        rpcA.respondDefault((cmd, body) -> {
+            awaitLatch(openGate);
+            return new SeriesStatusResponse(SeriesStatus.NOT_FOUND, OWNER_A.value(), null);
+        });
+
+        Thread reopener = new Thread(() -> {
+            try {
+                handleA.reopen();
+            } catch (SeriesNotFoundException expected) {
+                // esperado — o que importa aqui é a remoção condicional do mapa, checada depois
+            }
+        }, "test-reopen-A");
+        reopener.start();
+        Await.untilTrue("A bloqueado dentro do RPC de reabertura", AWAIT_TIMEOUT,
+                () -> reopener.getState() == Thread.State.WAITING || reopener.getState() == Thread.State.TIMED_WAITING);
+
+        RemoteSeriesHandle handleB = new RemoteSeriesHandle(SERIES_KEY, "yaml: fake", "hash-1", Map.of(),
+                Ngrrd.OpenOptions.defaults(), new FakePlacementLookup(OWNER_A.value()),
+                new RecordingClusterRpc(NodeId.of("client-under-test")), new NoOpWriteBuffer(), retry,
+                Duration.ofSeconds(5), Duration.ofSeconds(5), Clock.systemUTC(),
+                (key, handle) -> handles.remove(key, handle));
+        handles.put(SERIES_KEY, handleB);
+
+        openGate.countDown();
+        reopener.join(AWAIT_TIMEOUT.toMillis());
+
+        assertTrue(!reopener.isAlive(), "thread de reabertura de A deveria ter terminado");
+        assertSame(handleB, handles.get(SERIES_KEY), "a remoção condicional de A não pode apagar o handle B");
+    }
+
+    private static void awaitLatch(CountDownLatch latch) {
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException(e);
+        }
     }
 
     /** {@link PlacementLookup} fake: sempre devolve o dono atual configurado, sem RPC ao líder. */

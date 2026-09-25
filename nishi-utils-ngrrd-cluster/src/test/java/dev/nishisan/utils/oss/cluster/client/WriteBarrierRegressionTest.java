@@ -67,7 +67,7 @@ class WriteBarrierRegressionTest {
                 NgrrdClusterConfig.BufferFullPolicy.BLOCK, Duration.ofSeconds(3), key -> true,
                 (key, owner) -> handle.ownerChanged(owner), Clock.systemUTC(), null, null);
         handle = new RemoteSeriesHandle("s", "unused", "unused", Map.of(), null, lookup, rpc, dispatcher,
-                retry, Duration.ofSeconds(3), Duration.ofSeconds(3), Clock.systemUTC(), key -> { });
+                retry, Duration.ofSeconds(3), Duration.ofSeconds(3), Clock.systemUTC(), (key, h) -> { });
         handle.open();
     }
 

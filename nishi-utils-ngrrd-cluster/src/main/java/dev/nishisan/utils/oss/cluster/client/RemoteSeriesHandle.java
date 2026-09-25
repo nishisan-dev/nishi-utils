@@ -43,7 +43,8 @@ import java.time.Clock;
 import java.time.Duration;
 import java.util.Map;
 import java.util.Objects;
-import java.util.function.Consumer;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BiConsumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -72,17 +73,24 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
     /** Orçamento TOTAL do {@link #close()} público (achado do Refuter, B1: antes usava {@code retryPolicy.timeout()}). */
     private final Duration closeTimeout;
     private final Clock clock;
-    private final Consumer<String> onClose;
+    /**
+     * Recebe {@code (seriesKey, this)} — a instância, não só a chave — para que quem remove do mapa do
+     * cliente use remoção condicional ({@code Map#remove(key, value)}), nunca um {@code remove(key)}
+     * incondicional: sem isso, o {@link #close(Duration)}/{@link #markSeriesNotFound()} de um handle
+     * ANTIGO (ex.: um close lento em andamento) poderia remover um handle NOVO já registrado para a
+     * mesma chave.
+     */
+    private final BiConsumer<String, RemoteSeriesHandle> onClose;
 
     private volatile String owner;
     private volatile boolean closed;
     /** {@code true} depois que o dono confirmou {@code NOT_FOUND} para esta série ({@code createIfMissing=false}). */
-    private volatile boolean notFound;
+    private final AtomicBoolean notFound = new AtomicBoolean(false);
 
     public RemoteSeriesHandle(String seriesKey, String yaml, String definitionHashHex, Map<String, String> tags,
             Ngrrd.OpenOptions options, PlacementLookup resolver, ClusterRpc rpc, WriteBuffer dispatcher,
             RetryPolicy retryPolicy, Duration requestTimeout, Duration closeTimeout, Clock clock,
-            Consumer<String> onClose) {
+            BiConsumer<String, RemoteSeriesHandle> onClose) {
         this(seriesKey, yaml, definitionHashHex, tags, options, resolver, rpc, dispatcher, retryPolicy,
                 requestTimeout, closeTimeout, clock, onClose, null);
     }
@@ -90,7 +98,8 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
     public RemoteSeriesHandle(String seriesKey, String yaml, String definitionHashHex, Map<String, String> tags,
             Ngrrd.OpenOptions options, PlacementLookup resolver, ClusterRpc rpc, WriteBuffer dispatcher,
             RetryPolicy retryPolicy, Duration requestTimeout, Duration closeTimeout, Clock clock,
-            Consumer<String> onClose, dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor geometry) {
+            BiConsumer<String, RemoteSeriesHandle> onClose,
+            dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor geometry) {
         this.seriesKey = Objects.requireNonNull(seriesKey, "seriesKey");
         this.yaml = Objects.requireNonNull(yaml, "yaml");
         this.geometry = geometry;
@@ -185,15 +194,21 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
     /**
      * Marca a série como definitivamente inexistente: {@code write}/{@code flush}/{@code checkpoint}/
      * {@code read} passam a lançar {@link SeriesNotFoundException} e o handle se remove do mapa do
-     * cliente ({@link #onClose}), de modo que um {@code open} posterior refaz o fluxo do zero. Idempotente.
+     * cliente ({@link #onClose}), de modo que um {@code open} posterior refaz o fluxo do zero.
+     * Idempotente via {@link AtomicBoolean#compareAndSet} — só a chamada que vence a corrida executa o
+     * corpo (nunca dois {@code onClose.accept} para o mesmo handle).
      */
     private void markSeriesNotFound() {
-        if (notFound) {
+        if (!notFound.compareAndSet(false, true)) {
             return;
         }
-        notFound = true;
         closed = true;
-        onClose.accept(seriesKey);
+        onClose.accept(seriesKey, this);
+    }
+
+    /** Se o handle ainda pode ser reaproveitado por um {@code open} futuro da mesma chave. */
+    boolean isOpen() {
+        return !closed;
     }
 
     @Override
@@ -335,7 +350,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
                 LOGGER.log(Level.WARNING, "Falha ao fechar remotamente a série " + seriesKey, e);
             }
         }
-        onClose.accept(seriesKey);
+        onClose.accept(seriesKey, this);
     }
 
     private void executeSeriesCommand(String command, OperationRetry retry) {
@@ -361,7 +376,15 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
                     noteWrongOwner(ownerNodeId, retry);
                 } else if (status == SeriesStatus.NOT_OPEN) {
                     // Unlike the dispatcher's boolean callback, preserve failures and the caller's budget.
-                    open(retry);
+                    // Mesmo tratamento de série sumida que reopen() dá ao caminho assíncrono do
+                    // WriteDispatcher: sem createIfMissing, um NOT_OPEN pode descobrir que a série não
+                    // existe mais — o handle precisa ficar marcado, não só propagar a exceção desta vez.
+                    try {
+                        open(retry);
+                    } catch (SeriesNotFoundException e) {
+                        markSeriesNotFound();
+                        throw e;
+                    }
                 }
             }
             default -> throw new NgrrdClusterException(ErrorCode.REMOTE_ERROR,
@@ -445,7 +468,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
     }
 
     private void ensureOpen() {
-        if (notFound) {
+        if (notFound.get()) {
             throw new SeriesNotFoundException(seriesKey);
         }
         if (closed) {

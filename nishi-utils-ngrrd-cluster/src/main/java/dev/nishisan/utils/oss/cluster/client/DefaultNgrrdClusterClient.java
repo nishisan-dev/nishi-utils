@@ -302,7 +302,7 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
         String template = SeriesKeyTemplate.templateOf(yaml);
         String seriesKey = SeriesKeyTemplate.resolve(template, tags);
         RemoteSeriesHandle existing = handles.get(seriesKey);
-        if (existing != null) {
+        if (existing != null && existing.isOpen()) {
             return existing;
         }
         // item 10 (achado do Refuter): nunca fazer RPC dentro de computeIfAbsent — isso mantinha o bin
@@ -314,7 +314,10 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
         try {
             try (var guard = CoordinationLocks.acquire(lock)) {
                 existing = handles.get(seriesKey);
-                if (existing != null) {
+                // Um handle em cache já fechado/marcado inexistente (ex.: onClose ainda não rodou, ou
+                // perdeu a corrida de remoção condicional contra um handle mais novo) nunca é devolvido
+                // — substituído por um novo abaixo, que refaz o open do zero.
+                if (existing != null && existing.isOpen()) {
                     return existing;
                 }
                 RemoteSeriesHandle handle = openNewHandle(seriesKey, yaml, tags, options);

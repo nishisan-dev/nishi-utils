@@ -804,10 +804,46 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         List<SeriesWrite> lost = extractSeriesFrom(buf, key);
         if (!lost.isEmpty()) {
             samplesFailedCount.add(lost.size());
+            // Notifica quem já espera (route.progress.signalAll()) ANTES de descartar a rota — a ordem
+            // importa: descartar primeiro apagaria o rastro da falha para um waiter que ainda não
+            // reagiu.
             completeWrites(key, lost.size(), "série inexistente: " + key);
         }
+        discardRoute(key);
         LOGGER.log(Level.WARNING, "Série " + key + " inexistente ao reabrir — descartando "
                 + lost.size() + " escrita(s) pendente(s), sem novas tentativas", cause);
+    }
+
+    /**
+     * Troca a rota de {@code seriesKey} por uma nova, limpa, depois que a série foi confirmada
+     * inexistente — sem isto, {@code firstFailedSequence} ficaria marcado para sempre no mesmo objeto,
+     * envenenando {@code flushAll()} (que só itera {@link #pendingRoutes}) e o {@code checkpoint()} de
+     * um handle novo da mesma chave (que consulta {@link #routes} diretamente) para sempre.
+     *
+     * <p>O objeto antigo nunca é mutado depois da troca: quem já chamou {@link #flushSeriesSync} antes
+     * dela capturou a referência antiga e continua observando a falha corretamente, sem corrida com
+     * este método. Só troca se nenhuma escrita nova foi admitida nesta rota desde a falha
+     * ({@code submitted == completed}, verificado sob o mesmo lock que {@link #enqueue} usa para
+     * admitir) — uma escrita já admitida continua pertencendo à rota antiga, e trocar a deixaria sem
+     * dono.</p>
+     */
+    private void discardRoute(String seriesKey) {
+        SeriesRoute oldRoute = routes.get(seriesKey);
+        if (oldRoute == null) {
+            return;
+        }
+        oldRoute.lock.lock();
+        try {
+            if (oldRoute.submitted != oldRoute.completed) {
+                return;
+            }
+            routes.replace(seriesKey, oldRoute, new SeriesRoute(oldRoute.owner));
+        } finally {
+            oldRoute.lock.unlock();
+        }
+        synchronized (pendingLock) {
+            pendingRoutes.remove(oldRoute);
+        }
     }
 
     /**

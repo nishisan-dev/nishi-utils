@@ -47,10 +47,12 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 import java.util.function.Function;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -503,11 +505,10 @@ class WriteDispatcherTest {
 
     @Test
     void reopenerLancaSeriesNotFoundExceptionDescartaEscritasPendentesEMantemOutrasSeries() {
-        // Regressão da T6 (achado do Debugger na T4): quando reopen() falha porque a série sumiu
-        // (createIfMissing=false), deferSeries(-1) reagendaria a série para sempre — um loop infinito
-        // para uma série que nunca vai reabrir sozinha. O reopener deve poder sinalizar esse caso
-        // específico via SeriesNotFoundException e o dispatcher deve falhar o que está pendente em vez
-        // de adiar.
+        // Quando reopen() falha porque a série sumiu (createIfMissing=false), deferSeries(-1)
+        // reagendaria a série para sempre — um loop infinito para uma série que nunca vai reabrir
+        // sozinha. O reopener sinaliza esse caso específico via SeriesNotFoundException e o dispatcher
+        // falha o que está pendente em vez de adiar.
         AtomicInteger reopenCalls = new AtomicInteger();
         newDispatcher(1, Duration.ofSeconds(30), 1_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> {
             reopenCalls.incrementAndGet();
@@ -530,11 +531,132 @@ class WriteDispatcherTest {
         Await.untilTrue("escrita da série saudável, no mesmo nó, segue entregue", AWAIT_TIMEOUT,
                 () -> dispatcher.samplesSent() == 1L);
         assertEquals(1, reopenCalls.get(), "sem novas tentativas de reabertura para a série inexistente");
+    }
 
-        NgrrdClusterException ex = assertThrows(NgrrdClusterException.class,
-                () -> dispatcher.flushSeriesSync("gone", OWNER_A.value(), AWAIT_TIMEOUT),
-                "flush/barreira de quem espera pela série inexistente recebe a falha");
-        assertTrue(ex.getMessage().contains("gone"), "mensagem: " + ex.getMessage());
+    @Test
+    void seriesNotFoundExceptionDescartaTodasAsEscritasPendentesInclusiveAsQueChegaramDuranteAReabertura() {
+        // Um lote em voo (o que disparou o NOT_OPEN, reenfileirado na frente) mais escritas novas
+        // admitidas enquanto a reabertura ainda está em andamento (na fila atrás, pausadas) precisam
+        // falhar TODAS juntas quando a série é confirmada inexistente — nenhuma fica esquecida no
+        // buffer, nenhuma é enviada depois.
+        CountDownLatch reopenerGate = new CountDownLatch(1);
+        newDispatcher(1, Duration.ofSeconds(30), 1_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> {
+            awaitLatch(reopenerGate);
+            throw new SeriesNotFoundException(key);
+        });
+        rpc.respondDefault((cmd, body) -> {
+            WriteBatchRequest req = (WriteBatchRequest) body;
+            Map<String, SeriesStatus> status = new LinkedHashMap<>();
+            for (SeriesWrite w : req.writes()) {
+                status.put(w.seriesKey(), SeriesStatus.NOT_OPEN);
+            }
+            return new WriteBatchResponse(status, Map.of(), Map.of());
+        });
+
+        dispatcher.enqueue(OWNER_A.value(), write("gone", 1L, 1.0));
+        Await.untilTrue("reabertura em andamento (bloqueada no gate)", AWAIT_TIMEOUT,
+                () -> dispatcher.retriesByStatus().getOrDefault(SeriesStatus.NOT_OPEN, 0L) >= 1L);
+
+        dispatcher.enqueue(OWNER_A.value(), write("gone", 2L, 2.0));
+        dispatcher.enqueue(OWNER_A.value(), write("gone", 3L, 3.0));
+
+        reopenerGate.countDown();
+
+        Await.untilTrue("as 3 escritas pendentes falham juntas", AWAIT_TIMEOUT, () -> dispatcher.samplesFailed() == 3L);
+        assertEquals(0L, dispatcher.samplesSent());
+    }
+
+    @Test
+    void esperaBloqueadaNoFlushDaSerieInexistenteRecebeAFalha() throws InterruptedException {
+        // Quem já chamou flushSeriesSync ANTES da série ser confirmada inexistente (e está bloqueado
+        // esperando) precisa receber a falha — mesmo depois que a rota é trocada por uma limpa para não
+        // envenenar chamadas futuras (ver discardRoute).
+        CountDownLatch reopenerGate = new CountDownLatch(1);
+        newDispatcher(1, Duration.ofSeconds(30), 1_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> {
+            awaitLatch(reopenerGate);
+            throw new SeriesNotFoundException(key);
+        });
+        rpc.respondDefault((cmd, body) -> {
+            WriteBatchRequest req = (WriteBatchRequest) body;
+            String key = req.writes().get(0).seriesKey();
+            return new WriteBatchResponse(Map.of(key, SeriesStatus.NOT_OPEN), Map.of(), Map.of());
+        });
+
+        dispatcher.enqueue(OWNER_A.value(), write("gone", 1L, 1.0));
+        Await.untilTrue("reabertura em andamento (bloqueada no gate)", AWAIT_TIMEOUT,
+                () -> dispatcher.retriesByStatus().getOrDefault(SeriesStatus.NOT_OPEN, 0L) >= 1L);
+
+        AtomicReference<Throwable> caught = new AtomicReference<>();
+        Thread waiter = new Thread(() -> {
+            try {
+                dispatcher.flushSeriesSync("gone", OWNER_A.value(), AWAIT_TIMEOUT);
+            } catch (Throwable t) {
+                caught.set(t);
+            }
+        }, "test-flush-waiter");
+        waiter.start();
+        // Espera o waiter estar de fato bloqueado na barreira (Condition.await) antes de liberar a
+        // reabertura — garante que ele capturou a referência da rota ANTES dela ser trocada.
+        Await.untilTrue("waiter bloqueado esperando a barreira", AWAIT_TIMEOUT,
+                () -> waiter.getState() == Thread.State.WAITING || waiter.getState() == Thread.State.TIMED_WAITING);
+
+        reopenerGate.countDown();
+        waiter.join(AWAIT_TIMEOUT.toMillis());
+
+        assertFalse(waiter.isAlive(), "waiter deveria ter terminado");
+        assertTrue(caught.get() instanceof NgrrdClusterException,
+                "esperava NgrrdClusterException, obtido: " + caught.get());
+        assertTrue(caught.get().getMessage().contains("gone"), "mensagem: " + caught.get().getMessage());
+    }
+
+    @Test
+    void flushAllVoltaAFuncionarParaAsDemaisSeriesDepoisDeUmaSerieInexistente() {
+        newDispatcher(1, Duration.ofSeconds(30), 1_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> {
+            throw new SeriesNotFoundException(key);
+        });
+        rpc.respondDefault((cmd, body) -> {
+            WriteBatchRequest req = (WriteBatchRequest) body;
+            Map<String, SeriesStatus> status = new LinkedHashMap<>();
+            for (SeriesWrite w : req.writes()) {
+                status.put(w.seriesKey(), w.seriesKey().equals("gone") ? SeriesStatus.NOT_OPEN : SeriesStatus.OK);
+            }
+            return new WriteBatchResponse(status, Map.of(), Map.of());
+        });
+
+        dispatcher.enqueue(OWNER_A.value(), write("gone", 1L, 1.0));
+        Await.untilTrue("série declarada inexistente", AWAIT_TIMEOUT, () -> dispatcher.samplesFailed() == 1L);
+
+        // Sem discardRoute, flushAllSync() jamais devolveria — a rota de "gone" continuaria em
+        // pendingRoutes com firstFailedSequence marcado para sempre.
+        dispatcher.enqueue(OWNER_A.value(), write("healthy", 1L, 2.0));
+        dispatcher.flushAllSync();
+
+        assertEquals(1L, dispatcher.samplesSent());
+    }
+
+    @Test
+    void handleNovoDaMesmaChaveConsegueFlushAposSerieInexistente() {
+        AtomicInteger writeBatchCalls = new AtomicInteger();
+        newDispatcher(1, Duration.ofSeconds(30), 1_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> {
+            throw new SeriesNotFoundException(key);
+        });
+        rpc.respondDefault((cmd, body) -> {
+            WriteBatchRequest req = (WriteBatchRequest) body;
+            String key = req.writes().get(0).seriesKey();
+            // Só a 1a rodada (que gera o NOT_OPEN inicial) simula a série sumida; a 2a rodada representa
+            // um handle novo, recém-aberto com sucesso na mesma chave.
+            SeriesStatus status = writeBatchCalls.getAndIncrement() == 0 ? SeriesStatus.NOT_OPEN : SeriesStatus.OK;
+            return new WriteBatchResponse(Map.of(key, status), Map.of(), Map.of());
+        });
+
+        dispatcher.enqueue(OWNER_A.value(), write("gone", 1L, 1.0));
+        Await.untilTrue("série declarada inexistente", AWAIT_TIMEOUT, () -> dispatcher.samplesFailed() == 1L);
+
+        dispatcher.enqueue(OWNER_A.value(), write("gone", 2L, 9.0));
+        dispatcher.flushSeriesSync("gone", OWNER_A.value(), AWAIT_TIMEOUT); // não deve lançar
+
+        assertEquals(1L, dispatcher.samplesSent());
+        assertEquals(1L, dispatcher.samplesFailed());
     }
 
     @Test

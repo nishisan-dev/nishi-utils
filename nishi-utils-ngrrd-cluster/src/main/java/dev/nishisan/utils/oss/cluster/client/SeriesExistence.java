@@ -17,6 +17,8 @@
 
 package dev.nishisan.utils.oss.cluster.client;
 
+import dev.nishisan.utils.oss.cluster.api.NgrrdClusterClient;
+import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.api.SeriesInfo;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
 
@@ -33,9 +35,10 @@ import java.util.Optional;
 /**
  * Lógica de {@code exists}/{@code find} de {@link DefaultNgrrdClusterClient}, isolada num
  * colaborador testável sem {@code NGridNode} real: hit no cache local
- * ({@link PlacementLookup#placementCached}) responde sem RPC; misses são confirmados em lote no
- * líder via {@link CatalogLookupClient} — que nunca cria placement e nunca devolve resposta
- * parcial (qualquer falha ao consultar propaga {@link dev.nishisan.utils.oss.cluster.api.NgrrdClusterException}).
+ * ({@link PlacementLookup#placementCached} — cobre tanto a réplica do catálogo replicado quanto um
+ * override recente, ver seu Javadoc) responde sem RPC; misses são confirmados em lote no líder via
+ * {@link CatalogLookupClient} — que nunca cria placement e nunca devolve resposta parcial (qualquer
+ * falha ao consultar propaga {@link NgrrdClusterException}).
  *
  * <p>{@code MIGRATING} conta como existente nos dois caminhos: tanto o cache local quanto o líder
  * devolvem a entrada do catálogo independente do estado, e presença já basta.</p>
@@ -50,13 +53,13 @@ final class SeriesExistence {
         this.catalogLookupClient = Objects.requireNonNull(catalogLookupClient, "catalogLookupClient");
     }
 
-    /** @see dev.nishisan.utils.oss.cluster.api.NgrrdClusterClient#exists(String) */
+    /** @see NgrrdClusterClient#exists(String) */
     boolean exists(String seriesKey, Duration maxWait) {
         Objects.requireNonNull(seriesKey, "seriesKey");
         return exists(List.of(seriesKey), maxWait).get(seriesKey);
     }
 
-    /** @see dev.nishisan.utils.oss.cluster.api.NgrrdClusterClient#exists(Collection) */
+    /** @see NgrrdClusterClient#exists(Collection) */
     Map<String, Boolean> exists(Collection<String> seriesKeys, Duration maxWait) {
         Objects.requireNonNull(seriesKeys, "seriesKeys");
         Objects.requireNonNull(maxWait, "maxWait");
@@ -79,7 +82,7 @@ final class SeriesExistence {
         return Map.copyOf(result);
     }
 
-    /** @see dev.nishisan.utils.oss.cluster.api.NgrrdClusterClient#find(String) */
+    /** @see NgrrdClusterClient#find(String) */
     Optional<SeriesInfo> find(String seriesKey, Duration maxWait) {
         Objects.requireNonNull(seriesKey, "seriesKey");
         Objects.requireNonNull(maxWait, "maxWait");
