@@ -17,9 +17,17 @@
 
 package dev.nishisan.utils.oss.cluster.client;
 
+import dev.nishisan.utils.oss.api.SeriesNotFoundException;
+import dev.nishisan.utils.oss.cluster.api.ErrorCode;
+import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
 
 import java.time.Duration;
+import java.util.Collection;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 
 /**
@@ -78,6 +86,39 @@ public interface PlacementLookup {
      *         com o líder — nunca interpretado como ausência da série
      */
     SeriesPlacement resolveExistingAtLeader(String seriesKey, Duration maxWait);
+
+    /**
+     * Versão em lote de {@link #resolveExistingAtLeader(String, Duration)}: placements presentes no líder
+     * para {@code seriesKeys}, com as chaves ausentes fora do mapa (nunca {@code SeriesNotFoundException}).
+     * Usada pelo {@link WriteDispatcher} para desempatar, com autoridade, dicas de dono contraditórias
+     * de várias séries numa única consulta.
+     *
+     * <p>A implementação padrão consulta chave a chave dentro de um prazo único ({@code maxWait} vale
+     * para o lote inteiro); implementações com consulta em lote real ({@link PlacementResolver}) devem
+     * sobrescrevê-la com uma só chamada ao líder.</p>
+     *
+     * @throws dev.nishisan.utils.oss.cluster.api.NgrrdClusterException se não foi possível confirmar
+     *         com o líder — nunca interpretado como ausência das séries
+     */
+    default Map<String, SeriesPlacement> resolveExistingAtLeader(Collection<String> seriesKeys, Duration maxWait) {
+        Objects.requireNonNull(seriesKeys, "seriesKeys");
+        Objects.requireNonNull(maxWait, "maxWait");
+        long deadlineNanos = System.nanoTime() + maxWait.toNanos();
+        Map<String, SeriesPlacement> found = new LinkedHashMap<>();
+        for (String seriesKey : new LinkedHashSet<>(seriesKeys)) {
+            long remainingNanos = deadlineNanos - System.nanoTime();
+            if (remainingNanos <= 0) {
+                throw new NgrrdClusterException(ErrorCode.TIMEOUT,
+                        "prazo esgotado ao consultar o líder sobre " + seriesKeys.size() + " série(s)");
+            }
+            try {
+                found.put(seriesKey, resolveExistingAtLeader(seriesKey, Duration.ofNanos(remainingNanos)));
+            } catch (SeriesNotFoundException absent) {
+                // Ausente no líder: fica fora do mapa, como na consulta em lote.
+            }
+        }
+        return found;
+    }
 
     /**
      * Placement mais recente conhecido localmente (override em cache ou catálogo replicado), sem
