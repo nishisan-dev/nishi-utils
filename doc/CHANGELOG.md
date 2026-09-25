@@ -4,7 +4,84 @@
 
 ---
 
-## 2026-09-25 — Correções no rebalance com ingestão contínua — release 8.5.1
+## 2026-09-25 — Consultar existência e abrir sem criar — release 8.6.0
+
+Atende a [issue #171](https://github.com/nishisan-dev/nishi-utils/issues/171), nos dois modos do
+ngrrd (local e cluster). **Inclui as correções da 8.5.1** (rebalance com ingestão contínua, ver
+seção abaixo) — a 8.5.1 não teve release/tag própria; ela é publicada junto com esta versão.
+
+- `Ngrrd.OpenOptions.withCreateIfMissing(false)` (novo campo `createIfMissing`, default `true`)
+  desliga a criação implícita de `open`/`fromYaml`: série ausente lança
+  `dev.nishisan.utils.oss.api.SeriesNotFoundException` sem alocar nada, nos dois modos. No modo
+  local o handle de uma série existente segue gravável normalmente. `SeriesNotFoundException`
+  não herda de `NgrrdClusterException` (falha de transporte nunca a captura por engano) e expõe
+  `reason()` — `ABSENT` no modo local; `NOT_PLACED`/`MISSING_ON_OWNER` no cluster.
+- `Ngrrd.exists(...)` (três overloads, espelhando `open`/`fromYaml`) consulta a existência de uma
+  série no volume sem I/O de criação — resolve a chave física e pergunta ao storage.
+- `NgrrdClusterClient` ganha `exists(String)`, `exists(Collection<String>)`,
+  `find(String) → Optional<SeriesInfo>` e `verify(Collection<String>) → Map<String,
+  SeriesVerification>` (`PRESENT`/`MISSING_ON_OWNER`/`NOT_PLACED`/`UNVERIFIED`). Existência no
+  cluster é presença de placement no catálogo (`MIGRATING` conta como existente); um hit local
+  responde sem RPC, um miss é confirmado em lote no líder (`ngrrd.catalog.lookup`, novo comando,
+  paginado em `NgrrdClusterConfig.catalogLookupBatchSize`, default 2000, sequencial). Falha ao
+  confirmar (sem líder, timeout, transporte, líder sem o comando) nunca vira `false` — sempre
+  `NgrrdClusterException`. `verify` é a única verificação física (`ngrrd.series.exists.batch` no
+  dono, também novo).
+- `NgrrdClusterClient.open(..., createIfMissing=false)` abre um handle SOMENTE LEITURA: o cliente
+  nunca posiciona (`ngrrd.place`), o storage recusa criar — responde `SeriesStatus.NOT_FOUND`
+  só depois de o líder confirmar `ACTIVE(self)`, isto é, com ownership: a série é dele e o
+  arquivo não existe — e `write`/`flush`/`checkpoint` lançam `IllegalStateException`. O storage
+  abre sem criar sempre com `OnGeometryChange.FAIL`, qualquer que seja a política pedida:
+  geometria divergente vira erro ao leitor e nada é migrado nem recriado (exceção: um arquivo
+  truncado, menor que o header fixo, passa na checagem de existência e é reinicializado — ver
+  `doc/oss/ngrrd.md`). O OPEN sem criar também não invalida a confirmação de geometria no
+  catálogo antes de abrir; só a confirma depois do sucesso. Cache de handles sem
+  contagem de referências: abrir com criação sobre um somente leitura em cache o substitui por
+  um gravável novo (o antigo continua válido para quem já o tinha); abrir sem criar sobre um
+  gravável em cache devolve uma vista somente leitura nova a cada chamada, cujo `close()` nunca
+  fecha o gravável.
+- Storages anunciam capacidades de protocolo em `StorageNodeStatus.capabilities`
+  (`catalog.lookup`, `open.createIfMissing`, `series.exists.batch`); o cliente confere a
+  capacidade antes de enviar uma operação nova e falha com `ErrorCode.UNSUPPORTED_BY_NODE` — sem
+  RPC — contra um storage/líder de versão anterior, em vez de arriscar `false` ou criar a série
+  por engano. Status local sem a capacidade é confirmado por leitura forte no líder antes de
+  recusar, relida com backoff curto dentro do prazo restante quando ausente.
+- Corrige o seed da liderança do `placementHandler` no boot: vale para qualquer primeiro líder
+  eleito durante `builder.start()`, antes do registro dos listeners (não só para um cluster de
+  um nó) — `addLeadershipListener` não dispara callback sintético para quem já é líder. Sem o
+  seed, a janela de graça pós-eleição de `PLACE` e `ngrrd.catalog.lookup` nunca se abria naquele
+  mandato, e um miss logo após o boot podia virar "não existe" definitivo antes da réplica local
+  do catálogo convergir. O seed agora acontece antes de o handler ser registrado para atender
+  requisições (rede e caminho local).
+- Corrige o "não existe" falso logo após uma eleição: o coordenador troca o líder antes de
+  notificar os listeners, e o novo líder recontava as pendências a partir do catálogo inteiro
+  (centenas de ms com ~357 mil séries) antes de marcar o início da janela de graça — nesse
+  intervalo, um miss de `ngrrd.catalog.lookup` era respondido como `OK` sem a chave. A marca
+  agora é gravada antes de qualquer trabalho pesado, e um miss enquanto a réplica do líder ainda
+  sincroniza (`ReplicationManager.isLeaderSyncing()`) responde `NOT_LEADER` (o cliente retenta).
+- Um miss de `ngrrd.catalog.lookup` no intervalo em que o coordenador já trocou o líder mas ainda
+  não notificou os listeners também responde `NOT_LEADER`: depois de perder (ou não ter) a
+  liderança, o handler se considera dentro da janela de graça até ver a próxima posse.
+- **Mudança de assinatura:** os construtores públicos de `PlacementRequestHandler` recebem um
+  novo parâmetro `BooleanSupplier leaderSyncing` (logo após `leaderView`), usado para recusar
+  misses enquanto a réplica do líder sincroniza. Quem monta o handler fora do `NgrrdStorageNode`
+  precisa passar `replicationManager()::isLeaderSyncing` do `NGridNode`.
+- `NgrrdClusterAdminCli status` mostra as capacidades anunciadas por nó (coluna `CAPABILITIES`;
+  `-` quando o status não traz nenhuma).
+- Mudanças de comportamento no caminho que cria:
+  - `open` durante um `close()` lento do mesmo handle agora abre um handle novo (a 8.5.0
+    devolvia o handle que estava fechando);
+  - a reabertura automática de uma série no storage (após fechamento por ociosidade/LRU) nunca
+    cria: se o objeto sumiu, o storage responde `NOT_OPEN` e o `OPEN` do cliente o recria — um
+    round-trip a mais;
+  - `PLACE` de séries novas aguarda `placementGraceAfterLeadership` (3 s por padrão) depois que
+    o primeiro líder do boot assume, porque a janela de graça agora também se abre nesse
+    mandato — a criação das primeiras séries logo após subir o cluster atrasa até esse prazo.
+- Documentação: `doc/oss/ngrrd.md` (modo local), `doc/oss/ngrrd-cluster.md` (contrato de
+  consistência, cache de handles, reconciliação de catálogo externo) e
+  `doc/oss/ngrrd-cluster-operacao.md` (ordem de atualização — storages antes dos clientes).
+
+## 2026-09-25 — Correções no rebalance com ingestão contínua — release 8.5.1 (não publicada — incorporada na 8.6.0)
 
 Correções aplicadas ao módulo `nishi-utils-ngrrd-cluster`, complementando o trabalho da
 [PR #172](https://github.com/nishisan-dev/nishi-utils/pull/172) (rebalance com ingestão contínua, 8.5.0).

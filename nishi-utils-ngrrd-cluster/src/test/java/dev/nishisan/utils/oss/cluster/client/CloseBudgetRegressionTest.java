@@ -121,7 +121,8 @@ class CloseBudgetRegressionTest {
             String seriesKey = "series-" + i;
             RemoteSeriesHandle handle = new RemoteSeriesHandle(seriesKey, "yaml: fake", "hash-" + i, Map.of(),
                     Ngrrd.OpenOptions.defaults(), resolver, rpc, new NoOpWriteBuffer(), retryPolicy, requestTimeout,
-                    closeTimeout, Clock.systemUTC(), key -> { });
+                    closeTimeout, Clock.systemUTC(), (key, h) -> { }, CapabilityFixtures.advertisingAll(),
+                    () -> false);
             // open() não é usado de propósito: o fake de RPC nunca responde OK a nada, então open()
             // ficaria preso na própria retentativa dele. O dono é o que interessa testar aqui (close);
             // setado direto via reflexão, mesmo padrão já usado em StorageRequestHandlerTest.
@@ -221,6 +222,21 @@ class CloseBudgetRegressionTest {
     private static final class UnusedPlacementLookup implements PlacementLookup {
         @Override
         public SeriesPlacement resolve(String seriesKey, String definitionHashHex) {
+            throw new UnsupportedOperationException("não usado neste teste (só close())");
+        }
+
+        @Override
+        public SeriesPlacement resolveExisting(String seriesKey, Duration maxWait) {
+            throw new UnsupportedOperationException("não usado neste teste (só close())");
+        }
+
+        @Override
+        public SeriesPlacement resolveExistingAtLeader(String seriesKey, Duration maxWait) {
+            throw new UnsupportedOperationException("não usado neste teste (só close())");
+        }
+
+        @Override
+        public Optional<SeriesPlacement> placementCached(String seriesKey) {
             throw new UnsupportedOperationException("não usado neste teste (só close())");
         }
 

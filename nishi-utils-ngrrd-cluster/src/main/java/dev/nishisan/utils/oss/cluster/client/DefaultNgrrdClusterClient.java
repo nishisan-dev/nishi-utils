@@ -17,8 +17,6 @@
 
 package dev.nishisan.utils.oss.cluster.client;
 
-import dev.nishisan.utils.oss.cluster.rpc.CoordinationLocks;
-
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.ngrid.structures.NGrid;
@@ -31,7 +29,10 @@ import dev.nishisan.utils.oss.cluster.api.ErrorCode;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterClient;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterConfig;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
+import dev.nishisan.utils.oss.cluster.api.SeriesInfo;
+import dev.nishisan.utils.oss.cluster.api.SeriesVerification;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
+import dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.metrics.LatencySnapshot;
 import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
@@ -43,7 +44,9 @@ import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesStatus;
 import dev.nishisan.utils.oss.cluster.rpc.ClusterRpc;
 import dev.nishisan.utils.oss.cluster.rpc.TransportClusterRpc;
+import dev.nishisan.utils.oss.config.NgrrdYamlLoader;
 import dev.nishisan.utils.oss.format.DefinitionHash;
+import dev.nishisan.utils.oss.format.SeriesGeometry;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -52,13 +55,12 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import java.util.logging.Level;
@@ -93,19 +95,20 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
     /** Mesma instância de {@link #rpc}, com o tipo concreto — só para expor {@code latencySnapshot()}/{@code placeCount()} em {@link #metrics()}. */
     private final MetricsTrackingClusterRpc metricsRpc;
     private final PlacementResolver resolver;
+    private final SeriesExistence existence;
+    private final SeriesVerifier verifier;
     private final WriteDispatcher dispatcher;
-    private final ConcurrentMap<String, RemoteSeriesHandle> handles;
-    /**
-     * item 10 (achado do Refuter): lock por {@code seriesKey} usado só para serializar aberturas
-     * concorrentes DA MESMA série — ver {@link #open(String, Map, Ngrrd.OpenOptions)}.
-     */
-    private final ConcurrentMap<String, Object> openLocks;
+    /** Handles principais abertos, com as regras de reaproveitamento de {@link #open(String, Map, Ngrrd.OpenOptions)}. */
+    private final SeriesHandleCache handles;
+    /** Capacidades anunciadas pelos storages, conferidas antes de operações que dependem delas. */
+    private final NodeCapabilities capabilities;
 
     private volatile boolean closed;
 
     private DefaultNgrrdClusterClient(NgrrdClusterConfig config, NGridNode node, Path dataDir,
             boolean temporaryDataDir, MetricsTrackingClusterRpc rpc, PlacementResolver resolver,
-            WriteDispatcher dispatcher, ConcurrentMap<String, RemoteSeriesHandle> handles) {
+            SeriesExistence existence, SeriesVerifier verifier, WriteDispatcher dispatcher,
+            SeriesHandleCache handles, NodeCapabilities capabilities) {
         this.config = config;
         this.node = node;
         this.dataDir = dataDir;
@@ -113,9 +116,11 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
         this.rpc = rpc;
         this.metricsRpc = rpc;
         this.resolver = resolver;
+        this.existence = existence;
+        this.verifier = verifier;
         this.dispatcher = dispatcher;
         this.handles = handles;
-        this.openLocks = new ConcurrentHashMap<>();
+        this.capabilities = capabilities;
     }
 
     /** Conecta ao cluster ngrrd e devolve um cliente pronto para {@link #open}. */
@@ -165,9 +170,16 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
             MetricsTrackingClusterRpc rpc = new MetricsTrackingClusterRpc(transportRpc);
             RetryPolicy leaderRetry = new RetryPolicy(cfg.leaderWaitTimeout(), cfg.retryBackoffMin(),
                     cfg.retryBackoffMax());
-            PlacementResolver resolver = new PlacementResolver(catalog, rpc, leaderRetry, Clock.systemUTC());
+            NodeCapabilities capabilities = NodeCapabilities.from(catalog);
+            CatalogLookupClient catalogLookupClient = new CatalogLookupClient(rpc, leaderRetry, Clock.systemUTC(),
+                    cfg.catalogLookupBatchSize(), capabilities);
+            PlacementResolver resolver = new PlacementResolver(catalog, rpc, leaderRetry, Clock.systemUTC(),
+                    catalogLookupClient);
+            SeriesExistence existence = new SeriesExistence(resolver, catalogLookupClient);
+            SeriesVerifier verifier = new SeriesVerifier(resolver, catalogLookupClient, rpc, capabilities,
+                    cfg.requestTimeout(), cfg.retryTimeout(), cfg.catalogLookupBatchSize());
 
-            ConcurrentMap<String, RemoteSeriesHandle> handles = new ConcurrentHashMap<>();
+            SeriesHandleCache handles = new SeriesHandleCache();
             RetryPolicy opRetry = new RetryPolicy(cfg.retryTimeout(), cfg.retryBackoffMin(), cfg.retryBackoffMax());
             // Referência publicada com segurança (AtomicReference = volatile) para a thread do
             // tickLoop do WriteDispatcher, que só a lê ~METRICS_TICK_INTERVAL ticks depois de criada
@@ -195,7 +207,7 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
                         }
                     }, Clock.systemUTC(), cfg.metricsListener(), metricsSupplier);
             DefaultNgrrdClusterClient client = new DefaultNgrrdClusterClient(cfg, node, dataDir, temporaryDataDir,
-                    rpc, resolver, dispatcher, handles);
+                    rpc, resolver, existence, verifier, dispatcher, handles, capabilities);
             clientRef.set(client);
             return client;
         } catch (RuntimeException e) {
@@ -293,29 +305,9 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
         Objects.requireNonNull(tags, "tags");
         String template = SeriesKeyTemplate.templateOf(yaml);
         String seriesKey = SeriesKeyTemplate.resolve(template, tags);
-        RemoteSeriesHandle existing = handles.get(seriesKey);
-        if (existing != null) {
-            return existing;
-        }
-        // item 10 (achado do Refuter): nunca fazer RPC dentro de computeIfAbsent — isso mantinha o bin
-        // lock interno do ConcurrentHashMap preso durante toda a chamada de rede de openNewHandle
-        // (OPEN no dono), bloqueando get()/put() de QUALQUER OUTRA série neste mesmo mapa até a rede
-        // responder. Em vez disso, um lock por seriesKey (openLocks, construído sem I/O) serializa só
-        // as aberturas concorrentes DA MESMA série; handles só é tocado com get/put simples.
-        Object lock = openLocks.computeIfAbsent(seriesKey, key -> new Object());
-        try {
-            try (var guard = CoordinationLocks.acquire(lock)) {
-                existing = handles.get(seriesKey);
-                if (existing != null) {
-                    return existing;
-                }
-                RemoteSeriesHandle handle = openNewHandle(seriesKey, yaml, tags, options);
-                handles.put(seriesKey, handle);
-                return handle;
-            }
-        } finally {
-            openLocks.remove(seriesKey, lock);
-        }
+        Ngrrd.OpenOptions effective = options != null ? options : Ngrrd.OpenOptions.defaults();
+        return handles.open(seriesKey, effective.createIfMissing(),
+                () -> openNewHandle(seriesKey, yaml, tags, effective));
     }
 
     @Override
@@ -329,16 +321,44 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
         }
     }
 
+    @Override
+    public boolean exists(String seriesKey) {
+        ensureOpen();
+        Objects.requireNonNull(seriesKey, "seriesKey");
+        return existence.exists(seriesKey, config.retryTimeout());
+    }
+
+    @Override
+    public Map<String, Boolean> exists(Collection<String> seriesKeys) {
+        ensureOpen();
+        Objects.requireNonNull(seriesKeys, "seriesKeys");
+        return existence.exists(seriesKeys, config.retryTimeout());
+    }
+
+    @Override
+    public Optional<SeriesInfo> find(String seriesKey) {
+        ensureOpen();
+        Objects.requireNonNull(seriesKey, "seriesKey");
+        return existence.find(seriesKey, config.retryTimeout());
+    }
+
+    @Override
+    public Map<String, SeriesVerification> verify(Collection<String> seriesKeys) {
+        ensureOpen();
+        Objects.requireNonNull(seriesKeys, "seriesKeys");
+        return verifier.verify(seriesKeys);
+    }
+
     private RemoteSeriesHandle openNewHandle(String seriesKey, String yaml, Map<String, String> tags,
             Ngrrd.OpenOptions options) {
         String definitionHashHex = DefinitionHash.hex(yaml);
         RetryPolicy opRetry = new RetryPolicy(config.retryTimeout(), config.retryBackoffMin(),
                 config.retryBackoffMax());
+        GeometryDescriptor geometry = GeometryDescriptor.from(
+                new SeriesGeometry(NgrrdYamlLoader.parse(yaml, System::getenv)));
         RemoteSeriesHandle handle = new RemoteSeriesHandle(seriesKey, yaml, definitionHashHex, tags, options,
                 resolver, rpc, dispatcher, opRetry, config.requestTimeout(), config.closeTimeout(),
-                Clock.systemUTC(), handles::remove, dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor.from(
-                        new dev.nishisan.utils.oss.format.SeriesGeometry(
-                                dev.nishisan.utils.oss.config.NgrrdYamlLoader.parse(yaml, System::getenv))));
+                Clock.systemUTC(), handles::remove, capabilities, () -> closed, geometry);
         handle.open();
         return handle;
     }
@@ -504,7 +524,7 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
         // um closeTimeout inteiro "renovado" para cada fase — do contrário N handles lentos, mais o
         // dispatcher, podiam multiplicar o tempo total de close() por várias vezes closeTimeout.
         long deadline = System.currentTimeMillis() + config.closeTimeout().toMillis();
-        for (RemoteSeriesHandle handle : List.copyOf(handles.values())) {
+        for (RemoteSeriesHandle handle : handles.snapshot()) {
             long remainingMs = deadline - System.currentTimeMillis();
             Duration flushBudget = remainingMs > 0 ? Duration.ofMillis(remainingMs) : Duration.ZERO;
             try {

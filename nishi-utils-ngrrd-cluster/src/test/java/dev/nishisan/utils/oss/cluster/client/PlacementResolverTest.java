@@ -20,15 +20,21 @@ package dev.nishisan.utils.oss.cluster.client;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.structures.NGrid;
 import dev.nishisan.utils.ngrid.structures.NGridCluster;
+import dev.nishisan.utils.oss.Ngrrd;
+import dev.nishisan.utils.oss.api.SeriesNotFoundException;
 import dev.nishisan.utils.oss.cluster.api.ErrorCode;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
 import dev.nishisan.utils.oss.cluster.catalog.PlacementState;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
+import dev.nishisan.utils.oss.cluster.catalog.StorageCapabilities;
+import dev.nishisan.utils.oss.cluster.protocol.CatalogLookupResponse;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.protocol.PlaceRequest;
 import dev.nishisan.utils.oss.cluster.protocol.PlaceResponse;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesStatus;
+import dev.nishisan.utils.oss.cluster.protocol.SeriesStatusResponse;
+import dev.nishisan.utils.oss.cluster.protocol.SeriesWrite;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -41,6 +47,7 @@ import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import dev.nishisan.utils.oss.cluster.rpc.ClusterRpc;
 
@@ -75,7 +82,10 @@ class PlacementResolverTest {
         rpc = new RecordingClusterRpc(CLIENT);
         rpc.leader(LEADER);
         RetryPolicy retry = new RetryPolicy(Duration.ofSeconds(2), Duration.ofMillis(10), Duration.ofMillis(100));
-        resolver = new PlacementResolver(catalog, rpc, retry, java.time.Clock.systemUTC());
+        catalog.putNodeStatus(CapabilityFixtures.status(LEADER.value(), StorageCapabilities.ALL));
+        CatalogLookupClient lookupClient = new CatalogLookupClient(rpc, retry, Clock.systemUTC(), 2000,
+                NodeCapabilities.from(catalog));
+        resolver = new PlacementResolver(catalog, rpc, retry, Clock.systemUTC(), lookupClient);
     }
 
     @AfterEach
@@ -261,8 +271,9 @@ class PlacementResolverTest {
             public NodeId localId() { return CLIENT; }
             public Optional<NodeId> leaderId() { return Optional.of(LEADER); }
         };
-        var bounded = new PlacementResolver(catalog, boundedRpc,
-                new RetryPolicy(Duration.ofSeconds(2), Duration.ofMillis(1), Duration.ofMillis(2)), clock);
+        RetryPolicy boundedRetry = new RetryPolicy(Duration.ofSeconds(2), Duration.ofMillis(1), Duration.ofMillis(2));
+        var bounded = new PlacementResolver(catalog, boundedRpc, boundedRetry, clock,
+                new CatalogLookupClient(boundedRpc, boundedRetry, clock, 2000, NodeCapabilities.from(catalog)));
 
         assertEquals(ErrorCode.TIMEOUT, assertThrows(NgrrdClusterException.class,
                 () -> bounded.resolve("uncached", "hash", null, Duration.ofMillis(100))).code());
@@ -281,5 +292,209 @@ class PlacementResolverTest {
         assertTrue(failure.code() == ErrorCode.NO_LEADER || failure.code() == ErrorCode.TIMEOUT);
         assertTrue(Duration.ofNanos(System.nanoTime() - start).toMillis() < 500);
         assertTrue(rpc.calls().isEmpty());
+    }
+
+    @Test
+    void resolveExistingComPlacementLocalAtivoNaoFazRpc() {
+        SeriesPlacement active = SeriesPlacement.active("storage-a", 1_000L);
+        catalog.putPlacement("series-1", active);
+
+        SeriesPlacement resolved = resolver.resolveExisting("series-1", Duration.ofSeconds(1));
+
+        assertEquals(active, resolved);
+        assertEquals(0, rpc.calls().size(), "placement ACTIVE local não deveria consultar o líder");
+    }
+
+    @Test
+    void resolveExistingComMissConsultaLiderENuncaFazPlace() {
+        SeriesPlacement placed = SeriesPlacement.active("storage-a", 1_000L);
+        rpc.respondNext((cmd, body) -> {
+            assertEquals(Commands.CATALOG_LOOKUP, cmd);
+            return CatalogLookupResponse.ok(Map.of("series-1", placed));
+        });
+
+        SeriesPlacement resolved = resolver.resolveExisting("series-1", Duration.ofSeconds(1));
+
+        assertEquals(placed, resolved);
+        assertTrue(rpc.calls().stream().noneMatch(c -> c.command().equals(Commands.PLACE)),
+                "resolveExisting nunca deveria disparar PLACE");
+    }
+
+    @Test
+    void resolveExistingAusenteNoLiderLancaSeriesNotFound() {
+        rpc.respondNext((cmd, body) -> CatalogLookupResponse.ok(Map.of()));
+
+        SeriesNotFoundException ex = assertThrows(SeriesNotFoundException.class,
+                () -> resolver.resolveExisting("series-1", Duration.ofSeconds(1)));
+
+        assertEquals("series-1", ex.seriesKey());
+        assertEquals(SeriesNotFoundException.Reason.NOT_PLACED, ex.reason());
+    }
+
+    @Test
+    void handleSomenteLeituraComWrongOwnerSemDonoTerminaEmNotPlaced() {
+        // Ponta a ponta no cliente: o dono responde WRONG_OWNER sem dono (o líder não tem placement), o
+        // handle re-resolve por resolveExisting, o líder confirma a ausência e a exceção sai NOT_PLACED.
+        SeriesPlacement placed = SeriesPlacement.active("storage-a", 1_000L);
+        rpc.respondNext((cmd, body) -> {
+            assertEquals(Commands.CATALOG_LOOKUP, cmd);
+            return CatalogLookupResponse.ok(Map.of("series-1", placed));
+        });
+        rpc.respondNext((cmd, body) -> {
+            assertEquals(Commands.OPEN, cmd);
+            return new SeriesStatusResponse(SeriesStatus.WRONG_OWNER, null, null);
+        });
+        rpc.respondNext((cmd, body) -> {
+            assertEquals(Commands.CATALOG_LOOKUP, cmd);
+            return CatalogLookupResponse.ok(Map.of());
+        });
+        RetryPolicy retry = new RetryPolicy(Duration.ofSeconds(2), Duration.ofMillis(1), Duration.ofMillis(5));
+        RemoteSeriesHandle handle = new RemoteSeriesHandle("series-1", "yaml: fake", "hash-1", Map.of(),
+                Ngrrd.OpenOptions.defaults().withCreateIfMissing(false), resolver, rpc, new UnusedWriteBuffer(),
+                retry, Duration.ofSeconds(1), Duration.ofSeconds(1), Clock.systemUTC(), (key, h) -> { },
+                CapabilityFixtures.advertisingAll(), () -> false);
+
+        SeriesNotFoundException ex = assertThrows(SeriesNotFoundException.class, handle::open);
+
+        assertEquals(SeriesNotFoundException.Reason.NOT_PLACED, ex.reason());
+        assertTrue(rpc.calls().stream().noneMatch(c -> c.command().equals(Commands.PLACE)),
+                "handle somente leitura nunca posiciona");
+    }
+
+    @Test
+    void handleSomenteLeituraComReplicaLocalAtrasadaEWrongOwnerSemDonoTerminaRapidoEmNotPlaced() {
+        // A réplica local ainda diz ACTIVE(storage-a), mas o líder já não tem placement: o dono responde
+        // WRONG_OWNER sem dono e o handle precisa confirmar direto com o líder, sem voltar à réplica.
+        catalog.putPlacement("series-1", SeriesPlacement.active("storage-a", 1_000L));
+        rpc.respondDefault((cmd, body) -> switch (cmd) {
+            case Commands.OPEN -> new SeriesStatusResponse(SeriesStatus.WRONG_OWNER, null, null);
+            case Commands.CATALOG_LOOKUP -> CatalogLookupResponse.ok(Map.of());
+            default -> throw new AssertionError("comando inesperado: " + cmd);
+        });
+        RetryPolicy retry = new RetryPolicy(Duration.ofSeconds(5), Duration.ofMillis(1), Duration.ofMillis(5));
+        RemoteSeriesHandle handle = new RemoteSeriesHandle("series-1", "yaml: fake", "hash-1", Map.of(),
+                Ngrrd.OpenOptions.defaults().withCreateIfMissing(false), resolver, rpc, new UnusedWriteBuffer(),
+                retry, Duration.ofSeconds(1), Duration.ofSeconds(1), Clock.systemUTC(), (key, h) -> { },
+                CapabilityFixtures.advertisingAll(), () -> false);
+        long start = System.nanoTime();
+
+        SeriesNotFoundException ex = assertThrows(SeriesNotFoundException.class, handle::open);
+
+        long elapsedMs = Duration.ofNanos(System.nanoTime() - start).toMillis();
+        assertEquals(SeriesNotFoundException.Reason.NOT_PLACED, ex.reason());
+        assertTrue(elapsedMs < 2_000, "deveria terminar sem esperar o retryTimeout; levou " + elapsedMs + " ms");
+        assertEquals(List.of(Commands.OPEN, Commands.CATALOG_LOOKUP),
+                rpc.calls().stream().map(RecordingClusterRpc.Recorded::command).toList());
+    }
+
+    @Test
+    void handleSomenteLeituraComReplicaLocalAtrasadaEWrongOwnerSemDonoSegueComODonoDoLider() {
+        catalog.putPlacement("series-1", SeriesPlacement.active("storage-a", 1_000L));
+        SeriesPlacement atLeader = SeriesPlacement.active("storage-b", 2_000L);
+        rpc.respondNext((cmd, body) -> {
+            assertEquals(Commands.OPEN, cmd);
+            return new SeriesStatusResponse(SeriesStatus.WRONG_OWNER, null, null);
+        });
+        rpc.respondNext((cmd, body) -> {
+            assertEquals(Commands.CATALOG_LOOKUP, cmd);
+            return CatalogLookupResponse.ok(Map.of("series-1", atLeader));
+        });
+        rpc.respondNext((cmd, body) -> {
+            assertEquals(Commands.OPEN, cmd);
+            return new SeriesStatusResponse(SeriesStatus.OK, "storage-b", null, Boolean.TRUE);
+        });
+        RetryPolicy retry = new RetryPolicy(Duration.ofSeconds(5), Duration.ofMillis(1), Duration.ofMillis(5));
+        RemoteSeriesHandle handle = new RemoteSeriesHandle("series-1", "yaml: fake", "hash-1", Map.of(),
+                Ngrrd.OpenOptions.defaults().withCreateIfMissing(false), resolver, rpc, new UnusedWriteBuffer(),
+                retry, Duration.ofSeconds(1), Duration.ofSeconds(1), Clock.systemUTC(), (key, h) -> { },
+                CapabilityFixtures.advertisingAll(), () -> false);
+
+        handle.open();
+
+        List<RecordingClusterRpc.Recorded> calls = rpc.calls();
+        assertEquals(3, calls.size());
+        assertEquals(NodeId.of("storage-a"), calls.get(0).target());
+        assertEquals(NodeId.of("storage-b"), calls.get(2).target(), "segue com o dono informado pelo líder");
+    }
+
+    @Test
+    void resolveExistingAtLeaderIgnoraReplicaLocalEOverride() {
+        catalog.putPlacement("series-1", SeriesPlacement.active("storage-a", 1_000L));
+        resolver.noteOwner("series-1", "storage-c");
+        rpc.respondNext((cmd, body) -> CatalogLookupResponse.ok(Map.of()));
+
+        SeriesNotFoundException ex = assertThrows(SeriesNotFoundException.class,
+                () -> resolver.resolveExistingAtLeader("series-1", Duration.ofSeconds(1)));
+
+        assertEquals(SeriesNotFoundException.Reason.NOT_PLACED, ex.reason());
+        assertEquals(List.of(Commands.CATALOG_LOOKUP),
+                rpc.calls().stream().map(RecordingClusterRpc.Recorded::command).toList());
+    }
+
+    @Test
+    void resolveExistingMigrandoConsultaLider() {
+        SeriesPlacement before = SeriesPlacement.active("storage-a", 1_000L);
+        SeriesPlacement migrating = SeriesPlacement.migrating(before, "storage-b", "mig-1", 2_000L);
+        catalog.putPlacement("series-1", migrating);
+        SeriesPlacement completed = SeriesPlacement.active("storage-b", 3_000L);
+        rpc.respondNext((cmd, body) -> {
+            assertEquals(Commands.CATALOG_LOOKUP, cmd);
+            return CatalogLookupResponse.ok(Map.of("series-1", completed));
+        });
+
+        SeriesPlacement resolved = resolver.resolveExisting("series-1", Duration.ofSeconds(1));
+        // Placement ACTIVE devolvido pelo líder deveria ter sido gravado como override — uma segunda
+        // chamada não repete a consulta ao líder.
+        SeriesPlacement resolvedAgain = resolver.resolveExisting("series-1", Duration.ofSeconds(1));
+
+        assertEquals(completed, resolved);
+        assertEquals(completed, resolvedAgain);
+        assertEquals(1, rpc.calls().size(), "placement ACTIVE devolvido pelo líder deveria virar override");
+    }
+
+    @Test
+    void resolveExistingComPlacementMigrandoNoLiderNaoGravaOverride() {
+        SeriesPlacement before = SeriesPlacement.active("storage-a", 1_000L);
+        SeriesPlacement migratingAtLeader = SeriesPlacement.migrating(before, "storage-b", "mig-1", 2_000L);
+        rpc.respondDefault((cmd, body) -> {
+            assertEquals(Commands.CATALOG_LOOKUP, cmd);
+            return CatalogLookupResponse.ok(Map.of("series-1", migratingAtLeader));
+        });
+
+        SeriesPlacement first = resolver.resolveExisting("series-1", Duration.ofSeconds(1));
+        // Sem override gravado (placement não ACTIVE), a segunda chamada consulta o líder de novo.
+        SeriesPlacement second = resolver.resolveExisting("series-1", Duration.ofSeconds(1));
+
+        assertEquals(migratingAtLeader, first);
+        assertEquals(migratingAtLeader, second);
+        assertEquals(2, rpc.calls().size(), "placement MIGRATING não deveria ser cacheado como override");
+    }
+
+    @Test
+    @Timeout(2)
+    void resolveExistingSemLiderLancaNgrrdClusterExceptionENaoSeriesNotFound() {
+        rpc.leader(null);
+
+        assertThrows(NgrrdClusterException.class,
+                () -> resolver.resolveExisting("series-1", Duration.ofMillis(30)));
+        assertTrue(rpc.calls().isEmpty(), "sem líder eleito, nenhuma chamada deveria ter sido feita");
+    }
+
+    /** {@link WriteBuffer} que falha se for usado: um handle somente leitura nunca escreve. */
+    private static final class UnusedWriteBuffer implements WriteBuffer {
+        @Override
+        public void enqueue(String ownerNodeId, SeriesWrite write) {
+            throw new AssertionError("handle somente leitura não deveria enfileirar escritas");
+        }
+
+        @Override
+        public void flushNodeSync(String ownerNodeId) {
+            throw new AssertionError("handle somente leitura não deveria drenar o buffer");
+        }
+
+        @Override
+        public void flushNodeSync(String ownerNodeId, Duration maxWait) {
+            throw new AssertionError("handle somente leitura não deveria drenar o buffer");
+        }
     }
 }

@@ -57,6 +57,9 @@ class WriteBarrierRegressionTest {
     private void open() {
         PlacementLookup lookup = new PlacementLookup() {
             public SeriesPlacement resolve(String key, String hash) { return SeriesPlacement.active("A", 0); }
+            public SeriesPlacement resolveExisting(String key, Duration maxWait) { return resolve(key, null); }
+            public SeriesPlacement resolveExistingAtLeader(String key, Duration maxWait) { return resolve(key, null); }
+            public Optional<SeriesPlacement> placementCached(String key) { return Optional.of(resolve(key, null)); }
             public void invalidate(String key) { }
             public void noteOwner(String key, String owner) { }
         };
@@ -65,7 +68,8 @@ class WriteBarrierRegressionTest {
                 NgrrdClusterConfig.BufferFullPolicy.BLOCK, Duration.ofSeconds(3), key -> true,
                 (key, owner) -> handle.ownerChanged(owner), Clock.systemUTC(), null, null);
         handle = new RemoteSeriesHandle("s", "unused", "unused", Map.of(), null, lookup, rpc, dispatcher,
-                retry, Duration.ofSeconds(3), Duration.ofSeconds(3), Clock.systemUTC(), key -> { });
+                retry, Duration.ofSeconds(3), Duration.ofSeconds(3), Clock.systemUTC(), (key, h) -> { },
+                CapabilityFixtures.advertisingAll(), () -> false);
         handle.open();
     }
 

@@ -580,6 +580,92 @@ class SeriesHandleRegistryTest {
         }
     }
 
+    @Test
+    void reopenIfKnownAposObjetoRemovidoDevolveVazioENaoRecriaOObjeto() {
+        // reopenIfKnown nunca deve recriar o objeto físico, mesmo que a definição cacheada (por hash de
+        // YAML) tenha createIfMissing=true por ter sido a opção usada no open() original desta MESMA série.
+        MutableClock clock = new MutableClock(Instant.parse("2026-01-01T00:00:00Z"));
+        try (SeriesHandleRegistry registry = registry(Duration.ofMinutes(10), 10, clock)) {
+            String seriesKey = "series-objeto-removido";
+            registry.open(seriesKey, yaml, Ngrrd.OpenOptions.defaults());
+            clock.advance(Duration.ofMinutes(11));
+            assertEquals(1, registry.closeIdle());
+            assertTrue(registry.existing(seriesKey).isEmpty());
+
+            String objectKey = SeriesObjectKeys.objectKey("series", seriesKey);
+            assertTrue(volume.storage().exists(objectKey), "setup deveria ter deixado o objeto físico no volume");
+            volume.storage().delete(objectKey);
+            assertFalse(volume.storage().exists(objectKey));
+
+            Optional<NgrrdHandle> reopened = registry.reopenIfKnown(seriesKey);
+
+            assertTrue(reopened.isEmpty(), "reopenIfKnown não deveria recriar a série cujo objeto sumiu");
+            assertFalse(volume.storage().exists(objectKey), "reopenIfKnown NUNCA deveria recriar o objeto físico");
+        }
+    }
+
+    @Test
+    void reopenIfKnownNuncaCriaMesmoComDefinicaoCompartilhadaPorOutraSerieComCreateIfMissingTrue() {
+        // definitionByHash é compartilhado por YAML, não por seriesKey — uma série aberta com
+        // createIfMissing=false não pode ser recriada pela auto-cura só porque outra série com o MESMO
+        // YAML foi aberta depois com createIfMissing=true (options.createIfMissing sobrescrito no
+        // DefinitionRecord compartilhado).
+        MutableClock clock = new MutableClock(Instant.parse("2026-01-01T00:00:00Z"));
+        try (SeriesHandleRegistry registry = registry(Duration.ofMinutes(10), 10, clock)) {
+            String seriesFalse = "series-sem-criar-compartilhada";
+            String seriesTrue = "series-com-criar-compartilhada";
+
+            // series-sem-criar precisa existir fisicamente ANTES de abrir com createIfMissing=false —
+            // cria normalmente e fecha explicitamente para deixar só o objeto no disco.
+            registry.open(seriesFalse, yaml, Ngrrd.OpenOptions.defaults());
+            registry.close(seriesFalse);
+            String objectKey = SeriesObjectKeys.objectKey("series", seriesFalse);
+            assertTrue(volume.storage().exists(objectKey));
+
+            registry.open(seriesFalse, yaml, Ngrrd.OpenOptions.defaults().withCreateIfMissing(false));
+            clock.advance(Duration.ofMinutes(1));
+            // Mesmo YAML (mesmo hash) -> sobrescreve o DefinitionRecord compartilhado com createIfMissing=true.
+            registry.open(seriesTrue, yaml, Ngrrd.OpenOptions.defaults());
+
+            clock.advance(Duration.ofMinutes(11));
+            assertEquals(2, registry.closeIdle());
+            assertTrue(registry.existing(seriesFalse).isEmpty());
+
+            volume.storage().delete(objectKey);
+            assertFalse(volume.storage().exists(objectKey));
+
+            Optional<NgrrdHandle> reopened = registry.reopenIfKnown(seriesFalse);
+
+            assertTrue(reopened.isEmpty(),
+                    "reopenIfKnown não deveria recriar series-sem-criar mesmo com a definição compartilhada "
+                            + "cacheada por createIfMissing=true (de series-com-criar)");
+            assertFalse(volume.storage().exists(objectKey));
+        }
+    }
+
+    @Test
+    void reopenIfKnownComObjetoPresenteContinuaSeAutoCurandoNormalmente() {
+        // A auto-cura normal (objeto físico presente) não pode quebrar com createIfMissing=false forçado
+        // na reabertura — createIfMissing só impede CRIAR, nunca impede abrir um objeto que já existe.
+        MutableClock clock = new MutableClock(Instant.parse("2026-01-01T00:00:00Z"));
+        try (SeriesHandleRegistry registry = registry(Duration.ofMinutes(10), 10, clock)) {
+            String seriesKey = "series-autocura-normal";
+            NgrrdHandle handle = registry.open(seriesKey, yaml, Ngrrd.OpenOptions.defaults());
+            handle.write("in_octets", new Sample(1_700_000_100_000L, 1_000d));
+            handle.checkpoint();
+
+            clock.advance(Duration.ofMinutes(11));
+            assertEquals(1, registry.closeIdle());
+            assertTrue(registry.existing(seriesKey).isEmpty());
+
+            Optional<NgrrdHandle> reopened = registry.reopenIfKnown(seriesKey);
+
+            assertTrue(reopened.isPresent(),
+                    "reopenIfKnown deveria continuar reabrindo normalmente quando o objeto físico existe");
+            assertEquals(1, registry.openCount());
+        }
+    }
+
     /** {@link Clock} determinístico para controlar {@code lastAccess} nos testes. */
     private static final class MutableClock extends Clock {
         private Instant instant;

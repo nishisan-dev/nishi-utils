@@ -16,7 +16,7 @@ Depois de compilar e copiar as dependências conforme o quickstart, defina no te
 administração:
 
 ```bash
-NGRRD_CP='nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.5.1.jar:nishi-utils-ngrrd-cluster/target/lib/*'
+NGRRD_CP='nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.6.0.jar:nishi-utils-ngrrd-cluster/target/lib/*'
 NGRRD_SEED='127.0.0.1:7101'
 
 ngrrd_admin() {
@@ -86,7 +86,7 @@ YAML
 Em um terminal separado, mantenha o novo processo em primeiro plano:
 
 ```bash
-java -cp 'nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.5.1.jar:nishi-utils-ngrrd-cluster/target/lib/*' \
+java -cp 'nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.6.0.jar:nishi-utils-ngrrd-cluster/target/lib/*' \
   dev.nishisan.utils.oss.cluster.node.NgrrdStorageNodeMain \
   --config target/ngrrd-demo/storage-4.yaml
 ```
@@ -425,7 +425,10 @@ Métricas úteis por storage: `MIGRATIONS_IN`, `MIGRATIONS_OUT`, `SAMPLES_FAILED
 `USED_BYTES`, `CAPACITY_BYTES` e `RECONCILE_MISSING`, expostas por `ngrrd_admin metrics <nodeId>`.
 Capacidade omitida/desconhecida não significa disco livre: `FILL%` não substitui o monitoramento
 do filesystem. Pela API, `NodeMetricsSnapshot` também inclui histogramas de latência e erros
-por status; a CLI imprime apenas um subconjunto.
+por status; a CLI imprime apenas um subconjunto. **`errorsByStatus[NOT_FOUND]` inclui os `OPEN`
+sem criar legítimos de uma varredura de catálogo** — um consumidor que consulta muitas chaves
+ausentes com `createIfMissing=false` infla essa contagem sem indicar um problema; não trate
+sozinha como sinal de degradação.
 
 Na aplicação, acompanhe `client.metrics()`: `bufferedSamples` por destino, `retriesByStatus`,
 `samplesSent` e `samplesFailed`. As métricas de um novo cliente administrativo não representam
@@ -519,9 +522,10 @@ sem nova preparação são recusados e o coordenador resolve a transferência pe
 caminhos normais de recuperação. Uma recusa de capacidade preserva a origem e aparece no
 resultado da migração (`CAPACITY_EXCEEDED` ou `FILESYSTEM_CAPACITY_EXCEEDED`).
 
-O comando `status` mostra `MODE`, `WEIGHT` e `RESERVED`, além da carga e do total de
-`GEOMETRIAS PENDENTES` (ainda sem confirmação do dono). Uma drenagem sem
-movimentos admissíveis permanece `DRAINING` e emite `NGRRD_DRAIN_PENDING`; verifique espaço,
+O comando `status` mostra `MODE`, `WEIGHT`, `RESERVED` e as capacidades anunciadas por nó
+(`CAPABILITIES`), além da carga e do total de `GEOMETRIAS PENDENTES` (ainda sem confirmação do
+dono). Uma drenagem sem movimentos admissíveis permanece `DRAINING` e emite
+`NGRRD_DRAIN_PENDING`; verifique espaço,
 conectividade e confirmação de geometria antes de redisparar. Uma série grande sem destino
 não impede o planejamento das menores que ainda cabem.
 
@@ -540,3 +544,73 @@ não impede o planejamento das menores que ainda cabem.
 
 Reverter o modo não significa fazer downgrade dos binários. Cotas de séries/bytes e regras de
 afinidade (item 3 da issue) não fazem parte desta entrega.
+
+## Consultar existência e abrir sem criar (issue #171)
+
+### Ordem de atualização
+
+**Atualize TODOS os storages antes dos clientes que usam `exists`, `find`, `verify` ou `open`
+com `createIfMissing=false`.** Diferente da atualização coordenada da seção anterior, esta
+entrega tolera um período com versões mistas — mas só na direção storage-primeiro:
+
+1. Um storage novo aceita clientes antigos sem alteração: `OpenRequest.createIfMissing` chega
+   `null` de um cliente antigo e o storage trata como `true` (cria), igual a hoje.
+2. Um storage antigo (anterior a esta entrega) não conhece `createIfMissing` nem publica
+   capacidades no status (`StorageNodeStatus.capabilities`). Um cliente novo detecta a ausência
+   da capacidade exigida (`catalog.lookup` no líder para `exists`/`find`/`verify`;
+   `open.createIfMissing` no dono para `open` sem criar) **antes de enviar qualquer RPC** e
+   falha com `NgrrdClusterException` de código `ErrorCode.UNSUPPORTED_BY_NODE` — nunca `false`,
+   nunca cria a série por engano. Como defesa extra, um `OPEN` sem criar que receba `OK` sem a
+   confirmação do storage (campo que só um storage desta versão preenche) também vira
+   `UNSUPPORTED_BY_NODE` depois do fato — isso detecta um storage antigo que ignorou o pedido,
+   mas não desfaz uma criação que ele já tenha feito; o handle somente leitura se fecha.
+3. **Enquanto o líder eleito for um storage da versão anterior (8.5.x)**, todo status gravado no
+   catálogo passa pelo codec desse líder, que não conhece o campo `capabilities` e o descarta —
+   vale para os relatórios periódicos dos storages já atualizados, não só para as regravações de
+   `ngrrd.admin.drain`/`ngrrd.admin.activate` (`StorageNodeStatus.withState`). Nesse período as
+   APIs novas (`exists`/`find`/`verify`/`open` sem criar) respondem `UNSUPPORTED_BY_NODE` —
+   nunca uma resposta incorreta — até o líder ser um storage desta versão e os nós republicarem
+   o status no próximo relatório periódico (`statusReportInterval`, default 10 s). Por isso
+   atualize todos os storages antes de usar as APIs novas e confirme, na coluna `CAPABILITIES`
+   do comando `status`, que todos os nós reportam `catalog.lookup`, `open.createIfMissing` e
+   `series.exists.batch` (`-` indica um nó sem capacidades publicadas).
+4. Depois que todos os storages reportam capacidades, atualize os clientes normalmente — sem
+   necessidade de parar o tráfego, diferente da migração `COUNT`/`CAPACITY`/`WEIGHT`.
+
+### Mudanças de comportamento no caminho que cria
+
+Valem para todos os clientes depois de atualizar os storages, mesmo sem usar as APIs novas:
+
+- `open` durante um `close()` lento do mesmo handle abre um handle novo (a 8.5.0 devolvia o
+  handle que estava fechando).
+- A reabertura automática de uma série no storage (após fechamento por ociosidade/LRU) nunca
+  cria: se o objeto sumiu do volume, o storage responde `NOT_OPEN` e o `OPEN` do cliente recria a
+  série — um round-trip a mais nesse caso.
+- `PLACE` de séries novas aguarda `placementGraceAfterLeadership` (3 s por padrão) depois que o
+  primeiro líder do boot assume. Logo após subir o cluster, a criação das primeiras séries
+  atrasa até esse prazo; o cliente retenta `NOT_LEADER` dentro do `retryTimeout`.
+- Um `open` sem criar nunca migra nem recria a geometria de uma série: o storage usa
+  `OnGeometryChange.FAIL` para ele, qualquer que seja a política pedida, e uma definição
+  divergente vira erro ao leitor. Migrações de geometria continuam exigindo um `open` com
+  criação (ou o `NgrrdMigrateCli`).
+
+### Custo e limites operacionais
+
+- **`NOT_FOUND` no `OPEN` custa uma leitura forte ao líder.** O storage nunca responde
+  `NOT_FOUND` só com base na réplica local do catálogo (pode estar atrasada logo após um
+  restart) — confirma antes com uma leitura forte de placement (`placementStrong`) no líder. Uma
+  varredura de catálogo com muitas chaves ausentes gera esse RPC extra por chave ausente;
+  dimensione o `catalogLookupBatchSize` do lado do cliente (`exists`/`find`/`verify` já são
+  paginados e sequenciais) e evite paralelizar `open` sem criar sem controle de concorrência.
+- **A confirmação de capacidade pode consumir o prazo da chamada se o líder mudar no meio.** A
+  releitura de status ausente usa backoff curto (10 ms a 200 ms) dentro do `retryTimeout`
+  restante da operação; numa troca de liderança em curso, esse laço pode não convergir a tempo e
+  a chamada falha com `TIMEOUT` (leitura forte que só falhou no transporte) ou
+  `UNSUPPORTED_BY_NODE` (nenhum status publicado até o fim do prazo) em vez de completar — trate
+  como transitório e retente.
+- **Limitação conhecida (issue #174):** o estado "esquecida" (`isForgotten`) que o storage usa
+  para não confundir uma reconciliação em andamento com uma série realmente ausente é só em
+  memória. Se a origem de uma migração reiniciar logo depois de concluir o `FINISH`, a marca se
+  perde e a checagem volta a depender só da confirmação forte do líder — sem impacto de
+  corretude (o líder continua sendo a fonte de verdade), mas a janela de proteção contra um
+  `NOT_FOUND` prematuro fica menor até o próximo ciclo de reconciliação.

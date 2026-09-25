@@ -32,10 +32,13 @@ import dev.nishisan.utils.oss.blob.NgrrdBlob;
 import dev.nishisan.utils.oss.cluster.catalog.PlacementState;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
+import dev.nishisan.utils.oss.cluster.protocol.GeometryUpdateRequest;
 import dev.nishisan.utils.oss.cluster.protocol.OpenRequest;
 import dev.nishisan.utils.oss.cluster.protocol.ReadRequest;
 import dev.nishisan.utils.oss.cluster.protocol.ReadResponse;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesCommandRequest;
+import dev.nishisan.utils.oss.cluster.protocol.SeriesExistsBatchRequest;
+import dev.nishisan.utils.oss.cluster.protocol.SeriesExistsBatchResponse;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesExistsRequest;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesExistsResponse;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesStatus;
@@ -43,6 +46,7 @@ import dev.nishisan.utils.oss.cluster.protocol.SeriesStatusResponse;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesWrite;
 import dev.nishisan.utils.oss.cluster.protocol.WriteBatchRequest;
 import dev.nishisan.utils.oss.cluster.protocol.WriteBatchResponse;
+import dev.nishisan.utils.oss.cluster.rpc.ClusterRpc;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -58,15 +62,21 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -116,6 +126,10 @@ class StorageRequestHandlerTest {
 
     private OpenRequest openRequest(String seriesKey, SeriesPlacement hint) {
         return new OpenRequest(seriesKey, yaml, Map.of(), null, null, hint);
+    }
+
+    private OpenRequest openRequestNoCreate(String seriesKey, SeriesPlacement hint) {
+        return new OpenRequest(seriesKey, yaml, Map.of(), null, null, hint, false);
     }
 
     @Test
@@ -615,6 +629,341 @@ class StorageRequestHandlerTest {
         assertFalse(registry.isOpen("series-inexistente"), "SERIES_EXISTS nunca deveria abrir handle");
     }
 
+    @Test
+    void openSemCriarComObjetoAusenteRespondeNotFoundENadaCria() {
+        String seriesKey = "series-sem-criar-ausente";
+        placementLookup.put(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequestNoCreate(seriesKey, null), SOURCE);
+
+        assertEquals(SeriesStatus.NOT_FOUND, response.status());
+        assertFalse(registry.isOpen(seriesKey), "OPEN sem criar não deveria ter aberto a série");
+        assertFalse(volume.storage().exists(SeriesObjectKeys.objectKey(SERIES_OBJECT_PREFIX, seriesKey)),
+                "OPEN sem criar não deveria ter criado o objeto físico");
+        assertEquals(1, placementLookup.strongCalls(),
+                "NOT_FOUND precisa confirmar com o líder antes de responder, mesmo com a réplica local ACTIVE(self)");
+    }
+
+    @Test
+    void openSemCriarComObjetoPresenteAbre() {
+        String seriesKey = "series-sem-criar-presente";
+        placementLookup.put(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+        handler.handle(Commands.OPEN, openRequest(seriesKey, null), SOURCE);
+        handler.handle(Commands.CLOSE, new SeriesCommandRequest(seriesKey), SOURCE);
+        assertTrue(volume.storage().exists(SeriesObjectKeys.objectKey(SERIES_OBJECT_PREFIX, seriesKey)),
+                "setup deveria ter deixado o objeto físico no volume após o close");
+        assertFalse(registry.isOpen(seriesKey), "setup deveria ter fechado o handle antes do OPEN sem criar");
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequestNoCreate(seriesKey, null), SOURCE);
+
+        assertEquals(SeriesStatus.OK, response.status());
+        assertEquals(Boolean.TRUE, response.createIfMissingHonored(), "OPEN sem criar confirma que não criou");
+        assertTrue(registry.isOpen(seriesKey));
+    }
+
+    @Test
+    void openSemFlagContinuaCriando() {
+        String seriesKey = "series-sem-flag-cria";
+        placementLookup.put(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                new OpenRequest(seriesKey, yaml, Map.of(), null, null, null, null), SOURCE);
+
+        assertEquals(SeriesStatus.OK, response.status());
+        assertNull(response.createIfMissingHonored(), "OPEN com criação não precisa de confirmação");
+        assertTrue(registry.isOpen(seriesKey));
+        assertTrue(volume.storage().exists(SeriesObjectKeys.objectKey(SERIES_OBJECT_PREFIX, seriesKey)));
+    }
+
+    @Test
+    void openSemCriarComSerieJaAbertaRespondeOk() {
+        String seriesKey = "series-sem-criar-ja-aberta";
+        placementLookup.put(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+        handler.handle(Commands.OPEN, openRequest(seriesKey, null), SOURCE);
+        assertTrue(registry.isOpen(seriesKey));
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequestNoCreate(seriesKey, null), SOURCE);
+
+        assertEquals(SeriesStatus.OK, response.status());
+        assertEquals(Boolean.TRUE, response.createIfMissingHonored());
+    }
+
+    @Test
+    void openSemCriarComGeometriaDivergenteFalhaSemRegravarMesmoPedindoRecreate() {
+        // Handle somente leitura nunca pode disparar migração/recriação: sem criar, o storage usa
+        // OnGeometryChange.FAIL qualquer que seja o pedido — a divergência vira erro ao leitor e o
+        // arquivo fica como estava.
+        String seriesKey = "series-sem-criar-geometria-divergente";
+        placementLookup.put(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+        handler.handle(Commands.OPEN, openRequest(seriesKey, null), SOURCE);
+        handler.handle(Commands.CLOSE, new SeriesCommandRequest(seriesKey), SOURCE);
+        String objectKey = SeriesObjectKeys.objectKey(SERIES_OBJECT_PREFIX, seriesKey);
+        byte[] staticSectionBefore = volume.storage().seriesStaticSection(objectKey).orElseThrow();
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                new OpenRequest(seriesKey, divergentYaml(), Map.of(), null, OnGeometryChange.RECREATE, null, false),
+                SOURCE);
+
+        assertEquals(SeriesStatus.ERROR, response.status(), "divergência de geometria sem criar deveria falhar");
+        assertTrue(response.message().contains("NgrrdGeometryChangeException"), response.message());
+        assertFalse(registry.isOpen(seriesKey));
+        assertArrayEquals(staticSectionBefore, volume.storage().seriesStaticSection(objectKey).orElseThrow(),
+                "OPEN sem criar não pode regravar a série com a geometria nova");
+    }
+
+    @Test
+    void openSemCriarComSerieJaAbertaIgnoraGeometriaDivergente() {
+        // Com a série já aberta no registry, o OPEN sem criar reaproveita o handle existente: nada é
+        // reaberto, migrado nem recriado.
+        String seriesKey = "series-sem-criar-aberta-divergente";
+        placementLookup.put(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+        handler.handle(Commands.OPEN, openRequest(seriesKey, null), SOURCE);
+        String objectKey = SeriesObjectKeys.objectKey(SERIES_OBJECT_PREFIX, seriesKey);
+        byte[] staticSectionBefore = volume.storage().seriesStaticSection(objectKey).orElseThrow();
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                new OpenRequest(seriesKey, divergentYaml(), Map.of(), null, OnGeometryChange.RECREATE, null, false),
+                SOURCE);
+
+        assertEquals(SeriesStatus.OK, response.status());
+        assertArrayEquals(staticSectionBefore, volume.storage().seriesStaticSection(objectKey).orElseThrow());
+    }
+
+    /**
+     * Mesma definição de teste com o archive horário encolhido e a revisão de schema incrementada —
+     * geometria incompatível com a gravada e elegível a reescrita (MIGRATE/RECREATE só disparam quando a
+     * revisão da definição supera a gravada).
+     */
+    private String divergentYaml() {
+        String divergent = yaml.replace("rows: 4320", "rows: 2160")
+                .replace("  name: iface-traffic-blob\n", "  name: iface-traffic-blob\n  schemaRevision: 2\n");
+        assertNotEquals(yaml, divergent, "o YAML de teste deveria conter o archive a alterar");
+        return divergent;
+    }
+
+    @Test
+    void openSemCriarNaoInvalidaAConfirmacaoDeGeometria() {
+        // Leitor não derruba a confirmação de geometria no catálogo: sem criar, nada de publicação
+        // "geometria desconhecida" antes do open (só a confirmação depois do sucesso).
+        String seriesKey = "series-sem-criar-geometria-confirmada";
+        placementLookup.put(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+        GeometryRecordingRpc rpc = new GeometryRecordingRpc();
+        try (GeometryService geometryService = geometryService(rpc)) {
+            handler.geometryService(geometryService);
+            handler.handle(Commands.OPEN, openRequest(seriesKey, null), SOURCE);
+            handler.handle(Commands.CLOSE, new SeriesCommandRequest(seriesKey), SOURCE);
+            rpc.updates.clear();
+
+            SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                    openRequestNoCreate(seriesKey, null), SOURCE);
+
+            assertEquals(SeriesStatus.OK, response.status());
+            assertEquals(1, rpc.updates.size(), "só a confirmação pós-open deveria ser publicada: " + rpc.updates);
+            assertNotNull(rpc.updates.get(0).geometry(), "a única publicação é a confirmação da geometria");
+        }
+    }
+
+    @Test
+    void openComCriacaoInvalidaAConfirmacaoAntesDeAbrirEConfirmaDepois() {
+        String seriesKey = "series-com-criacao-geometria";
+        placementLookup.put(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+        GeometryRecordingRpc rpc = new GeometryRecordingRpc();
+        try (GeometryService geometryService = geometryService(rpc)) {
+            handler.geometryService(geometryService);
+
+            SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                    openRequest(seriesKey, null), SOURCE);
+
+            assertEquals(SeriesStatus.OK, response.status());
+            assertEquals(2, rpc.updates.size(), rpc.updates.toString());
+            assertNull(rpc.updates.get(0).geometry(), "antes do open a confirmação é invalidada");
+            assertNotNull(rpc.updates.get(1).geometry(), "depois do open a geometria é confirmada");
+        }
+    }
+
+    /**
+     * {@link GeometryService} só para publicar via {@code rpc}: o caminho de OPEN
+     * ({@code beforeOpen}/{@code afterOpen}) não usa o catálogo nem a visão de liderança, que por isso
+     * ficam nulos; o backfill nunca é iniciado.
+     */
+    private GeometryService geometryService(GeometryRecordingRpc rpc) {
+        return new GeometryService(new FakeTransport(SELF), null, volume, rpc, null, registry, SERIES_OBJECT_PREFIX,
+                clock);
+    }
+
+    @Test
+    void openSemCriarDeNaoDonoContinuaRespondendoWrongOwner() {
+        // Ownership é decidido ANTES do NOT_FOUND: mesmo com createIfMissing=false, um nó que não é
+        // dono continua respondendo WRONG_OWNER, nunca NOT_FOUND.
+        String seriesKey = "series-sem-criar-nao-dono";
+        placementLookup.put(seriesKey, SeriesPlacement.active(OTHER.value(), 1_000L));
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequestNoCreate(seriesKey, null), SOURCE);
+
+        assertEquals(SeriesStatus.WRONG_OWNER, response.status());
+        assertEquals(OTHER.value(), response.ownerNodeId());
+    }
+
+    @Test
+    void openSemCriarComReplicaLocalDesatualizadaEForteOutroDonoRedirecionaWrongOwner() {
+        // A réplica local pode continuar dizendo ACTIVE(self) por um instante depois de um restart logo
+        // após o FINISH de uma migração (a marca forgotten é só em memória) — NOT_FOUND baseado só nela
+        // seria falso. O líder (placementStrong) é quem decide de fato: aqui ele já sabe que o dono
+        // mudou.
+        String seriesKey = "series-not-found-strong-outro-dono";
+        long now = 1_000L;
+        placementLookup.putLocalOnly(seriesKey, SeriesPlacement.active(SELF.value(), now));
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.active(OTHER.value(), now));
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequestNoCreate(seriesKey, null), SOURCE);
+
+        assertEquals(SeriesStatus.WRONG_OWNER, response.status());
+        assertEquals(OTHER.value(), response.ownerNodeId());
+        assertFalse(registry.isOpen(seriesKey));
+    }
+
+    @Test
+    void openSemCriarComReplicaLocalDesatualizadaEForteMigrandoRedirecionaMigrating() {
+        String seriesKey = "series-not-found-strong-migrando";
+        long now = 1_000L;
+        placementLookup.putLocalOnly(seriesKey, SeriesPlacement.active(SELF.value(), now));
+        SeriesPlacement migrating = SeriesPlacement.migrating(
+                SeriesPlacement.active(SELF.value(), now), OTHER.value(), "mig-1", now + 1);
+        placementLookup.putStrongOnly(seriesKey, migrating);
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequestNoCreate(seriesKey, null), SOURCE);
+
+        assertEquals(SeriesStatus.MIGRATING, response.status());
+        assertFalse(registry.isOpen(seriesKey));
+    }
+
+    @Test
+    void openSemCriarComReplicaLocalDesatualizadaEForteAusenteRespondeWrongOwnerSemDono() {
+        // Sem placement nenhum no líder: não cabe a este nó responder pela série. WRONG_OWNER sem dono
+        // faz o cliente re-resolver pelo catálogo e reportar a ausência como NOT_PLACED; NOT_FOUND fica
+        // reservado para "o líder diz que a série é minha e o arquivo não existe".
+        String seriesKey = "series-not-found-strong-ausente";
+        placementLookup.putLocalOnly(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequestNoCreate(seriesKey, null), SOURCE);
+
+        assertEquals(SeriesStatus.WRONG_OWNER, response.status());
+        assertNull(response.ownerNodeId());
+        assertFalse(registry.isOpen(seriesKey));
+        assertEquals(1, placementLookup.strongCalls(), "a resposta precisa ter consultado o líder");
+    }
+
+    @Test
+    void openSemCriarComFalhaNaConsultaForteNuncaRespondeNotFound() {
+        String seriesKey = "series-not-found-strong-falha";
+        placementLookup.putLocalOnly(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+        placementLookup.failStrongWith(new RuntimeException("líder inalcançável"));
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequestNoCreate(seriesKey, null), SOURCE);
+
+        assertEquals(SeriesStatus.ERROR, response.status());
+        assertFalse(registry.isOpen(seriesKey));
+    }
+
+    @Test
+    void seriesExistsBatchDevolveSoAsPresentes() {
+        String present = "series-batch-presente";
+        String absent = "series-batch-ausente";
+        placementLookup.put(present, SeriesPlacement.active(SELF.value(), 1_000L));
+        handler.handle(Commands.OPEN, openRequest(present, null), SOURCE);
+        handler.handle(Commands.CHECKPOINT, new SeriesCommandRequest(present), SOURCE);
+
+        SeriesExistsBatchResponse response = (SeriesExistsBatchResponse) handler.handle(
+                Commands.SERIES_EXISTS_BATCH, new SeriesExistsBatchRequest(List.of(present, absent)), SOURCE);
+
+        assertEquals(SeriesStatus.OK, response.status());
+        assertEquals(Set.of(present), response.present());
+    }
+
+    @Test
+    void openSemCriarComRegistryLancandoSeriesNotFoundExceptionRespondeNotFound(@TempDir Path checkOnlyDir)
+            throws IOException {
+        // Cobre o catch(SeriesNotFoundException) de openWithMetadata — a corrida em que o objeto existe
+        // no instante do pré-check, mas sumiu quando registry.open() de fato tenta abrir (ex.: apagado
+        // por um reconciler entre as duas chamadas). Não há hook de produção para pausar exatamente
+        // entre o pré-check e o registry.open() dentro do mesmo método síncrono, então a divergência é
+        // obtida por um seam JÁ EXISTENTE no construtor de StorageRequestHandler: `volume` (usado só
+        // pelo pré-check e por SERIES_EXISTS/BATCH) é um parâmetro INDEPENDENTE do volume interno da
+        // SeriesHandleRegistry (usado pelo open de fato). Aqui o "volume de checagem" tem o objeto
+        // (pré-check vê exists=true); o registry real (do setUp, compartilhado com este handler racy)
+        // nunca teve o objeto — registry.open() lança SeriesNotFoundException de verdade, capturada
+        // pelo catch de openWithMetadata.
+        String seriesKey = "series-corrida-check-open";
+        placementLookup.put(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+
+        try (BlobVolumeRegistry checkVolumeRegistry = NgrrdBlob.registry().basePath(checkOnlyDir).volume("ngrrd").build()) {
+            BlobVolume checkVolume = checkVolumeRegistry.require("ngrrd");
+            try (SeriesHandleRegistry checkOnlyRegistry = new SeriesHandleRegistry(
+                    checkVolume, "ngrrd", Duration.ofMinutes(15), 10_000, clock)) {
+                checkOnlyRegistry.open(seriesKey, yaml, Ngrrd.OpenOptions.defaults());
+                checkOnlyRegistry.close(seriesKey);
+            }
+            String objectKey = SeriesObjectKeys.objectKey(SERIES_OBJECT_PREFIX, seriesKey);
+            assertTrue(checkVolume.storage().exists(objectKey),
+                    "setup deveria ter deixado o objeto físico só no volume de checagem");
+            assertFalse(volume.storage().exists(objectKey),
+                    "o volume real do registry nunca deveria ter recebido este objeto");
+
+            StorageRequestHandler racyHandler = new StorageRequestHandler(new FakeTransport(SELF), placementLookup,
+                    registry, checkVolume, SERIES_OBJECT_PREFIX, SELF, Durability.FSYNC, OnGeometryChange.FAIL, clock);
+
+            SeriesStatusResponse response = (SeriesStatusResponse) racyHandler.handle(Commands.OPEN,
+                    openRequestNoCreate(seriesKey, null), SOURCE);
+
+            assertEquals(SeriesStatus.NOT_FOUND, response.status());
+            assertFalse(registry.isOpen(seriesKey),
+                    "não deveria ter aberto a série real após a SeriesNotFoundException do registry.open()");
+        }
+    }
+
+    @Test
+    void seriesExistsBatchAcimaDoLimiteRespondeErro() {
+        List<String> tooMany = IntStream.rangeClosed(1, SeriesExistsBatchRequest.MAX_KEYS + 1)
+                .mapToObj(i -> "series-batch-" + i)
+                .collect(Collectors.toList());
+
+        SeriesExistsBatchResponse response = (SeriesExistsBatchResponse) handler.handle(
+                Commands.SERIES_EXISTS_BATCH, new SeriesExistsBatchRequest(tooMany), SOURCE);
+
+        assertEquals(SeriesStatus.ERROR, response.status());
+        assertTrue(response.present().isEmpty());
+    }
+
+    /** {@link ClusterRpc} que registra cada {@code GEOMETRY_UPDATE} publicado e responde {@code OK}. */
+    private static final class GeometryRecordingRpc implements ClusterRpc {
+        private final List<GeometryUpdateRequest> updates = new ArrayList<>();
+
+        @Override
+        public <R> R call(NodeId target, String command, Object body, Class<R> responseType) {
+            assertEquals(Commands.GEOMETRY_UPDATE, command);
+            updates.add((GeometryUpdateRequest) body);
+            return responseType.cast(new SeriesStatusResponse(SeriesStatus.OK, SELF.value(), null));
+        }
+
+        @Override
+        public NodeId localId() {
+            return SELF;
+        }
+
+        @Override
+        public Optional<NodeId> leaderId() {
+            return Optional.of(SELF);
+        }
+    }
+
     /** {@link Clock} determinístico para forçar fechamento por ociosidade via {@link SeriesHandleRegistry#closeIdle()}. */
     private static final class MutableClock extends Clock {
         private Instant instant;
@@ -653,6 +1002,7 @@ class StorageRequestHandlerTest {
         private final Map<String, SeriesPlacement> local = new HashMap<>();
         private final Map<String, SeriesPlacement> strong = new HashMap<>();
         private int strongCalls;
+        private RuntimeException strongFailure;
 
         void put(String seriesKey, SeriesPlacement placement) {
             local.put(seriesKey, placement);
@@ -662,6 +1012,16 @@ class StorageRequestHandlerTest {
         /** Coloca a série apenas na visão forte (líder), simulando réplica local ainda não convergida. */
         void putStrongOnly(String seriesKey, SeriesPlacement placement) {
             strong.put(seriesKey, placement);
+        }
+
+        /** Coloca a série apenas na réplica local, simulando o líder com uma visão diferente (ou vazia). */
+        void putLocalOnly(String seriesKey, SeriesPlacement placement) {
+            local.put(seriesKey, placement);
+        }
+
+        /** Toda consulta de {@link #placementStrong} seguinte lança {@code failure} em vez de responder. */
+        void failStrongWith(RuntimeException failure) {
+            this.strongFailure = failure;
         }
 
         int strongCalls() {
@@ -676,6 +1036,9 @@ class StorageRequestHandlerTest {
         @Override
         public Optional<SeriesPlacement> placementStrong(String seriesKey) {
             strongCalls++;
+            if (strongFailure != null) {
+                throw strongFailure;
+            }
             return Optional.ofNullable(strong.get(seriesKey));
         }
     }

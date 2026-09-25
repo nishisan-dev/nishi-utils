@@ -22,6 +22,7 @@ import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.oss.blob.BlobVolume;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogView;
 import dev.nishisan.utils.oss.cluster.catalog.NodeState;
+import dev.nishisan.utils.oss.cluster.catalog.StorageCapabilities;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.metrics.BlobVolumeSummary;
 import dev.nishisan.utils.oss.cluster.metrics.NgrrdClusterMetricsListener;
@@ -426,7 +427,7 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
             // histórico algum.
             NodeState state = strong.map(StorageNodeStatus::state).orElse(NodeState.ACTIVE);
             catalog.putNodeStatus(new StorageNodeStatus(nodeId, state, seriesCount, usedBytes, capacityBytes, now,
-                    distributionMode, weight, volume.storage().reservedBytes()));
+                    distributionMode, weight, volume.storage().reservedBytes(), StorageCapabilities.ALL));
         } finally {
             publishing.set(false);
         }

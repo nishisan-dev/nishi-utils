@@ -58,6 +58,10 @@ import java.util.function.Function;
  * @param closeTimeout              orçamento TOTAL (não por handle) para {@code close()} drenar os
  *                                  buffers de escrita antes de desistir; handles que não couberem no
  *                                  prazo fecham sem flush, e a amostra descartada é logada em ERROR
+ * @param catalogLookupBatchSize    número máximo de chaves por chamada de {@code ngrrd.catalog.lookup}/
+ *                                  {@code ngrrd.series.exists.batch} ao líder — lotes maiores são
+ *                                  paginados em chamadas sequenciais (ver {@code NgrrdClusterClient#exists}/
+ *                                  {@code #find})
  * @param metricsListener           integração opcional de métricas (ver {@link NgrrdClusterMetricsListener});
  *                                  {@code null} = nenhuma
  */
@@ -78,7 +82,14 @@ public record NgrrdClusterConfig(
         Duration retryBackoffMax,
         Duration leaderWaitTimeout,
         Duration closeTimeout,
+        int catalogLookupBatchSize,
         NgrrdClusterMetricsListener metricsListener) {
+
+    /** Menor {@code catalogLookupBatchSize} aceito. */
+    public static final int MIN_CATALOG_LOOKUP_BATCH_SIZE = 1;
+
+    /** Maior {@code catalogLookupBatchSize} aceito — mesmo teto de {@code CatalogLookupRequest#MAX_KEYS}. */
+    public static final int MAX_CATALOG_LOOKUP_BATCH_SIZE = 10_000;
 
     public NgrrdClusterConfig {
         Objects.requireNonNull(clientId, "clientId é obrigatório");
@@ -127,6 +138,12 @@ public record NgrrdClusterConfig(
         Objects.requireNonNull(closeTimeout, "closeTimeout é obrigatório");
         if (closeTimeout.isNegative() || closeTimeout.isZero()) {
             throw new IllegalArgumentException("closeTimeout deve ser > 0");
+        }
+        if (catalogLookupBatchSize < MIN_CATALOG_LOOKUP_BATCH_SIZE
+                || catalogLookupBatchSize > MAX_CATALOG_LOOKUP_BATCH_SIZE) {
+            throw new IllegalArgumentException("catalogLookupBatchSize deve estar entre "
+                    + MIN_CATALOG_LOOKUP_BATCH_SIZE + " e " + MAX_CATALOG_LOOKUP_BATCH_SIZE + ": "
+                    + catalogLookupBatchSize);
         }
     }
 
@@ -216,6 +233,9 @@ public record NgrrdClusterConfig(
             applyDuration(client.retryTimeout, "client.retryTimeout", builder::retryTimeout);
             applyDuration(client.closeTimeout, "client.closeTimeout", builder::closeTimeout);
             applyDuration(client.leaderWaitTimeout, "client.leaderWaitTimeout", builder::leaderWaitTimeout);
+            if (client.catalogLookupBatchSize != null) {
+                builder.catalogLookupBatchSize(client.catalogLookupBatchSize);
+            }
             return builder.build();
         }
 
@@ -243,6 +263,7 @@ public record NgrrdClusterConfig(
         public String retryTimeout;
         public String closeTimeout;
         public String leaderWaitTimeout;
+        public Integer catalogLookupBatchSize;
     }
 
     private static String defaultClientId() {
@@ -268,6 +289,7 @@ public record NgrrdClusterConfig(
         private Duration retryBackoffMax = Duration.ofSeconds(2);
         private Duration leaderWaitTimeout = Duration.ofSeconds(30);
         private Duration closeTimeout = Duration.ofSeconds(30);
+        private int catalogLookupBatchSize = 2_000;
         private NgrrdClusterMetricsListener metricsListener;
 
         private Builder() {
@@ -359,6 +381,15 @@ public record NgrrdClusterConfig(
             return this;
         }
 
+        /**
+         * Tamanho de página de {@code ngrrd.catalog.lookup}/{@code ngrrd.series.exists.batch}; default
+         * 2000, válido entre {@link #MIN_CATALOG_LOOKUP_BATCH_SIZE} e {@link #MAX_CATALOG_LOOKUP_BATCH_SIZE}.
+         */
+        public Builder catalogLookupBatchSize(int catalogLookupBatchSize) {
+            this.catalogLookupBatchSize = catalogLookupBatchSize;
+            return this;
+        }
+
         /** Integração opcional de métricas; {@code null} (default) = nenhuma. */
         public Builder metricsListener(NgrrdClusterMetricsListener metricsListener) {
             this.metricsListener = metricsListener;
@@ -368,7 +399,8 @@ public record NgrrdClusterConfig(
         public NgrrdClusterConfig build() {
             return new NgrrdClusterConfig(clientId, host, port, seed, peers, dataDir, batchMaxSamples,
                     batchMaxDelay, maxBufferedSamplesPerNode, bufferFullPolicy, requestTimeout, retryTimeout,
-                    retryBackoffMin, retryBackoffMax, leaderWaitTimeout, closeTimeout, metricsListener);
+                    retryBackoffMin, retryBackoffMax, leaderWaitTimeout, closeTimeout, catalogLookupBatchSize,
+                    metricsListener);
         }
     }
 }

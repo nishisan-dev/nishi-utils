@@ -17,10 +17,12 @@
 
 package dev.nishisan.utils.oss.cluster.catalog;
 
-import java.io.Serializable;
 import dev.nishisan.utils.oss.cluster.placement.DistributionMode;
+
+import java.io.Serializable;
 import java.time.Duration;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * Entrada do catálogo {@code ngrrd.nodes}: último status conhecido de um storage
@@ -35,6 +37,9 @@ import java.util.Objects;
  * @param distributionMode configured distribution strategy
  * @param weight explicit positive relative weight
  * @param reservedBytes incoming allocation bytes reserved locally
+ * @param capabilities     capacidades de protocolo que o nó anuncia ({@link StorageCapabilities}); vazio
+ *                         num status publicado por uma versão anterior a elas (campo ausente na
+ *                         serialização Java ou no JSON replicado) — nunca {@code null}, cópia imutável
  */
 public record StorageNodeStatus(
         String nodeId,
@@ -43,7 +48,8 @@ public record StorageNodeStatus(
         long usedBytes,
         long capacityBytes,
         long reportedAtEpochMs,
-        DistributionMode distributionMode, double weight, long reservedBytes) implements Serializable {
+        DistributionMode distributionMode, double weight, long reservedBytes,
+        Set<String> capabilities) implements Serializable {
 
     /** B1 (achado do Debugger): ver Javadoc de {@code SeriesPlacement#serialVersionUID}. */
     private static final long serialVersionUID = 1L;
@@ -51,6 +57,14 @@ public record StorageNodeStatus(
     public StorageNodeStatus(String nodeId, NodeState state, long seriesCount, long usedBytes,
             long capacityBytes, long reportedAtEpochMs) {
         this(nodeId, state, seriesCount, usedBytes, capacityBytes, reportedAtEpochMs, DistributionMode.COUNT, 1, 0);
+    }
+
+    /** Status sem capacidades anunciadas — a forma do record antes delas existirem. */
+    public StorageNodeStatus(String nodeId, NodeState state, long seriesCount, long usedBytes,
+            long capacityBytes, long reportedAtEpochMs, DistributionMode distributionMode, double weight,
+            long reservedBytes) {
+        this(nodeId, state, seriesCount, usedBytes, capacityBytes, reportedAtEpochMs, distributionMode, weight,
+                reservedBytes, Set.of());
     }
 
     public StorageNodeStatus {
@@ -61,6 +75,7 @@ public record StorageNodeStatus(
         }
         Objects.requireNonNull(nodeId, "nodeId é obrigatório");
         Objects.requireNonNull(state, "state é obrigatório");
+        capabilities = capabilities == null ? Set.of() : Set.copyOf(capabilities);
     }
 
     /** Cria o status inicial de um nó recém-ingressado no cluster, sem carga ainda reportada. */
@@ -68,14 +83,21 @@ public record StorageNodeStatus(
         return new StorageNodeStatus(nodeId, NodeState.ACTIVE, 0L, 0L, 0L, now);
     }
 
-    /** Atualiza a carga reportada, preservando {@code nodeId} e {@code state}. */
+    /** Atualiza a carga reportada, preservando {@code nodeId}, {@code state} e as capacidades. */
     public StorageNodeStatus withLoad(long seriesCount, long usedBytes, long capacityBytes, long now) {
-        return new StorageNodeStatus(nodeId, state, seriesCount, usedBytes, capacityBytes, now, distributionMode, weight, reservedBytes);
+        return new StorageNodeStatus(nodeId, state, seriesCount, usedBytes, capacityBytes, now, distributionMode, weight,
+                reservedBytes, capabilities);
     }
 
-    /** Transiciona o nó para outro {@link NodeState}, preservando a carga reportada. */
+    /** Transiciona o nó para outro {@link NodeState}, preservando a carga reportada e as capacidades. */
     public StorageNodeStatus withState(NodeState newState, long now) {
-        return new StorageNodeStatus(nodeId, newState, seriesCount, usedBytes, capacityBytes, now, distributionMode, weight, reservedBytes);
+        return new StorageNodeStatus(nodeId, newState, seriesCount, usedBytes, capacityBytes, now, distributionMode,
+                weight, reservedBytes, capabilities);
+    }
+
+    /** Se o nó anuncia {@code capability} (ver {@link StorageCapabilities}). */
+    public boolean advertises(String capability) {
+        return capabilities.contains(capability);
     }
 
     /** Fração ocupada da capacidade; {@code 0} se a capacidade não é conhecida ({@code capacityBytes <= 0}). */

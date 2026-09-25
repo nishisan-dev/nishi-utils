@@ -199,6 +199,137 @@ retentativa transparente:
   entre `requestTimeout` e o tempo restante do orçamento chamador (`retryTimeout` normal, ou o
   orçamento de `close()`).
 
+### 5.1. Consultar existência e abrir sem criar
+
+Por padrão, `open` posiciona (`ngrrd.place`) e cria a série quando ela ainda não existe no
+catálogo. Para um consumidor que percorre um catálogo externo com centenas de milhares de
+chaves e precisa saber quais têm dados sem materializar séries vazias, `NgrrdClusterClient`
+expõe uma consulta que nunca cria e um `open` que nunca posiciona:
+
+```java
+import dev.nishisan.utils.oss.api.Sample;
+import dev.nishisan.utils.oss.api.SeriesNotFoundException;
+import dev.nishisan.utils.oss.cluster.api.SeriesInfo;
+
+boolean one = client.exists("iface:eth0:in_octets");
+Map<String, Boolean> many = client.exists(List.of("iface:eth0:in_octets", "iface:eth1:in_octets"));
+Optional<SeriesInfo> info = client.find("iface:eth0:in_octets");
+
+Ngrrd.OpenOptions readOnly = Ngrrd.OpenOptions.defaults().withCreateIfMissing(false);
+try (NgrrdHandle handle = client.open(yaml, tags, readOnly)) {
+    SeriesResult r = handle.read("in_octets", query);           // leitura normal
+    handle.write("in_octets", new Sample(ts, v));               // lança IllegalStateException
+} catch (SeriesNotFoundException e) {
+    switch (e.reason()) {
+        case NOT_PLACED -> { /* não existe no cluster: remover do catálogo externo */ }
+        case MISSING_ON_OWNER -> { /* placement sem arquivo: inconsistência, NÃO remover */ }
+        default -> throw e;   // ABSENT não ocorre no cluster
+    }
+}
+```
+
+Exemplo de conciliação de um catálogo externo (ex.: Mongo) contra o cluster, usando `verify`
+para confirmar fisicamente antes de decidir:
+
+```java
+import dev.nishisan.utils.oss.cluster.api.SeriesVerification;
+
+Map<String, SeriesVerification> report = client.verify(externalCatalogKeys);
+for (var entry : report.entrySet()) {
+    switch (entry.getValue()) {
+        case NOT_PLACED -> externalCatalog.remove(entry.getKey());       // ausência confirmada
+        case PRESENT -> { /* nada a fazer */ }
+        case MISSING_ON_OWNER -> alerting.reportInconsistency(entry.getKey()); // NUNCA remover
+        case UNVERIFIED -> { /* falha ao confirmar: reagenda para a próxima rodada */ }
+    }
+}
+```
+
+**Existência = placement no catálogo (`ngrrd.catalog`), não presença física do arquivo.**
+`exists`/`find` só consultam o mapa de placement — um hit na réplica local (ou num override
+recente, ex.: de um `WRONG_OWNER`) responde sem RPC; um miss é confirmado em lote no líder
+(`ngrrd.catalog.lookup`, ver `NgrrdClusterConfig.catalogLookupBatchSize`, default 2000,
+1..10000) antes de responder `false`. `MIGRATING` conta como existente. Um placement sem
+arquivo (cliente que caiu entre `PLACE` e `OPEN`, ou disco perdido) aparece como `true` em
+`exists` — use `verify` para confirmar fisicamente com o dono antes de decidir.
+
+**Contrato de consistência:**
+
+- Depois de um `open`/`PLACE` feito por outro cliente: se a réplica local ainda não o viu, o
+  miss é confirmado no líder, que já tem o placement — devolve `true`.
+- Durante migração (`MIGRATING`): devolve `true`; `open` sem criar segue o fluxo normal de
+  espera/redirect.
+- `false` significa "o líder atual não tem placement para a chave no momento da consulta" —
+  não é atômico com um `open` concorrente de outro cliente que crie a série logo em seguida.
+- `exists` não lê o storage: um placement sem arquivo aparece como `true`, e o `open` sem criar
+  dessa série lança `SeriesNotFoundException` com `Reason.MISSING_ON_OWNER`.
+- Falha ao confirmar com o líder (sem líder, timeout, falha de transporte, líder antigo sem a
+  capacidade `catalog.lookup`) **nunca** vira `false` — sempre `NgrrdClusterException`.
+
+**`verify` é a verificação física**, diferente de `exists`/`find` (só catálogo): confirma no
+dono de cada série se o objeto existe de fato no volume. Devolve um `SeriesVerification` por
+chave — `PRESENT`, `MISSING_ON_OWNER`, `NOT_PLACED` ou `UNVERIFIED` (não foi possível confirmar
+com o dono; nunca interpretado como ausência). É o ponto natural para um relatório de
+conciliação sob demanda, mais caro que `exists` (RPC a cada dono, não só ao líder).
+
+**`open` sem criar abre um handle SOMENTE LEITURA.** O cliente nunca chama `ngrrd.place`: o
+dono vem do catálogo e o storage recusa abrir série inexistente. `write`, `flush` e
+`checkpoint` lançam `IllegalStateException`; o `close()` é local (sem `CLOSE` remoto nem
+drenagem de buffers — o storage fecha a série por ociosidade). Série ausente faz o `open` (ou
+uma leitura posterior, se ela deixar de existir) lançar `SeriesNotFoundException`; o handle se
+fecha e sai do cache do cliente. Um handle somente leitura nunca dispara migração nem recriação
+de geometria: o storage abre sem criar sempre com `OnGeometryChange.FAIL`, ignorando o
+`onGeometryChange` pedido — se a definição do leitor diverge da geometria gravada, o `open`
+falha com erro e o arquivo não é regravado. Se a série já estiver aberta no storage (por um
+gravável, por exemplo), o handle existente é reaproveitado e nada muda. A única exceção é um
+arquivo presente mas truncado (menor que o header fixo): ele passa na checagem de existência e
+o writer o reinicializa como série vazia — caso raro, descrito em
+[`doc/oss/ngrrd.md`](ngrrd.md#abrir-sem-criar-e-consultar-existência).
+
+No máximo um handle principal por `seriesKey` fica em cache. As combinações entre abrir com e
+sem criação:
+
+- **com criação + gravável já em cache:** devolve o mesmo handle (compartilhado);
+- **com criação + somente leitura já em cache:** abre um gravável NOVO com as opções de quem
+  pediu criar e o coloca no lugar do somente leitura no cache — o somente leitura antigo segue
+  válido e lendo para quem já o tinha, `close()` dele continua local, sem afetar o gravável;
+- **sem criar + gravável já em cache:** devolve uma VISTA somente leitura nova a CADA chamada —
+  leituras delegam ao gravável, escrita lança `IllegalStateException`, `close()` da vista fecha
+  só a vista (nunca o gravável, que segue escrevendo);
+- **sem criar + somente leitura já em cache:** devolve o existente (compartilhado).
+
+O `close()` de um gravável compartilhado fecha o handle para **todos** os chamadores que o
+obtiveram (contrato desde a 8.5.0); um somente leitura compartilhado tem o mesmo
+comportamento entre quem o recebeu, mas uma vista aberta sobre um gravável é sempre exclusiva
+de quem a pediu.
+
+**Como o consumidor deve reagir:**
+
+| Resultado | Ação |
+|---|---|
+| `exists` → `false`, ou `SeriesNotFoundException` com `NOT_PLACED` | Série confirmada ausente no cluster — seguro remover do catálogo externo. |
+| `SeriesNotFoundException` com `MISSING_ON_OWNER`, ou `verify` → `MISSING_ON_OWNER` | Inconsistência do cluster (placement sem arquivo) — **nunca** remover; investigar. |
+| `NgrrdClusterException` (inclusive `UNSUPPORTED_BY_NODE`), ou `verify` → `UNVERIFIED` | Falha ao consultar — nenhuma decisão sobre o catálogo externo; retentar depois. |
+
+`open` sem criar exige que o dono anuncie `open.createIfMissing` no status publicado (e
+`exists`/`find`/`verify` exigem `catalog.lookup` no líder); um storage de versão anterior faz a
+operação falhar com `NgrrdClusterException` de código `ErrorCode.UNSUPPORTED_BY_NODE` **antes**
+de qualquer RPC — nunca arriscando criar a série ou devolver `false` por engano. Atualize todos
+os storages antes de usar `exists`, `find`, `verify` ou `open` sem criar nos clientes (ordem
+detalhada no [guia de operação](ngrrd-cluster-operacao.md)).
+
+**Mudanças no caminho que cria (8.6.0).** Mesmo quem não usa as APIs novas percebe três
+diferenças em relação à 8.5.0:
+
+- `open` durante um `close()` lento do mesmo handle abre um handle **novo** — a 8.5.0 devolvia
+  o handle que estava fechando.
+- A reabertura automática de uma série no storage (depois de um fechamento por ociosidade/LRU)
+  **nunca cria**: se o objeto sumiu nesse meio-tempo, o storage responde `NOT_OPEN` e o `OPEN`
+  do cliente, que decide `createIfMissing` por si, recria a série — um round-trip a mais.
+- `PLACE` de séries novas aguarda `placementGraceAfterLeadership` (3 s por padrão) também depois
+  que o **primeiro** líder do boot assume: a criação das primeiras séries logo após subir o
+  cluster atrasa até esse prazo (o cliente retenta `NOT_LEADER` dentro do `retryTimeout`).
+
 ## 6. Storage node
 
 Para compilar, preparar as dependências, salvar o YAML e iniciar um ou três processos Java,
@@ -291,7 +422,10 @@ Repassados ao `NGridNodeBuilder` por baixo do `StorageNodeConfig`:
   assumir a liderança durante a qual `PlacementRequestHandler` recusa criar placements **novos**
   (responde `NOT_LEADER`, o cliente retenta) — dá tempo da réplica local do catálogo convergir
   antes de decidir sobre séries que já podem existir. Placements **já existentes** continuam
-  respondidos normalmente, sem passar por essa janela.
+  respondidos normalmente, sem passar por essa janela. A mesma janela vale para os misses de
+  `ngrrd.catalog.lookup` (`exists`/`find`/`verify`), que também respondem `NOT_LEADER` enquanto
+  a réplica do líder ainda sincroniza um mandato anterior. A janela é marcada antes de qualquer
+  outro trabalho da posse, e também no primeiro líder eleito durante o boot.
 
 ### 6.3. `SeriesHandleRegistry`
 

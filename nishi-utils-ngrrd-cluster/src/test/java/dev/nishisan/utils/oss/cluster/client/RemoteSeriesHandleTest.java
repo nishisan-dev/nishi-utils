@@ -21,12 +21,15 @@ import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.oss.Ngrrd;
 import dev.nishisan.utils.oss.api.Sample;
 import dev.nishisan.utils.oss.api.ConsolidationFunction;
+import dev.nishisan.utils.oss.api.SeriesNotFoundException;
 import dev.nishisan.utils.oss.api.SeriesResult;
 import dev.nishisan.utils.oss.api.ViewQuery;
 import dev.nishisan.utils.oss.cluster.api.ErrorCode;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
+import dev.nishisan.utils.oss.cluster.catalog.StorageCapabilities;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
+import dev.nishisan.utils.oss.cluster.protocol.OpenRequest;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesStatus;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesStatusResponse;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesWrite;
@@ -39,13 +42,24 @@ import org.junit.jupiter.params.provider.ValueSource;
 import java.io.IOException;
 import java.time.Clock;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Cobre {@link RemoteSeriesHandle} com {@link RecordingClusterRpc} fake e um
@@ -55,25 +69,39 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 class RemoteSeriesHandleTest {
 
     private static final String SERIES_KEY = "device:r1/iface:eth0";
+    private static final Duration AWAIT_TIMEOUT = Duration.ofSeconds(10);
     private static final NodeId OWNER_A = NodeId.of("storage-a");
     private static final NodeId OWNER_B = NodeId.of("storage-b");
 
     private RecordingClusterRpc rpc;
     private FakePlacementLookup resolver;
     private NoOpWriteBuffer dispatcher;
+    private final List<String> onCloseCalls = new CopyOnWriteArrayList<>();
+    /** Capacidades anunciadas pelos storages aos handles criados por {@link #newHandle}. */
+    private NodeCapabilities capabilities = CapabilityFixtures.advertisingAll();
+    /** Estado de fechamento do cliente visto pelos handles criados por {@link #newHandle}. */
+    private volatile boolean clientClosed;
 
     private RemoteSeriesHandle newHandle() {
-        return newHandle(Duration.ofSeconds(2));
+        return newHandle(Duration.ofSeconds(2), Ngrrd.OpenOptions.defaults());
     }
 
     private RemoteSeriesHandle newHandle(Duration retryTimeout) {
+        return newHandle(retryTimeout, Ngrrd.OpenOptions.defaults());
+    }
+
+    private RemoteSeriesHandle newHandle(Ngrrd.OpenOptions options) {
+        return newHandle(Duration.ofSeconds(2), options);
+    }
+
+    private RemoteSeriesHandle newHandle(Duration retryTimeout, Ngrrd.OpenOptions options) {
         rpc = new RecordingClusterRpc(NodeId.of("client-under-test"));
         resolver = new FakePlacementLookup(OWNER_A.value());
         dispatcher = new NoOpWriteBuffer();
         RetryPolicy retry = new RetryPolicy(retryTimeout, Duration.ofMillis(5), Duration.ofMillis(50));
-        return new RemoteSeriesHandle(SERIES_KEY, "yaml: fake", "hash-1", Map.of(), Ngrrd.OpenOptions.defaults(),
+        return new RemoteSeriesHandle(SERIES_KEY, "yaml: fake", "hash-1", Map.of(), options,
                 resolver, rpc, dispatcher, retry, Duration.ofSeconds(5), Duration.ofSeconds(5), Clock.systemUTC(),
-                key -> { });
+                (key, handle) -> onCloseCalls.add(key), capabilities, () -> clientClosed);
     }
 
     @Test
@@ -172,6 +200,9 @@ class RemoteSeriesHandleTest {
         return switch (command) {
             case Commands.READ -> new ReadResponse(status, owner, result, null);
             case Commands.READ_PRESET -> new ReadPresetResponse(status, owner, Map.of("in_bps", result), null);
+            // Storage atual: OPEN OK confirma que honrou createIfMissing=false (ignorado por graváveis).
+            case Commands.OPEN -> status == SeriesStatus.OK ? openOk(owner)
+                    : new SeriesStatusResponse(status, owner, null);
             default -> new SeriesStatusResponse(status, owner, null);
         };
     }
@@ -295,10 +326,540 @@ class RemoteSeriesHandleTest {
         assertEquals(List.of(Commands.OPEN, Commands.CHECKPOINT), commands, "não deveria ter retentado");
     }
 
+    @Test
+    void openSemCriarNaoFazPlaceEEnviaFlag() {
+        RemoteSeriesHandle handle = newHandle(Ngrrd.OpenOptions.defaults().withCreateIfMissing(false));
+        rpc.respondNext((cmd, body) -> openOk(OWNER_A.value()));
+
+        handle.open();
+
+        assertEquals(0, resolver.resolveCalls.get(), "open sem criar nunca posiciona (ngrrd.place)");
+        assertEquals(1, resolver.resolveExistingCalls.get());
+        OpenRequest request = (OpenRequest) rpc.calls().get(0).body();
+        assertEquals(Boolean.FALSE, request.createIfMissing());
+    }
+
+    @Test
+    void openPadraoEnviaFlagNula() {
+        RemoteSeriesHandle handle = newHandle();
+        rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
+
+        handle.open();
+
+        assertEquals(1, resolver.resolveCalls.get());
+        assertEquals(0, resolver.resolveExistingCalls.get());
+        OpenRequest request = (OpenRequest) rpc.calls().get(0).body();
+        assertNull(request.createIfMissing(), "createIfMissing=true não deve viajar no request (compat)");
+    }
+
+    @Test
+    void openSemCriarComNotFoundDoStorageLancaSeriesNotFound() {
+        RemoteSeriesHandle handle = newHandle(Ngrrd.OpenOptions.defaults().withCreateIfMissing(false));
+        rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.NOT_FOUND, OWNER_A.value(), null));
+
+        SeriesNotFoundException ex = assertThrows(SeriesNotFoundException.class, () -> handle.open());
+        assertEquals(SERIES_KEY, ex.seriesKey());
+        assertEquals(SeriesNotFoundException.Reason.MISSING_ON_OWNER, ex.reason());
+    }
+
+    @Test
+    void openSemCriarSemPlacementLancaSeriesNotFound() {
+        RemoteSeriesHandle handle = newHandle(Ngrrd.OpenOptions.defaults().withCreateIfMissing(false));
+        resolver.resolveExistingFailure = new SeriesNotFoundException(SERIES_KEY,
+                SeriesNotFoundException.Reason.NOT_PLACED);
+
+        assertThrows(SeriesNotFoundException.class, () -> handle.open());
+        assertTrue(rpc.calls().isEmpty(), "sem placement, o handle nunca chega a chamar OPEN no dono");
+    }
+
+    @Test
+    void openSemCriarComDonoSemCapacidadeFalhaSemEnviarOpen() {
+        capabilities = CapabilityFixtures.advertising(Set.of(StorageCapabilities.CATALOG_LOOKUP));
+        RemoteSeriesHandle handle = newHandle(Ngrrd.OpenOptions.defaults().withCreateIfMissing(false));
+
+        NgrrdClusterException ex = assertThrows(NgrrdClusterException.class, handle::open);
+
+        assertEquals(ErrorCode.UNSUPPORTED_BY_NODE, ex.code());
+        assertTrue(ex.getMessage().contains(OWNER_A.value()), ex.getMessage());
+        assertTrue(ex.getMessage().contains(StorageCapabilities.OPEN_CREATE_IF_MISSING), ex.getMessage());
+        assertTrue(rpc.calls().isEmpty(), "nenhum OPEN a um dono que não anuncia open.createIfMissing");
+    }
+
+    @Test
+    void reaberturaSomenteLeituraEmDonoNovoSemCapacidadeFalhaSemEnviarOpen() {
+        capabilities = CapabilityFixtures.advertisingByNode(Map.of(OWNER_A.value(), StorageCapabilities.ALL,
+                OWNER_B.value(), Set.of(StorageCapabilities.CATALOG_LOOKUP)));
+        RemoteSeriesHandle handle = readOnlyOpenedHandle();
+        rpc.respondNext((cmd, body) -> response(cmd, SeriesStatus.WRONG_OWNER, OWNER_B.value()));
+        rpc.respondNext((cmd, body) -> response(cmd, SeriesStatus.NOT_OPEN, OWNER_B.value()));
+
+        NgrrdClusterException ex = assertThrows(NgrrdClusterException.class, () -> handle.read("daily"));
+
+        assertEquals(ErrorCode.UNSUPPORTED_BY_NODE, ex.code());
+        assertEquals(List.of(Commands.OPEN, Commands.READ_PRESET, Commands.READ_PRESET), commands(),
+                "o redirecionamento não envia OPEN ao dono novo sem a capacidade");
+    }
+
+    @Test
+    void openSemCriarComOkSemConfirmacaoDoStorageLancaUnsupportedByNode() {
+        RemoteSeriesHandle handle = newHandle(Ngrrd.OpenOptions.defaults().withCreateIfMissing(false));
+        rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
+
+        NgrrdClusterException ex = assertThrows(NgrrdClusterException.class, handle::open);
+
+        assertEquals(ErrorCode.UNSUPPORTED_BY_NODE, ex.code());
+        assertTrue(ex.getMessage().contains(OWNER_A.value()), ex.getMessage());
+        assertEquals(List.of(Commands.OPEN), commands());
+        assertFalse(handle.isOpen(), "a abertura que falhou deixa o handle fechado");
+        NgrrdClusterException again = assertThrows(NgrrdClusterException.class, () -> handle.read("daily"));
+        assertEquals(ErrorCode.UNSUPPORTED_BY_NODE, again.code());
+        assertEquals(List.of(Commands.OPEN), commands(), "nenhum RPC depois da falha terminal");
+    }
+
+    @Test
+    void aberturaInicialQueFalhaDescartaOHandle() {
+        RemoteSeriesHandle handle = newHandle(Ngrrd.OpenOptions.defaults().withCreateIfMissing(false));
+        rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.NOT_FOUND, OWNER_A.value(), null));
+
+        assertThrows(SeriesNotFoundException.class, handle::open);
+
+        assertFalse(handle.isOpen());
+        assertThrows(NgrrdClusterException.class, () -> handle.read("daily"));
+        assertEquals(List.of(Commands.OPEN), commands());
+    }
+
+    @Test
+    void reaberturaSomenteLeituraComOkSemConfirmacaoLancaUnsupportedByNode() {
+        RemoteSeriesHandle handle = readOnlyOpenedHandle();
+        rpc.respondNext((cmd, body) -> response(cmd, SeriesStatus.NOT_OPEN, OWNER_A.value()));
+        rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
+
+        NgrrdClusterException ex = assertThrows(NgrrdClusterException.class, () -> handle.read("daily"));
+
+        assertEquals(ErrorCode.UNSUPPORTED_BY_NODE, ex.code());
+        assertEquals(List.of(Commands.OPEN, Commands.READ_PRESET, Commands.OPEN), commands(),
+                "a leitura não segue depois de um OPEN sem confirmação");
+        assertFalse(handle.isOpen(), "falha terminal: o handle não segue funcional contra o storage antigo");
+        assertEquals(List.of(SERIES_KEY), onCloseCalls, "sai do mapa do cliente (remoção condicional)");
+        NgrrdClusterException again = assertThrows(NgrrdClusterException.class, () -> handle.read("daily"));
+        assertEquals(ErrorCode.UNSUPPORTED_BY_NODE, again.code(), "operações seguintes relançam a causa");
+        assertEquals(3, commands().size(), "sem RPC depois da falha terminal");
+    }
+
+    @Test
+    void handleDepoisDoCloseDoClienteFalhaNaHoraComClosed() {
+        RemoteSeriesHandle readOnly = readOnlyOpenedHandle();
+        clientClosed = true;
+
+        NgrrdClusterException onRead = assertThrows(NgrrdClusterException.class, () -> readOnly.read("daily"));
+
+        assertEquals(ErrorCode.CLOSED, onRead.code());
+        assertEquals(List.of(Commands.OPEN), commands(), "nenhuma retentativa sobre o transporte fechado");
+    }
+
+    @Test
+    void handleGravavelDepoisDoCloseDoClienteRecusaEscritaComClosed() {
+        RemoteSeriesHandle writable = openedHandle();
+        clientClosed = true;
+
+        NgrrdClusterException onWrite = assertThrows(NgrrdClusterException.class,
+                () -> writable.write("in_octets", new Sample(1L, 1.0)));
+
+        assertEquals(ErrorCode.CLOSED, onWrite.code());
+        assertTrue(dispatcher.enqueued.isEmpty());
+    }
+
+    @Test
+    void openComCriarAceitaOkSemConfirmacao() {
+        RemoteSeriesHandle handle = newHandle();
+        rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
+
+        handle.open();
+
+        assertTrue(handle.isOpen());
+        assertEquals(List.of(Commands.OPEN), commands());
+    }
+
+    @Test
+    void handleComCriarNaoConfereCapacidade() {
+        capabilities = CapabilityFixtures.unused();
+        RemoteSeriesHandle handle = newHandle();
+        rpc.respondNext((cmd, body) -> openOk(OWNER_A.value()));
+        handle.open();
+        rpc.respondNext((cmd, body) -> response(cmd, SeriesStatus.NOT_OPEN, OWNER_A.value()));
+        rpc.respondDefault((cmd, body) -> response(cmd, SeriesStatus.OK, OWNER_A.value()));
+
+        handle.checkpoint();
+
+        assertEquals(List.of(Commands.OPEN, Commands.CHECKPOINT, Commands.OPEN, Commands.CHECKPOINT), commands());
+    }
+
+    @Test
+    void escritaEmHandleSomenteLeituraLancaIllegalStateSemTocarODispatcher() {
+        RemoteSeriesHandle handle = readOnlyOpenedHandle();
+
+        IllegalStateException onWrite = assertThrows(IllegalStateException.class,
+                () -> handle.write("in_octets", new Sample(1L, 1.0)));
+        assertTrue(onWrite.getMessage().contains(SERIES_KEY), onWrite.getMessage());
+        assertTrue(onWrite.getMessage().contains("somente leitura"), onWrite.getMessage());
+        assertThrows(IllegalStateException.class, handle::flush);
+        assertThrows(IllegalStateException.class, handle::checkpoint);
+
+        assertEquals(0, dispatcher.calls.get(), "handle somente leitura nunca chama o dispatcher");
+        assertEquals(List.of(Commands.OPEN), commands(), "nenhum RPC além do OPEN inicial");
+        assertTrue(handle.isOpen(), "a recusa não fecha o handle");
+    }
+
+    @Test
+    void readDeHandleSomenteLeituraFunciona() {
+        RemoteSeriesHandle handle = readOnlyOpenedHandle();
+        rpc.respondDefault((cmd, body) -> response(cmd, SeriesStatus.OK, OWNER_A.value()));
+
+        SeriesResult result = handle.read("in_bps", new ViewQuery(Duration.ofHours(1), 300, ConsolidationFunction.AVERAGE, 100));
+        Map<String, SeriesResult> preset = handle.read("daily");
+
+        assertEquals("in_bps", result.dsName());
+        assertTrue(preset.containsKey("in_bps"), preset.keySet().toString());
+        assertEquals(List.of(Commands.OPEN, Commands.READ, Commands.READ_PRESET), commands());
+        assertEquals(0, dispatcher.calls.get());
+    }
+
+    @Test
+    void readComNotOpenReabreSemCriar() {
+        RemoteSeriesHandle handle = readOnlyOpenedHandle();
+        rpc.respondNext((cmd, body) -> response(cmd, SeriesStatus.NOT_OPEN, OWNER_A.value()));
+        rpc.respondDefault((cmd, body) -> response(cmd, SeriesStatus.OK, OWNER_A.value()));
+
+        handle.read("in_bps", new ViewQuery(Duration.ofHours(1), 300, ConsolidationFunction.AVERAGE, 100));
+
+        assertEquals(List.of(Commands.OPEN, Commands.READ, Commands.OPEN, Commands.READ), commands());
+        assertEquals(0, resolver.resolveCalls.get(), "reabertura de handle somente leitura nunca posiciona");
+        assertEquals(2, resolver.resolveExistingCalls.get());
+        OpenRequest reopen = (OpenRequest) rpc.calls().get(2).body();
+        assertEquals(Boolean.FALSE, reopen.createIfMissing());
+    }
+
+    @Test
+    void readComNotOpenQueDescobreNotFoundFechaHandleSomenteLeitura() {
+        RemoteSeriesHandle handle = readOnlyOpenedHandle();
+        rpc.respondNext((cmd, body) -> response(cmd, SeriesStatus.NOT_OPEN, OWNER_A.value()));
+        rpc.respondDefault((cmd, body) -> new SeriesStatusResponse(SeriesStatus.NOT_FOUND, OWNER_A.value(), null));
+
+        SeriesNotFoundException ex = assertThrows(SeriesNotFoundException.class,
+                () -> handle.read("in_bps", new ViewQuery(Duration.ofHours(1), 300, ConsolidationFunction.AVERAGE, 100)));
+        assertEquals(SERIES_KEY, ex.seriesKey());
+        assertEquals(SeriesNotFoundException.Reason.MISSING_ON_OWNER, ex.reason());
+        assertEquals(List.of(SERIES_KEY), onCloseCalls, "handle deve se remover do mapa do cliente");
+        assertFalse(handle.isOpen());
+
+        SeriesNotFoundException again = assertThrows(SeriesNotFoundException.class, () -> handle.read("daily"));
+        assertEquals(SeriesNotFoundException.Reason.MISSING_ON_OWNER, again.reason(),
+                "depois de fechado pela ausência, o handle repete a mesma causa");
+        assertEquals(0, dispatcher.calls.get());
+    }
+
+    @Test
+    void wrongOwnerSemDonoInformadoQueDescobreSerieAusenteFechaHandleSomenteLeitura() {
+        RemoteSeriesHandle handle = readOnlyOpenedHandle();
+        rpc.respondNext((cmd, body) -> response(cmd, SeriesStatus.WRONG_OWNER, null));
+        resolver.resolveExistingFailure = new SeriesNotFoundException(SERIES_KEY,
+                SeriesNotFoundException.Reason.NOT_PLACED);
+
+        SeriesNotFoundException ex = assertThrows(SeriesNotFoundException.class, () -> handle.read("daily"));
+        assertEquals(SeriesNotFoundException.Reason.NOT_PLACED, ex.reason());
+        assertEquals(List.of(SERIES_KEY), onCloseCalls);
+        assertFalse(handle.isOpen());
+        assertEquals(0, resolver.resolveCalls.get(), "reposicionamento de handle somente leitura nunca posiciona");
+        assertEquals(1, resolver.resolveExistingAtLeaderCalls.get(), "WRONG_OWNER sem dono confirma no líder");
+    }
+
+    @Test
+    void handleGravavelComWrongOwnerSemDonoReResolveSemConsultarOLider() {
+        RemoteSeriesHandle handle = openedHandle();
+        rpc.respondNext((cmd, body) -> response(cmd, SeriesStatus.WRONG_OWNER, null));
+        rpc.respondDefault((cmd, body) -> response(cmd, SeriesStatus.OK, OWNER_A.value()));
+
+        handle.read("daily");
+
+        assertEquals(2, resolver.resolveCalls.get(), "gravável re-resolve pelo caminho de sempre");
+        assertEquals(0, resolver.resolveExistingAtLeaderCalls.get());
+        assertEquals(0, resolver.resolveExistingCalls.get());
+    }
+
+    @Test
+    void closeDeHandleSomenteLeituraELocalSemRpcNemDispatcher() {
+        RemoteSeriesHandle handle = readOnlyOpenedHandle();
+
+        handle.close();
+        handle.close();
+
+        assertFalse(handle.isOpen());
+        assertEquals(List.of(Commands.OPEN), commands(), "close de handle somente leitura não envia CLOSE");
+        assertEquals(0, dispatcher.calls.get(), "close de handle somente leitura não drena o dispatcher");
+        assertEquals(List.of(SERIES_KEY), onCloseCalls, "sai do mapa do cliente uma única vez");
+        assertThrows(NgrrdClusterException.class, () -> handle.read("daily"));
+    }
+
+    @Test
+    void reopenDeHandleSomenteLeituraNaoFazRpc() {
+        RemoteSeriesHandle handle = readOnlyOpenedHandle();
+
+        assertFalse(handle.reopen());
+
+        assertEquals(List.of(Commands.OPEN), commands());
+        assertTrue(handle.isOpen());
+    }
+
+    @Test
+    void descarteDeHandleNaoPublicadoELocalSemRpcNemOnClose() {
+        RemoteSeriesHandle handle = openedHandle();
+        onCloseCalls.clear();
+
+        handle.discard();
+
+        assertFalse(handle.isOpen());
+        assertEquals(List.of(Commands.OPEN), commands(), "o descarte não envia CLOSE");
+        assertEquals(0, dispatcher.calls.get(), "o descarte não drena o dispatcher");
+        assertTrue(onCloseCalls.isEmpty(), "um handle descartado nunca esteve no mapa do cliente");
+        NgrrdClusterException closed = assertThrows(NgrrdClusterException.class,
+                () -> handle.write("in_octets", new Sample(1L, 1.0)));
+        assertEquals(ErrorCode.CLOSED, closed.code());
+    }
+
+    @Test
+    void modoDoHandleEhFixoDesdeAConstrucao() {
+        assertTrue(openedHandle().isWritable());
+        assertFalse(readOnlyOpenedHandle().isWritable());
+    }
+
+    @Test
+    void corridaNaRemocaoNuncaApagaUmHandleNovoDaMesmaChave() throws InterruptedException {
+        // Reproduz o wiring real do cliente: onClose remove do mapa condicionalmente por instância
+        // (Map#remove(key, value)), nunca por chave sozinha. O handle A fica bloqueado no meio da
+        // reabertura que vai descobrir NOT_FOUND (e por isso vai chamar onClose bem mais tarde); enquanto
+        // ele está preso, um handle B "abre" na mesma chave (simulando um open() concorrente do cliente).
+        // Quando A finalmente terminar e chamar onClose, B precisa sobreviver.
+        ConcurrentMap<String, RemoteSeriesHandle> handles = new ConcurrentHashMap<>();
+        CountDownLatch openGate = new CountDownLatch(1);
+        RecordingClusterRpc rpcA = new RecordingClusterRpc(NodeId.of("client-under-test"));
+        FakePlacementLookup resolverA = new FakePlacementLookup(OWNER_A.value());
+        RetryPolicy retry = new RetryPolicy(Duration.ofSeconds(5), Duration.ofMillis(5), Duration.ofMillis(50));
+
+        RemoteSeriesHandle handleA = new RemoteSeriesHandle(SERIES_KEY, "yaml: fake", "hash-1", Map.of(),
+                Ngrrd.OpenOptions.defaults().withCreateIfMissing(false), resolverA, rpcA, new NoOpWriteBuffer(),
+                retry, Duration.ofSeconds(5), Duration.ofSeconds(5), Clock.systemUTC(),
+                (key, handle) -> handles.remove(key, handle), CapabilityFixtures.advertisingAll(), () -> false);
+        handles.put(SERIES_KEY, handleA);
+        rpcA.respondNext((cmd, body) -> openOk(OWNER_A.value()));
+        handleA.open();
+
+        rpcA.respondNext((cmd, body) -> response(cmd, SeriesStatus.NOT_OPEN, OWNER_A.value()));
+        rpcA.respondDefault((cmd, body) -> {
+            awaitLatch(openGate);
+            return new SeriesStatusResponse(SeriesStatus.NOT_FOUND, OWNER_A.value(), null);
+        });
+
+        Thread reader = new Thread(() -> {
+            // A SeriesNotFoundException é esperada; o que importa aqui é a remoção condicional.
+            assertThrows(SeriesNotFoundException.class, () -> handleA.read("daily"));
+        }, "test-read-A");
+        reader.start();
+        Await.untilTrue("A bloqueado dentro do RPC de reabertura", AWAIT_TIMEOUT,
+                () -> reader.getState() == Thread.State.WAITING || reader.getState() == Thread.State.TIMED_WAITING);
+
+        RemoteSeriesHandle handleB = new RemoteSeriesHandle(SERIES_KEY, "yaml: fake", "hash-1", Map.of(),
+                Ngrrd.OpenOptions.defaults(), new FakePlacementLookup(OWNER_A.value()),
+                new RecordingClusterRpc(NodeId.of("client-under-test")), new NoOpWriteBuffer(), retry,
+                Duration.ofSeconds(5), Duration.ofSeconds(5), Clock.systemUTC(),
+                (key, handle) -> handles.remove(key, handle), CapabilityFixtures.advertisingAll(), () -> false);
+        handles.put(SERIES_KEY, handleB);
+
+        openGate.countDown();
+        reader.join(AWAIT_TIMEOUT.toMillis());
+
+        assertFalse(reader.isAlive(), "thread de leitura de A deveria ter terminado");
+        assertFalse(handleA.isOpen());
+        assertSame(handleB, handles.get(SERIES_KEY), "a remoção condicional de A não pode apagar o handle B");
+    }
+
+    @Test
+    void leituraConcorrenteComDescobertaDeAusenciaNuncaVeClosedEspurio() throws InterruptedException {
+        for (int iteration = 0; iteration < 300; iteration++) {
+            RemoteSeriesHandle handle = readOnlyOpenedHandle();
+            AtomicReference<Thread> discoverer = new AtomicReference<>();
+            rpc.respondDefault((cmd, body) -> {
+                boolean discovering = Thread.currentThread() == discoverer.get();
+                if (discovering && Commands.READ_PRESET.equals(cmd)) {
+                    return response(cmd, SeriesStatus.NOT_OPEN, OWNER_A.value());
+                }
+                if (Commands.OPEN.equals(cmd)) {
+                    return new SeriesStatusResponse(SeriesStatus.NOT_FOUND, OWNER_A.value(), null);
+                }
+                return response(cmd, SeriesStatus.OK, OWNER_A.value());
+            });
+            CountDownLatch start = new CountDownLatch(1);
+            List<Throwable> outcomes = new CopyOnWriteArrayList<>();
+            List<Thread> readers = new ArrayList<>();
+            for (int r = 0; r < 3; r++) {
+                readers.add(new Thread(() -> {
+                    awaitLatch(start);
+                    for (;;) {
+                        try {
+                            handle.read("daily");
+                        } catch (RuntimeException e) {
+                            outcomes.add(e);
+                            return;
+                        }
+                    }
+                }, "test-reader-" + r));
+            }
+            Thread discovering = new Thread(() -> {
+                awaitLatch(start);
+                assertThrows(SeriesNotFoundException.class, () -> handle.read("daily"));
+            }, "test-discoverer");
+            discoverer.set(discovering);
+            readers.forEach(Thread::start);
+            discovering.start();
+            start.countDown();
+            discovering.join(AWAIT_TIMEOUT.toMillis());
+            for (Thread reader : readers) {
+                reader.join(AWAIT_TIMEOUT.toMillis());
+            }
+
+            assertEquals(readers.size(), outcomes.size(), "todo leitor precisa terminar com uma exceção");
+            for (Throwable outcome : outcomes) {
+                assertTrue(outcome instanceof SeriesNotFoundException,
+                        "iteração " + iteration + ": leitura concorrente viu " + outcome);
+                assertEquals(SeriesNotFoundException.Reason.MISSING_ON_OWNER,
+                        ((SeriesNotFoundException) outcome).reason());
+            }
+        }
+    }
+
+    @Test
+    void leituraDuranteONotificacaoDeAusenciaJaVeSeriesNotFound() {
+        AtomicReference<RemoteSeriesHandle> self = new AtomicReference<>();
+        AtomicReference<Throwable> seenInsideOnClose = new AtomicReference<>();
+        rpc = new RecordingClusterRpc(NodeId.of("client-under-test"));
+        resolver = new FakePlacementLookup(OWNER_A.value());
+        dispatcher = new NoOpWriteBuffer();
+        RetryPolicy retry = new RetryPolicy(Duration.ofSeconds(2), Duration.ofMillis(5), Duration.ofMillis(50));
+        RemoteSeriesHandle handle = new RemoteSeriesHandle(SERIES_KEY, "yaml: fake", "hash-1", Map.of(),
+                Ngrrd.OpenOptions.defaults().withCreateIfMissing(false), resolver, rpc, dispatcher, retry,
+                Duration.ofSeconds(5), Duration.ofSeconds(5), Clock.systemUTC(), (key, h) -> {
+                    // Outra thread lê no instante em que o handle é retirado do mapa do cliente.
+                    Thread reader = new Thread(() -> {
+                        try {
+                            self.get().read("daily");
+                        } catch (RuntimeException e) {
+                            seenInsideOnClose.set(e);
+                        }
+                    }, "test-reader-on-close");
+                    reader.start();
+                    joinQuietly(reader);
+                }, capabilities, () -> false);
+        self.set(handle);
+        rpc.respondNext((cmd, body) -> openOk(OWNER_A.value()));
+        handle.open();
+        rpc.respondNext((cmd, body) -> response(cmd, SeriesStatus.NOT_OPEN, OWNER_A.value()));
+        rpc.respondDefault((cmd, body) -> new SeriesStatusResponse(SeriesStatus.NOT_FOUND, OWNER_A.value(), null));
+
+        assertThrows(SeriesNotFoundException.class, () -> handle.read("daily"));
+
+        Throwable seen = seenInsideOnClose.get();
+        assertTrue(seen instanceof SeriesNotFoundException, "leitura concorrente viu " + seen);
+        assertEquals(SeriesNotFoundException.Reason.MISSING_ON_OWNER, ((SeriesNotFoundException) seen).reason());
+    }
+
+    @Test
+    void closeDepoisDaDescobertaDeAusenciaPreservaACausa() {
+        RemoteSeriesHandle handle = readOnlyOpenedHandle();
+        rpc.respondNext((cmd, body) -> response(cmd, SeriesStatus.NOT_OPEN, OWNER_A.value()));
+        rpc.respondDefault((cmd, body) -> new SeriesStatusResponse(SeriesStatus.NOT_FOUND, OWNER_A.value(), null));
+        assertThrows(SeriesNotFoundException.class, () -> handle.read("daily"));
+
+        handle.close();
+
+        SeriesNotFoundException again = assertThrows(SeriesNotFoundException.class, () -> handle.read("daily"));
+        assertEquals(SeriesNotFoundException.Reason.MISSING_ON_OWNER, again.reason());
+        assertEquals(List.of(SERIES_KEY), onCloseCalls, "sai do mapa uma única vez");
+    }
+
+    @Test
+    void descobertaDeAusenciaDepoisDoCloseNaoTrocaOEstadoFechado() throws InterruptedException {
+        RemoteSeriesHandle handle = readOnlyOpenedHandle();
+        CountDownLatch readInFlight = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        rpc.respondNext((cmd, body) -> {
+            readInFlight.countDown();
+            awaitLatch(release);
+            return response(cmd, SeriesStatus.NOT_OPEN, OWNER_A.value());
+        });
+        rpc.respondDefault((cmd, body) -> new SeriesStatusResponse(SeriesStatus.NOT_FOUND, OWNER_A.value(), null));
+        AtomicReference<Throwable> inFlightOutcome = new AtomicReference<>();
+        Thread reader = new Thread(() -> {
+            try {
+                handle.read("daily");
+            } catch (RuntimeException e) {
+                inFlightOutcome.set(e);
+            }
+        }, "test-read-in-flight");
+        reader.start();
+        awaitLatch(readInFlight);
+
+        handle.close();
+        release.countDown();
+        reader.join(AWAIT_TIMEOUT.toMillis());
+
+        assertTrue(inFlightOutcome.get() instanceof SeriesNotFoundException,
+                "leitura em voo viu " + inFlightOutcome.get());
+        NgrrdClusterException closed = assertThrows(NgrrdClusterException.class, () -> handle.read("daily"));
+        assertEquals(ErrorCode.CLOSED, closed.code(), "fechado pelo chamador antes da descoberta continua CLOSED");
+        assertEquals(List.of(SERIES_KEY), onCloseCalls, "sai do mapa uma única vez");
+    }
+
+    private RemoteSeriesHandle readOnlyOpenedHandle() {
+        RemoteSeriesHandle handle = newHandle(Ngrrd.OpenOptions.defaults().withCreateIfMissing(false));
+        rpc.respondNext((cmd, body) -> openOk(OWNER_A.value()));
+        handle.open();
+        onCloseCalls.clear();
+        return handle;
+    }
+
+    private List<String> commands() {
+        return rpc.calls().stream().map(RecordingClusterRpc.Recorded::command).toList();
+    }
+
+    /** Resposta {@code OK} de um {@code OPEN} por um storage atual, que confirma honrar createIfMissing=false. */
+    private static SeriesStatusResponse openOk(String owner) {
+        return new SeriesStatusResponse(SeriesStatus.OK, owner, null, Boolean.TRUE);
+    }
+
+    private static void joinQuietly(Thread thread) {
+        try {
+            thread.join(AWAIT_TIMEOUT.toMillis());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException(e);
+        }
+    }
+
+    private static void awaitLatch(CountDownLatch latch) {
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException(e);
+        }
+    }
+
     /** {@link PlacementLookup} fake: sempre devolve o dono atual configurado, sem RPC ao líder. */
     private static final class FakePlacementLookup implements PlacementLookup {
         private volatile String owner;
         private final AtomicInteger resolveCalls = new AtomicInteger();
+        private final AtomicInteger resolveExistingCalls = new AtomicInteger();
+        private final AtomicInteger resolveExistingAtLeaderCalls = new AtomicInteger();
+        private volatile RuntimeException resolveExistingFailure;
 
         FakePlacementLookup(String initialOwner) {
             this.owner = initialOwner;
@@ -308,6 +869,29 @@ class RemoteSeriesHandleTest {
         public SeriesPlacement resolve(String seriesKey, String definitionHashHex) {
             resolveCalls.incrementAndGet();
             return SeriesPlacement.active(owner, 0L);
+        }
+
+        @Override
+        public SeriesPlacement resolveExisting(String seriesKey, Duration maxWait) {
+            resolveExistingCalls.incrementAndGet();
+            if (resolveExistingFailure != null) {
+                throw resolveExistingFailure;
+            }
+            return SeriesPlacement.active(owner, 0L);
+        }
+
+        @Override
+        public SeriesPlacement resolveExistingAtLeader(String seriesKey, Duration maxWait) {
+            resolveExistingAtLeaderCalls.incrementAndGet();
+            if (resolveExistingFailure != null) {
+                throw resolveExistingFailure;
+            }
+            return SeriesPlacement.active(owner, 0L);
+        }
+
+        @Override
+        public Optional<SeriesPlacement> placementCached(String seriesKey) {
+            return Optional.of(SeriesPlacement.active(owner, 0L));
         }
 
         @Override
@@ -321,26 +905,41 @@ class RemoteSeriesHandleTest {
         }
     }
 
-    /** {@link WriteBuffer} fake: só grava o que foi enfileirado, nunca envia nada de fato. */
+    /**
+     * {@link WriteBuffer} fake: grava o que foi enfileirado e conta TODA chamada recebida, nunca envia
+     * nada de fato.
+     */
     private static final class NoOpWriteBuffer implements WriteBuffer {
         record Enqueued(String owner, SeriesWrite write) {
         }
 
         final List<Enqueued> enqueued = new CopyOnWriteArrayList<>();
+        final AtomicInteger calls = new AtomicInteger();
 
         @Override
         public void enqueue(String ownerNodeId, SeriesWrite write) {
+            calls.incrementAndGet();
             enqueued.add(new Enqueued(ownerNodeId, write));
         }
 
         @Override
         public void flushNodeSync(String ownerNodeId) {
-            // no-op
+            calls.incrementAndGet();
         }
 
         @Override
         public void flushNodeSync(String ownerNodeId, Duration maxWait) {
-            // no-op
+            calls.incrementAndGet();
+        }
+
+        @Override
+        public void flushSeriesSync(String seriesKey, String ownerNodeId) {
+            calls.incrementAndGet();
+        }
+
+        @Override
+        public void flushSeriesSync(String seriesKey, String ownerNodeId, Duration maxWait) {
+            calls.incrementAndGet();
         }
     }
 }

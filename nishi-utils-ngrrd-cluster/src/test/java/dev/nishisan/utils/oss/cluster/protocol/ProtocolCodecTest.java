@@ -32,16 +32,20 @@ import dev.nishisan.utils.oss.api.ViewQuery;
 import dev.nishisan.utils.oss.cluster.catalog.NodeState;
 import dev.nishisan.utils.oss.cluster.catalog.PlacementState;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
+import dev.nishisan.utils.oss.cluster.catalog.StorageCapabilities;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.metrics.BlobVolumeSummary;
 import dev.nishisan.utils.oss.cluster.metrics.LatencySnapshot;
 import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
+import dev.nishisan.utils.oss.cluster.placement.DistributionMode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -335,6 +339,29 @@ class ProtocolCodecTest {
     }
 
     @Test
+    void adminNodeStatusResponseComCapacidadesSobreviveAoRoundTrip() throws IOException {
+        StorageNodeStatus status = new StorageNodeStatus("node-a", NodeState.ACTIVE, 5, 1_000, 10_000, 5_000L,
+                DistributionMode.COUNT, 1, 0, StorageCapabilities.ALL);
+        AdminNodeStatusResponse original = new AdminNodeStatusResponse(SeriesStatus.OK, "node-a", status, null);
+
+        AdminNodeStatusResponse roundTripped = roundTripResponseBody(Commands.ADMIN_ACTIVATE, original);
+
+        assertEquals(original, roundTripped);
+        assertEquals(StorageCapabilities.ALL, roundTripped.nodeStatus().capabilities());
+    }
+
+    @Test
+    void statusDeNoSemCapacidadesNoJsonDesserializaComCapacidadesVazias() throws IOException {
+        StorageNodeStatus legacy = JacksonMessageCodec.createDefaultMapper().readValue(
+                "{\"nodeId\":\"node-a\",\"state\":\"ACTIVE\",\"seriesCount\":5,\"usedBytes\":1000,"
+                        + "\"capacityBytes\":10000,\"reportedAtEpochMs\":5000,\"distributionMode\":\"COUNT\","
+                        + "\"weight\":1.0,\"reservedBytes\":0}", StorageNodeStatus.class);
+
+        assertEquals("node-a", legacy.nodeId());
+        assertEquals(Set.of(), legacy.capabilities());
+    }
+
+    @Test
     void adminNodeStatusResponseDeErroSemNodeStatusSobreviveAoRoundTrip() throws IOException {
         AdminNodeStatusResponse original = new AdminNodeStatusResponse(SeriesStatus.ERROR, "node-a", null,
                 "nó desconhecido pelo catálogo: node-x");
@@ -407,5 +434,93 @@ class ProtocolCodecTest {
         assertEquals(checkpointLatency, roundTripped.checkpointLatency());
         assertEquals(readLatency, roundTripped.readLatency());
         assertEquals(blobStats, roundTripped.blobStats());
+    }
+
+    @Test
+    void catalogLookupRequestSobreviveAoRoundTrip() throws IOException {
+        CatalogLookupRequest original = new CatalogLookupRequest(List.of("series-1", "series-2"));
+        assertEquals(original, roundTripRequestBody(Commands.CATALOG_LOOKUP, original));
+    }
+
+    @Test
+    void catalogLookupRequestComListaNulaVemVazia() throws IOException {
+        CatalogLookupRequest original = new CatalogLookupRequest(null);
+        CatalogLookupRequest roundTripped = roundTripRequestBody(Commands.CATALOG_LOOKUP, original);
+        assertEquals(List.of(), roundTripped.seriesKeys());
+        assertEquals(original, roundTripped);
+    }
+
+    @Test
+    void catalogLookupResponseComPlacementsAtivoEMigrandoSobreviveAoRoundTrip() throws IOException {
+        SeriesPlacement active = SeriesPlacement.active("node-a", 1_000L);
+        SeriesPlacement migrating = SeriesPlacement.migrating(
+                SeriesPlacement.active("node-b", 1_000L), "node-c", "migration-1", 2_000L);
+        CatalogLookupResponse original =
+                CatalogLookupResponse.ok(Map.of("series-1", active, "series-2", migrating));
+        assertEquals(original, roundTripResponseBody(Commands.CATALOG_LOOKUP, original));
+    }
+
+    @Test
+    void catalogLookupResponseNotLeaderComHintSobreviveAoRoundTrip() throws IOException {
+        CatalogLookupResponse original = CatalogLookupResponse.notLeader("storage-1");
+        CatalogLookupResponse roundTripped = roundTripResponseBody(Commands.CATALOG_LOOKUP, original);
+        assertEquals(original, roundTripped);
+        assertEquals("storage-1", roundTripped.leaderNodeId());
+    }
+
+    @Test
+    void seriesExistsBatchRequestEResponseSobrevivemAoRoundTrip() throws IOException {
+        SeriesExistsBatchRequest request = new SeriesExistsBatchRequest(List.of("series-1", "series-2", "series-3"));
+        assertEquals(request, roundTripRequestBody(Commands.SERIES_EXISTS_BATCH, request));
+
+        SeriesExistsBatchResponse response = SeriesExistsBatchResponse.ok(Set.of("series-1", "series-3"));
+        assertEquals(response, roundTripResponseBody(Commands.SERIES_EXISTS_BATCH, response));
+    }
+
+    @Test
+    void seriesExistsBatchResponseOkSemPresentNoJsonDesserializaComPresentNulo() throws IOException {
+        SeriesExistsBatchResponse response = JacksonMessageCodec.createDefaultMapper()
+                .readValue("{\"status\":\"OK\",\"message\":null}", SeriesExistsBatchResponse.class);
+
+        assertEquals(SeriesStatus.OK, response.status());
+        assertNull(response.present(), "sem o campo present no JSON, present() precisa continuar null — "
+                + "nunca virar Set.of() (que o cliente confundiria com \"nenhuma chave presente\")");
+    }
+
+    @Test
+    void openRequestComCreateIfMissingFalseSobreviveAoRoundTrip() throws IOException {
+        SeriesPlacement placement = SeriesPlacement.active("node-a", 1_000L);
+        OpenRequest original = new OpenRequest("series-1", "ds: [in_octets]", Map.of(), Durability.FSYNC,
+                OnGeometryChange.MIGRATE, placement, false);
+        OpenRequest roundTripped = roundTripRequestBody(Commands.OPEN, original);
+        assertEquals(original, roundTripped);
+        assertEquals(false, roundTripped.createIfMissingOrDefault());
+    }
+
+    @Test
+    void seriesStatusResponseComConfirmacaoDeCreateIfMissingSobreviveAoRoundTrip() throws IOException {
+        SeriesStatusResponse original = new SeriesStatusResponse(SeriesStatus.OK, "node-a", null, Boolean.TRUE);
+
+        SeriesStatusResponse roundTripped = roundTripResponseBody(Commands.OPEN, original);
+
+        assertEquals(original, roundTripped);
+        assertEquals(Boolean.TRUE, roundTripped.createIfMissingHonored());
+    }
+
+    @Test
+    void seriesStatusResponseSemConfirmacaoDesserializaComoNula() throws IOException {
+        SeriesStatusResponse legacy = JacksonMessageCodec.createDefaultMapper().readValue(
+                "{\"status\":\"OK\",\"ownerNodeId\":\"node-a\"}", SeriesStatusResponse.class);
+
+        assertEquals(SeriesStatus.OK, legacy.status());
+        assertNull(legacy.createIfMissingHonored(), "resposta de storage anterior não traz a confirmação");
+        assertNull(new SeriesStatusResponse(SeriesStatus.OK, "node-a", null).createIfMissingHonored());
+    }
+
+    @Test
+    void openRequestSemCreateIfMissingDesserializaComoCriar() throws IOException {
+        OpenRequest legacy = new ObjectMapper().readValue(
+                "{\"seriesKey\":\"series-1\",\"yaml\":\"ds: [in_octets]\"}", OpenRequest.class);
+        assertTrue(legacy.createIfMissingOrDefault());
     }
 }

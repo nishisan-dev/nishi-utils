@@ -145,6 +145,9 @@ class RemoteSeriesRetryBudgetTest {
                 if (!initialOpen) lookupBudgets.add(maxWait);
                 return resolve(key, hash);
             }
+            public SeriesPlacement resolveExisting(String key, Duration maxWait) { return resolve(key, null); }
+            public SeriesPlacement resolveExistingAtLeader(String key, Duration maxWait) { return resolve(key, null); }
+            public Optional<SeriesPlacement> placementCached(String key) { return Optional.of(resolve(key, null)); }
             public void invalidate(String key) { }
             public void noteOwner(String key, String newOwner) { owner = newOwner; }
         };
@@ -171,7 +174,8 @@ class RemoteSeriesRetryBudgetTest {
         };
         var handle = new RemoteSeriesHandle("series", "yaml", "hash", Map.of(), Ngrrd.OpenOptions.defaults(),
                 lookup, rpc, buffer, new RetryPolicy(Duration.ofMillis(100), Duration.ofMillis(1), Duration.ofMillis(2)),
-                Duration.ofSeconds(5), Duration.ofSeconds(5), clock, key -> { });
+                Duration.ofSeconds(5), Duration.ofSeconds(5), clock, (key, handle2) -> { },
+                CapabilityFixtures.advertisingAll(), () -> false);
         handle.open();
         initialOpen = false;
         return handle;

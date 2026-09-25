@@ -17,6 +17,9 @@
 
 package dev.nishisan.utils.oss.cluster.catalog;
 
+import dev.nishisan.utils.ngrid.map.MapReplicationCodec;
+import dev.nishisan.utils.ngrid.map.MapReplicationCommand;
+import dev.nishisan.utils.oss.cluster.placement.DistributionMode;
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayInputStream;
@@ -24,10 +27,14 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.HashSet;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class StorageNodeStatusTest {
@@ -119,5 +126,105 @@ class StorageNodeStatusTest {
         assertEquals(12_345, draining.usedBytes());
         assertEquals(100_000, draining.capacityBytes());
         assertEquals(2_000L, draining.reportedAtEpochMs());
+    }
+
+    @Test
+    void statusSerializadoPelaVersao850SemCapacidadesLeCapacidadesVazias() throws Exception {
+        try (ObjectInputStream in = new ObjectInputStream(
+                getClass().getResourceAsStream("/legacy-catalog/node-8.5.0.ser"))) {
+            StorageNodeStatus status = (StorageNodeStatus) in.readObject();
+
+            assertEquals("legacy-850", status.nodeId());
+            assertEquals(7, status.seriesCount());
+            assertEquals(DistributionMode.WEIGHT, status.distributionMode());
+            assertEquals(2.5, status.weight());
+            assertEquals(100, status.reservedBytes());
+            assertEquals(Set.of(), status.capabilities());
+        }
+    }
+
+    @Test
+    void statusSerializadoPelaVersao831LeCapacidadesVazias() throws Exception {
+        try (ObjectInputStream in = new ObjectInputStream(
+                getClass().getResourceAsStream("/legacy-catalog/node-8.3.1.ser"))) {
+            StorageNodeStatus status = (StorageNodeStatus) in.readObject();
+
+            assertEquals("legacy", status.nodeId());
+            assertEquals(Set.of(), status.capabilities());
+        }
+    }
+
+    @Test
+    void statusReplicadoPelaVersao850SemCapacidadesLeCapacidadesVazias() {
+        // Bytes produzidos pelo MapReplicationCodec com o record de 9 componentes da 8.5.0.
+        String legacy = "{\"type\":\"PUT\",\"key\":\"legacy-850\",\"value\":{\"@class\":"
+                + "\"dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus\",\"nodeId\":\"legacy-850\","
+                + "\"state\":\"ACTIVE\",\"seriesCount\":7,\"usedBytes\":2048,\"capacityBytes\":50000,"
+                + "\"reportedAtEpochMs\":4321,\"distributionMode\":\"WEIGHT\",\"weight\":2.5,\"reservedBytes\":100}}";
+
+        MapReplicationCommand command = MapReplicationCodec.decode(legacy.getBytes(StandardCharsets.UTF_8));
+
+        StorageNodeStatus status = (StorageNodeStatus) command.value();
+        assertEquals("legacy-850", status.nodeId());
+        assertEquals(100, status.reservedBytes());
+        assertEquals(Set.of(), status.capabilities());
+    }
+
+    @Test
+    void capacidadesSobrevivemAReplicacaoDoMapa() {
+        StorageNodeStatus original = withCapabilities(Set.copyOf(StorageCapabilities.ALL));
+
+        MapReplicationCommand decoded = MapReplicationCodec.decode(
+                MapReplicationCodec.encode(MapReplicationCommand.put(original.nodeId(), original)));
+
+        assertEquals(original, decoded.value());
+        assertEquals(StorageCapabilities.ALL, ((StorageNodeStatus) decoded.value()).capabilities());
+    }
+
+    @Test
+    void capacidadesSobrevivemAoObjectOutputStream() throws IOException, ClassNotFoundException {
+        StorageNodeStatus original = withCapabilities(Set.of(StorageCapabilities.CATALOG_LOOKUP));
+
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (ObjectOutputStream out = new ObjectOutputStream(bytes)) {
+            out.writeObject(original);
+        }
+        try (ObjectInputStream in = new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray()))) {
+            assertEquals(original, in.readObject());
+        }
+    }
+
+    @Test
+    void capacidadesNulasViramVaziasEACopiaEhImutavel() {
+        assertEquals(Set.of(), withCapabilities(null).capabilities());
+        assertEquals(Set.of(), new StorageNodeStatus("node-a", NodeState.ACTIVE, 0, 0, 0, 1L).capabilities());
+
+        Set<String> source = new HashSet<>(Set.of(StorageCapabilities.CATALOG_LOOKUP));
+        StorageNodeStatus status = withCapabilities(source);
+        source.add(StorageCapabilities.SERIES_EXISTS_BATCH);
+
+        assertEquals(Set.of(StorageCapabilities.CATALOG_LOOKUP), status.capabilities());
+        assertThrows(UnsupportedOperationException.class, () -> status.capabilities().add("x"));
+    }
+
+    @Test
+    void transicoesPreservamAsCapacidades() {
+        StorageNodeStatus status = withCapabilities(StorageCapabilities.ALL);
+
+        assertEquals(StorageCapabilities.ALL, status.withLoad(1, 2, 3, 4L).capabilities());
+        assertEquals(StorageCapabilities.ALL, status.withState(NodeState.DRAINING, 4L).capabilities());
+    }
+
+    @Test
+    void capacidadesAnunciadasSaoAsTresDoProtocolo() {
+        assertEquals("catalog.lookup", StorageCapabilities.CATALOG_LOOKUP);
+        assertEquals("open.createIfMissing", StorageCapabilities.OPEN_CREATE_IF_MISSING);
+        assertEquals("series.exists.batch", StorageCapabilities.SERIES_EXISTS_BATCH);
+        assertEquals(Set.of("catalog.lookup", "open.createIfMissing", "series.exists.batch"), StorageCapabilities.ALL);
+    }
+
+    private static StorageNodeStatus withCapabilities(Set<String> capabilities) {
+        return new StorageNodeStatus("node-a", NodeState.ACTIVE, 1, 2, 3, 4L, DistributionMode.COUNT, 1, 0,
+                capabilities);
     }
 }

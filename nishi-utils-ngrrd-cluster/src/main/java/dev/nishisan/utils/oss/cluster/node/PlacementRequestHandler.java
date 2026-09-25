@@ -30,6 +30,8 @@ import dev.nishisan.utils.oss.cluster.catalog.PlacementState;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.placement.PlacementContext;
 import dev.nishisan.utils.oss.cluster.placement.PlacementPolicy;
+import dev.nishisan.utils.oss.cluster.protocol.CatalogLookupRequest;
+import dev.nishisan.utils.oss.cluster.protocol.CatalogLookupResponse;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.protocol.PlaceRequest;
 import dev.nishisan.utils.oss.cluster.protocol.PlaceResponse;
@@ -47,15 +49,20 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.function.BooleanSupplier;
 import java.util.stream.Collectors;
 
 /**
- * Atende, apenas no líder, o comando {@link Commands#PLACE}: cria (ou confirma,
- * idempotentemente) o placement de uma série nova via {@link PlacementPolicy}.
+ * Atende, apenas no líder, os comandos {@link Commands#PLACE} e {@link Commands#CATALOG_LOOKUP}.
  *
- * <p>Serializa a admissão de novos placements para contabilizar pendências antes
- * da decisão seguinte. O lock de cada série no catálogo também coordena mudanças
- * de geometria e migrações, evitando atualizações concorrentes do mesmo registro.</p>
+ * <p>{@link Commands#PLACE} cria (ou confirma, idempotentemente) o placement de uma série nova via
+ * {@link PlacementPolicy}, serializando a admissão de novos placements para contabilizar pendências
+ * antes da decisão seguinte. O lock de cada série no catálogo também coordena mudanças de geometria e
+ * migrações, evitando atualizações concorrentes do mesmo registro.</p>
+ *
+ * <p>{@link Commands#CATALOG_LOOKUP} é leitura pura — confirma em lote, no líder, o placement de
+ * séries que a réplica local do cliente não tinha (miss) — e por isso não disputa o
+ * {@code admissionLock} do {@code PLACE}.</p>
  */
 public final class PlacementRequestHandler extends RequestHandlerSupport implements LeadershipListener {
 
@@ -74,6 +81,7 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
 
     private final CatalogView catalog;
     private final LeaderView leaderView;
+    private final BooleanSupplier leaderSyncing;
     private final PlacementPolicy policy;
     private final Duration nodeStatusStaleAfter;
     private final Duration placementGraceAfterLeadership;
@@ -85,30 +93,44 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
     /**
      * Instante em que este nó percebeu ter assumido a liderança pela última vez — {@code 0}
      * (epoch) enquanto não visto nenhuma vez, para tratar como "fora da janela de graça" por
-     * default. Deliberadamente NÃO {@link Long#MIN_VALUE}: {@code clock.millis() - Long.MIN_VALUE}
-     * estoura o {@code long} (o resultado matematicamente correto excede {@link Long#MAX_VALUE}) e
-     * <em>wrap-around</em> vira um número NEGATIVO — menor que qualquer {@code placementGraceAfterLeadership}
-     * positivo — fazendo {@code handlePlace} enxergar "dentro da janela de graça" para sempre, mesmo
-     * décadas depois de qualquer liderança real (bug pego pelos testes existentes de
-     * {@code PlacementRequestHandlerTest}, que nunca chamam {@code onLeaderChanged}). {@code 0}
-     * evita o overflow: {@code clock.millis()} de qualquer relógio real (ou fake baseado numa data
-     * real) é sempre muitas ordens de grandeza maior que a janela de graça, então o subtraendo nunca
-     * é confundido com "recém-eleito". Só {@link #onLeaderChanged}
-     * escreve; {@link #handlePlace} só lê — não precisa de lock próprio, um valor um pouco atrasado
-     * só alarga/encolhe a janela por uma chamada, nunca quebra a invariante de segurança (seção 0 da
-     * spec do M3).
+     * default; {@link Long#MAX_VALUE} depois de um callback de perda (ou ausência) de liderança,
+     * para que tudo fique "dentro da janela" até o callback da próxima posse
+     * ({@code clock.millis() - Long.MAX_VALUE} é negativo, sem overflow, pois {@code clock.millis()}
+     * nunca é negativo). Deliberadamente NÃO {@link Long#MIN_VALUE} como valor inicial:
+     * {@code clock.millis() - Long.MIN_VALUE} estoura o {@code long} (o resultado matematicamente
+     * correto excede {@link Long#MAX_VALUE}) e <em>wrap-around</em> vira um número NEGATIVO — menor
+     * que qualquer {@code placementGraceAfterLeadership} positivo — fazendo {@code handlePlace}
+     * enxergar "dentro da janela de graça" para sempre, mesmo décadas depois de qualquer liderança
+     * real (bug pego pelos testes existentes de {@code PlacementRequestHandlerTest}, que nunca chamam
+     * {@code onLeaderChanged}). {@code 0} evita o overflow: {@code clock.millis()} de qualquer relógio
+     * real (ou fake baseado numa data real) é sempre muitas ordens de grandeza maior que a janela de
+     * graça, então o subtraendo nunca é confundido com "recém-eleito". Só {@link #onLeaderChanged}
+     * escreve; {@link #handlePlace} e {@link #handleCatalogLookup} só leem — não precisa de lock
+     * próprio, um valor um pouco atrasado só alarga/encolhe a janela por uma chamada, nunca quebra a
+     * invariante de segurança (seção 0 da spec do M3).
      */
     private volatile long becameLeaderAtMs = 0L;
 
+    /**
+     * @param leaderSyncing indica se a réplica deste nó, mesmo já líder, ainda está em catch-up de um
+     *                      mandato anterior ({@code ReplicationManager#isLeaderSyncing()}) — enquanto
+     *                      verdadeiro, um miss de {@link Commands#CATALOG_LOOKUP} não é definitivo
+     */
     public PlacementRequestHandler(Transport transport, CatalogService catalog, LeaderView leaderView,
-            PlacementPolicy policy, Duration nodeStatusStaleAfter, Clock clock) {
-        this(transport, catalog, leaderView, policy, nodeStatusStaleAfter, Duration.ofSeconds(3), clock);
+            BooleanSupplier leaderSyncing, PlacementPolicy policy, Duration nodeStatusStaleAfter, Clock clock) {
+        this(transport, catalog, leaderView, leaderSyncing, policy, nodeStatusStaleAfter, Duration.ofSeconds(3),
+                clock);
     }
 
+    /**
+     * @param leaderSyncing indica se a réplica deste nó, mesmo já líder, ainda está em catch-up de um
+     *                      mandato anterior ({@code ReplicationManager#isLeaderSyncing()}) — enquanto
+     *                      verdadeiro, um miss de {@link Commands#CATALOG_LOOKUP} não é definitivo
+     */
     public PlacementRequestHandler(Transport transport, CatalogService catalog, LeaderView leaderView,
-            PlacementPolicy policy, Duration nodeStatusStaleAfter, Duration placementGraceAfterLeadership,
-            Clock clock) {
-        this(transport, (CatalogView) catalog, leaderView, policy, nodeStatusStaleAfter,
+            BooleanSupplier leaderSyncing, PlacementPolicy policy, Duration nodeStatusStaleAfter,
+            Duration placementGraceAfterLeadership, Clock clock) {
+        this(transport, (CatalogView) catalog, leaderView, leaderSyncing, policy, nodeStatusStaleAfter,
                 placementGraceAfterLeadership, clock);
     }
 
@@ -117,11 +139,12 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
      * {@link CatalogService}/{@code DistributedMap} reais.
      */
     PlacementRequestHandler(Transport transport, CatalogView catalog, LeaderView leaderView,
-            PlacementPolicy policy, Duration nodeStatusStaleAfter, Duration placementGraceAfterLeadership,
-            Clock clock) {
-        super(transport, Set.of(Commands.PLACE));
+            BooleanSupplier leaderSyncing, PlacementPolicy policy, Duration nodeStatusStaleAfter,
+            Duration placementGraceAfterLeadership, Clock clock) {
+        super(transport, Set.of(Commands.PLACE, Commands.CATALOG_LOOKUP));
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.leaderView = Objects.requireNonNull(leaderView, "leaderView");
+        this.leaderSyncing = Objects.requireNonNull(leaderSyncing, "leaderSyncing");
         this.policy = Objects.requireNonNull(policy, "policy");
         this.nodeStatusStaleAfter = Objects.requireNonNull(nodeStatusStaleAfter, "nodeStatusStaleAfter");
         this.placementGraceAfterLeadership =
@@ -157,6 +180,10 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
 
     @Override
     protected Object handle(String command, Object body, NodeId source) {
+        if (Commands.CATALOG_LOOKUP.equals(command)) {
+            // Leitura pura: não disputa o admissionLock do PLACE.
+            return handleCatalogLookup((CatalogLookupRequest) body);
+        }
         // One admission decision at a time also serializes pending-count updates across keys.
         admissionLock.lock();
         try {
@@ -169,6 +196,16 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
     @Override
     public void onLeaderChanged(NodeId newLeader) {
         if (leaderView.isLeader()) {
+            // Seção 0 do M3: marca o início da janela de graça — enquanto ela não passa, handlePlace
+            // recusa criar placements NOVOS e handleCatalogLookup recusa responder miss (ambos com
+            // NOT_LEADER, o cliente retenta), dando tempo da réplica local do catálogo convergir.
+            // Placements JÁ existentes continuam respondidos normalmente (não passam por esta janela).
+            // Gravado ANTES de qualquer trabalho pesado: o coordenador troca o líder antes de chamar
+            // os listeners, então isLeader() já é true enquanto este método roda — se a marca viesse
+            // depois da recontagem abaixo (cópia do catálogo inteiro), um CATALOG_LOOKUP nesse meio
+            // tempo veria a marca antiga (ou 0), acharia a janela expirada e responderia um miss como
+            // "não existe" definitivo.
+            becameLeaderAtMs = clock.millis();
             // Assumiu a liderança agora (ou de novo): reconstrói pendingByNode a partir do catálogo
             // local em vez de começar do zero. Sem isso, um handoff logo após uma rajada de PLACEs
             // feitos pelo líder anterior faz o novo líder enxergar seriesCount desatualizado (ainda
@@ -176,17 +213,24 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
             // inteira decidiria pelo mesmo "menos carregado" aparente, concentrando tudo num nó só
             // (achado F2 do Debugger).
             recomputePendingFromCatalog();
-            // Seção 0 do M3: marca o início da janela de graça — enquanto ela não passa, handlePlace
-            // recusa criar placements NOVOS (responde NOT_LEADER, o cliente retenta), dando tempo da
-            // réplica local do catálogo convergir. Placements JÁ existentes continuam respondidos
-            // normalmente (não passam por esta janela).
-            becameLeaderAtMs = clock.millis();
         } else {
             // Perdeu (ou nunca teve) a liderança: os placements pendentes desde o último reporte de
             // status não valem mais para as decisões deste nó — zera para não carregar contagem
             // obsoleta caso ele volte a ser líder mais tarde.
             needsAdmissionRebuild = true;
             pendingByNode.clear();
+            // O coordenador troca o líder (e persiste a época, com I/O síncrono) ANTES de chamar os
+            // listeners: se este nó voltar a ser líder, há um intervalo em que isLeader() já é true e
+            // o callback de posse ainda não rodou. Long.MAX_VALUE deixa "agora - becameLeaderAtMs"
+            // negativo (sem overflow: clock.millis() >= 0), ou seja, dentro da janela de graça —
+            // PLACE de série nova e miss de CATALOG_LOOKUP respondem NOT_LEADER até a posse ser vista.
+            becameLeaderAtMs = Long.MAX_VALUE;
+            // Reconferência: este callback pode ter lido "não líder" concorrendo com a posse (ex.: o
+            // seed do boot e o callback do coordenador) — sem isto, um líder real ficaria preso em
+            // NOT_LEADER até a próxima troca de liderança.
+            if (leaderView.isLeader()) {
+                becameLeaderAtMs = clock.millis();
+            }
         }
     }
 
@@ -300,6 +344,56 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
         String leaderId = leaderView.leaderId().orElse(null);
         return new PlaceResponse(SeriesStatus.NOT_LEADER, null,
                 "este nó não é o líder atual", leaderId);
+    }
+
+    /**
+     * Atende {@link Commands#CATALOG_LOOKUP}: confirma em lote, no líder, o placement de séries que a
+     * réplica local do cliente não tinha (miss). Nunca cria placement — um miss aqui só pode virar
+     * "não existe" definitivo do lado do cliente quando esta resposta é {@link SeriesStatus#OK} e a
+     * chave está ausente de {@link CatalogLookupResponse#found()}. Havendo miss, responde
+     * {@link SeriesStatus#NOT_LEADER} (com o hint do líder) enquanto a janela de graça pós-liderança não
+     * passou ou enquanto a réplica deste líder ainda sincroniza — o cliente retenta.
+     */
+    private CatalogLookupResponse handleCatalogLookup(CatalogLookupRequest request) {
+        if (!leaderView.isLeader()) {
+            return CatalogLookupResponse.notLeader(leaderView.leaderId().orElse(null));
+        }
+        if (request.seriesKeys().size() > CatalogLookupRequest.MAX_KEYS) {
+            return CatalogLookupResponse.error("lote de " + request.seriesKeys().size()
+                    + " chaves excede o máximo de " + CatalogLookupRequest.MAX_KEYS);
+        }
+
+        Map<String, SeriesPlacement> found = new HashMap<>();
+        boolean anyMiss = false;
+        for (String key : request.seriesKeys()) {
+            // Checagem barata a cada chave: se a liderança caiu no meio do lote, sai imediatamente em
+            // vez de continuar gastando um round-trip de placementStrong por chave restante (pode ser
+            // um RPC ao "novo" líder) só para a rechecagem final abaixo descartar tudo de qualquer jeito.
+            if (!leaderView.isLeader()) {
+                return CatalogLookupResponse.notLeader(leaderView.leaderId().orElse(null));
+            }
+            Optional<SeriesPlacement> placement = catalog.placementStrong(key);
+            if (placement.isPresent()) {
+                found.put(key, placement.get());
+            } else {
+                anyMiss = true;
+            }
+        }
+
+        // Mesma janela de graça do PLACE (seção 0 do M3): a réplica do líder recém-eleito pode não
+        // ter convergido ainda; um miss dentro dessa janela não pode virar "não existe" definitivo.
+        // Idem enquanto a réplica deste líder ainda está em catch-up de um mandato anterior — o
+        // PLACE já é protegido nesse estado pela recusa da escrita (LeaderSyncingException), mas
+        // esta consulta é só leitura e precisa da checagem explícita.
+        if (anyMiss && (clock.millis() - becameLeaderAtMs < placementGraceAfterLeadership.toMillis()
+                || leaderSyncing.getAsBoolean())) {
+            return CatalogLookupResponse.notLeader(leaderView.leaderId().orElse(null));
+        }
+        if (!leaderView.isLeader()) {
+            // Perdeu a liderança durante a consulta.
+            return CatalogLookupResponse.notLeader(leaderView.leaderId().orElse(null));
+        }
+        return CatalogLookupResponse.ok(found);
     }
 
     private Map<String, Long> snapshotPending(Collection<StorageNodeStatus> nodes) {
