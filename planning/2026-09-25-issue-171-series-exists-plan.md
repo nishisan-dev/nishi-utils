@@ -112,7 +112,8 @@ public static boolean exists(String yamlContent, StorageFactory.StorageBindings 
 - [ ] **Passo 5:** doc em `doc/oss/ngrrd.md`: subseção "Abrir sem criar e consultar existência" com
   exemplo de `withCreateIfMissing(false)` + `catch (SeriesNotFoundException e)` e `Ngrrd.exists`.
 - [ ] **Passo 6: commit** `feat(ngrrd): abertura sem criar e consulta de existência no modo local (#171)`.
-- [ ] **Passo 7:** `mvn -pl nishi-utils-oss -am install -DskipTests -q` (disponibiliza o oss novo ao cluster).
+- [ ] **Passo 7:** nada a instalar — os comandos do cluster usam o build de reactor (`-pl
+  nishi-utils-ngrrd-cluster -am`), que já compila o oss novo junto.
 
 ---
 
@@ -471,7 +472,7 @@ final class SeriesVerifier {
   a PR #172 alterou: `ngrid-test/pom.xml`, `nishi-utils-core/pom.xml`, `nishi-utils-ngrrd-cluster/pom.xml`,
   raiz, oss, README, quickstart).
 - [ ] **Passo 1:** editar.
-- [ ] **Passo 2:** `mvn clean install -DskipTests -q` e `mvn verify -Pvalidate-javadoc -DexcludeNgrid=true
-  -pl nishi-utils-oss,nishi-utils-ngrrd-cluster -am` → verde.
+- [ ] **Passo 2:** `JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 mvn -pl nishi-utils-oss,nishi-utils-ngrrd-cluster
+  -am verify -Pvalidate-javadoc -DexcludeNgrid=true` → verde.
 - [ ] **Passo 3: commits** separados: `docs(ngrrd): consulta de existência e abertura sem criar (#171)` e
   `chore: versão 8.6.0`.
