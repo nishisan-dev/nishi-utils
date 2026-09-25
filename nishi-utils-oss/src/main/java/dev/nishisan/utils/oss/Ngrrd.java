@@ -221,19 +221,47 @@ public final class Ngrrd {
                                            String seriesKey) {
         NgrrdStorage storage = StorageFactory.from(storageSpec, bindings);
         boolean ownsStorage = storageSpec.backend() != StorageBackendType.SHARDED_BLOB;
+        boolean result;
         try {
             String storageKey = StorageKey.series(storageSpec.objectNaming(), seriesKey);
-            if (storage instanceof SeriesChannelProvider provider) {
-                return provider.seriesExists(storageKey);
-            }
-            return storage.exists(storageKey);
-        } finally {
-            if (ownsStorage && storage instanceof AutoCloseable ac) {
-                try {
-                    ac.close();
-                } catch (Exception e) {
-                    // log opcional — não bloqueia o consumidor.
-                }
+            result = storage instanceof SeriesChannelProvider provider
+                    ? provider.seriesExists(storageKey)
+                    : storage.exists(storageKey);
+        } catch (RuntimeException e) {
+            closeOwnedStorage(storage, ownsStorage, e);
+            throw e;
+        }
+        closeOwnedStorage(storage, ownsStorage, null);
+        return result;
+    }
+
+    /**
+     * Fecha um storage próprio (não compartilhado — ver {@code ownsStorage}: um
+     * volume {@code SHARDED_BLOB} é gerido pelo {@link BlobVolumeRegistry}, não
+     * por este método) após um uso pontual: falha ao abrir o writer ou consulta
+     * de {@link #exists}. Sem isso, um backend com recurso próprio (ex.:
+     * {@code S3Storage} com seu {@code S3Client}) vazaria a cada chamada que não
+     * chega a devolver um {@link NgrrdHandle} para o chamador fechar.
+     *
+     * <p>Quando {@code primaryFailure} não é {@code null} (falha ao construir o
+     * writer), uma falha de {@code close()} vira
+     * {@link Throwable#addSuppressed(Throwable)} nela — nunca mascara a causa
+     * original. Sem falha primária (consulta de {@link #exists} bem-sucedida),
+     * a falha de close é apenas registrada: não há exceção em curso para
+     * anexar, e o resultado da consulta já foi obtido.</p>
+     */
+    static void closeOwnedStorage(NgrrdStorage storage, boolean ownsStorage,
+                                  RuntimeException primaryFailure) {
+        if (!ownsStorage || !(storage instanceof AutoCloseable ac)) {
+            return;
+        }
+        try {
+            ac.close();
+        } catch (Exception closeFailure) {
+            if (primaryFailure != null) {
+                primaryFailure.addSuppressed(closeFailure);
+            } else {
+                System.err.println("ngrrd: falha ao fechar storage: " + closeFailure);
             }
         }
     }
@@ -256,6 +284,9 @@ public final class Ngrrd {
         }
 
         NgrrdStorage storage = StorageFactory.from(storageSpec, bindings);
+        // O volume SHARDED_BLOB é compartilhado entre handles; quem o fecha é o
+        // BlobVolumeRegistry, não este método nem o handle individual.
+        boolean ownsStorage = storageSpec.backend() != StorageBackendType.SHARDED_BLOB;
         // Tratamento de mudança de geometria: override de abertura > YAML > FAIL.
         OnGeometryChange onGeometryChange = resolveGeometryChange(options, storageSpec);
 
@@ -263,12 +294,19 @@ public final class Ngrrd {
         // Lock por handle compartilhado entre writer e leitores: garante o
         // contrato de 1 writer + N readers do NgrrdHandle.
         ReadWriteLock seriesLock = new ReentrantReadWriteLock();
-        NgrrdWriter writer = new NgrrdWriter(def, storage, seriesKey, metrics, seriesLock,
-                durability, onGeometryChange, System::currentTimeMillis, options.createIfMissing());
+        NgrrdWriter writer;
+        try {
+            writer = new NgrrdWriter(def, storage, seriesKey, metrics, seriesLock,
+                    durability, onGeometryChange, System::currentTimeMillis, options.createIfMissing());
+        } catch (RuntimeException e) {
+            // SeriesNotFoundException com createIfMissing=false é um caminho
+            // esperado e frequente (varredura de catálogo): sem fechar aqui, um
+            // storage próprio (S3Storage com seu S3Client) vazaria a cada chave
+            // ausente — o writer nunca chegou a existir para o chamador fechar.
+            closeOwnedStorage(storage, ownsStorage, e);
+            throw e;
+        }
 
-        // O volume SHARDED_BLOB é compartilhado entre handles; quem o fecha é o
-        // BlobVolumeRegistry, não o handle individual.
-        boolean ownsStorage = storageSpec.backend() != StorageBackendType.SHARDED_BLOB;
         return new DefaultHandle(def, storage, seriesKey, writer, metrics, seriesLock, ownsStorage);
     }
 
