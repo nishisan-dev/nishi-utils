@@ -262,9 +262,7 @@ public final class SeriesHandleRegistry implements Closeable {
         if (isMigrationFrozen(seriesKey)) {
             return Optional.empty();
         }
-        String hash = hashBySeriesKey.get(seriesKey);
-        DefinitionRecord definition = hash != null ? definitionByHash.get(hash) : null;
-        if (definition == null && !entries.containsKey(seriesKey)) {
+        if (!hashBySeriesKey.containsKey(seriesKey) && !entries.containsKey(seriesKey)) {
             return Optional.empty();
         }
 
@@ -278,10 +276,13 @@ public final class SeriesHandleRegistry implements Closeable {
                 if (entries.get(seriesKey) != entry) {
                     continue;
                 }
-                // A definição é reconferida sob o lock: um close()/forget() concorrente a remove ANTES de
+                // A definição é lida sob o lock: um close()/forget() concorrente a remove ANTES de
                 // procurar a entrada, então ou ele já a removeu (e aqui não se reabre) ou ainda vai achar
-                // e fechar a entrada que este método abrir — a série nunca termina aberta depois dele.
-                if (isMigrationFrozen(seriesKey) || !hashBySeriesKey.containsKey(seriesKey)) {
+                // e fechar a entrada que este método abrir — a série nunca termina aberta depois dele. Ler
+                // aqui (e não antes do laço) também garante reabrir com a definição corrente, não com a
+                // de um open() anterior substituída no meio do caminho por outro YAML.
+                String hash = hashBySeriesKey.get(seriesKey);
+                if (isMigrationFrozen(seriesKey) || hash == null) {
                     // Só remove se ainda vazia E ainda a corrente — nunca apaga um handle que outra
                     // thread já tenha aberto de verdade nesta mesma entrada nesse meio-tempo (o bug
                     // que o Refuter pegou: remover incondicionalmente fora do lock podia derrubar do
@@ -292,6 +293,7 @@ public final class SeriesHandleRegistry implements Closeable {
                     return Optional.empty();
                 }
                 if (entry.handle == null) {
+                    DefinitionRecord definition = definitionByHash.get(hash);
                     if (definition == null) {
                         entries.remove(seriesKey, entry);
                         return Optional.empty();

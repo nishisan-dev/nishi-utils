@@ -47,6 +47,14 @@ public interface CatalogView {
     /** Cópia imutável do catálogo na visão local (eventual) do nó. */
     Map<String, SeriesPlacement> placementsLocal();
 
+    /**
+     * Placement de uma série na visão local (eventual) do nó, lido na hora. O default copia o catálogo
+     * inteiro via {@link #placementsLocal()} — implementações reais devem ler a chave direto.
+     */
+    default Optional<SeriesPlacement> placementLocal(String seriesKey) {
+        return Optional.ofNullable(placementsLocal().get(seriesKey));
+    }
+
     /** Grava o placement da série; roteado ao líder pelo próprio {@code DistributedMap}. */
     void putPlacement(String seriesKey, SeriesPlacement placement);
 

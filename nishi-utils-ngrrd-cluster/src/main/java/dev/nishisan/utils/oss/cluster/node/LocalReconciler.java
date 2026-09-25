@@ -338,11 +338,11 @@ public final class LocalReconciler implements Closeable, LeadershipListener {
 
         // Issue #174: marcas de esquecida de séries cuja réplica local já mostra outro dono não protegem
         // mais nada (ver SeriesHandleRegistry#pruneForgotten) — sem placement local não há sinal de
-        // convergência e a marca fica.
-        int forgottenPruned = registry.pruneForgotten(seriesKey -> {
-            SeriesPlacement placement = placements.get(seriesKey);
-            return placement != null && !placement.isOwnedBy(self);
-        });
+        // convergência e a marca fica. Lê a réplica na hora, não o snapshot do início do ciclo: uma série
+        // que saiu deste nó durante um ciclo longo não pode perder a marca por uma foto anterior.
+        int forgottenPruned = registry.pruneForgotten(seriesKey -> catalog.placementLocal(seriesKey)
+                .filter(placement -> !placement.isOwnedBy(self))
+                .isPresent());
 
         firstCycleDone = true;
         long durationMs = clock.millis() - startedAt;
