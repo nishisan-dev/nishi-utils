@@ -35,6 +35,11 @@ import java.util.Objects;
  * @param placementHint     placement retornado pelo {@code ngrrd.place} que originou este open —
  *                          permite ao dono aceitar a requisição mesmo que seu catálogo local ainda
  *                          não tenha replicado a entrada recém-criada pelo líder
+ * @param createIfMissing   {@code true} cria a série quando ausente (comportamento atual);
+ *                          {@code false} exige que a série já exista, respondendo
+ *                          {@link SeriesStatus#NOT_FOUND} caso contrário; {@code null} equivale a
+ *                          {@code true} — compatível com clientes anteriores a esta issue, que não
+ *                          enviam o campo. Use {@link #createIfMissingOrDefault()} para normalizar.
  */
 public record OpenRequest(
         String seriesKey,
@@ -42,9 +47,27 @@ public record OpenRequest(
         Map<String, String> tags,
         Durability durability,
         OnGeometryChange onGeometryChange,
-        SeriesPlacement placementHint) {
+        SeriesPlacement placementHint,
+        Boolean createIfMissing) {
 
     public OpenRequest {
         tags = Map.copyOf(Objects.requireNonNullElse(tags, Map.of()));
+    }
+
+    /**
+     * Construtor de compatibilidade com a assinatura de 6 argumentos anterior a esta issue —
+     * {@code createIfMissing} fica {@code null} (equivalente a {@code true}).
+     */
+    public OpenRequest(String seriesKey, String yaml, Map<String, String> tags, Durability durability,
+            OnGeometryChange onGeometryChange, SeriesPlacement placementHint) {
+        this(seriesKey, yaml, tags, durability, onGeometryChange, placementHint, null);
+    }
+
+    /**
+     * Normaliza {@link #createIfMissing()}: {@code null} (cliente antigo, sem o campo) equivale a
+     * {@code true}.
+     */
+    public boolean createIfMissingOrDefault() {
+        return createIfMissing == null || createIfMissing;
     }
 }

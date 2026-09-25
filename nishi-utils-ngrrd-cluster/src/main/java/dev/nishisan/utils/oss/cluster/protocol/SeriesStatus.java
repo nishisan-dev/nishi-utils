@@ -44,6 +44,9 @@ public enum SeriesStatus {
     /** Nenhum storage node candidato disponível para receber a série. */
     NO_STORAGE_NODE_AVAILABLE,
 
+    /** Série inexistente e abertura sem criar. */
+    NOT_FOUND,
+
     /** Falha de aplicação não coberta pelos demais status. */
     ERROR
 }

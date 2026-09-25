@@ -52,6 +52,18 @@ public final class Commands {
      * dono forte que ele de fato possui a cópia antes de apagar uma órfã local (seção 0/ALTO-1 do M4).
      */
     public static final String SERIES_EXISTS = "ngrrd.series.exists";
+    /**
+     * Qualquer nó: variante em lote de {@link #SERIES_EXISTS} — verifica, sem abrir handle e sem
+     * checagem de ownership, quais séries de um lote existem fisicamente no volume local.
+     */
+    public static final String SERIES_EXISTS_BATCH = "ngrrd.series.exists.batch";
+
+    /**
+     * Líder: consulta em lote o placement de várias séries no catálogo {@code ngrrd.catalog} —
+     * usado para confirmar misses da réplica local antes de responder {@code false} ou
+     * {@code SeriesNotFoundException} ao cliente.
+     */
+    public static final String CATALOG_LOOKUP = "ngrrd.catalog.lookup";
 
     /** Origem: inicia a migração de uma série para outro storage node. */
     /** Destination: reserve exact bytes before receiving a transfer. */
@@ -90,7 +102,7 @@ public final class Commands {
      * qualquer storage node — líder ou não — responde por si mesmo.</p>
      */
     public static final Set<String> LEADER_COMMANDS = Set.of(
-            PLACE, GEOMETRY_UPDATE, ADMIN_DRAIN, ADMIN_ACTIVATE, ADMIN_STATUS, ADMIN_REBALANCE);
+            PLACE, GEOMETRY_UPDATE, CATALOG_LOOKUP, ADMIN_DRAIN, ADMIN_ACTIVATE, ADMIN_STATUS, ADMIN_REBALANCE);
 
     /** Comandos atendidos pelo dono da série. */
     public static final Set<String> OWNER_COMMANDS = Set.of(

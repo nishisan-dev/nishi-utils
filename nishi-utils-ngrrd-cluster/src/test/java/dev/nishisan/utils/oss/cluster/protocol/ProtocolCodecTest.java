@@ -36,12 +36,14 @@ import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.metrics.BlobVolumeSummary;
 import dev.nishisan.utils.oss.cluster.metrics.LatencySnapshot;
 import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -407,5 +409,63 @@ class ProtocolCodecTest {
         assertEquals(checkpointLatency, roundTripped.checkpointLatency());
         assertEquals(readLatency, roundTripped.readLatency());
         assertEquals(blobStats, roundTripped.blobStats());
+    }
+
+    @Test
+    void catalogLookupRequestSobreviveAoRoundTrip() throws IOException {
+        CatalogLookupRequest original = new CatalogLookupRequest(List.of("series-1", "series-2"));
+        assertEquals(original, roundTripRequestBody(Commands.CATALOG_LOOKUP, original));
+    }
+
+    @Test
+    void catalogLookupRequestComListaNulaVemVazia() throws IOException {
+        CatalogLookupRequest original = new CatalogLookupRequest(null);
+        CatalogLookupRequest roundTripped = roundTripRequestBody(Commands.CATALOG_LOOKUP, original);
+        assertEquals(List.of(), roundTripped.seriesKeys());
+        assertEquals(original, roundTripped);
+    }
+
+    @Test
+    void catalogLookupResponseComPlacementsAtivoEMigrandoSobreviveAoRoundTrip() throws IOException {
+        SeriesPlacement active = SeriesPlacement.active("node-a", 1_000L);
+        SeriesPlacement migrating = SeriesPlacement.migrating(
+                SeriesPlacement.active("node-b", 1_000L), "node-c", "migration-1", 2_000L);
+        CatalogLookupResponse original =
+                CatalogLookupResponse.ok(Map.of("series-1", active, "series-2", migrating));
+        assertEquals(original, roundTripResponseBody(Commands.CATALOG_LOOKUP, original));
+    }
+
+    @Test
+    void catalogLookupResponseNotLeaderComHintSobreviveAoRoundTrip() throws IOException {
+        CatalogLookupResponse original = CatalogLookupResponse.notLeader("storage-1");
+        CatalogLookupResponse roundTripped = roundTripResponseBody(Commands.CATALOG_LOOKUP, original);
+        assertEquals(original, roundTripped);
+        assertEquals("storage-1", roundTripped.leaderNodeId());
+    }
+
+    @Test
+    void seriesExistsBatchRequestEResponseSobrevivemAoRoundTrip() throws IOException {
+        SeriesExistsBatchRequest request = new SeriesExistsBatchRequest(List.of("series-1", "series-2", "series-3"));
+        assertEquals(request, roundTripRequestBody(Commands.SERIES_EXISTS_BATCH, request));
+
+        SeriesExistsBatchResponse response = SeriesExistsBatchResponse.ok(Set.of("series-1", "series-3"));
+        assertEquals(response, roundTripResponseBody(Commands.SERIES_EXISTS_BATCH, response));
+    }
+
+    @Test
+    void openRequestComCreateIfMissingFalseSobreviveAoRoundTrip() throws IOException {
+        SeriesPlacement placement = SeriesPlacement.active("node-a", 1_000L);
+        OpenRequest original = new OpenRequest("series-1", "ds: [in_octets]", Map.of(), Durability.FSYNC,
+                OnGeometryChange.MIGRATE, placement, false);
+        OpenRequest roundTripped = roundTripRequestBody(Commands.OPEN, original);
+        assertEquals(original, roundTripped);
+        assertEquals(false, roundTripped.createIfMissingOrDefault());
+    }
+
+    @Test
+    void openRequestSemCreateIfMissingDesserializaComoCriar() throws IOException {
+        OpenRequest legacy = new ObjectMapper().readValue(
+                "{\"seriesKey\":\"series-1\",\"yaml\":\"ds: [in_octets]\"}", OpenRequest.class);
+        assertTrue(legacy.createIfMissingOrDefault());
     }
 }
