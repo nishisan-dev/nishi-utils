@@ -54,6 +54,12 @@ public final class CatalogLookupClient {
     private final NodeCapabilities capabilities;
 
     /**
+     * Cria o cliente de consulta ao catálogo.
+     *
+     * @param rpc          transporte até o líder
+     * @param retry        prazo e backoff das retentativas
+     * @param clock        relógio dos prazos
+     * @param batchSize    máximo de chaves por página de {@code ngrrd.catalog.lookup}
      * @param capabilities confere {@code catalog.lookup} no líder antes de cada chamada a ele
      */
     public CatalogLookupClient(ClusterRpc rpc, RetryPolicy retry, Clock clock, int batchSize,

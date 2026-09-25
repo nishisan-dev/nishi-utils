@@ -98,7 +98,8 @@ class ClientExistenceTest {
             strongReads.incrementAndGet();
             return Optional.of(CapabilityFixtures.status(nodeId, StorageCapabilities.ALL));
         }));
-        rpc.respondDefault((cmd, body) -> CatalogLookupResponse.ok(Map.of("m1", SeriesPlacement.active("storage-a", 1L))));
+        rpc.respondDefault((cmd, body) -> CatalogLookupResponse.ok(
+                Map.of("m1", SeriesPlacement.active("storage-a", 1L))));
 
         assertTrue(existence.exists("m1", MAX_WAIT));
         assertEquals(1, strongReads.get());

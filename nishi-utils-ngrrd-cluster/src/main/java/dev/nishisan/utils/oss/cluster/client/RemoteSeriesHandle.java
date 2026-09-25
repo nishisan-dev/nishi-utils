@@ -66,7 +66,15 @@ import java.util.logging.Logger;
  * {@link #close()} desse handle é local (ver {@link #close(Duration)}). O modo (somente leitura ou
  * gravável) é fixo: um {@code open} com criação da mesma chave abre um handle gravável NOVO, que
  * substitui este no mapa do cliente; este fica destacado — continua lendo para quem o tem, e seu
- * {@code close()} continua local e não afeta o gravável (a remoção condicional do mapa vira no-op).</p>
+ * {@code close()} continua local e não afeta o gravável (a remoção condicional do mapa vira no-op).
+ * {@code WRONG_OWNER} sem dono informado é confirmado direto com o líder
+ * ({@link PlacementLookup#resolveExistingAtLeader}), e a ausência lá vira {@code NOT_PLACED}.</p>
+ *
+ * <p>Antes de todo {@code OPEN} de handle somente leitura, o dono precisa anunciar
+ * {@code open.createIfMissing} ({@link NodeCapabilities}); e um {@code OK} precisa trazer a confirmação
+ * {@code SeriesStatusResponse.createIfMissingHonored}. Sem uma ou outra, a operação falha com
+ * {@code ErrorCode.UNSUPPORTED_BY_NODE} — um storage de versão anterior criaria a série. Handles
+ * graváveis não conferem nada disso.</p>
  */
 public final class RemoteSeriesHandle implements NgrrdHandle {
 

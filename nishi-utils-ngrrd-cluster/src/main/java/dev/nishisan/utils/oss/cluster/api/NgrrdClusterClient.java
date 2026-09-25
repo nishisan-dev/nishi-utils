@@ -58,9 +58,22 @@ public interface NgrrdClusterClient extends Closeable {
      * {@link SeriesNotFoundException}; nesse caso o handle se fecha e sai do cache do cliente.
      * {@link SeriesNotFoundException#reason()} distingue {@code NOT_PLACED} (o líder não tem placement:
      * a série não existe no cluster) de {@code MISSING_ON_OWNER} (há placement, mas o dono confirmou
-     * que o arquivo não existe — inconsistência do cluster, não ausência no catálogo). {@code write}, {@code flush} e {@code checkpoint} lançam
-     * {@link IllegalStateException}. O {@code close()} desse handle é local: não drena buffers nem envia
-     * {@code CLOSE} ao storage, que fecha a série por ociosidade.</p>
+     * que o arquivo não existe — inconsistência do cluster, não ausência no catálogo). Se o dono
+     * responder {@code WRONG_OWNER} sem indicar o dono novo, o handle confirma direto com o líder (a réplica
+     * local pode estar atrasada) e, sem placement no líder, termina em {@code NOT_PLACED} na hora.
+     * {@code write}, {@code flush} e {@code checkpoint} lançam {@link IllegalStateException}. O
+     * {@code close()} desse handle é local: não drena buffers nem envia {@code CLOSE} ao storage, que fecha
+     * a série por ociosidade.</p>
+     *
+     * <p><b>Compatibilidade de versões.</b> Antes de todo {@code OPEN} sem criar (inclusive reaberturas e
+     * redirecionamentos), o cliente exige que o dono anuncie a capacidade {@code open.createIfMissing} no
+     * status publicado em {@code ngrrd.nodes}; um storage de versão anterior ignoraria o campo e criaria a
+     * série, então o {@code open} falha com {@link NgrrdClusterException} de código
+     * {@link ErrorCode#UNSUPPORTED_BY_NODE} sem enviar nada. Como defesa extra, um {@code OK} a um
+     * {@code OPEN} sem criar que não traga a confirmação do storage também vira
+     * {@code UNSUPPORTED_BY_NODE} — isso detecta um storage antigo, mas não desfaz uma criação que ele já
+     * tenha feito. Atualize os storages antes dos clientes. Handles abertos com criação não conferem
+     * capacidade (comportamento da 8.5.0).</p>
      *
      * <p><b>Cache de handles</b> — no máximo um handle principal por chave de série:</p>
      * <ul>
@@ -107,8 +120,15 @@ public interface NgrrdClusterClient extends Closeable {
      *       {@link SeriesNotFoundException.Reason#MISSING_ON_OWNER}.</li>
      * </ul>
      *
+     * <p>Confirmar um miss exige que o líder anuncie a capacidade {@code catalog.lookup} no status
+     * publicado em {@code ngrrd.nodes} (réplica local; ausente, uma leitura forte). Um líder de versão
+     * anterior não responde a consulta: o cliente falha na hora com
+     * {@link ErrorCode#UNSUPPORTED_BY_NODE}, sem RPC — nunca {@code false}, nunca espera o prazo até um
+     * {@code TIMEOUT}. Atualize os storages antes dos clientes.</p>
+     *
      * @throws NgrrdClusterException se não foi possível confirmar com o líder (sem líder, timeout,
-     *         falha de transporte, resposta inválida) — uma falha ao consultar nunca vira {@code false}
+     *         falha de transporte, resposta inválida) — uma falha ao consultar nunca vira {@code false};
+     *         com {@link ErrorCode#UNSUPPORTED_BY_NODE} se o líder não anuncia {@code catalog.lookup}
      */
     boolean exists(String seriesKey);
 
@@ -123,9 +143,12 @@ public interface NgrrdClusterClient extends Closeable {
     Map<String, Boolean> exists(Collection<String> seriesKeys);
 
     /**
-     * Informações de placement da série, se ela existir — mesma semântica de existência e o mesmo
-     * contrato de consistência de {@link #exists(String)}; um hit no cache local não faz RPC.
+     * Informações de placement da série, se ela existir — mesma semântica de existência, o mesmo
+     * contrato de consistência e a mesma exigência de {@code catalog.lookup} no líder (só para um miss)
+     * de {@link #exists(String)}; um hit no cache local não faz RPC.
      *
+     * @throws NgrrdClusterException nas mesmas condições de {@link #exists(String)}, inclusive
+     *         {@link ErrorCode#UNSUPPORTED_BY_NODE}
      * @see #exists(String)
      */
     Optional<SeriesInfo> find(String seriesKey);

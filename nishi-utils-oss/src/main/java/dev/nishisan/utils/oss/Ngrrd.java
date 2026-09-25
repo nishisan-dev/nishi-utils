@@ -354,7 +354,18 @@ public final class Ngrrd {
      *                        (leitura e escrita). No cluster
      *                        ({@code NgrrdClusterClient.open}), {@code false}
      *                        abre um handle SOMENTE LEITURA — escrita, flush e
-     *                        checkpoint lançam {@link IllegalStateException}.
+     *                        checkpoint lançam {@link IllegalStateException} e
+     *                        o {@code close()} é local; se a chave já tiver um
+     *                        handle gravável aberto no cliente, o {@code open}
+     *                        devolve uma vista somente leitura sobre ele, cujo
+     *                        {@code close()} nunca fecha o gravável; um
+     *                        {@code open} com criação posterior abre um
+     *                        gravável novo no lugar do somente leitura. Exige
+     *                        storages que anunciem {@code open.createIfMissing}:
+     *                        contra um storage de versão anterior o cluster
+     *                        falha com {@code UNSUPPORTED_BY_NODE} em vez de
+     *                        arriscar criar a série (atualize os storages antes
+     *                        dos clientes).
      */
     public record OpenOptions(Durability durability, OnGeometryChange onGeometryChange, boolean createIfMissing) {
 

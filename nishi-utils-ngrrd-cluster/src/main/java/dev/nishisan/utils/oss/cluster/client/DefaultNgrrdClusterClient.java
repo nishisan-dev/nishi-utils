@@ -17,7 +17,6 @@
 
 package dev.nishisan.utils.oss.cluster.client;
 
-
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.ngrid.structures.NGrid;
