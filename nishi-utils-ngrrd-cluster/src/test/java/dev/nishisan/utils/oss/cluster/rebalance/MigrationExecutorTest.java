@@ -234,8 +234,10 @@ class MigrationExecutorTest {
      * patch final do cutover não pode esperar atrás de chunks/patches de outras cópias na mesma banda
      * do nó — só ele usa {@code acquireUrgent}. Simula a fila cheia reservando, sincronamente, um slot
      * de banda "de outra cópia" bem no instante em que o patch final fica pronto (mesmo efeito de um
-     * chunk concorrente real: o orçamento compartilhado fica ocupado por ~1 s) e mede o tempo até a
-     * entrega do patch — comportamento observado, não a chamada de método em si.
+     * chunk concorrente real: o orçamento compartilhado fica ocupado por ~2 s) e mede o tempo até a
+     * entrega do patch — comportamento observado, não a chamada de método em si. (Fix round 1, item 4:
+     * folga maior entre a reserva (~2 s) e o limite da asserção (1 s) para reduzir sensibilidade a
+     * jitter de CI, mantendo uma margem clara acima do que o código antigo levaria.)
      */
     @Test
     void patchesFinaisDoCutoverUsamPrioridadeUrgenteNaBanda() throws Exception {
@@ -291,7 +293,7 @@ class MigrationExecutorTest {
                     // último patch de catch-up é que efetivamente sobrevive até o primeiro patch final;
                     // as anteriores só atrasam os próprios patches de catch-up restantes (esperado, não
                     // são urgentes) — por isso finalPatchStartedAt é sempre sobrescrito com a mais recente.
-                    assertTrue(bandwidth.acquire(200_000, () -> true));
+                    assertTrue(bandwidth.acquire(524_288, () -> true)); // ~2 s a 256 KiB/s
                     finalPatchStartedAt.set(System.nanoTime());
                 } else if (finalPatchDeliveredAt.get() == 0L) {
                     // Primeiro patch entregue já com a série congelada -- é o patch final do cutover.
@@ -319,7 +321,7 @@ class MigrationExecutorTest {
             assertTrue(finalPatchStartedAt.get() > 0L, "deveria ter reservado o slot concorrente antes do freeze");
             assertTrue(finalPatchDeliveredAt.get() > 0L, "deveria ter observado pelo menos um patch final pós-freeze");
             long deliveryMs = TimeUnit.NANOSECONDS.toMillis(finalPatchDeliveredAt.get() - finalPatchStartedAt.get());
-            assertTrue(deliveryMs < 300L,
+            assertTrue(deliveryMs < 1_000L,
                     "o patch final do cutover deveria furar a fila de banda (levou " + deliveryMs + " ms)");
             byte[] current = srcVolume.storage().get(objectKey(key)).orElseThrow();
             assertFalse(java.util.Arrays.equals(before, current));

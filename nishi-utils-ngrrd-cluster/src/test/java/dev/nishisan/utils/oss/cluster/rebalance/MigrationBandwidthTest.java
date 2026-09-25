@@ -42,16 +42,35 @@ class MigrationBandwidthTest {
      * Achado 2 da revisão pós-merge da PR #172: {@code acquireUrgent} não pode esperar a vez, mesmo
      * com a fila de chunks concorrentes já saturada — quem chama é o patch final do cutover, com a
      * série já congelada (clientes recebendo {@code MIGRATING}).
+     *
+     * <p>Fix round 1, item 4: a fila é saturada por uma SEGUNDA THREAD de fato parada dentro de
+     * {@code acquire} (não só por uma reserva síncrona feita pela própria thread de teste) — mais
+     * fiel ao cenário real de um chunk concorrente em voo — e o limite de tempo é mais folgado
+     * (200 ms) para reduzir sensibilidade a jitter de CI.</p>
      */
     @Test void acquireUrgentNaoEsperaComFilaCheia() throws Exception {
         var limiter = new MigrationBandwidth(1024); // 1 KiB/s: um chunk normal já satura por ~4 s.
-        assertTrue(limiter.acquire(4096, () -> true), "satura a fila com um chunk normal concorrente");
+        assertTrue(limiter.acquire(4096, () -> true), "primeira reserva é imediata (fila ainda vazia)");
 
-        long start = System.nanoTime();
-        limiter.acquireUrgent(256);
-        long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+        var contenderStarted = new CountDownLatch(1);
+        Thread contender = new Thread(() -> {
+            contenderStarted.countDown();
+            limiter.acquire(4096, () -> true); // fica de fato parado aqui, disputando a mesma fila.
+        }, "bandwidth-contender");
+        contender.setDaemon(true);
+        contender.start();
+        try {
+            assertTrue(contenderStarted.await(1, TimeUnit.SECONDS), "thread concorrente não chegou a iniciar");
+            Thread.sleep(50L); // dá tempo da thread concorrente entrar de fato no await() da fila.
 
-        assertTrue(elapsedMs < 20L, "acquireUrgent não deveria esperar a fila, levou " + elapsedMs + " ms");
+            long start = System.nanoTime();
+            limiter.acquireUrgent(256);
+            long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+
+            assertTrue(elapsedMs < 200L, "acquireUrgent não deveria esperar a fila, levou " + elapsedMs + " ms");
+        } finally {
+            contender.join(8_000L); // libera a thread concorrente; não é o foco da asserção acima.
+        }
     }
 
     /**
