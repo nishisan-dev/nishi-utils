@@ -198,6 +198,10 @@ class NgrrdClusterAdminCliTest {
         assertEquals("storage-7", client.metricsRequestedNodeId);
         assertTrue(capture.out.contains("storage-7"), capture.out);
         assertTrue(capture.out.contains("SERIES: 5"), capture.out);
+        assertTrue(capture.out.contains("REDIRECT_CONFIRMATIONS: 6"), capture.out);
+        assertTrue(capture.out.contains("REDIRECT_OVERRIDES: 7"), capture.out);
+        assertTrue(capture.out.contains("REDIRECT_CONFIRMATION_FAILURES: 8"), capture.out);
+        assertTrue(capture.out.contains("REDIRECT_CACHE_HITS: 9"), capture.out);
     }
 
     @Test
@@ -261,7 +265,8 @@ class NgrrdClusterAdminCliTest {
     private static NodeMetricsSnapshot fixedSnapshot(String nodeId) {
         return new NodeMetricsSnapshot(nodeId, 1_000L, true, 5L, 100L, 1_000L, 2, 3L, 30L, 0L, 1L, 0L, 4L,
                 LatencySnapshot.EMPTY, LatencySnapshot.EMPTY, LatencySnapshot.EMPTY, Map.of(),
-                new BlobVolumeSummary(1, 100L, 1_000L, 0.1, 5, 0L), 0L, 0L, 0L, 0L, 0L, 0L, 0L);
+                new BlobVolumeSummary(1, 100L, 1_000L, 0.1, 5, 0L), 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L,
+                LatencySnapshot.EMPTY, 6L, 7L, 8L, 9L);
     }
 
     private Capture run(String[] args, Function<NgrrdClusterConfig, NgrrdClusterClient> factory) {

@@ -179,6 +179,10 @@ public final class NgrrdClusterAdminCli {
         out.println("RECONCILE_ORPHANS_DELETED: " + snapshot.reconcileOrphansDeleted());
         out.println("RECONCILE_UNPLACED: " + snapshot.reconcileUnplaced());
         out.println("RECONCILE_MISSING: " + snapshot.reconcileMissing());
+        out.println("REDIRECT_CONFIRMATIONS: " + snapshot.redirectConfirmations());
+        out.println("REDIRECT_OVERRIDES: " + snapshot.redirectOverrides());
+        out.println("REDIRECT_CONFIRMATION_FAILURES: " + snapshot.redirectConfirmationFailures());
+        out.println("REDIRECT_CACHE_HITS: " + snapshot.redirectCacheHits());
     }
 
     private void printNodeStatus(String command, StorageNodeStatus status, PrintStream out) {

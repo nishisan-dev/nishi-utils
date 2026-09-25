@@ -278,12 +278,14 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
         LOGGER.info(String.format(Locale.ROOT,
                 "NGRRD_NODE_STATUS nodeId=%s leader=%s series=%d usedBytes=%d openHandles=%d samples/s=%.1f "
                         + "writeBatchP99us=%d checkpointP99us=%d readP99us=%d leaderConfirmations=%d "
-                        + "leaderConfirmationP99us=%d catalogLag=%s",
+                        + "leaderConfirmationP99us=%d catalogLag=%s redirectConfirmations=%d redirectOverrides=%d "
+                        + "redirectConfirmationFailures=%d redirectCacheHits=%d",
                 snapshot.nodeId(), snapshot.leader(), snapshot.seriesCount(), snapshot.usedBytes(),
                 snapshot.openHandles(), samplesPerSecond, snapshot.writeBatchLatency().p99Micros(),
                 snapshot.checkpointLatency().p99Micros(), snapshot.readLatency().p99Micros(),
                 snapshot.leaderConfirmations(), snapshot.leaderConfirmationLatency().p99Micros(),
-                CatalogReplicaStatus.describeLag(safeCatalogReplica())));
+                CatalogReplicaStatus.describeLag(safeCatalogReplica()), snapshot.redirectConfirmations(),
+                snapshot.redirectOverrides(), snapshot.redirectConfirmationFailures(), snapshot.redirectCacheHits()));
         if (metricsListener != null) {
             metricsListener.onNodeMetrics(snapshot);
         }
@@ -351,7 +353,11 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
                 reconcileReport.missing(),
                 reconcileReport.durationMs(),
                 handlerMetrics.leaderConfirmations(),
-                handlerMetrics.leaderConfirmationLatency());
+                handlerMetrics.leaderConfirmationLatency(),
+                handlerMetrics.redirectConfirmations(),
+                handlerMetrics.redirectOverrides(),
+                handlerMetrics.redirectConfirmationFailures(),
+                handlerMetrics.redirectCacheHits());
     }
 
     /**

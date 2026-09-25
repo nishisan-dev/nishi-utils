@@ -110,7 +110,7 @@ class NodeStatusReporterTest {
         CatalogService catalog = CatalogService.from(node);
         StorageRequestHandler.StorageHandlerMetrics handlerMetrics = new StorageRequestHandler.StorageHandlerMetrics(
                 7L, 42L, 1L, 3L, 2L, 1L, Map.of(SeriesStatus.ERROR, 1L), LatencySnapshot.EMPTY, LatencySnapshot.EMPTY,
-                LatencySnapshot.EMPTY, 5L, LEADER_CONFIRMATION_LATENCY);
+                LatencySnapshot.EMPTY, 5L, LEADER_CONFIRMATION_LATENCY, 11L, 4L, 2L, 9L);
         return new NodeStatusReporter(catalog, volume, registry, "storage-real", 1_000_000L, interval, clock,
                 () -> handlerMetrics, () -> true, listener);
     }
@@ -141,6 +141,10 @@ class NodeStatusReporterTest {
         assertEquals(1L, snapshot.flushes());
         assertEquals(5L, snapshot.leaderConfirmations());
         assertEquals(LEADER_CONFIRMATION_LATENCY, snapshot.leaderConfirmationLatency());
+        assertEquals(11L, snapshot.redirectConfirmations());
+        assertEquals(4L, snapshot.redirectOverrides());
+        assertEquals(2L, snapshot.redirectConfirmationFailures());
+        assertEquals(9L, snapshot.redirectCacheHits());
         assertEquals(1L, snapshot.errorsByStatus().get(SeriesStatus.ERROR));
         assertEquals(0L, snapshot.migrationsIn());
         assertEquals(0L, snapshot.migrationsOut());

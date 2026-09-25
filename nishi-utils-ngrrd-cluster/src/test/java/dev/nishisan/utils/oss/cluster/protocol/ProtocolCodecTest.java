@@ -421,6 +421,20 @@ class ProtocolCodecTest {
     }
 
     @Test
+    void nodeMetricsSnapshotComMetricasDeRedirecionamentoSobreviveAoRoundTrip() throws IOException {
+        NodeMetricsSnapshot original = new NodeMetricsSnapshot("storage-0", 1L, false, 0L, 0L, 0L, 0, 0L, 0L, 0L,
+                0L, 0L, 0L, LatencySnapshot.EMPTY, LatencySnapshot.EMPTY, LatencySnapshot.EMPTY, Map.of(),
+                new BlobVolumeSummary(1, 0L, 0L, 0.0, 0, 0L), 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, LatencySnapshot.EMPTY,
+                21L, 3L, 1L, 17L);
+
+        NodeMetricsSnapshot roundTripped = roundTripResponseBody(Commands.ADMIN_METRICS, original);
+
+        assertEquals(original, roundTripped);
+        assertEquals(21L, roundTripped.redirectConfirmations());
+        assertEquals(17L, roundTripped.redirectCacheHits());
+    }
+
+    @Test
     void adminStatusResponseComListasEMapasNulosViramVazios() throws IOException {
         AdminStatusResponse original = new AdminStatusResponse(SeriesStatus.NOT_LEADER, null, null, 0, null);
         AdminStatusResponse roundTripped = roundTripResponseBody(Commands.ADMIN_STATUS, original);

@@ -36,7 +36,9 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.logging.Level;
@@ -111,6 +113,8 @@ public final class SeriesHandleRegistry implements Closeable {
      * validade quando a réplica local converge para outro dono ({@link #pruneForgotten}).
      */
     private final Set<String> forgotten = ConcurrentHashMap.newKeySet();
+    /** Ver {@link #addOwnershipChangeListener}. */
+    private final List<Consumer<String>> ownershipChangeListeners = new CopyOnWriteArrayList<>();
 
     public SeriesHandleRegistry(BlobVolume volume, String volumeName, Duration idleTtl, int maxOpenHandles,
             Clock clock) {
@@ -122,6 +126,33 @@ public final class SeriesHandleRegistry implements Closeable {
         }
         this.maxOpenHandles = maxOpenHandles;
         this.clock = Objects.requireNonNull(clock, "clock");
+    }
+
+    /**
+     * Registra quem precisa saber que a posse local de uma série pode ter mudado — hoje, o cache de
+     * confirmações do líder do {@code StorageRequestHandler} (issue #177), que descarta a entrada da
+     * série. Disparado por {@link #beginMigrationCopy}, {@link #markMigrating}, {@link #clearMigrating},
+     * {@link #forget} e {@link #discard} (e, por consequência, {@link #close(String)}), sempre, mesmo
+     * quando a série não tinha handle aberto.
+     *
+     * <p><strong>Contrato:</strong> todo caminho futuro deste registro que mova a posse de uma série (início
+     * ou fim de migração, esquecimento, substituição da imagem) precisa disparar este aviso — senão uma
+     * confirmação em cache pode sobreviver à mudança por até o prazo do cache.</p>
+     *
+     * @param listener recebe o {@code seriesKey}; uma exceção dele é logada e não interrompe a operação
+     */
+    public void addOwnershipChangeListener(Consumer<String> listener) {
+        ownershipChangeListeners.add(Objects.requireNonNull(listener, "listener"));
+    }
+
+    private void fireOwnershipChange(String seriesKey) {
+        for (Consumer<String> listener : ownershipChangeListeners) {
+            try {
+                listener.accept(seriesKey);
+            } catch (RuntimeException e) {
+                LOGGER.log(Level.WARNING, "Falha num listener de mudança de posse da série " + seriesKey, e);
+            }
+        }
     }
 
     /**
@@ -349,6 +380,7 @@ public final class SeriesHandleRegistry implements Closeable {
      */
     public void discard(String seriesKey) {
         Objects.requireNonNull(seriesKey, "seriesKey");
+        fireOwnershipChange(seriesKey);
         HandleEntry entry = entries.get(seriesKey);
         if (entry == null) {
             return;
@@ -385,6 +417,7 @@ public final class SeriesHandleRegistry implements Closeable {
         // local (nem no hint) de dono enquanto esta série não for reaberta com confirmação forte do
         // líder ou a réplica local não convergir para outro dono (ver pruneForgotten).
         forgotten.add(seriesKey);
+        fireOwnershipChange(seriesKey);
         // Mesmo bloqueio de reabertura automática de close(): a definição sai antes da entrada e é
         // reconferida DENTRO do lock por reopenIfKnown, então nenhuma reabertura concorrente escapa.
         // Só o vínculo série→hash sai — definitionByHash é compartilhado por todas as séries do mesmo
@@ -534,6 +567,7 @@ public final class SeriesHandleRegistry implements Closeable {
         Objects.requireNonNull(seriesKey, "seriesKey");
         migrating.add(seriesKey);
         copying.remove(seriesKey);
+        fireOwnershipChange(seriesKey);
         HandleEntry entry = entries.get(seriesKey);
         if (entry == null) {
             return;
@@ -555,12 +589,14 @@ public final class SeriesHandleRegistry implements Closeable {
     public void clearMigrating(String seriesKey) {
         migrating.remove(seriesKey);
         copying.remove(seriesKey);
+        fireOwnershipChange(seriesKey);
     }
 
     /** Marks an online copy; existing same-geometry handles remain writable until markMigrating. */
     public void beginMigrationCopy(String seriesKey) {
         migrating.add(seriesKey);
         copying.add(seriesKey);
+        fireOwnershipChange(seriesKey);
     }
 
     /** True only for the short cutover, not the initial online copy. */

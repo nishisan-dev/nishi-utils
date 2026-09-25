@@ -95,6 +95,29 @@ class SeriesHandleRegistryTest {
     }
 
     @Test
+    void mudancasDePosseAvisamOsListenersMesmoSemHandleAberto() {
+        try (SeriesHandleRegistry registry = registry(Duration.ofMinutes(15), 10, Clock.systemUTC())) {
+            List<String> notified = new ArrayList<>();
+            registry.addOwnershipChangeListener(notified::add);
+            registry.addOwnershipChangeListener(key -> {
+                throw new IllegalStateException("listener com defeito não interrompe a operação");
+            });
+
+            registry.beginMigrationCopy("copy");
+            registry.markMigrating("mark");
+            registry.clearMigrating("clear");
+            registry.discard("discard");
+            registry.forget("forget");
+            registry.open("closed", yaml, Ngrrd.OpenOptions.defaults());
+            registry.close("closed");
+
+            assertTrue(notified.containsAll(List.of("copy", "mark", "clear", "discard", "forget", "closed")),
+                    "toda mudança de posse deveria ter sido avisada: " + notified);
+            assertFalse(registry.isOpen("closed"));
+        }
+    }
+
+    @Test
     void openReabreOMesmoHandleParaAMesmaChaveEExistingOEnxerga() {
         try (SeriesHandleRegistry registry = registry(Duration.ofMinutes(15), 10, Clock.systemUTC())) {
             NgrrdHandle first = registry.open("series-1", yaml, Ngrrd.OpenOptions.defaults());

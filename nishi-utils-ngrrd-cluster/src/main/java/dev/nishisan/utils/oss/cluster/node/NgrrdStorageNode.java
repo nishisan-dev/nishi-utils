@@ -31,6 +31,9 @@ import dev.nishisan.utils.oss.cluster.admin.AdminService;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogReplicaStatus;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
+import dev.nishisan.utils.oss.cluster.client.CatalogLookupClient;
+import dev.nishisan.utils.oss.cluster.client.NodeCapabilities;
+import dev.nishisan.utils.oss.cluster.client.RetryPolicy;
 import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
 import dev.nishisan.utils.oss.cluster.placement.LeastLoadedPlacementPolicy;
 import dev.nishisan.utils.oss.cluster.rebalance.MigrationCoordinator;
@@ -43,6 +46,10 @@ import dev.nishisan.utils.oss.cluster.rpc.TransportClusterRpc;
 import java.io.Closeable;
 import java.io.IOException;
 import java.time.Clock;
+import java.time.Duration;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Consumer;
@@ -60,6 +67,11 @@ public final class NgrrdStorageNode implements Closeable {
     private static final Logger LOGGER = Logger.getLogger(NgrrdStorageNode.class.getName());
 
     private static final String STORAGE_ROLE = "storage";
+    /** Backoff das retentativas de {@code ngrrd.catalog.lookup} na confirmação de redirecionamentos. */
+    private static final Duration LEADER_LOOKUP_BACKOFF_MIN = Duration.ofMillis(50);
+    private static final Duration LEADER_LOOKUP_BACKOFF_MAX = Duration.ofMillis(500);
+    /** Chaves por página de {@code ngrrd.catalog.lookup} na confirmação de redirecionamentos. */
+    private static final int LEADER_LOOKUP_BATCH_SIZE = 2_000;
     /** Hooks no-op — usado por {@link #start(StorageNodeConfig)} (produção; sem testes de queda do líder). */
     private static final MigrationCoordinator.MigrationHooks DEFAULT_MIGRATION_HOOKS =
             new MigrationCoordinator.MigrationHooks() {
@@ -184,6 +196,17 @@ public final class NgrrdStorageNode implements Closeable {
                     public Optional<SeriesPlacement> placementStrong(String seriesKey) {
                         return catalog.placementStrong(seriesKey);
                     }
+
+                    @Override
+                    public Map<String, SeriesPlacement> placementsAtLeader(Collection<String> seriesKeys,
+                            Duration maxWait) {
+                        return placementsAtLeaderOf(node, catalog, rpc, seriesKeys, maxWait);
+                    }
+
+                    @Override
+                    public boolean localIsAuthoritative() {
+                        return node.coordinator().isLeader();
+                    }
                 };
                 StorageRequestHandler storageHandler = new StorageRequestHandler(node.transport(),
                         placementLookup, registry, volume, cfg.seriesObjectPrefix(), self, cfg.defaultDurability(),
@@ -273,6 +296,33 @@ public final class NgrrdStorageNode implements Closeable {
             }
             throw e;
         }
+    }
+
+    /**
+     * {@link StorageRequestHandler.PlacementLookup#placementsAtLeader} de produção (issue #177): no líder,
+     * a réplica local é a fonte; num seguidor, {@code ngrrd.catalog.lookup} via {@link CatalogLookupClient}
+     * com prazo total {@code maxWait}. Nunca usa {@code placementStrong}/{@code DistributedMap} num
+     * seguidor — o {@code invokeLeader} do core pode bloquear por muito mais que o prazo (várias tentativas
+     * de {@code requestTimeout} com espera entre elas), e esta consulta roda segurando o lock de
+     * coordenação de um {@code OPEN}.
+     *
+     * <p>A capacidade {@code catalog.lookup} do líder é conferida só na réplica local de
+     * {@code ngrrd.nodes} (sem leitura forte, pelo mesmo motivo): um líder que não a anuncie falha a
+     * consulta, e o handler responde pela réplica local durante o cooldown.</p>
+     */
+    private static Map<String, SeriesPlacement> placementsAtLeaderOf(NGridNode node, CatalogService catalog,
+            TransportClusterRpc rpc, Collection<String> seriesKeys, Duration maxWait) {
+        if (node.coordinator().isLeader()) {
+            Map<String, SeriesPlacement> found = new HashMap<>();
+            for (String seriesKey : seriesKeys) {
+                catalog.placementLocal(seriesKey).ifPresent(placement -> found.put(seriesKey, placement));
+            }
+            return found;
+        }
+        CatalogLookupClient lookup = new CatalogLookupClient(rpc,
+                new RetryPolicy(maxWait, LEADER_LOOKUP_BACKOFF_MIN, LEADER_LOOKUP_BACKOFF_MAX), Clock.systemUTC(),
+                LEADER_LOOKUP_BATCH_SIZE, new NodeCapabilities(catalog::nodeStatusLocal, catalog::nodeStatusLocal));
+        return lookup.lookup(seriesKeys, maxWait);
     }
 
     /**
