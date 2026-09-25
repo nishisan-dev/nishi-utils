@@ -147,6 +147,7 @@ class SeriesExistenceClusterTest {
         assertThrows(IllegalStateException.class,
                 () -> readOnly.write("value", new Sample(START + 21 * STEP_MS, 21)));
         assertThrows(IllegalStateException.class, readOnly::checkpoint);
+        assertThrows(IllegalStateException.class, readOnly::flush);
 
         // O handle somente leitura continua acompanhando a série depois de novas escritas do gravável.
         writeSequence(writable, 21, 30);
