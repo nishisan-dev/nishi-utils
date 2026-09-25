@@ -241,12 +241,20 @@ completo. Um `COMMITTED` confirmado no destino tem precedência sobre a falha da
 inclusive quando o próprio poll ao destino falha por transporte (o destino segura o lock
 da série durante o commit/fsync, e o mesmo lock atende à consulta de status, então esse
 timeout é comum, não raro): a correção da 8.5.1 só aborta por falha da origem quando o
-destino respondeu e não confirmou `COMMITTED` na mesma rodada; se o poll do destino falhar,
-o coordenador tenta de novo até o `migrationTimeout`, reconsultando o destino uma última
-vez antes de desistir.
+destino respondeu e não confirmou `COMMITTED` na mesma rodada. Se o poll do destino falhar
+com a origem já em erro, o coordenador dá uma carência limitada de 10 s (contada da primeira
+falha da origem observada, sem renovar a cada rodada) antes de reconsultar o destino uma
+última vez e decidir — **trade-off aceito**: até 10 s de congelamento extra da série (clientes
+recebendo `MIGRATING`) nesse cenário específico, em troca de não esperar o `migrationTimeout`
+inteiro (10 min por padrão) sempre que o destino realmente cair durante o cutover. Se a origem
+nunca reportar erro (ou o poll do destino nunca falhar), o comportamento anterior se mantém: o
+coordenador tenta de novo até o `migrationTimeout`, reconsultando o destino uma última vez
+antes de desistir.
 
 O limite `ngrrd.rebalance.maxBytesPerSecond` reduz a competição com a ingestão. O orçamento
-é por **origem**, agregado entre seus destinos e transferências, com rajada de até um chunk.
+é por **origem**, agregado entre seus destinos e transferências, com rajada de até um chunk
+normal em trânsito mais os deltas finais (≤ 256 KiB cada) de cutovers simultâneos, que furam
+a fila de banda (ver abaixo).
 Conta bytes da imagem e dos blocos incrementais; framing, JSON/base64 e compressão mudam
 os bytes efetivos na rede. O padrão é 16 MiB/s por origem.
 Por exemplo, oito migrações em uma origem com `maxBytesPerSecond: 8388608` compartilham

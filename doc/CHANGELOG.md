@@ -16,14 +16,21 @@ Achados confirmados na revisão pós-merge da [PR #172](https://github.com/nishi
   comum, não o raro). Agora só aborta por erro da origem quando o destino respondeu
   (não-nulo) e não é `COMMITTED` na mesma iteração; se o poll do destino falhar, o laço
   continua até o timeout, e ao estourá-lo reconsulta o destino uma última vez antes de
-  abortar.
+  abortar. Correção de acompanhamento (fix round 1): sem limite algum, isso deixava a
+  série `MIGRATING` até o `migrationTimeout` inteiro (10 min por padrão) sempre que o
+  destino realmente caísse durante o cutover. `SOURCE_FAILURE_DESTINATION_GRACE` (10 s,
+  contados da primeira falha da origem observada) dá uma carência limitada antes da
+  reconsulta final — **trade-off aceito:** até 10 s de congelamento extra da série nesse
+  cenário específico, em troca de não esperar o prazo inteiro.
 - Com a série já congelada (clientes recebendo `MIGRATING`), cada patch final do delta
   esperava na mesma fila dos chunks de 256 KiB de outras cópias — medido em até 252 ms por
   rodada a 1 MiB/s com sete transferências concorrentes. `MigrationBandwidth` ganha
   `acquireUrgent(bytes)`: debita o orçamento imediatamente, sem esperar a vez. Só os
   patches enviados depois de `markMigrating` (cutover final) usam o modo urgente; os
   patches de catch-up continuam disputando a banda em pé de igualdade. O delta final
-  continua contando no orçamento — a média de bytes/s por origem é preservada.
+  continua contando no orçamento — a média de bytes/s por origem é preservada. A rajada do
+  orçamento (`ngrrd.rebalance.maxBytesPerSecond`) deixa de ser só "até um chunk": pode
+  incluir também os deltas finais de cutovers simultâneos.
 - `VirtualThreadMigrationTest` pula a partir do JDK 24: o JEP 491 faz `synchronized` deixar
   de prender a carrier thread, tornando o teste inócuo (passaria mesmo com a regressão de
   volta). O CI roda em JDK 21.
