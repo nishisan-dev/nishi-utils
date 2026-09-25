@@ -16,7 +16,7 @@ Depois de compilar e copiar as dependências conforme o quickstart, defina no te
 administração:
 
 ```bash
-NGRRD_CP='nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.4.1.jar:nishi-utils-ngrrd-cluster/target/lib/*'
+NGRRD_CP='nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.5.1.jar:nishi-utils-ngrrd-cluster/target/lib/*'
 NGRRD_SEED='127.0.0.1:7101'
 
 ngrrd_admin() {
@@ -86,7 +86,7 @@ YAML
 Em um terminal separado, mantenha o novo processo em primeiro plano:
 
 ```bash
-java -cp 'nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.4.1.jar:nishi-utils-ngrrd-cluster/target/lib/*' \
+java -cp 'nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.5.1.jar:nishi-utils-ngrrd-cluster/target/lib/*' \
   dev.nishisan.utils.oss.cluster.node.NgrrdStorageNodeMain \
   --config target/ngrrd-demo/storage-4.yaml
 ```
