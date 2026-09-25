@@ -4,6 +4,22 @@
 
 ---
 
+## 2026-09-24 — Checkpoint após migração — release 8.4.1
+
+Corrige a falha principal da [issue #169](https://github.com/nishisan-dev/nishi-utils/issues/169).
+
+- Checkpoint, flush e leituras recuperam `WRONG_OWNER` seguido de `NOT_OPEN`,
+  incluindo migrações durante a reabertura, sem consumir a recuperação de outro status.
+- A barreira de escrita, as consultas ao líder, o `OPEN`, os RPCs e as esperas respeitam
+  o orçamento original de retentativa. Erros permanentes e interrupções são preservados.
+- Logs `FINE`/`DEBUG` identificam os status intermediários e o prazo restante.
+- Regressões cobrem mudanças de dono, prazo esgotado e migração real com o handle original;
+  o checkpoint do teste de rebalance deixa de mascarar exceções com retentativa externa.
+- Compatível com storages 8.4.0: atualizar o cliente Java e a aplicação consumidora.
+  Não há mudança de protocolo, catálogo ou formato de armazenamento neste hotfix.
+- A observação secundária sobre transporte com 32 migrações simultâneas permanece
+  sem diagnóstico confirmado e não está incluída na correção.
+
 ## 2026-09-24 — Capacidade e distribuição ponderada do ngrrd — release 8.4.0
 
 Atende os itens 1 e 2 da [issue #167](https://github.com/nishisan-dev/nishi-utils/issues/167).

@@ -236,10 +236,8 @@ class RebalanceClusterTest {
         for (Map.Entry<String, NgrrdHandle> entry : handlesBySeriesKey.entrySet()) {
             String seriesKey = entry.getKey();
             NgrrdHandle handle = entry.getValue();
-            retryVoid(() -> {
-                handle.checkpoint();
-                return null;
-            });
+            // Recovery belongs to the client; an external retry would hide issue #169.
+            handle.checkpoint();
             int expectedSamples = sampleCountBySeriesKey.get(seriesKey);
             long endExclusive = alignedBase(seriesKey) + (expectedSamples + 1) * BASE_STEP_MS;
             // Mesma leitura do DistributedWriteReadClusterTest (M1c): série DERIVADA (in_bps — é ela

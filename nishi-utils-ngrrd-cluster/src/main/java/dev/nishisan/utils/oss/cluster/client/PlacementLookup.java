@@ -38,6 +38,16 @@ public interface PlacementLookup {
     default SeriesPlacement resolve(String key, String hash,
             dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor geometry) { return resolve(key, hash); }
 
+    /**
+     * Resolves within the caller's remaining operation budget. Blocking implementations should
+     * override this method to bound leader discovery, RPCs and retries by {@code maxWait}.
+     * The default preserves compatibility with existing in-memory lookups.
+     */
+    default SeriesPlacement resolve(String key, String hash,
+            dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor geometry, java.time.Duration maxWait) {
+        return resolve(key, hash, geometry);
+    }
+
     /** Descarta o override local conhecido para {@code seriesKey}, se houver. */
     void invalidate(String seriesKey);
 
