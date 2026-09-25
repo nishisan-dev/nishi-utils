@@ -365,7 +365,11 @@ public final class Ngrrd {
      *                        {@link OnGeometryChange#FAIL}, ignorando o
      *                        {@code onGeometryChange} pedido: geometria
      *                        divergente vira erro ao leitor e nada é migrado
-     *                        nem recriado. Exige
+     *                        nem recriado. Exceção: um arquivo presente mas
+     *                        truncado (menor que o header fixo) passa na
+     *                        checagem de existência e é reinicializado pelo
+     *                        writer, nos dois modos (ver {@code doc/oss/ngrrd.md}).
+     *                        Exige
      *                        storages que anunciem {@code open.createIfMissing}:
      *                        contra um storage de versão anterior o cluster
      *                        falha com {@code UNSUPPORTED_BY_NODE} em vez de

@@ -281,7 +281,10 @@ fecha e sai do cache do cliente. Um handle somente leitura nunca dispara migraç
 de geometria: o storage abre sem criar sempre com `OnGeometryChange.FAIL`, ignorando o
 `onGeometryChange` pedido — se a definição do leitor diverge da geometria gravada, o `open`
 falha com erro e o arquivo não é regravado. Se a série já estiver aberta no storage (por um
-gravável, por exemplo), o handle existente é reaproveitado e nada muda.
+gravável, por exemplo), o handle existente é reaproveitado e nada muda. A única exceção é um
+arquivo presente mas truncado (menor que o header fixo): ele passa na checagem de existência e
+o writer o reinicializa como série vazia — caso raro, descrito em
+[`doc/oss/ngrrd.md`](ngrrd.md#abrir-sem-criar-e-consultar-existência).
 
 No máximo um handle principal por `seriesKey` fica em cache. As combinações entre abrir com e
 sem criação:

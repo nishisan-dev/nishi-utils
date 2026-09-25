@@ -32,7 +32,10 @@ seção abaixo) — a 8.5.1 não teve release/tag própria; ela é publicada jun
   só depois de o líder confirmar `ACTIVE(self)`, isto é, com ownership: a série é dele e o
   arquivo não existe — e `write`/`flush`/`checkpoint` lançam `IllegalStateException`. O storage
   abre sem criar sempre com `OnGeometryChange.FAIL`, qualquer que seja a política pedida:
-  geometria divergente vira erro ao leitor e nada é migrado nem recriado. Cache de handles sem
+  geometria divergente vira erro ao leitor e nada é migrado nem recriado (exceção: um arquivo
+  truncado, menor que o header fixo, passa na checagem de existência e é reinicializado — ver
+  `doc/oss/ngrrd.md`). O OPEN sem criar também não invalida a confirmação de geometria no
+  catálogo antes de abrir; só a confirma depois do sucesso. Cache de handles sem
   contagem de referências: abrir com criação sobre um somente leitura em cache o substitui por
   um gravável novo (o antigo continua válido para quem já o tinha); abrir sem criar sobre um
   gravável em cache devolve uma vista somente leitura nova a cada chamada, cujo `close()` nunca
@@ -56,6 +59,13 @@ seção abaixo) — a 8.5.1 não teve release/tag própria; ela é publicada jun
   intervalo, um miss de `ngrrd.catalog.lookup` era respondido como `OK` sem a chave. A marca
   agora é gravada antes de qualquer trabalho pesado, e um miss enquanto a réplica do líder ainda
   sincroniza (`ReplicationManager.isLeaderSyncing()`) responde `NOT_LEADER` (o cliente retenta).
+- Um miss de `ngrrd.catalog.lookup` no intervalo em que o coordenador já trocou o líder mas ainda
+  não notificou os listeners também responde `NOT_LEADER`: depois de perder (ou não ter) a
+  liderança, o handler se considera dentro da janela de graça até ver a próxima posse.
+- **Mudança de assinatura:** os construtores públicos de `PlacementRequestHandler` recebem um
+  novo parâmetro `BooleanSupplier leaderSyncing` (logo após `leaderView`), usado para recusar
+  misses enquanto a réplica do líder sincroniza. Quem monta o handler fora do `NgrrdStorageNode`
+  precisa passar `replicationManager()::isLeaderSyncing` do `NGridNode`.
 - `NgrrdClusterAdminCli status` mostra as capacidades anunciadas por nó (coluna `CAPABILITIES`;
   `-` quando o status não traz nenhuma).
 - Mudanças de comportamento no caminho que cria:
