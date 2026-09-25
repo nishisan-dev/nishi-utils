@@ -522,9 +522,10 @@ sem nova preparação são recusados e o coordenador resolve a transferência pe
 caminhos normais de recuperação. Uma recusa de capacidade preserva a origem e aparece no
 resultado da migração (`CAPACITY_EXCEEDED` ou `FILESYSTEM_CAPACITY_EXCEEDED`).
 
-O comando `status` mostra `MODE`, `WEIGHT` e `RESERVED`, além da carga e do total de
-`GEOMETRIAS PENDENTES` (ainda sem confirmação do dono). Uma drenagem sem
-movimentos admissíveis permanece `DRAINING` e emite `NGRRD_DRAIN_PENDING`; verifique espaço,
+O comando `status` mostra `MODE`, `WEIGHT`, `RESERVED` e as capacidades anunciadas por nó
+(`CAPABILITIES`), além da carga e do total de `GEOMETRIAS PENDENTES` (ainda sem confirmação do
+dono). Uma drenagem sem movimentos admissíveis permanece `DRAINING` e emite
+`NGRRD_DRAIN_PENDING`; verifique espaço,
 conectividade e confirmação de geometria antes de redisparar. Uma série grande sem destino
 não impede o planejamento das menores que ainda cabem.
 
@@ -563,15 +564,16 @@ entrega tolera um período com versões mistas — mas só na direção storage-
    confirmação do storage (campo que só um storage desta versão preenche) também vira
    `UNSUPPORTED_BY_NODE` depois do fato — isso detecta um storage antigo que ignorou o pedido,
    mas não desfaz uma criação que ele já tenha feito; o handle somente leitura se fecha.
-3. **Durante a janela de versões mistas, se o líder eleito ainda for um storage na versão
-   anterior**, `ngrrd.admin.drain`/`ngrrd.admin.activate` regravam o status do nó afetado
-   (`StorageNodeStatus.withState`) sem o campo `capabilities`, que essa versão do líder não
-   conhece — as capacidades daquele nó somem do catálogo até o próximo relatório periódico dele
-   (`statusReportInterval`, default 10 s) as republicar. Uma consulta que caia exatamente nessa
-   janela vê `UNSUPPORTED_BY_NODE` em vez de operar normalmente; nunca uma resposta incorreta.
-   Evite `drain`/`activate` durante a janela de atualização, e não dependa de
-   `exists`/`find`/`verify`/`open` sem criar até confirmar (via `status`) que todos os storages já
-   reportam as capacidades novas.
+3. **Enquanto o líder eleito for um storage da versão anterior (8.5.x)**, todo status gravado no
+   catálogo passa pelo codec desse líder, que não conhece o campo `capabilities` e o descarta —
+   vale para os relatórios periódicos dos storages já atualizados, não só para as regravações de
+   `ngrrd.admin.drain`/`ngrrd.admin.activate` (`StorageNodeStatus.withState`). Nesse período as
+   APIs novas (`exists`/`find`/`verify`/`open` sem criar) respondem `UNSUPPORTED_BY_NODE` —
+   nunca uma resposta incorreta — até o líder ser um storage desta versão e os nós republicarem
+   o status no próximo relatório periódico (`statusReportInterval`, default 10 s). Por isso
+   atualize todos os storages antes de usar as APIs novas e confirme, na coluna `CAPABILITIES`
+   do comando `status`, que todos os nós reportam `catalog.lookup`, `open.createIfMissing` e
+   `series.exists.batch` (`-` indica um nó sem capacidades publicadas).
 4. Depois que todos os storages reportam capacidades, atualize os clientes normalmente — sem
    necessidade de parar o tráfego, diferente da migração `COUNT`/`CAPACITY`/`WEIGHT`.
 

@@ -32,6 +32,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 
 /**
  * CLI de administração do cluster ngrrd (seção 4 da spec do M4):
@@ -134,16 +135,29 @@ public final class NgrrdClusterAdminCli {
 
     private void printStatus(AdminStatusResponse response, PrintStream out) {
         out.println("LIDER: " + response.leaderNodeId());
-        out.printf(Locale.ROOT, "%-24s %-10s %-10s %8s %14s %7s %10s %10s %14s%n", "NODE", "STATE", "REACHABLE", "SERIES",
-                "BYTES", "FILL%", "MODE", "WEIGHT", "RESERVED");
+        out.printf(Locale.ROOT, "%-24s %-10s %-10s %8s %14s %7s %10s %10s %14s %s%n", "NODE", "STATE", "REACHABLE",
+                "SERIES", "BYTES", "FILL%", "MODE", "WEIGHT", "RESERVED", "CAPABILITIES");
         for (NodeStatusView view : response.nodes()) {
             StorageNodeStatus status = view.status();
-            out.printf(Locale.ROOT, "%-24s %-10s %-10s %8d %14d %6.1f%% %10s %10.3f %14d%n", status.nodeId(), status.state(),
-                    view.reachable(), status.seriesCount(), status.usedBytes(), status.fillRatio() * 100.0,
-                    status.distributionMode(), status.weight(), status.reservedBytes());
+            out.printf(Locale.ROOT, "%-24s %-10s %-10s %8d %14d %6.1f%% %10s %10.3f %14d %s%n", status.nodeId(),
+                    status.state(), view.reachable(), status.seriesCount(), status.usedBytes(),
+                    status.fillRatio() * 100.0, status.distributionMode(), status.weight(), status.reservedBytes(),
+                    formatCapabilities(status));
         }
         out.println("MIGRACOES EM CURSO: " + response.migrationsInFlight());
         out.println("GEOMETRIAS PENDENTES: " + response.geometriesPending());
+    }
+
+    /**
+     * Capacidades anunciadas pelo nó, em ordem alfabética e separadas por vírgula; {@code -} quando o
+     * status não traz nenhuma (storage de versão anterior, ou status regravado por um líder anterior a
+     * elas) — é por aqui que o operador confirma que todos os storages já as reportam.
+     */
+    private static String formatCapabilities(StorageNodeStatus status) {
+        if (status.capabilities().isEmpty()) {
+            return "-";
+        }
+        return status.capabilities().stream().sorted().collect(Collectors.joining(","));
     }
 
     private void printMetrics(NodeMetricsSnapshot snapshot, PrintStream out) {

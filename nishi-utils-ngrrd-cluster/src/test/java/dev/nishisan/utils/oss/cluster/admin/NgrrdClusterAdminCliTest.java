@@ -28,12 +28,15 @@ import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.api.SeriesInfo;
 import dev.nishisan.utils.oss.cluster.api.SeriesVerification;
 import dev.nishisan.utils.oss.cluster.catalog.NodeState;
+import dev.nishisan.utils.oss.cluster.catalog.StorageCapabilities;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.metrics.BlobVolumeSummary;
 import dev.nishisan.utils.oss.cluster.metrics.LatencySnapshot;
 import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
+import dev.nishisan.utils.oss.cluster.placement.DistributionMode;
 import dev.nishisan.utils.oss.cluster.protocol.AdminStatusResponse;
 import dev.nishisan.utils.oss.cluster.protocol.NodeStatusView;
+import dev.nishisan.utils.oss.cluster.protocol.SeriesStatus;
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayOutputStream;
@@ -44,6 +47,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
@@ -94,7 +98,7 @@ class NgrrdClusterAdminCliTest {
     void statusImprimeLiderNosEMigracoes() {
         ClientFake client = new ClientFake();
         client.statusResponse = new AdminStatusResponse(
-                dev.nishisan.utils.oss.cluster.protocol.SeriesStatus.OK, "storage-0",
+                SeriesStatus.OK, "storage-0",
                 List.of(
                         new NodeStatusView(new StorageNodeStatus("storage-0", NodeState.ACTIVE, 5, 1_000, 10_000, 1L), true),
                         new NodeStatusView(new StorageNodeStatus("storage-1", NodeState.DRAINING, 2, 500, 10_000, 1L), false)),
@@ -109,6 +113,36 @@ class NgrrdClusterAdminCliTest {
         assertTrue(capture.out.contains("DRAINING"), capture.out);
         assertTrue(capture.out.contains("MIGRACOES"), capture.out);
         assertTrue(client.closed.get(), "o cliente deveria ser fechado ao final");
+    }
+
+    @Test
+    void statusImprimeAsCapacidadesAnunciadasPorNo() {
+        ClientFake client = new ClientFake();
+        client.statusResponse = new AdminStatusResponse(SeriesStatus.OK, "storage-0",
+                List.of(
+                        new NodeStatusView(new StorageNodeStatus("storage-0", NodeState.ACTIVE, 5, 1_000, 10_000, 1L,
+                                DistributionMode.COUNT, 1, 0, Set.of(StorageCapabilities.SERIES_EXISTS_BATCH,
+                                        StorageCapabilities.CATALOG_LOOKUP,
+                                        StorageCapabilities.OPEN_CREATE_IF_MISSING)), true),
+                        new NodeStatusView(new StorageNodeStatus("storage-1", NodeState.ACTIVE, 2, 500, 10_000, 1L),
+                                true)),
+                0, Map.of("storage-0", 5L, "storage-1", 2L));
+
+        Capture capture = run(new String[] {"--seed", "127.0.0.1:9000", "status"}, cfg -> client);
+
+        assertEquals(0, capture.exitCode);
+        assertTrue(capture.out.contains("CAPABILITIES"), capture.out);
+        String node0 = lineOf(capture.out, "storage-0");
+        assertTrue(node0.endsWith("catalog.lookup,open.createIfMissing,series.exists.batch"), node0);
+        String node1 = lineOf(capture.out, "storage-1");
+        assertTrue(node1.endsWith(" -"), "nó sem capacidades anunciadas deveria mostrar '-': " + node1);
+    }
+
+    private static String lineOf(String output, String nodeId) {
+        return output.lines()
+                .filter(line -> line.startsWith(nodeId + " "))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("linha de " + nodeId + " ausente em:\n" + output));
     }
 
     @Test
