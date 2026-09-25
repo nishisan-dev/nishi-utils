@@ -17,18 +17,29 @@
 
 package dev.nishisan.utils.ngrid.cluster.transport;
 
+import dev.nishisan.utils.ngrid.common.ClusterMessage;
+import dev.nishisan.utils.ngrid.common.HandshakePayload;
+import dev.nishisan.utils.ngrid.common.MessageType;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
+import dev.nishisan.utils.ngrid.common.PeerUpdatePayload;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
+import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -134,6 +145,192 @@ class TcpTransportConcurrentMeshTest {
             assertTrue(client.peers().stream().noneMatch(peer -> peer.nodeId().equals(seed.nodeId())));
         } finally {
             closeQuietly(client, server);
+        }
+    }
+
+    /**
+     * Issue #169: um nó que entra com seeds {@code host:port} ainda não resolvidos propaga esses
+     * aliases no handshake. O storage que o recebe não pode trocar o peer canônico já verificado
+     * pelo alias — senão disca de novo para o mesmo processo sob outra chave, o outro lado fecha a
+     * conexão original pelo desempate e o request em voo falha com {@link PeerDisconnectedException}.
+     */
+    @Test
+    void joiningPeerWithUnresolvedSeedAliasKeepsEstablishedLinks() throws Exception {
+        int portA = allocateFreeLocalPort(Set.of());
+        int portC = allocateFreeLocalPort(Set.of(portA));
+        int portClient = allocateFreeLocalPort(Set.of(portA, portC));
+        NodeInfo a = new NodeInfo(NodeId.of("storage-a"), "127.0.0.1", portA);
+        NodeInfo c = new NodeInfo(NodeId.of("storage-c"), "127.0.0.1", portC);
+        NodeInfo client = new NodeInfo(NodeId.of("client-1"), "127.0.0.1", portClient);
+        NodeInfo aliasA = new NodeInfo(NodeId.of("127.0.0.1:" + portA), a.host(), a.port());
+        NodeInfo aliasC = new NodeInfo(NodeId.of("127.0.0.1:" + portC), c.host(), c.port());
+
+        TcpTransport storageA = new TcpTransport(meshConfig(a, c));
+        TcpTransport storageC = new TcpTransport(meshConfig(c, a));
+        TcpTransport clientTransport = new TcpTransport(meshConfig(client, aliasA, aliasC));
+        var releaseReply = new CountDownLatch(1);
+        var releaseClientDial = new CountDownLatch(1);
+        Set<NodeId> dialedByA = ConcurrentHashMap.newKeySet();
+        storageA.setBeforeDialHook(dialedByA::add);
+        storageC.addListener(slowResponder(storageC, releaseReply));
+        clientTransport.setBeforeDialHook(id -> {
+            if (id.equals(aliasC.nodeId())) {
+                awaitUninterruptibly(releaseClientDial);
+            }
+        });
+        try {
+            storageA.start();
+            storageC.start();
+            awaitFullDirectMesh(List.of(storageA, storageC), List.of(a, c), Duration.ofSeconds(10));
+            dialedByA.clear();
+
+            var pending = storageA.sendAndAwait(ClusterMessage.request(
+                    MessageType.CLIENT_REQUEST, "slow", a.nodeId(), c.nodeId(),
+                    "chunk"));
+
+            clientTransport.start();
+            awaitDiscovery(storageA, client.nodeId());
+            List<String> violations = sampleLinkWhileBroadcasting(storageA, c.nodeId(), aliasC.nodeId(),
+                    Duration.ofSeconds(2));
+
+            releaseReply.countDown();
+            String pendingOutcome = awaitOutcome(pending);
+            assertAll(
+                    () -> assertTrue(violations.isEmpty(),
+                            "storage-a perdeu o link canônico para storage-c: " + violations),
+                    () -> assertFalse(dialedByA.contains(aliasC.nodeId()),
+                            "storage-a discou o alias de seed de outro nó: " + dialedByA),
+                    () -> assertEquals("ok", pendingOutcome, "request em voo a->c deveria completar"));
+
+            releaseClientDial.countDown();
+            awaitFullDirectMesh(List.of(storageA, storageC, clientTransport), List.of(a, c, client),
+                    Duration.ofSeconds(15));
+        } finally {
+            releaseReply.countDown();
+            releaseClientDial.countDown();
+            closeQuietly(clientTransport, storageA, storageC);
+        }
+    }
+
+    /** Variante: o alias chega a storage-a por PEER_UPDATE de um terceiro, não por handshake. */
+    @Test
+    void seedAliasGossipedByPeerUpdateKeepsEstablishedLinks() throws Exception {
+        int portA = allocateFreeLocalPort(Set.of());
+        int portC = allocateFreeLocalPort(Set.of(portA));
+        NodeInfo a = new NodeInfo(NodeId.of("storage-a"), "127.0.0.1", portA);
+        NodeInfo c = new NodeInfo(NodeId.of("storage-c"), "127.0.0.1", portC);
+        NodeInfo aliasC = new NodeInfo(NodeId.of("127.0.0.1:" + portC), c.host(), c.port());
+        NodeInfo gossiper = new NodeInfo(NodeId.of("gossip-x"), "127.0.0.1", 1);
+
+        TcpTransport storageA = new TcpTransport(meshConfig(a, c));
+        TcpTransport storageC = new TcpTransport(meshConfig(c, a));
+        var releaseReply = new CountDownLatch(1);
+        Set<NodeId> dialedByA = ConcurrentHashMap.newKeySet();
+        storageA.setBeforeDialHook(dialedByA::add);
+        storageC.addListener(slowResponder(storageC, releaseReply));
+        try {
+            storageA.start();
+            storageC.start();
+            awaitFullDirectMesh(List.of(storageA, storageC), List.of(a, c), Duration.ofSeconds(10));
+            dialedByA.clear();
+
+            var pending = storageA.sendAndAwait(ClusterMessage.request(
+                    MessageType.CLIENT_REQUEST, "slow", a.nodeId(), c.nodeId(),
+                    "chunk"));
+
+            try (RawPeer raw = new RawPeer(a.host(), a.port())) {
+                raw.send(ClusterMessage.request(
+                        MessageType.HANDSHAKE, "hello", gossiper.nodeId(),
+                        a.nodeId(), new HandshakePayload(
+                                gossiper, Set.of(), Map.of(), false, true)));
+                awaitDiscovery(storageA, gossiper.nodeId());
+                raw.send(ClusterMessage.request(
+                        MessageType.PEER_UPDATE, "peer-update", gossiper.nodeId(),
+                        a.nodeId(), new PeerUpdatePayload(
+                                Set.of(gossiper, aliasC), Map.of())));
+                List<String> violations = sampleLinkWhileBroadcasting(storageA, c.nodeId(), aliasC.nodeId(),
+                        Duration.ofSeconds(2));
+
+                releaseReply.countDown();
+                String pendingOutcome = awaitOutcome(pending);
+                assertAll(
+                        () -> assertTrue(violations.isEmpty(),
+                                "storage-a perdeu o link canônico para storage-c: " + violations),
+                        () -> assertFalse(dialedByA.contains(aliasC.nodeId()),
+                                "storage-a discou o alias de seed de outro nó: " + dialedByA),
+                        () -> assertEquals("ok", pendingOutcome, "request em voo a->c deveria completar"));
+            }
+        } finally {
+            releaseReply.countDown();
+            closeQuietly(storageA, storageC);
+        }
+    }
+
+    /** Responde ao request {@code slow} só depois que {@code release} abrir. */
+    private static TransportListener slowResponder(TcpTransport self, CountDownLatch release) {
+        return new TransportListener() {
+            public void onPeerConnected(NodeInfo peer) { }
+            public void onPeerDisconnected(NodeId peer) { }
+            public void onMessage(ClusterMessage message) {
+                if ("slow".equals(message.qualifier())
+                        && message.type() == MessageType.CLIENT_REQUEST) {
+                    Thread.ofVirtual().start(() -> {
+                        awaitUninterruptibly(release);
+                        self.send(ClusterMessage.response(message, "done"));
+                    });
+                }
+            }
+        };
+    }
+
+    /**
+     * Emula heartbeats de {@code from} (broadcast a cada ~100 ms) e registra toda amostra em que o
+     * peer canônico some de {@code peers()}, o alias aparece, ou o link direto cai.
+     */
+    private static List<String> sampleLinkWhileBroadcasting(TcpTransport from, NodeId canonical, NodeId alias,
+                                                            Duration window) throws InterruptedException {
+        List<String> violations = new ArrayList<>();
+        long start = System.currentTimeMillis();
+        int tick = 0;
+        while (System.currentTimeMillis() - start < window.toMillis()) {
+            from.broadcast(ClusterMessage.request(
+                    MessageType.CLIENT_REQUEST, "tick", from.local().nodeId(), null,
+                    "tick-" + tick++));
+            Thread.sleep(100);
+            boolean knowsCanonical = from.peers().stream().anyMatch(p -> p.nodeId().equals(canonical));
+            boolean knowsAlias = from.peers().stream().anyMatch(p -> p.nodeId().equals(alias));
+            boolean connected = from.isConnected(canonical);
+            if (!knowsCanonical || knowsAlias || !connected) {
+                violations.add("t+" + (System.currentTimeMillis() - start) + "ms canonical=" + knowsCanonical
+                        + " alias=" + knowsAlias + " connected=" + connected);
+            }
+        }
+        return violations;
+    }
+
+    private static String awaitOutcome(CompletableFuture<?> pending) {
+        try {
+            pending.get(10, TimeUnit.SECONDS);
+            return "ok";
+        } catch (ExecutionException e) {
+            return e.getCause().toString();
+        } catch (Exception e) {
+            return e.toString();
+        }
+    }
+
+    private static void awaitUninterruptibly(CountDownLatch latch) {
+        boolean interrupted = false;
+        while (true) {
+            try {
+                latch.await();
+                break;
+            } catch (InterruptedException e) {
+                interrupted = true;
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
         }
     }
 

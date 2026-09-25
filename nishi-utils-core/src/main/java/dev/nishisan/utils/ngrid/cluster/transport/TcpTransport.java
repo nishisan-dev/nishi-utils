@@ -75,6 +75,13 @@ public final class TcpTransport implements Transport {
     private final TcpTransportConfig config;
     private final StatsUtils stats;
     private final Map<NodeId, NodeInfo> knownPeers = new ConcurrentHashMap<>();
+    // Ids confirmed first-hand by a direct handshake (the remote's own NodeInfo). Second-hand
+    // gossip never displaces them (see mergeGossipedPeer). Always a subset of knownPeers' keys.
+    private final Set<NodeId> verifiedPeers = ConcurrentHashMap.newKeySet();
+    // Serializes structural changes of knownPeers/verifiedPeers (address-collision cleanup and
+    // merges), so a concurrent handshake and gossip merge cannot interleave half-way. In-memory
+    // only: never held across I/O.
+    private final ReentrantLock peerTableLock = new ReentrantLock();
     private final Map<NodeId, Connection> connections = new ConcurrentHashMap<>();
     // Includes accepted sockets that have not supplied a handshake/peer identity yet.
     private final Set<Connection> liveSockets = ConcurrentHashMap.newKeySet();
@@ -370,21 +377,7 @@ public final class TcpTransport implements Transport {
 
     @Override
     public void addPeer(NodeInfo peer) {
-        if (peer == null || peer.nodeId().equals(config.local().nodeId())) {
-            return;
-        }
-        if (peer.host().equals(config.local().host()) && peer.port() == config.local().port()) {
-            return;
-        }
-        for (Map.Entry<NodeId, NodeInfo> entry : knownPeers.entrySet()) {
-            NodeInfo existing = entry.getValue();
-            if (!entry.getKey().equals(peer.nodeId())
-                    && existing.host().equals(peer.host())
-                    && existing.port() == peer.port()) {
-                knownPeers.remove(entry.getKey());
-            }
-        }
-        boolean added = knownPeers.putIfAbsent(peer.nodeId(), peer) == null;
+        boolean added = mergeGossipedPeer(peer);
         if (added && running && shouldInitiate(peer)) {
             scheduler.schedule(() -> ensureConnectionAsync(peer), 0, TimeUnit.MILLISECONDS);
         }
@@ -629,25 +622,34 @@ public final class TcpTransport implements Transport {
         // simultaneous-open tie-break already has the correct flag.
         connection.setPeerSupportsCompression(payload.supportsCompression());
         connection.setPeerSupportsUndeliverable(payload.supportsUndeliverable());
-        List<NodeId> staleIds = new ArrayList<>();
-        for (Map.Entry<NodeId, NodeInfo> entry : knownPeers.entrySet()) {
-            NodeInfo existing = entry.getValue();
-            if (!entry.getKey().equals(remoteInfo.nodeId())
-                    && existing.host().equals(remoteInfo.host())
-                    && existing.port() == remoteInfo.port()) {
-                staleIds.add(entry.getKey());
+        // A direct handshake is first-hand and authoritative: whatever other id we held for the
+        // remote's listen address (typically the provisional "host:port" seed alias) is replaced
+        // by the canonical one, which becomes verified.
+        List<Connection> staleConnections = new ArrayList<>();
+        peerTableLock.lock();
+        try {
+            List<NodeId> staleIds = new ArrayList<>();
+            for (Map.Entry<NodeId, NodeInfo> entry : knownPeers.entrySet()) {
+                if (!entry.getKey().equals(remoteInfo.nodeId()) && sameAddress(entry.getValue(), remoteInfo)) {
+                    staleIds.add(entry.getKey());
+                }
             }
-        }
-        for (NodeId staleId : staleIds) {
-            knownPeers.remove(staleId);
-            Connection staleConn = connections.remove(staleId);
-            // An outbound seed connection is initially indexed by host:port. Learning
-            // its canonical ID moves that same socket; it must not close itself here.
-            if (staleConn != null && staleConn != connection) {
-                staleConn.closeQuietly();
+            for (NodeId staleId : staleIds) {
+                knownPeers.remove(staleId);
+                verifiedPeers.remove(staleId);
+                Connection staleConn = connections.remove(staleId);
+                // An outbound seed connection is initially indexed by host:port. Learning
+                // its canonical ID moves that same socket; it must not close itself here.
+                if (staleConn != null && staleConn != connection) {
+                    staleConnections.add(staleConn);
+                }
             }
+            knownPeers.put(remoteInfo.nodeId(), remoteInfo);
+            verifiedPeers.add(remoteInfo.nodeId());
+        } finally {
+            peerTableLock.unlock();
         }
-        knownPeers.put(remoteInfo.nodeId(), remoteInfo);
+        staleConnections.forEach(Connection::closeQuietly);
 
         // Publish this connection through the single reconciliation point. If a concurrent
         // (simultaneous-open) connection already won the deterministic tie-break, we lost:
@@ -670,25 +672,8 @@ public final class TcpTransport implements Transport {
         listeners.forEach(listener -> listener.onPeerConnected(remoteInfo));
         // Merge peers and attempt connections
         payload.peers().forEach(peer -> {
-            if (peer.nodeId().equals(config.local().nodeId())) {
-                return;
-            }
-            if (peer.host().equals(config.local().host()) && peer.port() == config.local().port()) {
-                return;
-            }
-            for (Map.Entry<NodeId, NodeInfo> entry : knownPeers.entrySet()) {
-                NodeInfo existing = entry.getValue();
-                if (!entry.getKey().equals(peer.nodeId())
-                        && existing.host().equals(peer.host())
-                        && existing.port() == peer.port()) {
-                    knownPeers.remove(entry.getKey());
-                }
-            }
-            boolean added = knownPeers.putIfAbsent(peer.nodeId(), peer) == null;
-            
-            // Only attempt reverse connection if the peer has a valid port (not a discovery client)
-            if (added && !isConnected(peer.nodeId()) && peer.port() > 0 && shouldInitiate(peer)) {
-                scheduler.schedule(() -> ensureConnectionAsync(peer), 100, TimeUnit.MILLISECONDS);
+            if (mergeGossipedPeer(peer)) {
+                scheduleDialIfInitiator(peer);
             }
         });
         broadcastPeerList();
@@ -729,29 +714,77 @@ public final class TcpTransport implements Transport {
         router.updateReachability(message.source(), payload.peers(), payload.latencies());
 
         for (NodeInfo peer : payload.peers()) {
-            if (!peer.nodeId().equals(config.local().nodeId())) {
-                if (peer.host().equals(config.local().host()) && peer.port() == config.local().port()) {
-                    continue;
-                }
-                for (Map.Entry<NodeId, NodeInfo> entry : knownPeers.entrySet()) {
-                    NodeInfo existing = entry.getValue();
-                    if (!entry.getKey().equals(peer.nodeId())
-                            && existing.host().equals(peer.host())
-                            && existing.port() == peer.port()) {
-                        knownPeers.remove(entry.getKey());
-                    }
-                }
-                boolean added = knownPeers.compute(peer.nodeId(), (id, existing) -> {
-                    if (existing == null || !existing.equals(peer)) {
-                        return peer;
-                    }
-                    return existing;
-                }) == peer;
-                if (added && !isConnected(peer.nodeId()) && shouldInitiate(peer)) {
-                    scheduler.schedule(() -> ensureConnectionAsync(peer), 100, TimeUnit.MILLISECONDS);
-                }
+            if (mergeGossipedPeer(peer)) {
+                scheduleDialIfInitiator(peer);
             }
         }
+    }
+
+    /**
+     * Single admission point for peers learned second-hand: explicit {@link #addPeer} joins, the
+     * peer list carried by a handshake and PEER_UPDATE gossip. Every indirect source goes through
+     * here, so admission filters (e.g. ids that announced a graceful departure) plug in once.
+     * <p>
+     * Rules:
+     * <ul>
+     *   <li>the local node (by id or by listen address) is never merged;</li>
+     *   <li>an entry carrying a different id at the listen address of a peer <b>verified</b> by a
+     *       direct handshake is dropped. It is a provisional seed alias ({@code host:port}) of that
+     *       same process, gossiped by a node that has not resolved it yet. Letting it replace the
+     *       canonical id made the next send dial the same process again under the alias key; the
+     *       remote then closed the original link in the duplicate-connection tie-break, and every
+     *       request in flight on it failed with {@link PeerDisconnectedException} (issue #169);</li>
+     *   <li>otherwise a different id at the same address replaces the unverified entry (a seed
+     *       alias learning its canonical id second-hand, or a restarted process with a new id);</li>
+     *   <li>a verified peer's own entry is not overwritten by gossip while a direct connection to it
+     *       is open: its handshake is first-hand and fresher.</li>
+     * </ul>
+     *
+     * @return {@code true} when the entry was added or changed
+     */
+    private boolean mergeGossipedPeer(NodeInfo peer) {
+        if (peer == null || peer.nodeId().equals(config.local().nodeId()) || sameAddress(peer, config.local())) {
+            return false;
+        }
+        peerTableLock.lock();
+        try {
+            List<NodeId> displaced = new ArrayList<>();
+            for (Map.Entry<NodeId, NodeInfo> entry : knownPeers.entrySet()) {
+                if (entry.getKey().equals(peer.nodeId()) || !sameAddress(entry.getValue(), peer)) {
+                    continue;
+                }
+                if (verifiedPeers.contains(entry.getKey())) {
+                    LOGGER.fine(() -> "Ignoring gossiped " + peer + ": " + entry.getKey()
+                            + " was verified at that address by a direct handshake");
+                    return false;
+                }
+                displaced.add(entry.getKey());
+            }
+            displaced.forEach(knownPeers::remove);
+            NodeInfo existing = knownPeers.get(peer.nodeId());
+            if (peer.equals(existing)) {
+                return false;
+            }
+            if (existing != null && verifiedPeers.contains(peer.nodeId()) && isConnected(peer.nodeId())) {
+                return false;
+            }
+            knownPeers.put(peer.nodeId(), peer);
+            return true;
+        } finally {
+            peerTableLock.unlock();
+        }
+    }
+
+    /** Dials a newly learned peer when this node is the designated initiator for the pair. */
+    private void scheduleDialIfInitiator(NodeInfo peer) {
+        // Only listening peers are dialed (port 0 marks a discovery client).
+        if (running && peer.port() > 0 && !isConnected(peer.nodeId()) && shouldInitiate(peer)) {
+            scheduler.schedule(() -> ensureConnectionAsync(peer), 100, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    private static boolean sameAddress(NodeInfo a, NodeInfo b) {
+        return a.port() == b.port() && a.host().equals(b.host());
     }
 
     private boolean shouldInitiate(NodeInfo peer) {
