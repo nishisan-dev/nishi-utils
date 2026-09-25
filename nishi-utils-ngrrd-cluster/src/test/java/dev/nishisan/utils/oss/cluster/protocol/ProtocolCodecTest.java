@@ -417,6 +417,7 @@ class ProtocolCodecTest {
         LatencySnapshot writeBatchLatency = new LatencySnapshot(120L, 850L, 4_200L, 9_100L);
         LatencySnapshot checkpointLatency = new LatencySnapshot(30L, 1_500L, 6_000L, 12_000L);
         LatencySnapshot readLatency = new LatencySnapshot(75L, 300L, 1_100L, 2_500L);
+        LatencySnapshot leaderConfirmationLatency = new LatencySnapshot(9L, 700L, 2_000L, 3_000L);
         BlobVolumeSummary blobStats = new BlobVolumeSummary(4, 10_485_760L, 104_857_600L, 0.42, 350, 8_192L);
         Map<SeriesStatus, Long> errorsByStatus = Map.of(
                 SeriesStatus.WRONG_OWNER, 3L,
@@ -424,7 +425,7 @@ class ProtocolCodecTest {
                 SeriesStatus.ERROR, 2L);
         NodeMetricsSnapshot original = new NodeMetricsSnapshot("storage-0", 1_700_000_000_000L, true, 350L,
                 10_485_760L, 104_857_600L, 12, 120L, 4_800L, 7L, 30L, 5L, 75L, writeBatchLatency, checkpointLatency,
-                readLatency, errorsByStatus, blobStats, 0L, 0L, 0L, 0L, 0L, 0L, 0L);
+                readLatency, errorsByStatus, blobStats, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 9L, leaderConfirmationLatency);
 
         NodeMetricsSnapshot roundTripped = roundTripResponseBody(Commands.ADMIN_METRICS, original);
 
@@ -433,6 +434,7 @@ class ProtocolCodecTest {
         assertEquals(writeBatchLatency, roundTripped.writeBatchLatency());
         assertEquals(checkpointLatency, roundTripped.checkpointLatency());
         assertEquals(readLatency, roundTripped.readLatency());
+        assertEquals(leaderConfirmationLatency, roundTripped.leaderConfirmationLatency());
         assertEquals(blobStats, roundTripped.blobStats());
     }
 

@@ -262,10 +262,12 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
         double samplesPerSecond = computeSamplesPerSecond(snapshot.samplesWritten(), snapshot.capturedAtEpochMs());
         LOGGER.info(String.format(Locale.ROOT,
                 "NGRRD_NODE_STATUS nodeId=%s leader=%s series=%d usedBytes=%d openHandles=%d samples/s=%.1f "
-                        + "writeBatchP99us=%d checkpointP99us=%d readP99us=%d",
+                        + "writeBatchP99us=%d checkpointP99us=%d readP99us=%d leaderConfirmations=%d "
+                        + "leaderConfirmationP99us=%d",
                 snapshot.nodeId(), snapshot.leader(), snapshot.seriesCount(), snapshot.usedBytes(),
                 snapshot.openHandles(), samplesPerSecond, snapshot.writeBatchLatency().p99Micros(),
-                snapshot.checkpointLatency().p99Micros(), snapshot.readLatency().p99Micros()));
+                snapshot.checkpointLatency().p99Micros(), snapshot.readLatency().p99Micros(),
+                snapshot.leaderConfirmations(), snapshot.leaderConfirmationLatency().p99Micros()));
         if (metricsListener != null) {
             metricsListener.onNodeMetrics(snapshot);
         }
@@ -331,7 +333,9 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
                 reconcileReport.orphansDeleted(),
                 reconcileReport.unplaced(),
                 reconcileReport.missing(),
-                reconcileReport.durationMs());
+                reconcileReport.durationMs(),
+                handlerMetrics.leaderConfirmations(),
+                handlerMetrics.leaderConfirmationLatency());
     }
 
     /**

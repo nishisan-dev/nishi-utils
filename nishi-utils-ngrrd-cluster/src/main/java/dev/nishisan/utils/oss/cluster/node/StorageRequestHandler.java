@@ -122,6 +122,11 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
      *                      pendências rejeitadas por {@code WRONG_OWNER}/{@code NOT_OPEN}/
      *                      {@code MIGRATING} (essas são retentadas pelo cliente, não perdidas)
      * @param flushes       total de requisições {@code flush} atendidas com sucesso
+     * @param leaderConfirmations       leituras fortes de placement feitas no líder para confirmar o dono
+     *                                  de uma série sem objeto no volume, antes de criá-la ou de responder
+     *                                  {@code NOT_FOUND} a um {@code OPEN} (issue #174) — inclui as que
+     *                                  falharam no transporte
+     * @param leaderConfirmationLatency latência dessas leituras fortes
      */
     public record StorageHandlerMetrics(
             long writeBatches,
@@ -133,13 +138,24 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
             Map<SeriesStatus, Long> errorsByStatus,
             LatencySnapshot writeBatchLatency,
             LatencySnapshot checkpointLatency,
-            LatencySnapshot readLatency) {
+            LatencySnapshot readLatency,
+            long leaderConfirmations,
+            LatencySnapshot leaderConfirmationLatency) {
 
         public StorageHandlerMetrics {
             errorsByStatus = Map.copyOf(Objects.requireNonNullElse(errorsByStatus, Map.of()));
             writeBatchLatency = Objects.requireNonNullElse(writeBatchLatency, LatencySnapshot.EMPTY);
             checkpointLatency = Objects.requireNonNullElse(checkpointLatency, LatencySnapshot.EMPTY);
             readLatency = Objects.requireNonNullElse(readLatency, LatencySnapshot.EMPTY);
+            leaderConfirmationLatency = Objects.requireNonNullElse(leaderConfirmationLatency, LatencySnapshot.EMPTY);
+        }
+
+        /** Assinatura anterior à 8.6.0, sem as métricas de confirmação no líder (zeradas). */
+        public StorageHandlerMetrics(long writeBatches, long samplesWritten, long samplesFailed, long reads,
+                long checkpoints, long flushes, Map<SeriesStatus, Long> errorsByStatus,
+                LatencySnapshot writeBatchLatency, LatencySnapshot checkpointLatency, LatencySnapshot readLatency) {
+            this(writeBatches, samplesWritten, samplesFailed, reads, checkpoints, flushes, errorsByStatus,
+                    writeBatchLatency, checkpointLatency, readLatency, 0L, LatencySnapshot.EMPTY);
         }
     }
 
@@ -176,6 +192,8 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
     private final LatencyHistogram writeBatchLatency = new LatencyHistogram();
     private final LatencyHistogram checkpointLatency = new LatencyHistogram();
     private final LatencyHistogram readLatency = new LatencyHistogram();
+    private final LongAdder leaderConfirmationsCount = new LongAdder();
+    private final LatencyHistogram leaderConfirmationLatency = new LatencyHistogram();
     private final ConcurrentMap<String, Long> negativeLookupCacheExpiryMs = new ConcurrentHashMap<>();
 
     public StorageRequestHandler(Transport transport, PlacementLookup placementLookup,
@@ -248,7 +266,8 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
                 .collect(Collectors.toMap(Map.Entry::getKey, entry -> entry.getValue().sum()));
         return new StorageHandlerMetrics(writeBatchesCount.sum(), samplesWrittenCount.sum(), samplesFailedCount.sum(),
                 readsCount.sum(), checkpointsCount.sum(), flushesCount.sum(), errors, writeBatchLatency.snapshot(),
-                checkpointLatency.snapshot(), readLatency.snapshot());
+                checkpointLatency.snapshot(), readLatency.snapshot(), leaderConfirmationsCount.sum(),
+                leaderConfirmationLatency.snapshot());
     }
 
     private SeriesStatusResponse handleOpen(OpenRequest request) {
@@ -356,11 +375,15 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
      */
     private Optional<SeriesStatusResponse> confirmOwnerWithLeader(String seriesKey) {
         Optional<SeriesPlacement> strong;
+        leaderConfirmationsCount.increment();
+        long startNanos = System.nanoTime();
         try {
             strong = placementLookup.placementStrong(seriesKey);
         } catch (RuntimeException e) {
             recordError(SeriesStatus.ERROR);
             return Optional.of(new SeriesStatusResponse(SeriesStatus.ERROR, self.value(), describe(e)));
+        } finally {
+            leaderConfirmationLatency.record(System.nanoTime() - startNanos);
         }
         if (strong.isEmpty()) {
             recordError(SeriesStatus.WRONG_OWNER);

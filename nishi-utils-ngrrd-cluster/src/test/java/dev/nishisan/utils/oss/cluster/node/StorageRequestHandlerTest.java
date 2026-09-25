@@ -982,6 +982,21 @@ class StorageRequestHandlerTest {
     }
 
     @Test
+    void confirmacoesNoLiderSaoContadasNasMetricas() {
+        String created = "series-metrica-criada";
+        String missing = "series-metrica-ausente";
+        placementLookup.put(created, SeriesPlacement.active(SELF.value(), 1_000L));
+        placementLookup.put(missing, SeriesPlacement.active(SELF.value(), 1_000L));
+
+        handler.handle(Commands.OPEN, openRequest(created, null), SOURCE);
+        handler.handle(Commands.OPEN, openRequestNoCreate(missing, null), SOURCE);
+
+        StorageRequestHandler.StorageHandlerMetrics metrics = handler.metricsSnapshot();
+        assertEquals(2L, metrics.leaderConfirmations());
+        assertEquals(2L, metrics.leaderConfirmationLatency().count());
+    }
+
+    @Test
     void seriesExistsBatchDevolveSoAsPresentes() {
         String present = "series-batch-presente";
         String absent = "series-batch-ausente";
