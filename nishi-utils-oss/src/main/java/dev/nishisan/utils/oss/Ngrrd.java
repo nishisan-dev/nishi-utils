@@ -360,7 +360,12 @@ public final class Ngrrd {
      *                        devolve uma vista somente leitura sobre ele, cujo
      *                        {@code close()} nunca fecha o gravável; um
      *                        {@code open} com criação posterior abre um
-     *                        gravável novo no lugar do somente leitura. Exige
+     *                        gravável novo no lugar do somente leitura. No
+     *                        cluster, o storage abre sem criar sempre com
+     *                        {@link OnGeometryChange#FAIL}, ignorando o
+     *                        {@code onGeometryChange} pedido: geometria
+     *                        divergente vira erro ao leitor e nada é migrado
+     *                        nem recriado. Exige
      *                        storages que anunciem {@code open.createIfMissing}:
      *                        contra um storage de versão anterior o cluster
      *                        falha com {@code UNSUPPORTED_BY_NODE} em vez de

@@ -281,8 +281,12 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
                 return confirmSeriesNotFound(request.seriesKey());
             }
             Durability durability = request.durability() != null ? request.durability() : defaultDurability;
-            OnGeometryChange onGeometryChange = request.onGeometryChange() != null
-                    ? request.onGeometryChange() : defaultOnGeometryChange;
+            // Handle somente leitura (sem criar) nunca migra nem recria a série: com geometria divergente
+            // o leitor recebe erro e o arquivo fica como está, qualquer que seja a política pedida. Se a
+            // série já estiver aberta, o registry devolve o handle existente e a política nem é usada.
+            OnGeometryChange onGeometryChange = !request.createIfMissingOrDefault()
+                    ? OnGeometryChange.FAIL
+                    : request.onGeometryChange() != null ? request.onGeometryChange() : defaultOnGeometryChange;
             if (geometryService != null) { geometryService.beforeOpen(request.seriesKey()); }
             registry.open(request.seriesKey(), request.yaml(), Ngrrd.OpenOptions.of(durability, onGeometryChange)
                     .withCreateIfMissing(request.createIfMissingOrDefault()));

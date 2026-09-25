@@ -70,8 +70,10 @@ import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -684,6 +686,59 @@ class StorageRequestHandlerTest {
 
         assertEquals(SeriesStatus.OK, response.status());
         assertEquals(Boolean.TRUE, response.createIfMissingHonored());
+    }
+
+    @Test
+    void openSemCriarComGeometriaDivergenteFalhaSemRegravarMesmoPedindoRecreate() {
+        // Handle somente leitura nunca pode disparar migração/recriação: sem criar, o storage usa
+        // OnGeometryChange.FAIL qualquer que seja o pedido — a divergência vira erro ao leitor e o
+        // arquivo fica como estava.
+        String seriesKey = "series-sem-criar-geometria-divergente";
+        placementLookup.put(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+        handler.handle(Commands.OPEN, openRequest(seriesKey, null), SOURCE);
+        handler.handle(Commands.CLOSE, new SeriesCommandRequest(seriesKey), SOURCE);
+        String objectKey = SeriesObjectKeys.objectKey(SERIES_OBJECT_PREFIX, seriesKey);
+        byte[] staticSectionBefore = volume.storage().seriesStaticSection(objectKey).orElseThrow();
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                new OpenRequest(seriesKey, divergentYaml(), Map.of(), null, OnGeometryChange.RECREATE, null, false),
+                SOURCE);
+
+        assertEquals(SeriesStatus.ERROR, response.status(), "divergência de geometria sem criar deveria falhar");
+        assertTrue(response.message().contains("NgrrdGeometryChangeException"), response.message());
+        assertFalse(registry.isOpen(seriesKey));
+        assertArrayEquals(staticSectionBefore, volume.storage().seriesStaticSection(objectKey).orElseThrow(),
+                "OPEN sem criar não pode regravar a série com a geometria nova");
+    }
+
+    @Test
+    void openSemCriarComSerieJaAbertaIgnoraGeometriaDivergente() {
+        // Com a série já aberta no registry, o OPEN sem criar reaproveita o handle existente: nada é
+        // reaberto, migrado nem recriado.
+        String seriesKey = "series-sem-criar-aberta-divergente";
+        placementLookup.put(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+        handler.handle(Commands.OPEN, openRequest(seriesKey, null), SOURCE);
+        String objectKey = SeriesObjectKeys.objectKey(SERIES_OBJECT_PREFIX, seriesKey);
+        byte[] staticSectionBefore = volume.storage().seriesStaticSection(objectKey).orElseThrow();
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                new OpenRequest(seriesKey, divergentYaml(), Map.of(), null, OnGeometryChange.RECREATE, null, false),
+                SOURCE);
+
+        assertEquals(SeriesStatus.OK, response.status());
+        assertArrayEquals(staticSectionBefore, volume.storage().seriesStaticSection(objectKey).orElseThrow());
+    }
+
+    /**
+     * Mesma definição de teste com o archive horário encolhido e a revisão de schema incrementada —
+     * geometria incompatível com a gravada e elegível a reescrita (MIGRATE/RECREATE só disparam quando a
+     * revisão da definição supera a gravada).
+     */
+    private String divergentYaml() {
+        String divergent = yaml.replace("rows: 4320", "rows: 2160")
+                .replace("  name: iface-traffic-blob\n", "  name: iface-traffic-blob\n  schemaRevision: 2\n");
+        assertNotEquals(yaml, divergent, "o YAML de teste deveria conter o archive a alterar");
+        return divergent;
     }
 
     @Test
