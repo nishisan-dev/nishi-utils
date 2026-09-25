@@ -87,9 +87,9 @@ import java.util.stream.Collectors;
  * <p>Uma rota não marcada nunca é trocada: todas as escritas válidas da chave, de qualquer handle,
  * compartilham a mesma rota e a mesma ordem FIFO (toda a proteção de ordem — reenfileiramento na frente,
  * reposicionamento por {@code WRONG_OWNER} com o backlog junto — é por rota). A abertura de um handle
- * novo só avança a geração da rota ({@link SeriesRoute#generation}); uma reabertura assíncrona que
- * descobre {@link SeriesNotFoundException} só marca a rota se nenhum handle novo tiver aberto a chave
- * enquanto ela estava em voo.</p>
+ * novo publica o handle e, depois, avança a geração da rota ({@link SeriesRoute#generation}), as duas
+ * coisas sob o lock da rota; uma reabertura assíncrona que descobre {@link SeriesNotFoundException} só
+ * marca a rota se nenhum handle novo tiver aberto a chave enquanto ela estava em voo.</p>
  */
 public final class WriteDispatcher implements WriteBuffer, Closeable {
 
@@ -934,17 +934,21 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     /**
      * Registra a abertura de um handle novo de {@code seriesKey}, com dono {@code ownerNodeId} —
      * {@code RemoteSeriesHandle.open()} chama isto quando um handle novo da mesma chave abre com
-     * sucesso, ANTES de o handle ficar visível a quem escreve. Sob o lock da rota atual (o mesmo que
-     * {@link #enqueue} confere antes de admitir e que {@link #failRoute} usa para marcar):
+     * sucesso. Sob o lock da rota da chave (criada agora, se ainda não existir; o mesmo lock que
+     * {@link #enqueue} confere antes de admitir e que {@link #failRoute} usa para marcar), nesta ordem:
      * <ul>
-     *   <li>chave sem rota: nada a fazer;</li>
-     *   <li>a geração da rota avança ({@link SeriesRoute#generation}): uma reabertura assíncrona em voo,
-     *       que capturou a geração anterior, não marca mais a rota se descobrir {@code NOT_FOUND} — a
-     *       descoberta é anterior à abertura deste handle, e a série existe;</li>
+     *   <li>{@code publish} torna o handle novo visível (no cliente, ao reopener);</li>
+     *   <li>só depois a geração da rota avança ({@link SeriesRoute#generation}). Publica, depois avança
+     *       a geração: quem enxerga a geração nova já enxerga o handle novo. Uma reabertura assíncrona
+     *       em voo, que capturou a geração anterior, não marca mais a rota se descobrir
+     *       {@code NOT_FOUND} — a descoberta é anterior à abertura deste handle, e a série existe; e uma
+     *       reabertura que capture a geração nova chama o reopener com o handle novo já publicado, nunca
+     *       com o antigo;</li>
      *   <li>rota não marcada: continua sendo a rota da chave, com as escritas em voo de handles
-     *       anteriores e o dono atual — as escritas do handle novo entram atrás delas, na mesma ordem
-     *       FIFO. Duas rotas válidas para a mesma série separariam escritas que precisam chegar ao dono
-     *       em ordem;</li>
+     *       anteriores — as escritas do handle novo entram atrás delas, na mesma ordem FIFO. Duas rotas
+     *       válidas para a mesma série separariam escritas que precisam chegar ao dono em ordem. Sem
+     *       nada em voo, o dono da rota passa a ser {@code ownerNodeId} (evita um redirecionamento por
+     *       {@code WRONG_OWNER} na primeira escrita do handle novo);</li>
      *   <li>rota marcada inexistente: troca por uma rota nova e limpa, com dono {@code ownerNodeId}.
      *       Toda escrita posterior cai na rota nova e nunca herda a marca; as escritas da geração marcada
      *       ainda em voo carregam a própria rota ({@link PendingWrite}) e são concluídas nela (falham na
@@ -953,24 +957,33 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
      * </ul>
      */
     @Override
-    public void resetSeries(String seriesKey, String ownerNodeId) {
+    public void resetSeries(String seriesKey, String ownerNodeId, Runnable publish) {
         Objects.requireNonNull(ownerNodeId, "ownerNodeId");
-        SeriesRoute route = routes.get(seriesKey);
-        if (route == null) {
-            return;
-        }
-        boolean replaced = false;
-        route.lock.lock();
-        try {
-            route.generation++;
-            if (route.notFound) {
-                replaced = routes.replace(seriesKey, route, new SeriesRoute(ownerNodeId));
+        Objects.requireNonNull(publish, "publish");
+        for (;;) {
+            SeriesRoute route = routes.computeIfAbsent(seriesKey, key -> new SeriesRoute(ownerNodeId));
+            boolean replaced = false;
+            route.lock.lock();
+            try {
+                // Mesma reconferência de enqueue: a rota travada pode ter sido trocada nesse meio tempo.
+                if (routes.get(seriesKey) != route) {
+                    continue;
+                }
+                publish.run();
+                route.generation++;
+                if (route.notFound) {
+                    replaced = routes.replace(seriesKey, route, new SeriesRoute(ownerNodeId));
+                } else if (route.submitted == route.completed) {
+                    route.owner = ownerNodeId;
+                    route.destinations.add(ownerNodeId);
+                }
+            } finally {
+                route.lock.unlock();
             }
-        } finally {
-            route.lock.unlock();
-        }
-        if (replaced) {
-            retireIfDrained(route);
+            if (replaced) {
+                retireIfDrained(route);
+            }
+            return;
         }
     }
 

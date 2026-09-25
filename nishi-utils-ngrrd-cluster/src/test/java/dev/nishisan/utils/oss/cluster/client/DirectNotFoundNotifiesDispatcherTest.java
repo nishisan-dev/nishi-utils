@@ -112,7 +112,7 @@ class DirectNotFoundNotifiesDispatcherTest {
             handles.put(SERIES_KEY, handle);
 
             rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
-            handle.open();
+            handle.open(h -> { });
 
             rpc.respondNext((cmd, body) -> new ReadResponse(SeriesStatus.NOT_OPEN, null, null, null));
             rpc.respondDefault((cmd, body) -> new SeriesStatusResponse(SeriesStatus.NOT_FOUND, OWNER_A.value(), null));
@@ -153,7 +153,7 @@ class DirectNotFoundNotifiesDispatcherTest {
             handles.put(SERIES_KEY, handle);
 
             rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
-            handle.open();
+            handle.open(h -> { });
 
             rpc.respondNext((cmd, body) -> new ReadResponse(SeriesStatus.NOT_OPEN, null, null, null));
             rpc.respondDefault((cmd, body) -> new SeriesStatusResponse(SeriesStatus.NOT_FOUND, OWNER_A.value(), null));
@@ -205,8 +205,7 @@ class DirectNotFoundNotifiesDispatcherTest {
             });
 
             RemoteSeriesHandle handleA = newHandle(dispatcher);
-            handleA.open();
-            handles.put(SERIES_KEY, handleA);
+            handleA.open(h -> handles.put(SERIES_KEY, h));
 
             openStatus.set(SeriesStatus.NOT_FOUND);
             handleA.write("in_octets", new Sample(1L, 1.0));
@@ -221,8 +220,7 @@ class DirectNotFoundNotifiesDispatcherTest {
 
             openStatus.set(SeriesStatus.OK);
             RemoteSeriesHandle handleB = newHandle(dispatcher);
-            handleB.open();
-            handles.put(SERIES_KEY, handleB);
+            handleB.open(h -> handles.put(SERIES_KEY, h));
             handleB.write("in_octets", new Sample(2L, 2.0));
 
             releaseBatch.countDown();
@@ -280,8 +278,7 @@ class DirectNotFoundNotifiesDispatcherTest {
             buffer.onFlushSeries = flushEntered::countDown;
             RemoteSeriesHandle handleA = newHandle(buffer, rpc, Ngrrd.OpenOptions.defaults().withCreateIfMissing(false),
                     Duration.ofSeconds(30));
-            handleA.open();
-            handles.put(SERIES_KEY, handleA);
+            handleA.open(h -> handles.put(SERIES_KEY, h));
             openStatus.set(SeriesStatus.NOT_FOUND);
 
             handleA.write("in_octets", new Sample(1L, 1.0));
@@ -374,8 +371,7 @@ class DirectNotFoundNotifiesDispatcherTest {
 
             RemoteSeriesHandle handleA = newHandle(dispatcher, rpcA, Ngrrd.OpenOptions.defaults().withCreateIfMissing(false),
                     Duration.ofSeconds(30));
-            handleA.open();
-            handles.put(SERIES_KEY, handleA);
+            handleA.open(h -> handles.put(SERIES_KEY, h));
             handleA.write("in_octets", new Sample(1L, 1.0));
             assertTrue(reopenInFlight.await(AWAIT_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS),
                     "reopener chamou A.reopen() e o OPEN está em voo");
@@ -386,8 +382,7 @@ class DirectNotFoundNotifiesDispatcherTest {
 
             // O que DefaultNgrrdClusterClient.open faz ao ver A fechado: abre um handle novo e o publica.
             RemoteSeriesHandle handleB = newHandle(dispatcher, rpcB, Ngrrd.OpenOptions.defaults(), Duration.ofSeconds(5));
-            handleB.open();
-            handles.put(SERIES_KEY, handleB);
+            handleB.open(h -> handles.put(SERIES_KEY, h));
             handleB.write("in_octets", new Sample(2L, 2.0));
 
             releaseReopen.countDown();
@@ -454,8 +449,7 @@ class DirectNotFoundNotifiesDispatcherTest {
             rpcB.respondDefault((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
 
             RemoteSeriesHandle handleA = newHandle(dispatcher, rpcA, Ngrrd.OpenOptions.defaults(), Duration.ofSeconds(30));
-            handleA.open();
-            handles.put(SERIES_KEY, handleA);
+            handleA.open(h -> handles.put(SERIES_KEY, h));
             handleA.write("in_octets", new Sample(1L, 1.0));
 
             Thread closer = new Thread(handleA::close, "test-close-A");
@@ -464,8 +458,7 @@ class DirectNotFoundNotifiesDispatcherTest {
                     "o flush do close de A enviou w1, em voo");
 
             RemoteSeriesHandle handleB = newHandle(dispatcher, rpcB, Ngrrd.OpenOptions.defaults(), Duration.ofSeconds(5));
-            handleB.open();
-            handles.put(SERIES_KEY, handleB);
+            handleB.open(h -> handles.put(SERIES_KEY, h));
             handleB.write("in_octets", new Sample(2L, 2.0));
 
             releaseFirstBatch.countDown();
@@ -553,8 +546,8 @@ class DirectNotFoundNotifiesDispatcherTest {
         }
 
         @Override
-        public void resetSeries(String seriesKey, String ownerNodeId) {
-            delegate.resetSeries(seriesKey, ownerNodeId);
+        public void resetSeries(String seriesKey, String ownerNodeId, Runnable publish) {
+            delegate.resetSeries(seriesKey, ownerNodeId, publish);
         }
     }
 

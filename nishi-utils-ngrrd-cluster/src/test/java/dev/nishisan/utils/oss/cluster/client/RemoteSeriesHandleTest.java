@@ -102,7 +102,7 @@ class RemoteSeriesHandleTest {
         rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.WRONG_OWNER, OWNER_B.value(), null));
         rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_B.value(), null));
 
-        handle.open();
+        handle.open(h -> { });
 
         assertEquals(2, rpc.calls().size());
         assertEquals(OWNER_A, rpc.calls().get(0).target());
@@ -114,7 +114,7 @@ class RemoteSeriesHandleTest {
     void checkpointComNotOpenReabreERepeteUmaVez() {
         RemoteSeriesHandle handle = newHandle();
         rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
-        handle.open();
+        handle.open(h -> { });
 
         rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.NOT_OPEN, null, null));
         rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null)); // reopen
@@ -183,7 +183,7 @@ class RemoteSeriesHandleTest {
     private RemoteSeriesHandle openedHandle() {
         RemoteSeriesHandle handle = newHandle();
         rpc.respondNext((cmd, body) -> response(cmd, SeriesStatus.OK, OWNER_A.value()));
-        handle.open();
+        handle.open(h -> { });
         return handle;
     }
 
@@ -211,7 +211,7 @@ class RemoteSeriesHandleTest {
     void migratingAlemDoPrazoLancaExcecaoMigrating() {
         RemoteSeriesHandle handle = newHandle(Duration.ofMillis(150));
         rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
-        handle.open();
+        handle.open(h -> { });
 
         rpc.respondDefault((cmd, body) -> new SeriesStatusResponse(SeriesStatus.MIGRATING, OWNER_A.value(), null));
 
@@ -223,7 +223,7 @@ class RemoteSeriesHandleTest {
     void handleFechadoLancaClosedAoEscrever() {
         RemoteSeriesHandle handle = newHandle();
         rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
-        handle.open();
+        handle.open(h -> { });
 
         rpc.respondDefault((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
         handle.close();
@@ -237,7 +237,7 @@ class RemoteSeriesHandleTest {
     void writeEnfileiraNoDispatcherComODonoAtual() {
         RemoteSeriesHandle handle = newHandle();
         rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
-        handle.open();
+        handle.open(h -> { });
 
         handle.write("in_octets", new Sample(1L, 42.0));
 
@@ -256,7 +256,7 @@ class RemoteSeriesHandleTest {
         });
         rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
 
-        handle.open();
+        handle.open(h -> { });
 
         assertEquals(2, rpc.calls().size());
         assertEquals(Commands.OPEN, rpc.calls().get(0).command());
@@ -270,7 +270,7 @@ class RemoteSeriesHandleTest {
         // retentativa do TIMEOUT.
         RemoteSeriesHandle handle = newHandle();
         rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
-        handle.open();
+        handle.open(h -> { });
 
         rpc.respondNext((cmd, body) -> {
             throw new NgrrdClusterException(ErrorCode.REMOTE_ERROR, "falha de transporte simulada",
@@ -293,7 +293,7 @@ class RemoteSeriesHandleTest {
                             OWNER_A, java.util.UUID.randomUUID()));
         });
         rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
-        handle.open();
+        handle.open(h -> { });
         assertEquals(2, rpc.calls().size());
     }
 
@@ -303,7 +303,7 @@ class RemoteSeriesHandleTest {
         // erro de verdade) não é falha de transporte: deve subir direto, sem retentativa.
         RemoteSeriesHandle handle = newHandle();
         rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
-        handle.open();
+        handle.open(h -> { });
 
         rpc.respondDefault((cmd, body) -> {
             throw new NgrrdClusterException(ErrorCode.REMOTE_ERROR, "erro de aplicação simulado");
@@ -320,7 +320,7 @@ class RemoteSeriesHandleTest {
         RemoteSeriesHandle handle = newHandle(Ngrrd.OpenOptions.defaults().withCreateIfMissing(false));
         rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
 
-        handle.open();
+        handle.open(h -> { });
 
         assertEquals(0, resolver.resolveCalls.get(), "open sem criar nunca posiciona (ngrrd.place)");
         assertEquals(1, resolver.resolveExistingCalls.get());
@@ -333,7 +333,7 @@ class RemoteSeriesHandleTest {
         RemoteSeriesHandle handle = newHandle();
         rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
 
-        handle.open();
+        handle.open(h -> { });
 
         assertEquals(1, resolver.resolveCalls.get());
         assertEquals(0, resolver.resolveExistingCalls.get());
@@ -346,7 +346,7 @@ class RemoteSeriesHandleTest {
         RemoteSeriesHandle handle = newHandle(Ngrrd.OpenOptions.defaults().withCreateIfMissing(false));
         rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.NOT_FOUND, OWNER_A.value(), null));
 
-        SeriesNotFoundException ex = assertThrows(SeriesNotFoundException.class, handle::open);
+        SeriesNotFoundException ex = assertThrows(SeriesNotFoundException.class, () -> handle.open(h -> { }));
         assertEquals(SERIES_KEY, ex.seriesKey());
     }
 
@@ -355,7 +355,7 @@ class RemoteSeriesHandleTest {
         RemoteSeriesHandle handle = newHandle(Ngrrd.OpenOptions.defaults().withCreateIfMissing(false));
         resolver.resolveExistingFailure = new SeriesNotFoundException(SERIES_KEY);
 
-        assertThrows(SeriesNotFoundException.class, handle::open);
+        assertThrows(SeriesNotFoundException.class, () -> handle.open(h -> { }));
         assertTrue(rpc.calls().isEmpty(), "sem placement, o handle nunca chega a chamar OPEN no dono");
     }
 
@@ -363,7 +363,7 @@ class RemoteSeriesHandleTest {
     void reopenSemCriarComNotFoundRelancaEMarcaHandleInexistente() {
         RemoteSeriesHandle handle = newHandle(Ngrrd.OpenOptions.defaults().withCreateIfMissing(false));
         rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
-        handle.open();
+        handle.open(h -> { });
         onCloseCalls.clear();
 
         rpc.respondDefault((cmd, body) -> new SeriesStatusResponse(SeriesStatus.NOT_FOUND, OWNER_A.value(), null));
@@ -384,7 +384,7 @@ class RemoteSeriesHandleTest {
         // também, não só no caminho assíncrono do reopener do dispatcher.
         RemoteSeriesHandle handle = newHandle(Ngrrd.OpenOptions.defaults().withCreateIfMissing(false));
         rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
-        handle.open();
+        handle.open(h -> { });
         onCloseCalls.clear();
 
         rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.NOT_OPEN, null, null));
@@ -406,7 +406,7 @@ class RemoteSeriesHandleTest {
         // createIfMissing — o handle precisa ficar marcado aqui também.
         RemoteSeriesHandle handle = newHandle(Ngrrd.OpenOptions.defaults().withCreateIfMissing(false));
         rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
-        handle.open();
+        handle.open(h -> { });
         onCloseCalls.clear();
 
         rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.WRONG_OWNER, null, null));
@@ -430,8 +430,10 @@ class RemoteSeriesHandleTest {
         rpc.respondDefault((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_B.value(), null));
         resolver.owner = OWNER_B.value();
 
-        handle.open();
+        List<RemoteSeriesHandle> published = new CopyOnWriteArrayList<>();
+        handle.open(published::add);
         assertEquals(List.of(SERIES_KEY + "@" + OWNER_B.value()), dispatcher.resetSeries);
+        assertEquals(List.of(handle), published, "o handle é publicado dentro de resetSeries");
 
         assertTrue(handle.reopen());
         assertEquals(1, dispatcher.resetSeries.size(), "reopen() não desfaz marca alguma");
@@ -442,8 +444,10 @@ class RemoteSeriesHandleTest {
         RemoteSeriesHandle handle = newHandle(Ngrrd.OpenOptions.defaults().withCreateIfMissing(false));
         rpc.respondDefault((cmd, body) -> new SeriesStatusResponse(SeriesStatus.NOT_FOUND, OWNER_A.value(), null));
 
-        assertThrows(SeriesNotFoundException.class, handle::open);
+        List<RemoteSeriesHandle> published = new CopyOnWriteArrayList<>();
+        assertThrows(SeriesNotFoundException.class, () -> handle.open(published::add));
         assertTrue(dispatcher.resetSeries.isEmpty());
+        assertTrue(published.isEmpty(), "OPEN que falha não publica o handle");
     }
 
     @Test
@@ -465,7 +469,7 @@ class RemoteSeriesHandleTest {
         self.set(handle);
         dispatcher.onFailSeries = () -> events.add("failSeries:isOpen=" + self.get().isOpen());
         rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
-        handle.open();
+        handle.open(h -> { });
 
         rpc.respondDefault((cmd, body) -> new SeriesStatusResponse(SeriesStatus.NOT_FOUND, OWNER_A.value(), null));
         assertThrows(SeriesNotFoundException.class, handle::reopen);
@@ -493,7 +497,7 @@ class RemoteSeriesHandleTest {
                 (key, handle) -> handles.remove(key, handle));
         handles.put(SERIES_KEY, handleA);
         rpcA.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.OK, OWNER_A.value(), null));
-        handleA.open();
+        handleA.open(h -> { });
 
         rpcA.respondDefault((cmd, body) -> {
             awaitLatch(openGate);
@@ -598,8 +602,9 @@ class RemoteSeriesHandleTest {
         }
 
         @Override
-        public void resetSeries(String seriesKey, String ownerNodeId) {
+        public void resetSeries(String seriesKey, String ownerNodeId, Runnable publish) {
             resetSeries.add(seriesKey + "@" + ownerNodeId);
+            publish.run();
         }
 
         @Override

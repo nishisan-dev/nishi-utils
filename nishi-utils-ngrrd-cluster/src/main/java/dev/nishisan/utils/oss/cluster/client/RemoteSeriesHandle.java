@@ -46,6 +46,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiConsumer;
+import java.util.function.Consumer;
 import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -135,20 +136,22 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
      * {@code DefaultNgrrdClusterClient.open}, para um handle novo; {@link #reopen()} reexecuta só a
      * abertura remota quando um dono sinaliza {@code NOT_OPEN}.
      *
-     * <p>Aberto com sucesso, avisa o {@link #dispatcher} ({@link WriteBuffer#resetSeries}) — antes de o
-     * cliente publicar este handle — de que a chave tem um handle novo: se um handle anterior deixou a
-     * série marcada inexistente, as escritas deste handle passam a usar uma rota nova, sem a marca; se
-     * não, continuam na mesma rota (e na mesma ordem) das escritas ainda em voo do anterior, e a
-     * geração da rota avança para que uma reabertura pendente do handle anterior, que descubra
-     * {@code NOT_FOUND} depois desta abertura, não marque a rota. A reabertura de um handle já em uso
-     * nunca mexe na rota.</p>
+     * <p>Aberto com sucesso, o handle é publicado por {@code publish} DENTRO de
+     * {@link WriteBuffer#resetSeries}, sob o lock da rota da chave no {@link #dispatcher}: publica,
+     * depois avança a geração da rota. Assim, uma reabertura pendente do handle anterior que descubra
+     * {@code NOT_FOUND} depois desta abertura não marca a rota, e nenhuma reabertura que já veja a
+     * geração nova encontra o handle anterior no lugar deste. Se um handle anterior deixou a série
+     * marcada inexistente, as escritas deste handle passam a usar uma rota nova, sem a marca; se não,
+     * continuam na mesma rota (e na mesma ordem) das escritas ainda em voo do anterior. Se o
+     * {@code OPEN} falhar, nada é publicado. A reabertura de um handle já em uso nunca mexe na rota.</p>
      *
      * <p>item 12 (achado do Refuter): package-private de propósito — só {@code DefaultNgrrdClusterClient}
      * e o próprio {@code client} chamam isto; não faz parte do contrato público de {@link NgrrdHandle}.</p>
      */
-    void open() {
+    void open(Consumer<RemoteSeriesHandle> publish) {
+        Objects.requireNonNull(publish, "publish");
         open(new OperationRetry(Commands.OPEN));
-        dispatcher.resetSeries(seriesKey, owner);
+        dispatcher.resetSeries(seriesKey, owner, () -> publish.accept(this));
     }
 
     private void open(OperationRetry retry) {

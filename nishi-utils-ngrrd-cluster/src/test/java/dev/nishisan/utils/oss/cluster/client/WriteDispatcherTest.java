@@ -660,7 +660,7 @@ class WriteDispatcherTest {
                 "enquanto nenhum handle novo abrir, a chave segue marcada");
 
         // O que RemoteSeriesHandle.open() faz ao abrir com sucesso um handle novo da mesma chave.
-        dispatcher.resetSeries("gone", OWNER_A.value());
+        dispatcher.resetSeries("gone", OWNER_A.value(), () -> { });
         dispatcher.enqueue(OWNER_A.value(), write("gone", 2L, 9.0));
         dispatcher.flushSeriesSync("gone", OWNER_A.value(), AWAIT_TIMEOUT); // não deve lançar
 
@@ -698,7 +698,7 @@ class WriteDispatcherTest {
         dispatcher.enqueue(OWNER_A.value(), write("s1", 1L, 1.0));
         awaitLatch(reopenerEntered);
         // O que RemoteSeriesHandle.open() faz ao abrir com sucesso um handle novo da mesma chave.
-        dispatcher.resetSeries("s1", OWNER_A.value());
+        dispatcher.resetSeries("s1", OWNER_A.value(), () -> { });
         dispatcher.enqueue(OWNER_A.value(), write("s1", 2L, 2.0));
         reopenerGate.countDown();
 
@@ -709,6 +709,71 @@ class WriteDispatcherTest {
         dispatcher.enqueue(OWNER_A.value(), write("s1", 3L, 3.0));
         dispatcher.flushAllSync();
         assertEquals(3L, dispatcher.samplesSent(), "a chave nunca ficou marcada");
+    }
+
+    @Test
+    void notOpenLogoAposAAberturaDeUmHandleNovoLevaAReaberturaAoHandleNovoENaoMarcaARota() {
+        // O handle antigo A já sabe que a série não existe (reopen lança na hora); o lote w1 dele está
+        // preso no RPC. Um handle novo B abre a chave e é publicado dentro de resetSeries. Assim que a
+        // abertura termina, o lote volta NOT_OPEN: a reabertura tem de encontrar B — nunca A com a
+        // geração já avançada, o que marcaria a rota e envenenaria B para sempre.
+        AtomicReference<Function<String, Boolean>> currentHandle = new AtomicReference<>(key -> {
+            throw new SeriesNotFoundException(key);
+        });
+        newDispatcher(1, Duration.ofSeconds(30), 1_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK,
+                key -> currentHandle.get().apply(key));
+        CountDownLatch batchInFlight = new CountDownLatch(1);
+        CountDownLatch releaseBatch = new CountDownLatch(1);
+        AtomicInteger writeBatchCalls = new AtomicInteger();
+        List<Long> delivered = new CopyOnWriteArrayList<>();
+        rpc.respondDefault((cmd, body) -> {
+            WriteBatchRequest req = (WriteBatchRequest) body;
+            if (writeBatchCalls.getAndIncrement() == 0) {
+                batchInFlight.countDown();
+                awaitLatch(releaseBatch);
+                return new WriteBatchResponse(Map.of("s1", SeriesStatus.NOT_OPEN), Map.of(), Map.of());
+            }
+            req.writes().forEach(w -> delivered.add(w.tsEpochMs()));
+            return okFor(req);
+        });
+
+        dispatcher.enqueue(OWNER_A.value(), write("s1", 1L, 1.0));
+        awaitLatch(batchInFlight);
+        // A abertura de B termina aqui (o que RemoteSeriesHandle.open() faz ao abrir com sucesso): o
+        // handle novo é publicado para o reopener antes de a geração avançar.
+        dispatcher.resetSeries("s1", OWNER_A.value(), () -> currentHandle.set(key -> true));
+        releaseBatch.countDown();
+        Await.untilTrue("reabertura do lote de A concluída", AWAIT_TIMEOUT,
+                () -> dispatcher.samplesFailed() == 1L || !delivered.isEmpty());
+
+        dispatcher.enqueue(OWNER_A.value(), write("s1", 2L, 2.0));
+        dispatcher.flushSeriesSync("s1", OWNER_A.value(), AWAIT_TIMEOUT);
+        assertEquals(List.of(1L, 2L), delivered, "w1 entregue antes de w2");
+        assertEquals(0L, dispatcher.samplesFailed(), "a chave nunca foi marcada");
+    }
+
+    @Test
+    void handleNovoSemEscritaEmVooPassaADirigirARotaAoDonoQueEleAbriu() {
+        // Rota não marcada e drenada: o dono aberto pelo handle novo vira o dono da rota, e a próxima
+        // escrita vai direto a ele (sem um WRONG_OWNER para redirecionar). Com escrita em voo, o dono da
+        // rota não muda — o backlog continua na frente, na mesma ordem.
+        newDispatcher(1, Duration.ofSeconds(30), 1_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        rpc.respondDefault((cmd, body) -> okFor((WriteBatchRequest) body));
+
+        dispatcher.enqueue(OWNER_A.value(), write("s1", 1L, 1.0));
+        dispatcher.flushSeriesSync("s1", OWNER_A.value(), AWAIT_TIMEOUT);
+        AtomicBoolean published = new AtomicBoolean();
+        dispatcher.resetSeries("s1", OWNER_B.value(), () -> published.set(true));
+        assertTrue(published.get());
+
+        dispatcher.enqueue(OWNER_A.value(), write("s1", 2L, 2.0));
+        dispatcher.flushSeriesSync("s1", OWNER_B.value(), AWAIT_TIMEOUT);
+        List<NodeId> targets = rpc.calls().stream()
+                .filter(c -> c.command().equals(Commands.WRITE_BATCH))
+                .map(RecordingClusterRpc.Recorded::target)
+                .toList();
+        assertEquals(List.of(OWNER_A, OWNER_B), targets);
+        assertEquals(2L, dispatcher.samplesSent());
     }
 
     @Test
