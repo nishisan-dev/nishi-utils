@@ -943,6 +943,64 @@ class WriteDispatcherTest {
     }
 
     @Test
+    void pingPongSemLiderTemTaxaLimitada() throws Exception {
+        // Discordância permanente entre storage-a e storage-c com a consulta ao líder sempre falhando: sem
+        // autoridade, o cliente segue a última dica, mas com o backoff por série — a taxa de reenvios decai
+        // até backoffMax (200 ms), nunca um laço quente.
+        newDispatcher(1, Duration.ofMillis(10), 1_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        placementLookup.atLeader = keys -> {
+            throw new NgrrdClusterException(ErrorCode.UNSUPPORTED_BY_NODE, "líder sem catalog.lookup (simulado)");
+        };
+        rpc.respondByTarget((target, cmd, body) -> {
+            WriteBatchRequest req = (WriteBatchRequest) body;
+            return target.equals(OWNER_A) ? moved(req, OWNER_C) : moved(req, OWNER_A);
+        });
+
+        dispatcher.enqueue(OWNER_A.value(), write("s1", 1, 1));
+        Thread.sleep(1_000);
+        long batchesFirstSecond = countWriteBatchCalls();
+        int lookupsFirstSecond = placementLookup.atLeaderCalls.get();
+        Thread.sleep(3_000);
+        long batchesNextThreeSeconds = countWriteBatchCalls() - batchesFirstSecond;
+        int lookupsNextThreeSeconds = placementLookup.atLeaderCalls.get() - lookupsFirstSecond;
+
+        // 3 s a 200 ms por reenvio dão ~15 lotes; folga para o escalonamento.
+        assertTrue(batchesNextThreeSeconds <= 20, "reenvios demais com backoff no teto: " + batchesNextThreeSeconds
+                + " (primeiro segundo: " + batchesFirstSecond + ")");
+        assertTrue(lookupsNextThreeSeconds <= 20, "consultas ao líder demais com backoff no teto: "
+                + lookupsNextThreeSeconds + " (primeiro segundo: " + lookupsFirstSecond + ")");
+        assertEquals(0L, dispatcher.samplesSent());
+    }
+
+    @Test
+    void donoConfirmadoDepoisConsultaFalhaAindaConverge() {
+        // O líder confirma storage-c uma vez e depois some (consultas falham). storage-c, com a réplica
+        // atrasada por 1,5 s, ainda aponta storage-a: o cliente segue a dica velha, mas precisa voltar a
+        // storage-c e convergir quando a réplica dele alcançar o líder.
+        newDispatcher(1, Duration.ofMillis(10), 1_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        AtomicInteger lookups = new AtomicInteger();
+        placementLookup.atLeader = keys -> {
+            if (lookups.incrementAndGet() == 1) {
+                return Map.of("s1", SeriesPlacement.active(OWNER_C.value(), 1L));
+            }
+            throw new NgrrdClusterException(ErrorCode.NO_LEADER, "líder indisponível (simulado)");
+        };
+        long start = System.nanoTime();
+        rpc.respondByTarget((target, cmd, body) -> {
+            WriteBatchRequest req = (WriteBatchRequest) body;
+            if (target.equals(OWNER_A)) return moved(req, OWNER_C);
+            boolean caughtUp = System.nanoTime() - start > Duration.ofMillis(1_500).toNanos();
+            return caughtUp ? okFor(req) : moved(req, OWNER_A);
+        });
+
+        dispatcher.enqueue(OWNER_A.value(), write("s1", 1, 1));
+
+        Await.untilTrue("amostra confirmada em storage-c", AWAIT_TIMEOUT, () -> dispatcher.samplesSent() == 1L);
+        assertTrue(lookups.get() >= 2, "a consulta deveria ter falhado ao menos uma vez depois da confirmação");
+        assertEquals(0L, dispatcher.samplesFailed());
+    }
+
+    @Test
     void consultaConcluidaDepoisDoCloseNaoMoveEscritas() throws Exception {
         newDispatcher(1, Duration.ofMillis(10), 1_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
         CountDownLatch lookupEntered = new CountDownLatch(1);
