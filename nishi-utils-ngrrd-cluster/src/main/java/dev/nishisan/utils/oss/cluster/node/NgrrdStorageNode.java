@@ -28,9 +28,12 @@ import dev.nishisan.utils.oss.blob.BlobVolume;
 import dev.nishisan.utils.oss.blob.BlobVolumeRegistry;
 import dev.nishisan.utils.oss.blob.NgrrdBlob;
 import dev.nishisan.utils.oss.cluster.admin.AdminService;
+import dev.nishisan.utils.oss.cluster.api.ErrorCode;
+import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogReplicaStatus;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
+import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.client.CatalogLookupClient;
 import dev.nishisan.utils.oss.cluster.client.NodeCapabilities;
 import dev.nishisan.utils.oss.cluster.client.RetryPolicy;
@@ -53,6 +56,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -312,8 +316,9 @@ public final class NgrrdStorageNode implements Closeable {
      * coordenação de um {@code OPEN}.
      *
      * <p>A capacidade {@code catalog.lookup} do líder é conferida só na réplica local de
-     * {@code ngrrd.nodes} (sem leitura forte, pelo mesmo motivo): um líder que não a anuncie falha a
-     * consulta, e o handler responde pela réplica local durante o cooldown.</p>
+     * {@code ngrrd.nodes} (sem leitura forte, pelo mesmo motivo — ver {@link #leaderCapabilitiesFromLocal}):
+     * um líder que não a anuncie falha a consulta na hora, e o handler responde pela réplica local durante o
+     * cooldown.</p>
      */
     private static Map<String, SeriesPlacement> placementsAtLeaderOf(NGridNode node, CatalogService catalog,
             TransportClusterRpc rpc, Collection<String> seriesKeys, Duration maxWait) {
@@ -326,8 +331,27 @@ public final class NgrrdStorageNode implements Closeable {
         }
         CatalogLookupClient lookup = new CatalogLookupClient(rpc,
                 new RetryPolicy(maxWait, LEADER_LOOKUP_BACKOFF_MIN, LEADER_LOOKUP_BACKOFF_MAX), Clock.systemUTC(),
-                LEADER_LOOKUP_BATCH_SIZE, new NodeCapabilities(catalog::nodeStatusLocal, catalog::nodeStatusLocal));
+                LEADER_LOOKUP_BATCH_SIZE, leaderCapabilitiesFromLocal(catalog::nodeStatusLocal));
         return lookup.lookup(seriesKeys, maxWait);
+    }
+
+    /**
+     * Conferência de capacidades do líder usada por {@link #placementsAtLeaderOf}: só a réplica local de
+     * {@code ngrrd.nodes}, e resposta negativa imediata — status presente sem a capacidade (líder anterior à
+     * 8.6.0) ou status ainda ausente na réplica. Sem isso, um status ausente faria o {@link NodeCapabilities}
+     * reler a réplica até o prazo inteiro da confirmação, a cada fim de cooldown; aqui a falha é imediata e o
+     * handler responde pela réplica local.
+     */
+    static NodeCapabilities leaderCapabilitiesFromLocal(Function<String, Optional<StorageNodeStatus>> localStatus) {
+        Function<String, Optional<StorageNodeStatus>> presentOrFail = nodeId -> {
+            Optional<StorageNodeStatus> status = localStatus.apply(nodeId);
+            if (status.isEmpty()) {
+                throw new NgrrdClusterException(ErrorCode.UNSUPPORTED_BY_NODE, "status do líder " + nodeId
+                        + " ausente na réplica local; não foi possível conferir as capacidades dele");
+            }
+            return status;
+        };
+        return new NodeCapabilities(localStatus, presentOrFail);
     }
 
     /**
