@@ -190,7 +190,11 @@ public final class NgrrdStorageNode implements Closeable {
                     // por watermark enquanto o incumbente ainda produz — dois líderes, e o D10c descarta
                     // a cauda do perdedor (flips do catálogo já confirmados sumiam e a série migrada era
                     // recriada vazia na origem — achado do RebalanceClusterTest com log FINE).
-                    .affinityHandbackMode(cfg.affinityHandbackMode());
+                    .affinityHandbackMode(cfg.affinityHandbackMode())
+                    // Issue #178: entre dois sobreviventes com fronteiras incomparáveis (cada um com uma op
+                    // que o outro não tem), o CATÁLOGO decide — perder uma op de status (`ngrrd.nodes`,
+                    // regravada a cada tick) é irrelevante; perder um flip do catálogo perde uma migração.
+                    .priorityTopics(java.util.List.of(MapClusterService.topicFor(CatalogService.CATALOG_MAP)));
             CatalogService.declareMaps(builder);
             if (cfg.seed() != null) {
                 builder.seed(cfg.seed());
@@ -257,9 +261,23 @@ public final class NgrrdStorageNode implements Closeable {
                 MigrationExecutor migrationExecutor = new MigrationExecutor(node.transport(), registry, volume, rpc,
                         catalog, self, cfg.seriesObjectPrefix(), cfg.migrationChunkBytes(), cfg.maxSeriesBytes(),
                         cfg.migrationBytesPerSecond(), Clock.systemUTC(), cfg.quotaMaxSeries(), cfg.quotaMaxBytes());
+                // Fence do catálogo (issue #178): o novo líder só retoma migrações MIGRATING quando a réplica
+                // local do catálogo drenou o relay e alcançou a maior fronteira anunciada pelos peers elegíveis.
+                String catalogTopicForFence = MapClusterService.topicFor(CatalogService.CATALOG_MAP);
+                java.util.function.BooleanSupplier catalogFence = () -> {
+                    var status = node.replicationManager().getTopicReplicationStatuses().get(catalogTopicForFence);
+                    if (status == null) {
+                        return true;
+                    }
+                    boolean drained = status.relayBacklog() == 0 && !status.syncing() && !status.relayPendingBootstrap();
+                    boolean caughtUp = status.maxPeerFrontier() < 0
+                            || status.nextExpectedSequence() - 1 >= status.maxPeerFrontier();
+                    return drained && caughtUp;
+                };
                 MigrationCoordinator migrationCoordinator = new MigrationCoordinator(catalog, rpc, leaderView,
                         cfg.maxConcurrentMigrations(), cfg.migrationStatusPollInterval(), cfg.migrationTimeout(),
-                        Clock.systemUTC(), migrationHooks, cfg.maxDestinationCatalogLag(), cfg.placementRules());
+                        Clock.systemUTC(), migrationHooks, cfg.maxDestinationCatalogLag(), cfg.placementRules(),
+                        catalogFence, MigrationCoordinator.DEFAULT_RESUME_FENCE_TIMEOUT);
                 RebalanceSettings rebalanceSettings = new RebalanceSettings(cfg.rebalanceMinDelta(),
                         cfg.rebalanceTolerance(), cfg.maxMovesPerCycle(), cfg.maxDestinationCatalogLag());
                 Rebalancer rebalancer = new Rebalancer(catalog, leaderView, migrationCoordinator, rebalanceSettings,

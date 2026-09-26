@@ -101,7 +101,7 @@ public final class MigrationCoordinator implements LeadershipListener {
         }
     }
 
-    private static final MigrationHooks NO_OP_HOOKS = new MigrationHooks() {
+    static final MigrationHooks NO_OP_HOOKS = new MigrationHooks() {
     };
     /**
      * Tentativas (e intervalo entre elas) de {@link Commands#MIGRATE_FINISH} à origem após o flip do
@@ -134,6 +134,11 @@ public final class MigrationCoordinator implements LeadershipListener {
      */
     private static final int RESUME_SCAN_ATTEMPTS = 20;
     private static final Duration RESUME_SCAN_BACKOFF = Duration.ofMillis(500L);
+    /** Espera padrão pelo fence do catálogo antes de {@link #resumeInFlight()} (issue #178). */
+    public static final Duration DEFAULT_RESUME_FENCE_TIMEOUT = Duration.ofSeconds(30);
+    private static final Duration RESUME_FENCE_POLL = Duration.ofMillis(200L);
+    private final java.util.function.BooleanSupplier resumeFence;
+    private final Duration resumeFenceTimeout;
     /**
      * Tentativas (e intervalo entre elas) para gravar um placement que <strong>decide</strong> o
      * desfecho de uma migração — o flip para {@code ACTIVE(dst)} em {@link #complete} e a reversão em
@@ -262,7 +267,24 @@ public final class MigrationCoordinator implements LeadershipListener {
     public MigrationCoordinator(CatalogView catalog, ClusterRpc rpc, PlacementRequestHandler.LeaderView leaderView,
             int maxConcurrentMigrations, Duration migrationStatusPollInterval, Duration migrationTimeout,
             Clock clock, MigrationHooks hooks, long maxDestinationCatalogLag, PlacementRules placementRules) {
+        this(catalog, rpc, leaderView, maxConcurrentMigrations, migrationStatusPollInterval, migrationTimeout, clock,
+                hooks, maxDestinationCatalogLag, placementRules, () -> true, DEFAULT_RESUME_FENCE_TIMEOUT);
+    }
+
+    /**
+     * @param resumeFence        fence do catálogo (issue #178): {@code resumeInFlight} só varre a réplica local
+     *                           depois que ele responde {@code true} — a réplica do catálogo do novo líder
+     *                           drenou o relay e alcançou a maior fronteira anunciada pelos peers elegíveis
+     * @param resumeFenceTimeout tempo máximo de espera pelo fence; vencido, a varredura roda mesmo assim com
+     *                           um WARNING ({@code NGRRD_RESUME_FENCE_TIMEOUT})
+     */
+    public MigrationCoordinator(CatalogView catalog, ClusterRpc rpc, PlacementRequestHandler.LeaderView leaderView,
+            int maxConcurrentMigrations, Duration migrationStatusPollInterval, Duration migrationTimeout,
+            Clock clock, MigrationHooks hooks, long maxDestinationCatalogLag, PlacementRules placementRules,
+            java.util.function.BooleanSupplier resumeFence, Duration resumeFenceTimeout) {
         this.placementRules = Objects.requireNonNullElse(placementRules, PlacementRules.NONE);
+        this.resumeFence = Objects.requireNonNull(resumeFence, "resumeFence");
+        this.resumeFenceTimeout = Objects.requireNonNull(resumeFenceTimeout, "resumeFenceTimeout");
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.rpc = Objects.requireNonNull(rpc, "rpc");
         this.leaderView = Objects.requireNonNull(leaderView, "leaderView");
@@ -717,6 +739,9 @@ public final class MigrationCoordinator implements LeadershipListener {
      * {@link #runMigration} original que ainda esteja com a MESMA migração em andamento.
      */
     private void resumeInFlight() {
+        if (!awaitResumeFence()) {
+            return; // deixou de ser líder (ou fechou) enquanto esperava
+        }
         for (int attempt = 1; attempt <= RESUME_SCAN_ATTEMPTS; attempt++) {
             if (!driving()) {
                 return;
@@ -755,6 +780,42 @@ public final class MigrationCoordinator implements LeadershipListener {
                 sleepQuietly(RESUME_SCAN_BACKOFF);
             }
         }
+    }
+
+    /**
+     * Fence do catálogo (issue #178): a varredura de {@code MIGRATING} lê a réplica LOCAL (eventual). Um
+     * líder recém-eleito pode ainda ter entradas do catálogo no relay (não aplicadas) ou estar atrás da
+     * fronteira que os peers elegíveis anunciam — varrer agora perderia a migração em curso. Espera até
+     * {@link #resumeFenceTimeout}; vencido, segue com WARNING (a varredura de 20 tentativas conta a partir daqui).
+     *
+     * @return {@code false} se o nó deixou de conduzir enquanto esperava
+     */
+    private boolean awaitResumeFence() {
+        long deadline = clock.millis() + resumeFenceTimeout.toMillis();
+        boolean waited = false;
+        while (driving()) {
+            boolean ready;
+            try {
+                ready = resumeFence.getAsBoolean();
+            } catch (RuntimeException e) {
+                LOGGER.log(Level.FINE, "Fence do catálogo lançou; considerando pronto", e);
+                ready = true;
+            }
+            if (ready) {
+                if (waited) {
+                    LOGGER.info("NGRRD_RESUME_FENCE satisfeito: a réplica do catálogo alcançou a fronteira dos peers");
+                }
+                return true;
+            }
+            if (clock.millis() >= deadline) {
+                LOGGER.warning("NGRRD_RESUME_FENCE_TIMEOUT: a réplica do catálogo não alcançou a fronteira dos peers em "
+                        + resumeFenceTimeout + "; retomando migrações com a cópia local mesmo assim");
+                return true;
+            }
+            waited = true;
+            sleepQuietly(RESUME_FENCE_POLL);
+        }
+        return false;
     }
 
     private void resumeOne(String seriesKey, SeriesPlacement placement) {

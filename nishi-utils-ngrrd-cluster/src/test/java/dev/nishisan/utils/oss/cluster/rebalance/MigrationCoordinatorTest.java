@@ -676,6 +676,59 @@ class MigrationCoordinatorTest {
         awaitTrue("MIGRATE_FINISH enviado à origem", () -> rpc.callsTo(SRC, Commands.MIGRATE_FINISH) >= 1);
     }
 
+    /** Issue #178: o novo líder só varre a réplica local depois que o fence do catálogo libera. */
+    @Test
+    void resumeInFlightAguardaOFenceDoCatalogoAntesDeVarrerAReplicaLocal() {
+        String migrationId = "migration-resume-fenced";
+        catalog.putPlacement("s1",
+                new SeriesPlacement(SRC, DST, PlacementState.MIGRATING, migrationId, 1_000L, 1_000L));
+        rpc.respond(DST, Commands.MIGRATE_STATUS,
+                (target, body) -> new MigrateResponse(MigrateStatus.COMMITTED, null, 999L));
+        rpc.respond(SRC, Commands.MIGRATE_FINISH, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+        java.util.concurrent.atomic.AtomicBoolean fence = new java.util.concurrent.atomic.AtomicBoolean(false);
+
+        coordinator = new MigrationCoordinator(catalog, rpc, leaderView, 2, Duration.ofMillis(20),
+                Duration.ofSeconds(5), Clock.systemUTC(), MigrationCoordinator.NO_OP_HOOKS,
+                RebalanceSettings.DEFAULT_MAX_DESTINATION_CATALOG_LAG, null, fence::get, Duration.ofSeconds(10));
+        coordinator.onLeaderChanged(NodeId.of("self"));
+
+        // Fence fechado: a réplica local não é consultada — nenhum MIGRATE_STATUS sai.
+        long until = System.currentTimeMillis() + 800;
+        while (System.currentTimeMillis() < until) {
+            assertEquals(0, rpc.callsTo(DST, Commands.MIGRATE_STATUS),
+                    "com o fence fechado, resumeInFlight não pode retomar nada");
+            sleepQuietly(50);
+        }
+        fence.set(true);
+        awaitTrue("placement flipado para ACTIVE(dst) depois do fence", () -> {
+            Optional<SeriesPlacement> current = catalog.placementStrong("s1");
+            return current.isPresent() && current.get().state() == PlacementState.ACTIVE
+                    && current.get().ownerNodeId().equals(DST);
+        });
+    }
+
+    /** Issue #178: vencido o prazo do fence, a varredura roda mesmo assim (com WARNING). */
+    @Test
+    void resumeInFlightSegueAposOTimeoutDoFence() {
+        String migrationId = "migration-resume-fence-timeout";
+        catalog.putPlacement("s1",
+                new SeriesPlacement(SRC, DST, PlacementState.MIGRATING, migrationId, 1_000L, 1_000L));
+        rpc.respond(DST, Commands.MIGRATE_STATUS,
+                (target, body) -> new MigrateResponse(MigrateStatus.COMMITTED, null, 999L));
+        rpc.respond(SRC, Commands.MIGRATE_FINISH, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+
+        coordinator = new MigrationCoordinator(catalog, rpc, leaderView, 2, Duration.ofMillis(20),
+                Duration.ofSeconds(5), Clock.systemUTC(), MigrationCoordinator.NO_OP_HOOKS,
+                RebalanceSettings.DEFAULT_MAX_DESTINATION_CATALOG_LAG, null, () -> false, Duration.ofMillis(300));
+        coordinator.onLeaderChanged(NodeId.of("self"));
+
+        awaitTrue("placement flipado para ACTIVE(dst) após o timeout do fence", () -> {
+            Optional<SeriesPlacement> current = catalog.placementStrong("s1");
+            return current.isPresent() && current.get().state() == PlacementState.ACTIVE
+                    && current.get().ownerNodeId().equals(DST);
+        });
+    }
+
     @Test
     void resumeInFlightRetentaOFlipDoCatalogoRecusadoPeloLiderEmCatchUp() {
         String migrationId = "migration-resume-syncing";
@@ -932,6 +985,14 @@ class MigrationCoordinatorTest {
         assertEquals(0L, rpc.callsTo(SRC, Commands.MIGRATE_FINISH), "MIGRATE_FINISH não pode ser enviado após o close()");
         SeriesPlacement flipped = catalog.placementStrong("s1").orElseThrow();
         assertEquals(DST, flipped.ownerNodeId(), "o flip já gravado permanece (a origem vira órfã do reconciliador)");
+    }
+
+    private static void sleepQuietly(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private static void awaitTrue(String description, java.util.function.BooleanSupplier condition) {
