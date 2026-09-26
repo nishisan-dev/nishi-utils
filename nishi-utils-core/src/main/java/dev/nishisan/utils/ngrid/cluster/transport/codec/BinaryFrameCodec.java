@@ -47,11 +47,19 @@ import java.util.UUID;
  * | 11+N     | 8 bytes  | leaderHighWatermark                     |
  * | 19+N     | 8 bytes  | leaderEpoch                             |
  * | 27+N     | 1 byte   | leader flag (0/1) — OPTIONAL trailing   |
+ * | 28+N     | 2 bytes  | topic count (unsigned short) — OPTIONAL |
+ * | 30+N     | ...      | count × (u16 len, UTF-8 topic, i64 frontier) |
  * </pre>
  * <p>
  * The trailing leader flag (issue tems#9, D10c) is wire-compatible in both directions: an old
  * decoder stops after the three longs and ignores trailing bytes; a new decoder reads the flag
  * only when present ({@code remaining() > 0}) and defaults to {@code false} for old frames.
+ * <p>
+ * The trailing per-topic frontier section (issue #178) follows the same rule: it is emitted only
+ * when the payload carries a non-empty vector, a decoder that predates it ignores the trailing
+ * bytes, and a new decoder reads it only when at least the count is present ({@code remaining() >= 2}),
+ * decoding an empty map for older frames. At most {@link #MAX_TOPICS_PER_FRAME} topics are encoded
+ * (sorted by name; the sender logs once when it has to truncate).
  * <p>
  * This codec is thread-safe.
  *
@@ -67,6 +75,14 @@ public final class BinaryFrameCodec {
 
     /** Sentinel UUID used for lightweight messages that don't need correlation. */
     static final UUID ZERO_UUID = new UUID(0, 0);
+
+    /** Upper bound of per-topic frontiers carried in one heartbeat frame (issue #178). */
+    public static final int MAX_TOPICS_PER_FRAME = 255;
+
+    private static final java.util.concurrent.atomic.AtomicBoolean TRUNCATION_WARNED =
+            new java.util.concurrent.atomic.AtomicBoolean();
+    private static final java.util.logging.Logger LOGGER =
+            java.util.logging.Logger.getLogger(BinaryFrameCodec.class.getName());
 
     /**
      * Returns {@code true} if the given message type can be encoded by this codec.
@@ -105,8 +121,35 @@ public final class BinaryFrameCodec {
         HeartbeatPayload payload = message.payload(HeartbeatPayload.class);
         byte[] sourceBytes = message.source().value().getBytes(StandardCharsets.UTF_8);
 
-        // 1 (marker) + 2 (source length) + N (source) + 24 (3 longs) + 1 (leader flag)
-        ByteBuffer buffer = ByteBuffer.allocate(1 + 2 + sourceBytes.length + 24 + 1);
+        // Per-topic frontier section (issue #178): only for HEARTBEAT with a non-empty vector.
+        java.util.List<byte[]> topicNames = new java.util.ArrayList<>();
+        java.util.List<Long> frontiers = new java.util.ArrayList<>();
+        int sectionBytes = 0;
+        if (marker == HEARTBEAT_MARKER && !payload.topicFrontiers().isEmpty()) {
+            int count = 0;
+            for (java.util.Map.Entry<String, Long> e : payload.topicFrontiers().entrySet()) {
+                if (count == MAX_TOPICS_PER_FRAME) {
+                    if (TRUNCATION_WARNED.compareAndSet(false, true)) {
+                        LOGGER.warning(() -> "Heartbeat carries more than " + MAX_TOPICS_PER_FRAME
+                                + " replicated topics; only the first " + MAX_TOPICS_PER_FRAME
+                                + " (by name) are advertised in the frontier vector");
+                    }
+                    break;
+                }
+                byte[] name = e.getKey().getBytes(StandardCharsets.UTF_8);
+                if (name.length > 0xFFFF) {
+                    continue;
+                }
+                topicNames.add(name);
+                frontiers.add(e.getValue());
+                sectionBytes += 2 + name.length + 8;
+                count++;
+            }
+            sectionBytes += 2; // count
+        }
+
+        // 1 (marker) + 2 (source length) + N (source) + 24 (3 longs) + 1 (leader flag) + section
+        ByteBuffer buffer = ByteBuffer.allocate(1 + 2 + sourceBytes.length + 24 + 1 + sectionBytes);
         buffer.put(marker);
         buffer.putShort((short) sourceBytes.length);
         buffer.put(sourceBytes);
@@ -114,6 +157,15 @@ public final class BinaryFrameCodec {
         buffer.putLong(payload.leaderHighWatermark());
         buffer.putLong(payload.leaderEpoch());
         buffer.put(payload.leader() ? (byte) 1 : (byte) 0);
+        if (sectionBytes > 0) {
+            buffer.putShort((short) topicNames.size());
+            for (int i = 0; i < topicNames.size(); i++) {
+                byte[] name = topicNames.get(i);
+                buffer.putShort((short) name.length);
+                buffer.put(name);
+                buffer.putLong(frontiers.get(i));
+            }
+        }
 
         return buffer.array();
     }
@@ -151,8 +203,23 @@ public final class BinaryFrameCodec {
             // Optional trailing leader flag (issue tems#9, D10c): absent in frames from older
             // peers — decode as false (a node that cannot assert is never treated as a dual leader).
             boolean leader = buffer.remaining() > 0 && buffer.get() != 0;
+            // Optional trailing per-topic frontier section (issue #178): absent in frames from older
+            // peers — decode as an empty vector (consumers fall back to the scalar watermark).
+            java.util.Map<String, Long> topicFrontiers = java.util.Map.of();
+            if (buffer.remaining() >= 2) {
+                int count = buffer.getShort() & 0xFFFF;
+                java.util.Map<String, Long> decoded = new java.util.LinkedHashMap<>();
+                for (int i = 0; i < count; i++) {
+                    int len = buffer.getShort() & 0xFFFF;
+                    byte[] name = new byte[len];
+                    buffer.get(name);
+                    decoded.put(new String(name, StandardCharsets.UTF_8), buffer.getLong());
+                }
+                topicFrontiers = decoded;
+            }
 
-            HeartbeatPayload payload = new HeartbeatPayload(epochMilli, leaderHighWatermark, leaderEpoch, leader);
+            HeartbeatPayload payload = new HeartbeatPayload(epochMilli, leaderHighWatermark, leaderEpoch, leader,
+                    topicFrontiers);
 
             String qualifier = type == MessageType.HEARTBEAT ? "hb" : "rtt";
             return new ClusterMessage(ZERO_UUID, null, type, qualifier, source, null, payload, 1);
