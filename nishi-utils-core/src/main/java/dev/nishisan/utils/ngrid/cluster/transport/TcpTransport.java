@@ -162,9 +162,19 @@ public final class TcpTransport implements Transport {
         this.initialPeerIds = Collections.unmodifiableSet(seedIds);
     }
 
+    // Upper bound on how long a pending response may stay registered when the request timeout is
+    // disabled (<= 0): abandoned futures must not accumulate in pendingResponses forever. Visible for
+    // tests in this package.
+    static volatile java.time.Duration pendingResponseHardBound = java.time.Duration.ofMinutes(10);
+
     // For testing purposes
     NetworkRouter getRouter() {
         return router;
+    }
+
+    // Visible for tests in this package: number of requests awaiting a response.
+    int pendingResponseCount() {
+        return pendingResponses.size();
     }
 
     private record DialBackoff(long failedAtNanos, long nextAttemptAtNanos, int attempts) { }
@@ -380,6 +390,13 @@ public final class TcpTransport implements Transport {
         UUID requestId = message.messageId();
         PendingResponse response = new PendingResponse(destination, future);
         pendingResponses.put(requestId, response);
+        // A caller that cancels its future gives up on the response: drop the entry at once instead
+        // of keeping it (and its timeout task) until the timeout fires.
+        future.whenComplete((result, error) -> {
+            if (future.isCancelled() && pendingResponses.remove(requestId, response)) {
+                response.cancelTimeout();
+            }
+        });
         // Armed before anything is sent: the request timeout covers routing and the dial too.
         scheduleRequestTimeout(requestId, response);
 
@@ -452,20 +469,26 @@ public final class TcpTransport implements Transport {
         }
     }
 
+    /**
+     * Arms the timeout of a pending response: the configured request timeout or, when that is disabled
+     * ({@code <= 0}), the hard bound {@link #pendingResponseHardBound} — a pending entry is never left
+     * without a timeout, or abandoned futures (a peer that never answers, a caller that gave up) would
+     * accumulate in {@code pendingResponses} forever.
+     */
     private void scheduleRequestTimeout(UUID requestId, PendingResponse response) {
-        if (config.requestTimeout().isZero() || config.requestTimeout().isNegative()) {
-            return;
-        }
-        long timeoutMs = config.requestTimeout().toMillis();
+        boolean disabled = config.requestTimeout().isZero() || config.requestTimeout().isNegative();
+        java.time.Duration timeout = disabled ? pendingResponseHardBound : config.requestTimeout();
+        long timeoutMs = Math.max(1L, timeout.toMillis());
         ScheduledFuture<?> timeoutTask = scheduler.schedule(() -> {
             PendingResponse pr = pendingResponses.remove(requestId);
             if (pr != null) {
                 pr.clearTimeoutTask();
                 pr.future.completeExceptionally(new TimeoutException(String.format(
-                        "Request timed out requestId=%s destination=%s timeout=%s",
+                        "Request timed out requestId=%s destination=%s timeout=%s%s",
                         requestId,
                         response.destination,
-                        config.requestTimeout())));
+                        timeout,
+                        disabled ? " (hard bound: request timeout disabled)" : "")));
             }
         }, timeoutMs, TimeUnit.MILLISECONDS);
         response.setTimeoutTask(timeoutTask);
@@ -1251,7 +1274,8 @@ public final class TcpTransport implements Transport {
                     if (back != null && back.isOpen() && back.peerSupportsUndeliverable()) {
                         back.send(ClusterMessage.lightweight(MessageType.UNDELIVERABLE, "undeliverable", localId,
                                 message.source(),
-                                new UndeliverablePayload(message.messageId(), message.destination())));
+                                new UndeliverablePayload(message.messageId(), message.destination(),
+                                        message.correlationId().orElse(null))));
                     }
                 }
             }
@@ -1324,15 +1348,37 @@ public final class TcpTransport implements Transport {
         if (notice.source() != null && payload.destination() != null) {
             router.relayFailed(notice.source(), payload.destination());
         }
+        NodeId localId = config.local().nodeId();
+        if (payload.correlationId() != null) {
+            // About a RESPONSE this node sent: no pending entry here, but the requester holds one keyed
+            // by the correlation id and would wait out its timeout. Tell it, keyed by that id and naming
+            // this node as the request's destination (what its pending entry matches), through whatever
+            // route remains — the relay is no longer a candidate for it, so typically a direct dial (off
+            // this reader thread). Best effort: with no route left, the requester's timeout is the last
+            // resort; a requester older than 8.3.0 drops the unknown message type.
+            NodeId requester = payload.destination();
+            if (requester != null && !requester.equals(localId)) {
+                ClusterMessage forwarded = ClusterMessage.lightweight(MessageType.UNDELIVERABLE, "undeliverable",
+                        localId, requester, new UndeliverablePayload(payload.correlationId(), localId, null));
+                try {
+                    workerPool.submit(() -> send(forwarded));
+                } catch (RejectedExecutionException closing) {
+                    // shutting down: nothing to forward any more
+                }
+            }
+            return;
+        }
         PendingResponse pending = pendingResponses.get(payload.messageId());
         if (pending == null || !pending.destination.equals(payload.destination())) {
             return; // unknown, already completed, or a notice about some other destination
         }
         if (pendingResponses.remove(payload.messageId(), pending)) {
             pending.cancelTimeout();
+            String reason = payload.destination().equals(notice.source())
+                    ? "its response could not be delivered back (the relay lost the return path)"
+                    : "relay " + notice.source() + " has no connection to it";
             pending.future.completeExceptionally(new IOException("Request " + payload.messageId() + " to "
-                    + payload.destination() + " undeliverable: relay " + notice.source()
-                    + " has no connection to it"));
+                    + payload.destination() + " undeliverable: " + reason));
         }
     }
 
