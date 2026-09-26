@@ -35,6 +35,8 @@ import dev.nishisan.utils.oss.cluster.catalog.StorageCapabilities;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.node.PlacementRequestHandler;
 import dev.nishisan.utils.oss.cluster.placement.DistributionMode;
+import dev.nishisan.utils.oss.cluster.placement.PlacementRule;
+import dev.nishisan.utils.oss.cluster.placement.PlacementRules;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.protocol.MigrateControlRequest;
 import dev.nishisan.utils.oss.cluster.protocol.MigrateResponse;
@@ -315,6 +317,89 @@ class RebalancerTest {
         }
 
         assertEquals(List.of(Level.INFO, Level.FINE, Level.INFO, Level.FINE), levels);
+    }
+
+    /** Issue #167 (item 3): um destino na cota de séries aparece em {@code excludedDestinations} com {@code quota_series}. */
+    @Test
+    void triggerNowNaoEscolheDestinoNaCotaDeSeries() throws Exception {
+        leaderView.reachable.add("storage-quota");
+        catalog.putNodeStatus(withReplica("storage-a", 3, CatalogReplicaStatus.ofLeader()));
+        catalog.putNodeStatus(new StorageNodeStatus("storage-quota", NodeState.ACTIVE, 2, 0, 0, 1_000L,
+                DistributionMode.COUNT, 1, 0, StorageCapabilities.ALL, CatalogReplicaStatus.ofLeader(), 2, 0, null));
+        catalog.putNodeStatus(withReplica("storage-b", 0, CatalogReplicaStatus.ofLeader()));
+        for (int i = 0; i < 3; i++) {
+            catalog.putPlacement("series-" + i, SeriesPlacement.active("storage-a", 1_000L)
+                    .withGeometry(geometryId, true, 1_000L));
+        }
+
+        BlockingMigrationRpc rpc = new BlockingMigrationRpc(new CountDownLatch(0), new AtomicInteger());
+        MigrationCoordinator coordinator = new MigrationCoordinator(catalog, rpc, leaderView, 2,
+                Duration.ofMillis(20), Duration.ofSeconds(5), Clock.systemUTC());
+        Rebalancer rebalancer = new Rebalancer(catalog, leaderView, coordinator,
+                new RebalanceSettings(1L, 0.0, 50), false, Duration.ofSeconds(60), Duration.ofSeconds(5),
+                Clock.systemUTC());
+        try {
+            Rebalancer.TriggerResult result = rebalancer.triggerNow();
+
+            assertEquals(Map.of("storage-quota", "quota_series(3/2)"), result.excludedDestinations());
+            assertTrue(result.planned() >= 1, "storage-b é destino elegível");
+            awaitTrue("migração planejada iniciada", () -> !rpc.startTargets().isEmpty());
+            assertTrue(rpc.startTargets().stream().allMatch("storage-b"::equals), rpc.startTargets().toString());
+        } finally {
+            rebalancer.close();
+            coordinator.close();
+        }
+    }
+
+    /** Issue #167 (item 3): drain preso por regra loga {@code NGRRD_DRAIN_PENDING} com o novo motivo e {@code rulesSkipped}. */
+    @Test
+    void drainPresoPorRegraLogaOMotivoComRulesSkipped() {
+        PlacementRules rules = PlacementRules.of(List.of(
+                new PlacementRule("only-a", null, "series-", Set.of("storage-a"), null)));
+        catalog.putNodeStatus(withReplica("storage-a", 2, CatalogReplicaStatus.ofLeader())
+                .withState(NodeState.DRAINING, 1_000L));
+        catalog.putNodeStatus(withReplica("storage-b", 0, CatalogReplicaStatus.ofLeader()));
+        for (int i = 0; i < 2; i++) {
+            catalog.putPlacement("series-" + i, SeriesPlacement.active("storage-a", 1_000L)
+                    .withGeometry(geometryId, true, 1_000L));
+        }
+        MigrationCoordinator coordinator = new MigrationCoordinator(catalog,
+                new BlockingMigrationRpc(new CountDownLatch(0), new AtomicInteger()), leaderView, 2,
+                Duration.ofMillis(20), Duration.ofSeconds(5), Clock.systemUTC());
+        Rebalancer rebalancer = new Rebalancer(catalog, leaderView, coordinator,
+                new RebalanceSettings(1L, 0.0, 50), false, Duration.ofSeconds(60), Duration.ofSeconds(5),
+                Clock.systemUTC(), rules);
+        Logger logger = Logger.getLogger(Rebalancer.class.getName());
+        List<String> messages = new CopyOnWriteArrayList<>();
+        Handler capture = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                if (record.getMessage() != null && record.getMessage().startsWith("NGRRD_DRAIN_PENDING")) {
+                    messages.add(record.getMessage());
+                }
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        logger.addHandler(capture);
+        try {
+            Rebalancer.TriggerResult result = rebalancer.triggerNow();
+            assertEquals(0, result.planned());
+        } finally {
+            logger.removeHandler(capture);
+            rebalancer.close();
+            coordinator.close();
+        }
+
+        assertEquals(List.of("NGRRD_DRAIN_PENDING reason=no_admissible_destination_or_confirmed_geometry_or_quota_or_rules"
+                + " rulesSkipped=2"), messages);
+        assertEquals(NodeState.DRAINING, catalog.nodeStatusLocal("storage-a").orElseThrow().state());
     }
 
     private static StorageNodeStatus withReplica(String nodeId, long seriesCount, CatalogReplicaStatus replica) {

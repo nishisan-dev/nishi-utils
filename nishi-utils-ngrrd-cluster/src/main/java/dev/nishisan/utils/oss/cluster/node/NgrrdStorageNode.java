@@ -259,11 +259,12 @@ public final class NgrrdStorageNode implements Closeable {
                         cfg.migrationBytesPerSecond(), Clock.systemUTC());
                 MigrationCoordinator migrationCoordinator = new MigrationCoordinator(catalog, rpc, leaderView,
                         cfg.maxConcurrentMigrations(), cfg.migrationStatusPollInterval(), cfg.migrationTimeout(),
-                        Clock.systemUTC(), migrationHooks, cfg.maxDestinationCatalogLag());
+                        Clock.systemUTC(), migrationHooks, cfg.maxDestinationCatalogLag(), cfg.placementRules());
                 RebalanceSettings rebalanceSettings = new RebalanceSettings(cfg.rebalanceMinDelta(),
                         cfg.rebalanceTolerance(), cfg.maxMovesPerCycle(), cfg.maxDestinationCatalogLag());
                 Rebalancer rebalancer = new Rebalancer(catalog, leaderView, migrationCoordinator, rebalanceSettings,
-                        cfg.rebalanceEnabled(), cfg.rebalanceInterval(), cfg.migrationTimeout(), Clock.systemUTC());
+                        cfg.rebalanceEnabled(), cfg.rebalanceInterval(), cfg.migrationTimeout(), Clock.systemUTC(),
+                        cfg.placementRules());
                 AdminService adminService = new AdminService(catalog, rebalancer, Clock.systemUTC());
                 LocalReconciler localReconciler = new LocalReconciler(volume, catalog, rpc, registry, cfg.nodeId(),
                         cfg.seriesObjectPrefix(), cfg.orphanGrace(), cfg.reconcileInterval(),

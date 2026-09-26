@@ -23,11 +23,14 @@ import dev.nishisan.utils.ngrid.cluster.coordination.LeadershipListener;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogView;
+import dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor;
 import dev.nishisan.utils.oss.cluster.catalog.PlacementState;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
 import dev.nishisan.utils.oss.cluster.metrics.LatencyHistogram;
 import dev.nishisan.utils.oss.cluster.metrics.LatencySnapshot;
 import dev.nishisan.utils.oss.cluster.node.PlacementRequestHandler;
+import dev.nishisan.utils.oss.cluster.placement.DestinationEligibility;
+import dev.nishisan.utils.oss.cluster.placement.PlacementRules;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.protocol.MigrateControlRequest;
 import dev.nishisan.utils.oss.cluster.protocol.MigrateResponse;
@@ -181,6 +184,8 @@ public final class MigrationCoordinator implements LeadershipListener {
      * #177, ver {@link CatalogLagGate}); negativo desliga.
      */
     private final long maxDestinationCatalogLag;
+    /** Regras de placement deste líder ({@code ngrrd.placement.rules}, issue #167 item 3); nunca {@code null}. */
+    private final PlacementRules placementRules;
 
     private final LongAdder migrationsStarted = new LongAdder();
     private final LongAdder migrationsCompleted = new LongAdder();
@@ -244,6 +249,20 @@ public final class MigrationCoordinator implements LeadershipListener {
     public MigrationCoordinator(CatalogView catalog, ClusterRpc rpc, PlacementRequestHandler.LeaderView leaderView,
             int maxConcurrentMigrations, Duration migrationStatusPollInterval, Duration migrationTimeout,
             Clock clock, MigrationHooks hooks, long maxDestinationCatalogLag) {
+        this(catalog, rpc, leaderView, maxConcurrentMigrations, migrationStatusPollInterval, migrationTimeout, clock,
+                hooks, maxDestinationCatalogLag, PlacementRules.NONE);
+    }
+
+    /**
+     * @param maxDestinationCatalogLag lag máximo da réplica do catálogo do destino, rechecado quando a
+     *                                 migração vai começar; {@code -1} desliga
+     * @param placementRules           regras de placement deste nó (issue #167, item 3), rechecadas junto com a
+     *                                 cota do destino quando a migração vai começar; {@code null} = nenhuma
+     */
+    public MigrationCoordinator(CatalogView catalog, ClusterRpc rpc, PlacementRequestHandler.LeaderView leaderView,
+            int maxConcurrentMigrations, Duration migrationStatusPollInterval, Duration migrationTimeout,
+            Clock clock, MigrationHooks hooks, long maxDestinationCatalogLag, PlacementRules placementRules) {
+        this.placementRules = Objects.requireNonNullElse(placementRules, PlacementRules.NONE);
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.rpc = Objects.requireNonNull(rpc, "rpc");
         this.leaderView = Objects.requireNonNull(leaderView, "leaderView");
@@ -310,6 +329,18 @@ public final class MigrationCoordinator implements LeadershipListener {
             if (lagging.isPresent()) {
                 return new MigrationResult(MigrationOutcome.SKIPPED,
                         "destino " + dst + " com réplica do catálogo atrasada: " + lagging.get(), 0L, 0L);
+            }
+            // Issue #167 (item 3): cota dura e regras do destino, rechecadas na execução com as pendências
+            // atuais (o plano pode ter sido montado antes de outras migrações/placements para o mesmo nó).
+            long regionBytes = catalog.geometryLocal(activePlacement.geometryId())
+                    .map(GeometryDescriptor::regionBytes).orElse(0L);
+            Optional<String> ineligible = catalog.nodeStatusLocal(dst).flatMap(status -> DestinationEligibility.reason(
+                    status, catalog.pendingMigrationSeriesByNode().getOrDefault(dst, 0L),
+                    catalog.pendingBytesByNode().getOrDefault(dst, 0L), regionBytes, placementRules, seriesKey,
+                    activePlacement.definitionName()));
+            if (ineligible.isPresent()) {
+                return new MigrationResult(MigrationOutcome.SKIPPED,
+                        "destino " + dst + " inelegível: " + ineligible.get(), 0L, 0L);
             }
             String migrationId = UUID.randomUUID().toString();
             // Reivindica o id ANTES de qualquer escrita — se por acaso já estiver reivindicado (não
