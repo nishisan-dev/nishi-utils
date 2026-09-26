@@ -827,28 +827,39 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         }
     }
 
-    /** Uma consulta ao líder para o lote; cada série recebe o desfecho, inclusive quando a consulta falha. */
+    /**
+     * Uma consulta ao líder para o lote; cada série recebe o desfecho, inclusive quando a consulta falha —
+     * também por um {@link Error}: as séries drenadas da fila são liberadas antes de o {@code Error} ser
+     * relançado, senão ficariam pausadas ({@code Long.MAX_VALUE}) para sempre.
+     */
     private void resolveOwnersAtLeader(Set<String> keys) {
         Duration maxWait = OWNER_LOOKUP_MAX_WAIT.compareTo(retryPolicy.timeout()) < 0
                 ? OWNER_LOOKUP_MAX_WAIT : retryPolicy.timeout();
         Map<String, SeriesPlacement> found = null;
-        RuntimeException failure = null;
+        Throwable failure = null;
         ownerLookupsCount.increment();
         try {
             found = placementLookup.resolveExistingAtLeader(keys, maxWait);
             if (found == null) {
                 throw new NgrrdClusterException(ErrorCode.REMOTE_ERROR, "consulta ao líder sem resposta");
             }
-        } catch (RuntimeException e) {
+        } catch (Throwable e) {
             failure = e;
             logOwnerLookupFailure(keys.size(), e);
         }
+        Error error = failure instanceof Error lookupError ? lookupError : null;
         for (String seriesKey : keys) {
             try {
                 applyOwnerLookup(seriesKey, found, failure);
-            } catch (RuntimeException e) {
+            } catch (Throwable e) {
                 LOGGER.log(Level.WARNING, "Falha ao aplicar o dono confirmado pelo líder para " + seriesKey, e);
+                if (error == null && e instanceof Error applyError) {
+                    error = applyError;
+                }
             }
+        }
+        if (error != null) {
+            throw error;
         }
     }
 
@@ -875,7 +886,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
      * série ali para sempre se ele não for o dono (ex.: o dono real com réplica atrasada, que depois se
      * atualiza). Cada nova contradição volta a consultar o líder, que desempata assim que responder.
      */
-    private void applyOwnerLookup(String seriesKey, Map<String, SeriesPlacement> found, RuntimeException failure) {
+    private void applyOwnerLookup(String seriesKey, Map<String, SeriesPlacement> found, Throwable failure) {
         SeriesRoute route = routes.get(seriesKey);
         if (route == null) {
             return;
@@ -921,7 +932,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                     flushOwner = source;
                     changedOwner = source;
                 }
-            } catch (RuntimeException e) {
+            } catch (Throwable e) {
                 // Nunca deixa a série pausada para sempre (Long.MAX_VALUE) por uma falha inesperada aqui.
                 NodeBuffer buf = buffers.get(route.owner);
                 if (buf != null) {

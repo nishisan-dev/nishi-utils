@@ -860,6 +860,28 @@ class WriteDispatcherTest {
     }
 
     @Test
+    void errorNaConsultaNaoDeixaASeriePausadaParaSempre() {
+        newDispatcher(1, Duration.ofMillis(10), 1_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        AtomicInteger lookups = new AtomicInteger();
+        placementLookup.atLeader = keys -> {
+            if (lookups.incrementAndGet() == 1) {
+                throw new AssertionError("erro de linkagem simulado");
+            }
+            return Map.of("s1", SeriesPlacement.active(OWNER_A.value(), 1L));
+        };
+        AtomicInteger callsToA = new AtomicInteger();
+        rpc.respondByTarget((target, cmd, body) -> {
+            WriteBatchRequest req = (WriteBatchRequest) body;
+            return callsToA.incrementAndGet() == 1 ? moved(req, OWNER_A) : okFor(req);
+        });
+
+        dispatcher.enqueue(OWNER_A.value(), write("s1", 1, 1));
+
+        Await.untilTrue("amostra confirmada apesar do Error na consulta", AWAIT_TIMEOUT,
+                () -> dispatcher.samplesSent() == 1L);
+    }
+
+    @Test
     void migracaoLegitimaDepoisDoDonoConfirmadoConverge() {
         // O líder confirmou C; antes de qualquer OK, C migra de verdade para D e responde WRONG_OWNER(D).
         newDispatcher(1, Duration.ofMillis(10), 1_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
