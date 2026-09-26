@@ -36,7 +36,7 @@ Responsável pela comunicação de baixo nível entre os nós.
   - **Stickiness & Recuperação:** Rotas Proxy são mantidas enquanto forem vantajosas ou necessárias. Uma tarefa em background ("Probe") tenta periodicamente restabelecer a conexão direta de forma silenciosa.
   - **TTL:** Mensagens possuem um Time-To-Live para evitar loops infinitos de roteamento.
 - **Descoberta (Gossip Simples):**
-  - `HANDSHAKE`: Na conexão, troca metadados do nó e lista de peers conhecidos.
+  - `HANDSHAKE`: Na conexão, troca metadados do nó e lista de peers conhecidos. Numa conexão discada o handshake é sempre o primeiro frame (frames entregues antes dele ficam retidos e saem logo depois, em ordem; se o envio do handshake falhar, a conexão é fechada); um socket aceito sempre responde ao primeiro handshake lido, mesmo que um frame anterior já tenha permitido inferir a identidade do remoto. Seeds configurados como `host:port` entram com um id provisório (alias): o handshake troca o alias pelo id canônico, remove toda chave antiga que ainda aponte para a mesma conexão, e aliases não resolvidos nunca são gossipados. Enquanto a resposta não chega, o socket do alias atende o id canônico por no máximo `connectTimeout`; depois disso o id canônico é discado.
   - `PEER_UPDATE`: Broadcast periódico ou reativo para compartilhar novos peers descobertos, permitindo o fechamento da malha (full mesh). Desde a 8.7.0 carrega também `departed` (peers esquecidos e o TTL restante do tombstone de cada um).
   - `LEAVE` (8.7.0): enviado pelo `close()` do transporte em cada conexão cujo peer anunciou suporte no handshake (`supportsLeave`). Ver [Saída de membros](#saída-de-membros-leave-e-esquecimento-de-peers-efêmeros).
 - **RPC Interno:** Suporta mensagens do tipo `CLIENT_REQUEST`/`CLIENT_RESPONSE` com correlação (`correlationId`), permitindo chamadas síncronas (`sendAndAwait`).
@@ -233,7 +233,7 @@ heartbeat tentava discar para ele (até `connectTimeout`, com o log "No connecti
   nenhuma mensagem vinda dele (direta ou retransmitida por um relay) por mais de
   `departedPeerForgetAfter` é esquecido (kill -9, OOM, perda de rede). Numa malha parcial (firewall,
   link de um lado só), um cliente vivo que este nó não consegue discar segue falando por relay e não é
-  esquecido. O `NGridNode` usa `max(1 min, 2 × heartbeatTimeout)`. Como a saída aqui é só inferida,
+  esquecido. O `NGridNode` usa `max(1 min, 2 × heartbeatTimeout)` (= `6 × heartbeatInterval`). Como a saída aqui é só inferida,
   o tombstone dura a mesma janela (`departedPeerForgetAfter`), não os 10 min do LEAVE: um cliente vivo
   que ficou isolado (ex.: o único relay caiu) volta a ser aceito por gossip e tráfego retransmitido logo
   depois, e um cliente morto readmitido assim é esquecido de novo na janela seguinte.
@@ -243,7 +243,8 @@ heartbeat tentava discar para ele (até `connectTimeout`, com o log "No connecti
   roteador, mensagens retransmitidas e sockets sem handshake. Um **handshake direto** do mesmo id
   (nova encarnação), um `addPeer` explícito ou a expiração limpam o tombstone; heartbeats de um id em
   tombstone não recriam o membro.
-- **Disseminação:** a primeira recepção de um LEAVE dispara um `PEER_UPDATE` com `departed`. Essa
+- **Disseminação:** `departed` segue em todo `PEER_UPDATE` enquanto o tombstone durar; a primeira
+  recepção de um LEAVE só antecipa um `PEER_UPDATE` na hora. Essa
   notícia de segunda mão só serve para admissão: esquece um peer apenas conhecido (quem nunca alcançou
   o cliente também limpa), mas nunca derruba um peer com conexão handshaked aberta nem um votante.
 - **Votantes nunca são esquecidos:** um membro elegível a líder que envia LEAVE segue em

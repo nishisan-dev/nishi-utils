@@ -76,7 +76,24 @@ e o LEAVE gracioso do NGrid. **A dessincronia de escala do lag global de replica
   handshake, `PEER_UPDATE` e reachability); aliases de seed não resolvidos deixam de ser
   gossipados (`gossipablePeers()`); o `disconnect` não derruba mais o lock de conexão do peer nem
   falha respostas pendentes se outra conexão identificada para o mesmo peer segue aberta; logs de
-  disconnect do transporte passam a identificar o nó local.
+  disconnect do transporte passam a identificar o nó local. Um nó que entra e aprende por gossip o
+  id canônico de um seed antes da resposta do handshake reaproveita o socket já aberto para aquele
+  processo em vez de discar de novo (a discagem duplicada fazia cada ponta manter um socket
+  diferente no desempate e o link caía).
+- **Ordem do handshake e aliases de seed (correções finais da #169, encontradas antes do
+  release).** As correções acima abriram uma regressão em que o cliente não subia ("nenhum storage
+  node alcançável via transporte"): um frame que saía antes do handshake levava o storage a inferir
+  a identidade do discador pelo `source` e nunca responder o handshake, e o cliente ficava preso ao
+  alias `host:port`. Corrigido em quatro frentes: **a conexão discada envia o handshake antes de
+  qualquer frame** (frames entregues antes dele ficam retidos e saem em ordem logo depois); **o
+  socket aceito sempre responde ao primeiro handshake**, mesmo que um frame anterior já tenha
+  permitido inferir a identidade (protege também storages novos de clientes antigos);
+  **reaproveitamento limitado de um socket de alias que aguarda handshake** — ele só substitui a
+  discagem do id canônico por até `connectTimeout` desde a abertura (relógio monotônico), depois o
+  id canônico é discado; e **o handshake remove toda chave antiga (alias) que ainda aponte para a
+  conexão já identificada**, que antes ficava publicada para sempre e aparecia como peer vivo. Se o
+  envio do handshake de uma conexão discada falhar, a conexão é fechada e sai do mapa, em vez de
+  ficar publicada com todos os frames retidos.
 - **Lag de replicação do líder é zero no snapshot operacional.** O HWM rastreado do líder só
   avançava com heartbeats recebidos — e o líder não recebe o próprio heartbeat — então
   `NGridNode.operationalSnapshot` calculava um lag artificial e `HIGH_REPLICATION_LAG` disparava
@@ -84,22 +101,74 @@ e o LEAVE gracioso do NGrid. **A dessincronia de escala do lag global de replica
   `getAdvertisedHighWatermark()` como HWM rastreado e o lag é sempre 0 nele;
   `NGridAlertEngine.evaluateReplicationLag` não avalia mais lag de replicação quando o snapshot é
   do líder.
-- **HWM do tópico no líder recém-eleito considera a fronteira aplicada.** Um líder recém-eleito
-  passava a anunciar o high-watermark do tópico como o que ele havia **recebido**, não o que
-  **aplicou** — com um tópico ocioso (sem tráfego novo desde a eleição), os seguidores viam HWM 0 e
-  reportavam lag desconhecido mesmo com a réplica em dia. Corrigido: o líder recém-eleito anuncia a
-  fronteira aplicada como HWM.
+- **HWM do tópico no líder recém-eleito considera a fronteira aplicada.** O contador por tópico do
+  líder só era semeado na primeira produção do tópico: um nó promovido que aplicou N operações como
+  seguidor e ainda não produziu nada anunciava HWM 0 nos `RELAY_STREAM_BATCH`, e com o tópico ocioso
+  os seguidores reportavam lag desconhecido mesmo com a réplica em dia (o gate do rebalance do ngrrd
+  excluía todos eles como destino, #177). Corrigido: o HWM anunciado é o maior entre o contador
+  produzido e a fronteira aplicada.
 - **Issue #179 — sobreviventes não ficam mais sem líder após failover quando um membro
-  inelegível está à frente no odômetro aplicado.** Um cliente ngrrd (`leader-ineligible`) mais
-  adiantado que os storages sobreviventes podia impedir a eleição de um novo líder entre eles depois
-  da queda do líder anterior.
-- **LEAVE gracioso.** Membros efêmeros (inelegíveis a líder, ou porta ≤ 0 — clientes ngrrd e a CLI
-  administrativa) enviam `LEAVE` ao encerrar (best-effort, com flush por conexão) em vez de só
-  desconectar; os peers os esquecem por completo (tombstone de 10 min, retransmissão única) — a CLI
-  administrativa deixa de aparecer como membro do cluster depois de sair. Votantes continuam usando
-  o caminho de desconexão atual, sem forçar o esquecimento (evita encolher a maioria sem consenso).
-  Nova capacidade de handshake `supportsLeave`; nós anteriores a esta versão nunca recebem `LEAVE`.
-  Detalhes em `doc/ngrid/arquitetura.md`.
+  inelegível está à frente no odômetro aplicado.** Um cliente ngrrd (`leader-ineligible`) que
+  recebeu o último frame de replicação antes da queda do líder fazia o sobrevivente eleito por
+  afinidade adiar o reclaim, enquanto o outro sobrevivente o seguia: o cluster ficava sem líder
+  indefinidamente. `ClusterCoordinator.maxActivePeerHighWatermark()` passa a considerar só membros
+  ativos **elegíveis** a líder (placeholders de heartbeat com papéis ainda desconhecidos continuam
+  contando, de forma conservadora). Trade-off: em `RELAY_STREAM` o quórum de escrita é 1, então uma
+  operação que só um cliente recebeu antes da queda do líder se perde — como já acontecia antes, mas
+  agora sem o impasse de eleição.
+- **LEAVE gracioso e esquecimento de membros efêmeros.** Antes, um cliente que encerrava ficava
+  conhecido para sempre e cada heartbeat discava para ele ("No connection available for ..."); a CLI
+  administrativa aparecia como membro depois de sair. Detalhes em `doc/ngrid/arquitetura.md`.
+  - **Todo nó** (storage, cliente ngrrd ou CLI) envia `LEAVE` no `TcpTransport.close()`, diretamente
+    em cada conexão rastreada cujo peer anunciou `supportsLeave` no handshake, com flush por conexão
+    até `leaveFlushTimeout` (500 ms; `leaveOnClose(false)` desliga). Quem recebe esquece os membros
+    efêmeros e mantém os votantes conhecidos, mas inativos na hora (ver abaixo). Nós anteriores a
+    esta versão nunca recebem `LEAVE`.
+  - **Só primeira mão:** o receptor honra o LEAVE apenas na conexão rastreada daquele peer, com
+    handshake e identidade igual à anunciada; o LEAVE nunca é repassado.
+  - **Membro efêmero** = inelegível a líder ou porta ≤ 0 (clientes ngrrd e a CLI administrativa). Ao
+    receber o LEAVE dele, o peer o esquece por completo (transporte, roteador, membership) e põe o id
+    em tombstone por `departedPeerTombstoneTtl` (10 min) contra readmissão de segunda mão; um
+    handshake direto do mesmo id (nova encarnação) limpa o tombstone.
+  - **Disseminação:** o campo `departed` (id → TTL restante) segue em **todo** `PEER_UPDATE`
+    enquanto o tombstone durar; a primeira recepção do LEAVE só antecipa um `PEER_UPDATE` na hora.
+    Essa notícia de segunda mão só serve para admissão: esquece um peer apenas conhecido, mas nunca
+    derruba um peer com conexão handshaked aberta nem um votante, e nunca estende o tombstone.
+  - **Gatilho lento (backstop para kill -9, OOM, perda de rede):** um peer efêmero sem conexão aberta
+    **e** sem nenhum tráfego vindo dele, direto ou retransmitido por relay, por
+    `departedPeerForgetAfter` — no `NGridNode`, `max(1 min, 6 × heartbeatInterval)`, ou seja,
+    2 × heartbeatTimeout — é esquecido com tombstone curto (a mesma janela, não os 10 min do LEAVE),
+    para que um cliente vivo isolado por um tempo volte a ser aceito logo depois.
+  - **Votantes nunca são esquecidos:** um membro elegível a líder que envia LEAVE segue conhecido
+    (a maioria não encolhe sem consenso), mas é marcado inativo na hora, sem o grace de um intervalo
+    de heartbeat; o próximo heartbeat do mesmo id o reativa.
+  - Envio para um id em tombstone é descartado (`send`) ou falha na hora (`sendAndAwait`), sem
+    recriar rota nem logar falha de discagem; um socket que chega durante o LEAVE fecha sem warning.
+
+### Limitações conhecidas
+
+- **Rollback de um storage da 8.7.0 para a 8.6.0** exige apagar os dados persistidos do mapa
+  `ngrrd.nodes` daquele nó: o `StorageNodeStatus` gravado pela 8.7.0 carrega `CatalogReplicaStatus`
+  (serialização Java), que a 8.6.0 não consegue desserializar. A réplica reconverge a partir do
+  líder.
+- O TTL do tombstone (10 min), `leaveOnClose` e `leaveFlushTimeout` não são configuráveis por
+  YAML/`NGridConfig` nesta versão (só no `TcpTransportConfig`).
+- Um cliente que reinicia com `client.id` fixo, num par em que nenhum dos lados consegue discar o
+  outro (alcance só por relay), fica sem alcançar aquele storage até o TTL do tombstone expirar; o
+  id aleatório padrão evita o caso.
+- O reinício gracioso de um storage agora o marca inativo na hora nos peers (LEAVE de votante):
+  mantenha o rebalance automático desabilitado durante a janela de atualização.
+- Com o líder levando mais de 500 ms para confirmar, a confirmação de redirecionamento do lado do
+  storage cai no comportamento da 8.6.0 (`redirectConfirmationFailures` cresce); a detecção de dicas
+  contraditórias do cliente 8.7.0 continua valendo.
+- Dois clientes/CLIs na mesma máquina com o padrão `127.0.0.1:0` colidem por endereço
+  (pré-existente).
+- [Issue #178](https://github.com/nishisan-dev/nishi-utils/issues/178) aberta: dessincronia de
+  escala do odômetro de replicação. Inclui um caso pré-existente, não corrigido nesta versão (mesma
+  taxa na 8.6.0): como o gate de eleição compara um odômetro agregado entre tópicos, dominado pelo
+  tópico de status (`ngrrd.nodes`), um novo líder pode ser eleito **atrás** de um seguidor elegível
+  no tópico do catálogo; com quórum de escrita 1 em `RELAY_STREAM`, uma operação já confirmada que
+  só esse seguidor tinha se perde (ex.: uma migração que nunca conclui depois do failover).
 
 **Compatibilidade e ordem de atualização.** Mudanças aditivas e compatíveis no protocolo —
 atualize os storages primeiro, depois os clientes; mantenha o rebalance automático desabilitado

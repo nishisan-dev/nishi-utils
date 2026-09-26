@@ -763,15 +763,15 @@ e afetam qualquer usuário do NGrid, não só este módulo:
   cegos à linhagem/epoch — operações aplicadas a partir de ramos descartados inflam o contador e
   inviabilizam um emparelhamento exato entre incumbente e candidato durante o handoff. Follow-up
   epoch-aware (referenciado ali como PR #142) continua pendente.
-- **Saída graciosa (`LEAVE`) do NGrid, janela de bootstrap padrão e logs de handoff.** O NGrid não
-  tem hoje uma mensagem explícita de saída graciosa de um nó (`LEAVE`) distinta de uma queda —
-  todo desligamento de nó é indistinguível de uma falha do ponto de vista dos peers, o que
-  contribui para o churn de bootstrap citado em 13.1. Relacionado: o default de janela de bootstrap
-  do próprio core (fora do `bootDiscoveryWindow` específico do `NGridNodeBuilder` usado por este
-  módulo) e o nível de detalhe dos logs de handoff de liderança poderiam ser revistos juntos.
-  **Ainda não confirmado em código** — item registrado a partir de observação de campo; os demais
-  pontos desta seção foram confirmados nos artefatos de planejamento (`checkpoint.md`) e no
-  `doc/CHANGELOG.md`.
+- **Janela de bootstrap padrão e logs de handoff.** Desde a 8.7.0 o NGrid tem saída graciosa
+  (`LEAVE`, ver `doc/ngrid/arquitetura.md`): clientes e a CLI administrativa são esquecidos pelos
+  storages assim que saem, e o `LEAVE` de um storage (votante) confirma a saída na hora, sem o grace
+  de disconnect — ele segue conhecido como votante. Continuam em aberto o default de janela de
+  bootstrap do próprio core (fora do `bootDiscoveryWindow` específico do `NGridNodeBuilder` usado
+  por este módulo), que contribui para o churn de bootstrap citado em 13.1, e o nível de detalhe
+  dos logs de handoff de liderança. **Ainda não confirmado em código** — item registrado a partir
+  de observação de campo; os demais pontos desta seção foram confirmados nos artefatos de
+  planejamento (`checkpoint.md`) e no `doc/CHANGELOG.md`.
 
 Nenhum destes pontos bloqueia o uso do ngrrd cluster hoje — ficam registrados aqui porque foram
 encontrados no caminho e afetam a base sobre a qual este módulo é construído.

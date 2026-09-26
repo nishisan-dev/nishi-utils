@@ -334,8 +334,9 @@ rebalanceamento disparado: planejados=12 iniciados=12
 destino excluído: storage-3 (lag=4200>1000)
 ```
 
-Sem essas contagens (líder anterior à 8.7.0, ou implementação de cliente sem acesso a elas), a
-saída continua sendo só `rebalanceamento disparado`, como antes. O motivo de cada exclusão é
+Contra um líder 8.6.0 (que já devolve as contagens, mas não as exclusões) a CLI 8.7.0 imprime
+`planejados=N iniciados=M` sem linhas de exclusão. Só uma implementação de cliente de terceiros sem
+acesso às contagens (`RebalanceTrigger.unknown()`) produz apenas `rebalanceamento disparado`. O motivo de cada exclusão é
 `lag desconhecido`, `sincronizando`, `bootstrap pendente` ou `lag=<N>><limite>`; o nó excluído
 continua elegível como origem e entra normalmente no cálculo da distribuição alvo — só não recebe
 séries neste ciclo.
@@ -763,6 +764,9 @@ os storages antes dos clientes** para colher o lado que mais importa primeiro:
    (`maxDestinationCatalogLag`).
 4. Nós ainda na 8.6.0 não publicam `catalogReplica`: a coluna `CAT_LAG` mostra `-` para eles, e
    `CatalogLagGate` os trata como elegíveis (não bloqueia o rolling upgrade).
+5. **Rollback de um storage para a 8.6.0:** apague antes os dados persistidos do mapa `ngrrd.nodes`
+   daquele nó. O status gravado pela 8.7.0 carrega `CatalogReplicaStatus` (serialização Java), que a
+   8.6.0 não consegue desserializar; a réplica reconverge a partir do líder.
 
 ### Custo e limites
 
