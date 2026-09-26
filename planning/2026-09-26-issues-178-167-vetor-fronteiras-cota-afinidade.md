@@ -305,13 +305,26 @@ O CI remoto de `9f39afa` também passou
 
 ### Gates no código final (`e794a8e`)
 
-- `LeaderFailoverDuringMigrationClusterTest`: **8/8 rodadas consecutivas aprovadas**, 2 testes
-  por rodada, sem rerun automático, com dois carriers.
-- Suíte completa/Javadoc, resiliência, quatro comandos de CI e cotas/regras/forget-node:
-  nova execução em andamento; resultados anteriores não substituem esta rodada.
-- Evidências finais em `/tmp/nishi-utils-8.8.0-validation/final/`.
-- PR [#185](https://github.com/nishisan-dev/nishi-utils/pull/185) permanece em rascunho até
-  concluir os gates finais.
+Todos os gates abaixo foram executados novamente após a correção de pinning, com OpenJDK
+21.0.12.1. Os commits posteriores alteram somente a documentação.
+
+| Verificação | Resultado final |
+|---|---|
+| `mvn -B verify -Pvalidate-javadoc` | **aprovado**, cinco módulos, Javadoc e integrações Docker; core 697 testes (8 ignorados), OSS 253, ngrrd-cluster 787, Docker 25 (1 ignorado); total 1.762, zero falhas/erros; 24min21s |
+| `mvn -B test -pl nishi-utils-core -Presilience -Dsurefire.rerunFailingTestsCount=1` | **aprovado**, 48 testes (1 ignorado), zero falhas/erros |
+| `pr-validation.yml`: verify com `-DexcludeNgrid=true` | **aprovado**, 1.193 testes, zero falhas/erros/ignorados |
+| `pr-validation.yml`: `CheckpointAfterMigrationClusterTest` | **aprovado**, 1 teste |
+| `pr-validation.yml`: transporte TCP/proxy/compressão | **aprovado**, 19 testes |
+| `pr-validation.yml`: `ContinuousIngestionRebalanceClusterTest` | **aprovado**, 1 teste, dois carriers |
+| `QuotaClusterTest`, `PlacementRulesClusterTest`, `ForgetNodeClusterTest` | **aprovados**, 3 testes, dois carriers |
+| `LeaderFailoverDuringMigrationClusterTest` | **8/8 rodadas consecutivas aprovadas**, 2 testes por rodada, dois carriers, sem rerun automático |
+
+- Relatórios XML conferidos: nenhuma falha recuperada por rerun em todos os gates finais.
+- Evidências finais, comandos completos e relatórios em `/tmp/nishi-utils-8.8.0-validation/final/`.
+- CI remoto aprovado em `6177de3`, com o mesmo código final
+  ([execução](https://github.com/nishisan-dev/nishi-utils/actions/runs/36260449365)).
+- PR [#185](https://github.com/nishisan-dev/nishi-utils/pull/185) liberado para revisão após
+  os gates; a atualização final deste checkpoint gera uma nova execução do CI remoto.
 
 ### Referências de arquitetura para o follow-up
 
