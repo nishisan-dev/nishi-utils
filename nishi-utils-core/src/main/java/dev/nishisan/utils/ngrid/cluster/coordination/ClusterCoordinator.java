@@ -1273,8 +1273,15 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 // the affinity election must win — a transient refusal during an election dance must
                 // never invert affinity. The genuine stalemate signature is local state the elected
                 // node does not have — compared per topic when both advertise a vector (issue #178).
+                // Revisão #178 (A2): the escape is for ONE node. With two non-elected survivors both
+                // strictly ahead of a bootstrapping elected node, both used to take leadership at once
+                // (a self-inflicted dual-leader resolved by D10c with a discarded tail). Only the best
+                // non-elected candidate (newest state, then affinity) escapes, and never while some
+                // eligible peer already asserts leadership — that peer is followed instead.
                 if (recentRefusal && electedStillNotLeading && refusalConfirmedByLaterHeartbeat
-                        && localAheadOfPeer(electedId)) {
+                        && localAheadOfPeer(electedId)
+                        && assertingLeaderPeer(localId) == null
+                        && localIsBestEscapeCandidate(localId, electedId)) {
                     LOGGER.warning(() -> "[" + localId + "] Affinity-elected " + electedId + " refuses leadership and is not"
                             + " ahead (peer=" + electedWatermark + ", local=" + localApplied
                             + describePeerDivergence(electedId)
@@ -1614,6 +1621,33 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             return true;
         }
         return false;
+    }
+
+    /**
+     * True when no other ACTIVE, LEADER-ELIGIBLE peer (the elected node aside) is a better D9 escape
+     * candidate than the local node: none is ahead of it, and none with equal state outranks it by
+     * affinity (revisão #178, A2). Every node evaluates the same order, so exactly one escapes.
+     */
+    private boolean localIsBestEscapeCandidate(NodeId localId, NodeId electedId) {
+        NodeInfo local = transport.local();
+        for (ClusterMember member : members.values()) {
+            NodeId id = member.id();
+            if (id.equals(localId) || id.equals(electedId) || !isRealActivePeer(member, localId)
+                    || !member.info().isLeaderEligible()) {
+                continue;
+            }
+            Long watermark = peerHighWatermark.get(id);
+            if (watermark == null || watermark < 0L) {
+                continue; // unheard or bootstrapping: it cannot lead nor be ahead
+            }
+            if (peerAheadOfLocal(id)) {
+                return false;
+            }
+            if (!localAheadOfPeer(id) && LeadershipAffinity.outranks(member.info(), local)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** " (topic=a<b, ...)" for the first eligible peer ahead of the local node, or "" when none. */
