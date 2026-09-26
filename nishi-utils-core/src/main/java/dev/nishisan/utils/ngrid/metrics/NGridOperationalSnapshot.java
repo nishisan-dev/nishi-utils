@@ -39,10 +39,14 @@ import java.util.Map;
  * @param activeMembersCount         the number of active cluster members
  * @param isLeader                   whether the local node is the leader
  * @param hasValidLease              whether the leader lease is valid
- * @param trackedLeaderHighWatermark the tracked high watermark
+ * @param trackedLeaderHighWatermark the leader high watermark as seen by this node: on a follower,
+ *                                   the value tracked from the leader's heartbeats; on the leader,
+ *                                   its own advertised watermark (a node never receives its own
+ *                                   heartbeat, so the tracked value would be stale there)
  * @param globalSequence             the global replication sequence
  * @param lastAppliedSequence        the last applied sequence
- * @param replicationLag             the replication lag
+ * @param replicationLag             how far the applied frontier trails the leader watermark;
+ *                                   always {@code 0} on the leader
  * @param gapsDetected               the number of gaps detected
  * @param resendSuccessCount         the number of successful resends
  * @param snapshotFallbackCount      the number of snapshot fallbacks

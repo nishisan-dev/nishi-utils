@@ -714,6 +714,22 @@ public final class NGridNode implements Closeable {
     }
 
     /**
+     * Replication lag reported in the operational snapshot: how far this node's applied frontier
+     * trails the leader's watermark. The leader is the reference itself, so its lag is always zero.
+     *
+     * @param isLeader    whether this node is the current leader
+     * @param trackedHwm  the leader high watermark tracked by this node
+     * @param lastApplied the last sequence applied locally
+     * @return the non-negative lag; {@code 0} on the leader
+     */
+    static long replicationLag(boolean isLeader, long trackedHwm, long lastApplied) {
+        if (isLeader) {
+            return 0L;
+        }
+        return Math.max(0L, trackedHwm - lastApplied);
+    }
+
+    /**
      * Captures a comprehensive operational snapshot of this node, aggregating
      * cluster state, replication health, and I/O metrics into a single immutable
      * object suitable for dashboards and alerting engines.
@@ -731,11 +747,17 @@ public final class NGridNode implements Closeable {
         int activeMembersCount = coordinator.getActiveMembersCount();
         boolean isLeader = coordinator.isLeader();
         boolean hasValidLease = coordinator.hasValidLease();
-        long trackedHighWatermark = coordinator.getTrackedLeaderHighWatermark();
+        // The tracked leader watermark only moves on heartbeats received from the agreed leader, and
+        // a node never heartbeats itself: on the leader that value is stale (whatever it last saw as
+        // a follower), which produced a bogus HIGH_REPLICATION_LAG. The leader reports its own
+        // advertised watermark instead.
+        long trackedHighWatermark = isLeader
+                ? replicationManager.getAdvertisedHighWatermark()
+                : coordinator.getTrackedLeaderHighWatermark();
 
         long globalSeq = replicationManager.getGlobalSequence();
         long lastApplied = replicationManager.getLastAppliedSequence();
-        long lag = Math.max(0, trackedHighWatermark - lastApplied);
+        long lag = replicationLag(isLeader, trackedHighWatermark, lastApplied);
         long gaps = replicationManager.getGapsDetected();
         long resendSuccess = replicationManager.getResendSuccessCount();
         long snapshotFallback = replicationManager.getSnapshotFallbackCount();

@@ -82,6 +82,22 @@ class NGridAlertEngineTest {
         assertEquals(AlertSeverity.CRITICAL, captured.get(0).severity());
     }
 
+    /**
+     * Production (8.6.0): the leader reported {@code HIGH_REPLICATION_LAG CRITICAL 4761359} computed
+     * from a stale tracked watermark. The leader is the replication reference and never lags.
+     */
+    @Test
+    void leaderNeverFiresHighReplicationLag() {
+        NGridAlertEngine engine = buildEngine(50, 500, 100, 100);
+        engine.addListener(captured::add);
+
+        currentSnapshot.set(snapshot(4_761_359, true, true, 3, 3, 0, 0));
+        engine.evaluate();
+
+        assertTrue(captured.stream().noneMatch(a -> NGridAlertEngine.HIGH_REPLICATION_LAG.equals(a.alertType())),
+                "leader must not raise HIGH_REPLICATION_LAG: " + captured);
+    }
+
     @Test
     void leaderLeaseExpired() {
         NGridAlertEngine engine = buildEngine(1000, 5000, 100, 100);
@@ -225,7 +241,7 @@ class NGridAlertEngineTest {
         NGridAlertEngine engine = buildEngine(50, 500, 100, 100);
         engine.addListener(captured::add);
 
-        // Snapshot with high lag (CRITICAL) + expired lease + low quorum
+        // Leader snapshot with high lag + expired lease + low quorum
         NGridStatsSnapshot ioStats = new NGridStatsSnapshot(
                 Instant.now(), Map.of(), Map.of(), Map.of(), Map.of(),
                 Map.of(), Map.of(), Map.of(), Map.of());
@@ -238,11 +254,24 @@ class NGridAlertEngineTest {
         currentSnapshot.set(bad);
         engine.evaluate();
 
-        // Should fire: HIGH_REPLICATION_LAG (CRITICAL) + LEADER_LEASE_EXPIRED +
-        // LOW_QUORUM
-        assertEquals(3, captured.size());
-        assertTrue(captured.stream().anyMatch(a -> a.alertType().equals(NGridAlertEngine.HIGH_REPLICATION_LAG)));
+        // Should fire: LEADER_LEASE_EXPIRED + LOW_QUORUM. Replication lag is never evaluated on the
+        // leader (it is the replication reference; see leaderNeverFiresHighReplicationLag).
+        assertEquals(2, captured.size());
         assertTrue(captured.stream().anyMatch(a -> a.alertType().equals(NGridAlertEngine.LEADER_LEASE_EXPIRED)));
+        assertTrue(captured.stream().anyMatch(a -> a.alertType().equals(NGridAlertEngine.LOW_QUORUM)));
+
+        // A lagging follower in the same degraded cluster: HIGH_REPLICATION_LAG + LOW_QUORUM.
+        captured.clear();
+        currentSnapshot.set(new NGridOperationalSnapshot(
+                "node-2", "node-1", 1L, 1L, 3,
+                false, false, 1000L,
+                1000L, 400L, 600L,
+                0L, 0L, 0L, 0.0, 0,
+                1, 3, Map.of(), Map.of(), ioStats, Instant.now()));
+        engine.evaluate();
+        assertEquals(2, captured.size());
+        assertTrue(captured.stream().anyMatch(a -> a.alertType().equals(NGridAlertEngine.HIGH_REPLICATION_LAG)
+                && a.severity() == AlertSeverity.CRITICAL));
         assertTrue(captured.stream().anyMatch(a -> a.alertType().equals(NGridAlertEngine.LOW_QUORUM)));
     }
 
