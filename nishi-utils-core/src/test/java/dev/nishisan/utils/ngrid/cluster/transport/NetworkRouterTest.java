@@ -197,4 +197,45 @@ class NetworkRouterTest {
         shortLived.updateReachability(LIVE_PEER, List.of(info(TARGET)), Map.of(), Set.of(TARGET));
         assertTrue(shortLived.isProxy(TARGET), "relatório renovado volta a contar");
     }
+
+    // ---- B3: a node is never its own proxy ----
+
+    /**
+     * Todo nó lista a si mesmo no gossip; quando o handshake perde o desempate ou um PEER_UPDATE chega
+     * por uma conexão inferida, o alvo entra no próprio reachabilityMap. Ele nunca pode ser escolhido
+     * como relay de si mesmo: a rota PROXY(via = alvo) parecia direta mas isProxy ficava verdadeiro e
+     * markDirectFailure virava no-op, e a rota nunca se curava.
+     */
+    @Test
+    void theTargetIsNeverChosenAsItsOwnRelay() {
+        connected.add(TARGET);
+        router.updateReachability(TARGET, List.of(info(TARGET)), Map.of(TARGET, 0.1));
+        router.updateReachability(TARGET, List.of(info(TARGET)), Map.of(TARGET, 0.1), Set.of(TARGET));
+
+        router.markDirectFailure(TARGET);
+
+        assertEquals(Optional.of(TARGET), router.nextHop(TARGET));
+        assertFalse(router.isProxy(TARGET), "um nó não pode ser proxy de si mesmo");
+        NetworkRouter.Route route = router.routesSnapshot().get(TARGET);
+        assertTrue(route == null || route.type() == NetworkRouter.RouteType.DIRECT,
+                "a rota deveria ser DIRECT, mas é " + route);
+    }
+
+    /** A reavaliação por gossip também não pode trocar um relay perdido pelo próprio alvo. */
+    @Test
+    void reevaluationNeverFallsBackToTheTargetItself() {
+        connected.add(LIVE_PEER);
+        connected.add(TARGET);
+        router.updateReachability(TARGET, List.of(info(TARGET)), Map.of());
+        router.updateReachability(LIVE_PEER, List.of(info(TARGET)), Map.of(), Set.of(TARGET));
+        router.markDirectFailure(TARGET);
+        assertEquals(Optional.of(LIVE_PEER), router.nextHop(TARGET), "precondição: proxy via o peer vivo");
+
+        router.updateReachability(LIVE_PEER, List.of(info(TARGET)), Map.of(), Set.of());
+
+        assertFalse(router.isProxy(TARGET), "sem relay real a rota volta a DIRECT, não a PROXY(via = alvo)");
+        assertEquals(Optional.of(TARGET), router.nextHop(TARGET));
+        router.markDirectFailure(TARGET);
+        assertFalse(router.isProxy(TARGET), "markDirectFailure não pode escolher o alvo como relay");
+    }
 }

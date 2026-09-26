@@ -127,15 +127,21 @@ final class NetworkRouter {
     void updateReachability(NodeId sourcePeer, Collection<NodeInfo> knownByPeer, Map<NodeId, Double> latenciesFromSource,
                             Set<NodeId> connectedByPeer) {
         reportedLatencies.put(sourcePeer, new HashMap<>(latenciesFromSource));
+        // A peer never vouches for itself: every node lists itself in its gossip, and recording it as
+        // its own reporter made it its own relay (PROXY via the target), a route that never healed.
         if (connectedByPeer == null) {
             for (NodeInfo target : knownByPeer) {
-                reachabilityMap.computeIfAbsent(target.nodeId(), k -> ConcurrentHashMap.newKeySet()).add(sourcePeer);
+                if (!target.nodeId().equals(sourcePeer)) {
+                    reachabilityMap.computeIfAbsent(target.nodeId(), k -> ConcurrentHashMap.newKeySet()).add(sourcePeer);
+                }
             }
         } else {
             Set<NodeId> connected = Set.copyOf(connectedByPeer);
             connectedReports.put(sourcePeer, new ConnectedReport(connected, System.nanoTime()));
             for (NodeId target : connected) {
-                reachabilityMap.computeIfAbsent(target, k -> ConcurrentHashMap.newKeySet()).add(sourcePeer);
+                if (!target.equals(sourcePeer)) {
+                    reachabilityMap.computeIfAbsent(target, k -> ConcurrentHashMap.newKeySet()).add(sourcePeer);
+                }
             }
             reachabilityMap.forEach((target, reporters) -> {
                 if (!connected.contains(target)) {
@@ -206,9 +212,10 @@ final class NetworkRouter {
      */
     void markDirectFailure(NodeId target) {
         routes.compute(target, (id, current) -> {
-            if (current != null && current.type() == RouteType.PROXY) {
+            if (current != null && current.type() == RouteType.PROXY && !target.equals(current.via())) {
                 return current;
             }
+            // No route, DIRECT, or a PROXY through the target itself (treated as DIRECT).
             return findBestProxy(target, null).map(Route::proxy).orElse(Route.direct());
         });
     }
@@ -251,6 +258,9 @@ final class NetworkRouter {
 
     Optional<NodeId> nextHop(NodeId target, NodeId exclude) {
         Route route = routes.getOrDefault(target, Route.direct());
+        if (route.type() == RouteType.PROXY && target.equals(route.via())) {
+            route = Route.direct(); // a node is never its own relay
+        }
 
         // Phase 2: Even if we are DIRECT, check if there is a proxy path that is MUCH better
         if (route.type() == RouteType.DIRECT) {
@@ -317,7 +327,7 @@ final class NetworkRouter {
             return false;
         }
         NodeId via = route.via();
-        if (via == null || !relayCandidate.test(via)) {
+        if (via == null || via.equals(target) || !relayCandidate.test(via)) {
             return false;
         }
         ConnectedReport report = connectedReports.get(via);
@@ -341,8 +351,9 @@ final class NetworkRouter {
 
         Map<NodeId, Double> local = localLatenciesSupplier.get();
 
+        // The target itself is never a candidate (every node gossips itself).
         List<PathCost> scoredCandidates = candidates.stream()
-                .filter(id -> !id.equals(exclude) && relayCandidate.test(id))
+                .filter(id -> !id.equals(target) && !id.equals(exclude) && relayCandidate.test(id))
                 .map(proxyId -> {
                     Double rttToProxy = local.get(proxyId);
                     Map<NodeId, Double> proxyReported = reportedLatencies.get(proxyId);
