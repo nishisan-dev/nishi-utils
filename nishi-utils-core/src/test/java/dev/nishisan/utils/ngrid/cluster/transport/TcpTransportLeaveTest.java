@@ -315,7 +315,89 @@ class TcpTransportLeaveTest {
         assertTrue(knows(storage, other.nodeId()));
     }
 
+    /** A primeira recepção de um LEAVE é disseminada no PEER_UPDATE ({@code departed}), nunca repassada. */
+    @Test
+    void firstLeaveIsDisseminatedAsDepartedInPeerUpdate() throws Exception {
+        TcpTransport storage = start(TcpTransportConfig.builder(info("a-storage", freePort(), false)));
+        NodeInfo client = info("z-client", freePort(), true);
+        NodeInfo other = info("m-storage", freePort(), false);
+        RawPeer clientLink = raw(storage);
+        clientLink.send(handshake(client, storage.local(), Set.of()));
+        RawPeer otherLink = raw(storage);
+        otherLink.send(handshake(other, storage.local(), Set.of()));
+        awaitTrue(() -> storage.isConnected(client.nodeId()) && storage.isConnected(other.nodeId()),
+                "peers não conectaram");
+
+        clientLink.send(leave(client.nodeId(), client));
+
+        awaitTrue(() -> otherLink.received().stream()
+                        .filter(m -> m.type() == MessageType.PEER_UPDATE)
+                        .map(m -> m.payload(PeerUpdatePayload.class))
+                        .anyMatch(u -> u.departed().containsKey(client.nodeId())
+                                && u.peers().stream().noneMatch(p -> p.nodeId().equals(client.nodeId()))),
+                "os outros peers deveriam saber da saída pelo PEER_UPDATE");
+        assertTrue(otherLink.received().stream().noneMatch(m -> m.type() == MessageType.LEAVE),
+                "o LEAVE nunca é repassado");
+    }
+
+    /** Quem nunca alcançou o cliente que saiu também o esquece, pela notícia de segunda mão. */
+    @Test
+    void departureLearnedSecondHandForgetsAPeerKnownOnlyByGossip() throws Exception {
+        TcpTransport storage = start(TcpTransportConfig.builder(info("a-storage", freePort(), false))
+                .reconnectInterval(RECONNECT)
+                .connectTimeout(Duration.ofMillis(200)));
+        RecordingListener events = listen(storage);
+        NodeInfo client = info("z-client", freePort(), true); // nobody listens: never connected
+        NodeInfo reporter = info("m-storage", freePort(), false);
+        RawPeer reporterLink = raw(storage);
+        reporterLink.send(handshake(reporter, storage.local(), Set.of(client)));
+        awaitTrue(() -> knows(storage, client.nodeId()), "cliente não foi aprendido por gossip");
+
+        reporterLink.send(peerUpdate(reporter, Map.of(client.nodeId(), 60_000L)));
+
+        awaitTrue(() -> !knows(storage, client.nodeId()), "a saída de segunda mão deveria esquecer o cliente");
+        assertTrue(storage.isDeparted(client.nodeId()));
+        assertTrue(events.peerEvents(client.nodeId()).contains("left:z-client"));
+    }
+
+    /**
+     * Notícia de saída atrasada: o mesmo id já religou (handshake direto) quando o PEER_UPDATE com
+     * {@code departed} chega. Evidência de primeira mão vence: o peer segue conhecido e conectado.
+     */
+    @Test
+    void delayedSecondHandDepartureDoesNotEvictAReconnectedPeer() throws Exception {
+        TcpTransport storage = start(TcpTransportConfig.builder(info("a-storage", freePort(), false)));
+        NodeInfo client = info("z-client", freePort(), true);
+        NodeInfo reporter = info("m-storage", freePort(), false);
+        NodeInfo voter = info("n-storage", freePort(), false);
+        RawPeer reporterLink = raw(storage);
+        reporterLink.send(handshake(reporter, storage.local(), Set.of(voter)));
+        RawPeer clientLink = raw(storage);
+        clientLink.send(handshake(client, storage.local(), Set.of()));
+        awaitTrue(() -> storage.isConnected(client.nodeId()) && storage.isConnected(reporter.nodeId())
+                && knows(storage, voter.nodeId()), "peers não conectaram");
+
+        RecordingListener events = listen(storage);
+        reporterLink.send(peerUpdate(reporter, Map.of(client.nodeId(), 60_000L, voter.nodeId(), 60_000L,
+                storage.local().nodeId(), 60_000L)));
+        reporterLink.send(ClusterMessage.request(MessageType.CLIENT_REQUEST, "after-update", reporter.nodeId(),
+                storage.local().nodeId(), "x"));
+        awaitTrue(() -> events.qualifiers().contains("after-update"), "PEER_UPDATE não foi processado");
+
+        assertTrue(knows(storage, client.nodeId()) && storage.isConnected(client.nodeId()),
+                "notícia de segunda mão não pode derrubar um peer com conexão handshaked");
+        assertFalse(storage.isDeparted(client.nodeId()), "nem bloquear o id dele");
+        assertTrue(knows(storage, voter.nodeId()), "um peer elegível a líder nunca é esquecido de segunda mão");
+        assertFalse(storage.isDeparted(voter.nodeId()));
+        assertFalse(storage.isDeparted(storage.local().nodeId()), "um nó ignora a própria saída reportada");
+    }
+
     // ---- helpers ----
+
+    static ClusterMessage peerUpdate(NodeInfo source, Map<NodeId, Long> departed) {
+        return ClusterMessage.request(MessageType.PEER_UPDATE, "peer-update", source.nodeId(), null,
+                new PeerUpdatePayload(Set.of(source), Map.of(), departed));
+    }
 
     static NodeInfo info(String id, int port, boolean ephemeral) {
         Set<String> roles = ephemeral ? Set.of("client", NodeInfo.ROLE_LEADER_INELIGIBLE) : Set.of("storage");

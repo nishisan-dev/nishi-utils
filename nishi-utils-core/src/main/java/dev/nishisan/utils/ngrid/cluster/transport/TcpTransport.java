@@ -815,7 +815,7 @@ public final class TcpTransport implements Transport {
     }
 
     private void broadcastPeerList() {
-        PeerUpdatePayload payload = new PeerUpdatePayload(gossipablePeers(), collectLatencies());
+        PeerUpdatePayload payload = new PeerUpdatePayload(gossipablePeers(), collectLatencies(), departedSnapshot());
         ClusterMessage update = ClusterMessage.request(MessageType.PEER_UPDATE,
                 "peer-update",
                 config.local().nodeId(),
@@ -840,6 +840,8 @@ public final class TcpTransport implements Transport {
 
     private void handlePeerUpdate(ClusterMessage message) {
         PeerUpdatePayload payload = message.payload(PeerUpdatePayload.class);
+        // Departures first, so the same update cannot re-admit what it reports as gone.
+        payload.departed().forEach((id, remainingMs) -> learnDepartureSecondHand(id, remainingMs, message.source()));
         
         // Feed router with reachability info
         router.updateReachability(message.source(), admissible(payload.peers()), admissible(payload.latencies()));
@@ -910,6 +912,47 @@ public final class TcpTransport implements Transport {
         } finally {
             peerTableLock.unlock();
         }
+    }
+
+    /** Remaining TTL (ms) of each live tombstone, for the {@code departed} field of PEER_UPDATE. */
+    private Map<NodeId, Long> departedSnapshot() {
+        long nowMs = System.currentTimeMillis();
+        Map<NodeId, Long> snapshot = new HashMap<>();
+        departedPeers.forEach((id, expiresAt) -> {
+            if (expiresAt > nowMs) {
+                snapshot.put(id, expiresAt - nowMs);
+            }
+        });
+        return snapshot;
+    }
+
+    /**
+     * A peer reported {@code id} as departed. Second-hand, hence admission-only: the tombstone is
+     * recorded (capped by this node's own TTL, never extended by re-gossip) and a peer this node merely
+     * knows is forgotten — so a node that never reached the leaver cleans up too — but a peer this node
+     * holds a handshaked open connection to is left alone (the report may predate its reconnection:
+     * first-hand evidence wins), and a leader-eligible peer is never forgotten nor blocked this way.
+     */
+    private void learnDepartureSecondHand(NodeId id, Long remainingMs, NodeId reporter) {
+        if (id == null || remainingMs == null || remainingMs <= 0 || id.equals(config.local().nodeId())) {
+            return;
+        }
+        long ttlMs = Math.min(remainingMs, config.departedPeerTombstoneTtl().toMillis());
+        forget(id, ttlMs, "departure reported by " + reporter, true);
+    }
+
+    /** Whether an open socket already identified {@code id} through a handshake (published or not). */
+    private boolean hasHandshakedOpenConnection(NodeId id) {
+        Connection published = connections.get(id);
+        if (published != null && published.isOpen() && published.handshaked()) {
+            return true;
+        }
+        for (Connection candidate : liveSockets) {
+            if (candidate.isOpen() && candidate.handshaked() && id.equals(candidate.remoteId().orElse(null))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Dials a newly learned peer when this node is the designated initiator for the pair. */
@@ -1023,7 +1066,11 @@ public final class TcpTransport implements Transport {
         NodeInfo known = knownPeers.get(remoteId);
         if (isEphemeral(leaver) && (known == null || isEphemeral(known))) {
             LOGGER.info(() -> "Peer " + remoteId + " announced LEAVE (" + reason + ") on " + config.local().nodeId());
-            forget(remoteId, config.departedPeerTombstoneTtl().toMillis(), "LEAVE: " + reason);
+            if (forget(remoteId, config.departedPeerTombstoneTtl().toMillis(), "LEAVE: " + reason)) {
+                // First receipt: tell the other peers (PEER_UPDATE departed). The LEAVE itself is never
+                // forwarded; what peers learn this way is admission-only (see handlePeerUpdate).
+                broadcastPeerList();
+            }
             return;
         }
         LOGGER.info(() -> "Leader-eligible peer " + remoteId + " announced LEAVE (" + reason + ") on "
@@ -1154,6 +1201,16 @@ public final class TcpTransport implements Transport {
      * @return {@code true} when the peer was known (or connected) and has now been forgotten
      */
     private boolean forget(NodeId nodeId, long tombstoneTtlMs, String reason) {
+        return forget(nodeId, tombstoneTtlMs, reason, false);
+    }
+
+    /**
+     * @param secondHand the departure was reported by another peer: it is ignored for a peer this node
+     *                   holds a handshaked open connection to (a new incarnation already came back) and
+     *                   for a leader-eligible peer — checked under the same locks as the removal, so a
+     *                   handshake in progress is never undone
+     */
+    private boolean forget(NodeId nodeId, long tombstoneTtlMs, String reason, boolean secondHand) {
         if (nodeId == null || nodeId.equals(config.local().nodeId())) {
             return false;
         }
@@ -1166,6 +1223,15 @@ public final class TcpTransport implements Transport {
         try {
             peerTableLock.lock();
             try {
+                if (secondHand) {
+                    NodeInfo known = knownPeers.get(nodeId);
+                    if ((known != null && !isEphemeral(known))
+                            || (verifiedPeers.contains(nodeId) && hasHandshakedOpenConnection(nodeId))) {
+                        LOGGER.fine(() -> "Ignoring departure of " + nodeId + " on " + config.local().nodeId()
+                                + " (" + reason + "): connected first-hand or leader-eligible");
+                        return false;
+                    }
+                }
                 departedPeers.merge(nodeId, expiresAt, Math::max);
                 wasKnown = knownPeers.remove(nodeId) != null;
                 verifiedPeers.remove(nodeId);

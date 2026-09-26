@@ -23,6 +23,7 @@ import dev.nishisan.utils.ngrid.common.HandshakePayload;
 import dev.nishisan.utils.ngrid.common.MessageType;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
+import dev.nishisan.utils.ngrid.common.PeerUpdatePayload;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
@@ -75,6 +76,43 @@ class ProtocolCompatibilityIntegrationTest {
         HandshakePayload decoded = json.decode(legacy.getBytes(StandardCharsets.UTF_8)).payload(HandshakePayload.class);
         assertFalse(decoded.supportsLeave(), "an old handshake must not announce LEAVE support");
         assertTrue(decoded.supportsUndeliverable());
+    }
+
+    /**
+     * PEER_UPDATE {@code departed} (8.7.0): an older node decodes the payload with its own two-field
+     * shape and simply ignores the new property; a newer node reading an old update sees no departures.
+     */
+    @Test
+    void peerUpdateDepartedIsIgnoredByOldNodesAndAbsentFromTheirUpdates() throws Exception {
+        NodeInfo peer = new NodeInfo(NodeId.of("storage-1"), "localhost", 1);
+        byte[] encoded = json.encode(ClusterMessage.request(MessageType.PEER_UPDATE, "peer-update", peer.nodeId(),
+                null, new PeerUpdatePayload(Set.of(peer), Map.of(), Map.of(NodeId.of("client-1"), 60_000L))));
+        com.fasterxml.jackson.databind.ObjectMapper mapper = JacksonMessageCodec.createDefaultMapper();
+        com.fasterxml.jackson.databind.node.ObjectNode payload =
+                (com.fasterxml.jackson.databind.node.ObjectNode) mapper.readTree(encoded).get("payload");
+        assertTrue(payload.has("departed"), "precondition: the new field is on the wire");
+        payload.remove("@class");
+
+        LegacyPeerUpdatePayload legacy = mapper.treeToValue(payload, LegacyPeerUpdatePayload.class);
+        assertTrue(legacy.peers.contains(peer), "an old node still reads the peer list");
+
+        payload.remove("departed");
+        PeerUpdatePayload fromOldNode = mapper.treeToValue(payload, PeerUpdatePayload.class);
+        assertTrue(fromOldNode.departed().isEmpty(), "an update without the field reports no departure");
+        assertTrue(fromOldNode.peers().contains(peer));
+    }
+
+    /** The PEER_UPDATE payload shape of nodes older than 8.7.0 (no {@code departed}). */
+    static final class LegacyPeerUpdatePayload {
+        final Set<NodeInfo> peers;
+        final Map<NodeId, Double> latencies;
+
+        @com.fasterxml.jackson.annotation.JsonCreator
+        LegacyPeerUpdatePayload(@com.fasterxml.jackson.annotation.JsonProperty("peers") Set<NodeInfo> peers,
+                @com.fasterxml.jackson.annotation.JsonProperty("latencies") Map<NodeId, Double> latencies) {
+            this.peers = peers;
+            this.latencies = latencies;
+        }
     }
 
     @Test
