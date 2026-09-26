@@ -2173,10 +2173,32 @@ public class ReplicationManager
         return out;
     }
 
-    /** Best-effort highest assigned sequence for a topic (advisory lag metric carried to the follower). */
+    /**
+     * Best-effort highest sequence the leader holds for a topic (advisory lag metric carried to the
+     * follower): the larger of the produced counter and the applied frontier ({@code nextExpected - 1}).
+     *
+     * <p>Issue #177: {@code sequenceByTopic} is only seeded on the first PRODUCTION of a topic
+     * ({@link #nextSequenceForTopic}), so a freshly promoted leader that applied {@code N} ops as a
+     * follower and has produced nothing yet advertised {@code 0} — followers then reported "lag unknown"
+     * for as long as the topic stayed idle. The applied frontier is the same baseline the first
+     * production seeds from, and on the normal path it matches what the op-log can serve: follower-era
+     * applied runs are mirrored into it ({@link #mirrorAppliedToOpLog}) and a snapshot cutover/re-anchor
+     * already sets the counter to the watermark. The exceptions (a failed mirror append, a promoted
+     * leader skipping a TTL-evicted relay gap) leave op-log holes the first production would expose with
+     * this very baseline anyway. {@code needSnapshot}/{@code oldest} are computed from the op-log itself,
+     * so this value stays purely advisory.
+     *
+     * <p>The frontier is read lock-free, exactly as {@link #nextSequenceForTopic} reads the same
+     * baseline: a single-key read of the {@link ConcurrentHashMap} is atomic and visible, and
+     * {@link #sequenceBufferLock} only guards compound mutations. This keeps the RELAY_STREAM_FETCH
+     * handler (transport thread) off that lock — no blocking behind an apply commit and no lock-ordering
+     * exposure for any caller.
+     */
     private long currentLeaderTopicSequence(String topic) {
         java.util.concurrent.atomic.AtomicLong counter = sequenceByTopic.get(topic);
-        return counter == null ? 0L : counter.get();
+        long produced = counter == null ? 0L : counter.get();
+        long appliedFrontier = nextExpectedSequenceByTopic.getOrDefault(topic, 1L) - 1L;
+        return Math.max(produced, appliedFrontier);
     }
 
     private long currentNextExpected(String topic) {
@@ -2344,7 +2366,8 @@ public class ReplicationManager
     }
 
     /**
-     * Leader high-watermark for a topic: the leader's own highest assigned sequence, or the value a
+     * Leader high-watermark for a topic: the highest sequence the leader holds (produced or applied,
+     * see {@link #currentLeaderTopicSequence}), or the value a
      * follower learned from its last RELAY_STREAM_BATCH ({@code 0} if unknown yet).
      */
     public long getLeaderHighWatermark(String topic) {
