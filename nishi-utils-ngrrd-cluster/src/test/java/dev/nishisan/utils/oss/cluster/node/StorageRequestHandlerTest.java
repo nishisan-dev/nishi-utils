@@ -70,6 +70,13 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
@@ -741,6 +748,183 @@ class StorageRequestHandlerTest {
         assertEquals(OTHER.value(), write.ownerBySeries().get(seriesKey));
         assertEquals(0, placementLookup.leaderBatchCalls());
         assertEquals(0L, handler.metricsSnapshot().redirectConfirmations());
+    }
+
+    @Test
+    void semLiderConhecidoRespondePelaReplicaSemConsultarOLider() {
+        String seriesKey = "series-sem-lider";
+        placementLookup.putLocalOnly(seriesKey, SeriesPlacement.active(OTHER.value(), 1_000L));
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.active(SELF.value(), 2_000L));
+        placementLookup.leaderKnown(false);
+
+        WriteBatchResponse write = (WriteBatchResponse) handler.handle(Commands.WRITE_BATCH, singleWrite(seriesKey),
+                SOURCE);
+
+        assertEquals(SeriesStatus.WRONG_OWNER, write.statusBySeries().get(seriesKey));
+        assertEquals(OTHER.value(), write.ownerBySeries().get(seriesKey));
+        assertEquals(0, placementLookup.leaderBatchCalls(), "sem líder conhecido não há o que consultar");
+        assertEquals(1L, handler.metricsSnapshot().redirectConfirmationFailures());
+    }
+
+    @Test
+    void consultaPresaAoLiderNaoArrastaAsRequisicoesSeguintes() throws Exception {
+        String stuckKey = "series-consulta-presa";
+        placementLookup.putLocalOnly(stuckKey, SeriesPlacement.active(OTHER.value(), 1_000L));
+        List<String> others = List.of("series-presa-b", "series-presa-c", "series-presa-d");
+        for (String key : others) {
+            placementLookup.putLocalOnly(key, SeriesPlacement.active(OTHER.value(), 1_000L));
+        }
+        CountDownLatch gate = new CountDownLatch(1);
+        placementLookup.holdLeaderBatchesOn(gate);
+        placementLookup.failLeaderBatchWith(new RuntimeException("líder não responde"));
+        ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+        try {
+            Future<Object> stuck = executor.submit(() -> handler.handle(Commands.WRITE_BATCH, singleWrite(stuckKey),
+                    SOURCE));
+            placementLookup.awaitLeaderBatchesStarted(1);
+            // Uma consulta em curso há mais que o limiar de "presa": as seguintes não começam outra.
+            clock.advance(Duration.ofMillis(600));
+
+            for (String key : others) {
+                WriteBatchResponse response = (WriteBatchResponse) handler.handle(Commands.WRITE_BATCH,
+                        singleWrite(key), SOURCE);
+                assertEquals(SeriesStatus.WRONG_OWNER, response.statusBySeries().get(key));
+                assertEquals(OTHER.value(), response.ownerBySeries().get(key));
+            }
+            assertEquals(1, placementLookup.leaderBatchCalls(), "só a consulta presa deveria ter ido ao líder");
+
+            gate.countDown();
+            assertEquals(SeriesStatus.WRONG_OWNER,
+                    ((WriteBatchResponse) stuck.get(10, TimeUnit.SECONDS)).statusBySeries().get(stuckKey));
+            assertEquals(4L, handler.metricsSnapshot().redirectConfirmationFailures());
+        } finally {
+            gate.countDown();
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void comLiderIndisponivelSoUmaSondaPorJanelaDeCooldown() throws Exception {
+        List<String> keys = IntStream.range(0, 8).mapToObj(i -> "series-sonda-" + i).toList();
+        for (String key : keys) {
+            placementLookup.putLocalOnly(key, SeriesPlacement.active(OTHER.value(), 1_000L));
+            placementLookup.putStrongOnly(key, SeriesPlacement.active(SELF.value(), 2_000L));
+        }
+        placementLookup.failLeaderBatchWith(new RuntimeException("líder em eleição"));
+        handler.handle(Commands.WRITE_BATCH, singleWrite(keys.get(0)), SOURCE);
+        assertEquals(1, placementLookup.leaderBatchCalls());
+
+        // Passado o cooldown, o líder continua indisponível e lento: das requisições concorrentes só uma
+        // sonda o líder; as demais respondem pela réplica sem esperar.
+        clock.advance(Duration.ofMillis(1_100));
+        CountDownLatch gate = new CountDownLatch(1);
+        placementLookup.holdLeaderBatchesOn(gate);
+        ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+        try {
+            List<Future<Object>> responses = new ArrayList<>();
+            for (String key : keys.subList(1, keys.size())) {
+                responses.add(executor.submit(() -> handler.handle(Commands.WRITE_BATCH, singleWrite(key), SOURCE)));
+            }
+            placementLookup.awaitLeaderBatchesStarted(2);
+            awaitCompletedCount(responses, responses.size() - 1);
+            assertEquals(2, placementLookup.leaderBatchCalls(), "só uma sonda por janela de cooldown");
+            gate.countDown();
+            for (Future<Object> response : responses) {
+                assertEquals(SeriesStatus.WRONG_OWNER,
+                        ((WriteBatchResponse) response.get(10, TimeUnit.SECONDS)).statusBySeries().values()
+                                .iterator().next());
+            }
+        } finally {
+            gate.countDown();
+            executor.shutdownNow();
+        }
+
+        // Líder de volta: a sonda seguinte ao cooldown confirma e a operação normal volta.
+        placementLookup.holdLeaderBatchesOn(null);
+        placementLookup.failLeaderBatchWith(null);
+        clock.advance(Duration.ofMillis(1_100));
+        WriteBatchResponse recovered = (WriteBatchResponse) handler.handle(Commands.WRITE_BATCH,
+                singleWrite(keys.get(0)), SOURCE);
+        assertEquals(SeriesStatus.NOT_OPEN, recovered.statusBySeries().get(keys.get(0)));
+    }
+
+    @Test
+    void comLiderSaudavelConfirmacoesConcorrentesCorremEmParalelo() throws Exception {
+        String first = "series-paralela-a";
+        String second = "series-paralela-b";
+        for (String key : List.of(first, second)) {
+            placementLookup.putLocalOnly(key, SeriesPlacement.active(OTHER.value(), 1_000L));
+            placementLookup.putStrongOnly(key, SeriesPlacement.active(THIRD.value(), 2_000L));
+        }
+        CountDownLatch gate = new CountDownLatch(1);
+        placementLookup.holdLeaderBatchesOn(gate);
+        ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+        try {
+            Future<Object> a = executor.submit(() -> handler.handle(Commands.WRITE_BATCH, singleWrite(first), SOURCE));
+            Future<Object> b = executor.submit(() -> handler.handle(Commands.WRITE_BATCH, singleWrite(second),
+                    SOURCE));
+
+            placementLookup.awaitLeaderBatchesStarted(2);
+            gate.countDown();
+
+            assertEquals(THIRD.value(), ((WriteBatchResponse) a.get(10, TimeUnit.SECONDS)).ownerBySeries().get(first));
+            assertEquals(THIRD.value(), ((WriteBatchResponse) b.get(10, TimeUnit.SECONDS)).ownerBySeries().get(second));
+        } finally {
+            gate.countDown();
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void confirmacaoQueTerminaDepoisDeUmaMudancaDePosseNaoRessuscitaOCache() throws Exception {
+        String seriesKey = "series-cache-ressuscitado";
+        placementLookup.putLocalOnly(seriesKey, SeriesPlacement.active(OTHER.value(), 1_000L));
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.active(THIRD.value(), 2_000L));
+        CountDownLatch gate = new CountDownLatch(1);
+        placementLookup.holdLeaderBatchesOn(gate);
+        ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+        try {
+            Future<Object> inFlight = executor.submit(() -> handler.handle(Commands.WRITE_BATCH,
+                    singleWrite(seriesKey), SOURCE));
+            placementLookup.awaitLeaderBatchesStarted(1);
+
+            registry.markMigrating(seriesKey);
+            gate.countDown();
+            inFlight.get(10, TimeUnit.SECONDS);
+
+            assertEquals(0, confirmedCacheSize(), "a confirmação anterior à mudança de posse não pode ir ao cache");
+        } finally {
+            gate.countDown();
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void placementMigratingDoLiderNaoVaiParaOCache() throws Exception {
+        String seriesKey = "series-lider-migrando-sem-cache";
+        placementLookup.putLocalOnly(seriesKey, SeriesPlacement.active(OTHER.value(), 1_000L));
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.migrating(
+                SeriesPlacement.active(OTHER.value(), 1_000L), THIRD.value(), "mig-1", 2_000L));
+
+        WriteBatchResponse first = (WriteBatchResponse) handler.handle(Commands.WRITE_BATCH, singleWrite(seriesKey),
+                SOURCE);
+        handler.handle(Commands.WRITE_BATCH, singleWrite(seriesKey), SOURCE);
+
+        assertEquals(SeriesStatus.MIGRATING, first.statusBySeries().get(seriesKey));
+        assertEquals(0, confirmedCacheSize());
+        assertEquals(2, placementLookup.leaderBatchCalls(), "sem cache, cada requisição confirma no líder");
+    }
+
+    /** Espera ao menos {@code count} das respostas terem terminado. */
+    private static void awaitCompletedCount(List<Future<Object>> responses, int count) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 10_000L;
+        while (responses.stream().filter(Future::isDone).count() < count) {
+            if (System.currentTimeMillis() > deadline) {
+                throw new AssertionError("só " + responses.stream().filter(Future::isDone).count()
+                        + " resposta(s) terminaram; esperado " + count);
+            }
+            Thread.sleep(10L);
+        }
     }
 
     private static WriteBatchRequest singleWrite(String seriesKey) {
@@ -1478,7 +1662,7 @@ class StorageRequestHandlerTest {
 
     /** {@link Clock} determinístico para forçar fechamento por ociosidade via {@link SeriesHandleRegistry#closeIdle()}. */
     private static final class MutableClock extends Clock {
-        private Instant instant;
+        private volatile Instant instant;
 
         MutableClock(Instant start) {
             this.instant = start;
@@ -1516,9 +1700,13 @@ class StorageRequestHandlerTest {
         private final Map<String, SeriesPlacement> strong = new HashMap<>();
         private int strongCalls;
         private RuntimeException strongFailure;
-        private final List<List<String>> leaderBatches = new ArrayList<>();
-        private RuntimeException leaderBatchFailure;
-        private boolean authoritative;
+        private final List<List<String>> leaderBatches = new CopyOnWriteArrayList<>();
+        private volatile RuntimeException leaderBatchFailure;
+        private volatile boolean authoritative;
+        private volatile boolean leaderKnown = true;
+        /** Quando não nulo, cada consulta em lote ao líder espera este latch antes de responder. */
+        private volatile CountDownLatch leaderBatchGate;
+        private final Semaphore leaderBatchStarted = new Semaphore(0);
 
         void put(String seriesKey, SeriesPlacement placement) {
             local.put(seriesKey, placement);
@@ -1562,9 +1750,42 @@ class StorageRequestHandlerTest {
             return leaderBatches;
         }
 
+        /** Simula a ausência de líder conhecido por este nó. */
+        void leaderKnown(boolean value) {
+            this.leaderKnown = value;
+        }
+
+        /** As consultas em lote seguintes ficam presas até {@code gate} abrir ({@code null} = sem espera). */
+        void holdLeaderBatchesOn(CountDownLatch gate) {
+            this.leaderBatchGate = gate;
+        }
+
+        /** Espera {@code count} consultas em lote terem começado. */
+        void awaitLeaderBatchesStarted(int count) throws InterruptedException {
+            assertTrue(leaderBatchStarted.tryAcquire(count, 10, TimeUnit.SECONDS),
+                    "consultas em lote ao líder deveriam ter começado: " + count);
+        }
+
+        @Override
+        public boolean leaderKnown() {
+            return leaderKnown;
+        }
+
         @Override
         public Map<String, SeriesPlacement> placementsAtLeader(Collection<String> seriesKeys, Duration maxWait) {
             leaderBatches.add(List.copyOf(seriesKeys));
+            leaderBatchStarted.release();
+            CountDownLatch gate = leaderBatchGate;
+            if (gate != null) {
+                try {
+                    if (!gate.await(10, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("gate da consulta ao líder nunca abriu");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException(e);
+                }
+            }
             if (leaderBatchFailure != null) {
                 throw leaderBatchFailure;
             }

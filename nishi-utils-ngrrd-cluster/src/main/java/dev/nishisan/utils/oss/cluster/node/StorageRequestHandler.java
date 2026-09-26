@@ -57,6 +57,7 @@ import dev.nishisan.utils.oss.definition.ObjectNaming;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -65,6 +66,9 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -145,6 +149,15 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
          */
         default boolean localIsAuthoritative() {
             return false;
+        }
+
+        /**
+         * Se este nó conhece um líder a quem perguntar. Sem líder (eleição em curso), um redirecionamento
+         * derivado da réplica local é respondido por ela na hora, sem pagar o prazo de
+         * {@link #placementsAtLeader} para descobrir o óbvio.
+         */
+        default boolean leaderKnown() {
+            return true;
         }
     }
 
@@ -237,6 +250,15 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
      * requisição pagaria o prazo inteiro de {@link #OWNER_CONFIRMATION_TIMEOUT}.
      */
     private static final Duration REDIRECT_CONFIRMATION_COOLDOWN = Duration.ofSeconds(1);
+    /**
+     * Uma confirmação no líder em curso há mais que isto é tratada como "presa" (líder lento ou
+     * inalcançável): enquanto ela não termina, as requisições seguintes respondem pela réplica local em vez
+     * de abrir outra consulta que também esperaria o prazo inteiro. No caminho saudável a consulta leva
+     * milissegundos e nunca chega aqui.
+     */
+    private static final Duration STALLED_CONFIRMATION_THRESHOLD = Duration.ofMillis(500);
+    /** Faixas do contador de geração de posse ({@link #ownershipGenerations}). */
+    private static final int OWNERSHIP_GENERATION_STRIPES = 1024;
 
     /**
      * {@link Commands#SERIES_EXISTS} e {@link Commands#SERIES_EXISTS_BATCH} não passam pela checagem de
@@ -284,6 +306,24 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
     private final ConcurrentMap<String, ConfirmedPlacement> confirmedPlacements = new ConcurrentHashMap<>();
     /** Até quando (relógio {@link #clock}) os redirecionamentos seguem a réplica local após uma falha. */
     private volatile long redirectConfirmationCooldownUntilMs;
+    /**
+     * Se a última confirmação no líder terminou em falha. Enquanto verdadeiro, passado o cooldown, só UMA
+     * consulta de sonda ({@link #confirmationProbeInFlight}) vai ao líder por vez; as demais respondem pela
+     * réplica local. Com o líder saudável ({@code false}) as confirmações correm em paralelo, sem trava.
+     */
+    private volatile boolean leaderConfirmationDegraded;
+    private final AtomicBoolean confirmationProbeInFlight = new AtomicBoolean();
+    /** Confirmações no líder em curso: ficha → instante de início (relógio {@link #clock}). */
+    private final ConcurrentMap<Long, Long> confirmationsInFlight = new ConcurrentHashMap<>();
+    private final AtomicLong confirmationTokens = new AtomicLong();
+    /**
+     * Geração de posse por faixa de {@code seriesKey}, incrementada a cada mudança local de posse
+     * ({@link SeriesHandleRegistry#addOwnershipChangeListener}). Uma confirmação lê a geração antes da
+     * consulta ao líder e só grava no {@link #confirmedPlacements} se ela não mudou — senão uma consulta em
+     * voo durante a mudança ressuscitaria no cache a posse anterior. Colisão de faixa só faz deixar de
+     * cachear (nunca cacheia a mais).
+     */
+    private final AtomicLongArray ownershipGenerations = new AtomicLongArray(OWNERSHIP_GENERATION_STRIPES);
 
     public StorageRequestHandler(Transport transport, PlacementLookup placementLookup,
             SeriesHandleRegistry registry, BlobVolume volume, String seriesObjectPrefix, NodeId self,
@@ -297,7 +337,7 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
         this.defaultDurability = Objects.requireNonNull(defaultDurability, "defaultDurability");
         this.defaultOnGeometryChange = Objects.requireNonNull(defaultOnGeometryChange, "defaultOnGeometryChange");
         this.clock = Objects.requireNonNull(clock, "clock");
-        registry.addOwnershipChangeListener(confirmedPlacements::remove);
+        registry.addOwnershipChangeListener(this::onOwnershipChanged);
     }
 
     @Override
@@ -700,7 +740,8 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
      *   <li>este nó é o líder ({@link PlacementLookup#localIsAuthoritative}) → resposta local;</li>
      *   <li>confirmação válida em {@link #confirmedPlacements} → resposta por ela, SEM
      *       {@code confirmedByLeader} (nunca autoriza criar uma série);</li>
-     *   <li>dentro do {@link #REDIRECT_CONFIRMATION_COOLDOWN} após uma falha → resposta local (8.6.0);</li>
+     *   <li>sem autorização de {@link #tryBeginConfirmation} (sem líder conhecido, cooldown após falha,
+     *       consulta presa ou sonda já em curso) → resposta local (8.6.0);</li>
      *   <li>senão entra no lote de {@link PlacementLookup#placementsAtLeader}: encontrado → decisão do
      *       líder (e cache); ausente → {@code WRONG_OWNER} sem dono (e cache negativo); falha → resposta
      *       local e cooldown.</li>
@@ -734,16 +775,76 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
             if (cached != null) {
                 redirectCacheHitsCount.increment();
                 decisions.put(seriesKey, cached);
-            } else if (now < redirectConfirmationCooldownUntilMs) {
-                redirectConfirmationFailuresCount.increment();
             } else {
                 toConfirm.put(seriesKey, local.redirectPlacement());
             }
         }
-        if (!toConfirm.isEmpty()) {
-            confirmRedirectsAtLeader(toConfirm, decisions);
+        if (toConfirm.isEmpty()) {
+            return decisions;
         }
+        ConfirmationPermit permit = tryBeginConfirmation(now);
+        if (permit == null) {
+            // Sem líder conhecido, em cooldown, com uma consulta presa ou com a sonda já em curso: a réplica
+            // local responde (comportamento da 8.6.0) sem pagar o prazo da consulta.
+            redirectConfirmationFailuresCount.add(toConfirm.size());
+            return decisions;
+        }
+        confirmRedirectsAtLeader(toConfirm, decisions, permit);
         return decisions;
+    }
+
+    /**
+     * Autoriza uma confirmação no líder agora, ou {@code null} se ela deve ser pulada: nenhum líder
+     * conhecido; dentro do {@link #REDIRECT_CONFIRMATION_COOLDOWN} após uma falha; alguma confirmação em
+     * curso há mais que {@link #STALLED_CONFIRMATION_THRESHOLD}; ou, com a última confirmação falha, outra
+     * requisição já sondando o líder. No caminho saudável não há trava: confirmações concorrentes correm em
+     * paralelo. Toda autorização concedida precisa terminar em {@link #finishConfirmation}.
+     */
+    private ConfirmationPermit tryBeginConfirmation(long now) {
+        if (!placementLookup.leaderKnown() || now < redirectConfirmationCooldownUntilMs) {
+            return null;
+        }
+        long stalledIfStartedBefore = now - STALLED_CONFIRMATION_THRESHOLD.toMillis();
+        for (long startedAt : confirmationsInFlight.values()) {
+            if (startedAt <= stalledIfStartedBefore) {
+                return null;
+            }
+        }
+        boolean probe = leaderConfirmationDegraded;
+        if (probe && !confirmationProbeInFlight.compareAndSet(false, true)) {
+            return null;
+        }
+        long token = confirmationTokens.incrementAndGet();
+        confirmationsInFlight.put(token, now);
+        return new ConfirmationPermit(token, probe);
+    }
+
+    /** Encerra uma confirmação autorizada por {@link #tryBeginConfirmation}, atualizando o estado do líder. */
+    private void finishConfirmation(ConfirmationPermit permit, boolean succeeded) {
+        confirmationsInFlight.remove(permit.token());
+        if (succeeded) {
+            leaderConfirmationDegraded = false;
+        } else {
+            leaderConfirmationDegraded = true;
+            redirectConfirmationCooldownUntilMs = clock.millis() + REDIRECT_CONFIRMATION_COOLDOWN.toMillis();
+        }
+        if (permit.probe()) {
+            confirmationProbeInFlight.set(false);
+        }
+    }
+
+    /**
+     * Aviso de {@link SeriesHandleRegistry} de que a posse local de {@code seriesKey} pode ter mudado:
+     * avança a geração ANTES de remover a entrada do cache — a ordem que {@link #putConfirmedPlacement}
+     * precisa para nunca deixar uma confirmação anterior à mudança no cache.
+     */
+    private void onOwnershipChanged(String seriesKey) {
+        ownershipGenerations.incrementAndGet(generationStripe(seriesKey));
+        confirmedPlacements.remove(seriesKey);
+    }
+
+    private static int generationStripe(String seriesKey) {
+        return Math.floorMod(seriesKey.hashCode(), OWNERSHIP_GENERATION_STRIPES);
     }
 
     /**
@@ -848,17 +949,23 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
      * e grava as decisões em {@code decisions} (que já traz as respostas locais, mantidas se a consulta
      * falhar).
      */
-    private void confirmRedirectsAtLeader(Map<String, SeriesPlacement> toConfirm, Map<String, Ownership> decisions) {
+    private void confirmRedirectsAtLeader(Map<String, SeriesPlacement> toConfirm, Map<String, Ownership> decisions,
+            ConfirmationPermit permit) {
         redirectConfirmationsCount.add(toConfirm.size());
+        Map<String, Long> generationsBefore = new HashMap<>();
+        for (String seriesKey : toConfirm.keySet()) {
+            generationsBefore.put(seriesKey, ownershipGenerations.get(generationStripe(seriesKey)));
+        }
         Map<String, SeriesPlacement> atLeader;
         try {
             atLeader = placementLookup.placementsAtLeader(toConfirm.keySet(), OWNER_CONFIRMATION_TIMEOUT);
             if (atLeader == null) {
                 throw new IllegalStateException("consulta ao líder devolveu null");
             }
+            finishConfirmation(permit, true);
         } catch (RuntimeException e) {
+            finishConfirmation(permit, false);
             redirectConfirmationFailuresCount.add(toConfirm.size());
-            redirectConfirmationCooldownUntilMs = clock.millis() + REDIRECT_CONFIRMATION_COOLDOWN.toMillis();
             LOGGER.log(Level.FINE, e, () -> "Falha ao confirmar no líder o redirecionamento de " + toConfirm.size()
                     + " série(s); respondendo pela réplica local por " + REDIRECT_CONFIRMATION_COOLDOWN.toMillis()
                     + " ms");
@@ -873,7 +980,7 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
                 decided = Ownership.leader(SeriesStatus.WRONG_OWNER, null);
             } else {
                 negativeLookupCacheExpiryMs.remove(seriesKey);
-                putConfirmedPlacement(seriesKey, leaderPlacement, now);
+                putConfirmedPlacement(seriesKey, leaderPlacement, now, generationsBefore.get(seriesKey));
                 decided = ownershipFromLeader(seriesKey, leaderPlacement);
             }
             Ownership local = decisions.put(seriesKey, decided);
@@ -948,18 +1055,32 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
     }
 
     /**
-     * Registra a confirmação do líder no {@link #confirmedPlacements}. Só ao passar do teto: varre as
-     * expiradas e, se ainda acima, esvazia o cache (ele é só um atalho — a próxima requisição de cada série
-     * consulta o líder de novo).
+     * Registra a confirmação do líder no {@link #confirmedPlacements}. Só placements {@code ACTIVE}: um
+     * {@code MIGRATING} vai mudar em breve e é justamente o que se quer confirmar a cada requisição. Não
+     * grava se a geração de posse da série mudou desde antes da consulta ({@code generationBefore}); a
+     * rechecagem depois do {@code put} fecha a corrida com {@link #onOwnershipChanged} (que avança a geração
+     * antes de remover). Só ao passar do teto: varre as expiradas e, se ainda acima, esvazia o cache (ele é
+     * só um atalho — a próxima requisição de cada série consulta o líder de novo).
      */
-    private void putConfirmedPlacement(String seriesKey, SeriesPlacement placement, long now) {
+    private void putConfirmedPlacement(String seriesKey, SeriesPlacement placement, long now, long generationBefore) {
+        if (placement.state() != PlacementState.ACTIVE) {
+            return;
+        }
+        int stripe = generationStripe(seriesKey);
+        if (ownershipGenerations.get(stripe) != generationBefore) {
+            return;
+        }
         if (confirmedPlacements.size() >= CONFIRMED_PLACEMENT_MAX_ENTRIES) {
             confirmedPlacements.values().removeIf(entry -> entry.expiresAtMs() <= now);
             if (confirmedPlacements.size() >= CONFIRMED_PLACEMENT_MAX_ENTRIES) {
                 confirmedPlacements.clear();
             }
         }
-        confirmedPlacements.put(seriesKey, new ConfirmedPlacement(placement, now + CONFIRMED_PLACEMENT_TTL.toMillis()));
+        ConfirmedPlacement entry = new ConfirmedPlacement(placement, now + CONFIRMED_PLACEMENT_TTL.toMillis());
+        confirmedPlacements.put(seriesKey, entry);
+        if (ownershipGenerations.get(stripe) != generationBefore) {
+            confirmedPlacements.remove(seriesKey, entry);
+        }
     }
 
     private void recordError(SeriesStatus status) {
@@ -1023,5 +1144,14 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
      * @param expiresAtMs instante (relógio {@link #clock}) a partir do qual a entrada não vale mais
      */
     private record ConfirmedPlacement(SeriesPlacement placement, long expiresAtMs) {
+    }
+
+    /**
+     * Autorização de uma confirmação no líder ({@link #tryBeginConfirmation}).
+     *
+     * @param token ficha em {@link #confirmationsInFlight}
+     * @param probe se é a sonda única de um líder em falha (libera {@link #confirmationProbeInFlight})
+     */
+    private record ConfirmationPermit(long token, boolean probe) {
     }
 }

@@ -207,6 +207,11 @@ public final class NgrrdStorageNode implements Closeable {
                     public boolean localIsAuthoritative() {
                         return node.coordinator().isLeader();
                     }
+
+                    @Override
+                    public boolean leaderKnown() {
+                        return rpc.leaderId().isPresent();
+                    }
                 };
                 StorageRequestHandler storageHandler = new StorageRequestHandler(node.transport(),
                         placementLookup, registry, volume, cfg.seriesObjectPrefix(), self, cfg.defaultDurability(),
