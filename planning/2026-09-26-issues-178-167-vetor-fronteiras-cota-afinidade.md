@@ -250,3 +250,80 @@ mvn -B -q install -DskipTests -Djacoco.skip=true -pl .,nishi-utils-core,nishi-ut
 mvn -pl nishi-utils-ngrrd-cluster verify -Pngrrd-cluster -Dtest=LeaderFailoverDuringMigrationClusterTest \
     -DfailIfNoSpecifiedTests=false -Djdk.virtualThreadScheduler.parallelism=2
 ```
+
+## Retomada local — 2026-09-26
+
+Base confirmada no remoto: `9184aaf`, sem PR aberto. Continuação no branch
+`codex/release-8-8-0-validation`, em worktree separado, com OpenJDK 21.
+
+### Correções encontradas na validação integrada
+
+- `f44115a`: o desempate de vetores incomparáveis com soma igual concatenava os tópicos locais
+  e os remotos. Com `{map:a: 10}` contra `{map:b: 10}`, ambos os nós se consideravam à frente.
+  Agora a união dos tópicos é ordenada, após a lista de prioridades. Dois testes novos falharam
+  antes e passaram depois, inclusive quando o tópico prioritário está empatado.
+- `9f39afa`: expiração e reentrada podiam se sobrepor: um heartbeat reativava o membro antes de
+  a limpeza antiga apagar seu watermark e notificar a saída. O join-quiesce podia perder essa
+  transição e aceitar o progresso da sessão anterior. Heartbeat, conexão e expiração agora usam
+  a sincronização da eleição para preservar a ordem. Um teste com barreira força a sobreposição:
+  falhou sem a correção e passou com ela. O teste de carga de streaming também espera os gates
+  de escrita após o consenso, antes de começar a produzir.
+- `e794a8e`: a sincronização ampliada acima revelou pinning de virtual threads no Java 21
+  durante a aceitação com dois carriers. Um dump capturou logging sob o monitor da coordenação
+  enquanto os carriers ficavam presos. As nove regiões agora usam `ReentrantLock`, mantendo
+  reentrância e ordenação. Um teste em JVM isolada com dois carriers falhou com o monitor e
+  passou com a correção. A bateria direcionada passou com 31 testes.
+
+### Evidências desta retomada
+
+- Primeira execução de `mvn -B verify -Pvalidate-javadoc`: core com 695 testes, 1 falha, 1 erro,
+  8 ignorados. As falhas foram `JoinQuiesceReleaseGateTest.rejoinDiscardsStaleProgressFromPreviousSession`
+  e `RelayStreamReplicationTest.streamContiguousUnderFirehoseNoNak` (`LeaderSyncingException`).
+  Os demais módulos não chegaram a executar nessa tentativa.
+- Reentrada isolada sem a correção: falhou na segunda repetição.
+- Com as correções: dez execuções consecutivas de `JoinQuiesceReleaseGateTest` e
+  `RelayStreamReplicationTest` passaram (sem rerun automático).
+- Bateria direcionada final: 30 testes, zero falhas/erros/ignorados, incluindo a corrida forçada,
+  `TopicFrontiersTest`, `TopicFrontierElectionGateTest` e `CoordinatorHardeningTest`.
+- Logs e relatórios locais preservados em `/tmp/nishi-utils-8.8.0-validation/`.
+
+### Gates anteriores à correção de pinning
+
+Executados com OpenJDK 21.0.12.1 no código corrigido (`9f39afa`):
+
+| Verificação | Resultado |
+|---|---|
+| `mvn -B verify -Pvalidate-javadoc` | **aprovado**, todos os cinco módulos; core 696 testes (8 ignorados), OSS 253, ngrrd-cluster 787, integrações Docker do `ngrid-test` 25 (1 ignorado); zero falhas/erros e Javadoc aprovado |
+| `mvn -B test -pl nishi-utils-core -Presilience -Dsurefire.rerunFailingTestsCount=1` | **aprovado**, 48 testes (1 ignorado), zero falhas/erros |
+| Quatro comandos de `pr-validation.yml` | **aprovados**: verify com 1.193 testes; checkpoint com 1; transporte com 19; ingestão contínua com 1 |
+| `QuotaClusterTest`, `PlacementRulesClusterTest`, `ForgetNodeClusterTest` | **aprovados**, 3 testes |
+| `LeaderFailoverDuringMigrationClusterTest` | primeira rodada **falhou**, 2 testes/1 falha; revelou pinning, corrigido em `e794a8e` |
+
+Os cenários ngrrd usam `JAVA_TOOL_OPTIONS=-Djdk.virtualThreadScheduler.parallelism=2`.
+O CI remoto de `9f39afa` também passou
+([execução](https://github.com/nishisan-dev/nishi-utils/actions/runs/36258971055)).
+
+### Gates no código final (`e794a8e`)
+
+- `LeaderFailoverDuringMigrationClusterTest`: **8/8 rodadas consecutivas aprovadas**, 2 testes
+  por rodada, sem rerun automático, com dois carriers.
+- Suíte completa/Javadoc, resiliência, quatro comandos de CI e cotas/regras/forget-node:
+  nova execução em andamento; resultados anteriores não substituem esta rodada.
+- Evidências finais em `/tmp/nishi-utils-8.8.0-validation/final/`.
+- PR [#185](https://github.com/nishisan-dev/nishi-utils/pull/185) permanece em rascunho até
+  concluir os gates finais.
+
+### Referências de arquitetura para o follow-up
+
+Comparação com Kafka e JGroups, propostas de linhagem/commit, visões de membership,
+callbacks ordenados e antiguidade como desempate:
+[referências e critérios de aceite](2026-09-26-ngrid-referencias-kafka-jgroups.md).
+A proposta não altera o protocolo desta entrega nem encerra as limitações da #184.
+
+### Ambiente e pendências externas
+
+- Os worktrees `.claude/worktrees/agent-*` citados no checkpoint anterior não estão registrados
+  nem presentes neste ambiente. Os dois branches de backup continuam no remoto.
+- O worktree temporário usado para reproduzir as falhas foi removido após preservar os relatórios.
+- A #181 continua aberta: validação de conteúdo e vazão no TEMS ainda necessária após o merge.
+  Não houve alteração nem validação de produção nesta retomada.
