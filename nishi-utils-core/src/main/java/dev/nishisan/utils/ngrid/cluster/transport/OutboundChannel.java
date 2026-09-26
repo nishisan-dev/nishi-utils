@@ -19,6 +19,7 @@ package dev.nishisan.utils.ngrid.cluster.transport;
 
 import dev.nishisan.utils.ngrid.common.ClusterMessage;
 
+import java.util.Collection;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
@@ -84,6 +85,18 @@ final class OutboundChannel {
      */
     ClusterMessage poll(long timeout, TimeUnit unit) throws InterruptedException {
         return queue.poll(timeout, unit);
+    }
+
+    /**
+     * Removes every queued message, in FIFO order, into {@code sink} (atomically with respect to
+     * concurrent enqueues/polls). Used when the connection closes to hand its unsent frames over to
+     * the connection that replaced it.
+     *
+     * @param sink where the drained messages go
+     * @return the number of messages drained
+     */
+    int drainTo(Collection<? super ClusterMessage> sink) {
+        return queue.drainTo(sink);
     }
 
     /**

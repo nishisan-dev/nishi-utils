@@ -135,6 +135,10 @@ public final class TcpTransport implements Transport {
     // handshake is queued, so a test can send through the published connection in that window.
     // No-op in production.
     private volatile java.util.function.Consumer<NodeId> afterPublishHook = id -> { };
+    // Test seam: runs on a connection's writer thread right before each frame is encoded and written,
+    // so a test can hold a connection's writer on a chosen frame (frames queued behind it stay queued).
+    // No-op in production.
+    private volatile java.util.function.Consumer<ClusterMessage> beforeWriteHook = message -> { };
 
     private volatile boolean running;
     // Set by close() before it announces the departure (LEAVE): from then on no new connection is
@@ -202,6 +206,11 @@ public final class TcpTransport implements Transport {
     // peer, right before its handshake is queued.
     void setAfterPublishHook(java.util.function.Consumer<NodeId> hook) {
         this.afterPublishHook = Objects.requireNonNull(hook, "hook");
+    }
+
+    // Visible for tests in this package: hook invoked by a connection's writer before writing each frame.
+    void setBeforeWriteHook(java.util.function.Consumer<ClusterMessage> hook) {
+        this.beforeWriteHook = Objects.requireNonNull(hook, "hook");
     }
 
     @Override
@@ -1343,6 +1352,43 @@ public final class TcpTransport implements Transport {
         });
     }
 
+    /**
+     * A frame that never reached the socket of {@code from}, now closed — still queued when the
+     * simultaneous-open tie-break closed the connection, held before its handshake, or handed to
+     * {@code send} after the close: it goes over the connection now live for the same peer when one
+     * exists (the tie-break winner, an adopted socket), preserving order since the caller is the
+     * writer draining its own queue. When none does, its pending response (if any) fails at once with
+     * {@link PeerDisconnectedException} instead of waiting out the request timeout. Nothing is done
+     * while the transport is closing ({@link #close()} fails every pending response itself), and a
+     * HANDSHAKE belongs to its own connection.
+     */
+    private void redirectOrFail(Connection from, ClusterMessage message) {
+        if (!running || message.type() == MessageType.HANDSHAKE) {
+            return;
+        }
+        NodeId peer = from.remoteId().orElse(null);
+        Connection live = peer != null ? connections.get(peer) : null;
+        if (live != null && live != from && live.isOpen()) {
+            LOGGER.fine(() -> "Redirecting unsent " + message.type() + " to " + peer + " over its live connection");
+            live.send(message);
+            return;
+        }
+        failPendingRequest(message, peer != null ? peer : message.destination());
+    }
+
+    /** Fails, at once, the pending response of {@code message} (a request that will never leave), if any. */
+    private void failPendingRequest(ClusterMessage message, NodeId peer) {
+        if (ClusterMessage.ZERO_UUID.equals(message.messageId())) {
+            return;
+        }
+        PendingResponse pending = pendingResponses.remove(message.messageId());
+        if (pending != null) {
+            pending.cancelTimeout();
+            pending.future.completeExceptionally(new PeerDisconnectedException(
+                    peer != null ? peer : pending.destination, message.messageId()));
+        }
+    }
+
     private void failPendingResponsesTo(NodeId nodeId) {
         List<Map.Entry<UUID, PendingResponse>> toFail = new ArrayList<>();
         for (Map.Entry<UUID, PendingResponse> entry : pendingResponses.entrySet()) {
@@ -1743,6 +1789,9 @@ public final class TcpTransport implements Transport {
 
         void send(ClusterMessage message) {
             if (!isOpen()) {
+                // Closed (e.g. it lost the tie-break to another connection of the same peer): never
+                // drop silently — the request would wait out its timeout for nothing.
+                redirectOrFail(this, message);
                 return;
             }
             if (outboundInitiated && !handshakeQueued) {
@@ -1764,6 +1813,28 @@ public final class TcpTransport implements Transport {
                 }
             }
             outbound.enqueue(message);
+            if (!isOpen()) {
+                // Closed between the check above and the enqueue: the writer may already have drained
+                // its leftovers, so hand over whatever is still queued (usually just this frame).
+                unsentFrames().forEach(unsent -> redirectOrFail(this, unsent));
+            }
+        }
+
+        /**
+         * Frames of this connection that never reached its socket, in the order they were sent: those
+         * held before the handshake (never queued yet) followed by the outbound queue. Empties both.
+         */
+        private List<ClusterMessage> unsentFrames() {
+            List<ClusterMessage> unsent = new ArrayList<>();
+            handshakeGate.lock();
+            try {
+                unsent.addAll(heldBeforeHandshake);
+                heldBeforeHandshake.clear();
+            } finally {
+                handshakeGate.unlock();
+            }
+            outbound.drainTo(unsent);
+            return unsent;
         }
 
         /**
@@ -1794,12 +1865,23 @@ public final class TcpTransport implements Transport {
 
         private void drainOutbound() {
             byte[] lengthPrefix = new byte[Integer.BYTES];
+            // The frame in hand, and whether its bytes started to leave: a frame whose write began may
+            // have partially reached the peer and is never resent (its pending response fails fast
+            // instead); one whose write never began is redirected like the queued ones.
+            ClusterMessage inHand = null;
+            boolean writeStarted = false;
             try {
                 while (isOpen()) {
                     ClusterMessage message = outbound.poll(1, TimeUnit.SECONDS);
                     if (message == null) {
                         continue; // timeout — recheck isOpen()
                     }
+                    inHand = message;
+                    writeStarted = false;
+                    if (!isOpen()) {
+                        break; // closed while waiting: redirected below, ahead of the queued ones
+                    }
+                    beforeWriteHook.accept(message);
                     // One writer owns this raw socket stream. DataOutputStream.write(byte[])
                     // itself is synchronized on Java 21 and would pin a slow socket writer.
                     byte[] data = codec.encode(message);
@@ -1807,9 +1889,11 @@ public final class TcpTransport implements Transport {
                     lengthPrefix[1] = (byte) (data.length >>> 16);
                     lengthPrefix[2] = (byte) (data.length >>> 8);
                     lengthPrefix[3] = (byte) data.length;
+                    writeStarted = true;
                     outputStream.write(lengthPrefix);
                     outputStream.write(data);
                     outputStream.flush();
+                    inHand = null;
                     if (!flushWaiters.isEmpty()) {
                         CompletableFuture<Void> waiter = flushWaiters.remove(message.messageId());
                         if (waiter != null) {
@@ -1826,6 +1910,17 @@ public final class TcpTransport implements Transport {
                 closeQuietly();
             } finally {
                 failFlushWaiters();
+                // Nothing queued here leaves any more: hand it to the peer's live connection or fail it.
+                if (inHand != null) {
+                    if (writeStarted) {
+                        failPendingRequest(inHand, remoteId().orElse(inHand.destination()));
+                    } else {
+                        redirectOrFail(this, inHand);
+                    }
+                }
+                for (ClusterMessage unsent : unsentFrames()) {
+                    redirectOrFail(this, unsent);
+                }
             }
         }
 
