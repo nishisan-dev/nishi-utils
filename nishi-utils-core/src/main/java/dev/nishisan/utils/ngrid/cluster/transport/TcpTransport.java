@@ -767,7 +767,11 @@ public final class TcpTransport implements Transport {
     private void handleHandshake(Connection connection, ClusterMessage message) {
         HandshakePayload payload = message.payload(HandshakePayload.class);
         NodeInfo remoteInfo = payload.local();
-        boolean firstHandshakeOnThisConnection = connection.remoteId().isEmpty();
+        // The dialer learns our identity only from this reply, so the first handshake read on an
+        // accepted socket is always answered — even when an earlier frame already let readLoop infer
+        // the remote's identity (a remote id alone does not mean its handshake was seen; older nodes
+        // may send a frame before their handshake).
+        boolean firstHandshakeOnThisConnection = !connection.outboundInitiated && !connection.handshaked();
         connection.setRemote(remoteInfo);
         // Negotiate outbound compression for this connection based on the peer's advertised
         // capability. Done before any early return so the connection that ends up winning a

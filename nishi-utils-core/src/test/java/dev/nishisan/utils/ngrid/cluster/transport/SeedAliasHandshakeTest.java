@@ -19,10 +19,12 @@ package dev.nishisan.utils.ngrid.cluster.transport;
 
 import dev.nishisan.utils.ngrid.cluster.transport.codec.CompositeMessageCodec;
 import dev.nishisan.utils.ngrid.common.ClusterMessage;
+import dev.nishisan.utils.ngrid.common.HandshakePayload;
 import dev.nishisan.utils.ngrid.common.HeartbeatPayload;
 import dev.nishisan.utils.ngrid.common.MessageType;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
+import dev.nishisan.utils.ngrid.common.PeerUpdatePayload;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -36,12 +38,15 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -108,6 +113,26 @@ class SeedAliasHandshakeTest {
         DataInputStream in = new DataInputStream(accepted.getInputStream());
         assertEquals(MessageType.HANDSHAKE, readFrame(in).type(), "primeiro frame da conexão discada");
         assertEquals(MessageType.HEARTBEAT, readFrame(in).type(), "o frame retido segue depois do handshake");
+    }
+
+    /** Um frame anterior ao handshake não pode calar a resposta do handshake numa conexão aceita. */
+    @Test
+    void acceptedSocketAnswersTheFirstHandshakeEvenAfterTheIdentityWasInferred() throws Exception {
+        NodeInfo server = node("storage-z", freePort());
+        NodeInfo dialer = node("client-raw", freePort());
+        TcpTransport transport = transport(server);
+        transport.start();
+        RawPeer raw = new RawPeer(server.host(), server.port());
+        closeables.add(raw);
+
+        raw.send(ClusterMessage.request(MessageType.PEER_UPDATE, "peer-update", dialer.nodeId(), server.nodeId(),
+                new PeerUpdatePayload(Set.of(dialer), Map.of())));
+        Thread.sleep(200);
+        raw.send(ClusterMessage.request(MessageType.HANDSHAKE, "hello", dialer.nodeId(), server.nodeId(),
+                new HandshakePayload(dialer, Set.of(), Map.of(), false, true)));
+
+        awaitTrue(() -> raw.received().stream().anyMatch(m -> m.type() == MessageType.HANDSHAKE),
+                "o handshake do discador ficou sem resposta");
     }
 
     // ---- helpers ----
