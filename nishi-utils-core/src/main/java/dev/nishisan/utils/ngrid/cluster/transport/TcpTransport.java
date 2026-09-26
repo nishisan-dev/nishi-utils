@@ -244,6 +244,12 @@ public final class TcpTransport implements Transport {
         if (destination == null) {
             return;
         }
+        if (isDeparted(destination) && !isConnected(destination)) {
+            // A peer forgotten for good (e.g. a late notification to a client that left): nothing to
+            // route to, and trying would recreate its routing state and log a connection failure.
+            LOGGER.fine(() -> "Dropping " + message.type() + " to departed peer " + destination);
+            return;
+        }
         
         // Priority 1: If we have an active, open connection to this node, use it!
         // This bypasses routing logic for already connected peers (including discovery clients).
@@ -306,6 +312,10 @@ public final class TcpTransport implements Transport {
         NodeId destination = message.destination();
         if (destination == null) {
             future.completeExceptionally(new IOException("sendAndAwait requires a destination"));
+            return future;
+        }
+        if (isDeparted(destination) && !isConnected(destination)) {
+            future.completeExceptionally(new IOException("Peer " + destination + " departed"));
             return future;
         }
         UUID requestId = message.messageId();

@@ -168,6 +168,55 @@ class TcpTransportLeaveTest {
     }
 
     /**
+     * Envio para um id esquecido (ex.: resposta ou notificação atrasada de um serviço para o cliente que
+     * saiu): falha rápido, sem procurar rota, sem log de "No connection available" e sem recriar estado
+     * de roteamento para o id.
+     */
+    @Test
+    void sendingToAForgottenPeerFailsFastWithoutRecreatingItsRoute() throws Exception {
+        TcpTransport storage = start(TcpTransportConfig.builder(info("a-storage", freePort(), false)));
+        NodeInfo client = info("z-client", freePort(), true);
+        RawPeer clientLink = raw(storage);
+        clientLink.send(handshake(client, storage.local(), Set.of()));
+        awaitTrue(() -> storage.isConnected(client.nodeId()), "cliente não conectou");
+        storage.forget(client.nodeId());
+        List<String> warnings = new CopyOnWriteArrayList<>();
+        java.util.logging.Handler capture = new java.util.logging.Handler() {
+            @Override
+            public void publish(java.util.logging.LogRecord record) {
+                if (record.getLevel().intValue() >= java.util.logging.Level.WARNING.intValue()) {
+                    warnings.add(record.getMessage());
+                }
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        java.util.logging.Logger logger = java.util.logging.Logger.getLogger(TcpTransport.class.getName());
+        logger.addHandler(capture);
+        try {
+            storage.send(ClusterMessage.request(MessageType.CLIENT_REQUEST, "late-notify", storage.local().nodeId(),
+                    client.nodeId(), "x"));
+            CompletableFuture<ClusterMessage> request = storage.sendAndAwait(ClusterMessage.request(
+                    MessageType.CLIENT_REQUEST, "late-request", storage.local().nodeId(), client.nodeId(), "x"));
+
+            ExecutionException failure = assertThrows(ExecutionException.class,
+                    () -> request.get(1, TimeUnit.SECONDS));
+            assertInstanceOf(IOException.class, failure.getCause());
+            assertTrue(warnings.isEmpty(), "envio para um id esquecido não é falha de conexão: " + warnings);
+            assertFalse(storage.getRouter().routesSnapshot().containsKey(client.nodeId()),
+                    "o envio não pode recriar rota para o id esquecido");
+        } finally {
+            logger.removeHandler(capture);
+        }
+    }
+
+    /**
      * Saída sem LEAVE (kill -9, OOM, perda de rede): o peer efêmero é esquecido depois de
      * {@code departedPeerForgetAfter} sem conexão; um peer elegível a líder nunca é esquecido assim, e
      * um efêmero ainda conectado também não.
