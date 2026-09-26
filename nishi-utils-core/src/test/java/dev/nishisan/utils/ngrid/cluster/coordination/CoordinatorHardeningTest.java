@@ -120,6 +120,40 @@ class CoordinatorHardeningTest {
         assertEquals(null, lastLeader.get(), "listeners viram o step-down");
     }
 
+    /** C9: o líder que não ouve NENHUM votante por um heartbeatTimeout inteiro rebaixa na hora. */
+    @Test
+    void isolatedLeaderStepsDownWithinOneHeartbeatTimeout() throws Exception {
+        // Afinidade menor que a do local (prio 0): o local é o eleito por afinidade.
+        NodeInfo v1 = new NodeInfo(NodeId.of("node-v1"), "127.0.0.1", 2, Set.of(), -10);
+        NodeInfo v2 = new NodeInfo(NodeId.of("node-v2"), "127.0.0.1", 3, Set.of(), -10);
+        Harness h = new Harness(null, false, List.of(v1, v2)); // não-pair: maioria 2 de 3
+        h.start();
+        java.util.concurrent.ScheduledFuture<?> beats = h.sched.scheduleAtFixedRate(() -> {
+            h.heartbeat(v1.nodeId());
+            h.heartbeat(v2.nodeId());
+        }, 0, 50, java.util.concurrent.TimeUnit.MILLISECONDS);
+        awaitTrue(() -> h.coord.isLeader(), "líder com quórum (maior afinidade: id local)");
+        assertTrue(h.coord.hasValidLease());
+
+        // Partição: os dois votantes somem de uma vez (o transporte ainda os diz "conectados", como
+        // um link half-open — a evicção por membro esperaria o grace de proxy, ~3× o timeout).
+        beats.cancel(true);
+        long t0 = System.currentTimeMillis();
+        awaitTrue(() -> !h.coord.isLeader(), "líder isolado rebaixa");
+        long took = System.currentTimeMillis() - t0;
+        assertTrue(took <= HB.multipliedBy(9).toMillis(),
+                "step-down proativo em ~1 heartbeatTimeout (3×HB), não após o grace (levou " + took + "ms)");
+        assertFalse(h.coord.hasValidLease(), "isolado: sem lease, escritas rejeitadas");
+
+        // Os votantes voltam: o step-down agendou a reavaliação e o nó reassume sem evento externo.
+        java.util.concurrent.ScheduledFuture<?> back = h.sched.scheduleAtFixedRate(() -> {
+            h.heartbeat(v1.nodeId());
+            h.heartbeat(v2.nodeId());
+        }, 0, 50, java.util.concurrent.TimeUnit.MILLISECONDS);
+        awaitTrue(() -> h.coord.isLeader(), "reassume quando o quórum volta");
+        back.cancel(true);
+    }
+
     /** B10: um membro elegível com porta 0 não conta como votante ativo (mesma população do denominador). */
     @Test
     void portZeroMemberDoesNotCountTowardsTheVoterMajority() throws Exception {

@@ -86,6 +86,13 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     private volatile long trackedLeaderHighWatermark = -1L;
     private volatile long trackedLeaderEpoch = 0L;
     private volatile Instant leaseExpiresAt = Instant.MIN;
+    /**
+     * Epoch-millis of the last heartbeat received from any leader-eligible peer with a real listen
+     * port (a voter), revisão #178, C9: a leader that hears no voter for a whole heartbeat timeout is
+     * isolated and steps down at once instead of leading (and accepting writes) until the per-member
+     * eviction — with its proxy-reachable grace — finally drains its membership view.
+     */
+    private volatile long lastVoterHeartbeatMs = 0L;
     private final Path epochPath;
     /** Epoch-millis until which a non-preferred node defers self-election; {@code 0} = no deferral. */
     private volatile long bootDiscoveryDeadlineMs = 0L;
@@ -1009,6 +1016,21 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             // Check leader lease expiry before processing members
             if (isLeader() && Instant.now().isAfter(leaseExpiresAt)) {
                 LOGGER.warning("Leader lease expired — stepping down to prevent split-brain");
+                stepDown();
+                return;
+            }
+            // Revisão #178 (C9): proactive isolation step-down. Losing quorum is already detected by
+            // the per-member eviction below, but that path waits heartbeatTimeout PLUS the
+            // proxy-reachable grace per member (up to ~3× the timeout): an isolated leader kept
+            // answering hasValidLease() and taking writes for that long. Hearing NO voter at all for a
+            // whole heartbeat timeout is a stronger, earlier signal — step down now. Pair mode keeps
+            // its documented lead-while-alone semantics; a single-voter cluster has nobody to hear.
+            long isolationNow = Instant.now().toEpochMilli();
+            if (isLeader() && !config.pairMode() && requiredVoterMajority() > 1
+                    && lastVoterHeartbeatMs > 0L
+                    && isolationNow - lastVoterHeartbeatMs > config.heartbeatTimeout().toMillis()) {
+                LOGGER.warning(() -> "[" + transport.local().nodeId() + "] Leader heard no voter for "
+                        + (isolationNow - lastVoterHeartbeatMs) + "ms (> heartbeatTimeout); stepping down as isolated");
                 stepDown();
                 return;
             }
@@ -1954,6 +1976,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             // leaderless immediately after a failover. Arm a fresh lease window at election time.
             if (isNowLeader && !wasLeader) {
                 this.leaseExpiresAt = Instant.now().plus(config.leaseTimeout());
+                lastVoterHeartbeatMs = Instant.now().toEpochMilli(); // C9: isolation window starts now
                 // We are leading now: any future return as a follower must re-sync before reclaiming, so
                 // arm the latch fresh for the NEXT session (it is only meaningful while catching up).
                 reclaimCaughtUpLatch = false;
@@ -2023,6 +2046,18 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                         () -> listener.onLeadershipChanged(false, null), "onLeadershipChanged", listener));
                 notifyMembershipListeners();
                 announceLeadershipChange();
+                // Revisão #178 (C9): a step-down is not the end of the story — re-evaluate after one
+                // heartbeat interval so a node that regained (or never really lost) its quorum is
+                // re-elected without depending on an external event (a bare LeaderElectionService
+                // assembly stayed leaderless forever; the NGridNode nudge re-elected it "by accident").
+                if (running) {
+                    try {
+                        scheduler.schedule(this::reevaluateLeadership,
+                                config.heartbeatInterval().toMillis(), TimeUnit.MILLISECONDS);
+                    } catch (java.util.concurrent.RejectedExecutionException ignored) {
+                        // closing: nothing to re-elect
+                    }
+                }
             }
         }
     }
@@ -2223,6 +2258,10 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                     return;
                 }
                 lastHeartbeatStampMs.put(source, stamp);
+                NodeInfo senderInfo = findPeerInfo(source).orElse(null);
+                if (senderInfo != null && senderInfo.port() > 0 && senderInfo.isLeaderEligible()) {
+                    lastVoterHeartbeatMs = Instant.now().toEpochMilli(); // C9: a voter is talking to us
+                }
             }
 
             // FENCING: Reject heartbeats from leaders with stale epochs.
