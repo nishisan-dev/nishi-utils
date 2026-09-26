@@ -183,10 +183,10 @@ ambiente cair. Tudo abaixo está commitado e no remoto (último commit desta se�
 | 2 Onda C (C1–C9) | **feito** | `RelayStreamRobustnessTest`, `CoordinatorHardeningTest` (C9 = step-down por isolamento). |
 | B9 (esquecer votante) | **feito** | `Transport/NGridNode.decommissionPeer`, `TcpTransport` (tombstone 24 h), `ngrrd.admin.forget` + CLI `forget-node`, `ForgetNodeClusterTest` verde. |
 | 3 ngrrd cota + regras (fatias 1–9, 11) | **feito, integrado** | 10 commits do subagente; `QuotaClusterTest`/`PlacementRulesClusterTest` verdes. |
-| 3 fatia 10 (fence do catálogo) | **feito (código+unitários)** | `MigrationCoordinator.awaitResumeFence`; só loga quando precisou esperar — nas rodadas verdes o fence foi satisfeito de imediato. |
+| 3 fatia 10 (fence do catálogo) | **feito** | `MigrationCoordinator.awaitResumeFence`; só loga quando precisou esperar — nas rodadas verdes o fence foi satisfeito de imediato. |
 | Onda D (testes/docs) | **feito** | `RelayStreamReplicationTest` por tópico e portas dinâmicas; `doc/testes-vermelhos-conhecidos.md` sem entradas; AGENTS.md. |
 | 4 versão/docs | **feito** | 8.8.0 nos 5 POMs, README, quickstart; CHANGELOG 8.8.0 completo. |
-| Verificação final | **pendente** | ver abaixo. |
+| Verificação final | **parcial** | LF 8/8 verde, ngrrd 787 verdes; suíte completa do core/resilience/javadoc/pr-validation pendentes — ver abaixo. |
 
 ### Achados relevantes durante a execução (além do plano)
 
@@ -206,17 +206,40 @@ ambiente cair. Tudo abaixo está commitado e no remoto (último commit desta se�
   os vermelhos conhecidos da base (`RelayStreamReplicationTest` 200/400, ingest como root) — não
   representam o branch integrado.
 
-### Verificação pendente (ordem)
+### Verificação — resultado (atualizado no fim da sessão)
 
-1. `mvn -pl nishi-utils-ngrrd-cluster verify` (unitários do ngrrd contra core 8.8.0) — em execução.
-2. 8× `LeaderFailoverDuringMigrationClusterTest` com `-Pngrrd-cluster -Djdk.virtualThreadScheduler.parallelism=2`
-   no branch integrado (critério de aceite da #178); + 2× dos `*ClusterTest` novos
-   (`QuotaClusterTest`, `PlacementRulesClusterTest`, `ForgetNodeClusterTest`, `IdleCatalogFailoverClusterTest`).
-3. `mvn -pl nishi-utils-core test` completo e `-Presilience -Dsurefire.rerunFailingTestsCount=1`.
-4. `mvn verify -Pvalidate-javadoc` e o comando do `pr-validation.yml`
-   (`mvn verify -pl nishi-utils-core,nishi-utils-oss,nishi-utils-ngrrd-cluster -am -DexcludeNgrid=true -Dsurefire.rerunFailingTestsCount=1`).
-5. Limpar worktrees dos subagentes (`.claude/worktrees/agent-*`), PR (só quando pedido) e
-   comentar nas issues #178/#167 após o merge.
+Feito no branch integrado (`7d38201`+), 2 CPUs, `-Djdk.virtualThreadScheduler.parallelism=2`:
+
+- **`LeaderFailoverDuringMigrationClusterTest` 8/8 verde** (22–52 s por rodada) — critério de aceite da #178.
+- `mvn -pl nishi-utils-ngrrd-cluster verify` (unitários contra core 8.8.0): **787 testes, 0 falhas**.
+- `ForgetNodeClusterTest`, `QuotaClusterTest`, `PlacementRulesClusterTest` verdes (1×, 2×, 2×).
+- Regressão E2E de eleição/restart do core (13 classes) verde após o yield do líder recém-eleito.
+- `TcpTransportLeaveTest` (16) verde com o `decommissionPeer`.
+
+Ainda **não** executado no branch integrado (créditos da nuvem): suíte completa
+`mvn -pl nishi-utils-core test`, `-Presilience -Dsurefire.rerunFailingTestsCount=1`,
+`mvn verify -Pvalidate-javadoc` e o comando do `pr-validation.yml`
+(`mvn verify -pl nishi-utils-core,nishi-utils-oss,nishi-utils-ngrrd-cluster -am -DexcludeNgrid=true -Dsurefire.rerunFailingTestsCount=1`).
+Referências: a suíte completa do core rodou verde (fora os dois vermelhos conhecidos da base, hoje
+tratados) na Parte 1 e na onda C; o subagente de transporte rodou a suíte em main+B1–B10 com o
+mesmo resultado; o subagente do ngrrd rodou `-Pvalidate-javadoc` verde no branch dele.
+
+### Issues (comentadas/abertas em 2026-09-26)
+
+- #178 e #167: comentário de progresso com o que foi entregue e a validação.
+- #181 (réplica diverge com `CAT_LAG 0`): relação com a escala por tópico e resposta sobre reconstruir a réplica.
+- #117 (rota proxy nunca cura) e #164 (maturidade): atualizados com os achados B1–B7 / a revisão.
+- Novas: **#182** (revisão 8.8.0 — eleição, coordinator e replicação A1–A5, C1–C9), **#183**
+  (revisão 8.8.0 — transporte B1–B10 e B9 `forget-node`), **#184** (limitações remanescentes / follow-up).
+  #182 e #183 fecham com o merge do PR da 8.8.0.
+
+### Próximos passos ao retomar
+
+1. Rodar o que falta da verificação acima; se algo quebrar, o CHANGELOG e as issues #182–#184 dizem onde olhar.
+2. Abrir o PR (PT-BR, título "Fronteiras por tópico, cota e regras de placement, revisão do NGrid — 8.8.0"),
+   referenciando #178, #167, #182, #183; comentar #181 após validação no TEMS.
+3. Os worktrees `.claude/worktrees/agent-*` estão travados por processos já encerrados: `git worktree remove -f -f`.
+   Branches de backup no remoto: `backup/agent-transport-wave-b`, `backup/agent-ngrrd-quota-rules`.
 
 ### Como retomar num ambiente novo
 
