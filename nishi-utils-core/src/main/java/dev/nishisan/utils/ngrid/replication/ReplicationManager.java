@@ -75,9 +75,11 @@ public class ReplicationManager
     private final java.util.concurrent.atomic.AtomicLong globalSequence = new java.util.concurrent.atomic.AtomicLong(0);
     private final Map<String, java.util.concurrent.atomic.AtomicLong> sequenceByTopic = new ConcurrentHashMap<>();
     private final Map<String, ReentrantLock> leaderEmissionLocksByTopic = new ConcurrentHashMap<>();
-    private final java.util.concurrent.atomic.AtomicLong appliedSequence = new java.util.concurrent.atomic.AtomicLong(
-            0);
-    private volatile long lastAppliedSequence = 0;
+    // Issue #178: there is NO scalar applied odometer any more. The applied state of this node is the
+    // per-topic frontier vector (appliedFrontiers()); getLastAppliedSequence() is derived from it as
+    // the SUM of the frontiers, which is the same number for a leader and for a caught-up follower.
+    // The former counter mixed three scales (sum on restart seed, max-per-topic on follower commit,
+    // one-tick-per-op on leader commit) and could not be compared across roles or topics.
     private final Set<String> syncingTopics = ConcurrentHashMap.newKeySet();
     // Janitor state: timestamp (millis) of the LAST sync activity per topic — updated on every
     // SYNC_RESPONSE chunk received. The janitor releases a sync guard only when NO chunk has arrived
@@ -551,13 +553,26 @@ public class ReplicationManager
         if (bootstrapGateEngaged()) {
             return -1L;
         }
-        return coordinator.isLeader()
-                ? Math.max(getGlobalSequence(), getLastAppliedSequence())
-                : getLastAppliedSequence();
+        // Issue #178: one scale for both roles — the sum of the per-topic applied frontiers. On the
+        // leader the frontier of a topic already covers everything it produced (advanceLeaderFrontier
+        // on commit, and the D9 re-anchor on restart), so globalSequence no longer takes part.
+        return getLastAppliedSequence();
     }
 
     private long localAppliedForReclaim() {
         return bootstrapGateEngaged() ? Long.MIN_VALUE : getLastAppliedSequence();
+    }
+
+    /**
+     * The per-topic frontier vector this node advertises in heartbeats (issue #178): empty while the
+     * bootstrap gate is engaged (the scalar watermark is {@code -1} then, and an empty vector reads as
+     * "no vector" to peers, which fall back to that scalar), else {@link #appliedFrontiers()}.
+     */
+    private Map<String, Long> advertisedTopicFrontiers() {
+        if (bootstrapGateEngaged()) {
+            return Map.of();
+        }
+        return appliedFrontiers().byTopic();
     }
 
     private boolean isLocallyEligibleForLeadership() {
@@ -605,8 +620,53 @@ public class ReplicationManager
         return globalSequence.get();
     }
 
+    /**
+     * Total applied progress of this node: the SUM of the per-topic applied frontiers (issue #178).
+     * Derived, never counted — a leader and a fully caught-up follower report the same number, and a
+     * restart resumes it from the durable frontiers. For per-topic comparisons use
+     * {@link #appliedFrontiers()}; this scalar only serves observability and peers that predate the
+     * frontier vector.
+     *
+     * @return the sum of {@code nextExpected - 1} (or the produced counter, whichever is higher) over
+     *         every replicated topic
+     */
     public long getLastAppliedSequence() {
-        return lastAppliedSequence;
+        return appliedFrontiers().total();
+    }
+
+    /**
+     * The per-topic applied frontier vector of this node (issue #178): for every replicated topic
+     * (registered handler, durable follower frontier or produced counter), the highest sequence this
+     * node holds — {@code max(produced, nextExpected - 1)}. Read lock-free from the concurrent maps
+     * (single-key reads are atomic; the lock only guards compound mutations), so it is safe on the
+     * heartbeat and transport threads.
+     *
+     * @return the frontier vector (synthetic sequence-state keys excluded)
+     */
+    public TopicFrontiers appliedFrontiers() {
+        Map<String, Long> frontiers = new HashMap<>();
+        for (String topic : handlers.keySet()) {
+            frontiers.put(topic, topicFrontier(topic));
+        }
+        for (String topic : nextExpectedSequenceByTopic.keySet()) {
+            if (!TopicFrontiers.isSyntheticKey(topic)) {
+                frontiers.put(topic, topicFrontier(topic));
+            }
+        }
+        for (String topic : sequenceByTopic.keySet()) {
+            if (!TopicFrontiers.isSyntheticKey(topic)) {
+                frontiers.put(topic, topicFrontier(topic));
+            }
+        }
+        return TopicFrontiers.of(frontiers);
+    }
+
+    /** Applied frontier of one topic: {@code max(produced, nextExpected - 1)}, never negative. */
+    private long topicFrontier(String topic) {
+        java.util.concurrent.atomic.AtomicLong counter = sequenceByTopic.get(topic);
+        long produced = counter == null ? 0L : counter.get();
+        long appliedFrontier = nextExpectedSequenceByTopic.getOrDefault(topic, 1L) - 1L;
+        return Math.max(0L, Math.max(produced, appliedFrontier));
     }
 
     /**
@@ -633,33 +693,21 @@ public class ReplicationManager
     }
 
     /**
-     * Seeds the applied-progress metric from the durable per-topic apply frontiers, so a restart
-     * resumes the metric instead of reporting 0 (the counter is per-session). The total applied op
-     * count equals the sum of {@code (nextExpected - 1)} across topics.
+     * Re-anchors the durable per-topic apply frontiers on the per-topic PRODUCED counters after a
+     * restart (issue tems#9, D9). The applied progress itself is no longer seeded: it is derived from
+     * these frontiers ({@link #appliedFrontiers()}, issue #178), so a restart resumes it automatically.
      */
     private void seedAppliedSequenceFromFrontier() {
-        // Two durable measures of how much state this node has APPLIED, restored from sequence-state.dat:
-        //  - the per-topic FOLLOWER frontier sum (nextExpectedSequenceByTopic) — non-empty when this node
-        //    was a follower for those topics;
-        //  - the LEADER-produced count (globalSequence, the "_global" key) — non-zero when this node was
-        //    the leader (a leader applies everything it produces, but never populates the follower
-        //    frontier, so its frontier sum is 0).
-        // A returning ex-LEADER therefore has frontier sum 0 while it actually holds globalSequence ops.
-        // Seeding from the frontier alone would advertise applied=0 — making the (higher-affinity)
-        // ex-leader look permanently behind the ex-follower, so it defers to sync while the ex-follower
-        // defers to it by affinity and the cluster wedges leaderless. Seeding from max(frontierSum,
-        // globalSequence) restores the true applied frontier for both roles (they coincide for a single
-        // topic), so the election/watermark gate picks the right leader. Synthetic keys stay filtered (D1).
-        //
-        // D9 (issue tems#9): the FRONTIER itself must be re-anchored on the per-topic PRODUCED counter
-        // first. An ex-leader's frontier is stale at the point it last applied as a follower (a leader
-        // never advances it), while "_topic:{t}" holds everything it produced — and the node is the
-        // source of truth for its own production. Leaving the stale frontier in place made a clean
-        // rejoin re-pull (and RE-APPLY!) the node's own produced tail from the new leader's binlog,
-        // double-counting it into the applied metric: the inflated counter armed a PREMATURE reclaim,
-        // then froze (post-reclaim production restarts below it, so max() never advances), the follower's
-        // honest counter crossed it ~20 heartbeats later, and gate A evicted the leader into a leaderless
-        // mutual-deferral stalemate.
+        // D9 (issue tems#9): the FRONTIER must be re-anchored on the per-topic PRODUCED counter. An
+        // ex-leader's frontier could be stale at the point it last applied as a follower (before #178
+        // a leader never advanced it — advanceLeaderFrontier now does, but a sequence-state file written
+        // by an older version, or one flushed before the last commits, still needs this), while
+        // "_topic:{t}" holds everything it produced — and the node is the source of truth for its own
+        // production. Leaving the stale frontier in place made a clean rejoin re-pull (and RE-APPLY!)
+        // the node's own produced tail from the new leader's binlog, double-counting it into the
+        // applied metric: the inflated counter armed a PREMATURE reclaim, then froze, the follower's
+        // honest counter crossed it ~20 heartbeats later, and gate A evicted the leader into a
+        // leaderless mutual-deferral stalemate.
         acquireSequenceLock();
         try {
             sequenceByTopic.forEach((topic, seq) -> {
@@ -675,18 +723,6 @@ public class ReplicationManager
             });
         } finally {
             sequenceBufferLock.unlock();
-        }
-        long frontierSum = 0L;
-        for (Map.Entry<String, Long> e : nextExpectedSequenceByTopic.entrySet()) {
-            if (isSyntheticSequenceStateKey(e.getKey())) {
-                continue;
-            }
-            frontierSum += Math.max(0L, e.getValue() - 1L);
-        }
-        long applied = Math.max(frontierSum, Math.max(0L, globalSequence.get()));
-        if (applied > 0L) {
-            appliedSequence.set(applied);
-            lastAppliedSequence = applied;
         }
     }
 
@@ -718,7 +754,6 @@ public class ReplicationManager
      */
     public void resetSequenceState() {
         globalSequence.set(0);
-        lastAppliedSequence = 0;
         nextExpectedSequenceByTopic.clear();
         sequenceByTopic.clear();
         if (sequenceStatePath != null) {
@@ -1016,8 +1051,6 @@ public class ReplicationManager
                 // the resend index lag the send frontier by the whole apply backlog under high
                 // throughput, which made frontier resends impossible → perpetual snapshot fallback.
                 if (operation.markCommitStarted()) {
-                    long appliedSeq = appliedSequence.updateAndGet(c -> Math.max(c, operation.sequence));
-                    lastAppliedSequence = appliedSeq;
                     operation.markLocalApplied();
                     completeOperation(operation);
                 }
@@ -1032,7 +1065,6 @@ public class ReplicationManager
                     executor.submit(() -> {
                         try {
                             handler.apply(operation.operationId, operation.localApplyPayload);
-                            recordApplied();
                             acquireSequenceLock();
                             try {
                                 applied.add(operation.operationId);
@@ -1060,6 +1092,7 @@ public class ReplicationManager
     }
 
     private void completeOperation(PendingOperation operation) {
+        advanceLeaderFrontier(operation.topic, operation.sequence);
         operation.complete(OperationStatus.COMMITTED);
         log.computeIfPresent(operation.operationId, (id, record) -> {
             record.status(OperationStatus.COMMITTED);
@@ -1275,8 +1308,6 @@ public class ReplicationManager
         // contiguously with the lineage it actually holds (fixes the understated-watermark case the
         // supplier comment in start() documents). The active-leader path never gets here (role guard
         // in handleSyncResponse).
-        appliedSequence.set(watermark);
-        lastAppliedSequence = watermark;
         globalSequence.updateAndGet(current -> watermark);
         sequenceByTopic.computeIfAbsent(topic, k -> new java.util.concurrent.atomic.AtomicLong())
                 .set(watermark);
@@ -1362,7 +1393,7 @@ public class ReplicationManager
         }
         if (chunkIndex == 0) {
             syncRequestCount.incrementAndGet();
-            LOGGER.info(() -> "Lag detected (" + (coordinator.getTrackedLeaderHighWatermark() - lastAppliedSequence)
+            LOGGER.info(() -> "Lag detected (" + (coordinator.getTrackedLeaderHighWatermark() - getLastAppliedSequence())
                     + "). Requesting sync for " + topic);
         }
         SyncRequestPayload payload = new SyncRequestPayload(topic, chunkIndex);
@@ -2005,12 +2036,7 @@ public class ReplicationManager
                 applied.add(e.operationId());
             }
             trimApplied();
-            // Re-anchor the global applied odometer to the lineage position of the last applied entry
-            // (issue tems#9, D11) instead of blind-counting entries. This MATCHES the leader, which sets
-            // applied = max(op.sequence) (the per-topic sequence) on commit, and is immune to a relay
-            // re-pull / duplicate frame re-inflating the follower above the leader's lineage — the
-            // residual "offset de linhagem". Monotonic (accumulateAndGet with max never regresses).
-            lastAppliedSequence = appliedSequence.accumulateAndGet(last.sequence(), Math::max);
+            // The applied progress is derived from nextExpected (issue #178): nothing else to count.
             sequenceStateDirty = true;
         } finally {
             sequenceBufferLock.unlock();
@@ -2820,7 +2846,8 @@ public class ReplicationManager
      * real catch-up took 64s).
      */
     private long leaderQuiesceTarget() {
-        return Math.max(getGlobalSequence(), getLastAppliedSequence());
+        // Issue #178: the same derived total the leader advertises (see advertisedLeaderHighWatermark).
+        return getLastAppliedSequence();
     }
 
     /** Max age for a follower progress report to count toward releasing a quiesce gate. */
@@ -3182,8 +3209,6 @@ public class ReplicationManager
         if (watermark < 0L) {
             return;
         }
-        appliedSequence.set(watermark);
-        lastAppliedSequence = watermark;
         globalSequence.updateAndGet(current -> watermark);
         String topic = primaryTopic();
         if (!topic.isEmpty()) {
@@ -3510,8 +3535,24 @@ public class ReplicationManager
         return counter.incrementAndGet();
     }
 
-    private void recordApplied() {
-        lastAppliedSequence = appliedSequence.incrementAndGet();
+    /**
+     * Leader-side commit: advances the durable apply frontier and the RELAY_STREAM pull cursor of the
+     * topic to the committed sequence (issue #178). A leader applies everything it produces, so its
+     * frontier is {@code produced}; keeping {@code nextExpected}/cursor in step means (a) the
+     * frontier vector has one definition for both roles, and (b) a LIVE demotion (step-down, reclaim,
+     * preferred leader) resumes the stream at the new leader's next sequence instead of re-pulling —
+     * and RE-APPLYING — the node's own produced tail from a stale cursor (a queue OFFER is not
+     * idempotent: that replay duplicated items).
+     */
+    private void advanceLeaderFrontier(String topic, long sequence) {
+        if (sequence <= 0L || topic == null) {
+            return;
+        }
+        nextExpectedSequenceByTopic.merge(topic, sequence + 1L, Math::max);
+        if (isStreamMode()) {
+            relayStreamCursor(topic).accumulateAndGet(sequence, Math::max);
+        }
+        sequenceStateDirty = true;
     }
 
     /**
