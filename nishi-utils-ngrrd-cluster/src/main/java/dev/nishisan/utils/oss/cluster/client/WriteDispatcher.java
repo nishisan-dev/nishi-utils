@@ -57,6 +57,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
@@ -150,6 +151,8 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             Thread.ofVirtual().name("ngrrd-owner-lookup-", 0).factory());
     private final ConcurrentLinkedQueue<String> ownerLookupQueue = new ConcurrentLinkedQueue<>();
     private final AtomicBoolean ownerLookupRunning = new AtomicBoolean(false);
+    /** Último WARNING de falha da consulta ao líder — rate limit global (uma consulta cobre várias séries). */
+    private final AtomicLong lastOwnerLookupFailureLogMs = new AtomicLong(Long.MIN_VALUE);
     private final Thread tickThread;
     private volatile boolean closed;
 
@@ -703,6 +706,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             contradictory = isContradictory(route, owner, newOwner);
             route.redirectAttempts++;
             route.redirectedBy.add(owner);
+            route.lastHint = newOwner;
             visited = String.valueOf(route.redirectedBy);
             if (contradictory) {
                 buf.lock.lock();
@@ -837,8 +841,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             }
         } catch (RuntimeException e) {
             failure = e;
-            LOGGER.log(Level.WARNING, "Falha ao confirmar no líder o dono de " + keys.size()
-                    + " série(s) com dicas de WRONG_OWNER contraditórias; mantendo o dono atual com backoff", e);
+            logOwnerLookupFailure(keys.size(), e);
         }
         for (String seriesKey : keys) {
             try {
@@ -850,10 +853,27 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     }
 
     /**
+     * WARNING no máximo uma vez a cada {@value #RETRY_LOG_INTERVAL_MS} ms para todo o dispatcher (um líder
+     * sem {@code catalog.lookup} faria cada contradição falhar); a pilha só em FINE.
+     */
+    private void logOwnerLookupFailure(int seriesCount, Throwable failure) {
+        long now = clock.millis();
+        long last = lastOwnerLookupFailureLogMs.get();
+        if ((last == Long.MIN_VALUE || now - last >= RETRY_LOG_INTERVAL_MS)
+                && lastOwnerLookupFailureLogMs.compareAndSet(last, now)) {
+            LOGGER.warning("Falha ao confirmar no líder o dono de " + seriesCount + " série(s) com dicas de"
+                    + " WRONG_OWNER contraditórias; seguindo a última dica com backoff: " + failure);
+        }
+        LOGGER.log(Level.FINE, "Falha na consulta de dono ao líder", failure);
+    }
+
+    /**
      * Aplica a resposta do líder a uma série pausada por dicas contraditórias: {@code ACTIVE(X)} reroteia
      * para X e fixa X como dono confirmado do episódio; {@code MIGRATING} vai para a origem com o backoff
-     * de {@code MIGRATING}; ausente invalida o placement e reabre; falha da consulta mantém o dono atual
-     * com backoff (a próxima contradição consulta de novo).
+     * de {@code MIGRATING}; ausente invalida o placement e reabre. Falha da consulta segue a última dica
+     * recebida, com o backoff por série: sem autoridade, ficar no nó que deu a dica contraditória prenderia a
+     * série ali para sempre se ele não for o dono (ex.: o dono real com réplica atrasada, que depois se
+     * atualiza). Cada nova contradição volta a consultar o líder, que desempata assim que responder.
      */
     private void applyOwnerLookup(String seriesKey, Map<String, SeriesPlacement> found, RuntimeException failure) {
         SeriesRoute route = routes.get(seriesKey);
@@ -873,7 +893,15 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 SeriesPlacement placement = failure == null ? found.get(seriesKey) : null;
                 flushOwner = current;
                 if (failure != null) {
-                    delayMs = deferSeries(currentBuf, seriesKey, backoffMs);
+                    String hint = route.lastHint;
+                    if (hint == null || hint.equals(current)) {
+                        delayMs = deferSeries(currentBuf, seriesKey, backoffMs);
+                    } else {
+                        delayMs = rerouteLocked(route, currentBuf, seriesKey, List.of(), hint, backoffMs);
+                        placementLookup.noteOwner(seriesKey, hint);
+                        flushOwner = hint;
+                        changedOwner = hint;
+                    }
                 } else if (placement == null) {
                     placementLookup.invalidate(seriesKey);
                     reopenBuf = currentBuf;
@@ -1124,6 +1152,8 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         private String confirmedOwner;
         /** Série pausada aguardando a consulta ao líder ({@code scheduleOwnerLookup}). */
         private boolean ownerLookupPending;
+        /** Última dica de dono recebida no episódio; seguida quando a consulta ao líder falha. */
+        private String lastHint;
 
         SeriesRoute(String owner) {
             this.owner = owner;
@@ -1134,6 +1164,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             redirectedBy.clear();
             redirectAttempts = 0;
             confirmedOwner = null;
+            lastHint = null;
         }
     }
 

@@ -220,6 +220,29 @@ class RemoteSeriesRetryBudgetTest {
         assertTrue(atLeaderBudgets.stream().allMatch(d -> d.toMillis() > 0 && d.toMillis() <= 100));
     }
 
+    @Test
+    void falhaNaConsultaAoLiderSegueAUltimaDicaEConverge() {
+        // O handle abre no dono real "c", cuja réplica atrasada aponta "a" uma vez; "a" (em dia) aponta "c".
+        // Sem autoridade (consulta falha), seguir a última dica leva de volta a "c" — ficar em "a" esgotaria
+        // o prazo com WRONG_OWNER.
+        owner = "c";
+        RemoteSeriesHandle handle = handle(0);
+        atLeader = key -> {
+            throw new NgrrdClusterException(ErrorCode.UNSUPPORTED_BY_NODE, "líder sem catalog.lookup (simulado)");
+        };
+        int[] callsToC = {0};
+        targetResponder = (target, command, timeout) -> {
+            clock.advance(10);
+            if (target.equals("a")) return status(SeriesStatus.WRONG_OWNER, "c");
+            return ++callsToC[0] == 1 ? status(SeriesStatus.WRONG_OWNER, "a") : status(SeriesStatus.OK, "c");
+        };
+
+        handle.checkpoint();
+
+        assertEquals(List.of("c", "a", "c"), targets);
+        assertEquals(1, atLeaderBudgets.size());
+    }
+
     private RemoteSeriesHandle handle(long writeDrainMillis) {
         return handle(writeDrainMillis, true);
     }

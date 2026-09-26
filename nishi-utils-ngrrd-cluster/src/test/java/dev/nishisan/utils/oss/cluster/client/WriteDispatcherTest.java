@@ -836,6 +836,90 @@ class WriteDispatcherTest {
         assertTrue(lastGapMs >= 75, "o backoff de MIGRATING não pode zerar a cada salto: " + lastGapMs + " ms");
     }
 
+    @Test
+    void consultaIndisponivelNaoPrendeASerieNoNoQueNaoEDono() {
+        // Líder sem catalog.lookup (≤ 8.5) ou consulta falhando sempre. A série começa no dono real C, cuja
+        // réplica está atrasada (aponta A) por 300 ms; A está em dia e aponta C. Sem autoridade, o cliente
+        // segue a última dica com backoff — nunca fica parado em A, que jamais vai aceitar.
+        newDispatcher(1, Duration.ofMillis(10), 1_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        placementLookup.atLeader = keys -> {
+            throw new NgrrdClusterException(ErrorCode.UNSUPPORTED_BY_NODE, "líder sem catalog.lookup (simulado)");
+        };
+        long start = System.nanoTime();
+        rpc.respondByTarget((target, cmd, body) -> {
+            WriteBatchRequest req = (WriteBatchRequest) body;
+            if (target.equals(OWNER_A)) return moved(req, OWNER_C);
+            boolean caughtUp = System.nanoTime() - start > Duration.ofMillis(300).toNanos();
+            return caughtUp ? okFor(req) : moved(req, OWNER_A);
+        });
+
+        dispatcher.enqueue(OWNER_C.value(), write("s1", 1, 1));
+
+        Await.untilTrue("amostra confirmada no dono real", AWAIT_TIMEOUT, () -> dispatcher.samplesSent() == 1L);
+        assertTrue(placementLookup.atLeaderCalls.get() >= 1, "a contradição deveria ter tentado o líder");
+    }
+
+    @Test
+    void migracaoLegitimaDepoisDoDonoConfirmadoConverge() {
+        // O líder confirmou C; antes de qualquer OK, C migra de verdade para D e responde WRONG_OWNER(D).
+        newDispatcher(1, Duration.ofMillis(10), 1_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        AtomicInteger phase = new AtomicInteger();
+        placementLookup.atLeader = keys -> Map.of("s1",
+                SeriesPlacement.active(phase.get() == 0 ? OWNER_C.value() : OWNER_D.value(), 1L));
+        AtomicInteger callsToC = new AtomicInteger();
+        rpc.respondByTarget((target, cmd, body) -> {
+            WriteBatchRequest req = (WriteBatchRequest) body;
+            if (target.equals(OWNER_A)) return moved(req, OWNER_C);
+            if (target.equals(OWNER_C)) {
+                if (callsToC.incrementAndGet() == 1) return moved(req, OWNER_A);   // réplica atrasada em C
+                phase.set(1);
+                return moved(req, OWNER_D);                                        // migrou de fato para D
+            }
+            return okFor(req);
+        });
+
+        dispatcher.enqueue(OWNER_A.value(), write("s1", 1, 1));
+
+        Await.untilTrue("amostra confirmada em storage-d", AWAIT_TIMEOUT, () -> dispatcher.samplesSent() == 1L);
+        assertTrue(rpc.calls().stream().anyMatch(c -> c.target().equals(OWNER_D)));
+    }
+
+    @Test
+    void muitasSeriesContraditoriasConvergemEmOrdem() {
+        newDispatcher(1, Duration.ofMillis(10), 1_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        placementLookup.atLeader = keys -> {
+            Map<String, SeriesPlacement> found = new LinkedHashMap<>();
+            keys.forEach(key -> found.put(key, SeriesPlacement.active(OWNER_C.value(), 1L)));
+            return found;
+        };
+        rpc.respondByTarget((target, cmd, body) -> {
+            WriteBatchRequest req = (WriteBatchRequest) body;
+            if (target.equals(OWNER_A)) return moved(req, OWNER_C);
+            return placementLookup.atLeaderCalls.get() > 0 ? okFor(req) : moved(req, OWNER_A);
+        });
+        int seriesCount = 50;
+        int perSeries = 20;
+        for (int i = 0; i < perSeries; i++) {
+            for (int s = 0; s < seriesCount; s++) {
+                dispatcher.enqueue(OWNER_A.value(), write("s" + s, i, i));
+            }
+        }
+
+        dispatcher.flushAllSync();
+
+        assertEquals((long) seriesCount * perSeries, dispatcher.samplesSent());
+        assertTrue(placementLookup.atLeaderCalls.get() < seriesCount, "consultas coalescidas em lote: "
+                + placementLookup.atLeaderCalls.get());
+        for (int s = 0; s < seriesCount; s++) {
+            String key = "s" + s;
+            List<Long> atC = rpc.calls().stream().filter(c -> c.target().equals(OWNER_C))
+                    .flatMap(c -> ((WriteBatchRequest) c.body()).writes().stream())
+                    .filter(w -> w.seriesKey().equals(key)).map(SeriesWrite::tsEpochMs).distinct().toList();
+            // Reenvios antes do OK são permitidos; a primeira entrega de cada amostra segue a ordem da série.
+            assertEquals(java.util.stream.LongStream.range(0, perSeries).boxed().toList(), atC, key);
+        }
+    }
+
     private long writeBatchesFor(String seriesKey) {
         return rpc.calls().stream().filter(c -> c.command().equals(Commands.WRITE_BATCH))
                 .filter(c -> ((WriteBatchRequest) c.body()).writes().getFirst().seriesKey().equals(seriesKey))

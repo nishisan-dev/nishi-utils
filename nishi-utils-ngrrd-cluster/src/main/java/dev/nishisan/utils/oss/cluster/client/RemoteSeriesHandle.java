@@ -668,7 +668,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
      * Desempata no líder uma dica de dono contraditória, com prazo {@code min(restante, requestTimeout)}:
      * encontrado, o dono do líder passa a ser o alvo e o dono confirmado da operação; ausente, um handle
      * gravável re-resolve com criação e um somente leitura se fecha com {@code NOT_PLACED}; falha ao
-     * consultar mantém o alvo atual (a pausa exponencial e o prazo da operação seguem valendo).
+     * consultar segue a dica recebida (a pausa exponencial e o prazo da operação seguem valendo).
      */
     private void confirmOwnerAtLeader(String target, String hint, OperationRetry retry) {
         Duration remaining = retry.remaining();
@@ -686,8 +686,13 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
             owner = resolvePlacement(true, retry.remaining()).ownerNodeId();
             return;
         } catch (NgrrdClusterException e) {
+            // Sem autoridade, segue a dica: ficar em `target` prenderia a operação num nó que talvez não seja
+            // o dono (ex.: o dono real com réplica atrasada apontou para cá). A pausa exponencial e o prazo da
+            // operação continuam valendo, e a próxima contradição consulta o líder de novo.
             LOGGER.log(Level.FINE, e, () -> "Falha ao confirmar no líder o dono de " + seriesKey + " (dicas "
-                    + retry.redirectedBy + " → " + hint + "); mantendo " + target);
+                    + retry.redirectedBy + " → " + hint + "); seguindo a dica");
+            resolver.noteOwner(seriesKey, hint);
+            owner = hint;
             return;
         }
         LOGGER.log(Level.FINE, () -> "Dicas de dono contraditórias para " + seriesKey + " (" + retry.redirectedBy
