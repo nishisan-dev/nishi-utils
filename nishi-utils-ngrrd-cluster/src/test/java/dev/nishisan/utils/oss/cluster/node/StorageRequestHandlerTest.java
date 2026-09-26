@@ -86,6 +86,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -927,6 +928,67 @@ class StorageRequestHandlerTest {
         }
     }
 
+    @Test
+    void parteLocalLentaDaRequisicaoNaoFazAConsultaNascerPresa() throws Exception {
+        // A leitura forte do caminho de série esquecida demora 600 ms antes de a requisição chegar ao líder:
+        // a consulta dela começa agora, não quando a requisição começou — senão nasceria "presa" e as
+        // requisições saudáveis concorrentes pulariam a confirmação (o pingue-pongue da #177).
+        String forgottenKey = "series-esquecida-leitura-lenta";
+        String slowRedirect = "series-redirecionada-lenta";
+        String healthyRedirect = "series-redirecionada-saudavel";
+        placementLookup.put(forgottenKey, SeriesPlacement.active(SELF.value(), 1_000L));
+        registry.open(forgottenKey, yaml, Ngrrd.OpenOptions.defaults());
+        registry.forget(forgottenKey);
+        for (String key : List.of(slowRedirect, healthyRedirect)) {
+            placementLookup.putLocalOnly(key, SeriesPlacement.active(OTHER.value(), 1_000L));
+            placementLookup.putStrongOnly(key, SeriesPlacement.active(THIRD.value(), 2_000L));
+        }
+        placementLookup.onStrongRead(() -> clock.advance(Duration.ofMillis(600)));
+        CountDownLatch gate = new CountDownLatch(1);
+        placementLookup.holdLeaderBatchesOn(gate);
+        ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+        try {
+            Future<Object> slow = executor.submit(() -> handler.handle(Commands.WRITE_BATCH, new WriteBatchRequest(
+                    List.of(new SeriesWrite(forgottenKey, "in_octets", 1_700_000_000_000L, 1d),
+                            new SeriesWrite(slowRedirect, "in_octets", 1_700_000_000_000L, 1d))), SOURCE));
+            placementLookup.awaitLeaderBatchesStarted(1);
+            placementLookup.onStrongRead(null);
+
+            Future<Object> healthy = executor.submit(() -> handler.handle(Commands.WRITE_BATCH,
+                    singleWrite(healthyRedirect), SOURCE));
+            placementLookup.awaitLeaderBatchesStarted(1);
+            gate.countDown();
+
+            assertEquals(2, placementLookup.leaderBatchCalls(), "a requisição saudável deveria confirmar no líder");
+            assertEquals(THIRD.value(), ((WriteBatchResponse) healthy.get(10, TimeUnit.SECONDS)).ownerBySeries()
+                    .get(healthyRedirect));
+            assertEquals(THIRD.value(), ((WriteBatchResponse) slow.get(10, TimeUnit.SECONDS)).ownerBySeries()
+                    .get(slowRedirect));
+        } finally {
+            gate.countDown();
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void errorNaConsultaAoLiderNaoDesligaAsConfirmacoesSeguintes() {
+        String seriesKey = "series-error-na-consulta";
+        placementLookup.putLocalOnly(seriesKey, SeriesPlacement.active(OTHER.value(), 1_000L));
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.active(THIRD.value(), 2_000L));
+        placementLookup.errorLeaderBatchWith(new StackOverflowError("simulado"));
+
+        assertThrows(StackOverflowError.class,
+                () -> handler.handle(Commands.WRITE_BATCH, singleWrite(seriesKey), SOURCE));
+
+        placementLookup.errorLeaderBatchWith(null);
+        clock.advance(Duration.ofSeconds(60));
+        WriteBatchResponse response = (WriteBatchResponse) handler.handle(Commands.WRITE_BATCH,
+                singleWrite(seriesKey), SOURCE);
+
+        assertEquals(2, placementLookup.leaderBatchCalls(), "a ficha da consulta que lançou Error não pode vazar");
+        assertEquals(THIRD.value(), response.ownerBySeries().get(seriesKey));
+    }
+
     private static WriteBatchRequest singleWrite(String seriesKey) {
         return new WriteBatchRequest(List.of(new SeriesWrite(seriesKey, "in_octets", 1_700_000_000_000L, 1d)));
     }
@@ -1704,6 +1766,10 @@ class StorageRequestHandlerTest {
         private volatile RuntimeException leaderBatchFailure;
         private volatile boolean authoritative;
         private volatile boolean leaderKnown = true;
+        /** Executado a cada {@link #placementStrong} (ex.: avançar o relógio para simular uma leitura lenta). */
+        private volatile Runnable strongReadHook;
+        /** Quando não nulo, a consulta em lote ao líder lança este {@link Error}. */
+        private volatile Error leaderBatchError;
         /** Quando não nulo, cada consulta em lote ao líder espera este latch antes de responder. */
         private volatile CountDownLatch leaderBatchGate;
         private final Semaphore leaderBatchStarted = new Semaphore(0);
@@ -1750,6 +1816,14 @@ class StorageRequestHandlerTest {
             return leaderBatches;
         }
 
+        void onStrongRead(Runnable hook) {
+            this.strongReadHook = hook;
+        }
+
+        void errorLeaderBatchWith(Error error) {
+            this.leaderBatchError = error;
+        }
+
         /** Simula a ausência de líder conhecido por este nó. */
         void leaderKnown(boolean value) {
             this.leaderKnown = value;
@@ -1786,6 +1860,9 @@ class StorageRequestHandlerTest {
                     throw new IllegalStateException(e);
                 }
             }
+            if (leaderBatchError != null) {
+                throw leaderBatchError;
+            }
             if (leaderBatchFailure != null) {
                 throw leaderBatchFailure;
             }
@@ -1815,6 +1892,10 @@ class StorageRequestHandlerTest {
         @Override
         public Optional<SeriesPlacement> placementStrong(String seriesKey) {
             strongCalls++;
+            Runnable hook = strongReadHook;
+            if (hook != null) {
+                hook.run();
+            }
             if (strongFailure != null) {
                 throw strongFailure;
             }

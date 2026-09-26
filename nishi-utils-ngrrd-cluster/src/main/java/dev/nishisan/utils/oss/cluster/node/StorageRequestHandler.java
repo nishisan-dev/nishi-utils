@@ -254,7 +254,9 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
      * Uma confirmação no líder em curso há mais que isto é tratada como "presa" (líder lento ou
      * inalcançável): enquanto ela não termina, as requisições seguintes respondem pela réplica local em vez
      * de abrir outra consulta que também esperaria o prazo inteiro. No caminho saudável a consulta leva
-     * milissegundos e nunca chega aqui.
+     * milissegundos e nunca chega aqui. Por desenho, uma confirmação legitimamente lenta (acima do limiar)
+     * também faz as requisições concorrentes responderem pela réplica local até ela terminar — no máximo
+     * {@link #OWNER_CONFIRMATION_TIMEOUT}.
      */
     private static final Duration STALLED_CONFIRMATION_THRESHOLD = Duration.ofMillis(500);
     /** Faixas do contador de geração de posse ({@link #ownershipGenerations}). */
@@ -782,7 +784,7 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
         if (toConfirm.isEmpty()) {
             return decisions;
         }
-        ConfirmationPermit permit = tryBeginConfirmation(now);
+        ConfirmationPermit permit = tryBeginConfirmation();
         if (permit == null) {
             // Sem líder conhecido, em cooldown, com uma consulta presa ou com a sonda já em curso: a réplica
             // local responde (comportamento da 8.6.0) sem pagar o prazo da consulta.
@@ -800,7 +802,11 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
      * requisição já sondando o líder. No caminho saudável não há trava: confirmações concorrentes correm em
      * paralelo. Toda autorização concedida precisa terminar em {@link #finishConfirmation}.
      */
-    private ConfirmationPermit tryBeginConfirmation(long now) {
+    private ConfirmationPermit tryBeginConfirmation() {
+        // Relógio lido aqui, não no início da requisição: a parte local (leitura forte dos caminhos de série
+        // esquecida/réplica vazia/hint) pode ter levado mais que o limiar, e uma consulta carimbada com o
+        // instante antigo nasceria "presa", fazendo as requisições concorrentes pularem a confirmação.
+        long now = clock.millis();
         if (!placementLookup.leaderKnown() || now < redirectConfirmationCooldownUntilMs) {
             return null;
         }
@@ -957,19 +963,23 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
             generationsBefore.put(seriesKey, ownershipGenerations.get(generationStripe(seriesKey)));
         }
         Map<String, SeriesPlacement> atLeader;
+        boolean succeeded = false;
         try {
             atLeader = placementLookup.placementsAtLeader(toConfirm.keySet(), OWNER_CONFIRMATION_TIMEOUT);
             if (atLeader == null) {
                 throw new IllegalStateException("consulta ao líder devolveu null");
             }
-            finishConfirmation(permit, true);
+            succeeded = true;
         } catch (RuntimeException e) {
-            finishConfirmation(permit, false);
             redirectConfirmationFailuresCount.add(toConfirm.size());
             LOGGER.log(Level.FINE, e, () -> "Falha ao confirmar no líder o redirecionamento de " + toConfirm.size()
                     + " série(s); respondendo pela réplica local por " + REDIRECT_CONFIRMATION_COOLDOWN.toMillis()
                     + " ms");
             return;
+        } finally {
+            // Sempre, inclusive com um Error: uma ficha vazada em confirmationsInFlight pareceria uma
+            // consulta presa para sempre e desligaria as confirmações até o restart do nó.
+            finishConfirmation(permit, succeeded);
         }
         long now = clock.millis();
         for (String seriesKey : toConfirm.keySet()) {
