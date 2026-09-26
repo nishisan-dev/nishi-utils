@@ -173,6 +173,12 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     // the choreographed transition lands as a single clean leader change; the dual-leader resolver
     // remains the backstop once the handover clears (e.g. a lost completion message).
     private volatile java.util.function.BooleanSupplier handoverInProgressSupplier = () -> false;
+    /**
+     * Whether the local leader has PRODUCED anything since it took leadership (revisão #178): while
+     * it has not, yielding to a peer that holds newer state loses nothing. Defaults to {@code true}
+     * (never yield) until the replication layer wires it.
+     */
+    private volatile java.util.function.BooleanSupplier leaderProducedSupplier = () -> true;
 
     /**
      * Supplies the local node's applied replication frontier (how much state it has). Wired by the
@@ -1189,6 +1195,24 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             boolean leaderBehindOwnFollower = weWouldLead && isLeaderInternal(localId)
                     && aheadEligiblePeer(localId) != null;
             if (leaderBehindOwnFollower) {
+                // Revisão #178: the election raced a heartbeat. A leader that has produced NOTHING yet
+                // can still hand over to the peer that holds the newer state without any divergence —
+                // the only way not to lose the op that peer alone holds (a catalog flip confirmed to
+                // the writer, e.g. a migration commit). Once it produced, F2 applies: retain.
+                NodeId ahead = aheadEligiblePeer(localId);
+                boolean handoverInProgress = false;
+                try {
+                    handoverInProgress = handoverInProgressSupplier.getAsBoolean();
+                } catch (RuntimeException ignored) {
+                    // treat as not in progress
+                }
+                if (ahead != null && !handoverInProgress && !safeLeaderHasProduced()) {
+                    LOGGER.warning(() -> "[" + localId + "] Yielding fresh leadership to " + ahead
+                            + ": it holds state this node lacks" + describePeerDivergence(ahead)
+                            + " and nothing was produced since the election (revisão #178)");
+                    updateLeader(ahead);
+                    return;
+                }
                 long now = Instant.now().toEpochMilli();
                 if (now - lastLeaderBehindWarnMs > 60_000L) {
                     lastLeaderBehindWarnMs = now;
@@ -1439,6 +1463,27 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      *
      * @param supplier the in-progress predicate (must not be {@code null})
      */
+    /**
+     * Wires "has the local leader produced anything since its election?" (revisão #178). A freshly
+     * elected leader that learns — from a heartbeat that arrived too late for the election — that a
+     * peer holds newer state on some topic yields to that peer while it has produced nothing: no
+     * lineage has diverged yet, so the op that only the peer holds is not lost. Once it produced,
+     * it retains (D9 F2) and the peer's tail is the one discarded by the stream re-anchor.
+     *
+     * @param supplier {@code true} once the local leader produced at least one operation
+     */
+    public void setLeaderProductionSupplier(java.util.function.BooleanSupplier supplier) {
+        this.leaderProducedSupplier = supplier != null ? supplier : (() -> true);
+    }
+
+    private boolean safeLeaderHasProduced() {
+        try {
+            return leaderProducedSupplier.getAsBoolean();
+        } catch (RuntimeException e) {
+            return true;
+        }
+    }
+
     public void setHandoverInProgressSupplier(java.util.function.BooleanSupplier supplier) {
         this.handoverInProgressSupplier = Objects.requireNonNull(supplier, "supplier");
     }
@@ -1974,6 +2019,12 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             // inherit a stale, already-expired lease and be stepped down on the very next eviction
             // cycle — that cycle checks lease expiry BEFORE renewing — leaving the cluster
             // leaderless immediately after a failover. Arm a fresh lease window at election time.
+            if (previous != null && !previous.equals(localNodeId) && !wasLeader) {
+                // Revisão #178: a remote leader went away (or was replaced) — broadcast our frontier at
+                // once so every survivor elects on FRESH vectors instead of heartbeats up to an
+                // interval old (the election that raced the last catalog flip).
+                announceLeadershipChange();
+            }
             if (isNowLeader && !wasLeader) {
                 this.leaseExpiresAt = Instant.now().plus(config.leaseTimeout());
                 lastVoterHeartbeatMs = Instant.now().toEpochMilli(); // C9: isolation window starts now
@@ -2171,6 +2222,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         // A4: heartbeats of the leaving incarnation still in flight must not reactivate it.
         leavingUntilMs.put(peerId, Instant.now().toEpochMilli() + config.heartbeatTimeout().toMillis());
         confirmPeerDisconnect(peerId);
+        announceLeadershipChange(); // revisão #178: fresh frontier for the election that may follow
     }
 
     /** Clears the per-peer state kept for {@code peerId} (preferred leader, watermark, D9/D10c marks). */

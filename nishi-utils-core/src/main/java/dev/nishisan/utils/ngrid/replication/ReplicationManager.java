@@ -81,6 +81,8 @@ public class ReplicationManager
     // the SUM of the frontiers, which is the same number for a leader and for a caught-up follower.
     // The former counter mixed three scales (sum on restart seed, max-per-topic on follower commit,
     // one-tick-per-op on leader commit) and could not be compared across roles or topics.
+    /** Operations produced by this node since it last took leadership (revisão #178: fresh-leader yield). */
+    private final java.util.concurrent.atomic.AtomicLong producedSinceElection = new java.util.concurrent.atomic.AtomicLong();
     private final Set<String> syncingTopics = ConcurrentHashMap.newKeySet();
     // Janitor state: timestamp (millis) of the LAST sync activity per topic — updated on every
     // SYNC_RESPONSE chunk received. The janitor releases a sync guard only when NO chunk has arrived
@@ -408,6 +410,7 @@ public class ReplicationManager
         // like with like topic by topic instead of through the aggregated total.
         coordinator.setTopicFrontiersSupplier(this::advertisedTopicFrontiers);
         coordinator.setTopicPriority(config.priorityTopics());
+        coordinator.setLeaderProductionSupplier(() -> producedSinceElection.get() > 0L);
         // Sync-before-reclaim (watermark gate): feed the coordinator the local APPLIED frontier and the
         // catch-up tolerance. The coordinator compares this against every peer's advertised watermark
         // (learned from heartbeats) to decide whether a returning higher-affinity node may reclaim
@@ -951,6 +954,7 @@ public class ReplicationManager
         emissionLock.lock();
         try {
             globalSequence.incrementAndGet();
+            producedSinceElection.incrementAndGet();
             long seq = nextSequenceForTopic(operation.topic);
             operation.sequence = seq;
 
@@ -2841,6 +2845,7 @@ public class ReplicationManager
             failAllPending("Lost leadership to " + newLeader);
             return;
         }
+        producedSinceElection.set(0L); // revisão #178: a fresh leader may still yield to newer state
         leaderSyncTopics.clear();
         leaderSyncTopics.addAll(handlers.keySet());
         leaderSyncing.set(!leaderSyncTopics.isEmpty());

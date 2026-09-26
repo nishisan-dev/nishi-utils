@@ -139,11 +139,26 @@ class TopicFrontierElectionGateTest {
         awaitLeader(h, PREFERRED);
     }
 
-    /** (d) O líder corrente NUNCA abdica por um vetor de seguidor acima do seu (F2 do D9 preservado). */
+    /** Líder recém-eleito que nada produziu cede ao peer que tem estado mais novo (eleição que correu com heartbeat). */
+    @Test
+    void freshLeaderYieldsToPeerHoldingNewerStateWhenNothingWasProduced() throws Exception {
+        Harness h = harness(PREFERRED, 100, INCUMBENT, 50, Duration.ofMillis(200));
+        h.localFrontiers.set(Map.of(CATALOG, 3L, NODES, 20L));
+        h.coord.setLeaderProductionSupplier(() -> false);
+        h.start();
+        awaitLeader(h, PREFERRED);
+        // O heartbeat do peer chega tarde demais para a eleição, mas traz o flip do catálogo (4 > 3).
+        h.startPeerHeartbeats(INCUMBENT, 7L, 24L, Map.of(CATALOG, 4L, NODES, 20L));
+        awaitLeader(h, INCUMBENT);
+        assertFalse(h.coord.isLeader(), "sem nada produzido, ceder não perde nenhuma op");
+    }
+
+    /** (d) O líder corrente que JÁ produziu nunca abdica por um vetor de seguidor acima do seu (F2 do D9). */
     @Test
     void servingLeaderNeverAbdicatesOnFollowerVectorAhead() throws Exception {
         Harness h = harness(PREFERRED, 100, INCUMBENT, 50, Duration.ofMillis(200));
         h.localFrontiers.set(Map.of(CATALOG, 10L, NODES, 20L));
+        h.coord.setLeaderProductionSupplier(() -> true);
         h.start();
         awaitLeader(h, PREFERRED); // lidera sozinho após a janela de boot
         h.startPeerHeartbeats(INCUMBENT, 7L, 40L, Map.of(CATALOG, 20L, NODES, 20L)); // "à frente"
