@@ -2781,21 +2781,22 @@ public class ReplicationManager
         if (payload.appliedSequence() < 0 || payload.epoch() != coordinator.getLeaderEpoch()) {
             return;
         }
-        followerAppliedByNode.put(source,
-                new FollowerProgress(payload.appliedSequence(), payload.epoch(), System.currentTimeMillis()));
+        FollowerProgress progress = new FollowerProgress(payload.appliedSequence(), payload.epoch(),
+                System.currentTimeMillis(), TopicFrontiers.of(payload.topicFrontiers()));
+        followerAppliedByNode.put(source, progress);
         if (quiescingFor.contains(source)) {
-            if (payload.appliedSequence() >= leaderQuiesceTarget() - config.joinSyncLagThreshold()) {
+            if (followerCaughtUp(progress, config.joinSyncLagThreshold())) {
                 quiescingFor.remove(source);
                 maybeReleaseJoinQuiesce();
             }
         }
         if (reclaimQuiescing.get() && source.equals(reclaimQuiesceFor)
-                && payload.appliedSequence() >= leaderQuiesceTarget()) {
+                && followerCaughtUp(progress, 0L)) {
             // The candidate paired up exactly against the frozen watermark (issue tems#9, D10b):
             // surface it to the coordinator NOW — waiting for the candidate's next heartbeat (up to
             // one interval stale) would stretch the pause for nothing. Gate B opens, recompute hands
             // leadership to the candidate, and onLeaderChanged releases this quiesce.
-            coordinator.noteFollowerWatermark(source, payload.appliedSequence());
+            coordinator.noteFollowerWatermark(source, payload.appliedSequence(), payload.topicFrontiers());
         } else if (config.leaderPauseOnReclaim() && !reclaimQuiescing.get()) {
             // Fresh progress is the approach signal — engaging here beats the 200ms tick.
             maybeEngageReclaimQuiesce();
@@ -2811,7 +2812,7 @@ public class ReplicationManager
             // Report the advertised watermark (issue tems#9, D10a): -1 while the bootstrap gate is
             // engaged, so the leader never mistakes a pre-bootstrap frontier for catch-up progress.
             FollowerProgressPayload payload = new FollowerProgressPayload(advertisedLeaderHighWatermark(),
-                    coordinator.getTrackedLeaderEpoch());
+                    coordinator.getTrackedLeaderEpoch(), advertisedTopicFrontiers());
             transport.send(ClusterMessage.request(MessageType.FOLLOWER_PROGRESS, "follower-progress",
                     transport.local().nodeId(), leader.nodeId(), payload));
         });
@@ -2830,7 +2831,6 @@ public class ReplicationManager
         }
         // Drop joiners that have since caught up — judged only on a FRESH report from the current
         // epoch (issue tems#9, D10a): a stale entry must never release the gate.
-        long target = leaderQuiesceTarget();
         long threshold = config.joinSyncLagThreshold();
         long freshnessMs = followerProgressFreshnessMs();
         long now = System.currentTimeMillis();
@@ -2840,7 +2840,7 @@ public class ReplicationManager
             return progress != null
                     && progress.epoch() == currentEpoch
                     && now - progress.atMillis() <= freshnessMs
-                    && progress.applied() >= target - threshold;
+                    && followerCaughtUp(progress, threshold);
         });
         maybeReleaseJoinQuiesce();
     }
@@ -2875,7 +2875,25 @@ public class ReplicationManager
     }
 
     /** A follower's apply progress as last reported (issue tems#9, D10a). */
-    private record FollowerProgress(long applied, long epoch, long atMillis) {
+    private record FollowerProgress(long applied, long epoch, long atMillis, TopicFrontiers frontiers) {
+    }
+
+    /**
+     * Whether a follower's reported progress has caught up with the leader's frontier (issue #178):
+     * per topic when the follower reported a frontier vector and the leader has one (the follower is
+     * caught up when it is not BEHIND the leader's vector within {@code threshold} on any topic),
+     * else by the scalar total against {@link #leaderQuiesceTarget()}.
+     */
+    private boolean followerCaughtUp(FollowerProgress progress, long threshold) {
+        if (progress == null || progress.applied() < 0L) {
+            return false;
+        }
+        TopicFrontiers reported = progress.frontiers();
+        TopicFrontiers local = appliedFrontiers();
+        if (reported != null && !reported.isEmpty() && !local.isEmpty()) {
+            return !reported.isBehind(local, threshold, config.priorityTopics());
+        }
+        return progress.applied() >= leaderQuiesceTarget() - Math.max(0L, threshold);
     }
 
     // ── Quiesce-assisted reclaim — "leader pause on reclaim" (issue tems#9, D10b) ───────────────

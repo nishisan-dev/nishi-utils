@@ -176,6 +176,40 @@ class JoinQuiesceReleaseGateTest {
         }
     }
 
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    @DisplayName("#178: o release do quiesce compara a fronteira POR TÓPICO, não a soma")
+    void releaseComparesPerTopicFrontiers() throws Exception {
+        // Líder com dois tópicos: 10.000 aplicadas em `cardinal-state` e 5 em `map:status`.
+        Map<String, Long> persisted = new HashMap<>();
+        persisted.put(TOPIC, PROMOTED_APPLIED + 1L);
+        persisted.put("map:status", 6L);
+        persisted.put("_global", PROMOTED_GLOBAL);
+        persisted.put("_topic:" + TOPIC, PROMOTED_GLOBAL);
+        try (java.io.ObjectOutputStream oos = new java.io.ObjectOutputStream(
+                Files.newOutputStream(tempDir.resolve("sequence-state.dat")))) {
+            oos.writeObject(persisted);
+        }
+        try (Harness h = new Harness(tempDir, scheduler, Duration.ofSeconds(60))) {
+            h.manager.start();
+            h.awaitSelfLeadership(10_000);
+            assertEquals(PROMOTED_APPLIED + 5L, h.manager.getLastAppliedSequence(), "soma das fronteiras");
+
+            h.connectJoiner();
+            h.awaitQuiescing(true, 5_000);
+
+            // Soma igual (10.005) mas atrás no tópico principal: com o agregado liberaria; por tópico, não.
+            h.deliverFollowerProgress(PROMOTED_APPLIED + 5L, h.coordinator.getLeaderEpoch(),
+                    Map.of(TOPIC, PROMOTED_APPLIED - 5L, "map:status", 10L));
+            h.assertQuiescingHolds(1_000);
+
+            // Em dia nos dois tópicos — libera.
+            h.deliverFollowerProgress(PROMOTED_APPLIED + 5L, h.coordinator.getLeaderEpoch(),
+                    Map.of(TOPIC, PROMOTED_APPLIED, "map:status", 5L));
+            h.awaitQuiescing(false, 5_000);
+        }
+    }
+
     /** Fabrica o sequence-state.dat exatamente como {@code saveSequenceState} persiste. */
     private void writePromotedLeaderSequenceState() throws IOException {
         Map<String, Long> persisted = new HashMap<>();
@@ -225,8 +259,12 @@ class JoinQuiesceReleaseGateTest {
         }
 
         void deliverFollowerProgress(long applied, long epoch) {
+            deliverFollowerProgress(applied, epoch, null);
+        }
+
+        void deliverFollowerProgress(long applied, long epoch, Map<String, Long> frontiers) {
             transport.deliverToListeners(ClusterMessage.request(MessageType.FOLLOWER_PROGRESS,
-                    "follower-progress", JOINER, LOCAL, new FollowerProgressPayload(applied, epoch)));
+                    "follower-progress", JOINER, LOCAL, new FollowerProgressPayload(applied, epoch, frontiers)));
         }
 
         void awaitSelfLeadership(long timeoutMs) throws InterruptedException {

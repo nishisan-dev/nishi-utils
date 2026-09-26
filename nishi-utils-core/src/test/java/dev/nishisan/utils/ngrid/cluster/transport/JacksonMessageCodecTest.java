@@ -90,6 +90,22 @@ class JacksonMessageCodecTest {
     }
 
     @Test
+    void followerProgressJsonWithoutTopicFrontiersDecodesEmptyVector() throws Exception {
+        // Issue #178: seguidor anterior à 8.8.0 manda só appliedSequence/epoch.
+        com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+        dev.nishisan.utils.ngrid.common.FollowerProgressPayload legacy = mapper.readValue(
+                "{\"appliedSequence\":42,\"epoch\":7}", dev.nishisan.utils.ngrid.common.FollowerProgressPayload.class);
+        assertEquals(42L, legacy.appliedSequence());
+        assertEquals(java.util.Map.of(), legacy.topicFrontiers());
+        dev.nishisan.utils.ngrid.common.FollowerProgressPayload withVector =
+                new dev.nishisan.utils.ngrid.common.FollowerProgressPayload(42L, 7L, java.util.Map.of("map:a", 40L, "map:b", 2L));
+        ClusterMessage message = ClusterMessage.request(MessageType.FOLLOWER_PROGRESS, "follower-progress",
+                NodeId.of("node-1"), NodeId.of("node-2"), withVector);
+        assertEquals(withVector.topicFrontiers(), codec.decode(codec.encode(message))
+                .payload(dev.nishisan.utils.ngrid.common.FollowerProgressPayload.class).topicFrontiers());
+    }
+
+    @Test
     void shouldRoundTripHeartbeatMessage() throws Exception {
         NodeId sourceId = NodeId.of("node-1");
         NodeId destId = NodeId.of("node-2");
