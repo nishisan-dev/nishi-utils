@@ -33,6 +33,12 @@ com teste de reprodução e correção para cada achado. Plano em
   `ReplicationConfig`; ordem por nome como padrão; deve ser igual em todos os nós).
   `ClusterCoordinator.maxActivePeerTopicFrontier(topic)` e `TopicReplicationStatus.maxPeerFrontier`
   expõem a maior fronteira dos peers elegíveis por tópico.
+- **Líder recém-eleito cede ao estado mais novo.** A eleição pode correr com o heartbeat (3 s): o
+  sobrevivente de maior afinidade era eleito com vetores desatualizados e, ao ver o outro à frente no
+  catálogo, retinha (F2) — a op confirmada se perdia (`LeaderFailoverDuringMigrationClusterTest`, 1
+  em 6). Agora um líder que ainda não produziu nada desde a eleição cede ao peer elegível que o
+  domina (nada diverge, nada se perde); o peer assume pelo escape D9. A perda de um líder remoto e o
+  LEAVE de um votante disparam um heartbeat imediato, para que a eleição use vetores frescos.
 - **Quiesce por tópico.** O join-quiesce e o pareamento do reclaim-quiesce liberam quando o seguidor
   não está atrás em nenhum tópico.
 - **Observabilidade.** Lag global = soma dos lags por tópico (`getTotalReplicationLag()`);
