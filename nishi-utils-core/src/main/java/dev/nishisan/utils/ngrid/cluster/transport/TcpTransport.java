@@ -380,22 +380,45 @@ public final class TcpTransport implements Transport {
         UUID requestId = message.messageId();
         PendingResponse response = new PendingResponse(destination, future);
         pendingResponses.put(requestId, response);
+        // Armed before anything is sent: the request timeout covers routing and the dial too.
+        scheduleRequestTimeout(requestId, response);
 
-        // Routing Logic
         Optional<NodeId> nextHop = router.nextHop(destination, null);
         if (nextHop.isEmpty()) {
-            pendingResponses.remove(requestId, response);
-            future.completeExceptionally(new IOException("No route available for " + destination));
+            failPending(requestId, response, new IOException("No route available for " + destination));
             return future;
         }
-
         NodeId target = nextHop.get();
         response.via = target;
-        Connection connection = ensureConnection(target);
-        
-        if (connection != null) {
-            connection.send(message);
-        } else {
+        // Fast path, on the caller's thread: an open connection to the next hop only enqueues, so
+        // consecutive requests from one caller keep their order on the wire.
+        Connection open = connections.get(target);
+        if (open != null && open.isOpen()) {
+            open.send(message);
+            return future;
+        }
+        // Otherwise a dial is needed: it blocks up to connectTimeout (twice with the proxy fallback) and
+        // queues behind the peer's connection lock. Never on the caller's thread — that is the single
+        // ngrid-metrics thread (RttMonitor, LeaderReelectionService), a relay fetch thread, or an RPC
+        // caller whose own bounded wait would only start once this returned. The future is returned
+        // at once; the request timeout armed above bounds the dial.
+        try {
+            workerPool.submit(() -> dispatchRequest(message, requestId, response, target));
+        } catch (RejectedExecutionException e) {
+            failPending(requestId, response, new IOException("Transport closed"));
+        }
+        return future;
+    }
+
+    /** Routes and sends a request whose next hop had no open connection (worker pool). */
+    private void dispatchRequest(ClusterMessage message, UUID requestId, PendingResponse response, NodeId target) {
+        NodeId destination = message.destination();
+        try {
+            Connection connection = ensureConnection(target);
+            if (connection != null) {
+                connection.send(message);
+                return;
+            }
             if (target.equals(destination)) {
                 // Direct failed, try immediate fallback
                 router.markDirectFailure(destination);
@@ -405,39 +428,47 @@ public final class TcpTransport implements Transport {
                     if (proxyConn != null) {
                         response.via = fallback.get();
                         proxyConn.send(message);
-                    } else {
-                        pendingResponses.remove(requestId, response);
-                        future.completeExceptionally(new IOException("No connection available for " + destination + " (via " + fallback.get() + ")"));
-                        return future;
+                        return;
                     }
+                    failPending(requestId, response, new IOException("No connection available for " + destination
+                            + " (via " + fallback.get() + ")"));
                 } else {
-                    pendingResponses.remove(requestId, response);
-                    future.completeExceptionally(new IOException("No connection available for " + destination));
-                    return future;
+                    failPending(requestId, response, new IOException("No connection available for " + destination));
                 }
             } else {
-                pendingResponses.remove(requestId, response);
-                future.completeExceptionally(new IOException("No connection available for " + destination + " (via " + target + ")"));
-                return future;
+                failPending(requestId, response, new IOException("No connection available for " + destination
+                        + " (via " + target + ")"));
             }
+        } catch (Throwable t) {
+            LOGGER.log(Level.WARNING, "Unexpected error dispatching request " + requestId + " to " + destination, t);
+            failPending(requestId, response, t);
         }
+    }
 
-        if (!config.requestTimeout().isZero() && !config.requestTimeout().isNegative()) {
-            long timeoutMs = config.requestTimeout().toMillis();
-            ScheduledFuture<?> timeoutTask = scheduler.schedule(() -> {
-                PendingResponse pr = pendingResponses.remove(requestId);
-                if (pr != null) {
-                    pr.clearTimeoutTask();
-                    pr.future.completeExceptionally(new TimeoutException(String.format(
-                            "Request timed out requestId=%s destination=%s timeout=%s",
-                            requestId,
-                            destination,
-                            config.requestTimeout())));
-                }
-            }, timeoutMs, TimeUnit.MILLISECONDS);
-            response.setTimeoutTask(timeoutTask);
+    private void failPending(UUID requestId, PendingResponse response, Throwable cause) {
+        if (pendingResponses.remove(requestId, response)) {
+            response.cancelTimeout();
+            response.future.completeExceptionally(cause);
         }
-        return future;
+    }
+
+    private void scheduleRequestTimeout(UUID requestId, PendingResponse response) {
+        if (config.requestTimeout().isZero() || config.requestTimeout().isNegative()) {
+            return;
+        }
+        long timeoutMs = config.requestTimeout().toMillis();
+        ScheduledFuture<?> timeoutTask = scheduler.schedule(() -> {
+            PendingResponse pr = pendingResponses.remove(requestId);
+            if (pr != null) {
+                pr.clearTimeoutTask();
+                pr.future.completeExceptionally(new TimeoutException(String.format(
+                        "Request timed out requestId=%s destination=%s timeout=%s",
+                        requestId,
+                        response.destination,
+                        config.requestTimeout())));
+            }
+        }, timeoutMs, TimeUnit.MILLISECONDS);
+        response.setTimeoutTask(timeoutTask);
     }
 
     @Override
