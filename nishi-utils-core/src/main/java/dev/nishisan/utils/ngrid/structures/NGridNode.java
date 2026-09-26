@@ -335,12 +335,14 @@ public final class NGridNode implements Closeable {
         });
         int derivedMinClusterSize = Math.max(1, Math.min(config.replicationQuorum(), config.peers().size() + 1));
         int minClusterSize = config.minClusterSize() != null ? config.minClusterSize() : derivedMinClusterSize;
+        // Revisão #178 (C8): persist the leader epoch under the data directory so a restarted node
+        // never regresses the cluster term (a null directory silently disabled persistence).
         ClusterCoordinatorConfig coordinatorConfig = ClusterCoordinatorConfig.of(
                 config.heartbeatInterval(),
                 config.heartbeatInterval().multipliedBy(3),
                 config.leaseTimeout(),
                 minClusterSize,
-                null)
+                config.dataDirectory())
                 .withPairMode(config.pairMode())
                 .withBootDiscoveryWindow(
                         config.bootDiscoveryWindow() != null ? config.bootDiscoveryWindow() : Duration.ZERO);
@@ -850,6 +852,19 @@ public final class NGridNode implements Closeable {
                 if (first == null) {
                     first = e;
                 }
+            }
+        }
+        // Revisão #178 (C4): step down BEFORE closing the replication manager. Closing it first left a
+        // window where the node still answered isLeader()/hasValidLease() with its op-log already
+        // closed, so every write failed "op-log append failed … write not durable" while clients kept
+        // being routed here.
+        try {
+            if (coordinator != null) {
+                coordinator.stop();
+            }
+        } catch (RuntimeException e) {
+            if (first == null) {
+                first = new IOException("Failed to stop coordinator", e);
             }
         }
         try {

@@ -720,6 +720,11 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         if (!running) {
             return;
         }
+        // Revisão #178 (B10): a stopped coordinator must not keep answering isLeader()/hasValidLease():
+        // step down first (listeners fail pending writes, peers get the leader=false announcement).
+        if (isLeader()) {
+            stepDown();
+        }
         running = false;
         transport.removeListener(this);
     }
@@ -929,8 +934,21 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         membershipListeners.remove(listener);
     }
 
+    /**
+     * Runs a listener callback isolating its failure (revisão #178, C3): one throwing listener used to
+     * skip every listener after it, the election listeners and the leadership announcement, and the
+     * exception escaped {@code recomputeLeader} (lost silently on a virtual-thread dispatch).
+     */
+    private void safeNotify(Runnable callback, String what, Object listener) {
+        try {
+            callback.run();
+        } catch (RuntimeException | Error e) {
+            LOGGER.log(Level.SEVERE, "Leadership listener " + listener + " failed in " + what, e);
+        }
+    }
+
     private void notifyMembershipListeners() {
-        membershipListeners.forEach(MembershipListener::onMembershipChanged);
+        membershipListeners.forEach(l -> safeNotify(l::onMembershipChanged, "onMembershipChanged", l));
     }
 
     /**
@@ -1018,8 +1036,10 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                         LOGGER.fine(() -> "Granting proxy-reachable grace to overdue member: " + member.info());
                         continue;
                     }
+                    if (!member.markInactiveIfStale(now - config.heartbeatTimeout().toMillis())) {
+                        continue; // a heartbeat landed between the check and the mark (B10)
+                    }
                     LOGGER.fine(() -> "Marking member inactive due to missed heartbeat: " + member.info());
-                    member.markInactive();
                     // Drop the dead peer's tracked watermark so a deferring higher-affinity node can lead.
                     peerHighWatermark.remove(member.id());
                     peerTopicFrontiers.remove(member.id());
@@ -1826,8 +1846,14 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      * appear in the denominator, so counting them here would inflate the numerator alone.
      */
     private long activeVoterCount() {
+        // Same population as requiredVoterMajority (revisão #178, B10): a real listen port and
+        // leader-eligible — a port-0 member must not count on the active side either (it is not in
+        // the denominator, so counting it let a node out-vote a dead real voter). The local node is
+        // always a voter of its own cluster (manual assemblies and tests bind it on port 0).
+        NodeId localId = transport.local().nodeId();
         return members.values().stream()
-                .filter(m -> m.isActive() && !m.info().host().isBlank() && m.info().isLeaderEligible())
+                .filter(m -> m.isActive() && !m.info().host().isBlank() && m.info().isLeaderEligible()
+                        && (m.info().port() > 0 || m.id().equals(localId)))
                 .count();
     }
 
@@ -1947,11 +1973,13 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 // stream fetches and snapshot requests go — log it so a wrong adoption is attributable.
                 LOGGER.info(() -> "[" + localNodeId + "] Leader view changed: " + previous + " -> " + newLeaderId);
             }
-            leadershipListeners.forEach(listener -> listener.onLeaderChanged(newLeaderId));
+            leadershipListeners.forEach(listener -> safeNotify(() -> listener.onLeaderChanged(newLeaderId),
+                    "onLeaderChanged", listener));
 
             // Notify LeaderElectionListener if local node's leadership status changed
             if (wasLeader != isNowLeader) {
-                leaderElectionListeners.forEach(listener -> listener.onLeadershipChanged(isNowLeader, newLeaderId));
+                leaderElectionListeners.forEach(listener -> safeNotify(
+                        () -> listener.onLeadershipChanged(isNowLeader, newLeaderId), "onLeadershipChanged", listener));
                 // Announce the change right away instead of at the next periodic tick: peers decide whom
                 // to follow, whether a refusal is stale (D9 escape) and whether a rival is a dual-leader
                 // from the leader flag of the LATEST heartbeat, and a full interval of silence after a
@@ -1989,8 +2017,10 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 reclaimCaughtUpLatch = false; // A5: re-sync before any reclaim
                 LOGGER.warning(() -> "Leader stepped down. New epoch: " + newEpoch);
 
-                leadershipListeners.forEach(listener -> listener.onLeaderChanged(null));
-                leaderElectionListeners.forEach(listener -> listener.onLeadershipChanged(false, null));
+                leadershipListeners.forEach(listener -> safeNotify(() -> listener.onLeaderChanged(null),
+                        "onLeaderChanged", listener));
+                leaderElectionListeners.forEach(listener -> safeNotify(
+                        () -> listener.onLeadershipChanged(false, null), "onLeadershipChanged", listener));
                 notifyMembershipListeners();
                 announceLeadershipChange();
             }
@@ -2248,6 +2278,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 }
             }
             boolean[] isNewMember = {false};
+            boolean[] reactivated = {false};
             members.compute(source, (id, existing) -> {
                 if (existing != null) {
                     if (existing.info().host().isBlank()) {
@@ -2262,13 +2293,20 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                             return new ClusterMember(real.get());
                         }
                     }
-                    existing.touch();
+                    reactivated[0] = existing.touchAndReportReactivation();
                     return existing;
                 }
                 isNewMember[0] = true;
                 return new ClusterMember(
                         findPeerInfo(source).orElseGet(() -> new NodeInfo(source, "", 0)));
             });
+            if (reactivated[0]) {
+                // A member that came back by heartbeat alone (no handshake) is a membership change
+                // the listeners must see (revisão #178, B10): the ngrrd rebalancer/reporter and the
+                // join-quiesce bookkeeping key on these events. Notified AFTER the recompute below,
+                // so a listener that keys on isLeader() (the join-quiesce) sees the re-elected state.
+                isNewMember[0] = true;
+            }
 
             // FENCING by leader IDENTITY: the agreed leader (deterministic max NodeId) is
             // authoritative — adopt its term even if it momentarily appears lower than a ghost term
@@ -2290,6 +2328,9 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 }
                 if (isNewMember[0] || watermarkAdvanced || assertionChanged) {
                     recomputeLeader();
+                }
+                if (reactivated[0]) {
+                    notifyMembershipListeners();
                 }
                 return;
             }
@@ -2318,6 +2359,9 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 // (a) defer our reclaim while a peer is ahead, or (b) release the incumbent's step-down
                 // guard the moment a higher-affinity candidate has caught up to our state.
                 recomputeLeader();
+            }
+            if (reactivated[0]) {
+                notifyMembershipListeners();
             }
         }
     }

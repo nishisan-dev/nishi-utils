@@ -20,7 +20,10 @@ package dev.nishisan.utils.ngrid.common;
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
 
+import java.util.Collections;
+import java.util.Map;
 import java.util.Objects;
+import java.util.TreeMap;
 
 /**
  * Interim leader → candidate grant of an orchestrated affinity handback (issue tems#9, D11).
@@ -38,15 +41,32 @@ public final class HandbackGrantPayload {
     private final String topic;
     private final long frozenWatermark;
     private final long leaderEpoch;
+    private final Map<String, Long> frozenByTopic;
 
     @JsonCreator
     public HandbackGrantPayload(
             @JsonProperty("topic") String topic,
             @JsonProperty("frozenWatermark") long frozenWatermark,
-            @JsonProperty("leaderEpoch") long leaderEpoch) {
+            @JsonProperty("leaderEpoch") long leaderEpoch,
+            @JsonProperty("frozenByTopic") Map<String, Long> frozenByTopic) {
         this.topic = Objects.requireNonNull(topic, "topic");
         this.frozenWatermark = frozenWatermark;
         this.leaderEpoch = leaderEpoch;
+        this.frozenByTopic = frozenByTopic == null || frozenByTopic.isEmpty()
+                ? Map.of() : Collections.unmodifiableMap(new TreeMap<>(frozenByTopic));
+    }
+
+    /** Compatibility constructor (pre-#178): single representative topic. */
+    public HandbackGrantPayload(String topic, long frozenWatermark, long leaderEpoch) {
+        this(topic, frozenWatermark, leaderEpoch, null);
+    }
+
+    /**
+     * The incumbent's frozen frontier PER TOPIC (revisão #178, C2): every topic the candidate must
+     * bootstrap and the incumbent will re-anchor on demotion. Empty from an older incumbent.
+     */
+    public Map<String, Long> frozenByTopic() {
+        return frozenByTopic;
     }
 
     public String topic() {

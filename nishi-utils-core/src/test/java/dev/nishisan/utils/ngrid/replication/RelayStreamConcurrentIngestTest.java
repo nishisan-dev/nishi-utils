@@ -226,6 +226,11 @@ class RelayStreamConcurrentIngestTest {
     @Timeout(value = 60, unit = TimeUnit.SECONDS)
     @DisplayName("Gap re-pull com purge falho cai para snapshot — nunca re-fetch sobre relay sujo")
     void gapRepullFallsBackToSnapshotWhenPurgeFails() throws Exception {
+        // Diretório somente-leitura não impede o root de apagar arquivos: o purge teria sucesso e o
+        // cenário (purge falho → snapshot) não existiria. Executado como root (containers de CI/dev),
+        // o teste é ignorado em vez de dar um vermelho falso.
+        org.junit.jupiter.api.Assumptions.assumeFalse("root".equals(System.getProperty("user.name")),
+                "o cenário de purge falho por permissão não é reproduzível como root");
         // Relay perfurado [1,2,4,5] como no caso legado, mas com o diretório do tópico SEM permissão
         // de escrita: o truncate do purge não consegue apagar os arquivos. Re-anchorar o cursor assim
         // mesmo appendaria os frames re-fetchados ATRÁS do head antigo e o apply ficaria preso no

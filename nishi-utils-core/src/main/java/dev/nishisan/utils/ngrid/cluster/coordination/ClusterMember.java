@@ -46,9 +46,31 @@ final class ClusterMember {
         return nodeInfo;
     }
 
-    void touch() {
+    synchronized void touch() {
         lastHeartbeat.set(Instant.now().toEpochMilli());
         active = true;
+    }
+
+    /**
+     * Marks the member inactive only if its last heartbeat is still older than {@code thresholdMs}
+     * (revisão #178, B10): the eviction sweep's check-then-mark is otherwise not atomic with a
+     * concurrent {@link #touch()}, and a heartbeat landing between the two was lost for a cycle.
+     *
+     * @return {@code true} when the member was active and is now inactive
+     */
+    synchronized boolean markInactiveIfStale(long thresholdMs) {
+        if (!active || lastHeartbeat.get() > thresholdMs) {
+            return false;
+        }
+        active = false;
+        return true;
+    }
+
+    /** True when the member was inactive before this {@link #touch()} (reactivation). */
+    synchronized boolean touchAndReportReactivation() {
+        boolean wasInactive = !active;
+        touch();
+        return wasInactive;
     }
 
     long lastHeartbeat() {
