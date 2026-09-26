@@ -46,8 +46,10 @@ class RelayStreamReplicationTest {
     @Test
     @Timeout(value = 60, unit = TimeUnit.SECONDS)
     void streamConvergesQueueAndMapWithoutNakOrSnapshot() throws Exception {
-        NodeInfo infoA = new NodeInfo(NodeId.of("stream-a"), "localhost", 9861);
-        NodeInfo infoB = new NodeInfo(NodeId.of("stream-b"), "localhost", 9862);
+        int portA = allocateFreeLocalPort(java.util.Set.of());
+        int portB = allocateFreeLocalPort(java.util.Set.of(portA));
+        NodeInfo infoA = new NodeInfo(NodeId.of("stream-a"), "localhost", portA);
+        NodeInfo infoB = new NodeInfo(NodeId.of("stream-b"), "localhost", portB);
         Path base = Files.createTempDirectory("ngrid-stream-e2e");
 
         try (NGridNode a = streamNode(infoA, infoB, base.resolve("a"));
@@ -75,7 +77,15 @@ class RelayStreamReplicationTest {
             long expected = leader.replicationManager().getGlobalSequence();
             assertEquals(2L * n, expected, "leader must have sequenced all queue + map ops");
 
+            // Issue #178: the applied odometer is the SUM of the per-topic frontiers on both roles, so
+            // 200 queue ops + 200 map ops converge at 400 (the former max-per-topic follower counter
+            // could never pass 200 here, whatever the stream did). Convergence is also asserted per
+            // topic, which is what the odometer derives from.
             awaitApplied(follower, expected, 30_000);
+            assertEquals(leader.replicationManager().appliedFrontiers(), follower.replicationManager().appliedFrontiers(),
+                    "per-topic frontiers must match the leader's");
+            assertEquals(n, follower.replicationManager().appliedFrontiers().frontier("queue:stream-queue"));
+            assertEquals(n, follower.replicationManager().appliedFrontiers().frontier("map:stream-map"));
 
             // The stream is contiguous by construction: zero gaps, zero NAK, zero snapshot fallback.
             assertEquals(0L, follower.replicationManager().getGapsDetected(),
@@ -100,8 +110,10 @@ class RelayStreamReplicationTest {
     @Test
     @Timeout(value = 90, unit = TimeUnit.SECONDS)
     void streamContiguousUnderFirehoseNoNak() throws Exception {
-        NodeInfo infoA = new NodeInfo(NodeId.of("stream-fh-a"), "localhost", 9863);
-        NodeInfo infoB = new NodeInfo(NodeId.of("stream-fh-b"), "localhost", 9864);
+        int portA = allocateFreeLocalPort(java.util.Set.of());
+        int portB = allocateFreeLocalPort(java.util.Set.of(portA));
+        NodeInfo infoA = new NodeInfo(NodeId.of("stream-fh-a"), "localhost", portA);
+        NodeInfo infoB = new NodeInfo(NodeId.of("stream-fh-b"), "localhost", portB);
         Path base = Files.createTempDirectory("ngrid-stream-firehose");
 
         try (NGridNode a = streamNode(infoA, infoB, base.resolve("a"));
@@ -145,6 +157,20 @@ class RelayStreamReplicationTest {
                 .replicationOperationTimeout(Duration.ofSeconds(10))
                 .heartbeatInterval(Duration.ofMillis(200))
                 .build());
+    }
+
+    private static int allocateFreeLocalPort(java.util.Set<Integer> avoid) throws java.io.IOException {
+        for (int attempt = 0; attempt < 50; attempt++) {
+            try (java.net.ServerSocket socket = new java.net.ServerSocket()) {
+                socket.setReuseAddress(true);
+                socket.bind(new java.net.InetSocketAddress("127.0.0.1", 0));
+                int port = socket.getLocalPort();
+                if (port > 0 && !avoid.contains(port)) {
+                    return port;
+                }
+            }
+        }
+        throw new java.io.IOException("Unable to allocate a free local port after multiple attempts");
     }
 
     private static void awaitApplied(NGridNode follower, long target, long timeoutMs) throws InterruptedException {

@@ -3,7 +3,7 @@
 ## Visão rápida do repositório
 - Monorepo Maven com `pom.xml` agregando `nishi-utils-core` e `ngrid-test`.
 - O código de runtime fica em `nishi-utils-core/src/main/java/dev/nishisan/utils/{map,queue,ngrid,stats}`.
-- O workflow de release (`.github/workflows/publish.yml`) publica apenas `nishi-utils-core`; trate `ngrid-test` como módulo de suporte/teste, não como artefato de release.
+- O workflow de release (`.github/workflows/publish.yml`) publica `nishi-utils-core`, `nishi-utils-oss` e `nishi-utils-ngrrd-cluster`; trate `ngrid-test` como módulo de suporte/teste, não como artefato de release.
 
 ## Arquitetura que vale entender antes de editar
 - `NGrid` é a parte mais acoplada: `NGridNode` integra `TcpTransport`, `ClusterCoordinator`, `ReplicationManager`, `QueueClusterService` e `MapClusterService` (`nishi-utils-core/.../ngrid/structures/NGridNode.java`).
@@ -27,7 +27,7 @@
 
 ## Workflows de build, teste e execução
 - Teste padrão do monorepo: `mvn test` (README e CI usam isso como baseline).
-- Gate de resiliência in-process: `mvn test -Presilience -Dsurefire.rerunFailingTestsCount=1` (`.github/workflows/resilience.yml`).
+- Gate de resiliência in-process: `mvn test -Presilience -Dsurefire.rerunFailingTestsCount=1` (profile do `pom.xml`; não roda no CI hospedado — o `pr-validation.yml` usa `-DexcludeNgrid=true` e dois `*ClusterTest` do ngrrd escolhidos a dedo).
 - Gate Docker/Testcontainers: primeiro construir `ngrid-test:latest`, depois instalar `nishi-utils-core`, depois rodar `mvn -pl ngrid-test verify -Dngrid.test.docker=true -Dtest='...' -DfailIfNoTests=false` (veja o job `docker-resilience-gate`).
 - Profile Maven `docker-resilience`: roda ITs Docker via Failsafe (`**/cluster/*IT.java`), sem surefire, com `ngrid.test.docker=true` e `TESTCONTAINERS_RYUK_DISABLED=true`. Uso: `mvn verify -Pdocker-resilience`.
 - Soak test (longa duração): `mvn test -Psoak -Dngrid.soak.durationMinutes=720`. Roda apenas `soak/NGridSoakTest.java`; disponível via `workflow_dispatch` no CI com parâmetro `run_soak=true`.

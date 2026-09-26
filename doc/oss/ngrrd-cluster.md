@@ -779,8 +779,10 @@ imprime só a confirmação do disparo, como antes.
 - **Fora do CI hospedado, por desenho** — mesmo motivo e mesmo padrão da suíte de resiliência do
   NGrid (`doc/testes-vermelhos-conhecidos.md`): os `*ClusterTest` deste módulo são sensíveis a
   tempo e recursos do executor e não passam de forma confiável em runner hospedado. `pr-validation.yml`
-  não os toca (roda `mvn verify -pl nishi-utils-core -DexcludeNgrid=true`, que nem sequer constrói
-  este módulo); rode localmente com `mvn -pl nishi-utils-ngrrd-cluster verify -Pngrrd-cluster`.
+  constrói este módulo e roda apenas dois deles escolhidos a dedo
+  (`CheckpointAfterMigrationClusterTest` e `ContinuousIngestionRebalanceClusterTest`, este com
+  `-Djdk.virtualThreadScheduler.parallelism=2`); o restante roda localmente com
+  `mvn -pl nishi-utils-ngrrd-cluster verify -Pngrrd-cluster`.
 - **Docker IT:** fora do escopo deste marco — follow-up natural reaproveitando `NGridNodeContainer`
   e os markers de log da seção 10, no módulo `ngrid-test`.
 - Nomes de `@Test` em PT-BR (padrão do TEMS); classes auxiliares, campos e métodos de apoio em
@@ -825,9 +827,16 @@ imprime só a confirmação do disparo, como antes.
 
 ### 13.2. Vermelho conhecido deste módulo
 
-`LeaderFailoverDuringMigrationClusterTest` falha intermitentemente (~1 em 4 execuções) — ver
-detalhe e as duas assinaturas observadas em `doc/testes-vermelhos-conhecidos.md`. Investigação
-adicional (fora do escopo deste marco) autorizada para depois do M5.
+Nenhum desde a 8.8.0. `LeaderFailoverDuringMigrationClusterTest` falhava intermitentemente
+(~1 em 4 execuções) por duas causas do core, ambas corrigidas na 8.8.0 (issue #178 e revisão do
+NGrid; ver `doc/CHANGELOG.md`): a rota PROXY para o líder morto que nunca voltava a DIRECT e
+ganhava graça de evicção indevida, e o `op-log append failed … write not durable` no líder
+moribundo (ordem de fechamento do `NGridNode`). Além disso, o novo líder só retoma migrações
+`MIGRATING` depois do **fence do catálogo** (seção 8): a réplica local do tópico `map:ngrrd.catalog`
+precisa ter drenado o relay e alcançado a maior fronteira anunciada pelos peers elegíveis
+(`TopicReplicationStatus.maxPeerFrontier`), com prazo de 30 s e `NGRRD_RESUME_FENCE_TIMEOUT` se
+vencer; e o storage declara `priorityTopics(map:ngrrd.catalog)` ao NGrid, para que, entre dois
+sobreviventes com fronteiras incomparáveis, o catálogo decida quem lidera.
 
 ### 13.3. Trabalhos futuros — pontos abertos no core (fora do escopo deste módulo)
 
@@ -838,19 +847,20 @@ e afetam qualquer usuário do NGrid, não só este módulo:
   persistência (`NMapPersistenceMode.DISABLED`) não recupera seu conteúdo automaticamente ao
   reingressar num cluster já convergido após reiniciar — depende de o líder reenviar um snapshot
   completo por outro gatilho.
-- **Higiene do `TcpTransport`.** Três comportamentos observados que merecem endurecimento:
-  reconexão infinita sem backoff-teto contra um peer que nunca vai voltar; possibilidade de um nó
-  tentar abrir proxy para si mesmo; e um fast-path de `sendAndAwait` que não cobre todos os casos de
-  borda de timeout/reconexão.
+- **Higiene do `TcpTransport`.** Resolvido na 8.8.0 (revisão do NGrid, onda B): backoff exponencial
+  com cache negativo de discagem, relay só com link vivo ao destino (e nunca um cliente inelegível
+  nem o próprio destino), rota PROXY que volta a DIRECT quando o relay não entrega, `sendAndAwait`
+  sem discagem na thread do chamador e pendentes que falham quando o próximo salto cai. Ver
+  `doc/CHANGELOG.md`.
 - **`NMapPersistence` falha em silêncio para valor não serializável.** Um valor sem `Serializable`
   gravado num `DistributedMap` persistente falha o append do WAL sem propagar a exceção — o mapa
   parece persistir, mas não persiste (a causa raiz do bug de catálogo vazio corrigido no M1c; ver
   seção 3). Deveria falhar alto (exceção explícita), não em silêncio.
-- **Reclaim de liderança cego à linhagem.** Segue como limitação conhecida desde o handoff por
-  afinidade (D10, `doc/CHANGELOG.md`, entrada de 2026-06-11): contadores escalares de progresso são
-  cegos à linhagem/epoch — operações aplicadas a partir de ramos descartados inflam o contador e
-  inviabilizam um emparelhamento exato entre incumbente e candidato durante o handoff. Follow-up
-  epoch-aware (referenciado ali como PR #142) continua pendente.
+- **Reclaim de liderança cego à linhagem.** Mitigado na 8.8.0 (issue #178): os gates comparam a
+  fronteira aplicada **por tópico** (vetor no heartbeat) em vez de um contador escalar, o epoch do
+  líder passou a ser persistido e o handback re-ancora todos os tópicos. A ordenação epoch-aware de
+  linhagem no protocolo (o follow-up referenciado como PR #142) continua pendente: sequências de
+  linhagens divergentes ainda são numericamente comparáveis.
 - **Janela de bootstrap padrão e logs de handoff.** Desde a 8.7.0 o NGrid tem saída graciosa
   (`LEAVE`, ver `doc/ngrid/arquitetura.md`): clientes e a CLI administrativa são esquecidos pelos
   storages assim que saem, e o `LEAVE` de um storage (votante) confirma a saída na hora, sem o grace
