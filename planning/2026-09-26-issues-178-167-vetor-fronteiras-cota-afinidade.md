@@ -165,3 +165,65 @@ ngrrd:
 - `mvn -pl nishi-utils-core clean install -DskipTests && mvn -pl nishi-utils-ngrrd-cluster verify` e `... verify -Pngrrd-cluster` (≥ 3 rodadas de `LeaderFailoverDuringMigrationClusterTest` e dos `*ClusterTest` novos com `-Djdk.virtualThreadScheduler.parallelism=2`).
 - `mvn verify -Pvalidate-javadoc`; o comando do `pr-validation.yml` (`mvn verify -pl core,oss,ngrrd-cluster -am -DexcludeNgrid=true -Dsurefire.rerunFailingTestsCount=1`).
 - Compatibilidade: teste de codec com frame 8.7.0 (sem seção) e JSON legado; fixtures `.ser` legadas do ngrrd.
+
+---
+
+## Checkpoint de execução — 2026-09-26 (branch `claude/issues-178-167-ngrrd-ygtv07`)
+
+Snapshot do que já está feito, do que foi encontrado e do que ainda falta, para o caso de o
+ambiente cair. Tudo abaixo está commitado e no remoto (último commit desta seção incluído).
+
+### Status por parte
+
+| Parte | Status | Observações |
+|---|---|---|
+| 1.1–1.6 core #178 (vetor de fronteiras, odômetro derivado, gates por vetor, quiesce por tópico, observabilidade, E2E) | **feito** | `TopicFrontiers`, `ReplicationManager.appliedFrontiers()`, heartbeat binário com seção final, `priorityTopics`. `MultiTopicRestartWatermarkE2ETest` verde. |
+| 2 Onda A (A1–A5) | **feito** | A1 `LiveDemotionNoReplayE2ETest` (240→120 na 8.7.0), A2 `StalemateEscapeSingleWinnerTest`, A3/A4/A5 em `TopicFrontierElectionGateTest`/`LeaveMembershipTest`. |
+| 2 Onda B (B1–B8, B10) | **feito, integrado** | Branch do subagente (9 commits) merged sem conflito. |
+| 2 Onda C (C1–C9) | **feito** | `RelayStreamRobustnessTest`, `CoordinatorHardeningTest` (C9 = step-down por isolamento). |
+| B9 (esquecer votante) | **feito** | `Transport/NGridNode.decommissionPeer`, `TcpTransport` (tombstone 24 h), `ngrrd.admin.forget` + CLI `forget-node`, `ForgetNodeClusterTest` verde. |
+| 3 ngrrd cota + regras (fatias 1–9, 11) | **feito, integrado** | 10 commits do subagente; `QuotaClusterTest`/`PlacementRulesClusterTest` verdes. |
+| 3 fatia 10 (fence do catálogo) | **feito (código+unitários)** | `MigrationCoordinator.awaitResumeFence`; só loga quando precisou esperar — nas rodadas verdes o fence foi satisfeito de imediato. |
+| Onda D (testes/docs) | **feito** | `RelayStreamReplicationTest` por tópico e portas dinâmicas; `doc/testes-vermelhos-conhecidos.md` sem entradas; AGENTS.md. |
+| 4 versão/docs | **feito** | 8.8.0 nos 5 POMs, README, quickstart; CHANGELOG 8.8.0 completo. |
+| Verificação final | **pendente** | ver abaixo. |
+
+### Achados relevantes durante a execução (além do plano)
+
+- **Yield do líder recém-eleito** (commit `439631c`): a eleição corre com o heartbeat (3 s); o
+  sobrevivente de maior afinidade era eleito com vetores desatualizados e, ao ver o outro à frente
+  no catálogo, retinha (F2) — a op confirmada se perdia (`LeaderFailoverDuringMigrationClusterTest`,
+  ~1 em 6). Líder que nada produziu desde a eleição cede ao peer que o domina; perda de líder remoto
+  e LEAVE de votante disparam heartbeat imediato. Regressão E2E do core verde depois disso.
+- **Rodada do `LeaderFailoverDuringMigrationClusterTest` sem os fixes de transporte**: falhou
+  "sem líder" porque storage-1 só recebia os heartbeats de storage-0 via relay por storage-2
+  (achado B1: rota PROXY nunca voltava a DIRECT); ao matar storage-2 o líder ficou isolado e o C9
+  rebaixou corretamente. Motivo de integrar a Onda B antes de repetir o critério de aceite 8×.
+- `RelayStreamConcurrentIngestTest.gapRepull…` falha como root (pré-existente na base) → ignorado
+  por `Assumptions` quando root. `NGridIntegrationTest` era flaky na base (1/2); verde nas rodadas
+  após os fixes.
+- Suíte do core do subagente de transporte (base = main 8.7.0 + B1–B10, sem as partes 1–3) reproduz
+  os vermelhos conhecidos da base (`RelayStreamReplicationTest` 200/400, ingest como root) — não
+  representam o branch integrado.
+
+### Verificação pendente (ordem)
+
+1. `mvn -pl nishi-utils-ngrrd-cluster verify` (unitários do ngrrd contra core 8.8.0) — em execução.
+2. 8× `LeaderFailoverDuringMigrationClusterTest` com `-Pngrrd-cluster -Djdk.virtualThreadScheduler.parallelism=2`
+   no branch integrado (critério de aceite da #178); + 2× dos `*ClusterTest` novos
+   (`QuotaClusterTest`, `PlacementRulesClusterTest`, `ForgetNodeClusterTest`, `IdleCatalogFailoverClusterTest`).
+3. `mvn -pl nishi-utils-core test` completo e `-Presilience -Dsurefire.rerunFailingTestsCount=1`.
+4. `mvn verify -Pvalidate-javadoc` e o comando do `pr-validation.yml`
+   (`mvn verify -pl nishi-utils-core,nishi-utils-oss,nishi-utils-ngrrd-cluster -am -DexcludeNgrid=true -Dsurefire.rerunFailingTestsCount=1`).
+5. Limpar worktrees dos subagentes (`.claude/worktrees/agent-*`), PR (só quando pedido) e
+   comentar nas issues #178/#167 após o merge.
+
+### Como retomar num ambiente novo
+
+```bash
+git fetch origin claude/issues-178-167-ngrrd-ygtv07 && git checkout claude/issues-178-167-ngrrd-ygtv07
+export JAVA_TOOL_OPTIONS=
+mvn -B -q install -DskipTests -Djacoco.skip=true -pl .,nishi-utils-core,nishi-utils-oss   # core/oss 8.8.0 no ~/.m2
+mvn -pl nishi-utils-ngrrd-cluster verify -Pngrrd-cluster -Dtest=LeaderFailoverDuringMigrationClusterTest \
+    -DfailIfNoSpecifiedTests=false -Djdk.virtualThreadScheduler.parallelism=2
+```
