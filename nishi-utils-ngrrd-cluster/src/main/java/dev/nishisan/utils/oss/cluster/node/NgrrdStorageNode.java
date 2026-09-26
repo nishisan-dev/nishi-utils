@@ -57,6 +57,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.UnaryOperator;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -142,8 +143,27 @@ public final class NgrrdStorageNode implements Closeable {
      */
     public static NgrrdStorageNode start(StorageNodeConfig cfg, MigrationCoordinator.MigrationHooks migrationHooks)
             throws IOException {
+        return start(cfg, migrationHooks, UnaryOperator.identity());
+    }
+
+    /**
+     * Gancho de teste: como {@link #start(StorageNodeConfig, MigrationCoordinator.MigrationHooks)}, mas
+     * aplicando {@code lookupDecorator} ao {@link StorageRequestHandler.PlacementLookup} de produção antes
+     * de entregá-lo ao {@link StorageRequestHandler} — permite simular, num cluster real, a réplica local do
+     * catálogo atrasada neste nó (issue #177). Não é API estável.
+     *
+     * <p>Limitação: só o {@link StorageRequestHandler} enxerga a visão decorada. {@link MigrationExecutor},
+     * {@link LocalReconciler}, {@link GeometryService}, {@link PlacementRequestHandler} e o reporter de status
+     * continuam lendo a réplica real via {@link CatalogService}.</p>
+     *
+     * @param lookupDecorator recebe o adaptador de produção e devolve o que o handler vai usar (nunca
+     *                        {@code null}); {@link UnaryOperator#identity()} equivale ao comportamento normal
+     */
+    public static NgrrdStorageNode start(StorageNodeConfig cfg, MigrationCoordinator.MigrationHooks migrationHooks,
+            UnaryOperator<StorageRequestHandler.PlacementLookup> lookupDecorator) throws IOException {
         Objects.requireNonNull(cfg, "cfg");
         Objects.requireNonNull(migrationHooks, "migrationHooks");
+        Objects.requireNonNull(lookupDecorator, "lookupDecorator");
 
         BlobVolumeRegistry volumeRegistry = NgrrdBlob.registry()
                 .basePath(cfg.volumeDir())
@@ -190,7 +210,7 @@ public final class NgrrdStorageNode implements Closeable {
                 // Adaptador em vez de método de referência: StorageRequestHandler.PlacementLookup agora
                 // também exige placementStrong (round-trip ao líder), usado quando a réplica local do
                 // catálogo ainda está vazia (ex.: logo após um restart) — ver F1.2.
-                StorageRequestHandler.PlacementLookup placementLookup = new StorageRequestHandler.PlacementLookup() {
+                StorageRequestHandler.PlacementLookup productionLookup = new StorageRequestHandler.PlacementLookup() {
                     @Override
                     public Optional<SeriesPlacement> placementLocal(String seriesKey) {
                         return catalog.placementLocal(seriesKey);
@@ -217,6 +237,8 @@ public final class NgrrdStorageNode implements Closeable {
                         return rpc.leaderId().isPresent();
                     }
                 };
+                StorageRequestHandler.PlacementLookup placementLookup = Objects.requireNonNull(
+                        lookupDecorator.apply(productionLookup), "lookupDecorator devolveu null");
                 StorageRequestHandler storageHandler = new StorageRequestHandler(node.transport(),
                         placementLookup, registry, volume, cfg.seriesObjectPrefix(), self, cfg.defaultDurability(),
                         cfg.defaultOnGeometryChange(), Clock.systemUTC());

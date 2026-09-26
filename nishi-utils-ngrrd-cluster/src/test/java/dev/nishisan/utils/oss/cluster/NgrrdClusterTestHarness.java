@@ -27,6 +27,7 @@ import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.node.NgrrdStorageNode;
 import dev.nishisan.utils.oss.cluster.node.StorageNodeConfig;
+import dev.nishisan.utils.oss.cluster.node.StorageRequestHandler;
 import dev.nishisan.utils.oss.cluster.rebalance.MigrationCoordinator;
 import dev.nishisan.utils.oss.cluster.rebalance.RebalanceSettings;
 
@@ -44,6 +45,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.function.IntFunction;
+import java.util.function.UnaryOperator;
 
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -120,6 +122,23 @@ public final class NgrrdClusterTestHarness implements Closeable {
     public static NgrrdClusterTestHarness start(Path base, int storageNodeCount,
             Consumer<StorageNodeConfig.Builder> customize,
             IntFunction<MigrationCoordinator.MigrationHooks> migrationHooksByIndex) throws IOException {
+        return start(base, storageNodeCount, customize, migrationHooksByIndex, index -> UnaryOperator.identity());
+    }
+
+    /**
+     * Como {@link #start(Path, int, Consumer, IntFunction)}, mas decorando por índice de nó (o nó
+     * {@code i} tem {@code nodeId} {@code storage-i}) o {@link StorageRequestHandler.PlacementLookup} do
+     * {@code StorageRequestHandler} — simula a réplica local do catálogo atrasada num nó específico
+     * (issue #177). Ver a limitação em
+     * {@link NgrrdStorageNode#start(StorageNodeConfig, MigrationCoordinator.MigrationHooks, UnaryOperator)}:
+     * só o handler de storage enxerga a visão decorada. {@link #restartStorageNode} e
+     * {@link #addStorageNode} sobem nós sem decorador.
+     */
+    public static NgrrdClusterTestHarness start(Path base, int storageNodeCount,
+            Consumer<StorageNodeConfig.Builder> customize,
+            IntFunction<MigrationCoordinator.MigrationHooks> migrationHooksByIndex,
+            IntFunction<UnaryOperator<StorageRequestHandler.PlacementLookup>> lookupDecoratorByIndex)
+            throws IOException {
         Objects.requireNonNull(base, "base");
         if (storageNodeCount <= 0) {
             throw new IllegalArgumentException("storageNodeCount deve ser > 0: " + storageNodeCount);
@@ -143,7 +162,7 @@ public final class NgrrdClusterTestHarness implements Closeable {
             customize.accept(builder);
             StorageNodeConfig config = builder.build();
             configs.add(config);
-            nodes.add(NgrrdStorageNode.start(config, migrationHooksByIndex.apply(i)));
+            nodes.add(NgrrdStorageNode.start(config, migrationHooksByIndex.apply(i), lookupDecoratorByIndex.apply(i)));
         }
         return new NgrrdClusterTestHarness(base, configs, nodes);
     }
