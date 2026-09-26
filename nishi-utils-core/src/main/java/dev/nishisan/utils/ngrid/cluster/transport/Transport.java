@@ -66,6 +66,20 @@ public interface Transport extends Closeable {
     void addPeer(NodeInfo peer);
 
     /**
+     * Whether {@code nodeId} is a peer this transport forgot as departed and whose id is still
+     * tombstoned: second-hand sources cannot bring it back until a direct handshake from it (a new
+     * incarnation), an explicit {@link #addPeer} or the tombstone's expiry. Messages from such an id
+     * that were already in flight when it was forgotten must not re-create state for it.
+     *
+     * @param nodeId the peer id
+     * @return {@code true} while the id is tombstoned; {@code false} by default
+     * @since 8.7.0
+     */
+    default boolean isDeparted(NodeId nodeId) {
+        return false;
+    }
+
+    /**
      * Current outbound replication queue depth per node (RF3, issue #113).
      * Implementations without per-connection buffering return an empty map.
      *

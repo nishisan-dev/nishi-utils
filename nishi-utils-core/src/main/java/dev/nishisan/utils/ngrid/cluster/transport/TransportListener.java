@@ -41,6 +41,23 @@ public interface TransportListener {
     void onPeerDisconnected(NodeId peerId);
 
     /**
+     * Invoked when the transport <b>forgets</b> a departed peer: the id left the known-peer set for
+     * good (a graceful LEAVE of an ephemeral member, or an ephemeral member disconnected for too long)
+     * and is tombstoned against second-hand re-admission. Unlike {@link #onPeerDisconnected(NodeId)},
+     * no reconnection is expected; per-peer state may be dropped. A later direct handshake from the
+     * same id is a new incarnation and is reported through {@link #onPeerConnected(NodeInfo)}.
+     * <p>
+     * Defaults to {@link #onPeerDisconnected(NodeId)}; the transport does not report the same
+     * departure again as a plain disconnect.
+     *
+     * @param peerId identifier of the forgotten peer
+     * @since 8.7.0
+     */
+    default void onPeerLeft(NodeId peerId) {
+        onPeerDisconnected(peerId);
+    }
+
+    /**
      * Invoked when a cluster message is received from a peer.
      *
      * @param message the received cluster message

@@ -39,6 +39,7 @@ public final class TcpTransportConfig {
     private final int outboundQueueCapacity;
     private final boolean compressionEnabled;
     private final int compressionMinSize;
+    private final Duration departedPeerTombstoneTtl;
 
     private TcpTransportConfig(Builder builder) {
         this.local = builder.local;
@@ -51,6 +52,7 @@ public final class TcpTransportConfig {
         this.outboundQueueCapacity = builder.outboundQueueCapacity;
         this.compressionEnabled = builder.compressionEnabled;
         this.compressionMinSize = builder.compressionMinSize;
+        this.departedPeerTombstoneTtl = builder.departedPeerTombstoneTtl;
     }
 
     public NodeInfo local() {
@@ -130,6 +132,19 @@ public final class TcpTransportConfig {
         return compressionMinSize;
     }
 
+    /**
+     * How long the id of a forgotten (departed) peer stays tombstoned. While tombstoned, second-hand
+     * sources (gossip, a third node's handshake peer list, relayed messages, an inbound connection
+     * without handshake) cannot bring the id back; a direct handshake from that id (a new incarnation)
+     * or an explicit {@link TcpTransport#addPeer} clears it at once. Defaults to 10 minutes.
+     *
+     * @return the tombstone time-to-live
+     * @since 8.7.0
+     */
+    public Duration departedPeerTombstoneTtl() {
+        return departedPeerTombstoneTtl;
+    }
+
     public static Builder builder(NodeInfo local) {
         return new Builder(local);
     }
@@ -145,6 +160,7 @@ public final class TcpTransportConfig {
         private int outboundQueueCapacity = 0;
         private boolean compressionEnabled = true;
         private int compressionMinSize = 512;
+        private Duration departedPeerTombstoneTtl = Duration.ofMinutes(10);
 
         private Builder(NodeInfo local) {
             this.local = Objects.requireNonNull(local, "local");
@@ -233,6 +249,22 @@ public final class TcpTransportConfig {
                 throw new IllegalArgumentException("compressionMinSize must be >= 0");
             }
             this.compressionMinSize = minSize;
+            return this;
+        }
+
+        /**
+         * Sets how long the id of a forgotten peer stays tombstoned (default 10 minutes).
+         *
+         * @param ttl the tombstone time-to-live, must be positive
+         * @return this builder
+         * @since 8.7.0
+         */
+        public Builder departedPeerTombstoneTtl(Duration ttl) {
+            Objects.requireNonNull(ttl, "ttl");
+            if (ttl.isZero() || ttl.isNegative()) {
+                throw new IllegalArgumentException("departedPeerTombstoneTtl must be positive");
+            }
+            this.departedPeerTombstoneTtl = ttl;
             return this;
         }
 

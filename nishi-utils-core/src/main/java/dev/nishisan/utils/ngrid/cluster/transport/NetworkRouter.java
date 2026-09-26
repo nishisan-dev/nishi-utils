@@ -125,6 +125,33 @@ final class NetworkRouter {
         });
     }
 
+    /**
+     * Drops everything known about a departed peer: its own route, the reachability and latencies it
+     * reported, and every mention of it as a target or relay in other peers' reports. A proxy route
+     * that went through it is re-evaluated (another relay, or back to direct), so nothing keeps
+     * pointing at an id the transport no longer knows.
+     *
+     * @param id the forgotten peer
+     */
+    void forget(NodeId id) {
+        routes.remove(id);
+        reachabilityMap.remove(id);
+        reportedLatencies.remove(id);
+        reachabilityMap.values().forEach(reporters -> reporters.remove(id));
+        // Inner latency maps are replaced, never mutated: findBestProxy reads them concurrently.
+        reportedLatencies.replaceAll((source, latencies) -> {
+            if (!latencies.containsKey(id)) {
+                return latencies;
+            }
+            Map<NodeId, Double> copy = new HashMap<>(latencies);
+            copy.remove(id);
+            return copy;
+        });
+        routes.replaceAll((target, route) -> route.type() == RouteType.PROXY && id.equals(route.via())
+                ? findBestProxy(target, id).map(Route::proxy).orElse(Route.direct())
+                : route);
+    }
+
     void promoteToDirect(NodeId target) {
         routes.put(target, Route.direct());
     }

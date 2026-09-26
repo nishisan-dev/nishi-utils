@@ -85,6 +85,9 @@ public final class TcpTransport implements Transport {
     private final ReentrantLock peerTableLock = new ReentrantLock();
     // Ids of the configured bootstrap peers; until verified they are not gossiped (gossipablePeers).
     private final Set<NodeId> initialPeerIds;
+    // Tombstones of forgotten (departed) peers: id -> expiry (epoch millis). While present, second-hand
+    // sources cannot re-admit the id (see forget). Written under peerTableLock; purged lazily.
+    private final Map<NodeId, Long> departedPeers = new ConcurrentHashMap<>();
     private final Map<NodeId, Connection> connections = new ConcurrentHashMap<>();
     // Includes accepted sockets that have not supplied a handshake/peer identity yet.
     private final Set<Connection> liveSockets = ConcurrentHashMap.newKeySet();
@@ -392,6 +395,15 @@ public final class TcpTransport implements Transport {
 
     @Override
     public void addPeer(NodeInfo peer) {
+        // An explicit join is first-hand intent: it lifts a tombstone left by an earlier departure.
+        if (peer != null) {
+            peerTableLock.lock();
+            try {
+                departedPeers.remove(peer.nodeId());
+            } finally {
+                peerTableLock.unlock();
+            }
+        }
         boolean added = mergeGossipedPeer(peer);
         if (added && running && shouldInitiate(peer)) {
             scheduler.schedule(() -> ensureConnectionAsync(peer), 0, TimeUnit.MILLISECONDS);
@@ -429,6 +441,7 @@ public final class TcpTransport implements Transport {
         if (!running) {
             return;
         }
+        purgeExpiredTombstones(System.currentTimeMillis());
         // Fast path: skip iteration if all known peers are connected
         boolean allConnected = knownPeers.values().stream()
                 .filter(p -> !p.nodeId().equals(config.local().nodeId()) && p.port() > 0)
@@ -483,6 +496,9 @@ public final class TcpTransport implements Transport {
             if (current != null && current.isOpen()) {
                 return current;
             }
+            if (!knownPeers.containsKey(nodeId)) {
+                return null; // forgotten while this caller waited for the peer lock
+            }
             Connection unpublished = unpublishedLinkTo(nodeInfo);
             if (unpublished != null) {
                 return unpublished;
@@ -516,8 +532,8 @@ public final class TcpTransport implements Transport {
     // One lock per peer id, serializing dials to it and publication of its live connection. An
     // entry must outlive disconnects: dropping it while a dial still holds the old lock let the
     // next caller create a fresh one and dial the same peer concurrently. Entries are removed only
-    // on close(); a future "forget peer" path (peer removed from knownPeers for good) is the one
-    // place that may also drop that peer's entry.
+    // on close() and when the peer is forgotten for good (forget / dropConnectionLock), the one
+    // place allowed to drop a single peer's entry.
     private final Map<NodeId, ReentrantLock> connectionLocks = new ConcurrentHashMap<>();
 
     /**
@@ -596,6 +612,14 @@ public final class TcpTransport implements Transport {
         lifecycleLock.lock();
         try {
             if (!running || !candidate.isOpen()) {
+                candidate.closeQuietly();
+                return null;
+            }
+            if (isDeparted(remoteId)) {
+                // A forgotten peer is re-admitted only by its own handshake, which lifts the tombstone
+                // before publishing. A dial that raced the forget, or an inbound socket identified
+                // just by the source of its first message, must not bring it back.
+                LOGGER.fine(() -> "Not publishing a connection for departed peer " + remoteId);
                 candidate.closeQuietly();
                 return null;
             }
@@ -720,6 +744,12 @@ public final class TcpTransport implements Transport {
                     staleConnections.add(staleConn);
                 }
             }
+            // A direct handshake from a departed id is a new incarnation: first-hand, it lifts the
+            // tombstone whatever its origin (own LEAVE, disconnect timeout or gossip).
+            if (departedPeers.remove(remoteInfo.nodeId()) != null) {
+                LOGGER.info(() -> "Departed peer " + remoteInfo.nodeId() + " is back on "
+                        + config.local().nodeId() + " (direct handshake); tombstone cleared");
+            }
             knownPeers.put(remoteInfo.nodeId(), remoteInfo);
             verifiedPeers.add(remoteInfo.nodeId());
         } finally {
@@ -735,7 +765,7 @@ public final class TcpTransport implements Transport {
         Connection live = registerLiveConnection(remoteNodeId, connection);
         if (live == null) { return; }
         if (live != connection) {
-            router.updateReachability(remoteNodeId, payload.peers(), payload.latencies());
+            router.updateReachability(remoteNodeId, admissible(payload.peers()), admissible(payload.latencies()));
             return;
         }
 
@@ -743,7 +773,7 @@ public final class TcpTransport implements Transport {
         router.promoteToDirect(remoteNodeId);
 
         // Feed router with reachability info
-        router.updateReachability(remoteInfo.nodeId(), payload.peers(), payload.latencies());
+        router.updateReachability(remoteInfo.nodeId(), admissible(payload.peers()), admissible(payload.latencies()));
 
         listeners.forEach(listener -> listener.onPeerConnected(remoteInfo));
         // Merge peers and attempt connections
@@ -787,7 +817,7 @@ public final class TcpTransport implements Transport {
         PeerUpdatePayload payload = message.payload(PeerUpdatePayload.class);
         
         // Feed router with reachability info
-        router.updateReachability(message.source(), payload.peers(), payload.latencies());
+        router.updateReachability(message.source(), admissible(payload.peers()), admissible(payload.latencies()));
 
         for (NodeInfo peer : payload.peers()) {
             if (mergeGossipedPeer(peer)) {
@@ -813,7 +843,9 @@ public final class TcpTransport implements Transport {
      *   <li>otherwise a different id at the same address replaces the unverified entry (a seed
      *       alias learning its canonical id second-hand, or a restarted process with a new id);</li>
      *   <li>a verified peer's own entry is not overwritten by gossip while a direct connection to it
-     *       is open: its handshake is first-hand and fresher.</li>
+     *       is open: its handshake is first-hand and fresher;</li>
+     *   <li>a departed (tombstoned) id is rejected: gossip still listing a peer that left must not
+     *       bring it back (see {@link #forget(NodeId)}).</li>
      * </ul>
      *
      * @return {@code true} when the entry was added or changed
@@ -824,6 +856,10 @@ public final class TcpTransport implements Transport {
         }
         peerTableLock.lock();
         try {
+            if (isDeparted(peer.nodeId())) {
+                LOGGER.fine(() -> "Ignoring gossiped " + peer + ": departed (tombstoned) on " + config.local().nodeId());
+                return false;
+            }
             List<NodeId> displaced = new ArrayList<>();
             for (Map.Entry<NodeId, NodeInfo> entry : knownPeers.entrySet()) {
                 if (entry.getKey().equals(peer.nodeId()) || !sameAddress(entry.getValue(), peer)) {
@@ -869,6 +905,13 @@ public final class TcpTransport implements Transport {
 
     private void handleMessage(NodeId senderId, ClusterMessage message) {
         if (message.type() == MessageType.HANDSHAKE) {
+            return;
+        }
+        NodeId source = message.source();
+        if (source != null && !source.equals(senderId) && isDeparted(source)) {
+            // Relayed (second-hand) traffic of a forgotten peer — typically in flight when it left. Its
+            // new incarnation is re-admitted by its own direct handshake, not through a relay.
+            LOGGER.fine(() -> "Dropping " + message.type() + " relayed by " + senderId + " from departed peer " + source);
             return;
         }
         if (message.type() == MessageType.UNDELIVERABLE && config.local().nodeId().equals(message.destination())) {
@@ -973,6 +1016,13 @@ public final class TcpTransport implements Transport {
 
     private void handleDisconnect(Connection connection) {
         connection.remoteId().ifPresent(nodeId -> {
+            if (isDeparted(nodeId) && !knownPeers.containsKey(nodeId)) {
+                // Forgotten for good: forget() already failed its pending responses and reported the
+                // departure (onPeerLeft); this socket closing is not news.
+                connections.remove(nodeId, connection);
+                LOGGER.fine(() -> "Disconnect of departed peer " + nodeId + " on " + config.local().nodeId() + " ignored");
+                return;
+            }
             LOGGER.info(() -> "Handling disconnect from " + nodeId + " on " + config.local().nodeId() + " (remote=" + connection.remote + ", open=" + connection.isOpen() + ")");
             // Only treat the peer as disconnected when the currently tracked connection goes away.
             // In rare races, nodes can end up with multiple TCP connections; a stale connection closing
@@ -996,22 +1046,141 @@ public final class TcpTransport implements Transport {
             }
             LOGGER.info(() -> "Disconnect confirmed for " + nodeId + " on " + config.local().nodeId() + "; failing pending responses");
             // The per-peer connection lock is deliberately kept (see connectionLocks).
-            List<Map.Entry<UUID, PendingResponse>> toFail = new ArrayList<>();
-            for (Map.Entry<UUID, PendingResponse> entry : pendingResponses.entrySet()) {
-                if (nodeId.equals(entry.getValue().destination)) {
-                    toFail.add(entry);
-                }
-            }
-            for (Map.Entry<UUID, PendingResponse> entry : toFail) {
-                UUID requestId = entry.getKey();
-                PendingResponse pending = entry.getValue();
-                if (pendingResponses.remove(requestId, pending)) {
-                    pending.cancelTimeout();
-                    pending.future.completeExceptionally(new PeerDisconnectedException(nodeId, requestId));
-                }
-            }
+            failPendingResponsesTo(nodeId);
             listeners.forEach(listener -> listener.onPeerDisconnected(nodeId));
         });
+    }
+
+    private void failPendingResponsesTo(NodeId nodeId) {
+        List<Map.Entry<UUID, PendingResponse>> toFail = new ArrayList<>();
+        for (Map.Entry<UUID, PendingResponse> entry : pendingResponses.entrySet()) {
+            if (nodeId.equals(entry.getValue().destination)) {
+                toFail.add(entry);
+            }
+        }
+        for (Map.Entry<UUID, PendingResponse> entry : toFail) {
+            UUID requestId = entry.getKey();
+            PendingResponse pending = entry.getValue();
+            if (pendingResponses.remove(requestId, pending)) {
+                pending.cancelTimeout();
+                pending.future.completeExceptionally(new PeerDisconnectedException(nodeId, requestId));
+            }
+        }
+    }
+
+    @Override
+    public boolean isDeparted(NodeId nodeId) {
+        Long expiresAt = departedPeers.get(nodeId);
+        return expiresAt != null && expiresAt > System.currentTimeMillis();
+    }
+
+    /**
+     * Forgets a departed peer for good and tombstones its id for
+     * {@link TcpTransportConfig#departedPeerTombstoneTtl()}.
+     *
+     * @see #forget(NodeId, long, String)
+     */
+    boolean forget(NodeId nodeId) {
+        return forget(nodeId, config.departedPeerTombstoneTtl().toMillis(), "departed");
+    }
+
+    /**
+     * Forgets a departed peer for good: removes it from the known and verified peers, drops its
+     * published connection (closed), its per-peer connection lock and everything the router knows
+     * about it, fails its pending responses with {@link PeerDisconnectedException} and reports it to
+     * the listeners through {@link TransportListener#onPeerLeft(NodeId)}. Its id is tombstoned for
+     * {@code tombstoneTtlMs}: second-hand sources (gossip, a third node's handshake peer list, relayed
+     * messages, an inbound socket identified only by the source of its first message) cannot re-admit
+     * it, while a direct handshake from that id (a new incarnation), an explicit {@link #addPeer} or
+     * the expiry lift the tombstone. Without this, a member that left (e.g. a short-lived client)
+     * stayed in {@code knownPeers} forever and every heartbeat broadcast dialed it again.
+     *
+     * @return {@code true} when the peer was known (or connected) and has now been forgotten
+     */
+    private boolean forget(NodeId nodeId, long tombstoneTtlMs, String reason) {
+        if (nodeId == null || nodeId.equals(config.local().nodeId())) {
+            return false;
+        }
+        long expiresAt = System.currentTimeMillis() + tombstoneTtlMs;
+        boolean wasKnown;
+        Connection published;
+        // lifecycleLock -> peerTableLock: registerLiveConnection checks the tombstone under the
+        // lifecycle lock, so a publication cannot slip in between the tombstone and the removal.
+        lifecycleLock.lock();
+        try {
+            peerTableLock.lock();
+            try {
+                departedPeers.merge(nodeId, expiresAt, Math::max);
+                wasKnown = knownPeers.remove(nodeId) != null;
+                verifiedPeers.remove(nodeId);
+                published = connections.remove(nodeId);
+            } finally {
+                peerTableLock.unlock();
+            }
+        } finally {
+            lifecycleLock.unlock();
+        }
+        if (published != null) {
+            published.closeQuietly();
+        }
+        dropConnectionLock(nodeId);
+        router.forget(nodeId);
+        failPendingResponsesTo(nodeId);
+        if (!wasKnown && published == null) {
+            return false;
+        }
+        LOGGER.info(() -> "Forgot departed peer " + nodeId + " on " + config.local().nodeId() + " (" + reason
+                + "); tombstoned for " + tombstoneTtlMs + " ms");
+        listeners.forEach(listener -> listener.onPeerLeft(nodeId));
+        return true;
+    }
+
+    /**
+     * Drops the per-peer connection lock of a forgotten peer, unless a dial is holding it right now
+     * (that dial re-checks knownPeers under the lock and gives up; the entry is swept later).
+     */
+    private void dropConnectionLock(NodeId nodeId) {
+        ReentrantLock lock = connectionLocks.get(nodeId);
+        if (lock != null && lock.tryLock()) {
+            try {
+                connectionLocks.remove(nodeId, lock);
+            } finally {
+                lock.unlock();
+            }
+        }
+    }
+
+    /** Lazily removes expired tombstones and sweeps the connection locks of forgotten peers. */
+    private void purgeExpiredTombstones(long nowMs) {
+        departedPeers.entrySet().removeIf(entry -> entry.getValue() <= nowMs);
+        for (NodeId id : connectionLocks.keySet()) {
+            if (departedPeers.containsKey(id) && !knownPeers.containsKey(id) && !connections.containsKey(id)) {
+                dropConnectionLock(id);
+            }
+        }
+    }
+
+    /** Peers minus departed (tombstoned) ids: reachability input from second-hand reports. */
+    private Collection<NodeInfo> admissible(Collection<NodeInfo> peers) {
+        if (departedPeers.isEmpty()) {
+            return peers;
+        }
+        List<NodeInfo> admissible = new ArrayList<>(peers.size());
+        for (NodeInfo peer : peers) {
+            if (!isDeparted(peer.nodeId())) {
+                admissible.add(peer);
+            }
+        }
+        return admissible;
+    }
+
+    private Map<NodeId, Double> admissible(Map<NodeId, Double> latencies) {
+        if (departedPeers.isEmpty()) {
+            return latencies;
+        }
+        Map<NodeId, Double> admissible = new HashMap<>(latencies);
+        admissible.keySet().removeIf(this::isDeparted);
+        return admissible;
     }
 
     @Override
