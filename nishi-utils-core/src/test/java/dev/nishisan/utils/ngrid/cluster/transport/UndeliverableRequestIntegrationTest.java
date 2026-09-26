@@ -78,9 +78,14 @@ class UndeliverableRequestIntegrationTest {
             // Wait for both readers to observe EOF before testing the relay-only path.
             await(() -> !transB.isConnected(infoC.nodeId()) && !transA.isConnected(infoC.nodeId()),
                     "A and B see C gone");
-            // Since 8.8.0 B reports at once that it lost its link to C, so A would dial C directly. The
-            // fail-fast under test is the relay's notice for a STALE route: re-inject B's earlier report
-            // (as if its PEER_UPDATE were still in flight) so A routes to C via B.
+            // Since 8.8.0 B reports at once that it lost its link to C, so A would dial C directly. Wait
+            // until that report has been processed by A (B is no longer a relay candidate for C)...
+            await(() -> {
+                transA.getRouter().markDirectFailure(infoC.nodeId());
+                return Optional.of(infoC.nodeId()).equals(transA.getRouter().nextHop(infoC.nodeId()));
+            }, "A processed B's report that it lost C");
+            // ...then re-inject B's earlier report (as if its PEER_UPDATE were still in flight): the
+            // fail-fast under test is the relay's notice for a STALE route to C via B.
             transA.getRouter().updateReachability(infoB.nodeId(), Set.of(infoC), Map.of(), Set.of(infoC.nodeId()));
             transA.getRouter().markDirectFailure(infoC.nodeId());
             Optional<NodeId> hop = transA.getRouter().nextHop(infoC.nodeId());

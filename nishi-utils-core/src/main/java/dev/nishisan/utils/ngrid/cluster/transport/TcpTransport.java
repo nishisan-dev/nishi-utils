@@ -58,6 +58,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
@@ -99,6 +100,13 @@ public final class TcpTransport implements Transport {
     // forget-after-disconnection backstop must not take it for gone.
     private final Map<NodeId, Long> lastInboundFromPeer = new ConcurrentHashMap<>();
     private final Map<NodeId, Connection> connections = new ConcurrentHashMap<>();
+    // Negative dial cache: per peer, the last failed dial, when the next one may be attempted and how
+    // many failed in a row. Exponential backoff starting at reconnectInterval, doubled per failure,
+    // capped at max(5 s, 3 x reconnectInterval), plus up to 20 % jitter. Without it every caller
+    // (reconnect loop, heartbeats, probes, RTT pings, RPCs) dialed a dead peer on every call and queued
+    // on its connection lock for k x connectTimeout. Cleared by a successful dial, an inbound handshake
+    // from the peer, an explicit addPeer, or forget.
+    private final Map<NodeId, DialBackoff> dialBackoffs = new ConcurrentHashMap<>();
     // Includes accepted sockets that have not supplied a handshake/peer identity yet.
     private final Set<Connection> liveSockets = ConcurrentHashMap.newKeySet();
     private final ReentrantLock lifecycleLock = new ReentrantLock();
@@ -153,6 +161,30 @@ public final class TcpTransport implements Transport {
     // For testing purposes
     NetworkRouter getRouter() {
         return router;
+    }
+
+    private record DialBackoff(long failedAtNanos, long nextAttemptAtNanos, int attempts) { }
+
+    /** Whether a dial to {@code nodeId} failed recently enough that the next one must wait. */
+    private boolean inDialBackoff(NodeId nodeId) {
+        DialBackoff backoff = dialBackoffs.get(nodeId);
+        return backoff != null && System.nanoTime() - backoff.nextAttemptAtNanos() < 0;
+    }
+
+    private void recordDialFailure(NodeId nodeId) {
+        dialBackoffs.compute(nodeId, (id, previous) -> {
+            int attempts = previous == null ? 1 : previous.attempts() + 1;
+            long baseMs = Math.max(1L, config.reconnectInterval().toMillis());
+            long capMs = Math.max(5_000L, 3L * baseMs);
+            long delayMs = Math.min(capMs, baseMs * (1L << Math.min(attempts - 1, 20)));
+            long jitterMs = ThreadLocalRandom.current().nextLong(delayMs / 5 + 1);
+            long now = System.nanoTime();
+            return new DialBackoff(now, now + TimeUnit.MILLISECONDS.toNanos(delayMs + jitterMs), attempts);
+        });
+    }
+
+    private void clearDialBackoff(NodeId nodeId) {
+        dialBackoffs.remove(nodeId);
     }
 
     // Visible for tests in this package: hook invoked right before each outbound dial.
@@ -446,7 +478,8 @@ public final class TcpTransport implements Transport {
 
     @Override
     public void addPeer(NodeInfo peer) {
-        // An explicit join is first-hand intent: it lifts a tombstone left by an earlier departure.
+        // An explicit join is first-hand intent: it lifts a tombstone left by an earlier departure and
+        // any dial backoff, so the peer is dialed right away.
         if (peer != null) {
             peerTableLock.lock();
             try {
@@ -454,6 +487,7 @@ public final class TcpTransport implements Transport {
             } finally {
                 peerTableLock.unlock();
             }
+            clearDialBackoff(peer.nodeId());
         }
         boolean added = mergeGossipedPeer(peer);
         if (added && running && shouldInitiate(peer)) {
@@ -513,7 +547,7 @@ public final class TcpTransport implements Transport {
             if (peer.nodeId().equals(config.local().nodeId()) || peer.port() <= 0) {
                 continue;
             }
-            if (!shouldInitiate(peer)) {
+            if (!shouldInitiate(peer) || inDialBackoff(peer.nodeId())) {
                 continue;
             }
             ensureConnectionAsync(peer);
@@ -547,6 +581,12 @@ public final class TcpTransport implements Transport {
         if (nodeInfo.port() <= 0) {
             return null;
         }
+        // Fail fast, before the peer lock: a peer whose last dial failed is not dialed again until its
+        // backoff expires, so callers see "no connection" at once instead of queueing behind a dial.
+        if (inDialBackoff(nodeId)) {
+            LOGGER.fine(() -> "Not dialing " + nodeId + ": in dial backoff");
+            return null;
+        }
         ReentrantLock peerLock = getLockFor(nodeId);
         peerLock.lock();
         try {
@@ -560,6 +600,9 @@ public final class TcpTransport implements Transport {
             Connection unpublished = unpublishedLinkTo(nodeInfo);
             if (unpublished != null) {
                 return unpublished;
+            }
+            if (inDialBackoff(nodeId)) {
+                return null; // the dial this caller waited for just failed
             }
             try {
                 beforeDialHook.accept(nodeId);
@@ -586,9 +629,13 @@ public final class TcpTransport implements Transport {
                         throw e;
                     }
                 }
+                if (live != null) {
+                    clearDialBackoff(nodeId);
+                }
                 LOGGER.fine(() -> "Connected to " + nodeInfo);
                 return live;
             } catch (IOException e) {
+                recordDialFailure(nodeId);
                 LOGGER.log(Level.FINE, "Unable to connect to {0}: {1}", new Object[]{nodeInfo, e.getMessage()});
                 return null;
             }
@@ -886,6 +933,8 @@ public final class TcpTransport implements Transport {
         connections.entrySet().removeIf(entry -> entry.getValue() == connection
                 && !entry.getKey().equals(remoteNodeId));
         if (live == null) { return; }
+        // The peer is reachable (it reached us): a pending dial backoff for it is moot.
+        clearDialBackoff(remoteNodeId);
         if (live != connection) {
             router.updateReachability(remoteNodeId, admissible(payload.peers()), admissible(payload.latencies()),
                     admissibleIds(payload.connectedPeers()));
@@ -1386,6 +1435,7 @@ public final class TcpTransport implements Transport {
             published.closeQuietly();
         }
         dropConnectionLock(nodeId);
+        dialBackoffs.remove(nodeId);
         router.forget(nodeId);
         failPendingResponsesTo(nodeId);
         if (!wasKnown && published == null) {
@@ -1550,6 +1600,7 @@ public final class TcpTransport implements Transport {
             Thread.currentThread().interrupt();
         }
         connectionLocks.clear();
+        dialBackoffs.clear();
         pendingResponses.values().forEach(pending -> {
             pending.cancelTimeout();
             pending.future.completeExceptionally(new IOException("Transport closed"));
