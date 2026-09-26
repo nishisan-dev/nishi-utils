@@ -574,6 +574,22 @@ public final class NGridNode implements Closeable {
         return config;
     }
 
+    /**
+     * Decommissions a leader-eligible peer on THIS node (revisão #178, B9): the transport forgets it
+     * (tombstoned for a long window, out of the voter majority) and the coordinator drops it from the
+     * membership at once. Must be run on every node of the cluster; the peer must already be down.
+     *
+     * @param nodeId the voter to forget
+     * @return {@code true} if the transport knew the peer
+     * @since 8.8.0
+     */
+    public boolean decommissionPeer(NodeId nodeId) {
+        java.util.Objects.requireNonNull(nodeId, "nodeId");
+        boolean forgotten = transport.decommissionPeer(nodeId);
+        coordinator.onPeerLeft(nodeId);
+        return forgotten;
+    }
+
     public Transport transport() {
         return transport;
     }
