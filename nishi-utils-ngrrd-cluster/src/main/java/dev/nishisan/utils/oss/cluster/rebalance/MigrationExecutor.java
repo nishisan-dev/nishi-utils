@@ -128,6 +128,9 @@ public final class MigrationExecutor extends RequestHandlerSupport {
     private final ObjectNaming objectNaming;
     private final long migrationChunkBytes;
     private final long maxSeriesBytes;
+    /** Cota dura deste nó como destino ({@code ngrrd.quota.*}, issue #167 item 3); {@code 0} = sem limite. */
+    private final long quotaMaxSeries;
+    private final long quotaMaxBytes;
     private final Clock clock;
     private final MigrationBandwidth bandwidth;
     private final ExecutorService transferExecutor;
@@ -157,7 +160,26 @@ public final class MigrationExecutor extends RequestHandlerSupport {
     public MigrationExecutor(Transport transport, SeriesHandleRegistry registry, BlobVolume volume, ClusterRpc rpc,
             CatalogView catalog, NodeId self, String seriesObjectPrefix, long migrationChunkBytes,
             long maxSeriesBytes, long migrationBytesPerSecond, Clock clock) {
+        this(transport, registry, volume, rpc, catalog, self, seriesObjectPrefix, migrationChunkBytes, maxSeriesBytes,
+                migrationBytesPerSecond, clock, 0L, 0L);
+    }
+
+    /**
+     * @param quotaMaxSeries cota dura de séries deste nó (issue #167, item 3): um {@code MIGRATE_PREPARE} é
+     *                       recusado com {@link MigrateStatus#QUOTA_EXCEEDED} quando as entradas do volume mais
+     *                       os alvos de migração abertos já a atingem; {@code 0} = sem limite
+     * @param quotaMaxBytes  cota dura de bytes: recusa quando usados + reservados + pedidos a ultrapassam;
+     *                       {@code 0} = sem limite
+     */
+    public MigrationExecutor(Transport transport, SeriesHandleRegistry registry, BlobVolume volume, ClusterRpc rpc,
+            CatalogView catalog, NodeId self, String seriesObjectPrefix, long migrationChunkBytes,
+            long maxSeriesBytes, long migrationBytesPerSecond, Clock clock, long quotaMaxSeries, long quotaMaxBytes) {
         super(transport, Commands.MIGRATION_COMMANDS);
+        if (quotaMaxSeries < 0 || quotaMaxBytes < 0) {
+            throw new IllegalArgumentException("quota deve ser >= 0 (0 = sem limite)");
+        }
+        this.quotaMaxSeries = quotaMaxSeries;
+        this.quotaMaxBytes = quotaMaxBytes;
         this.bandwidth = new MigrationBandwidth(migrationBytesPerSecond);
         this.registry = Objects.requireNonNull(registry, "registry");
         this.volume = Objects.requireNonNull(volume, "volume");
@@ -588,6 +610,13 @@ public final class MigrationExecutor extends RequestHandlerSupport {
                     ? MigrateResponse.of(old.liveCopy ? MigrateStatus.COPY_READY : MigrateStatus.OK, null)
                     : MigrateResponse.of(MigrateStatus.ERROR, "reservation identity mismatch");
         }
+        // Issue #167 (item 3): a cota é do PRÓPRIO destino (config local), rechecada aqui porque o líder
+        // decide com um status possivelmente defasado. Só migrações novas chegam aqui (o re-PREPARE
+        // idempotente já retornou acima).
+        Optional<String> quota = quotaRefusal(request);
+        if (quota.isPresent()) {
+            return failTarget(request.seriesKey(), request.migrationId(), MigrateStatus.QUOTA_EXCEEDED, quota.get());
+        }
         try {
             volume.storage().reserve(request.migrationId(), request.storageKey(), request.totalBytes());
         } catch (RuntimeException e) {
@@ -606,10 +635,44 @@ public final class MigrationExecutor extends RequestHandlerSupport {
     }
 
     private MigrateResponse failTarget(String seriesKey, String migrationId, String message) {
+        return failTarget(seriesKey, migrationId, MigrateStatus.ERROR, message);
+    }
+
+    private MigrateResponse failTarget(String seriesKey, String migrationId, MigrateStatus status, String message) {
         staging.remove(migrationId);
         volume.storage().releaseReservation(migrationId);
         updateState(migrationId, seriesKey, Role.TARGET, MigratePhase.FAILED, null, message);
-        return MigrateResponse.of(MigrateStatus.ERROR, message);
+        return MigrateResponse.of(status, message);
+    }
+
+    /**
+     * Motivo de cota pelo qual este destino recusa a reserva: séries = entradas vivas do volume + alvos de
+     * migração ainda abertos (excluindo esta) {@code >= quotaMaxSeries}; bytes = usados + reservados +
+     * {@code totalBytes} {@code > quotaMaxBytes}. Vazio sem cota ou com folga.
+     */
+    private Optional<String> quotaRefusal(MigratePrepareRequest request) {
+        if (quotaMaxSeries <= 0 && quotaMaxBytes <= 0) {
+            return Optional.empty();
+        }
+        var stats = volume.stats();
+        if (quotaMaxSeries > 0) {
+            long openTargets = states.values().stream()
+                    .filter(s -> s.role() == Role.TARGET && !isTerminal(s.phase())
+                            && !s.migrationId().equals(request.migrationId()))
+                    .count();
+            long effective = stats.catalogEntryCount() + openTargets;
+            if (effective >= quotaMaxSeries) {
+                return Optional.of("quota_series(" + (effective + 1) + "/" + quotaMaxSeries + ")");
+            }
+        }
+        if (quotaMaxBytes > 0) {
+            long used = Arrays.stream(stats.shardUsedBytes()).sum();
+            long effective = used + volume.storage().reservedBytes() + request.totalBytes();
+            if (effective > quotaMaxBytes) {
+                return Optional.of("quota_bytes(" + effective + "/" + quotaMaxBytes + ")");
+            }
+        }
+        return Optional.empty();
     }
 
     private MigrateResponse handleChunk(MigrateChunkRequest request) {

@@ -121,6 +121,14 @@ class ProtocolCodecTest {
     }
 
     @Test
+    void migrateResponseQuotaExceededSobreviveAoRoundTrip() throws IOException {
+        MigrateResponse original = MigrateResponse.of(MigrateStatus.QUOTA_EXCEEDED, "quota_series(6/5)");
+        assertEquals(original, roundTripResponseBody(Commands.MIGRATE_PREPARE, original));
+        assertEquals(MigrateStatus.QUOTA_EXCEEDED, MigrateStatus.values()[MigrateStatus.values().length - 1],
+                "QUOTA_EXCEEDED fica no fim do enum");
+    }
+
+    @Test
     void placeRequestComDefinitionNameSobreviveAoRoundTrip() throws IOException {
         PlaceRequest original = new PlaceRequest("series-1", "abc123def456", null, null, "ifaceStats");
         assertEquals(original, roundTripRequestBody(Commands.PLACE, original));
