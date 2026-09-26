@@ -294,7 +294,7 @@ public final class NgrrdStorageNode implements Closeable {
                         migrationExecutor, cfg.migrationTimeout(), localReconciler);
                 AdminRequestHandler adminHandler = new AdminRequestHandler(node.transport(), self, leaderView,
                         catalog, statusReporter::metricsSnapshot, rpc, rebalancer, adminService, migrationCoordinator,
-                        cfg.placementRules());
+                        cfg.placementRules(), peerId -> node.decommissionPeer(NodeId.of(peerId)));
 
                 statusReporter.distribution(cfg.distributionMode(), cfg.weight());
                 // Issue #167 (item 3): cota dura e fingerprint das regras de placement em todo status.

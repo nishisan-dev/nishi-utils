@@ -93,6 +93,14 @@ public final class Commands {
     public static final String ADMIN_METRICS = "ngrrd.admin.metrics";
     /** Coordenador (líder): dispara um ciclo de rebalanceamento imediato. */
     public static final String ADMIN_REBALANCE = "ngrrd.admin.rebalance";
+    /**
+     * Esquece um storage node substituído/desativado (revisão #178, B9; desde a 8.8.0). Sem
+     * {@code forwarded}: coordenador (líder) — valida que o nó já não tem séries no catálogo nem
+     * está alcançável, propaga a ordem a todos os storages alcançáveis e remove o nó do catálogo.
+     * Com {@code forwarded}: qualquer nó — só esquece o peer no seu próprio {@code Transport}
+     * ({@code NGridNode.decommissionPeer}), saindo da maioria de votantes.
+     */
+    public static final String ADMIN_FORGET = "ngrrd.admin.forget";
 
     /**
      * Comandos atendidos exclusivamente pelo líder do cluster.

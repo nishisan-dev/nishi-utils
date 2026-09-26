@@ -37,6 +37,7 @@ import dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.metrics.LatencySnapshot;
 import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
+import dev.nishisan.utils.oss.cluster.protocol.AdminForgetResponse;
 import dev.nishisan.utils.oss.cluster.protocol.AdminNodeRequest;
 import dev.nishisan.utils.oss.cluster.protocol.AdminNodeStatusResponse;
 import dev.nishisan.utils.oss.cluster.protocol.AdminRebalanceResponse;
@@ -457,6 +458,38 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
     @Override
     public StorageNodeStatus activateNode(String nodeId) {
         return adminTransition(Commands.ADMIN_ACTIVATE, nodeId, "ngrrd.admin.activate");
+    }
+
+    @Override
+    public AdminForgetResponse forgetNode(String nodeId) {
+        ensureOpen();
+        Objects.requireNonNull(nodeId, "nodeId");
+        int attempt = 0;
+        NodeId leaderHint = null;
+        for (;;) {
+            attempt++;
+            NodeId leader = leaderHint != null ? leaderHint : awaitLeaderIdOrThrow();
+            leaderHint = null;
+            AdminForgetResponse response = rpc.call(leader, Commands.ADMIN_FORGET, new AdminNodeRequest(nodeId, false),
+                    AdminForgetResponse.class);
+            if (response.status() == SeriesStatus.OK) {
+                return response;
+            }
+            if (response.status() != SeriesStatus.NOT_LEADER) {
+                throw new NgrrdClusterException(ErrorCode.REMOTE_ERROR,
+                        "ngrrd.admin.forget respondeu " + response.status()
+                                + (response.message() != null ? " (" + response.message() + ")" : ""));
+            }
+            if (attempt >= MAX_NOT_LEADER_ATTEMPTS) {
+                throw new NgrrdClusterException(ErrorCode.NO_LEADER,
+                        "NOT_LEADER persistente ao executar ngrrd.admin.forget após " + attempt + " tentativas");
+            }
+            if (response.leaderNodeId() != null) {
+                leaderHint = NodeId.of(response.leaderNodeId());
+            } else {
+                sleepQuietly(LEADER_POLL_INTERVAL_MS);
+            }
+        }
     }
 
     /** Implementação comum de {@link #drainNode(String)}/{@link #activateNode(String)}. */
