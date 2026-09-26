@@ -54,11 +54,16 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -255,6 +260,61 @@ class RebalancerTest {
             rebalancer.close();
             coordinator.close();
         }
+    }
+
+    /**
+     * O conjunto de exclusões costuma se repetir a cada ciclo enquanto um nó segue atrasado: o marcador
+     * {@code NGRRD_REBALANCE_DEST_EXCLUDED} sai em INFO só quando o conjunto (nós e motivos) muda, e em FINE
+     * nos ciclos em que se repete.
+     */
+    @Test
+    void exclusaoDeDestinoSoLogaEmInfoQuandoOConjuntoMuda() {
+        leaderView.reachable.add("storage-lag");
+        catalog.putNodeStatus(withReplica("storage-a", 0, CatalogReplicaStatus.ofLeader()));
+        catalog.putNodeStatus(withReplica("storage-lag", 0,
+                new CatalogReplicaStatus(false, 5_000L, 9_000L, 4_001L, false, false, true)));
+        MigrationCoordinator coordinator = new MigrationCoordinator(catalog,
+                new BlockingMigrationRpc(new CountDownLatch(0), new AtomicInteger()), leaderView, 2,
+                Duration.ofMillis(20), Duration.ofSeconds(5), Clock.systemUTC());
+        Rebalancer rebalancer = new Rebalancer(catalog, leaderView, coordinator,
+                new RebalanceSettings(1L, 0.0, 50), false, Duration.ofSeconds(60), Duration.ofSeconds(5),
+                Clock.systemUTC());
+        Logger logger = Logger.getLogger(Rebalancer.class.getName());
+        List<Level> levels = new CopyOnWriteArrayList<>();
+        Handler capture = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                if (record.getMessage() != null && record.getMessage().startsWith("NGRRD_REBALANCE_DEST_EXCLUDED")) {
+                    levels.add(record.getLevel());
+                }
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        Level previousLevel = logger.getLevel();
+        logger.setLevel(Level.ALL);
+        logger.addHandler(capture);
+        try {
+            rebalancer.triggerNow();
+            rebalancer.triggerNow();
+            catalog.putNodeStatus(withReplica("storage-lag", 0,
+                    new CatalogReplicaStatus(false, 7_000L, 11_000L, 4_001L, false, false, true)));
+            rebalancer.triggerNow();
+            rebalancer.triggerNow();
+        } finally {
+            logger.removeHandler(capture);
+            logger.setLevel(previousLevel);
+            rebalancer.close();
+            coordinator.close();
+        }
+
+        assertEquals(List.of(Level.INFO, Level.FINE, Level.INFO, Level.FINE), levels);
     }
 
     private static StorageNodeStatus withReplica(String nodeId, long seriesCount, CatalogReplicaStatus replica) {

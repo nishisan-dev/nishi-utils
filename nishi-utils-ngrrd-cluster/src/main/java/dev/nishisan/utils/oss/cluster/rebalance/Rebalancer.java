@@ -73,6 +73,11 @@ public final class Rebalancer implements LeadershipListener, ClusterCoordinator.
     private final ScheduledExecutorService scheduler;
 
     private final AtomicBoolean running = new AtomicBoolean(false);
+    /**
+     * Exclusões de destino do ciclo anterior (nó → motivo): {@code NGRRD_REBALANCE_DEST_EXCLUDED} sai em
+     * INFO só quando o conjunto muda — um nó que segue atrasado repetiria a mesma linha a cada ciclo.
+     */
+    private volatile Map<String, String> lastExcludedDestinations = Map.of();
     private volatile ScheduledFuture<?> intervalTask;
     private volatile ScheduledFuture<?> debounceTask;
 
@@ -337,7 +342,8 @@ public final class Rebalancer implements LeadershipListener, ClusterCoordinator.
      * Monta o plano do ciclo sobre a visão local do líder — usado pelo ciclo agendado, pelo disparo por
      * membership e por {@link #triggerNow()}. Destinos com a réplica do catálogo atrasada
      * ({@link CatalogLagGate}, limite {@link RebalanceSettings#maxDestinationCatalogLag()}) ficam de fora e
-     * são logados em {@code NGRRD_REBALANCE_DEST_EXCLUDED}.
+     * são logados em {@code NGRRD_REBALANCE_DEST_EXCLUDED} (INFO quando o conjunto muda, FINE quando se
+     * repete).
      */
     private CyclePlan buildPlan() {
         Collection<StorageNodeStatus> nodes = catalog.nodesLocal();
@@ -368,10 +374,12 @@ public final class Rebalancer implements LeadershipListener, ClusterCoordinator.
                     .ifPresent(reason -> excluded.put(node.nodeId(), reason));
         }
         if (!excluded.isEmpty()) {
-            LOGGER.info("NGRRD_REBALANCE_DEST_EXCLUDED nodes=" + excluded.entrySet().stream()
+            Level level = excluded.equals(lastExcludedDestinations) ? Level.FINE : Level.INFO;
+            LOGGER.log(level, "NGRRD_REBALANCE_DEST_EXCLUDED nodes=" + excluded.entrySet().stream()
                     .map(entry -> entry.getKey() + "(" + entry.getValue() + ")")
                     .collect(Collectors.joining(",")));
         }
+        lastExcludedDestinations = Map.copyOf(excluded);
         return excluded;
     }
 
