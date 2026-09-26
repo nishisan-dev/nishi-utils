@@ -171,6 +171,10 @@ Transport (`TcpTransport`/`NetworkRouter`):
 
 - Ordenação epoch-aware de linhagem no protocolo (follow-up do D8/D10) segue pendente: sequências
   de linhagens divergentes continuam numericamente comparáveis.
+- Um relay não rastreia os requests que encaminhou (B6): a queda do destino depois do
+  encaminhamento é sinalizada pelo relatório de peers conectados do relay (`PEER_UPDATE`) ou pelo
+  UNDELIVERABLE; o `requestTimeout` segue como último recurso. O UNDELIVERABLE de uma resposta
+  (B10) é repassado ao requisitante em melhor esforço — sem rota, vale o timeout.
 - Listeners de liderança ainda rodam sob `leaderComputationLock` (com I/O de disco no re-anchor do
   handback) — documentado, sem mudança nesta versão (C10).
 - Séries legadas sem `definitionName` só casam regras por `keyPrefix` até serem reabertas por um
