@@ -135,6 +135,56 @@ class SeedAliasHandshakeTest {
                 "o handshake do discador ficou sem resposta");
     }
 
+    /**
+     * Defesa em profundidade: um socket de alias cujo handshake nunca é respondido não pode substituir o
+     * dial do id canônico indefinidamente — depois de um prazo limitado o id canônico é discado.
+     */
+    @Test
+    void aliasSocketWithoutHandshakeReplyDoesNotReplaceTheCanonicalDialForever() throws Exception {
+        ServerSocket silentSeed = new ServerSocket();
+        closeables.add(silentSeed);
+        silentSeed.bind(new InetSocketAddress("127.0.0.1", 0));
+        int seedPort = silentSeed.getLocalPort();
+        usedPorts.add(seedPort);
+        List<Socket> accepted = new java.util.concurrent.CopyOnWriteArrayList<>();
+        closeables.add(() -> accepted.forEach(socket -> {
+            try {
+                socket.close();
+            } catch (IOException ignored) {
+                // best-effort cleanup
+            }
+        }));
+        Thread.ofVirtual().start(() -> {
+            try {
+                while (true) {
+                    accepted.add(silentSeed.accept()); // accepts, reads nothing, never answers
+                }
+            } catch (IOException ignored) {
+                // server closed
+            }
+        });
+        NodeInfo client = node("client-1", freePort());
+        NodeInfo alias = node("127.0.0.1:" + seedPort, seedPort);
+        NodeInfo canonical = node("storage-c", seedPort);
+        TcpTransport transport = transport(client, Duration.ofMillis(300), alias);
+        AtomicInteger canonicalDials = new AtomicInteger();
+        transport.setBeforeDialHook(id -> {
+            if (id.equals(canonical.nodeId())) {
+                canonicalDials.incrementAndGet();
+            }
+        });
+        transport.start();
+        awaitTrue(() -> !accepted.isEmpty() && transport.isConnected(alias.nodeId()),
+                "o cliente não discou o alias do seed");
+
+        transport.addPeer(canonical); // the canonical id of that address, learned from gossip
+        awaitTrue(() -> {
+            transport.send(ClusterMessage.lightweight(MessageType.HEARTBEAT, "hb", client.nodeId(),
+                    canonical.nodeId(), HeartbeatPayload.now()));
+            return canonicalDials.get() > 0;
+        }, "o id canônico nunca foi discado: o socket do alias sem handshake o substituiu indefinidamente");
+    }
+
     // ---- helpers ----
 
     /**

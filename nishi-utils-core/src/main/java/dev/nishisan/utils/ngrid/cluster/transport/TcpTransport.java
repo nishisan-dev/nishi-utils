@@ -585,11 +585,21 @@ public final class TcpTransport implements Transport {
      * duplicate connection that each endpoint registered in a different order (the dialer re-keys
      * the seed link only when the reply arrives), so the tie-break in registerLiveConnection kept a
      * different socket on each side and the link dropped.
+     * <p>
+     * A socket still waiting for the remote's handshake is reused only while that handshake can still
+     * be in flight — for at most {@link TcpTransportConfig#connectTimeout()} since the socket was
+     * opened. A socket whose handshake was never answered (e.g. the remote inferred our identity from an earlier frame) must not stand in
+     * for the canonical id forever: past that bound the canonical id is dialed, as before.
      */
     private Connection unpublishedLinkTo(NodeInfo target) {
+        long nowMs = System.currentTimeMillis();
+        long handshakeWaitMs = config.connectTimeout().toMillis();
         for (Connection candidate : liveSockets) {
             NodeInfo remote = candidate.remote;
-            if (remote == null || !candidate.isOpen()) {
+            // A socket whose remote handshake was already read is being published right now: reuse it.
+            // One still waiting for that handshake is reused only within the bound above.
+            if (remote == null || !candidate.isOpen()
+                    || (!candidate.handshaked() && nowMs - candidate.openedAtMs > handshakeWaitMs)) {
                 continue;
             }
             if (remote.nodeId().equals(target.nodeId())) {
@@ -1513,8 +1523,11 @@ public final class TcpTransport implements Transport {
         private final ReentrantLock handshakeGate = new ReentrantLock();
         private final List<ClusterMessage> heldBeforeHandshake = new ArrayList<>();
         private volatile boolean handshakeQueued;
+        // When the socket was registered; bounds how long an unanswered link may stand in for a dial.
+        private final long openedAtMs;
 
         private Connection(Socket socket, boolean outboundInitiated) throws IOException {
+            this.openedAtMs = System.currentTimeMillis();
             this.socket = socket;
             this.outboundInitiated = outboundInitiated;
             this.codec = new CompositeMessageCodec(config.compressionMinSize());
