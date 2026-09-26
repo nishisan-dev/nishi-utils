@@ -601,14 +601,14 @@ public final class TcpTransport implements Transport {
      * for the canonical id forever: past that bound the canonical id is dialed, as before.
      */
     private Connection unpublishedLinkTo(NodeInfo target) {
-        long nowMs = System.currentTimeMillis();
-        long handshakeWaitMs = config.connectTimeout().toMillis();
+        long nowNanos = System.nanoTime();
+        long handshakeWaitNanos = config.connectTimeout().toNanos();
         for (Connection candidate : liveSockets) {
             NodeInfo remote = candidate.remote;
             // A socket whose remote handshake was already read is being published right now: reuse it.
             // One still waiting for that handshake is reused only within the bound above.
             if (remote == null || !candidate.isOpen()
-                    || (!candidate.handshaked() && nowMs - candidate.openedAtMs > handshakeWaitMs)) {
+                    || (!candidate.handshaked() && nowNanos - candidate.openedAtNanos > handshakeWaitNanos)) {
                 continue;
             }
             if (remote.nodeId().equals(target.nodeId())) {
@@ -1538,11 +1538,12 @@ public final class TcpTransport implements Transport {
         private final ReentrantLock handshakeGate = new ReentrantLock();
         private final List<ClusterMessage> heldBeforeHandshake = new ArrayList<>();
         private volatile boolean handshakeQueued;
-        // When the socket was registered; bounds how long an unanswered link may stand in for a dial.
-        private final long openedAtMs;
+        // When the socket was registered (monotonic clock); bounds how long an unanswered link may
+        // stand in for a dial, immune to wall-clock jumps.
+        private final long openedAtNanos;
 
         private Connection(Socket socket, boolean outboundInitiated) throws IOException {
-            this.openedAtMs = System.currentTimeMillis();
+            this.openedAtNanos = System.nanoTime();
             this.socket = socket;
             this.outboundInitiated = outboundInitiated;
             this.codec = new CompositeMessageCodec(config.compressionMinSize());
