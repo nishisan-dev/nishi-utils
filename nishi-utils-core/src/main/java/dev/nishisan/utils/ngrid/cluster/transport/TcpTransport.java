@@ -390,6 +390,7 @@ public final class TcpTransport implements Transport {
         }
 
         NodeId target = nextHop.get();
+        response.via = target;
         Connection connection = ensureConnection(target);
         
         if (connection != null) {
@@ -402,6 +403,7 @@ public final class TcpTransport implements Transport {
                 if (fallback.isPresent() && !fallback.get().equals(destination)) {
                     Connection proxyConn = ensureConnection(fallback.get());
                     if (proxyConn != null) {
+                        response.via = fallback.get();
                         proxyConn.send(message);
                     } else {
                         pendingResponses.remove(requestId, response);
@@ -1022,6 +1024,9 @@ public final class TcpTransport implements Transport {
         PeerUpdatePayload payload = message.payload(PeerUpdatePayload.class);
         // Departures first, so the same update cannot re-admit what it reports as gone.
         payload.departed().forEach((id, remainingMs) -> learnDepartureSecondHand(id, remainingMs, message.source()));
+        if (payload.connectedPeers() != null && message.source() != null) {
+            failPendingResponsesViaRelay(message.source(), payload.connectedPeers());
+        }
         
         // Feed router with reachability info
         router.updateReachability(message.source(), admissible(payload.peers()), admissible(payload.latencies()),
@@ -1185,7 +1190,13 @@ public final class TcpTransport implements Transport {
                 return;
             }
             // Forwarding: ONE hop, over an OPEN direct connection to the destination only. A relay must
-            // never dial the destination on behalf of the sender nor re-proxy through a third node:
+            // never dial the destination on behalf of the sender nor re-proxy through a third node.
+            // Forwarded requests are NOT tracked here: if the destination dies after the forward, no
+            // UNDELIVERABLE follows. What the relay does report, when it confirms the destination's
+            // disconnect, is its new connected-peer set (PEER_UPDATE); the requester fails its pending
+            // requests routed through this relay to that destination on receipt (see
+            // failPendingResponsesViaRelay), and its request timeout remains the last resort.
+            // Rationale for not dialing/re-proxying:
             // when the destination is dead (a killed leader still targeted by every follower's fetches,
             // heartbeats and client requests) each relayed message turned into a TTL-bounded storm of
             // failed dials and re-forwards across the survivors, executed INLINE on the read loop of the
@@ -1389,10 +1400,16 @@ public final class TcpTransport implements Transport {
         }
     }
 
+    /**
+     * Fails every pending response whose request was addressed to {@code nodeId} OR sent through it as
+     * next hop (a relay): a relay that disconnected will never deliver the response, so the requester
+     * must not wait out its timeout.
+     */
     private void failPendingResponsesTo(NodeId nodeId) {
         List<Map.Entry<UUID, PendingResponse>> toFail = new ArrayList<>();
         for (Map.Entry<UUID, PendingResponse> entry : pendingResponses.entrySet()) {
-            if (nodeId.equals(entry.getValue().destination)) {
+            PendingResponse pending = entry.getValue();
+            if (nodeId.equals(pending.destination) || nodeId.equals(pending.via)) {
                 toFail.add(entry);
             }
         }
@@ -1402,6 +1419,27 @@ public final class TcpTransport implements Transport {
             if (pendingResponses.remove(requestId, pending)) {
                 pending.cancelTimeout();
                 pending.future.completeExceptionally(new PeerDisconnectedException(nodeId, requestId));
+            }
+        }
+    }
+
+    /**
+     * {@code relay} reported the peers it is connected to: a request routed through it to a destination
+     * it no longer reaches (the destination died after the forward) will never be answered through it.
+     * Fail those pending responses at once — the relay does not track forwarded requests, so no
+     * UNDELIVERABLE would ever come.
+     */
+    private void failPendingResponsesViaRelay(NodeId relay, Set<NodeId> relayConnected) {
+        for (Map.Entry<UUID, PendingResponse> entry : pendingResponses.entrySet()) {
+            PendingResponse pending = entry.getValue();
+            if (!relay.equals(pending.via) || relay.equals(pending.destination)
+                    || relayConnected.contains(pending.destination)) {
+                continue;
+            }
+            if (pendingResponses.remove(entry.getKey(), pending)) {
+                pending.cancelTimeout();
+                pending.future.completeExceptionally(new IOException("Request " + entry.getKey() + " to "
+                        + pending.destination + " undeliverable: relay " + relay + " lost its connection to it"));
             }
         }
     }
@@ -2007,6 +2045,9 @@ public final class TcpTransport implements Transport {
     private static final class PendingResponse {
         private final NodeId destination;
         private final CompletableFuture<ClusterMessage> future;
+        // The next hop the request was sent to: the destination itself, or the relay. A disconnect of
+        // the relay (or its report that it lost the destination) fails the response.
+        private volatile NodeId via;
         private volatile ScheduledFuture<?> timeoutTask;
 
         private PendingResponse(NodeId destination, CompletableFuture<ClusterMessage> future) {

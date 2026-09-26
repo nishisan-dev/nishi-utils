@@ -31,10 +31,12 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -103,6 +105,118 @@ class UndeliverableRequestIntegrationTest {
             assertTrue(elapsed < 10_000, "must fail fast, took " + elapsed + " ms");
             assertTrue(String.valueOf(failure.getCause().getMessage()).contains("undeliverable"),
                     "failure must come from the relay's notice: " + failure.getCause());
+        }
+    }
+
+    /**
+     * B6: um request roteado por um relay (próximo salto) deve falhar rápido quando o RELAY cai.
+     * failPendingResponsesTo casava só o destino final, então o request esperava o requestTimeout.
+     */
+    @Test
+    void requestRoutedThroughARelayFailsFastWhenTheRelayDisconnects() throws Exception {
+        int portA = allocateFreeLocalPort(Set.of());
+        int portB = allocateFreeLocalPort(Set.of(portA));
+        int portC = allocateFreeLocalPort(Set.of(portA, portB));
+        NodeInfo infoA = new NodeInfo(NodeId.of("node-a"), "localhost", portA);
+        NodeInfo infoB = new NodeInfo(NodeId.of("node-b"), "localhost", portB);
+        NodeInfo infoC = new NodeInfo(NodeId.of("node-c"), "localhost", portC);
+        TcpTransportConfig confA = TcpTransportConfig.builder(infoA).addPeer(infoB)
+                .requestTimeout(Duration.ofSeconds(60)).build();
+        TcpTransportConfig confB = TcpTransportConfig.builder(infoB).build();
+        TcpTransportConfig confC = TcpTransportConfig.builder(infoC).addPeer(infoB).build();
+
+        try (TcpTransport transA = new TcpTransport(confA);
+             TcpTransport transB = new TcpTransport(confB);
+             TcpTransport transC = new TcpTransport(confC)) {
+            transB.start();
+            transC.start();
+            transA.start();
+            await(() -> transA.isConnected(infoB.nodeId()) && transB.isConnected(infoC.nodeId()), "mesh up");
+            // B reports C as connected: once that report reached A, B is a relay candidate for C.
+            await(() -> {
+                transA.getRouter().markDirectFailure(infoC.nodeId());
+                return Optional.of(infoB.nodeId()).equals(transA.getRouter().nextHop(infoC.nodeId()));
+            }, "A routes to C via B");
+
+            // C never answers (no listener). The request is forwarded by B and stays pending on A.
+            CompletableFuture<ClusterMessage> future = transA.sendAndAwait(ClusterMessage.request(
+                    MessageType.CLIENT_REQUEST, "via-relay", infoA.nodeId(), infoC.nodeId(), "ping"));
+            Thread.sleep(200);
+            transB.close();
+
+            ExecutionException failure = assertThrows(ExecutionException.class,
+                    () -> future.get(10, TimeUnit.SECONDS),
+                    "the request must fail when its relay disconnects, not wait out the 60 s timeout");
+            assertInstanceOf(PeerDisconnectedException.class, failure.getCause());
+        }
+    }
+
+    /**
+     * B6: o destino morre depois de o relay já ter encaminhado o request — nenhum UNDELIVERABLE volta.
+     * O relay não rastreia os requests que encaminhou; o que ele reporta, ao confirmar a queda do
+     * destino, é o novo conjunto de peers conectados (PEER_UPDATE). O remetente falha na hora os
+     * requests pendentes roteados por esse relay para um destino que ele deixou de alcançar.
+     */
+    @Test
+    void requestForwardedByARelayFailsFastWhenTheRelayLosesTheDestination() throws Exception {
+        int portA = allocateFreeLocalPort(Set.of());
+        int portB = allocateFreeLocalPort(Set.of(portA));
+        int portC = allocateFreeLocalPort(Set.of(portA, portB));
+        NodeInfo infoA = new NodeInfo(NodeId.of("node-a"), "localhost", portA);
+        NodeInfo infoB = new NodeInfo(NodeId.of("node-b"), "localhost", portB);
+        NodeInfo infoC = new NodeInfo(NodeId.of("node-c"), "localhost", portC);
+        TcpTransportConfig confA = TcpTransportConfig.builder(infoA).addPeer(infoB)
+                .requestTimeout(Duration.ofSeconds(60)).build();
+        TcpTransportConfig confB = TcpTransportConfig.builder(infoB).build();
+        TcpTransportConfig confC = TcpTransportConfig.builder(infoC).addPeer(infoB).build();
+        CountDownLatch releaseDials = new CountDownLatch(1);
+        CountDownLatch receivedByC = new CountDownLatch(1);
+
+        try (TcpTransport transA = new TcpTransport(confA);
+             TcpTransport transB = new TcpTransport(confB);
+             TcpTransport transC = new TcpTransport(confC)) {
+            // A never gets a direct link to C (as when the relay is used for real): its dial is held.
+            transA.setBeforeDialHook(id -> {
+                if (id.equals(infoC.nodeId())) {
+                    try {
+                        releaseDials.await();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            });
+            transC.addListener(new TransportListener() {
+                public void onPeerConnected(NodeInfo peer) { }
+                public void onPeerDisconnected(NodeId peer) { }
+                public void onMessage(ClusterMessage message) {
+                    if ("via-relay".equals(message.qualifier())) {
+                        receivedByC.countDown();
+                    }
+                }
+            });
+            transB.start();
+            transC.start();
+            transA.start();
+            await(() -> transA.isConnected(infoB.nodeId()) && transB.isConnected(infoC.nodeId()), "mesh up");
+            await(() -> {
+                transA.getRouter().markDirectFailure(infoC.nodeId());
+                return Optional.of(infoB.nodeId()).equals(transA.getRouter().nextHop(infoC.nodeId()));
+            }, "A routes to C via B");
+
+            CompletableFuture<ClusterMessage> future = transA.sendAndAwait(ClusterMessage.request(
+                    MessageType.CLIENT_REQUEST, "via-relay", infoA.nodeId(), infoC.nodeId(), "ping"));
+            assertTrue(receivedByC.await(10, TimeUnit.SECONDS), "B must have forwarded the request to C");
+            assertTrue(!transA.isConnected(infoC.nodeId()), "precondition: A has no direct link to C");
+
+            transC.close();
+
+            ExecutionException failure = assertThrows(ExecutionException.class,
+                    () -> future.get(10, TimeUnit.SECONDS),
+                    "the request must fail once the relay reports it lost C, not wait out the 60 s timeout");
+            assertTrue(String.valueOf(failure.getCause().getMessage()).contains(infoB.nodeId().value()),
+                    "the failure must name the relay: " + failure.getCause());
+        } finally {
+            releaseDials.countDown();
         }
     }
 
