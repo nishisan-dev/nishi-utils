@@ -24,6 +24,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 
 /**
  * Immutable vector of applied frontiers, one per replication topic (issue #178).
@@ -191,8 +192,9 @@ public record TopicFrontiers(Map<String, Long> byTopic) {
         if (priorityTopics != null) {
             ordered.addAll(priorityTopics);
         }
-        ordered.addAll(byTopic.keySet());
-        ordered.addAll(other.byTopic.keySet());
+        Set<String> remainingTopics = new TreeSet<>(byTopic.keySet());
+        remainingTopics.addAll(other.byTopic.keySet());
+        ordered.addAll(remainingTopics);
         for (String topic : ordered) {
             long mine = frontier(topic);
             long theirs = other.frontier(topic);

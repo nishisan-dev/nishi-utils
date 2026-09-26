@@ -21,6 +21,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.List;
 import java.util.Map;
 
 import org.junit.jupiter.api.Test;
@@ -79,6 +80,36 @@ class TopicFrontiersTest {
         // A prioridade nunca sobrepõe a dominância nem a soma.
         TopicFrontiers e = TopicFrontiers.of(Map.of("map:ngrrd.catalog", 9L, "map:ngrrd.nodes", 22L));
         assertTrue(c.isBehind(e, 0L, java.util.List.of("map:ngrrd.catalog")), "soma 31 > 30 vence a prioridade");
+    }
+
+    @Test
+    void equalTotalsWithDifferentTopicsChooseTheSameWinnerOnBothPeers() {
+        TopicFrontiers a = TopicFrontiers.of(Map.of("map:a", 10L));
+        TopicFrontiers b = TopicFrontiers.of(Map.of("map:b", 10L));
+
+        assertEquals(Comparison.INCOMPARABLE, a.compare(b, 0L));
+        assertTrue(a.isAhead(b, 0L), "map:a wins in topic-name order");
+        assertTrue(b.isBehind(a, 0L), "both peers must agree on the winner");
+        assertFalse(b.isAhead(a, 0L));
+        assertFalse(a.isBehind(b, 0L));
+    }
+
+    @Test
+    void tiedPriorityTopicsFallBackToTheSortedUnionOnBothPeers() {
+        TopicFrontiers a = TopicFrontiers.of(Map.of("map:a", 10L, "map:priority", 5L));
+        TopicFrontiers b = TopicFrontiers.of(Map.of("map:b", 10L, "map:priority", 5L));
+        List<String> priorities = List.of("map:priority");
+
+        assertTrue(a.isAhead(b, 0L, priorities));
+        assertTrue(b.isBehind(a, 0L, priorities));
+        assertFalse(b.isAhead(a, 0L, priorities));
+        assertFalse(a.isBehind(b, 0L, priorities));
+
+        List<String> bFirst = List.of("map:b");
+        assertTrue(b.isAhead(a, 0L, bFirst), "explicit priority still overrides topic-name order");
+        assertTrue(a.isBehind(b, 0L, bFirst));
+        assertFalse(a.isAhead(b, 0L, bFirst));
+        assertFalse(b.isBehind(a, 0L, bFirst));
     }
 
     @Test

@@ -33,6 +33,10 @@ com teste de reprodução e correção para cada achado. Plano em
   `ReplicationConfig`; ordem por nome como padrão; deve ser igual em todos os nós).
   `ClusterCoordinator.maxActivePeerTopicFrontier(topic)` e `TopicReplicationStatus.maxPeerFrontier`
   expõem a maior fronteira dos peers elegíveis por tópico.
+- **Desempate simétrico com tópicos ausentes.** Quando dois vetores têm a mesma soma e conjuntos
+  diferentes de tópicos, o desempate ordena a união dos nomes após os tópicos prioritários. Antes,
+  cada nó comparava seus próprios tópicos primeiro e ambos podiam se considerar à frente.
+  Dois testes de regressão cobrem o caso sem prioridade e com prioridade empatada.
 - **Líder recém-eleito cede ao estado mais novo.** A eleição pode correr com o heartbeat (3 s): o
   sobrevivente de maior afinidade era eleito com vetores desatualizados e, ao ver o outro à frente no
   catálogo, retinha (F2) — a op confirmada se perdia (`LeaderFailoverDuringMigrationClusterTest`, 1

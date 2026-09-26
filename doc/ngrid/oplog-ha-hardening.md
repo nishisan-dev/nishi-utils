@@ -632,4 +632,3 @@ sem vetor; incomparáveis; F2 preservado; gate B por tópico; escape D9 por veto
 (compatibilidade), `MultiTopicRestartWatermarkE2ETest`, `LiveDemotionNoReplayE2ETest` (falha na
 8.7.0: 240 itens em vez de 120), `RelayStreamRobustnessTest`, `CoordinatorHardeningTest`, E2E de
 handback verdes com dois tópicos.
-
