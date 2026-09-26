@@ -37,6 +37,7 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketException;
+import java.net.SocketTimeoutException;
 import java.time.Instant;
 import java.util.Collection;
 import java.util.Collections;
@@ -140,6 +141,14 @@ public final class TcpTransport implements Transport {
     // No-op in production.
     private volatile java.util.function.Consumer<ClusterMessage> beforeWriteHook = message -> { };
 
+    // Half-open detection: a connection whose reader receives nothing for this long is closed. Every
+    // live link carries the periodic connected-peer gossip (probeLoop, every routeProbeInterval), so a
+    // silence of max(departedPeerForgetAfter, 3 x routeProbeInterval) — the forget-after window is
+    // 2 x the coordinator's heartbeat timeout when wired by NGridNode — means the peer is gone without
+    // FIN/RST (dead host, NAT, cable). TCP keepalive is enabled too, as a second line (its timers are
+    // OS-level and, where the JDK exposes them, tuned to a third of this window).
+    private final long readIdleTimeoutMs;
+
     private volatile boolean running;
     // Set by close() before it announces the departure (LEAVE): from then on no new connection is
     // registered or published, so the set of peers told about the departure is final.
@@ -155,6 +164,8 @@ public final class TcpTransport implements Transport {
         this.stats = stats;
         this.router = new NetworkRouter(this::collectLatencies, this::canRelay,
                 config.routeProbeInterval().multipliedBy(2));
+        this.readIdleTimeoutMs = Math.max(config.departedPeerForgetAfter().toMillis(),
+                config.routeProbeInterval().multipliedBy(3).toMillis());
         knownPeers.put(config.local().nodeId(), config.local());
         config.initialPeers().forEach(p -> knownPeers.putIfAbsent(p.nodeId(), p));
         Set<NodeId> seedIds = new HashSet<>();
@@ -774,6 +785,7 @@ public final class TcpTransport implements Transport {
         try {
             if (!running || leaving) { throw new IOException("Transport closed during connect"); }
             socket.setTcpNoDelay(true);
+            configureLiveness(socket);
             connection = new Connection(socket, preResolved != null);
             liveSockets.add(connection);
             if (preResolved != null) {
@@ -791,6 +803,28 @@ public final class TcpTransport implements Transport {
         Thread.ofVirtual().name("ngrid-transport-reader").start(connection::readLoop);
         LOGGER.fine(() -> "Registered connection: " + socket.getRemoteSocketAddress());
         return connection;
+    }
+
+    /**
+     * Keepalive and read timeout of a socket (see {@link #readIdleTimeoutMs}). The keepalive timers
+     * (idle, interval, count) are set where the JDK exposes them (Linux, macOS); elsewhere the OS
+     * defaults apply and the read timeout alone bounds a half-open connection.
+     */
+    private void configureLiveness(Socket socket) throws IOException {
+        socket.setKeepAlive(true);
+        if (readIdleTimeoutMs > 0 && readIdleTimeoutMs <= Integer.MAX_VALUE) {
+            socket.setSoTimeout((int) readIdleTimeoutMs);
+        }
+        try {
+            if (socket.supportedOptions().contains(jdk.net.ExtendedSocketOptions.TCP_KEEPIDLE)) {
+                int idleSeconds = (int) Math.max(1L, Math.min(Integer.MAX_VALUE, readIdleTimeoutMs / 3_000L));
+                socket.setOption(jdk.net.ExtendedSocketOptions.TCP_KEEPIDLE, idleSeconds);
+                socket.setOption(jdk.net.ExtendedSocketOptions.TCP_KEEPINTERVAL, Math.max(1, idleSeconds / 3));
+                socket.setOption(jdk.net.ExtendedSocketOptions.TCP_KEEPCOUNT, 3);
+            }
+        } catch (UnsupportedOperationException | IllegalArgumentException | IOException e) {
+            LOGGER.fine(() -> "TCP keepalive timers not tunable on this platform: " + e.getMessage());
+        }
     }
 
     /**
@@ -2083,6 +2117,14 @@ public final class TcpTransport implements Transport {
                         }
                         handleMessage(remoteId().orElse(null), message);
                     }
+                }
+            } catch (SocketTimeoutException e) {
+                if (open) {
+                    // Nothing arrived for the whole read-idle window while every live link carries
+                    // periodic gossip: the peer is gone without closing (half-open). Close it here, so
+                    // it stops counting as connected and its outbound queue stops growing.
+                    LOGGER.log(Level.INFO, "Connection to {0} silent for {1} ms: closing half-open connection",
+                            new Object[]{remote, readIdleTimeoutMs});
                 }
             } catch (Exception e) {
                 if (open) {

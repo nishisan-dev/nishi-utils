@@ -18,27 +18,37 @@
 package dev.nishisan.utils.ngrid.cluster.transport;
 
 import dev.nishisan.utils.ngrid.common.ClusterMessage;
+import dev.nishisan.utils.ngrid.common.MessageType;
 
 import java.util.Collection;
+import java.util.Iterator;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Outbound message buffer for a single transport connection.
+ * Outbound message buffer for a single transport connection, with bounded backpressure on the
+ * recoverable data plane (issue #113; restored in 8.8.0 after the 5.0.0 push-protocol removal left the
+ * queue unbounded and the counters at a constant zero).
  *
  * <p>
- * Since 5.0.0 (RELAY_STREAM, the definitive replication model) the leader no longer pushes
- * replication traffic: followers PULL the durable op-log as a sequential stream and the leader
- * commits asynchronously on its own binlog. There is therefore no unbounded best-effort data plane
- * to bound, and the legacy per-connection replication drop policy (which dropped excess
- * {@code REPLICATION_REQUEST} bursts and let the follower recover via gap/snapshot catch-up) was
- * removed along with the push protocol. This channel is now a plain unbounded outbound queue.
+ * Policy: only <b>data frames</b> — {@link MessageType#RELAY_STREAM_BATCH}, the replication stream a
+ * follower pulls and re-fetches on its own when a batch is missing — count towards
+ * {@code capacity} and may be dropped. When a data frame arrives while {@code capacity} data frames
+ * are already queued, the <b>oldest</b> queued data frame is dropped (the newest carries the most
+ * recent state; the follower's next fetch recovers the gap). Every other frame — HEARTBEAT, PING,
+ * HANDSHAKE, PEER_UPDATE, LEAVE, UNDELIVERABLE, requests/responses, SYNC_*, RELAY_STREAM_FETCH — is
+ * control traffic: never dropped, never counted, so a slow follower can never starve the heartbeat
+ * (which would trigger a spurious re-election) nor lose a request.
  * </p>
  *
  * <p>
- * The depth/dropped/capacity accessors are retained as stable {@code 0} values so the transport's
- * observability surface (occupancy and drop metrics) keeps compiling and reporting a meaningful
- * "no drops" view.
+ * {@code capacity == 0} means unbounded (nothing is ever dropped); the depth counter is still kept
+ * for observability. The limit is soft: the check-then-enqueue race lets concurrent producers
+ * overshoot by at most their number. The quota is per physical connection: a data frame relayed for
+ * another destination is subject to the relay's quota (memory relief on the relay; the destination's
+ * catch-up recovers it).
  * </p>
  *
  * <p>
@@ -50,29 +60,56 @@ import java.util.concurrent.TimeUnit;
 final class OutboundChannel {
 
     private final LinkedBlockingQueue<ClusterMessage> queue = new LinkedBlockingQueue<>();
+    private final int capacity;
+    private final AtomicInteger pendingData = new AtomicInteger();
+    private final AtomicLong dropped = new AtomicLong();
 
     /**
-     * Creates an outbound channel. The {@code replicationCapacity} argument is accepted for source
-     * compatibility but no longer has any effect (the replication drop policy was removed with the
-     * push protocol in 5.0.0).
+     * Creates an outbound channel.
      *
-     * @param replicationCapacity ignored; must be {@code >= 0}
-     * @throws IllegalArgumentException if {@code replicationCapacity} is negative
+     * @param capacity maximum number of queued data frames before the oldest is dropped;
+     *                 {@code 0} for unbounded
+     * @throws IllegalArgumentException if {@code capacity} is negative
      */
-    OutboundChannel(int replicationCapacity) {
-        if (replicationCapacity < 0) {
+    OutboundChannel(int capacity) {
+        if (capacity < 0) {
             throw new IllegalArgumentException("replicationCapacity must be >= 0");
         }
+        this.capacity = capacity;
+    }
+
+    /** The one rule deciding which frames are bounded (data plane) — kept in a single place. */
+    private static boolean isDataFrame(ClusterMessage message) {
+        return message.type() == MessageType.RELAY_STREAM_BATCH;
     }
 
     /**
-     * Enqueues a message. The backing queue is unbounded, so this always accepts.
+     * Enqueues a message. Control frames are always accepted. A data frame is always accepted too,
+     * but when the data quota is full the oldest queued data frame is dropped to make room for it.
      *
      * @param message the message to enqueue
-     * @return {@code true} (always)
+     * @return {@code true} when the message was queued (always, for the current policy)
      */
     boolean enqueue(ClusterMessage message) {
+        if (!isDataFrame(message)) {
+            return queue.offer(message);
+        }
+        if (capacity > 0 && pendingData.get() >= capacity && dropOldestDataFrame()) {
+            dropped.incrementAndGet();
+        }
+        pendingData.incrementAndGet();
         return queue.offer(message);
+    }
+
+    private boolean dropOldestDataFrame() {
+        for (Iterator<ClusterMessage> it = queue.iterator(); it.hasNext(); ) {
+            if (isDataFrame(it.next())) {
+                it.remove();
+                pendingData.decrementAndGet();
+                return true;
+            }
+        }
+        return false; // the quota was just drained by the writer
     }
 
     /**
@@ -84,7 +121,11 @@ final class OutboundChannel {
      * @throws InterruptedException if interrupted while waiting
      */
     ClusterMessage poll(long timeout, TimeUnit unit) throws InterruptedException {
-        return queue.poll(timeout, unit);
+        ClusterMessage message = queue.poll(timeout, unit);
+        if (message != null && isDataFrame(message)) {
+            pendingData.decrementAndGet();
+        }
+        return message;
     }
 
     /**
@@ -96,35 +137,42 @@ final class OutboundChannel {
      * @return the number of messages drained
      */
     int drainTo(Collection<? super ClusterMessage> sink) {
-        return queue.drainTo(sink);
+        java.util.ArrayList<ClusterMessage> drained = new java.util.ArrayList<>();
+        int count = queue.drainTo(drained);
+        for (ClusterMessage message : drained) {
+            if (isDataFrame(message)) {
+                pendingData.decrementAndGet();
+            }
+        }
+        sink.addAll(drained);
+        return count;
     }
 
     /**
-     * Returns the replication queue depth. Always {@code 0} since the push data plane was removed.
+     * Returns the number of data frames currently queued (bounded by {@link #capacity()} when it is
+     * positive, up to the concurrent-producer overshoot).
      *
-     * @return {@code 0}
+     * @return the queued data frame count
      */
     int dataDepth() {
-        return 0;
+        return Math.max(0, pendingData.get());
     }
 
     /**
-     * Returns the cumulative number of replication messages dropped by backpressure. Always
-     * {@code 0} since the drop policy was removed.
+     * Returns the cumulative number of data frames dropped by backpressure on this connection.
      *
-     * @return {@code 0}
+     * @return the drop count
      */
     long droppedCount() {
-        return 0L;
+        return dropped.get();
     }
 
     /**
-     * Returns the configured replication capacity. Always {@code 0} (unbounded) since the drop
-     * policy was removed.
+     * Returns the configured data-frame capacity; {@code 0} means unbounded.
      *
-     * @return {@code 0}
+     * @return the capacity
      */
     int capacity() {
-        return 0;
+        return capacity;
     }
 }
