@@ -246,7 +246,8 @@ public final class NgrrdStorageNode implements Closeable {
                         PlacementRequestHandler.fromCoordinator(node.coordinator(), node.transport());
                 PlacementRequestHandler placementHandler = new PlacementRequestHandler(node.transport(), catalog,
                         leaderView, node.replicationManager()::isLeaderSyncing, new LeastLoadedPlacementPolicy(),
-                        cfg.nodeStatusStaleAfter(), cfg.placementGraceAfterLeadership(), Clock.systemUTC());
+                        cfg.nodeStatusStaleAfter(), cfg.placementGraceAfterLeadership(), Clock.systemUTC(),
+                        cfg.placementRules());
                 wirePlacementHandler(placementHandler, self, node.coordinator()::addLeadershipListener,
                         node.transport()::addListener, rpc::registerLocalHandler);
 

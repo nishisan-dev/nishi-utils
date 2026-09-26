@@ -28,6 +28,7 @@ import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogView;
 import dev.nishisan.utils.oss.cluster.catalog.PlacementState;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
+import dev.nishisan.utils.oss.cluster.placement.DestinationEligibility;
 import dev.nishisan.utils.oss.cluster.placement.PlacementContext;
 import dev.nishisan.utils.oss.cluster.placement.PlacementPolicy;
 import dev.nishisan.utils.oss.cluster.placement.PlacementRules;
@@ -87,6 +88,8 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
     private final Duration nodeStatusStaleAfter;
     private final Duration placementGraceAfterLeadership;
     private final Clock clock;
+    /** Regras de placement deste líder ({@code ngrrd.placement.rules}, issue #167 item 3); nunca {@code null}. */
+    private final PlacementRules placementRules;
 
     private volatile boolean needsAdmissionRebuild = true;
     private final java.util.concurrent.locks.ReentrantLock admissionLock = new java.util.concurrent.locks.ReentrantLock();
@@ -132,7 +135,20 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
             BooleanSupplier leaderSyncing, PlacementPolicy policy, Duration nodeStatusStaleAfter,
             Duration placementGraceAfterLeadership, Clock clock) {
         this(transport, (CatalogView) catalog, leaderView, leaderSyncing, policy, nodeStatusStaleAfter,
-                placementGraceAfterLeadership, clock);
+                placementGraceAfterLeadership, clock, PlacementRules.NONE);
+    }
+
+    /**
+     * @param leaderSyncing  indica se a réplica deste nó, mesmo já líder, ainda está em catch-up de um
+     *                       mandato anterior ({@code ReplicationManager#isLeaderSyncing()})
+     * @param placementRules regras de placement deste nó ({@code ngrrd.placement.rules}, issue #167 item 3),
+     *                       aplicadas quando ele é o líder; {@code null} = nenhuma
+     */
+    public PlacementRequestHandler(Transport transport, CatalogService catalog, LeaderView leaderView,
+            BooleanSupplier leaderSyncing, PlacementPolicy policy, Duration nodeStatusStaleAfter,
+            Duration placementGraceAfterLeadership, Clock clock, PlacementRules placementRules) {
+        this(transport, (CatalogView) catalog, leaderView, leaderSyncing, policy, nodeStatusStaleAfter,
+                placementGraceAfterLeadership, clock, placementRules);
     }
 
     /**
@@ -142,7 +158,16 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
     PlacementRequestHandler(Transport transport, CatalogView catalog, LeaderView leaderView,
             BooleanSupplier leaderSyncing, PlacementPolicy policy, Duration nodeStatusStaleAfter,
             Duration placementGraceAfterLeadership, Clock clock) {
+        this(transport, catalog, leaderView, leaderSyncing, policy, nodeStatusStaleAfter,
+                placementGraceAfterLeadership, clock, PlacementRules.NONE);
+    }
+
+    /** Construtor de teste com regras de placement (ver acima). */
+    PlacementRequestHandler(Transport transport, CatalogView catalog, LeaderView leaderView,
+            BooleanSupplier leaderSyncing, PlacementPolicy policy, Duration nodeStatusStaleAfter,
+            Duration placementGraceAfterLeadership, Clock clock, PlacementRules placementRules) {
         super(transport, Set.of(Commands.PLACE, Commands.CATALOG_LOOKUP));
+        this.placementRules = Objects.requireNonNullElse(placementRules, PlacementRules.NONE);
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.leaderView = Objects.requireNonNull(leaderView, "leaderView");
         this.leaderSyncing = Objects.requireNonNull(leaderSyncing, "leaderSyncing");
@@ -299,11 +324,16 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
                 needsAdmissionRebuild = false;
             }
             Collection<StorageNodeStatus> nodes = catalog.nodesLocal();
+            Set<String> reachable = leaderView.reachableNodeIds();
             long now = clock.millis();
-            PlacementContext ctx = new PlacementContext(nodes, leaderView.reachableNodeIds(),
+            // Issue #167 (item 3): as regras são uniformes por configuração; um nó alcançável com um
+            // fingerprint diferente do deste líder gera um WARNING (uma vez por mudança), nunca descarte.
+            DestinationEligibility.warnIfRulesDiverge(placementRules,
+                    nodes.stream().filter(node -> reachable.contains(node.nodeId())).toList());
+            PlacementContext ctx = new PlacementContext(nodes, reachable,
                     snapshotPending(nodes), now, nodeStatusStaleAfter, request.preferredOwnerNodeId(),
                     request.geometry() == null ? 0 : request.geometry().regionBytes(), catalog.pendingBytesByNode(),
-                    request.seriesKey(), request.definitionName(), PlacementRules.NONE);
+                    request.seriesKey(), request.definitionName(), placementRules);
 
             Optional<String> chosen = policy.choose(ctx);
             if (chosen.isEmpty()) {

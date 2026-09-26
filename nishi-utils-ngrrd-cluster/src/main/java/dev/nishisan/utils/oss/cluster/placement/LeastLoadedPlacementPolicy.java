@@ -20,6 +20,7 @@ package dev.nishisan.utils.oss.cluster.placement;
 import dev.nishisan.utils.oss.cluster.catalog.NodeState;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
@@ -44,6 +45,14 @@ import java.util.logging.Logger;
  * séries novas no primeiro nó a reportar ao novo líder. Sem candidato algum
  * (nem ACTIVE+alcançável), retorna {@link Optional#empty()} — cabe ao
  * chamador responder {@code NO_STORAGE_NODE_AVAILABLE}.</p>
+ *
+ * <p>Issue #167 (item 3): depois da guarda de capacidade, um candidato também é descartado quando
+ * {@link DestinationEligibility#reason} devolve um motivo — cota dura do nó ({@code quota_series}/
+ * {@code quota_bytes}) ou regra de placement ({@code rule_pinned_elsewhere}/{@code rule_excluded}) —
+ * salvo se ele é o {@code preferredOwnerNodeId} (adoção/retomada: o dono preferido ignora cota e
+ * regras; o rebalance corrige depois). Um {@code pin} nunca transborda: se nenhum nó fixado sobrevive
+ * aos filtros, a decisão é vazia mesmo havendo outros nós livres. Quando esse filtro esvazia um
+ * conjunto não vazio, loga {@code NGRRD_PLACEMENT_NO_CANDIDATE series=<chave> excluded=<id>(<motivo>),…}.</p>
  *
  * <p>Entre os candidatos: se {@code preferredOwnerNodeId} sobreviveu aos
  * filtros acima, ele vence direto (ex.: adoção de série existente pelo
@@ -81,13 +90,40 @@ public final class LeastLoadedPlacementPolicy implements PlacementPolicy {
     @Override
     public Optional<String> choose(PlacementContext ctx) {
         DistributionWeights weights = DistributionWeights.resolve(ctx.nodes(), ctx.reachableNodeIds());
-        List<StorageNodeStatus> activeReachable = ctx.nodes().stream()
+        List<StorageNodeStatus> withCapacity = ctx.nodes().stream()
                 .filter(node -> node.state() == NodeState.ACTIVE)
                 .filter(node -> ctx.reachableNodeIds().contains(node.nodeId()))
                 .filter(node -> dev.nishisan.utils.oss.storage.blob.CapacityBudget.fits(node.capacityBytes(),
                         node.usedBytes(), Math.max(node.reservedBytes(), ctx.pendingBytesByNode().getOrDefault(node.nodeId(), 0L)),
                         ctx.requestedBytes()))
                 .toList();
+
+        // Issue #167 (item 3): cota dura e regras de placement gateiam só o DESTINO; o dono preferido
+        // (adoção/retomada) passa direto — o rebalance corrige depois, se for o caso.
+        List<StorageNodeStatus> activeReachable = new ArrayList<>(withCapacity.size());
+        List<String> excluded = new ArrayList<>();
+        for (StorageNodeStatus node : withCapacity) {
+            if (node.nodeId().equals(ctx.preferredOwnerNodeId())) {
+                Optional<String> ignored = eligibilityReason(node, ctx);
+                if (ignored.isPresent()) {
+                    LOGGER.log(Level.FINE, "Dono preferido {0} da série {1} ignora cota/regras ({2})",
+                            new Object[] {node.nodeId(), ctx.seriesKey(), ignored.get()});
+                }
+                activeReachable.add(node);
+                continue;
+            }
+            Optional<String> reason = eligibilityReason(node, ctx);
+            if (reason.isPresent()) {
+                excluded.add(node.nodeId() + "(" + reason.get() + ")");
+            } else {
+                activeReachable.add(node);
+            }
+        }
+        if (activeReachable.isEmpty() && !withCapacity.isEmpty()) {
+            LOGGER.info("NGRRD_PLACEMENT_NO_CANDIDATE series=" + ctx.seriesKey() + " excluded="
+                    + String.join(",", excluded));
+            return Optional.empty();
+        }
 
         List<StorageNodeStatus> fresh = activeReachable.stream()
                 .filter(node -> node.isFresh(ctx.nowEpochMs(), ctx.nodeStatusStaleAfter()))
@@ -126,6 +162,14 @@ public final class LeastLoadedPlacementPolicy implements PlacementPolicy {
                 .map(node -> new Candidate(node.nodeId(), effectiveLoad(node, ctx) / weights.weight(node.nodeId()), sortableFillRatio(node)))
                 .min(byTotalOrder)
                 .map(Candidate::nodeId);
+    }
+
+    /** Cota (com pendências ainda não refletidas no status) e depois regras; vazio = elegível. */
+    private static Optional<String> eligibilityReason(StorageNodeStatus node, PlacementContext ctx) {
+        return DestinationEligibility.reason(node,
+                ctx.pendingSeriesByNode().getOrDefault(node.nodeId(), 0L),
+                ctx.pendingBytesByNode().getOrDefault(node.nodeId(), 0L),
+                ctx.requestedBytes(), ctx.placementRules(), ctx.seriesKey(), ctx.definitionName());
     }
 
     private static long effectiveLoad(StorageNodeStatus node, PlacementContext ctx) {
