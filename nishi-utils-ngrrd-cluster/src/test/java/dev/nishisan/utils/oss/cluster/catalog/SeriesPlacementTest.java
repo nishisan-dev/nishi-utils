@@ -176,6 +176,23 @@ class SeriesPlacementTest {
     }
 
     @Test
+    void placementSerializadoPelaVersao870LeTodosOsCamposDaquelaVersao() throws Exception {
+        try (ObjectInputStream in = new ObjectInputStream(
+                getClass().getResourceAsStream("/legacy-catalog/placement-8.7.0.ser"))) {
+            SeriesPlacement placement = (SeriesPlacement) in.readObject();
+
+            assertEquals("legacy-870", placement.ownerNodeId());
+            assertNull(placement.targetNodeId());
+            assertEquals(PlacementState.ACTIVE, placement.state());
+            assertNull(placement.migrationId());
+            assertEquals(8765L, placement.createdAtEpochMs());
+            assertEquals(8766L, placement.updatedAtEpochMs());
+            assertEquals("geometry-870", placement.geometryId());
+            assertTrue(placement.geometryConfirmed());
+        }
+    }
+
+    @Test
     void isOwnedByDuranteMigracaoRespondePeloOwnerNaoPeloTarget() {
         SeriesPlacement current = SeriesPlacement.active("node-a", 1_000L);
         SeriesPlacement migrating = SeriesPlacement.migrating(current, "node-b", "migration-1", 2_000L);

@@ -294,6 +294,27 @@ class StorageNodeStatusTest {
         assertEquals(replica, status.withState(NodeState.DRAINING, 4L).catalogReplica());
     }
 
+    @Test
+    void statusSerializadoPelaVersao870LeTodosOsCamposDaquelaVersao() throws Exception {
+        try (ObjectInputStream in = new ObjectInputStream(
+                getClass().getResourceAsStream("/legacy-catalog/node-8.7.0.ser"))) {
+            StorageNodeStatus status = (StorageNodeStatus) in.readObject();
+
+            assertEquals("legacy-870", status.nodeId());
+            assertEquals(NodeState.ACTIVE, status.state());
+            assertEquals(13, status.seriesCount());
+            assertEquals(4096, status.usedBytes());
+            assertEquals(70_000, status.capacityBytes());
+            assertEquals(8765L, status.reportedAtEpochMs());
+            assertEquals(DistributionMode.CAPACITY, status.distributionMode());
+            assertEquals(3.0, status.weight());
+            assertEquals(300, status.reservedBytes());
+            assertEquals(StorageCapabilities.ALL, status.capabilities());
+            assertEquals(new CatalogReplicaStatus(false, 12L, 5_000L, 4_989L, false, false, true),
+                    status.catalogReplica());
+        }
+    }
+
     private static StorageNodeStatus withCatalogReplica(CatalogReplicaStatus replica) {
         return new StorageNodeStatus("node-a", NodeState.ACTIVE, 1, 2, 3, 4L, DistributionMode.COUNT, 1, 0,
                 StorageCapabilities.ALL, replica);
