@@ -2439,6 +2439,28 @@ public class ReplicationManager
         return Math.max(0L, hwm - (currentNextExpected(topic) - 1L));
     }
 
+    /**
+     * Sum of the per-topic replication lags over the topics whose leader high-watermark is known
+     * (issue #178), or {@code -1} when no topic has a known leader HWM yet (nothing streamed).
+     * Always {@code 0} on the leader.
+     *
+     * @return the total follower lag, or {@code -1} if unknown
+     */
+    public long getTotalReplicationLag() {
+        if (coordinator.isLeader()) {
+            return 0L;
+        }
+        long total = 0L;
+        boolean known = false;
+        for (String topic : handlers.keySet()) {
+            if (getLeaderHighWatermark(topic) > 0L) {
+                known = true;
+                total += getReplicationLag(topic);
+            }
+        }
+        return known ? total : -1L;
+    }
+
     /** Cumulative stream bytes pulled for a topic (RELAY_STREAM throughput). */
     public long getStreamBytesIn(String topic) {
         java.util.concurrent.atomic.AtomicLong bytes = streamBytesInByTopic.get(topic);

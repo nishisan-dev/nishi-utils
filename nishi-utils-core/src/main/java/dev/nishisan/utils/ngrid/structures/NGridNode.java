@@ -766,7 +766,12 @@ public final class NGridNode implements Closeable {
 
         long globalSeq = replicationManager.getGlobalSequence();
         long lastApplied = replicationManager.getLastAppliedSequence();
-        long lag = replicationLag(isLeader, trackedHighWatermark, lastApplied);
+        // Issue #178: the lag is the SUM of the per-topic lags (leader HWM per topic learned from the
+        // stream) whenever at least one topic's leader HWM is known; the scalar difference is only the
+        // fallback for a follower that has not streamed anything yet.
+        long topicLag = replicationManager.getTotalReplicationLag();
+        long lag = isLeader ? 0L
+                : topicLag >= 0L ? topicLag : replicationLag(isLeader, trackedHighWatermark, lastApplied);
         long gaps = replicationManager.getGapsDetected();
         long resendSuccess = replicationManager.getResendSuccessCount();
         long snapshotFallback = replicationManager.getSnapshotFallbackCount();
@@ -812,7 +817,8 @@ public final class NGridNode implements Closeable {
                 outboundDepthByNode,
                 outboundDroppedByNode,
                 ioStats,
-                Instant.now());
+                Instant.now(),
+                replicationManager.appliedFrontiers().byTopic());
     }
 
     @Override

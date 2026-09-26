@@ -460,16 +460,23 @@ public final class DistributedMap<K, V>
         if (consistency.level() == ConsistencyLevel.EVENTUAL) {
             canReadLocally = true;
         } else if (consistency.level() == ConsistencyLevel.BOUNDED) {
-            long leaderWatermark = coordinator.getTrackedLeaderHighWatermark();
-            if (leaderWatermark < 0) {
-                // Leader watermark unknown, conservatively route to leader or fail?
-                // For now, fallback to leader.
-                canReadLocally = false;
+            // Issue #178: bound the lag of THIS map's topic (leader HWM per topic, learned from the
+            // stream) rather than the aggregate across every replicated topic — the aggregate could
+            // be inflated by a busy unrelated topic or read zero while this map was still behind.
+            String topic = "map:" + mapName;
+            if (replicationManager != null && replicationManager.getLeaderHighWatermark(topic) > 0L) {
+                canReadLocally = replicationManager.getReplicationLag(topic) <= consistency.maxLag();
             } else {
-                long localSequence = replicationManager != null ? replicationManager.getLastAppliedSequence() : 0;
-                long lag = leaderWatermark - localSequence;
-                if (lag <= consistency.maxLag()) {
-                    canReadLocally = true;
+                long leaderWatermark = coordinator.getTrackedLeaderHighWatermark();
+                if (leaderWatermark < 0) {
+                    // Leader watermark unknown: conservatively route to the leader.
+                    canReadLocally = false;
+                } else {
+                    long localSequence = replicationManager != null ? replicationManager.getLastAppliedSequence() : 0;
+                    long lag = leaderWatermark - localSequence;
+                    if (lag <= consistency.maxLag()) {
+                        canReadLocally = true;
+                    }
                 }
             }
         }
