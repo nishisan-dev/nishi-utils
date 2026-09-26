@@ -155,8 +155,10 @@ Transport (`TcpTransport`/`NetworkRouter`):
 
 ### Compatibilidade e upgrade
 
-- Mudanças de fio aditivas (heartbeat com seção final; campos JSON anuláveis; records do ngrrd com
-  construtores de compatibilidade e fixtures `.ser` 8.7.0). Atualize os **storages antes dos
+- Mudanças de fio aditivas (heartbeat com seção final; campos JSON anuláveis — `topicFrontiers`,
+  `connectedPeers` no handshake/`PEER_UPDATE`, `correlationId` no UNDELIVERABLE, `frozenByTopic`/
+  `cutoverByTopic` no handback; records do ngrrd com construtores de compatibilidade e fixtures
+  `.ser` 8.7.0). Atualize os **storages antes dos
   clientes**, com o rebalance desligado na janela. Durante a janela mista os gates de eleição caem na
   comparação escalar da 8.7.0 contra peers antigos.
 - `priorityTopics` e `ngrrd.placement.rules` devem ser idênticos em todos os nós.
