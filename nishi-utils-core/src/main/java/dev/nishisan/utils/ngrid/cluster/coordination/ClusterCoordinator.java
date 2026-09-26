@@ -1116,8 +1116,11 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             // source of the stream — a leader observing a follower's counter above its own is, by
             // construction, a counter-scale desync (e.g. an inflated restart seed), never a reason to
             // abdicate into a leaderless mutual-deferral stalemate.
+            // Only a peer GENUINELY ahead (per topic, issue #178) counts here — never the boot-window
+            // deferral inside isCaughtUpToCluster(), which is a reclaim-side rule: the incumbent seeing
+            // a follower BEHIND during its own boot window is not a desync and must not log as one.
             boolean leaderBehindOwnFollower = weWouldLead && isLeaderInternal(localId)
-                    && !isCaughtUpToCluster();
+                    && aheadEligiblePeer(localId) != null;
             if (leaderBehindOwnFollower) {
                 long now = Instant.now().toEpochMilli();
                 if (now - lastLeaderBehindWarnMs > 60_000L) {
