@@ -26,10 +26,19 @@ package dev.nishisan.utils.oss.cluster.protocol;
  * @param preferredOwnerNodeId dono preferido, ou {@code null}; usado por adoção
  *                             ({@code LocalReconciler}) e por retomada após migração abortada
  * @param geometry exact requested geometry, or null for legacy/adoption requests
+ * @param definitionName {@code metadata.name} da definição ngrrd da série (issue #167, item 3), usado pelas
+ *                       regras de placement do líder e gravado no catálogo; {@code null} num pedido de
+ *                       adoção ({@code LocalReconciler}) ou vindo de um cliente anterior a este campo
  */
 public record PlaceRequest(String seriesKey, String definitionHashHex, String preferredOwnerNodeId,
-        dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor geometry) {
+        dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor geometry, String definitionName) {
     public PlaceRequest(String seriesKey, String definitionHashHex, String preferredOwnerNodeId) {
         this(seriesKey, definitionHashHex, preferredOwnerNodeId, null);
+    }
+
+    /** Forma da 8.7.0, sem {@code definitionName}. */
+    public PlaceRequest(String seriesKey, String definitionHashHex, String preferredOwnerNodeId,
+            dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor geometry) {
+        this(seriesKey, definitionHashHex, preferredOwnerNodeId, geometry, null);
     }
 }

@@ -46,6 +46,7 @@ import dev.nishisan.utils.oss.cluster.protocol.SeriesStatus;
 import dev.nishisan.utils.oss.cluster.rpc.ClusterRpc;
 import dev.nishisan.utils.oss.cluster.rpc.TransportClusterRpc;
 import dev.nishisan.utils.oss.config.NgrrdYamlLoader;
+import dev.nishisan.utils.oss.definition.NgrrdDefinition;
 import dev.nishisan.utils.oss.format.DefinitionHash;
 import dev.nishisan.utils.oss.format.SeriesGeometry;
 
@@ -355,11 +356,13 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
         String definitionHashHex = DefinitionHash.hex(yaml);
         RetryPolicy opRetry = new RetryPolicy(config.retryTimeout(), config.retryBackoffMin(),
                 config.retryBackoffMax());
-        GeometryDescriptor geometry = GeometryDescriptor.from(
-                new SeriesGeometry(NgrrdYamlLoader.parse(yaml, System::getenv)));
+        NgrrdDefinition definition = NgrrdYamlLoader.parse(yaml, System::getenv);
+        GeometryDescriptor geometry = GeometryDescriptor.from(new SeriesGeometry(definition));
+        // Issue #167 (item 3): o metadata.name vai ao líder no PLACE para as regras de placement.
         RemoteSeriesHandle handle = new RemoteSeriesHandle(seriesKey, yaml, definitionHashHex, tags, options,
                 resolver, rpc, dispatcher, opRetry, config.requestTimeout(), config.closeTimeout(),
-                Clock.systemUTC(), handles::remove, capabilities, () -> closed, geometry);
+                Clock.systemUTC(), handles::remove, capabilities, () -> closed, geometry,
+                definition.metadata().name());
         handle.open();
         return handle;
     }

@@ -17,6 +17,8 @@
 
 package dev.nishisan.utils.oss.cluster.catalog;
 
+import dev.nishisan.utils.ngrid.map.MapReplicationCodec;
+import dev.nishisan.utils.ngrid.map.MapReplicationCommand;
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayInputStream;
@@ -24,6 +26,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.nio.charset.StandardCharsets;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -189,6 +192,71 @@ class SeriesPlacementTest {
             assertEquals(8766L, placement.updatedAtEpochMs());
             assertEquals("geometry-870", placement.geometryId());
             assertTrue(placement.geometryConfirmed());
+            assertNull(placement.definitionName(), "placement da 8.7.0 não conhece a definição");
+        }
+    }
+
+    @Test
+    void placementReplicadoPelaVersao870SemDefinitionNameLeNomeNulo() {
+        // Bytes produzidos pelo MapReplicationCodec com o record de 8 componentes da 8.7.0.
+        String legacy = "{\"type\":\"PUT\",\"key\":\"s\",\"value\":{\"@class\":"
+                + "\"dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement\",\"ownerNodeId\":\"legacy-870\","
+                + "\"targetNodeId\":null,\"state\":\"ACTIVE\",\"migrationId\":null,\"createdAtEpochMs\":8765,"
+                + "\"updatedAtEpochMs\":8766,\"geometryId\":\"geometry-870\",\"geometryConfirmed\":true}}";
+
+        MapReplicationCommand command = MapReplicationCodec.decode(legacy.getBytes(StandardCharsets.UTF_8));
+
+        SeriesPlacement placement = (SeriesPlacement) command.value();
+        assertEquals("legacy-870", placement.ownerNodeId());
+        assertEquals("geometry-870", placement.geometryId());
+        assertNull(placement.definitionName());
+    }
+
+    @Test
+    void definitionNameSobreviveAReplicacaoDoMapaEAoObjectOutputStream() throws IOException, ClassNotFoundException {
+        SeriesPlacement original = SeriesPlacement.active("node-a", 1_000L).withDefinitionName("ifaceStats", 2_000L);
+
+        MapReplicationCommand decoded = MapReplicationCodec.decode(
+                MapReplicationCodec.encode(MapReplicationCommand.put("s", original)));
+        assertEquals(original, decoded.value());
+
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (ObjectOutputStream out = new ObjectOutputStream(bytes)) {
+            out.writeObject(original);
+        }
+        try (ObjectInputStream in = new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray()))) {
+            SeriesPlacement read = (SeriesPlacement) in.readObject();
+            assertEquals(original, read);
+            assertEquals("ifaceStats", read.definitionName());
+        }
+    }
+
+    @Test
+    void withDefinitionNameGuardaONomeAtualizaUpdatedAtENormalizaBranco() {
+        SeriesPlacement active = SeriesPlacement.active("node-a", 1_000L).withGeometry("g", true, 1_500L);
+
+        SeriesPlacement named = active.withDefinitionName("ifaceStats", 2_000L);
+
+        assertEquals("ifaceStats", named.definitionName());
+        assertEquals(2_000L, named.updatedAtEpochMs());
+        assertEquals(1_000L, named.createdAtEpochMs());
+        assertEquals("g", named.geometryId());
+        assertTrue(named.geometryConfirmed());
+        assertNull(active.withDefinitionName(" ", 2_000L).definitionName());
+        assertNull(new SeriesPlacement("node-a", null, PlacementState.ACTIVE, null, 1L, 1L, null, false, "")
+                .definitionName());
+        assertNull(SeriesPlacement.active("node-a", 1L).definitionName(), "construtores anteriores deixam nulo");
+    }
+
+    @Test
+    void transicoesDeMigracaoPreservamODefinitionName() {
+        SeriesPlacement active = SeriesPlacement.active("a", 1L).withDefinitionName("ifaceStats", 2L);
+        SeriesPlacement migrating = SeriesPlacement.migrating(active, "b", "move", 3L);
+
+        for (SeriesPlacement placement : new SeriesPlacement[] {migrating,
+                SeriesPlacement.completed(migrating, 4L), SeriesPlacement.aborted(migrating, 4L),
+                active.withGeometry("g", false, 5L)}) {
+            assertEquals("ifaceStats", placement.definitionName());
         }
     }
 

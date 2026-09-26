@@ -27,6 +27,9 @@ import dev.nishisan.utils.oss.cluster.catalog.NodeState;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.placement.LeastLoadedPlacementPolicy;
+import dev.nishisan.utils.oss.cluster.placement.PlacementContext;
+import dev.nishisan.utils.oss.cluster.placement.PlacementPolicy;
+import dev.nishisan.utils.oss.cluster.placement.PlacementRules;
 import dev.nishisan.utils.oss.cluster.protocol.CatalogLookupRequest;
 import dev.nishisan.utils.oss.cluster.protocol.CatalogLookupResponse;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
@@ -313,6 +316,85 @@ class PlacementRequestHandlerTest {
                 new PlaceRequest("series-1", "hash-1", "node-b"), NodeId.of("client"));
 
         assertEquals("node-b", response.placement().ownerNodeId());
+    }
+
+    // ---------------------------------------------------------------- issue #167 (item 3): definitionName
+
+    @Test
+    void contextoDePlacementLevaAChaveEONomeDaDefinicaoDaSerie() {
+        leaderView.leader = true;
+        putNode("node-a", 0, clock.millis());
+        CapturingPolicy policy = new CapturingPolicy();
+        PlacementRequestHandler capturing = new PlacementRequestHandler(cluster.node(0).transport(), catalog,
+                leaderView, leaderSyncing::get, policy, INTERVAL, GRACE, clock);
+
+        PlaceResponse response = (PlaceResponse) capturing.handle(Commands.PLACE,
+                new PlaceRequest("br-sp/if-1", "hash-1", null, null, "ifaceStats"), NodeId.of("client"));
+
+        assertEquals(SeriesStatus.OK, response.status());
+        assertEquals("br-sp/if-1", policy.last.seriesKey());
+        assertEquals("ifaceStats", policy.last.definitionName());
+        assertEquals(PlacementRules.NONE, policy.last.placementRules());
+        assertEquals("ifaceStats", response.placement().definitionName(), "o placement novo nasce com o nome");
+        assertEquals("ifaceStats", catalog.placementStrong("br-sp/if-1").orElseThrow().definitionName());
+    }
+
+    @Test
+    void placeDeSerieLegadaJaAtivaPreencheODefinitionNameNoCatalogo() {
+        leaderView.leader = true;
+        putNode("node-a", 0, clock.millis());
+        SeriesPlacement legacy = SeriesPlacement.active("node-a", 500L);
+        catalog.putPlacement("series-1", legacy);
+        assertNull(legacy.definitionName());
+
+        PlaceResponse response = (PlaceResponse) handler.handle(Commands.PLACE,
+                new PlaceRequest("series-1", "hash-1", null, null, "ifaceStats"), NodeId.of("client"));
+
+        assertEquals(SeriesStatus.OK, response.status());
+        assertEquals("ifaceStats", response.placement().definitionName());
+        assertEquals("node-a", response.placement().ownerNodeId());
+        assertEquals(500L, response.placement().createdAtEpochMs());
+        assertEquals("ifaceStats", catalog.placementStrong("series-1").orElseThrow().definitionName());
+    }
+
+    @Test
+    void placeDeSerieJaNomeadaNaoReescreveOCatalogo() {
+        leaderView.leader = true;
+        putNode("node-a", 0, clock.millis());
+        SeriesPlacement named = SeriesPlacement.active("node-a", 500L).withDefinitionName("ifaceStats", 600L);
+        catalog.putPlacement("series-1", named);
+
+        PlaceResponse response = (PlaceResponse) handler.handle(Commands.PLACE,
+                new PlaceRequest("series-1", "hash-1", null, null, "outraDefinicao"), NodeId.of("client"));
+
+        assertEquals(SeriesStatus.OK, response.status());
+        assertEquals(named, response.placement(), "nem o nome nem o updatedAt mudam");
+        assertEquals(named, catalog.placementStrong("series-1").orElseThrow());
+    }
+
+    @Test
+    void placeSemNomeDeSerieLegadaNaoPreencheNada() {
+        leaderView.leader = true;
+        putNode("node-a", 0, clock.millis());
+        SeriesPlacement legacy = SeriesPlacement.active("node-a", 500L);
+        catalog.putPlacement("series-1", legacy);
+
+        PlaceResponse response = (PlaceResponse) handler.handle(Commands.PLACE,
+                new PlaceRequest("series-1", null, "node-a"), NodeId.of("client"));
+
+        assertEquals(legacy, response.placement());
+    }
+
+    /** Política que guarda o último contexto recebido e delega a decisão à política real. */
+    private static final class CapturingPolicy implements PlacementPolicy {
+        private final PlacementPolicy delegate = new LeastLoadedPlacementPolicy();
+        private volatile PlacementContext last;
+
+        @Override
+        public Optional<String> choose(PlacementContext ctx) {
+            last = ctx;
+            return delegate.choose(ctx);
+        }
     }
 
     // ---------------------------------------------------------------- seção 0 do M3

@@ -30,6 +30,7 @@ import dev.nishisan.utils.oss.cluster.catalog.PlacementState;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.placement.PlacementContext;
 import dev.nishisan.utils.oss.cluster.placement.PlacementPolicy;
+import dev.nishisan.utils.oss.cluster.placement.PlacementRules;
 import dev.nishisan.utils.oss.cluster.protocol.CatalogLookupRequest;
 import dev.nishisan.utils.oss.cluster.protocol.CatalogLookupResponse;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
@@ -280,7 +281,8 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
             }
             Optional<SeriesPlacement> alreadyPlaced = catalog.placementStrong(request.seriesKey());
             if (alreadyPlaced.isPresent()) {
-                return new PlaceResponse(SeriesStatus.OK, alreadyPlaced.get(), null, null);
+                return new PlaceResponse(SeriesStatus.OK, backfillDefinitionName(request, alreadyPlaced.get()), null,
+                        null);
             }
 
             // Seção 0 do M3: a série não está no catálogo (nem na leitura STRONG, que já foi ao
@@ -300,7 +302,8 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
             long now = clock.millis();
             PlacementContext ctx = new PlacementContext(nodes, leaderView.reachableNodeIds(),
                     snapshotPending(nodes), now, nodeStatusStaleAfter, request.preferredOwnerNodeId(),
-                    request.geometry() == null ? 0 : request.geometry().regionBytes(), catalog.pendingBytesByNode());
+                    request.geometry() == null ? 0 : request.geometry().regionBytes(), catalog.pendingBytesByNode(),
+                    request.seriesKey(), request.definitionName(), PlacementRules.NONE);
 
             Optional<String> chosen = policy.choose(ctx);
             if (chosen.isEmpty()) {
@@ -315,7 +318,8 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
                 return notLeaderResponse();
             }
 
-            SeriesPlacement placement = SeriesPlacement.active(chosen.get(), now);
+            SeriesPlacement placement = SeriesPlacement.active(chosen.get(), now)
+                    .withDefinitionName(request.definitionName(), now);
             if (request.geometry() != null) {
                 catalog.putGeometry(request.geometry());
                 placement = placement.withGeometry(request.geometry().id(), false, now);
@@ -331,6 +335,29 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
             }
             recordPending(chosen.get(), nodes);
             return new PlaceResponse(SeriesStatus.OK, placement, null, null);
+        }
+    }
+
+    /**
+     * Issue #167 (item 3): preenchimento oportunista do {@code definitionName} de um placement legado
+     * ({@code ACTIVE}, sem nome) quando o {@code PLACE} do cliente traz o nome — sob o mesmo lock de
+     * stripe já adquirido por {@link #handlePlace}. Não reescreve um placement já nomeado, nem um em
+     * migração (a transição de conclusão/aborto o reescreveria por cima). Uma falha ao gravar não
+     * atrapalha o {@code PLACE}: responde o placement como estava. Não há backfill em lote — só o
+     * próximo {@code PLACE} de cada série (limitação documentada).
+     */
+    private SeriesPlacement backfillDefinitionName(PlaceRequest request, SeriesPlacement current) {
+        String name = request.definitionName();
+        if (name == null || name.isBlank() || current.definitionName() != null
+                || current.state() != PlacementState.ACTIVE || !leaderView.isLeader()) {
+            return current;
+        }
+        SeriesPlacement named = current.withDefinitionName(name, clock.millis());
+        try {
+            catalog.putPlacement(request.seriesKey(), named);
+            return named;
+        } catch (RuntimeException e) {
+            return current;
         }
     }
 
