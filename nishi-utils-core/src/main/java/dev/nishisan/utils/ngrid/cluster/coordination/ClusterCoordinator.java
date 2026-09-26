@@ -102,6 +102,22 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     /** Per-peer last-known replication high-watermark, learned from heartbeats. -1 until first heard. */
     private final Map<NodeId, Long> peerHighWatermark = new ConcurrentHashMap<>();
     /**
+     * Per-peer send timestamp ({@code HeartbeatPayload.epochMilli}) of the newest heartbeat applied
+     * (revisão #178, A3). Heartbeats are dispatched one virtual thread each, so two from the same peer
+     * can be applied out of order; an older one must not overwrite the newer assertion/watermark/epoch
+     * (a demoted node's {@code leader=false} announcement lost to a periodic {@code leader=true}
+     * heartbeat re-adopted it for a whole interval). A regression larger than the heartbeat timeout is
+     * a sender clock jump, not a reorder, and is accepted.
+     */
+    private final Map<NodeId, Long> lastHeartbeatStampMs = new ConcurrentHashMap<>();
+    /**
+     * Voters that announced their departure (LEAVE) and whose heartbeats are ignored until they
+     * reconnect (a new incarnation handshakes → {@link #onPeerConnected}) or the heartbeat timeout
+     * elapses (revisão #178, A4): a heartbeat read before the LEAVE but dispatched after it must not
+     * reactivate the member and re-adopt it as leader, delaying the failover by a full eviction cycle.
+     */
+    private final Map<NodeId, Long> leavingUntilMs = new ConcurrentHashMap<>();
+    /**
      * Per-peer last-known applied frontier PER TOPIC, learned from heartbeats (issue #178). Absent or
      * empty for peers that advertise no vector (older version, or bootstrap gate engaged): every gate
      * then falls back to the scalar {@link #peerHighWatermark} for that peer.
@@ -229,6 +245,15 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      */
     public void setTopicFrontiersSupplier(java.util.function.Supplier<Map<String, Long>> supplier) {
         this.topicFrontiersSupplier = supplier != null ? supplier : Map::of;
+    }
+
+    /**
+     * Signals that the local applied frontier REGRESSED (a snapshot cutover onto another lineage, a
+     * dual-leader yield resync): the reclaim latch earned before is void (revisão #178, A5) — the node
+     * must catch up to the incumbent's frontier again before it may reclaim.
+     */
+    public void noteLocalFrontierRegressed() {
+        reclaimCaughtUpLatch = false;
     }
 
     /**
@@ -1565,7 +1590,10 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     private boolean isCaughtUpToCluster() {
         long maxPeer = maxActivePeerHighWatermark();
         if (maxPeer < 0) {
-            return true; // no active peer has reported a watermark — nothing ahead of us
+            // No active peer has reported a watermark — nothing ahead of us. The latch is only
+            // meaningful while catching up to someone (A5): reset it, as the Javadoc promises.
+            reclaimCaughtUpLatch = false;
+            return true;
         }
         if (reclaimCaughtUpLatch) {
             return true; // already caught up this session; do not chase the incumbent's moving tail
@@ -1875,6 +1903,9 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 // asserting leaders (issue tems#9, D10c).
                 dualLeaderObservations.clear();
                 yieldingToDualLeader = false;
+                // A5: a demoted node must prove it is caught up again before it may reclaim — the
+                // latch earned in the previous catch-up says nothing about the new incumbent's tail.
+                reclaimCaughtUpLatch = false;
             }
 
             if (!isNowLeader && !wasLeader) {
@@ -1921,6 +1952,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             if (previous != null && previous.equals(transport.local().nodeId())) {
                 long newEpoch = leaderEpoch.incrementAndGet();
                 persistEpoch(newEpoch);
+                reclaimCaughtUpLatch = false; // A5: re-sync before any reclaim
                 LOGGER.warning(() -> "Leader stepped down. New epoch: " + newEpoch);
 
                 leadershipListeners.forEach(listener -> listener.onLeaderChanged(null));
@@ -1944,6 +1976,9 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
 
     @Override
     public void onPeerConnected(NodeInfo peer) {
+        if (peer != null) {
+            leavingUntilMs.remove(peer.nodeId()); // a new incarnation (or a reconnect) speaks again
+        }
         members.compute(peer.nodeId(), (id, existing) -> {
             // Replace any placeholder member information (e.g. created from a heartbeat
             // before we learned host/port), or update when host/port changes (e.g. peer restarted
@@ -2034,6 +2069,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         }
         LOGGER.info(() -> "[" + transport.local().nodeId() + "] Leader-eligible member " + peerId
                 + " announced its departure; confirming the disconnect without the grace");
+        // A4: heartbeats of the leaving incarnation still in flight must not reactivate it.
+        leavingUntilMs.put(peerId, Instant.now().toEpochMilli() + config.heartbeatTimeout().toMillis());
         confirmPeerDisconnect(peerId);
     }
 
@@ -2049,6 +2086,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         // reclaim gate is a no-op and the node leads.
         peerHighWatermark.remove(peerId);
         peerTopicFrontiers.remove(peerId);
+        lastHeartbeatStampMs.remove(peerId);
         // A gone peer can neither refuse nor assert leadership (issue tems#9, D9).
         leaderRefusalAtMs.remove(peerId);
         peerAssertsLeadership.remove(peerId);
@@ -2100,6 +2138,27 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 // after it): it must not re-create the member it removed. The member's new incarnation
                 // lifts the tombstone with its own handshake before its heartbeats arrive.
                 return;
+            }
+            if (!source.equals(transport.local().nodeId())) {
+                // A4: a voter that said it is leaving stays quiet until it reconnects or the window lapses.
+                Long leavingUntil = leavingUntilMs.get(source);
+                if (leavingUntil != null) {
+                    if (Instant.now().toEpochMilli() < leavingUntil) {
+                        LOGGER.fine(() -> "Ignoring heartbeat from departing voter " + source);
+                        return;
+                    }
+                    leavingUntilMs.remove(source);
+                }
+                // A3: drop a heartbeat older than the newest one already applied from this peer.
+                long stamp = payload.epochMilli();
+                Long newest = lastHeartbeatStampMs.get(source);
+                if (newest != null && stamp < newest
+                        && newest - stamp <= config.heartbeatTimeout().toMillis()) {
+                    LOGGER.fine(() -> "Ignoring out-of-order heartbeat from " + source
+                            + " (stamp " + stamp + " < " + newest + ")");
+                    return;
+                }
+                lastHeartbeatStampMs.put(source, stamp);
             }
 
             // FENCING: Reject heartbeats from leaders with stale epochs.

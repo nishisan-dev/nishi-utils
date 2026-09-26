@@ -216,9 +216,72 @@ class TopicFrontierElectionGateTest {
                 "peer com vetor mas sem o tópico → fronteira 0 (não -1)");
     }
 
+    /** (A3) Um heartbeat mais antigo do mesmo peer não regride o epoch/asserção já aplicados. */
+    @Test
+    void olderHeartbeatFromSamePeerIsIgnoredButAClockJumpIsAccepted() throws Exception {
+        Harness h = harness(INCUMBENT, 50, PREFERRED, 100, Duration.ofMillis(200));
+        h.localFrontiers.set(Map.of(CATALOG, 10L));
+        h.start();
+        long t = System.currentTimeMillis();
+        h.heartbeat(PREFERRED, t, 5L, 30L, true, Map.of(CATALOG, 10L));
+        awaitLeader(h, PREFERRED);
+        // O epoch rastreado só avança em heartbeats do líder JÁ acordado: mais um, já eleito.
+        h.heartbeat(PREFERRED, t + 1, 5L, 30L, true, Map.of(CATALOG, 10L));
+        assertEquals(5L, h.coord.getTrackedLeaderEpoch());
+
+        // Reordenado: enviado ANTES (t-100) mas despachado depois; epoch menor → deve ser ignorado.
+        h.heartbeat(PREFERRED, t - 100, 4L, 30L, true, Map.of(CATALOG, 10L));
+        assertEquals(5L, h.coord.getTrackedLeaderEpoch(), "heartbeat mais antigo não regride o epoch");
+
+        // Salto de relógio do remetente (regressão maior que o heartbeatTimeout): aceito.
+        h.heartbeat(PREFERRED, t - 60_000, 6L, 30L, true, Map.of(CATALOG, 10L));
+        assertEquals(6L, h.coord.getTrackedLeaderEpoch(), "regressão grande = salto de relógio, aceito");
+    }
+
+    /** (A5) A trava de catch-up não sobrevive a uma regressão da fronteira local. */
+    @Test
+    void reclaimLatchIsVoidAfterLocalFrontierRegression() throws Exception {
+        NodeId top = NodeId.of("node-0"); // afinidade máxima: o líder que vai morrer
+        NodeId third = NodeId.of("node-3"); // afinidade mínima, mas com estado mais novo
+        Harness h = harness(PREFERRED, 100, INCUMBENT, 50, Duration.ofMillis(200),
+                List.of(new NodeInfo(top, "127.0.0.1", 3, Collections.emptySet(), 200),
+                        new NodeInfo(third, "127.0.0.1", 4, Collections.emptySet(), 10)));
+        h.localFrontiers.set(Map.of(CATALOG, 5L));
+        h.start();
+        h.startPeerHeartbeats(top, 7L, 10L, Map.of(CATALOG, 10L), true);
+        h.startPeerHeartbeats(third, 7L, 10L, Map.of(CATALOG, 10L), false);
+        awaitLeader(h, top);
+
+        // O local (afinidade abaixo de `top`) alcança a fronteira: a trava de catch-up é armada.
+        h.localFrontiers.set(Map.of(CATALOG, 10L));
+        h.coord.reevaluateLeadership();
+        Thread.sleep(400);
+        assertFalse(h.coord.isLeader());
+
+        // A fronteira local REGRIDE (cutover para outra linhagem); `third` continua em 10.
+        h.localFrontiers.set(Map.of(CATALOG, 4L));
+        h.coord.noteLocalFrontierRegressed();
+        // `top` morre: sem a correção, a trava antiga pula o gate A e o local lidera atrás de `third`.
+        h.stopPeerHeartbeats(top);
+        long deadline = System.currentTimeMillis() + 2_500;
+        while (System.currentTimeMillis() < deadline) {
+            assertFalse(h.coord.isLeader(),
+                    "trava obsoleta não pode autorizar o reclaim de um nó atrás de um peer elegível (A5)");
+            Thread.sleep(50);
+        }
+        h.localFrontiers.set(Map.of(CATALOG, 10L));
+        h.coord.reevaluateLeadership();
+        awaitLeader(h, PREFERRED);
+    }
+
     private Harness harness(NodeId localId, int localPriority, NodeId peerId, int peerPriority,
             Duration discoveryWindow) {
-        Harness h = new Harness(localId, localPriority, peerId, peerPriority, discoveryWindow);
+        return harness(localId, localPriority, peerId, peerPriority, discoveryWindow, List.of());
+    }
+
+    private Harness harness(NodeId localId, int localPriority, NodeId peerId, int peerPriority,
+            Duration discoveryWindow, List<NodeInfo> extraPeers) {
+        Harness h = new Harness(localId, localPriority, peerId, peerPriority, discoveryWindow, extraPeers);
         closeables.add(h);
         return h;
     }
@@ -240,12 +303,16 @@ class TopicFrontierElectionGateTest {
         final ClusterCoordinator coord;
         final ScheduledExecutorService sched;
         final AtomicReference<Map<String, Long>> localFrontiers = new AtomicReference<>(Map.of());
-        volatile ScheduledFuture<?> peerTask;
+        final Map<NodeId, ScheduledFuture<?>> peerTasks = new ConcurrentHashMap<>();
 
-        Harness(NodeId localId, int localPriority, NodeId peerId, int peerPriority, Duration discoveryWindow) {
+        Harness(NodeId localId, int localPriority, NodeId peerId, int peerPriority, Duration discoveryWindow,
+                List<NodeInfo> extraPeers) {
             NodeInfo localInfo = new NodeInfo(localId, "127.0.0.1", 1, Collections.emptySet(), localPriority);
             NodeInfo peerInfo = new NodeInfo(peerId, "127.0.0.1", 2, Collections.emptySet(), peerPriority);
-            this.transport = new LoopbackTransport(localInfo, List.of(peerInfo));
+            List<NodeInfo> peers = new ArrayList<>();
+            peers.add(peerInfo);
+            peers.addAll(extraPeers);
+            this.transport = new LoopbackTransport(localInfo, peers);
             ClusterCoordinatorConfig cfg = ClusterCoordinatorConfig.of(
                     Duration.ofMillis(150), Duration.ofMillis(600), Duration.ofSeconds(60), 1, null)
                     .withPairMode(true)
@@ -264,16 +331,32 @@ class TopicFrontierElectionGateTest {
         }
 
         void startPeerHeartbeats(NodeId source, long epoch, long highWatermark, Map<String, Long> frontiers) {
-            peerTask = sched.scheduleAtFixedRate(() -> coord.onMessage(
+            startPeerHeartbeats(source, epoch, highWatermark, frontiers, false);
+        }
+
+        void startPeerHeartbeats(NodeId source, long epoch, long highWatermark, Map<String, Long> frontiers,
+                boolean leader) {
+            stopPeerHeartbeats(source);
+            peerTasks.put(source, sched.scheduleAtFixedRate(() -> coord.onMessage(
                     ClusterMessage.lightweight(MessageType.HEARTBEAT, "hb", source, null,
-                            HeartbeatPayload.now(highWatermark, epoch, false, frontiers))),
-                    0, 100, TimeUnit.MILLISECONDS);
+                            HeartbeatPayload.now(highWatermark, epoch, leader, frontiers))),
+                    0, 100, TimeUnit.MILLISECONDS));
+        }
+
+        void heartbeat(NodeId source, long stampMs, long epoch, long highWatermark, boolean leader,
+                Map<String, Long> frontiers) {
+            coord.onMessage(ClusterMessage.lightweight(MessageType.HEARTBEAT, "hb", source, null,
+                    new HeartbeatPayload(stampMs, highWatermark, epoch, leader, frontiers)));
         }
 
         void stopPeerHeartbeats() {
-            if (peerTask != null) {
-                peerTask.cancel(true);
-                peerTask = null;
+            peerTasks.keySet().forEach(this::stopPeerHeartbeats);
+        }
+
+        void stopPeerHeartbeats(NodeId source) {
+            ScheduledFuture<?> task = peerTasks.remove(source);
+            if (task != null) {
+                task.cancel(true);
             }
         }
 

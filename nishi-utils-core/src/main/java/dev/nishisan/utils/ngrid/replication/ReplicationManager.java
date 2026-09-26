@@ -1327,6 +1327,7 @@ public class ReplicationManager
         // supplier comment in start() documents). The active-leader path never gets here (role guard
         // in handleSyncResponse).
         globalSequence.updateAndGet(current -> watermark);
+        coordinator.noteLocalFrontierRegressed(); // A5: the reclaim latch of the old lineage is void
         sequenceByTopic.computeIfAbsent(topic, k -> new java.util.concurrent.atomic.AtomicLong())
                 .set(watermark);
         boolean completedBootstrap = relayPendingBootstrap.remove(topic);
