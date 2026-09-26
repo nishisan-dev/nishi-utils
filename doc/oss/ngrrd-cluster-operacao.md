@@ -395,6 +395,25 @@ de parar ou apagar o volume.
 da coordenação do NGrid. Drenar dados e manter a maioria de coordenação são verificações
 separadas. Clientes não contam como substitutos de storage nodes no quórum de liderança.
 
+### Substituir ou desativar um storage de vez (`forget-node`)
+
+Um storage que **não volta** (hardware trocado, nó recriado com outro id) continua contando na
+maioria de votantes da eleição do NGrid: com 3 storages e um substituído sob novo id o cluster passa
+a exigir 3 de 4 votos, e uma segunda queda qualquer o deixa sem líder. Desde a 8.8.0:
+
+```bash
+ngrrd_admin drain storage-4        # esvazia (aguarde DRAINED, SERIES=0)
+# pare o processo de storage-4
+ngrrd_admin forget-node storage-4  # esquece em todos os storages e remove do catálogo
+ngrrd_admin status                 # storage-4 não aparece mais
+```
+
+O líder recusa o comando enquanto `storage-4` ainda estiver alcançável ou tiver séries (ou
+migrações de entrada) no catálogo — drene e pare antes. Se algum storage estiver caído na hora, a
+CLI devolve `1` com `NAO confirmado em: <nó>`: repita o comando quando ele voltar, senão ele
+continua a contar `storage-4` na sua maioria. O id fica em tombstone por 24 h contra o gossip; subir
+de novo um nó com o **mesmo** id o readmite pelo handshake direto (o status volta a ser publicado).
+
 ### Reativar um nó drenado
 
 Reinicie com o mesmo ID e diretórios, aguarde conectividade e execute:

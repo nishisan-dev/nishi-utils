@@ -107,6 +107,11 @@ Transport (`TcpTransport`/`NetworkRouter`):
 - **B7** — `sendAndAwait` não disca mais na thread do chamador (o prazo cobre a discagem).
 - **B8** — backpressure de saída limitada de volta (#113), `SO_KEEPALIVE` e timeout de leitura
   contra peer half-open.
+- **B9** — votantes nunca eram esquecidos: um storage substituído sob outro id inflava a maioria
+  para sempre. `Transport.decommissionPeer(id)` / `NGridNode.decommissionPeer(id)` (ordem do
+  operador, único caminho que esquece um elegível a líder): sai dos peers conhecidos e da maioria,
+  conexões fechadas, pendentes falhados, `onPeerLeft` e tombstone de 24 h contra o gossip; a nova
+  encarnação sob o mesmo id levanta o tombstone pelo handshake direto.
 - **B10** — UNDELIVERABLE de resposta encaminhado ao requisitante; entradas de `pendingResponses`
   não vazam com `requestTimeout <= 0` ou futuro cancelado.
 
@@ -131,8 +136,14 @@ Transport (`TcpTransport`/`NetworkRouter`):
   elegíveis (prazo 30 s; `NGRRD_RESUME_FENCE_TIMEOUT`). O storage declara
   `priorityTopics(map:ngrrd.catalog)`: entre sobreviventes com fronteiras incomparáveis, o catálogo
   decide.
-- Documentação: `doc/oss/ngrrd-cluster.md` (§6.1 YAML, §7 elegibilidade, §8 cotas/fase 0, §9 drain,
-  §11 CLI, §13), `doc/oss/ngrrd-cluster-operacao.md` (seção "Cotas e regras de placement").
+- **`forget-node <nodeId>` (revisão #178, B9).** `ngrrd.admin.forget` / `NgrrdClusterClient.forgetNode`:
+  o líder recusa enquanto o nó estiver alcançável ou tiver séries/migrações de entrada no catálogo;
+  senão propaga a ordem a todos os storages alcançáveis (`NGridNode.decommissionPeer` em cada um),
+  esquece-o localmente e remove o nó do catálogo. Storages que não confirmaram voltam em `failedOn`
+  (CLI devolve 1 com `NAO confirmado em:` — repita neles). `ForgetNodeClusterTest`.
+- Documentação: `doc/oss/ngrrd-cluster.md` (§6.1 YAML, §7 elegibilidade, §8 cotas/fase 0, §9 drain e
+  `forget-node`, §11 CLI, §13), `doc/oss/ngrrd-cluster-operacao.md` (seções "Cotas e regras de
+  placement" e "Substituir ou desativar um storage de vez").
 
 ### Testes e documentação
 
@@ -149,6 +160,8 @@ Transport (`TcpTransport`/`NetworkRouter`):
   clientes**, com o rebalance desligado na janela. Durante a janela mista os gates de eleição caem na
   comparação escalar da 8.7.0 contra peers antigos.
 - `priorityTopics` e `ngrrd.placement.rules` devem ser idênticos em todos os nós.
+- `forget-node` exige storages 8.8.0 (um storage 8.7.0 responde erro ao `ngrrd.admin.forget` e
+  continua a contar o nó esquecido na sua maioria até ser atualizado).
 - Rollback para 8.7.0: o epoch persistido em `dataDirectory/leader-epoch.dat` é ignorado pela versão
   anterior; `relay/dead-letter/` pode ser apagado.
 

@@ -684,6 +684,16 @@ ACTIVE(src) --[migrate()]--> catálogo := MIGRATING(owner=src, target=dst)
   catálogo é necessária.
 - **Queda sem drenagem:** ver seção 2 — indisponibilidade das séries do nó até ele voltar, por
   desenho.
+- **Substituir ou desativar um storage de vez (`forget-node <nodeId>`, 8.8.0):** o NGrid nunca
+  esquece um votante por conta própria (um LEAVE só o marca inativo), então um storage substituído
+  sob outro id inflava a maioria de votantes para sempre. `forget-node` vai ao líder
+  (`ngrrd.admin.forget`), que recusa enquanto o nó ainda estiver alcançável ou tiver séries/migrações
+  de entrada no catálogo (drene e pare o processo antes); senão propaga a ordem a todos os storages
+  alcançáveis (cada um esquece o peer no transporte: `NGridNode.decommissionPeer`, tombstone de 24 h
+  contra o gossip de quem ainda o lista), esquece-o localmente e remove o nó do catálogo. A CLI lista
+  `esquecido em: <nó>` e, para os storages que não confirmaram (caídos no momento), devolve 1 com
+  `NAO confirmado em: <nó>` — repita o comando quando voltarem. Um nó que suba de novo com o mesmo id
+  é readmitido pelo próprio handshake.
 
 ## 10. Métricas
 
@@ -730,7 +740,7 @@ local ao confirmar um redirecionamento), e `NGRRD_STORAGE_NODE_STARTED` (process
 
 ```
 java -cp ... dev.nishisan.utils.oss.cluster.admin.NgrrdClusterAdminCli \
-  --seed host:port [--client-id x] <status|metrics <nodeId>|drain <nodeId>|activate <nodeId>|rebalance>
+  --seed host:port [--client-id x] <status|metrics <nodeId>|drain <nodeId>|activate <nodeId>|forget-node <nodeId>|rebalance>
 ```
 
 Entra na malha como cliente transparente (mesmo papel `client`+`leader-ineligible` de
@@ -744,6 +754,11 @@ contagem das regras do **líder**) e, depois de `RESERVED`, as colunas `QUOTA`
 `-`, com sufixo `!` quando difere do fingerprint do líder — nó reiniciado com outro YAML, ou ainda
 não reiniciado após uma mudança). `rebalance` lista também os destinos excluídos por cota
 (`quota_series(<n>/<max>)`/`quota_bytes(<n>/<max>)`).
+
+`forget-node <nodeId>` (8.8.0) esquece um storage substituído ou desativado em todo o cluster
+(seção 9): código `0` quando todos os storages confirmaram, `1` com a lista `NAO confirmado em:` em
+`stderr` quando algum estava caído (repita nele) ou quando o líder recusou (nó ainda alcançável ou
+com séries no catálogo).
 
 `status` traz, desde a 8.7.0, a coluna `CAT_LAG` — forma curta do `CatalogReplicaStatus` do nó
 (seção 3): `lider`, o lag numérico, `sync` (sincronizando por snapshot), `boot` (bootstrap do relay
@@ -775,7 +790,9 @@ imprime só a confirmação do disparo, como antes.
   (`AdminStatusClusterTest`, `AdminCliClusterTest`); destino com réplica do catálogo atrasada
   confirmando no líder, issue #177 (`StaleReplicaRedirectClusterTest`, via um gancho de teste que
   decora o `PlacementLookup` do storage para congelar a réplica local — o core não permite pausar a
-  replicação diretamente).
+  replicação diretamente); cota por nó e regras de placement, issue #167 item 3 (`QuotaClusterTest`,
+  `PlacementRulesClusterTest`); esquecimento de um storage substituído em todo o cluster e
+  sobrevivência à segunda queda com 4 → 3 votantes (`ForgetNodeClusterTest`, revisão #178 B9).
 - **Fora do CI hospedado, por desenho** — mesmo motivo e mesmo padrão da suíte de resiliência do
   NGrid (`doc/testes-vermelhos-conhecidos.md`): os `*ClusterTest` deste módulo são sensíveis a
   tempo e recursos do executor e não passam de forma confiável em runner hospedado. `pr-validation.yml`

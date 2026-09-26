@@ -250,8 +250,12 @@ heartbeat tentava discar para ele (até `connectTimeout`, com o log "No connecti
 - **Votantes nunca são esquecidos:** um membro elegível a líder que envia LEAVE segue em
   `knownPeers` e na membership (a maioria não encolhe sem consenso); o coordenador apenas o marca
   inativo na hora, sem o grace de disconnect, e o próximo heartbeat do mesmo id o reativa.
-  **Descomissionar um votante de vez** (ex.: storage drenado que não volta) continua exigindo ação do
-  operador.
+  **Descomissionar um votante de vez** (ex.: storage drenado que não volta) é ação do operador
+  (8.8.0): `Transport.decommissionPeer(id)` / `NGridNode.decommissionPeer(id)` é o único caminho que
+  esquece um elegível a líder — sai de `knownPeers` (e da maioria), conexões fechadas, pendentes
+  falhados, `onPeerLeft` nos listeners e tombstone de **24 h** contra gossip; deve rodar em todo nó
+  (o ngrrd o propaga pelo `ngrrd.admin.forget` / CLI `forget-node`). Um handshake direto do mesmo id
+  (nova encarnação) levanta o tombstone.
 
 ```mermaid
 sequenceDiagram
