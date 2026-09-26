@@ -239,20 +239,42 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     }
 
     /**
-     * Highest replication high-watermark currently advertised by any ACTIVE peer (excluding the local
-     * node), or {@code -1} when no active peer has reported one yet. This is the cluster's "newest known
-     * state" frontier that a returning node must reach before it may reclaim leadership.
+     * Highest replication high-watermark currently advertised by any ACTIVE, LEADER-ELIGIBLE peer
+     * (excluding the local node), or {@code -1} when no such peer has reported one yet. This is the
+     * cluster's "newest known state" frontier that a returning node must reach before it may reclaim
+     * leadership.
      *
-     * @return the max active-peer watermark, or {@code -1} if none is known
+     * <p>A leader-ineligible member ({@link NodeInfo#ROLE_LEADER_INELIGIBLE}, e.g. an ngrrd client) is
+     * deliberately ignored, like in {@code highestWatermarkActivePeer} and
+     * {@code hasActivePeerWithUnknownWatermark}: it can never lead nor serve the stream, so
+     * state that only it holds can never be synced FROM it — waiting for it can never resolve (issue
+     * #179: a client that received the last replication frame before the leader died made the affinity
+     * winner defer to a peer that was not ahead, the other survivor followed the winner without a D9
+     * escape, and the cluster stayed leaderless forever). Every consumer wants the eligible frontier:
+     * <ul>
+     *   <li>gate A / reclaim ({@code isCaughtUpToCluster}): only an eligible peer can be the
+     *       incumbent a reclaiming node must catch up to;</li>
+     *   <li>the "leader observes a peer watermark above its own applied" warning: a client's counter is
+     *       a mirror of the stream this leader serves, never a rival state;</li>
+     *   <li>{@code ReplicationManager#nudgeLeadershipOnCatchUp}: a deferring node is caught up once it
+     *       reaches the eligible frontier, so the nudge must fire then.</li>
+     * </ul>
+     * Only members KNOWN to be ineligible are excluded: a HEARTBEAT placeholder (blank host, roles not
+     * learned yet) still counts, conservatively — it may be a storage node that is the incumbent ahead of
+     * us, and the gate must not let a behind node reclaim before that is known.
+     *
+     * @return the max active, leader-eligible peer watermark, or {@code -1} if none is known
      */
     public long maxActivePeerHighWatermark() {
         long max = -1L;
         NodeId localId = transport.local().nodeId();
         for (Map.Entry<NodeId, Long> e : peerHighWatermark.entrySet()) {
-            if (e.getKey().equals(localId)) {
+            if (e.getKey().equals(localId) || e.getValue() == null) {
                 continue;
             }
-            if (isActiveMember(e.getKey()) && e.getValue() != null && e.getValue() > max) {
+            ClusterMember member = members.get(e.getKey());
+            if (member != null && member.isActive() && member.info().isLeaderEligible()
+                    && e.getValue() > max) {
                 max = e.getValue();
             }
         }
@@ -922,7 +944,9 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             // the peer that is ahead keeps leading (in pair mode it self-elects locally) until WE catch
             // up — then the latch flips and the next recompute promotes us. Lead-while-alone / AP is
             // preserved: with no active peer ahead, maxActivePeerHighWatermark() is -1 and the gate is a
-            // no-op, so the node still leads (after the boot-discovery window, handled above).
+            // no-op, so the node still leads (after the boot-discovery window, handled above). Only
+            // leader-eligible peers count as "ahead" (issue #179): a client can never serve the state it
+            // holds, so deferring to its watermark would wedge the cluster leaderless after a failover.
             //
             // Gate A NEVER evicts the CURRENT leader (issue tems#9, D9): it gates the RECLAIM of a
             // returning node; the incumbent's side is gate B. In stream mode the serving leader IS the
