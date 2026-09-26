@@ -31,14 +31,18 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import dev.nishisan.utils.ngrid.cluster.transport.Transport;
 import dev.nishisan.utils.ngrid.cluster.transport.TransportListener;
@@ -59,6 +63,84 @@ class CoordinatorHardeningTest {
     private static final Duration HB = Duration.ofMillis(100);
 
     private final List<AutoCloseable> closeables = new ArrayList<>();
+
+    @Test
+    void coordinatorContentionLeavesVirtualThreadCarriersAvailable(@TempDir Path dir) throws Exception {
+        // Scheduler size is fixed on first use, so isolate this regression in a two-carrier JVM.
+        Path output = dir.resolve("virtual-thread-probe.log");
+        Process probe = new ProcessBuilder(
+                Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                "-Djdk.virtualThreadScheduler.parallelism=2",
+                "-Djdk.virtualThreadScheduler.maxPoolSize=2",
+                "-cp", System.getProperty("surefire.test.class.path", System.getProperty("java.class.path")),
+                CarrierProbe.class.getName())
+                .redirectErrorStream(true).redirectOutput(output.toFile()).start();
+        try {
+            assertTrue(probe.waitFor(20, TimeUnit.SECONDS), "carrier probe must terminate");
+            assertEquals(0, probe.exitValue(), Files.readString(output));
+        } finally {
+            if (probe.isAlive()) {
+                probe.destroyForcibly();
+                probe.waitFor(5, TimeUnit.SECONDS);
+            }
+        }
+    }
+
+    public static final class CarrierProbe {
+        public static void main(String[] args) throws Exception {
+            CoordinatorHardeningTest suite = new CoordinatorHardeningTest();
+            try {
+                suite.verifyCarrierProgress();
+            } finally {
+                suite.tearDown();
+            }
+        }
+    }
+
+    private void verifyCarrierProgress() throws Exception {
+        Harness h = new Harness(null, true, List.of());
+        h.start();
+        NodeInfo peer = new NodeInfo(NodeId.of("node-peer"), "127.0.0.1", 2);
+        CountDownLatch holding = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicBoolean firstNotification = new AtomicBoolean(true);
+        h.coord.addMembershipListener(() -> {
+            if (firstNotification.compareAndSet(true, false)) {
+                holding.countDown();
+                try {
+                    release.await(10, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        });
+        Thread holder = Thread.ofPlatform().start(() -> h.coord.onPeerConnected(peer));
+        List<Thread> waiters = new ArrayList<>();
+        try {
+            assertTrue(holding.await(5, TimeUnit.SECONDS));
+            CountDownLatch attempting = new CountDownLatch(2);
+            for (int i = 0; i < 2; i++) {
+                waiters.add(Thread.ofVirtual().start(() -> {
+                    attempting.countDown();
+                    h.heartbeat(peer.nodeId());
+                }));
+            }
+            assertTrue(attempting.await(5, TimeUnit.SECONDS));
+            awaitTrue(() -> waiters.stream().allMatch(t -> t.getState() == Thread.State.BLOCKED
+                    || t.getState() == Thread.State.WAITING), "heartbeats awaiting the coordinator");
+            CountDownLatch unrelatedWork = new CountDownLatch(1);
+            Thread probe = Thread.ofVirtual().start(unrelatedWork::countDown);
+            waiters.add(probe);
+            assertTrue(unrelatedWork.await(2, TimeUnit.SECONDS),
+                    "coordinator contention must not pin every carrier and stall unrelated network work");
+        } finally {
+            release.countDown();
+            holder.join(5_000);
+            for (Thread waiter : waiters) {
+                waiter.join(5_000);
+            }
+        }
+    }
 
     @AfterEach
     void tearDown() {

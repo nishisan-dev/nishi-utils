@@ -45,6 +45,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -215,7 +216,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         void onMembershipChanged();
     }
 
-    private final Object leaderComputationLock = new Object();
+    // ReentrantLock preserves election ordering without pinning Java 21 virtual-thread carriers.
+    private final ReentrantLock leaderComputationLock = new ReentrantLock();
     private final AtomicReference<NodeId> preferredLeader = new AtomicReference<>();
     private volatile long preferredLeaderUntilMs;
 
@@ -1014,8 +1016,11 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      * actions.
      */
     private void evictDeadMembers() {
-        synchronized (leaderComputationLock) {
+        leaderComputationLock.lock();
+        try {
             evictDeadMembersUnderLock();
+        } finally {
+            leaderComputationLock.unlock();
         }
     }
 
@@ -1113,7 +1118,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      * listeners are notified.
      */
     private void recomputeLeader() {
-        synchronized (leaderComputationLock) {
+        leaderComputationLock.lock();
+        try {
             if (!hasLeadershipQuorum()) {
                 updateLeader(null);
                 return;
@@ -1385,6 +1391,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             }
 
             updateLeader(electedId);
+        } finally {
+            leaderComputationLock.unlock();
         }
     }
 
@@ -1509,7 +1517,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      * @return {@code true} when the local node would win the affinity election
      */
     public boolean localIsPreferredLeader() {
-        synchronized (leaderComputationLock) {
+        leaderComputationLock.lock();
+        try {
             NodeId localId = transport.local().nodeId();
             NodeId electedId = members.values().stream()
                     .filter(ClusterCoordinator::isLeaderCandidate)
@@ -1518,6 +1527,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                     .map(ClusterMember::id)
                     .orElse(null);
             return localId.equals(electedId);
+        } finally {
+            leaderComputationLock.unlock();
         }
     }
 
@@ -1553,7 +1564,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      *         or the current epoch, unchanged, if the local node is leader-ineligible
      */
     public long assumeLeadershipForHandback(long grantedEpoch) {
-        synchronized (leaderComputationLock) {
+        leaderComputationLock.lock();
+        try {
             if (!transport.local().isLeaderEligible()) {
                 LOGGER.warning(() -> "Ignoring handback leadership assumption: local node "
                         + transport.local().nodeId() + " is leader-ineligible (issue tems#9, D11)");
@@ -1562,6 +1574,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             leaderEpoch.updateAndGet(cur -> Math.max(cur, grantedEpoch));
             updateLeader(transport.local().nodeId()); // increments to >= grantedEpoch+1, fires listeners
             return leaderEpoch.get();
+        } finally {
+            leaderComputationLock.unlock();
         }
     }
 
@@ -1574,12 +1588,15 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      * @param newEpoch  the candidate's asserted epoch
      */
     public void acceptHandbackWinner(NodeId newLeader, long newEpoch) {
-        synchronized (leaderComputationLock) {
+        leaderComputationLock.lock();
+        try {
             if (newLeader == null) {
                 return;
             }
             updateLeader(newLeader); // step down to the winner (was leader -> "stepped down")
             observeEpoch(newEpoch);  // now a follower -> adopt the winner's term (no re-stamp)
+        } finally {
+            leaderComputationLock.unlock();
         }
     }
 
@@ -1634,7 +1651,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
 
     /** The losing side of a confirmed dual-leader steps down to the rival and arms the resync. */
     private void resolveDualLeaderYield(NodeId rival) {
-        synchronized (leaderComputationLock) {
+        leaderComputationLock.lock();
+        try {
             dualLeaderObservations.clear();
             if (!isLeader()) {
                 yieldingToDualLeader = false;
@@ -1653,6 +1671,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             }
             updateLeader(rival);
             yieldingToDualLeader = false;
+        } finally {
+            leaderComputationLock.unlock();
         }
     }
 
@@ -2089,7 +2109,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      * leader from accepting writes.
      */
     private void stepDown() {
-        synchronized (leaderComputationLock) {
+        leaderComputationLock.lock();
+        try {
             NodeId previous = leader.getAndSet(null);
             if (previous != null && previous.equals(transport.local().nodeId())) {
                 long newEpoch = leaderEpoch.incrementAndGet();
@@ -2116,6 +2137,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                     }
                 }
             }
+        } finally {
+            leaderComputationLock.unlock();
         }
     }
 
@@ -2132,8 +2155,11 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
 
     @Override
     public void onPeerConnected(NodeInfo peer) {
-        synchronized (leaderComputationLock) {
+        leaderComputationLock.lock();
+        try {
             onPeerConnectedUnderLock(peer);
+        } finally {
+            leaderComputationLock.unlock();
         }
     }
 
@@ -2299,8 +2325,11 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         // Eviction must finish clearing the old session and notifying membership before a new
         // heartbeat can reactivate the peer. Otherwise its fresh watermark can be erased by the
         // old sweep, and listeners can miss the inactive -> active transition entirely.
-        synchronized (leaderComputationLock) {
+        leaderComputationLock.lock();
+        try {
             onMessageUnderLock(message);
+        } finally {
+            leaderComputationLock.unlock();
         }
     }
 

@@ -42,6 +42,10 @@ com teste de reprodução e correção para cada achado. Plano em
   de reativar o membro. Isso impede apagar o watermark fresco e perder o reengajamento do
   join-quiesce. O teste de carga de streaming também aguarda a liberação dos gates de escrita
   após o consenso, pois o líder recém-eleito ainda pode estar drenando o relay.
+- **Coordenação sem prender executores de virtual threads no Java 21.** A sincronização da
+  eleição usa `ReentrantLock`: esperar pela coordenação ou por logging dentro dela não ocupa
+  todos os executores e paralisa o tráfego de rede. Regressão em uma JVM isolada com apenas
+  dois executores, além do failover de migração com o mesmo limite.
 - **Líder recém-eleito cede ao estado mais novo.** A eleição pode correr com o heartbeat (3 s): o
   sobrevivente de maior afinidade era eleito com vetores desatualizados e, ao ver o outro à frente no
   catálogo, retinha (F2) — a op confirmada se perdia (`LeaderFailoverDuringMigrationClusterTest`, 1
