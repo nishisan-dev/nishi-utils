@@ -1075,6 +1075,11 @@ public final class TcpTransport implements Transport {
         }
         LOGGER.info(() -> "Leader-eligible peer " + remoteId + " announced LEAVE (" + reason + ") on "
                 + config.local().nodeId() + "; kept as a known voter");
+        // It is closing anyway: stop reading, so it is no longer "connected" when the listeners are told,
+        // and let them skip the disconnect grace. The regular disconnect handling follows as the read
+        // loop of this connection ends.
+        connection.closeQuietly();
+        listeners.forEach(listener -> listener.onPeerLeaving(remoteId));
     }
 
     /**

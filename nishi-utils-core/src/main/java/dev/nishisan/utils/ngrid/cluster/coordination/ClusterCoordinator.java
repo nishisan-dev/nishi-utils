@@ -1770,6 +1770,25 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         }
     }
 
+    /**
+     * A leader-eligible peer announced first-hand that it is closing (LEAVE). It stays in the membership
+     * and in the transport's known peers (a voter is never forgotten: the majority must not shrink
+     * without consensus), but it is declared inactive right away instead of after the disconnect grace:
+     * the grace exists for sockets that flap during a join, not for a peer that said it is gone. If it
+     * comes back with the same id, its next heartbeat reactivates it ({@link ClusterMember#touch()}).
+     * Decommissioning a voter for good (e.g. a drained storage that will not return) still requires
+     * operator action.
+     */
+    @Override
+    public void onPeerLeaving(NodeId peerId) {
+        if (peerId == null || peerId.equals(transport.local().nodeId())) {
+            return;
+        }
+        LOGGER.info(() -> "[" + transport.local().nodeId() + "] Leader-eligible member " + peerId
+                + " announced its departure; confirming the disconnect without the grace");
+        confirmPeerDisconnect(peerId);
+    }
+
     /** Clears the per-peer state kept for {@code peerId} (preferred leader, watermark, D9/D10c marks). */
     private void forgetPeerState(NodeId peerId) {
         NodeId preferred = preferredLeader.get();

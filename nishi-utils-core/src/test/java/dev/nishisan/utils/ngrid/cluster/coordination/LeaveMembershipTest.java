@@ -115,6 +115,29 @@ class LeaveMembershipTest {
         assertFalse(h.activeIds().contains(CLIENT), "heartbeat atrasado recriou o membro que saiu");
     }
 
+    /**
+     * LEAVE de um membro elegível (votante): não é esquecido — segue na membership e em knownPeers —, mas
+     * fica inativo na hora, sem esperar o grace de disconnect; se o mesmo id voltar, o próximo heartbeat
+     * o reativa.
+     */
+    @Test
+    void leavingVoterIsMarkedInactiveAtOnceAndAHeartbeatReactivatesIt() throws Exception {
+        Harness h = harness();
+        h.join(h.voter);
+        awaitTrue(() -> h.activeIds().contains(VOTER), "votante ativo");
+        int before = h.membershipEvents.get();
+
+        h.transport.connected.remove(VOTER); // the transport closed the leaver's connection
+        h.coord.onPeerLeaving(VOTER);
+
+        assertFalse(h.activeIds().contains(VOTER), "o votante que anunciou a saída deveria ficar inativo na hora");
+        assertEquals(before + 1, h.membershipEvents.get());
+
+        h.transport.connected.add(VOTER);
+        h.heartbeat(VOTER);
+        assertTrue(h.activeIds().contains(VOTER), "o heartbeat de quem voltou com o mesmo id o reativa");
+    }
+
     // ---- harness ----
 
     private Harness harness() {

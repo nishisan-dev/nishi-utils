@@ -254,8 +254,11 @@ class TcpTransportLeaveTest {
         NodeId voterId = voter.local().nodeId();
         awaitHandshaked(voter, storage);
 
+        RecordingListener events = listen(storage);
         voter.close();
         awaitTrue(() -> !storage.isConnected(voterId), "desconexão não percebida");
+        awaitTrue(() -> events.peerEvents(voterId).contains("leaving:m-storage"),
+                "a saída anunciada de um votante é reportada (onPeerLeaving) para o caminho rápido");
         Thread.sleep(RECONNECT.toMillis() * 4);
         assertTrue(knows(storage, voterId), "um membro elegível a líder nunca é esquecido pelo LEAVE");
         assertFalse(storage.isDeparted(voterId));
@@ -509,6 +512,11 @@ class TcpTransportLeaveTest {
         @Override
         public void onPeerLeft(NodeId peerId) {
             events.add("left:" + peerId.value());
+        }
+
+        @Override
+        public void onPeerLeaving(NodeId peerId) {
+            events.add("leaving:" + peerId.value());
         }
 
         @Override

@@ -58,6 +58,19 @@ public interface TransportListener {
     }
 
     /**
+     * Invoked when a <b>leader-eligible</b> peer announced, first-hand, that it is closing (LEAVE). The
+     * peer is not forgotten — it stays a known voter, so the leadership majority is never shrunk
+     * without consensus — but its connection is already closed and it is not coming back soon, so the
+     * disconnect grace may be skipped. The regular {@link #onPeerDisconnected(NodeId)} follows.
+     * No-op by default.
+     *
+     * @param peerId identifier of the leaving peer
+     * @since 8.7.0
+     */
+    default void onPeerLeaving(NodeId peerId) {
+    }
+
+    /**
      * Invoked when a cluster message is received from a peer.
      *
      * @param message the received cluster message
