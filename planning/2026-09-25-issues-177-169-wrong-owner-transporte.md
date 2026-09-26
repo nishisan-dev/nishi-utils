@@ -81,6 +81,45 @@
 - Copiar este plano para `planning/2026-09-25-issues-177-169-wrong-owner-transporte.md`.
 - PR com descrição em PT-BR; após merge, release 8.7.0 via `gh release create` antes da tag. Comentar nas issues #169/#177 (pedir nova validação no TEMS). A #169 só é fechada se a reprodução C0 confirmar a causa.
 
+## Execução / desvios
+
+Registro do que mudou em relação ao plano durante a execução (estado final no branch da 8.7.0).
+
+- **LEAVE — desenho final revisto.** O esquecimento continua sendo `forget` + tombstone, mas:
+  - **A4 (retransmissão única de LEAVE) foi descartado.** O LEAVE só é honrado em primeira mão (na
+    conexão rastreada daquele peer, com handshake e identidade igual à anunciada) e nunca é
+    repassado. Em troca, o campo `departed` (id → TTL restante) segue em todo `PEER_UPDATE`
+    enquanto o tombstone durar (a primeira recepção só antecipa um broadcast), e é **só de admissão**: esquece um peer apenas conhecido, nunca um peer
+    com conexão handshaked aberta nem um votante, e nunca estende o tombstone.
+  - **Efêmero** = inelegível a líder ou porta ≤ 0, na visão de quem sai e na do receptor.
+  - **Gatilho lento** (backstop sem LEAVE: kill -9, OOM, perda de rede), não previsto no plano: peer
+    efêmero sem conexão **e** sem tráfego direto ou retransmitido por
+    `departedPeerForgetAfter` (`max(1 min, 6 × heartbeatInterval)` no `NGridNode`) é esquecido com
+    tombstone **curto** (a mesma janela); os 10 min de `departedPeerTombstoneTtl` ficam só para o
+    LEAVE e sua disseminação. Exigir ausência de tráfego relayed evita esquecer um cliente vivo numa
+    malha parcial.
+  - **Caminho rápido do votante:** o LEAVE de um membro elegível não o esquece, mas fecha a conexão
+    e avisa `onPeerLeaving`; o coordenador confirma o disconnect na hora, sem o grace.
+  - Ajustes de acabamento: envio para id em tombstone falha rápido sem recriar rota; socket que chega
+    durante o LEAVE fecha sem WARNING.
+  - A5 entrou como `AdminCliClusterTest#cliAdministrativoNaoFicaComoMembroDepoisDeSair` (três
+    execuções do CLI; na base `f7d3ccd` os ids seguem em `transport().peers()` de todos os storages).
+- **#179 incluída na 8.7.0** (fora do plano original): `maxActivePeerHighWatermark()` passa a ignorar
+  membros inelegíveis — um cliente à frente no odômetro deixava o cluster sem líder após o failover.
+  Trade-off: com quórum 1 em `RELAY_STREAM`, uma operação que só o cliente recebeu se perde, como
+  antes, mas sem o impasse.
+- **Regressão de alias/handshake encontrada e corrigida antes do release.** As correções de C
+  (reuso do socket do seed ainda não resolvido) abriram uma janela em que um frame saía antes do
+  handshake: o storage inferia a identidade do discador e não respondia, e o cliente ficava preso ao
+  alias ("nenhum storage node alcançável via transporte"). Corrigido com: handshake como primeiro
+  frame da conexão discada (frames retidos até ele), socket aceito sempre responde ao primeiro
+  handshake, reuso do socket de alias limitado a `connectTimeout` (relógio monotônico), remoção das
+  chaves antigas que apontam para a conexão já identificada, e fechamento da conexão discada cujo
+  envio de handshake falha.
+- **Dessincronia de escala do lag global separada na #178** (aberta). A revisão da #179 registrou lá
+  também um caso pré-existente, não corrigido aqui: líder eleito atrás de um seguidor elegível no
+  tópico do catálogo, porque o gate compara um odômetro agregado entre tópicos.
+
 ## Verificação
 - Unitários por fatia: `JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 mvn -pl nishi-utils-core test -Dtest=TcpTransportConcurrentMeshTest,TcpTransportLeaveTest,ProtocolCompatibilityIntegrationTest,LeaveMembershipTest,NGridOperationalSnapshotTest,NGridAlertEngineTest` e `mvn -pl nishi-utils-ngrrd-cluster test -Dtest=StorageRequestHandlerTest,WriteDispatcherTest,WriteBarrierRegressionTest,RemoteSeriesRetryBudgetTest,PlacementResolverTest,Rebalance*Test,NgrrdClusterAdminCliTest`.
 - Cada teste de reprodução (C0, `checkpointConcluiApesarDeDicasContraditorias`, `StaleReplicaRedirectClusterTest`) deve falhar antes da correção e passar depois; conferir por mutação/revert pontual.
