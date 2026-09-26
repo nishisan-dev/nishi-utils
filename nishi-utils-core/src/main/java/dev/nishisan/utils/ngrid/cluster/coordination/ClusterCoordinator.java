@@ -25,6 +25,7 @@ import dev.nishisan.utils.ngrid.common.HeartbeatPayload;
 import dev.nishisan.utils.ngrid.common.MessageType;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
+import dev.nishisan.utils.ngrid.common.TopicFrontiers;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -77,6 +78,10 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     private final AtomicReference<NodeId> leader = new AtomicReference<>();
     private final AtomicLong leaderEpoch = new AtomicLong(0);
     private volatile java.util.function.LongSupplier leaderHighWatermarkSupplier = () -> -1L;
+    /** Per-topic applied frontier vector advertised in heartbeats (issue #178); empty = no vector. */
+    private volatile java.util.function.Supplier<Map<String, Long>> topicFrontiersSupplier = Map::of;
+    /** Topic precedence for the incomparable-vector tie-break (issue #178); empty = name order. */
+    private volatile java.util.List<String> topicPriority = java.util.List.of();
     private volatile java.util.function.BooleanSupplier localLeadershipEligibilitySupplier = () -> true;
     private volatile long trackedLeaderHighWatermark = -1L;
     private volatile long trackedLeaderEpoch = 0L;
@@ -96,6 +101,12 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
 
     /** Per-peer last-known replication high-watermark, learned from heartbeats. -1 until first heard. */
     private final Map<NodeId, Long> peerHighWatermark = new ConcurrentHashMap<>();
+    /**
+     * Per-peer last-known applied frontier PER TOPIC, learned from heartbeats (issue #178). Absent or
+     * empty for peers that advertise no vector (older version, or bootstrap gate engaged): every gate
+     * then falls back to the scalar {@link #peerHighWatermark} for that peer.
+     */
+    private final Map<NodeId, TopicFrontiers> peerTopicFrontiers = new ConcurrentHashMap<>();
     // Last time each peer REFUSED to serve the stream as a non-leader (issue tems#9, D9): fed by the
     // replication layer when a RELAY_STREAM_FETCH addressed to our adopted leader comes back with
     // leaderUnavailable. A recent refusal from the affinity-elected node is the stalemate signal that
@@ -210,6 +221,27 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     }
 
     /**
+     * Registers the supplier of the local node's applied frontier PER TOPIC (issue #178), carried in
+     * every heartbeat next to the scalar watermark so peers compare replication progress topic by
+     * topic. An empty map means "no vector" (peers fall back to the scalar watermark).
+     *
+     * @param supplier the per-topic frontier supplier (never returns {@code null})
+     */
+    public void setTopicFrontiersSupplier(java.util.function.Supplier<Map<String, Long>> supplier) {
+        this.topicFrontiersSupplier = supplier != null ? supplier : Map::of;
+    }
+
+    /**
+     * Sets the topic precedence used to order two INCOMPARABLE frontier vectors with the same total
+     * (issue #178). Must be identical on every node so they rank a pair the same way.
+     *
+     * @param priorityTopics topics in precedence order; {@code null}/empty = topic-name order
+     */
+    public void setTopicPriority(java.util.List<String> priorityTopics) {
+        this.topicPriority = priorityTopics == null ? java.util.List.of() : java.util.List.copyOf(priorityTopics);
+    }
+
+    /**
      * Registers a local leadership eligibility predicate. This lets subsystems that own durable state
      * keep the local node from taking leadership while that state is known to be unsafe to serve. The
      * predicate is local-only; peers express their readiness indirectly through their advertised
@@ -282,21 +314,151 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     }
 
     /**
-     * Returns the active, leader-eligible peer (distinct from {@code localId}) advertising the
-     * highest replication watermark — the node a deferring local node should follow and sync from —
-     * or {@code null} if no such peer has reported a watermark yet. A leader-ineligible peer is never
-     * returned: a deferring node must never adopt an ineligible peer as its local leader.
+     * Highest applied frontier any ACTIVE, LEADER-ELIGIBLE peer advertises for {@code topic} (issue
+     * #178), or {@code -1} when no such peer advertises a frontier vector. Lets a subsystem fence on a
+     * single topic (e.g. the ngrrd catalog before resuming in-flight migrations on a new leader).
+     *
+     * @param topic the replication topic
+     * @return the max eligible peer frontier for the topic, or {@code -1} if unknown
      */
-    private NodeId highestWatermarkActivePeer(NodeId localId) {
-        NodeId best = null;
-        long bestWm = -1L;
+    public long maxActivePeerTopicFrontier(String topic) {
+        long max = -1L;
+        NodeId localId = transport.local().nodeId();
+        for (Map.Entry<NodeId, TopicFrontiers> e : peerTopicFrontiers.entrySet()) {
+            if (e.getKey().equals(localId) || e.getValue() == null || e.getValue().isEmpty()) {
+                continue;
+            }
+            ClusterMember member = members.get(e.getKey());
+            if (member != null && member.isActive() && member.info().isLeaderEligible()) {
+                max = Math.max(max, e.getValue().frontier(topic));
+            }
+        }
+        return max;
+    }
+
+    /**
+     * True when some ACTIVE, LEADER-ELIGIBLE peer is AHEAD of the local node (issue #178): per topic
+     * when both advertise a frontier vector, by the scalar watermark otherwise. This is the predicate
+     * behind gate A and the catch-up nudge; a peer that only mirrors the stream (a client) never counts.
+     *
+     * @return {@code true} while a peer holds state this node has not applied yet
+     */
+    public boolean localBehindEligiblePeer() {
+        return aheadEligiblePeer(transport.local().nodeId()) != null;
+    }
+
+    /** The active, eligible peer AHEAD of the local node (the first found), or {@code null}. */
+    private NodeId aheadEligiblePeer(NodeId localId) {
         for (Map.Entry<NodeId, Long> e : peerHighWatermark.entrySet()) {
             if (e.getKey().equals(localId) || e.getValue() == null) {
                 continue;
             }
             ClusterMember member = members.get(e.getKey());
-            if (member != null && isLeaderCandidate(member) && e.getValue() > bestWm) {
-                bestWm = e.getValue();
+            if (member != null && member.isActive() && member.info().isLeaderEligible()
+                    && peerAheadOfLocal(e.getKey())) {
+                return e.getKey();
+            }
+        }
+        return null;
+    }
+
+    /** Local frontier vector, or {@code null} when the local node advertises none. */
+    private TopicFrontiers localFrontiersOrNull() {
+        Map<String, Long> frontiers = safeTopicFrontiers();
+        return frontiers.isEmpty() ? null : TopicFrontiers.of(frontiers);
+    }
+
+    /** A peer's frontier vector, or {@code null} when it advertises none (older peer / bootstrapping). */
+    private TopicFrontiers peerFrontiersOrNull(NodeId peer) {
+        TopicFrontiers frontiers = peerTopicFrontiers.get(peer);
+        return frontiers == null || frontiers.isEmpty() ? null : frontiers;
+    }
+
+    /**
+     * Is {@code peer} AHEAD of the local node — does it hold state we have not applied? Per topic when
+     * both sides advertise a vector (issue #178), else by the scalar watermark. A peer advertising
+     * {@code -1} (bootstrap gate) is never ahead.
+     */
+    private boolean peerAheadOfLocal(NodeId peer) {
+        Long watermark = peerHighWatermark.get(peer);
+        if (watermark == null || watermark < 0L) {
+            return false;
+        }
+        TopicFrontiers local = localFrontiersOrNull();
+        TopicFrontiers theirs = peerFrontiersOrNull(peer);
+        if (local != null && theirs != null) {
+            return local.isBehind(theirs, syncReclaimLagThreshold, topicPriority);
+        }
+        return watermark > safeLocalApplied() + syncReclaimLagThreshold;
+    }
+
+    /**
+     * Is the local node STRICTLY AHEAD of {@code peer} (beyond the tolerance)? Per topic when both
+     * sides advertise a vector, else by the scalar watermark. Used by the D9 stalemate escape.
+     */
+    private boolean localAheadOfPeer(NodeId peer) {
+        Long watermark = peerHighWatermark.get(peer);
+        long localApplied = safeLocalApplied();
+        if (watermark == null || localApplied < 0L) {
+            return false;
+        }
+        TopicFrontiers local = localFrontiersOrNull();
+        TopicFrontiers theirs = peerFrontiersOrNull(peer);
+        if (local != null && theirs != null && watermark >= 0L) {
+            return local.isAhead(theirs, syncReclaimLagThreshold, topicPriority);
+        }
+        return localApplied > watermark + syncReclaimLagThreshold;
+    }
+
+    /**
+     * Orders two peers by advertised state: {@code > 0} when {@code a} holds newer state than {@code b}
+     * (per topic when both advertise a vector, else by scalar watermark), affinity (priority, then id)
+     * as the tie-break so every node ranks the same pair identically.
+     */
+    private int compareAdvertisedState(NodeId a, NodeId b) {
+        TopicFrontiers fa = peerFrontiersOrNull(a);
+        TopicFrontiers fb = peerFrontiersOrNull(b);
+        long wa = peerHighWatermark.getOrDefault(a, -1L);
+        long wb = peerHighWatermark.getOrDefault(b, -1L);
+        if (fa != null && fb != null && wa >= 0L && wb >= 0L) {
+            if (fa.isAhead(fb, syncReclaimLagThreshold, topicPriority)) {
+                return 1;
+            }
+            if (fa.isBehind(fb, syncReclaimLagThreshold, topicPriority)) {
+                return -1;
+            }
+        } else if (wa != wb) {
+            return Long.compare(wa, wb);
+        }
+        ClusterMember ma = members.get(a);
+        ClusterMember mb = members.get(b);
+        int pa = ma == null ? Integer.MIN_VALUE : ma.info().priority();
+        int pb = mb == null ? Integer.MIN_VALUE : mb.info().priority();
+        if (pa != pb) {
+            return Integer.compare(pa, pb);
+        }
+        return a.compareTo(b);
+    }
+
+    /**
+     * Returns the active, leader-eligible peer (distinct from {@code localId}) advertising the newest
+     * replication state — the node a deferring local node should follow and sync from — or
+     * {@code null} if no such peer has reported a watermark yet. Ranked per topic when the peers
+     * advertise frontier vectors (issue #178), by scalar watermark otherwise, affinity as tie-break. A
+     * leader-ineligible peer is never returned: a deferring node must never adopt an ineligible peer
+     * as its local leader.
+     */
+    private NodeId highestWatermarkActivePeer(NodeId localId) {
+        NodeId best = null;
+        for (Map.Entry<NodeId, Long> e : peerHighWatermark.entrySet()) {
+            if (e.getKey().equals(localId) || e.getValue() == null || e.getValue() < 0L) {
+                continue;
+            }
+            ClusterMember member = members.get(e.getKey());
+            if (member == null || !isLeaderCandidate(member)) {
+                continue;
+            }
+            if (best == null || compareAdvertisedState(e.getKey(), best) > 0) {
                 best = e.getKey();
             }
         }
@@ -767,7 +929,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 return;
             }
             HeartbeatPayload payload = HeartbeatPayload.now(leaderHighWatermarkSupplier.getAsLong(),
-                    leaderEpoch.get(), isLeader());
+                    leaderEpoch.get(), isLeader(), safeTopicFrontiers());
             ClusterMessage heartbeat = ClusterMessage.lightweight(MessageType.HEARTBEAT,
                     "hb",
                     transport.local().nodeId(),
@@ -835,6 +997,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                     member.markInactive();
                     // Drop the dead peer's tracked watermark so a deferring higher-affinity node can lead.
                     peerHighWatermark.remove(member.id());
+                    peerTopicFrontiers.remove(member.id());
                     leaderRefusalAtMs.remove(member.id());
                     peerAssertsLeadership.remove(member.id());
                     changed = true;
@@ -961,6 +1124,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                     lastLeaderBehindWarnMs = now;
                     LOGGER.warning(() -> "Current leader observes a peer watermark above its own applied ("
                             + safeLocalApplied() + " < " + maxActivePeerHighWatermark()
+                            + describeAheadPeerDivergence(localId)
                             + "); retaining leadership (counter-scale desync symptom — see issue tems#9/D9)");
                 }
             }
@@ -1080,12 +1244,12 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 // STRICTLY ahead beyond the tolerance: with equal watermarks (every fresh boot is 0/0)
                 // the affinity election must win — a transient refusal during an election dance must
                 // never invert affinity. The genuine stalemate signature is local state the elected
-                // node does not have.
+                // node does not have — compared per topic when both advertise a vector (issue #178).
                 if (recentRefusal && electedStillNotLeading && refusalConfirmedByLaterHeartbeat
-                        && electedWatermark != null && localApplied >= 0
-                        && localApplied > electedWatermark + syncReclaimLagThreshold) {
+                        && localAheadOfPeer(electedId)) {
                     LOGGER.warning(() -> "[" + localId + "] Affinity-elected " + electedId + " refuses leadership and is not"
                             + " ahead (peer=" + electedWatermark + ", local=" + localApplied
+                            + describePeerDivergence(electedId)
                             + "); taking leadership to break the leaderless stalemate (issue tems#9, D9)");
                     updateLeader(localId);
                     return;
@@ -1140,10 +1304,29 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      * @param watermark its applied watermark (ignored when negative)
      */
     public void noteFollowerWatermark(NodeId node, long watermark) {
+        noteFollowerWatermark(node, watermark, null);
+    }
+
+    /**
+     * Same as {@link #noteFollowerWatermark(NodeId, long)}, also merging the follower's per-topic
+     * frontier vector (issue #178) when it reported one (per-topic max, never regressing).
+     *
+     * @param node           the reporting follower
+     * @param watermark      its applied watermark (ignored when negative)
+     * @param topicFrontiers its per-topic frontiers, or {@code null}/empty when not reported
+     */
+    public void noteFollowerWatermark(NodeId node, long watermark, Map<String, Long> topicFrontiers) {
         if (node == null || watermark < 0 || node.equals(transport.local().nodeId())) {
             return;
         }
         peerHighWatermark.merge(node, watermark, Math::max);
+        if (topicFrontiers != null && !topicFrontiers.isEmpty()) {
+            peerTopicFrontiers.merge(node, TopicFrontiers.of(topicFrontiers), (current, reported) -> {
+                Map<String, Long> merged = new java.util.HashMap<>(current.byTopic());
+                reported.byTopic().forEach((topic, frontier) -> merged.merge(topic, frontier, Math::max));
+                return TopicFrontiers.of(merged);
+            });
+        }
         reevaluateLeadership();
     }
 
@@ -1391,11 +1574,32 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 && maxPeer < localApplied) {
             return false;
         }
-        if (localApplied >= maxPeer - syncReclaimLagThreshold) {
+        // Issue #178: "caught up" = no eligible active peer holds state we lack — decided PER TOPIC
+        // against every peer that advertises a frontier vector (a peer behind on one topic and ahead
+        // on another is resolved by the deterministic total tie-break), by scalar watermark against
+        // peers that do not.
+        if (aheadEligiblePeer(localId) == null) {
             reclaimCaughtUpLatch = true;
             return true;
         }
         return false;
+    }
+
+    /** " (topic=a<b, ...)" for the first eligible peer ahead of the local node, or "" when none. */
+    private String describeAheadPeerDivergence(NodeId localId) {
+        NodeId ahead = aheadEligiblePeer(localId);
+        return ahead == null ? "" : describePeerDivergence(ahead);
+    }
+
+    /** " (peer <id>: topic=a<b, ...)" when both sides advertise a vector, or "" otherwise. */
+    private String describePeerDivergence(NodeId peer) {
+        TopicFrontiers local = localFrontiersOrNull();
+        TopicFrontiers theirs = peerFrontiersOrNull(peer);
+        if (local == null || theirs == null) {
+            return "";
+        }
+        String divergence = local.describeDivergence(theirs, syncReclaimLagThreshold);
+        return divergence.isEmpty() ? "" : " (peer " + peer + ": " + divergence + ")";
     }
 
     /**
@@ -1413,6 +1617,13 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         if (candWatermark == null) {
             return true; // unheard candidate frontier — conservatively keep leadership until it reports
         }
+        TopicFrontiers local = localFrontiersOrNull();
+        TopicFrontiers theirs = peerFrontiersOrNull(candidate);
+        if (local != null && theirs != null && candWatermark >= 0L) {
+            // Issue #178: per topic — a candidate missing the last op of ONE topic is behind, whatever
+            // its total says.
+            return theirs.isBehind(local, syncReclaimLagThreshold, topicPriority);
+        }
         return candWatermark < localWatermark - syncReclaimLagThreshold;
     }
 
@@ -1422,6 +1633,16 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         } catch (RuntimeException e) {
             // A supplier failure must not crash the election; treat as "unknown frontier = behind".
             return Long.MIN_VALUE;
+        }
+    }
+
+    /** The local per-topic frontier vector for heartbeats; empty on supplier failure (no vector). */
+    private Map<String, Long> safeTopicFrontiers() {
+        try {
+            Map<String, Long> frontiers = topicFrontiersSupplier.get();
+            return frontiers == null ? Map.of() : frontiers;
+        } catch (RuntimeException e) {
+            return Map.of();
         }
     }
 
@@ -1824,6 +2045,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         // waiting on a peer that is genuinely gone (lead-while-alone): with no active peer ahead, the
         // reclaim gate is a no-op and the node leads.
         peerHighWatermark.remove(peerId);
+        peerTopicFrontiers.remove(peerId);
         // A gone peer can neither refuse nor assert leadership (issue tems#9, D9).
         leaderRefusalAtMs.remove(peerId);
         peerAssertsLeadership.remove(peerId);
@@ -1914,7 +2136,17 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 if (reported >= -1) {
                     Long prev = peerHighWatermark.put(source, reported);
                     watermarkAdvanced = prev == null || reported != prev;
-                    if (watermarkAdvanced && reported > safeLocalApplied() + syncReclaimLagThreshold) {
+                    // Issue #178: record the per-topic frontier vector next to the scalar (an empty
+                    // vector = "none advertised": older peer or bootstrap gate → scalar fallback).
+                    TopicFrontiers reportedFrontiers = TopicFrontiers.of(payload.topicFrontiers());
+                    TopicFrontiers prevFrontiers = reportedFrontiers.isEmpty()
+                            ? peerTopicFrontiers.remove(source)
+                            : peerTopicFrontiers.put(source, reportedFrontiers);
+                    if (!Objects.equals(prevFrontiers, reportedFrontiers)
+                            && !(prevFrontiers == null && reportedFrontiers.isEmpty())) {
+                        watermarkAdvanced = true;
+                    }
+                    if (watermarkAdvanced && peerAheadOfLocal(source)) {
                         reclaimCaughtUpLatch = false;
                     }
                 }

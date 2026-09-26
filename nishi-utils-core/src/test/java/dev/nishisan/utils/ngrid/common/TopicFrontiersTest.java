@@ -15,7 +15,7 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>
  */
 
-package dev.nishisan.utils.ngrid.replication;
+package dev.nishisan.utils.ngrid.common;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -25,7 +25,7 @@ import java.util.Map;
 
 import org.junit.jupiter.api.Test;
 
-import dev.nishisan.utils.ngrid.replication.TopicFrontiers.Comparison;
+import dev.nishisan.utils.ngrid.common.TopicFrontiers.Comparison;
 
 /** Semântica do vetor de fronteiras por tópico (issue #178). */
 class TopicFrontiersTest {
@@ -64,12 +64,21 @@ class TopicFrontiersTest {
         assertTrue(a.isAhead(b, 0L), "soma 30 > 29 decide");
         assertTrue(b.isBehind(a, 0L));
         assertFalse(a.isBehind(b, 0L));
-        // Somas iguais e incomparáveis: ninguém está atrás — a afinidade decide no coordinator.
+        // Somas iguais e incomparáveis: o primeiro tópico (em ordem de prioridade, depois por nome)
+        // em que divergem decide — determinístico e igual nos dois lados.
         TopicFrontiers c = TopicFrontiers.of(Map.of("map:ngrrd.catalog", 10L, "map:ngrrd.nodes", 20L));
         TopicFrontiers d = TopicFrontiers.of(Map.of("map:ngrrd.catalog", 11L, "map:ngrrd.nodes", 19L));
-        assertFalse(c.isBehind(d, 0L));
+        assertTrue(c.isBehind(d, 0L), "sem lista: ordem por nome → catalog decide → d à frente");
+        assertTrue(d.isAhead(c, 0L));
         assertFalse(d.isBehind(c, 0L));
-        assertFalse(c.isAhead(d, 0L));
+        // Com prioridade explícita para `nodes`, inverte.
+        java.util.List<String> nodesFirst = java.util.List.of("map:ngrrd.nodes");
+        assertTrue(d.isBehind(c, 0L, nodesFirst));
+        assertTrue(c.isAhead(d, 0L, nodesFirst));
+        assertFalse(c.isBehind(d, 0L, nodesFirst));
+        // A prioridade nunca sobrepõe a dominância nem a soma.
+        TopicFrontiers e = TopicFrontiers.of(Map.of("map:ngrrd.catalog", 9L, "map:ngrrd.nodes", 22L));
+        assertTrue(c.isBehind(e, 0L, java.util.List.of("map:ngrrd.catalog")), "soma 31 > 30 vence a prioridade");
     }
 
     @Test

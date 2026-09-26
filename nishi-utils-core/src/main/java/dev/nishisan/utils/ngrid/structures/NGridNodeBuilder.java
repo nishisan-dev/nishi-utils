@@ -66,6 +66,7 @@ public final class NGridNodeBuilder {
     private boolean leaderPauseOnReclaim = false;
     private Duration bootDiscoveryWindow;
     private boolean affinityHandbackMode = false;
+    private java.util.List<String> priorityTopics = java.util.List.of();
     private int priority = 0;
     private Set<String> roles = Collections.emptySet();
 
@@ -350,6 +351,18 @@ public final class NGridNodeBuilder {
      * @param enabled {@code true} to use the snapshot-orchestrated handover
      * @return this builder
      */
+    /**
+     * Replication topics that take precedence when two nodes hold incomparable per-topic frontiers
+     * with the same total after a failover (issue #178); see {@link NGridConfig.Builder#priorityTopics}.
+     *
+     * @param priorityTopics topics in precedence order, e.g. {@code List.of("map:ngrrd.catalog")}
+     * @return this builder
+     */
+    public NGridNodeBuilder priorityTopics(java.util.List<String> priorityTopics) {
+        this.priorityTopics = priorityTopics == null ? java.util.List.of() : java.util.List.copyOf(priorityTopics);
+        return this;
+    }
+
     public NGridNodeBuilder affinityHandbackMode(boolean enabled) {
         this.affinityHandbackMode = enabled;
         return this;
@@ -383,7 +396,8 @@ public final class NGridNodeBuilder {
                 .leaderPauseOnJoin(leaderPauseOnJoin)
                 .leaderPauseOnReclaim(leaderPauseOnReclaim)
                 .bootDiscoveryWindow(bootDiscoveryWindow)
-                .affinityHandbackMode(affinityHandbackMode);
+                .affinityHandbackMode(affinityHandbackMode)
+                .priorityTopics(priorityTopics);
 
         if (dataDir != null) {
             builder.dataDirectory(dataDir);

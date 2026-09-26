@@ -384,6 +384,7 @@ public final class NGridNode implements Closeable {
         replicationBuilder.reclaimQuiesceMaxDuration(config.reclaimQuiesceMaxDuration());
         replicationBuilder.reclaimQuiesceCooldown(config.reclaimQuiesceCooldown());
         replicationBuilder.affinityHandbackMode(config.affinityHandbackMode());
+        replicationBuilder.priorityTopics(config.priorityTopics());
         replicationBuilder.handoverMaxDuration(config.handoverMaxDuration());
         replicationBuilder.handoverSnapshotTimeout(config.handoverSnapshotTimeout());
         replicationBuilder.handoverRequestTimeout(config.handoverRequestTimeout());

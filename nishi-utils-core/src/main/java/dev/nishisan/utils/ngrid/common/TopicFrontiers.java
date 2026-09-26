@@ -15,11 +15,14 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>
  */
 
-package dev.nishisan.utils.ngrid.replication;
+package dev.nishisan.utils.ngrid.common;
 
 import java.util.Collections;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.TreeMap;
 
 /**
@@ -35,6 +38,13 @@ import java.util.TreeMap;
  * the same number for a leader and for a fully caught-up follower and is used for observability
  * and for peers that predate the vector (rolling upgrade). It is never used to rank two nodes that
  * both advertise a vector unless their vectors are {@link Comparison#INCOMPARABLE incomparable}.
+ *
+ * <p>Two incomparable vectors (each ahead on some topic) are ordered deterministically so that every
+ * node ranks the same pair identically: by {@link #total()} first, then topic by topic in
+ * <em>priority order</em> — the caller's priority list first (e.g. the ngrrd catalog before its
+ * status topic), the remaining topics by name. The first topic on which they differ decides. This
+ * is a convention for choosing which lineage survives when both hold an unreplicated op; it never
+ * overrides dominance.
  *
  * <p>Synthetic sequence-state keys ({@code _global}, {@code _topic:*}) are never part of a vector.
  *
@@ -139,20 +149,61 @@ public record TopicFrontiers(Map<String, Long> byTopic) {
 
     /**
      * True when {@code other} holds state this node lacks: it dominates this vector, or the vectors
-     * are incomparable and {@code other} has the larger total (the deterministic tie-break both sides
-     * compute identically, so exactly one of the two nodes yields).
+     * are incomparable and {@code other} wins the deterministic tie-break (larger total, then the
+     * first differing topic in priority order — both sides compute it identically, so exactly one
+     * of the two nodes yields).
      */
     public boolean isBehind(TopicFrontiers other, long threshold) {
+        return isBehind(other, threshold, List.of());
+    }
+
+    /** {@link #isBehind(TopicFrontiers, long)} with an explicit topic priority list for the tie-break. */
+    public boolean isBehind(TopicFrontiers other, long threshold, List<String> priorityTopics) {
         Comparison c = compare(other, threshold);
         return c == Comparison.BEHIND
-                || (c == Comparison.INCOMPARABLE && total() < other.total());
+                || (c == Comparison.INCOMPARABLE && tieBreak(other, threshold, priorityTopics) < 0);
     }
 
     /** Mirror of {@link #isBehind}: true when this vector holds state {@code other} lacks. */
     public boolean isAhead(TopicFrontiers other, long threshold) {
+        return isAhead(other, threshold, List.of());
+    }
+
+    /** {@link #isAhead(TopicFrontiers, long)} with an explicit topic priority list for the tie-break. */
+    public boolean isAhead(TopicFrontiers other, long threshold, List<String> priorityTopics) {
         Comparison c = compare(other, threshold);
         return c == Comparison.AHEAD
-                || (c == Comparison.INCOMPARABLE && total() > other.total());
+                || (c == Comparison.INCOMPARABLE && tieBreak(other, threshold, priorityTopics) > 0);
+    }
+
+    /**
+     * Deterministic order between two INCOMPARABLE vectors: larger total wins; on equal totals the
+     * first topic (priority list first, then the rest by name) on which they differ beyond the
+     * threshold wins for the side holding the higher frontier. {@code 0} only when nothing differs.
+     */
+    private int tieBreak(TopicFrontiers other, long threshold, List<String> priorityTopics) {
+        int byTotal = Long.compare(total(), other.total());
+        if (byTotal != 0) {
+            return byTotal;
+        }
+        long tolerance = Math.max(0L, threshold);
+        Set<String> ordered = new LinkedHashSet<>();
+        if (priorityTopics != null) {
+            ordered.addAll(priorityTopics);
+        }
+        ordered.addAll(byTopic.keySet());
+        ordered.addAll(other.byTopic.keySet());
+        for (String topic : ordered) {
+            long mine = frontier(topic);
+            long theirs = other.frontier(topic);
+            if (mine > theirs + tolerance) {
+                return 1;
+            }
+            if (theirs > mine + tolerance) {
+                return -1;
+            }
+        }
+        return 0;
     }
 
     /**

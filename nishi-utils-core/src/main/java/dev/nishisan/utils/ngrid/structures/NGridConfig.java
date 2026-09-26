@@ -62,6 +62,7 @@ public final class NGridConfig {
     private final Duration reclaimQuiesceMaxDuration;
     private final Duration reclaimQuiesceCooldown;
     private final boolean affinityHandbackMode;
+    private final java.util.List<String> priorityTopics;
     private final Duration handoverMaxDuration;
     private final Duration handoverSnapshotTimeout;
     private final Duration handoverRequestTimeout;
@@ -133,6 +134,7 @@ public final class NGridConfig {
         this.reclaimQuiesceMaxDuration = builder.reclaimQuiesceMaxDuration;
         this.reclaimQuiesceCooldown = builder.reclaimQuiesceCooldown;
         this.affinityHandbackMode = builder.affinityHandbackMode;
+        this.priorityTopics = java.util.List.copyOf(builder.priorityTopics);
         this.handoverMaxDuration = builder.handoverMaxDuration;
         this.handoverSnapshotTimeout = builder.handoverSnapshotTimeout;
         this.handoverRequestTimeout = builder.handoverRequestTimeout;
@@ -415,6 +417,18 @@ public final class NGridConfig {
      */
     public boolean affinityHandbackMode() {
         return affinityHandbackMode;
+    }
+
+    /**
+     * Replication topics ({@code "map:<name>"} / {@code "queue:<name>"}) that take precedence, in order,
+     * when two nodes hold incomparable per-topic frontiers with the same total after a failover (issue
+     * #178): the first listed topic on which they differ decides which lineage survives. Must be the
+     * same on every node. Defaults to empty (topic-name order).
+     *
+     * @return the topic priority list (never null)
+     */
+    public java.util.List<String> priorityTopics() {
+        return priorityTopics;
     }
 
     /**
@@ -706,6 +720,7 @@ public final class NGridConfig {
         private Duration reclaimQuiesceMaxDuration = Duration.ofSeconds(5);
         private Duration reclaimQuiesceCooldown = Duration.ofSeconds(60);
         private boolean affinityHandbackMode = false;
+        private java.util.List<String> priorityTopics = java.util.List.of();
         private Duration handoverMaxDuration = Duration.ofSeconds(120);
         private Duration handoverSnapshotTimeout = Duration.ofSeconds(120);
         private Duration handoverRequestTimeout = Duration.ofSeconds(30);
@@ -1153,6 +1168,18 @@ public final class NGridConfig {
          */
         public Builder affinityHandbackMode(boolean enabled) {
             this.affinityHandbackMode = enabled;
+            return this;
+        }
+
+        /**
+         * Sets the replication topics that break ties between incomparable per-topic frontiers
+         * (issue #178). See {@link NGridConfig#priorityTopics()}.
+         *
+         * @param priorityTopics topics in precedence order, e.g. {@code List.of("map:ngrrd.catalog")}
+         * @return this builder
+         */
+        public Builder priorityTopics(java.util.List<String> priorityTopics) {
+            this.priorityTopics = priorityTopics == null ? java.util.List.of() : java.util.List.copyOf(priorityTopics);
             return this;
         }
 

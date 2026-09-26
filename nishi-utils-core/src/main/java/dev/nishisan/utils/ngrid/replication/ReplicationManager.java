@@ -34,6 +34,7 @@ import dev.nishisan.utils.ngrid.common.HandbackGrantPayload;
 import dev.nishisan.utils.ngrid.common.HandbackRequestPayload;
 import dev.nishisan.utils.ngrid.common.MessageType;
 import dev.nishisan.utils.ngrid.common.NodeId;
+import dev.nishisan.utils.ngrid.common.TopicFrontiers;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.ngrid.common.OperationStatus;
 import dev.nishisan.utils.ngrid.common.RelayStreamBatchPayload;
@@ -315,6 +316,9 @@ public class ReplicationManager
      * @param lag                   leader high-watermark minus the applied frontier (follower lag)
      * @param streamBytesIn         cumulative stream bytes pulled for the topic (RELAY_STREAM)
      * @param streaming             true while actively streaming the topic from the leader
+     * @param maxPeerFrontier       highest applied frontier any active, leader-eligible peer advertises
+     *                              for the topic in its heartbeat (issue #178), or {@code -1} if none
+     *                              advertises a frontier vector
      */
     public record TopicReplicationStatus(
             String topic,
@@ -329,7 +333,18 @@ public class ReplicationManager
             long leaderOldestSequence,
             long lag,
             long streamBytesIn,
-            boolean streaming) {
+            boolean streaming,
+            long maxPeerFrontier) {
+
+        /** Compatibility constructor (pre-#178): {@code maxPeerFrontier = -1}. */
+        public TopicReplicationStatus(String topic, long nextExpectedSequence, long relayHeadSequence,
+                long relayBacklog, boolean syncing, boolean relayPendingBootstrap, boolean resendPending,
+                long streamCursor, long leaderHighWatermark, long leaderOldestSequence, long lag,
+                long streamBytesIn, boolean streaming) {
+            this(topic, nextExpectedSequence, relayHeadSequence, relayBacklog, syncing, relayPendingBootstrap,
+                    resendPending, streamCursor, leaderHighWatermark, leaderOldestSequence, lag, streamBytesIn,
+                    streaming, -1L);
+        }
     }
 
     public ReplicationManager(Transport transport, ClusterCoordinator coordinator, ReplicationConfig config) {
@@ -370,6 +385,10 @@ public class ReplicationManager
         // max(globalSequence, lastApplied) keeps the advertised watermark on the same scale as every
         // follower's applied frontier, so the gate compares like with like.
         coordinator.setLeaderHighWatermarkSupplier(this::advertisedLeaderHighWatermark);
+        // Issue #178: the heartbeat also carries the frontier PER TOPIC, so the gates below compare
+        // like with like topic by topic instead of through the aggregated total.
+        coordinator.setTopicFrontiersSupplier(this::advertisedTopicFrontiers);
+        coordinator.setTopicPriority(config.priorityTopics());
         // Sync-before-reclaim (watermark gate): feed the coordinator the local APPLIED frontier and the
         // catch-up tolerance. The coordinator compares this against every peer's advertised watermark
         // (learned from heartbeats) to decide whether a returning higher-affinity node may reclaim
@@ -786,9 +805,8 @@ public class ReplicationManager
             if (maxPeer < 0) {
                 return; // no peer ahead — nothing deferred (lead-while-alone is handled by recompute)
             }
-            long applied = getLastAppliedSequence();
-            long threshold = Math.max(0L, config.joinSyncLagThreshold());
-            if (applied >= maxPeer - threshold) {
+            // Issue #178: caught up = no eligible peer ahead, decided per topic by the coordinator.
+            if (!coordinator.localBehindEligiblePeer()) {
                 coordinator.reevaluateLeadership();
             }
         } catch (Throwable t) {
@@ -2479,7 +2497,8 @@ public class ReplicationManager
                     getLeaderOldestSequence(topic),
                     getReplicationLag(topic),
                     getStreamBytesIn(topic),
-                    isStreaming(topic)));
+                    isStreaming(topic),
+                    coordinator.maxActivePeerTopicFrontier(topic)));
         }
         return statuses;
     }

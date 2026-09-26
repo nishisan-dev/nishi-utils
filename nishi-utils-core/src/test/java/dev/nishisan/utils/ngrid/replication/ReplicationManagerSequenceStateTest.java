@@ -44,6 +44,7 @@ import dev.nishisan.utils.ngrid.cluster.transport.TransportListener;
 import dev.nishisan.utils.ngrid.common.ClusterMessage;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
+import dev.nishisan.utils.ngrid.common.TopicFrontiers;
 
 /**
  * Reprodução do D1 da issue #139: o seed do applied a partir do frontier persistido
