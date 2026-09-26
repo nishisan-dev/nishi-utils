@@ -301,8 +301,11 @@ public final class MigrationCoordinator implements LeadershipListener {
             // Issue #177: o plano pode ter sido montado minutos antes (fila do semáforo); o destino é
             // rechecado agora, pelo status na réplica local do líder (a autoritativa). Um destino com a
             // réplica atrasada responderia pela réplica durante o corte de dono. Só migrações novas: as
-            // retomadas por resumeInFlight() já estão em curso e precisam terminar.
-            Optional<String> lagging = catalog.nodeStatusLocal(dst)
+            // retomadas por resumeInFlight() já estão em curso e precisam terminar. O líder atual como destino
+            // é isento (mesmo critério do Rebalancer): a réplica dele é a fonte, mesmo que o último status
+            // que publicou seja de antes de assumir.
+            boolean destinationIsLeader = leaderView.leaderId().map(dst::equals).orElse(false);
+            Optional<String> lagging = destinationIsLeader ? Optional.empty() : catalog.nodeStatusLocal(dst)
                     .flatMap(status -> CatalogLagGate.exclusionReason(status, maxDestinationCatalogLag));
             if (lagging.isPresent()) {
                 return new MigrationResult(MigrationOutcome.SKIPPED,

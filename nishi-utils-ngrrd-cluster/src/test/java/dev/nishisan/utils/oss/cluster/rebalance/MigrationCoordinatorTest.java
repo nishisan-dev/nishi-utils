@@ -193,6 +193,24 @@ class MigrationCoordinatorTest {
     }
 
     @Test
+    void destinoQueEhOLiderAtualNaoPassaPelaPortaDeLag() throws Exception {
+        // Mesmo critério do Rebalancer: a réplica do líder é a fonte, mesmo que o último status que ele
+        // publicou seja de antes de assumir a liderança.
+        newCoordinator(2);
+        leaderView.leaderId = Optional.of(DST);
+        catalog.putPlacement("s1", SeriesPlacement.active(SRC, 1_000L));
+        catalog.putNodeStatus(withReplica(DST, CatalogReplicaStatus.from(false, null)));
+        rpc.respond(SRC, Commands.MIGRATE_START, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+        rpc.respond(DST, Commands.MIGRATE_STATUS,
+                (target, body) -> new MigrateResponse(MigrateStatus.COMMITTED, null, 10L));
+        rpc.respond(SRC, Commands.MIGRATE_FINISH, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+
+        MigrationResult result = coordinator.migrate("s1", SRC, DST).get(AWAIT_TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+
+        assertEquals(MigrationOutcome.COMPLETED, result.outcome(), result.reason());
+    }
+
+    @Test
     void portaDesligadaNaoBarraDestinoAtrasado() throws Exception {
         coordinator = new MigrationCoordinator(catalog, rpc, leaderView, 2, Duration.ofMillis(20),
                 Duration.ofSeconds(5), Clock.systemUTC(), new MigrationCoordinator.MigrationHooks() {
@@ -999,6 +1017,7 @@ class MigrationCoordinatorTest {
     /** {@link PlacementRequestHandler.LeaderView} fake. */
     private static final class LeaderViewFake implements PlacementRequestHandler.LeaderView {
         private volatile boolean leader;
+        private volatile Optional<String> leaderId = Optional.empty();
 
         @Override
         public boolean isLeader() {
@@ -1007,7 +1026,7 @@ class MigrationCoordinatorTest {
 
         @Override
         public Optional<String> leaderId() {
-            return Optional.empty();
+            return leaderId;
         }
 
         @Override
