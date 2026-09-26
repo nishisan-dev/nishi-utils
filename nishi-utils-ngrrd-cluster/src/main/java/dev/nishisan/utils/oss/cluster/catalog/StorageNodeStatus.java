@@ -40,6 +40,9 @@ import java.util.Set;
  * @param capabilities     capacidades de protocolo que o nó anuncia ({@link StorageCapabilities}); vazio
  *                         num status publicado por uma versão anterior a elas (campo ausente na
  *                         serialização Java ou no JSON replicado) — nunca {@code null}, cópia imutável
+ * @param catalogReplica   estado da réplica local do catálogo neste nó (issue #177); {@code null} quando o
+ *                         status foi publicado por uma versão anterior (campo ausente na serialização Java
+ *                         ou no JSON replicado) ou não pôde ser coletado — "não reportado", nunca "em dia"
  */
 public record StorageNodeStatus(
         String nodeId,
@@ -49,7 +52,8 @@ public record StorageNodeStatus(
         long capacityBytes,
         long reportedAtEpochMs,
         DistributionMode distributionMode, double weight, long reservedBytes,
-        Set<String> capabilities) implements Serializable {
+        Set<String> capabilities,
+        CatalogReplicaStatus catalogReplica) implements Serializable {
 
     /** B1 (achado do Debugger): ver Javadoc de {@code SeriesPlacement#serialVersionUID}. */
     private static final long serialVersionUID = 1L;
@@ -65,6 +69,14 @@ public record StorageNodeStatus(
             long reservedBytes) {
         this(nodeId, state, seriesCount, usedBytes, capacityBytes, reportedAtEpochMs, distributionMode, weight,
                 reservedBytes, Set.of());
+    }
+
+    /** Status sem a réplica do catálogo — a forma do record da 8.6.0, antes dela existir. */
+    public StorageNodeStatus(String nodeId, NodeState state, long seriesCount, long usedBytes,
+            long capacityBytes, long reportedAtEpochMs, DistributionMode distributionMode, double weight,
+            long reservedBytes, Set<String> capabilities) {
+        this(nodeId, state, seriesCount, usedBytes, capacityBytes, reportedAtEpochMs, distributionMode, weight,
+                reservedBytes, capabilities, null);
     }
 
     public StorageNodeStatus {
@@ -83,16 +95,22 @@ public record StorageNodeStatus(
         return new StorageNodeStatus(nodeId, NodeState.ACTIVE, 0L, 0L, 0L, now);
     }
 
-    /** Atualiza a carga reportada, preservando {@code nodeId}, {@code state} e as capacidades. */
+    /**
+     * Atualiza a carga reportada, preservando {@code nodeId}, {@code state}, as capacidades e a réplica do
+     * catálogo.
+     */
     public StorageNodeStatus withLoad(long seriesCount, long usedBytes, long capacityBytes, long now) {
         return new StorageNodeStatus(nodeId, state, seriesCount, usedBytes, capacityBytes, now, distributionMode, weight,
-                reservedBytes, capabilities);
+                reservedBytes, capabilities, catalogReplica);
     }
 
-    /** Transiciona o nó para outro {@link NodeState}, preservando a carga reportada e as capacidades. */
+    /**
+     * Transiciona o nó para outro {@link NodeState}, preservando a carga reportada, as capacidades e a
+     * réplica do catálogo.
+     */
     public StorageNodeStatus withState(NodeState newState, long now) {
         return new StorageNodeStatus(nodeId, newState, seriesCount, usedBytes, capacityBytes, now, distributionMode,
-                weight, reservedBytes, capabilities);
+                weight, reservedBytes, capabilities, catalogReplica);
     }
 
     /** Se o nó anuncia {@code capability} (ver {@link StorageCapabilities}). */

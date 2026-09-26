@@ -480,6 +480,116 @@ class PlacementResolverTest {
         assertTrue(rpc.calls().isEmpty(), "sem líder eleito, nenhuma chamada deveria ter sido feita");
     }
 
+    @Test
+    void dicaDeWrongOwnerNaoVenceEntradaMaisNovaDaReplica() {
+        catalog.putPlacement("series-1", SeriesPlacement.active("storage-a", 1_000L));
+        resolver.noteOwner("series-1", "storage-c");
+        // Empate de updatedAt: a dica vence a réplica que ela mesma contradiz.
+        assertEquals("storage-c", resolver.resolve("series-1", "hash-1").ownerNodeId());
+
+        // A réplica avança depois da dica (ex.: migração abortada e reconfirmada em storage-a): a
+        // entrada estritamente mais nova vence — a dica não carrega o relógio do cliente.
+        catalog.putPlacement("series-1", SeriesPlacement.active("storage-a", 2_000L));
+
+        assertEquals("storage-a", resolver.resolve("series-1", "hash-1").ownerNodeId());
+        assertEquals(0, rpc.calls().size());
+    }
+
+    @Test
+    void carimboDaDicaEOMaiorUpdatedAtConhecido() {
+        long[] now = {10_000L};
+        PlacementResolver clocked = resolverWithClock(now);
+        catalog.putPlacement("series-1", SeriesPlacement.active("storage-a", 1_000L));
+        rpc.respondNext((cmd, body) -> CatalogLookupResponse.ok(
+                Map.of("series-1", SeriesPlacement.active("storage-b", 4_000L))));
+        clocked.resolveExistingAtLeader("series-1", Duration.ofSeconds(1));
+        now[0] += 5_000L;
+
+        clocked.noteOwner("series-1", "storage-c");
+
+        SeriesPlacement cached = clocked.placementCached("series-1").orElseThrow();
+        assertEquals("storage-c", cached.ownerNodeId());
+        assertEquals(4_000L, cached.updatedAtEpochMs(), "carimbo = maior updatedAt conhecido, não o relógio");
+    }
+
+    @Test
+    void semNadaConhecidoADicaUsaORelogioDoCliente() {
+        long[] now = {7_000L};
+        PlacementResolver clocked = resolverWithClock(now);
+
+        clocked.noteOwner("series-1", "storage-c");
+
+        assertEquals(7_000L, clocked.placementCached("series-1").orElseThrow().updatedAtEpochMs());
+    }
+
+    @Test
+    void dicaIgnoradaEnquantoOverrideAutoritativoTemMenosDeDoisSegundos() {
+        long[] now = {10_000L};
+        PlacementResolver clocked = resolverWithClock(now);
+        rpc.respondNext((cmd, body) -> CatalogLookupResponse.ok(
+                Map.of("series-1", SeriesPlacement.active("storage-c", 5_000L))));
+        clocked.resolveExistingAtLeader("series-1", Duration.ofSeconds(1));
+
+        now[0] += 1_000L;
+        clocked.noteOwner("series-1", "storage-a");
+        assertEquals("storage-c", clocked.placementCached("series-1").orElseThrow().ownerNodeId(),
+                "dica contrária ao líder, dada logo após a confirmação, é ignorada");
+
+        now[0] += 1_500L;
+        clocked.noteOwner("series-1", "storage-a");
+        assertEquals("storage-a", clocked.placementCached("series-1").orElseThrow().ownerNodeId(),
+                "passado o intervalo de retenção, a dica volta a valer");
+    }
+
+    @Test
+    void placeNoLiderTambemEAutoritativo() {
+        long[] now = {10_000L};
+        PlacementResolver clocked = resolverWithClock(now);
+        rpc.respondNext((cmd, body) -> new PlaceResponse(SeriesStatus.OK,
+                SeriesPlacement.active("storage-b", 9_000L), null, null));
+        clocked.resolve("series-1", "hash-1");
+
+        clocked.noteOwner("series-1", "storage-a");
+
+        assertEquals("storage-b", clocked.placementCached("series-1").orElseThrow().ownerNodeId());
+    }
+
+    @Test
+    void consultaEmLoteAoLiderFazUmaUnicaChamada() {
+        long[] now = {10_000L};
+        PlacementResolver clocked = resolverWithClock(now);
+        SeriesPlacement active = SeriesPlacement.active("storage-c", 3_000L);
+        SeriesPlacement migrating = SeriesPlacement.migrating(SeriesPlacement.active("storage-a", 1_000L),
+                "storage-b", "mig-1", 2_000L);
+        clocked.noteOwner("s3", "storage-x");
+        rpc.respondDefault((cmd, body) -> {
+            assertEquals(Commands.CATALOG_LOOKUP, cmd);
+            return CatalogLookupResponse.ok(Map.of("s1", active, "s2", migrating));
+        });
+
+        Map<String, SeriesPlacement> found = clocked.resolveExistingAtLeader(List.of("s1", "s2", "s3"),
+                Duration.ofSeconds(1));
+
+        assertEquals(Map.of("s1", active, "s2", migrating), found);
+        assertEquals(1, rpc.calls().size(), "uma única consulta para o lote inteiro");
+        assertEquals(Optional.empty(), clocked.placementCached("s3"), "ausente no líder descarta o override");
+        clocked.noteOwner("s1", "storage-a");
+        assertEquals("storage-c", clocked.placementCached("s1").orElseThrow().ownerNodeId(),
+                "ACTIVE do lote vira override autoritativo");
+    }
+
+    private PlacementResolver resolverWithClock(long[] now) {
+        Clock clock = new Clock() {
+            public ZoneId getZone() { return ZoneOffset.UTC; }
+            public Clock withZone(ZoneId zone) { return this; }
+            public Instant instant() { return Instant.ofEpochMilli(now[0]); }
+            public long millis() { return now[0]; }
+        };
+        RetryPolicy retry = new RetryPolicy(Duration.ofSeconds(2), Duration.ofMillis(10), Duration.ofMillis(100));
+        return new PlacementResolver(catalog, rpc, retry, clock,
+                new CatalogLookupClient(rpc, retry, clock, 2000, NodeCapabilities.from(catalog)));
+    }
+
     /** {@link WriteBuffer} que falha se for usado: um handle somente leitura nunca escreve. */
     private static final class UnusedWriteBuffer implements WriteBuffer {
         @Override

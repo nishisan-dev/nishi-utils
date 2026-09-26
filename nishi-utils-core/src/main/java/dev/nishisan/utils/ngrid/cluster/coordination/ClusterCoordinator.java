@@ -239,20 +239,42 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     }
 
     /**
-     * Highest replication high-watermark currently advertised by any ACTIVE peer (excluding the local
-     * node), or {@code -1} when no active peer has reported one yet. This is the cluster's "newest known
-     * state" frontier that a returning node must reach before it may reclaim leadership.
+     * Highest replication high-watermark currently advertised by any ACTIVE, LEADER-ELIGIBLE peer
+     * (excluding the local node), or {@code -1} when no such peer has reported one yet. This is the
+     * cluster's "newest known state" frontier that a returning node must reach before it may reclaim
+     * leadership.
      *
-     * @return the max active-peer watermark, or {@code -1} if none is known
+     * <p>A leader-ineligible member ({@link NodeInfo#ROLE_LEADER_INELIGIBLE}, e.g. an ngrrd client) is
+     * deliberately ignored, like in {@code highestWatermarkActivePeer} and
+     * {@code hasActivePeerWithUnknownWatermark}: it can never lead nor serve the stream, so
+     * state that only it holds can never be synced FROM it — waiting for it can never resolve (issue
+     * #179: a client that received the last replication frame before the leader died made the affinity
+     * winner defer to a peer that was not ahead, the other survivor followed the winner without a D9
+     * escape, and the cluster stayed leaderless forever). Every consumer wants the eligible frontier:
+     * <ul>
+     *   <li>gate A / reclaim ({@code isCaughtUpToCluster}): only an eligible peer can be the
+     *       incumbent a reclaiming node must catch up to;</li>
+     *   <li>the "leader observes a peer watermark above its own applied" warning: a client's counter is
+     *       a mirror of the stream this leader serves, never a rival state;</li>
+     *   <li>{@code ReplicationManager#nudgeLeadershipOnCatchUp}: a deferring node is caught up once it
+     *       reaches the eligible frontier, so the nudge must fire then.</li>
+     * </ul>
+     * Only members KNOWN to be ineligible are excluded: a HEARTBEAT placeholder (blank host, roles not
+     * learned yet) still counts, conservatively — it may be a storage node that is the incumbent ahead of
+     * us, and the gate must not let a behind node reclaim before that is known.
+     *
+     * @return the max active, leader-eligible peer watermark, or {@code -1} if none is known
      */
     public long maxActivePeerHighWatermark() {
         long max = -1L;
         NodeId localId = transport.local().nodeId();
         for (Map.Entry<NodeId, Long> e : peerHighWatermark.entrySet()) {
-            if (e.getKey().equals(localId)) {
+            if (e.getKey().equals(localId) || e.getValue() == null) {
                 continue;
             }
-            if (isActiveMember(e.getKey()) && e.getValue() != null && e.getValue() > max) {
+            ClusterMember member = members.get(e.getKey());
+            if (member != null && member.isActive() && member.info().isLeaderEligible()
+                    && e.getValue() > max) {
                 max = e.getValue();
             }
         }
@@ -922,7 +944,9 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             // the peer that is ahead keeps leading (in pair mode it self-elects locally) until WE catch
             // up — then the latch flips and the next recompute promotes us. Lead-while-alone / AP is
             // preserved: with no active peer ahead, maxActivePeerHighWatermark() is -1 and the gate is a
-            // no-op, so the node still leads (after the boot-discovery window, handled above).
+            // no-op, so the node still leads (after the boot-discovery window, handled above). Only
+            // leader-eligible peers count as "ahead" (issue #179): a client can never serve the state it
+            // holds, so deferring to its watermark would wedge the cluster leaderless after a failover.
             //
             // Gate A NEVER evicts the CURRENT leader (issue tems#9, D9): it gates the RECLAIM of a
             // returning node; the incumbent's side is gate B. In stream mode the serving leader IS the
@@ -1554,13 +1578,17 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      *       majority — an inflated denominator can make a healthy quorum fall short and stall the
      *       election;</li>
      *   <li>leader-ineligible members ({@link NodeInfo#ROLE_LEADER_INELIGIBLE}, e.g. short-lived clients)
-     *       are excluded for the same reason: {@code knownPeers} never forgets a peer that left (there is
-     *       no graceful-leave message, and dropping departed peers would weaken split-brain safety for the
-     *       durable members), so every client that ever joined would otherwise keep raising the majority
-     *       the eligible survivors must reach — until a single failover, or even plain client churn, left
-     *       the cluster permanently leaderless. Clients can never lead, so they belong on neither side of
-     *       the majority (see {@link #activeVoterCount()}): counting them on the active side alone would
-     *       let a node partitioned away with its clients out-vote the eligible majority.</li>
+     *       are excluded for the same reason. The transport now forgets a departed ephemeral member (its
+     *       graceful LEAVE, or a disconnection longer than the transport's forget window), but a client
+     *       can still linger in {@code knownPeers} until then, and would keep raising the majority the
+     *       eligible survivors must reach — until a single failover, or even plain client churn, left the
+     *       cluster leaderless. Clients can never lead, so they belong on neither side of the majority
+     *       (see {@link #activeVoterCount()}): counting them on the active side alone would let a node
+     *       partitioned away with its clients out-vote the eligible majority.</li>
+     *   <li>leader-eligible members (voters) are never forgotten, not even after a graceful LEAVE:
+     *       shrinking the denominator without consensus would weaken split-brain safety for the durable
+     *       members. Decommissioning a voter for good (e.g. a drained storage that will not return) still
+     *       requires operator action.</li>
      * </ul>
      */
     private int requiredVoterMajority() {
@@ -1737,6 +1765,76 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     }
 
     /**
+     * The transport forgot {@code peerId} for good (a departed ephemeral member: graceful LEAVE of a
+     * leader-ineligible or portless peer, or one disconnected for too long). Unlike a disconnect, no
+     * return is expected: the member is removed from the membership instead of lingering as inactive,
+     * together with every per-peer state {@link #confirmPeerDisconnect(NodeId)} clears. Membership
+     * listeners are notified only when the removed member was still active — an already-inactive
+     * departure changes nothing they can observe (the ngrrd rebalancer debounces on these events). The
+     * transport-level disconnect that may follow finds no member and is a no-op. A later direct
+     * handshake from the same id is a new incarnation and re-enters through
+     * {@link #onPeerConnected(NodeInfo)}.
+     */
+    @Override
+    public void onPeerLeft(NodeId peerId) {
+        if (peerId == null || peerId.equals(transport.local().nodeId())) {
+            return;
+        }
+        ClusterMember removed = members.remove(peerId);
+        if (removed == null) {
+            return;
+        }
+        boolean wasActive = removed.isActive();
+        forgetPeerState(peerId);
+        LOGGER.info(() -> "[" + transport.local().nodeId() + "] Member " + peerId + " left the cluster"
+                + (wasActive ? "" : " (already inactive)"));
+        recomputeLeader();
+        if (wasActive) {
+            notifyMembershipListeners();
+        }
+    }
+
+    /**
+     * A leader-eligible peer announced first-hand that it is closing (LEAVE). It stays in the membership
+     * and in the transport's known peers (a voter is never forgotten: the majority must not shrink
+     * without consensus), but it is declared inactive right away instead of after the disconnect grace:
+     * the grace exists for sockets that flap during a join, not for a peer that said it is gone. If it
+     * comes back with the same id, its next heartbeat reactivates it ({@link ClusterMember#touch()}).
+     * Decommissioning a voter for good (e.g. a drained storage that will not return) still requires
+     * operator action.
+     */
+    @Override
+    public void onPeerLeaving(NodeId peerId) {
+        if (peerId == null || peerId.equals(transport.local().nodeId())) {
+            return;
+        }
+        LOGGER.info(() -> "[" + transport.local().nodeId() + "] Leader-eligible member " + peerId
+                + " announced its departure; confirming the disconnect without the grace");
+        confirmPeerDisconnect(peerId);
+    }
+
+    /** Clears the per-peer state kept for {@code peerId} (preferred leader, watermark, D9/D10c marks). */
+    private void forgetPeerState(NodeId peerId) {
+        NodeId preferred = preferredLeader.get();
+        if (preferred != null && preferred.equals(peerId)) {
+            preferredLeader.set(null);
+            preferredLeaderUntilMs = 0L;
+        }
+        // Drop the disconnected peer's tracked watermark so a deferring higher-affinity node stops
+        // waiting on a peer that is genuinely gone (lead-while-alone): with no active peer ahead, the
+        // reclaim gate is a no-op and the node leads.
+        peerHighWatermark.remove(peerId);
+        // A gone peer can neither refuse nor assert leadership (issue tems#9, D9).
+        leaderRefusalAtMs.remove(peerId);
+        peerAssertsLeadership.remove(peerId);
+        // A gone rival can no longer sustain a dual-leader (issue tems#9, D10c).
+        dualLeaderObservations.remove(peerId);
+        if (dualLeaderObservations.isEmpty()) {
+            yieldingToDualLeader = false;
+        }
+    }
+
+    /**
      * Declares {@code peerId} gone unless the transport reports it connected again (directly or via a
      * proxy) — the deferred half of {@link #onPeerDisconnected(NodeId)}.
      */
@@ -1761,23 +1859,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         ClusterMember member = members.get(peerId);
         if (member != null && member.isActive()) {
             member.markInactive();
-            NodeId preferred = preferredLeader.get();
-            if (preferred != null && preferred.equals(peerId)) {
-                preferredLeader.set(null);
-                preferredLeaderUntilMs = 0L;
-            }
-            // Drop the disconnected peer's tracked watermark so a deferring higher-affinity node stops
-            // waiting on a peer that is genuinely gone (lead-while-alone): with no active peer ahead, the
-            // reclaim gate is a no-op and the node leads.
-            peerHighWatermark.remove(peerId);
-            // A gone peer can neither refuse nor assert leadership (issue tems#9, D9).
-            leaderRefusalAtMs.remove(peerId);
-            peerAssertsLeadership.remove(peerId);
-            // A gone rival can no longer sustain a dual-leader (issue tems#9, D10c).
-            dualLeaderObservations.remove(peerId);
-            if (dualLeaderObservations.isEmpty()) {
-                yieldingToDualLeader = false;
-            }
+            forgetPeerState(peerId);
             recomputeLeader();
             notifyMembershipListeners();
         }
@@ -1788,6 +1870,12 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         if (message.type() == MessageType.HEARTBEAT) {
             HeartbeatPayload payload = message.payload(HeartbeatPayload.class);
             NodeId source = message.source();
+            if (transport.isDeparted(source)) {
+                // A heartbeat of a member the transport just forgot (read before its LEAVE, dispatched
+                // after it): it must not re-create the member it removed. The member's new incarnation
+                // lifts the tombstone with its own handshake before its heartbeats arrive.
+                return;
+            }
 
             // FENCING: Reject heartbeats from leaders with stale epochs.
             // This prevents an ex-leader that stepped down from being

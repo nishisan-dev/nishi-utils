@@ -39,6 +39,10 @@ public final class TcpTransportConfig {
     private final int outboundQueueCapacity;
     private final boolean compressionEnabled;
     private final int compressionMinSize;
+    private final Duration departedPeerTombstoneTtl;
+    private final Duration departedPeerForgetAfter;
+    private final boolean leaveOnClose;
+    private final Duration leaveFlushTimeout;
 
     private TcpTransportConfig(Builder builder) {
         this.local = builder.local;
@@ -51,6 +55,10 @@ public final class TcpTransportConfig {
         this.outboundQueueCapacity = builder.outboundQueueCapacity;
         this.compressionEnabled = builder.compressionEnabled;
         this.compressionMinSize = builder.compressionMinSize;
+        this.departedPeerTombstoneTtl = builder.departedPeerTombstoneTtl;
+        this.departedPeerForgetAfter = builder.departedPeerForgetAfter;
+        this.leaveOnClose = builder.leaveOnClose;
+        this.leaveFlushTimeout = builder.leaveFlushTimeout;
     }
 
     public NodeInfo local() {
@@ -130,6 +138,61 @@ public final class TcpTransportConfig {
         return compressionMinSize;
     }
 
+    /**
+     * How long the id of a peer that announced its departure (LEAVE, first-hand) stays tombstoned; the
+     * departure disseminated from it carries the remaining time. A departure only inferred by
+     * {@link #departedPeerForgetAfter()} is tombstoned for that window instead. While tombstoned, second-hand
+     * sources (gossip, a third node's handshake peer list, relayed messages, an inbound connection
+     * without handshake) cannot bring the id back; a direct handshake from that id (a new incarnation)
+     * or an explicit {@link TcpTransport#addPeer} clears it at once. Defaults to 10 minutes.
+     *
+     * @return the tombstone time-to-live
+     * @since 8.7.0
+     */
+    public Duration departedPeerTombstoneTtl() {
+        return departedPeerTombstoneTtl;
+    }
+
+    /**
+     * How long an <b>ephemeral</b> peer (leader-ineligible, or without a listen port) may stay without
+     * an open connection, and without any traffic from it (direct or relayed), before the transport
+     * forgets it; its id is then tombstoned for this same window only, not for
+     * {@link #departedPeerTombstoneTtl()}, since the departure is inferred. It is the backstop for departures that never announced
+     * themselves (kill -9, OOM, network loss); a graceful close announces itself with a LEAVE.
+     * Leader-eligible peers are never forgotten this way. Defaults to 1 minute; {@code NGridNode} uses
+     * {@code max(1 min, 2 x heartbeatTimeout)}.
+     *
+     * @return the disconnection time after which an ephemeral peer is forgotten
+     * @since 8.7.0
+     */
+    public Duration departedPeerForgetAfter() {
+        return departedPeerForgetAfter;
+    }
+
+    /**
+     * Whether {@link TcpTransport#close()} announces the departure with a {@code LEAVE} on each open
+     * connection whose peer supports it, so ephemeral members are forgotten at once instead of after
+     * {@link #departedPeerForgetAfter()}. Defaults to {@code true}.
+     *
+     * @return whether a closing transport sends LEAVE
+     * @since 8.7.0
+     */
+    public boolean leaveOnClose() {
+        return leaveOnClose;
+    }
+
+    /**
+     * Upper bound {@link TcpTransport#close()} waits for the LEAVE messages to be flushed to the sockets
+     * before closing them. A large outbound backlog ahead of the LEAVE may exceed it; the close then
+     * proceeds as a plain close (the peers fall back to the disconnection timeout). Defaults to 500 ms.
+     *
+     * @return the LEAVE flush timeout
+     * @since 8.7.0
+     */
+    public Duration leaveFlushTimeout() {
+        return leaveFlushTimeout;
+    }
+
     public static Builder builder(NodeInfo local) {
         return new Builder(local);
     }
@@ -145,6 +208,10 @@ public final class TcpTransportConfig {
         private int outboundQueueCapacity = 0;
         private boolean compressionEnabled = true;
         private int compressionMinSize = 512;
+        private Duration departedPeerTombstoneTtl = Duration.ofMinutes(10);
+        private Duration departedPeerForgetAfter = Duration.ofMinutes(1);
+        private boolean leaveOnClose = true;
+        private Duration leaveFlushTimeout = Duration.ofMillis(500);
 
         private Builder(NodeInfo local) {
             this.local = Objects.requireNonNull(local, "local");
@@ -233,6 +300,67 @@ public final class TcpTransportConfig {
                 throw new IllegalArgumentException("compressionMinSize must be >= 0");
             }
             this.compressionMinSize = minSize;
+            return this;
+        }
+
+        /**
+         * Sets how long the id of a forgotten peer stays tombstoned (default 10 minutes).
+         *
+         * @param ttl the tombstone time-to-live, must be positive
+         * @return this builder
+         * @since 8.7.0
+         */
+        public Builder departedPeerTombstoneTtl(Duration ttl) {
+            Objects.requireNonNull(ttl, "ttl");
+            if (ttl.isZero() || ttl.isNegative()) {
+                throw new IllegalArgumentException("departedPeerTombstoneTtl must be positive");
+            }
+            this.departedPeerTombstoneTtl = ttl;
+            return this;
+        }
+
+        /**
+         * Sets how long an ephemeral peer may stay disconnected before it is forgotten (default 1
+         * minute).
+         *
+         * @param after the disconnection time, must be positive
+         * @return this builder
+         * @since 8.7.0
+         */
+        public Builder departedPeerForgetAfter(Duration after) {
+            Objects.requireNonNull(after, "after");
+            if (after.isZero() || after.isNegative()) {
+                throw new IllegalArgumentException("departedPeerForgetAfter must be positive");
+            }
+            this.departedPeerForgetAfter = after;
+            return this;
+        }
+
+        /**
+         * Enables or disables the LEAVE announcement on close (default {@code true}).
+         *
+         * @param enabled whether a closing transport sends LEAVE
+         * @return this builder
+         * @since 8.7.0
+         */
+        public Builder leaveOnClose(boolean enabled) {
+            this.leaveOnClose = enabled;
+            return this;
+        }
+
+        /**
+         * Sets how long close() waits for the LEAVE messages to be flushed (default 500 ms).
+         *
+         * @param timeout the flush timeout, must not be negative
+         * @return this builder
+         * @since 8.7.0
+         */
+        public Builder leaveFlushTimeout(Duration timeout) {
+            Objects.requireNonNull(timeout, "timeout");
+            if (timeout.isNegative()) {
+                throw new IllegalArgumentException("leaveFlushTimeout must not be negative");
+            }
+            this.leaveFlushTimeout = timeout;
             return this;
         }
 

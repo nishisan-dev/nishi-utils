@@ -35,11 +35,19 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
+import java.util.logging.SimpleFormatter;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -56,6 +64,13 @@ class AdminCliClusterTest {
     private static final int STORAGE_NODE_COUNT = 3;
     private static final int SERIES_COUNT = 9;
     private static final Duration AWAIT_TIMEOUT = Duration.ofSeconds(90);
+    private static final String ADMIN_ID_PREFIX = "ngrrd-cluster-admin-leave-";
+    private static final int ADMIN_RUNS = 3;
+    private static final String NGRID_LOGGER_NAME = "dev.nishisan.utils.ngrid";
+    /** Um LEAVE de membro efêmero é esquecido na hora; o gatilho lento (≥ 1 min) não pode ser o caminho. */
+    private static final Duration ADMIN_FORGET_TIMEOUT = Duration.ofSeconds(10);
+    /** Cobre vários ciclos de reconexão, heartbeat e gossip entre os storages. */
+    private static final Duration ADMIN_QUIET_WINDOW = Duration.ofSeconds(8);
 
     private NgrrdClusterTestHarness harness;
 
@@ -119,6 +134,110 @@ class AdminCliClusterTest {
                         .orElse(false));
 
         client.close();
+    }
+
+    /**
+     * O CLI administrativo entra na malha como membro efêmero (cliente, inelegível a líder) e sai no fim
+     * de cada comando. Os storages não podem guardá-lo como peer nem seguir discando para ele: antes do
+     * LEAVE, cada execução do CLI deixava um id {@code ngrrd-cluster-admin-*} conhecido para sempre,
+     * com "No connection available" a cada heartbeat.
+     */
+    @Test
+    void cliAdministrativoNaoFicaComoMembroDepoisDeSair(@TempDir Path base) throws Exception {
+        harness = NgrrdClusterTestHarness.start(base, STORAGE_NODE_COUNT, builder -> builder.rebalanceEnabled(false));
+        harness.awaitLeader();
+        harness.awaitNodeStatuses(STORAGE_NODE_COUNT);
+        harness.awaitMeshStable();
+
+        Logger ngridLogger = Logger.getLogger(NGRID_LOGGER_NAME);
+        WarningCapture warnings = new WarningCapture(ADMIN_ID_PREFIX);
+        ngridLogger.addHandler(warnings);
+        try {
+            String seed = seedAddress();
+            NgrrdClusterAdminCli cli = new NgrrdClusterAdminCli();
+            List<String> adminIds = new ArrayList<>();
+            for (int i = 0; i < ADMIN_RUNS; i++) {
+                String adminId = ADMIN_ID_PREFIX + i;
+                adminIds.add(adminId);
+                Capture capture = run(cli, "--seed", seed, "--client-id", adminId, "status");
+                assertEquals(0, capture.exitCode, capture.err);
+            }
+
+            long forgetDeadline = System.currentTimeMillis() + ADMIN_FORGET_TIMEOUT.toMillis();
+            while (!describeAdminLeftovers(adminIds).isEmpty() && System.currentTimeMillis() < forgetDeadline) {
+                Thread.sleep(150L);
+            }
+            assertEquals("", describeAdminLeftovers(adminIds),
+                    "storages ainda conhecem o CLI administrativo " + ADMIN_FORGET_TIMEOUT + " depois que ele saiu");
+
+            // Depois da carência, nenhum storage volta a aprender (gossip) nem a discar os ids que saíram.
+            warnings.clear();
+            Thread.sleep(ADMIN_QUIET_WINDOW.toMillis());
+            assertEquals("", describeAdminLeftovers(adminIds), "CLI administrativo voltou a ser conhecido");
+            assertTrue(warnings.messages().isEmpty(),
+                    "storages seguem tentando falar com o CLI que saiu: " + warnings.messages());
+        } finally {
+            ngridLogger.removeHandler(warnings);
+        }
+    }
+
+    /** Ids administrativos ainda vistos como peer do transporte ou membro ativo, por storage (vazio = nenhum). */
+    private String describeAdminLeftovers(List<String> adminIds) {
+        StringBuilder leftovers = new StringBuilder();
+        for (NgrrdStorageNode node : harness.nodes()) {
+            List<String> seen = new ArrayList<>();
+            node.node().transport().peers().stream()
+                    .map(peer -> peer.nodeId().value())
+                    .filter(adminIds::contains)
+                    .forEach(id -> seen.add("peer:" + id));
+            node.node().coordinator().activeMembers().stream()
+                    .map(member -> member.nodeId().value())
+                    .filter(adminIds::contains)
+                    .forEach(id -> seen.add("member:" + id));
+            if (!seen.isEmpty()) {
+                leftovers.append(node.nodeId()).append(seen).append(' ');
+            }
+        }
+        return leftovers.toString().trim();
+    }
+
+    /** Guarda as mensagens (formatadas) de WARNING ou acima que citam o CLI administrativo. */
+    private static final class WarningCapture extends Handler {
+        private final String marker;
+        private final List<String> messages = new CopyOnWriteArrayList<>();
+        private final SimpleFormatter formatter = new SimpleFormatter();
+
+        private WarningCapture(String marker) {
+            this.marker = marker;
+            setLevel(Level.WARNING);
+        }
+
+        @Override
+        public void publish(LogRecord record) {
+            if (record.getLevel().intValue() < Level.WARNING.intValue()) {
+                return;
+            }
+            String message = formatter.formatMessage(record);
+            if (message != null && message.contains(marker)) {
+                messages.add(message);
+            }
+        }
+
+        void clear() {
+            messages.clear();
+        }
+
+        List<String> messages() {
+            return List.copyOf(messages);
+        }
+
+        @Override
+        public void flush() {
+        }
+
+        @Override
+        public void close() {
+        }
     }
 
     private String seedAddress() {

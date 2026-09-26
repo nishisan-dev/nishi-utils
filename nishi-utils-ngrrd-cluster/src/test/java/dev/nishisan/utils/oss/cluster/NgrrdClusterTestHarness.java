@@ -20,12 +20,16 @@ package dev.nishisan.utils.oss.cluster;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterClient;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterConfig;
+import dev.nishisan.utils.oss.cluster.catalog.CatalogReplicaStatus;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
 import dev.nishisan.utils.oss.cluster.catalog.PlacementState;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
+import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.node.NgrrdStorageNode;
 import dev.nishisan.utils.oss.cluster.node.StorageNodeConfig;
+import dev.nishisan.utils.oss.cluster.node.StorageRequestHandler;
 import dev.nishisan.utils.oss.cluster.rebalance.MigrationCoordinator;
+import dev.nishisan.utils.oss.cluster.rebalance.RebalanceSettings;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -41,6 +45,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.function.IntFunction;
+import java.util.function.UnaryOperator;
 
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -117,6 +122,23 @@ public final class NgrrdClusterTestHarness implements Closeable {
     public static NgrrdClusterTestHarness start(Path base, int storageNodeCount,
             Consumer<StorageNodeConfig.Builder> customize,
             IntFunction<MigrationCoordinator.MigrationHooks> migrationHooksByIndex) throws IOException {
+        return start(base, storageNodeCount, customize, migrationHooksByIndex, index -> UnaryOperator.identity());
+    }
+
+    /**
+     * Como {@link #start(Path, int, Consumer, IntFunction)}, mas decorando por índice de nó (o nó
+     * {@code i} tem {@code nodeId} {@code storage-i}) o {@link StorageRequestHandler.PlacementLookup} do
+     * {@code StorageRequestHandler} — simula a réplica local do catálogo atrasada num nó específico
+     * (issue #177). Ver a limitação em
+     * {@link NgrrdStorageNode#start(StorageNodeConfig, MigrationCoordinator.MigrationHooks, UnaryOperator)}:
+     * só o handler de storage enxerga a visão decorada. {@link #restartStorageNode} e
+     * {@link #addStorageNode} sobem nós sem decorador.
+     */
+    public static NgrrdClusterTestHarness start(Path base, int storageNodeCount,
+            Consumer<StorageNodeConfig.Builder> customize,
+            IntFunction<MigrationCoordinator.MigrationHooks> migrationHooksByIndex,
+            IntFunction<UnaryOperator<StorageRequestHandler.PlacementLookup>> lookupDecoratorByIndex)
+            throws IOException {
         Objects.requireNonNull(base, "base");
         if (storageNodeCount <= 0) {
             throw new IllegalArgumentException("storageNodeCount deve ser > 0: " + storageNodeCount);
@@ -140,7 +162,7 @@ public final class NgrrdClusterTestHarness implements Closeable {
             customize.accept(builder);
             StorageNodeConfig config = builder.build();
             configs.add(config);
-            nodes.add(NgrrdStorageNode.start(config, migrationHooksByIndex.apply(i)));
+            nodes.add(NgrrdStorageNode.start(config, migrationHooksByIndex.apply(i), lookupDecoratorByIndex.apply(i)));
         }
         return new NgrrdClusterTestHarness(base, configs, nodes);
     }
@@ -208,6 +230,23 @@ public final class NgrrdClusterTestHarness implements Closeable {
         awaitMeshStable();
         CatalogService catalog = storageNodes.get(0).catalog();
         awaitTrue(n + " storage node(s) reportados no catálogo", () -> catalog.nodesLocal().size() == n);
+    }
+
+    /**
+     * Espera o status de {@code nodeId} visto pelo líder anunciar a réplica do catálogo em dia (lag conhecido
+     * dentro de {@link RebalanceSettings#DEFAULT_MAX_DESTINATION_CATALOG_LAG}). Pré-condição de quem dispara
+     * uma migração direto no {@code MigrationCoordinator} logo após escrever no catálogo: desde a issue
+     * #177 o coordenador recusa ({@code SKIPPED}) um destino cujo último status publicado ainda não conhece
+     * o high-watermark do líder — o status de boot, publicado antes da primeira escrita no catálogo, diz
+     * exatamente isso até o próximo relatório.
+     */
+    public void awaitCatalogReplicaCaughtUp(String nodeId) {
+        awaitTrue("réplica do catálogo de " + nodeId + " em dia no status visto pelo líder", () -> {
+            CatalogReplicaStatus replica = leaderNode().catalog().nodeStatusLocal(nodeId)
+                    .map(StorageNodeStatus::catalogReplica)
+                    .orElse(null);
+            return replica != null && replica.caughtUp(RebalanceSettings.DEFAULT_MAX_DESTINATION_CATALOG_LAG);
+        });
     }
 
     /** Espera até que o catálogo local do primeiro storage node tenha {@code n} placements {@code ACTIVE}. */

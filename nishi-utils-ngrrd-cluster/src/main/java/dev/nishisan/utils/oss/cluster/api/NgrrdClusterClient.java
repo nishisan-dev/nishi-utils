@@ -209,6 +209,16 @@ public interface NgrrdClusterClient extends Closeable {
     void rebalanceNow();
 
     /**
+     * Como {@link #rebalanceNow()}, devolvendo o que o líder planejou — inclusive os nós excluídos como
+     * destino por causa da réplica do catálogo (issue #177). O default chama {@link #rebalanceNow()} e
+     * devolve {@link RebalanceTrigger#unknown()}; o cliente do cluster devolve as contagens reais.
+     */
+    default RebalanceTrigger triggerRebalance() {
+        rebalanceNow();
+        return RebalanceTrigger.unknown();
+    }
+
+    /**
      * Marca {@code nodeId} como {@code DRAINING} no líder ({@code ngrrd.admin.drain}), com a mesma
      * re-resolução automática de {@code NOT_LEADER} de {@link #clusterStatus()}. Idempotente — chamar de
      * novo sobre um nó já {@code DRAINING}/{@code DRAINED} apenas redispara o ciclo de rebalanceamento.

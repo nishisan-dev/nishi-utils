@@ -17,6 +17,9 @@
 
 package dev.nishisan.utils.oss.cluster.protocol;
 
+import java.util.Map;
+import java.util.Objects;
+
 /**
  * Resposta de {@code ngrrd.admin.rebalance}: dispara um ciclo imediato do
  * {@code Rebalancer} e devolve quantos movimentos foram planejados/submetidos —
@@ -30,6 +33,19 @@ package dev.nishisan.utils.oss.cluster.protocol;
  * @param planned      quantidade de movimentos planejados neste ciclo (0 se um ciclo já estava em
  *                     andamento e este pedido não chegou a planejar um novo)
  * @param started      quantidade de movimentos efetivamente submetidos ao {@code MigrationCoordinator}
+ * @param excludedDestinations nós excluídos como destino neste ciclo por causa da réplica do catálogo
+ *                     (issue #177), com o motivo; vazio (nunca {@code null}) quando nenhum foi excluído ou
+ *                     a resposta veio de um líder anterior à 8.7.0 (campo ausente no JSON)
  */
-public record AdminRebalanceResponse(SeriesStatus status, String leaderNodeId, int planned, int started) {
+public record AdminRebalanceResponse(SeriesStatus status, String leaderNodeId, int planned, int started,
+        Map<String, String> excludedDestinations) {
+
+    public AdminRebalanceResponse {
+        excludedDestinations = Map.copyOf(Objects.requireNonNullElse(excludedDestinations, Map.of()));
+    }
+
+    /** Resposta sem destinos excluídos — a forma anterior à 8.7.0. */
+    public AdminRebalanceResponse(SeriesStatus status, String leaderNodeId, int planned, int started) {
+        this(status, leaderNodeId, planned, started, Map.of());
+    }
 }

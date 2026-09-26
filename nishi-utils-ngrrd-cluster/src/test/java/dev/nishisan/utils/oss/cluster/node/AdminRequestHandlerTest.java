@@ -27,13 +27,16 @@ import dev.nishisan.utils.ngrid.structures.NGrid;
 import dev.nishisan.utils.ngrid.structures.NGridCluster;
 import dev.nishisan.utils.ngrid.structures.NGridNode;
 import dev.nishisan.utils.oss.cluster.admin.AdminService;
+import dev.nishisan.utils.oss.cluster.catalog.CatalogReplicaStatus;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
 import dev.nishisan.utils.oss.cluster.catalog.NodeState;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
+import dev.nishisan.utils.oss.cluster.catalog.StorageCapabilities;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.metrics.BlobVolumeSummary;
 import dev.nishisan.utils.oss.cluster.metrics.LatencySnapshot;
 import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
+import dev.nishisan.utils.oss.cluster.placement.DistributionMode;
 import dev.nishisan.utils.oss.cluster.protocol.AdminNodeRequest;
 import dev.nishisan.utils.oss.cluster.protocol.AdminNodeStatusResponse;
 import dev.nishisan.utils.oss.cluster.protocol.AdminRebalanceResponse;
@@ -287,6 +290,21 @@ class AdminRequestHandlerTest {
         // Catálogo vazio (nenhum StorageNodeStatus/placement registrado neste teste) -> nada a mover.
         assertEquals(0, response.planned());
         assertEquals(0, response.started());
+    }
+
+    @Test
+    void rebalanceNoLiderDevolveOsDestinosExcluidosPelaReplicaDoCatalogo() {
+        leaderView.leader = true;
+        leaderView.reachable.add("storage-lag");
+        catalog.putNodeStatus(new StorageNodeStatus("storage-lag", NodeState.ACTIVE, 0, 0, 0, 1_000L,
+                DistributionMode.COUNT, 1, 0, StorageCapabilities.ALL,
+                new CatalogReplicaStatus(false, 5_000L, 9_000L, 4_001L, false, false, true)));
+
+        AdminRebalanceResponse response =
+                (AdminRebalanceResponse) handler.handle(Commands.ADMIN_REBALANCE, null, CLIENT);
+
+        assertEquals(SeriesStatus.OK, response.status());
+        assertEquals(Map.of("storage-lag", "lag=5000>1000"), response.excludedDestinations());
     }
 
     @Test

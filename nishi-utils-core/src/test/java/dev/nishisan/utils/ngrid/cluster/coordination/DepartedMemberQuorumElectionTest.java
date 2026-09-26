@@ -19,6 +19,7 @@ package dev.nishisan.utils.ngrid.cluster.coordination;
 
 import dev.nishisan.utils.map.NMapPersistenceMode;
 import dev.nishisan.utils.ngrid.ClusterTestUtils;
+import dev.nishisan.utils.ngrid.cluster.transport.TcpTransport;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.ngrid.structures.DistributedMap;
@@ -108,9 +109,43 @@ class DepartedMemberQuorumElectionTest {
         }
     };
 
+    /**
+     * Transport records of traffic still aimed at a peer: failed dials ("Unable to connect to",
+     * "Direct connection failed for", "No connection available for") and relays dropping messages for it
+     * ("Dropping relayed message") — a departed member still being dialed/routed to by every heartbeat
+     * broadcast. FINE records included (the logger level is lowered for the test).
+     */
+    private static final List<String> TRAFFIC_TO_PEER_MARKERS = List.of("Unable to connect to",
+            "Direct connection failed for", "No connection available for", "Dropping relayed message");
+    private final List<String> trafficToPeerRecords = new CopyOnWriteArrayList<>();
+    private final Logger transportLogger = Logger.getLogger(TcpTransport.class.getName());
+    private Level previousTransportLevel;
+    private final Handler transportLogHandler = new Handler() {
+        private final java.util.logging.Formatter formatter = new java.util.logging.SimpleFormatter();
+
+        @Override
+        public void publish(LogRecord record) {
+            String message = record.getMessage();
+            if (message != null && TRAFFIC_TO_PEER_MARKERS.stream().anyMatch(message::startsWith)) {
+                trafficToPeerRecords.add(formatter.formatMessage(record));
+            }
+        }
+
+        @Override
+        public void flush() {
+        }
+
+        @Override
+        public void close() {
+        }
+    };
+
     @BeforeEach
     void setUp() throws Exception {
         Logger.getLogger(ClusterCoordinator.class.getName()).addHandler(coordinatorLogHandler);
+        previousTransportLevel = transportLogger.getLevel();
+        transportLogger.setLevel(Level.FINE);
+        transportLogger.addHandler(transportLogHandler);
         List<NodeInfo> infos = new ArrayList<>();
         for (int i = 1; i <= 3; i++) {
             infos.add(new NodeInfo(NodeId.of("node-" + i), "127.0.0.1", allocateFreeLocalPort(), Set.of(), 0));
@@ -125,6 +160,8 @@ class DepartedMemberQuorumElectionTest {
     @AfterEach
     void tearDown() {
         Logger.getLogger(ClusterCoordinator.class.getName()).removeHandler(coordinatorLogHandler);
+        transportLogger.removeHandler(transportLogHandler);
+        transportLogger.setLevel(previousTransportLevel);
         if (Boolean.getBoolean("ngrid.test.timeline")) {
             System.out.println(diagnostics(nodes));
         }
@@ -155,6 +192,9 @@ class DepartedMemberQuorumElectionTest {
             joinWriteReadAndLeave("client-" + round);
             awaitAgreedLeaderAmong(nodes, ELECTION_BUDGET);
         }
+        // The clients that left are gone for good: no storage keeps them as members or known peers, and
+        // none keeps dialing them (each heartbeat broadcast used to, logging "No connection available").
+        assertDepartedClientsForgotten(List.of("client-1", "client-2", "client-3"));
         // The leader must not merely reappear: it must stay. Observe over a few heartbeat timeouts.
         long deadline = System.currentTimeMillis() + 3_000;
         while (System.currentTimeMillis() < deadline) {
@@ -187,6 +227,34 @@ class DepartedMemberQuorumElectionTest {
         client.close();
         clients.remove(client);
         mark("closed " + clientId);
+    }
+
+    private void assertDepartedClientsForgotten(List<String> clientIds) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 5_000;
+        while (System.currentTimeMillis() < deadline && !departedClientsForgotten(clientIds)) {
+            Thread.sleep(100);
+        }
+        assertTrue(departedClientsForgotten(clientIds),
+                () -> "clientes que saíram seguem conhecidos pelos storages" + diagnostics(nodes));
+        trafficToPeerRecords.clear();
+        Thread.sleep(HEARTBEAT.toMillis() * 8); // several heartbeat broadcasts
+        List<String> dialed = trafficToPeerRecords.stream()
+                .filter(text -> clientIds.stream().anyMatch(text::contains))
+                .toList();
+        assertTrue(dialed.isEmpty(), () -> "storages seguem discando clientes que saíram: " + dialed);
+    }
+
+    private boolean departedClientsForgotten(List<String> clientIds) {
+        for (NGridNode node : nodes) {
+            boolean member = node.coordinator().activeMembers().stream()
+                    .anyMatch(m -> clientIds.contains(m.nodeId().value()));
+            boolean known = node.transport().peers().stream()
+                    .anyMatch(p -> clientIds.contains(p.nodeId().value()));
+            if (member || known) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private NGridNode currentLeaderNode() {

@@ -26,6 +26,7 @@ import dev.nishisan.utils.oss.api.Sample;
 import dev.nishisan.utils.oss.blob.BlobVolume;
 import dev.nishisan.utils.oss.blob.BlobVolumeRegistry;
 import dev.nishisan.utils.oss.blob.NgrrdBlob;
+import dev.nishisan.utils.oss.cluster.catalog.CatalogReplicaStatus;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogView;
 import dev.nishisan.utils.oss.cluster.catalog.NodeState;
@@ -64,6 +65,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -108,7 +110,7 @@ class NodeStatusReporterTest {
         CatalogService catalog = CatalogService.from(node);
         StorageRequestHandler.StorageHandlerMetrics handlerMetrics = new StorageRequestHandler.StorageHandlerMetrics(
                 7L, 42L, 1L, 3L, 2L, 1L, Map.of(SeriesStatus.ERROR, 1L), LatencySnapshot.EMPTY, LatencySnapshot.EMPTY,
-                LatencySnapshot.EMPTY, 5L, LEADER_CONFIRMATION_LATENCY);
+                LatencySnapshot.EMPTY, 5L, LEADER_CONFIRMATION_LATENCY, 11L, 4L, 2L, 9L);
         return new NodeStatusReporter(catalog, volume, registry, "storage-real", 1_000_000L, interval, clock,
                 () -> handlerMetrics, () -> true, listener);
     }
@@ -139,6 +141,10 @@ class NodeStatusReporterTest {
         assertEquals(1L, snapshot.flushes());
         assertEquals(5L, snapshot.leaderConfirmations());
         assertEquals(LEADER_CONFIRMATION_LATENCY, snapshot.leaderConfirmationLatency());
+        assertEquals(11L, snapshot.redirectConfirmations());
+        assertEquals(4L, snapshot.redirectOverrides());
+        assertEquals(2L, snapshot.redirectConfirmationFailures());
+        assertEquals(9L, snapshot.redirectCacheHits());
         assertEquals(1L, snapshot.errorsByStatus().get(SeriesStatus.ERROR));
         assertEquals(0L, snapshot.migrationsIn());
         assertEquals(0L, snapshot.migrationsOut());
@@ -215,6 +221,57 @@ class NodeStatusReporterTest {
             reporter.start();
             awaitTrue("status deveria ter sido publicado", () -> !catalog.published.isEmpty());
             assertEquals(StorageCapabilities.ALL, catalog.published.get(0).capabilities());
+        } finally {
+            reporter.close();
+        }
+    }
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+    void statusPublicadoLevaOLagDaReplicaDoCatalogo() throws InterruptedException {
+        CatalogViewFake catalog = new CatalogViewFake();
+        CatalogReplicaStatus replica = new CatalogReplicaStatus(false, 42L, 1_000L, 959L, false, false, true);
+        NodeStatusReporter reporter = reporterWithFakeCatalog(catalog, Duration.ofMillis(30));
+        reporter.catalogReplication(() -> replica);
+        try {
+            reporter.start();
+            awaitTrue("status deveria ter sido publicado", () -> !catalog.published.isEmpty());
+            assertEquals(replica, catalog.published.get(0).catalogReplica());
+        } finally {
+            reporter.close();
+        }
+    }
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+    void falhaAoLerAReplicaDoCatalogoAindaPublicaOStatusSemOCampo() throws InterruptedException {
+        CatalogViewFake catalog = new CatalogViewFake();
+        AtomicInteger supplierCalls = new AtomicInteger();
+        NodeStatusReporter reporter = reporterWithFakeCatalog(catalog, Duration.ofMillis(30));
+        reporter.catalogReplication(() -> {
+            supplierCalls.incrementAndGet();
+            throw new IllegalStateException("replicação ainda não inicializada (simulado)");
+        });
+        try {
+            reporter.start();
+            awaitTrue("status deveria ter sido publicado mesmo com o supplier falhando",
+                    () -> !catalog.published.isEmpty());
+            assertNull(catalog.published.get(0).catalogReplica());
+            assertTrue(supplierCalls.get() >= 1, "o supplier deveria ter sido consultado");
+        } finally {
+            reporter.close();
+        }
+    }
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+    void semSupplierDeReplicaPublicaOStatusSemOCampo() throws InterruptedException {
+        CatalogViewFake catalog = new CatalogViewFake();
+        NodeStatusReporter reporter = reporterWithFakeCatalog(catalog, Duration.ofMillis(30));
+        try {
+            reporter.start();
+            awaitTrue("status deveria ter sido publicado", () -> !catalog.published.isEmpty());
+            assertNull(catalog.published.get(0).catalogReplica());
         } finally {
             reporter.close();
         }

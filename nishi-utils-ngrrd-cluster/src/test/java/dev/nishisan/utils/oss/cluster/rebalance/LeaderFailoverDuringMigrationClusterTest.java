@@ -95,6 +95,7 @@ class LeaderFailoverDuringMigrationClusterTest {
         String dst = pickDestination(leaderNode.nodeId(), src);
         byte[] originalImage = imageAt(src, seriesKey).orElseThrow();
         String originalSha = sha256Hex(originalImage);
+        harness.awaitCatalogReplicaCaughtUp(dst);
 
         CompletableFuture<MigrationCoordinator.MigrationResult> migrationFuture =
                 leaderNode.migrationCoordinator().migrate(seriesKey, src, dst);
@@ -148,6 +149,7 @@ class LeaderFailoverDuringMigrationClusterTest {
         String dst = pickDestination(leaderNode.nodeId(), src);
         byte[] originalImage = imageAt(src, seriesKey).orElseThrow();
         String originalSha = sha256Hex(originalImage);
+        harness.awaitCatalogReplicaCaughtUp(dst);
 
         CompletableFuture<MigrationCoordinator.MigrationResult> migrationFuture =
                 leaderNode.migrationCoordinator().migrate(seriesKey, src, dst);

@@ -40,6 +40,10 @@ import java.util.Objects;
  *                        ({@code place}, {@code writeBatch}, {@code checkpoint}, {@code read}, ...),
  *                        agregada num único histograma (não quebrada por comando)
  * @param placeCount      total de chamadas {@code ngrrd.place} feitas por este cliente
+ * @param ownerLookups    consultas ao líder feitas pelo buffer de escrita para desempatar dicas de dono
+ *                        ({@code WRONG_OWNER}) contraditórias
+ * @param redirectCycles  dicas de {@code WRONG_OWNER} classificadas como contraditórias (ciclo entre nós,
+ *                        nó apontando a si mesmo, divergência do dono confirmado ou excesso de saltos)
  */
 public record ClientMetricsSnapshot(
         long samplesEnqueued,
@@ -50,11 +54,21 @@ public record ClientMetricsSnapshot(
         Map<String, Long> bufferedSamples,
         int openHandles,
         LatencySnapshot rpcLatency,
-        long placeCount) {
+        long placeCount,
+        long ownerLookups,
+        long redirectCycles) {
 
     public ClientMetricsSnapshot {
         retriesByStatus = Map.copyOf(Objects.requireNonNullElse(retriesByStatus, Map.of()));
         bufferedSamples = Map.copyOf(Objects.requireNonNullElse(bufferedSamples, Map.of()));
         rpcLatency = Objects.requireNonNullElse(rpcLatency, LatencySnapshot.EMPTY);
+    }
+
+    /** Compatibilidade com a assinatura anterior à 8.7.0: {@code ownerLookups} e {@code redirectCycles} zerados. */
+    public ClientMetricsSnapshot(long samplesEnqueued, long samplesSent, long samplesFailed, long batchesSent,
+            Map<SeriesStatus, Long> retriesByStatus, Map<String, Long> bufferedSamples, int openHandles,
+            LatencySnapshot rpcLatency, long placeCount) {
+        this(samplesEnqueued, samplesSent, samplesFailed, batchesSent, retriesByStatus, bufferedSamples, openHandles,
+                rpcLatency, placeCount, 0L, 0L);
     }
 }

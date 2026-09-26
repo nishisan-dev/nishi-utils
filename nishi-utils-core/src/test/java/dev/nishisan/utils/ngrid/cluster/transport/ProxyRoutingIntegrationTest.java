@@ -48,6 +48,9 @@ class ProxyRoutingIntegrationTest {
             waitForConnected(transB, infoA.nodeId());
             waitForConnected(transB, infoC.nodeId());
             waitForConnected(transC, infoB.nodeId());
+            // The direct A-C link must have settled before the failure is simulated: a handshake on
+            // that link completing after markDirectFailure promotes the route back to DIRECT.
+            waitForStableLink(transA, transC);
 
             System.out.println("Mesh converged.");
 
@@ -111,6 +114,31 @@ class ProxyRoutingIntegrationTest {
             Thread.sleep(50);
         }
         throw new RuntimeException("Peer " + target + " not connected by " + transport.local().nodeId());
+    }
+
+    /**
+     * Waits until both endpoints report the direct link as connected and it stays so for a quiet
+     * window (no simultaneous-open reshuffle or late handshake still in flight).
+     */
+    private void waitForStableLink(TcpTransport left, TcpTransport right) throws InterruptedException {
+        NodeId leftId = left.local().nodeId();
+        NodeId rightId = right.local().nodeId();
+        long stableForMs = 500;
+        long start = System.currentTimeMillis();
+        long connectedSince = -1;
+        while (System.currentTimeMillis() - start < 10_000) {
+            boolean connected = left.isConnected(rightId) && right.isConnected(leftId);
+            long now = System.currentTimeMillis();
+            if (!connected) {
+                connectedSince = -1;
+            } else if (connectedSince < 0) {
+                connectedSince = now;
+            } else if (now - connectedSince >= stableForMs) {
+                return;
+            }
+            Thread.sleep(25);
+        }
+        throw new RuntimeException("Direct link " + leftId + " <-> " + rightId + " did not settle");
     }
 
     private void waitForProxyRoute(TcpTransport transport, NodeId target, NodeId expectedProxy)

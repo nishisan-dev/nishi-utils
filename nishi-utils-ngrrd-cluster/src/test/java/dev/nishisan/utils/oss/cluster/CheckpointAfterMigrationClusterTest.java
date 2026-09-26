@@ -59,6 +59,7 @@ class CheckpointAfterMigrationClusterTest {
                                 .filter(n -> !n.node().transport().local().nodeId().value().equals(source))
                                 .findFirst().orElseThrow();
                         String target = destination.node().transport().local().nodeId().value();
+                        harness.awaitCatalogReplicaCaughtUp(target);
                         var result = harness.leaderNode().migrationCoordinator().migrate(key, source, target)
                                 .get(60, TimeUnit.SECONDS);
                         assertEquals(MigrationOutcome.COMPLETED, result.outcome(), result.reason());

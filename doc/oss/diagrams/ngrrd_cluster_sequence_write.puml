@@ -5,9 +5,11 @@ skinparam shadowing false
 
 actor "Aplicação" as app
 participant "RemoteSeriesHandle\n(cliente)" as handle
+participant "WriteDispatcher\n(cliente)" as dispatcher
 participant "PlacementResolver\n(cliente)" as resolver
 participant "Líder\n(PlacementRequestHandler)" as leader
 participant "Dono\n(StorageRequestHandler)" as owner
+participant "Outro nó\n(réplica atrasada)" as other
 database "BlobVolume\n(dono)" as vol
 
 app -> handle : open(yaml, tags)
@@ -75,4 +77,36 @@ handle -> owner : ngrrd.open(...)
 owner --> handle : OK
 handle -> owner : ngrrd.checkpoint(seriesKey) (repete uma vez)
 owner --> handle : OK
+
+== Destino confirma no líder um redirecionamento da réplica local (issue #177) ==
+dispatcher -> other : ngrrd.writeBatch([...])
+other -> other : réplica local ACTIVE(outro) ou MIGRATING\n(não é a origem copiando)
+note right of other
+  StorageRequestHandler.ownershipBatch():
+  todo redirecionamento derivado da réplica
+  é confirmado no líder, exceto se este nó
+  já é o líder (uma consulta por request)
+end note
+other -> leader : ngrrd.catalog.lookup([...], prazo 2s)
+alt líder confirma outro dono (ou nenhum)
+  leader --> other : ACTIVE(dono) / ausente
+  other --> dispatcher : WRONG_OWNER(dono) (confirmado; cache 5s)
+else líder indisponível
+  other --> dispatcher : WRONG_OWNER(réplica local)\n(comportamento 8.6.0; cooldown 1s até a próxima tentativa)
+end
+
+== Cliente detecta dica contraditória e resolve no líder (issue #177) ==
+dispatcher -> other : ngrrd.writeBatch([...])
+other --> dispatcher : WRONG_OWNER(newOwner)
+dispatcher -> dispatcher : classifica a dica: aponta para\no próprio nó, nó já visitado no episódio,\ndiverge do dono confirmado, ou >= 4 saltos?
+alt dica contraditória
+  dispatcher -> dispatcher : pausa só esta série\n(consulta coalescida, uma por vez)
+  dispatcher -> leader : ngrrd.catalog.lookup(seriesKey)
+  leader --> dispatcher : ACTIVE(dono real) / MIGRATING / ausente
+  dispatcher -> resolver : noteOwner(seriesKey, dono, authoritative=true)
+  dispatcher -> owner : ngrrd.writeBatch([...]) (dono confirmado)
+else cadeia legítima (poucos saltos, sem contradição)
+  dispatcher -> resolver : noteOwner(seriesKey, newOwner)
+  dispatcher -> owner : ngrrd.writeBatch([...]) (sem consulta ao líder)
+end
 @enduml

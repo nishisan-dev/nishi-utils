@@ -22,6 +22,8 @@ import dev.nishisan.utils.oss.cluster.api.ClientMetricsSnapshot;
 import dev.nishisan.utils.oss.cluster.api.ErrorCode;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterConfig;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
+import dev.nishisan.utils.oss.cluster.catalog.PlacementState;
+import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
 import dev.nishisan.utils.oss.cluster.metrics.NgrrdClusterMetricsListener;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesStatus;
@@ -47,6 +49,7 @@ import java.util.Objects;
 import java.util.PriorityQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -54,6 +57,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
@@ -75,6 +79,14 @@ import java.util.stream.Collectors;
  * ({@code maxBufferedSamplesPerNode}); ao encher, {@link #enqueue} bloqueia
  * ({@link NgrrdClusterConfig.BufferFullPolicy#BLOCK}) ou lança
  * {@link ErrorCode#BUFFER_FULL} ({@link NgrrdClusterConfig.BufferFullPolicy#FAIL}).</p>
+ *
+ * <p><strong>Dicas de dono contraditórias (#177).</strong> Um {@code WRONG_OWNER} com dono informado é
+ * seguido enquanto a cadeia de saltos for plausível, com backoff exponencial por série que atravessa os
+ * nós. Quando a dica contradiz o episódio de redirecionamento — aponta o próprio nó, um nó que já
+ * redirecionou a série, diverge do dono confirmado pelo líder ou excede {@value #MAX_REDIRECT_HOPS}
+ * saltos —, só aquela série é pausada e o dono é confirmado no líder por uma consulta em lote
+ * ({@link PlacementLookup#resolveExistingAtLeader(java.util.Collection, Duration)}), coalescida entre as
+ * séries. O primeiro {@code OK} da série encerra o episódio.</p>
  */
 public final class WriteDispatcher implements WriteBuffer, Closeable {
 
@@ -83,6 +95,13 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     private static final long DRAIN_POLL_MS = 20L;
     /** Default dos construtores que não recebem {@code ownerChanged} explicitamente (testes antigos). */
     private static final BiConsumer<String, String> NO_OP_OWNER_CHANGED = (seriesKey, newOwner) -> { };
+    /**
+     * Saltos de {@code WRONG_OWNER} aceitos num mesmo episódio antes de desconfiar da cadeia e confirmar o
+     * dono no líder — folga para a cadeia legítima origem → intermediário → destino.
+     */
+    static final int MAX_REDIRECT_HOPS = 4;
+    /** Teto de cada consulta ao líder para desempatar dicas contraditórias (limitado também por {@code retryPolicy.timeout()}). */
+    static final Duration OWNER_LOOKUP_MAX_WAIT = Duration.ofSeconds(5);
 
     private final ClusterRpc rpc;
     private final PlacementLookup placementLookup;
@@ -121,14 +140,35 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     // Bound OPEN traffic independently of WRITE_BATCH; mass cold starts must not flood the leader.
     private final ExecutorService recoveryPool = Executors.newFixedThreadPool(4,
             Thread.ofPlatform().daemon(true).name("ngrrd-write-reopen-", 0).factory());
+    /**
+     * Consultas ao líder para dicas de dono contraditórias: uma tarefa por vez ({@link #ownerLookupRunning}),
+     * que drena {@link #ownerLookupQueue} em lotes. Executor próprio, não o {@link #recoveryPool}: cada
+     * reabertura ali pode esperar até {@code retryTimeout} (OPEN com retentativas), e uma migração em massa
+     * ocupa as 4 threads com reaberturas — a consulta que desfaz o pingue-pongue ficaria na fila atrás
+     * delas. Virtual thread: a tarefa só bloqueia em RPC (mesmo perfil das threads de flush).
+     */
+    private final ExecutorService ownerLookupPool = Executors.newThreadPerTaskExecutor(
+            Thread.ofVirtual().name("ngrrd-owner-lookup-", 0).factory());
+    private final ConcurrentLinkedQueue<String> ownerLookupQueue = new ConcurrentLinkedQueue<>();
+    private final AtomicBoolean ownerLookupRunning = new AtomicBoolean(false);
+    /** Último WARNING de falha da consulta ao líder — rate limit global (uma consulta cobre várias séries). */
+    private final AtomicLong lastOwnerLookupFailureLogMs = new AtomicLong(Long.MIN_VALUE);
     private final Thread tickThread;
     private volatile boolean closed;
+    /**
+     * {@code true} a partir do descarte final do {@code close()}: uma consulta ao líder que termine depois
+     * disso não move mais nada entre buffers (criaria um buffer fora da contabilidade de
+     * {@code samplesFailed}).
+     */
+    private volatile boolean drained;
 
     private final LongAdder samplesEnqueuedCount = new LongAdder();
     private final LongAdder samplesSentCount = new LongAdder();
     private final LongAdder samplesFailedCount = new LongAdder();
     private final LongAdder batchesSentCount = new LongAdder();
     private final ConcurrentMap<SeriesStatus, LongAdder> retryCounts = new ConcurrentHashMap<>();
+    private final LongAdder ownerLookupsCount = new LongAdder();
+    private final LongAdder redirectCyclesCount = new LongAdder();
     /** Marca de tempo do último log de retry por série, para o rate limit de {@link #logRetryRateLimited}. */
     private final ConcurrentMap<String, Long> lastRetryLogMs = new ConcurrentHashMap<>();
     private static final long RETRY_LOG_INTERVAL_MS = 10_000L;
@@ -398,6 +438,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         }
 
         recoveryPool.shutdownNow();
+        ownerLookupPool.shutdownNow();
         flushPool.shutdown();
         try {
             if (!flushPool.awaitTermination(2, TimeUnit.SECONDS)) {
@@ -408,10 +449,17 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             flushPool.shutdownNow();
         }
         try {
+            // shutdownNow já interrompeu a consulta em andamento; espera ela soltar antes do descarte final.
+            ownerLookupPool.awaitTermination(1, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        try {
             tickThread.join(1_000L);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+        drained = true;
 
         for (Map.Entry<String, NodeBuffer> entry : buffers.entrySet()) {
             NodeBuffer buf = entry.getValue();
@@ -449,6 +497,16 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     /** Total de lotes {@code WRITE_BATCH} efetivamente enviados (sucesso de transporte). */
     public long batchesSent() {
         return batchesSentCount.sum();
+    }
+
+    /** Consultas ao líder feitas para desempatar dicas de dono contraditórias (#177). */
+    public long ownerLookups() {
+        return ownerLookupsCount.sum();
+    }
+
+    /** Dicas de {@code WRONG_OWNER} classificadas como contraditórias (ciclo, auto-redirecionamento, excesso de saltos). */
+    public long redirectCycles() {
+        return redirectCyclesCount.sum();
     }
 
     /** Retentativas observadas, agrupadas pelo {@link SeriesStatus} que as motivou. */
@@ -599,42 +657,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 recordRetry(SeriesStatus.WRONG_OWNER);
                 String newOwner = response.ownerBySeries().get(seriesKey);
                 if (newOwner != null) {
-                    logRetryRateLimited(seriesKey, SeriesStatus.WRONG_OWNER, "novo dono informado: " + newOwner);
-                    SeriesRoute route = routes.get(seriesKey);
-                    route.lock.lock();
-                    try {
-                        List<SeriesWrite> reordered = new ArrayList<>(writes);
-                        if (!newOwner.equals(owner)) {
-                            reordered.addAll(extractSeriesFrom(buf, seriesKey));
-                        }
-                        // Publish the new route only after its older writes are queued. New
-                        // admissions (including callers with a stale owner) cannot overtake them.
-                        NodeBuffer target = buffers.computeIfAbsent(newOwner, id -> new NodeBuffer());
-                        target.lock.lock();
-                        try {
-                            requeueFront(target, reordered);
-                            if (!newOwner.equals(owner)) {
-                                target.queue.defer(seriesKey, clock.millis() + retryPolicy.backoffMin().toMillis());
-                            }
-                        } finally { target.lock.unlock(); }
-                        route.owner = newOwner;
-                        route.destinations.add(newOwner);
-                        placementLookup.noteOwner(seriesKey, newOwner);
-                        ownerChanged.accept(seriesKey, newOwner);
-                    } finally {
-                        route.lock.unlock();
-                    }
-                    if (!newOwner.equals(owner)) {
-                        // O dono novo tem seu próprio NodeBuffer, fora do drainLoop atual (que só itera
-                        // o buffer de `owner`) — sem acionar o flush dele aqui, as amostras
-                        // reenfileiradas só seriam enviadas no próximo tick (até batchMaxDelay depois).
-                        // backoffMin (não zero) antes do reenvio: dois nós que discordam sobre quem é o
-                        // dono (ex.: durante uma reconvergência) reenviariam um para o outro em
-                        // ping-pong sem NENHUMA pausa se o retry fosse imediato. Agendado explicitamente
-                        // (não só via backoffUntilMs) para não depender do próximo tick — que pode estar
-                        // a até batchMaxDelay de distância, bem mais que o backoffMin desejado aqui.
-                        triggerRetryAfter(newOwner, retryPolicy.backoffMin());
-                    }
+                    followOwnerHint(owner, buf, seriesKey, writes, newOwner);
                 } else {
                     // "Não sei de quem é" (resposta sem ownerBySeries) NÃO é o mesmo que "sei que não é
                     // meu": pode ser exatamente este nó, só que com a réplica local do catálogo ainda
@@ -675,6 +698,300 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         }
     }
 
+    /**
+     * {@code WRONG_OWNER} com dono informado ({@code newOwner}) para escritas enviadas a {@code owner}.
+     *
+     * <p>Dica plausível: reroteia a série (com o backlog dela) para {@code newOwner}, com backoff exponencial
+     * por série ({@code redirectAttempts}, que atravessa os nós; o 1º salto espera {@code backoffMin}, como
+     * antes). Dica contraditória (#177 — ver {@link #isContradictory}): mantém as escritas na frente do
+     * buffer atual, pausa só esta série e agenda a confirmação do dono no líder ({@link #scheduleOwnerLookup}).
+     * Isso também encerra o laço quente de um nó que aponta a si mesmo.</p>
+     */
+    private void followOwnerHint(String owner, NodeBuffer buf, String seriesKey, List<SeriesWrite> writes,
+            String newOwner) {
+        SeriesRoute route = routes.get(seriesKey);
+        boolean contradictory;
+        boolean lookup = false;
+        long delayMs;
+        String visited;
+        route.lock.lock();
+        try {
+            contradictory = isContradictory(route, owner, newOwner);
+            route.redirectAttempts++;
+            route.redirectedBy.add(owner);
+            route.lastHint = newOwner;
+            visited = String.valueOf(route.redirectedBy);
+            if (contradictory) {
+                buf.lock.lock();
+                try {
+                    for (int i = writes.size() - 1; i >= 0; i--) { buf.queue.addFirst(writes.get(i)); }
+                    // Pausada até a resposta do líder, como numa reabertura (reopenAsync).
+                    buf.queue.defer(seriesKey, Long.MAX_VALUE);
+                } finally { buf.lock.unlock(); }
+                if (!route.ownerLookupPending) {
+                    route.ownerLookupPending = true;
+                    lookup = true;
+                }
+                delayMs = 0L;
+            } else {
+                // Publish the new route only after its older writes are queued. New
+                // admissions (including callers with a stale owner) cannot overtake them.
+                delayMs = rerouteLocked(route, buf, seriesKey, writes, newOwner,
+                        retryPolicy.backoffFor(route.redirectAttempts).toMillis());
+                placementLookup.noteOwner(seriesKey, newOwner);
+                ownerChanged.accept(seriesKey, newOwner);
+            }
+        } finally {
+            route.lock.unlock();
+        }
+        if (contradictory) {
+            redirectCyclesCount.increment();
+            logRetryRateLimited(seriesKey, SeriesStatus.WRONG_OWNER, "dicas de dono contraditórias ("
+                    + visited + " → " + newOwner + "); consultando o líder");
+            if (lookup) {
+                scheduleOwnerLookup(seriesKey);
+            }
+            return;
+        }
+        logRetryRateLimited(seriesKey, SeriesStatus.WRONG_OWNER, "novo dono informado: " + newOwner);
+        // O dono novo tem seu próprio NodeBuffer, fora do drainLoop atual (que só itera o buffer de
+        // `owner`) — sem acionar o flush dele aqui, as amostras reenfileiradas só seriam enviadas no
+        // próximo tick (até batchMaxDelay depois). O atraso nunca é zero: dois nós que discordam sobre o
+        // dono reenviariam um para o outro sem pausa; e cresce a cada salto do episódio.
+        triggerRetryAfter(newOwner, Duration.ofMillis(delayMs));
+    }
+
+    /**
+     * Uma dica de dono é contraditória quando aponta o próprio nó que respondeu, um nó que já redirecionou
+     * a série neste episódio, diverge do dono que o líder confirmou neste episódio, ou chega depois de
+     * {@value #MAX_REDIRECT_HOPS} saltos. Chamado sob {@code route.lock}.
+     */
+    private static boolean isContradictory(SeriesRoute route, String owner, String newOwner) {
+        return newOwner.equals(owner)
+                || route.redirectedBy.contains(newOwner)
+                || (route.confirmedOwner != null && !newOwner.equals(route.confirmedOwner))
+                || route.redirectAttempts >= MAX_REDIRECT_HOPS;
+    }
+
+    /**
+     * Move a série de {@code fromBuf} para o buffer de {@code newOwner} (que deve ser outro nó): primeiro
+     * {@code frontWrites}, depois todo o backlog da série que ainda estava em {@code fromBuf}, na ordem. O
+     * buffer de destino herda as tentativas da série (o backoff de {@code MIGRATING}/reabertura não zera a
+     * cada salto) e a pausa por {@code delayMs} ({@code < 0}: backoff por série de {@code MIGRATING}).
+     * Só então publica a rota nova. Chamado sob {@code route.lock}; devolve o atraso aplicado.
+     */
+    private long rerouteLocked(SeriesRoute route, NodeBuffer fromBuf, String seriesKey, List<SeriesWrite> frontWrites,
+            String newOwner, long delayMs) {
+        Extracted extracted = extractSeriesFrom(fromBuf, seriesKey);
+        List<SeriesWrite> reordered = new ArrayList<>(frontWrites.size() + extracted.writes().size());
+        reordered.addAll(frontWrites);
+        reordered.addAll(extracted.writes());
+        NodeBuffer target = buffers.computeIfAbsent(newOwner, id -> new NodeBuffer());
+        long applied;
+        target.lock.lock();
+        try {
+            requeueFront(target, reordered);
+            target.queue.carryAttempts(seriesKey, extracted.attempts());
+            applied = deferSeries(target, seriesKey, delayMs);
+        } finally { target.lock.unlock(); }
+        route.owner = newOwner;
+        route.destinations.add(newOwner);
+        return applied;
+    }
+
+    /** Enfileira {@code seriesKey} para a consulta coalescida ao líder e garante uma tarefa de consulta ativa. */
+    private void scheduleOwnerLookup(String seriesKey) {
+        ownerLookupQueue.add(seriesKey);
+        startOwnerLookupTask();
+    }
+
+    private void startOwnerLookupTask() {
+        if (!ownerLookupRunning.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            ownerLookupPool.execute(this::runOwnerLookups);
+        } catch (RejectedExecutionException closing) {
+            ownerLookupRunning.set(false);
+            for (String seriesKey; (seriesKey = ownerLookupQueue.poll()) != null; ) {
+                releaseWithoutLookup(seriesKey);
+            }
+        }
+    }
+
+    private void runOwnerLookups() {
+        try {
+            for (;;) {
+                Set<String> keys = new LinkedHashSet<>();
+                for (String seriesKey; (seriesKey = ownerLookupQueue.poll()) != null; ) {
+                    keys.add(seriesKey);
+                }
+                if (keys.isEmpty()) {
+                    return;
+                }
+                resolveOwnersAtLeader(keys);
+            }
+        } finally {
+            ownerLookupRunning.set(false);
+            // Uma chave enfileirada entre o último poll e o set(false) não pode ficar órfã.
+            if (!ownerLookupQueue.isEmpty()) {
+                startOwnerLookupTask();
+            }
+        }
+    }
+
+    /**
+     * Uma consulta ao líder para o lote; cada série recebe o desfecho, inclusive quando a consulta falha —
+     * também por um {@link Error}: as séries drenadas da fila são liberadas antes de o {@code Error} ser
+     * relançado, senão ficariam pausadas ({@code Long.MAX_VALUE}) para sempre.
+     */
+    private void resolveOwnersAtLeader(Set<String> keys) {
+        Duration maxWait = OWNER_LOOKUP_MAX_WAIT.compareTo(retryPolicy.timeout()) < 0
+                ? OWNER_LOOKUP_MAX_WAIT : retryPolicy.timeout();
+        Map<String, SeriesPlacement> found = null;
+        Throwable failure = null;
+        ownerLookupsCount.increment();
+        try {
+            found = placementLookup.resolveExistingAtLeader(keys, maxWait);
+            if (found == null) {
+                throw new NgrrdClusterException(ErrorCode.REMOTE_ERROR, "consulta ao líder sem resposta");
+            }
+        } catch (Throwable e) {
+            failure = e;
+            logOwnerLookupFailure(keys.size(), e);
+        }
+        Error error = failure instanceof Error lookupError ? lookupError : null;
+        for (String seriesKey : keys) {
+            try {
+                applyOwnerLookup(seriesKey, found, failure);
+            } catch (Throwable e) {
+                LOGGER.log(Level.WARNING, "Falha ao aplicar o dono confirmado pelo líder para " + seriesKey, e);
+                if (error == null && e instanceof Error applyError) {
+                    error = applyError;
+                }
+            }
+        }
+        if (error != null) {
+            throw error;
+        }
+    }
+
+    /**
+     * WARNING no máximo uma vez a cada {@value #RETRY_LOG_INTERVAL_MS} ms para todo o dispatcher (um líder
+     * sem {@code catalog.lookup} faria cada contradição falhar); a pilha só em FINE.
+     */
+    private void logOwnerLookupFailure(int seriesCount, Throwable failure) {
+        long now = clock.millis();
+        long last = lastOwnerLookupFailureLogMs.get();
+        if ((last == Long.MIN_VALUE || now - last >= RETRY_LOG_INTERVAL_MS)
+                && lastOwnerLookupFailureLogMs.compareAndSet(last, now)) {
+            LOGGER.warning("Falha ao confirmar no líder o dono de " + seriesCount + " série(s) com dicas de"
+                    + " WRONG_OWNER contraditórias; seguindo a última dica com backoff: " + failure);
+        }
+        LOGGER.log(Level.FINE, "Falha na consulta de dono ao líder", failure);
+    }
+
+    /**
+     * Aplica a resposta do líder a uma série pausada por dicas contraditórias: {@code ACTIVE(X)} reroteia
+     * para X e fixa X como dono confirmado do episódio; {@code MIGRATING} vai para a origem com o backoff
+     * de {@code MIGRATING}; ausente invalida o placement e reabre. Falha da consulta segue a última dica
+     * recebida, com o backoff por série: sem autoridade, ficar no nó que deu a dica contraditória prenderia a
+     * série ali para sempre se ele não for o dono (ex.: o dono real com réplica atrasada, que depois se
+     * atualiza). Cada nova contradição volta a consultar o líder, que desempata assim que responder.
+     * Depois do descarte final do {@code close()}, não faz nada além de liberar a flag de consulta.
+     */
+    private void applyOwnerLookup(String seriesKey, Map<String, SeriesPlacement> found, Throwable failure) {
+        SeriesRoute route = routes.get(seriesKey);
+        if (route == null) {
+            return;
+        }
+        String flushOwner;
+        NodeBuffer reopenBuf = null;
+        long delayMs = 0L;
+        String changedOwner = null;
+        route.lock.lock();
+        try {
+            if (drained) {
+                route.ownerLookupPending = false;
+                return;
+            }
+            try {
+                String current = route.owner;
+                NodeBuffer currentBuf = buffers.computeIfAbsent(current, id -> new NodeBuffer());
+                long backoffMs = retryPolicy.backoffFor(route.redirectAttempts).toMillis();
+                SeriesPlacement placement = failure == null ? found.get(seriesKey) : null;
+                flushOwner = current;
+                if (failure != null) {
+                    String hint = route.lastHint;
+                    if (hint == null || hint.equals(current)) {
+                        delayMs = deferSeries(currentBuf, seriesKey, backoffMs);
+                    } else {
+                        delayMs = rerouteLocked(route, currentBuf, seriesKey, List.of(), hint, backoffMs);
+                        placementLookup.noteOwner(seriesKey, hint);
+                        flushOwner = hint;
+                        changedOwner = hint;
+                    }
+                } else if (placement == null) {
+                    placementLookup.invalidate(seriesKey);
+                    reopenBuf = currentBuf;
+                } else if (placement.state() == PlacementState.ACTIVE) {
+                    String confirmed = placement.ownerNodeId();
+                    route.confirmedOwner = confirmed;
+                    route.redirectedBy.clear();
+                    delayMs = confirmed.equals(current) ? deferSeries(currentBuf, seriesKey, backoffMs)
+                            : rerouteLocked(route, currentBuf, seriesKey, List.of(), confirmed, backoffMs);
+                    flushOwner = confirmed;
+                    changedOwner = confirmed;
+                } else {
+                    // MIGRATING: a origem responde MIGRATING até o fim da cópia (backoff de MIGRATING por série).
+                    String source = placement.ownerNodeId();
+                    delayMs = source.equals(current) ? deferSeries(currentBuf, seriesKey, -1)
+                            : rerouteLocked(route, currentBuf, seriesKey, List.of(), source, -1);
+                    flushOwner = source;
+                    changedOwner = source;
+                }
+            } catch (Throwable e) {
+                // Nunca deixa a série pausada para sempre (Long.MAX_VALUE) por uma falha inesperada aqui.
+                NodeBuffer buf = buffers.get(route.owner);
+                if (buf != null) {
+                    deferSeries(buf, seriesKey, -1);
+                }
+                throw e;
+            } finally {
+                route.ownerLookupPending = false;
+            }
+            if (changedOwner != null) {
+                ownerChanged.accept(seriesKey, changedOwner);
+            }
+        } finally {
+            route.lock.unlock();
+        }
+        if (reopenBuf != null) {
+            logRetryRateLimited(seriesKey, SeriesStatus.WRONG_OWNER, "líder não conhece a série — reabrindo");
+            reopenAsync(flushOwner, reopenBuf, seriesKey, List.of());
+        } else {
+            triggerRetryAfter(flushOwner, Duration.ofMillis(delayMs));
+        }
+    }
+
+    /** Fechamento em curso: libera a série pausada sem consulta, com o backoff de {@code MIGRATING}. */
+    private void releaseWithoutLookup(String seriesKey) {
+        SeriesRoute route = routes.get(seriesKey);
+        if (route == null) {
+            return;
+        }
+        route.lock.lock();
+        try {
+            route.ownerLookupPending = false;
+            NodeBuffer buf = buffers.get(route.owner);
+            if (buf != null) {
+                deferSeries(buf, seriesKey, -1);
+            }
+        } finally {
+            route.lock.unlock();
+        }
+    }
+
     // FIFO admission/rerouting ensures completions form a prefix of each series. A failed
     // prefix remains observable: a later checkpoint cannot certify those lost samples.
     private void completeWrites(String seriesKey, int count, String failure) {
@@ -686,6 +1003,10 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 route.failureMessage = failure;
             }
             route.completed += count;
+            if (failure == null) {
+                // OK do dono: o episódio de redirecionamento (#177) terminou.
+                route.resetRedirectEpisode();
+            }
             if (route.completed == route.submitted && route.firstFailedSequence == Long.MAX_VALUE) {
                 synchronized (pendingLock) {
                     pendingRoutes.remove(route);
@@ -736,11 +1057,11 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
      * levar junto qualquer backlog da MESMA série que ainda estivesse atrás na fila do dono antigo, em
      * vez de deixá-lo ser enviado depois ao dono errado.
      */
-    private static List<SeriesWrite> extractSeriesFrom(NodeBuffer buf, String seriesKey) {
+    private static Extracted extractSeriesFrom(NodeBuffer buf, String seriesKey) {
         buf.lock.lock();
         try {
-            List<SeriesWrite> extracted = buf.queue.extract(seriesKey);
-            if (!extracted.isEmpty()) {
+            Extracted extracted = buf.queue.extract(seriesKey);
+            if (!extracted.writes().isEmpty()) {
                 buf.notFull.signalAll();
             }
             return extracted;
@@ -758,12 +1079,14 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     }
 
     // Only this series waits. Node-wide backoff is reserved for transport failures.
-    private void deferSeries(NodeBuffer buf, String key, long delayMillis) {
+    // Returns the applied delay (delayMillis < 0: per-series exponential backoff).
+    private long deferSeries(NodeBuffer buf, String key, long delayMillis) {
         buf.lock.lock();
         try {
             long delay = delayMillis >= 0 ? delayMillis
                     : retryPolicy.backoffFor(buf.queue.nextAttempt(key)).toMillis();
             buf.queue.defer(key, clock.millis() + delay);
+            return delay;
         } finally { buf.lock.unlock(); }
     }
 
@@ -849,12 +1172,33 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         private long completed;
         private long firstFailedSequence = Long.MAX_VALUE;
         private String failureMessage;
+        // Redirect episode (#177), from the first WRONG_OWNER to the next OK of the series.
+        /** Nós que responderam WRONG_OWNER no episódio atual, na ordem. */
+        private final Set<String> redirectedBy = new LinkedHashSet<>();
+        /** Saltos do episódio: expoente do backoff por série, que (ao contrário do buffer) atravessa os nós. */
+        private int redirectAttempts;
+        /** Dono confirmado pelo líder neste episódio; uma dica divergente dele é contraditória. */
+        private String confirmedOwner;
+        /** Série pausada aguardando a consulta ao líder ({@code scheduleOwnerLookup}). */
+        private boolean ownerLookupPending;
+        /** Última dica de dono recebida no episódio; seguida quando a consulta ao líder falha. */
+        private String lastHint;
 
         SeriesRoute(String owner) {
             this.owner = owner;
             destinations.add(owner);
         }
+
+        void resetRedirectEpisode() {
+            redirectedBy.clear();
+            redirectAttempts = 0;
+            confirmedOwner = null;
+            lastHint = null;
+        }
     }
+
+    /** Escritas de uma série retiradas de um buffer, com as tentativas que ela acumulava ali. */
+    private record Extracted(List<SeriesWrite> writes, int attempts) { }
 
     /** All access is under NodeBuffer.lock. FIFO within a series; round-robin between ready series. */
     private static final class PendingWrites {
@@ -899,15 +1243,20 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         }
         int nextAttempt(String key) { return attempts.merge(key, 1, Integer::sum); }
         void succeeded(String key) { attempts.remove(key); }
-        List<SeriesWrite> extract(String key) {
+        /** Keeps the per-series retry count across buffers when a series is rerouted. */
+        void carryAttempts(String key, int count) {
+            if (count > 0) { attempts.merge(key, count, Math::max); }
+        }
+        Extracted extract(String key) {
             var queue = series.remove(key);
             ready.remove(key);
             Delay delay = paused.remove(key);
             if (delay != null) { wakeups.remove(delay); }
-            attempts.remove(key);
-            if (queue == null) { return List.of(); }
+            Integer carried = attempts.remove(key);
+            int count = carried == null ? 0 : carried;
+            if (queue == null) { return new Extracted(List.of(), count); }
             size -= queue.size();
-            return new ArrayList<>(queue);
+            return new Extracted(new ArrayList<>(queue), count);
         }
         void clear() { series.clear(); ready.clear(); paused.clear(); wakeups.clear(); attempts.clear(); size = 0; }
     }

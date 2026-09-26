@@ -66,6 +66,12 @@ import java.util.Objects;
  *                                   de uma série sem objeto no volume antes de criá-la ou de responder
  *                                   {@code NOT_FOUND} a um {@code OPEN} (issue #174)
  * @param leaderConfirmationLatency  latência dessas leituras fortes
+ * @param redirectConfirmations        séries cujo redirecionamento derivado da réplica local do catálogo foi
+ *                                     enviado ao líder para confirmação (issue #177)
+ * @param redirectOverrides            redirecionamentos em que o líder divergiu da réplica local
+ * @param redirectConfirmationFailures redirecionamentos respondidos pela réplica local porque a confirmação
+ *                                     falhou ou estava em cooldown
+ * @param redirectCacheHits            redirecionamentos respondidos por uma confirmação recente em cache
  */
 public record NodeMetricsSnapshot(
         String nodeId,
@@ -94,7 +100,11 @@ public record NodeMetricsSnapshot(
         long reconcileMissing,
         long reconcileLastDurationMs,
         long leaderConfirmations,
-        LatencySnapshot leaderConfirmationLatency) {
+        LatencySnapshot leaderConfirmationLatency,
+        long redirectConfirmations,
+        long redirectOverrides,
+        long redirectConfirmationFailures,
+        long redirectCacheHits) {
 
     public NodeMetricsSnapshot {
         Objects.requireNonNull(nodeId, "nodeId é obrigatório");
@@ -118,5 +128,20 @@ public record NodeMetricsSnapshot(
                 readLatency, errorsByStatus, blobStats, migrationsIn, migrationsOut, reconcileAdopted,
                 reconcileOrphansDeleted, reconcileUnplaced, reconcileMissing, reconcileLastDurationMs, 0L,
                 LatencySnapshot.EMPTY);
+    }
+
+    /** Assinatura da 8.6.0, sem as métricas de confirmação de redirecionamento (zeradas). */
+    public NodeMetricsSnapshot(String nodeId, long capturedAtEpochMs, boolean leader, long seriesCount,
+            long usedBytes, long capacityBytes, int openHandles, long writeBatches, long samplesWritten,
+            long samplesFailed, long checkpoints, long flushes, long reads, LatencySnapshot writeBatchLatency,
+            LatencySnapshot checkpointLatency, LatencySnapshot readLatency, Map<SeriesStatus, Long> errorsByStatus,
+            BlobVolumeSummary blobStats, long migrationsIn, long migrationsOut, long reconcileAdopted,
+            long reconcileOrphansDeleted, long reconcileUnplaced, long reconcileMissing,
+            long reconcileLastDurationMs, long leaderConfirmations, LatencySnapshot leaderConfirmationLatency) {
+        this(nodeId, capturedAtEpochMs, leader, seriesCount, usedBytes, capacityBytes, openHandles, writeBatches,
+                samplesWritten, samplesFailed, checkpoints, flushes, reads, writeBatchLatency, checkpointLatency,
+                readLatency, errorsByStatus, blobStats, migrationsIn, migrationsOut, reconcileAdopted,
+                reconcileOrphansDeleted, reconcileUnplaced, reconcileMissing, reconcileLastDurationMs,
+                leaderConfirmations, leaderConfirmationLatency, 0L, 0L, 0L, 0L);
     }
 }

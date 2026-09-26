@@ -184,6 +184,10 @@ public final class NGridAlertEngine implements Closeable {
     }
 
     private void evaluateReplicationLag(NGridOperationalSnapshot snapshot) {
+        if (snapshot.isLeader()) {
+            // The leader is the replication reference; it cannot lag behind itself.
+            return;
+        }
         long lag = snapshot.replicationLag();
         if (lag >= lagCriticalThreshold) {
             dispatchIfCooldownExpired(NGridAlert.of(

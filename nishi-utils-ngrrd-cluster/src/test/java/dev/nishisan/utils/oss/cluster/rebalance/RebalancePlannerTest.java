@@ -28,6 +28,7 @@ import java.util.Map;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -193,5 +194,80 @@ class RebalancePlannerTest {
 
         assertEquals(3, moves.size());
         assertTrue(moves.stream().allMatch(m -> m.src().equals("a") && m.dst().equals("b")));
+    }
+
+    // ---- Issue #177: destino com réplica do catálogo atrasada ----
+
+    @Test
+    void destinoExcluidoNuncaRecebeMasContinuaNaDistribuicao() {
+        List<StorageNodeStatus> nodes = List.of(
+                node("a", NodeState.ACTIVE, 100),
+                node("b", NodeState.ACTIVE, 0),
+                node("c", NodeState.ACTIVE, 0));
+        Map<String, List<String>> seriesByOwner = Map.of("a", seriesRange("s", 100));
+
+        List<Move> moves = RebalancePlanner.plan(nodes, seriesByOwner, Set.of("a", "b", "c"), Set.of(),
+                new RebalanceSettings(0L, 0.0, 1_000), Set.of("b"));
+
+        assertFalse(moves.isEmpty());
+        assertTrue(moves.stream().noneMatch(m -> m.dst().equals("b")), "b está excluído como destino: " + moves);
+        assertTrue(moves.stream().allMatch(m -> m.src().equals("a") && m.dst().equals("c")));
+    }
+
+    @Test
+    void destinoExcluidoContinuaSendoOrigem() {
+        List<StorageNodeStatus> nodes = List.of(
+                node("a", NodeState.ACTIVE, 10),
+                node("b", NodeState.ACTIVE, 0));
+        Map<String, List<String>> seriesByOwner = Map.of("a", seriesRange("s", 10));
+
+        List<Move> moves = RebalancePlanner.plan(nodes, seriesByOwner, Set.of("a", "b"), Set.of(),
+                new RebalanceSettings(0L, 0.0, 100), Set.of("a"));
+
+        assertFalse(moves.isEmpty(), "a (excluído só como destino) ainda cede séries");
+        assertTrue(moves.stream().allMatch(m -> m.src().equals("a") && m.dst().equals("b")));
+    }
+
+    @Test
+    void todosOsDestinosExcluidosDevolvePlanoVazioSemExcecao() {
+        List<StorageNodeStatus> nodes = List.of(
+                node("a", NodeState.ACTIVE, 10),
+                node("b", NodeState.ACTIVE, 0));
+        Map<String, List<String>> seriesByOwner = Map.of("a", seriesRange("s", 10));
+
+        List<Move> moves = RebalancePlanner.plan(nodes, seriesByOwner, Set.of("a", "b"), Set.of(),
+                new RebalanceSettings(0L, 0.0, 100), Set.of("a", "b"));
+
+        assertTrue(moves.isEmpty());
+    }
+
+    @Test
+    void drenagemRespeitaODestinoExcluido() {
+        List<StorageNodeStatus> nodes = List.of(
+                node("a", NodeState.DRAINING, 4),
+                node("b", NodeState.ACTIVE, 0),
+                node("c", NodeState.ACTIVE, 0));
+        Map<String, List<String>> seriesByOwner = Map.of("a", seriesRange("s", 4));
+
+        List<Move> onlyC = RebalancePlanner.plan(nodes, seriesByOwner, Set.of("a", "b", "c"), Set.of(),
+                new RebalanceSettings(50L, 0.10, 50), Set.of("b"));
+        List<Move> none = RebalancePlanner.plan(nodes, seriesByOwner, Set.of("a", "b", "c"), Set.of(),
+                new RebalanceSettings(50L, 0.10, 50), Set.of("b", "c"));
+
+        assertEquals(4, onlyC.size());
+        assertTrue(onlyC.stream().allMatch(m -> m.src().equals("a") && m.dst().equals("c")));
+        assertTrue(none.isEmpty(), "sem destino elegível a drenagem espera: " + none);
+    }
+
+    @Test
+    void semExclusoesOPlanoEhOMesmoDeAntes() {
+        List<StorageNodeStatus> nodes = List.of(
+                node("a", NodeState.ACTIVE, 100),
+                node("b", NodeState.ACTIVE, 0));
+        Map<String, List<String>> seriesByOwner = Map.of("a", seriesRange("s", 100));
+        RebalanceSettings settings = new RebalanceSettings(0L, 0.10, 1_000);
+
+        assertEquals(RebalancePlanner.plan(nodes, seriesByOwner, Set.of("a", "b"), Set.of(), settings),
+                RebalancePlanner.plan(nodes, seriesByOwner, Set.of("a", "b"), Set.of(), settings, Set.of()));
     }
 }

@@ -70,6 +70,13 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
@@ -79,6 +86,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -93,6 +101,7 @@ class StorageRequestHandlerTest {
 
     private static final NodeId SELF = NodeId.of("node-self");
     private static final NodeId OTHER = NodeId.of("node-other");
+    private static final NodeId THIRD = NodeId.of("node-third");
     private static final NodeId SOURCE = NodeId.of("node-client");
 
     /** Mesmo default programático de {@code StorageNodeConfig} — casa com o {@code seriesPrefix: "series"} do YAML de teste. */
@@ -409,10 +418,11 @@ class StorageRequestHandlerTest {
     }
 
     @Test
-    void serieEsquecidaComReplicaLocalJaConvergidaDescartaAMarcaSemConsultarOLider() {
+    void serieEsquecidaComReplicaLocalJaConvergidaDescartaAMarcaEConfirmaORedirecionamentoNoLider() {
         // Issue #174: a marca de esquecida só protege enquanto a réplica local pode ainda dizer
         // ACTIVE(self). Quando ela já mostra o novo dono, a marca sai e a escrita atrasada é redirecionada
-        // pela réplica local, sem ir ao líder.
+        // — e, desde a issue #177, todo redirecionamento derivado da réplica local é confirmado no líder
+        // (uma consulta em lote, nunca a leitura forte por chave).
         String seriesKey = "series-migrada-replica-convergida";
         placementLookup.put(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
         handler.handle(Commands.OPEN, openRequest(seriesKey, null), SOURCE);
@@ -427,6 +437,8 @@ class StorageRequestHandlerTest {
         assertEquals(SeriesStatus.WRONG_OWNER, response.statusBySeries().get(seriesKey));
         assertEquals(OTHER.value(), response.ownerBySeries().get(seriesKey));
         assertEquals(strongCallsBefore, placementLookup.strongCalls());
+        assertEquals(1, placementLookup.leaderBatchCalls(), "o redirecionamento deveria ter sido confirmado no líder");
+        assertEquals(0L, handler.metricsSnapshot().redirectOverrides(), "líder e réplica concordam");
         assertFalse(registry.isForgotten(seriesKey), "a marca deveria sair com a réplica local já convergida");
     }
 
@@ -442,6 +454,549 @@ class StorageRequestHandlerTest {
                 new SeriesWrite(seriesKey, "in_octets", 1_700_000_000_000L, 1d))), SOURCE);
 
         assertTrue(registry.isForgotten(seriesKey), "sem a réplica local convergida a marca continua valendo");
+    }
+
+    // ---- Issue #177: redirecionamento derivado da réplica local confirmado no líder ----
+
+    @Test
+    void destinoComReplicaActiveOutroELiderActiveSelfRespondeNotOpenEOOpenAbreSemCriar() {
+        // Destino de uma migração logo após o MIGRATE_COMMIT: o objeto já está no volume, o handle foi
+        // descartado e a réplica local ainda diz ACTIVE(origem). Antes da #177 respondia
+        // WRONG_OWNER(origem), e a origem (esquecida, que consulta o líder) respondia WRONG_OWNER(destino):
+        // o cliente ficava em pingue-pongue.
+        String seriesKey = "series-destino-replica-atrasada";
+        String objectKey = SeriesObjectKeys.objectKey(SERIES_OBJECT_PREFIX, seriesKey);
+        registry.open(seriesKey, yaml, Ngrrd.OpenOptions.defaults());
+        registry.close(seriesKey);
+        byte[] committedImage = volume.storage().get(objectKey).orElseThrow();
+        placementLookup.putLocalOnly(seriesKey, SeriesPlacement.active(OTHER.value(), 1_000L));
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.active(SELF.value(), 2_000L));
+
+        WriteBatchResponse write = (WriteBatchResponse) handler.handle(Commands.WRITE_BATCH, singleWrite(seriesKey),
+                SOURCE);
+
+        assertEquals(SeriesStatus.NOT_OPEN, write.statusBySeries().get(seriesKey));
+        assertEquals(1, placementLookup.leaderBatchCalls());
+        assertEquals(1L, handler.metricsSnapshot().redirectOverrides());
+
+        SeriesStatusResponse open = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequest(seriesKey, null), SOURCE);
+
+        assertEquals(SeriesStatus.OK, open.status());
+        assertEquals(0, placementLookup.strongCalls(), "objeto presente: o OPEN não precisa de leitura forte");
+        assertArrayEquals(committedImage, volume.storage().get(objectKey).orElseThrow(),
+                "o OPEN deveria abrir a imagem commitada, sem recriá-la");
+        assertEquals(1, placementLookup.leaderBatchCalls(), "o OPEN usa o placement confirmado em cache");
+        assertEquals(1L, handler.metricsSnapshot().redirectCacheHits());
+
+        WriteBatchResponse retried = (WriteBatchResponse) handler.handle(Commands.WRITE_BATCH,
+                singleWrite(seriesKey), SOURCE);
+        assertEquals(SeriesStatus.OK, retried.statusBySeries().get(seriesKey));
+    }
+
+    @Test
+    void destinoComReplicaMigratingOutroParaSelfELiderActiveSelfConfirmaNoLider() {
+        String seriesKey = "series-destino-replica-migrando";
+        placementLookup.putLocalOnly(seriesKey, SeriesPlacement.migrating(
+                SeriesPlacement.active(OTHER.value(), 1_000L), SELF.value(), "mig-1", 2_000L));
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.active(SELF.value(), 3_000L));
+
+        WriteBatchResponse write = (WriteBatchResponse) handler.handle(Commands.WRITE_BATCH, singleWrite(seriesKey),
+                SOURCE);
+
+        assertEquals(SeriesStatus.NOT_OPEN, write.statusBySeries().get(seriesKey));
+        assertEquals(1, placementLookup.leaderBatchCalls());
+        assertEquals(1L, handler.metricsSnapshot().redirectOverrides());
+    }
+
+    @Test
+    void terceiroNoComReplicaMigratingRedirecionaParaODonoQueOLiderConhece() {
+        String seriesKey = "series-terceiro-migrando";
+        placementLookup.putLocalOnly(seriesKey, SeriesPlacement.migrating(
+                SeriesPlacement.active(OTHER.value(), 1_000L), THIRD.value(), "mig-1", 2_000L));
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.active(THIRD.value(), 3_000L));
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.FLUSH,
+                new SeriesCommandRequest(seriesKey), SOURCE);
+
+        assertEquals(SeriesStatus.WRONG_OWNER, response.status());
+        assertEquals(THIRD.value(), response.ownerNodeId());
+        assertEquals(1, placementLookup.leaderBatchCalls());
+    }
+
+    @Test
+    void terceiroNoComReplicaMigratingELiderAindaMigrandoRespondeMigratingSemSobrepor() {
+        String seriesKey = "series-terceiro-migrando-confirmado";
+        placementLookup.put(seriesKey, SeriesPlacement.migrating(
+                SeriesPlacement.active(OTHER.value(), 1_000L), THIRD.value(), "mig-1", 2_000L));
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.FLUSH,
+                new SeriesCommandRequest(seriesKey), SOURCE);
+
+        assertEquals(SeriesStatus.MIGRATING, response.status());
+        assertEquals(OTHER.value(), response.ownerNodeId());
+        assertEquals(1, placementLookup.leaderBatchCalls());
+        assertEquals(0L, handler.metricsSnapshot().redirectOverrides());
+    }
+
+    @Test
+    void replicaActiveOutroComLiderActiveTerceiroRedirecionaParaOTerceiro() {
+        String seriesKey = "series-replica-outro-lider-terceiro";
+        placementLookup.putLocalOnly(seriesKey, SeriesPlacement.active(OTHER.value(), 1_000L));
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.active(THIRD.value(), 2_000L));
+
+        WriteBatchResponse write = (WriteBatchResponse) handler.handle(Commands.WRITE_BATCH, singleWrite(seriesKey),
+                SOURCE);
+
+        assertEquals(SeriesStatus.WRONG_OWNER, write.statusBySeries().get(seriesKey));
+        assertEquals(THIRD.value(), write.ownerBySeries().get(seriesKey));
+        assertEquals(1L, handler.metricsSnapshot().redirectOverrides());
+    }
+
+    @Test
+    void replicaActiveOutroComSerieAusenteNoLiderRespondeWrongOwnerSemDono() {
+        String seriesKey = "series-replica-outro-lider-ausente";
+        placementLookup.putLocalOnly(seriesKey, SeriesPlacement.active(OTHER.value(), 1_000L));
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.CHECKPOINT,
+                new SeriesCommandRequest(seriesKey), SOURCE);
+
+        assertEquals(SeriesStatus.WRONG_OWNER, response.status());
+        assertNull(response.ownerNodeId());
+        assertEquals(1, placementLookup.leaderBatchCalls());
+    }
+
+    @Test
+    void loteDeTresSeriesRedirecionadasFazUmaUnicaConsultaAoLider() {
+        List<String> keys = List.of("series-lote-a", "series-lote-b", "series-lote-c");
+        for (String key : keys) {
+            placementLookup.putLocalOnly(key, SeriesPlacement.active(OTHER.value(), 1_000L));
+            placementLookup.putStrongOnly(key, SeriesPlacement.active(THIRD.value(), 2_000L));
+        }
+        String owned = "series-lote-propria";
+        placementLookup.put(owned, SeriesPlacement.active(SELF.value(), 1_000L));
+        handler.handle(Commands.OPEN, openRequest(owned, null), SOURCE);
+        List<SeriesWrite> writes = new ArrayList<>();
+        for (String key : keys) {
+            writes.add(new SeriesWrite(key, "in_octets", 1_700_000_000_000L, 1d));
+        }
+        writes.add(new SeriesWrite(owned, "in_octets", 1_700_000_000_000L, 1d));
+
+        WriteBatchResponse response = (WriteBatchResponse) handler.handle(Commands.WRITE_BATCH,
+                new WriteBatchRequest(writes), SOURCE);
+
+        for (String key : keys) {
+            assertEquals(SeriesStatus.WRONG_OWNER, response.statusBySeries().get(key));
+            assertEquals(THIRD.value(), response.ownerBySeries().get(key));
+        }
+        assertEquals(SeriesStatus.OK, response.statusBySeries().get(owned));
+        assertEquals(1, placementLookup.leaderBatchCalls(), "uma consulta por requisição, não por série");
+        assertEquals(Set.copyOf(keys), Set.copyOf(placementLookup.leaderBatches().get(0)));
+        assertEquals(3L, handler.metricsSnapshot().redirectConfirmations());
+        assertEquals(3L, handler.metricsSnapshot().redirectOverrides());
+    }
+
+    @Test
+    void confirmacaoDoLiderFicaEmCacheAteOPrazo() {
+        String seriesKey = "series-cache-ttl";
+        placementLookup.putLocalOnly(seriesKey, SeriesPlacement.active(OTHER.value(), 1_000L));
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.active(THIRD.value(), 2_000L));
+
+        handler.handle(Commands.WRITE_BATCH, singleWrite(seriesKey), SOURCE);
+        WriteBatchResponse cached = (WriteBatchResponse) handler.handle(Commands.WRITE_BATCH, singleWrite(seriesKey),
+                SOURCE);
+
+        assertEquals(THIRD.value(), cached.ownerBySeries().get(seriesKey));
+        assertEquals(1, placementLookup.leaderBatchCalls(), "dentro do prazo a resposta vem do cache");
+        assertEquals(1L, handler.metricsSnapshot().redirectCacheHits());
+
+        clock.advance(Duration.ofSeconds(6));
+        handler.handle(Commands.WRITE_BATCH, singleWrite(seriesKey), SOURCE);
+        assertEquals(2, placementLookup.leaderBatchCalls(), "após o prazo o líder é consultado de novo");
+    }
+
+    @Test
+    void cacheNaoValeQuandoAReplicaLocalAvancaAlemDaConfirmacao() {
+        String seriesKey = "series-cache-replica-avancou";
+        placementLookup.putLocalOnly(seriesKey, SeriesPlacement.active(OTHER.value(), 1_000L));
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.active(THIRD.value(), 2_000L));
+        handler.handle(Commands.WRITE_BATCH, singleWrite(seriesKey), SOURCE);
+
+        placementLookup.put(seriesKey, SeriesPlacement.active(OTHER.value(), 5_000L));
+        WriteBatchResponse response = (WriteBatchResponse) handler.handle(Commands.WRITE_BATCH,
+                singleWrite(seriesKey), SOURCE);
+
+        assertEquals(2, placementLookup.leaderBatchCalls());
+        assertEquals(OTHER.value(), response.ownerBySeries().get(seriesKey));
+    }
+
+    @Test
+    void mudancaDePosseNoRegistryInvalidaOCache() throws Exception {
+        String seriesKey = "series-cache-invalidado";
+        placementLookup.putLocalOnly(seriesKey, SeriesPlacement.active(OTHER.value(), 1_000L));
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.active(THIRD.value(), 2_000L));
+
+        handler.handle(Commands.WRITE_BATCH, singleWrite(seriesKey), SOURCE);
+        assertEquals(1, confirmedCacheSize());
+        registry.markMigrating(seriesKey);
+        assertEquals(0, confirmedCacheSize(), "markMigrating deveria invalidar o cache");
+        registry.clearMigrating(seriesKey);
+
+        handler.handle(Commands.WRITE_BATCH, singleWrite(seriesKey), SOURCE);
+        assertEquals(2, placementLookup.leaderBatchCalls());
+        registry.discard(seriesKey);
+        assertEquals(0, confirmedCacheSize(), "discard deveria invalidar o cache");
+
+        handler.handle(Commands.WRITE_BATCH, singleWrite(seriesKey), SOURCE);
+        assertEquals(3, placementLookup.leaderBatchCalls());
+        registry.forget(seriesKey);
+        assertEquals(0, confirmedCacheSize(), "forget deveria invalidar o cache");
+
+        handler.handle(Commands.WRITE_BATCH, singleWrite(seriesKey), SOURCE);
+        assertEquals(4, placementLookup.leaderBatchCalls());
+        registry.beginMigrationCopy(seriesKey);
+        assertEquals(0, confirmedCacheSize(), "beginMigrationCopy deveria invalidar o cache");
+    }
+
+    @Test
+    void clearMigratingInvalidaOCache() throws Exception {
+        String seriesKey = "series-cache-clear";
+        placementLookup.putLocalOnly(seriesKey, SeriesPlacement.active(OTHER.value(), 1_000L));
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.active(THIRD.value(), 2_000L));
+        handler.handle(Commands.WRITE_BATCH, singleWrite(seriesKey), SOURCE);
+        assertEquals(1, confirmedCacheSize());
+
+        registry.clearMigrating(seriesKey);
+
+        assertEquals(0, confirmedCacheSize());
+    }
+
+    @Test
+    void confirmacaoEmCacheNaoAutorizaCriarSerieNoOpen() {
+        // Proteção da #174 mantida: uma resposta vinda do cache nunca conta como confirmação do líder
+        // para criar a série vazia — o OPEN com criação repete a leitura forte.
+        String seriesKey = "series-cache-nao-cria";
+        placementLookup.putLocalOnly(seriesKey, SeriesPlacement.active(OTHER.value(), 1_000L));
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.active(SELF.value(), 2_000L));
+        handler.handle(Commands.WRITE_BATCH, singleWrite(seriesKey), SOURCE);
+        // O líder mudou de ideia depois da confirmação que ficou em cache.
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.active(OTHER.value(), 3_000L));
+
+        SeriesStatusResponse open = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequest(seriesKey, null), SOURCE);
+
+        assertEquals(1, placementLookup.leaderBatchCalls(), "o OPEN respondeu pelo cache");
+        assertEquals(1, placementLookup.strongCalls(), "a criação precisa de uma leitura forte própria");
+        assertEquals(SeriesStatus.WRONG_OWNER, open.status());
+        assertEquals(OTHER.value(), open.ownerNodeId());
+        assertFalse(volume.storage().exists(SeriesObjectKeys.objectKey(SERIES_OBJECT_PREFIX, seriesKey)));
+    }
+
+    @Test
+    void confirmacaoEmCacheComLiderAindaSelfCriaAposLeituraForte() {
+        String seriesKey = "series-cache-cria-confirmado";
+        placementLookup.putLocalOnly(seriesKey, SeriesPlacement.active(OTHER.value(), 1_000L));
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.active(SELF.value(), 2_000L));
+        handler.handle(Commands.WRITE_BATCH, singleWrite(seriesKey), SOURCE);
+
+        SeriesStatusResponse open = (SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequest(seriesKey, null), SOURCE);
+
+        assertEquals(SeriesStatus.OK, open.status());
+        assertEquals(1, placementLookup.strongCalls());
+        assertTrue(volume.storage().exists(SeriesObjectKeys.objectKey(SERIES_OBJECT_PREFIX, seriesKey)));
+    }
+
+    @Test
+    void liderIndisponivelMantemARespostaLocalComCooldown() {
+        String seriesKey = "series-lider-indisponivel";
+        placementLookup.putLocalOnly(seriesKey, SeriesPlacement.active(OTHER.value(), 1_000L));
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.active(SELF.value(), 2_000L));
+        placementLookup.failLeaderBatchWith(new RuntimeException("líder inalcançável"));
+
+        WriteBatchResponse first = (WriteBatchResponse) handler.handle(Commands.WRITE_BATCH, singleWrite(seriesKey),
+                SOURCE);
+        WriteBatchResponse second = (WriteBatchResponse) handler.handle(Commands.WRITE_BATCH, singleWrite(seriesKey),
+                SOURCE);
+
+        assertEquals(SeriesStatus.WRONG_OWNER, first.statusBySeries().get(seriesKey));
+        assertEquals(OTHER.value(), first.ownerBySeries().get(seriesKey));
+        assertEquals(SeriesStatus.WRONG_OWNER, second.statusBySeries().get(seriesKey));
+        assertEquals(OTHER.value(), second.ownerBySeries().get(seriesKey));
+        assertEquals(1, placementLookup.leaderBatchCalls(), "dentro do cooldown o líder não é consultado");
+        assertEquals(2L, handler.metricsSnapshot().redirectConfirmationFailures());
+
+        placementLookup.failLeaderBatchWith(null);
+        clock.advance(Duration.ofMillis(1_100));
+        WriteBatchResponse afterCooldown = (WriteBatchResponse) handler.handle(Commands.WRITE_BATCH,
+                singleWrite(seriesKey), SOURCE);
+
+        assertEquals(2, placementLookup.leaderBatchCalls(), "após o cooldown o líder volta a ser consultado");
+        assertEquals(SeriesStatus.NOT_OPEN, afterCooldown.statusBySeries().get(seriesKey));
+    }
+
+    @Test
+    void noLiderAReplicaLocalEhAutoritativaENaoHaConsulta() {
+        String seriesKey = "series-no-lider";
+        placementLookup.putLocalOnly(seriesKey, SeriesPlacement.active(OTHER.value(), 1_000L));
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.active(SELF.value(), 2_000L));
+        placementLookup.authoritative(true);
+
+        WriteBatchResponse write = (WriteBatchResponse) handler.handle(Commands.WRITE_BATCH, singleWrite(seriesKey),
+                SOURCE);
+
+        assertEquals(SeriesStatus.WRONG_OWNER, write.statusBySeries().get(seriesKey));
+        assertEquals(OTHER.value(), write.ownerBySeries().get(seriesKey));
+        assertEquals(0, placementLookup.leaderBatchCalls());
+        assertEquals(0L, handler.metricsSnapshot().redirectConfirmations());
+    }
+
+    @Test
+    void semLiderConhecidoRespondePelaReplicaSemConsultarOLider() {
+        String seriesKey = "series-sem-lider";
+        placementLookup.putLocalOnly(seriesKey, SeriesPlacement.active(OTHER.value(), 1_000L));
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.active(SELF.value(), 2_000L));
+        placementLookup.leaderKnown(false);
+
+        WriteBatchResponse write = (WriteBatchResponse) handler.handle(Commands.WRITE_BATCH, singleWrite(seriesKey),
+                SOURCE);
+
+        assertEquals(SeriesStatus.WRONG_OWNER, write.statusBySeries().get(seriesKey));
+        assertEquals(OTHER.value(), write.ownerBySeries().get(seriesKey));
+        assertEquals(0, placementLookup.leaderBatchCalls(), "sem líder conhecido não há o que consultar");
+        assertEquals(1L, handler.metricsSnapshot().redirectConfirmationFailures());
+    }
+
+    @Test
+    void consultaPresaAoLiderNaoArrastaAsRequisicoesSeguintes() throws Exception {
+        String stuckKey = "series-consulta-presa";
+        placementLookup.putLocalOnly(stuckKey, SeriesPlacement.active(OTHER.value(), 1_000L));
+        List<String> others = List.of("series-presa-b", "series-presa-c", "series-presa-d");
+        for (String key : others) {
+            placementLookup.putLocalOnly(key, SeriesPlacement.active(OTHER.value(), 1_000L));
+        }
+        CountDownLatch gate = new CountDownLatch(1);
+        placementLookup.holdLeaderBatchesOn(gate);
+        placementLookup.failLeaderBatchWith(new RuntimeException("líder não responde"));
+        ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+        try {
+            Future<Object> stuck = executor.submit(() -> handler.handle(Commands.WRITE_BATCH, singleWrite(stuckKey),
+                    SOURCE));
+            placementLookup.awaitLeaderBatchesStarted(1);
+            // Uma consulta em curso há mais que o limiar de "presa": as seguintes não começam outra.
+            clock.advance(Duration.ofMillis(600));
+
+            for (String key : others) {
+                WriteBatchResponse response = (WriteBatchResponse) handler.handle(Commands.WRITE_BATCH,
+                        singleWrite(key), SOURCE);
+                assertEquals(SeriesStatus.WRONG_OWNER, response.statusBySeries().get(key));
+                assertEquals(OTHER.value(), response.ownerBySeries().get(key));
+            }
+            assertEquals(1, placementLookup.leaderBatchCalls(), "só a consulta presa deveria ter ido ao líder");
+
+            gate.countDown();
+            assertEquals(SeriesStatus.WRONG_OWNER,
+                    ((WriteBatchResponse) stuck.get(10, TimeUnit.SECONDS)).statusBySeries().get(stuckKey));
+            assertEquals(4L, handler.metricsSnapshot().redirectConfirmationFailures());
+        } finally {
+            gate.countDown();
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void comLiderIndisponivelSoUmaSondaPorJanelaDeCooldown() throws Exception {
+        List<String> keys = IntStream.range(0, 8).mapToObj(i -> "series-sonda-" + i).toList();
+        for (String key : keys) {
+            placementLookup.putLocalOnly(key, SeriesPlacement.active(OTHER.value(), 1_000L));
+            placementLookup.putStrongOnly(key, SeriesPlacement.active(SELF.value(), 2_000L));
+        }
+        placementLookup.failLeaderBatchWith(new RuntimeException("líder em eleição"));
+        handler.handle(Commands.WRITE_BATCH, singleWrite(keys.get(0)), SOURCE);
+        assertEquals(1, placementLookup.leaderBatchCalls());
+
+        // Passado o cooldown, o líder continua indisponível e lento: das requisições concorrentes só uma
+        // sonda o líder; as demais respondem pela réplica sem esperar.
+        clock.advance(Duration.ofMillis(1_100));
+        CountDownLatch gate = new CountDownLatch(1);
+        placementLookup.holdLeaderBatchesOn(gate);
+        ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+        try {
+            List<Future<Object>> responses = new ArrayList<>();
+            for (String key : keys.subList(1, keys.size())) {
+                responses.add(executor.submit(() -> handler.handle(Commands.WRITE_BATCH, singleWrite(key), SOURCE)));
+            }
+            placementLookup.awaitLeaderBatchesStarted(2);
+            awaitCompletedCount(responses, responses.size() - 1);
+            assertEquals(2, placementLookup.leaderBatchCalls(), "só uma sonda por janela de cooldown");
+            gate.countDown();
+            for (Future<Object> response : responses) {
+                assertEquals(SeriesStatus.WRONG_OWNER,
+                        ((WriteBatchResponse) response.get(10, TimeUnit.SECONDS)).statusBySeries().values()
+                                .iterator().next());
+            }
+        } finally {
+            gate.countDown();
+            executor.shutdownNow();
+        }
+
+        // Líder de volta: a sonda seguinte ao cooldown confirma e a operação normal volta.
+        placementLookup.holdLeaderBatchesOn(null);
+        placementLookup.failLeaderBatchWith(null);
+        clock.advance(Duration.ofMillis(1_100));
+        WriteBatchResponse recovered = (WriteBatchResponse) handler.handle(Commands.WRITE_BATCH,
+                singleWrite(keys.get(0)), SOURCE);
+        assertEquals(SeriesStatus.NOT_OPEN, recovered.statusBySeries().get(keys.get(0)));
+    }
+
+    @Test
+    void comLiderSaudavelConfirmacoesConcorrentesCorremEmParalelo() throws Exception {
+        String first = "series-paralela-a";
+        String second = "series-paralela-b";
+        for (String key : List.of(first, second)) {
+            placementLookup.putLocalOnly(key, SeriesPlacement.active(OTHER.value(), 1_000L));
+            placementLookup.putStrongOnly(key, SeriesPlacement.active(THIRD.value(), 2_000L));
+        }
+        CountDownLatch gate = new CountDownLatch(1);
+        placementLookup.holdLeaderBatchesOn(gate);
+        ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+        try {
+            Future<Object> a = executor.submit(() -> handler.handle(Commands.WRITE_BATCH, singleWrite(first), SOURCE));
+            Future<Object> b = executor.submit(() -> handler.handle(Commands.WRITE_BATCH, singleWrite(second),
+                    SOURCE));
+
+            placementLookup.awaitLeaderBatchesStarted(2);
+            gate.countDown();
+
+            assertEquals(THIRD.value(), ((WriteBatchResponse) a.get(10, TimeUnit.SECONDS)).ownerBySeries().get(first));
+            assertEquals(THIRD.value(), ((WriteBatchResponse) b.get(10, TimeUnit.SECONDS)).ownerBySeries().get(second));
+        } finally {
+            gate.countDown();
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void confirmacaoQueTerminaDepoisDeUmaMudancaDePosseNaoRessuscitaOCache() throws Exception {
+        String seriesKey = "series-cache-ressuscitado";
+        placementLookup.putLocalOnly(seriesKey, SeriesPlacement.active(OTHER.value(), 1_000L));
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.active(THIRD.value(), 2_000L));
+        CountDownLatch gate = new CountDownLatch(1);
+        placementLookup.holdLeaderBatchesOn(gate);
+        ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+        try {
+            Future<Object> inFlight = executor.submit(() -> handler.handle(Commands.WRITE_BATCH,
+                    singleWrite(seriesKey), SOURCE));
+            placementLookup.awaitLeaderBatchesStarted(1);
+
+            registry.markMigrating(seriesKey);
+            gate.countDown();
+            inFlight.get(10, TimeUnit.SECONDS);
+
+            assertEquals(0, confirmedCacheSize(), "a confirmação anterior à mudança de posse não pode ir ao cache");
+        } finally {
+            gate.countDown();
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void placementMigratingDoLiderNaoVaiParaOCache() throws Exception {
+        String seriesKey = "series-lider-migrando-sem-cache";
+        placementLookup.putLocalOnly(seriesKey, SeriesPlacement.active(OTHER.value(), 1_000L));
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.migrating(
+                SeriesPlacement.active(OTHER.value(), 1_000L), THIRD.value(), "mig-1", 2_000L));
+
+        WriteBatchResponse first = (WriteBatchResponse) handler.handle(Commands.WRITE_BATCH, singleWrite(seriesKey),
+                SOURCE);
+        handler.handle(Commands.WRITE_BATCH, singleWrite(seriesKey), SOURCE);
+
+        assertEquals(SeriesStatus.MIGRATING, first.statusBySeries().get(seriesKey));
+        assertEquals(0, confirmedCacheSize());
+        assertEquals(2, placementLookup.leaderBatchCalls(), "sem cache, cada requisição confirma no líder");
+    }
+
+    /** Espera ao menos {@code count} das respostas terem terminado. */
+    private static void awaitCompletedCount(List<Future<Object>> responses, int count) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 10_000L;
+        while (responses.stream().filter(Future::isDone).count() < count) {
+            if (System.currentTimeMillis() > deadline) {
+                throw new AssertionError("só " + responses.stream().filter(Future::isDone).count()
+                        + " resposta(s) terminaram; esperado " + count);
+            }
+            Thread.sleep(10L);
+        }
+    }
+
+    @Test
+    void parteLocalLentaDaRequisicaoNaoFazAConsultaNascerPresa() throws Exception {
+        // A leitura forte do caminho de série esquecida demora 600 ms antes de a requisição chegar ao líder:
+        // a consulta dela começa agora, não quando a requisição começou — senão nasceria "presa" e as
+        // requisições saudáveis concorrentes pulariam a confirmação (o pingue-pongue da #177).
+        String forgottenKey = "series-esquecida-leitura-lenta";
+        String slowRedirect = "series-redirecionada-lenta";
+        String healthyRedirect = "series-redirecionada-saudavel";
+        placementLookup.put(forgottenKey, SeriesPlacement.active(SELF.value(), 1_000L));
+        registry.open(forgottenKey, yaml, Ngrrd.OpenOptions.defaults());
+        registry.forget(forgottenKey);
+        for (String key : List.of(slowRedirect, healthyRedirect)) {
+            placementLookup.putLocalOnly(key, SeriesPlacement.active(OTHER.value(), 1_000L));
+            placementLookup.putStrongOnly(key, SeriesPlacement.active(THIRD.value(), 2_000L));
+        }
+        placementLookup.onStrongRead(() -> clock.advance(Duration.ofMillis(600)));
+        CountDownLatch gate = new CountDownLatch(1);
+        placementLookup.holdLeaderBatchesOn(gate);
+        ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+        try {
+            Future<Object> slow = executor.submit(() -> handler.handle(Commands.WRITE_BATCH, new WriteBatchRequest(
+                    List.of(new SeriesWrite(forgottenKey, "in_octets", 1_700_000_000_000L, 1d),
+                            new SeriesWrite(slowRedirect, "in_octets", 1_700_000_000_000L, 1d))), SOURCE));
+            placementLookup.awaitLeaderBatchesStarted(1);
+            placementLookup.onStrongRead(null);
+
+            Future<Object> healthy = executor.submit(() -> handler.handle(Commands.WRITE_BATCH,
+                    singleWrite(healthyRedirect), SOURCE));
+            placementLookup.awaitLeaderBatchesStarted(1);
+            gate.countDown();
+
+            assertEquals(2, placementLookup.leaderBatchCalls(), "a requisição saudável deveria confirmar no líder");
+            assertEquals(THIRD.value(), ((WriteBatchResponse) healthy.get(10, TimeUnit.SECONDS)).ownerBySeries()
+                    .get(healthyRedirect));
+            assertEquals(THIRD.value(), ((WriteBatchResponse) slow.get(10, TimeUnit.SECONDS)).ownerBySeries()
+                    .get(slowRedirect));
+        } finally {
+            gate.countDown();
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void errorNaConsultaAoLiderNaoDesligaAsConfirmacoesSeguintes() {
+        String seriesKey = "series-error-na-consulta";
+        placementLookup.putLocalOnly(seriesKey, SeriesPlacement.active(OTHER.value(), 1_000L));
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.active(THIRD.value(), 2_000L));
+        placementLookup.errorLeaderBatchWith(new StackOverflowError("simulado"));
+
+        assertThrows(StackOverflowError.class,
+                () -> handler.handle(Commands.WRITE_BATCH, singleWrite(seriesKey), SOURCE));
+
+        placementLookup.errorLeaderBatchWith(null);
+        clock.advance(Duration.ofSeconds(60));
+        WriteBatchResponse response = (WriteBatchResponse) handler.handle(Commands.WRITE_BATCH,
+                singleWrite(seriesKey), SOURCE);
+
+        assertEquals(2, placementLookup.leaderBatchCalls(), "a ficha da consulta que lançou Error não pode vazar");
+        assertEquals(THIRD.value(), response.ownerBySeries().get(seriesKey));
+    }
+
+    private static WriteBatchRequest singleWrite(String seriesKey) {
+        return new WriteBatchRequest(List.of(new SeriesWrite(seriesKey, "in_octets", 1_700_000_000_000L, 1d)));
+    }
+
+    private int confirmedCacheSize() throws Exception {
+        Field field = StorageRequestHandler.class.getDeclaredField("confirmedPlacements");
+        field.setAccessible(true);
+        return ((Map<?, ?>) field.get(handler)).size();
     }
 
     @Test
@@ -1169,7 +1724,7 @@ class StorageRequestHandlerTest {
 
     /** {@link Clock} determinístico para forçar fechamento por ociosidade via {@link SeriesHandleRegistry#closeIdle()}. */
     private static final class MutableClock extends Clock {
-        private Instant instant;
+        private volatile Instant instant;
 
         MutableClock(Instant start) {
             this.instant = start;
@@ -1199,13 +1754,25 @@ class StorageRequestHandlerTest {
      * Fake de {@link StorageRequestHandler.PlacementLookup}: dois mapas em memória — {@code local}
      * (réplica eventual, pode ficar vazia mesmo com a série colocada — simula o catálogo logo após um
      * restart) e {@code strong} (o que o líder responderia num round-trip). {@code strongCalls} conta
-     * as consultas de {@link #placementStrong}, para os testes confirmarem o cache negativo do handler.
+     * as consultas de {@link #placementStrong}, para os testes confirmarem o cache negativo do handler;
+     * {@link #placementsAtLeader} lê a mesma visão forte e registra cada lote consultado (issue #177).
      */
     private static final class PlacementLookupFake implements StorageRequestHandler.PlacementLookup {
         private final Map<String, SeriesPlacement> local = new HashMap<>();
         private final Map<String, SeriesPlacement> strong = new HashMap<>();
         private int strongCalls;
         private RuntimeException strongFailure;
+        private final List<List<String>> leaderBatches = new CopyOnWriteArrayList<>();
+        private volatile RuntimeException leaderBatchFailure;
+        private volatile boolean authoritative;
+        private volatile boolean leaderKnown = true;
+        /** Executado a cada {@link #placementStrong} (ex.: avançar o relógio para simular uma leitura lenta). */
+        private volatile Runnable strongReadHook;
+        /** Quando não nulo, a consulta em lote ao líder lança este {@link Error}. */
+        private volatile Error leaderBatchError;
+        /** Quando não nulo, cada consulta em lote ao líder espera este latch antes de responder. */
+        private volatile CountDownLatch leaderBatchGate;
+        private final Semaphore leaderBatchStarted = new Semaphore(0);
 
         void put(String seriesKey, SeriesPlacement placement) {
             local.put(seriesKey, placement);
@@ -1231,6 +1798,92 @@ class StorageRequestHandlerTest {
             return strongCalls;
         }
 
+        /** Toda consulta em lote seguinte ao líder lança {@code failure}; {@code null} volta a responder. */
+        void failLeaderBatchWith(RuntimeException failure) {
+            this.leaderBatchFailure = failure;
+        }
+
+        /** Simula este nó como líder (réplica local autoritativa). */
+        void authoritative(boolean value) {
+            this.authoritative = value;
+        }
+
+        int leaderBatchCalls() {
+            return leaderBatches.size();
+        }
+
+        List<List<String>> leaderBatches() {
+            return leaderBatches;
+        }
+
+        void onStrongRead(Runnable hook) {
+            this.strongReadHook = hook;
+        }
+
+        void errorLeaderBatchWith(Error error) {
+            this.leaderBatchError = error;
+        }
+
+        /** Simula a ausência de líder conhecido por este nó. */
+        void leaderKnown(boolean value) {
+            this.leaderKnown = value;
+        }
+
+        /** As consultas em lote seguintes ficam presas até {@code gate} abrir ({@code null} = sem espera). */
+        void holdLeaderBatchesOn(CountDownLatch gate) {
+            this.leaderBatchGate = gate;
+        }
+
+        /** Espera {@code count} consultas em lote terem começado. */
+        void awaitLeaderBatchesStarted(int count) throws InterruptedException {
+            assertTrue(leaderBatchStarted.tryAcquire(count, 10, TimeUnit.SECONDS),
+                    "consultas em lote ao líder deveriam ter começado: " + count);
+        }
+
+        @Override
+        public boolean leaderKnown() {
+            return leaderKnown;
+        }
+
+        @Override
+        public Map<String, SeriesPlacement> placementsAtLeader(Collection<String> seriesKeys, Duration maxWait) {
+            leaderBatches.add(List.copyOf(seriesKeys));
+            leaderBatchStarted.release();
+            CountDownLatch gate = leaderBatchGate;
+            if (gate != null) {
+                try {
+                    if (!gate.await(10, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("gate da consulta ao líder nunca abriu");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException(e);
+                }
+            }
+            if (leaderBatchError != null) {
+                throw leaderBatchError;
+            }
+            if (leaderBatchFailure != null) {
+                throw leaderBatchFailure;
+            }
+            if (strongFailure != null) {
+                throw strongFailure;
+            }
+            Map<String, SeriesPlacement> found = new HashMap<>();
+            for (String key : seriesKeys) {
+                SeriesPlacement placement = strong.get(key);
+                if (placement != null) {
+                    found.put(key, placement);
+                }
+            }
+            return found;
+        }
+
+        @Override
+        public boolean localIsAuthoritative() {
+            return authoritative;
+        }
+
         @Override
         public Optional<SeriesPlacement> placementLocal(String seriesKey) {
             return Optional.ofNullable(local.get(seriesKey));
@@ -1239,6 +1892,10 @@ class StorageRequestHandlerTest {
         @Override
         public Optional<SeriesPlacement> placementStrong(String seriesKey) {
             strongCalls++;
+            Runnable hook = strongReadHook;
+            if (hook != null) {
+                hook.run();
+            }
             if (strongFailure != null) {
                 throw strongFailure;
             }

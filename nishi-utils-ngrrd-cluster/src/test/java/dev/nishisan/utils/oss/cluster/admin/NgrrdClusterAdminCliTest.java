@@ -25,8 +25,10 @@ import dev.nishisan.utils.oss.cluster.api.ErrorCode;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterClient;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterConfig;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
+import dev.nishisan.utils.oss.cluster.api.RebalanceTrigger;
 import dev.nishisan.utils.oss.cluster.api.SeriesInfo;
 import dev.nishisan.utils.oss.cluster.api.SeriesVerification;
+import dev.nishisan.utils.oss.cluster.catalog.CatalogReplicaStatus;
 import dev.nishisan.utils.oss.cluster.catalog.NodeState;
 import dev.nishisan.utils.oss.cluster.catalog.StorageCapabilities;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
@@ -138,6 +140,47 @@ class NgrrdClusterAdminCliTest {
         assertTrue(node1.endsWith(" -"), "nó sem capacidades anunciadas deveria mostrar '-': " + node1);
     }
 
+    @Test
+    void statusImprimeOLagDaReplicaDoCatalogoPorNo() {
+        ClientFake client = new ClientFake();
+        client.statusResponse = new AdminStatusResponse(SeriesStatus.OK, "storage-lider",
+                List.of(
+                        viewWithReplica("storage-lider", CatalogReplicaStatus.ofLeader()),
+                        viewWithReplica("storage-emdia", new CatalogReplicaStatus(false, 12L, 500L, 489L, false, false,
+                                true)),
+                        viewWithReplica("storage-sync", new CatalogReplicaStatus(false, 0L, 500L, 1L, true, false,
+                                false)),
+                        viewWithReplica("storage-boot", new CatalogReplicaStatus(false, 0L, 500L, 1L, false, true,
+                                false)),
+                        viewWithReplica("storage-desconh", CatalogReplicaStatus.from(false, null)),
+                        viewWithReplica("storage-antigo", null)),
+                0, Map.of());
+
+        Capture capture = run(new String[] {"--seed", "127.0.0.1:9000", "status"}, cfg -> client);
+
+        assertEquals(0, capture.exitCode);
+        String header = capture.out.lines().filter(line -> line.startsWith("NODE ")).findFirst().orElseThrow();
+        assertTrue(header.contains(" CAT_LAG "), header);
+        assertTrue(header.indexOf("CAT_LAG") < header.indexOf("CAPABILITIES"), header);
+        assertEquals("lider", catLagOf(capture.out, "storage-lider"));
+        assertEquals("12", catLagOf(capture.out, "storage-emdia"));
+        assertEquals("sync", catLagOf(capture.out, "storage-sync"));
+        assertEquals("boot", catLagOf(capture.out, "storage-boot"));
+        assertEquals("?", catLagOf(capture.out, "storage-desconh"));
+        assertEquals("-", catLagOf(capture.out, "storage-antigo"));
+    }
+
+    private static NodeStatusView viewWithReplica(String nodeId, CatalogReplicaStatus replica) {
+        return new NodeStatusView(new StorageNodeStatus(nodeId, NodeState.ACTIVE, 1, 10, 100, 1L,
+                DistributionMode.COUNT, 1, 0, StorageCapabilities.ALL, replica), true);
+    }
+
+    /** Penúltima coluna da linha do nó (a última é CAPABILITIES, sem espaços). */
+    private static String catLagOf(String output, String nodeId) {
+        String[] columns = lineOf(output, nodeId).trim().split("\\s+");
+        return columns[columns.length - 2];
+    }
+
     private static String lineOf(String output, String nodeId) {
         return output.lines()
                 .filter(line -> line.startsWith(nodeId + " "))
@@ -156,6 +199,10 @@ class NgrrdClusterAdminCliTest {
         assertEquals("storage-7", client.metricsRequestedNodeId);
         assertTrue(capture.out.contains("storage-7"), capture.out);
         assertTrue(capture.out.contains("SERIES: 5"), capture.out);
+        assertTrue(capture.out.contains("REDIRECT_CONFIRMATIONS: 6"), capture.out);
+        assertTrue(capture.out.contains("REDIRECT_OVERRIDES: 7"), capture.out);
+        assertTrue(capture.out.contains("REDIRECT_CONFIRMATION_FAILURES: 8"), capture.out);
+        assertTrue(capture.out.contains("REDIRECT_CACHE_HITS: 9"), capture.out);
     }
 
     @Test
@@ -197,6 +244,32 @@ class NgrrdClusterAdminCliTest {
     }
 
     @Test
+    void rebalanceImprimePlanejadosIniciadosEExclusoes() {
+        ClientFake client = new ClientFake();
+        client.rebalanceTrigger = new RebalanceTrigger(4, 3, Map.of("storage-c", "lag=12345>1000",
+                "storage-b", "sincronizando"));
+
+        Capture capture = run(new String[] {"--seed", "127.0.0.1:9000", "rebalance"}, cfg -> client);
+
+        assertEquals(0, capture.exitCode);
+        List<String> lines = capture.out.lines().toList();
+        assertEquals("rebalanceamento disparado: planejados=4 iniciados=3", lines.get(0));
+        assertEquals("destino excluído: storage-b (sincronizando)", lines.get(1));
+        assertEquals("destino excluído: storage-c (lag=12345>1000)", lines.get(2));
+    }
+
+    @Test
+    void rebalanceContraClienteSemContagensImprimeSoAConfirmacao() {
+        ClientFake client = new ClientFake();
+
+        Capture capture = run(new String[] {"--seed", "127.0.0.1:9000", "rebalance"}, cfg -> client);
+
+        assertEquals(0, capture.exitCode);
+        assertTrue(client.rebalanceCalled.get());
+        assertEquals(List.of("rebalanceamento disparado"), capture.out.lines().toList());
+    }
+
+    @Test
     void comandoDesconhecidoFalhaComCodigoUm() {
         Capture capture = run(new String[] {"--seed", "127.0.0.1:9000", "chute"}, cfg -> new ClientFake());
 
@@ -219,7 +292,8 @@ class NgrrdClusterAdminCliTest {
     private static NodeMetricsSnapshot fixedSnapshot(String nodeId) {
         return new NodeMetricsSnapshot(nodeId, 1_000L, true, 5L, 100L, 1_000L, 2, 3L, 30L, 0L, 1L, 0L, 4L,
                 LatencySnapshot.EMPTY, LatencySnapshot.EMPTY, LatencySnapshot.EMPTY, Map.of(),
-                new BlobVolumeSummary(1, 100L, 1_000L, 0.1, 5, 0L), 0L, 0L, 0L, 0L, 0L, 0L, 0L);
+                new BlobVolumeSummary(1, 100L, 1_000L, 0.1, 5, 0L), 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L,
+                LatencySnapshot.EMPTY, 6L, 7L, 8L, 9L);
     }
 
     private Capture run(String[] args, Function<NgrrdClusterConfig, NgrrdClusterClient> factory) {
@@ -247,6 +321,8 @@ class NgrrdClusterAdminCliTest {
         String drainRequestedNodeId;
         String activateRequestedNodeId;
         final AtomicBoolean rebalanceCalled = new AtomicBoolean();
+        /** {@code null} = usa o default de {@link NgrrdClusterClient#triggerRebalance()}. */
+        RebalanceTrigger rebalanceTrigger;
         final AtomicBoolean closed = new AtomicBoolean();
 
         @Override
@@ -307,6 +383,15 @@ class NgrrdClusterAdminCliTest {
         @Override
         public void rebalanceNow() {
             rebalanceCalled.set(true);
+        }
+
+        @Override
+        public RebalanceTrigger triggerRebalance() {
+            if (rebalanceTrigger == null) {
+                return NgrrdClusterClient.super.triggerRebalance();
+            }
+            rebalanceCalled.set(true);
+            return rebalanceTrigger;
         }
 
         @Override

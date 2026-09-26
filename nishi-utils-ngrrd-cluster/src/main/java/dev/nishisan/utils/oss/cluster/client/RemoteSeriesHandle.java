@@ -43,8 +43,10 @@ import dev.nishisan.utils.oss.cluster.rpc.ClusterRpc;
 
 import java.time.Clock;
 import java.time.Duration;
+import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 import java.util.function.BooleanSupplier;
@@ -70,6 +72,11 @@ import java.util.logging.Logger;
  * {@code close()} continua local e não afeta o gravável (a remoção condicional do mapa vira no-op).
  * {@code WRONG_OWNER} sem dono informado é confirmado direto com o líder
  * ({@link PlacementLookup#resolveExistingAtLeader}), e a ausência lá vira {@code NOT_PLACED}.</p>
+ *
+ * <p>{@code WRONG_OWNER} com dono informado é seguido enquanto a cadeia de saltos da operação for
+ * plausível; uma dica contraditória (aponta o próprio nó, um nó que já redirecionou a operação, diverge do
+ * dono confirmado pelo líder ou chega depois de 4 saltos) é
+ * desempatada no líder, dentro do mesmo prazo da operação (#177).</p>
  *
  * <p>Antes de todo {@code OPEN} de handle somente leitura, o dono precisa anunciar
  * {@code open.createIfMissing} ({@link NodeCapabilities}); e um {@code OK} precisa trazer a confirmação
@@ -238,7 +245,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
                 case WRONG_OWNER, MIGRATING, NOT_LEADER -> {
                     retry.pause(Commands.OPEN, candidateOwner, response.status(), response.ownerNodeId());
                     if (response.status() == SeriesStatus.WRONG_OWNER) {
-                        noteWrongOwner(response.ownerNodeId(), retry);
+                        noteWrongOwner(candidateOwner, response.ownerNodeId(), retry);
                     }
                 }
                 // NOT_FOUND: o dono confirmou com o líder que a série é dele e o arquivo não existe.
@@ -537,7 +544,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
             case WRONG_OWNER, NOT_OPEN, MIGRATING -> {
                 retry.pause(command, target, status, ownerNodeId);
                 if (status == SeriesStatus.WRONG_OWNER) {
-                    noteWrongOwner(ownerNodeId, retry);
+                    noteWrongOwner(target, ownerNodeId, retry);
                 } else if (status == SeriesStatus.NOT_OPEN) {
                     // Unlike the dispatcher's boolean callback, preserve failures and the caller's budget.
                     markingSeriesNotFound(() -> {
@@ -557,6 +564,12 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
         private final long deadlineMs = clock.millis() + retryPolicy.timeout().toMillis();
         private int attempts;
         private SeriesStatus lastStatus;
+        /** Nós que responderam {@code WRONG_OWNER} com dono informado nesta operação, na ordem. */
+        private final Set<String> redirectedBy = new LinkedHashSet<>();
+        /** Dono confirmado pelo líder nesta operação; uma dica divergente dele é contraditória. */
+        private String confirmedOwner;
+        /** {@code WRONG_OWNER} com dono informado recebidos nesta operação. */
+        private int redirects;
 
         private OperationRetry(String operation) {
             this.operation = operation;
@@ -617,14 +630,27 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
     }
 
     /**
-     * Redireciona depois de um {@code WRONG_OWNER}. Com o dono informado, segue com ele. Sem dono, um
-     * handle gravável re-resolve como sempre ({@link PlacementLookup#resolve}); um handle somente leitura
-     * confirma direto com o líder ({@link PlacementLookup#resolveExistingAtLeader}) — a réplica local pode
-     * estar atrasada e devolveria o mesmo dono até o prazo se esgotar. Ausente no líder, a leitura termina
-     * em {@link SeriesNotFoundException} com {@code NOT_PLACED} e o handle se fecha.
+     * Redireciona depois de um {@code WRONG_OWNER} de {@code target}. Com o dono informado e uma cadeia de
+     * saltos plausível, segue com ele. Com uma dica contraditória (#177 — o destino com a réplica do catálogo
+     * atrasada aponta a origem, que aponta o destino), confirma o dono no líder
+     * ({@link #confirmOwnerAtLeader}). Sem dono, um handle gravável re-resolve como sempre
+     * ({@link PlacementLookup#resolve}); um handle somente leitura confirma direto com o líder
+     * ({@link PlacementLookup#resolveExistingAtLeader}) — a réplica local pode estar atrasada e devolveria o
+     * mesmo dono até o prazo se esgotar. Ausente no líder, a leitura termina em
+     * {@link SeriesNotFoundException} com {@code NOT_PLACED} e o handle se fecha.
      */
-    private void noteWrongOwner(String newOwnerNodeId, OperationRetry retry) {
+    private void noteWrongOwner(String target, String newOwnerNodeId, OperationRetry retry) {
         if (newOwnerNodeId != null) {
+            boolean contradictory = newOwnerNodeId.equals(target)
+                    || retry.redirectedBy.contains(newOwnerNodeId)
+                    || (retry.confirmedOwner != null && !newOwnerNodeId.equals(retry.confirmedOwner))
+                    || retry.redirects >= WriteDispatcher.MAX_REDIRECT_HOPS;
+            retry.redirects++;
+            retry.redirectedBy.add(target);
+            if (contradictory) {
+                confirmOwnerAtLeader(target, newOwnerNodeId, retry);
+                return;
+            }
             resolver.noteOwner(seriesKey, newOwnerNodeId);
             owner = newOwnerNodeId;
             return;
@@ -636,6 +662,44 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
             owner = markingSeriesNotFound(() -> resolver.resolveExistingAtLeader(seriesKey, retry.remaining()))
                     .ownerNodeId();
         }
+    }
+
+    /**
+     * Desempata no líder uma dica de dono contraditória, com prazo {@code min(restante, requestTimeout)}:
+     * encontrado, o dono do líder passa a ser o alvo e o dono confirmado da operação; ausente, um handle
+     * gravável re-resolve com criação e um somente leitura se fecha com {@code NOT_PLACED}; falha ao
+     * consultar segue a dica recebida (a pausa exponencial e o prazo da operação seguem valendo).
+     */
+    private void confirmOwnerAtLeader(String target, String hint, OperationRetry retry) {
+        Duration remaining = retry.remaining();
+        Duration maxWait = remaining.compareTo(requestTimeout) < 0 ? remaining : requestTimeout;
+        boolean writable = state.get().writable();
+        SeriesPlacement confirmed;
+        try {
+            confirmed = writable ? resolver.resolveExistingAtLeader(seriesKey, maxWait)
+                    : markingSeriesNotFound(() -> resolver.resolveExistingAtLeader(seriesKey, maxWait));
+        } catch (SeriesNotFoundException absent) {
+            if (!writable) {
+                throw absent;
+            }
+            resolver.invalidate(seriesKey);
+            owner = resolvePlacement(true, retry.remaining()).ownerNodeId();
+            return;
+        } catch (NgrrdClusterException e) {
+            // Sem autoridade, segue a dica: ficar em `target` prenderia a operação num nó que talvez não seja
+            // o dono (ex.: o dono real com réplica atrasada apontou para cá). A pausa exponencial e o prazo da
+            // operação continuam valendo, e a próxima contradição consulta o líder de novo.
+            LOGGER.log(Level.FINE, e, () -> "Falha ao confirmar no líder o dono de " + seriesKey + " (dicas "
+                    + retry.redirectedBy + " → " + hint + "); seguindo a dica");
+            resolver.noteOwner(seriesKey, hint);
+            owner = hint;
+            return;
+        }
+        LOGGER.log(Level.FINE, () -> "Dicas de dono contraditórias para " + seriesKey + " (" + retry.redirectedBy
+                + " → " + hint + "); o líder confirmou " + confirmed.ownerNodeId());
+        owner = confirmed.ownerNodeId();
+        retry.confirmedOwner = confirmed.ownerNodeId();
+        retry.redirectedBy.clear();
     }
 
     private void ensureOpen() {

@@ -128,7 +128,8 @@ public final class AdminRequestHandler extends RequestHandlerSupport {
             return new AdminRebalanceResponse(SeriesStatus.NOT_LEADER, leaderView.leaderId().orElse(null), 0, 0);
         }
         Rebalancer.TriggerResult result = rebalancer.triggerNow();
-        return new AdminRebalanceResponse(SeriesStatus.OK, self.value(), result.planned(), result.started());
+        return new AdminRebalanceResponse(SeriesStatus.OK, self.value(), result.planned(), result.started(),
+                result.excludedDestinations());
     }
 
     private AdminStatusResponse handleStatus() {

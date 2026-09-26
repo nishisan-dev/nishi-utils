@@ -34,13 +34,27 @@ public final class PeerUpdatePayload {
 
     private final Set<NodeInfo> peers;
     private final Map<NodeId, Double> latencies;
+    /**
+     * Peers the sender forgot as departed (8.7.0), with the remaining time-to-live of each tombstone in
+     * milliseconds. Admission-only for the receiver: it blocks second-hand re-admission of those ids and
+     * lets a node that never reached the leaver forget it too, but never evicts a peer the receiver
+     * holds a handshaked connection to, nor a leader-eligible one. Absent in updates of older nodes
+     * (empty), and ignored by them ({@code FAIL_ON_UNKNOWN_PROPERTIES} is off).
+     */
+    private final Map<NodeId, Long> departed;
+
+    public PeerUpdatePayload(Set<NodeInfo> peers, Map<NodeId, Double> latencies) {
+        this(peers, latencies, null);
+    }
 
     @JsonCreator
     public PeerUpdatePayload(
             @JsonProperty("peers") Set<NodeInfo> peers,
-            @JsonProperty("latencies") Map<NodeId, Double> latencies) {
+            @JsonProperty("latencies") Map<NodeId, Double> latencies,
+            @JsonProperty("departed") Map<NodeId, Long> departed) {
         this.peers = Collections.unmodifiableSet(new HashSet<>(Objects.requireNonNull(peers, "peers")));
         this.latencies = Collections.unmodifiableMap(new HashMap<>(Objects.requireNonNull(latencies, "latencies")));
+        this.departed = departed == null ? Map.of() : Collections.unmodifiableMap(new HashMap<>(departed));
     }
 
     public Set<NodeInfo> peers() {
@@ -49,5 +63,16 @@ public final class PeerUpdatePayload {
 
     public Map<NodeId, Double> latencies() {
         return latencies;
+    }
+
+    /**
+     * Departed peers known to the sender, with the remaining tombstone time-to-live in milliseconds;
+     * empty for updates of nodes that predate the field.
+     *
+     * @return departed peer ids and their remaining tombstone TTL (ms)
+     * @since 8.7.0
+     */
+    public Map<NodeId, Long> departed() {
+        return departed;
     }
 }

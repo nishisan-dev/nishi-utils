@@ -36,8 +36,9 @@ Responsável pela comunicação de baixo nível entre os nós.
   - **Stickiness & Recuperação:** Rotas Proxy são mantidas enquanto forem vantajosas ou necessárias. Uma tarefa em background ("Probe") tenta periodicamente restabelecer a conexão direta de forma silenciosa.
   - **TTL:** Mensagens possuem um Time-To-Live para evitar loops infinitos de roteamento.
 - **Descoberta (Gossip Simples):**
-  - `HANDSHAKE`: Na conexão, troca metadados do nó e lista de peers conhecidos.
-  - `PEER_UPDATE`: Broadcast periódico ou reativo para compartilhar novos peers descobertos, permitindo o fechamento da malha (full mesh).
+  - `HANDSHAKE`: Na conexão, troca metadados do nó e lista de peers conhecidos. Numa conexão discada o handshake é sempre o primeiro frame (frames entregues antes dele ficam retidos e saem logo depois, em ordem; se o envio do handshake falhar, a conexão é fechada); um socket aceito sempre responde ao primeiro handshake lido, mesmo que um frame anterior já tenha permitido inferir a identidade do remoto. Seeds configurados como `host:port` entram com um id provisório (alias): o handshake troca o alias pelo id canônico, remove toda chave antiga que ainda aponte para a mesma conexão, e aliases não resolvidos nunca são gossipados. Enquanto a resposta não chega, o socket do alias atende o id canônico por no máximo `connectTimeout`; depois disso o id canônico é discado.
+  - `PEER_UPDATE`: Broadcast periódico ou reativo para compartilhar novos peers descobertos, permitindo o fechamento da malha (full mesh). Desde a 8.7.0 carrega também `departed` (peers esquecidos e o TTL restante do tombstone de cada um).
+  - `LEAVE` (8.7.0): enviado pelo `close()` do transporte em cada conexão cujo peer anunciou suporte no handshake (`supportsLeave`). Ver [Saída de membros](#saída-de-membros-leave-e-esquecimento-de-peers-efêmeros).
 - **RPC Interno:** Suporta mensagens do tipo `CLIENT_REQUEST`/`CLIENT_RESPONSE` com correlação (`correlationId`), permitindo chamadas síncronas (`sendAndAwait`).
 
 ### 2. Camada de Coordenação
@@ -207,7 +208,64 @@ stateDiagram-v2
   Desconhecido --> Ativo: onPeerConnected() ou HEARTBEAT
   Ativo --> Inativo: onPeerDisconnected()
   Ativo --> Inativo: heartbeatTimeout (evictDeadMembers)
+  Ativo --> Inativo: onPeerLeaving() (LEAVE de votante, sem grace)
   Inativo --> Ativo: reconexao + HEARTBEAT/onPeerConnected
+  Ativo --> Desconhecido: onPeerLeft() (efêmero esquecido)
+  Inativo --> Desconhecido: onPeerLeft() (efêmero esquecido)
+```
+
+### Saída de membros (LEAVE) e esquecimento de peers efêmeros
+
+Um membro **efêmero** — inelegível a líder (`NodeInfo.ROLE_LEADER_INELIGIBLE`, ex.: o cliente do
+ngrrd/CLI de administração) ou sem porta de escuta — é **esquecido** pelo transporte quando sai:
+sai de `knownPeers`, do roteador e da membership do coordenador, e deixa de ser discado pelos
+heartbeats. Antes disso, um cliente que encerrava ficava conhecido para sempre e cada broadcast de
+heartbeat tentava discar para ele (até `connectTimeout`, com o log "No connection available for ...").
+
+- **Gatilho rápido (LEAVE):** `TcpTransport.close()` envia `LEAVE` diretamente em cada conexão
+  rastreada (só para peers com `supportsLeave`) e espera o flush de cada mensagem até
+  `leaveFlushTimeout` (500 ms) antes de fechar os sockets; `leaveOnClose(false)` desliga. Um backlog
+  de saída grande pode estourar o prazo: o close segue normal e os peers caem no gatilho lento.
+- **Primeira mão apenas:** o receptor honra o LEAVE só na conexão rastreada para aquele peer, com
+  handshake, e com a identidade anunciada igual à da conexão — LEAVE forjado ou atrasado de uma
+  encarnação antiga num socket substituído é descartado. O LEAVE nunca é repassado.
+- **Gatilho lento (backstop):** no `reconnectLoop`, um peer efêmero sem conexão aberta **e** sem
+  nenhuma mensagem vinda dele (direta ou retransmitida por um relay) por mais de
+  `departedPeerForgetAfter` é esquecido (kill -9, OOM, perda de rede). Numa malha parcial (firewall,
+  link de um lado só), um cliente vivo que este nó não consegue discar segue falando por relay e não é
+  esquecido. O `NGridNode` usa `max(1 min, 2 × heartbeatTimeout)` (= `6 × heartbeatInterval`). Como a saída aqui é só inferida,
+  o tombstone dura a mesma janela (`departedPeerForgetAfter`), não os 10 min do LEAVE: um cliente vivo
+  que ficou isolado (ex.: o único relay caiu) volta a ser aceito por gossip e tráfego retransmitido logo
+  depois, e um cliente morto readmitido assim é esquecido de novo na janela seguinte.
+- **Tombstone:** o id esquecido por LEAVE fica bloqueado por `departedPeerTombstoneTtl` (10 min; o
+  gatilho lento usa a janela curta acima) contra
+  readmissão de segunda mão — gossip, lista de peers de handshake de terceiros, alcançabilidade do
+  roteador, mensagens retransmitidas e sockets sem handshake. Um **handshake direto** do mesmo id
+  (nova encarnação), um `addPeer` explícito ou a expiração limpam o tombstone; heartbeats de um id em
+  tombstone não recriam o membro.
+- **Disseminação:** `departed` segue em todo `PEER_UPDATE` enquanto o tombstone durar; a primeira
+  recepção de um LEAVE só antecipa um `PEER_UPDATE` na hora. Essa
+  notícia de segunda mão só serve para admissão: esquece um peer apenas conhecido (quem nunca alcançou
+  o cliente também limpa), mas nunca derruba um peer com conexão handshaked aberta nem um votante.
+- **Votantes nunca são esquecidos:** um membro elegível a líder que envia LEAVE segue em
+  `knownPeers` e na membership (a maioria não encolhe sem consenso); o coordenador apenas o marca
+  inativo na hora, sem o grace de disconnect, e o próximo heartbeat do mesmo id o reativa.
+  **Descomissionar um votante de vez** (ex.: storage drenado que não volta) continua exigindo ação do
+  operador.
+
+```mermaid
+sequenceDiagram
+participant C as Cliente (inelegível)
+participant S1 as Storage 1
+participant S2 as Storage 2
+
+Note over C: close()
+C->>S1: LEAVE(node=C)
+C->>S2: LEAVE(node=C)
+Note over S1: 1ª mão: esquece C + tombstone
+S1-->>S2: PEER_UPDATE(peers, departed={C: ttl})
+Note over S2: já esqueceu C pelo próprio LEAVE; um nó sem link com C esqueceria aqui
+Note over S1,S2: gossip atrasado listando C não o readmite; handshake direto de C (nova encarnação) sim
 ```
 
 ## Fluxos Principais

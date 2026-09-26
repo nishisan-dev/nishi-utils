@@ -19,6 +19,7 @@ package dev.nishisan.utils.oss.cluster.client;
 
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.oss.Ngrrd;
+import dev.nishisan.utils.oss.api.SeriesNotFoundException;
 import dev.nishisan.utils.oss.cluster.api.ErrorCode;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor;
@@ -31,6 +32,7 @@ import org.junit.jupiter.params.provider.EnumSource;
 
 import java.time.*;
 import java.util.*;
+import java.util.function.Function;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -39,12 +41,22 @@ class RemoteSeriesRetryBudgetTest {
     private final List<Duration> rpcBudgets = new ArrayList<>();
     private final List<Duration> lookupBudgets = new ArrayList<>();
     private final List<String> commands = new ArrayList<>();
+    private final List<String> targets = new ArrayList<>();
+    private final List<Duration> atLeaderBudgets = new ArrayList<>();
     private String owner = "a";
     private boolean initialOpen = true;
     private Responder responder;
+    /** Quando presente, substitui {@link #responder} e recebe também o nó de destino. */
+    private TargetResponder targetResponder;
+    /** Resposta do líder a {@code resolveExistingAtLeader}; por padrão, o dono corrente do fake. */
+    private Function<String, SeriesPlacement> atLeader = key -> SeriesPlacement.active(owner, 0);
 
     private interface Responder {
         SeriesStatusResponse respond(String command, Duration timeout);
+    }
+
+    private interface TargetResponder {
+        SeriesStatusResponse respond(String target, String command, Duration timeout);
     }
 
     @Test
@@ -138,7 +150,104 @@ class RemoteSeriesRetryBudgetTest {
         }
     }
 
+    @Test
+    void checkpointComDicasAlternadasConsultaOLiderUmaVez() {
+        RemoteSeriesHandle handle = handle(0);
+        atLeader = key -> SeriesPlacement.active("c", 0);
+        // #177: a origem "a" aponta o destino "c"; "c" (réplica atrasada) aponta de volta "a".
+        targetResponder = (target, command, timeout) -> {
+            clock.advance(10);
+            if (target.equals("a")) return status(SeriesStatus.WRONG_OWNER, "c");
+            return atLeaderBudgets.isEmpty() ? status(SeriesStatus.WRONG_OWNER, "a") : status(SeriesStatus.OK, "c");
+        };
+
+        handle.checkpoint();
+
+        assertEquals(List.of(Duration.ofMillis(80)), atLeaderBudgets, "uma consulta, dentro do prazo restante");
+        assertEquals(List.of("a", "c", "c"), targets);
+    }
+
+    @Test
+    void leituraSomenteLeituraComDicasAlternadasConsultaOLiderUmaVez() {
+        RemoteSeriesHandle handle = handle(0, false);
+        atLeader = key -> SeriesPlacement.active("c", 0);
+        targetResponder = (target, command, timeout) -> {
+            clock.advance(10);
+            if (target.equals("a")) return status(SeriesStatus.WRONG_OWNER, "c");
+            return atLeaderBudgets.isEmpty() ? status(SeriesStatus.WRONG_OWNER, "a") : status(SeriesStatus.OK, "c");
+        };
+
+        assertEquals(Map.of(), handle.read("daily"));
+
+        assertEquals(1, atLeaderBudgets.size());
+        assertEquals(List.of("a", "c", "c"), targets);
+        assertTrue(handle.isOpen());
+    }
+
+    @Test
+    void leituraComDicasContraditoriasESerieAusenteNoLiderFechaOHandle() {
+        RemoteSeriesHandle handle = handle(0, false);
+        atLeader = key -> {
+            throw new SeriesNotFoundException(key, SeriesNotFoundException.Reason.NOT_PLACED);
+        };
+        targetResponder = (target, command, timeout) -> {
+            clock.advance(10);
+            return status(SeriesStatus.WRONG_OWNER, target.equals("a") ? "c" : "a");
+        };
+
+        SeriesNotFoundException absent = assertThrows(SeriesNotFoundException.class, () -> handle.read("daily"));
+
+        assertEquals(SeriesNotFoundException.Reason.NOT_PLACED, absent.reason());
+        assertFalse(handle.isOpen(), "série ausente no líder encerra o handle somente leitura");
+    }
+
+    @Test
+    void falhaNaConsultaAoLiderTerminaEmWrongOwnerDentroDoPrazo() {
+        RemoteSeriesHandle handle = handle(0);
+        atLeader = key -> {
+            throw new NgrrdClusterException(ErrorCode.NO_LEADER, "sem líder (simulado)");
+        };
+        targetResponder = (target, command, timeout) -> {
+            clock.advance(10);
+            return status(SeriesStatus.WRONG_OWNER, target.equals("a") ? "c" : "a");
+        };
+
+        NgrrdClusterException failure = assertThrows(NgrrdClusterException.class, handle::checkpoint);
+
+        assertEquals(ErrorCode.WRONG_OWNER, failure.code());
+        assertEquals(100, clock.millis());
+        assertFalse(atLeaderBudgets.isEmpty(), "a contradição deveria ter consultado o líder");
+        assertTrue(atLeaderBudgets.stream().allMatch(d -> d.toMillis() > 0 && d.toMillis() <= 100));
+    }
+
+    @Test
+    void falhaNaConsultaAoLiderSegueAUltimaDicaEConverge() {
+        // O handle abre no dono real "c", cuja réplica atrasada aponta "a" uma vez; "a" (em dia) aponta "c".
+        // Sem autoridade (consulta falha), seguir a última dica leva de volta a "c" — ficar em "a" esgotaria
+        // o prazo com WRONG_OWNER.
+        owner = "c";
+        RemoteSeriesHandle handle = handle(0);
+        atLeader = key -> {
+            throw new NgrrdClusterException(ErrorCode.UNSUPPORTED_BY_NODE, "líder sem catalog.lookup (simulado)");
+        };
+        int[] callsToC = {0};
+        targetResponder = (target, command, timeout) -> {
+            clock.advance(10);
+            if (target.equals("a")) return status(SeriesStatus.WRONG_OWNER, "c");
+            return ++callsToC[0] == 1 ? status(SeriesStatus.WRONG_OWNER, "a") : status(SeriesStatus.OK, "c");
+        };
+
+        handle.checkpoint();
+
+        assertEquals(List.of("c", "a", "c"), targets);
+        assertEquals(1, atLeaderBudgets.size());
+    }
+
     private RemoteSeriesHandle handle(long writeDrainMillis) {
+        return handle(writeDrainMillis, true);
+    }
+
+    private RemoteSeriesHandle handle(long writeDrainMillis, boolean writable) {
         var lookup = new PlacementLookup() {
             public SeriesPlacement resolve(String key, String hash) { return SeriesPlacement.active(owner, 0); }
             public SeriesPlacement resolve(String key, String hash, GeometryDescriptor geometry, Duration maxWait) {
@@ -146,7 +255,10 @@ class RemoteSeriesRetryBudgetTest {
                 return resolve(key, hash);
             }
             public SeriesPlacement resolveExisting(String key, Duration maxWait) { return resolve(key, null); }
-            public SeriesPlacement resolveExistingAtLeader(String key, Duration maxWait) { return resolve(key, null); }
+            public SeriesPlacement resolveExistingAtLeader(String key, Duration maxWait) {
+                atLeaderBudgets.add(maxWait);
+                return atLeader.apply(key);
+            }
             public Optional<SeriesPlacement> placementCached(String key) { return Optional.of(resolve(key, null)); }
             public void invalidate(String key) { }
             public void noteOwner(String key, String newOwner) { owner = newOwner; }
@@ -156,10 +268,18 @@ class RemoteSeriesRetryBudgetTest {
                 throw new AssertionError("RPC must have an explicit budget");
             }
             public <R> R call(NodeId target, String command, Object body, Class<R> type, Duration timeout) {
-                if (initialOpen) return type.cast(status(SeriesStatus.OK, owner));
+                if (initialOpen) return type.cast(new SeriesStatusResponse(SeriesStatus.OK, owner, null, Boolean.TRUE));
                 commands.add(command);
+                targets.add(target.value());
                 rpcBudgets.add(timeout);
-                return type.cast(responder.respond(command, timeout));
+                SeriesStatusResponse response = targetResponder != null
+                        ? targetResponder.respond(target.value(), command, timeout)
+                        : responder.respond(command, timeout);
+                if (type == ReadPresetResponse.class) {
+                    return type.cast(new ReadPresetResponse(response.status(), response.ownerNodeId(), Map.of(),
+                            response.message()));
+                }
+                return type.cast(response);
             }
             public NodeId localId() { return NodeId.of("client"); }
             public Optional<NodeId> leaderId() { return Optional.of(NodeId.of("leader")); }
@@ -172,7 +292,8 @@ class RemoteSeriesRetryBudgetTest {
                 clock.advance(writeDrainMillis);
             }
         };
-        var handle = new RemoteSeriesHandle("series", "yaml", "hash", Map.of(), Ngrrd.OpenOptions.defaults(),
+        var handle = new RemoteSeriesHandle("series", "yaml", "hash", Map.of(),
+                Ngrrd.OpenOptions.defaults().withCreateIfMissing(writable),
                 lookup, rpc, buffer, new RetryPolicy(Duration.ofMillis(100), Duration.ofMillis(1), Duration.ofMillis(2)),
                 Duration.ofSeconds(5), Duration.ofSeconds(5), clock, (key, handle2) -> { },
                 CapabilityFixtures.advertisingAll(), () -> false);

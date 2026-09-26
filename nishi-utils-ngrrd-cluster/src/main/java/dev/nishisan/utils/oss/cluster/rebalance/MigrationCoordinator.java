@@ -176,6 +176,11 @@ public final class MigrationCoordinator implements LeadershipListener {
     private final ExecutorService pool;
     private final Clock clock;
     private final MigrationHooks hooks;
+    /**
+     * Lag máximo da réplica do catálogo do destino, rechecado na execução de cada migração nova (issue
+     * #177, ver {@link CatalogLagGate}); negativo desliga.
+     */
+    private final long maxDestinationCatalogLag;
 
     private final LongAdder migrationsStarted = new LongAdder();
     private final LongAdder migrationsCompleted = new LongAdder();
@@ -220,9 +225,25 @@ public final class MigrationCoordinator implements LeadershipListener {
                 NO_OP_HOOKS);
     }
 
+    /**
+     * Como o construtor completo, com {@link RebalanceSettings#DEFAULT_MAX_DESTINATION_CATALOG_LAG} como lag
+     * máximo da réplica do catálogo do destino.
+     */
     public MigrationCoordinator(CatalogView catalog, ClusterRpc rpc, PlacementRequestHandler.LeaderView leaderView,
             int maxConcurrentMigrations, Duration migrationStatusPollInterval, Duration migrationTimeout,
             Clock clock, MigrationHooks hooks) {
+        this(catalog, rpc, leaderView, maxConcurrentMigrations, migrationStatusPollInterval, migrationTimeout, clock,
+                hooks, RebalanceSettings.DEFAULT_MAX_DESTINATION_CATALOG_LAG);
+    }
+
+    /**
+     * @param maxDestinationCatalogLag lag máximo da réplica do catálogo do destino, rechecado quando a
+     *                                 migração vai começar ({@code ngrrd.rebalance.maxDestinationCatalogLag});
+     *                                 {@code -1} desliga
+     */
+    public MigrationCoordinator(CatalogView catalog, ClusterRpc rpc, PlacementRequestHandler.LeaderView leaderView,
+            int maxConcurrentMigrations, Duration migrationStatusPollInterval, Duration migrationTimeout,
+            Clock clock, MigrationHooks hooks, long maxDestinationCatalogLag) {
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.rpc = Objects.requireNonNull(rpc, "rpc");
         this.leaderView = Objects.requireNonNull(leaderView, "leaderView");
@@ -235,6 +256,10 @@ public final class MigrationCoordinator implements LeadershipListener {
         this.migrationTimeout = Objects.requireNonNull(migrationTimeout, "migrationTimeout");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.hooks = Objects.requireNonNull(hooks, "hooks");
+        if (maxDestinationCatalogLag < -1) {
+            throw new IllegalArgumentException("maxDestinationCatalogLag deve ser >= -1: " + maxDestinationCatalogLag);
+        }
+        this.maxDestinationCatalogLag = maxDestinationCatalogLag;
         this.pool = Executors.newCachedThreadPool(runnable -> {
             Thread thread = new Thread(runnable, "ngrrd-migration-coord");
             thread.setDaemon(true);
@@ -272,6 +297,19 @@ public final class MigrationCoordinator implements LeadershipListener {
             SeriesPlacement activePlacement = current.get();
             if (catalog.geometryTrackingEnabled() && !activePlacement.geometryConfirmed()) {
                 return new MigrationResult(MigrationOutcome.SKIPPED, "geometry is not confirmed", 0L, 0L);
+            }
+            // Issue #177: o plano pode ter sido montado minutos antes (fila do semáforo); o destino é
+            // rechecado agora, pelo status na réplica local do líder (a autoritativa). Um destino com a
+            // réplica atrasada responderia pela réplica durante o corte de dono. Só migrações novas: as
+            // retomadas por resumeInFlight() já estão em curso e precisam terminar. O líder atual como destino
+            // é isento (mesmo critério do Rebalancer): a réplica dele é a fonte, mesmo que o último status
+            // que publicou seja de antes de assumir.
+            boolean destinationIsLeader = leaderView.leaderId().map(dst::equals).orElse(false);
+            Optional<String> lagging = destinationIsLeader ? Optional.empty() : catalog.nodeStatusLocal(dst)
+                    .flatMap(status -> CatalogLagGate.exclusionReason(status, maxDestinationCatalogLag));
+            if (lagging.isPresent()) {
+                return new MigrationResult(MigrationOutcome.SKIPPED,
+                        "destino " + dst + " com réplica do catálogo atrasada: " + lagging.get(), 0L, 0L);
             }
             String migrationId = UUID.randomUUID().toString();
             // Reivindica o id ANTES de qualquer escrita — se por acaso já estiver reivindicado (não

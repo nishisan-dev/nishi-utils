@@ -19,6 +19,7 @@ package dev.nishisan.utils.ngrid.cluster.transport;
 
 import dev.nishisan.utils.ngrid.common.ClusterMessage;
 import dev.nishisan.utils.ngrid.common.HandshakePayload;
+import dev.nishisan.utils.ngrid.common.LeavePayload;
 import dev.nishisan.utils.ngrid.common.MessageType;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
@@ -41,6 +42,8 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -49,6 +52,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -75,6 +79,25 @@ public final class TcpTransport implements Transport {
     private final TcpTransportConfig config;
     private final StatsUtils stats;
     private final Map<NodeId, NodeInfo> knownPeers = new ConcurrentHashMap<>();
+    // Ids confirmed first-hand by a direct handshake (the remote's own NodeInfo). Second-hand
+    // gossip never displaces them (see mergeGossipedPeer). Always a subset of knownPeers' keys.
+    private final Set<NodeId> verifiedPeers = ConcurrentHashMap.newKeySet();
+    // Serializes structural changes of knownPeers/verifiedPeers (address-collision cleanup and
+    // merges), so a concurrent handshake and gossip merge cannot interleave half-way. In-memory
+    // only: never held across I/O.
+    private final ReentrantLock peerTableLock = new ReentrantLock();
+    // Ids of the configured bootstrap peers; until verified they are not gossiped (gossipablePeers).
+    private final Set<NodeId> initialPeerIds;
+    // Tombstones of forgotten (departed) peers: id -> expiry (epoch millis). While present, second-hand
+    // sources cannot re-admit the id (see forget). Written under peerTableLock; purged lazily.
+    private final Map<NodeId, Long> departedPeers = new ConcurrentHashMap<>();
+    // Since when (epoch millis) each known ephemeral peer has had no open connection; drives the
+    // forget-after-disconnection backstop (forgetLongDisconnectedEphemeralPeers). Scheduler thread only.
+    private final Map<NodeId, Long> disconnectedSince = new ConcurrentHashMap<>();
+    // Last time (epoch millis) any message sourced by each peer arrived, directly or through a relay.
+    // A peer this node cannot dial (partial mesh) may still be alive and talking through a relay; the
+    // forget-after-disconnection backstop must not take it for gone.
+    private final Map<NodeId, Long> lastInboundFromPeer = new ConcurrentHashMap<>();
     private final Map<NodeId, Connection> connections = new ConcurrentHashMap<>();
     // Includes accepted sockets that have not supplied a handshake/peer identity yet.
     private final Set<Connection> liveSockets = ConcurrentHashMap.newKeySet();
@@ -95,8 +118,18 @@ public final class TcpTransport implements Transport {
     // or stuck connect for a given peer (e.g. a node that just died) without relying on real
     // network timeouts. No-op in production.
     private volatile java.util.function.Consumer<NodeId> beforeDialHook = id -> { };
+    // Test seam: runs in handleHandshake between identifying the connection and publishing it, so a
+    // test can hold a second connection of the same peer in that window. No-op in production.
+    private volatile java.util.function.Consumer<NodeId> handshakeIdentityHook = id -> { };
+    // Test seam: runs in ensureConnection after a dialed connection is published and before its
+    // handshake is queued, so a test can send through the published connection in that window.
+    // No-op in production.
+    private volatile java.util.function.Consumer<NodeId> afterPublishHook = id -> { };
 
     private volatile boolean running;
+    // Set by close() before it announces the departure (LEAVE): from then on no new connection is
+    // registered or published, so the set of peers told about the departure is final.
+    private volatile boolean leaving;
     private ServerSocket serverSocket;
 
     public TcpTransport(TcpTransportConfig config) {
@@ -108,6 +141,9 @@ public final class TcpTransport implements Transport {
         this.stats = stats;
         knownPeers.put(config.local().nodeId(), config.local());
         config.initialPeers().forEach(p -> knownPeers.putIfAbsent(p.nodeId(), p));
+        Set<NodeId> seedIds = new HashSet<>();
+        config.initialPeers().forEach(p -> seedIds.add(p.nodeId()));
+        this.initialPeerIds = Collections.unmodifiableSet(seedIds);
     }
 
     // For testing purposes
@@ -118,6 +154,18 @@ public final class TcpTransport implements Transport {
     // Visible for tests in this package: hook invoked right before each outbound dial.
     void setBeforeDialHook(java.util.function.Consumer<NodeId> hook) {
         this.beforeDialHook = Objects.requireNonNull(hook, "hook");
+    }
+
+    // Visible for tests in this package: hook invoked once an incoming handshake has set the
+    // connection's remote identity, before the connection is published for that peer.
+    void setHandshakeIdentityHook(java.util.function.Consumer<NodeId> hook) {
+        this.handshakeIdentityHook = Objects.requireNonNull(hook, "hook");
+    }
+
+    // Visible for tests in this package: hook invoked once a dialed connection is published for the
+    // peer, right before its handshake is queued.
+    void setAfterPublishHook(java.util.function.Consumer<NodeId> hook) {
+        this.afterPublishHook = Objects.requireNonNull(hook, "hook");
     }
 
     @Override
@@ -210,6 +258,12 @@ public final class TcpTransport implements Transport {
         if (destination == null) {
             return;
         }
+        if (isDeparted(destination) && !isConnected(destination)) {
+            // A peer forgotten for good (e.g. a late notification to a client that left): nothing to
+            // route to, and trying would recreate its routing state and log a connection failure.
+            LOGGER.fine(() -> "Dropping " + message.type() + " to departed peer " + destination);
+            return;
+        }
         
         // Priority 1: If we have an active, open connection to this node, use it!
         // This bypasses routing logic for already connected peers (including discovery clients).
@@ -272,6 +326,10 @@ public final class TcpTransport implements Transport {
         NodeId destination = message.destination();
         if (destination == null) {
             future.completeExceptionally(new IOException("sendAndAwait requires a destination"));
+            return future;
+        }
+        if (isDeparted(destination) && !isConnected(destination)) {
+            future.completeExceptionally(new IOException("Peer " + destination + " departed"));
             return future;
         }
         UUID requestId = message.messageId();
@@ -370,21 +428,16 @@ public final class TcpTransport implements Transport {
 
     @Override
     public void addPeer(NodeInfo peer) {
-        if (peer == null || peer.nodeId().equals(config.local().nodeId())) {
-            return;
-        }
-        if (peer.host().equals(config.local().host()) && peer.port() == config.local().port()) {
-            return;
-        }
-        for (Map.Entry<NodeId, NodeInfo> entry : knownPeers.entrySet()) {
-            NodeInfo existing = entry.getValue();
-            if (!entry.getKey().equals(peer.nodeId())
-                    && existing.host().equals(peer.host())
-                    && existing.port() == peer.port()) {
-                knownPeers.remove(entry.getKey());
+        // An explicit join is first-hand intent: it lifts a tombstone left by an earlier departure.
+        if (peer != null) {
+            peerTableLock.lock();
+            try {
+                departedPeers.remove(peer.nodeId());
+            } finally {
+                peerTableLock.unlock();
             }
         }
-        boolean added = knownPeers.putIfAbsent(peer.nodeId(), peer) == null;
+        boolean added = mergeGossipedPeer(peer);
         if (added && running && shouldInitiate(peer)) {
             scheduler.schedule(() -> ensureConnectionAsync(peer), 0, TimeUnit.MILLISECONDS);
         }
@@ -406,12 +459,17 @@ public final class TcpTransport implements Transport {
                 }
                 break;
             } catch (EOFException e) {
-                if (running) {
+                if (running && !leaving) {
                     LOGGER.log(Level.INFO, "Connection closed immediately during handshake (EOF): {0}", e.getMessage());
                 }
             } catch (IOException e) {
-                if (running) {
+                // While leaving (close() flushing its LEAVE), registerConnection refuses and closes new
+                // sockets on purpose: that is the shutdown, not an accept error.
+                if (running && !leaving) {
                     LOGGER.log(Level.WARNING, "Error accepting connection", e);
+                } else {
+                    LOGGER.fine(() -> "Connection refused on " + config.local().nodeId() + " while closing: "
+                            + e.getMessage());
                 }
             }
         }
@@ -421,6 +479,9 @@ public final class TcpTransport implements Transport {
         if (!running) {
             return;
         }
+        long nowMs = System.currentTimeMillis();
+        purgeExpiredTombstones(nowMs);
+        forgetLongDisconnectedEphemeralPeers(nowMs);
         // Fast path: skip iteration if all known peers are connected
         boolean allConnected = knownPeers.values().stream()
                 .filter(p -> !p.nodeId().equals(config.local().nodeId()) && p.port() > 0)
@@ -475,6 +536,13 @@ public final class TcpTransport implements Transport {
             if (current != null && current.isOpen()) {
                 return current;
             }
+            if (!knownPeers.containsKey(nodeId)) {
+                return null; // forgotten while this caller waited for the peer lock
+            }
+            Connection unpublished = unpublishedLinkTo(nodeInfo);
+            if (unpublished != null) {
+                return unpublished;
+            }
             try {
                 beforeDialHook.accept(nodeId);
                 LOGGER.fine(() -> "Initiating connection to " + nodeInfo);
@@ -488,7 +556,17 @@ public final class TcpTransport implements Transport {
                 // the same physical link instead of clobbering each other.
                 Connection live = registerLiveConnection(nodeId, connection);
                 if (live == connection) {
-                    sendHandshake(connection);
+                    try {
+                        afterPublishHook.accept(nodeId);
+                        sendHandshake(connection);
+                    } catch (RuntimeException e) {
+                        // Without its handshake queued, the pre-handshake gate would hold every frame
+                        // sent over this published link forever, and the reconnect loop would still see
+                        // the peer as connected. Drop the link so the peer is dialed again.
+                        connections.entrySet().removeIf(entry -> entry.getValue() == connection);
+                        connection.closeQuietly();
+                        throw e;
+                    }
                 }
                 LOGGER.fine(() -> "Connected to " + nodeInfo);
                 return live;
@@ -501,17 +579,70 @@ public final class TcpTransport implements Transport {
         }
     }
 
+    // One lock per peer id, serializing dials to it and publication of its live connection. An
+    // entry must outlive disconnects: dropping it while a dial still holds the old lock let the
+    // next caller create a fresh one and dial the same peer concurrently. Entries are removed only
+    // on close() and when the peer is forgotten for good (forget / dropConnectionLock), the one
+    // place allowed to drop a single peer's entry.
     private final Map<NodeId, ReentrantLock> connectionLocks = new ConcurrentHashMap<>();
+
+    /**
+     * An open socket that already leads to {@code target}'s process but is not published under its
+     * id: the link to a bootstrap seed whose handshake reply has not resolved the seed's provisional
+     * alias yet (same listen address), or a link to that very id still in the middle of its own
+     * handshake. Messages sent over it reach the right process. Dialing again instead opened a
+     * duplicate connection that each endpoint registered in a different order (the dialer re-keys
+     * the seed link only when the reply arrives), so the tie-break in registerLiveConnection kept a
+     * different socket on each side and the link dropped.
+     * <p>
+     * A socket still waiting for the remote's handshake is reused only while that handshake can still
+     * be in flight — for at most {@link TcpTransportConfig#connectTimeout()} since the socket was
+     * opened. A socket whose handshake was never answered (e.g. the remote inferred our identity from an earlier frame) must not stand in
+     * for the canonical id forever: past that bound the canonical id is dialed, as before.
+     */
+    private Connection unpublishedLinkTo(NodeInfo target) {
+        long nowNanos = System.nanoTime();
+        long handshakeWaitNanos = config.connectTimeout().toNanos();
+        for (Connection candidate : liveSockets) {
+            NodeInfo remote = candidate.remote;
+            // A socket whose remote handshake was already read is being published right now: reuse it.
+            // One still waiting for that handshake is reused only within the bound above.
+            if (remote == null || !candidate.isOpen()
+                    || (!candidate.handshaked() && nowNanos - candidate.openedAtNanos > handshakeWaitNanos)) {
+                continue;
+            }
+            if (remote.nodeId().equals(target.nodeId())) {
+                return candidate;
+            }
+            if (sameAddress(remote, target) && initialPeerIds.contains(remote.nodeId())
+                    && !verifiedPeers.contains(remote.nodeId())) {
+                return candidate;
+            }
+        }
+        return null;
+    }
 
     private ReentrantLock getLockFor(NodeId nodeId) {
         return connectionLocks.computeIfAbsent(nodeId, id -> new ReentrantLock());
+    }
+
+    // Visible for tests in this package: whether close() would announce LEAVE to this peer (its tracked
+    // connection is open and the peer's handshake on it announced support).
+    boolean announcesLeaveTo(NodeId nodeId) {
+        Connection connection = connections.get(nodeId);
+        return connection != null && connection.isOpen() && connection.handshaked() && connection.peerSupportsLeave();
+    }
+
+    // Visible for tests in this package: the per-peer lock serializing dials/publication.
+    ReentrantLock connectionLockFor(NodeId nodeId) {
+        return getLockFor(nodeId);
     }
 
     private Connection registerConnection(Socket socket, NodeInfo preResolved) throws IOException {
         Connection connection;
         lifecycleLock.lock();
         try {
-            if (!running) { throw new IOException("Transport closed during connect"); }
+            if (!running || leaving) { throw new IOException("Transport closed during connect"); }
             socket.setTcpNoDelay(true);
             connection = new Connection(socket, preResolved != null);
             liveSockets.add(connection);
@@ -551,9 +682,22 @@ public final class TcpTransport implements Transport {
                 candidate.closeQuietly();
                 return null;
             }
+            if (isDeparted(remoteId)) {
+                // A forgotten peer is re-admitted only by its own handshake, which lifts the tombstone
+                // before publishing. A dial that raced the forget, or an inbound socket identified
+                // just by the source of its first message, must not bring it back.
+                LOGGER.fine(() -> "Not publishing a connection for departed peer " + remoteId);
+                candidate.closeQuietly();
+                return null;
+            }
             Connection existing = connections.get(remoteId);
             if (existing == candidate) {
                 return candidate;
+            }
+            if (leaving) {
+                // Closing: the peers to announce the departure to were already chosen.
+                candidate.closeQuietly();
+                return null;
             }
             if (existing == null || !existing.isOpen()) {
                 connections.put(remoteId, candidate);
@@ -606,11 +750,31 @@ public final class TcpTransport implements Transport {
         }
     }
 
+    /**
+     * Peers this node vouches for in its handshake and PEER_UPDATE gossip: every known peer except
+     * bootstrap entries from the configuration ({@link TcpTransportConfig#initialPeers()}) not yet
+     * confirmed by a direct handshake. Such an entry is usually a provisional seed alias
+     * ({@code host:port}, {@code seed-host:port}) whose real id is still unknown; gossiping it made
+     * receivers replace the canonical id of that same process with the alias (issue #169). Once
+     * the seed answers, the alias is replaced by its verified canonical id, which is gossiped.
+     */
+    private Set<NodeInfo> gossipablePeers() {
+        Set<NodeInfo> peers = new HashSet<>();
+        for (NodeInfo peer : knownPeers.values()) {
+            NodeId id = peer.nodeId();
+            if (initialPeerIds.contains(id) && !verifiedPeers.contains(id)) {
+                continue;
+            }
+            peers.add(peer);
+        }
+        return peers;
+    }
+
     private void sendHandshake(Connection connection) {
         NodeInfo localInfo = config.local();
-        Set<NodeInfo> peers = Set.copyOf(knownPeers.values());
+        Set<NodeInfo> peers = gossipablePeers();
         HandshakePayload payload = new HandshakePayload(localInfo, peers, collectLatencies(),
-                config.compressionEnabled(), true);
+                config.compressionEnabled(), true, true);
         ClusterMessage message = ClusterMessage.request(MessageType.HANDSHAKE,
                 "hello",
                 localInfo.nodeId(),
@@ -622,32 +786,54 @@ public final class TcpTransport implements Transport {
     private void handleHandshake(Connection connection, ClusterMessage message) {
         HandshakePayload payload = message.payload(HandshakePayload.class);
         NodeInfo remoteInfo = payload.local();
-        boolean firstHandshakeOnThisConnection = connection.remoteId().isEmpty();
+        // The dialer learns our identity only from this reply, so the first handshake read on an
+        // accepted socket is always answered — even when an earlier frame already let readLoop infer
+        // the remote's identity (a remote id alone does not mean its handshake was seen; older nodes
+        // may send a frame before their handshake).
+        boolean firstHandshakeOnThisConnection = !connection.outboundInitiated && !connection.handshaked();
         connection.setRemote(remoteInfo);
         // Negotiate outbound compression for this connection based on the peer's advertised
         // capability. Done before any early return so the connection that ends up winning a
         // simultaneous-open tie-break already has the correct flag.
         connection.setPeerSupportsCompression(payload.supportsCompression());
         connection.setPeerSupportsUndeliverable(payload.supportsUndeliverable());
-        List<NodeId> staleIds = new ArrayList<>();
-        for (Map.Entry<NodeId, NodeInfo> entry : knownPeers.entrySet()) {
-            NodeInfo existing = entry.getValue();
-            if (!entry.getKey().equals(remoteInfo.nodeId())
-                    && existing.host().equals(remoteInfo.host())
-                    && existing.port() == remoteInfo.port()) {
-                staleIds.add(entry.getKey());
+        connection.setPeerSupportsLeave(payload.supportsLeave());
+        connection.markHandshaked();
+        handshakeIdentityHook.accept(remoteInfo.nodeId());
+        // A direct handshake is first-hand and authoritative: whatever other id we held for the
+        // remote's listen address (typically the provisional "host:port" seed alias) is replaced
+        // by the canonical one, which becomes verified.
+        List<Connection> staleConnections = new ArrayList<>();
+        peerTableLock.lock();
+        try {
+            List<NodeId> staleIds = new ArrayList<>();
+            for (Map.Entry<NodeId, NodeInfo> entry : knownPeers.entrySet()) {
+                if (!entry.getKey().equals(remoteInfo.nodeId()) && sameAddress(entry.getValue(), remoteInfo)) {
+                    staleIds.add(entry.getKey());
+                }
             }
-        }
-        for (NodeId staleId : staleIds) {
-            knownPeers.remove(staleId);
-            Connection staleConn = connections.remove(staleId);
-            // An outbound seed connection is initially indexed by host:port. Learning
-            // its canonical ID moves that same socket; it must not close itself here.
-            if (staleConn != null && staleConn != connection) {
-                staleConn.closeQuietly();
+            for (NodeId staleId : staleIds) {
+                knownPeers.remove(staleId);
+                verifiedPeers.remove(staleId);
+                Connection staleConn = connections.remove(staleId);
+                // An outbound seed connection is initially indexed by host:port. Learning
+                // its canonical ID moves that same socket; it must not close itself here.
+                if (staleConn != null && staleConn != connection) {
+                    staleConnections.add(staleConn);
+                }
             }
+            // A direct handshake from a departed id is a new incarnation: first-hand, it lifts the
+            // tombstone whatever its origin (own LEAVE, disconnect timeout or gossip).
+            if (departedPeers.remove(remoteInfo.nodeId()) != null) {
+                LOGGER.info(() -> "Departed peer " + remoteInfo.nodeId() + " is back on "
+                        + config.local().nodeId() + " (direct handshake); tombstone cleared");
+            }
+            knownPeers.put(remoteInfo.nodeId(), remoteInfo);
+            verifiedPeers.add(remoteInfo.nodeId());
+        } finally {
+            peerTableLock.unlock();
         }
-        knownPeers.put(remoteInfo.nodeId(), remoteInfo);
+        staleConnections.forEach(Connection::closeQuietly);
 
         // Publish this connection through the single reconciliation point. If a concurrent
         // (simultaneous-open) connection already won the deterministic tie-break, we lost:
@@ -655,9 +841,15 @@ public final class TcpTransport implements Transport {
         // already drives this peer.
         NodeId remoteNodeId = remoteInfo.nodeId();
         Connection live = registerLiveConnection(remoteNodeId, connection);
+        // The socket is now known by its canonical id only: drop every other key still pointing to it
+        // (typically the seed alias it was dialed under, when gossip already removed that alias from
+        // knownPeers so the address-collision cleanup above did not see it). Left behind, the alias
+        // stayed published forever and was reported as a live peer.
+        connections.entrySet().removeIf(entry -> entry.getValue() == connection
+                && !entry.getKey().equals(remoteNodeId));
         if (live == null) { return; }
         if (live != connection) {
-            router.updateReachability(remoteNodeId, payload.peers(), payload.latencies());
+            router.updateReachability(remoteNodeId, admissible(payload.peers()), admissible(payload.latencies()));
             return;
         }
 
@@ -665,30 +857,13 @@ public final class TcpTransport implements Transport {
         router.promoteToDirect(remoteNodeId);
 
         // Feed router with reachability info
-        router.updateReachability(remoteInfo.nodeId(), payload.peers(), payload.latencies());
+        router.updateReachability(remoteInfo.nodeId(), admissible(payload.peers()), admissible(payload.latencies()));
 
         listeners.forEach(listener -> listener.onPeerConnected(remoteInfo));
         // Merge peers and attempt connections
         payload.peers().forEach(peer -> {
-            if (peer.nodeId().equals(config.local().nodeId())) {
-                return;
-            }
-            if (peer.host().equals(config.local().host()) && peer.port() == config.local().port()) {
-                return;
-            }
-            for (Map.Entry<NodeId, NodeInfo> entry : knownPeers.entrySet()) {
-                NodeInfo existing = entry.getValue();
-                if (!entry.getKey().equals(peer.nodeId())
-                        && existing.host().equals(peer.host())
-                        && existing.port() == peer.port()) {
-                    knownPeers.remove(entry.getKey());
-                }
-            }
-            boolean added = knownPeers.putIfAbsent(peer.nodeId(), peer) == null;
-            
-            // Only attempt reverse connection if the peer has a valid port (not a discovery client)
-            if (added && !isConnected(peer.nodeId()) && peer.port() > 0 && shouldInitiate(peer)) {
-                scheduler.schedule(() -> ensureConnectionAsync(peer), 100, TimeUnit.MILLISECONDS);
+            if (mergeGossipedPeer(peer)) {
+                scheduleDialIfInitiator(peer);
             }
         });
         broadcastPeerList();
@@ -699,7 +874,7 @@ public final class TcpTransport implements Transport {
     }
 
     private void broadcastPeerList() {
-        PeerUpdatePayload payload = new PeerUpdatePayload(Set.copyOf(knownPeers.values()), collectLatencies());
+        PeerUpdatePayload payload = new PeerUpdatePayload(gossipablePeers(), collectLatencies(), departedSnapshot());
         ClusterMessage update = ClusterMessage.request(MessageType.PEER_UPDATE,
                 "peer-update",
                 config.local().nodeId(),
@@ -724,34 +899,131 @@ public final class TcpTransport implements Transport {
 
     private void handlePeerUpdate(ClusterMessage message) {
         PeerUpdatePayload payload = message.payload(PeerUpdatePayload.class);
+        // Departures first, so the same update cannot re-admit what it reports as gone.
+        payload.departed().forEach((id, remainingMs) -> learnDepartureSecondHand(id, remainingMs, message.source()));
         
         // Feed router with reachability info
-        router.updateReachability(message.source(), payload.peers(), payload.latencies());
+        router.updateReachability(message.source(), admissible(payload.peers()), admissible(payload.latencies()));
 
         for (NodeInfo peer : payload.peers()) {
-            if (!peer.nodeId().equals(config.local().nodeId())) {
-                if (peer.host().equals(config.local().host()) && peer.port() == config.local().port()) {
-                    continue;
-                }
-                for (Map.Entry<NodeId, NodeInfo> entry : knownPeers.entrySet()) {
-                    NodeInfo existing = entry.getValue();
-                    if (!entry.getKey().equals(peer.nodeId())
-                            && existing.host().equals(peer.host())
-                            && existing.port() == peer.port()) {
-                        knownPeers.remove(entry.getKey());
-                    }
-                }
-                boolean added = knownPeers.compute(peer.nodeId(), (id, existing) -> {
-                    if (existing == null || !existing.equals(peer)) {
-                        return peer;
-                    }
-                    return existing;
-                }) == peer;
-                if (added && !isConnected(peer.nodeId()) && shouldInitiate(peer)) {
-                    scheduler.schedule(() -> ensureConnectionAsync(peer), 100, TimeUnit.MILLISECONDS);
-                }
+            if (mergeGossipedPeer(peer)) {
+                scheduleDialIfInitiator(peer);
             }
         }
+    }
+
+    /**
+     * Single admission point for peers learned second-hand: explicit {@link #addPeer} joins, the
+     * peer list carried by a handshake and PEER_UPDATE gossip. Every indirect source goes through
+     * here, so admission filters (e.g. ids that announced a graceful departure) plug in once.
+     * <p>
+     * Rules:
+     * <ul>
+     *   <li>the local node (by id or by listen address) is never merged;</li>
+     *   <li>an entry carrying a different id at the listen address of a peer <b>verified</b> by a
+     *       direct handshake is dropped. It is a provisional seed alias ({@code host:port}) of that
+     *       same process, gossiped by a node that has not resolved it yet. Letting it replace the
+     *       canonical id made the next send dial the same process again under the alias key; the
+     *       remote then closed the original link in the duplicate-connection tie-break, and every
+     *       request in flight on it failed with {@link PeerDisconnectedException} (issue #169);</li>
+     *   <li>otherwise a different id at the same address replaces the unverified entry (a seed
+     *       alias learning its canonical id second-hand, or a restarted process with a new id);</li>
+     *   <li>a verified peer's own entry is not overwritten by gossip while a direct connection to it
+     *       is open: its handshake is first-hand and fresher;</li>
+     *   <li>a departed (tombstoned) id is rejected: gossip still listing a peer that left must not
+     *       bring it back (see {@link #forget(NodeId)}).</li>
+     * </ul>
+     *
+     * @return {@code true} when the entry was added or changed
+     */
+    private boolean mergeGossipedPeer(NodeInfo peer) {
+        if (peer == null || peer.nodeId().equals(config.local().nodeId()) || sameAddress(peer, config.local())) {
+            return false;
+        }
+        peerTableLock.lock();
+        try {
+            if (isDeparted(peer.nodeId())) {
+                LOGGER.fine(() -> "Ignoring gossiped " + peer + ": departed (tombstoned) on " + config.local().nodeId());
+                return false;
+            }
+            List<NodeId> displaced = new ArrayList<>();
+            for (Map.Entry<NodeId, NodeInfo> entry : knownPeers.entrySet()) {
+                if (entry.getKey().equals(peer.nodeId()) || !sameAddress(entry.getValue(), peer)) {
+                    continue;
+                }
+                if (verifiedPeers.contains(entry.getKey())) {
+                    LOGGER.fine(() -> "Ignoring gossiped " + peer + ": " + entry.getKey()
+                            + " was verified at that address by a direct handshake");
+                    return false;
+                }
+                displaced.add(entry.getKey());
+            }
+            displaced.forEach(knownPeers::remove);
+            NodeInfo existing = knownPeers.get(peer.nodeId());
+            if (peer.equals(existing)) {
+                return false;
+            }
+            if (existing != null && verifiedPeers.contains(peer.nodeId()) && isConnected(peer.nodeId())) {
+                return false;
+            }
+            knownPeers.put(peer.nodeId(), peer);
+            return true;
+        } finally {
+            peerTableLock.unlock();
+        }
+    }
+
+    /** Remaining TTL (ms) of each live tombstone, for the {@code departed} field of PEER_UPDATE. */
+    private Map<NodeId, Long> departedSnapshot() {
+        long nowMs = System.currentTimeMillis();
+        Map<NodeId, Long> snapshot = new HashMap<>();
+        departedPeers.forEach((id, expiresAt) -> {
+            if (expiresAt > nowMs) {
+                snapshot.put(id, expiresAt - nowMs);
+            }
+        });
+        return snapshot;
+    }
+
+    /**
+     * A peer reported {@code id} as departed. Second-hand, hence admission-only: the tombstone is
+     * recorded (capped by this node's own TTL, never extended by re-gossip) and a peer this node merely
+     * knows is forgotten — so a node that never reached the leaver cleans up too — but a peer this node
+     * holds a handshaked open connection to is left alone (the report may predate its reconnection:
+     * first-hand evidence wins), and a leader-eligible peer is never forgotten nor blocked this way.
+     */
+    private void learnDepartureSecondHand(NodeId id, Long remainingMs, NodeId reporter) {
+        if (id == null || remainingMs == null || remainingMs <= 0 || id.equals(config.local().nodeId())) {
+            return;
+        }
+        long ttlMs = Math.min(remainingMs, config.departedPeerTombstoneTtl().toMillis());
+        forget(id, ttlMs, "departure reported by " + reporter, true);
+    }
+
+    /** Whether an open socket already identified {@code id} through a handshake (published or not). */
+    private boolean hasHandshakedOpenConnection(NodeId id) {
+        Connection published = connections.get(id);
+        if (published != null && published.isOpen() && published.handshaked()) {
+            return true;
+        }
+        for (Connection candidate : liveSockets) {
+            if (candidate.isOpen() && candidate.handshaked() && id.equals(candidate.remoteId().orElse(null))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Dials a newly learned peer when this node is the designated initiator for the pair. */
+    private void scheduleDialIfInitiator(NodeInfo peer) {
+        // Only listening peers are dialed (port 0 marks a discovery client).
+        if (running && peer.port() > 0 && !isConnected(peer.nodeId()) && shouldInitiate(peer)) {
+            scheduler.schedule(() -> ensureConnectionAsync(peer), 100, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    private static boolean sameAddress(NodeInfo a, NodeInfo b) {
+        return a.port() == b.port() && a.host().equals(b.host());
     }
 
     private boolean shouldInitiate(NodeInfo peer) {
@@ -760,6 +1032,18 @@ public final class TcpTransport implements Transport {
 
     private void handleMessage(NodeId senderId, ClusterMessage message) {
         if (message.type() == MessageType.HANDSHAKE) {
+            return;
+        }
+        NodeId source = message.source();
+        if (source != null) {
+            // Liveness evidence for the slow forget trigger, relayed traffic included (recorded before
+            // the tombstone filter below: it must reflect what arrives, not what is accepted).
+            lastInboundFromPeer.put(source, System.currentTimeMillis());
+        }
+        if (source != null && !source.equals(senderId) && isDeparted(source)) {
+            // Relayed (second-hand) traffic of a forgotten peer — typically in flight when it left. Its
+            // new incarnation is re-admitted by its own direct handshake, not through a relay.
+            LOGGER.fine(() -> "Dropping " + message.type() + " relayed by " + senderId + " from departed peer " + source);
             return;
         }
         if (message.type() == MessageType.UNDELIVERABLE && config.local().nodeId().equals(message.destination())) {
@@ -823,6 +1107,46 @@ public final class TcpTransport implements Transport {
     }
 
     /**
+     * A peer announced it is closing for good. Honored only first-hand: on the connection currently
+     * tracked for that peer, identified by a handshake, and only when the announced node is that
+     * connection's identity — which rejects a spoofed LEAVE and a delayed LEAVE of an old incarnation
+     * arriving on a replaced socket. Never forwarded. An ephemeral leaver (leader-ineligible or without
+     * a listen port, in its own announcement and in this node's view alike) is forgotten at once; a
+     * leader-eligible one stays a known voter, so the majority is never shrunk without consensus.
+     */
+    private void handleLeave(Connection connection, ClusterMessage message) {
+        LeavePayload payload = message.payload(LeavePayload.class);
+        NodeId remoteId = connection.remoteId().orElse(null);
+        NodeInfo leaver = payload != null ? payload.node() : null;
+        if (leaver == null || remoteId == null || !connection.handshaked()
+                || !leaver.nodeId().equals(remoteId) || !remoteId.equals(message.source())
+                || connections.get(remoteId) != connection) {
+            LOGGER.fine(() -> "Ignoring LEAVE of " + (leaver != null ? leaver.nodeId() : null) + " on "
+                    + config.local().nodeId() + ": not first-hand on the connection tracked for it (remote="
+                    + remoteId + ")");
+            return;
+        }
+        String reason = payload.reason();
+        NodeInfo known = knownPeers.get(remoteId);
+        if (isEphemeral(leaver) && (known == null || isEphemeral(known))) {
+            LOGGER.info(() -> "Peer " + remoteId + " announced LEAVE (" + reason + ") on " + config.local().nodeId());
+            if (forget(remoteId, config.departedPeerTombstoneTtl().toMillis(), "LEAVE: " + reason)) {
+                // First receipt: tell the other peers (PEER_UPDATE departed). The LEAVE itself is never
+                // forwarded; what peers learn this way is admission-only (see handlePeerUpdate).
+                broadcastPeerList();
+            }
+            return;
+        }
+        LOGGER.info(() -> "Leader-eligible peer " + remoteId + " announced LEAVE (" + reason + ") on "
+                + config.local().nodeId() + "; kept as a known voter");
+        // It is closing anyway: stop reading, so it is no longer "connected" when the listeners are told,
+        // and let them skip the disconnect grace. The regular disconnect handling follows as the read
+        // loop of this connection ends.
+        connection.closeQuietly();
+        listeners.forEach(listener -> listener.onPeerLeaving(remoteId));
+    }
+
+    /**
      * A relay could not forward one of our messages (no direct connection to its destination): fail
      * the matching pending request/response now rather than at the request timeout.
      */
@@ -843,45 +1167,282 @@ public final class TcpTransport implements Transport {
         }
     }
 
+    /**
+     * Publishes, for {@code nodeId}, another open socket whose remote identity is that peer.
+     *
+     * @return the connection now live for the peer, or {@code null} when there is none
+     */
+    private Connection adoptOpenConnection(NodeId nodeId, Connection closed) {
+        for (Connection candidate : liveSockets) {
+            if (candidate == closed || !candidate.isOpen()
+                    || !nodeId.equals(candidate.remoteId().orElse(null))) {
+                continue;
+            }
+            Connection live = registerLiveConnection(nodeId, candidate);
+            if (live != null && live.isOpen()) {
+                return live;
+            }
+        }
+        return null;
+    }
+
     private void handleDisconnect(Connection connection) {
         connection.remoteId().ifPresent(nodeId -> {
-            LOGGER.info(() -> "Handling disconnect from " + nodeId + " (remote=" + connection.remote + ", open=" + connection.isOpen() + ")");
+            if (isDeparted(nodeId) && !knownPeers.containsKey(nodeId)) {
+                // Forgotten for good: forget() already failed its pending responses and reported the
+                // departure (onPeerLeft); this socket closing is not news.
+                connections.remove(nodeId, connection);
+                LOGGER.fine(() -> "Disconnect of departed peer " + nodeId + " on " + config.local().nodeId() + " ignored");
+                return;
+            }
+            LOGGER.info(() -> "Handling disconnect from " + nodeId + " on " + config.local().nodeId() + " (remote=" + connection.remote + ", open=" + connection.isOpen() + ")");
             // Only treat the peer as disconnected when the currently tracked connection goes away.
             // In rare races, nodes can end up with multiple TCP connections; a stale connection closing
             // must NOT fail in-flight request/response calls if there is still an active connection.
             boolean removedActive = connections.remove(nodeId, connection);
             Connection current = connections.get(nodeId);
             if (!removedActive && current != null && current.isOpen()) {
-                LOGGER.info(() -> "Ignoring disconnect for " + nodeId + " because an active connection remains");
+                LOGGER.info(() -> "Ignoring disconnect for " + nodeId + " on " + config.local().nodeId() + " because an active connection remains");
                 return;
             }
             if (current != null && current.isOpen()) {
                 return;
             }
-            LOGGER.info(() -> "Disconnect confirmed for " + nodeId + "; failing pending responses");
-            // Best-effort cleanup: if the peer is no longer connected, drop the per-peer lock.
-            // It will be recreated if we reconnect.
-            connectionLocks.remove(nodeId);
-            List<Map.Entry<UUID, PendingResponse>> toFail = new ArrayList<>();
-            for (Map.Entry<UUID, PendingResponse> entry : pendingResponses.entrySet()) {
-                if (nodeId.equals(entry.getValue().destination)) {
-                    toFail.add(entry);
-                }
+            // Pending responses are global, not per connection. Before failing them, adopt any other
+            // open connection already identified as this peer but not published for it (one in the
+            // middle of its own handshake, or a dial registered but not yet published): the peer is
+            // still reachable and the responses will arrive through that connection.
+            if (adoptOpenConnection(nodeId, connection) != null) {
+                LOGGER.info(() -> "Disconnect from " + nodeId + " on " + config.local().nodeId() + " absorbed: another open connection to it took over");
+                return;
             }
-            for (Map.Entry<UUID, PendingResponse> entry : toFail) {
-                UUID requestId = entry.getKey();
-                PendingResponse pending = entry.getValue();
-                if (pendingResponses.remove(requestId, pending)) {
-                    pending.cancelTimeout();
-                    pending.future.completeExceptionally(new PeerDisconnectedException(nodeId, requestId));
-                }
-            }
+            LOGGER.info(() -> "Disconnect confirmed for " + nodeId + " on " + config.local().nodeId() + "; failing pending responses");
+            // The per-peer connection lock is deliberately kept (see connectionLocks).
+            failPendingResponsesTo(nodeId);
             listeners.forEach(listener -> listener.onPeerDisconnected(nodeId));
         });
     }
 
+    private void failPendingResponsesTo(NodeId nodeId) {
+        List<Map.Entry<UUID, PendingResponse>> toFail = new ArrayList<>();
+        for (Map.Entry<UUID, PendingResponse> entry : pendingResponses.entrySet()) {
+            if (nodeId.equals(entry.getValue().destination)) {
+                toFail.add(entry);
+            }
+        }
+        for (Map.Entry<UUID, PendingResponse> entry : toFail) {
+            UUID requestId = entry.getKey();
+            PendingResponse pending = entry.getValue();
+            if (pendingResponses.remove(requestId, pending)) {
+                pending.cancelTimeout();
+                pending.future.completeExceptionally(new PeerDisconnectedException(nodeId, requestId));
+            }
+        }
+    }
+
+    @Override
+    public boolean isDeparted(NodeId nodeId) {
+        Long expiresAt = departedPeers.get(nodeId);
+        return expiresAt != null && expiresAt > System.currentTimeMillis();
+    }
+
+    /**
+     * Forgets a departed peer for good and tombstones its id for
+     * {@link TcpTransportConfig#departedPeerTombstoneTtl()}.
+     *
+     * @see #forget(NodeId, long, String)
+     */
+    boolean forget(NodeId nodeId) {
+        return forget(nodeId, config.departedPeerTombstoneTtl().toMillis(), "departed");
+    }
+
+    /**
+     * Forgets a departed peer for good: removes it from the known and verified peers, drops its
+     * published connection (closed), its per-peer connection lock and everything the router knows
+     * about it, fails its pending responses with {@link PeerDisconnectedException} and reports it to
+     * the listeners through {@link TransportListener#onPeerLeft(NodeId)}. Its id is tombstoned for
+     * {@code tombstoneTtlMs}: second-hand sources (gossip, a third node's handshake peer list, relayed
+     * messages, an inbound socket identified only by the source of its first message) cannot re-admit
+     * it, while a direct handshake from that id (a new incarnation), an explicit {@link #addPeer} or
+     * the expiry lift the tombstone. Without this, a member that left (e.g. a short-lived client)
+     * stayed in {@code knownPeers} forever and every heartbeat broadcast dialed it again.
+     *
+     * @return {@code true} when the peer was known (or connected) and has now been forgotten
+     */
+    private boolean forget(NodeId nodeId, long tombstoneTtlMs, String reason) {
+        return forget(nodeId, tombstoneTtlMs, reason, false);
+    }
+
+    /**
+     * @param secondHand the departure was reported by another peer: it is ignored for a peer this node
+     *                   holds a handshaked open connection to (a new incarnation already came back) and
+     *                   for a leader-eligible peer — checked under the same locks as the removal, so a
+     *                   handshake in progress is never undone
+     */
+    private boolean forget(NodeId nodeId, long tombstoneTtlMs, String reason, boolean secondHand) {
+        if (nodeId == null || nodeId.equals(config.local().nodeId())) {
+            return false;
+        }
+        long expiresAt = System.currentTimeMillis() + tombstoneTtlMs;
+        boolean wasKnown;
+        Connection published;
+        // lifecycleLock -> peerTableLock: registerLiveConnection checks the tombstone under the
+        // lifecycle lock, so a publication cannot slip in between the tombstone and the removal.
+        lifecycleLock.lock();
+        try {
+            peerTableLock.lock();
+            try {
+                if (secondHand) {
+                    NodeInfo known = knownPeers.get(nodeId);
+                    if ((known != null && !isEphemeral(known))
+                            || (verifiedPeers.contains(nodeId) && hasHandshakedOpenConnection(nodeId))) {
+                        LOGGER.fine(() -> "Ignoring departure of " + nodeId + " on " + config.local().nodeId()
+                                + " (" + reason + "): connected first-hand or leader-eligible");
+                        return false;
+                    }
+                }
+                departedPeers.merge(nodeId, expiresAt, Math::max);
+                wasKnown = knownPeers.remove(nodeId) != null;
+                verifiedPeers.remove(nodeId);
+                published = connections.remove(nodeId);
+            } finally {
+                peerTableLock.unlock();
+            }
+        } finally {
+            lifecycleLock.unlock();
+        }
+        if (published != null) {
+            published.closeQuietly();
+        }
+        dropConnectionLock(nodeId);
+        router.forget(nodeId);
+        failPendingResponsesTo(nodeId);
+        if (!wasKnown && published == null) {
+            return false;
+        }
+        LOGGER.info(() -> "Forgot departed peer " + nodeId + " on " + config.local().nodeId() + " (" + reason
+                + "); tombstoned for " + tombstoneTtlMs + " ms");
+        listeners.forEach(listener -> listener.onPeerLeft(nodeId));
+        return true;
+    }
+
+    /**
+     * Drops the per-peer connection lock of a forgotten peer, unless a dial is holding it right now
+     * (that dial re-checks knownPeers under the lock and gives up; the entry is swept later).
+     */
+    private void dropConnectionLock(NodeId nodeId) {
+        ReentrantLock lock = connectionLocks.get(nodeId);
+        if (lock != null && lock.tryLock()) {
+            try {
+                connectionLocks.remove(nodeId, lock);
+            } finally {
+                lock.unlock();
+            }
+        }
+    }
+
+    /**
+     * Whether {@code peer} is an ephemeral member: leader-ineligible (a client) or without a listen port
+     * (a discovery client / placeholder). Only ephemeral peers are ever forgotten: a voter is kept even
+     * after it left, so the leadership majority is never shrunk without consensus.
+     */
+    private static boolean isEphemeral(NodeInfo peer) {
+        return peer.port() <= 0 || !peer.isLeaderEligible();
+    }
+
+    /**
+     * Backstop for departures that never announced themselves (kill -9, OOM, network loss): an
+     * ephemeral peer without an open connection for longer than
+     * {@link TcpTransportConfig#departedPeerForgetAfter()} is forgotten and tombstoned for that same
+     * window (the departure is inferred, not announced). Before this, such
+     * a peer stayed known forever and every heartbeat broadcast dialed it (up to connectTimeout each),
+     * logging "No connection available". A peer is only taken for gone when, for that same window,
+     * nothing sourced by it arrived either — directly or through a relay: in a partial mesh (firewall,
+     * one-sided link) a live client this node cannot dial keeps talking through a relay, and forgetting
+     * it would drop all its relayed traffic with no way back (it never handshakes this node directly).
+     */
+    private void forgetLongDisconnectedEphemeralPeers(long nowMs) {
+        long forgetAfterMs = config.departedPeerForgetAfter().toMillis();
+        NodeId localId = config.local().nodeId();
+        disconnectedSince.keySet().removeIf(id -> !knownPeers.containsKey(id));
+        // Evidence older than the window is meaningless; this also drops ids that were never learned.
+        lastInboundFromPeer.values().removeIf(at -> nowMs - at >= forgetAfterMs);
+        for (NodeInfo peer : List.copyOf(knownPeers.values())) {
+            NodeId id = peer.nodeId();
+            if (id.equals(localId) || !isEphemeral(peer) || isConnected(id)) {
+                disconnectedSince.remove(id);
+                continue;
+            }
+            long since = disconnectedSince.computeIfAbsent(id, k -> nowMs);
+            long disconnectedForMs = nowMs - since;
+            Long lastInbound = lastInboundFromPeer.get(id);
+            boolean silent = lastInbound == null || nowMs - lastInbound >= forgetAfterMs;
+            if (disconnectedForMs >= forgetAfterMs && silent) {
+                disconnectedSince.remove(id);
+                // Short tombstone: this departure is only inferred. The long TTL is for a first-hand
+                // LEAVE; here a live peer cut off for a while (e.g. its only relay was down) must be
+                // re-admitted by gossip, and its relayed traffic accepted, once the window passes. A dead
+                // peer re-admitted that way is simply forgotten again after another window.
+                forget(id, Math.min(forgetAfterMs, config.departedPeerTombstoneTtl().toMillis()),
+                        "ephemeral peer without connection nor traffic for " + disconnectedForMs + " ms");
+            }
+        }
+    }
+
+    /** Lazily removes expired tombstones and sweeps the connection locks of forgotten peers. */
+    private void purgeExpiredTombstones(long nowMs) {
+        departedPeers.entrySet().removeIf(entry -> entry.getValue() <= nowMs);
+        for (NodeId id : connectionLocks.keySet()) {
+            if (departedPeers.containsKey(id) && !knownPeers.containsKey(id) && !connections.containsKey(id)) {
+                dropConnectionLock(id);
+            }
+        }
+    }
+
+    /** Peers minus departed (tombstoned) ids: reachability input from second-hand reports. */
+    private Collection<NodeInfo> admissible(Collection<NodeInfo> peers) {
+        if (departedPeers.isEmpty()) {
+            return peers;
+        }
+        List<NodeInfo> admissible = new ArrayList<>(peers.size());
+        for (NodeInfo peer : peers) {
+            if (!isDeparted(peer.nodeId())) {
+                admissible.add(peer);
+            }
+        }
+        return admissible;
+    }
+
+    private Map<NodeId, Double> admissible(Map<NodeId, Double> latencies) {
+        if (departedPeers.isEmpty()) {
+            return latencies;
+        }
+        Map<NodeId, Double> admissible = new HashMap<>(latencies);
+        admissible.keySet().removeIf(this::isDeparted);
+        return admissible;
+    }
+
     @Override
     public void close() throws IOException {
+        List<Connection> leaveTargets = List.of();
+        lifecycleLock.lock();
+        try {
+            if (running && !leaving && config.leaveOnClose()) {
+                leaving = true;
+                Set<Connection> distinct = Collections.newSetFromMap(new IdentityHashMap<>());
+                for (Connection connection : connections.values()) {
+                    if (connection.isOpen() && connection.peerSupportsLeave()) {
+                        distinct.add(connection);
+                    }
+                }
+                leaveTargets = List.copyOf(distinct);
+            }
+        } finally {
+            lifecycleLock.unlock();
+        }
+        // Before the connections are dropped: each peer learns first-hand that this node is gone for
+        // good (an ephemeral member is then forgotten instead of redialed until a timeout).
+        announceLeave(leaveTargets);
         List<Connection> socketsToClose;
         lifecycleLock.lock();
         try {
@@ -915,6 +1476,39 @@ public final class TcpTransport implements Transport {
         pendingResponses.clear();
     }
 
+    /**
+     * Sends a LEAVE directly on each connection (not through broadcast(), which is fire-and-forget on
+     * the worker pool) and waits, up to {@link TcpTransportConfig#leaveFlushTimeout()}, until each one
+     * has been flushed to its socket. A large outbound backlog ahead of the LEAVE may exceed the
+     * timeout: the close then proceeds as a plain close and those peers fall back to the
+     * disconnection timeout.
+     */
+    private void announceLeave(List<Connection> targets) {
+        if (targets.isEmpty()) {
+            return;
+        }
+        NodeInfo localInfo = config.local();
+        LeavePayload payload = new LeavePayload(localInfo, "close");
+        List<CompletableFuture<Void>> flushed = new ArrayList<>(targets.size());
+        for (Connection connection : targets) {
+            flushed.add(connection.sendAndAwaitFlush(ClusterMessage.request(MessageType.LEAVE, "leave",
+                    localInfo.nodeId(), connection.remoteId().orElse(null), payload)));
+        }
+        try {
+            CompletableFuture.allOf(flushed.toArray(CompletableFuture[]::new))
+                    .get(config.leaveFlushTimeout().toMillis(), TimeUnit.MILLISECONDS);
+            LOGGER.fine(() -> "LEAVE flushed to " + targets.size() + " peer(s) by " + localInfo.nodeId());
+        } catch (TimeoutException e) {
+            long pending = flushed.stream().filter(f -> !f.isDone()).count();
+            LOGGER.info(() -> "LEAVE of " + localInfo.nodeId() + " not flushed to " + pending + " peer(s) within "
+                    + config.leaveFlushTimeout() + "; closing anyway");
+        } catch (ExecutionException e) {
+            LOGGER.fine(() -> "LEAVE of " + localInfo.nodeId() + " not delivered to every peer: " + e.getCause());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     private final class Connection implements Closeable {
         private final Socket socket;
         private final OutputStream outputStream;
@@ -929,9 +1523,27 @@ public final class TcpTransport implements Transport {
         private volatile boolean peerSupportsCompression;
         // Negotiated in the handshake (8.3.0): only a peer that announced it receives UNDELIVERABLE.
         private volatile boolean peerSupportsUndeliverable;
+        // Negotiated in the handshake (8.7.0): only a peer that announced it receives LEAVE.
+        private volatile boolean peerSupportsLeave;
+        // Whether the remote identity was set by a handshake on this socket (not inferred).
+        private volatile boolean handshaked;
+        // Messages whose flush to the socket someone waits for (sendAndAwaitFlush), by messageId.
+        private final Map<UUID, CompletableFuture<Void>> flushWaiters = new ConcurrentHashMap<>();
         private volatile boolean open = true;
+        // Dialed connection: frames handed to send() before our handshake is queued wait here, so the
+        // handshake is always the first frame the remote reads. The connection is reachable by other
+        // senders (connections map, unpublishedLinkTo) before ensureConnection queues the handshake,
+        // and an earlier frame made the remote infer our identity from its source and never answer
+        // the handshake: the dialer then never learned the canonical id of a seed dialed by alias.
+        private final ReentrantLock handshakeGate = new ReentrantLock();
+        private final List<ClusterMessage> heldBeforeHandshake = new ArrayList<>();
+        private volatile boolean handshakeQueued;
+        // When the socket was registered (monotonic clock); bounds how long an unanswered link may
+        // stand in for a dial, immune to wall-clock jumps.
+        private final long openedAtNanos;
 
         private Connection(Socket socket, boolean outboundInitiated) throws IOException {
+            this.openedAtNanos = System.nanoTime();
             this.socket = socket;
             this.outboundInitiated = outboundInitiated;
             this.codec = new CompositeMessageCodec(config.compressionMinSize());
@@ -965,6 +1577,22 @@ public final class TcpTransport implements Transport {
             return peerSupportsUndeliverable;
         }
 
+        void setPeerSupportsLeave(boolean peerSupports) {
+            this.peerSupportsLeave = peerSupports;
+        }
+
+        boolean peerSupportsLeave() {
+            return peerSupportsLeave;
+        }
+
+        void markHandshaked() {
+            this.handshaked = true;
+        }
+
+        boolean handshaked() {
+            return handshaked;
+        }
+
         Optional<NodeId> remoteId() {
             return Optional.ofNullable(remote).map(NodeInfo::nodeId);
         }
@@ -985,7 +1613,51 @@ public final class TcpTransport implements Transport {
             if (!isOpen()) {
                 return;
             }
+            if (outboundInitiated && !handshakeQueued) {
+                handshakeGate.lock();
+                try {
+                    if (!handshakeQueued) {
+                        if (message.type() == MessageType.HANDSHAKE) {
+                            outbound.enqueue(message);
+                            heldBeforeHandshake.forEach(outbound::enqueue);
+                            heldBeforeHandshake.clear();
+                            handshakeQueued = true;
+                        } else {
+                            heldBeforeHandshake.add(message);
+                        }
+                        return;
+                    }
+                } finally {
+                    handshakeGate.unlock();
+                }
+            }
             outbound.enqueue(message);
+        }
+
+        /**
+         * Enqueues {@code message} (which must carry a unique messageId) and returns a future completed
+         * by the writer right after that exact message was flushed to the socket, or exceptionally when
+         * the connection closes or the writer fails first.
+         */
+        CompletableFuture<Void> sendAndAwaitFlush(ClusterMessage message) {
+            CompletableFuture<Void> flushed = new CompletableFuture<>();
+            flushWaiters.put(message.messageId(), flushed);
+            if (isOpen()) {
+                outbound.enqueue(message);
+            }
+            if (!isOpen()) {
+                failFlushWaiters(); // closed before (or while) enqueuing: the writer may be gone
+            }
+            return flushed;
+        }
+
+        private void failFlushWaiters() {
+            for (UUID id : List.copyOf(flushWaiters.keySet())) {
+                CompletableFuture<Void> waiter = flushWaiters.remove(id);
+                if (waiter != null) {
+                    waiter.completeExceptionally(new IOException("Connection to " + remote + " closed before flush"));
+                }
+            }
         }
 
         private void drainOutbound() {
@@ -1006,6 +1678,12 @@ public final class TcpTransport implements Transport {
                     outputStream.write(lengthPrefix);
                     outputStream.write(data);
                     outputStream.flush();
+                    if (!flushWaiters.isEmpty()) {
+                        CompletableFuture<Void> waiter = flushWaiters.remove(message.messageId());
+                        if (waiter != null) {
+                            waiter.complete(null);
+                        }
+                    }
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -1014,6 +1692,8 @@ public final class TcpTransport implements Transport {
                     LOGGER.log(Level.FINE, "Writer terminating for {0}: {1}", new Object[]{remote, e.getMessage()});
                 }
                 closeQuietly();
+            } finally {
+                failFlushWaiters();
             }
         }
 
@@ -1048,6 +1728,8 @@ public final class TcpTransport implements Transport {
                     }
                     if (message.type() == MessageType.HANDSHAKE) {
                         handleHandshake(this, message);
+                    } else if (message.type() == MessageType.LEAVE) {
+                        handleLeave(this, message);
                     } else {
                         if (remote == null && message.source() != null) {
                             NodeInfo inferred = new NodeInfo(

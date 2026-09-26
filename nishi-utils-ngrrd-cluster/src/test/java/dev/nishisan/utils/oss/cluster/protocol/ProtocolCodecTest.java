@@ -29,6 +29,7 @@ import dev.nishisan.utils.oss.api.Durability;
 import dev.nishisan.utils.oss.api.OnGeometryChange;
 import dev.nishisan.utils.oss.api.SeriesResult;
 import dev.nishisan.utils.oss.api.ViewQuery;
+import dev.nishisan.utils.oss.cluster.catalog.CatalogReplicaStatus;
 import dev.nishisan.utils.oss.cluster.catalog.NodeState;
 import dev.nishisan.utils.oss.cluster.catalog.PlacementState;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
@@ -398,6 +399,58 @@ class ProtocolCodecTest {
                 List.of(new NodeStatusView(nodeA, true), new NodeStatusView(nodeB, false)), 1,
                 Map.of("node-a", 120L, "node-b", 80L));
         assertEquals(original, roundTripResponseBody(Commands.ADMIN_STATUS, original));
+    }
+
+    @Test
+    void adminStatusResponseComReplicaDoCatalogoSobreviveAoRoundTrip() throws IOException {
+        StorageNodeStatus leader = new StorageNodeStatus("node-a", NodeState.ACTIVE, 1, 2, 3, 4L,
+                DistributionMode.COUNT, 1, 0, StorageCapabilities.ALL, CatalogReplicaStatus.ofLeader());
+        StorageNodeStatus follower = new StorageNodeStatus("node-b", NodeState.ACTIVE, 1, 2, 3, 4L,
+                DistributionMode.COUNT, 1, 0, StorageCapabilities.ALL,
+                new CatalogReplicaStatus(false, 7L, 900L, 894L, false, false, true));
+        StorageNodeStatus legacy = new StorageNodeStatus("node-c", NodeState.ACTIVE, 1, 2, 3, 4L);
+        AdminStatusResponse original = new AdminStatusResponse(SeriesStatus.OK, "node-a",
+                List.of(new NodeStatusView(leader, true), new NodeStatusView(follower, true),
+                        new NodeStatusView(legacy, true)), 0, Map.of());
+
+        AdminStatusResponse roundTripped = roundTripResponseBody(Commands.ADMIN_STATUS, original);
+
+        assertEquals(original, roundTripped);
+        assertEquals(follower.catalogReplica(), roundTripped.nodes().get(1).status().catalogReplica());
+        assertNull(roundTripped.nodes().get(2).status().catalogReplica());
+    }
+
+    @Test
+    void nodeMetricsSnapshotComMetricasDeRedirecionamentoSobreviveAoRoundTrip() throws IOException {
+        NodeMetricsSnapshot original = new NodeMetricsSnapshot("storage-0", 1L, false, 0L, 0L, 0L, 0, 0L, 0L, 0L,
+                0L, 0L, 0L, LatencySnapshot.EMPTY, LatencySnapshot.EMPTY, LatencySnapshot.EMPTY, Map.of(),
+                new BlobVolumeSummary(1, 0L, 0L, 0.0, 0, 0L), 0L, 0L, 0L, 0L, 0L, 0L, 0L, 0L, LatencySnapshot.EMPTY,
+                21L, 3L, 1L, 17L);
+
+        NodeMetricsSnapshot roundTripped = roundTripResponseBody(Commands.ADMIN_METRICS, original);
+
+        assertEquals(original, roundTripped);
+        assertEquals(21L, roundTripped.redirectConfirmations());
+        assertEquals(17L, roundTripped.redirectCacheHits());
+    }
+
+    @Test
+    void adminRebalanceResponseComExclusoesSobreviveAoRoundTrip() throws IOException {
+        AdminRebalanceResponse original = new AdminRebalanceResponse(SeriesStatus.OK, "node-a", 3, 3,
+                Map.of("node-c", "lag=12345>1000", "node-d", "sincronizando"));
+
+        assertEquals(original, roundTripResponseBody(Commands.ADMIN_REBALANCE, original));
+    }
+
+    @Test
+    void adminRebalanceResponseDeUmLiderAnteriorSemExclusoesLeMapaVazio() throws IOException {
+        AdminRebalanceResponse legacy = new ObjectMapper().readValue(
+                "{\"status\":\"OK\",\"leaderNodeId\":\"node-a\",\"planned\":2,\"started\":2}",
+                AdminRebalanceResponse.class);
+
+        assertEquals(Map.of(), legacy.excludedDestinations());
+        assertEquals(2, legacy.planned());
+        assertEquals(Map.of(), new AdminRebalanceResponse(SeriesStatus.OK, "node-a", 1, 1).excludedDestinations());
     }
 
     @Test

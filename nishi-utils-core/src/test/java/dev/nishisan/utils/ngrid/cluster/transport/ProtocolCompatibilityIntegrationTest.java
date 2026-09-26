@@ -23,14 +23,12 @@ import dev.nishisan.utils.ngrid.common.HandshakePayload;
 import dev.nishisan.utils.ngrid.common.MessageType;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
+import dev.nishisan.utils.ngrid.common.PeerUpdatePayload;
 import org.junit.jupiter.api.Test;
 
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
-import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
@@ -66,6 +64,55 @@ class ProtocolCompatibilityIntegrationTest {
         HandshakePayload decoded = json.decode(legacy.getBytes(StandardCharsets.UTF_8)).payload(HandshakePayload.class);
         assertFalse(decoded.supportsUndeliverable(), "an old handshake must not announce the notice");
         assertFalse(decoded.supportsCompression());
+    }
+
+    @Test
+    void handshakeWithoutSupportsLeaveMeansNoSupport() throws Exception {
+        NodeInfo old = new NodeInfo(NodeId.of("old-node"), "localhost", 1);
+        byte[] encoded = json.encode(ClusterMessage.request(MessageType.HANDSHAKE, "hello", old.nodeId(), null,
+                new HandshakePayload(old, Set.of(), Map.of(), true, true, false)));
+        String legacy = new String(encoded, StandardCharsets.UTF_8).replace(",\"supportsLeave\":false", "");
+        assertFalse(legacy.contains("supportsLeave"), "precondition: field removed from the wire form");
+        HandshakePayload decoded = json.decode(legacy.getBytes(StandardCharsets.UTF_8)).payload(HandshakePayload.class);
+        assertFalse(decoded.supportsLeave(), "an old handshake must not announce LEAVE support");
+        assertTrue(decoded.supportsUndeliverable());
+    }
+
+    /**
+     * PEER_UPDATE {@code departed} (8.7.0): an older node decodes the payload with its own two-field
+     * shape and simply ignores the new property; a newer node reading an old update sees no departures.
+     */
+    @Test
+    void peerUpdateDepartedIsIgnoredByOldNodesAndAbsentFromTheirUpdates() throws Exception {
+        NodeInfo peer = new NodeInfo(NodeId.of("storage-1"), "localhost", 1);
+        byte[] encoded = json.encode(ClusterMessage.request(MessageType.PEER_UPDATE, "peer-update", peer.nodeId(),
+                null, new PeerUpdatePayload(Set.of(peer), Map.of(), Map.of(NodeId.of("client-1"), 60_000L))));
+        com.fasterxml.jackson.databind.ObjectMapper mapper = JacksonMessageCodec.createDefaultMapper();
+        com.fasterxml.jackson.databind.node.ObjectNode payload =
+                (com.fasterxml.jackson.databind.node.ObjectNode) mapper.readTree(encoded).get("payload");
+        assertTrue(payload.has("departed"), "precondition: the new field is on the wire");
+        payload.remove("@class");
+
+        LegacyPeerUpdatePayload legacy = mapper.treeToValue(payload, LegacyPeerUpdatePayload.class);
+        assertTrue(legacy.peers.contains(peer), "an old node still reads the peer list");
+
+        payload.remove("departed");
+        PeerUpdatePayload fromOldNode = mapper.treeToValue(payload, PeerUpdatePayload.class);
+        assertTrue(fromOldNode.departed().isEmpty(), "an update without the field reports no departure");
+        assertTrue(fromOldNode.peers().contains(peer));
+    }
+
+    /** The PEER_UPDATE payload shape of nodes older than 8.7.0 (no {@code departed}). */
+    static final class LegacyPeerUpdatePayload {
+        final Set<NodeInfo> peers;
+        final Map<NodeId, Double> latencies;
+
+        @com.fasterxml.jackson.annotation.JsonCreator
+        LegacyPeerUpdatePayload(@com.fasterxml.jackson.annotation.JsonProperty("peers") Set<NodeInfo> peers,
+                @com.fasterxml.jackson.annotation.JsonProperty("latencies") Map<NodeId, Double> latencies) {
+            this.peers = peers;
+            this.latencies = latencies;
+        }
     }
 
     @Test
@@ -121,53 +168,6 @@ class ProtocolCompatibilityIntegrationTest {
                         "the connection must survive an undecodable message; delivered=" + delivered);
                 assertTrue(transport.isConnected(oldInfo.nodeId()), "connection must still be tracked as open");
             }
-        }
-    }
-
-    /** A bare TCP client speaking the legacy JSON framing (int length + JSON bytes). */
-    private final class RawPeer implements AutoCloseable {
-        private final Socket socket;
-        private final DataOutputStream out;
-        private final List<ClusterMessage> received = new CopyOnWriteArrayList<>();
-        private final Thread reader;
-
-        RawPeer(int port) throws IOException {
-            socket = new Socket();
-            socket.connect(new InetSocketAddress("localhost", port), 5_000);
-            out = new DataOutputStream(socket.getOutputStream());
-            DataInputStream in = new DataInputStream(socket.getInputStream());
-            reader = Thread.ofVirtual().start(() -> {
-                try {
-                    while (true) {
-                        int length = in.readInt();
-                        byte[] data = in.readNBytes(length);
-                        int offset = data.length > 0 && data[0] == 0x00 ? 1 : 0; // JSON-with-marker frames
-                        if (data.length - offset > 0 && data[offset] == '{') {
-                            received.add(json.decode(java.util.Arrays.copyOfRange(data, offset, data.length)));
-                        }
-                    }
-                } catch (IOException ignored) {
-                    // socket closed
-                }
-            });
-        }
-
-        void writeFrame(byte[] jsonBytes) throws IOException {
-            synchronized (out) {
-                out.writeInt(jsonBytes.length);
-                out.write(jsonBytes);
-                out.flush();
-            }
-        }
-
-        List<ClusterMessage> received() {
-            return received;
-        }
-
-        @Override
-        public void close() throws IOException {
-            socket.close();
-            reader.interrupt();
         }
     }
 

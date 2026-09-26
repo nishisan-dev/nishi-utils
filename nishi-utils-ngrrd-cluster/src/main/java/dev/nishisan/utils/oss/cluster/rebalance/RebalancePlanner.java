@@ -45,9 +45,21 @@ public final class RebalancePlanner {
      */
     public static List<Move> plan(Collection<StorageNodeStatus> nodes, Map<String, List<String>> seriesByOwner,
             Set<String> reachable, Set<String> migratingKeys, RebalanceSettings settings) {
+        return plan(nodes, seriesByOwner, reachable, migratingKeys, settings, Set.of());
+    }
+
+    /**
+     * Como {@link #plan(Collection, Map, Set, Set, RebalanceSettings)}, sem nunca escolher como destino um nó
+     * de {@code excludedDestinations} (issue #177, ver {@link CatalogLagGate}). O nó excluído continua na
+     * distribuição alvo e pode ser origem; sem nenhum destino elegível, o plano sai vazio.
+     */
+    public static List<Move> plan(Collection<StorageNodeStatus> nodes, Map<String, List<String>> seriesByOwner,
+            Set<String> reachable, Set<String> migratingKeys, RebalanceSettings settings,
+            Set<String> excludedDestinations) {
         Map<String, Long> unknownSizes = new HashMap<>();
         seriesByOwner.values().forEach(keys -> keys.forEach(key -> unknownSizes.put(key, 0L)));
-        return plan(nodes, seriesByOwner, reachable, migratingKeys, settings, unknownSizes, Map.of(), Map.of());
+        return plan(nodes, seriesByOwner, reachable, migratingKeys, settings, unknownSizes, Map.of(), Map.of(),
+                excludedDestinations);
     }
 
     /** Plans with exact confirmed allocation sizes and outstanding incoming budgets. */
@@ -55,7 +67,19 @@ public final class RebalancePlanner {
             Set<String> reachable, Set<String> migratingKeys, RebalanceSettings settings,
             Map<String, Long> regionBytesBySeries, Map<String, Long> pendingBytesByNode,
             Map<String, Long> pendingSeriesByNode) {
+        return plan(nodes, seriesByOwner, reachable, migratingKeys, settings, regionBytesBySeries,
+                pendingBytesByNode, pendingSeriesByNode, Set.of());
+    }
+
+    /**
+     * Como o planejamento com tamanhos exatos, sem nunca escolher como destino um nó de
+     * {@code excludedDestinations} (issue #177).
+     */
+    public static List<Move> plan(Collection<StorageNodeStatus> nodes, Map<String, List<String>> seriesByOwner,
+            Set<String> reachable, Set<String> migratingKeys, RebalanceSettings settings,
+            Map<String, Long> regionBytesBySeries, Map<String, Long> pendingBytesByNode,
+            Map<String, Long> pendingSeriesByNode, Set<String> excludedDestinations) {
         return new CapacityAwarePlanner(nodes, seriesByOwner, reachable, migratingKeys, settings,
-                regionBytesBySeries, pendingBytesByNode, pendingSeriesByNode).plan();
+                regionBytesBySeries, pendingBytesByNode, pendingSeriesByNode, excludedDestinations).plan();
     }
 }

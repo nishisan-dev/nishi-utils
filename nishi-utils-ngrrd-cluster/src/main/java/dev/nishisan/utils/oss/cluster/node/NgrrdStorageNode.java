@@ -20,6 +20,7 @@ package dev.nishisan.utils.oss.cluster.node;
 import dev.nishisan.utils.ngrid.cluster.coordination.LeadershipListener;
 import dev.nishisan.utils.ngrid.cluster.transport.TransportListener;
 import dev.nishisan.utils.ngrid.common.NodeId;
+import dev.nishisan.utils.ngrid.map.MapClusterService;
 import dev.nishisan.utils.ngrid.structures.NGrid;
 import dev.nishisan.utils.ngrid.structures.NGridNode;
 import dev.nishisan.utils.ngrid.structures.NGridNodeBuilder;
@@ -27,8 +28,15 @@ import dev.nishisan.utils.oss.blob.BlobVolume;
 import dev.nishisan.utils.oss.blob.BlobVolumeRegistry;
 import dev.nishisan.utils.oss.blob.NgrrdBlob;
 import dev.nishisan.utils.oss.cluster.admin.AdminService;
+import dev.nishisan.utils.oss.cluster.api.ErrorCode;
+import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
+import dev.nishisan.utils.oss.cluster.catalog.CatalogReplicaStatus;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
+import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
+import dev.nishisan.utils.oss.cluster.client.CatalogLookupClient;
+import dev.nishisan.utils.oss.cluster.client.NodeCapabilities;
+import dev.nishisan.utils.oss.cluster.client.RetryPolicy;
 import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
 import dev.nishisan.utils.oss.cluster.placement.LeastLoadedPlacementPolicy;
 import dev.nishisan.utils.oss.cluster.rebalance.MigrationCoordinator;
@@ -41,9 +49,15 @@ import dev.nishisan.utils.oss.cluster.rpc.TransportClusterRpc;
 import java.io.Closeable;
 import java.io.IOException;
 import java.time.Clock;
+import java.time.Duration;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.UnaryOperator;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -58,6 +72,11 @@ public final class NgrrdStorageNode implements Closeable {
     private static final Logger LOGGER = Logger.getLogger(NgrrdStorageNode.class.getName());
 
     private static final String STORAGE_ROLE = "storage";
+    /** Backoff das retentativas de {@code ngrrd.catalog.lookup} na confirmação de redirecionamentos. */
+    private static final Duration LEADER_LOOKUP_BACKOFF_MIN = Duration.ofMillis(50);
+    private static final Duration LEADER_LOOKUP_BACKOFF_MAX = Duration.ofMillis(500);
+    /** Chaves por página de {@code ngrrd.catalog.lookup} na confirmação de redirecionamentos. */
+    private static final int LEADER_LOOKUP_BATCH_SIZE = 2_000;
     /** Hooks no-op — usado por {@link #start(StorageNodeConfig)} (produção; sem testes de queda do líder). */
     private static final MigrationCoordinator.MigrationHooks DEFAULT_MIGRATION_HOOKS =
             new MigrationCoordinator.MigrationHooks() {
@@ -124,8 +143,27 @@ public final class NgrrdStorageNode implements Closeable {
      */
     public static NgrrdStorageNode start(StorageNodeConfig cfg, MigrationCoordinator.MigrationHooks migrationHooks)
             throws IOException {
+        return start(cfg, migrationHooks, UnaryOperator.identity());
+    }
+
+    /**
+     * Gancho de teste: como {@link #start(StorageNodeConfig, MigrationCoordinator.MigrationHooks)}, mas
+     * aplicando {@code lookupDecorator} ao {@link StorageRequestHandler.PlacementLookup} de produção antes
+     * de entregá-lo ao {@link StorageRequestHandler} — permite simular, num cluster real, a réplica local do
+     * catálogo atrasada neste nó (issue #177). Não é API estável.
+     *
+     * <p>Limitação: só o {@link StorageRequestHandler} enxerga a visão decorada. {@link MigrationExecutor},
+     * {@link LocalReconciler}, {@link GeometryService}, {@link PlacementRequestHandler} e o reporter de status
+     * continuam lendo a réplica real via {@link CatalogService}.</p>
+     *
+     * @param lookupDecorator recebe o adaptador de produção e devolve o que o handler vai usar (nunca
+     *                        {@code null}); {@link UnaryOperator#identity()} equivale ao comportamento normal
+     */
+    public static NgrrdStorageNode start(StorageNodeConfig cfg, MigrationCoordinator.MigrationHooks migrationHooks,
+            UnaryOperator<StorageRequestHandler.PlacementLookup> lookupDecorator) throws IOException {
         Objects.requireNonNull(cfg, "cfg");
         Objects.requireNonNull(migrationHooks, "migrationHooks");
+        Objects.requireNonNull(lookupDecorator, "lookupDecorator");
 
         BlobVolumeRegistry volumeRegistry = NgrrdBlob.registry()
                 .basePath(cfg.volumeDir())
@@ -172,7 +210,7 @@ public final class NgrrdStorageNode implements Closeable {
                 // Adaptador em vez de método de referência: StorageRequestHandler.PlacementLookup agora
                 // também exige placementStrong (round-trip ao líder), usado quando a réplica local do
                 // catálogo ainda está vazia (ex.: logo após um restart) — ver F1.2.
-                StorageRequestHandler.PlacementLookup placementLookup = new StorageRequestHandler.PlacementLookup() {
+                StorageRequestHandler.PlacementLookup productionLookup = new StorageRequestHandler.PlacementLookup() {
                     @Override
                     public Optional<SeriesPlacement> placementLocal(String seriesKey) {
                         return catalog.placementLocal(seriesKey);
@@ -182,7 +220,25 @@ public final class NgrrdStorageNode implements Closeable {
                     public Optional<SeriesPlacement> placementStrong(String seriesKey) {
                         return catalog.placementStrong(seriesKey);
                     }
+
+                    @Override
+                    public Map<String, SeriesPlacement> placementsAtLeader(Collection<String> seriesKeys,
+                            Duration maxWait) {
+                        return placementsAtLeaderOf(node, catalog, rpc, seriesKeys, maxWait);
+                    }
+
+                    @Override
+                    public boolean localIsAuthoritative() {
+                        return node.coordinator().isLeader();
+                    }
+
+                    @Override
+                    public boolean leaderKnown() {
+                        return rpc.leaderId().isPresent();
+                    }
                 };
+                StorageRequestHandler.PlacementLookup placementLookup = Objects.requireNonNull(
+                        lookupDecorator.apply(productionLookup), "lookupDecorator devolveu null");
                 StorageRequestHandler storageHandler = new StorageRequestHandler(node.transport(),
                         placementLookup, registry, volume, cfg.seriesObjectPrefix(), self, cfg.defaultDurability(),
                         cfg.defaultOnGeometryChange(), Clock.systemUTC());
@@ -202,9 +258,9 @@ public final class NgrrdStorageNode implements Closeable {
                         cfg.migrationBytesPerSecond(), Clock.systemUTC());
                 MigrationCoordinator migrationCoordinator = new MigrationCoordinator(catalog, rpc, leaderView,
                         cfg.maxConcurrentMigrations(), cfg.migrationStatusPollInterval(), cfg.migrationTimeout(),
-                        Clock.systemUTC(), migrationHooks);
+                        Clock.systemUTC(), migrationHooks, cfg.maxDestinationCatalogLag());
                 RebalanceSettings rebalanceSettings = new RebalanceSettings(cfg.rebalanceMinDelta(),
-                        cfg.rebalanceTolerance(), cfg.maxMovesPerCycle());
+                        cfg.rebalanceTolerance(), cfg.maxMovesPerCycle(), cfg.maxDestinationCatalogLag());
                 Rebalancer rebalancer = new Rebalancer(catalog, leaderView, migrationCoordinator, rebalanceSettings,
                         cfg.rebalanceEnabled(), cfg.rebalanceInterval(), cfg.migrationTimeout(), Clock.systemUTC());
                 AdminService adminService = new AdminService(catalog, rebalancer, Clock.systemUTC());
@@ -220,6 +276,10 @@ public final class NgrrdStorageNode implements Closeable {
                         catalog, statusReporter::metricsSnapshot, rpc, rebalancer, adminService, migrationCoordinator);
 
                 statusReporter.distribution(cfg.distributionMode(), cfg.weight());
+                // Issue #177: lag POR TÓPICO do catálogo (o lag global do snapshot operacional não serve).
+                String catalogTopic = MapClusterService.topicFor(CatalogService.CATALOG_MAP);
+                statusReporter.catalogReplication(() -> CatalogReplicaStatus.from(node.coordinator().isLeader(),
+                        node.replicationManager().getTopicReplicationStatuses().get(catalogTopic)));
                 node.transport().addListener(geometryService);
                 rpc.registerLocalHandler(geometryService);
                 node.transport().addListener(storageHandler);
@@ -267,6 +327,53 @@ public final class NgrrdStorageNode implements Closeable {
             }
             throw e;
         }
+    }
+
+    /**
+     * {@link StorageRequestHandler.PlacementLookup#placementsAtLeader} de produção (issue #177): no líder,
+     * a réplica local é a fonte; num seguidor, {@code ngrrd.catalog.lookup} via {@link CatalogLookupClient}
+     * com prazo total {@code maxWait}. Nunca usa {@code placementStrong}/{@code DistributedMap} num
+     * seguidor — o {@code invokeLeader} do core pode bloquear por muito mais que o prazo (várias tentativas
+     * de {@code requestTimeout} com espera entre elas), e esta consulta roda segurando o lock de
+     * coordenação de um {@code OPEN}.
+     *
+     * <p>A capacidade {@code catalog.lookup} do líder é conferida só na réplica local de
+     * {@code ngrrd.nodes} (sem leitura forte, pelo mesmo motivo — ver {@link #leaderCapabilitiesFromLocal}):
+     * um líder que não a anuncie falha a consulta na hora, e o handler responde pela réplica local durante o
+     * cooldown.</p>
+     */
+    private static Map<String, SeriesPlacement> placementsAtLeaderOf(NGridNode node, CatalogService catalog,
+            TransportClusterRpc rpc, Collection<String> seriesKeys, Duration maxWait) {
+        if (node.coordinator().isLeader()) {
+            Map<String, SeriesPlacement> found = new HashMap<>();
+            for (String seriesKey : seriesKeys) {
+                catalog.placementLocal(seriesKey).ifPresent(placement -> found.put(seriesKey, placement));
+            }
+            return found;
+        }
+        CatalogLookupClient lookup = new CatalogLookupClient(rpc,
+                new RetryPolicy(maxWait, LEADER_LOOKUP_BACKOFF_MIN, LEADER_LOOKUP_BACKOFF_MAX), Clock.systemUTC(),
+                LEADER_LOOKUP_BATCH_SIZE, leaderCapabilitiesFromLocal(catalog::nodeStatusLocal));
+        return lookup.lookup(seriesKeys, maxWait);
+    }
+
+    /**
+     * Conferência de capacidades do líder usada por {@link #placementsAtLeaderOf}: só a réplica local de
+     * {@code ngrrd.nodes}, e resposta negativa imediata — status presente sem a capacidade (líder anterior à
+     * 8.6.0) ou status ainda ausente na réplica. Sem isso, um status ausente faria o {@link NodeCapabilities}
+     * reler a réplica até o prazo inteiro da confirmação, a cada fim de cooldown; aqui a falha é imediata e o
+     * handler responde pela réplica local.
+     */
+    static NodeCapabilities leaderCapabilitiesFromLocal(Function<String, Optional<StorageNodeStatus>> localStatus) {
+        Function<String, Optional<StorageNodeStatus>> presentOrFail = nodeId -> {
+            Optional<StorageNodeStatus> status = localStatus.apply(nodeId);
+            if (status.isEmpty()) {
+                throw new NgrrdClusterException(ErrorCode.UNSUPPORTED_BY_NODE, "status do líder " + nodeId
+                        + " ausente na réplica local; não foi possível conferir as capacidades dele");
+            }
+            return status;
+        };
+        return new NodeCapabilities(localStatus, presentOrFail);
     }
 
     /**

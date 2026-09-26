@@ -100,6 +100,15 @@ record StorageNodeStatus(String nodeId, NodeState state /* ACTIVE | DRAINING | D
   (`{prefix}/{seriesKey}.ngrr`) sem ter como saber, só olhando o volume, qual prefixo uma definição
   customizada usaria antes de abri-la. Um `OPEN` cuja definição usa um prefixo diferente do
   configurado no nó é **rejeitado** com `SeriesStatus#ERROR`.
+- **Lag da réplica local do catálogo (`StorageNodeStatus.catalogReplica`, issue #177, desde a
+  8.7.0).** Cada storage publica, junto do resto do status, um `CatalogReplicaStatus` (`leader`,
+  `lag`, `leaderHighWatermark`, `nextExpectedSequence`, `syncing`, `pendingBootstrap`, `streaming`)
+  com o lag **por tópico** (`map:ngrrd.catalog`) do `ReplicationManager` do NGrid — diferente do
+  `HIGH_REPLICATION_LAG` global do snapshot operacional, que fica dessincronizado entre líder e
+  seguidores (issue #178, ainda aberta) e não serve para decidir se a réplica do catálogo deste nó
+  é confiável. `lag = 0` só é significativo quando o high-watermark do líder já é conhecido
+  (`leaderHighWatermark > 0`); o campo é `null` num status publicado por um nó anterior a esta
+  versão. Ver a coluna `CAT_LAG` (seção 11) e o gate de rebalance (seção 8).
 
 ## 4. Protocolo
 
@@ -139,6 +148,21 @@ Status de série (`SeriesStatus`): `OK`, `WRONG_OWNER`, `MIGRATING`, `NOT_OPEN`,
 - **`WRONG_OWNER`:** o nó contatado não é (mais) o dono segundo seu catálogo local — normalmente
   logo após uma migração. O cliente invalida o cache de placement, releitura (ou pergunta ao
   líder) e reenfileira.
+- **Redirecionamento confirmado no líder (issue #177, desde a 8.7.0).** Um `WRONG_OWNER`/`MIGRATING`
+  derivado só da réplica local do catálogo pode estar atrasado — o sintoma em produção era um
+  pingue-pongue entre origem e destino de um rebalance durante minutos, cada um apontando para o
+  outro. `StorageRequestHandler` confirma no líder, numa única consulta em lote por request
+  (`ngrrd.catalog.lookup`, prazo de 2 s), todo redirecionamento que a réplica local geraria, exceto
+  quando o próprio nó já é o líder; o líder encontrar outro dono ou nenhum vira a resposta enviada
+  ao cliente, uma confirmação positiva fica em cache por 5 s (nunca autoriza criar), e o líder
+  inalcançável faz o nó cair no comportamento da 8.6.0 (responder pela réplica local), com cooldown
+  de 1 s entre tentativas de confirmar de novo. Do lado do cliente, `WriteDispatcher`/
+  `RemoteSeriesHandle` classificam uma dica de `WRONG_OWNER` como **contraditória** — aponta para o
+  próprio nó, para um nó já visitado no episódio de redirecionamento, diverge do dono já confirmado
+  pelo líder, ou o episódio já tem 4 saltos — e resolvem no líder com uma consulta coalescida antes
+  de reenviar, em vez de seguir a dica cegamente; a cadeia legítima de poucos saltos continua sem
+  RPC extra. Métricas, ordem de atualização e troubleshooting em
+  [`ngrrd-cluster-operacao.md`](ngrrd-cluster-operacao.md#confirmação-de-redirecionamento-no-líder-e-lag-do-catálogo-issue-177).
 - **`MIGRATING`:** a série está em trânsito; cliente faz backoff (100 ms → 2 s), governado pela
   `RetryPolicy` construída a partir de `NgrrdClusterConfig#retryTimeout` (default 5 min); esgotado
   esse prazo, lança `NgrrdClusterException(MIGRATING)` — não `SERIES_UNAVAILABLE`.
@@ -383,6 +407,7 @@ ngrrd:
     migrationTimeout: 10m              # opcional, default 10m
     chunkBytes: 262144                 # opcional, default 256 KiB
     maxSeriesBytes: 67108864           # opcional, default 64 MiB
+    maxDestinationCatalogLag: 1000     # opcional, default 1000 — issue #177; -1 desliga, 0 exige réplica em dia
   reconcile:
     interval: 10m                      # opcional, default 10m
     orphanGrace: 5m                    # opcional, default 5m
@@ -512,6 +537,20 @@ Drenagem e rebalance só movem séries com geometria confirmada para destinos qu
 bytes reais, incluindo reservas; saídas ainda pendentes não liberam orçamento.
 Veja [configuração e atualização coordenada](ngrrd-cluster-operacao.md#capacidade-e-distribuição-ponderada-issue-167-itens-1-e-2).
 
+**Destino excluído por réplica do catálogo atrasada (issue #177).** `CatalogLagGate` retira da
+lista de destinos elegíveis, em qualquer modo de distribuição, um nó cuja `CatalogReplicaStatus`
+publicada (seção 3) tenha lag acima de `ngrrd.rebalance.maxDestinationCatalogLag` (default 1000),
+lag desconhecido, sincronização por snapshot em curso ou bootstrap do relay pendente — um destino
+nessas condições responde pela réplica durante o corte de dono e alimenta o pingue-pongue de
+`WRONG_OWNER` descrito na seção 4. A exclusão vale só para **destino**: o nó continua podendo ser
+origem e continua contado no cálculo da distribuição alvo. `-1` desliga a porta; `0` exige a
+réplica em dia; um nó sem o campo (rolling upgrade a partir da 8.6.0) é elegível. O líder nunca é
+excluído (a réplica dele é a fonte). A condição é reconferida quando cada migração vai começar de
+fato (`MigrationCoordinator`) — se o destino deixou de ser elegível nesse meio-tempo, o movimento
+é `SKIPPED`; migrações já em andamento retomadas por um novo líder (`resumeInFlight()`) não passam
+por essa checagem. `NGRRD_REBALANCE_DEST_EXCLUDED` sai em `INFO` só quando o conjunto de exclusões
+muda de um ciclo para o outro (evita repetir a mesma linha a cada ciclo).
+
 `MigrationCoordinator` executa cada movimento como máquina de estados idempotente por
 `migrationId` (UUID):
 
@@ -588,20 +627,35 @@ líder): `leader` (se este nó é líder agora), `seriesCount`, `usedBytes`/`cap
 `BlobVolumeStats`), `migrationsIn`/`migrationsOut` e, desde o M4, `reconcileAdopted`/
 `reconcileOrphansDeleted`/`reconcileUnplaced`/`reconcileMissing`/`reconcileLastDurationMs`
 e, desde a 8.6.0, `leaderConfirmations`/`leaderConfirmationLatency` (leituras fortes no líder para
-confirmar o dono de uma série sem objeto no volume antes de criá-la ou de responder `NOT_FOUND`).
+confirmar o dono de uma série sem objeto no volume antes de criá-la ou de responder `NOT_FOUND`) e,
+desde a 8.7.0, `redirectConfirmations`/`redirectOverrides`/`redirectConfirmationFailures`/
+`redirectCacheHits` — confirmações no líder de um redirecionamento (`WRONG_OWNER`/`MIGRATING`)
+derivado da réplica local do catálogo (issue #177): `redirectConfirmations` conta as séries
+confirmadas numa consulta ao líder, `redirectOverrides` quantas vezes o líder divergiu da réplica
+local, `redirectConfirmationFailures` quantas vezes a resposta caiu para a réplica local por falha
+ou indisponibilidade do líder, e `redirectCacheHits` quantas foram respondidas por uma confirmação
+recente em cache (TTL de 5 s) sem nova consulta.
 
 `ClientMetricsSnapshot` (no cliente): `samplesEnqueued`/`samplesSent`/`samplesFailed`,
 `batchesSent`, `retriesByStatus`, `bufferedSamples` por nó de destino, `openHandles`,
-`rpcLatency` (agregada, não quebrada por comando) e `placeCount`.
+`rpcLatency` (agregada, não quebrada por comando), `placeCount` e, desde a 8.7.0, `ownerLookups`
+(consultas ao líder feitas pelo `WriteDispatcher` para desempatar uma dica de dono contraditória) e
+`redirectCycles` (dicas de `WRONG_OWNER` classificadas como contraditórias — apontam para o próprio
+nó, para um nó já visitado no episódio, divergem do dono confirmado, ou excedem 4 saltos).
 
 Integração opcional via `NgrrdClusterMetricsListener` (storage node e cliente); log periódico
 `NGRRD_NODE_STATUS` (marker de log do projeto — base para futuros Docker ITs; inclui
 `leaderConfirmations`/`leaderConfirmationP99us`, as confirmações de dono no líder antes de criar
-uma série ou responder `NOT_FOUND`), `NGRRD_REBALANCE`/
-`NGRRD_REBALANCE_MOVE` a cada ciclo de rebalanceamento, `NGRRD_NODE_DRAINED` quando o `Rebalancer`
+uma série ou responder `NOT_FOUND`, `catalogLag=` — forma curta do lag da réplica local do
+catálogo, seção 3 — e `redirectConfirmations`/`redirectOverrides`/`redirectConfirmationFailures`/
+`redirectCacheHits`), `NGRRD_REBALANCE`/
+`NGRRD_REBALANCE_MOVE` a cada ciclo de rebalanceamento, `NGRRD_REBALANCE_DEST_EXCLUDED` quando o
+conjunto de destinos excluídos por lag do catálogo muda de um ciclo para o outro (issue #177),
+`NGRRD_NODE_DRAINED` quando o `Rebalancer`
 promove um nó a `DRAINED`, `NGRRD_RECONCILE`/`NGRRD_RECONCILE_ORPHAN_DELETED`/`RECONCILE_UNPLACED`
 a cada ciclo do reconciliador (com `forgottenPruned`, marcas de série esquecida descartadas no
-ciclo), e `NGRRD_STORAGE_NODE_STARTED` (processo pronto, emitido por
+ciclo), `NGRRD_OWNER_REDIRECT_OVERRIDE` (nível `FINE`, por série, quando o líder diverge da réplica
+local ao confirmar um redirecionamento), e `NGRRD_STORAGE_NODE_STARTED` (processo pronto, emitido por
 `NgrrdStorageNodeMain`).
 
 ## 11. CLI de administração
@@ -615,6 +669,15 @@ Entra na malha como cliente transparente (mesmo papel `client`+`leader-ineligibl
 `NgrrdClusterClient`), executa um único comando e sai — sem dependência de biblioteca de CLI,
 saída tabular em texto simples. Código de saída `0` em sucesso, `1` em qualquer falha (parsing,
 conexão ou erro remoto), sempre reportada em `stderr` — nunca lança para o chamador.
+
+`status` traz, desde a 8.7.0, a coluna `CAT_LAG` — forma curta do `CatalogReplicaStatus` do nó
+(seção 3): `lider`, o lag numérico, `sync` (sincronizando por snapshot), `boot` (bootstrap do relay
+pendente), `?` (lag desconhecido, HWM do líder ainda não visto) ou `-` (nó anterior à 8.7.0, campo
+ausente no status). `rebalance` imprime `rebalanceamento disparado: planejados=N iniciados=M`
+seguido de uma linha `destino excluído: <nó> (<motivo>)` por nó excluído do ciclo pela réplica do
+catálogo atrasada (issue #177; motivo é `lag desconhecido`, `sincronizando`, `bootstrap pendente`
+ou `lag=<N>><limite>`); sem contagens conhecidas (implementação de cliente sem acesso a elas),
+imprime só a confirmação do disparo, como antes.
 
 ## 12. Testes
 
@@ -634,7 +697,10 @@ conexão ou erro remoto), sempre reportada em `stderr` — nunca lança para o c
   (`LeaderFailoverDuringMigrationClusterTest` — ver seção 13); churn de liderança durante placement
   (`PlacementUnderLeaderChurnClusterTest`); drenagem até zero séries (`DrainClusterTest`); adoção de
   volume single-node existente (`AdoptExistingVolumeClusterTest`); status/CLI administrativos
-  (`AdminStatusClusterTest`, `AdminCliClusterTest`).
+  (`AdminStatusClusterTest`, `AdminCliClusterTest`); destino com réplica do catálogo atrasada
+  confirmando no líder, issue #177 (`StaleReplicaRedirectClusterTest`, via um gancho de teste que
+  decora o `PlacementLookup` do storage para congelar a réplica local — o core não permite pausar a
+  replicação diretamente).
 - **Fora do CI hospedado, por desenho** — mesmo motivo e mesmo padrão da suíte de resiliência do
   NGrid (`doc/testes-vermelhos-conhecidos.md`): os `*ClusterTest` deste módulo são sensíveis a
   tempo e recursos do executor e não passam de forma confiável em runner hospedado. `pr-validation.yml`
@@ -697,15 +763,15 @@ e afetam qualquer usuário do NGrid, não só este módulo:
   cegos à linhagem/epoch — operações aplicadas a partir de ramos descartados inflam o contador e
   inviabilizam um emparelhamento exato entre incumbente e candidato durante o handoff. Follow-up
   epoch-aware (referenciado ali como PR #142) continua pendente.
-- **Saída graciosa (`LEAVE`) do NGrid, janela de bootstrap padrão e logs de handoff.** O NGrid não
-  tem hoje uma mensagem explícita de saída graciosa de um nó (`LEAVE`) distinta de uma queda —
-  todo desligamento de nó é indistinguível de uma falha do ponto de vista dos peers, o que
-  contribui para o churn de bootstrap citado em 13.1. Relacionado: o default de janela de bootstrap
-  do próprio core (fora do `bootDiscoveryWindow` específico do `NGridNodeBuilder` usado por este
-  módulo) e o nível de detalhe dos logs de handoff de liderança poderiam ser revistos juntos.
-  **Ainda não confirmado em código** — item registrado a partir de observação de campo; os demais
-  pontos desta seção foram confirmados nos artefatos de planejamento (`checkpoint.md`) e no
-  `doc/CHANGELOG.md`.
+- **Janela de bootstrap padrão e logs de handoff.** Desde a 8.7.0 o NGrid tem saída graciosa
+  (`LEAVE`, ver `doc/ngrid/arquitetura.md`): clientes e a CLI administrativa são esquecidos pelos
+  storages assim que saem, e o `LEAVE` de um storage (votante) confirma a saída na hora, sem o grace
+  de disconnect — ele segue conhecido como votante. Continuam em aberto o default de janela de
+  bootstrap do próprio core (fora do `bootDiscoveryWindow` específico do `NGridNodeBuilder` usado
+  por este módulo), que contribui para o churn de bootstrap citado em 13.1, e o nível de detalhe
+  dos logs de handoff de liderança. **Ainda não confirmado em código** — item registrado a partir
+  de observação de campo; os demais pontos desta seção foram confirmados nos artefatos de
+  planejamento (`checkpoint.md`) e no `doc/CHANGELOG.md`.
 
 Nenhum destes pontos bloqueia o uso do ngrrd cluster hoje — ficam registrados aqui porque foram
 encontrados no caminho e afetam a base sobre a qual este módulo é construído.

@@ -21,6 +21,7 @@ import dev.nishisan.utils.oss.NgrrdHandle;
 import dev.nishisan.utils.oss.api.Sample;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterClient;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
+import dev.nishisan.utils.oss.cluster.catalog.CatalogReplicaStatus;
 import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
 import dev.nishisan.utils.oss.cluster.node.NgrrdStorageNode;
 import dev.nishisan.utils.oss.cluster.node.NodeStatusReporter;
@@ -50,6 +51,7 @@ import java.util.logging.LogRecord;
 import java.util.logging.Logger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -58,7 +60,8 @@ import static org.junit.jupiter.api.Assertions.fail;
  * cliente, 20 séries escritas e com checkpoint. Cobre: {@code clusterStatus()} listando os 2 nós
  * alcançáveis com a contagem de séries correta, {@code nodeMetrics(ownerId)} refletindo operações
  * reais (amostras, latência de checkpoint, handles abertos), a marcação {@code reachable=false} de
- * um nó derrubado dentro de 10 s, e o log marker {@code NGRRD_NODE_STATUS}.
+ * um nó derrubado dentro de 10 s, e o log marker {@code NGRRD_NODE_STATUS}. Desde a issue #177, também
+ * o estado da réplica local do catálogo publicado por cada nó ({@link CatalogReplicaStatus}).
  */
 // SEPARATE_THREAD (mesmo motivo de DistributedWriteReadClusterTest): o modo padrão do @Timeout só
 // mede o tempo depois que o método retorna — não preempta uma chamada bloqueada de verdade.
@@ -166,6 +169,34 @@ class AdminStatusClusterTest {
                 assertTrue(view.reachable(), view.status().nodeId() + " deveria estar alcançável antes de derrubar nó algum");
             }
 
+            // Issue #177: todo nó publica o estado da réplica local do catálogo; só o líder se declara líder e
+            // os seguidores já conhecem o high-watermark dele (houve escrita no catálogo: os 20 placements). O
+            // status de boot de um seguidor, publicado antes dessa escrita, ainda não conhece o HWM — por isso
+            // o poll até o próximo relatório.
+            AtomicReference<AdminStatusResponse> replicaStatusRef = new AtomicReference<>();
+            awaitTrue("clusterStatus() reporta a réplica do catálogo de todos os nós", AWAIT_TIMEOUT, () -> {
+                try {
+                    AdminStatusResponse response = client.clusterStatus();
+                    replicaStatusRef.set(response);
+                    return response.status() == SeriesStatus.OK && catalogReplicasReported(response);
+                } catch (NgrrdClusterException e) {
+                    return false;
+                }
+            }, () -> "último status: " + describeCatalogReplicas(replicaStatusRef.get()));
+            AdminStatusResponse replicaStatus = replicaStatusRef.get();
+            assertEquals(STORAGE_NODE_COUNT, replicaStatus.nodes().size(), describeCatalogReplicas(replicaStatus));
+            List<String> leadersByReplica = replicaStatus.nodes().stream()
+                    .filter(view -> view.status().catalogReplica().leader())
+                    .map(view -> view.status().nodeId())
+                    .toList();
+            assertEquals(1, leadersByReplica.size(), describeCatalogReplicas(replicaStatus));
+            for (NodeStatusView view : replicaStatus.nodes()) {
+                CatalogReplicaStatus replica = view.status().catalogReplica();
+                assertNotNull(replica, view.status().nodeId() + " sem catalogReplica");
+                assertTrue(replica.lagKnown(),
+                        view.status().nodeId() + " deveria conhecer o HWM do líder: " + replica);
+            }
+
             // nodeMetrics(ownerId): dono real (o que recebeu mais séries) reflete operações de verdade.
             String ownerId = status.seriesCountByNode().entrySet().stream()
                     .max(Map.Entry.comparingByValue())
@@ -229,6 +260,11 @@ class AdminStatusClusterTest {
 
     private static void awaitTrue(String description, Duration timeout, BooleanSupplier condition)
             throws InterruptedException {
+        awaitTrue(description, timeout, condition, () -> "");
+    }
+
+    private static void awaitTrue(String description, Duration timeout, BooleanSupplier condition,
+            Supplier<String> diagnostics) throws InterruptedException {
         long deadline = System.currentTimeMillis() + timeout.toMillis();
         while (System.currentTimeMillis() < deadline) {
             if (condition.getAsBoolean()) {
@@ -237,8 +273,40 @@ class AdminStatusClusterTest {
             Thread.sleep(150L);
         }
         if (!condition.getAsBoolean()) {
-            fail("Condição não satisfeita a tempo (" + timeout + "): " + description);
+            fail("Condição não satisfeita a tempo (" + timeout + "): " + description + " " + diagnostics.get());
         }
+    }
+
+    /**
+     * Se todo nó do status traz {@code catalogReplica}, exatamente um se declara líder e todo seguidor já
+     * conhece o high-watermark do líder ({@link CatalogReplicaStatus#lagKnown()}).
+     */
+    private static boolean catalogReplicasReported(AdminStatusResponse response) {
+        if (response.nodes().size() != STORAGE_NODE_COUNT) {
+            return false;
+        }
+        long leaders = 0;
+        for (NodeStatusView view : response.nodes()) {
+            CatalogReplicaStatus replica = view.status().catalogReplica();
+            if (replica == null || !replica.lagKnown()) {
+                return false;
+            }
+            if (replica.leader()) {
+                leaders++;
+            }
+        }
+        return leaders == 1;
+    }
+
+    private static String describeCatalogReplicas(AdminStatusResponse response) {
+        if (response == null) {
+            return "<nenhum>";
+        }
+        StringBuilder sb = new StringBuilder();
+        for (NodeStatusView view : response.nodes()) {
+            sb.append(view.status().nodeId()).append('=').append(view.status().catalogReplica()).append(' ');
+        }
+        return sb.toString();
     }
 
     /** {@link Handler} de JUL que só guarda as mensagens, para verificar o marcador {@code NGRRD_NODE_STATUS}. */

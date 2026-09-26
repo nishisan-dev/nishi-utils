@@ -20,10 +20,15 @@ package dev.nishisan.utils.oss.cluster.rebalance;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.oss.cluster.api.ErrorCode;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
+import dev.nishisan.utils.oss.cluster.catalog.CatalogReplicaStatus;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogView;
+import dev.nishisan.utils.oss.cluster.catalog.NodeState;
 import dev.nishisan.utils.oss.cluster.catalog.PlacementState;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
+import dev.nishisan.utils.oss.cluster.catalog.StorageCapabilities;
+import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.node.PlacementRequestHandler;
+import dev.nishisan.utils.oss.cluster.placement.DistributionMode;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.protocol.MigrateResponse;
 import dev.nishisan.utils.oss.cluster.protocol.MigrateStatus;
@@ -158,6 +163,75 @@ class MigrationCoordinatorTest {
 
         assertEquals(MigrationOutcome.SKIPPED, result.outcome());
         assertTrue(rpc.calls().isEmpty(), "não deveria ter feito nenhuma chamada RPC");
+    }
+
+    @Test
+    void destinoComReplicaDoCatalogoAtrasadaNaExecucaoResultaEmSkipped() throws Exception {
+        newCoordinator(2);
+        catalog.putPlacement("s1", SeriesPlacement.active(SRC, 1_000L));
+        catalog.putNodeStatus(withReplica(DST, new CatalogReplicaStatus(false, 5_000L, 9_000L, 4_001L, false, false,
+                true)));
+
+        MigrationResult result = coordinator.migrate("s1", SRC, DST).get(AWAIT_TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+
+        assertEquals(MigrationOutcome.SKIPPED, result.outcome());
+        assertEquals("destino " + DST + " com réplica do catálogo atrasada: lag=5000>1000", result.reason());
+        assertTrue(rpc.calls().isEmpty(), "não deveria ter feito nenhuma chamada RPC");
+        assertEquals(SeriesPlacement.active(SRC, 1_000L), catalog.placementStrong("s1").orElseThrow());
+    }
+
+    @Test
+    void destinoSincronizandoNaExecucaoResultaEmSkipped() throws Exception {
+        newCoordinator(2);
+        catalog.putPlacement("s1", SeriesPlacement.active(SRC, 1_000L));
+        catalog.putNodeStatus(withReplica(DST, new CatalogReplicaStatus(false, 0L, 9_000L, 1L, true, false, false)));
+
+        MigrationResult result = coordinator.migrate("s1", SRC, DST).get(AWAIT_TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+
+        assertEquals(MigrationOutcome.SKIPPED, result.outcome());
+        assertTrue(result.reason().endsWith("sincronizando"), result.reason());
+    }
+
+    @Test
+    void destinoQueEhOLiderAtualNaoPassaPelaPortaDeLag() throws Exception {
+        // Mesmo critério do Rebalancer: a réplica do líder é a fonte, mesmo que o último status que ele
+        // publicou seja de antes de assumir a liderança.
+        newCoordinator(2);
+        leaderView.leaderId = Optional.of(DST);
+        catalog.putPlacement("s1", SeriesPlacement.active(SRC, 1_000L));
+        catalog.putNodeStatus(withReplica(DST, CatalogReplicaStatus.from(false, null)));
+        rpc.respond(SRC, Commands.MIGRATE_START, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+        rpc.respond(DST, Commands.MIGRATE_STATUS,
+                (target, body) -> new MigrateResponse(MigrateStatus.COMMITTED, null, 10L));
+        rpc.respond(SRC, Commands.MIGRATE_FINISH, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+
+        MigrationResult result = coordinator.migrate("s1", SRC, DST).get(AWAIT_TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+
+        assertEquals(MigrationOutcome.COMPLETED, result.outcome(), result.reason());
+    }
+
+    @Test
+    void portaDesligadaNaoBarraDestinoAtrasado() throws Exception {
+        coordinator = new MigrationCoordinator(catalog, rpc, leaderView, 2, Duration.ofMillis(20),
+                Duration.ofSeconds(5), Clock.systemUTC(), new MigrationCoordinator.MigrationHooks() {
+                }, -1L);
+        coordinator.onLeaderChanged(NodeId.of("self"));
+        catalog.putPlacement("s1", SeriesPlacement.active(SRC, 1_000L));
+        catalog.putNodeStatus(withReplica(DST, new CatalogReplicaStatus(false, 5_000L, 9_000L, 4_001L, false, false,
+                true)));
+        rpc.respond(SRC, Commands.MIGRATE_START, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+        rpc.respond(DST, Commands.MIGRATE_STATUS,
+                (target, body) -> new MigrateResponse(MigrateStatus.COMMITTED, null, 10L));
+        rpc.respond(SRC, Commands.MIGRATE_FINISH, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+
+        MigrationResult result = coordinator.migrate("s1", SRC, DST).get(AWAIT_TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+
+        assertEquals(MigrationOutcome.COMPLETED, result.outcome());
+    }
+
+    private static StorageNodeStatus withReplica(String nodeId, CatalogReplicaStatus replica) {
+        return new StorageNodeStatus(nodeId, NodeState.ACTIVE, 0, 0, 0, 1L, DistributionMode.COUNT, 1, 0,
+                StorageCapabilities.ALL, replica);
     }
 
     @Test
@@ -855,14 +929,17 @@ class MigrationCoordinatorTest {
             return Optional.empty();
         }
 
+        /** Status de nós visíveis em {@link #nodesLocal} (a rechecagem do destino da issue #177). */
+        private final Map<String, StorageNodeStatus> nodeStatuses = new ConcurrentHashMap<>();
+
         @Override
-        public void putNodeStatus(dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus status) {
-            // Não usado por MigrationCoordinator — sem estado de nó a manter neste fake.
+        public void putNodeStatus(StorageNodeStatus status) {
+            nodeStatuses.put(status.nodeId(), status);
         }
 
         @Override
-        public Collection<dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus> nodesLocal() {
-            return List.of();
+        public Collection<StorageNodeStatus> nodesLocal() {
+            return List.copyOf(nodeStatuses.values());
         }
 
         /** Quantas varreduras da cópia local já aconteceram (uma por {@code placementsLocal()}). */
@@ -940,6 +1017,7 @@ class MigrationCoordinatorTest {
     /** {@link PlacementRequestHandler.LeaderView} fake. */
     private static final class LeaderViewFake implements PlacementRequestHandler.LeaderView {
         private volatile boolean leader;
+        private volatile Optional<String> leaderId = Optional.empty();
 
         @Override
         public boolean isLeader() {
@@ -948,7 +1026,7 @@ class MigrationCoordinatorTest {
 
         @Override
         public Optional<String> leaderId() {
-            return Optional.empty();
+            return leaderId;
         }
 
         @Override
