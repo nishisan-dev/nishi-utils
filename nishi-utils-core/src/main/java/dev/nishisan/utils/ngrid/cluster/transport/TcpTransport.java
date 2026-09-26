@@ -1562,6 +1562,28 @@ public final class TcpTransport implements Transport {
     }
 
     /**
+     * Tombstone of an operator decommission ({@link #decommissionPeer}, revisão #178 B9): long enough
+     * for every node of the cluster to receive the order and for the gossip of the ones that have not
+     * yet to be ignored meanwhile; a new incarnation under the same id lifts it with its own handshake.
+     */
+    static final java.time.Duration DECOMMISSION_TOMBSTONE_TTL = java.time.Duration.ofHours(24);
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>First-hand by definition (an operator order), so it applies to a leader-eligible voter as well:
+     * the only path that ever forgets one. The tombstone lasts {@link #DECOMMISSION_TOMBSTONE_TTL}.</p>
+     */
+    @Override
+    public boolean decommissionPeer(NodeId nodeId) {
+        boolean forgotten = forget(nodeId, DECOMMISSION_TOMBSTONE_TTL.toMillis(), "decommission");
+        if (forgotten) {
+            broadcastPeerList(); // tell the peers (admission-only for them, see handlePeerUpdate)
+        }
+        return forgotten;
+    }
+
+    /**
      * Forgets a departed peer for good and tombstones its id for
      * {@link TcpTransportConfig#departedPeerTombstoneTtl()}.
      *

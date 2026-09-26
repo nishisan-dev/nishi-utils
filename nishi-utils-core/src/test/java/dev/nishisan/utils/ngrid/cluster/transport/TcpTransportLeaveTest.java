@@ -464,6 +464,46 @@ class TcpTransportLeaveTest {
         assertFalse(storage.isDeparted(voterId));
     }
 
+    /** Revisão #178 (B9): a ordem do operador é o único caminho que esquece um votante. */
+    @Test
+    void decommissionForgetsALeaderEligibleVoterAndTombstonesItAgainstGossip() throws Exception {
+        TcpTransport storage = start(TcpTransportConfig.builder(info("a-storage", freePort(), false))
+                .reconnectInterval(RECONNECT));
+        TcpTransport voter = start(TcpTransportConfig.builder(info("m-storage", freePort(), false))
+                .reconnectInterval(RECONNECT)
+                .addPeer(storage.local()));
+        NodeId voterId = voter.local().nodeId();
+        NodeInfo voterInfo = voter.local();
+        awaitHandshaked(voter, storage);
+        RecordingListener events = listen(storage);
+        voter.close();
+        awaitTrue(() -> !storage.isConnected(voterId), "desconexão não percebida");
+        assertTrue(knows(storage, voterId), "um votante que só fechou continua conhecido");
+        assertFalse(storage.decommissionPeer(NodeId.of("never-known")), "id desconhecido: nada a esquecer");
+
+        assertTrue(storage.decommissionPeer(voterId), "o votante conhecido é esquecido");
+        assertFalse(knows(storage, voterId), "sai dos peers conhecidos (e da maioria de votantes)");
+        assertTrue(storage.isDeparted(voterId), "tombstone longo");
+        assertTrue(events.peerEvents(voterId).contains("left:m-storage"), "listeners recebem onPeerLeft: "
+                + events.peerEvents(voterId));
+        assertFalse(storage.decommissionPeer(voterId), "idempotente: já esquecido");
+
+        // Gossip de um terceiro que ainda lista o votante não o traz de volta.
+        RawPeer gossiper = raw(storage);
+        gossiper.send(handshake(info("g-storage", freePort(), false), storage.local(), Set.of(voterInfo)));
+        awaitTrue(() -> storage.isConnected(NodeId.of("g-storage")), "gossiper não conectou");
+        Thread.sleep(RECONNECT.toMillis() * 4);
+        assertFalse(knows(storage, voterId), "gossip (segunda mão) não readmite um votante esquecido");
+
+        // Uma nova encarnação sob o mesmo id (handshake direto) levanta o tombstone.
+        TcpTransport reborn = start(TcpTransportConfig.builder(voterInfo).reconnectInterval(RECONNECT)
+                .addPeer(storage.local()));
+        awaitTrue(() -> storage.isConnected(voterId) && knows(storage, voterId),
+                "a nova encarnação deveria ser aceita pelo handshake direto");
+        assertFalse(storage.isDeparted(voterId));
+        reborn.close();
+    }
+
     @Test
     void leaveIsSentOnlyToPeersThatAnnouncedSupport() throws Exception {
         TcpTransport closing = start(TcpTransportConfig.builder(info("z-client", freePort(), true)));
