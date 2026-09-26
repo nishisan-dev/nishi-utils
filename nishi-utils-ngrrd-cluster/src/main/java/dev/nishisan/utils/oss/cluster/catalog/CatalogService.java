@@ -177,6 +177,17 @@ public final class CatalogService implements CatalogView {
     public void putNodeStatus(StorageNodeStatus status) {
         nodes.put(status.nodeId(), status);
     }
+
+    /**
+     * Remove o status de um storage node esquecido ({@code ngrrd.admin.forget}, revisão #178 B9): ele
+     * deixa de aparecer no {@code status} e de ser considerado por placement/rebalance. Roteado ao líder
+     * pelo próprio {@link DistributedMap}. Um nó que volte a subir com esse id publica um status novo.
+     *
+     * @since 8.8.0
+     */
+    public void removeNodeStatus(String nodeId) {
+        nodes.remove(Objects.requireNonNull(nodeId, "nodeId"));
+    }
     @Override
     public boolean geometryTrackingEnabled() { return geometries != null; }
 

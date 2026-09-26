@@ -25,6 +25,8 @@ import dev.nishisan.utils.oss.cluster.catalog.NodeState;
 import dev.nishisan.utils.oss.cluster.catalog.PlacementState;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.node.PlacementRequestHandler;
+import dev.nishisan.utils.oss.cluster.placement.DestinationEligibility;
+import dev.nishisan.utils.oss.cluster.placement.PlacementRules;
 import dev.nishisan.utils.oss.cluster.rebalance.MigrationCoordinator.MigrationResult;
 
 import java.io.Closeable;
@@ -70,6 +72,8 @@ public final class Rebalancer implements LeadershipListener, ClusterCoordinator.
     private final Duration rebalanceInterval;
     private final Duration migrationTimeout;
     private final Clock clock;
+    /** Regras de placement deste líder ({@code ngrrd.placement.rules}, issue #167 item 3); nunca {@code null}. */
+    private final PlacementRules placementRules;
     private final ScheduledExecutorService scheduler;
 
     private final AtomicBoolean running = new AtomicBoolean(false);
@@ -84,6 +88,18 @@ public final class Rebalancer implements LeadershipListener, ClusterCoordinator.
     public Rebalancer(CatalogService catalog, PlacementRequestHandler.LeaderView leaderView,
             MigrationCoordinator coordinator, RebalanceSettings settings, boolean rebalanceEnabled,
             Duration rebalanceInterval, Duration migrationTimeout, Clock clock) {
+        this(catalog, leaderView, coordinator, settings, rebalanceEnabled, rebalanceInterval, migrationTimeout, clock,
+                PlacementRules.NONE);
+    }
+
+    /**
+     * @param placementRules regras de placement deste nó ({@code ngrrd.placement.rules}, issue #167 item 3),
+     *                       aplicadas ao planejar quando ele é o líder; {@code null} = nenhuma
+     */
+    public Rebalancer(CatalogService catalog, PlacementRequestHandler.LeaderView leaderView,
+            MigrationCoordinator coordinator, RebalanceSettings settings, boolean rebalanceEnabled,
+            Duration rebalanceInterval, Duration migrationTimeout, Clock clock, PlacementRules placementRules) {
+        this.placementRules = Objects.requireNonNullElse(placementRules, PlacementRules.NONE);
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.leaderView = Objects.requireNonNull(leaderView, "leaderView");
         this.coordinator = Objects.requireNonNull(coordinator, "coordinator");
@@ -353,25 +369,68 @@ public final class Rebalancer implements LeadershipListener, ClusterCoordinator.
                 .filter(entry -> entry.getValue().state() == PlacementState.MIGRATING)
                 .map(Map.Entry::getKey)
                 .collect(Collectors.toUnmodifiableSet());
-        Map<String, String> excluded = excludedDestinations(nodes, reachable);
-        return new CyclePlan(planMoves(nodes, seriesByOwner, reachable, migratingKeys, excluded.keySet()), excluded);
+        Pending pending = pendingFromCatalog(nodes);
+        Map<String, String> excluded = excludedDestinations(nodes, reachable, pending);
+        return new CyclePlan(planMoves(nodes, seriesByOwner, reachable, migratingKeys, excluded.keySet(), pending),
+                excluded);
     }
 
     /**
-     * Destinos candidatos ({@code ACTIVE} e alcançáveis) excluídos pela réplica do catálogo, em ordem de
-     * {@code nodeId}. O próprio líder nunca é excluído: a réplica dele é a fonte, mesmo que o último status
-     * que publicou seja de antes de assumir.
+     * Uma passada por {@code placementsLocal()} para tudo que o ciclo precisa: tamanhos confirmados, bytes e
+     * séries pendentes por nó (alocações/migrações ainda não refletidas no status) e o {@code definitionName}
+     * conhecido de cada série (issue #167, item 3). {@code sizes} só é preenchido com o rastreio de geometria
+     * ligado; os demais mapas valem sempre.
      */
-    private Map<String, String> excludedDestinations(Collection<StorageNodeStatus> nodes, Set<String> reachable) {
+    private record Pending(Map<String, Long> sizes, Map<String, Long> bytesByNode, Map<String, Long> seriesByNode,
+            Map<String, String> definitionNameBySeries) {
+    }
+
+    private Pending pendingFromCatalog(Collection<StorageNodeStatus> nodes) {
+        boolean tracking = catalog.geometryTrackingEnabled();
+        Map<String, Long> sizes = new java.util.HashMap<>();
+        Map<String, Long> pendingBytes = new java.util.HashMap<>();
+        Map<String, Long> pendingSeries = new java.util.HashMap<>();
+        Map<String, String> definitionNames = new java.util.HashMap<>();
+        Map<String, Long> reported = new java.util.HashMap<>();
+        nodes.forEach(n -> reported.put(n.nodeId(), n.reportedAtEpochMs()));
+        catalog.placementsLocal().forEach((key, placement) -> {
+            if (placement.definitionName() != null) { definitionNames.put(key, placement.definitionName()); }
+            String target = placement.targetNodeId() != null ? placement.targetNodeId() : placement.ownerNodeId();
+            if (placement.targetNodeId() != null) { pendingSeries.merge(target, 1L, Long::sum); }
+            if (!tracking) { return; }
+            var geometry = catalog.geometryLocal(placement.geometryId());
+            if (placement.geometryConfirmed()) { geometry.ifPresent(g -> sizes.put(key, g.regionBytes())); }
+            if (placement.targetNodeId() != null || !placement.geometryConfirmed()
+                    || placement.updatedAtEpochMs() >= reported.getOrDefault(target, 0L)) {
+                geometry.ifPresent(g -> pendingBytes.merge(target, g.regionBytes(), Math::addExact));
+            }
+        });
+        return new Pending(sizes, pendingBytes, pendingSeries, definitionNames);
+    }
+
+    /**
+     * Destinos candidatos ({@code ACTIVE} e alcançáveis) excluídos pela réplica do catálogo (issue #177) ou
+     * pela própria cota dura ({@code quota_series}/{@code quota_bytes}, issue #167 item 3 — motivo de nó,
+     * independente da série), em ordem de {@code nodeId}. O próprio líder nunca é excluído pela réplica: a
+     * dele é a fonte, mesmo que o último status que publicou seja de antes de assumir; a cota vale para ele
+     * como para qualquer outro.
+     */
+    private Map<String, String> excludedDestinations(Collection<StorageNodeStatus> nodes, Set<String> reachable,
+            Pending pending) {
         Optional<String> leaderId = leaderView.leaderId();
         Map<String, String> excluded = new TreeMap<>();
         for (StorageNodeStatus node : nodes) {
-            if (node.state() != NodeState.ACTIVE || !reachable.contains(node.nodeId())
-                    || leaderId.map(node.nodeId()::equals).orElse(false)) {
+            if (node.state() != NodeState.ACTIVE || !reachable.contains(node.nodeId())) {
                 continue;
             }
-            CatalogLagGate.exclusionReason(node, settings.maxDestinationCatalogLag())
-                    .ifPresent(reason -> excluded.put(node.nodeId(), reason));
+            Optional<String> reason = leaderId.map(node.nodeId()::equals).orElse(false) ? Optional.empty()
+                    : CatalogLagGate.exclusionReason(node, settings.maxDestinationCatalogLag());
+            if (reason.isEmpty()) {
+                reason = DestinationEligibility.quotaReason(node,
+                        pending.seriesByNode().getOrDefault(node.nodeId(), 0L),
+                        pending.bytesByNode().getOrDefault(node.nodeId(), 0L), 0L);
+            }
+            reason.ifPresent(r -> excluded.put(node.nodeId(), r));
         }
         if (!excluded.isEmpty()) {
             Level level = excluded.equals(lastExcludedDestinations) ? Level.FINE : Level.INFO;
@@ -384,33 +443,28 @@ public final class Rebalancer implements LeadershipListener, ClusterCoordinator.
     }
 
     private List<Move> planMoves(Collection<StorageNodeStatus> nodes, Map<String, List<String>> seriesByOwner,
-            Set<String> reachable, Set<String> migratingKeys, Set<String> excludedDestinations) {
-        if (!catalog.geometryTrackingEnabled()) {
-            return RebalancePlanner.plan(nodes, seriesByOwner, reachable, migratingKeys, settings,
-                    excludedDestinations);
+            Set<String> reachable, Set<String> migratingKeys, Set<String> excludedDestinations, Pending pending) {
+        Map<String, Long> sizes;
+        Map<String, Long> pendingBytes;
+        if (catalog.geometryTrackingEnabled()) {
+            sizes = pending.sizes();
+            pendingBytes = pending.bytesByNode();
+        } else {
+            // Sem rastreio de geometria: tamanho desconhecido (0) para toda série — só destinos sem
+            // capacidade declarada podem recebê-la (mesma semântica da sobrecarga legada do planejador).
+            sizes = new java.util.HashMap<>();
+            seriesByOwner.values().forEach(keys -> keys.forEach(key -> sizes.put(key, 0L)));
+            pendingBytes = Map.of();
         }
-        Map<String, Long> sizes = new java.util.HashMap<>();
-        Map<String, Long> pendingBytes = new java.util.HashMap<>();
-        Map<String, Long> pendingSeries = new java.util.HashMap<>();
-        Map<String, Long> reported = new java.util.HashMap<>();
-        nodes.forEach(n -> reported.put(n.nodeId(), n.reportedAtEpochMs()));
-        catalog.placementsLocal().forEach((key, placement) -> {
-            var geometry = catalog.geometryLocal(placement.geometryId());
-            if (placement.geometryConfirmed()) { geometry.ifPresent(g -> sizes.put(key, g.regionBytes())); }
-            String target = placement.targetNodeId() != null ? placement.targetNodeId() : placement.ownerNodeId();
-            if (placement.targetNodeId() != null) { pendingSeries.merge(target, 1L, Long::sum); }
-            if (placement.targetNodeId() != null || !placement.geometryConfirmed()
-                    || placement.updatedAtEpochMs() >= reported.getOrDefault(target, 0L)) {
-                geometry.ifPresent(g -> pendingBytes.merge(target, g.regionBytes(), Math::addExact));
-            }
-        });
-        var plan = RebalancePlanner.plan(nodes, seriesByOwner, reachable, migratingKeys, settings,
-                sizes, pendingBytes, pendingSeries, excludedDestinations);
-        if (plan.isEmpty() && nodes.stream().anyMatch(n -> n.state() == NodeState.DRAINING
+        RebalancePlanner.Plan plan = RebalancePlanner.plan(nodes, seriesByOwner, reachable, migratingKeys, settings,
+                sizes, pendingBytes, pending.seriesByNode(), excludedDestinations, placementRules,
+                pending.definitionNameBySeries());
+        if (plan.moves().isEmpty() && nodes.stream().anyMatch(n -> n.state() == NodeState.DRAINING
                 && !seriesByOwner.getOrDefault(n.nodeId(), List.of()).isEmpty())) {
-            LOGGER.info("NGRRD_DRAIN_PENDING reason=no_admissible_destination_or_confirmed_geometry");
+            LOGGER.info("NGRRD_DRAIN_PENDING reason=no_admissible_destination_or_confirmed_geometry_or_quota_or_rules"
+                    + " rulesSkipped=" + plan.rulesSkipped());
         }
-        return plan;
+        return plan.moves();
     }
 
     @Override

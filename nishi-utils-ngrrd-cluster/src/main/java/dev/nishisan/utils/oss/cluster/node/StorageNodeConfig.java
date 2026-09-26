@@ -18,6 +18,8 @@
 package dev.nishisan.utils.oss.cluster.node;
 
 import dev.nishisan.utils.oss.cluster.placement.DistributionMode;
+import dev.nishisan.utils.oss.cluster.placement.PlacementRule;
+import dev.nishisan.utils.oss.cluster.placement.PlacementRules;
 import dev.nishisan.utils.oss.cluster.rebalance.RebalanceSettings;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
@@ -34,8 +36,11 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 import java.util.function.Function;
 
 /**
@@ -154,6 +159,12 @@ import java.util.function.Function;
  *                                 atrasada que isso, sincronizando ou com lag desconhecido, e o
  *                                 {@code MigrationCoordinator} recheca na execução. Default 1000; {@code -1}
  *                                 desliga; {@code 0} exige a réplica em dia
+ * @param quotaMaxSeries           cota dura de séries deste nó ({@code ngrrd.quota.maxSeries}, issue #167 item 3):
+ *                                 o líder não coloca nem migra para cá séries além dela; {@code 0} = sem limite
+ * @param quotaMaxBytes            cota dura de bytes ocupados+reservados ({@code ngrrd.quota.maxBytes});
+ *                                 {@code 0} = sem limite
+ * @param placementRules           regras de placement ({@code ngrrd.placement.rules}), uniformes em todos os
+ *                                 nós; o líder aplica a cópia dele. Nunca {@code null} ({@link PlacementRules#NONE})
  */
 public record StorageNodeConfig(
         String nodeId,
@@ -196,7 +207,64 @@ public record StorageNodeConfig(
         DistributionMode distributionMode,
         double weight,
         long migrationBytesPerSecond,
+        long maxDestinationCatalogLag,
+        long quotaMaxSeries,
+        long quotaMaxBytes,
+        PlacementRules placementRules) {
+
+    /** Construtor de compatibilidade (forma da 8.7.0), sem cota nem regras de placement. */
+    public StorageNodeConfig(
+        String nodeId,
+        String host,
+        int port,
+        String seed,
+        List<String> peers,
+        Path dataDir,
+        int priority,
+        Path volumeDir,
+        String volumeName,
+        int shardCount,
+        long segmentBytes,
+        long initialShardCapacityBytes,
+        long capacityBytes,
+        Duration statusReportInterval,
+        Duration nodeStatusStaleAfter,
+        Duration handleIdleTtl,
+        int maxOpenHandles,
+        Duration requestTimeout,
+        Durability defaultDurability,
+        OnGeometryChange defaultOnGeometryChange,
+        NgrrdClusterMetricsListener metricsListener,
+        Duration bootDiscoveryWindow,
+        boolean affinityHandbackMode,
+        Duration placementGraceAfterLeadership,
+        boolean rebalanceEnabled,
+        Duration rebalanceInterval,
+        long rebalanceMinDelta,
+        double rebalanceTolerance,
+        int maxConcurrentMigrations,
+        int maxMovesPerCycle,
+        Duration migrationTimeout,
+        long migrationChunkBytes,
+        long maxSeriesBytes,
+        Duration migrationStatusPollInterval,
+        Duration reconcileInterval,
+        Duration orphanGrace,
+        String seriesObjectPrefix,
+        DistributionMode distributionMode,
+        double weight,
+        long migrationBytesPerSecond,
         long maxDestinationCatalogLag) {
+        this(nodeId, host, port, seed, peers, dataDir, priority, volumeDir, volumeName, shardCount, segmentBytes,
+                initialShardCapacityBytes, capacityBytes, statusReportInterval, nodeStatusStaleAfter,
+                handleIdleTtl, maxOpenHandles, requestTimeout, defaultDurability, defaultOnGeometryChange,
+                metricsListener, bootDiscoveryWindow, affinityHandbackMode, placementGraceAfterLeadership,
+                rebalanceEnabled, rebalanceInterval, rebalanceMinDelta, rebalanceTolerance,
+                maxConcurrentMigrations, maxMovesPerCycle, migrationTimeout, migrationChunkBytes, maxSeriesBytes,
+                migrationStatusPollInterval, reconcileInterval, orphanGrace, seriesObjectPrefix,
+                distributionMode, weight, migrationBytesPerSecond, maxDestinationCatalogLag,
+                0L, 0L, PlacementRules.NONE);
+    }
 
     /** Construtor de compatibilidade (forma da 8.6.0), com {@code maxDestinationCatalogLag} no default. */
     public StorageNodeConfig(
@@ -360,6 +428,13 @@ public record StorageNodeConfig(
         if (!Double.isFinite(weight) || weight <= 0) {
             throw new IllegalArgumentException("weight must be positive and finite");
         }
+        if (quotaMaxSeries < 0) {
+            throw new IllegalArgumentException("ngrrd.quota.maxSeries deve ser >= 0 (0 = sem limite): " + quotaMaxSeries);
+        }
+        if (quotaMaxBytes < 0) {
+            throw new IllegalArgumentException("ngrrd.quota.maxBytes deve ser >= 0 (0 = sem limite): " + quotaMaxBytes);
+        }
+        placementRules = Objects.requireNonNullElse(placementRules, PlacementRules.NONE);
         Objects.requireNonNull(nodeId, "nodeId é obrigatório");
         if (nodeId.isBlank()) {
             throw new IllegalArgumentException("nodeId não pode ser vazio");
@@ -569,6 +644,17 @@ public record StorageNodeConfig(
                 builder.distributionMode(ngrrd.distribution.mode);
             }
             if (ngrrd.weight != null) { builder.weight(ngrrd.weight); }
+            if (ngrrd.quota != null) {
+                if (ngrrd.quota.maxSeries != null) {
+                    builder.quotaMaxSeries(ngrrd.quota.maxSeries);
+                }
+                if (ngrrd.quota.maxBytes != null) {
+                    builder.quotaMaxBytes(ngrrd.quota.maxBytes);
+                }
+            }
+            if (ngrrd.placement != null && ngrrd.placement.rules != null) {
+                builder.placementRules(parseRules(ngrrd.placement.rules));
+            }
             RebalanceSection rebalance = ngrrd.rebalance;
             if (rebalance != null) {
                 if (rebalance.enabled != null) {
@@ -622,6 +708,33 @@ public record StorageNodeConfig(
                 throw new IllegalArgumentException(message);
             }
         }
+
+        /**
+         * Converte {@code ngrrd.placement.rules[]}; uma regra malformada (sem nome, sem critério, sem
+         * exatamente um de pin/exclude) ou um nome duplicado falha o boot com a posição na mensagem.
+         */
+        private static PlacementRules parseRules(List<RuleSection> sections) {
+            List<PlacementRule> rules = new ArrayList<>(sections.size());
+            for (int i = 0; i < sections.size(); i++) {
+                RuleSection section = sections.get(i);
+                try {
+                    require(section != null, "regra vazia");
+                    rules.add(new PlacementRule(section.name, section.definition, section.keyPrefix,
+                            toSet(section.pin), toSet(section.exclude)));
+                } catch (IllegalArgumentException | NullPointerException e) {
+                    throw new IllegalArgumentException("ngrrd.placement.rules[" + i + "]: " + e.getMessage(), e);
+                }
+            }
+            try {
+                return PlacementRules.of(rules);
+            } catch (IllegalArgumentException e) {
+                throw new IllegalArgumentException("ngrrd.placement.rules: " + e.getMessage(), e);
+            }
+        }
+
+        private static Set<String> toSet(List<String> ids) {
+            return ids == null ? Set.of() : new LinkedHashSet<>(ids);
+        }
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
@@ -650,6 +763,28 @@ public record StorageNodeConfig(
         public DistributionSection distribution;
         public Double weight;
         public ReconcileSection reconcile;
+        public QuotaSection quota;
+        public PlacementSection placement;
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private static final class QuotaSection {
+        public Long maxSeries;
+        public Long maxBytes;
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private static final class PlacementSection {
+        public List<RuleSection> rules;
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private static final class RuleSection {
+        public String name;
+        public String definition;
+        public String keyPrefix;
+        public List<String> pin;
+        public List<String> exclude;
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
@@ -706,6 +841,9 @@ public record StorageNodeConfig(
         private long capacityBytes = 0L;
         private DistributionMode distributionMode = DistributionMode.COUNT;
         private double weight = 1.0;
+        private long quotaMaxSeries = 0L;
+        private long quotaMaxBytes = 0L;
+        private PlacementRules placementRules = PlacementRules.NONE;
         private Duration statusReportInterval = Duration.ofSeconds(10);
         /** {@code null} = calculado em {@link #build()} a partir de {@link #statusReportInterval}. */
         private Duration nodeStatusStaleAfter;
@@ -970,6 +1108,13 @@ public record StorageNodeConfig(
         /** Explicit relative node weight (default 1). */
         public Builder weight(double weight) { this.weight = weight; return this; }
 
+        /** Cota dura de séries deste nó ({@code ngrrd.quota.maxSeries}); {@code 0} = sem limite (default). */
+        public Builder quotaMaxSeries(long quotaMaxSeries) { this.quotaMaxSeries = quotaMaxSeries; return this; }
+        /** Cota dura de bytes ocupados+reservados ({@code ngrrd.quota.maxBytes}); {@code 0} = sem limite (default). */
+        public Builder quotaMaxBytes(long quotaMaxBytes) { this.quotaMaxBytes = quotaMaxBytes; return this; }
+        /** Regras de placement ({@code ngrrd.placement.rules}); default {@link PlacementRules#NONE}. */
+        public Builder placementRules(PlacementRules placementRules) { this.placementRules = placementRules; return this; }
+
         public StorageNodeConfig build() {
             Duration resolvedStaleAfter = nodeStatusStaleAfter != null
                     ? nodeStatusStaleAfter
@@ -982,7 +1127,8 @@ public record StorageNodeConfig(
                     rebalanceEnabled, rebalanceInterval, rebalanceMinDelta, rebalanceTolerance,
                     maxConcurrentMigrations, maxMovesPerCycle, migrationTimeout, migrationChunkBytes,
                     maxSeriesBytes, migrationStatusPollInterval, reconcileInterval, orphanGrace,
-                    seriesObjectPrefix, distributionMode, weight, migrationBytesPerSecond, maxDestinationCatalogLag);
+                    seriesObjectPrefix, distributionMode, weight, migrationBytesPerSecond, maxDestinationCatalogLag,
+                    quotaMaxSeries, quotaMaxBytes, placementRules);
         }
 
         private static Duration maxDuration(Duration a, Duration b) {

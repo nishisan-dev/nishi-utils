@@ -32,13 +32,31 @@ public final class HandbackCompletePayload {
 
     private final long cutoverWatermark;
     private final long newEpoch;
+    private final java.util.Map<String, Long> cutoverByTopic;
 
     @JsonCreator
     public HandbackCompletePayload(
             @JsonProperty("cutoverWatermark") long cutoverWatermark,
-            @JsonProperty("newEpoch") long newEpoch) {
+            @JsonProperty("newEpoch") long newEpoch,
+            @JsonProperty("cutoverByTopic") java.util.Map<String, Long> cutoverByTopic) {
         this.cutoverWatermark = cutoverWatermark;
         this.newEpoch = newEpoch;
+        this.cutoverByTopic = cutoverByTopic == null || cutoverByTopic.isEmpty()
+                ? java.util.Map.of()
+                : java.util.Collections.unmodifiableMap(new java.util.TreeMap<>(cutoverByTopic));
+    }
+
+    /** Compatibility constructor (pre-#178): single cutover watermark. */
+    public HandbackCompletePayload(long cutoverWatermark, long newEpoch) {
+        this(cutoverWatermark, newEpoch, null);
+    }
+
+    /**
+     * The candidate's cutover frontier PER TOPIC (revisão #178, C2): the incumbent re-anchors every
+     * topic on demotion instead of an arbitrary "primary" one. Empty from an older candidate.
+     */
+    public java.util.Map<String, Long> cutoverByTopic() {
+        return cutoverByTopic;
     }
 
     public long cutoverWatermark() {

@@ -335,12 +335,14 @@ public final class NGridNode implements Closeable {
         });
         int derivedMinClusterSize = Math.max(1, Math.min(config.replicationQuorum(), config.peers().size() + 1));
         int minClusterSize = config.minClusterSize() != null ? config.minClusterSize() : derivedMinClusterSize;
+        // Revisão #178 (C8): persist the leader epoch under the data directory so a restarted node
+        // never regresses the cluster term (a null directory silently disabled persistence).
         ClusterCoordinatorConfig coordinatorConfig = ClusterCoordinatorConfig.of(
                 config.heartbeatInterval(),
                 config.heartbeatInterval().multipliedBy(3),
                 config.leaseTimeout(),
                 minClusterSize,
-                null)
+                config.dataDirectory())
                 .withPairMode(config.pairMode())
                 .withBootDiscoveryWindow(
                         config.bootDiscoveryWindow() != null ? config.bootDiscoveryWindow() : Duration.ZERO);
@@ -384,6 +386,7 @@ public final class NGridNode implements Closeable {
         replicationBuilder.reclaimQuiesceMaxDuration(config.reclaimQuiesceMaxDuration());
         replicationBuilder.reclaimQuiesceCooldown(config.reclaimQuiesceCooldown());
         replicationBuilder.affinityHandbackMode(config.affinityHandbackMode());
+        replicationBuilder.priorityTopics(config.priorityTopics());
         replicationBuilder.handoverMaxDuration(config.handoverMaxDuration());
         replicationBuilder.handoverSnapshotTimeout(config.handoverSnapshotTimeout());
         replicationBuilder.handoverRequestTimeout(config.handoverRequestTimeout());
@@ -569,6 +572,22 @@ public final class NGridNode implements Closeable {
 
     public NGridConfig config() {
         return config;
+    }
+
+    /**
+     * Decommissions a leader-eligible peer on THIS node (revisão #178, B9): the transport forgets it
+     * (tombstoned for a long window, out of the voter majority) and the coordinator drops it from the
+     * membership at once. Must be run on every node of the cluster; the peer must already be down.
+     *
+     * @param nodeId the voter to forget
+     * @return {@code true} if the transport knew the peer
+     * @since 8.8.0
+     */
+    public boolean decommissionPeer(NodeId nodeId) {
+        java.util.Objects.requireNonNull(nodeId, "nodeId");
+        boolean forgotten = transport.decommissionPeer(nodeId);
+        coordinator.onPeerLeft(nodeId);
+        return forgotten;
     }
 
     public Transport transport() {
@@ -765,7 +784,12 @@ public final class NGridNode implements Closeable {
 
         long globalSeq = replicationManager.getGlobalSequence();
         long lastApplied = replicationManager.getLastAppliedSequence();
-        long lag = replicationLag(isLeader, trackedHighWatermark, lastApplied);
+        // Issue #178: the lag is the SUM of the per-topic lags (leader HWM per topic learned from the
+        // stream) whenever at least one topic's leader HWM is known; the scalar difference is only the
+        // fallback for a follower that has not streamed anything yet.
+        long topicLag = replicationManager.getTotalReplicationLag();
+        long lag = isLeader ? 0L
+                : topicLag >= 0L ? topicLag : replicationLag(isLeader, trackedHighWatermark, lastApplied);
         long gaps = replicationManager.getGapsDetected();
         long resendSuccess = replicationManager.getResendSuccessCount();
         long snapshotFallback = replicationManager.getSnapshotFallbackCount();
@@ -811,7 +835,8 @@ public final class NGridNode implements Closeable {
                 outboundDepthByNode,
                 outboundDroppedByNode,
                 ioStats,
-                Instant.now());
+                Instant.now(),
+                replicationManager.appliedFrontiers().byTopic());
     }
 
     @Override
@@ -843,6 +868,19 @@ public final class NGridNode implements Closeable {
                 if (first == null) {
                     first = e;
                 }
+            }
+        }
+        // Revisão #178 (C4): step down BEFORE closing the replication manager. Closing it first left a
+        // window where the node still answered isLeader()/hasValidLease() with its op-log already
+        // closed, so every write failed "op-log append failed … write not durable" while clients kept
+        // being routed here.
+        try {
+            if (coordinator != null) {
+                coordinator.stop();
+            }
+        } catch (RuntimeException e) {
+            if (first == null) {
+                first = new IOException("Failed to stop coordinator", e);
             }
         }
         try {

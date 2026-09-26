@@ -60,6 +60,8 @@ import java.util.Map;
  *                                   backpressure per node (cumulative)
  * @param ioStats                    the I/O statistics snapshot
  * @param capturedAt                 the timestamp when the snapshot was taken
+ * @param appliedByTopic             the applied frontier per replication topic (issue #178); the sum
+ *                                   equals {@code lastAppliedSequence}
  */
 public record NGridOperationalSnapshot(
                 // ── Cluster ──
@@ -94,5 +96,27 @@ public record NGridOperationalSnapshot(
                 NGridStatsSnapshot ioStats,
 
                 // ── Timestamp ──
-                Instant capturedAt) {
+                Instant capturedAt,
+
+                // ── Per-topic applied frontiers (issue #178) ──
+                Map<String, Long> appliedByTopic) {
+
+    /** Compatibility constructor (pre-#178): no per-topic frontiers. */
+    public NGridOperationalSnapshot(String localNodeId, String leaderId, long leaderEpoch, long trackedLeaderEpoch,
+            int activeMembersCount, boolean isLeader, boolean hasValidLease, long trackedLeaderHighWatermark,
+            long globalSequence, long lastAppliedSequence, long replicationLag, long gapsDetected,
+            long resendSuccessCount, long snapshotFallbackCount, double averageConvergenceTimeMs,
+            int pendingOperationsCount, int reachableNodesCount, int totalNodesCount,
+            Map<String, Integer> outboundQueueDepthByNode, Map<String, Long> outboundDroppedByNode,
+            NGridStatsSnapshot ioStats, Instant capturedAt) {
+        this(localNodeId, leaderId, leaderEpoch, trackedLeaderEpoch, activeMembersCount, isLeader, hasValidLease,
+                trackedLeaderHighWatermark, globalSequence, lastAppliedSequence, replicationLag, gapsDetected,
+                resendSuccessCount, snapshotFallbackCount, averageConvergenceTimeMs, pendingOperationsCount,
+                reachableNodesCount, totalNodesCount, outboundQueueDepthByNode, outboundDroppedByNode, ioStats,
+                capturedAt, Map.of());
+    }
+
+    public NGridOperationalSnapshot {
+        appliedByTopic = appliedByTopic == null ? Map.of() : Map.copyOf(appliedByTopic);
+    }
 }

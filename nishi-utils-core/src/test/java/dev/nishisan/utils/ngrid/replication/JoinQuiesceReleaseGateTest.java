@@ -43,11 +43,15 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -176,6 +180,92 @@ class JoinQuiesceReleaseGateTest {
         }
     }
 
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    @DisplayName("#178: o release do quiesce compara a fronteira POR TÓPICO, não a soma")
+    void releaseComparesPerTopicFrontiers() throws Exception {
+        // Líder com dois tópicos: 10.000 aplicadas em `cardinal-state` e 5 em `map:status`.
+        Map<String, Long> persisted = new HashMap<>();
+        persisted.put(TOPIC, PROMOTED_APPLIED + 1L);
+        persisted.put("map:status", 6L);
+        persisted.put("_global", PROMOTED_GLOBAL);
+        persisted.put("_topic:" + TOPIC, PROMOTED_GLOBAL);
+        try (java.io.ObjectOutputStream oos = new java.io.ObjectOutputStream(
+                Files.newOutputStream(tempDir.resolve("sequence-state.dat")))) {
+            oos.writeObject(persisted);
+        }
+        try (Harness h = new Harness(tempDir, scheduler, Duration.ofSeconds(60))) {
+            h.manager.start();
+            h.awaitSelfLeadership(10_000);
+            assertEquals(PROMOTED_APPLIED + 5L, h.manager.getLastAppliedSequence(), "soma das fronteiras");
+
+            h.connectJoiner();
+            h.awaitQuiescing(true, 5_000);
+
+            // Soma igual (10.005) mas atrás no tópico principal: com o agregado liberaria; por tópico, não.
+            h.deliverFollowerProgress(PROMOTED_APPLIED + 5L, h.coordinator.getLeaderEpoch(),
+                    Map.of(TOPIC, PROMOTED_APPLIED - 5L, "map:status", 10L));
+            h.assertQuiescingHolds(1_000);
+
+            // Em dia nos dois tópicos — libera.
+            h.deliverFollowerProgress(PROMOTED_APPLIED + 5L, h.coordinator.getLeaderEpoch(),
+                    Map.of(TOPIC, PROMOTED_APPLIED, "map:status", 5L));
+            h.awaitQuiescing(false, 5_000);
+        }
+    }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void rejoinWhileEvictionNotifiesMembershipRequiresFreshProgress() throws Exception {
+        writePromotedLeaderSequenceState();
+        CountDownLatch evictionNotifying = new CountDownLatch(1);
+        CountDownLatch finishEviction = new CountDownLatch(1);
+        AtomicBoolean pauseEviction = new AtomicBoolean();
+        Consumer<ClusterCoordinator> beforeMembership = coordinator -> {
+            if (coordinator.activeMembers().stream().noneMatch(m -> JOINER.equals(m.nodeId()))
+                    && pauseEviction.compareAndSet(true, false)) {
+                evictionNotifying.countDown();
+                try {
+                    if (!finishEviction.await(5, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("eviction barrier timed out");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException(e);
+                }
+            }
+        };
+
+        try (Harness h = new Harness(tempDir, scheduler, Duration.ofMillis(800), beforeMembership)) {
+            h.manager.start();
+            h.awaitSelfLeadership(10_000);
+            h.connectJoiner();
+            h.awaitQuiescing(true, 5_000);
+            h.deliverFollowerProgress(PROMOTED_APPLIED, h.coordinator.getLeaderEpoch());
+            h.awaitQuiescing(false, 5_000);
+
+            pauseEviction.set(true);
+            h.transport.setConnected(JOINER, false);
+            assertTrue(evictionNotifying.await(10, TimeUnit.SECONDS));
+            CompletableFuture<Void> rejoin = CompletableFuture.runAsync(h::connectJoiner);
+            try {
+                // Reproduce the overlap while the replication listener has not seen the eviction.
+                // The corrected coordinator queues the rejoin behind that membership transition.
+                rejoin.get(250, TimeUnit.MILLISECONDS);
+            } catch (TimeoutException expected) {
+                // The eviction barrier is still held.
+            } finally {
+                finishEviction.countDown();
+            }
+            rejoin.get(5, TimeUnit.SECONDS);
+            h.awaitQuiescing(true, 5_000);
+            h.deliverFollowerProgress(PROMOTED_APPLIED, h.coordinator.getLeaderEpoch());
+            h.awaitQuiescing(false, 5_000);
+        } finally {
+            finishEviction.countDown();
+        }
+    }
+
     /** Fabrica o sequence-state.dat exatamente como {@code saveSequenceState} persiste. */
     private void writePromotedLeaderSequenceState() throws IOException {
         Map<String, Long> persisted = new HashMap<>();
@@ -196,12 +286,18 @@ class JoinQuiesceReleaseGateTest {
         final ReplicationManager manager;
 
         Harness(Path dataDir, ScheduledExecutorService scheduler, Duration heartbeatTimeout) {
+            this(dataDir, scheduler, heartbeatTimeout, ignored -> { });
+        }
+
+        Harness(Path dataDir, ScheduledExecutorService scheduler, Duration heartbeatTimeout,
+                Consumer<ClusterCoordinator> beforeMembership) {
             NodeInfo localNode = new NodeInfo(LOCAL, "127.0.0.1", 1);
             this.transport = new RecordingTransport(localNode, List.of());
             // minClusterSize=1 sem peers: o nó local se elege sozinho (lead-while-alone).
             this.coordinator = new ClusterCoordinator(transport,
                     ClusterCoordinatorConfig.of(Duration.ofMillis(100), heartbeatTimeout, 1),
                     scheduler);
+            coordinator.addMembershipListener(() -> beforeMembership.accept(coordinator));
             coordinator.start();
             this.manager = new ReplicationManager(transport, coordinator,
                     ReplicationConfig.builder(1)
@@ -225,8 +321,12 @@ class JoinQuiesceReleaseGateTest {
         }
 
         void deliverFollowerProgress(long applied, long epoch) {
+            deliverFollowerProgress(applied, epoch, null);
+        }
+
+        void deliverFollowerProgress(long applied, long epoch, Map<String, Long> frontiers) {
             transport.deliverToListeners(ClusterMessage.request(MessageType.FOLLOWER_PROGRESS,
-                    "follower-progress", JOINER, LOCAL, new FollowerProgressPayload(applied, epoch)));
+                    "follower-progress", JOINER, LOCAL, new FollowerProgressPayload(applied, epoch, frontiers)));
         }
 
         void awaitSelfLeadership(long timeoutMs) throws InterruptedException {

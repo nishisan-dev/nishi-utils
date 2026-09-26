@@ -125,6 +125,67 @@ class BinaryFrameCodecTest {
     }
 
     @Test
+    void shouldRoundTripTopicFrontierVector() throws Exception {
+        // Issue #178: o heartbeat carrega a fronteira aplicada por tópico (seção final opcional).
+        NodeId source = NodeId.of("node-vec");
+        java.util.Map<String, Long> frontiers = new java.util.LinkedHashMap<>();
+        frontiers.put("map:ngrrd.nodes", 5000L);
+        frontiers.put("map:ngrrd.catalog", 10L);
+        frontiers.put("map:ngrrd.geometries", 3L);
+        HeartbeatPayload payload = new HeartbeatPayload(System.currentTimeMillis(), 5013L, 7L, true, frontiers);
+        ClusterMessage original = ClusterMessage.lightweight(MessageType.HEARTBEAT, "hb", source, null, payload);
+
+        HeartbeatPayload decoded = codec.decode(codec.encode(original)).payload(HeartbeatPayload.class);
+        assertEquals(5013L, decoded.leaderHighWatermark());
+        assertEquals(true, decoded.leader());
+        assertEquals(java.util.Map.of("map:ngrrd.catalog", 10L, "map:ngrrd.nodes", 5000L,
+                "map:ngrrd.geometries", 3L), decoded.topicFrontiers());
+        assertEquals(java.util.List.of("map:ngrrd.catalog", "map:ngrrd.geometries", "map:ngrrd.nodes"),
+                new java.util.ArrayList<>(decoded.topicFrontiers().keySet()), "vetor ordenado por tópico");
+    }
+
+    @Test
+    void frameWithoutFrontierSectionDecodesEmptyVector() throws Exception {
+        // Frame 8.7.0 (marker + source + 3 longs + flag de líder): sem a seção de fronteiras.
+        NodeId source = NodeId.of("node-870");
+        byte[] sourceBytes = source.value().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        java.nio.ByteBuffer legacy = java.nio.ByteBuffer.allocate(1 + 2 + sourceBytes.length + 24 + 1);
+        legacy.put(BinaryFrameCodec.HEARTBEAT_MARKER);
+        legacy.putShort((short) sourceBytes.length);
+        legacy.put(sourceBytes);
+        legacy.putLong(System.currentTimeMillis());
+        legacy.putLong(42L);
+        legacy.putLong(7L);
+        legacy.put((byte) 1);
+
+        HeartbeatPayload decoded = codec.decode(legacy.array()).payload(HeartbeatPayload.class);
+        assertEquals(42L, decoded.leaderHighWatermark());
+        assertEquals(true, decoded.leader());
+        assertEquals(java.util.Map.of(), decoded.topicFrontiers(),
+                "frame sem a seção decodifica vetor vazio (peer antigo → fallback escalar)");
+        // E o inverso: um decoder antigo pararia na flag e ignoraria a seção — o prefixo do frame
+        // novo é byte a byte o frame antigo.
+        ClusterMessage withVector = ClusterMessage.lightweight(MessageType.HEARTBEAT, "hb", source, null,
+                new HeartbeatPayload(1L, 42L, 7L, true, java.util.Map.of("t", 9L)));
+        byte[] encoded = codec.encode(withVector);
+        byte[] prefix = java.util.Arrays.copyOf(encoded, 1 + 2 + sourceBytes.length + 24 + 1);
+        HeartbeatPayload asOldDecoder = codec.decode(prefix).payload(HeartbeatPayload.class);
+        assertEquals(42L, asOldDecoder.leaderHighWatermark());
+        assertEquals(true, asOldDecoder.leader());
+        assertEquals(java.util.Map.of(), asOldDecoder.topicFrontiers());
+    }
+
+    @Test
+    void emptyVectorEmitsNoSectionAndPingNeverCarriesOne() throws Exception {
+        NodeId source = NodeId.of("node-size");
+        byte[] sourceBytes = source.value().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        ClusterMessage ping = ClusterMessage.lightweight(MessageType.PING, "rtt", source, null,
+                new HeartbeatPayload(1L, 1L, 1L, false, java.util.Map.of("t", 9L)));
+        assertEquals(1 + 2 + sourceBytes.length + 24 + 1, codec.encode(ping).length,
+                "PING nunca carrega a seção de fronteiras");
+    }
+
+    @Test
     void shouldRejectUnsupportedType() {
         NodeId source = NodeId.of("node-1");
         ClusterMessage message = ClusterMessage.request(

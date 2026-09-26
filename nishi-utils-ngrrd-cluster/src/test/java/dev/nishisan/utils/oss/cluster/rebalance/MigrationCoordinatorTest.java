@@ -29,6 +29,8 @@ import dev.nishisan.utils.oss.cluster.catalog.StorageCapabilities;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.node.PlacementRequestHandler;
 import dev.nishisan.utils.oss.cluster.placement.DistributionMode;
+import dev.nishisan.utils.oss.cluster.placement.PlacementRule;
+import dev.nishisan.utils.oss.cluster.placement.PlacementRules;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.protocol.MigrateResponse;
 import dev.nishisan.utils.oss.cluster.protocol.MigrateStatus;
@@ -227,6 +229,62 @@ class MigrationCoordinatorTest {
         MigrationResult result = coordinator.migrate("s1", SRC, DST).get(AWAIT_TIMEOUT.toSeconds(), TimeUnit.SECONDS);
 
         assertEquals(MigrationOutcome.COMPLETED, result.outcome());
+    }
+
+    @Test
+    void destinoNaCotaDeSeriesNaExecucaoResultaEmSkipped() throws Exception {
+        newCoordinator(2);
+        catalog.putPlacement("s1", SeriesPlacement.active(SRC, 1_000L));
+        catalog.putNodeStatus(new StorageNodeStatus(DST, NodeState.ACTIVE, 5, 0, 0, 1L, DistributionMode.COUNT, 1, 0,
+                StorageCapabilities.ALL, CatalogReplicaStatus.ofLeader(), 5, 0, null));
+
+        MigrationResult result = coordinator.migrate("s1", SRC, DST).get(AWAIT_TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+
+        assertEquals(MigrationOutcome.SKIPPED, result.outcome());
+        assertEquals("destino " + DST + " inelegível: quota_series(6/5)", result.reason());
+        assertTrue(rpc.calls().isEmpty(), "não deveria ter feito nenhuma chamada RPC");
+        assertEquals(SeriesPlacement.active(SRC, 1_000L), catalog.placementStrong("s1").orElseThrow());
+    }
+
+    @Test
+    void destinoExcluidoPelaRegraNaExecucaoResultaEmSkipped() throws Exception {
+        PlacementRules rules = PlacementRules.of(List.of(
+                new PlacementRule("core", "ifaceStats", null, Set.of(SRC), null)));
+        coordinator = new MigrationCoordinator(catalog, rpc, leaderView, 2, Duration.ofMillis(20),
+                Duration.ofSeconds(5), Clock.systemUTC(), new MigrationCoordinator.MigrationHooks() {
+                }, RebalanceSettings.DEFAULT_MAX_DESTINATION_CATALOG_LAG, rules);
+        coordinator.onLeaderChanged(NodeId.of("self"));
+        catalog.putPlacement("s1", SeriesPlacement.active(SRC, 1_000L).withDefinitionName("ifaceStats", 1_000L));
+        catalog.putNodeStatus(withReplica(DST, CatalogReplicaStatus.ofLeader()));
+
+        MigrationResult result = coordinator.migrate("s1", SRC, DST).get(AWAIT_TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+
+        assertEquals(MigrationOutcome.SKIPPED, result.outcome());
+        assertEquals("destino " + DST + " inelegível: rule_pinned_elsewhere(core)", result.reason());
+        assertTrue(rpc.calls().isEmpty());
+    }
+
+    @Test
+    void destinoElegivelPorCotaERegraSegueNormalmente() throws Exception {
+        PlacementRules rules = PlacementRules.of(List.of(
+                new PlacementRule("core", "ifaceStats", null, Set.of(DST), null)));
+        coordinator = new MigrationCoordinator(catalog, rpc, leaderView, 2, Duration.ofMillis(20),
+                Duration.ofSeconds(5), Clock.systemUTC(), new MigrationCoordinator.MigrationHooks() {
+                }, RebalanceSettings.DEFAULT_MAX_DESTINATION_CATALOG_LAG, rules);
+        coordinator.onLeaderChanged(NodeId.of("self"));
+        catalog.putPlacement("s1", SeriesPlacement.active(SRC, 1_000L).withDefinitionName("ifaceStats", 1_000L));
+        catalog.putNodeStatus(new StorageNodeStatus(DST, NodeState.ACTIVE, 4, 0, 0, 1L, DistributionMode.COUNT, 1, 0,
+                StorageCapabilities.ALL, CatalogReplicaStatus.ofLeader(), 5, 0, null));
+        rpc.respond(SRC, Commands.MIGRATE_START, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+        rpc.respond(DST, Commands.MIGRATE_STATUS,
+                (target, body) -> new MigrateResponse(MigrateStatus.COMMITTED, null, 10L));
+        rpc.respond(SRC, Commands.MIGRATE_FINISH, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+
+        MigrationResult result = coordinator.migrate("s1", SRC, DST).get(AWAIT_TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+
+        assertEquals(MigrationOutcome.COMPLETED, result.outcome(), result.reason());
+        assertEquals("ifaceStats", catalog.placementStrong("s1").orElseThrow().definitionName(),
+                "o nome da definição sobrevive à migração");
     }
 
     private static StorageNodeStatus withReplica(String nodeId, CatalogReplicaStatus replica) {
@@ -618,6 +676,59 @@ class MigrationCoordinatorTest {
         awaitTrue("MIGRATE_FINISH enviado à origem", () -> rpc.callsTo(SRC, Commands.MIGRATE_FINISH) >= 1);
     }
 
+    /** Issue #178: o novo líder só varre a réplica local depois que o fence do catálogo libera. */
+    @Test
+    void resumeInFlightAguardaOFenceDoCatalogoAntesDeVarrerAReplicaLocal() {
+        String migrationId = "migration-resume-fenced";
+        catalog.putPlacement("s1",
+                new SeriesPlacement(SRC, DST, PlacementState.MIGRATING, migrationId, 1_000L, 1_000L));
+        rpc.respond(DST, Commands.MIGRATE_STATUS,
+                (target, body) -> new MigrateResponse(MigrateStatus.COMMITTED, null, 999L));
+        rpc.respond(SRC, Commands.MIGRATE_FINISH, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+        java.util.concurrent.atomic.AtomicBoolean fence = new java.util.concurrent.atomic.AtomicBoolean(false);
+
+        coordinator = new MigrationCoordinator(catalog, rpc, leaderView, 2, Duration.ofMillis(20),
+                Duration.ofSeconds(5), Clock.systemUTC(), MigrationCoordinator.NO_OP_HOOKS,
+                RebalanceSettings.DEFAULT_MAX_DESTINATION_CATALOG_LAG, null, fence::get, Duration.ofSeconds(10));
+        coordinator.onLeaderChanged(NodeId.of("self"));
+
+        // Fence fechado: a réplica local não é consultada — nenhum MIGRATE_STATUS sai.
+        long until = System.currentTimeMillis() + 800;
+        while (System.currentTimeMillis() < until) {
+            assertEquals(0, rpc.callsTo(DST, Commands.MIGRATE_STATUS),
+                    "com o fence fechado, resumeInFlight não pode retomar nada");
+            sleepQuietly(50);
+        }
+        fence.set(true);
+        awaitTrue("placement flipado para ACTIVE(dst) depois do fence", () -> {
+            Optional<SeriesPlacement> current = catalog.placementStrong("s1");
+            return current.isPresent() && current.get().state() == PlacementState.ACTIVE
+                    && current.get().ownerNodeId().equals(DST);
+        });
+    }
+
+    /** Issue #178: vencido o prazo do fence, a varredura roda mesmo assim (com WARNING). */
+    @Test
+    void resumeInFlightSegueAposOTimeoutDoFence() {
+        String migrationId = "migration-resume-fence-timeout";
+        catalog.putPlacement("s1",
+                new SeriesPlacement(SRC, DST, PlacementState.MIGRATING, migrationId, 1_000L, 1_000L));
+        rpc.respond(DST, Commands.MIGRATE_STATUS,
+                (target, body) -> new MigrateResponse(MigrateStatus.COMMITTED, null, 999L));
+        rpc.respond(SRC, Commands.MIGRATE_FINISH, (target, body) -> MigrateResponse.of(MigrateStatus.OK, null));
+
+        coordinator = new MigrationCoordinator(catalog, rpc, leaderView, 2, Duration.ofMillis(20),
+                Duration.ofSeconds(5), Clock.systemUTC(), MigrationCoordinator.NO_OP_HOOKS,
+                RebalanceSettings.DEFAULT_MAX_DESTINATION_CATALOG_LAG, null, () -> false, Duration.ofMillis(300));
+        coordinator.onLeaderChanged(NodeId.of("self"));
+
+        awaitTrue("placement flipado para ACTIVE(dst) após o timeout do fence", () -> {
+            Optional<SeriesPlacement> current = catalog.placementStrong("s1");
+            return current.isPresent() && current.get().state() == PlacementState.ACTIVE
+                    && current.get().ownerNodeId().equals(DST);
+        });
+    }
+
     @Test
     void resumeInFlightRetentaOFlipDoCatalogoRecusadoPeloLiderEmCatchUp() {
         String migrationId = "migration-resume-syncing";
@@ -874,6 +985,14 @@ class MigrationCoordinatorTest {
         assertEquals(0L, rpc.callsTo(SRC, Commands.MIGRATE_FINISH), "MIGRATE_FINISH não pode ser enviado após o close()");
         SeriesPlacement flipped = catalog.placementStrong("s1").orElseThrow();
         assertEquals(DST, flipped.ownerNodeId(), "o flip já gravado permanece (a origem vira órfã do reconciliador)");
+    }
+
+    private static void sleepQuietly(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private static void awaitTrue(String description, java.util.function.BooleanSupplier condition) {

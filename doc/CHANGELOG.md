@@ -4,6 +4,197 @@
 
 ---
 
+## 2026-09-26 — Fronteiras por tópico no heartbeat, cotas e regras de placement, revisão do NGrid — release 8.8.0
+
+Atende a [issue #178](https://github.com/nishisan-dev/nishi-utils/issues/178) (escala do odômetro
+aplicado divergente entre seed, commit e líder; líder eleito atrás de um seguidor no catálogo) e ao
+item 3 da [issue #167](https://github.com/nishisan-dev/nishi-utils/issues/167) (cota e regras de
+placement por nó). Inclui uma **revisão de maturidade do NGrid** (eleição, replicação e transport)
+com teste de reprodução e correção para cada achado. Plano em
+`planning/2026-09-26-issues-178-167-vetor-fronteiras-cota-afinidade.md`.
+
+### NGrid (`nishi-utils-core`) — issue #178
+
+- **Vetor de fronteiras por tópico no heartbeat.** `HeartbeatPayload.topicFrontiers` (tópico → última
+  sequência aplicada) viaja no frame binário como seção final opcional e no JSON como campo anulável;
+  decoders antigos ignoram, decoders novos leem só quando presente. `FOLLOWER_PROGRESS`,
+  `HANDBACK_GRANT` e `HANDBACK_COMPLETE` carregam o mesmo vetor (campos aditivos com construtores
+  de compatibilidade). Novo tipo público `dev.nishisan.utils.ngrid.common.TopicFrontiers`.
+- **Odômetro derivado, escala única.** `getLastAppliedSequence()` passa a ser a SOMA das fronteiras
+  por tópico (`appliedFrontiers()`), igual para líder e seguidor; os contadores escalares
+  (`appliedSequence`, `lastAppliedSequence`) e seus writes (seed por soma, commit por máximo, tick
+  por op, `SET` no cutover e no handback) foram removidos. O líder avança `nextExpected` e o cursor
+  de fetch a cada commit. `globalSequence` continua como métrica de produção (`_global`), mas sai do
+  watermark anunciado e dos alvos de quiesce.
+- **Gates de eleição por tópico.** Gate A (reclaim), gate B (step-down), escolha do peer a seguir e
+  escape D9 comparam o vetor; peer sem vetor (8.7.0 ou bootstrap) cai no escalar. Vetores
+  incomparáveis são ordenados de forma determinística: maior soma, depois o primeiro tópico
+  divergente na ordem de **`priorityTopics`** (novo em `NGridConfig`/`NGridNodeBuilder`/
+  `ReplicationConfig`; ordem por nome como padrão; deve ser igual em todos os nós).
+  `ClusterCoordinator.maxActivePeerTopicFrontier(topic)` e `TopicReplicationStatus.maxPeerFrontier`
+  expõem a maior fronteira dos peers elegíveis por tópico.
+- **Desempate simétrico com tópicos ausentes.** Quando dois vetores têm a mesma soma e conjuntos
+  diferentes de tópicos, o desempate ordena a união dos nomes após os tópicos prioritários. Antes,
+  cada nó comparava seus próprios tópicos primeiro e ambos podiam se considerar à frente.
+  Dois testes de regressão cobrem o caso sem prioridade e com prioridade empatada.
+- **Reentrada durante a expiração de um membro.** Heartbeats, conexão e expiração compartilham
+  a sincronização da eleição: a limpeza da sessão antiga e a notificação de saída terminam antes
+  de reativar o membro. Isso impede apagar o watermark fresco e perder o reengajamento do
+  join-quiesce. O teste de carga de streaming também aguarda a liberação dos gates de escrita
+  após o consenso, pois o líder recém-eleito ainda pode estar drenando o relay.
+- **Coordenação sem prender executores de virtual threads no Java 21.** A sincronização da
+  eleição usa `ReentrantLock`: esperar pela coordenação ou por logging dentro dela não ocupa
+  todos os executores e paralisa o tráfego de rede. Regressão em uma JVM isolada com apenas
+  dois executores, além do failover de migração com o mesmo limite.
+- **Líder recém-eleito cede ao estado mais novo.** A eleição pode correr com o heartbeat (3 s): o
+  sobrevivente de maior afinidade era eleito com vetores desatualizados e, ao ver o outro à frente no
+  catálogo, retinha (F2) — a op confirmada se perdia (`LeaderFailoverDuringMigrationClusterTest`, 1
+  em 6). Agora um líder que ainda não produziu nada desde a eleição cede ao peer elegível que o
+  domina (nada diverge, nada se perde); o peer assume pelo escape D9. A perda de um líder remoto e o
+  LEAVE de um votante disparam um heartbeat imediato, para que a eleição use vetores frescos.
+- **Quiesce por tópico.** O join-quiesce e o pareamento do reclaim-quiesce liberam quando o seguidor
+  não está atrás em nenhum tópico.
+- **Observabilidade.** Lag global = soma dos lags por tópico (`getTotalReplicationLag()`);
+  `NGridOperationalSnapshot.appliedByTopic` (campo final novo, construtor de compatibilidade);
+  `Consistency.bounded(maxLag)` limita o lag do tópico do próprio mapa.
+- Testes: `TopicFrontiersTest`, `TopicFrontierElectionGateTest`, `StalemateEscapeSingleWinnerTest`,
+  `ReplicationManagerSequenceStateTest` (3 tópicos), `JoinQuiesceReleaseGateTest` (por tópico),
+  `BinaryFrameCodecTest`/`JacksonMessageCodecTest` (frames e JSON 8.7.0),
+  `MultiTopicRestartWatermarkE2ETest`, `LiveDemotionNoReplayE2ETest`.
+
+### NGrid (`nishi-utils-core`) — revisão de maturidade
+
+Eleição e coordinator:
+
+- **A1** — um líder rebaixado ao vivo re-puxava e re-aplicava as próprias escritas (fila com 240
+  itens em vez de 120 na 8.7.0); corrigido pelo avanço da fronteira/cursor no commit do líder.
+- **A2** — o escape do impasse D9 promovia dois sobreviventes ao mesmo tempo (dual-leader com
+  descarte de cauda); agora só o melhor candidato não-eleito escapa, e nunca enquanto outro peer
+  elegível afirma liderança.
+- **A3** — heartbeats do mesmo peer despachados fora de ordem regrediam epoch/asserção/watermark;
+  um heartbeat com `epochMilli` menor que o último aplicado é descartado (regressão maior que o
+  `heartbeatTimeout` = salto de relógio, aceito).
+- **A4** — heartbeats em voo de um votante que anunciou LEAVE não o reativam até ele reconectar ou a
+  janela vencer.
+- **A5** — `reclaimCaughtUpLatch` é limpa na demoção, no `stepDown`, sem peer à frente e quando a
+  fronteira local regride (cutover).
+- **B10** — `stop()` rebaixa o líder; votante com porta 0 fora do numerador do quórum (o nó local
+  sempre vota); evicção atômica com `touch()`; reativação por heartbeat notifica a membership.
+- **C3** — exceção de um listener não pula os demais nem a notificação de eleição; NPE no step-down
+  durante um handback.
+- **C8** — o epoch do líder é persistido em `dataDirectory` (o `NGridNode` passava `null`) e não
+  regride no restart.
+- **C9** — líder que não ouve nenhum votante por um `heartbeatTimeout` rebaixa na hora (fora do pair
+  mode); o `stepDown()` reagenda a reavaliação após um intervalo.
+
+Replicação:
+
+- **C1** — chunks de snapshot só do líder acordado e em ordem de uma única cadeia; o install e o
+  cutover re-checam que o nó não foi promovido.
+- **C2** — o handback D11 congela e re-ancora TODOS os tópicos (antes, um "primário" arbitrário — com
+  a fila, o tópico interno `map:_ngrid-queue-offsets` ficava com cursor obsoleto).
+- **C4** — `replicate()` rejeita escritas depois de `stop()`; `NGridNode.close()` rebaixa o
+  coordinator antes de fechar o `ReplicationManager` (fim do `op-log append failed … write not
+  durable` no líder moribundo); `globalSequence` volta atrás numa emissão falha.
+- **C5** — entrada do relay cujo apply/decode falha 200 vezes seguidas é movida para
+  `relay/dead-letter/<tópico>/` (SEVERE, métrica `getDeadLetteredCount()`) e o tópico segue.
+- **C6** — recusa do líder ao stream com backoff exponencial por tópico (poll → 1 s) e recompute no
+  máximo uma vez por intervalo; troca de líder limpa os prazos de fetch em voo; snapshots pedidos no
+  máximo a cada 5 s por tópico.
+- **C7** — `resetSequenceState()` removido (sem chamadores).
+
+Transport (`TcpTransport`/`NetworkRouter`):
+
+- **B1** — um peer só é candidato a relay se reporta link **conectado** ao destino (campo aditivo
+  no handshake/`PEER_UPDATE`); UNDELIVERABLE do relay o remove e a rota volta a DIRECT; `isProxied`
+  só com rota validada. Era a assinatura "Failing over to proxy ngrrd-client-…" por 150 s após a
+  morte do líder.
+- **B2** — membro inelegível a líder (cliente) não serve de relay.
+- **B3** — nó nunca é escolhido como proxy de si mesmo.
+- **B4** — backoff exponencial com jitter e cache negativo de discagem (reconnect loop, heartbeats,
+  probe, RTT e `sendAndAwait` respeitam).
+- **B5** — frames enfileirados numa conexão perdedora do desempate são redrenados para a conexão
+  sobrevivente (ou os pendentes falham rápido) em vez de esperar o `requestTimeout`.
+- **B6** — pendentes indexados também pelo próximo salto: a queda do relay falha os requests
+  roteados por ele.
+- **B7** — `sendAndAwait` não disca mais na thread do chamador (o prazo cobre a discagem).
+- **B8** — backpressure de saída limitada de volta (#113), `SO_KEEPALIVE` e timeout de leitura
+  contra peer half-open.
+- **B9** — votantes nunca eram esquecidos: um storage substituído sob outro id inflava a maioria
+  para sempre. `Transport.decommissionPeer(id)` / `NGridNode.decommissionPeer(id)` (ordem do
+  operador, único caminho que esquece um elegível a líder): sai dos peers conhecidos e da maioria,
+  conexões fechadas, pendentes falhados, `onPeerLeft` e tombstone de 24 h contra o gossip; a nova
+  encarnação sob o mesmo id levanta o tombstone pelo handshake direto.
+- **B10** — UNDELIVERABLE de resposta encaminhado ao requisitante; entradas de `pendingResponses`
+  não vazam com `requestTimeout <= 0` ou futuro cancelado.
+
+### ngrrd cluster (`nishi-utils-ngrrd-cluster`)
+
+- **Cota por nó (issue #167, item 3).** `ngrrd.quota.maxSeries` / `ngrrd.quota.maxBytes` (0 = sem
+  limite): limite duro que barra **destinos** — placement, receptores do rebalance e do drain e o
+  próprio `MIGRATE_PREPARE` do destino (`MigrateStatus.QUOTA_EXCEEDED`). Um nó acima da cota vira
+  fonte preferencial. Alvos ponderados (`CAPACITY`/`WEIGHT`) limitados pela cota com redistribuição
+  por peso (water-filling). Publicado em `StorageNodeStatus.quotaMaxSeries/quotaMaxBytes`.
+- **Regras de placement (issue #167, item 3).** `ngrrd.placement.rules`: lista ordenada de regras
+  `{name, definition?, keyPrefix?, pin | exclude}` — a primeira que casa vence; `pin` nunca
+  transborda. Uniformes em todos os storages (fingerprint publicado em
+  `StorageNodeStatus.placementRulesHash`; divergência gera `NGRRD_PLACEMENT_RULES divergent` e
+  coluna `RULES` com `!` na CLI). O nome da definição (`metadata.name`) passa a viajar em
+  `PlaceRequest.definitionName` e a ser guardado em `SeriesPlacement.definitionName`, com backfill
+  oportunista na reabertura; séries legadas sem nome só casam regras por `keyPrefix`. Fase 0 do
+  rebalance move séries cujo dono viola uma regra. `status` mostra `QUOTA` e `RULES`;
+  `rebalance` lista exclusões `quota_*`/`rule_*`.
+- **Fence do catálogo no failover (issue #178).** O novo líder só retoma migrações `MIGRATING`
+  quando a réplica local de `map:ngrrd.catalog` drenou o relay e alcançou a maior fronteira dos peers
+  elegíveis (prazo 30 s; `NGRRD_RESUME_FENCE_TIMEOUT`). O storage declara
+  `priorityTopics(map:ngrrd.catalog)`: entre sobreviventes com fronteiras incomparáveis, o catálogo
+  decide.
+- **`forget-node <nodeId>` (revisão #178, B9).** `ngrrd.admin.forget` / `NgrrdClusterClient.forgetNode`:
+  o líder recusa enquanto o nó estiver alcançável ou tiver séries/migrações de entrada no catálogo;
+  senão propaga a ordem a todos os storages alcançáveis (`NGridNode.decommissionPeer` em cada um),
+  esquece-o localmente e remove o nó do catálogo. Storages que não confirmaram voltam em `failedOn`
+  (CLI devolve 1 com `NAO confirmado em:` — repita neles). `ForgetNodeClusterTest`.
+- Documentação: `doc/oss/ngrrd-cluster.md` (§6.1 YAML, §7 elegibilidade, §8 cotas/fase 0, §9 drain e
+  `forget-node`, §11 CLI, §13), `doc/oss/ngrrd-cluster-operacao.md` (seções "Cotas e regras de
+  placement" e "Substituir ou desativar um storage de vez").
+
+### Testes e documentação
+
+- `doc/testes-vermelhos-conhecidos.md` sem entradas: `RelayStreamReplicationTest` (artefato de
+  escala), `LeaderFailoverDuringMigrationClusterTest` e `JoinQuiesceReleaseGateTest` resolvidos.
+  `RelayStreamConcurrentIngestTest.gapRepull…` é ignorado como root.
+- `doc/ngrid/arquitetura.md` (fronteira por tópico no heartbeat), `doc/ngrid/oplog-ha-hardening.md`
+  (seção 15), `AGENTS.md` (workflows) atualizados.
+
+### Compatibilidade e upgrade
+
+- Mudanças de fio aditivas (heartbeat com seção final; campos JSON anuláveis — `topicFrontiers`,
+  `connectedPeers` no handshake/`PEER_UPDATE`, `correlationId` no UNDELIVERABLE, `frozenByTopic`/
+  `cutoverByTopic` no handback; records do ngrrd com construtores de compatibilidade e fixtures
+  `.ser` 8.7.0). Atualize os **storages antes dos
+  clientes**, com o rebalance desligado na janela. Durante a janela mista os gates de eleição caem na
+  comparação escalar da 8.7.0 contra peers antigos.
+- `priorityTopics` e `ngrrd.placement.rules` devem ser idênticos em todos os nós.
+- `forget-node` exige storages 8.8.0 (um storage 8.7.0 responde erro ao `ngrrd.admin.forget` e
+  continua a contar o nó esquecido na sua maioria até ser atualizado).
+- Rollback para 8.7.0: o epoch persistido em `dataDirectory/leader-epoch.dat` é ignorado pela versão
+  anterior; `relay/dead-letter/` pode ser apagado.
+
+### Limitações conhecidas
+
+- Ordenação epoch-aware de linhagem no protocolo (follow-up do D8/D10) segue pendente: sequências
+  de linhagens divergentes continuam numericamente comparáveis.
+- Um relay não rastreia os requests que encaminhou (B6): a queda do destino depois do
+  encaminhamento é sinalizada pelo relatório de peers conectados do relay (`PEER_UPDATE`) ou pelo
+  UNDELIVERABLE; o `requestTimeout` segue como último recurso. O UNDELIVERABLE de uma resposta
+  (B10) é repassado ao requisitante em melhor esforço — sem rota, vale o timeout.
+- Listeners de liderança ainda rodam sob `leaderComputationLock` (com I/O de disco no re-anchor do
+  handback) — documentado, sem mudança nesta versão (C10).
+- Séries legadas sem `definitionName` só casam regras por `keyPrefix` até serem reabertas por um
+  cliente 8.8.0.
+
+---
+
 ## 2026-09-26 — WRONG_OWNER confirmado no líder, lag do catálogo e reconexão de storages — release 8.7.0
 
 Atende a [issue #177](https://github.com/nishisan-dev/nishi-utils/issues/177) (WRONG_OWNER em

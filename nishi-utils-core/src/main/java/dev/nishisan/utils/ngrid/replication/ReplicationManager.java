@@ -34,6 +34,7 @@ import dev.nishisan.utils.ngrid.common.HandbackGrantPayload;
 import dev.nishisan.utils.ngrid.common.HandbackRequestPayload;
 import dev.nishisan.utils.ngrid.common.MessageType;
 import dev.nishisan.utils.ngrid.common.NodeId;
+import dev.nishisan.utils.ngrid.common.TopicFrontiers;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.ngrid.common.OperationStatus;
 import dev.nishisan.utils.ngrid.common.RelayStreamBatchPayload;
@@ -75,9 +76,13 @@ public class ReplicationManager
     private final java.util.concurrent.atomic.AtomicLong globalSequence = new java.util.concurrent.atomic.AtomicLong(0);
     private final Map<String, java.util.concurrent.atomic.AtomicLong> sequenceByTopic = new ConcurrentHashMap<>();
     private final Map<String, ReentrantLock> leaderEmissionLocksByTopic = new ConcurrentHashMap<>();
-    private final java.util.concurrent.atomic.AtomicLong appliedSequence = new java.util.concurrent.atomic.AtomicLong(
-            0);
-    private volatile long lastAppliedSequence = 0;
+    // Issue #178: there is NO scalar applied odometer any more. The applied state of this node is the
+    // per-topic frontier vector (appliedFrontiers()); getLastAppliedSequence() is derived from it as
+    // the SUM of the frontiers, which is the same number for a leader and for a caught-up follower.
+    // The former counter mixed three scales (sum on restart seed, max-per-topic on follower commit,
+    // one-tick-per-op on leader commit) and could not be compared across roles or topics.
+    /** Operations produced by this node since it last took leadership (revisão #178: fresh-leader yield). */
+    private final java.util.concurrent.atomic.AtomicLong producedSinceElection = new java.util.concurrent.atomic.AtomicLong();
     private final Set<String> syncingTopics = ConcurrentHashMap.newKeySet();
     // Janitor state: timestamp (millis) of the LAST sync activity per topic — updated on every
     // SYNC_RESPONSE chunk received. The janitor releases a sync guard only when NO chunk has arrived
@@ -112,6 +117,8 @@ public class ReplicationManager
     });
 
     private volatile boolean running;
+    /** Set once {@link #stop()} ran (revisão #178, C4): a stopping node rejects new writes at once. */
+    private volatile boolean stopped;
 
     // Durable per-topic apply frontier (the next sequence the follower expects to apply) and its
     // coalesced disk persistence. This is the RELAY_STREAM apply cursor; the dedicated lock below
@@ -154,6 +161,22 @@ public class ReplicationManager
     private final java.util.concurrent.atomic.AtomicBoolean joinQuiescing = new java.util.concurrent.atomic.AtomicBoolean(
             false);
     private final Map<NodeId, FollowerProgress> followerAppliedByNode = new ConcurrentHashMap<>();
+    /** C6: per-topic exponential backoff (ms) while the adopted leader refuses to serve the stream. */
+    private final Map<String, Long> refusalBackoffMsByTopic = new ConcurrentHashMap<>();
+    /** C6: last time a refusal was surfaced to the coordinator, per refusing node (rate limit). */
+    private final Map<NodeId, Long> lastRefusalNotedMs = new ConcurrentHashMap<>();
+    /** C6: last snapshot request per topic, to keep a failing install from re-requesting every fetch. */
+    private final Map<String, Long> lastSnapshotRequestMs = new ConcurrentHashMap<>();
+    /** C6: minimum spacing between two snapshot requests for the same topic. */
+    private static final long SNAPSHOT_REQUEST_COOLDOWN_MS = 5_000L;
+    /** C5: consecutive failures of the SAME relay head sequence before it is dead-lettered. */
+    static volatile int RELAY_DEAD_LETTER_THRESHOLD = 200; // package-visible for tests
+    /** C5: per-topic (sequence, consecutive failures) of the relay head. */
+    private final Map<String, long[]> relayHeadFailures = new ConcurrentHashMap<>();
+    private final java.util.concurrent.atomic.AtomicLong deadLetteredCount = new java.util.concurrent.atomic.AtomicLong();
+    /** C1: source and next expected chunk of the snapshot chain in flight, per topic. */
+    private final Map<String, NodeId> syncChainSource = new ConcurrentHashMap<>();
+    private final Map<String, Integer> syncChainNextChunk = new ConcurrentHashMap<>();
     private final Set<NodeId> quiescingFor = ConcurrentHashMap.newKeySet();
     private volatile long joinQuiesceStartedMs;
     // Active members observed on the previous membership change, to detect newly-joined nodes.
@@ -188,6 +211,7 @@ public class ReplicationManager
     // watermark while the candidate installs the snapshot (defense in depth vs the app's consumer pause).
     private final java.util.concurrent.atomic.AtomicBoolean handoverFreezing =
             new java.util.concurrent.atomic.AtomicBoolean(false);
+    private volatile Map<String, Long> handoverFrozenByTopic = Map.of();
     private volatile long handoverFrozenWatermark = -1L;
     private volatile NodeId handbackPeer;        // candidate (on the leader) / interim leader (on the candidate)
     private volatile long handbackGrantedEpoch;  // candidate side: the incumbent's epoch from the GRANT
@@ -313,6 +337,9 @@ public class ReplicationManager
      * @param lag                   leader high-watermark minus the applied frontier (follower lag)
      * @param streamBytesIn         cumulative stream bytes pulled for the topic (RELAY_STREAM)
      * @param streaming             true while actively streaming the topic from the leader
+     * @param maxPeerFrontier       highest applied frontier any active, leader-eligible peer advertises
+     *                              for the topic in its heartbeat (issue #178), or {@code -1} if none
+     *                              advertises a frontier vector
      */
     public record TopicReplicationStatus(
             String topic,
@@ -327,7 +354,18 @@ public class ReplicationManager
             long leaderOldestSequence,
             long lag,
             long streamBytesIn,
-            boolean streaming) {
+            boolean streaming,
+            long maxPeerFrontier) {
+
+        /** Compatibility constructor (pre-#178): {@code maxPeerFrontier = -1}. */
+        public TopicReplicationStatus(String topic, long nextExpectedSequence, long relayHeadSequence,
+                long relayBacklog, boolean syncing, boolean relayPendingBootstrap, boolean resendPending,
+                long streamCursor, long leaderHighWatermark, long leaderOldestSequence, long lag,
+                long streamBytesIn, boolean streaming) {
+            this(topic, nextExpectedSequence, relayHeadSequence, relayBacklog, syncing, relayPendingBootstrap,
+                    resendPending, streamCursor, leaderHighWatermark, leaderOldestSequence, lag, streamBytesIn,
+                    streaming, -1L);
+        }
     }
 
     public ReplicationManager(Transport transport, ClusterCoordinator coordinator, ReplicationConfig config) {
@@ -368,6 +406,11 @@ public class ReplicationManager
         // max(globalSequence, lastApplied) keeps the advertised watermark on the same scale as every
         // follower's applied frontier, so the gate compares like with like.
         coordinator.setLeaderHighWatermarkSupplier(this::advertisedLeaderHighWatermark);
+        // Issue #178: the heartbeat also carries the frontier PER TOPIC, so the gates below compare
+        // like with like topic by topic instead of through the aggregated total.
+        coordinator.setTopicFrontiersSupplier(this::advertisedTopicFrontiers);
+        coordinator.setTopicPriority(config.priorityTopics());
+        coordinator.setLeaderProductionSupplier(() -> producedSinceElection.get() > 0L);
         // Sync-before-reclaim (watermark gate): feed the coordinator the local APPLIED frontier and the
         // catch-up tolerance. The coordinator compares this against every peer's advertised watermark
         // (learned from heartbeats) to decide whether a returning higher-affinity node may reclaim
@@ -456,6 +499,7 @@ public class ReplicationManager
         if (!running) {
             return;
         }
+        stopped = true;
         running = false;
         // Stop the RELAY_STREAM fetch loops first: they only pull and persist to the relay (no apply
         // state), so quiescing them before the apply loops keeps shutdown ordering simple and avoids a
@@ -551,13 +595,26 @@ public class ReplicationManager
         if (bootstrapGateEngaged()) {
             return -1L;
         }
-        return coordinator.isLeader()
-                ? Math.max(getGlobalSequence(), getLastAppliedSequence())
-                : getLastAppliedSequence();
+        // Issue #178: one scale for both roles — the sum of the per-topic applied frontiers. On the
+        // leader the frontier of a topic already covers everything it produced (advanceLeaderFrontier
+        // on commit, and the D9 re-anchor on restart), so globalSequence no longer takes part.
+        return getLastAppliedSequence();
     }
 
     private long localAppliedForReclaim() {
         return bootstrapGateEngaged() ? Long.MIN_VALUE : getLastAppliedSequence();
+    }
+
+    /**
+     * The per-topic frontier vector this node advertises in heartbeats (issue #178): empty while the
+     * bootstrap gate is engaged (the scalar watermark is {@code -1} then, and an empty vector reads as
+     * "no vector" to peers, which fall back to that scalar), else {@link #appliedFrontiers()}.
+     */
+    private Map<String, Long> advertisedTopicFrontiers() {
+        if (bootstrapGateEngaged()) {
+            return Map.of();
+        }
+        return appliedFrontiers().byTopic();
     }
 
     private boolean isLocallyEligibleForLeadership() {
@@ -605,8 +662,53 @@ public class ReplicationManager
         return globalSequence.get();
     }
 
+    /**
+     * Total applied progress of this node: the SUM of the per-topic applied frontiers (issue #178).
+     * Derived, never counted — a leader and a fully caught-up follower report the same number, and a
+     * restart resumes it from the durable frontiers. For per-topic comparisons use
+     * {@link #appliedFrontiers()}; this scalar only serves observability and peers that predate the
+     * frontier vector.
+     *
+     * @return the sum of {@code nextExpected - 1} (or the produced counter, whichever is higher) over
+     *         every replicated topic
+     */
     public long getLastAppliedSequence() {
-        return lastAppliedSequence;
+        return appliedFrontiers().total();
+    }
+
+    /**
+     * The per-topic applied frontier vector of this node (issue #178): for every replicated topic
+     * (registered handler, durable follower frontier or produced counter), the highest sequence this
+     * node holds — {@code max(produced, nextExpected - 1)}. Read lock-free from the concurrent maps
+     * (single-key reads are atomic; the lock only guards compound mutations), so it is safe on the
+     * heartbeat and transport threads.
+     *
+     * @return the frontier vector (synthetic sequence-state keys excluded)
+     */
+    public TopicFrontiers appliedFrontiers() {
+        Map<String, Long> frontiers = new HashMap<>();
+        for (String topic : handlers.keySet()) {
+            frontiers.put(topic, topicFrontier(topic));
+        }
+        for (String topic : nextExpectedSequenceByTopic.keySet()) {
+            if (!TopicFrontiers.isSyntheticKey(topic)) {
+                frontiers.put(topic, topicFrontier(topic));
+            }
+        }
+        for (String topic : sequenceByTopic.keySet()) {
+            if (!TopicFrontiers.isSyntheticKey(topic)) {
+                frontiers.put(topic, topicFrontier(topic));
+            }
+        }
+        return TopicFrontiers.of(frontiers);
+    }
+
+    /** Applied frontier of one topic: {@code max(produced, nextExpected - 1)}, never negative. */
+    private long topicFrontier(String topic) {
+        java.util.concurrent.atomic.AtomicLong counter = sequenceByTopic.get(topic);
+        long produced = counter == null ? 0L : counter.get();
+        long appliedFrontier = nextExpectedSequenceByTopic.getOrDefault(topic, 1L) - 1L;
+        return Math.max(0L, Math.max(produced, appliedFrontier));
     }
 
     /**
@@ -633,33 +735,21 @@ public class ReplicationManager
     }
 
     /**
-     * Seeds the applied-progress metric from the durable per-topic apply frontiers, so a restart
-     * resumes the metric instead of reporting 0 (the counter is per-session). The total applied op
-     * count equals the sum of {@code (nextExpected - 1)} across topics.
+     * Re-anchors the durable per-topic apply frontiers on the per-topic PRODUCED counters after a
+     * restart (issue tems#9, D9). The applied progress itself is no longer seeded: it is derived from
+     * these frontiers ({@link #appliedFrontiers()}, issue #178), so a restart resumes it automatically.
      */
     private void seedAppliedSequenceFromFrontier() {
-        // Two durable measures of how much state this node has APPLIED, restored from sequence-state.dat:
-        //  - the per-topic FOLLOWER frontier sum (nextExpectedSequenceByTopic) — non-empty when this node
-        //    was a follower for those topics;
-        //  - the LEADER-produced count (globalSequence, the "_global" key) — non-zero when this node was
-        //    the leader (a leader applies everything it produces, but never populates the follower
-        //    frontier, so its frontier sum is 0).
-        // A returning ex-LEADER therefore has frontier sum 0 while it actually holds globalSequence ops.
-        // Seeding from the frontier alone would advertise applied=0 — making the (higher-affinity)
-        // ex-leader look permanently behind the ex-follower, so it defers to sync while the ex-follower
-        // defers to it by affinity and the cluster wedges leaderless. Seeding from max(frontierSum,
-        // globalSequence) restores the true applied frontier for both roles (they coincide for a single
-        // topic), so the election/watermark gate picks the right leader. Synthetic keys stay filtered (D1).
-        //
-        // D9 (issue tems#9): the FRONTIER itself must be re-anchored on the per-topic PRODUCED counter
-        // first. An ex-leader's frontier is stale at the point it last applied as a follower (a leader
-        // never advances it), while "_topic:{t}" holds everything it produced — and the node is the
-        // source of truth for its own production. Leaving the stale frontier in place made a clean
-        // rejoin re-pull (and RE-APPLY!) the node's own produced tail from the new leader's binlog,
-        // double-counting it into the applied metric: the inflated counter armed a PREMATURE reclaim,
-        // then froze (post-reclaim production restarts below it, so max() never advances), the follower's
-        // honest counter crossed it ~20 heartbeats later, and gate A evicted the leader into a leaderless
-        // mutual-deferral stalemate.
+        // D9 (issue tems#9): the FRONTIER must be re-anchored on the per-topic PRODUCED counter. An
+        // ex-leader's frontier could be stale at the point it last applied as a follower (before #178
+        // a leader never advanced it — advanceLeaderFrontier now does, but a sequence-state file written
+        // by an older version, or one flushed before the last commits, still needs this), while
+        // "_topic:{t}" holds everything it produced — and the node is the source of truth for its own
+        // production. Leaving the stale frontier in place made a clean rejoin re-pull (and RE-APPLY!)
+        // the node's own produced tail from the new leader's binlog, double-counting it into the
+        // applied metric: the inflated counter armed a PREMATURE reclaim, then froze, the follower's
+        // honest counter crossed it ~20 heartbeats later, and gate A evicted the leader into a
+        // leaderless mutual-deferral stalemate.
         acquireSequenceLock();
         try {
             sequenceByTopic.forEach((topic, seq) -> {
@@ -675,18 +765,6 @@ public class ReplicationManager
             });
         } finally {
             sequenceBufferLock.unlock();
-        }
-        long frontierSum = 0L;
-        for (Map.Entry<String, Long> e : nextExpectedSequenceByTopic.entrySet()) {
-            if (isSyntheticSequenceStateKey(e.getKey())) {
-                continue;
-            }
-            frontierSum += Math.max(0L, e.getValue() - 1L);
-        }
-        long applied = Math.max(frontierSum, Math.max(0L, globalSequence.get()));
-        if (applied > 0L) {
-            appliedSequence.set(applied);
-            lastAppliedSequence = applied;
         }
     }
 
@@ -711,26 +789,6 @@ public class ReplicationManager
         return log.size();
     }
 
-    /**
-     * Resets the persisted sequence state. Used when stale data from a previous
-     * epoch is truncated — the old sequence numbers become invalid and the
-     * ReplicationManager must start fresh so followers can sync correctly.
-     */
-    public void resetSequenceState() {
-        globalSequence.set(0);
-        lastAppliedSequence = 0;
-        nextExpectedSequenceByTopic.clear();
-        sequenceByTopic.clear();
-        if (sequenceStatePath != null) {
-            try {
-                Files.deleteIfExists(sequenceStatePath);
-                LOGGER.info("Sequence state reset due to epoch truncation");
-            } catch (IOException e) {
-                LOGGER.log(Level.WARNING, "Failed to delete sequence state file", e);
-            }
-        }
-    }
-
     public boolean isLeaderSyncing() {
         return leaderSyncing.get();
     }
@@ -751,9 +809,8 @@ public class ReplicationManager
             if (maxPeer < 0) {
                 return; // no peer ahead — nothing deferred (lead-while-alone is handled by recompute)
             }
-            long applied = getLastAppliedSequence();
-            long threshold = Math.max(0L, config.joinSyncLagThreshold());
-            if (applied >= maxPeer - threshold) {
+            // Issue #178: caught up = no eligible peer ahead, decided per topic by the coordinator.
+            if (!coordinator.localBehindEligiblePeer()) {
                 coordinator.reevaluateLeadership();
             }
         } catch (Throwable t) {
@@ -816,6 +873,9 @@ public class ReplicationManager
      */
     public CompletableFuture<ReplicationResult> replicate(String topic, Object wirePayload,
             Object localApplyPayload, Integer quorumOverride) {
+        if (stopped) {
+            throw new IllegalStateException("ReplicationManager is shutting down; write rejected");
+        }
         if (!coordinator.isLeader()) {
             throw new IllegalStateException("Replication can only be initiated by the leader");
         }
@@ -894,6 +954,7 @@ public class ReplicationManager
         emissionLock.lock();
         try {
             globalSequence.incrementAndGet();
+            producedSinceElection.incrementAndGet();
             long seq = nextSequenceForTopic(operation.topic);
             operation.sequence = seq;
 
@@ -907,6 +968,7 @@ public class ReplicationManager
             // the stream source.
             if (isStreamMode() && !appendStreamOpLog(operation, seq)) {
                 rollbackTopicSequence(operation.topic, seq);
+                globalSequence.decrementAndGet(); // C4: the production counter must not count a failed emission
                 failOperation(operation, new IllegalStateException(
                         "RELAY_STREAM op-log append failed (seq " + seq + ", topic " + operation.topic
                                 + "); write not durable in the stream source"));
@@ -1016,8 +1078,6 @@ public class ReplicationManager
                 // the resend index lag the send frontier by the whole apply backlog under high
                 // throughput, which made frontier resends impossible → perpetual snapshot fallback.
                 if (operation.markCommitStarted()) {
-                    long appliedSeq = appliedSequence.updateAndGet(c -> Math.max(c, operation.sequence));
-                    lastAppliedSequence = appliedSeq;
                     operation.markLocalApplied();
                     completeOperation(operation);
                 }
@@ -1032,7 +1092,6 @@ public class ReplicationManager
                     executor.submit(() -> {
                         try {
                             handler.apply(operation.operationId, operation.localApplyPayload);
-                            recordApplied();
                             acquireSequenceLock();
                             try {
                                 applied.add(operation.operationId);
@@ -1060,6 +1119,7 @@ public class ReplicationManager
     }
 
     private void completeOperation(PendingOperation operation) {
+        advanceLeaderFrontier(operation.topic, operation.sequence);
         operation.complete(OperationStatus.COMMITTED);
         log.computeIfPresent(operation.operationId, (id, record) -> {
             record.status(OperationStatus.COMMITTED);
@@ -1185,6 +1245,33 @@ public class ReplicationManager
         ReplicationHandler handler = handlers.get(payload.topic());
         if (handler == null)
             return;
+        // C1: only the AGREED leader's chunks are installed, and only in the order of ONE chain. A
+        // leader change mid-transfer used to stitch chunk 0 from the old leader with chunk 1+ from
+        // the new one into a single install; a stale chunk from a superseded chain now drops the
+        // chain and releases the guard so the next tick restarts from chunk 0 against the current leader.
+        String topic = payload.topic();
+        NodeId source = message.source();
+        NodeId agreedLeader = coordinator.leaderInfo().map(NodeInfo::nodeId).orElse(null);
+        if (agreedLeader == null || !agreedLeader.equals(source)) {
+            LOGGER.warning(() -> "Ignoring snapshot chunk " + payload.chunkIndex() + " for " + topic + " from "
+                    + source + " (agreed leader: " + agreedLeader + ")");
+            abandonSyncChain(topic);
+            return;
+        }
+        if (payload.chunkIndex() == 0) {
+            syncChainSource.put(topic, source);
+            syncChainNextChunk.put(topic, 1);
+        } else {
+            Integer expected = syncChainNextChunk.get(topic);
+            NodeId chainSource = syncChainSource.get(topic);
+            if (expected == null || expected != payload.chunkIndex() || !source.equals(chainSource)) {
+                LOGGER.warning(() -> "Ignoring out-of-chain snapshot chunk " + payload.chunkIndex() + " for " + topic
+                        + " from " + source + " (expected chunk " + expected + " from " + chainSource + ")");
+                abandonSyncChain(topic);
+                return;
+            }
+            syncChainNextChunk.put(topic, payload.chunkIndex() + 1);
+        }
         if (coordinator.isLeader()) {
             // Role guard (issue tems#9, D8): an ACTIVE LEADER never installs a peer snapshot. A late
             // chunk from a sync requested while this node was still a follower (the server may answer
@@ -1231,6 +1318,13 @@ public class ReplicationManager
                     }
                     return;
                 }
+                if (coordinator.isLeader()) {
+                    // C1: promoted between receipt and install — never reset/cut over a live leader.
+                    LOGGER.warning(() -> "Dropping snapshot chunk for " + payload.topic()
+                            + ": this node was promoted before the install ran");
+                    abandonSyncChain(payload.topic());
+                    return;
+                }
                 if (payload.chunkIndex() == 0) {
                     LOGGER.info(() -> "Starting sync for " + payload.topic() + " at sequence " + payload.sequence());
                     handler.resetState();
@@ -1248,8 +1342,16 @@ public class ReplicationManager
                     // Last chunk installed: let the handler reassemble/decode a multi-chunk
                     // (byte-sliced) snapshot before the follower is considered caught up.
                     handler.onSnapshotInstalled();
+                    if (coordinator.isLeader()) {
+                        LOGGER.warning(() -> "Dropping snapshot cutover for " + payload.topic()
+                                + ": this node was promoted during the install");
+                        abandonSyncChain(payload.topic());
+                        return;
+                    }
                     LOGGER.info(
                             () -> "Sync completed for " + payload.topic() + ". Final sequence: " + payload.sequence());
+                    syncChainSource.remove(payload.topic());
+                    syncChainNextChunk.remove(payload.topic());
                     completeSnapshotCutover(payload.topic(), payload.sequence());
                     syncingTopics.remove(payload.topic());
                     if (leaderSyncTopics.remove(payload.topic()) && leaderSyncTopics.isEmpty()) {
@@ -1265,6 +1367,18 @@ public class ReplicationManager
         });
     }
 
+    /** C1: drops the snapshot chain in flight for {@code topic} and releases its sync guard. */
+    private void abandonSyncChain(String topic) {
+        syncChainSource.remove(topic);
+        syncChainNextChunk.remove(topic);
+        syncingTopics.remove(topic);
+    }
+
+    /** C5: relay entries moved out of the stream because they could not be applied. */
+    public long getDeadLetteredCount() {
+        return deadLetteredCount.get();
+    }
+
     private void completeSnapshotCutover(String topic, long watermark) {
         // The installed snapshot REPLACES the local state (resetState + install), so every counter
         // re-anchors on the serving leader's lineage at the watermark — SET, not max (issue tems#9,
@@ -1275,9 +1389,8 @@ public class ReplicationManager
         // contiguously with the lineage it actually holds (fixes the understated-watermark case the
         // supplier comment in start() documents). The active-leader path never gets here (role guard
         // in handleSyncResponse).
-        appliedSequence.set(watermark);
-        lastAppliedSequence = watermark;
         globalSequence.updateAndGet(current -> watermark);
+        coordinator.noteLocalFrontierRegressed(); // A5: the reclaim latch of the old lineage is void
         sequenceByTopic.computeIfAbsent(topic, k -> new java.util.concurrent.atomic.AtomicLong())
                 .set(watermark);
         boolean completedBootstrap = relayPendingBootstrap.remove(topic);
@@ -1362,7 +1475,7 @@ public class ReplicationManager
         }
         if (chunkIndex == 0) {
             syncRequestCount.incrementAndGet();
-            LOGGER.info(() -> "Lag detected (" + (coordinator.getTrackedLeaderHighWatermark() - lastAppliedSequence)
+            LOGGER.info(() -> "Lag detected (" + (coordinator.getTrackedLeaderHighWatermark() - getLastAppliedSequence())
                     + "). Requesting sync for " + topic);
         }
         SyncRequestPayload payload = new SyncRequestPayload(topic, chunkIndex);
@@ -1603,11 +1716,21 @@ public class ReplicationManager
             // (or to us) and cannot serve the stream. Surface the refusal to the coordinator — if we
             // are not behind the refusing node, its escape takes leadership and breaks the mutual-
             // deferral stalemate; otherwise the next recompute re-adopts whoever can actually serve.
-            relayFetchPendingUntilByTopic.put(topic,
-                    System.currentTimeMillis() + Math.max(1L, config.relayStreamPollInterval().toMillis()));
-            coordinator.noteLeaderRefusal(message.source());
+            // C6: exponential backoff per topic (poll interval → 1 s) instead of a hot 50 ms loop that
+            // also forced ~20 leadership recomputes per second per topic; the recompute is surfaced
+            // at most once per heartbeat interval per refusing node.
+            long now = System.currentTimeMillis();
+            long backoff = refusalBackoffMsByTopic.merge(topic, Math.max(1L, config.relayStreamPollInterval().toMillis()),
+                    (cur, initial) -> Math.min(1_000L, cur * 2L));
+            relayFetchPendingUntilByTopic.put(topic, now + backoff);
+            Long lastNoted = lastRefusalNotedMs.get(message.source());
+            if (lastNoted == null || now - lastNoted >= Math.max(50L, config.followerProgressInterval().toMillis())) {
+                lastRefusalNotedMs.put(message.source(), now);
+                coordinator.noteLeaderRefusal(message.source());
+            }
             return;
         }
+        refusalBackoffMsByTopic.remove(topic);
         leaderHwmByTopic.put(topic, batch.leaderHighWatermark());
         leaderOldestByTopic.put(topic, batch.oldestSequence());
         if (!batch.frames().isEmpty()) {
@@ -1623,8 +1746,19 @@ public class ReplicationManager
             // Below the leader's retained window: bootstrap, then resume streaming from the watermark.
             relayFetchPendingUntilByTopic.put(topic,
                     System.currentTimeMillis() + config.relayStreamFetchTimeout().toMillis());
-            if (syncingTopics.add(topic) && !requestSync(topic)) {
-                syncingTopics.remove(topic); // no request in flight: do not park the topic behind the guard
+            // C6: a snapshot whose install keeps failing must not be re-requested on every fetch
+            // (a full snapshot every ~2 s = a snapshot storm on the leader).
+            long now = System.currentTimeMillis();
+            Long last = lastSnapshotRequestMs.get(topic);
+            if (last != null && now - last < SNAPSHOT_REQUEST_COOLDOWN_MS) {
+                return;
+            }
+            if (syncingTopics.add(topic)) {
+                if (requestSync(topic)) {
+                    lastSnapshotRequestMs.put(topic, now);
+                } else {
+                    syncingTopics.remove(topic); // no request in flight: do not park the topic behind the guard
+                }
             }
             return;
         }
@@ -1792,7 +1926,19 @@ public class ReplicationManager
             if (headFrame == null) {
                 break; // relay drained for now
             }
-            RelayEntry entry = RelayEntryCodec.decode(headFrame);
+            RelayEntry entry;
+            try {
+                entry = RelayEntryCodec.decode(headFrame);
+            } catch (Exception e) {
+                // C5: an undecodable frame at the head would otherwise be retried every 50 ms forever,
+                // blocking the topic. Count the failure; past the threshold, dead-letter the frame.
+                if (noteRelayHeadFailure(topic, -1L)) {
+                    deadLetterRelayHead(topic, relay, headFrame, null, e);
+                    progressed = true;
+                    continue;
+                }
+                throw e;
+            }
 
             if (entry.sequence() < nextExpected) {
                 // Duplicate/already-applied (re-peek after crash, or a resend copy): drop the real head.
@@ -1807,9 +1953,24 @@ public class ReplicationManager
             if (entry.sequence() == nextExpected) {
                 try {
                     handler.apply(entry.operationId(), handler.decodePayload(entry.payloadBytes()));
+                    relayHeadFailures.remove(topic);
                 } catch (Exception e) {
                     // The failing entry stays at the relay head (not yet polled): rethrow so the apply
-                    // loop backs off and retries it. Nothing was committed for it.
+                    // loop backs off and retries it. Nothing was committed for it. C5: after
+                    // RELAY_DEAD_LETTER_THRESHOLD consecutive failures of the SAME sequence the entry is
+                    // dead-lettered (SEVERE + file under relay/dead-letter) and the frontier advances
+                    // past it, so one poison entry cannot stall the topic forever.
+                    if (noteRelayHeadFailure(topic, entry.sequence())) {
+                        deadLetterRelayHead(topic, relay, headFrame, entry, e);
+                        commitRelayBatch(topic, List.of(entry));
+                        if (!pollExpected(relay, entry.sequence())) {
+                            progressed = true;
+                            break;
+                        }
+                        nextExpected++;
+                        progressed = true;
+                        continue;
+                    }
                     applyError = e;
                     break;
                 }
@@ -1845,6 +2006,48 @@ public class ReplicationManager
             maybeReleaseRelayDrainGate(topic);
         }
         return progressed;
+    }
+
+    /**
+     * C5: records a failure of the relay head; returns {@code true} once the same head (by sequence,
+     * {@code -1} for an undecodable frame) failed {@link #RELAY_DEAD_LETTER_THRESHOLD} times in a row.
+     */
+    private boolean noteRelayHeadFailure(String topic, long sequence) {
+        long[] state = relayHeadFailures.compute(topic, (t, cur) -> {
+            if (cur == null || cur[0] != sequence) {
+                return new long[] { sequence, 1L };
+            }
+            cur[1]++;
+            return cur;
+        });
+        return state[1] >= RELAY_DEAD_LETTER_THRESHOLD;
+    }
+
+    /** C5: moves the poison relay head to {@code relay/dead-letter/} and removes it from the relay. */
+    private void deadLetterRelayHead(String topic, NQueue<byte[]> relay, byte[] frame, RelayEntry entry,
+            Exception cause) {
+        relayHeadFailures.remove(topic);
+        deadLetteredCount.incrementAndGet();
+        String name = (entry == null ? "undecodable" : Long.toString(entry.sequence())) + "-" + System.currentTimeMillis()
+                + ".frame";
+        try {
+            Path dir = config.dataDirectory().resolve("relay").resolve("dead-letter")
+                    .resolve(topic.replaceAll("[^A-Za-z0-9._-]", "_"));
+            Files.createDirectories(dir);
+            Files.write(dir.resolve(name), frame);
+        } catch (Exception io) {
+            LOGGER.log(Level.WARNING, "Failed to persist dead-lettered relay entry for topic " + topic, io);
+        }
+        LOGGER.log(Level.SEVERE, "Dead-lettering relay entry " + (entry == null ? "(undecodable)" : "seq " + entry.sequence())
+                + " of topic " + topic + " after " + RELAY_DEAD_LETTER_THRESHOLD + " consecutive failures; the topic"
+                + " resumes past it (frame saved as " + name + ")", cause);
+        if (entry == null) {
+            try {
+                relay.poll(); // the undecodable frame cannot be verified by sequence: drop the head as is
+            } catch (Exception io) {
+                LOGGER.log(Level.WARNING, "Failed to drop dead-lettered relay head for topic " + topic, io);
+            }
+        }
     }
 
     /**
@@ -2005,12 +2208,7 @@ public class ReplicationManager
                 applied.add(e.operationId());
             }
             trimApplied();
-            // Re-anchor the global applied odometer to the lineage position of the last applied entry
-            // (issue tems#9, D11) instead of blind-counting entries. This MATCHES the leader, which sets
-            // applied = max(op.sequence) (the per-topic sequence) on commit, and is immune to a relay
-            // re-pull / duplicate frame re-inflating the follower above the leader's lineage — the
-            // residual "offset de linhagem". Monotonic (accumulateAndGet with max never regresses).
-            lastAppliedSequence = appliedSequence.accumulateAndGet(last.sequence(), Math::max);
+            // The applied progress is derived from nextExpected (issue #178): nothing else to count.
             sequenceStateDirty = true;
         } finally {
             sequenceBufferLock.unlock();
@@ -2395,6 +2593,28 @@ public class ReplicationManager
         return Math.max(0L, hwm - (currentNextExpected(topic) - 1L));
     }
 
+    /**
+     * Sum of the per-topic replication lags over the topics whose leader high-watermark is known
+     * (issue #178), or {@code -1} when no topic has a known leader HWM yet (nothing streamed).
+     * Always {@code 0} on the leader.
+     *
+     * @return the total follower lag, or {@code -1} if unknown
+     */
+    public long getTotalReplicationLag() {
+        if (coordinator.isLeader()) {
+            return 0L;
+        }
+        long total = 0L;
+        boolean known = false;
+        for (String topic : handlers.keySet()) {
+            if (getLeaderHighWatermark(topic) > 0L) {
+                known = true;
+                total += getReplicationLag(topic);
+            }
+        }
+        return known ? total : -1L;
+    }
+
     /** Cumulative stream bytes pulled for a topic (RELAY_STREAM throughput). */
     public long getStreamBytesIn(String topic) {
         java.util.concurrent.atomic.AtomicLong bytes = streamBytesInByTopic.get(topic);
@@ -2453,7 +2673,8 @@ public class ReplicationManager
                     getLeaderOldestSequence(topic),
                     getReplicationLag(topic),
                     getStreamBytesIn(topic),
-                    isStreaming(topic)));
+                    isStreaming(topic),
+                    coordinator.maxActivePeerTopicFrontier(topic)));
         }
         return statuses;
     }
@@ -2598,14 +2819,21 @@ public class ReplicationManager
             // already re-anchored and cleared the role before firing this, so this only runs when the
             // message did NOT arrive — closing the hole that would otherwise leave the demoted incumbent on
             // its pre-handback odometer base (the permanent lineage offset).
-            if (handbackRole.get() == HandbackRole.LEADER_SERVING && newLeader.equals(handbackPeer)) {
+            if (handbackRole.get() == HandbackRole.LEADER_SERVING && Objects.equals(newLeader, handbackPeer)) {
                 long frozen = handoverFrozenWatermark;
+                Map<String, Long> frozenByTopic = handoverFrozenByTopic;
                 handoverFreezing.set(false);
                 handoverFrozenWatermark = -1L;
+                handoverFrozenByTopic = Map.of();
                 handbackRole.set(HandbackRole.NONE);
                 handbackPeer = null;
-                reanchorAsDemotedIncumbent(frozen);
+                reanchorAsDemotedIncumbent(frozenByTopic, frozen);
             }
+            // C6: an in-flight fetch deadline against the OLD leader must not delay the first fetch to
+            // the new one by a full relayStreamFetchTimeout; refusal backoffs restart as well.
+            relayFetchPendingUntilByTopic.clear();
+            refusalBackoffMsByTopic.clear();
+            handlers.keySet().forEach(this::signalFetch);
             if (previousLeader != null && previousLeader.equals(localId)) {
                 leaderSyncing.set(false);
                 leaderSyncTopics.clear();
@@ -2617,6 +2845,7 @@ public class ReplicationManager
             failAllPending("Lost leadership to " + newLeader);
             return;
         }
+        producedSinceElection.set(0L); // revisão #178: a fresh leader may still yield to newer state
         leaderSyncTopics.clear();
         leaderSyncTopics.addAll(handlers.keySet());
         leaderSyncing.set(!leaderSyncTopics.isEmpty());
@@ -2736,21 +2965,22 @@ public class ReplicationManager
         if (payload.appliedSequence() < 0 || payload.epoch() != coordinator.getLeaderEpoch()) {
             return;
         }
-        followerAppliedByNode.put(source,
-                new FollowerProgress(payload.appliedSequence(), payload.epoch(), System.currentTimeMillis()));
+        FollowerProgress progress = new FollowerProgress(payload.appliedSequence(), payload.epoch(),
+                System.currentTimeMillis(), TopicFrontiers.of(payload.topicFrontiers()));
+        followerAppliedByNode.put(source, progress);
         if (quiescingFor.contains(source)) {
-            if (payload.appliedSequence() >= leaderQuiesceTarget() - config.joinSyncLagThreshold()) {
+            if (followerCaughtUp(progress, config.joinSyncLagThreshold())) {
                 quiescingFor.remove(source);
                 maybeReleaseJoinQuiesce();
             }
         }
         if (reclaimQuiescing.get() && source.equals(reclaimQuiesceFor)
-                && payload.appliedSequence() >= leaderQuiesceTarget()) {
+                && followerCaughtUp(progress, 0L)) {
             // The candidate paired up exactly against the frozen watermark (issue tems#9, D10b):
             // surface it to the coordinator NOW — waiting for the candidate's next heartbeat (up to
             // one interval stale) would stretch the pause for nothing. Gate B opens, recompute hands
             // leadership to the candidate, and onLeaderChanged releases this quiesce.
-            coordinator.noteFollowerWatermark(source, payload.appliedSequence());
+            coordinator.noteFollowerWatermark(source, payload.appliedSequence(), payload.topicFrontiers());
         } else if (config.leaderPauseOnReclaim() && !reclaimQuiescing.get()) {
             // Fresh progress is the approach signal — engaging here beats the 200ms tick.
             maybeEngageReclaimQuiesce();
@@ -2766,7 +2996,7 @@ public class ReplicationManager
             // Report the advertised watermark (issue tems#9, D10a): -1 while the bootstrap gate is
             // engaged, so the leader never mistakes a pre-bootstrap frontier for catch-up progress.
             FollowerProgressPayload payload = new FollowerProgressPayload(advertisedLeaderHighWatermark(),
-                    coordinator.getTrackedLeaderEpoch());
+                    coordinator.getTrackedLeaderEpoch(), advertisedTopicFrontiers());
             transport.send(ClusterMessage.request(MessageType.FOLLOWER_PROGRESS, "follower-progress",
                     transport.local().nodeId(), leader.nodeId(), payload));
         });
@@ -2785,7 +3015,6 @@ public class ReplicationManager
         }
         // Drop joiners that have since caught up — judged only on a FRESH report from the current
         // epoch (issue tems#9, D10a): a stale entry must never release the gate.
-        long target = leaderQuiesceTarget();
         long threshold = config.joinSyncLagThreshold();
         long freshnessMs = followerProgressFreshnessMs();
         long now = System.currentTimeMillis();
@@ -2795,7 +3024,7 @@ public class ReplicationManager
             return progress != null
                     && progress.epoch() == currentEpoch
                     && now - progress.atMillis() <= freshnessMs
-                    && progress.applied() >= target - threshold;
+                    && followerCaughtUp(progress, threshold);
         });
         maybeReleaseJoinQuiesce();
     }
@@ -2820,7 +3049,8 @@ public class ReplicationManager
      * real catch-up took 64s).
      */
     private long leaderQuiesceTarget() {
-        return Math.max(getGlobalSequence(), getLastAppliedSequence());
+        // Issue #178: the same derived total the leader advertises (see advertisedLeaderHighWatermark).
+        return getLastAppliedSequence();
     }
 
     /** Max age for a follower progress report to count toward releasing a quiesce gate. */
@@ -2829,7 +3059,25 @@ public class ReplicationManager
     }
 
     /** A follower's apply progress as last reported (issue tems#9, D10a). */
-    private record FollowerProgress(long applied, long epoch, long atMillis) {
+    private record FollowerProgress(long applied, long epoch, long atMillis, TopicFrontiers frontiers) {
+    }
+
+    /**
+     * Whether a follower's reported progress has caught up with the leader's frontier (issue #178):
+     * per topic when the follower reported a frontier vector and the leader has one (the follower is
+     * caught up when it is not BEHIND the leader's vector within {@code threshold} on any topic),
+     * else by the scalar total against {@link #leaderQuiesceTarget()}.
+     */
+    private boolean followerCaughtUp(FollowerProgress progress, long threshold) {
+        if (progress == null || progress.applied() < 0L) {
+            return false;
+        }
+        TopicFrontiers reported = progress.frontiers();
+        TopicFrontiers local = appliedFrontiers();
+        if (reported != null && !reported.isEmpty() && !local.isEmpty()) {
+            return !reported.isBehind(local, threshold, config.priorityTopics());
+        }
+        return progress.applied() >= leaderQuiesceTarget() - Math.max(0L, threshold);
     }
 
     // ── Quiesce-assisted reclaim — "leader pause on reclaim" (issue tems#9, D10b) ───────────────
@@ -3058,13 +3306,18 @@ public class ReplicationManager
         }
         long frozen = leaderQuiesceTarget();
         handoverFrozenWatermark = frozen;
+        // Revisão #178 (C2): freeze EVERY topic's frontier, not an arbitrary "primary" one — the
+        // demotion re-anchors each topic on its own watermark (backstop path) and the candidate
+        // bootstraps all of them.
+        Map<String, Long> frozenByTopic = appliedFrontiers().byTopic();
+        handoverFrozenByTopic = frozenByTopic;
         handbackRole.set(HandbackRole.LEADER_SERVING);
         String topic = primaryTopic();
         LOGGER.info(() -> "Affinity handback: granting handover to " + candidate + " at W=" + frozen
-                + " (issue tems#9, D11)");
+                + " byTopic=" + frozenByTopic + " (issue tems#9, D11)");
         transport.send(ClusterMessage.request(MessageType.HANDBACK_GRANT, "handback",
                 transport.local().nodeId(), candidate,
-                new HandbackGrantPayload(topic, frozen, coordinator.getLeaderEpoch())));
+                new HandbackGrantPayload(topic, frozen, coordinator.getLeaderEpoch(), frozenByTopic)));
     }
 
     /** CANDIDATE side: handover granted — arm bootstrap for all topics and pull the full snapshot. */
@@ -3122,7 +3375,7 @@ public class ReplicationManager
         if (interimLeader != null) {
             transport.send(ClusterMessage.request(MessageType.HANDBACK_COMPLETE, "handback",
                     transport.local().nodeId(), interimLeader,
-                    new HandbackCompletePayload(watermark, newEpoch)));
+                    new HandbackCompletePayload(watermark, newEpoch, appliedFrontiers().byTopic())));
         }
         for (HandoverListener l : handoverListeners) {
             try {
@@ -3148,9 +3401,10 @@ public class ReplicationManager
         // incumbent keeps its pre-handback odometer base and reappears as a permanent lineage offset
         // (the counter-scale desync the new leader then logs forever). Runs before acceptHandbackWinner
         // so the first follower heartbeat already advertises W.
-        reanchorAsDemotedIncumbent(payload.cutoverWatermark());
+        reanchorAsDemotedIncumbent(payload.cutoverByTopic(), payload.cutoverWatermark());
         handoverFreezing.set(false);
         handoverFrozenWatermark = -1L;
+        handoverFrozenByTopic = Map.of();
         handbackRole.set(HandbackRole.NONE);
         handbackPeer = null;
         // Step down to the winner promptly; the candidate's higher-epoch heartbeats are the backstop.
@@ -3178,15 +3432,37 @@ public class ReplicationManager
      *
      * @param watermark the frozen handover watermark {@code W} (the candidate's cutover watermark)
      */
+    private void reanchorAsDemotedIncumbent(Map<String, Long> byTopic, long watermark) {
+        if (byTopic != null && !byTopic.isEmpty()) {
+            // Revisão #178 (C2): every topic re-anchors on ITS OWN cutover frontier.
+            byTopic.forEach(this::reanchorTopicAsDemotedIncumbent);
+            LOGGER.info(() -> "Affinity handback: demoted incumbent re-anchored per topic " + byTopic
+                    + " (issue tems#9, D11)");
+            return;
+        }
+        reanchorAsDemotedIncumbent(watermark);
+    }
+
+    /** Legacy (pre-#178) re-anchor: a single scalar applied to the representative topic. */
     private void reanchorAsDemotedIncumbent(long watermark) {
         if (watermark < 0L) {
             return;
         }
-        appliedSequence.set(watermark);
-        lastAppliedSequence = watermark;
         globalSequence.updateAndGet(current -> watermark);
         String topic = primaryTopic();
         if (!topic.isEmpty()) {
+            reanchorTopicAsDemotedIncumbent(topic, watermark);
+        }
+        LOGGER.info(() -> "Affinity handback: demoted incumbent re-anchored to W=" + watermark
+                + " (lineage offset zeroed; issue tems#9, D11)");
+    }
+
+    /** Re-anchors one topic's produced counter, frontier, op-log and relay cursor at {@code watermark}. */
+    private void reanchorTopicAsDemotedIncumbent(String topic, long watermark) {
+        if (topic == null || topic.isEmpty() || watermark < 0L) {
+            return;
+        }
+        {
             sequenceByTopic.computeIfAbsent(topic, k -> new java.util.concurrent.atomic.AtomicLong())
                     .set(watermark);
             acquireSequenceLock();
@@ -3218,8 +3494,6 @@ public class ReplicationManager
             relayFetchPendingUntilByTopic.put(topic, 0L);
             signalFetch(topic);
         }
-        LOGGER.info(() -> "Affinity handback: demoted incumbent re-anchored to W=" + watermark
-                + " (lineage offset zeroed; issue tems#9, D11)");
     }
 
     /**
@@ -3510,8 +3784,24 @@ public class ReplicationManager
         return counter.incrementAndGet();
     }
 
-    private void recordApplied() {
-        lastAppliedSequence = appliedSequence.incrementAndGet();
+    /**
+     * Leader-side commit: advances the durable apply frontier and the RELAY_STREAM pull cursor of the
+     * topic to the committed sequence (issue #178). A leader applies everything it produces, so its
+     * frontier is {@code produced}; keeping {@code nextExpected}/cursor in step means (a) the
+     * frontier vector has one definition for both roles, and (b) a LIVE demotion (step-down, reclaim,
+     * preferred leader) resumes the stream at the new leader's next sequence instead of re-pulling —
+     * and RE-APPLYING — the node's own produced tail from a stale cursor (a queue OFFER is not
+     * idempotent: that replay duplicated items).
+     */
+    private void advanceLeaderFrontier(String topic, long sequence) {
+        if (sequence <= 0L || topic == null) {
+            return;
+        }
+        nextExpectedSequenceByTopic.merge(topic, sequence + 1L, Math::max);
+        if (isStreamMode()) {
+            relayStreamCursor(topic).accumulateAndGet(sequence, Math::max);
+        }
+        sequenceStateDirty = true;
     }
 
     /**

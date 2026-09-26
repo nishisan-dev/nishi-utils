@@ -68,6 +68,11 @@ class NGridOperationalSnapshotTest {
         assertEquals(0, snapshot.pendingOperationsCount());
         assertEquals(3, snapshot.reachableNodesCount());
         assertEquals(3, snapshot.totalNodesCount());
+        assertEquals(Map.of(), snapshot.appliedByTopic(), "construtor de compatibilidade: sem vetor por tópico");
+        NGridOperationalSnapshot withTopics = new NGridOperationalSnapshot(
+                "node-1", "node-1", 3L, 3L, 3, true, true, 500L, 500L, 500L, 0L, 2L, 1L, 0L, 12.5, 0, 3, 3,
+                Map.of(), Map.of(), ioStats, now, Map.of("map:a", 300L, "map:b", 200L));
+        assertEquals(Map.of("map:a", 300L, "map:b", 200L), withTopics.appliedByTopic());
         assertSame(ioStats, snapshot.ioStats());
         assertEquals(now, snapshot.capturedAt());
     }

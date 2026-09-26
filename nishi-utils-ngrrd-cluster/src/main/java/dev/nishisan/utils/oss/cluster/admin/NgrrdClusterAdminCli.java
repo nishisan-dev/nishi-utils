@@ -25,6 +25,7 @@ import dev.nishisan.utils.oss.cluster.api.RebalanceTrigger;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogReplicaStatus;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
+import dev.nishisan.utils.oss.cluster.protocol.AdminForgetResponse;
 import dev.nishisan.utils.oss.cluster.protocol.AdminStatusResponse;
 import dev.nishisan.utils.oss.cluster.protocol.NodeStatusView;
 
@@ -32,6 +33,7 @@ import java.io.PrintStream;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.TreeMap;
 import java.util.UUID;
 import java.util.function.Function;
@@ -40,7 +42,7 @@ import java.util.stream.Collectors;
 /**
  * CLI de administração do cluster ngrrd (seção 4 da spec do M4):
  * {@code java -cp ... dev.nishisan.utils.oss.cluster.admin.NgrrdClusterAdminCli --seed host:port
- * [--client-id x] <status|metrics <nodeId>|drain <nodeId>|activate <nodeId>|rebalance>}.
+ * [--client-id x] <status|metrics <nodeId>|drain <nodeId>|activate <nodeId>|forget-node <nodeId>|rebalance>}.
  *
  * <p>Entra na malha como cliente transparente ({@code roles client+leader-ineligible}, o mesmo papel de
  * {@link NgrrdClusterClient}), executa um único comando e sai — sem dependência de nenhuma biblioteca de
@@ -50,7 +52,7 @@ import java.util.stream.Collectors;
 public final class NgrrdClusterAdminCli {
 
     private static final String USAGE = "uso: NgrrdClusterAdminCli --seed host:port [--client-id x] "
-            + "<status|metrics <nodeId>|drain <nodeId>|activate <nodeId>|rebalance>";
+            + "<status|metrics <nodeId>|drain <nodeId>|activate <nodeId>|forget-node <nodeId>|rebalance>";
 
     public static void main(String[] args) {
         int exitCode = new NgrrdClusterAdminCli().run(args, System.out, System.err);
@@ -119,6 +121,9 @@ public final class NgrrdClusterAdminCli {
                     printNodeStatus("activate", client.activateNode(parsed.nodeId), out);
                     return 0;
                 }
+                case "forget-node" -> {
+                    return printForget(client.forgetNode(parsed.nodeId), out, err);
+                }
                 case "rebalance" -> {
                     printRebalance(client.triggerRebalance(), out);
                     return 0;
@@ -137,17 +142,43 @@ public final class NgrrdClusterAdminCli {
 
     private void printStatus(AdminStatusResponse response, PrintStream out) {
         out.println("LIDER: " + response.leaderNodeId());
-        out.printf(Locale.ROOT, "%-24s %-10s %-10s %8s %14s %7s %10s %10s %14s %8s %s%n", "NODE", "STATE",
-                "REACHABLE", "SERIES", "BYTES", "FILL%", "MODE", "WEIGHT", "RESERVED", "CAT_LAG", "CAPABILITIES");
+        // Issue #167 (item 3): regras do líder; cada nó mostra o próprio fingerprint, com "!" quando diverge.
+        out.println("REGRAS: " + orDash(response.placementRulesHash()) + " (" + response.placementRulesCount()
+                + " regras)");
+        out.printf(Locale.ROOT, "%-24s %-10s %-10s %8s %14s %7s %10s %10s %14s %20s %9s %8s %s%n", "NODE", "STATE",
+                "REACHABLE", "SERIES", "BYTES", "FILL%", "MODE", "WEIGHT", "RESERVED", "QUOTA", "RULES", "CAT_LAG",
+                "CAPABILITIES");
         for (NodeStatusView view : response.nodes()) {
             StorageNodeStatus status = view.status();
-            out.printf(Locale.ROOT, "%-24s %-10s %-10s %8d %14d %6.1f%% %10s %10.3f %14d %8s %s%n", status.nodeId(),
-                    status.state(), view.reachable(), status.seriesCount(), status.usedBytes(),
+            out.printf(Locale.ROOT, "%-24s %-10s %-10s %8d %14d %6.1f%% %10s %10.3f %14d %20s %9s %8s %s%n",
+                    status.nodeId(), status.state(), view.reachable(), status.seriesCount(), status.usedBytes(),
                     status.fillRatio() * 100.0, status.distributionMode(), status.weight(), status.reservedBytes(),
+                    formatQuota(status), formatRules(status, response.placementRulesHash()),
                     CatalogReplicaStatus.describeLag(status.catalogReplica()), formatCapabilities(status));
         }
         out.println("MIGRACOES EM CURSO: " + response.migrationsInFlight());
         out.println("GEOMETRIAS PENDENTES: " + response.geometriesPending());
+    }
+
+    /** {@code <maxSeries|->/<maxBytes|->}: cota dura do nó; {@code -} = sem limite. */
+    private static String formatQuota(StorageNodeStatus status) {
+        return (status.quotaMaxSeries() > 0 ? String.valueOf(status.quotaMaxSeries()) : "-") + "/"
+                + (status.quotaMaxBytes() > 0 ? String.valueOf(status.quotaMaxBytes()) : "-");
+    }
+
+    /**
+     * Primeiros 8 hex do fingerprint das regras do nó ({@code -} sem regras), com {@code !} quando difere do
+     * fingerprint do líder — as regras são configuração uniforme, então {@code !} indica um nó reiniciado com
+     * outro YAML (ou ainda não reiniciado após uma mudança).
+     */
+    private static String formatRules(StorageNodeStatus status, String leaderHash) {
+        String own = status.placementRulesHash();
+        String shown = own == null ? "-" : own.substring(0, Math.min(8, own.length()));
+        return Objects.equals(own, leaderHash) ? shown : shown + "!";
+    }
+
+    private static String orDash(String value) {
+        return value == null ? "-" : value;
     }
 
     /**
@@ -201,6 +232,24 @@ public final class NgrrdClusterAdminCli {
                 out.println("destino excluído: " + nodeId + " (" + reason + ")"));
     }
 
+    /** Código de saída 1 quando algum storage não confirmou: o operador precisa repetir o comando nele. */
+    private int printForget(AdminForgetResponse response, PrintStream out, PrintStream err) {
+        out.println("forget-node OK: " + response.nodeId() + " removido do catálogo pelo líder "
+                + response.leaderNodeId());
+        for (String nodeId : response.forgottenOn()) {
+            out.println("esquecido em: " + nodeId);
+        }
+        if (response.failedOn().isEmpty()) {
+            return 0;
+        }
+        for (String nodeId : response.failedOn()) {
+            err.println("NAO confirmado em: " + nodeId);
+        }
+        err.println("erro: repita 'forget-node " + response.nodeId() + "' quando esses storages voltarem; "
+                + "até lá continuam a contar o nó na maioria de votantes");
+        return 1;
+    }
+
     private void printNodeStatus(String command, StorageNodeStatus status, PrintStream out) {
         out.println(command + " OK");
         out.printf(Locale.ROOT, "%-24s %-10s %8s %14s%n", "NODE", "STATE", "SERIES", "BYTES");
@@ -211,7 +260,7 @@ public final class NgrrdClusterAdminCli {
     /** Argumentos já parseados e validados de {@link #run(String[], PrintStream, PrintStream)}. */
     private record ParsedArgs(String seed, String clientId, String command, String nodeId) {
 
-        private static final List<String> NODE_ID_COMMANDS = List.of("metrics", "drain", "activate");
+        private static final List<String> NODE_ID_COMMANDS = List.of("metrics", "drain", "activate", "forget-node");
 
         static ParsedArgs parse(String[] args) {
             if (args == null) {
@@ -238,7 +287,8 @@ public final class NgrrdClusterAdminCli {
                 throw new IllegalArgumentException("--seed é obrigatório");
             }
             if (positional.isEmpty()) {
-                throw new IllegalArgumentException("comando é obrigatório: status|metrics|drain|activate|rebalance");
+                throw new IllegalArgumentException(
+                        "comando é obrigatório: status|metrics|drain|activate|forget-node|rebalance");
             }
             String command = positional.get(0).toLowerCase(Locale.ROOT);
             String nodeId = positional.size() > 1 ? positional.get(1) : null;

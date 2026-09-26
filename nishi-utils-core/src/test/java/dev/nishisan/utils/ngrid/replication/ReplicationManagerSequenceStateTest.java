@@ -44,6 +44,7 @@ import dev.nishisan.utils.ngrid.cluster.transport.TransportListener;
 import dev.nishisan.utils.ngrid.common.ClusterMessage;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
+import dev.nishisan.utils.ngrid.common.TopicFrontiers;
 
 /**
  * Reprodução do D1 da issue #139: o seed do applied a partir do frontier persistido
@@ -167,6 +168,58 @@ class ReplicationManagerSequenceStateTest {
                             + "RE-APLICAR a própria cauda (issue tems#9, D9)");
             assertEquals(300L, manager.getLastAppliedSequence(),
                     "o applied semeado deve refletir o estado real (produzido), numa escala única");
+        } finally {
+            manager.close();
+            coordinator.close();
+        }
+    }
+
+    /**
+     * Issue #178: com VÁRIOS tópicos o odômetro aplicado não pode misturar escalas. O seed antigo
+     * somava as fronteiras (ou pegava {@code _global}, maior ainda), o commit do seguidor tomava o
+     * MÁXIMO por tópico e o líder contava um tick por op — um nó reiniciado com 3 tópicos ficava
+     * preso na escala da soma e anunciava um watermark acima do líder ("peer watermark above its own
+     * applied"). Agora o applied é DERIVADO do vetor de fronteiras: soma por definição, em todos os
+     * papéis e caminhos.
+     */
+    @Test
+    void appliedIsDerivedFromPerTopicFrontiersWithMultipleTopics() throws Exception {
+        // Três tópicos como no ngrrd (catalog/nodes/geometries) com fronteiras distintas; _global
+        // deliberadamente MAIOR que a soma (líder antigo após cutover), para provar que não entra.
+        Map<String, Long> persisted = new HashMap<>();
+        persisted.put("map:ngrrd.catalog", 11L);      // 10 aplicadas
+        persisted.put("map:ngrrd.nodes", 5001L);      // 5000 aplicadas
+        persisted.put("map:ngrrd.geometries", 4L);    // 3 aplicadas
+        persisted.put("_global", 9_999_999L);
+        persisted.put("_topic:map:ngrrd.catalog", 10L);
+        try (java.io.ObjectOutputStream oos = new java.io.ObjectOutputStream(
+                Files.newOutputStream(tempDir.resolve("sequence-state.dat")))) {
+            oos.writeObject(persisted);
+        }
+
+        NodeInfo local = new NodeInfo(NodeId.of("aaa-node"), "127.0.0.1", 0);
+        NodeInfo peer = new NodeInfo(NodeId.of("zzz-peer"), "127.0.0.1", 0);
+        StubTransport transport = new StubTransport(local, List.of(peer));
+        ClusterCoordinator coordinator = new ClusterCoordinator(transport,
+                ClusterCoordinatorConfig.of(Duration.ofMillis(150), Duration.ofSeconds(10), 2), scheduler);
+        coordinator.start();
+
+        ReplicationManager manager = new ReplicationManager(transport, coordinator,
+                ReplicationConfig.builder(1)
+                        .dataDirectory(tempDir)
+                        .followerIngestMode(FollowerIngestMode.RELAY_STREAM)
+                        .build());
+        manager.start();
+        try {
+            TopicFrontiers frontiers = manager.appliedFrontiers();
+            assertEquals(10L, frontiers.frontier("map:ngrrd.catalog"));
+            assertEquals(5000L, frontiers.frontier("map:ngrrd.nodes"));
+            assertEquals(3L, frontiers.frontier("map:ngrrd.geometries"));
+            assertEquals(0L, frontiers.frontier("_global"), "chaves sintéticas nunca entram no vetor");
+            assertEquals(5013L, manager.getLastAppliedSequence(),
+                    "o applied é a SOMA das fronteiras por tópico — nem o máximo (5000) nem _global");
+            assertEquals(5013L, manager.getAdvertisedHighWatermark(),
+                    "o watermark anunciado nos heartbeats usa a mesma escala derivada");
         } finally {
             manager.close();
             coordinator.close();

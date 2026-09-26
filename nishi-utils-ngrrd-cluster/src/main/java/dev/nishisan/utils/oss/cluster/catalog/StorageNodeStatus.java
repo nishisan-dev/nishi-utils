@@ -43,6 +43,13 @@ import java.util.Set;
  * @param catalogReplica   estado da réplica local do catálogo neste nó (issue #177); {@code null} quando o
  *                         status foi publicado por uma versão anterior (campo ausente na serialização Java
  *                         ou no JSON replicado) ou não pôde ser coletado — "não reportado", nunca "em dia"
+ * @param quotaMaxSeries   cota dura de séries deste nó ({@code ngrrd.quota.maxSeries}, issue #167 item 3);
+ *                         {@code 0} = sem limite (também num status publicado por uma versão anterior)
+ * @param quotaMaxBytes    cota dura de bytes ocupados+reservados ({@code ngrrd.quota.maxBytes}); {@code 0} =
+ *                         sem limite
+ * @param placementRulesHash fingerprint das regras de placement carregadas por este nó
+ *                         ({@code PlacementRules#fingerprint()}); {@code null} sem regras ou num status
+ *                         publicado por uma versão anterior
  */
 public record StorageNodeStatus(
         String nodeId,
@@ -53,7 +60,10 @@ public record StorageNodeStatus(
         long reportedAtEpochMs,
         DistributionMode distributionMode, double weight, long reservedBytes,
         Set<String> capabilities,
-        CatalogReplicaStatus catalogReplica) implements Serializable {
+        CatalogReplicaStatus catalogReplica,
+        long quotaMaxSeries,
+        long quotaMaxBytes,
+        String placementRulesHash) implements Serializable {
 
     /** B1 (achado do Debugger): ver Javadoc de {@code SeriesPlacement#serialVersionUID}. */
     private static final long serialVersionUID = 1L;
@@ -79,11 +89,23 @@ public record StorageNodeStatus(
                 reservedBytes, capabilities, null);
     }
 
+    /** Status sem cota nem hash de regras — a forma do record da 8.7.0, antes deles existirem. */
+    public StorageNodeStatus(String nodeId, NodeState state, long seriesCount, long usedBytes,
+            long capacityBytes, long reportedAtEpochMs, DistributionMode distributionMode, double weight,
+            long reservedBytes, Set<String> capabilities, CatalogReplicaStatus catalogReplica) {
+        this(nodeId, state, seriesCount, usedBytes, capacityBytes, reportedAtEpochMs, distributionMode, weight,
+                reservedBytes, capabilities, catalogReplica, 0L, 0L, null);
+    }
+
     public StorageNodeStatus {
         // Missing fields in the old persistent record are null/zero.
         if (distributionMode == null) { distributionMode = DistributionMode.COUNT; weight = 1; }
         if (!Double.isFinite(weight) || weight <= 0 || reservedBytes < 0) {
             throw new IllegalArgumentException("invalid node weight or reservation");
+        }
+        if (quotaMaxSeries < 0 || quotaMaxBytes < 0) {
+            throw new IllegalArgumentException("quota deve ser >= 0 (0 = sem limite): series=" + quotaMaxSeries
+                    + " bytes=" + quotaMaxBytes);
         }
         Objects.requireNonNull(nodeId, "nodeId é obrigatório");
         Objects.requireNonNull(state, "state é obrigatório");
@@ -96,21 +118,37 @@ public record StorageNodeStatus(
     }
 
     /**
-     * Atualiza a carga reportada, preservando {@code nodeId}, {@code state}, as capacidades e a réplica do
-     * catálogo.
+     * Atualiza a carga reportada, preservando {@code nodeId}, {@code state}, as capacidades, a réplica do
+     * catálogo, a cota e o hash de regras.
      */
     public StorageNodeStatus withLoad(long seriesCount, long usedBytes, long capacityBytes, long now) {
         return new StorageNodeStatus(nodeId, state, seriesCount, usedBytes, capacityBytes, now, distributionMode, weight,
-                reservedBytes, capabilities, catalogReplica);
+                reservedBytes, capabilities, catalogReplica, quotaMaxSeries, quotaMaxBytes, placementRulesHash);
     }
 
     /**
-     * Transiciona o nó para outro {@link NodeState}, preservando a carga reportada, as capacidades e a
-     * réplica do catálogo.
+     * Transiciona o nó para outro {@link NodeState}, preservando a carga reportada, as capacidades, a
+     * réplica do catálogo, a cota e o hash de regras.
      */
     public StorageNodeStatus withState(NodeState newState, long now) {
         return new StorageNodeStatus(nodeId, newState, seriesCount, usedBytes, capacityBytes, now, distributionMode,
-                weight, reservedBytes, capabilities, catalogReplica);
+                weight, reservedBytes, capabilities, catalogReplica, quotaMaxSeries, quotaMaxBytes, placementRulesHash);
+    }
+
+    /**
+     * Se {@code effective} séries (as que o nó teria após receber mais uma) ultrapassam a cota de séries;
+     * sempre {@code false} sem cota ({@code quotaMaxSeries == 0}).
+     */
+    public boolean seriesQuotaReached(long effective) {
+        return quotaMaxSeries > 0 && effective > quotaMaxSeries;
+    }
+
+    /**
+     * Se {@code effective} bytes (ocupados + reservados/pendentes + os da série a receber) ultrapassam a
+     * cota de bytes; sempre {@code false} sem cota ({@code quotaMaxBytes == 0}).
+     */
+    public boolean bytesQuotaReached(long effective) {
+        return quotaMaxBytes > 0 && effective > quotaMaxBytes;
     }
 
     /** Se o nó anuncia {@code capability} (ver {@link StorageCapabilities}). */

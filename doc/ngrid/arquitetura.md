@@ -250,8 +250,12 @@ heartbeat tentava discar para ele (até `connectTimeout`, com o log "No connecti
 - **Votantes nunca são esquecidos:** um membro elegível a líder que envia LEAVE segue em
   `knownPeers` e na membership (a maioria não encolhe sem consenso); o coordenador apenas o marca
   inativo na hora, sem o grace de disconnect, e o próximo heartbeat do mesmo id o reativa.
-  **Descomissionar um votante de vez** (ex.: storage drenado que não volta) continua exigindo ação do
-  operador.
+  **Descomissionar um votante de vez** (ex.: storage drenado que não volta) é ação do operador
+  (8.8.0): `Transport.decommissionPeer(id)` / `NGridNode.decommissionPeer(id)` é o único caminho que
+  esquece um elegível a líder — sai de `knownPeers` (e da maioria), conexões fechadas, pendentes
+  falhados, `onPeerLeft` nos listeners e tombstone de **24 h** contra gossip; deve rodar em todo nó
+  (o ngrrd o propaga pelo `ngrrd.admin.forget` / CLI `forget-node`). Um handshake direto do mesmo id
+  (nova encarnação) levanta o tombstone.
 
 ```mermaid
 sequenceDiagram
@@ -314,6 +318,32 @@ flowchart TD
     isLeaderCheck -->|Não| followerRole[Follower]
     end
 ```
+
+#### Fronteira aplicada por tópico no heartbeat (issue #178, desde a 8.8.0)
+
+Cada nó anuncia no `HEARTBEAT`, além do watermark escalar, o **vetor de fronteiras por tópico**
+(`HeartbeatPayload.topicFrontiers`: `map:<nome>`/`queue:<nome>` → última sequência aplicada). No
+frame binário é uma seção final opcional (`u16 count` + `count × (u16 len, tópico UTF-8, i64
+fronteira)`), ignorada por decoders antigos e lida só quando presente — compatível nos dois sentidos
+de um rolling upgrade. O odômetro escalar (`getLastAppliedSequence`) é **derivado** desse vetor
+(soma das fronteiras) e vale o mesmo para líder e seguidor; ele só serve a peers sem vetor.
+
+Os gates de eleição comparam o vetor, não o escalar:
+
+- **gate A (reclaim):** um nó só reclama a liderança quando nenhum peer elegível ativo o domina
+  em algum tópico (dentro do `joinSyncLagThreshold`);
+- **gate B (step-down):** o incumbente não cede a um candidato que esteja atrás em **um** tópico
+  que seja, qualquer que seja a soma;
+- **peer a seguir / escape D9:** escolhidos pelo vetor (dominância; incomparáveis → maior soma →
+  primeiro tópico divergente em ordem de prioridade — `NGridConfig.priorityTopics`, ordem por nome
+  como padrão; empate → afinidade). O escape D9 promove um único nó (o melhor candidato não-eleito)
+  e nunca enquanto outro peer elegível afirma liderança.
+- **`FOLLOWER_PROGRESS`** carrega o mesmo vetor: o join-quiesce libera quando o joiner não está
+  atrás em nenhum tópico.
+
+Com isso um seguidor que perdeu a última op do `ngrrd.catalog` não é mais eleito à frente de um
+peer que a tem, ainda que o tópico de status (`ngrrd.nodes`, gravado a cada tick) dominasse o
+agregado. Detalhes e testes em `doc/ngrid/oplog-ha-hardening.md`, seção 15.
 
 ### Replicação de Operações (Escrita)
 

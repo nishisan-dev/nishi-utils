@@ -48,6 +48,11 @@ import java.util.Set;
  * @param preferredOwnerNodeId dono preferido (ex.: adoção pelo {@code LocalReconciler}), ou {@code null}
  * @param requestedBytes aligned allocation size of the new series
  * @param pendingBytesByNode incoming bytes not yet reflected in node reports
+ * @param seriesKey            chave da série sendo colocada (issue #167, item 3) — usada pelas regras de
+ *                             placement; {@code null} num contexto legado (sem regras aplicáveis)
+ * @param definitionName       {@code metadata.name} da definição da série, ou {@code null} quando o cliente
+ *                             não informou (série legada: só casa regras sem critério de definição)
+ * @param placementRules       regras de placement do líder; nunca {@code null} ({@link PlacementRules#NONE})
  */
 public record PlacementContext(
         Collection<StorageNodeStatus> nodes,
@@ -55,7 +60,8 @@ public record PlacementContext(
         Map<String, Long> pendingSeriesByNode,
         long nowEpochMs,
         Duration nodeStatusStaleAfter,
-        String preferredOwnerNodeId, long requestedBytes, Map<String, Long> pendingBytesByNode) {
+        String preferredOwnerNodeId, long requestedBytes, Map<String, Long> pendingBytesByNode,
+        String seriesKey, String definitionName, PlacementRules placementRules) {
 
     public PlacementContext(Collection<StorageNodeStatus> nodes, Set<String> reachableNodeIds,
             Map<String, Long> pendingSeriesByNode, long nowEpochMs, Duration nodeStatusStaleAfter,
@@ -63,8 +69,17 @@ public record PlacementContext(
         this(nodes, reachableNodeIds, pendingSeriesByNode, nowEpochMs, nodeStatusStaleAfter, preferredOwnerNodeId, 0, Map.of());
     }
 
+    /** Forma da 8.7.0, sem chave/definição/regras (nenhuma regra é aplicada). */
+    public PlacementContext(Collection<StorageNodeStatus> nodes, Set<String> reachableNodeIds,
+            Map<String, Long> pendingSeriesByNode, long nowEpochMs, Duration nodeStatusStaleAfter,
+            String preferredOwnerNodeId, long requestedBytes, Map<String, Long> pendingBytesByNode) {
+        this(nodes, reachableNodeIds, pendingSeriesByNode, nowEpochMs, nodeStatusStaleAfter, preferredOwnerNodeId,
+                requestedBytes, pendingBytesByNode, null, null, PlacementRules.NONE);
+    }
+
     public PlacementContext {
         if (requestedBytes < 0) { throw new IllegalArgumentException("negative requested bytes"); }
+        placementRules = Objects.requireNonNullElse(placementRules, PlacementRules.NONE);
         pendingBytesByNode = Map.copyOf(pendingBytesByNode);
         Objects.requireNonNull(nodes, "nodes");
         Objects.requireNonNull(reachableNodeIds, "reachableNodeIds");

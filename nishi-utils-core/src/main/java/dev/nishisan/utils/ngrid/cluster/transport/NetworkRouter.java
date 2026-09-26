@@ -75,14 +75,121 @@ final class NetworkRouter {
      * routed through it (heartbeats included, which evicts live members).
      */
     private final Predicate<NodeId> relayCandidate;
+    /**
+     * Connected-peer reports (8.8.0): what each peer said, in its handshake or PEER_UPDATE, about the
+     * peers it currently holds an open connection to — and when. A peer is a relay candidate for a
+     * target only while it reports that target as connected; a peer that merely lists the target in
+     * its gossip does not count (everyone keeps listing a dead leader). Peers that predate the field
+     * (no report) fall back to the gossip rule above.
+     */
+    private final Map<NodeId, ConnectedReport> connectedReports = new ConcurrentHashMap<>();
+    // How long a connected-peer report vouches for a PROXY route (isProxy); refreshed by gossip.
+    private final long reportFreshnessNanos;
+
+    private record ConnectedReport(Set<NodeId> connected, long atNanos) {
+        boolean fresh(long nowNanos, long freshnessNanos) {
+            return nowNanos - atNanos <= freshnessNanos;
+        }
+    }
 
     NetworkRouter(Supplier<Map<NodeId, Double>> localLatenciesSupplier) {
         this(localLatenciesSupplier, id -> true);
     }
 
     NetworkRouter(Supplier<Map<NodeId, Double>> localLatenciesSupplier, Predicate<NodeId> relayCandidate) {
+        this(localLatenciesSupplier, relayCandidate, java.time.Duration.ofSeconds(20));
+    }
+
+    /**
+     * @param reportFreshness how long a peer's connected-peer report keeps vouching for a PROXY route
+     *                        through it (see {@link #isProxy(NodeId)}); the transport refreshes reports
+     *                        through periodic gossip
+     */
+    NetworkRouter(Supplier<Map<NodeId, Double>> localLatenciesSupplier, Predicate<NodeId> relayCandidate,
+                  java.time.Duration reportFreshness) {
         this.localLatenciesSupplier = localLatenciesSupplier;
         this.relayCandidate = relayCandidate;
+        this.reportFreshnessNanos = reportFreshness.toNanos();
+    }
+
+    /**
+     * Updates the reachability information of nodes and re-evaluates routes if necessary.
+     *
+     * @param sourcePeer          the peer reporting the reachability data
+     * @param knownByPeer         the nodes known by the reporting peer (its gossip)
+     * @param latenciesFromSource the latencies reported by the peer for each target node
+     * @param connectedByPeer     the ids the peer currently holds an open connection to, or {@code null}
+     *                            when the report predates the field (8.7.0): the peer list is then taken
+     *                            as reachability evidence, as before. With the field, the peer is a relay
+     *                            candidate only for the targets listed here, and stops being one for
+     *                            every target it no longer reports.
+     */
+    void updateReachability(NodeId sourcePeer, Collection<NodeInfo> knownByPeer, Map<NodeId, Double> latenciesFromSource,
+                            Set<NodeId> connectedByPeer) {
+        reportedLatencies.put(sourcePeer, new HashMap<>(latenciesFromSource));
+        // A peer never vouches for itself: every node lists itself in its gossip, and recording it as
+        // its own reporter made it its own relay (PROXY via the target), a route that never healed.
+        if (connectedByPeer == null) {
+            for (NodeInfo target : knownByPeer) {
+                if (!target.nodeId().equals(sourcePeer)) {
+                    reachabilityMap.computeIfAbsent(target.nodeId(), k -> ConcurrentHashMap.newKeySet()).add(sourcePeer);
+                }
+            }
+        } else {
+            Set<NodeId> connected = Set.copyOf(connectedByPeer);
+            connectedReports.put(sourcePeer, new ConnectedReport(connected, System.nanoTime()));
+            for (NodeId target : connected) {
+                if (!target.equals(sourcePeer)) {
+                    reachabilityMap.computeIfAbsent(target, k -> ConcurrentHashMap.newKeySet()).add(sourcePeer);
+                }
+            }
+            reachabilityMap.forEach((target, reporters) -> {
+                if (!connected.contains(target)) {
+                    reporters.remove(sourcePeer);
+                }
+            });
+        }
+        reevaluateProxyRoutes(null);
+    }
+
+    /**
+     * A relay reported one of our messages as UNDELIVERABLE: it holds no connection to the target, so
+     * it is no longer a candidate for that target. A PROXY route through it moves to another candidate
+     * or, when none remains, back to DIRECT — so the next send dials the target itself and, failing
+     * that, the transport sees the peer as unreachable instead of relaying into the void forever.
+     *
+     * @param via    the relay that could not forward
+     * @param target the destination it could not reach
+     */
+    void relayFailed(NodeId via, NodeId target) {
+        Set<NodeId> reporters = reachabilityMap.get(target);
+        if (reporters != null) {
+            reporters.remove(via);
+        }
+        connectedReports.computeIfPresent(via, (id, report) -> {
+            if (!report.connected().contains(target)) {
+                return report;
+            }
+            Set<NodeId> remaining = new java.util.HashSet<>(report.connected());
+            remaining.remove(target);
+            return new ConnectedReport(Set.copyOf(remaining), report.atNanos());
+        });
+        routes.computeIfPresent(target, (id, current) -> {
+            if (current.type() == RouteType.PROXY && via.equals(current.via())) {
+                return findBestProxy(target, via).map(Route::proxy).orElse(Route.direct());
+            }
+            return current;
+        });
+    }
+
+    /**
+     * Re-evaluates every PROXY route: the best current candidate, or DIRECT when no candidate remains
+     * (the relays lost their link to the target, or we lost ours to them).
+     */
+    private void reevaluateProxyRoutes(NodeId exclude) {
+        routes.replaceAll((target, route) -> route.type() == RouteType.PROXY
+                ? findBestProxy(target, exclude).map(Route::proxy).orElse(Route.direct())
+                : route);
     }
 
     /**
@@ -94,20 +201,7 @@ final class NetworkRouter {
      *                             reported by the peer for each target node.
      */
     void updateReachability(NodeId sourcePeer, Collection<NodeInfo> knownByPeer, Map<NodeId, Double> latenciesFromSource) {
-        reportedLatencies.put(sourcePeer, new HashMap<>(latenciesFromSource));
-        for (NodeInfo target : knownByPeer) {
-            reachabilityMap.computeIfAbsent(target.nodeId(), k -> ConcurrentHashMap.newKeySet()).add(sourcePeer);
-        }
-        // Re-evaluate routes for these targets if we are in proxy mode
-        for (NodeInfo target : knownByPeer) {
-            NodeId targetId = target.nodeId();
-            routes.computeIfPresent(targetId, (id, current) -> {
-                if (current.type() == RouteType.PROXY) {
-                    return findBestProxy(targetId, null).map(Route::proxy).orElse(current);
-                }
-                return current;
-            });
-        }
+        updateReachability(sourcePeer, knownByPeer, latenciesFromSource, null);
     }
 
     /**
@@ -118,9 +212,10 @@ final class NetworkRouter {
      */
     void markDirectFailure(NodeId target) {
         routes.compute(target, (id, current) -> {
-            if (current != null && current.type() == RouteType.PROXY) {
+            if (current != null && current.type() == RouteType.PROXY && !target.equals(current.via())) {
                 return current;
             }
+            // No route, DIRECT, or a PROXY through the target itself (treated as DIRECT).
             return findBestProxy(target, null).map(Route::proxy).orElse(Route.direct());
         });
     }
@@ -137,6 +232,7 @@ final class NetworkRouter {
         routes.remove(id);
         reachabilityMap.remove(id);
         reportedLatencies.remove(id);
+        connectedReports.remove(id);
         reachabilityMap.values().forEach(reporters -> reporters.remove(id));
         // Inner latency maps are replaced, never mutated: findBestProxy reads them concurrently.
         reportedLatencies.replaceAll((source, latencies) -> {
@@ -162,6 +258,9 @@ final class NetworkRouter {
 
     Optional<NodeId> nextHop(NodeId target, NodeId exclude) {
         Route route = routes.getOrDefault(target, Route.direct());
+        if (route.type() == RouteType.PROXY && target.equals(route.via())) {
+            route = Route.direct(); // a node is never its own relay
+        }
 
         // Phase 2: Even if we are DIRECT, check if there is a proxy path that is MUCH better
         if (route.type() == RouteType.DIRECT) {
@@ -212,9 +311,30 @@ final class NetworkRouter {
         return Optional.empty();
     }
 
+    /**
+     * Whether {@code target} is currently routed through a relay that can actually reach it: the route
+     * is PROXY, we hold a connection to the relay, and the relay's connected-peer report names the
+     * target and is fresh (within the report freshness). Gossip alone (a relay that merely lists the
+     * target) no longer counts: it kept a dead leader "reachable via proxy" and granted it the
+     * coordinator's eviction grace. A relay that predates the report (no field) counts as before.
+     *
+     * @param target the destination
+     * @return {@code true} while a live relay vouches for the target
+     */
     boolean isProxy(NodeId target) {
         Route route = routes.get(target);
-        return route != null && route.type() == RouteType.PROXY;
+        if (route == null || route.type() != RouteType.PROXY) {
+            return false;
+        }
+        NodeId via = route.via();
+        if (via == null || via.equals(target) || !relayCandidate.test(via)) {
+            return false;
+        }
+        ConnectedReport report = connectedReports.get(via);
+        if (report == null) {
+            return true; // legacy relay (8.7.0): gossip is the only evidence, as before
+        }
+        return report.connected().contains(target) && report.fresh(System.nanoTime(), reportFreshnessNanos);
     }
 
     private record PathCost(NodeId nodeId, double cost) {}
@@ -231,8 +351,9 @@ final class NetworkRouter {
 
         Map<NodeId, Double> local = localLatenciesSupplier.get();
 
+        // The target itself is never a candidate (every node gossips itself).
         List<PathCost> scoredCandidates = candidates.stream()
-                .filter(id -> !id.equals(exclude) && relayCandidate.test(id))
+                .filter(id -> !id.equals(target) && !id.equals(exclude) && relayCandidate.test(id))
                 .map(proxyId -> {
                     Double rttToProxy = local.get(proxyId);
                     Map<NodeId, Double> proxyReported = reportedLatencies.get(proxyId);

@@ -228,6 +228,42 @@ class NodeStatusReporterTest {
 
     @Test
     @Timeout(value = 10, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+    void statusPublicadoLevaACotaEOHashDasRegrasDePlacement() throws InterruptedException {
+        CatalogViewFake catalog = new CatalogViewFake();
+        NodeStatusReporter reporter = reporterWithFakeCatalog(catalog, Duration.ofMillis(30));
+        reporter.quota(200_000L, 68_719_476_736L);
+        reporter.placementRulesHash("0123456789abcdef");
+        try {
+            reporter.start();
+            awaitTrue("status deveria ter sido publicado", () -> !catalog.published.isEmpty());
+            StorageNodeStatus published = catalog.published.get(0);
+            assertEquals(200_000L, published.quotaMaxSeries());
+            assertEquals(68_719_476_736L, published.quotaMaxBytes());
+            assertEquals("0123456789abcdef", published.placementRulesHash());
+        } finally {
+            reporter.close();
+        }
+    }
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+    void semCotaNemRegrasConfiguradasOStatusSaiComCotaZeroEHashNulo() throws InterruptedException {
+        CatalogViewFake catalog = new CatalogViewFake();
+        NodeStatusReporter reporter = reporterWithFakeCatalog(catalog, Duration.ofMillis(30));
+        try {
+            reporter.start();
+            awaitTrue("status deveria ter sido publicado", () -> !catalog.published.isEmpty());
+            StorageNodeStatus published = catalog.published.get(0);
+            assertEquals(0L, published.quotaMaxSeries());
+            assertEquals(0L, published.quotaMaxBytes());
+            assertNull(published.placementRulesHash());
+        } finally {
+            reporter.close();
+        }
+    }
+
+    @Test
+    @Timeout(value = 10, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
     void statusPublicadoLevaOLagDaReplicaDoCatalogo() throws InterruptedException {
         CatalogViewFake catalog = new CatalogViewFake();
         CatalogReplicaStatus replica = new CatalogReplicaStatus(false, 42L, 1_000L, 959L, false, false, true);

@@ -445,6 +445,65 @@ class MigrationExecutorTest {
         assertEquals(0, dstVolume.storage().reservedBytes());
     }
 
+    // ---- Issue #167 (item 3): o destino recusa MIGRATE_PREPARE além da própria cota ----
+
+    private MigrationExecutor quotaExecutor(long quotaMaxSeries, long quotaMaxBytes) {
+        dstExecutor.close();
+        dstExecutor = new MigrationExecutor(new FakeTransport(DST), dstRegistry, dstVolume, rpc, dstCatalog, DST,
+                "series", 4_096L, MAX_SERIES_BYTES, MigrationBandwidth.DEFAULT_BYTES_PER_SECOND, Clock.systemUTC(),
+                quotaMaxSeries, quotaMaxBytes);
+        rpc.register(DST, dstExecutor);
+        return dstExecutor;
+    }
+
+    @Test
+    void destinoRecusaPrepareQuandoAsEntradasMaisOsAlvosAbertosAtingemACotaDeSeries() {
+        quotaExecutor(1, 0);
+        publishMigration("q-a", "q-a-id");
+        publishMigration("q-b", "q-b-id");
+
+        // 0 entradas + 0 alvos abertos < 1: cabe. Depois disso 0 + 1 alvo aberto >= 1: recusa.
+        assertEquals(MigrateStatus.COPY_READY, ((MigrateResponse) dstExecutor.handleLocal(Commands.MIGRATE_PREPARE,
+                new MigratePrepareRequest("q-a", "q-a-id", objectKey("q-a"), 8192, true))).status());
+        MigrateResponse refused = (MigrateResponse) dstExecutor.handleLocal(Commands.MIGRATE_PREPARE,
+                new MigratePrepareRequest("q-b", "q-b-id", objectKey("q-b"), 8192, true));
+
+        assertEquals(MigrateStatus.QUOTA_EXCEEDED, refused.status());
+        assertEquals("quota_series(2/1)", refused.message());
+        assertEquals(8192, dstVolume.storage().reservedBytes(), "só a primeira reserva fica de pé");
+        assertEquals(MigrateStatus.ERROR, status(dstExecutor, "q-b-id").status(), "a migração recusada fica FAILED");
+        // Re-PREPARE da migração já aceita continua idempotente (não conta a si mesma na cota).
+        assertEquals(MigrateStatus.COPY_READY, ((MigrateResponse) dstExecutor.handleLocal(Commands.MIGRATE_PREPARE,
+                new MigratePrepareRequest("q-a", "q-a-id", objectKey("q-a"), 8192, true))).status());
+    }
+
+    @Test
+    void destinoRecusaPrepareQuandoUsadoMaisReservadoMaisPedidoEstouraACotaDeBytes() {
+        quotaExecutor(0, 10_000);
+        publishMigration("b-a", "b-a-id");
+        publishMigration("b-b", "b-b-id");
+
+        assertEquals(MigrateStatus.COPY_READY, ((MigrateResponse) dstExecutor.handleLocal(Commands.MIGRATE_PREPARE,
+                new MigratePrepareRequest("b-a", "b-a-id", objectKey("b-a"), 8192, true))).status());
+        MigrateResponse refused = (MigrateResponse) dstExecutor.handleLocal(Commands.MIGRATE_PREPARE,
+                new MigratePrepareRequest("b-b", "b-b-id", objectKey("b-b"), 8192, true));
+
+        assertEquals(MigrateStatus.QUOTA_EXCEEDED, refused.status());
+        assertEquals("quota_bytes(16384/10000)", refused.message());
+        assertEquals(8192, dstVolume.storage().reservedBytes());
+    }
+
+    @Test
+    void semCotaConfiguradaOPrepareNaoMudaDeComportamento() {
+        quotaExecutor(0, 0);
+        for (int i = 0; i < 3; i++) {
+            publishMigration("n-" + i, "n-" + i + "-id");
+            assertEquals(MigrateStatus.COPY_READY, ((MigrateResponse) dstExecutor.handleLocal(Commands.MIGRATE_PREPARE,
+                    new MigratePrepareRequest("n-" + i, "n-" + i + "-id", objectKey("n-" + i), 8192, true))).status());
+        }
+        assertEquals(3 * 8192, dstVolume.storage().reservedBytes());
+    }
+
     @Test
     void invalidPatchesReleaseReservationWithoutInstallingPartialImage() {
         for (int scenario = 0; scenario < 3; scenario++) {

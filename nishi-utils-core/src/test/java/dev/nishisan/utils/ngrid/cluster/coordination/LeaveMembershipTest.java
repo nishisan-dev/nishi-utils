@@ -133,7 +133,14 @@ class LeaveMembershipTest {
         assertFalse(h.activeIds().contains(VOTER), "o votante que anunciou a saída deveria ficar inativo na hora");
         assertEquals(before + 1, h.membershipEvents.get());
 
+        // Revisão #178 (A4): um heartbeat da encarnação que SAIU, lido antes do LEAVE e despachado
+        // depois, não pode reativar o membro (re-adotava o líder rebaixado por um ciclo inteiro).
+        h.heartbeat(VOTER);
+        assertFalse(h.activeIds().contains(VOTER), "heartbeat em voo da encarnação que saiu não reativa o votante");
+
+        // Quem volta com o mesmo id fala de novo pelo handshake (onPeerConnected) — aí o heartbeat reativa.
         h.transport.connected.add(VOTER);
+        h.coord.onPeerConnected(h.voter);
         h.heartbeat(VOTER);
         assertTrue(h.activeIds().contains(VOTER), "o heartbeat de quem voltou com o mesmo id o reativa");
     }

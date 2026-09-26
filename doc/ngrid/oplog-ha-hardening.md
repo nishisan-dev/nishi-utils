@@ -566,3 +566,69 @@ E2E (`AutomaticLeaderHandbackE2ETest`): coreografia completa, **sem janela de du
 `applied == global == follower.applied` (offset 0), zero perda/duplicata. `HandbackSafetyE2ETest`:
 failover genuíno promove o sobrevivente; aborto retém a liderança e descongela. Regressões D8/D9/D10
 verdes (handback é opt-in; default da lib off).
+
+## 15. Fronteiras por tópico no heartbeat e revisão de maturidade (issue #178, 8.8.0)
+
+### O problema
+
+O odômetro global de progresso aplicado misturava **três escalas**: a soma das fronteiras por
+tópico (seed no restart), o máximo da sequência por tópico (commit do seguidor) e um tick por
+operação (commit do líder), além de `SET`s com o watermark de um único tópico no cutover de snapshot
+e no handback D11 (`primaryTopic()` arbitrário). Com vários tópicos replicados o valor de um nó
+reiniciado não era comparável ao do líder (`HIGH_REPLICATION_LAG` de milhões sem backlog, `peer
+watermark above its own applied`), e o gate de eleição — agregado — não distinguia um seguidor sem a
+última op do catálogo de um com uma op de status a mais: em `RELAY_STREAM` (quórum 1) a op
+confirmada se perdia.
+
+### O desenho
+
+- **`TopicFrontiers`** (`common`): vetor imutável tópico → fronteira, com `compare` por dominância
+  (`AHEAD`/`BEHIND`/`EQUAL`/`INCOMPARABLE`), tolerância por tópico e desempate determinístico dos
+  incomparáveis (maior soma, depois o primeiro tópico divergente na ordem de prioridade —
+  `priorityTopics`, nome como padrão). Ambos os lados calculam a mesma ordem, logo exatamente um cede.
+- **`ReplicationManager.appliedFrontiers()`**: `max(produzido, nextExpected − 1)` por tópico; o líder
+  avança `nextExpected` e o cursor de fetch a cada commit, então a fronteira tem uma única definição
+  para os dois papéis (e uma demoção ao vivo não re-puxa a própria cauda — A1). `getLastAppliedSequence()`
+  = soma; `globalSequence` sai do watermark anunciado e dos alvos de quiesce.
+- **Heartbeat, `FOLLOWER_PROGRESS`, `HANDBACK_GRANT`/`HANDBACK_COMPLETE`** carregam o vetor (campos
+  aditivos; construtores de compatibilidade; frame binário com seção final opcional).
+- **Coordinator:** `peerTopicFrontiers` ao lado de `peerHighWatermark`; gate A, gate B, peer a seguir
+  e escape D9 pelo vetor; escalar só para peers sem vetor; `maxActivePeerTopicFrontier(topic)` para
+  fences de aplicação (o ngrrd espera a fronteira do catálogo antes de retomar migrações).
+- **Observabilidade:** lag global = soma dos lags por tópico; `NGridOperationalSnapshot.appliedByTopic`;
+  `Consistency.bounded` limita o lag do tópico do próprio mapa.
+
+### Revisão do NGrid entregue junto (ondas A–C, B10, C9)
+
+Eleição/coordinator: escape D9 de um só vencedor (A2), heartbeats do mesmo peer nunca aplicados
+fora de ordem (A3), janela pós-LEAVE (A4), trava de reclaim limpa na demoção/step-down/regressão
+(A5), listeners isolados (C3), epoch persistido (C8), `stop()` rebaixa (B10), votante com porta 0
+fora do numerador (B10), evicção atômica com `touch()` e reativação notificada (B10), líder isolado
+rebaixa em um `heartbeatTimeout` e o step-down reagenda a eleição (C9).
+
+Replicação: cadeia de snapshot só do líder acordado e em ordem (C1), handback multi-tópico (C2),
+`replicate()` rejeita depois de `stop()` e o `NGridNode` rebaixa antes de fechar o op-log (C4),
+dead-letter de entrada envenenada do relay (C5), backoff na recusa do líder, prazos de fetch limpos
+na troca de líder e cooldown de snapshot (C6), `resetSequenceState()` removido (C7).
+
+Transport (onda B): relay só com link vivo ao destino e rota que volta a DIRECT (B1), relay sempre
+elegível (B2), nunca proxy de si mesmo (B3), backoff e cache negativo de discagem (B4), redrenagem
+dos frames da conexão perdedora (B5), pendentes indexados pelo próximo salto (B6), `sendAndAwait`
+sem discar na thread do chamador (B7), UNDELIVERABLE de resposta e vazamento de pendentes (B10),
+backpressure limitada com keepalive e timeout de leitura (B8).
+
+### Compatibilidade
+
+Todas as mudanças de fio são aditivas. Durante a janela mista de um rolling upgrade os gates caem
+na comparação escalar da 8.7.0 contra peers antigos; atualize os storages antes dos clientes e
+mantenha o rebalance desligado na janela. `priorityTopics` deve ser idêntico em todos os nós.
+
+### Validação
+
+`TopicFrontiersTest`, `TopicFrontierElectionGateTest` (mesma soma atrás no catálogo defere; peer
+sem vetor; incomparáveis; F2 preservado; gate B por tópico; escape D9 por vetor; A3; A5),
+`StalemateEscapeSingleWinnerTest` (dois coordinators num barramento), `ReplicationManagerSequenceStateTest`
+(3 tópicos), `JoinQuiesceReleaseGateTest` (por tópico), `BinaryFrameCodecTest`/`JacksonMessageCodecTest`
+(compatibilidade), `MultiTopicRestartWatermarkE2ETest`, `LiveDemotionNoReplayE2ETest` (falha na
+8.7.0: 240 itens em vez de 120), `RelayStreamRobustnessTest`, `CoordinatorHardeningTest`, E2E de
+handback verdes com dois tópicos.

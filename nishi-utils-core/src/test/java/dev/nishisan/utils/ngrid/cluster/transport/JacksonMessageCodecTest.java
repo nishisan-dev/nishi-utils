@@ -70,6 +70,42 @@ class JacksonMessageCodecTest {
     }
 
     @Test
+    void heartbeatJsonWithoutTopicFrontiersDecodesEmptyVector() throws Exception {
+        // Issue #178: peer anterior à 8.8.0 não manda "topicFrontiers".
+        com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+        HeartbeatPayload decoded = mapper.readValue(
+                "{\"epochMilli\":1,\"leaderHighWatermark\":42,\"leaderEpoch\":7,\"leader\":true}",
+                HeartbeatPayload.class);
+        assertEquals(java.util.Map.of(), decoded.topicFrontiers());
+        HeartbeatPayload withVector = mapper.readValue(
+                "{\"epochMilli\":1,\"leaderHighWatermark\":42,\"leaderEpoch\":7,\"leader\":true,"
+                        + "\"topicFrontiers\":{\"map:b\":2,\"map:a\":40}}",
+                HeartbeatPayload.class);
+        assertEquals(java.util.Map.of("map:a", 40L, "map:b", 2L), withVector.topicFrontiers());
+        ClusterMessage message = ClusterMessage.lightweight(MessageType.HEARTBEAT, "hb",
+                NodeId.of("node-vec"), null, withVector);
+        assertEquals(withVector.topicFrontiers(),
+                codec.decode(codec.encode(message)).payload(HeartbeatPayload.class).topicFrontiers(),
+                "round-trip JSON do vetor por tópico");
+    }
+
+    @Test
+    void followerProgressJsonWithoutTopicFrontiersDecodesEmptyVector() throws Exception {
+        // Issue #178: seguidor anterior à 8.8.0 manda só appliedSequence/epoch.
+        com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+        dev.nishisan.utils.ngrid.common.FollowerProgressPayload legacy = mapper.readValue(
+                "{\"appliedSequence\":42,\"epoch\":7}", dev.nishisan.utils.ngrid.common.FollowerProgressPayload.class);
+        assertEquals(42L, legacy.appliedSequence());
+        assertEquals(java.util.Map.of(), legacy.topicFrontiers());
+        dev.nishisan.utils.ngrid.common.FollowerProgressPayload withVector =
+                new dev.nishisan.utils.ngrid.common.FollowerProgressPayload(42L, 7L, java.util.Map.of("map:a", 40L, "map:b", 2L));
+        ClusterMessage message = ClusterMessage.request(MessageType.FOLLOWER_PROGRESS, "follower-progress",
+                NodeId.of("node-1"), NodeId.of("node-2"), withVector);
+        assertEquals(withVector.topicFrontiers(), codec.decode(codec.encode(message))
+                .payload(dev.nishisan.utils.ngrid.common.FollowerProgressPayload.class).topicFrontiers());
+    }
+
+    @Test
     void shouldRoundTripHeartbeatMessage() throws Exception {
         NodeId sourceId = NodeId.of("node-1");
         NodeId destId = NodeId.of("node-2");

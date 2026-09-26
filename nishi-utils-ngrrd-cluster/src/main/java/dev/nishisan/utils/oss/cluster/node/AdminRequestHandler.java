@@ -23,6 +23,8 @@ import dev.nishisan.utils.oss.cluster.admin.AdminService;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
+import dev.nishisan.utils.oss.cluster.placement.PlacementRules;
+import dev.nishisan.utils.oss.cluster.protocol.AdminForgetResponse;
 import dev.nishisan.utils.oss.cluster.protocol.AdminNodeRequest;
 import dev.nishisan.utils.oss.cluster.protocol.AdminNodeStatusResponse;
 import dev.nishisan.utils.oss.cluster.protocol.AdminRebalanceResponse;
@@ -35,12 +37,14 @@ import dev.nishisan.utils.oss.cluster.rebalance.Rebalancer;
 import dev.nishisan.utils.oss.cluster.rpc.ClusterRpc;
 import dev.nishisan.utils.oss.cluster.rpc.RequestHandlerSupport;
 
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
@@ -63,6 +67,14 @@ import java.util.stream.Collectors;
  * {@code NOT_LEADER}/{@code leaderNodeId} de {@code ADMIN_STATUS}/{@code ADMIN_REBALANCE}; delega a
  * transição em si a {@link AdminService}, que já dispara um ciclo do {@link Rebalancer}. Um
  * {@code nodeId} desconhecido do catálogo responde {@link SeriesStatus#ERROR}.</p>
+ *
+ * <p>{@code ADMIN_FORGET} (revisão #178, B9; desde a 8.8.0): sem {@link AdminNodeRequest#forwarded()},
+ * só o líder responde — recusa ({@code ERROR}) se o nó ainda é o próprio líder, ainda está alcançável ou
+ * ainda tem séries/migrações de entrada no catálogo (drene antes); senão propaga a ordem, com
+ * {@code forwarded=true}, a cada storage alcançável do catálogo, esquece o peer localmente
+ * ({@code NGridNode.decommissionPeer}) e remove o nó do catálogo. Com {@code forwarded=true}, qualquer nó
+ * apenas esquece o peer no seu {@code Transport}. Sem um {@code peerDecommissioner} configurado, responde
+ * {@code ERROR}.</p>
  */
 public final class AdminRequestHandler extends RequestHandlerSupport {
 
@@ -74,12 +86,44 @@ public final class AdminRequestHandler extends RequestHandlerSupport {
     private final Rebalancer rebalancer;
     private final AdminService adminService;
     private final MigrationCoordinator migrationCoordinator;
+    /** Regras de placement deste nó (issue #167, item 3), reportadas em {@code ngrrd.admin.status} quando líder. */
+    private final PlacementRules placementRules;
+    /** Esquece um peer votante no transporte deste nó ({@code ngrrd.admin.forget}); {@code null} = não suportado. */
+    private final Predicate<String> peerDecommissioner;
 
     public AdminRequestHandler(Transport transport, NodeId self, PlacementRequestHandler.LeaderView leaderView,
             CatalogService catalog, Supplier<NodeMetricsSnapshot> localMetricsSupplier, ClusterRpc rpc,
             Rebalancer rebalancer, AdminService adminService, MigrationCoordinator migrationCoordinator) {
+        this(transport, self, leaderView, catalog, localMetricsSupplier, rpc, rebalancer, adminService,
+                migrationCoordinator, PlacementRules.NONE);
+    }
+
+    /**
+     * @param placementRules regras de placement deste nó ({@code ngrrd.placement.rules}, issue #167 item 3),
+     *                       cujo fingerprint e contagem saem em {@code ngrrd.admin.status}; {@code null} = nenhuma
+     */
+    public AdminRequestHandler(Transport transport, NodeId self, PlacementRequestHandler.LeaderView leaderView,
+            CatalogService catalog, Supplier<NodeMetricsSnapshot> localMetricsSupplier, ClusterRpc rpc,
+            Rebalancer rebalancer, AdminService adminService, MigrationCoordinator migrationCoordinator,
+            PlacementRules placementRules) {
+        this(transport, self, leaderView, catalog, localMetricsSupplier, rpc, rebalancer, adminService,
+                migrationCoordinator, placementRules, null);
+    }
+
+    /**
+     * @param peerDecommissioner esquece o peer votante {@code nodeId} no transporte deste nó
+     *                           ({@code NGridNode.decommissionPeer}, revisão #178 B9), devolvendo se ele era
+     *                           conhecido; {@code null} = {@code ngrrd.admin.forget} responde {@code ERROR}
+     * @since 8.8.0
+     */
+    public AdminRequestHandler(Transport transport, NodeId self, PlacementRequestHandler.LeaderView leaderView,
+            CatalogService catalog, Supplier<NodeMetricsSnapshot> localMetricsSupplier, ClusterRpc rpc,
+            Rebalancer rebalancer, AdminService adminService, MigrationCoordinator migrationCoordinator,
+            PlacementRules placementRules, Predicate<String> peerDecommissioner) {
         super(transport, Set.of(Commands.ADMIN_STATUS, Commands.ADMIN_METRICS, Commands.ADMIN_REBALANCE,
-                Commands.ADMIN_DRAIN, Commands.ADMIN_ACTIVATE));
+                Commands.ADMIN_DRAIN, Commands.ADMIN_ACTIVATE, Commands.ADMIN_FORGET));
+        this.placementRules = Objects.requireNonNullElse(placementRules, PlacementRules.NONE);
+        this.peerDecommissioner = peerDecommissioner;
         this.self = Objects.requireNonNull(self, "self");
         this.leaderView = Objects.requireNonNull(leaderView, "leaderView");
         this.catalog = Objects.requireNonNull(catalog, "catalog");
@@ -98,6 +142,7 @@ public final class AdminRequestHandler extends RequestHandlerSupport {
             case Commands.ADMIN_REBALANCE -> handleRebalance();
             case Commands.ADMIN_DRAIN -> handleDrain((AdminNodeRequest) body);
             case Commands.ADMIN_ACTIVATE -> handleActivate((AdminNodeRequest) body);
+            case Commands.ADMIN_FORGET -> handleForget((AdminNodeRequest) body);
             default -> throw new IllegalArgumentException("Comando não suportado por AdminRequestHandler: " + command);
         };
     }
@@ -123,6 +168,70 @@ public final class AdminRequestHandler extends RequestHandlerSupport {
         }
     }
 
+    private AdminForgetResponse handleForget(AdminNodeRequest request) {
+        String target = request != null ? request.nodeId() : null;
+        if (target == null || target.isBlank()) {
+            return AdminForgetResponse.of(SeriesStatus.ERROR, null, target, "nodeId é obrigatório");
+        }
+        if (peerDecommissioner == null) {
+            return AdminForgetResponse.of(SeriesStatus.ERROR, null, target,
+                    "ngrrd.admin.forget não suportado por " + self.value());
+        }
+        if (request.forwarded()) {
+            // Ordem propagada pelo líder: só o transporte local. "Já desconhecido" também é sucesso.
+            peerDecommissioner.test(target);
+            return new AdminForgetResponse(SeriesStatus.OK, null, target, List.of(self.value()), List.of(), null);
+        }
+        if (!leaderView.isLeader()) {
+            return AdminForgetResponse.of(SeriesStatus.NOT_LEADER, leaderView.leaderId().orElse(null), target, null);
+        }
+        if (target.equals(self.value())) {
+            return AdminForgetResponse.of(SeriesStatus.ERROR, self.value(), target,
+                    "o líder não esquece a si mesmo; pare este nó e repita o comando a partir de outro");
+        }
+        if (leaderView.reachableNodeIds().contains(target)) {
+            return AdminForgetResponse.of(SeriesStatus.ERROR, self.value(), target,
+                    "nó ainda alcançável; pare o processo (drenado) antes de esquecê-lo");
+        }
+        long owned = catalog.seriesByOwnerLocal().getOrDefault(target, List.of()).size();
+        long inbound = catalog.placementsLocal().values().stream()
+                .filter(placement -> target.equals(placement.targetNodeId())).count();
+        if (owned > 0 || inbound > 0) {
+            return AdminForgetResponse.of(SeriesStatus.ERROR, self.value(), target,
+                    "nó ainda tem " + owned + " série(s) e " + inbound + " migração(ões) de entrada no catálogo;"
+                            + " drene-o (ngrrd.admin.drain) e aguarde DRAINED antes de esquecê-lo");
+        }
+        List<String> forgottenOn = new ArrayList<>();
+        List<String> failedOn = new ArrayList<>();
+        Set<String> reachable = leaderView.reachableNodeIds();
+        for (StorageNodeStatus status : catalog.nodesLocal()) {
+            String peer = status.nodeId();
+            if (peer.equals(target) || peer.equals(self.value())) {
+                continue;
+            }
+            if (!reachable.contains(peer)) {
+                failedOn.add(peer);
+                continue;
+            }
+            try {
+                AdminForgetResponse response = rpc.call(NodeId.of(peer), Commands.ADMIN_FORGET,
+                        new AdminNodeRequest(target, true), AdminForgetResponse.class);
+                if (response != null && response.status() == SeriesStatus.OK) {
+                    forgottenOn.add(peer);
+                } else {
+                    failedOn.add(peer);
+                }
+            } catch (RuntimeException e) {
+                failedOn.add(peer);
+            }
+        }
+        peerDecommissioner.test(target);
+        forgottenOn.add(self.value());
+        catalog.removeNodeStatus(target);
+        return new AdminForgetResponse(SeriesStatus.OK, self.value(), target, forgottenOn, failedOn,
+                failedOn.isEmpty() ? null : "repita o comando quando voltarem: " + String.join(", ", failedOn));
+    }
+
     private AdminRebalanceResponse handleRebalance() {
         if (!leaderView.isLeader()) {
             return new AdminRebalanceResponse(SeriesStatus.NOT_LEADER, leaderView.leaderId().orElse(null), 0, 0);
@@ -146,7 +255,8 @@ public final class AdminRequestHandler extends RequestHandlerSupport {
                 .collect(Collectors.toMap(Map.Entry::getKey, entry -> (long) entry.getValue().size()));
         return new AdminStatusResponse(SeriesStatus.OK, self.value(), views,
                 migrationCoordinator.activeMigrationCount(), seriesCountByNode,
-                catalog.placementsLocal().values().stream().filter(p -> !p.geometryConfirmed()).count());
+                catalog.placementsLocal().values().stream().filter(p -> !p.geometryConfirmed()).count(),
+                placementRules.fingerprint(), placementRules.size());
     }
 
     private NodeMetricsSnapshot handleMetrics(AdminNodeRequest request) {

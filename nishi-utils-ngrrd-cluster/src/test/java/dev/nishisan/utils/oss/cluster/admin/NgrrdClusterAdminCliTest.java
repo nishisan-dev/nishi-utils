@@ -36,6 +36,7 @@ import dev.nishisan.utils.oss.cluster.metrics.BlobVolumeSummary;
 import dev.nishisan.utils.oss.cluster.metrics.LatencySnapshot;
 import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
 import dev.nishisan.utils.oss.cluster.placement.DistributionMode;
+import dev.nishisan.utils.oss.cluster.protocol.AdminForgetResponse;
 import dev.nishisan.utils.oss.cluster.protocol.AdminStatusResponse;
 import dev.nishisan.utils.oss.cluster.protocol.NodeStatusView;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesStatus;
@@ -170,6 +171,63 @@ class NgrrdClusterAdminCliTest {
         assertEquals("-", catLagOf(capture.out, "storage-antigo"));
     }
 
+    /** Issue #167 (item 3): cabeçalho {@code REGRAS:} e colunas {@code QUOTA}/{@code RULES} (com {@code !} na divergência). */
+    @Test
+    void statusImprimeCotaERegrasPorNoMarcandoDivergenciaDoLider() {
+        ClientFake client = new ClientFake();
+        client.statusResponse = new AdminStatusResponse(SeriesStatus.OK, "storage-lider",
+                List.of(
+                        viewWithQuota("storage-lider", 200_000, 68_719_476_736L, "0123456789abcdef"),
+                        viewWithQuota("storage-igual", 0, 1_024, "0123456789abcdef"),
+                        viewWithQuota("storage-diverg", 10, 0, "fedcba9876543210"),
+                        viewWithQuota("storage-semregra", 0, 0, null)),
+                0, Map.of(), 0L, "0123456789abcdef", 2);
+
+        Capture capture = run(new String[] {"--seed", "127.0.0.1:9000", "status"}, cfg -> client);
+
+        assertEquals(0, capture.exitCode);
+        assertTrue(capture.out.contains("REGRAS: 0123456789abcdef (2 regras)"), capture.out);
+        String header = capture.out.lines().filter(line -> line.startsWith("NODE ")).findFirst().orElseThrow();
+        assertTrue(header.indexOf("RESERVED") < header.indexOf("QUOTA"), header);
+        assertTrue(header.indexOf("QUOTA") < header.indexOf("RULES"), header);
+        assertTrue(header.indexOf("RULES") < header.indexOf("CAT_LAG"), header);
+        assertEquals("200000/68719476736", columnOf(capture.out, "storage-lider", 4));
+        assertEquals("01234567", columnOf(capture.out, "storage-lider", 3));
+        assertEquals("-/1024", columnOf(capture.out, "storage-igual", 4));
+        assertEquals("01234567", columnOf(capture.out, "storage-igual", 3));
+        assertEquals("10/-", columnOf(capture.out, "storage-diverg", 4));
+        assertEquals("fedcba98!", columnOf(capture.out, "storage-diverg", 3));
+        assertEquals("-/-", columnOf(capture.out, "storage-semregra", 4));
+        assertEquals("-!", columnOf(capture.out, "storage-semregra", 3));
+    }
+
+    @Test
+    void statusSemRegrasNoLiderImprimeTracoENaoMarcaNosSemRegra() {
+        ClientFake client = new ClientFake();
+        client.statusResponse = new AdminStatusResponse(SeriesStatus.OK, "storage-lider",
+                List.of(viewWithQuota("storage-lider", 0, 0, null), viewWithQuota("storage-antigo", 0, 0, null)),
+                0, Map.of());
+
+        Capture capture = run(new String[] {"--seed", "127.0.0.1:9000", "status"}, cfg -> client);
+
+        assertEquals(0, capture.exitCode);
+        assertTrue(capture.out.contains("REGRAS: - (0 regras)"), capture.out);
+        assertEquals("-", columnOf(capture.out, "storage-lider", 3));
+        assertEquals("-", columnOf(capture.out, "storage-antigo", 3));
+    }
+
+    private static NodeStatusView viewWithQuota(String nodeId, long quotaMaxSeries, long quotaMaxBytes, String hash) {
+        return new NodeStatusView(new StorageNodeStatus(nodeId, NodeState.ACTIVE, 1, 10, 100, 1L,
+                DistributionMode.COUNT, 1, 0, StorageCapabilities.ALL, CatalogReplicaStatus.ofLeader(),
+                quotaMaxSeries, quotaMaxBytes, hash), true);
+    }
+
+    /** Coluna contada a partir do fim da linha do nó (1 = CAPABILITIES, 2 = CAT_LAG, 3 = RULES, 4 = QUOTA). */
+    private static String columnOf(String output, String nodeId, int fromEnd) {
+        String[] columns = lineOf(output, nodeId).trim().split("\\s+");
+        return columns[columns.length - fromEnd];
+    }
+
     private static NodeStatusView viewWithReplica(String nodeId, CatalogReplicaStatus replica) {
         return new NodeStatusView(new StorageNodeStatus(nodeId, NodeState.ACTIVE, 1, 10, 100, 1L,
                 DistributionMode.COUNT, 1, 0, StorageCapabilities.ALL, replica), true);
@@ -296,6 +354,57 @@ class NgrrdClusterAdminCliTest {
                 LatencySnapshot.EMPTY, 6L, 7L, 8L, 9L);
     }
 
+    @Test
+    void forgetNodeImprimeOndeFoiEsquecidoERetornaZero() {
+        ClientFake client = new ClientFake();
+        client.forgetResponse = new AdminForgetResponse(SeriesStatus.OK, "storage-1", "storage-old",
+                List.of("storage-2", "storage-1"), List.of(), null);
+
+        Capture capture = run(new String[] {"--seed", "127.0.0.1:9000", "forget-node", "storage-old"}, cfg -> client);
+
+        assertEquals(0, capture.exitCode, capture.err);
+        assertEquals("storage-old", client.forgetRequestedNodeId);
+        assertTrue(capture.out.contains("forget-node OK: storage-old"), capture.out);
+        assertTrue(capture.out.contains("esquecido em: storage-2"), capture.out);
+        assertTrue(capture.out.contains("esquecido em: storage-1"), capture.out);
+        assertTrue(capture.err.isBlank(), capture.err);
+    }
+
+    @Test
+    void forgetNodeComStorageSemConfirmacaoRetornaUmEListaOndeRepetir() {
+        ClientFake client = new ClientFake();
+        client.forgetResponse = new AdminForgetResponse(SeriesStatus.OK, "storage-1", "storage-old",
+                List.of("storage-1"), List.of("storage-3"), "repita o comando quando voltarem: storage-3");
+
+        Capture capture = run(new String[] {"--seed", "127.0.0.1:9000", "forget-node", "storage-old"}, cfg -> client);
+
+        assertEquals(1, capture.exitCode);
+        assertTrue(capture.out.contains("esquecido em: storage-1"), capture.out);
+        assertTrue(capture.err.contains("NAO confirmado em: storage-3"), capture.err);
+        assertTrue(capture.err.contains("forget-node storage-old"), capture.err);
+    }
+
+    @Test
+    void forgetNodeRecusadoPeloLiderRetornaUmComOMotivo() {
+        ClientFake client = new ClientFake();
+        client.forgetFailure = new NgrrdClusterException(ErrorCode.REMOTE_ERROR,
+                "ngrrd.admin.forget respondeu ERROR (nó ainda tem 3 série(s))");
+
+        Capture capture = run(new String[] {"--seed", "127.0.0.1:9000", "forget-node", "storage-old"}, cfg -> client);
+
+        assertEquals(1, capture.exitCode);
+        assertTrue(capture.err.contains("REMOTE_ERROR"), capture.err);
+        assertTrue(capture.err.contains("3 série(s)"), capture.err);
+    }
+
+    @Test
+    void forgetNodeExigeNodeId() {
+        Capture capture = run(new String[] {"--seed", "127.0.0.1:9000", "forget-node"}, cfg -> new ClientFake());
+
+        assertEquals(1, capture.exitCode);
+        assertTrue(capture.err.contains("exige <nodeId>"), capture.err);
+    }
+
     private Capture run(String[] args, Function<NgrrdClusterConfig, NgrrdClusterClient> factory) {
         ByteArrayOutputStream outBytes = new ByteArrayOutputStream();
         ByteArrayOutputStream errBytes = new ByteArrayOutputStream();
@@ -316,6 +425,9 @@ class NgrrdClusterAdminCliTest {
         NodeMetricsSnapshot metricsResponse;
         StorageNodeStatus drainResponse;
         StorageNodeStatus activateResponse;
+        AdminForgetResponse forgetResponse;
+        RuntimeException forgetFailure;
+        String forgetRequestedNodeId;
         RuntimeException drainFailure;
         String metricsRequestedNodeId;
         String drainRequestedNodeId;
@@ -407,6 +519,15 @@ class NgrrdClusterAdminCliTest {
         public StorageNodeStatus activateNode(String nodeId) {
             activateRequestedNodeId = nodeId;
             return activateResponse;
+        }
+
+        @Override
+        public AdminForgetResponse forgetNode(String nodeId) {
+            forgetRequestedNodeId = nodeId;
+            if (forgetFailure != null) {
+                throw forgetFailure;
+            }
+            return forgetResponse;
         }
 
         @Override

@@ -49,6 +49,165 @@ class LeastLoadedPlacementPolicyTest {
         return new PlacementContext(nodes, reachable, pending, now, INTERVAL, preferredOwnerNodeId);
     }
 
+    // ---------------------------------------------------------------- issue #167 (item 3): cota e regras
+
+    private static StorageNodeStatus quotaNode(String nodeId, long seriesCount, long usedBytes, long reservedBytes,
+            long quotaMaxSeries, long quotaMaxBytes, long now) {
+        return new StorageNodeStatus(nodeId, NodeState.ACTIVE, seriesCount, usedBytes, 0, now, DistributionMode.COUNT,
+                1, reservedBytes, dev.nishisan.utils.oss.cluster.catalog.StorageCapabilities.ALL, null,
+                quotaMaxSeries, quotaMaxBytes, null);
+    }
+
+    private static PlacementContext ruledContext(List<StorageNodeStatus> nodes, Map<String, Long> pending,
+            long requestedBytes, Map<String, Long> pendingBytes, String preferred, String seriesKey,
+            String definitionName, PlacementRules rules, long now) {
+        Set<String> reachable = nodes.stream().map(StorageNodeStatus::nodeId).collect(Collectors.toSet());
+        return new PlacementContext(nodes, reachable, pending, now, INTERVAL, preferred, requestedBytes, pendingBytes,
+                seriesKey, definitionName, rules);
+    }
+
+    private static final PlacementRules RULES = PlacementRules.of(List.of(
+            new PlacementRule("tems-core", "ifaceStats", null, Set.of("node-b", "node-c"), null),
+            new PlacementRule("no-lab-on-c", null, "lab/", null, Set.of("node-c"))));
+
+    @Test
+    void cotaDeSeriesExcluiONoMenosCarregadoQueJaEstaNaCota() {
+        long now = 1_000L;
+        // a seria o menos carregado (2 séries) mas tem cota 2: 2+0+1 > 2, fica de fora; b (10, sem cota) vence.
+        StorageNodeStatus a = quotaNode("node-a", 2, 0, 0, 2, 0, now);
+        StorageNodeStatus b = quotaNode("node-b", 10, 0, 0, 0, 0, now);
+        PlacementContext ctx = ruledContext(List.of(a, b), Map.of(), 4096, Map.of(), null, "s", null,
+                PlacementRules.NONE, now);
+
+        assertEquals(Optional.of("node-b"), policy.choose(ctx));
+    }
+
+    @Test
+    void cotaDeSeriesContaAsPendentesDesdeOUltimoStatus() {
+        long now = 1_000L;
+        // a: 1 série reportada + 1 pendente + esta = 3 > cota 2.
+        StorageNodeStatus a = quotaNode("node-a", 1, 0, 0, 2, 0, now);
+        StorageNodeStatus b = quotaNode("node-b", 10, 0, 0, 0, 0, now);
+        PlacementContext ctx = ruledContext(List.of(a, b), Map.of("node-a", 1L), 4096, Map.of(), null, "s", null,
+                PlacementRules.NONE, now);
+
+        assertEquals(Optional.of("node-b"), policy.choose(ctx));
+    }
+
+    @Test
+    void cotaDeBytesComReservaExcluiONoQueNaoCabeMaisUmaSerie() {
+        long now = 1_000L;
+        // a: 900 usados + 60 reservados + 50 pedidos = 1010 > cota 1000; b tem folga.
+        StorageNodeStatus a = quotaNode("node-a", 0, 900, 60, 0, 1_000, now);
+        StorageNodeStatus b = quotaNode("node-b", 5, 100, 0, 0, 1_000, now);
+        PlacementContext ctx = ruledContext(List.of(a, b), Map.of(), 50, Map.of(), null, "s", null,
+                PlacementRules.NONE, now);
+        assertEquals(Optional.of("node-b"), policy.choose(ctx));
+
+        // O pendente de bytes (maior que a reserva) também conta.
+        PlacementContext pendingCtx = ruledContext(List.of(a, b), Map.of(), 10, Map.of("node-a", 95L), null, "s",
+                null, PlacementRules.NONE, now);
+        assertEquals(Optional.of("node-b"), policy.choose(pendingCtx));
+
+        // Com folga (900 + 60 + 40 = 1000) o nó menos carregado volta a vencer.
+        PlacementContext fitsCtx = ruledContext(List.of(a, b), Map.of(), 40, Map.of(), null, "s", null,
+                PlacementRules.NONE, now);
+        assertEquals(Optional.of("node-a"), policy.choose(fitsCtx));
+    }
+
+    @Test
+    void cotaEsgotadaEmTodosOsCandidatosRetornaVazio() {
+        long now = 1_000L;
+        StorageNodeStatus a = quotaNode("node-a", 2, 0, 0, 2, 0, now);
+        StorageNodeStatus b = quotaNode("node-b", 3, 0, 0, 3, 0, now);
+        PlacementContext ctx = ruledContext(List.of(a, b), Map.of(), 4096, Map.of(), null, "s", null,
+                PlacementRules.NONE, now);
+
+        assertEquals(Optional.empty(), policy.choose(ctx));
+    }
+
+    @Test
+    void pinRestringeAosNosDaRegraMesmoComOutroMenosCarregado() {
+        long now = 1_000L;
+        StorageNodeStatus a = quotaNode("node-a", 0, 0, 0, 0, 0, now);
+        StorageNodeStatus b = quotaNode("node-b", 50, 0, 0, 0, 0, now);
+        StorageNodeStatus c = quotaNode("node-c", 40, 0, 0, 0, 0, now);
+        PlacementContext ctx = ruledContext(List.of(a, b, c), Map.of(), 4096, Map.of(), null, "br-sp/if-1",
+                "ifaceStats", RULES, now);
+
+        assertEquals(Optional.of("node-c"), policy.choose(ctx), "o menos carregado entre os fixados");
+    }
+
+    @Test
+    void pinNaoTransbordaQuandoNenhumNoFixadoEstaElegivel() {
+        long now = 1_000L;
+        StorageNodeStatus a = quotaNode("node-a", 0, 0, 0, 0, 0, now);
+        // b e c fixados pela regra, mas b está na cota e c não é alcançável.
+        StorageNodeStatus b = quotaNode("node-b", 5, 0, 0, 5, 0, now);
+        StorageNodeStatus c = quotaNode("node-c", 0, 0, 0, 0, 0, now);
+        PlacementContext ctx = new PlacementContext(List.of(a, b, c), Set.of("node-a", "node-b"), Map.of(), now,
+                INTERVAL, null, 4096, Map.of(), "br-sp/if-1", "ifaceStats", RULES);
+
+        assertEquals(Optional.empty(), policy.choose(ctx), "pin nunca transborda para fora da lista");
+    }
+
+    @Test
+    void excludeTiraSoOsNosListadosDaRegra() {
+        long now = 1_000L;
+        StorageNodeStatus a = quotaNode("node-a", 20, 0, 0, 0, 0, now);
+        StorageNodeStatus b = quotaNode("node-b", 10, 0, 0, 0, 0, now);
+        StorageNodeStatus c = quotaNode("node-c", 0, 0, 0, 0, 0, now);
+        PlacementContext ctx = ruledContext(List.of(a, b, c), Map.of(), 4096, Map.of(), null, "lab/x", "cpuStats",
+                RULES, now);
+
+        assertEquals(Optional.of("node-b"), policy.choose(ctx), "c é o menos carregado, mas está excluído");
+    }
+
+    @Test
+    void donoPreferidoIgnoraCotaERegras() {
+        long now = 1_000L;
+        // a está na cota E excluído pela regra de lab/, mas é o dono preferido (adoção/retomada): vence.
+        StorageNodeStatus a = quotaNode("node-a", 5, 0, 0, 5, 0, now);
+        StorageNodeStatus b = quotaNode("node-b", 0, 0, 0, 0, 0, now);
+        PlacementRules excludeA = PlacementRules.of(List.of(
+                new PlacementRule("no-lab-on-a", null, "lab/", null, Set.of("node-a"))));
+        PlacementContext ctx = ruledContext(List.of(a, b), Map.of(), 4096, Map.of(), "node-a", "lab/x", null,
+                excludeA, now);
+
+        assertEquals(Optional.of("node-a"), policy.choose(ctx));
+    }
+
+    @Test
+    void serieLegadaSemDefinicaoSoCasaRegrasPorKeyPrefix() {
+        long now = 1_000L;
+        StorageNodeStatus a = quotaNode("node-a", 0, 0, 0, 0, 0, now);
+        StorageNodeStatus b = quotaNode("node-b", 50, 0, 0, 0, 0, now);
+        StorageNodeStatus c = quotaNode("node-c", 40, 0, 0, 0, 0, now);
+
+        // Sem definitionName, a regra "tems-core" (definition=ifaceStats) não casa: a série é irrestrita.
+        PlacementContext unnamed = ruledContext(List.of(a, b, c), Map.of(), 4096, Map.of(), null, "br-sp/if-1",
+                null, RULES, now);
+        assertEquals(Optional.of("node-a"), policy.choose(unnamed));
+
+        // Mas a regra só por prefixo ("lab/") continua valendo para a série legada: c, agora o menos
+        // carregado, está excluído e b vence.
+        StorageNodeStatus aLoaded = quotaNode("node-a", 20, 0, 0, 0, 0, now);
+        StorageNodeStatus bLoaded = quotaNode("node-b", 10, 0, 0, 0, 0, now);
+        StorageNodeStatus cEmpty = quotaNode("node-c", 0, 0, 0, 0, 0, now);
+        PlacementContext lab = ruledContext(List.of(aLoaded, bLoaded, cEmpty), Map.of(), 4096, Map.of(), null,
+                "lab/x", null, RULES, now);
+        assertEquals(Optional.of("node-b"), policy.choose(lab), "c (menos carregado) está excluído para lab/");
+    }
+
+    @Test
+    void contextoLegadoSemChaveNemRegrasNaoAplicaRegraAlguma() {
+        long now = 1_000L;
+        StorageNodeStatus a = quotaNode("node-a", 0, 0, 0, 0, 0, now);
+        PlacementContext ctx = context(List.of(a), Set.of("node-a"), Map.of(), now, null);
+
+        assertEquals(Optional.of("node-a"), policy.choose(ctx));
+    }
+
     @Test
     void cargaEfetivaEhOCriterioPrimarioMesmoComFillRatioPior() {
         long now = 1_000L;

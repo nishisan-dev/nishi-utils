@@ -21,6 +21,9 @@ import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
 
 import java.time.Instant;
+import java.util.Collections;
+import java.util.Map;
+import java.util.TreeMap;
 
 /**
  * Simple heartbeat payload carrying a timestamp from the sender.
@@ -30,6 +33,12 @@ import java.time.Instant;
  * OBSERVABLE: two nodes asserting it to each other trigger the deterministic affinity resolution.
  * Absent on the wire (older peers), it decodes as {@code false} on both the binary and the JSON
  * paths.
+ * <p>
+ * Issue #178: the payload also carries the sender's applied frontier PER TOPIC
+ * ({@link #topicFrontiers()}), so peers compare replication progress topic by topic instead of
+ * through one aggregated counter. Absent on the wire (older peers, or a sender whose bootstrap gate
+ * is engaged) it decodes as an empty map, which every consumer reads as "no vector: fall back to
+ * the scalar watermark".
  */
 public final class HeartbeatPayload {
 
@@ -37,25 +46,40 @@ public final class HeartbeatPayload {
     private final long leaderHighWatermark;
     private final long leaderEpoch;
     private final boolean leader;
+    private final Map<String, Long> topicFrontiers;
 
     @JsonCreator
     public HeartbeatPayload(
             @JsonProperty("epochMilli") long epochMilli,
             @JsonProperty("leaderHighWatermark") long leaderHighWatermark,
             @JsonProperty("leaderEpoch") long leaderEpoch,
-            @JsonProperty("leader") boolean leader) {
+            @JsonProperty("leader") boolean leader,
+            @JsonProperty("topicFrontiers") Map<String, Long> topicFrontiers) {
         this.epochMilli = epochMilli;
         this.leaderHighWatermark = leaderHighWatermark;
         this.leaderEpoch = leaderEpoch;
         this.leader = leader;
+        this.topicFrontiers = topicFrontiers == null || topicFrontiers.isEmpty()
+                ? Map.of()
+                : Collections.unmodifiableMap(new TreeMap<>(topicFrontiers));
+    }
+
+    public HeartbeatPayload(long epochMilli, long leaderHighWatermark, long leaderEpoch, boolean leader) {
+        this(epochMilli, leaderHighWatermark, leaderEpoch, leader, null);
     }
 
     public HeartbeatPayload(long epochMilli, long leaderHighWatermark, long leaderEpoch) {
-        this(epochMilli, leaderHighWatermark, leaderEpoch, false);
+        this(epochMilli, leaderHighWatermark, leaderEpoch, false, null);
+    }
+
+    public static HeartbeatPayload now(long leaderHighWatermark, long leaderEpoch, boolean leader,
+            Map<String, Long> topicFrontiers) {
+        return new HeartbeatPayload(Instant.now().toEpochMilli(), leaderHighWatermark, leaderEpoch, leader,
+                topicFrontiers);
     }
 
     public static HeartbeatPayload now(long leaderHighWatermark, long leaderEpoch, boolean leader) {
-        return new HeartbeatPayload(Instant.now().toEpochMilli(), leaderHighWatermark, leaderEpoch, leader);
+        return now(leaderHighWatermark, leaderEpoch, leader, null);
     }
 
     public static HeartbeatPayload now(long leaderHighWatermark, long leaderEpoch) {
@@ -81,5 +105,13 @@ public final class HeartbeatPayload {
     /** True when the SENDER asserted leadership at send time (issue tems#9, D10c). */
     public boolean leader() {
         return leader;
+    }
+
+    /**
+     * The sender's applied frontier per replication topic (issue #178), sorted by topic; empty when the
+     * sender did not advertise a vector (older peer, or bootstrap gate engaged). Never {@code null}.
+     */
+    public Map<String, Long> topicFrontiers() {
+        return topicFrontiers;
     }
 }

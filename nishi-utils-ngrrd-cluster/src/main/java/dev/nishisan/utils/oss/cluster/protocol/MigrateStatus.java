@@ -41,5 +41,14 @@ public enum MigrateStatus {
     HASH_MISMATCH,
 
     /** Falha de aplicação não coberta pelos demais status. */
-    ERROR
+    ERROR,
+
+    /**
+     * O destino recusou o {@code MIGRATE_PREPARE} porque a série extrapolaria a própria cota dura
+     * ({@code ngrrd.quota.maxSeries}/{@code maxBytes}, issue #167 item 3); a mensagem traz
+     * {@code quota_series(n/max)} ou {@code quota_bytes(n/max)}. Mantido no FIM do enum: uma origem 8.7.0
+     * (que não conhece este valor) falha ao decodificar a resposta e aborta a migração — aceitável, versões
+     * mistas no cluster não são suportadas.
+     */
+    QUOTA_EXCEEDED
 }

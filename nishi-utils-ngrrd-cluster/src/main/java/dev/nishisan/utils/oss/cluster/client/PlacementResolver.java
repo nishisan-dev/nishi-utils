@@ -106,6 +106,13 @@ public final class PlacementResolver implements PlacementLookup {
     @Override
     public SeriesPlacement resolve(String seriesKey, String definitionHashHex,
             dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor geometry, Duration maxWait) {
+        return resolve(seriesKey, definitionHashHex, geometry, maxWait, null);
+    }
+
+    @Override
+    public SeriesPlacement resolve(String seriesKey, String definitionHashHex,
+            dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor geometry, Duration maxWait,
+            String definitionName) {
         Objects.requireNonNull(seriesKey, "seriesKey");
         Objects.requireNonNull(maxWait, "maxWait");
         long deadline = clock.millis() + Math.min(retry.timeout().toMillis(), maxWait.toMillis());
@@ -121,7 +128,7 @@ public final class PlacementResolver implements PlacementLookup {
         if (freshest != null && freshest.state() == PlacementState.ACTIVE) {
             return freshest;
         }
-        return placeAtLeader(seriesKey, definitionHashHex, geometry, deadline);
+        return placeAtLeader(seriesKey, definitionHashHex, geometry, definitionName, deadline);
     }
 
     @Override
@@ -257,7 +264,8 @@ public final class PlacementResolver implements PlacementLookup {
     }
 
     private SeriesPlacement placeAtLeader(String seriesKey, String definitionHashHex,
-            dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor geometry, long deadline) {
+            dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor geometry, String definitionName,
+            long deadline) {
         int attempt = 0;
         // B2 (achado do Refuter): quando o nó consultado responde NOT_LEADER indicando quem é o líder
         // atual, vamos direto a ele na próxima tentativa — só cai de volta em rpc.leaderId() (que pode
@@ -273,7 +281,8 @@ public final class PlacementResolver implements PlacementLookup {
             PlaceResponse response;
             try {
                 response = rpc.call(leader, Commands.PLACE,
-                        new PlaceRequest(seriesKey, definitionHashHex, null, geometry), PlaceResponse.class,
+                        new PlaceRequest(seriesKey, definitionHashHex, null, geometry, definitionName),
+                        PlaceResponse.class,
                         LeaderCalls.remainingUntil(clock, deadline, description));
             } catch (NgrrdClusterException e) {
                 // B3 (achado do Refuter): falha de TRANSPORTE (não de aplicação) ao chamar o líder —

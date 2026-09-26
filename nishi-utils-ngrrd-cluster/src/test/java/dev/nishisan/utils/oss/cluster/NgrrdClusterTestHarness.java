@@ -45,6 +45,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.function.IntFunction;
+import java.util.function.ObjIntConsumer;
 import java.util.function.UnaryOperator;
 
 import static org.junit.jupiter.api.Assertions.fail;
@@ -139,6 +140,27 @@ public final class NgrrdClusterTestHarness implements Closeable {
             IntFunction<MigrationCoordinator.MigrationHooks> migrationHooksByIndex,
             IntFunction<UnaryOperator<StorageRequestHandler.PlacementLookup>> lookupDecoratorByIndex)
             throws IOException {
+        return start(base, storageNodeCount, (builder, index) -> customize.accept(builder), migrationHooksByIndex,
+                lookupDecoratorByIndex);
+    }
+
+    /**
+     * Como {@link #start(Path, int, Consumer)}, mas com o customizador recebendo também o índice do nó (o nó
+     * {@code i} tem {@code nodeId} {@code storage-i}) — para configurações diferentes por nó (issue #167,
+     * item 3: cota e regras de placement de um nó específico). {@link #restartStorageNode} reutiliza a
+     * configuração resultante.
+     */
+    public static NgrrdClusterTestHarness start(Path base, int storageNodeCount,
+            ObjIntConsumer<StorageNodeConfig.Builder> customizeByIndex) throws IOException {
+        return start(base, storageNodeCount, customizeByIndex, index -> NO_OP_MIGRATION_HOOKS,
+                index -> UnaryOperator.identity());
+    }
+
+    private static NgrrdClusterTestHarness start(Path base, int storageNodeCount,
+            ObjIntConsumer<StorageNodeConfig.Builder> customizeByIndex,
+            IntFunction<MigrationCoordinator.MigrationHooks> migrationHooksByIndex,
+            IntFunction<UnaryOperator<StorageRequestHandler.PlacementLookup>> lookupDecoratorByIndex)
+            throws IOException {
         Objects.requireNonNull(base, "base");
         if (storageNodeCount <= 0) {
             throw new IllegalArgumentException("storageNodeCount deve ser > 0: " + storageNodeCount);
@@ -159,7 +181,7 @@ public final class NgrrdClusterTestHarness implements Closeable {
                     .dataDir(base.resolve("storage-" + i + "/data"))
                     .volumeDir(base.resolve("storage-" + i + "/volume"))
                     .statusReportInterval(DEFAULT_STATUS_REPORT_INTERVAL);
-            customize.accept(builder);
+            customizeByIndex.accept(builder, i);
             StorageNodeConfig config = builder.build();
             configs.add(config);
             nodes.add(NgrrdStorageNode.start(config, migrationHooksByIndex.apply(i), lookupDecoratorByIndex.apply(i)));

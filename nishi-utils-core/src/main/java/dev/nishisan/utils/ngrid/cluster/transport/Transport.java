@@ -80,6 +80,23 @@ public interface Transport extends Closeable {
     }
 
     /**
+     * Forgets a LEADER-ELIGIBLE peer for good (operator decommission, revisão #178, B9): the peer
+     * leaves the known-peers set (so it no longer counts in the voter majority), its connections are
+     * closed and its id is tombstoned for a long window so gossip from nodes that still list it does
+     * not bring it back. A voter is never forgotten on its own (a graceful LEAVE only marks it
+     * inactive), so replacing a storage under a new id used to raise the required majority forever.
+     * Run it on EVERY node of the cluster (the ngrrd admin CLI fans it out); listeners receive
+     * {@link TransportListener#onPeerLeft(NodeId)}.
+     *
+     * @param nodeId the voter to decommission
+     * @return {@code true} if the peer was known and is now forgotten; {@code false} by default
+     * @since 8.8.0
+     */
+    default boolean decommissionPeer(NodeId nodeId) {
+        return false;
+    }
+
+    /**
      * Current outbound replication queue depth per node (RF3, issue #113).
      * Implementations without per-connection buffering return an empty map.
      *

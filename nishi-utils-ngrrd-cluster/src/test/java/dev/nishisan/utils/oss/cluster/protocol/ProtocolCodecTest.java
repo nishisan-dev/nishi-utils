@@ -121,6 +121,41 @@ class ProtocolCodecTest {
     }
 
     @Test
+    void migrateResponseQuotaExceededSobreviveAoRoundTrip() throws IOException {
+        MigrateResponse original = MigrateResponse.of(MigrateStatus.QUOTA_EXCEEDED, "quota_series(6/5)");
+        assertEquals(original, roundTripResponseBody(Commands.MIGRATE_PREPARE, original));
+        assertEquals(MigrateStatus.QUOTA_EXCEEDED, MigrateStatus.values()[MigrateStatus.values().length - 1],
+                "QUOTA_EXCEEDED fica no fim do enum");
+    }
+
+    @Test
+    void placeRequestComDefinitionNameSobreviveAoRoundTrip() throws IOException {
+        PlaceRequest original = new PlaceRequest("series-1", "abc123def456", null, null, "ifaceStats");
+        assertEquals(original, roundTripRequestBody(Commands.PLACE, original));
+        assertEquals("ifaceStats", roundTripRequestBody(Commands.PLACE, original).definitionName());
+    }
+
+    @Test
+    void placeRequestDaVersao870SemDefinitionNameLeNomeNulo() throws Exception {
+        PlaceRequest legacy = new com.fasterxml.jackson.databind.ObjectMapper().readValue(
+                "{\"seriesKey\":\"s\",\"definitionHashHex\":\"h\",\"preferredOwnerNodeId\":null,\"geometry\":null}",
+                PlaceRequest.class);
+        assertEquals(new PlaceRequest("s", "h", null), legacy);
+        assertEquals(null, legacy.definitionName());
+    }
+
+    @Test
+    void adminForgetSobreviveAoRoundTrip() throws IOException {
+        AdminNodeRequest request = new AdminNodeRequest("storage-old", true);
+        assertEquals(request, roundTripRequestBody(Commands.ADMIN_FORGET, request));
+        AdminForgetResponse response = new AdminForgetResponse(SeriesStatus.OK, "storage-1", "storage-old",
+                List.of("storage-1", "storage-2"), List.of("storage-3"), "repita em storage-3");
+        assertEquals(response, roundTripResponseBody(Commands.ADMIN_FORGET, response));
+        AdminForgetResponse refusal = AdminForgetResponse.of(SeriesStatus.ERROR, "storage-1", "storage-old", "motivo");
+        assertEquals(refusal, roundTripResponseBody(Commands.ADMIN_FORGET, refusal));
+    }
+
+    @Test
     void placeResponseComPlacementMigrandoSobreviveAoRoundTrip() throws IOException {
         SeriesPlacement placement = new SeriesPlacement("node-a", "node-b", PlacementState.MIGRATING,
                 "migration-1", 1_000L, 2_000L);

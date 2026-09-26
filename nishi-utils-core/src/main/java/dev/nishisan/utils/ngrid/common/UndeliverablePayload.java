@@ -25,9 +25,26 @@ import java.util.UUID;
  * holds no direct connection to that destination. The sender fails the matching pending
  * request/response immediately instead of waiting out its request timeout — typically the case of a
  * request still routed to a leader that just died while the gossip-based proxy route to it remains.
+ * <p>
+ * When the undeliverable message was a RESPONSE, {@code correlationId} (8.8.0, additive; {@code null}
+ * from older relays) carries the id of the request it answered: the responder holds no pending entry
+ * for its own response, but the requester does, keyed by that id, so the responder forwards the notice
+ * to the requester with {@code messageId = correlationId}.
  *
- * @param messageId   the id of the message that could not be forwarded
- * @param destination the destination the relay could not reach
+ * @param messageId     the id of the message that could not be forwarded
+ * @param destination   the destination the relay could not reach
+ * @param correlationId the request id the undeliverable message answered, when it was a response;
+ *                      otherwise {@code null}
  */
-public record UndeliverablePayload(UUID messageId, NodeId destination) {
+public record UndeliverablePayload(UUID messageId, NodeId destination, UUID correlationId) {
+
+    /**
+     * Notice about a message that is not a response (no correlation id), as sent by relays before 8.8.0.
+     *
+     * @param messageId   the id of the message that could not be forwarded
+     * @param destination the destination the relay could not reach
+     */
+    public UndeliverablePayload(UUID messageId, NodeId destination) {
+        this(messageId, destination, null);
+    }
 }

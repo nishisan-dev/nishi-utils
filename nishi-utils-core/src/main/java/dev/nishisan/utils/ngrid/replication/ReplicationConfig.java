@@ -67,6 +67,7 @@ public final class ReplicationConfig {
     private final Duration handoverSnapshotTimeout;
     private final Duration handoverRequestTimeout;
     private final Duration handoverCooldown;
+    private final java.util.List<String> priorityTopics;
 
     private ReplicationConfig(int quorum, Duration operationTimeout, Duration retryInterval, boolean strictConsistency,
             Path dataDirectory, int resendGapThreshold, Duration resendTimeout, int replicationLogRetention,
@@ -83,7 +84,7 @@ public final class ReplicationConfig {
             int relayStreamFetchBatch, Duration relayStreamPollInterval, Duration relayStreamFetchTimeout,
             int relayMaxBacklog,
             boolean affinityHandbackMode, Duration handoverMaxDuration, Duration handoverSnapshotTimeout,
-            Duration handoverRequestTimeout, Duration handoverCooldown) {
+            Duration handoverRequestTimeout, Duration handoverCooldown, java.util.List<String> priorityTopics) {
         this.quorum = quorum;
         this.operationTimeout = Objects.requireNonNull(operationTimeout, "operationTimeout");
         this.retryInterval = Objects.requireNonNull(retryInterval, "retryInterval");
@@ -127,6 +128,7 @@ public final class ReplicationConfig {
         this.handoverSnapshotTimeout = Objects.requireNonNull(handoverSnapshotTimeout, "handoverSnapshotTimeout");
         this.handoverRequestTimeout = Objects.requireNonNull(handoverRequestTimeout, "handoverRequestTimeout");
         this.handoverCooldown = Objects.requireNonNull(handoverCooldown, "handoverCooldown");
+        this.priorityTopics = priorityTopics == null ? java.util.List.of() : java.util.List.copyOf(priorityTopics);
     }
 
     public static ReplicationConfig of(int quorum) {
@@ -425,6 +427,18 @@ public final class ReplicationConfig {
     }
 
     /**
+     * Topics that take precedence, in order, when two nodes' per-topic frontier vectors are
+     * INCOMPARABLE with the same total (issue #178): the first listed topic on which they differ
+     * decides which lineage survives a failover. Topics not listed follow by name. Must be identical
+     * on every node. Defaults to empty (name order only).
+     *
+     * @return the topic priority list (never null)
+     */
+    public java.util.List<String> priorityTopics() {
+        return priorityTopics;
+    }
+
+    /**
      * Upper bound on a handback once the incumbent enters PREP (issue tems#9, D11): if the candidate
      * does not complete the snapshot install + cutover within this window, the incumbent aborts,
      * un-freezes production and retains leadership (availability first; no demotion → no dual-leader).
@@ -607,6 +621,7 @@ public final class ReplicationConfig {
         private Duration relayStreamFetchTimeout = Duration.ofSeconds(2);
         private int relayMaxBacklog = 200_000;
         private boolean affinityHandbackMode = false;
+        private java.util.List<String> priorityTopics = java.util.List.of();
         private Duration handoverMaxDuration = Duration.ofSeconds(120);
         private Duration handoverSnapshotTimeout = Duration.ofSeconds(120);
         private Duration handoverRequestTimeout = Duration.ofSeconds(30);
@@ -1096,6 +1111,18 @@ public final class ReplicationConfig {
         }
 
         /**
+         * Sets the topic priority list used to break ties between incomparable frontier vectors
+         * (issue #178). See {@link ReplicationConfig#priorityTopics()}.
+         *
+         * @param priorityTopics topics in precedence order (e.g. {@code "map:ngrrd.catalog"}); null = none
+         * @return this builder
+         */
+        public Builder priorityTopics(java.util.List<String> priorityTopics) {
+            this.priorityTopics = priorityTopics == null ? java.util.List.of() : java.util.List.copyOf(priorityTopics);
+            return this;
+        }
+
+        /**
          * Sets the upper bound on a handback once the incumbent enters PREP (issue tems#9, D11).
          *
          * @param duration the maximum handover duration (must be positive)
@@ -1170,7 +1197,7 @@ public final class ReplicationConfig {
                     leaderPauseOnReclaim, reclaimQuiesceThreshold, reclaimQuiesceMaxDuration, reclaimQuiesceCooldown,
                     relayStreamFetchBatch, relayStreamPollInterval, relayStreamFetchTimeout, relayMaxBacklog,
                     affinityHandbackMode, handoverMaxDuration, handoverSnapshotTimeout, handoverRequestTimeout,
-                    handoverCooldown);
+                    handoverCooldown, priorityTopics);
         }
     }
 }

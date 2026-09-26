@@ -25,6 +25,7 @@ import dev.nishisan.utils.ngrid.common.HeartbeatPayload;
 import dev.nishisan.utils.ngrid.common.MessageType;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
+import dev.nishisan.utils.ngrid.common.TopicFrontiers;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -44,6 +45,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -77,10 +79,21 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     private final AtomicReference<NodeId> leader = new AtomicReference<>();
     private final AtomicLong leaderEpoch = new AtomicLong(0);
     private volatile java.util.function.LongSupplier leaderHighWatermarkSupplier = () -> -1L;
+    /** Per-topic applied frontier vector advertised in heartbeats (issue #178); empty = no vector. */
+    private volatile java.util.function.Supplier<Map<String, Long>> topicFrontiersSupplier = Map::of;
+    /** Topic precedence for the incomparable-vector tie-break (issue #178); empty = name order. */
+    private volatile java.util.List<String> topicPriority = java.util.List.of();
     private volatile java.util.function.BooleanSupplier localLeadershipEligibilitySupplier = () -> true;
     private volatile long trackedLeaderHighWatermark = -1L;
     private volatile long trackedLeaderEpoch = 0L;
     private volatile Instant leaseExpiresAt = Instant.MIN;
+    /**
+     * Epoch-millis of the last heartbeat received from any leader-eligible peer with a real listen
+     * port (a voter), revisão #178, C9: a leader that hears no voter for a whole heartbeat timeout is
+     * isolated and steps down at once instead of leading (and accepting writes) until the per-member
+     * eviction — with its proxy-reachable grace — finally drains its membership view.
+     */
+    private volatile long lastVoterHeartbeatMs = 0L;
     private final Path epochPath;
     /** Epoch-millis until which a non-preferred node defers self-election; {@code 0} = no deferral. */
     private volatile long bootDiscoveryDeadlineMs = 0L;
@@ -96,6 +109,28 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
 
     /** Per-peer last-known replication high-watermark, learned from heartbeats. -1 until first heard. */
     private final Map<NodeId, Long> peerHighWatermark = new ConcurrentHashMap<>();
+    /**
+     * Per-peer send timestamp ({@code HeartbeatPayload.epochMilli}) of the newest heartbeat applied
+     * (revisão #178, A3). Heartbeats are dispatched one virtual thread each, so two from the same peer
+     * can be applied out of order; an older one must not overwrite the newer assertion/watermark/epoch
+     * (a demoted node's {@code leader=false} announcement lost to a periodic {@code leader=true}
+     * heartbeat re-adopted it for a whole interval). A regression larger than the heartbeat timeout is
+     * a sender clock jump, not a reorder, and is accepted.
+     */
+    private final Map<NodeId, Long> lastHeartbeatStampMs = new ConcurrentHashMap<>();
+    /**
+     * Voters that announced their departure (LEAVE) and whose heartbeats are ignored until they
+     * reconnect (a new incarnation handshakes → {@link #onPeerConnected}) or the heartbeat timeout
+     * elapses (revisão #178, A4): a heartbeat read before the LEAVE but dispatched after it must not
+     * reactivate the member and re-adopt it as leader, delaying the failover by a full eviction cycle.
+     */
+    private final Map<NodeId, Long> leavingUntilMs = new ConcurrentHashMap<>();
+    /**
+     * Per-peer last-known applied frontier PER TOPIC, learned from heartbeats (issue #178). Absent or
+     * empty for peers that advertise no vector (older version, or bootstrap gate engaged): every gate
+     * then falls back to the scalar {@link #peerHighWatermark} for that peer.
+     */
+    private final Map<NodeId, TopicFrontiers> peerTopicFrontiers = new ConcurrentHashMap<>();
     // Last time each peer REFUSED to serve the stream as a non-leader (issue tems#9, D9): fed by the
     // replication layer when a RELAY_STREAM_FETCH addressed to our adopted leader comes back with
     // leaderUnavailable. A recent refusal from the affinity-elected node is the stalemate signal that
@@ -139,6 +174,12 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     // the choreographed transition lands as a single clean leader change; the dual-leader resolver
     // remains the backstop once the handover clears (e.g. a lost completion message).
     private volatile java.util.function.BooleanSupplier handoverInProgressSupplier = () -> false;
+    /**
+     * Whether the local leader has PRODUCED anything since it took leadership (revisão #178): while
+     * it has not, yielding to a peer that holds newer state loses nothing. Defaults to {@code true}
+     * (never yield) until the replication layer wires it.
+     */
+    private volatile java.util.function.BooleanSupplier leaderProducedSupplier = () -> true;
 
     /**
      * Supplies the local node's applied replication frontier (how much state it has). Wired by the
@@ -175,7 +216,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         void onMembershipChanged();
     }
 
-    private final Object leaderComputationLock = new Object();
+    // ReentrantLock preserves election ordering without pinning Java 21 virtual-thread carriers.
+    private final ReentrantLock leaderComputationLock = new ReentrantLock();
     private final AtomicReference<NodeId> preferredLeader = new AtomicReference<>();
     private volatile long preferredLeaderUntilMs;
 
@@ -207,6 +249,36 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      */
     public void setLeaderHighWatermarkSupplier(java.util.function.LongSupplier supplier) {
         this.leaderHighWatermarkSupplier = Objects.requireNonNull(supplier);
+    }
+
+    /**
+     * Registers the supplier of the local node's applied frontier PER TOPIC (issue #178), carried in
+     * every heartbeat next to the scalar watermark so peers compare replication progress topic by
+     * topic. An empty map means "no vector" (peers fall back to the scalar watermark).
+     *
+     * @param supplier the per-topic frontier supplier (never returns {@code null})
+     */
+    public void setTopicFrontiersSupplier(java.util.function.Supplier<Map<String, Long>> supplier) {
+        this.topicFrontiersSupplier = supplier != null ? supplier : Map::of;
+    }
+
+    /**
+     * Signals that the local applied frontier REGRESSED (a snapshot cutover onto another lineage, a
+     * dual-leader yield resync): the reclaim latch earned before is void (revisão #178, A5) — the node
+     * must catch up to the incumbent's frontier again before it may reclaim.
+     */
+    public void noteLocalFrontierRegressed() {
+        reclaimCaughtUpLatch = false;
+    }
+
+    /**
+     * Sets the topic precedence used to order two INCOMPARABLE frontier vectors with the same total
+     * (issue #178). Must be identical on every node so they rank a pair the same way.
+     *
+     * @param priorityTopics topics in precedence order; {@code null}/empty = topic-name order
+     */
+    public void setTopicPriority(java.util.List<String> priorityTopics) {
+        this.topicPriority = priorityTopics == null ? java.util.List.of() : java.util.List.copyOf(priorityTopics);
     }
 
     /**
@@ -282,21 +354,151 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     }
 
     /**
-     * Returns the active, leader-eligible peer (distinct from {@code localId}) advertising the
-     * highest replication watermark — the node a deferring local node should follow and sync from —
-     * or {@code null} if no such peer has reported a watermark yet. A leader-ineligible peer is never
-     * returned: a deferring node must never adopt an ineligible peer as its local leader.
+     * Highest applied frontier any ACTIVE, LEADER-ELIGIBLE peer advertises for {@code topic} (issue
+     * #178), or {@code -1} when no such peer advertises a frontier vector. Lets a subsystem fence on a
+     * single topic (e.g. the ngrrd catalog before resuming in-flight migrations on a new leader).
+     *
+     * @param topic the replication topic
+     * @return the max eligible peer frontier for the topic, or {@code -1} if unknown
      */
-    private NodeId highestWatermarkActivePeer(NodeId localId) {
-        NodeId best = null;
-        long bestWm = -1L;
+    public long maxActivePeerTopicFrontier(String topic) {
+        long max = -1L;
+        NodeId localId = transport.local().nodeId();
+        for (Map.Entry<NodeId, TopicFrontiers> e : peerTopicFrontiers.entrySet()) {
+            if (e.getKey().equals(localId) || e.getValue() == null || e.getValue().isEmpty()) {
+                continue;
+            }
+            ClusterMember member = members.get(e.getKey());
+            if (member != null && member.isActive() && member.info().isLeaderEligible()) {
+                max = Math.max(max, e.getValue().frontier(topic));
+            }
+        }
+        return max;
+    }
+
+    /**
+     * True when some ACTIVE, LEADER-ELIGIBLE peer is AHEAD of the local node (issue #178): per topic
+     * when both advertise a frontier vector, by the scalar watermark otherwise. This is the predicate
+     * behind gate A and the catch-up nudge; a peer that only mirrors the stream (a client) never counts.
+     *
+     * @return {@code true} while a peer holds state this node has not applied yet
+     */
+    public boolean localBehindEligiblePeer() {
+        return aheadEligiblePeer(transport.local().nodeId()) != null;
+    }
+
+    /** The active, eligible peer AHEAD of the local node (the first found), or {@code null}. */
+    private NodeId aheadEligiblePeer(NodeId localId) {
         for (Map.Entry<NodeId, Long> e : peerHighWatermark.entrySet()) {
             if (e.getKey().equals(localId) || e.getValue() == null) {
                 continue;
             }
             ClusterMember member = members.get(e.getKey());
-            if (member != null && isLeaderCandidate(member) && e.getValue() > bestWm) {
-                bestWm = e.getValue();
+            if (member != null && member.isActive() && member.info().isLeaderEligible()
+                    && peerAheadOfLocal(e.getKey())) {
+                return e.getKey();
+            }
+        }
+        return null;
+    }
+
+    /** Local frontier vector, or {@code null} when the local node advertises none. */
+    private TopicFrontiers localFrontiersOrNull() {
+        Map<String, Long> frontiers = safeTopicFrontiers();
+        return frontiers.isEmpty() ? null : TopicFrontiers.of(frontiers);
+    }
+
+    /** A peer's frontier vector, or {@code null} when it advertises none (older peer / bootstrapping). */
+    private TopicFrontiers peerFrontiersOrNull(NodeId peer) {
+        TopicFrontiers frontiers = peerTopicFrontiers.get(peer);
+        return frontiers == null || frontiers.isEmpty() ? null : frontiers;
+    }
+
+    /**
+     * Is {@code peer} AHEAD of the local node — does it hold state we have not applied? Per topic when
+     * both sides advertise a vector (issue #178), else by the scalar watermark. A peer advertising
+     * {@code -1} (bootstrap gate) is never ahead.
+     */
+    private boolean peerAheadOfLocal(NodeId peer) {
+        Long watermark = peerHighWatermark.get(peer);
+        if (watermark == null || watermark < 0L) {
+            return false;
+        }
+        TopicFrontiers local = localFrontiersOrNull();
+        TopicFrontiers theirs = peerFrontiersOrNull(peer);
+        if (local != null && theirs != null) {
+            return local.isBehind(theirs, syncReclaimLagThreshold, topicPriority);
+        }
+        return watermark > safeLocalApplied() + syncReclaimLagThreshold;
+    }
+
+    /**
+     * Is the local node STRICTLY AHEAD of {@code peer} (beyond the tolerance)? Per topic when both
+     * sides advertise a vector, else by the scalar watermark. Used by the D9 stalemate escape.
+     */
+    private boolean localAheadOfPeer(NodeId peer) {
+        Long watermark = peerHighWatermark.get(peer);
+        long localApplied = safeLocalApplied();
+        if (watermark == null || localApplied < 0L) {
+            return false;
+        }
+        TopicFrontiers local = localFrontiersOrNull();
+        TopicFrontiers theirs = peerFrontiersOrNull(peer);
+        if (local != null && theirs != null && watermark >= 0L) {
+            return local.isAhead(theirs, syncReclaimLagThreshold, topicPriority);
+        }
+        return localApplied > watermark + syncReclaimLagThreshold;
+    }
+
+    /**
+     * Orders two peers by advertised state: {@code > 0} when {@code a} holds newer state than {@code b}
+     * (per topic when both advertise a vector, else by scalar watermark), affinity (priority, then id)
+     * as the tie-break so every node ranks the same pair identically.
+     */
+    private int compareAdvertisedState(NodeId a, NodeId b) {
+        TopicFrontiers fa = peerFrontiersOrNull(a);
+        TopicFrontiers fb = peerFrontiersOrNull(b);
+        long wa = peerHighWatermark.getOrDefault(a, -1L);
+        long wb = peerHighWatermark.getOrDefault(b, -1L);
+        if (fa != null && fb != null && wa >= 0L && wb >= 0L) {
+            if (fa.isAhead(fb, syncReclaimLagThreshold, topicPriority)) {
+                return 1;
+            }
+            if (fa.isBehind(fb, syncReclaimLagThreshold, topicPriority)) {
+                return -1;
+            }
+        } else if (wa != wb) {
+            return Long.compare(wa, wb);
+        }
+        ClusterMember ma = members.get(a);
+        ClusterMember mb = members.get(b);
+        int pa = ma == null ? Integer.MIN_VALUE : ma.info().priority();
+        int pb = mb == null ? Integer.MIN_VALUE : mb.info().priority();
+        if (pa != pb) {
+            return Integer.compare(pa, pb);
+        }
+        return a.compareTo(b);
+    }
+
+    /**
+     * Returns the active, leader-eligible peer (distinct from {@code localId}) advertising the newest
+     * replication state — the node a deferring local node should follow and sync from — or
+     * {@code null} if no such peer has reported a watermark yet. Ranked per topic when the peers
+     * advertise frontier vectors (issue #178), by scalar watermark otherwise, affinity as tie-break. A
+     * leader-ineligible peer is never returned: a deferring node must never adopt an ineligible peer
+     * as its local leader.
+     */
+    private NodeId highestWatermarkActivePeer(NodeId localId) {
+        NodeId best = null;
+        for (Map.Entry<NodeId, Long> e : peerHighWatermark.entrySet()) {
+            if (e.getKey().equals(localId) || e.getValue() == null || e.getValue() < 0L) {
+                continue;
+            }
+            ClusterMember member = members.get(e.getKey());
+            if (member == null || !isLeaderCandidate(member)) {
+                continue;
+            }
+            if (best == null || compareAdvertisedState(e.getKey(), best) > 0) {
                 best = e.getKey();
             }
         }
@@ -533,6 +735,11 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         if (!running) {
             return;
         }
+        // Revisão #178 (B10): a stopped coordinator must not keep answering isLeader()/hasValidLease():
+        // step down first (listeners fail pending writes, peers get the leader=false announcement).
+        if (isLeader()) {
+            stepDown();
+        }
         running = false;
         transport.removeListener(this);
     }
@@ -742,8 +949,21 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         membershipListeners.remove(listener);
     }
 
+    /**
+     * Runs a listener callback isolating its failure (revisão #178, C3): one throwing listener used to
+     * skip every listener after it, the election listeners and the leadership announcement, and the
+     * exception escaped {@code recomputeLeader} (lost silently on a virtual-thread dispatch).
+     */
+    private void safeNotify(Runnable callback, String what, Object listener) {
+        try {
+            callback.run();
+        } catch (RuntimeException | Error e) {
+            LOGGER.log(Level.SEVERE, "Leadership listener " + listener + " failed in " + what, e);
+        }
+    }
+
     private void notifyMembershipListeners() {
-        membershipListeners.forEach(MembershipListener::onMembershipChanged);
+        membershipListeners.forEach(l -> safeNotify(l::onMembershipChanged, "onMembershipChanged", l));
     }
 
     /**
@@ -767,7 +987,7 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 return;
             }
             HeartbeatPayload payload = HeartbeatPayload.now(leaderHighWatermarkSupplier.getAsLong(),
-                    leaderEpoch.get(), isLeader());
+                    leaderEpoch.get(), isLeader(), safeTopicFrontiers());
             ClusterMessage heartbeat = ClusterMessage.lightweight(MessageType.HEARTBEAT,
                     "hb",
                     transport.local().nodeId(),
@@ -796,6 +1016,15 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      * actions.
      */
     private void evictDeadMembers() {
+        leaderComputationLock.lock();
+        try {
+            evictDeadMembersUnderLock();
+        } finally {
+            leaderComputationLock.unlock();
+        }
+    }
+
+    private void evictDeadMembersUnderLock() {
         try {
             if (!running) {
                 return;
@@ -804,6 +1033,21 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             // Check leader lease expiry before processing members
             if (isLeader() && Instant.now().isAfter(leaseExpiresAt)) {
                 LOGGER.warning("Leader lease expired — stepping down to prevent split-brain");
+                stepDown();
+                return;
+            }
+            // Revisão #178 (C9): proactive isolation step-down. Losing quorum is already detected by
+            // the per-member eviction below, but that path waits heartbeatTimeout PLUS the
+            // proxy-reachable grace per member (up to ~3× the timeout): an isolated leader kept
+            // answering hasValidLease() and taking writes for that long. Hearing NO voter at all for a
+            // whole heartbeat timeout is a stronger, earlier signal — step down now. Pair mode keeps
+            // its documented lead-while-alone semantics; a single-voter cluster has nobody to hear.
+            long isolationNow = Instant.now().toEpochMilli();
+            if (isLeader() && !config.pairMode() && requiredVoterMajority() > 1
+                    && lastVoterHeartbeatMs > 0L
+                    && isolationNow - lastVoterHeartbeatMs > config.heartbeatTimeout().toMillis()) {
+                LOGGER.warning(() -> "[" + transport.local().nodeId() + "] Leader heard no voter for "
+                        + (isolationNow - lastVoterHeartbeatMs) + "ms (> heartbeatTimeout); stepping down as isolated");
                 stepDown();
                 return;
             }
@@ -831,10 +1075,13 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                         LOGGER.fine(() -> "Granting proxy-reachable grace to overdue member: " + member.info());
                         continue;
                     }
+                    if (!member.markInactiveIfStale(now - config.heartbeatTimeout().toMillis())) {
+                        continue; // a heartbeat landed between the check and the mark (B10)
+                    }
                     LOGGER.fine(() -> "Marking member inactive due to missed heartbeat: " + member.info());
-                    member.markInactive();
                     // Drop the dead peer's tracked watermark so a deferring higher-affinity node can lead.
                     peerHighWatermark.remove(member.id());
+                    peerTopicFrontiers.remove(member.id());
                     leaderRefusalAtMs.remove(member.id());
                     peerAssertsLeadership.remove(member.id());
                     changed = true;
@@ -871,7 +1118,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      * listeners are notified.
      */
     private void recomputeLeader() {
-        synchronized (leaderComputationLock) {
+        leaderComputationLock.lock();
+        try {
             if (!hasLeadershipQuorum()) {
                 updateLeader(null);
                 return;
@@ -953,14 +1201,36 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             // source of the stream — a leader observing a follower's counter above its own is, by
             // construction, a counter-scale desync (e.g. an inflated restart seed), never a reason to
             // abdicate into a leaderless mutual-deferral stalemate.
+            // Only a peer GENUINELY ahead (per topic, issue #178) counts here — never the boot-window
+            // deferral inside isCaughtUpToCluster(), which is a reclaim-side rule: the incumbent seeing
+            // a follower BEHIND during its own boot window is not a desync and must not log as one.
             boolean leaderBehindOwnFollower = weWouldLead && isLeaderInternal(localId)
-                    && !isCaughtUpToCluster();
+                    && aheadEligiblePeer(localId) != null;
             if (leaderBehindOwnFollower) {
+                // Revisão #178: the election raced a heartbeat. A leader that has produced NOTHING yet
+                // can still hand over to the peer that holds the newer state without any divergence —
+                // the only way not to lose the op that peer alone holds (a catalog flip confirmed to
+                // the writer, e.g. a migration commit). Once it produced, F2 applies: retain.
+                NodeId ahead = aheadEligiblePeer(localId);
+                boolean handoverInProgress = false;
+                try {
+                    handoverInProgress = handoverInProgressSupplier.getAsBoolean();
+                } catch (RuntimeException ignored) {
+                    // treat as not in progress
+                }
+                if (ahead != null && !handoverInProgress && !safeLeaderHasProduced()) {
+                    LOGGER.warning(() -> "[" + localId + "] Yielding fresh leadership to " + ahead
+                            + ": it holds state this node lacks" + describePeerDivergence(ahead)
+                            + " and nothing was produced since the election (revisão #178)");
+                    updateLeader(ahead);
+                    return;
+                }
                 long now = Instant.now().toEpochMilli();
                 if (now - lastLeaderBehindWarnMs > 60_000L) {
                     lastLeaderBehindWarnMs = now;
                     LOGGER.warning(() -> "Current leader observes a peer watermark above its own applied ("
                             + safeLocalApplied() + " < " + maxActivePeerHighWatermark()
+                            + describeAheadPeerDivergence(localId)
                             + "); retaining leadership (counter-scale desync symptom — see issue tems#9/D9)");
                 }
             }
@@ -1080,12 +1350,19 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 // STRICTLY ahead beyond the tolerance: with equal watermarks (every fresh boot is 0/0)
                 // the affinity election must win — a transient refusal during an election dance must
                 // never invert affinity. The genuine stalemate signature is local state the elected
-                // node does not have.
+                // node does not have — compared per topic when both advertise a vector (issue #178).
+                // Revisão #178 (A2): the escape is for ONE node. With two non-elected survivors both
+                // strictly ahead of a bootstrapping elected node, both used to take leadership at once
+                // (a self-inflicted dual-leader resolved by D10c with a discarded tail). Only the best
+                // non-elected candidate (newest state, then affinity) escapes, and never while some
+                // eligible peer already asserts leadership — that peer is followed instead.
                 if (recentRefusal && electedStillNotLeading && refusalConfirmedByLaterHeartbeat
-                        && electedWatermark != null && localApplied >= 0
-                        && localApplied > electedWatermark + syncReclaimLagThreshold) {
+                        && localAheadOfPeer(electedId)
+                        && assertingLeaderPeer(localId) == null
+                        && localIsBestEscapeCandidate(localId, electedId)) {
                     LOGGER.warning(() -> "[" + localId + "] Affinity-elected " + electedId + " refuses leadership and is not"
                             + " ahead (peer=" + electedWatermark + ", local=" + localApplied
+                            + describePeerDivergence(electedId)
                             + "); taking leadership to break the leaderless stalemate (issue tems#9, D9)");
                     updateLeader(localId);
                     return;
@@ -1114,6 +1391,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             }
 
             updateLeader(electedId);
+        } finally {
+            leaderComputationLock.unlock();
         }
     }
 
@@ -1140,10 +1419,29 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      * @param watermark its applied watermark (ignored when negative)
      */
     public void noteFollowerWatermark(NodeId node, long watermark) {
+        noteFollowerWatermark(node, watermark, null);
+    }
+
+    /**
+     * Same as {@link #noteFollowerWatermark(NodeId, long)}, also merging the follower's per-topic
+     * frontier vector (issue #178) when it reported one (per-topic max, never regressing).
+     *
+     * @param node           the reporting follower
+     * @param watermark      its applied watermark (ignored when negative)
+     * @param topicFrontiers its per-topic frontiers, or {@code null}/empty when not reported
+     */
+    public void noteFollowerWatermark(NodeId node, long watermark, Map<String, Long> topicFrontiers) {
         if (node == null || watermark < 0 || node.equals(transport.local().nodeId())) {
             return;
         }
         peerHighWatermark.merge(node, watermark, Math::max);
+        if (topicFrontiers != null && !topicFrontiers.isEmpty()) {
+            peerTopicFrontiers.merge(node, TopicFrontiers.of(topicFrontiers), (current, reported) -> {
+                Map<String, Long> merged = new java.util.HashMap<>(current.byTopic());
+                reported.byTopic().forEach((topic, frontier) -> merged.merge(topic, frontier, Math::max));
+                return TopicFrontiers.of(merged);
+            });
+        }
         reevaluateLeadership();
     }
 
@@ -1179,6 +1477,27 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      *
      * @param supplier the in-progress predicate (must not be {@code null})
      */
+    /**
+     * Wires "has the local leader produced anything since its election?" (revisão #178). A freshly
+     * elected leader that learns — from a heartbeat that arrived too late for the election — that a
+     * peer holds newer state on some topic yields to that peer while it has produced nothing: no
+     * lineage has diverged yet, so the op that only the peer holds is not lost. Once it produced,
+     * it retains (D9 F2) and the peer's tail is the one discarded by the stream re-anchor.
+     *
+     * @param supplier {@code true} once the local leader produced at least one operation
+     */
+    public void setLeaderProductionSupplier(java.util.function.BooleanSupplier supplier) {
+        this.leaderProducedSupplier = supplier != null ? supplier : (() -> true);
+    }
+
+    private boolean safeLeaderHasProduced() {
+        try {
+            return leaderProducedSupplier.getAsBoolean();
+        } catch (RuntimeException e) {
+            return true;
+        }
+    }
+
     public void setHandoverInProgressSupplier(java.util.function.BooleanSupplier supplier) {
         this.handoverInProgressSupplier = Objects.requireNonNull(supplier, "supplier");
     }
@@ -1198,7 +1517,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      * @return {@code true} when the local node would win the affinity election
      */
     public boolean localIsPreferredLeader() {
-        synchronized (leaderComputationLock) {
+        leaderComputationLock.lock();
+        try {
             NodeId localId = transport.local().nodeId();
             NodeId electedId = members.values().stream()
                     .filter(ClusterCoordinator::isLeaderCandidate)
@@ -1207,6 +1527,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                     .map(ClusterMember::id)
                     .orElse(null);
             return localId.equals(electedId);
+        } finally {
+            leaderComputationLock.unlock();
         }
     }
 
@@ -1242,7 +1564,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      *         or the current epoch, unchanged, if the local node is leader-ineligible
      */
     public long assumeLeadershipForHandback(long grantedEpoch) {
-        synchronized (leaderComputationLock) {
+        leaderComputationLock.lock();
+        try {
             if (!transport.local().isLeaderEligible()) {
                 LOGGER.warning(() -> "Ignoring handback leadership assumption: local node "
                         + transport.local().nodeId() + " is leader-ineligible (issue tems#9, D11)");
@@ -1251,6 +1574,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             leaderEpoch.updateAndGet(cur -> Math.max(cur, grantedEpoch));
             updateLeader(transport.local().nodeId()); // increments to >= grantedEpoch+1, fires listeners
             return leaderEpoch.get();
+        } finally {
+            leaderComputationLock.unlock();
         }
     }
 
@@ -1263,12 +1588,15 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      * @param newEpoch  the candidate's asserted epoch
      */
     public void acceptHandbackWinner(NodeId newLeader, long newEpoch) {
-        synchronized (leaderComputationLock) {
+        leaderComputationLock.lock();
+        try {
             if (newLeader == null) {
                 return;
             }
             updateLeader(newLeader); // step down to the winner (was leader -> "stepped down")
             observeEpoch(newEpoch);  // now a follower -> adopt the winner's term (no re-stamp)
+        } finally {
+            leaderComputationLock.unlock();
         }
     }
 
@@ -1323,7 +1651,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
 
     /** The losing side of a confirmed dual-leader steps down to the rival and arms the resync. */
     private void resolveDualLeaderYield(NodeId rival) {
-        synchronized (leaderComputationLock) {
+        leaderComputationLock.lock();
+        try {
             dualLeaderObservations.clear();
             if (!isLeader()) {
                 yieldingToDualLeader = false;
@@ -1342,6 +1671,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             }
             updateLeader(rival);
             yieldingToDualLeader = false;
+        } finally {
+            leaderComputationLock.unlock();
         }
     }
 
@@ -1379,7 +1710,10 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     private boolean isCaughtUpToCluster() {
         long maxPeer = maxActivePeerHighWatermark();
         if (maxPeer < 0) {
-            return true; // no active peer has reported a watermark — nothing ahead of us
+            // No active peer has reported a watermark — nothing ahead of us. The latch is only
+            // meaningful while catching up to someone (A5): reset it, as the Javadoc promises.
+            reclaimCaughtUpLatch = false;
+            return true;
         }
         if (reclaimCaughtUpLatch) {
             return true; // already caught up this session; do not chase the incumbent's moving tail
@@ -1391,11 +1725,59 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 && maxPeer < localApplied) {
             return false;
         }
-        if (localApplied >= maxPeer - syncReclaimLagThreshold) {
+        // Issue #178: "caught up" = no eligible active peer holds state we lack — decided PER TOPIC
+        // against every peer that advertises a frontier vector (a peer behind on one topic and ahead
+        // on another is resolved by the deterministic total tie-break), by scalar watermark against
+        // peers that do not.
+        if (aheadEligiblePeer(localId) == null) {
             reclaimCaughtUpLatch = true;
             return true;
         }
         return false;
+    }
+
+    /**
+     * True when no other ACTIVE, LEADER-ELIGIBLE peer (the elected node aside) is a better D9 escape
+     * candidate than the local node: none is ahead of it, and none with equal state outranks it by
+     * affinity (revisão #178, A2). Every node evaluates the same order, so exactly one escapes.
+     */
+    private boolean localIsBestEscapeCandidate(NodeId localId, NodeId electedId) {
+        NodeInfo local = transport.local();
+        for (ClusterMember member : members.values()) {
+            NodeId id = member.id();
+            if (id.equals(localId) || id.equals(electedId) || !isRealActivePeer(member, localId)
+                    || !member.info().isLeaderEligible()) {
+                continue;
+            }
+            Long watermark = peerHighWatermark.get(id);
+            if (watermark == null || watermark < 0L) {
+                continue; // unheard or bootstrapping: it cannot lead nor be ahead
+            }
+            if (peerAheadOfLocal(id)) {
+                return false;
+            }
+            if (!localAheadOfPeer(id) && LeadershipAffinity.outranks(member.info(), local)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** " (topic=a<b, ...)" for the first eligible peer ahead of the local node, or "" when none. */
+    private String describeAheadPeerDivergence(NodeId localId) {
+        NodeId ahead = aheadEligiblePeer(localId);
+        return ahead == null ? "" : describePeerDivergence(ahead);
+    }
+
+    /** " (peer <id>: topic=a<b, ...)" when both sides advertise a vector, or "" otherwise. */
+    private String describePeerDivergence(NodeId peer) {
+        TopicFrontiers local = localFrontiersOrNull();
+        TopicFrontiers theirs = peerFrontiersOrNull(peer);
+        if (local == null || theirs == null) {
+            return "";
+        }
+        String divergence = local.describeDivergence(theirs, syncReclaimLagThreshold);
+        return divergence.isEmpty() ? "" : " (peer " + peer + ": " + divergence + ")";
     }
 
     /**
@@ -1413,6 +1795,13 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         if (candWatermark == null) {
             return true; // unheard candidate frontier — conservatively keep leadership until it reports
         }
+        TopicFrontiers local = localFrontiersOrNull();
+        TopicFrontiers theirs = peerFrontiersOrNull(candidate);
+        if (local != null && theirs != null && candWatermark >= 0L) {
+            // Issue #178: per topic — a candidate missing the last op of ONE topic is behind, whatever
+            // its total says.
+            return theirs.isBehind(local, syncReclaimLagThreshold, topicPriority);
+        }
         return candWatermark < localWatermark - syncReclaimLagThreshold;
     }
 
@@ -1422,6 +1811,16 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         } catch (RuntimeException e) {
             // A supplier failure must not crash the election; treat as "unknown frontier = behind".
             return Long.MIN_VALUE;
+        }
+    }
+
+    /** The local per-topic frontier vector for heartbeats; empty on supplier failure (no vector). */
+    private Map<String, Long> safeTopicFrontiers() {
+        try {
+            Map<String, Long> frontiers = topicFrontiersSupplier.get();
+            return frontiers == null ? Map.of() : frontiers;
+        } catch (RuntimeException e) {
+            return Map.of();
         }
     }
 
@@ -1540,8 +1939,14 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      * appear in the denominator, so counting them here would inflate the numerator alone.
      */
     private long activeVoterCount() {
+        // Same population as requiredVoterMajority (revisão #178, B10): a real listen port and
+        // leader-eligible — a port-0 member must not count on the active side either (it is not in
+        // the denominator, so counting it let a node out-vote a dead real voter). The local node is
+        // always a voter of its own cluster (manual assemblies and tests bind it on port 0).
+        NodeId localId = transport.local().nodeId();
         return members.values().stream()
-                .filter(m -> m.isActive() && !m.info().host().isBlank() && m.info().isLeaderEligible())
+                .filter(m -> m.isActive() && !m.info().host().isBlank() && m.info().isLeaderEligible()
+                        && (m.info().port() > 0 || m.id().equals(localId)))
                 .count();
     }
 
@@ -1640,8 +2045,15 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
             // inherit a stale, already-expired lease and be stepped down on the very next eviction
             // cycle — that cycle checks lease expiry BEFORE renewing — leaving the cluster
             // leaderless immediately after a failover. Arm a fresh lease window at election time.
+            if (previous != null && !previous.equals(localNodeId) && !wasLeader) {
+                // Revisão #178: a remote leader went away (or was replaced) — broadcast our frontier at
+                // once so every survivor elects on FRESH vectors instead of heartbeats up to an
+                // interval old (the election that raced the last catalog flip).
+                announceLeadershipChange();
+            }
             if (isNowLeader && !wasLeader) {
                 this.leaseExpiresAt = Instant.now().plus(config.leaseTimeout());
+                lastVoterHeartbeatMs = Instant.now().toEpochMilli(); // C9: isolation window starts now
                 // We are leading now: any future return as a follower must re-sync before reclaiming, so
                 // arm the latch fresh for the NEXT session (it is only meaningful while catching up).
                 reclaimCaughtUpLatch = false;
@@ -1651,6 +2063,9 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 // asserting leaders (issue tems#9, D10c).
                 dualLeaderObservations.clear();
                 yieldingToDualLeader = false;
+                // A5: a demoted node must prove it is caught up again before it may reclaim — the
+                // latch earned in the previous catch-up says nothing about the new incumbent's tail.
+                reclaimCaughtUpLatch = false;
             }
 
             if (!isNowLeader && !wasLeader) {
@@ -1658,11 +2073,13 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 // stream fetches and snapshot requests go — log it so a wrong adoption is attributable.
                 LOGGER.info(() -> "[" + localNodeId + "] Leader view changed: " + previous + " -> " + newLeaderId);
             }
-            leadershipListeners.forEach(listener -> listener.onLeaderChanged(newLeaderId));
+            leadershipListeners.forEach(listener -> safeNotify(() -> listener.onLeaderChanged(newLeaderId),
+                    "onLeaderChanged", listener));
 
             // Notify LeaderElectionListener if local node's leadership status changed
             if (wasLeader != isNowLeader) {
-                leaderElectionListeners.forEach(listener -> listener.onLeadershipChanged(isNowLeader, newLeaderId));
+                leaderElectionListeners.forEach(listener -> safeNotify(
+                        () -> listener.onLeadershipChanged(isNowLeader, newLeaderId), "onLeadershipChanged", listener));
                 // Announce the change right away instead of at the next periodic tick: peers decide whom
                 // to follow, whether a refusal is stale (D9 escape) and whether a rival is a dual-leader
                 // from the leader flag of the LATEST heartbeat, and a full interval of silence after a
@@ -1692,18 +2109,36 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      * leader from accepting writes.
      */
     private void stepDown() {
-        synchronized (leaderComputationLock) {
+        leaderComputationLock.lock();
+        try {
             NodeId previous = leader.getAndSet(null);
             if (previous != null && previous.equals(transport.local().nodeId())) {
                 long newEpoch = leaderEpoch.incrementAndGet();
                 persistEpoch(newEpoch);
+                reclaimCaughtUpLatch = false; // A5: re-sync before any reclaim
                 LOGGER.warning(() -> "Leader stepped down. New epoch: " + newEpoch);
 
-                leadershipListeners.forEach(listener -> listener.onLeaderChanged(null));
-                leaderElectionListeners.forEach(listener -> listener.onLeadershipChanged(false, null));
+                leadershipListeners.forEach(listener -> safeNotify(() -> listener.onLeaderChanged(null),
+                        "onLeaderChanged", listener));
+                leaderElectionListeners.forEach(listener -> safeNotify(
+                        () -> listener.onLeadershipChanged(false, null), "onLeadershipChanged", listener));
                 notifyMembershipListeners();
                 announceLeadershipChange();
+                // Revisão #178 (C9): a step-down is not the end of the story — re-evaluate after one
+                // heartbeat interval so a node that regained (or never really lost) its quorum is
+                // re-elected without depending on an external event (a bare LeaderElectionService
+                // assembly stayed leaderless forever; the NGridNode nudge re-elected it "by accident").
+                if (running) {
+                    try {
+                        scheduler.schedule(this::reevaluateLeadership,
+                                config.heartbeatInterval().toMillis(), TimeUnit.MILLISECONDS);
+                    } catch (java.util.concurrent.RejectedExecutionException ignored) {
+                        // closing: nothing to re-elect
+                    }
+                }
             }
+        } finally {
+            leaderComputationLock.unlock();
         }
     }
 
@@ -1720,6 +2155,18 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
 
     @Override
     public void onPeerConnected(NodeInfo peer) {
+        leaderComputationLock.lock();
+        try {
+            onPeerConnectedUnderLock(peer);
+        } finally {
+            leaderComputationLock.unlock();
+        }
+    }
+
+    private void onPeerConnectedUnderLock(NodeInfo peer) {
+        if (peer != null) {
+            leavingUntilMs.remove(peer.nodeId()); // a new incarnation (or a reconnect) speaks again
+        }
         members.compute(peer.nodeId(), (id, existing) -> {
             // Replace any placeholder member information (e.g. created from a heartbeat
             // before we learned host/port), or update when host/port changes (e.g. peer restarted
@@ -1810,7 +2257,10 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         }
         LOGGER.info(() -> "[" + transport.local().nodeId() + "] Leader-eligible member " + peerId
                 + " announced its departure; confirming the disconnect without the grace");
+        // A4: heartbeats of the leaving incarnation still in flight must not reactivate it.
+        leavingUntilMs.put(peerId, Instant.now().toEpochMilli() + config.heartbeatTimeout().toMillis());
         confirmPeerDisconnect(peerId);
+        announceLeadershipChange(); // revisão #178: fresh frontier for the election that may follow
     }
 
     /** Clears the per-peer state kept for {@code peerId} (preferred leader, watermark, D9/D10c marks). */
@@ -1824,6 +2274,8 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         // waiting on a peer that is genuinely gone (lead-while-alone): with no active peer ahead, the
         // reclaim gate is a no-op and the node leads.
         peerHighWatermark.remove(peerId);
+        peerTopicFrontiers.remove(peerId);
+        lastHeartbeatStampMs.remove(peerId);
         // A gone peer can neither refuse nor assert leadership (issue tems#9, D9).
         leaderRefusalAtMs.remove(peerId);
         peerAssertsLeadership.remove(peerId);
@@ -1867,6 +2319,21 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
 
     @Override
     public void onMessage(ClusterMessage message) {
+        if (message.type() != MessageType.HEARTBEAT) {
+            return;
+        }
+        // Eviction must finish clearing the old session and notifying membership before a new
+        // heartbeat can reactivate the peer. Otherwise its fresh watermark can be erased by the
+        // old sweep, and listeners can miss the inactive -> active transition entirely.
+        leaderComputationLock.lock();
+        try {
+            onMessageUnderLock(message);
+        } finally {
+            leaderComputationLock.unlock();
+        }
+    }
+
+    private void onMessageUnderLock(ClusterMessage message) {
         if (message.type() == MessageType.HEARTBEAT) {
             HeartbeatPayload payload = message.payload(HeartbeatPayload.class);
             NodeId source = message.source();
@@ -1875,6 +2342,31 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 // after it): it must not re-create the member it removed. The member's new incarnation
                 // lifts the tombstone with its own handshake before its heartbeats arrive.
                 return;
+            }
+            if (!source.equals(transport.local().nodeId())) {
+                // A4: a voter that said it is leaving stays quiet until it reconnects or the window lapses.
+                Long leavingUntil = leavingUntilMs.get(source);
+                if (leavingUntil != null) {
+                    if (Instant.now().toEpochMilli() < leavingUntil) {
+                        LOGGER.fine(() -> "Ignoring heartbeat from departing voter " + source);
+                        return;
+                    }
+                    leavingUntilMs.remove(source);
+                }
+                // A3: drop a heartbeat older than the newest one already applied from this peer.
+                long stamp = payload.epochMilli();
+                Long newest = lastHeartbeatStampMs.get(source);
+                if (newest != null && stamp < newest
+                        && newest - stamp <= config.heartbeatTimeout().toMillis()) {
+                    LOGGER.fine(() -> "Ignoring out-of-order heartbeat from " + source
+                            + " (stamp " + stamp + " < " + newest + ")");
+                    return;
+                }
+                lastHeartbeatStampMs.put(source, stamp);
+                NodeInfo senderInfo = findPeerInfo(source).orElse(null);
+                if (senderInfo != null && senderInfo.port() > 0 && senderInfo.isLeaderEligible()) {
+                    lastVoterHeartbeatMs = Instant.now().toEpochMilli(); // C9: a voter is talking to us
+                }
             }
 
             // FENCING: Reject heartbeats from leaders with stale epochs.
@@ -1914,12 +2406,23 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 if (reported >= -1) {
                     Long prev = peerHighWatermark.put(source, reported);
                     watermarkAdvanced = prev == null || reported != prev;
-                    if (watermarkAdvanced && reported > safeLocalApplied() + syncReclaimLagThreshold) {
+                    // Issue #178: record the per-topic frontier vector next to the scalar (an empty
+                    // vector = "none advertised": older peer or bootstrap gate → scalar fallback).
+                    TopicFrontiers reportedFrontiers = TopicFrontiers.of(payload.topicFrontiers());
+                    TopicFrontiers prevFrontiers = reportedFrontiers.isEmpty()
+                            ? peerTopicFrontiers.remove(source)
+                            : peerTopicFrontiers.put(source, reportedFrontiers);
+                    if (!Objects.equals(prevFrontiers, reportedFrontiers)
+                            && !(prevFrontiers == null && reportedFrontiers.isEmpty())) {
+                        watermarkAdvanced = true;
+                    }
+                    if (watermarkAdvanced && peerAheadOfLocal(source)) {
                         reclaimCaughtUpLatch = false;
                     }
                 }
             }
             boolean[] isNewMember = {false};
+            boolean[] reactivated = {false};
             members.compute(source, (id, existing) -> {
                 if (existing != null) {
                     if (existing.info().host().isBlank()) {
@@ -1934,13 +2437,20 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                             return new ClusterMember(real.get());
                         }
                     }
-                    existing.touch();
+                    reactivated[0] = existing.touchAndReportReactivation();
                     return existing;
                 }
                 isNewMember[0] = true;
                 return new ClusterMember(
                         findPeerInfo(source).orElseGet(() -> new NodeInfo(source, "", 0)));
             });
+            if (reactivated[0]) {
+                // A member that came back by heartbeat alone (no handshake) is a membership change
+                // the listeners must see (revisão #178, B10): the ngrrd rebalancer/reporter and the
+                // join-quiesce bookkeeping key on these events. Notified AFTER the recompute below,
+                // so a listener that keys on isLeader() (the join-quiesce) sees the re-elected state.
+                isNewMember[0] = true;
+            }
 
             // FENCING by leader IDENTITY: the agreed leader (deterministic max NodeId) is
             // authoritative — adopt its term even if it momentarily appears lower than a ghost term
@@ -1962,6 +2472,9 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 }
                 if (isNewMember[0] || watermarkAdvanced || assertionChanged) {
                     recomputeLeader();
+                }
+                if (reactivated[0]) {
+                    notifyMembershipListeners();
                 }
                 return;
             }
@@ -1990,6 +2503,9 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                 // (a) defer our reclaim while a peer is ahead, or (b) release the incumbent's step-down
                 // guard the moment a higher-affinity candidate has caught up to our state.
                 recomputeLeader();
+            }
+            if (reactivated[0]) {
+                notifyMembershipListeners();
             }
         }
     }
