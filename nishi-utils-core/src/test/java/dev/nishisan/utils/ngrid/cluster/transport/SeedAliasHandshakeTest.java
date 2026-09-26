@@ -42,6 +42,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
 
@@ -113,6 +114,47 @@ class SeedAliasHandshakeTest {
         DataInputStream in = new DataInputStream(accepted.getInputStream());
         assertEquals(MessageType.HANDSHAKE, readFrame(in).type(), "primeiro frame da conexão discada");
         assertEquals(MessageType.HEARTBEAT, readFrame(in).type(), "o frame retido segue depois do handshake");
+    }
+
+    /**
+     * Se o envio do handshake de uma conexão discada falha, a conexão não pode ficar publicada e aberta
+     * com todos os frames retidos pela trava pré-handshake para sempre: ela é fechada e o peer volta a ser
+     * discado, agora com o handshake como primeiro frame.
+     */
+    @Test
+    void failedHandshakeSendClosesTheDialedConnection() throws Exception {
+        ServerSocket seedServer = new ServerSocket();
+        closeables.add(seedServer);
+        seedServer.bind(new InetSocketAddress("127.0.0.1", 0));
+        int seedPort = seedServer.getLocalPort();
+        usedPorts.add(seedPort);
+        NodeInfo client = node("client-1", freePort());
+        NodeInfo alias = node("127.0.0.1:" + seedPort, seedPort);
+        TcpTransport transport = transport(client, alias);
+        AtomicBoolean failNext = new AtomicBoolean(true);
+        transport.setAfterPublishHook(id -> {
+            if (id.equals(alias.nodeId()) && failNext.getAndSet(false)) {
+                throw new IllegalStateException("simulated handshake send failure");
+            }
+        });
+        transport.start();
+        Socket first = seedServer.accept();
+        closeables.add(first);
+
+        first.setSoTimeout(5_000);
+        assertEquals(-1, first.getInputStream().read(),
+                "a conexão discada cujo handshake falhou ficou aberta, retendo os frames");
+
+        // The next send redials the peer (client-1 sorts after the alias, so the reconnect loop does not).
+        transport.send(ClusterMessage.lightweight(MessageType.HEARTBEAT, "hb", client.nodeId(), alias.nodeId(),
+                HeartbeatPayload.now()));
+        seedServer.setSoTimeout(5_000);
+        Socket second = seedServer.accept();
+        closeables.add(second);
+        second.setSoTimeout(5_000);
+        DataInputStream in = new DataInputStream(second.getInputStream());
+        assertEquals(MessageType.HANDSHAKE, readFrame(in).type(), "o redial não enviou o handshake primeiro");
+        assertEquals(MessageType.HEARTBEAT, readFrame(in).type(), "o frame do redial não foi entregue");
     }
 
     /** Um frame anterior ao handshake não pode calar a resposta do handshake numa conexão aceita. */

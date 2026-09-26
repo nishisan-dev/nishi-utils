@@ -556,8 +556,17 @@ public final class TcpTransport implements Transport {
                 // the same physical link instead of clobbering each other.
                 Connection live = registerLiveConnection(nodeId, connection);
                 if (live == connection) {
-                    afterPublishHook.accept(nodeId);
-                    sendHandshake(connection);
+                    try {
+                        afterPublishHook.accept(nodeId);
+                        sendHandshake(connection);
+                    } catch (RuntimeException e) {
+                        // Without its handshake queued, the pre-handshake gate would hold every frame
+                        // sent over this published link forever, and the reconnect loop would still see
+                        // the peer as connected. Drop the link so the peer is dialed again.
+                        connections.entrySet().removeIf(entry -> entry.getValue() == connection);
+                        connection.closeQuietly();
+                        throw e;
+                    }
                 }
                 LOGGER.fine(() -> "Connected to " + nodeInfo);
                 return live;
