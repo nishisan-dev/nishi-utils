@@ -99,11 +99,32 @@ Nenhuma mudança no desempate por afinidade/ID foi introduzida nesta retomada.
 
 ## Caminho de implementação
 
-Concluir os gates da 8.8.0 e usar este documento para detalhar o follow-up da #184.
-Antes de implementar consenso próprio para o catálogo, comparar uma biblioteca Raft
-existente com o protocolo atual, incluindo persistência, mudança de membros, migração de
-versão e custo operacional. JGroups pode fornecer comunicação/membership, mas sua adoção
-por si só não estabelece o contrato de durabilidade do NGrid.
+Direção esclarecida pelo mantenedor: estudar as abordagens de Kafka e JGroups, validar
+sua adequação ao NGrid e desenvolver uma implementação própria. Esses projetos são
+referências de mecanismos, premissas e cenários de falha. A adoção de bibliotecas externas
+não faz parte desta proposta.
+
+Com os gates da 8.8.0 concluídos, detalhar o follow-up da #184 nesta sequência:
+
+1. **Mapear garantias e premissas.** Para cada mecanismo estudado, identificar qual problema
+   resolve, de quais condições depende e como se aplica ao NGrid. Explicitar confirmação de
+   escrita, persistência, quórum, identidade de sessão e comportamento durante partições.
+2. **Especificar o protocolo próprio.** Descrever estados, mensagens, transições, dados
+   persistidos e regras de autoridade antes de alterar a eleição. Separar elegibilidade,
+   desempate, confirmação de escrita e recuperação. Preservar as partes já adequadas do NGrid.
+3. **Validar o modelo.** Criar cenários controlados com mensagens atrasadas, duplicadas ou
+   reordenadas, reinício, partições, troca de membros e falhas entre persistência e resposta.
+   Verificar preservação das escritas confirmadas dentro do contrato, rejeição de autoridades
+   antigas e retomada do progresso quando as condições de comunicação e quórum forem atendidas.
+   Usar os contraexemplos encontrados para revisar a especificação; testes verdes isolados
+   não constituem prova geral de correção do protocolo.
+4. **Implementar e integrar em etapas.** Introduzir cada mecanismo validado com testes de
+   regressão, observabilidade e uma estratégia explícita de compatibilidade de protocolo e
+   dados persistidos. Revalidar as garantias na implementação real e medir custo e desempenho.
+
+O primeiro recorte proposto é linhagem e confirmação do catálogo. Antiguidade como desempate
+fica subordinada às regras de aptidão definidas nesse desenho. A decisão de implementação
+vem da adequação e das evidências obtidas, não apenas da semelhança com outro projeto.
 
 As propostas acima são inferências para o NGrid a partir das referências; não são uma
 afirmação de que Kafka ou JGroups usam a mesma arquitetura interna que este repositório.
