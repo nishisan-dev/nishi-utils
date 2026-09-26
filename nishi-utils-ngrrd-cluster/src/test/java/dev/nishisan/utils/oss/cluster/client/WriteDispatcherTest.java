@@ -942,6 +942,41 @@ class WriteDispatcherTest {
         }
     }
 
+    @Test
+    void consultaConcluidaDepoisDoCloseNaoMoveEscritas() throws Exception {
+        newDispatcher(1, Duration.ofMillis(10), 1_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        CountDownLatch lookupEntered = new CountDownLatch(1);
+        CountDownLatch releaseLookup = new CountDownLatch(1);
+        placementLookup.atLeader = keys -> {
+            lookupEntered.countDown();
+            // Consulta que ignora a interrupção do close() e só termina depois do descarte final.
+            boolean interrupted = false;
+            while (releaseLookup.getCount() > 0) {
+                try {
+                    releaseLookup.await();
+                } catch (InterruptedException e) {
+                    interrupted = true;
+                }
+            }
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+            return Map.of("s1", SeriesPlacement.active(OWNER_C.value(), 1L));
+        };
+        rpc.respondByTarget((target, cmd, body) -> moved((WriteBatchRequest) body, OWNER_A));
+        dispatcher.enqueue(OWNER_A.value(), write("s1", 1, 1));
+        assertTrue(lookupEntered.await(5, TimeUnit.SECONDS));
+
+        dispatcher.close(Duration.ofMillis(50));
+        assertEquals(1L, dispatcher.samplesFailed(), "a amostra pausada é descartada e contabilizada no close");
+        releaseLookup.countDown();
+        Thread.sleep(200);
+
+        assertEquals(Map.of(OWNER_A.value(), 0L), dispatcher.bufferedSamples(),
+                "consulta concluída após o close não cria buffer nem move escritas");
+        assertTrue(rpc.calls().stream().noneMatch(c -> c.target().equals(OWNER_C)));
+    }
+
     private long writeBatchesFor(String seriesKey) {
         return rpc.calls().stream().filter(c -> c.command().equals(Commands.WRITE_BATCH))
                 .filter(c -> ((WriteBatchRequest) c.body()).writes().getFirst().seriesKey().equals(seriesKey))

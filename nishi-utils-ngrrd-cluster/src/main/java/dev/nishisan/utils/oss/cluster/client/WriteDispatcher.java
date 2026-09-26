@@ -155,6 +155,12 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     private final AtomicLong lastOwnerLookupFailureLogMs = new AtomicLong(Long.MIN_VALUE);
     private final Thread tickThread;
     private volatile boolean closed;
+    /**
+     * {@code true} a partir do descarte final do {@code close()}: uma consulta ao líder que termine depois
+     * disso não move mais nada entre buffers (criaria um buffer fora da contabilidade de
+     * {@code samplesFailed}).
+     */
+    private volatile boolean drained;
 
     private final LongAdder samplesEnqueuedCount = new LongAdder();
     private final LongAdder samplesSentCount = new LongAdder();
@@ -443,10 +449,17 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             flushPool.shutdownNow();
         }
         try {
+            // shutdownNow já interrompeu a consulta em andamento; espera ela soltar antes do descarte final.
+            ownerLookupPool.awaitTermination(1, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        try {
             tickThread.join(1_000L);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+        drained = true;
 
         for (Map.Entry<String, NodeBuffer> entry : buffers.entrySet()) {
             NodeBuffer buf = entry.getValue();
@@ -885,6 +898,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
      * recebida, com o backoff por série: sem autoridade, ficar no nó que deu a dica contraditória prenderia a
      * série ali para sempre se ele não for o dono (ex.: o dono real com réplica atrasada, que depois se
      * atualiza). Cada nova contradição volta a consultar o líder, que desempata assim que responder.
+     * Depois do descarte final do {@code close()}, não faz nada além de liberar a flag de consulta.
      */
     private void applyOwnerLookup(String seriesKey, Map<String, SeriesPlacement> found, Throwable failure) {
         SeriesRoute route = routes.get(seriesKey);
@@ -897,6 +911,10 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         String changedOwner = null;
         route.lock.lock();
         try {
+            if (drained) {
+                route.ownerLookupPending = false;
+                return;
+            }
             try {
                 String current = route.owner;
                 NodeBuffer currentBuf = buffers.computeIfAbsent(current, id -> new NodeBuffer());
