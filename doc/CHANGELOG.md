@@ -4,6 +4,111 @@
 
 ---
 
+## 2026-09-26 — WRONG_OWNER confirmado no líder, lag do catálogo e reconexão de storages — release 8.7.0
+
+Atende a [issue #177](https://github.com/nishisan-dev/nishi-utils/issues/177) (WRONG_OWNER em
+pingue-pongue durante rebalance com ingestão contínua, produção TEMS) e
+[issue #169](https://github.com/nishisan-dev/nishi-utils/issues/169) (desconexões
+`PeerDisconnectedException` entre storages quando um cliente reconecta). Inclui também a correção
+de uma causa de cluster sem líder após failover ([issue #179](https://github.com/nishisan-dev/nishi-utils/issues/179))
+e o LEAVE gracioso do NGrid. **A dessincronia de escala do lag global de replicação
+([issue #178](https://github.com/nishisan-dev/nishi-utils/issues/178)) segue aberta** — use `CAT_LAG`
+(por tópico) em vez do `HIGH_REPLICATION_LAG` agregado para diagnosticar o catálogo do ngrrd.
+
+### ngrrd cluster (`nishi-utils-ngrrd-cluster`)
+
+- **Storage confirma no líder o redirecionamento derivado da réplica local.** `StorageRequestHandler`
+  não responde mais `WRONG_OWNER`/`MIGRATING` só com base na cópia eventual do catálogo: todo
+  redirecionamento derivado da réplica (dono divergente, ou migração em que este nó não é a origem
+  copiando) é confirmado no líder numa única consulta em lote por request
+  (`ngrrd.catalog.lookup`, prazo `OWNER_CONFIRMATION_TIMEOUT` = 2 s), exceto quando o próprio nó já é
+  o líder. Confirmação positiva fica em cache por 5 s (até 100 mil chaves, invalidado por qualquer
+  mudança de posse local) — o cache nunca autoriza criar uma série, só evita reconsultar o líder a
+  cada request. Líder indisponível cai no comportamento da 8.6.0 (resposta pela réplica local), com
+  cooldown de 1 s antes de tentar confirmar de novo e uma única sondagem enquanto durar a
+  degradação. Log `NGRRD_OWNER_REDIRECT_OVERRIDE` (FINE) quando o líder diverge da réplica. Novas
+  métricas `redirectConfirmations`, `redirectOverrides`, `redirectConfirmationFailures`,
+  `redirectCacheHits` em `NodeMetricsSnapshot`/`ngrrd_admin metrics`/`NGRRD_NODE_STATUS`.
+- **Cliente detecta dicas de dono contraditórias e resolve no líder.** `WriteDispatcher` e
+  `RemoteSeriesHandle` não seguem mais toda dica de `WRONG_OWNER` cegamente: uma dica é
+  contraditória quando aponta para o próprio nó, para um nó já visitado no episódio de
+  redirecionamento, diverge do dono já confirmado pelo líder, ou o episódio já tem 4 saltos. Nesse
+  caso a série pausa sozinha e uma consulta coalescida ao líder (uma tarefa por vez, não uma por
+  série) decide o próximo passo; a cadeia legítima A→B→C continua sem RPC extra. Backoff
+  exponencial por série (`redirectAttempts`) atravessa saltos; falha da consulta segue a última
+  dica conhecida em vez de travar a série. `PlacementResolver.noteOwner` não sobrepõe mais um
+  override autoritativo recente (líder/`ngrrd.catalog.lookup`) e carimba a dica com o maior
+  `updatedAt` conhecido, nunca com o relógio do cliente — corrige o laço quente de auto-redirect.
+  Novas métricas `ownerLookups`/`redirectCycles` em `ClientMetricsSnapshot`.
+- **Lag da réplica do catálogo por nó.** `StorageNodeStatus.catalogReplica`
+  (`CatalogReplicaStatus`: `leader`, `lag`, `leaderHighWatermark`, `nextExpectedSequence`,
+  `syncing`, `pendingBootstrap`, `streaming`) expõe o lag **por tópico** do mapa `ngrrd.catalog`,
+  alimentado por `ReplicationManager.getTopicReplicationStatuses()` — diferente do
+  `HIGH_REPLICATION_LAG` global (dessincronizado, issue #178 aberta). Coluna `CAT_LAG` no comando
+  `status` da CLI (`lider`, número, `sync`, `boot`, `?` = lag desconhecido, `-` = nó anterior à
+  8.7.0) e `catalogLag=` na linha `NGRRD_NODE_STATUS`.
+- **Rebalance não escolhe destino com réplica do catálogo atrasada.** Nova configuração
+  `ngrrd.rebalance.maxDestinationCatalogLag` (padrão 1000; `-1` desliga a porta; `0` exige réplica
+  em dia) exclui como **destino** — nunca como origem, e sem afetar o cálculo da distribuição alvo —
+  nós com lag acima do limite, lag desconhecido, sincronizando ou com bootstrap pendente. Nós sem o
+  campo (rolling upgrade a partir da 8.6.0) continuam elegíveis; o líder nunca é excluído. Rechecado
+  na execução de cada migração (`SKIPPED` se deixou de ser elegível nesse meio-tempo), não na
+  recuperação de migrações em curso. Log `NGRRD_REBALANCE_DEST_EXCLUDED` (INFO só quando o conjunto
+  de exclusões muda). `ngrrd_admin rebalance` imprime `planejados=N iniciados=M` e uma linha
+  `destino excluído: <nó> (<motivo>)` por nó fora da rodada; nova API
+  `NgrrdClusterClient.triggerRebalance()` devolvendo `RebalanceTrigger` (a `rebalanceNow()` anterior
+  continua disponível, delegando para a nova).
+- Documentação: `doc/oss/ngrrd-cluster.md` (semântica de redirecionamento confirmado no líder, YAML
+  de `maxDestinationCatalogLag`, métricas novas), `doc/oss/ngrrd-cluster-operacao.md` (coluna
+  `CAT_LAG`, saída do `rebalance`, troubleshooting de `WRONG_OWNER` alternando entre nós, ordem de
+  atualização) e o diagrama `doc/oss/diagrams/ngrrd_cluster_sequence_write.puml`.
+
+### NGrid (`nishi-utils-core`)
+
+- **Issue #169 — aliases de seed não resolvidos não derrubam mais links já estabelecidos entre
+  storages.** Um nó entrando na malha (ex.: um cliente reiniciando) podia gossipar seu próprio
+  alias de seed (`host:port`) antes de ser identificado; um storage que recebesse esse alias
+  substituía o peer canônico já verificado em `knownPeers`, discava de novo para o mesmo processo
+  sob outra chave, e o desempate de conexões do outro lado fechava o link original —
+  derrubando requisições storage↔storage em voo (`ngrrd.migrate.chunk` falhando com
+  `PeerDisconnectedException`). Corrigido em `TcpTransport`: alias gossipado no `host:port` de um
+  peer já verificado pelo handshake é descartado (`mergeGossipedPeer`, usado uniformemente no
+  handshake, `PEER_UPDATE` e reachability); aliases de seed não resolvidos deixam de ser
+  gossipados (`gossipablePeers()`); o `disconnect` não derruba mais o lock de conexão do peer nem
+  falha respostas pendentes se outra conexão identificada para o mesmo peer segue aberta; logs de
+  disconnect do transporte passam a identificar o nó local.
+- **Lag de replicação do líder é zero no snapshot operacional.** O HWM rastreado do líder só
+  avançava com heartbeats recebidos — e o líder não recebe o próprio heartbeat — então
+  `NGridNode.operationalSnapshot` calculava um lag artificial e `HIGH_REPLICATION_LAG` disparava
+  `CRITICAL` no próprio líder (observado em produção: 4.761.359). O líder agora reporta
+  `getAdvertisedHighWatermark()` como HWM rastreado e o lag é sempre 0 nele;
+  `NGridAlertEngine.evaluateReplicationLag` não avalia mais lag de replicação quando o snapshot é
+  do líder.
+- **HWM do tópico no líder recém-eleito considera a fronteira aplicada.** Um líder recém-eleito
+  passava a anunciar o high-watermark do tópico como o que ele havia **recebido**, não o que
+  **aplicou** — com um tópico ocioso (sem tráfego novo desde a eleição), os seguidores viam HWM 0 e
+  reportavam lag desconhecido mesmo com a réplica em dia. Corrigido: o líder recém-eleito anuncia a
+  fronteira aplicada como HWM.
+- **Issue #179 — sobreviventes não ficam mais sem líder após failover quando um membro
+  inelegível está à frente no odômetro aplicado.** Um cliente ngrrd (`leader-ineligible`) mais
+  adiantado que os storages sobreviventes podia impedir a eleição de um novo líder entre eles depois
+  da queda do líder anterior.
+- **LEAVE gracioso.** Membros efêmeros (inelegíveis a líder, ou porta ≤ 0 — clientes ngrrd e a CLI
+  administrativa) enviam `LEAVE` ao encerrar (best-effort, com flush por conexão) em vez de só
+  desconectar; os peers os esquecem por completo (tombstone de 10 min, retransmissão única) — a CLI
+  administrativa deixa de aparecer como membro do cluster depois de sair. Votantes continuam usando
+  o caminho de desconexão atual, sem forçar o esquecimento (evita encolher a maioria sem consenso).
+  Nova capacidade de handshake `supportsLeave`; nós anteriores a esta versão nunca recebem `LEAVE`.
+  Detalhes em `doc/ngrid/arquitetura.md`.
+
+**Compatibilidade e ordem de atualização.** Mudanças aditivas e compatíveis no protocolo —
+atualize os storages primeiro, depois os clientes; mantenha o rebalance automático desabilitado
+durante a janela e só reabilite quando todos os storages estiverem na 8.7.0 (mesma orientação da
+8.5.0, ver `doc/oss/ngrrd-cluster-operacao.md`). Um cliente 8.6.0 contra storages 8.7.0 já se
+beneficia da confirmação no líder feita pelo storage; um cliente 8.7.0 contra storages 8.6.0 ainda
+converge pela detecção do lado do cliente. Nós anteriores à 8.7.0 simplesmente não publicam
+`catalogReplica` (coluna `CAT_LAG` mostra `-`) e nunca recebem `LEAVE`.
+
 ## 2026-09-25 — Consultar existência e abrir sem criar — release 8.6.0
 
 Atende a [issue #171](https://github.com/nishisan-dev/nishi-utils/issues/171), nos dois modos do
