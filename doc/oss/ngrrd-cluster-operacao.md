@@ -16,7 +16,7 @@ Depois de compilar e copiar as dependências conforme o quickstart, defina no te
 administração:
 
 ```bash
-NGRRD_CP='nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.6.0.jar:nishi-utils-ngrrd-cluster/target/lib/*'
+NGRRD_CP='nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.7.0.jar:nishi-utils-ngrrd-cluster/target/lib/*'
 NGRRD_SEED='127.0.0.1:7101'
 
 ngrrd_admin() {
@@ -33,6 +33,10 @@ Ajuste a versão do JAR ao build instalado. O seed precisa estar acessível, mas
 ser o líder. Cada chamada da CLI abre uma conexão como cliente e a encerra ao terminar.
 Use estas consultas pontualmente; para monitoramento contínuo, prefira um cliente persistente
 com `clusterStatus()`, `nodeMetrics(nodeId)` e `metrics()`.
+
+A partir da 8.7.0, a CLI envia `LEAVE` ao sair (NGrid): ela não fica mais aparecendo como membro
+do cluster nos ciclos e status seguintes depois que o comando termina. Contra storages anteriores
+a esta versão (que não conhecem `LEAVE`), o comportamento é o mesmo de antes.
 
 Os comandos acima são para o laboratório local. A CLI atual anuncia o endereço padrão
 `127.0.0.1` e não possui `--host`. Para administração entre máquinas, use a API
@@ -86,7 +90,7 @@ YAML
 Em um terminal separado, mantenha o novo processo em primeiro plano:
 
 ```bash
-java -cp 'nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.6.0.jar:nishi-utils-ngrrd-cluster/target/lib/*' \
+java -cp 'nishi-utils-ngrrd-cluster/target/nishi-utils-ngrrd-cluster-8.7.0.jar:nishi-utils-ngrrd-cluster/target/lib/*' \
   dev.nishisan.utils.oss.cluster.node.NgrrdStorageNodeMain \
   --config target/ngrrd-demo/storage-4.yaml
 ```
@@ -160,6 +164,7 @@ As opções ficam em `ngrrd.rebalance` no YAML de **cada storage node**:
 | `chunkBytes` | `262144` | Tamanho dos chunks de transferência: 256 KiB. |
 | `maxBytesPerSecond` | `16777216` | Orçamento agregado de payload de migração por nó de origem: 16 MiB/s, compartilhado entre todas as transferências. Deve ser positivo. |
 | `maxSeriesBytes` | `67108864` | Tamanho máximo aceito para uma imagem de série em migração: 64 MiB. |
+| `maxDestinationCatalogLag` | `1000` | Lag máximo (em sequências do tópico `map:ngrrd.catalog`) aceito num destino de migração; acima disso, lag desconhecido, sincronizando ou com bootstrap pendente, o nó é excluído como destino neste ciclo (issue #177, seção 8 da referência técnica). `-1` desliga a porta; `0` exige a réplica em dia. |
 
 O líder usa sua própria configuração para planejar. Mantenha os parâmetros alinhados entre
 os storages, pois qualquer um pode assumir a liderança. Os executores também usam seus
@@ -320,6 +325,21 @@ O comando respeita `minDelta`, `tolerance` e `maxMovesPerCycle`; não força equ
 e não escolhe uma série ou destino específicos. Se um ciclo já estiver em execução, não
 inicia outro. Observe o progresso antes de repetir.
 
+Desde a 8.7.0, com o líder e a CLI nesta versão, a saída inclui as contagens do ciclo e, se algum
+nó ficou de fora como destino pela réplica do catálogo atrasada (`maxDestinationCatalogLag`,
+issue #177), uma linha por nó excluído:
+
+```text
+rebalanceamento disparado: planejados=12 iniciados=12
+destino excluído: storage-3 (lag=4200>1000)
+```
+
+Sem essas contagens (líder anterior à 8.7.0, ou implementação de cliente sem acesso a elas), a
+saída continua sendo só `rebalanceamento disparado`, como antes. O motivo de cada exclusão é
+`lag desconhecido`, `sincronizando`, `bootstrap pendente` ou `lag=<N>><limite>`; o nó excluído
+continua elegível como origem e entra normalmente no cálculo da distribuição alvo — só não recebe
+séries neste ciclo.
+
 Para depender de acionamento administrativo, substitua o bloco correspondente em todos os
 storages e aplique-o no startup:
 
@@ -421,9 +441,14 @@ equilíbrio: também pode não haver movimentos elegíveis, haver falhas ou falt
 | `series changed too fast for a bounded cutover` | A cópia incremental acumulou mais de 256 KiB para a troca final. A tentativa preserva a origem. Ajuste banda de migração e concorrência conforme a folga do destino e acompanhe a próxima tentativa; não aumente a carga além da capacidade física disponível. |
 | `MIGRATING` dura além do esperado | Confira logs de origem, destino e líder, conectividade e prazos do storage e cliente. Não há duração fixa garantida por série. |
 | Administração não responde durante uma queda | Verifique maioria e eleição. `status`, `drain`, `activate` e `rebalance` dependem do líder. O protocolo de métricas do nó é local, mas a descoberta/conexão da ferramenta também precisa funcionar. |
+| `WRONG_OWNER` alternando entre nós (issue #177) | Confira `CAT_LAG` no `status`: um destino recém-promovido com lag alto, `sync` ou `boot` responde pela réplica atrasada até confirmar no líder. Compare `REDIRECT_OVERRIDES`/`REDIRECT_CONFIRMATIONS`/`REDIRECT_CONFIRMATION_FAILURES` (`ngrrd_admin metrics <nodeId>`) — `REDIRECT_CONFIRMATION_FAILURES` alto indica líder inacessível ou lento a partir daquele nó; `ownerLookups()` alto em `client.metrics()` (`ClientMetricsSnapshot`) indica dicas contraditórias sendo resolvidas no líder, não um laço quente sem controle — compare com `redirectCycles()` para ver quantas dicas foram classificadas como contraditórias. Ajustar `maxDestinationCatalogLag` para baixo reduz a janela em que um destino atrasado é escolhido, à custa de menos destinos elegíveis por ciclo. |
 
 Métricas úteis por storage: `MIGRATIONS_IN`, `MIGRATIONS_OUT`, `SAMPLES_FAILED`, `SERIES`,
-`USED_BYTES`, `CAPACITY_BYTES` e `RECONCILE_MISSING`, expostas por `ngrrd_admin metrics <nodeId>`.
+`USED_BYTES`, `CAPACITY_BYTES`, `RECONCILE_MISSING` e, desde a 8.7.0,
+`REDIRECT_CONFIRMATIONS`/`REDIRECT_OVERRIDES`/`REDIRECT_CONFIRMATION_FAILURES`/
+`REDIRECT_CACHE_HITS`, expostas por `ngrrd_admin metrics <nodeId>`. A coluna `CAT_LAG` do
+`status` (`lider`, número, `sync`, `boot`, `?`, `-`) mostra o lag da réplica local do catálogo de
+cada nó — ver [seção 3 da referência técnica](ngrrd-cluster.md#3-catálogo).
 Capacidade omitida/desconhecida não significa disco livre: `FILL%` não substitui o monitoramento
 do filesystem. Pela API, `NodeMetricsSnapshot` também inclui histogramas de latência e erros
 por status; a CLI imprime apenas um subconjunto. **`errorsByStatus[NOT_FOUND]` inclui os `OPEN`
@@ -693,3 +718,64 @@ já dependiam do líder para o `PLACE`, então nada muda para elas.
 ou série esquecida) que encontre a série em `MIGRATING` com dono = este nó responde `MIGRATING`,
 salvo durante a cópia online da própria origem — mesmo critério que já valia para a réplica local.
 Antes, esse caminho respondia `OK` e a série podia ser aberta ou escrita durante a troca de dono.
+
+## Confirmação de redirecionamento no líder e lag do catálogo (issue #177)
+
+### O que muda
+
+Um rebalance com ingestão contínua podia deixar séries presas num `WRONG_OWNER` alternando entre
+origem e destino por minutos: o destino, com a réplica local do catálogo ainda atrasada, apontava
+de volta para a origem; a origem (que já tinha esquecido a série) consultava o líder e apontava
+para o destino. Nenhum dos dois lados confirmava a decisão da réplica local com o líder antes de
+responder ao cliente.
+
+Desde a 8.7.0, todo redirecionamento (`WRONG_OWNER`/`MIGRATING`) que um storage derivaria só da
+sua réplica local do catálogo é confirmado no líder antes de sair — numa única consulta por
+request, com prazo de 2 s — exceto quando o próprio nó já é o líder (nesse caso a réplica dele é a
+fonte). Uma confirmação positiva recente (5 s) fica em cache para não repetir a consulta a cada
+request da mesma série; o cache nunca autoriza **criar** uma série, só evita reconsultar um
+redirecionamento já confirmado. Se o líder estiver inalcançável, o nó volta a responder pela
+réplica local (comportamento da 8.6.0), com 1 s de intervalo mínimo entre tentativas de confirmar
+de novo — para não pagar o prazo inteiro de 2 s a cada request enquanto durar a degradação.
+
+Do lado do cliente, uma dica de `WRONG_OWNER` que aponte para o próprio nó, para um nó já visitado
+no mesmo episódio de redirecionamento, que divirja do dono já confirmado pelo líder, ou que já
+tenha 4 saltos, é tratada como **contraditória**: a série pausa sozinha (as demais continuam
+fluindo normalmente) e uma consulta coalescida ao líder — uma por vez, não uma por série —
+resolve o dono real antes de reenviar. Uma cadeia de redirecionamento legítima e curta continua
+sem consulta extra ao líder.
+
+### Ordem de atualização
+
+Mudança aditiva e compatível no protocolo — não há necessidade de parar o tráfego, mas **atualize
+os storages antes dos clientes** para colher o lado que mais importa primeiro:
+
+1. **Storages primeiro.** Um storage 8.7.0 já confirma no líder mesmo respondendo a um cliente
+   8.6.0 — o cliente antigo simplesmente recebe uma resposta mais confiável, sem saber que ela foi
+   confirmada. Isso já resolve o pingue-pongue do lado do storage, que era a origem do incidente
+   original.
+2. **Clientes depois.** Um cliente 8.7.0 contra storages ainda 8.6.0 não tem a confirmação do lado
+   do storage, mas já detecta e resolve dicas contraditórias sozinho (a correção do lado do
+   cliente é independente da versão do storage).
+3. Mantenha o rebalance automático desabilitado durante a janela de atualização (mesma orientação
+   já usada para a cópia online, seção 4) e só o reabilite depois que todos os storages estiverem
+   na 8.7.0 — um destino escolhido por um líder 8.6.0 não aplica o gate de lag do catálogo
+   (`maxDestinationCatalogLag`).
+4. Nós ainda na 8.6.0 não publicam `catalogReplica`: a coluna `CAT_LAG` mostra `-` para eles, e
+   `CatalogLagGate` os trata como elegíveis (não bloqueia o rolling upgrade).
+
+### Custo e limites
+
+- A confirmação no líder só acontece quando o storage já responderia `WRONG_OWNER`/`MIGRATING`
+  pela réplica local — não afeta o caminho feliz (réplica concorda com o líder, que é o caso
+  comum). O custo extra é a consulta ao líder (até 2 s de prazo) nesse subconjunto de requests,
+  amortizado pelo cache de 5 s para requests repetidos da mesma série.
+- **Líder indisponível não trava a série indefinidamente**: o storage cai de volta no
+  comportamento da 8.6.0 (responde pela réplica local) depois de uma falha, com 1 s de intervalo
+  mínimo entre novas tentativas de confirmação — o mesmo trade-off da 8.6.0 entre confiar cegamente
+  na réplica local ou bloquear sem líder, só que agora por 1 s em vez de a cada request.
+- `maxDestinationCatalogLag` só afeta **quem é escolhido como destino** de uma migração nova; não
+  cancela nem pausa uma migração já em andamento, e não impede que a série já exista em qualquer
+  nó. Um valor muito baixo (perto de `0`) pode reduzir a quantidade de destinos elegíveis por
+  ciclo em clusters com replicação lenta — acompanhe `NGRRD_REBALANCE_DEST_EXCLUDED` antes de
+  apertar o limite.
