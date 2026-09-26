@@ -121,6 +121,10 @@ public final class TcpTransport implements Transport {
     // Test seam: runs in handleHandshake between identifying the connection and publishing it, so a
     // test can hold a second connection of the same peer in that window. No-op in production.
     private volatile java.util.function.Consumer<NodeId> handshakeIdentityHook = id -> { };
+    // Test seam: runs in ensureConnection after a dialed connection is published and before its
+    // handshake is queued, so a test can send through the published connection in that window.
+    // No-op in production.
+    private volatile java.util.function.Consumer<NodeId> afterPublishHook = id -> { };
 
     private volatile boolean running;
     // Set by close() before it announces the departure (LEAVE): from then on no new connection is
@@ -156,6 +160,12 @@ public final class TcpTransport implements Transport {
     // connection's remote identity, before the connection is published for that peer.
     void setHandshakeIdentityHook(java.util.function.Consumer<NodeId> hook) {
         this.handshakeIdentityHook = Objects.requireNonNull(hook, "hook");
+    }
+
+    // Visible for tests in this package: hook invoked once a dialed connection is published for the
+    // peer, right before its handshake is queued.
+    void setAfterPublishHook(java.util.function.Consumer<NodeId> hook) {
+        this.afterPublishHook = Objects.requireNonNull(hook, "hook");
     }
 
     @Override
@@ -546,6 +556,7 @@ public final class TcpTransport implements Transport {
                 // the same physical link instead of clobbering each other.
                 Connection live = registerLiveConnection(nodeId, connection);
                 if (live == connection) {
+                    afterPublishHook.accept(nodeId);
                     sendHandshake(connection);
                 }
                 LOGGER.fine(() -> "Connected to " + nodeInfo);
@@ -1490,6 +1501,14 @@ public final class TcpTransport implements Transport {
         // Messages whose flush to the socket someone waits for (sendAndAwaitFlush), by messageId.
         private final Map<UUID, CompletableFuture<Void>> flushWaiters = new ConcurrentHashMap<>();
         private volatile boolean open = true;
+        // Dialed connection: frames handed to send() before our handshake is queued wait here, so the
+        // handshake is always the first frame the remote reads. The connection is reachable by other
+        // senders (connections map, unpublishedLinkTo) before ensureConnection queues the handshake,
+        // and an earlier frame made the remote infer our identity from its source and never answer
+        // the handshake: the dialer then never learned the canonical id of a seed dialed by alias.
+        private final ReentrantLock handshakeGate = new ReentrantLock();
+        private final List<ClusterMessage> heldBeforeHandshake = new ArrayList<>();
+        private volatile boolean handshakeQueued;
 
         private Connection(Socket socket, boolean outboundInitiated) throws IOException {
             this.socket = socket;
@@ -1560,6 +1579,24 @@ public final class TcpTransport implements Transport {
         void send(ClusterMessage message) {
             if (!isOpen()) {
                 return;
+            }
+            if (outboundInitiated && !handshakeQueued) {
+                handshakeGate.lock();
+                try {
+                    if (!handshakeQueued) {
+                        if (message.type() == MessageType.HANDSHAKE) {
+                            outbound.enqueue(message);
+                            heldBeforeHandshake.forEach(outbound::enqueue);
+                            heldBeforeHandshake.clear();
+                            handshakeQueued = true;
+                        } else {
+                            heldBeforeHandshake.add(message);
+                        }
+                        return;
+                    }
+                } finally {
+                    handshakeGate.unlock();
+                }
             }
             outbound.enqueue(message);
         }
