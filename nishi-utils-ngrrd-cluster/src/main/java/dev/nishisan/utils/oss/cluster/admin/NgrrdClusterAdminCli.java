@@ -32,6 +32,7 @@ import java.io.PrintStream;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Objects;
 import java.util.TreeMap;
 import java.util.UUID;
 import java.util.function.Function;
@@ -137,17 +138,43 @@ public final class NgrrdClusterAdminCli {
 
     private void printStatus(AdminStatusResponse response, PrintStream out) {
         out.println("LIDER: " + response.leaderNodeId());
-        out.printf(Locale.ROOT, "%-24s %-10s %-10s %8s %14s %7s %10s %10s %14s %8s %s%n", "NODE", "STATE",
-                "REACHABLE", "SERIES", "BYTES", "FILL%", "MODE", "WEIGHT", "RESERVED", "CAT_LAG", "CAPABILITIES");
+        // Issue #167 (item 3): regras do líder; cada nó mostra o próprio fingerprint, com "!" quando diverge.
+        out.println("REGRAS: " + orDash(response.placementRulesHash()) + " (" + response.placementRulesCount()
+                + " regras)");
+        out.printf(Locale.ROOT, "%-24s %-10s %-10s %8s %14s %7s %10s %10s %14s %20s %9s %8s %s%n", "NODE", "STATE",
+                "REACHABLE", "SERIES", "BYTES", "FILL%", "MODE", "WEIGHT", "RESERVED", "QUOTA", "RULES", "CAT_LAG",
+                "CAPABILITIES");
         for (NodeStatusView view : response.nodes()) {
             StorageNodeStatus status = view.status();
-            out.printf(Locale.ROOT, "%-24s %-10s %-10s %8d %14d %6.1f%% %10s %10.3f %14d %8s %s%n", status.nodeId(),
-                    status.state(), view.reachable(), status.seriesCount(), status.usedBytes(),
+            out.printf(Locale.ROOT, "%-24s %-10s %-10s %8d %14d %6.1f%% %10s %10.3f %14d %20s %9s %8s %s%n",
+                    status.nodeId(), status.state(), view.reachable(), status.seriesCount(), status.usedBytes(),
                     status.fillRatio() * 100.0, status.distributionMode(), status.weight(), status.reservedBytes(),
+                    formatQuota(status), formatRules(status, response.placementRulesHash()),
                     CatalogReplicaStatus.describeLag(status.catalogReplica()), formatCapabilities(status));
         }
         out.println("MIGRACOES EM CURSO: " + response.migrationsInFlight());
         out.println("GEOMETRIAS PENDENTES: " + response.geometriesPending());
+    }
+
+    /** {@code <maxSeries|->/<maxBytes|->}: cota dura do nó; {@code -} = sem limite. */
+    private static String formatQuota(StorageNodeStatus status) {
+        return (status.quotaMaxSeries() > 0 ? String.valueOf(status.quotaMaxSeries()) : "-") + "/"
+                + (status.quotaMaxBytes() > 0 ? String.valueOf(status.quotaMaxBytes()) : "-");
+    }
+
+    /**
+     * Primeiros 8 hex do fingerprint das regras do nó ({@code -} sem regras), com {@code !} quando difere do
+     * fingerprint do líder — as regras são configuração uniforme, então {@code !} indica um nó reiniciado com
+     * outro YAML (ou ainda não reiniciado após uma mudança).
+     */
+    private static String formatRules(StorageNodeStatus status, String leaderHash) {
+        String own = status.placementRulesHash();
+        String shown = own == null ? "-" : own.substring(0, Math.min(8, own.length()));
+        return Objects.equals(own, leaderHash) ? shown : shown + "!";
+    }
+
+    private static String orDash(String value) {
+        return value == null ? "-" : value;
     }
 
     /**
