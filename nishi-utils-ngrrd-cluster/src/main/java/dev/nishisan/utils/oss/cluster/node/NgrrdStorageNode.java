@@ -276,6 +276,12 @@ public final class NgrrdStorageNode implements Closeable {
                         catalog, statusReporter::metricsSnapshot, rpc, rebalancer, adminService, migrationCoordinator);
 
                 statusReporter.distribution(cfg.distributionMode(), cfg.weight());
+                // Issue #167 (item 3): cota dura e fingerprint das regras de placement em todo status.
+                statusReporter.quota(cfg.quotaMaxSeries(), cfg.quotaMaxBytes());
+                statusReporter.placementRulesHash(cfg.placementRules().fingerprint());
+                LOGGER.info("NGRRD_PLACEMENT_RULES loaded count=" + cfg.placementRules().size() + " hash="
+                        + (cfg.placementRules().fingerprint() == null ? "-" : cfg.placementRules().fingerprint())
+                        + " node=" + cfg.nodeId());
                 // Issue #177: lag POR TÓPICO do catálogo (o lag global do snapshot operacional não serve).
                 String catalogTopic = MapClusterService.topicFor(CatalogService.CATALOG_MAP);
                 statusReporter.catalogReplication(() -> CatalogReplicaStatus.from(node.coordinator().isLeader(),

@@ -312,7 +312,97 @@ class StorageNodeStatusTest {
             assertEquals(StorageCapabilities.ALL, status.capabilities());
             assertEquals(new CatalogReplicaStatus(false, 12L, 5_000L, 4_989L, false, false, true),
                     status.catalogReplica());
+            assertEquals(0L, status.quotaMaxSeries(), "sem cota de séries num status da 8.7.0");
+            assertEquals(0L, status.quotaMaxBytes(), "sem cota de bytes num status da 8.7.0");
+            assertNull(status.placementRulesHash(), "sem hash de regras num status da 8.7.0");
         }
+    }
+
+    @Test
+    void statusReplicadoPelaVersao870SemCotaLeCotaZeroEHashNulo() {
+        // Bytes produzidos pelo MapReplicationCodec com o record de 11 componentes da 8.7.0.
+        String legacy = "{\"type\":\"PUT\",\"key\":\"legacy-870\",\"value\":{\"@class\":"
+                + "\"dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus\",\"nodeId\":\"legacy-870\","
+                + "\"state\":\"ACTIVE\",\"seriesCount\":13,\"usedBytes\":4096,\"capacityBytes\":70000,"
+                + "\"reportedAtEpochMs\":8765,\"distributionMode\":\"CAPACITY\",\"weight\":3.0,\"reservedBytes\":300,"
+                + "\"capabilities\":[\"java.util.ImmutableCollections$Set12\",[\"catalog.lookup\"]],"
+                + "\"catalogReplica\":{\"leader\":false,\"lag\":12,\"leaderHighWatermark\":5000,"
+                + "\"nextExpectedSequence\":4989,\"syncing\":false,\"pendingBootstrap\":false,\"streaming\":true}}}";
+
+        MapReplicationCommand command = MapReplicationCodec.decode(legacy.getBytes(StandardCharsets.UTF_8));
+
+        StorageNodeStatus status = (StorageNodeStatus) command.value();
+        assertEquals("legacy-870", status.nodeId());
+        assertEquals(13, status.seriesCount());
+        assertEquals(0L, status.quotaMaxSeries());
+        assertEquals(0L, status.quotaMaxBytes());
+        assertNull(status.placementRulesHash());
+    }
+
+    @Test
+    void cotaEHashDeRegrasSobrevivemAReplicacaoDoMapaEAoObjectOutputStream() throws IOException, ClassNotFoundException {
+        StorageNodeStatus original = withQuota(200_000L, 68_719_476_736L, "0123456789abcdef");
+
+        MapReplicationCommand decoded = MapReplicationCodec.decode(
+                MapReplicationCodec.encode(MapReplicationCommand.put(original.nodeId(), original)));
+        assertEquals(original, decoded.value());
+
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (ObjectOutputStream out = new ObjectOutputStream(bytes)) {
+            out.writeObject(original);
+        }
+        try (ObjectInputStream in = new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray()))) {
+            StorageNodeStatus read = (StorageNodeStatus) in.readObject();
+            assertEquals(original, read);
+            assertEquals(200_000L, read.quotaMaxSeries());
+            assertEquals(68_719_476_736L, read.quotaMaxBytes());
+            assertEquals("0123456789abcdef", read.placementRulesHash());
+        }
+    }
+
+    @Test
+    void construtoresAnterioresDeixamACotaZeroEOHashNulo() {
+        StorageNodeStatus status = withCatalogReplica(CatalogReplicaStatus.ofLeader());
+
+        assertEquals(0L, status.quotaMaxSeries());
+        assertEquals(0L, status.quotaMaxBytes());
+        assertNull(status.placementRulesHash());
+    }
+
+    @Test
+    void cotaNegativaEhRejeitada() {
+        assertThrows(IllegalArgumentException.class, () -> withQuota(-1L, 0L, null));
+        assertThrows(IllegalArgumentException.class, () -> withQuota(0L, -1L, null));
+    }
+
+    @Test
+    void transicoesPreservamACotaEOHashDeRegras() {
+        StorageNodeStatus status = withQuota(10L, 20L, "abcdef0123456789");
+
+        for (StorageNodeStatus next : new StorageNodeStatus[] {
+                status.withLoad(1, 2, 3, 4L), status.withState(NodeState.DRAINING, 4L)}) {
+            assertEquals(10L, next.quotaMaxSeries());
+            assertEquals(20L, next.quotaMaxBytes());
+            assertEquals("abcdef0123456789", next.placementRulesHash());
+        }
+    }
+
+    @Test
+    void cotaAtingidaSoQuandoConfiguradaEOEfetivoUltrapassaOMaximo() {
+        StorageNodeStatus unlimited = withQuota(0L, 0L, null);
+        StorageNodeStatus limited = withQuota(3L, 1_000L, null);
+
+        assertFalse(unlimited.seriesQuotaReached(Long.MAX_VALUE));
+        assertFalse(unlimited.bytesQuotaReached(Long.MAX_VALUE));
+        assertFalse(limited.seriesQuotaReached(3L), "exatamente no máximo ainda cabe");
+        assertTrue(limited.seriesQuotaReached(4L));
+        assertFalse(limited.bytesQuotaReached(1_000L));
+        assertTrue(limited.bytesQuotaReached(1_001L));
+    }
+
+    private static StorageNodeStatus withQuota(long maxSeries, long maxBytes, String rulesHash) {
+        return new StorageNodeStatus("node-a", NodeState.ACTIVE, 1, 2, 3, 4L, DistributionMode.COUNT, 1, 0,
+                StorageCapabilities.ALL, CatalogReplicaStatus.ofLeader(), maxSeries, maxBytes, rulesHash);
     }
 
     private static StorageNodeStatus withCatalogReplica(CatalogReplicaStatus replica) {

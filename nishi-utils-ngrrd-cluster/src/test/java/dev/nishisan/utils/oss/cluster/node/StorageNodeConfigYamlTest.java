@@ -19,15 +19,20 @@ package dev.nishisan.utils.oss.cluster.node;
 
 import dev.nishisan.utils.oss.api.Durability;
 import dev.nishisan.utils.oss.api.OnGeometryChange;
+import dev.nishisan.utils.oss.cluster.placement.PlacementRule;
+import dev.nishisan.utils.oss.cluster.placement.PlacementRules;
 import org.junit.jupiter.api.Test;
 
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Function;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -254,6 +259,125 @@ class StorageNodeConfigYamlTest {
         IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
                 () -> StorageNodeConfig.fromYaml(yaml.formatted(-2), NO_ENV));
         assertTrue(e.getMessage().contains("maxDestinationCatalogLag"), "mensagem: " + e.getMessage());
+    }
+
+    @Test
+    void cotaERegrasDePlacementSaoLidasDoYaml() {
+        String yaml = """
+                node:
+                  id: storage-0
+                  host: 127.0.0.1
+                  port: 9100
+                  dataDir: /var/ngrrd/storage-0/data
+                ngrrd:
+                  volume:
+                    dir: /var/ngrrd/storage-0/volume
+                    name: ngrrd
+                  quota:
+                    maxSeries: 200000
+                    maxBytes: 68719476736
+                  placement:
+                    rules:
+                      - name: tems-core
+                        definition: ifaceStats
+                        keyPrefix: "br-sp/"
+                        pin: [storage-1, storage-2]
+                      - name: no-lab-on-3
+                        keyPrefix: "lab/"
+                        exclude: [storage-3]
+                """;
+
+        StorageNodeConfig config = StorageNodeConfig.fromYaml(yaml, NO_ENV);
+
+        assertEquals(200_000L, config.quotaMaxSeries());
+        assertEquals(68_719_476_736L, config.quotaMaxBytes());
+        assertEquals(PlacementRules.of(List.of(
+                new PlacementRule("tems-core", "ifaceStats", "br-sp/", Set.of("storage-1", "storage-2"), null),
+                new PlacementRule("no-lab-on-3", null, "lab/", null, Set.of("storage-3")))),
+                config.placementRules());
+        assertNotNull(config.placementRules().fingerprint());
+    }
+
+    @Test
+    void semCotaNemRegrasOsDefaultsSaoSemLimiteESemRegras() {
+        String yaml = """
+                node:
+                  id: storage-0
+                  host: 127.0.0.1
+                  port: 9100
+                  dataDir: /var/ngrrd/storage-0/data
+                ngrrd:
+                  volume:
+                    dir: /var/ngrrd/storage-0/volume
+                    name: ngrrd
+                  quota: {}
+                  placement: {}
+                """;
+
+        StorageNodeConfig config = StorageNodeConfig.fromYaml(yaml, NO_ENV);
+
+        assertEquals(0L, config.quotaMaxSeries());
+        assertEquals(0L, config.quotaMaxBytes());
+        assertEquals(PlacementRules.NONE, config.placementRules());
+        assertNull(config.placementRules().fingerprint());
+    }
+
+    @Test
+    void cotaNegativaERegraMalformadaFalhamNoBootComMensagemClara() {
+        String base = """
+                node:
+                  id: storage-0
+                  host: 127.0.0.1
+                  port: 9100
+                  dataDir: /var/ngrrd/storage-0/data
+                ngrrd:
+                  volume:
+                    dir: /var/ngrrd/storage-0/volume
+                    name: ngrrd
+                """;
+
+        assertThrows(IllegalArgumentException.class,
+                () -> StorageNodeConfig.fromYaml(base + "  quota:\n    maxSeries: -1\n", NO_ENV));
+        assertThrows(IllegalArgumentException.class,
+                () -> StorageNodeConfig.fromYaml(base + "  quota:\n    maxBytes: -5\n", NO_ENV));
+
+        // Regra sem pin nem exclude.
+        String semDestino = base + """
+                  placement:
+                    rules:
+                      - name: broken
+                        keyPrefix: "lab/"
+                """;
+        IllegalArgumentException error = assertThrows(IllegalArgumentException.class,
+                () -> StorageNodeConfig.fromYaml(semDestino, NO_ENV));
+        assertTrue(error.getMessage().startsWith("ngrrd.placement.rules[0]: "), error.getMessage());
+
+        // Segunda regra sem critério algum.
+        String semCriterio = base + """
+                  placement:
+                    rules:
+                      - name: ok
+                        keyPrefix: "lab/"
+                        exclude: [storage-3]
+                      - name: broken
+                        pin: [storage-1]
+                """;
+        error = assertThrows(IllegalArgumentException.class, () -> StorageNodeConfig.fromYaml(semCriterio, NO_ENV));
+        assertTrue(error.getMessage().startsWith("ngrrd.placement.rules[1]: "), error.getMessage());
+
+        // Nomes duplicados.
+        String duplicada = base + """
+                  placement:
+                    rules:
+                      - name: dup
+                        keyPrefix: "lab/"
+                        exclude: [storage-3]
+                      - name: dup
+                        keyPrefix: "br-sp/"
+                        pin: [storage-1]
+                """;
+        error = assertThrows(IllegalArgumentException.class, () -> StorageNodeConfig.fromYaml(duplicada, NO_ENV));
+        assertTrue(error.getMessage().startsWith("ngrrd.placement.rules: "), error.getMessage());
     }
 
     @Test
