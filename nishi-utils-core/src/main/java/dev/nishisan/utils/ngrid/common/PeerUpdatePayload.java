@@ -42,19 +42,50 @@ public final class PeerUpdatePayload {
      * (empty), and ignored by them ({@code FAIL_ON_UNKNOWN_PROPERTIES} is off).
      */
     private final Map<NodeId, Long> departed;
+    /**
+     * Ids of the peers the sender currently holds an open connection to (8.8.0): the peers it can relay
+     * to right now. {@code null} in updates of older nodes, whose peer list then still counts as
+     * reachability evidence (see {@link HandshakePayload#connectedPeers()}).
+     */
+    private final Set<NodeId> connectedPeers;
 
     public PeerUpdatePayload(Set<NodeInfo> peers, Map<NodeId, Double> latencies) {
-        this(peers, latencies, null);
+        this(peers, latencies, null, null);
+    }
+
+    /**
+     * Creates an update without the connected-peer report ({@code connectedPeers} absent, as in the wire
+     * form of 8.7.0).
+     *
+     * @param peers     the peers known to the sender
+     * @param latencies latencies measured by the sender
+     * @param departed  departed peers with the remaining tombstone TTL, or {@code null}
+     */
+    public PeerUpdatePayload(Set<NodeInfo> peers, Map<NodeId, Double> latencies, Map<NodeId, Long> departed) {
+        this(peers, latencies, departed, null);
     }
 
     @JsonCreator
     public PeerUpdatePayload(
             @JsonProperty("peers") Set<NodeInfo> peers,
             @JsonProperty("latencies") Map<NodeId, Double> latencies,
-            @JsonProperty("departed") Map<NodeId, Long> departed) {
+            @JsonProperty("departed") Map<NodeId, Long> departed,
+            @JsonProperty("connectedPeers") Set<NodeId> connectedPeers) {
         this.peers = Collections.unmodifiableSet(new HashSet<>(Objects.requireNonNull(peers, "peers")));
         this.latencies = Collections.unmodifiableMap(new HashMap<>(Objects.requireNonNull(latencies, "latencies")));
         this.departed = departed == null ? Map.of() : Collections.unmodifiableMap(new HashMap<>(departed));
+        this.connectedPeers = connectedPeers == null ? null : Collections.unmodifiableSet(new HashSet<>(connectedPeers));
+    }
+
+    /**
+     * Ids of the peers the sender holds an open connection to, or {@code null} when the update predates
+     * the field.
+     *
+     * @return the sender's connected peer ids, or {@code null} for updates without the field
+     * @since 8.8.0
+     */
+    public Set<NodeId> connectedPeers() {
+        return connectedPeers;
     }
 
     public Set<NodeInfo> peers() {

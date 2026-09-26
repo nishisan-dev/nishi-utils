@@ -419,6 +419,73 @@ class TcpTransportConcurrentMeshTest {
         }
     }
 
+    /**
+     * B4: discagens para um peer morto têm backoff exponencial e cache negativo. Sem isso, o loop de
+     * reconexão (taxa fixa), cada send/heartbeat/probe/RTT discava de novo a cada chamada e os
+     * chamadores enfileiravam no lock por peer por k × connectTimeout. Com o peer de volta, a
+     * reconexão ainda acontece (o backoff é limitado a max(5 s, 3 × reconnectInterval)).
+     */
+    @Test
+    void dialsToADeadPeerBackOffAndReconnectWhenItReturns() throws Exception {
+        int portA = allocateFreeLocalPort(Set.of());
+        int portB = allocateFreeLocalPort(Set.of(portA));
+        NodeInfo a = new NodeInfo(NodeId.of("a-node"), "127.0.0.1", portA);
+        NodeInfo b = new NodeInfo(NodeId.of("b-node"), "127.0.0.1", portB);
+        TcpTransport transportA = new TcpTransport(TcpTransportConfig.builder(a).addPeer(b)
+                .reconnectInterval(Duration.ofMillis(100))
+                .routeProbeInterval(Duration.ofMillis(200))
+                .connectTimeout(Duration.ofMillis(500))
+                .build());
+        TcpTransport transportB = new TcpTransport(meshConfig(b));
+        TcpTransport reborn = new TcpTransport(meshConfig(b)); // no peers: only A dials
+        var dialsToB = new java.util.concurrent.atomic.AtomicInteger();
+        transportA.setBeforeDialHook(id -> {
+            if (id.equals(b.nodeId())) {
+                dialsToB.incrementAndGet();
+            }
+        });
+        var disconnected = new CountDownLatch(1);
+        transportA.addListener(new TransportListener() {
+            public void onPeerConnected(NodeInfo peer) { }
+            public void onPeerDisconnected(NodeId peer) {
+                if (peer.equals(b.nodeId())) {
+                    disconnected.countDown();
+                }
+            }
+            public void onMessage(ClusterMessage message) { }
+        });
+        try {
+            transportB.start();
+            transportA.start();
+            awaitFullDirectMesh(List.of(transportA, transportB), List.of(a, b), Duration.ofSeconds(10));
+
+            transportB.close();
+            assertTrue(disconnected.await(5, TimeUnit.SECONDS), "disconnect de b-node não foi confirmado");
+            dialsToB.set(0);
+
+            // Heartbeats, RTT probes and RPCs keep targeting the dead peer.
+            long end = System.currentTimeMillis() + 3_000;
+            while (System.currentTimeMillis() < end) {
+                transportA.send(ClusterMessage.request(MessageType.CLIENT_REQUEST, "hb", a.nodeId(), b.nodeId(), "x"));
+                Thread.sleep(20);
+            }
+            int dials = dialsToB.get();
+            // 100, 200, 400, 800, 1600 ms (+ ≤20 % jitter) ≈ 5 dials in 3 s; a fixed-rate loop alone
+            // would make ~30, and every send() another ~150.
+            assertTrue(dials >= 2 && dials <= 12,
+                    "discagens para o peer morto em 3 s deveriam ter backoff exponencial, mas foram " + dials);
+
+            reborn.start();
+            long deadline = System.currentTimeMillis() + 10_000;
+            while (System.currentTimeMillis() < deadline && !transportA.isConnected(b.nodeId())) {
+                Thread.sleep(50);
+            }
+            assertTrue(transportA.isConnected(b.nodeId()), "A deveria rediscar b-node depois que ele voltou");
+        } finally {
+            closeQuietly(transportA, transportB, reborn);
+        }
+    }
+
     private static boolean receivedType(RawPeer raw, MessageType type) {
         return raw.received().stream().anyMatch(m -> m.type() == type);
     }

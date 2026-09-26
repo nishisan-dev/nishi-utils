@@ -107,6 +107,68 @@ class PendingResponseDisconnectGraceTest {
         }
     }
 
+    /**
+     * B5: quando o desempate do simultaneous-open fecha a conexão que já estava publicada, os frames
+     * ainda enfileirados nela (atrás de um frame em escrita) eram descartados em silêncio e o request
+     * esperava o requestTimeout inteiro. Eles devem ser redrenados, em ordem, para a conexão vencedora.
+     */
+    @Test
+    void requestQueuedOnALosingConnectionIsDeliveredOverTheWinner() throws Exception {
+        int portLocal = allocateFreeLocalPort();
+        int portRemote = allocateFreeLocalPort();
+        // z-node > a-node: the inbound connection from a-node wins over z-node's own dialed one.
+        NodeInfo local = new NodeInfo(NodeId.of("z-node"), "127.0.0.1", portLocal);
+        NodeInfo remote = new NodeInfo(NodeId.of("a-node"), "127.0.0.1", portRemote);
+        var fillerReached = new CountDownLatch(1);
+        var releaseFiller = new CountDownLatch(1);
+        TcpTransport transport = new TcpTransport(TcpTransportConfig.builder(local)
+                .addPeer(remote)
+                .requestTimeout(Duration.ofSeconds(15))
+                .reconnectInterval(Duration.ofSeconds(30))
+                .build());
+        transport.setBeforeWriteHook(message -> {
+            if ("filler".equals(message.qualifier())) {
+                fillerReached.countDown();
+                awaitUninterruptibly(releaseFiller);
+            }
+        });
+        // a-node's listener: accepts z-node's dial and never answers (its handshake stays pending).
+        try (ServerSocket remoteListener = new ServerSocket()) {
+            remoteListener.setReuseAddress(true);
+            remoteListener.bind(new InetSocketAddress("127.0.0.1", portRemote));
+            transport.start();
+            try (var dialed = remoteListener.accept()) {
+                awaitTrue(() -> transport.isConnected(remote.nodeId()), "conexão discada não foi publicada");
+
+                // Hold the dialed connection's writer on a filler frame; the request queues behind it.
+                transport.send(ClusterMessage.request(MessageType.CLIENT_REQUEST, "filler", local.nodeId(),
+                        remote.nodeId(), "x"));
+                assertTrue(fillerReached.await(5, TimeUnit.SECONDS), "writer não chegou ao filler");
+                CompletableFuture<ClusterMessage> pending = transport.sendAndAwait(ClusterMessage.request(
+                        MessageType.CLIENT_REQUEST, "slow", local.nodeId(), remote.nodeId(), "chunk"));
+
+                // Simultaneous open: a-node's inbound handshake wins the tie-break; the dialed one closes.
+                try (RawPeer winner = new RawPeer(local.host(), portLocal)) {
+                    winner.send(handshake(remote, local));
+                    awaitTrue(() -> winner.received().stream().anyMatch(m -> m.type() == MessageType.HANDSHAKE),
+                            "handshake de resposta não chegou pela conexão vencedora");
+                    releaseFiller.countDown();
+
+                    awaitTrue(() -> requestOn(winner).isPresent() || pending.isDone(),
+                            "request enfileirado na conexão perdedora nem foi redrenado nem falhou rápido");
+                    assertFalse(pending.isDone(), "o request nunca saiu: deveria ter sido redrenado, não falhado: "
+                            + outcome(pending));
+                    ClusterMessage request = requestOn(winner).orElseThrow();
+                    winner.send(ClusterMessage.response(request, "done"));
+                    assertEquals("done", pending.get(5, TimeUnit.SECONDS).payload(String.class));
+                }
+            }
+        } finally {
+            releaseFiller.countDown();
+            transport.close();
+        }
+    }
+
     private static ClusterMessage handshake(NodeInfo self, NodeInfo target) {
         return ClusterMessage.request(MessageType.HANDSHAKE, "hello", self.nodeId(), target.nodeId(),
                 new HandshakePayload(self, Set.of(), Map.of(), false, true));

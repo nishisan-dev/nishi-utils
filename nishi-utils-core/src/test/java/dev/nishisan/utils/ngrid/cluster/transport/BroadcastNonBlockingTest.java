@@ -26,10 +26,16 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -87,6 +93,67 @@ class BroadcastNonBlockingTest {
             // Garante que o teste exercitou de fato o caminho de discagem (e não passou por vácuo).
             assertTrue(dialReached.await(3, TimeUnit.SECONDS),
                     "a discagem para o peer preso nunca foi tentada — o teste não exercitou o caminho");
+        } finally {
+            release.countDown();
+            transport.close();
+        }
+    }
+
+    /**
+     * B7: {@code sendAndAwait} discava de forma síncrona na thread do chamador (até 2 × connectTimeout):
+     * a thread única {@code ngrid-metrics} (RttMonitor + LeaderReelectionService), as threads de fetch
+     * do relay e os chamadores de RPC do ngrrd (cujo {@code get(waitMillis)} só começava depois da
+     * discagem) ficavam presos num peer morto. A discagem passa a correr no worker pool; o future volta
+     * na hora e o requestTimeout cobre a discagem.
+     */
+    @Test
+    void sendAndAwaitDoesNotDialOnTheCallerThread() throws Exception {
+        int localPort = freePort(Set.of());
+        int stuckPort = freePort(Set.of(localPort));
+        NodeInfo local = new NodeInfo(NodeId.of("local-node"), "127.0.0.1", localPort);
+        NodeInfo stuckPeer = new NodeInfo(NodeId.of("stuck-peer"), "127.0.0.1", stuckPort);
+
+        TcpTransport transport = new TcpTransport(TcpTransportConfig.builder(local)
+                .addPeer(stuckPeer)
+                .reconnectInterval(Duration.ofSeconds(30))
+                .routeProbeInterval(Duration.ofSeconds(30))
+                .connectTimeout(Duration.ofSeconds(5))
+                .requestTimeout(Duration.ofSeconds(1))
+                .build());
+        CountDownLatch dialReached = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        transport.setBeforeDialHook(id -> {
+            if (id.equals(stuckPeer.nodeId())) {
+                dialReached.countDown();
+                try {
+                    release.await(10, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        });
+
+        transport.start();
+        try {
+            // start() dials the initial peer once on the worker pool; let that dial be the stuck one.
+            assertTrue(dialReached.await(3, TimeUnit.SECONDS), "a discagem inicial nunca foi tentada");
+
+            ClusterMessage request = ClusterMessage.request(MessageType.CLIENT_REQUEST, "rpc", local.nodeId(),
+                    stuckPeer.nodeId(), "ping");
+            long t0 = System.nanoTime();
+            CompletableFuture<ClusterMessage> future = transport.sendAndAwait(request);
+            long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
+
+            assertTrue(elapsedMs < 500,
+                    "sendAndAwait() travou " + elapsedMs + "ms esperando o lock/discagem de um peer preso — "
+                            + "a discagem deveria correr no worker pool");
+            assertFalse(future.isDone(), "o future deveria estar pendente enquanto a discagem corre");
+
+            // The request timeout covers the dial: it fires while the dial is still stuck.
+            ExecutionException failure = assertThrows(ExecutionException.class,
+                    () -> future.get(3, TimeUnit.SECONDS));
+            assertInstanceOf(TimeoutException.class, failure.getCause(),
+                    "o requestTimeout deveria cobrir a discagem: " + failure.getCause());
         } finally {
             release.countDown();
             transport.close();

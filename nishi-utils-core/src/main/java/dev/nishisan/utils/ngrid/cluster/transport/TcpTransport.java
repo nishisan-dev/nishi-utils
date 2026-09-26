@@ -37,6 +37,7 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketException;
+import java.net.SocketTimeoutException;
 import java.time.Instant;
 import java.util.Collection;
 import java.util.Collections;
@@ -58,6 +59,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
@@ -99,6 +101,13 @@ public final class TcpTransport implements Transport {
     // forget-after-disconnection backstop must not take it for gone.
     private final Map<NodeId, Long> lastInboundFromPeer = new ConcurrentHashMap<>();
     private final Map<NodeId, Connection> connections = new ConcurrentHashMap<>();
+    // Negative dial cache: per peer, the last failed dial, when the next one may be attempted and how
+    // many failed in a row. Exponential backoff starting at reconnectInterval, doubled per failure,
+    // capped at max(5 s, 3 x reconnectInterval), plus up to 20 % jitter. Without it every caller
+    // (reconnect loop, heartbeats, probes, RTT pings, RPCs) dialed a dead peer on every call and queued
+    // on its connection lock for k x connectTimeout. Cleared by a successful dial, an inbound handshake
+    // from the peer, an explicit addPeer, or forget.
+    private final Map<NodeId, DialBackoff> dialBackoffs = new ConcurrentHashMap<>();
     // Includes accepted sockets that have not supplied a handshake/peer identity yet.
     private final Set<Connection> liveSockets = ConcurrentHashMap.newKeySet();
     private final ReentrantLock lifecycleLock = new ReentrantLock();
@@ -106,8 +115,10 @@ public final class TcpTransport implements Transport {
     private final Map<UUID, PendingResponse> pendingResponses = new ConcurrentHashMap<>();
     // Use Virtual Threads for per-task execution
     private final ExecutorService workerPool = Executors.newVirtualThreadPerTaskExecutor();
-    // A relay must be a peer we currently hold an open connection to (see NetworkRouter.relayCandidate).
-    private final NetworkRouter router = new NetworkRouter(this::collectLatencies, this::isConnected);
+    // A relay must be a peer we currently hold an open connection to (see NetworkRouter.relayCandidate),
+    // and it vouches for a target only through a fresh connected-peer report: refreshed by the
+    // periodic gossip of probeLoop (every routeProbeInterval), so it stays fresh for twice that.
+    private final NetworkRouter router;
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "ngrid-transport-scheduler");
         t.setDaemon(true);
@@ -125,6 +136,18 @@ public final class TcpTransport implements Transport {
     // handshake is queued, so a test can send through the published connection in that window.
     // No-op in production.
     private volatile java.util.function.Consumer<NodeId> afterPublishHook = id -> { };
+    // Test seam: runs on a connection's writer thread right before each frame is encoded and written,
+    // so a test can hold a connection's writer on a chosen frame (frames queued behind it stay queued).
+    // No-op in production.
+    private volatile java.util.function.Consumer<ClusterMessage> beforeWriteHook = message -> { };
+
+    // Half-open detection: a connection whose reader receives nothing for this long is closed. Every
+    // live link carries the periodic connected-peer gossip (probeLoop, every routeProbeInterval), so a
+    // silence of max(departedPeerForgetAfter, 3 x routeProbeInterval) — the forget-after window is
+    // 2 x the coordinator's heartbeat timeout when wired by NGridNode — means the peer is gone without
+    // FIN/RST (dead host, NAT, cable). TCP keepalive is enabled too, as a second line (its timers are
+    // OS-level and, where the JDK exposes them, tuned to a third of this window).
+    private final long readIdleTimeoutMs;
 
     private volatile boolean running;
     // Set by close() before it announces the departure (LEAVE): from then on no new connection is
@@ -139,6 +162,10 @@ public final class TcpTransport implements Transport {
     public TcpTransport(TcpTransportConfig config, StatsUtils stats) {
         this.config = Objects.requireNonNull(config, "config");
         this.stats = stats;
+        this.router = new NetworkRouter(this::collectLatencies, this::canRelay,
+                config.routeProbeInterval().multipliedBy(2));
+        this.readIdleTimeoutMs = Math.max(config.departedPeerForgetAfter().toMillis(),
+                config.routeProbeInterval().multipliedBy(3).toMillis());
         knownPeers.put(config.local().nodeId(), config.local());
         config.initialPeers().forEach(p -> knownPeers.putIfAbsent(p.nodeId(), p));
         Set<NodeId> seedIds = new HashSet<>();
@@ -146,9 +173,43 @@ public final class TcpTransport implements Transport {
         this.initialPeerIds = Collections.unmodifiableSet(seedIds);
     }
 
+    // Upper bound on how long a pending response may stay registered when the request timeout is
+    // disabled (<= 0): abandoned futures must not accumulate in pendingResponses forever. Visible for
+    // tests in this package.
+    static volatile java.time.Duration pendingResponseHardBound = java.time.Duration.ofMinutes(10);
+
     // For testing purposes
     NetworkRouter getRouter() {
         return router;
+    }
+
+    // Visible for tests in this package: number of requests awaiting a response.
+    int pendingResponseCount() {
+        return pendingResponses.size();
+    }
+
+    private record DialBackoff(long failedAtNanos, long nextAttemptAtNanos, int attempts) { }
+
+    /** Whether a dial to {@code nodeId} failed recently enough that the next one must wait. */
+    private boolean inDialBackoff(NodeId nodeId) {
+        DialBackoff backoff = dialBackoffs.get(nodeId);
+        return backoff != null && System.nanoTime() - backoff.nextAttemptAtNanos() < 0;
+    }
+
+    private void recordDialFailure(NodeId nodeId) {
+        dialBackoffs.compute(nodeId, (id, previous) -> {
+            int attempts = previous == null ? 1 : previous.attempts() + 1;
+            long baseMs = Math.max(1L, config.reconnectInterval().toMillis());
+            long capMs = Math.max(5_000L, 3L * baseMs);
+            long delayMs = Math.min(capMs, baseMs * (1L << Math.min(attempts - 1, 20)));
+            long jitterMs = ThreadLocalRandom.current().nextLong(delayMs / 5 + 1);
+            long now = System.nanoTime();
+            return new DialBackoff(now, now + TimeUnit.MILLISECONDS.toNanos(delayMs + jitterMs), attempts);
+        });
+    }
+
+    private void clearDialBackoff(NodeId nodeId) {
+        dialBackoffs.remove(nodeId);
     }
 
     // Visible for tests in this package: hook invoked right before each outbound dial.
@@ -166,6 +227,11 @@ public final class TcpTransport implements Transport {
     // peer, right before its handshake is queued.
     void setAfterPublishHook(java.util.function.Consumer<NodeId> hook) {
         this.afterPublishHook = Objects.requireNonNull(hook, "hook");
+    }
+
+    // Visible for tests in this package: hook invoked by a connection's writer before writing each frame.
+    void setBeforeWriteHook(java.util.function.Consumer<ClusterMessage> hook) {
+        this.beforeWriteHook = Objects.requireNonNull(hook, "hook");
     }
 
     @Override
@@ -335,21 +401,52 @@ public final class TcpTransport implements Transport {
         UUID requestId = message.messageId();
         PendingResponse response = new PendingResponse(destination, future);
         pendingResponses.put(requestId, response);
+        // A caller that cancels its future gives up on the response: drop the entry at once instead
+        // of keeping it (and its timeout task) until the timeout fires.
+        future.whenComplete((result, error) -> {
+            if (future.isCancelled() && pendingResponses.remove(requestId, response)) {
+                response.cancelTimeout();
+            }
+        });
+        // Armed before anything is sent: the request timeout covers routing and the dial too.
+        scheduleRequestTimeout(requestId, response);
 
-        // Routing Logic
         Optional<NodeId> nextHop = router.nextHop(destination, null);
         if (nextHop.isEmpty()) {
-            pendingResponses.remove(requestId, response);
-            future.completeExceptionally(new IOException("No route available for " + destination));
+            failPending(requestId, response, new IOException("No route available for " + destination));
             return future;
         }
-
         NodeId target = nextHop.get();
-        Connection connection = ensureConnection(target);
-        
-        if (connection != null) {
-            connection.send(message);
-        } else {
+        response.via = target;
+        // Fast path, on the caller's thread: an open connection to the next hop only enqueues, so
+        // consecutive requests from one caller keep their order on the wire.
+        Connection open = connections.get(target);
+        if (open != null && open.isOpen()) {
+            open.send(message);
+            return future;
+        }
+        // Otherwise a dial is needed: it blocks up to connectTimeout (twice with the proxy fallback) and
+        // queues behind the peer's connection lock. Never on the caller's thread — that is the single
+        // ngrid-metrics thread (RttMonitor, LeaderReelectionService), a relay fetch thread, or an RPC
+        // caller whose own bounded wait would only start once this returned. The future is returned
+        // at once; the request timeout armed above bounds the dial.
+        try {
+            workerPool.submit(() -> dispatchRequest(message, requestId, response, target));
+        } catch (RejectedExecutionException e) {
+            failPending(requestId, response, new IOException("Transport closed"));
+        }
+        return future;
+    }
+
+    /** Routes and sends a request whose next hop had no open connection (worker pool). */
+    private void dispatchRequest(ClusterMessage message, UUID requestId, PendingResponse response, NodeId target) {
+        NodeId destination = message.destination();
+        try {
+            Connection connection = ensureConnection(target);
+            if (connection != null) {
+                connection.send(message);
+                return;
+            }
             if (target.equals(destination)) {
                 // Direct failed, try immediate fallback
                 router.markDirectFailure(destination);
@@ -357,46 +454,75 @@ public final class TcpTransport implements Transport {
                 if (fallback.isPresent() && !fallback.get().equals(destination)) {
                     Connection proxyConn = ensureConnection(fallback.get());
                     if (proxyConn != null) {
+                        response.via = fallback.get();
                         proxyConn.send(message);
-                    } else {
-                        pendingResponses.remove(requestId, response);
-                        future.completeExceptionally(new IOException("No connection available for " + destination + " (via " + fallback.get() + ")"));
-                        return future;
+                        return;
                     }
+                    failPending(requestId, response, new IOException("No connection available for " + destination
+                            + " (via " + fallback.get() + ")"));
                 } else {
-                    pendingResponses.remove(requestId, response);
-                    future.completeExceptionally(new IOException("No connection available for " + destination));
-                    return future;
+                    failPending(requestId, response, new IOException("No connection available for " + destination));
                 }
             } else {
-                pendingResponses.remove(requestId, response);
-                future.completeExceptionally(new IOException("No connection available for " + destination + " (via " + target + ")"));
-                return future;
+                failPending(requestId, response, new IOException("No connection available for " + destination
+                        + " (via " + target + ")"));
             }
+        } catch (Throwable t) {
+            LOGGER.log(Level.WARNING, "Unexpected error dispatching request " + requestId + " to " + destination, t);
+            failPending(requestId, response, t);
         }
+    }
 
-        if (!config.requestTimeout().isZero() && !config.requestTimeout().isNegative()) {
-            long timeoutMs = config.requestTimeout().toMillis();
-            ScheduledFuture<?> timeoutTask = scheduler.schedule(() -> {
-                PendingResponse pr = pendingResponses.remove(requestId);
-                if (pr != null) {
-                    pr.clearTimeoutTask();
-                    pr.future.completeExceptionally(new TimeoutException(String.format(
-                            "Request timed out requestId=%s destination=%s timeout=%s",
-                            requestId,
-                            destination,
-                            config.requestTimeout())));
-                }
-            }, timeoutMs, TimeUnit.MILLISECONDS);
-            response.setTimeoutTask(timeoutTask);
+    private void failPending(UUID requestId, PendingResponse response, Throwable cause) {
+        if (pendingResponses.remove(requestId, response)) {
+            response.cancelTimeout();
+            response.future.completeExceptionally(cause);
         }
-        return future;
+    }
+
+    /**
+     * Arms the timeout of a pending response: the configured request timeout or, when that is disabled
+     * ({@code <= 0}), the hard bound {@link #pendingResponseHardBound} — a pending entry is never left
+     * without a timeout, or abandoned futures (a peer that never answers, a caller that gave up) would
+     * accumulate in {@code pendingResponses} forever.
+     */
+    private void scheduleRequestTimeout(UUID requestId, PendingResponse response) {
+        boolean disabled = config.requestTimeout().isZero() || config.requestTimeout().isNegative();
+        java.time.Duration timeout = disabled ? pendingResponseHardBound : config.requestTimeout();
+        long timeoutMs = Math.max(1L, timeout.toMillis());
+        ScheduledFuture<?> timeoutTask = scheduler.schedule(() -> {
+            PendingResponse pr = pendingResponses.remove(requestId);
+            if (pr != null) {
+                pr.clearTimeoutTask();
+                pr.future.completeExceptionally(new TimeoutException(String.format(
+                        "Request timed out requestId=%s destination=%s timeout=%s%s",
+                        requestId,
+                        response.destination,
+                        timeout,
+                        disabled ? " (hard bound: request timeout disabled)" : "")));
+            }
+        }, timeoutMs, TimeUnit.MILLISECONDS);
+        response.setTimeoutTask(timeoutTask);
     }
 
     @Override
     public boolean isConnected(NodeId nodeId) {
         Connection conn = connections.get(nodeId);
         return conn != null && conn.isOpen();
+    }
+
+    /**
+     * Whether {@code nodeId} may relay our messages: a peer we hold an open connection to AND a
+     * leader-eligible member. A leader-ineligible client is ephemeral and must not carry storage
+     * traffic (a client relaying between two storage nodes tied their replication to its lifetime).
+     * A peer whose role is unknown counts as eligible (conservative).
+     */
+    private boolean canRelay(NodeId nodeId) {
+        if (!isConnected(nodeId)) {
+            return false;
+        }
+        NodeInfo info = knownPeers.get(nodeId);
+        return info == null || info.isLeaderEligible();
     }
 
     @Override
@@ -428,7 +554,8 @@ public final class TcpTransport implements Transport {
 
     @Override
     public void addPeer(NodeInfo peer) {
-        // An explicit join is first-hand intent: it lifts a tombstone left by an earlier departure.
+        // An explicit join is first-hand intent: it lifts a tombstone left by an earlier departure and
+        // any dial backoff, so the peer is dialed right away.
         if (peer != null) {
             peerTableLock.lock();
             try {
@@ -436,6 +563,7 @@ public final class TcpTransport implements Transport {
             } finally {
                 peerTableLock.unlock();
             }
+            clearDialBackoff(peer.nodeId());
         }
         boolean added = mergeGossipedPeer(peer);
         if (added && running && shouldInitiate(peer)) {
@@ -495,7 +623,7 @@ public final class TcpTransport implements Transport {
             if (peer.nodeId().equals(config.local().nodeId()) || peer.port() <= 0) {
                 continue;
             }
-            if (!shouldInitiate(peer)) {
+            if (!shouldInitiate(peer) || inDialBackoff(peer.nodeId())) {
                 continue;
             }
             ensureConnectionAsync(peer);
@@ -529,6 +657,12 @@ public final class TcpTransport implements Transport {
         if (nodeInfo.port() <= 0) {
             return null;
         }
+        // Fail fast, before the peer lock: a peer whose last dial failed is not dialed again until its
+        // backoff expires, so callers see "no connection" at once instead of queueing behind a dial.
+        if (inDialBackoff(nodeId)) {
+            LOGGER.fine(() -> "Not dialing " + nodeId + ": in dial backoff");
+            return null;
+        }
         ReentrantLock peerLock = getLockFor(nodeId);
         peerLock.lock();
         try {
@@ -542,6 +676,9 @@ public final class TcpTransport implements Transport {
             Connection unpublished = unpublishedLinkTo(nodeInfo);
             if (unpublished != null) {
                 return unpublished;
+            }
+            if (inDialBackoff(nodeId)) {
+                return null; // the dial this caller waited for just failed
             }
             try {
                 beforeDialHook.accept(nodeId);
@@ -568,9 +705,13 @@ public final class TcpTransport implements Transport {
                         throw e;
                     }
                 }
+                if (live != null) {
+                    clearDialBackoff(nodeId);
+                }
                 LOGGER.fine(() -> "Connected to " + nodeInfo);
                 return live;
             } catch (IOException e) {
+                recordDialFailure(nodeId);
                 LOGGER.log(Level.FINE, "Unable to connect to {0}: {1}", new Object[]{nodeInfo, e.getMessage()});
                 return null;
             }
@@ -644,6 +785,7 @@ public final class TcpTransport implements Transport {
         try {
             if (!running || leaving) { throw new IOException("Transport closed during connect"); }
             socket.setTcpNoDelay(true);
+            configureLiveness(socket);
             connection = new Connection(socket, preResolved != null);
             liveSockets.add(connection);
             if (preResolved != null) {
@@ -661,6 +803,28 @@ public final class TcpTransport implements Transport {
         Thread.ofVirtual().name("ngrid-transport-reader").start(connection::readLoop);
         LOGGER.fine(() -> "Registered connection: " + socket.getRemoteSocketAddress());
         return connection;
+    }
+
+    /**
+     * Keepalive and read timeout of a socket (see {@link #readIdleTimeoutMs}). The keepalive timers
+     * (idle, interval, count) are set where the JDK exposes them (Linux, macOS); elsewhere the OS
+     * defaults apply and the read timeout alone bounds a half-open connection.
+     */
+    private void configureLiveness(Socket socket) throws IOException {
+        socket.setKeepAlive(true);
+        if (readIdleTimeoutMs > 0 && readIdleTimeoutMs <= Integer.MAX_VALUE) {
+            socket.setSoTimeout((int) readIdleTimeoutMs);
+        }
+        try {
+            if (socket.supportedOptions().contains(jdk.net.ExtendedSocketOptions.TCP_KEEPIDLE)) {
+                int idleSeconds = (int) Math.max(1L, Math.min(Integer.MAX_VALUE, readIdleTimeoutMs / 3_000L));
+                socket.setOption(jdk.net.ExtendedSocketOptions.TCP_KEEPIDLE, idleSeconds);
+                socket.setOption(jdk.net.ExtendedSocketOptions.TCP_KEEPINTERVAL, Math.max(1, idleSeconds / 3));
+                socket.setOption(jdk.net.ExtendedSocketOptions.TCP_KEEPCOUNT, 3);
+            }
+        } catch (UnsupportedOperationException | IllegalArgumentException | IOException e) {
+            LOGGER.fine(() -> "TCP keepalive timers not tunable on this platform: " + e.getMessage());
+        }
     }
 
     /**
@@ -723,6 +887,9 @@ public final class TcpTransport implements Transport {
         if (!running) {
             return;
         }
+        // Keep the peers' view of our connections fresh: their PROXY routes through us are vouched for
+        // only by a recent report (see NetworkRouter.isProxy).
+        publishConnectedPeers();
         for (Map.Entry<NodeId, NetworkRouter.Route> entry : router.routesSnapshot().entrySet()) {
             if (entry.getValue().type() == NetworkRouter.RouteType.PROXY) {
                 NodeId target = entry.getKey();
@@ -770,11 +937,28 @@ public final class TcpTransport implements Transport {
         return peers;
     }
 
+    /**
+     * Ids of the peers this node holds an open connection to right now — the peers it can relay to.
+     * Reported in the handshake and in PEER_UPDATE so that a peer chooses this node as relay for a
+     * target only while the link to that target is live. Unresolved seed aliases are left out, as in
+     * {@link #gossipablePeers()}.
+     */
+    private Set<NodeId> connectedPeerIds() {
+        Set<NodeId> ids = new HashSet<>();
+        connections.forEach((id, connection) -> {
+            if (connection.isOpen() && !(initialPeerIds.contains(id) && !verifiedPeers.contains(id))) {
+                ids.add(id);
+            }
+        });
+        ids.remove(config.local().nodeId());
+        return ids;
+    }
+
     private void sendHandshake(Connection connection) {
         NodeInfo localInfo = config.local();
         Set<NodeInfo> peers = gossipablePeers();
         HandshakePayload payload = new HandshakePayload(localInfo, peers, collectLatencies(),
-                config.compressionEnabled(), true, true);
+                config.compressionEnabled(), true, true, connectedPeerIds());
         ClusterMessage message = ClusterMessage.request(MessageType.HANDSHAKE,
                 "hello",
                 localInfo.nodeId(),
@@ -848,8 +1032,11 @@ public final class TcpTransport implements Transport {
         connections.entrySet().removeIf(entry -> entry.getValue() == connection
                 && !entry.getKey().equals(remoteNodeId));
         if (live == null) { return; }
+        // The peer is reachable (it reached us): a pending dial backoff for it is moot.
+        clearDialBackoff(remoteNodeId);
         if (live != connection) {
-            router.updateReachability(remoteNodeId, admissible(payload.peers()), admissible(payload.latencies()));
+            router.updateReachability(remoteNodeId, admissible(payload.peers()), admissible(payload.latencies()),
+                    admissibleIds(payload.connectedPeers()));
             return;
         }
 
@@ -857,7 +1044,8 @@ public final class TcpTransport implements Transport {
         router.promoteToDirect(remoteNodeId);
 
         // Feed router with reachability info
-        router.updateReachability(remoteInfo.nodeId(), admissible(payload.peers()), admissible(payload.latencies()));
+        router.updateReachability(remoteInfo.nodeId(), admissible(payload.peers()), admissible(payload.latencies()),
+                admissibleIds(payload.connectedPeers()));
 
         listeners.forEach(listener -> listener.onPeerConnected(remoteInfo));
         // Merge peers and attempt connections
@@ -874,13 +1062,36 @@ public final class TcpTransport implements Transport {
     }
 
     private void broadcastPeerList() {
-        PeerUpdatePayload payload = new PeerUpdatePayload(gossipablePeers(), collectLatencies(), departedSnapshot());
+        PeerUpdatePayload payload = new PeerUpdatePayload(gossipablePeers(), collectLatencies(), departedSnapshot(),
+                connectedPeerIds());
         ClusterMessage update = ClusterMessage.request(MessageType.PEER_UPDATE,
                 "peer-update",
                 config.local().nodeId(),
                 null,
                 payload);
         broadcast(update);
+    }
+
+    /**
+     * Sends the current peer list, with the connected-peer report, over every open connection — and
+     * only there: unlike {@link #broadcastPeerList()} it never dials. Used when the set of connected
+     * peers shrinks (a confirmed disconnect: the peers routing through this node must stop at once)
+     * and periodically by {@link #probeLoop()} to keep the report fresh.
+     */
+    private void publishConnectedPeers() {
+        if (!running || leaving) {
+            return;
+        }
+        PeerUpdatePayload payload = new PeerUpdatePayload(gossipablePeers(), collectLatencies(), departedSnapshot(),
+                connectedPeerIds());
+        NodeId localId = config.local().nodeId();
+        for (Map.Entry<NodeId, Connection> entry : connections.entrySet()) {
+            Connection connection = entry.getValue();
+            if (connection.isOpen()) {
+                connection.send(ClusterMessage.request(MessageType.PEER_UPDATE, "peer-update", localId,
+                        entry.getKey(), payload));
+            }
+        }
     }
 
     private Map<NodeId, Double> collectLatencies() {
@@ -901,9 +1112,13 @@ public final class TcpTransport implements Transport {
         PeerUpdatePayload payload = message.payload(PeerUpdatePayload.class);
         // Departures first, so the same update cannot re-admit what it reports as gone.
         payload.departed().forEach((id, remainingMs) -> learnDepartureSecondHand(id, remainingMs, message.source()));
+        if (payload.connectedPeers() != null && message.source() != null) {
+            failPendingResponsesViaRelay(message.source(), payload.connectedPeers());
+        }
         
         // Feed router with reachability info
-        router.updateReachability(message.source(), admissible(payload.peers()), admissible(payload.latencies()));
+        router.updateReachability(message.source(), admissible(payload.peers()), admissible(payload.latencies()),
+                admissibleIds(payload.connectedPeers()));
 
         for (NodeInfo peer : payload.peers()) {
             if (mergeGossipedPeer(peer)) {
@@ -1063,7 +1278,13 @@ public final class TcpTransport implements Transport {
                 return;
             }
             // Forwarding: ONE hop, over an OPEN direct connection to the destination only. A relay must
-            // never dial the destination on behalf of the sender nor re-proxy through a third node:
+            // never dial the destination on behalf of the sender nor re-proxy through a third node.
+            // Forwarded requests are NOT tracked here: if the destination dies after the forward, no
+            // UNDELIVERABLE follows. What the relay does report, when it confirms the destination's
+            // disconnect, is its new connected-peer set (PEER_UPDATE); the requester fails its pending
+            // requests routed through this relay to that destination on receipt (see
+            // failPendingResponsesViaRelay), and its request timeout remains the last resort.
+            // Rationale for not dialing/re-proxying:
             // when the destination is dead (a killed leader still targeted by every follower's fetches,
             // heartbeats and client requests) each relayed message turned into a TTL-bounded storm of
             // failed dials and re-forwards across the survivors, executed INLINE on the read loop of the
@@ -1087,7 +1308,8 @@ public final class TcpTransport implements Transport {
                     if (back != null && back.isOpen() && back.peerSupportsUndeliverable()) {
                         back.send(ClusterMessage.lightweight(MessageType.UNDELIVERABLE, "undeliverable", localId,
                                 message.source(),
-                                new UndeliverablePayload(message.messageId(), message.destination())));
+                                new UndeliverablePayload(message.messageId(), message.destination(),
+                                        message.correlationId().orElse(null))));
                     }
                 }
             }
@@ -1155,15 +1377,42 @@ public final class TcpTransport implements Transport {
         if (payload == null || payload.messageId() == null) {
             return;
         }
+        // The relay has no link to the destination: stop routing through it (back to DIRECT when no
+        // other relay can reach the destination), whatever the message was.
+        if (notice.source() != null && payload.destination() != null) {
+            router.relayFailed(notice.source(), payload.destination());
+        }
+        NodeId localId = config.local().nodeId();
+        if (payload.correlationId() != null) {
+            // About a RESPONSE this node sent: no pending entry here, but the requester holds one keyed
+            // by the correlation id and would wait out its timeout. Tell it, keyed by that id and naming
+            // this node as the request's destination (what its pending entry matches), through whatever
+            // route remains — the relay is no longer a candidate for it, so typically a direct dial (off
+            // this reader thread). Best effort: with no route left, the requester's timeout is the last
+            // resort; a requester older than 8.3.0 drops the unknown message type.
+            NodeId requester = payload.destination();
+            if (requester != null && !requester.equals(localId)) {
+                ClusterMessage forwarded = ClusterMessage.lightweight(MessageType.UNDELIVERABLE, "undeliverable",
+                        localId, requester, new UndeliverablePayload(payload.correlationId(), localId, null));
+                try {
+                    workerPool.submit(() -> send(forwarded));
+                } catch (RejectedExecutionException closing) {
+                    // shutting down: nothing to forward any more
+                }
+            }
+            return;
+        }
         PendingResponse pending = pendingResponses.get(payload.messageId());
         if (pending == null || !pending.destination.equals(payload.destination())) {
             return; // unknown, already completed, or a notice about some other destination
         }
         if (pendingResponses.remove(payload.messageId(), pending)) {
             pending.cancelTimeout();
+            String reason = payload.destination().equals(notice.source())
+                    ? "its response could not be delivered back (the relay lost the return path)"
+                    : "relay " + notice.source() + " has no connection to it";
             pending.future.completeExceptionally(new IOException("Request " + payload.messageId() + " to "
-                    + payload.destination() + " undeliverable: relay " + notice.source()
-                    + " has no connection to it"));
+                    + payload.destination() + " undeliverable: " + reason));
         }
     }
 
@@ -1220,13 +1469,58 @@ public final class TcpTransport implements Transport {
             // The per-peer connection lock is deliberately kept (see connectionLocks).
             failPendingResponsesTo(nodeId);
             listeners.forEach(listener -> listener.onPeerDisconnected(nodeId));
+            // Peers routing to nodeId through this node must learn at once that the link is gone.
+            publishConnectedPeers();
         });
     }
 
+    /**
+     * A frame that never reached the socket of {@code from}, now closed — still queued when the
+     * simultaneous-open tie-break closed the connection, held before its handshake, or handed to
+     * {@code send} after the close: it goes over the connection now live for the same peer when one
+     * exists (the tie-break winner, an adopted socket), preserving order since the caller is the
+     * writer draining its own queue. When none does, its pending response (if any) fails at once with
+     * {@link PeerDisconnectedException} instead of waiting out the request timeout. Nothing is done
+     * while the transport is closing ({@link #close()} fails every pending response itself), and a
+     * HANDSHAKE belongs to its own connection.
+     */
+    private void redirectOrFail(Connection from, ClusterMessage message) {
+        if (!running || message.type() == MessageType.HANDSHAKE) {
+            return;
+        }
+        NodeId peer = from.remoteId().orElse(null);
+        Connection live = peer != null ? connections.get(peer) : null;
+        if (live != null && live != from && live.isOpen()) {
+            LOGGER.fine(() -> "Redirecting unsent " + message.type() + " to " + peer + " over its live connection");
+            live.send(message);
+            return;
+        }
+        failPendingRequest(message, peer != null ? peer : message.destination());
+    }
+
+    /** Fails, at once, the pending response of {@code message} (a request that will never leave), if any. */
+    private void failPendingRequest(ClusterMessage message, NodeId peer) {
+        if (ClusterMessage.ZERO_UUID.equals(message.messageId())) {
+            return;
+        }
+        PendingResponse pending = pendingResponses.remove(message.messageId());
+        if (pending != null) {
+            pending.cancelTimeout();
+            pending.future.completeExceptionally(new PeerDisconnectedException(
+                    peer != null ? peer : pending.destination, message.messageId()));
+        }
+    }
+
+    /**
+     * Fails every pending response whose request was addressed to {@code nodeId} OR sent through it as
+     * next hop (a relay): a relay that disconnected will never deliver the response, so the requester
+     * must not wait out its timeout.
+     */
     private void failPendingResponsesTo(NodeId nodeId) {
         List<Map.Entry<UUID, PendingResponse>> toFail = new ArrayList<>();
         for (Map.Entry<UUID, PendingResponse> entry : pendingResponses.entrySet()) {
-            if (nodeId.equals(entry.getValue().destination)) {
+            PendingResponse pending = entry.getValue();
+            if (nodeId.equals(pending.destination) || nodeId.equals(pending.via)) {
                 toFail.add(entry);
             }
         }
@@ -1236,6 +1530,27 @@ public final class TcpTransport implements Transport {
             if (pendingResponses.remove(requestId, pending)) {
                 pending.cancelTimeout();
                 pending.future.completeExceptionally(new PeerDisconnectedException(nodeId, requestId));
+            }
+        }
+    }
+
+    /**
+     * {@code relay} reported the peers it is connected to: a request routed through it to a destination
+     * it no longer reaches (the destination died after the forward) will never be answered through it.
+     * Fail those pending responses at once — the relay does not track forwarded requests, so no
+     * UNDELIVERABLE would ever come.
+     */
+    private void failPendingResponsesViaRelay(NodeId relay, Set<NodeId> relayConnected) {
+        for (Map.Entry<UUID, PendingResponse> entry : pendingResponses.entrySet()) {
+            PendingResponse pending = entry.getValue();
+            if (!relay.equals(pending.via) || relay.equals(pending.destination)
+                    || relayConnected.contains(pending.destination)) {
+                continue;
+            }
+            if (pendingResponses.remove(entry.getKey(), pending)) {
+                pending.cancelTimeout();
+                pending.future.completeExceptionally(new IOException("Request " + entry.getKey() + " to "
+                        + pending.destination + " undeliverable: relay " + relay + " lost its connection to it"));
             }
         }
     }
@@ -1315,6 +1630,7 @@ public final class TcpTransport implements Transport {
             published.closeQuietly();
         }
         dropConnectionLock(nodeId);
+        dialBackoffs.remove(nodeId);
         router.forget(nodeId);
         failPendingResponsesTo(nodeId);
         if (!wasKnown && published == null) {
@@ -1413,6 +1729,16 @@ public final class TcpTransport implements Transport {
         return admissible;
     }
 
+    /** Connected-peer report minus departed (tombstoned) ids; {@code null} stays {@code null} (no report). */
+    private Set<NodeId> admissibleIds(Set<NodeId> ids) {
+        if (ids == null || departedPeers.isEmpty()) {
+            return ids;
+        }
+        Set<NodeId> admissible = new HashSet<>(ids);
+        admissible.removeIf(this::isDeparted);
+        return admissible;
+    }
+
     private Map<NodeId, Double> admissible(Map<NodeId, Double> latencies) {
         if (departedPeers.isEmpty()) {
             return latencies;
@@ -1469,6 +1795,7 @@ public final class TcpTransport implements Transport {
             Thread.currentThread().interrupt();
         }
         connectionLocks.clear();
+        dialBackoffs.clear();
         pendingResponses.values().forEach(pending -> {
             pending.cancelTimeout();
             pending.future.completeExceptionally(new IOException("Transport closed"));
@@ -1611,6 +1938,9 @@ public final class TcpTransport implements Transport {
 
         void send(ClusterMessage message) {
             if (!isOpen()) {
+                // Closed (e.g. it lost the tie-break to another connection of the same peer): never
+                // drop silently — the request would wait out its timeout for nothing.
+                redirectOrFail(this, message);
                 return;
             }
             if (outboundInitiated && !handshakeQueued) {
@@ -1632,6 +1962,28 @@ public final class TcpTransport implements Transport {
                 }
             }
             outbound.enqueue(message);
+            if (!isOpen()) {
+                // Closed between the check above and the enqueue: the writer may already have drained
+                // its leftovers, so hand over whatever is still queued (usually just this frame).
+                unsentFrames().forEach(unsent -> redirectOrFail(this, unsent));
+            }
+        }
+
+        /**
+         * Frames of this connection that never reached its socket, in the order they were sent: those
+         * held before the handshake (never queued yet) followed by the outbound queue. Empties both.
+         */
+        private List<ClusterMessage> unsentFrames() {
+            List<ClusterMessage> unsent = new ArrayList<>();
+            handshakeGate.lock();
+            try {
+                unsent.addAll(heldBeforeHandshake);
+                heldBeforeHandshake.clear();
+            } finally {
+                handshakeGate.unlock();
+            }
+            outbound.drainTo(unsent);
+            return unsent;
         }
 
         /**
@@ -1662,12 +2014,23 @@ public final class TcpTransport implements Transport {
 
         private void drainOutbound() {
             byte[] lengthPrefix = new byte[Integer.BYTES];
+            // The frame in hand, and whether its bytes started to leave: a frame whose write began may
+            // have partially reached the peer and is never resent (its pending response fails fast
+            // instead); one whose write never began is redirected like the queued ones.
+            ClusterMessage inHand = null;
+            boolean writeStarted = false;
             try {
                 while (isOpen()) {
                     ClusterMessage message = outbound.poll(1, TimeUnit.SECONDS);
                     if (message == null) {
                         continue; // timeout — recheck isOpen()
                     }
+                    inHand = message;
+                    writeStarted = false;
+                    if (!isOpen()) {
+                        break; // closed while waiting: redirected below, ahead of the queued ones
+                    }
+                    beforeWriteHook.accept(message);
                     // One writer owns this raw socket stream. DataOutputStream.write(byte[])
                     // itself is synchronized on Java 21 and would pin a slow socket writer.
                     byte[] data = codec.encode(message);
@@ -1675,9 +2038,11 @@ public final class TcpTransport implements Transport {
                     lengthPrefix[1] = (byte) (data.length >>> 16);
                     lengthPrefix[2] = (byte) (data.length >>> 8);
                     lengthPrefix[3] = (byte) data.length;
+                    writeStarted = true;
                     outputStream.write(lengthPrefix);
                     outputStream.write(data);
                     outputStream.flush();
+                    inHand = null;
                     if (!flushWaiters.isEmpty()) {
                         CompletableFuture<Void> waiter = flushWaiters.remove(message.messageId());
                         if (waiter != null) {
@@ -1694,6 +2059,17 @@ public final class TcpTransport implements Transport {
                 closeQuietly();
             } finally {
                 failFlushWaiters();
+                // Nothing queued here leaves any more: hand it to the peer's live connection or fail it.
+                if (inHand != null) {
+                    if (writeStarted) {
+                        failPendingRequest(inHand, remoteId().orElse(inHand.destination()));
+                    } else {
+                        redirectOrFail(this, inHand);
+                    }
+                }
+                for (ClusterMessage unsent : unsentFrames()) {
+                    redirectOrFail(this, unsent);
+                }
             }
         }
 
@@ -1742,6 +2118,14 @@ public final class TcpTransport implements Transport {
                         handleMessage(remoteId().orElse(null), message);
                     }
                 }
+            } catch (SocketTimeoutException e) {
+                if (open) {
+                    // Nothing arrived for the whole read-idle window while every live link carries
+                    // periodic gossip: the peer is gone without closing (half-open). Close it here, so
+                    // it stops counting as connected and its outbound queue stops growing.
+                    LOGGER.log(Level.INFO, "Connection to {0} silent for {1} ms: closing half-open connection",
+                            new Object[]{remote, readIdleTimeoutMs});
+                }
             } catch (Exception e) {
                 if (open) {
                     LOGGER.log(Level.INFO, "Connection closed {0} at {1}", new Object[]{remote, Instant.now()});
@@ -1780,6 +2164,9 @@ public final class TcpTransport implements Transport {
     private static final class PendingResponse {
         private final NodeId destination;
         private final CompletableFuture<ClusterMessage> future;
+        // The next hop the request was sent to: the destination itself, or the relay. A disconnect of
+        // the relay (or its report that it lost the destination) fails the response.
+        private volatile NodeId via;
         private volatile ScheduledFuture<?> timeoutTask;
 
         private PendingResponse(NodeId destination, CompletableFuture<ClusterMessage> future) {
