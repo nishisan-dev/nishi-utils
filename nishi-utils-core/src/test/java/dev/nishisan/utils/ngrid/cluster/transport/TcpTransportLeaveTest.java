@@ -217,6 +217,46 @@ class TcpTransportLeaveTest {
     }
 
     /**
+     * Malha parcial: um cliente VIVO que o storage não consegue discar (firewall, link parcial) mas que
+     * segue falando com ele por relay não pode ser esquecido pelo gatilho lento — senão todo o tráfego
+     * retransmitido dele passa a ser descartado e não há recuperação (ele nunca faz handshake direto).
+     */
+    @Test
+    void liveEphemeralPeerReachableOnlyThroughARelayIsNotForgotten() throws Exception {
+        Duration forgetAfter = Duration.ofMillis(600);
+        TcpTransport storage = start(TcpTransportConfig.builder(info("a-storage", freePort(), false))
+                .reconnectInterval(RECONNECT)
+                .connectTimeout(Duration.ofMillis(200))
+                .departedPeerForgetAfter(forgetAfter));
+        RecordingListener events = listen(storage);
+        NodeInfo client = info("z-client", freePort(), true); // nobody listens: the storage cannot dial it
+        NodeInfo relay = info("m-storage", freePort(), false);
+        RawPeer relayLink = raw(storage);
+        relayLink.send(handshake(relay, storage.local(), Set.of(client)));
+        awaitTrue(() -> storage.isConnected(relay.nodeId()) && knows(storage, client.nodeId()),
+                "cliente não foi aprendido pelo gossip do relay");
+
+        int sent = 0;
+        long until = System.currentTimeMillis() + forgetAfter.toMillis() * 4;
+        while (System.currentTimeMillis() < until) {
+            relayLink.send(ClusterMessage.request(MessageType.CLIENT_REQUEST, "via-relay-" + sent, client.nodeId(),
+                    storage.local().nodeId(), "hb"));
+            sent++;
+            Thread.sleep(100);
+        }
+        int expected = sent;
+        awaitTrue(() -> events.qualifiers().size() >= expected, "tráfego retransmitido não chegou");
+
+        assertTrue(knows(storage, client.nodeId()), "cliente vivo alcançável só por relay foi esquecido");
+        assertFalse(storage.isDeparted(client.nodeId()));
+        assertEquals(sent, events.qualifiers().stream().filter(q -> q.startsWith("via-relay-")).count(),
+                "todo o tráfego retransmitido do cliente vivo deveria ser entregue");
+
+        // Once its relayed traffic stops as well, the backstop applies again.
+        awaitTrue(() -> !knows(storage, client.nodeId()), "cliente silencioso e sem conexão não foi esquecido");
+    }
+
+    /**
      * Saída sem LEAVE (kill -9, OOM, perda de rede): o peer efêmero é esquecido depois de
      * {@code departedPeerForgetAfter} sem conexão; um peer elegível a líder nunca é esquecido assim, e
      * um efêmero ainda conectado também não.

@@ -229,9 +229,11 @@ heartbeat tentava discar para ele (até `connectTimeout`, com o log "No connecti
 - **Primeira mão apenas:** o receptor honra o LEAVE só na conexão rastreada para aquele peer, com
   handshake, e com a identidade anunciada igual à da conexão — LEAVE forjado ou atrasado de uma
   encarnação antiga num socket substituído é descartado. O LEAVE nunca é repassado.
-- **Gatilho lento (backstop):** no `reconnectLoop`, um peer efêmero sem conexão aberta por mais de
-  `departedPeerForgetAfter` é esquecido (kill -9, OOM, perda de rede). O `NGridNode` usa
-  `max(1 min, 2 × heartbeatTimeout)`.
+- **Gatilho lento (backstop):** no `reconnectLoop`, um peer efêmero sem conexão aberta **e** sem
+  nenhuma mensagem vinda dele (direta ou retransmitida por um relay) por mais de
+  `departedPeerForgetAfter` é esquecido (kill -9, OOM, perda de rede). Numa malha parcial (firewall,
+  link de um lado só), um cliente vivo que este nó não consegue discar segue falando por relay e não é
+  esquecido. O `NGridNode` usa `max(1 min, 2 × heartbeatTimeout)`.
 - **Tombstone:** o id esquecido fica bloqueado por `departedPeerTombstoneTtl` (10 min) contra
   readmissão de segunda mão — gossip, lista de peers de handshake de terceiros, alcançabilidade do
   roteador, mensagens retransmitidas e sockets sem handshake. Um **handshake direto** do mesmo id

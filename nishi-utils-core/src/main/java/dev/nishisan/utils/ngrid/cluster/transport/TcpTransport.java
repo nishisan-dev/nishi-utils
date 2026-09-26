@@ -94,6 +94,10 @@ public final class TcpTransport implements Transport {
     // Since when (epoch millis) each known ephemeral peer has had no open connection; drives the
     // forget-after-disconnection backstop (forgetLongDisconnectedEphemeralPeers). Scheduler thread only.
     private final Map<NodeId, Long> disconnectedSince = new ConcurrentHashMap<>();
+    // Last time (epoch millis) any message sourced by each peer arrived, directly or through a relay.
+    // A peer this node cannot dial (partial mesh) may still be alive and talking through a relay; the
+    // forget-after-disconnection backstop must not take it for gone.
+    private final Map<NodeId, Long> lastInboundFromPeer = new ConcurrentHashMap<>();
     private final Map<NodeId, Connection> connections = new ConcurrentHashMap<>();
     // Includes accepted sockets that have not supplied a handshake/peer identity yet.
     private final Set<Connection> liveSockets = ConcurrentHashMap.newKeySet();
@@ -986,6 +990,11 @@ public final class TcpTransport implements Transport {
             return;
         }
         NodeId source = message.source();
+        if (source != null) {
+            // Liveness evidence for the slow forget trigger, relayed traffic included (recorded before
+            // the tombstone filter below: it must reflect what arrives, not what is accepted).
+            lastInboundFromPeer.put(source, System.currentTimeMillis());
+        }
         if (source != null && !source.equals(senderId) && isDeparted(source)) {
             // Relayed (second-hand) traffic of a forgotten peer — typically in flight when it left. Its
             // new incarnation is re-admitted by its own direct handshake, not through a relay.
@@ -1301,14 +1310,17 @@ public final class TcpTransport implements Transport {
      * ephemeral peer without an open connection for longer than
      * {@link TcpTransportConfig#departedPeerForgetAfter()} is forgotten and tombstoned. Before this, such
      * a peer stayed known forever and every heartbeat broadcast dialed it (up to connectTimeout each),
-     * logging "No connection available". A live ephemeral peer keeps a direct connection to every
-     * listening node it heartbeats, so it is not affected; one reachable only through a relay (partial
-     * partition) is forgotten here too and returns with its next direct handshake.
+     * logging "No connection available". A peer is only taken for gone when, for that same window,
+     * nothing sourced by it arrived either — directly or through a relay: in a partial mesh (firewall,
+     * one-sided link) a live client this node cannot dial keeps talking through a relay, and forgetting
+     * it would drop all its relayed traffic with no way back (it never handshakes this node directly).
      */
     private void forgetLongDisconnectedEphemeralPeers(long nowMs) {
         long forgetAfterMs = config.departedPeerForgetAfter().toMillis();
         NodeId localId = config.local().nodeId();
         disconnectedSince.keySet().removeIf(id -> !knownPeers.containsKey(id));
+        // Evidence older than the window is meaningless; this also drops ids that were never learned.
+        lastInboundFromPeer.values().removeIf(at -> nowMs - at >= forgetAfterMs);
         for (NodeInfo peer : List.copyOf(knownPeers.values())) {
             NodeId id = peer.nodeId();
             if (id.equals(localId) || !isEphemeral(peer) || isConnected(id)) {
@@ -1317,10 +1329,12 @@ public final class TcpTransport implements Transport {
             }
             long since = disconnectedSince.computeIfAbsent(id, k -> nowMs);
             long disconnectedForMs = nowMs - since;
-            if (disconnectedForMs >= forgetAfterMs) {
+            Long lastInbound = lastInboundFromPeer.get(id);
+            boolean silent = lastInbound == null || nowMs - lastInbound >= forgetAfterMs;
+            if (disconnectedForMs >= forgetAfterMs && silent) {
                 disconnectedSince.remove(id);
                 forget(id, config.departedPeerTombstoneTtl().toMillis(),
-                        "ephemeral peer without connection for " + disconnectedForMs + " ms");
+                        "ephemeral peer without connection nor traffic for " + disconnectedForMs + " ms");
             }
         }
     }
