@@ -60,6 +60,17 @@ public interface PlacementLookup {
     }
 
     /**
+     * Como {@link #resolve(String, String, GeometryDescriptor, Duration)}, levando também o
+     * {@code metadata.name} da definição ao líder ({@code PlaceRequest.definitionName}, issue #167 item 3)
+     * para as regras de placement. O default ignora o nome (compatibilidade com lookups em memória).
+     */
+    default SeriesPlacement resolve(String key, String hash,
+            dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor geometry, java.time.Duration maxWait,
+            String definitionName) {
+        return resolve(key, hash, geometry, maxWait);
+    }
+
+    /**
      * Placement existente de {@code seriesKey}, resolvendo com o líder ({@code ngrrd.catalog.lookup})
      * quando o cache local não confirma um placement {@code ACTIVE} — nunca cria posicionamento novo
      * (nunca dispara {@code ngrrd.place}). Um miss verdadeiro (a série não existe) é diferente de uma

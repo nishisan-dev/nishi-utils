@@ -246,7 +246,8 @@ public final class NgrrdStorageNode implements Closeable {
                         PlacementRequestHandler.fromCoordinator(node.coordinator(), node.transport());
                 PlacementRequestHandler placementHandler = new PlacementRequestHandler(node.transport(), catalog,
                         leaderView, node.replicationManager()::isLeaderSyncing, new LeastLoadedPlacementPolicy(),
-                        cfg.nodeStatusStaleAfter(), cfg.placementGraceAfterLeadership(), Clock.systemUTC());
+                        cfg.nodeStatusStaleAfter(), cfg.placementGraceAfterLeadership(), Clock.systemUTC(),
+                        cfg.placementRules());
                 wirePlacementHandler(placementHandler, self, node.coordinator()::addLeadershipListener,
                         node.transport()::addListener, rpc::registerLocalHandler);
 
@@ -255,14 +256,15 @@ public final class NgrrdStorageNode implements Closeable {
                 storageHandler.geometryService(geometryService);
                 MigrationExecutor migrationExecutor = new MigrationExecutor(node.transport(), registry, volume, rpc,
                         catalog, self, cfg.seriesObjectPrefix(), cfg.migrationChunkBytes(), cfg.maxSeriesBytes(),
-                        cfg.migrationBytesPerSecond(), Clock.systemUTC());
+                        cfg.migrationBytesPerSecond(), Clock.systemUTC(), cfg.quotaMaxSeries(), cfg.quotaMaxBytes());
                 MigrationCoordinator migrationCoordinator = new MigrationCoordinator(catalog, rpc, leaderView,
                         cfg.maxConcurrentMigrations(), cfg.migrationStatusPollInterval(), cfg.migrationTimeout(),
-                        Clock.systemUTC(), migrationHooks, cfg.maxDestinationCatalogLag());
+                        Clock.systemUTC(), migrationHooks, cfg.maxDestinationCatalogLag(), cfg.placementRules());
                 RebalanceSettings rebalanceSettings = new RebalanceSettings(cfg.rebalanceMinDelta(),
                         cfg.rebalanceTolerance(), cfg.maxMovesPerCycle(), cfg.maxDestinationCatalogLag());
                 Rebalancer rebalancer = new Rebalancer(catalog, leaderView, migrationCoordinator, rebalanceSettings,
-                        cfg.rebalanceEnabled(), cfg.rebalanceInterval(), cfg.migrationTimeout(), Clock.systemUTC());
+                        cfg.rebalanceEnabled(), cfg.rebalanceInterval(), cfg.migrationTimeout(), Clock.systemUTC(),
+                        cfg.placementRules());
                 AdminService adminService = new AdminService(catalog, rebalancer, Clock.systemUTC());
                 LocalReconciler localReconciler = new LocalReconciler(volume, catalog, rpc, registry, cfg.nodeId(),
                         cfg.seriesObjectPrefix(), cfg.orphanGrace(), cfg.reconcileInterval(),
@@ -273,9 +275,16 @@ public final class NgrrdStorageNode implements Closeable {
                         storageHandler::metricsSnapshot, node.coordinator()::isLeader, cfg.metricsListener(),
                         migrationExecutor, cfg.migrationTimeout(), localReconciler);
                 AdminRequestHandler adminHandler = new AdminRequestHandler(node.transport(), self, leaderView,
-                        catalog, statusReporter::metricsSnapshot, rpc, rebalancer, adminService, migrationCoordinator);
+                        catalog, statusReporter::metricsSnapshot, rpc, rebalancer, adminService, migrationCoordinator,
+                        cfg.placementRules());
 
                 statusReporter.distribution(cfg.distributionMode(), cfg.weight());
+                // Issue #167 (item 3): cota dura e fingerprint das regras de placement em todo status.
+                statusReporter.quota(cfg.quotaMaxSeries(), cfg.quotaMaxBytes());
+                statusReporter.placementRulesHash(cfg.placementRules().fingerprint());
+                LOGGER.info("NGRRD_PLACEMENT_RULES loaded count=" + cfg.placementRules().size() + " hash="
+                        + (cfg.placementRules().fingerprint() == null ? "-" : cfg.placementRules().fingerprint())
+                        + " node=" + cfg.nodeId());
                 // Issue #177: lag POR TÓPICO do catálogo (o lag global do snapshot operacional não serve).
                 String catalogTopic = MapClusterService.topicFor(CatalogService.CATALOG_MAP);
                 statusReporter.catalogReplication(() -> CatalogReplicaStatus.from(node.coordinator().isLeader(),

@@ -23,6 +23,7 @@ import dev.nishisan.utils.oss.cluster.admin.AdminService;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
+import dev.nishisan.utils.oss.cluster.placement.PlacementRules;
 import dev.nishisan.utils.oss.cluster.protocol.AdminNodeRequest;
 import dev.nishisan.utils.oss.cluster.protocol.AdminNodeStatusResponse;
 import dev.nishisan.utils.oss.cluster.protocol.AdminRebalanceResponse;
@@ -74,12 +75,27 @@ public final class AdminRequestHandler extends RequestHandlerSupport {
     private final Rebalancer rebalancer;
     private final AdminService adminService;
     private final MigrationCoordinator migrationCoordinator;
+    /** Regras de placement deste nó (issue #167, item 3), reportadas em {@code ngrrd.admin.status} quando líder. */
+    private final PlacementRules placementRules;
 
     public AdminRequestHandler(Transport transport, NodeId self, PlacementRequestHandler.LeaderView leaderView,
             CatalogService catalog, Supplier<NodeMetricsSnapshot> localMetricsSupplier, ClusterRpc rpc,
             Rebalancer rebalancer, AdminService adminService, MigrationCoordinator migrationCoordinator) {
+        this(transport, self, leaderView, catalog, localMetricsSupplier, rpc, rebalancer, adminService,
+                migrationCoordinator, PlacementRules.NONE);
+    }
+
+    /**
+     * @param placementRules regras de placement deste nó ({@code ngrrd.placement.rules}, issue #167 item 3),
+     *                       cujo fingerprint e contagem saem em {@code ngrrd.admin.status}; {@code null} = nenhuma
+     */
+    public AdminRequestHandler(Transport transport, NodeId self, PlacementRequestHandler.LeaderView leaderView,
+            CatalogService catalog, Supplier<NodeMetricsSnapshot> localMetricsSupplier, ClusterRpc rpc,
+            Rebalancer rebalancer, AdminService adminService, MigrationCoordinator migrationCoordinator,
+            PlacementRules placementRules) {
         super(transport, Set.of(Commands.ADMIN_STATUS, Commands.ADMIN_METRICS, Commands.ADMIN_REBALANCE,
                 Commands.ADMIN_DRAIN, Commands.ADMIN_ACTIVATE));
+        this.placementRules = Objects.requireNonNullElse(placementRules, PlacementRules.NONE);
         this.self = Objects.requireNonNull(self, "self");
         this.leaderView = Objects.requireNonNull(leaderView, "leaderView");
         this.catalog = Objects.requireNonNull(catalog, "catalog");
@@ -146,7 +162,8 @@ public final class AdminRequestHandler extends RequestHandlerSupport {
                 .collect(Collectors.toMap(Map.Entry::getKey, entry -> (long) entry.getValue().size()));
         return new AdminStatusResponse(SeriesStatus.OK, self.value(), views,
                 migrationCoordinator.activeMigrationCount(), seriesCountByNode,
-                catalog.placementsLocal().values().stream().filter(p -> !p.geometryConfirmed()).count());
+                catalog.placementsLocal().values().stream().filter(p -> !p.geometryConfirmed()).count(),
+                placementRules.fingerprint(), placementRules.size());
     }
 
     private NodeMetricsSnapshot handleMetrics(AdminNodeRequest request) {

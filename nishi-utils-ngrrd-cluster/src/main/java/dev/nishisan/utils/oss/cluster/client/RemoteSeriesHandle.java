@@ -92,6 +92,8 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
     private final String yaml;
     private final String definitionHashHex;
     private final GeometryDescriptor geometry;
+    /** {@code metadata.name} da definição, enviado no {@code PLACE} (issue #167, item 3); {@code null} = não informado. */
+    private final String definitionName;
     private final Map<String, String> tags;
     private final Ngrrd.OpenOptions options;
     private final PlacementLookup resolver;
@@ -170,9 +172,19 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
             RetryPolicy retryPolicy, Duration requestTimeout, Duration closeTimeout, Clock clock,
             BiConsumer<String, RemoteSeriesHandle> onClose, NodeCapabilities capabilities,
             BooleanSupplier clientClosed, GeometryDescriptor geometry) {
+        this(seriesKey, yaml, definitionHashHex, tags, options, resolver, rpc, dispatcher, retryPolicy,
+                requestTimeout, closeTimeout, clock, onClose, capabilities, clientClosed, geometry, null);
+    }
+
+    public RemoteSeriesHandle(String seriesKey, String yaml, String definitionHashHex, Map<String, String> tags,
+            Ngrrd.OpenOptions options, PlacementLookup resolver, ClusterRpc rpc, WriteBuffer dispatcher,
+            RetryPolicy retryPolicy, Duration requestTimeout, Duration closeTimeout, Clock clock,
+            BiConsumer<String, RemoteSeriesHandle> onClose, NodeCapabilities capabilities,
+            BooleanSupplier clientClosed, GeometryDescriptor geometry, String definitionName) {
         this.seriesKey = Objects.requireNonNull(seriesKey, "seriesKey");
         this.yaml = Objects.requireNonNull(yaml, "yaml");
         this.geometry = geometry;
+        this.definitionName = definitionName;
         this.definitionHashHex = Objects.requireNonNull(definitionHashHex, "definitionHashHex");
         this.tags = Map.copyOf(Objects.requireNonNullElse(tags, Map.of()));
         this.options = options != null ? options : Ngrrd.OpenOptions.defaults();
@@ -264,7 +276,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
      * {@link SeriesNotFoundException} se o líder confirmar que não há placement.
      */
     private SeriesPlacement resolvePlacement(boolean writable, Duration maxWait) {
-        return writable ? resolver.resolve(seriesKey, definitionHashHex, geometry, maxWait)
+        return writable ? resolver.resolve(seriesKey, definitionHashHex, geometry, maxWait, definitionName)
                 : resolver.resolveExisting(seriesKey, maxWait);
     }
 

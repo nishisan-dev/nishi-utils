@@ -13,6 +13,22 @@ class WeightedDistributionTest {
         return new StorageNodeStatus(id, state, 0, used, capacity, 1000, mode, weight, 0);
     }
 
+    @Test void placementRespeitaACotaDeSeriesMesmoNoNoDeMaiorPeso() {
+        // b tem peso 3 mas cota de 50 séries: depois de 50 placements ele some dos candidatos e a absorve o resto.
+        var nodes = List.of(node("a", NodeState.ACTIVE, 0, 0, DistributionMode.WEIGHT, 1),
+                new StorageNodeStatus("b", NodeState.ACTIVE, 0, 0, 0, 1000, DistributionMode.WEIGHT, 3, 0,
+                        StorageCapabilities.ALL, null, 50, 0, null));
+        Set<String> reachable = Set.of("a", "b");
+        Map<String, Long> pending = new HashMap<>();
+        for (int i = 0; i < 200; i++) {
+            String chosen = new LeastLoadedPlacementPolicy().choose(new PlacementContext(nodes, reachable, pending,
+                    1000, Duration.ofSeconds(10), null, 4096, Map.of(), "series-" + i, null, PlacementRules.NONE))
+                    .orElseThrow();
+            pending.merge(chosen, 1L, Long::sum);
+        }
+        assertEquals(Map.of("a", 150L, "b", 50L), pending);
+    }
+
     @Test void placementAndRebalanceConvergeToSameWeightedShares() {
         var nodes = List.of(node("a", NodeState.ACTIVE, 0, 0, DistributionMode.WEIGHT, 1),
                 node("b", NodeState.ACTIVE, 0, 0, DistributionMode.WEIGHT, 3));

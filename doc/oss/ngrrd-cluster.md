@@ -411,7 +411,34 @@ ngrrd:
   reconcile:
     interval: 10m                      # opcional, default 10m
     orphanGrace: 5m                    # opcional, default 5m
+  quota:                               # opcional; 0/omitido = sem limite (issue #167, item 3)
+    maxSeries: 200000
+    maxBytes: 68719476736
+  placement:
+    rules:                             # avaliadas em ordem; a primeira que casa vence
+      - name: tems-core
+        definition: ifaceStats         # metadata.name da definição (opcional)
+        keyPrefix: "br-sp/"            # prefixo da seriesKey (opcional) — ao menos um dos dois
+        pin: [storage-1, storage-2]
+      - name: no-lab-on-3
+        keyPrefix: "lab/"
+        exclude: [storage-3]           # exatamente um de pin/exclude
 ```
+
+**Cota e regras de placement (issue #167, item 3).** `ngrrd.quota.maxSeries`/`maxBytes` são a cota
+**dura** deste nó como destino (`0`/omitido = sem limite; negativo falha o boot): o líder não coloca
+nem migra para cá uma série que a ultrapasse, e o próprio nó recusa `MIGRATE_PREPARE` além dela
+(seções 7 e 8). `ngrrd.placement.rules` é uma lista ordenada de regras — cada uma com `name`
+(único), ao menos um critério (`definition` = `metadata.name` da definição ngrrd; `keyPrefix` =
+prefixo da chave da série; os dois juntos valem em E) e exatamente um efeito não vazio (`pin`: a
+série só vive nos nós listados; `exclude`: em qualquer nó menos os listados). A primeira regra que
+casa vence; sem casamento a série é irrestrita. Uma regra malformada ou um nome duplicado falha o
+boot com `ngrrd.placement.rules[i]: …`. As regras são **configuração uniforme**: todo storage node
+carrega a mesma lista (mesmo precedente de `distribution.mode`) e o líder aplica a cópia dele; cada
+nó publica o fingerprint da sua lista em `StorageNodeStatus.placementRulesHash` (SHA-256 do texto
+canônico, 16 hex) e o líder loga `NGRRD_PLACEMENT_RULES divergent leader=<hash> nodes=<id>(<hash|->),…`
+em `WARNING` (uma vez por mudança) quando um nó `ACTIVE` alcançável diverge — as regras nunca são
+descartadas por divergência. Ver [operação](ngrrd-cluster-operacao.md#cotas-e-regras-de-placement-issue-167-item-3).
 
 Interpolação `${VAR}`/`${VAR:default}` disponível em qualquer valor string, como no restante do
 projeto. **`bootDiscoveryWindow`, `affinityHandbackMode`, `placementGraceAfterLeadership`,
@@ -501,9 +528,22 @@ Ordem total e determinística — o resultado nunca depende da ordem de iteraç�
    típico de handoff de liderança recente, não de queda real — o filtro é ignorado para aquele
    ciclo; do contrário um handoff concentraria 100% das séries novas no primeiro nó a reportar ao
    novo líder.
-2. Se `preferredOwnerNodeId` (adoção do `LocalReconciler`, ou reafirmação de um dono já existente)
-   sobreviver aos filtros acima, ele vence direto, sem passar pelo desempate.
-3. Caso contrário, desempate em ordem: **(a)** menor carga efetiva dividida pelo peso (`COUNT` usa peso 1). A carga efetiva soma `seriesCount` reportado +
+2. **Cota e regras (issue #167, item 3):** depois da guarda de capacidade, `DestinationEligibility`
+   descarta o candidato cuja cota dura não comporta mais uma série —
+   `quota_series(<seriesCount + pendentes + 1>/<maxSeries>)` ou
+   `quota_bytes(<usados + max(reservados, pendentes) + pedidos>/<maxBytes>)` — e depois o que a
+   primeira regra casada pela série (`seriesKey` + `definitionName` vindos do `PlaceRequest`) não
+   admite: `rule_pinned_elsewhere(<regra>)` ou `rule_excluded(<regra>)`. Uma série cujo
+   `definitionName` é desconhecido (placement legado, cliente anterior a este campo) só casa regras
+   sem o critério `definition`. Um `pin` **nunca transborda**: sem nó fixado elegível a decisão é
+   vazia mesmo havendo outros nós livres. Quando este filtro esvazia um conjunto que tinha
+   candidatos, o líder loga `NGRRD_PLACEMENT_NO_CANDIDATE series=<chave> excluded=<id>(<motivo>),…`.
+   A ordem completa de elegibilidade é: `ACTIVE` → alcançável → capacidade (95 %) → cota → regras →
+   frescor → dono preferido.
+3. Se `preferredOwnerNodeId` (adoção do `LocalReconciler`, ou reafirmação de um dono já existente)
+   sobreviver aos filtros acima, ele vence direto, sem passar pelo desempate — e **ignora cota e
+   regras** (log `FINE`): a série já existe naquele volume; o rebalance corrige depois (fase 0).
+4. Caso contrário, desempate em ordem: **(a)** menor carga efetiva dividida pelo peso (`COUNT` usa peso 1). A carga efetiva soma `seriesCount` reportado +
    placements feitos pelo líder desde o último reporte daquele nó (`pendingSeriesByNode` — sem
    isso, uma rajada de séries novas cairia inteira no mesmo nó até o próximo status); **(b)** menor
    `fillRatio` (capacidade desconhecida conta como `0.0`); **(c)** menor `nodeId` — sempre decide,
@@ -536,6 +576,28 @@ Em `CAPACITY` e `WEIGHT`, placement e rebalance compartilham pesos e metas propo
 Drenagem e rebalance só movem séries com geometria confirmada para destinos que comportem os
 bytes reais, incluindo reservas; saídas ainda pendentes não liberam orçamento.
 Veja [configuração e atualização coordenada](ngrrd-cluster-operacao.md#capacidade-e-distribuição-ponderada-issue-167-itens-1-e-2).
+
+**Cota dura e regras de placement no rebalance (issue #167, item 3).** Cota e regras gateiam só
+**destinos**; um nó que já está acima da própria cota (adoção, dono preferido, cota reduzida) é
+tratado como **fonte**: em `COUNT` uma fonte com `carga > maxSeries` sempre cede, sem esperar o
+limiar de `minDelta`/`tolerance`. No planejador (`CapacityAwarePlanner`):
+
+- **Fase 0**, antes da drenagem: toda série cujo dono `ACTIVE` as regras não admitem vai para o
+  primeiro destino elegível que caiba, mesmo com o cluster equilibrado (limitada por
+  `maxMovesPerCycle`) — é o que corrige uma adoção, um dono preferido ou uma regra nova.
+- Um nó com `carga >= maxSeries` sai da lista de destinos; um destino cuja cota de bytes não
+  comporta `usados + entrando + bytes da série` não recebe; um destino que a regra da série exclui
+  é pulado tanto na drenagem quanto no balanceamento.
+- Em `CAPACITY`/`WEIGHT` os alvos são calculados por *water-filling*: o alvo de um nó é limitado à
+  sua `maxSeries` e o excedente é redistribuído por peso entre os nós sem teto, até nenhum estourar
+  (determinístico, ids ordenados).
+- `Rebalancer.excludedDestinations` (devolvido por `ngrrd.admin.rebalance`) passa a listar também
+  os motivos de nó `quota_series(<n>/<max>)`/`quota_bytes(<n>/<max>)`, além dos de réplica
+  atrasada; `MigrationCoordinator` recheca cota e regra do destino quando a migração vai começar
+  (`SKIPPED` com `destino <dst> inelegível: <motivo>`), e o **próprio destino** recusa
+  `MIGRATE_PREPARE` com `MigrateStatus.QUOTA_EXCEEDED` quando `entradas do volume + alvos de
+  migração abertos >= maxSeries` ou `usados + reservados + totalBytes > maxBytes` da configuração
+  local — a origem falha e o líder aborta.
 
 **Destino excluído por réplica do catálogo atrasada (issue #177).** `CatalogLagGate` retira da
 lista de destinos elegíveis, em qualquer modo de distribuição, um nó cuja `CatalogReplicaStatus`
@@ -607,6 +669,12 @@ ACTIVE(src) --[migrate()]--> catálogo := MIGRATING(owner=src, target=dst)
   `seriesCount == 0` **e** nenhuma migração em curso como origem, o `Rebalancer` promove o nó a
   `DRAINED` (nunca antes disso, mesmo que o status pareça vazio momentaneamente). Aí sim o
   operador pode parar o processo.
+- **Drenagem sob cota e regras (issue #167, item 3):** uma série presa por `pin` (nenhum nó fixado
+  `ACTIVE`, alcançável, com cota e capacidade) ou sem destino admitido pela sua regra **não sai**
+  do nó — o drain fica pendente, o nó permanece `DRAINING` (nunca é promovido a `DRAINED` com séries)
+  e o líder loga `NGRRD_DRAIN_PENDING reason=no_admissible_destination_or_confirmed_geometry_or_quota_or_rules
+  rulesSkipped=<n>` (`n` = séries sem destino por causa das regras). Cabe ao operador ampliar o
+  `pin`/cota (reinício coordenado) ou reativar o nó.
 - `activate <nodeId>`: reverte para `ACTIVE`, idempotente; o nó volta a ser candidato no próximo
   ciclo de placement/rebalanceamento.
 - `status`: líder, nós (estado, alcançável, séries, bytes, fill%), migrações em curso.
@@ -670,6 +738,13 @@ Entra na malha como cliente transparente (mesmo papel `client`+`leader-ineligibl
 saída tabular em texto simples. Código de saída `0` em sucesso, `1` em qualquer falha (parsing,
 conexão ou erro remoto), sempre reportada em `stderr` — nunca lança para o chamador.
 
+`status` traz, desde a issue #167 (item 3), a linha `REGRAS: <hash|-> (<n> regras)` (fingerprint e
+contagem das regras do **líder**) e, depois de `RESERVED`, as colunas `QUOTA`
+(`<maxSeries|->/<maxBytes|->`, `-` = sem limite) e `RULES` (8 primeiros hex do fingerprint do nó ou
+`-`, com sufixo `!` quando difere do fingerprint do líder — nó reiniciado com outro YAML, ou ainda
+não reiniciado após uma mudança). `rebalance` lista também os destinos excluídos por cota
+(`quota_series(<n>/<max>)`/`quota_bytes(<n>/<max>)`).
+
 `status` traz, desde a 8.7.0, a coluna `CAT_LAG` — forma curta do `CatalogReplicaStatus` do nó
 (seção 3): `lider`, o lag numérico, `sync` (sincronizando por snapshot), `boot` (bootstrap do relay
 pendente), `?` (lag desconhecido, HWM do líder ainda não visto) ou `-` (nó anterior à 8.7.0, campo
@@ -727,6 +802,19 @@ imprime só a confirmação do disparo, como antes.
   Métrica prática: em vez de "cada storage node recebe ≈ 1/4 das séries novas" sob esse churn, o
   critério de aceite observado nos testes é "≥ 1/4 por nó" — a distribuição perfeita só se
   estabiliza depois que a liderança assenta.
+- **Cota e regras de placement (issue #167, item 3).** (a) `SeriesPlacement.definitionName` só é
+  conhecido a partir do `PLACE` de um cliente desta versão: um placement legado (ou criado por
+  adoção do `LocalReconciler`) fica com `null` e **só casa regras sem o critério `definition`**; o
+  próximo `PLACE` do cliente para a série (todo `open` que não a encontra no cache local) preenche o
+  nome oportunisticamente — **não há backfill em lote**, então uma regra por `definition` só passa a
+  valer para as séries antigas depois que os clientes as reabrirem (ou, se for preciso, use
+  `keyPrefix`). (b) As regras são uniformes por configuração e mudam com **reinício coordenado** de
+  todos os storages: o líder aplica a cópia dele, divergência só gera `WARNING` e `!` na CLI. (c) A
+  cota é rechecada pelo destino, mas o placement decide com o status mais recente: uma série pode
+  escapar pela janela entre o `PLACE` e o próximo status (o rebalance corrige, tratando o nó como
+  fonte acima da cota). (d) `MigrateStatus.QUOTA_EXCEEDED` fica no fim do enum: uma origem 8.7.0 não
+  o conhece e falha ao decodificar a resposta (aborta a migração) — aceitável, versões mistas não
+  são suportadas.
 - **`ngrrd.admin.status`/`ngrrd.admin.drain`/`ngrrd.admin.activate`/`ngrrd.admin.rebalance`
   bloqueiam sem líder.** São comandos do líder (`LEADER_COMMANDS`); sem maioria elegível eleita
   (seção 2), eles simplesmente não respondem até haver líder — não há timeout curto dedicado além

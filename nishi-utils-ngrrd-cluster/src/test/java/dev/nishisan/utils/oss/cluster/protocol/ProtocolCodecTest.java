@@ -121,6 +121,30 @@ class ProtocolCodecTest {
     }
 
     @Test
+    void migrateResponseQuotaExceededSobreviveAoRoundTrip() throws IOException {
+        MigrateResponse original = MigrateResponse.of(MigrateStatus.QUOTA_EXCEEDED, "quota_series(6/5)");
+        assertEquals(original, roundTripResponseBody(Commands.MIGRATE_PREPARE, original));
+        assertEquals(MigrateStatus.QUOTA_EXCEEDED, MigrateStatus.values()[MigrateStatus.values().length - 1],
+                "QUOTA_EXCEEDED fica no fim do enum");
+    }
+
+    @Test
+    void placeRequestComDefinitionNameSobreviveAoRoundTrip() throws IOException {
+        PlaceRequest original = new PlaceRequest("series-1", "abc123def456", null, null, "ifaceStats");
+        assertEquals(original, roundTripRequestBody(Commands.PLACE, original));
+        assertEquals("ifaceStats", roundTripRequestBody(Commands.PLACE, original).definitionName());
+    }
+
+    @Test
+    void placeRequestDaVersao870SemDefinitionNameLeNomeNulo() throws Exception {
+        PlaceRequest legacy = new com.fasterxml.jackson.databind.ObjectMapper().readValue(
+                "{\"seriesKey\":\"s\",\"definitionHashHex\":\"h\",\"preferredOwnerNodeId\":null,\"geometry\":null}",
+                PlaceRequest.class);
+        assertEquals(new PlaceRequest("s", "h", null), legacy);
+        assertEquals(null, legacy.definitionName());
+    }
+
+    @Test
     void placeResponseComPlacementMigrandoSobreviveAoRoundTrip() throws IOException {
         SeriesPlacement placement = new SeriesPlacement("node-a", "node-b", PlacementState.MIGRATING,
                 "migration-1", 1_000L, 2_000L);

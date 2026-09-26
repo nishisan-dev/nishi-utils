@@ -18,6 +18,7 @@
 package dev.nishisan.utils.oss.cluster.rebalance;
 
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
+import dev.nishisan.utils.oss.cluster.placement.PlacementRules;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
@@ -79,7 +80,38 @@ public final class RebalancePlanner {
             Set<String> reachable, Set<String> migratingKeys, RebalanceSettings settings,
             Map<String, Long> regionBytesBySeries, Map<String, Long> pendingBytesByNode,
             Map<String, Long> pendingSeriesByNode, Set<String> excludedDestinations) {
-        return new CapacityAwarePlanner(nodes, seriesByOwner, reachable, migratingKeys, settings,
-                regionBytesBySeries, pendingBytesByNode, pendingSeriesByNode, excludedDestinations).plan();
+        return plan(nodes, seriesByOwner, reachable, migratingKeys, settings, regionBytesBySeries,
+                pendingBytesByNode, pendingSeriesByNode, excludedDestinations, PlacementRules.NONE, Map.of()).moves();
+    }
+
+    /**
+     * Resultado de um planejamento (issue #167, item 3).
+     *
+     * @param moves        movimentos planejados, na ordem em que devem ser submetidos
+     * @param rulesSkipped séries de drain/fase 0 que ficaram sem destino porque toda opção restante estava
+     *                     vedada por regra de placement — um drain com isso {@code > 0} fica pendente
+     */
+    public record Plan(List<Move> moves, int rulesSkipped) {
+        public Plan {
+            moves = List.copyOf(moves);
+        }
+    }
+
+    /**
+     * Planejamento completo (issue #167, item 3): além das exclusões de destino, respeita a cota dura de
+     * cada nó ({@code quotaMaxSeries}/{@code quotaMaxBytes} do status) e as regras de placement
+     * {@code rules} — {@code definitionNameBySeries} dá o {@code metadata.name} conhecido de cada série
+     * (ausente = série legada, que só casa regras por prefixo de chave).
+     */
+    public static Plan plan(Collection<StorageNodeStatus> nodes, Map<String, List<String>> seriesByOwner,
+            Set<String> reachable, Set<String> migratingKeys, RebalanceSettings settings,
+            Map<String, Long> regionBytesBySeries, Map<String, Long> pendingBytesByNode,
+            Map<String, Long> pendingSeriesByNode, Set<String> excludedDestinations, PlacementRules rules,
+            Map<String, String> definitionNameBySeries) {
+        CapacityAwarePlanner planner = new CapacityAwarePlanner(nodes, seriesByOwner, reachable, migratingKeys,
+                settings, regionBytesBySeries, pendingBytesByNode, pendingSeriesByNode, excludedDestinations, rules,
+                definitionNameBySeries);
+        List<Move> moves = planner.plan();
+        return new Plan(moves, planner.rulesSkipped());
     }
 }

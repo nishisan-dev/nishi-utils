@@ -131,6 +131,21 @@ class PlacementResolverTest {
     }
 
     @Test
+    void resolveComDefinitionNameEnviaONomeAoLider() {
+        SeriesPlacement placed = SeriesPlacement.active("storage-a", 1_000L).withDefinitionName("ifaceStats", 1_000L);
+        rpc.respondNext((cmd, body) -> {
+            assertEquals(Commands.PLACE, cmd);
+            assertEquals(new PlaceRequest("series-1", "hash-1", null, null, "ifaceStats"), body);
+            return new PlaceResponse(SeriesStatus.OK, placed, null, null);
+        });
+
+        SeriesPlacement resolved = resolver.resolve("series-1", "hash-1", null, Duration.ofSeconds(5), "ifaceStats");
+
+        assertEquals(placed, resolved);
+        assertEquals(1, rpc.calls().size());
+    }
+
+    @Test
     void placeComFalhaDeTransporteNaPrimeiraTentativaRetentaEConclui() {
         // B3 (achado do Refuter): TIMEOUT/REMOTE_ERROR(IOException) ao chamar o líder não deve subir
         // direto — o resolver retenta com backoff em vez de propagar a falha de transporte.

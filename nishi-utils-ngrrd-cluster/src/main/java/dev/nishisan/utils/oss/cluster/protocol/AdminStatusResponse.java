@@ -35,17 +35,28 @@ import java.util.Objects;
  * @param migrationsInFlight  quantidade de migrações em curso
  * @param seriesCountByNode   quantidade de séries por nó, segundo o catálogo; nunca {@code null}
  * @param geometriesPending placements whose physical geometry still needs owner confirmation
+ * @param placementRulesHash  fingerprint das regras de placement do LÍDER ({@code PlacementRules#fingerprint()},
+ *                            issue #167 item 3); {@code null} sem regras ou num líder anterior a este campo. A
+ *                            CLI compara com o {@code placementRulesHash} de cada nó para marcar divergência
+ * @param placementRulesCount quantidade de regras carregadas pelo líder; {@code 0} sem regras
  */
 public record AdminStatusResponse(
         SeriesStatus status,
         String leaderNodeId,
         List<NodeStatusView> nodes,
         int migrationsInFlight,
-        Map<String, Long> seriesCountByNode, long geometriesPending) {
+        Map<String, Long> seriesCountByNode, long geometriesPending,
+        String placementRulesHash, int placementRulesCount) {
 
     public AdminStatusResponse(SeriesStatus status, String leaderNodeId, List<NodeStatusView> nodes,
             int migrationsInFlight, Map<String, Long> seriesCountByNode) {
         this(status, leaderNodeId, nodes, migrationsInFlight, seriesCountByNode, 0);
+    }
+
+    /** Forma da 8.7.0, sem as regras do líder. */
+    public AdminStatusResponse(SeriesStatus status, String leaderNodeId, List<NodeStatusView> nodes,
+            int migrationsInFlight, Map<String, Long> seriesCountByNode, long geometriesPending) {
+        this(status, leaderNodeId, nodes, migrationsInFlight, seriesCountByNode, geometriesPending, null, 0);
     }
 
     public AdminStatusResponse {

@@ -37,6 +37,8 @@ import dev.nishisan.utils.oss.cluster.metrics.BlobVolumeSummary;
 import dev.nishisan.utils.oss.cluster.metrics.LatencySnapshot;
 import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
 import dev.nishisan.utils.oss.cluster.placement.DistributionMode;
+import dev.nishisan.utils.oss.cluster.placement.PlacementRule;
+import dev.nishisan.utils.oss.cluster.placement.PlacementRules;
 import dev.nishisan.utils.oss.cluster.protocol.AdminNodeRequest;
 import dev.nishisan.utils.oss.cluster.protocol.AdminNodeStatusResponse;
 import dev.nishisan.utils.oss.cluster.protocol.AdminRebalanceResponse;
@@ -174,6 +176,27 @@ class AdminRequestHandlerTest {
         assertEquals(Map.of("storage-a", 2L, "storage-b", 1L), response.seriesCountByNode());
         assertEquals(3, response.geometriesPending());
         assertEquals(0, response.migrationsInFlight(), "MÉDIO-5: em repouso, nenhuma migração ativa no coordenador");
+    }
+
+    /** Issue #167 (item 3): o status leva o fingerprint e a contagem das regras do líder. */
+    @Test
+    void statusNoLiderLevaOFingerprintEAContagemDasRegrasDoLider() {
+        leaderView.leader = true;
+        PlacementRules rules = PlacementRules.of(List.of(
+                new PlacementRule("core", "ifaceStats", null, Set.of("storage-a"), null),
+                new PlacementRule("no-lab", null, "lab/", null, Set.of("storage-b"))));
+        AdminRequestHandler ruled = new AdminRequestHandler(node.transport(), SELF, leaderView, catalog,
+                () -> localSnapshot, rpc, rebalancer, adminService, coordinator, rules);
+
+        AdminStatusResponse response = (AdminStatusResponse) ruled.handle(Commands.ADMIN_STATUS, null, CLIENT);
+
+        assertEquals(SeriesStatus.OK, response.status());
+        assertEquals(rules.fingerprint(), response.placementRulesHash());
+        assertEquals(2, response.placementRulesCount());
+
+        AdminStatusResponse unruled = (AdminStatusResponse) handler.handle(Commands.ADMIN_STATUS, null, CLIENT);
+        assertNull(unruled.placementRulesHash());
+        assertEquals(0, unruled.placementRulesCount());
     }
 
     @Test

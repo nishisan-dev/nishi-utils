@@ -114,6 +114,27 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
         this.distributionMode = mode;
         this.weight = weight;
     }
+    private volatile long quotaMaxSeries;
+    private volatile long quotaMaxBytes;
+    private volatile String placementRulesHash;
+
+    /**
+     * Cota dura deste nó ({@code ngrrd.quota.maxSeries}/{@code maxBytes}, issue #167 item 3), publicada em
+     * todo status; {@code 0} = sem limite.
+     */
+    public void quota(long maxSeries, long maxBytes) {
+        this.quotaMaxSeries = maxSeries;
+        this.quotaMaxBytes = maxBytes;
+    }
+
+    /**
+     * Fingerprint das regras de placement carregadas por este nó ({@code PlacementRules#fingerprint()}),
+     * publicado em todo status para o líder e a CLI detectarem divergência; {@code null} = sem regras.
+     */
+    public void placementRulesHash(String hash) {
+        this.placementRulesHash = hash;
+    }
+
     /**
      * Fonte do estado da réplica local do catálogo publicado em {@link StorageNodeStatus#catalogReplica()}
      * (issue #177); {@code null} = não configurada (o campo sai {@code null}).
@@ -454,7 +475,7 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
             NodeState state = strong.map(StorageNodeStatus::state).orElse(NodeState.ACTIVE);
             catalog.putNodeStatus(new StorageNodeStatus(nodeId, state, seriesCount, usedBytes, capacityBytes, now,
                     distributionMode, weight, volume.storage().reservedBytes(), StorageCapabilities.ALL,
-                    safeCatalogReplica()));
+                    safeCatalogReplica(), quotaMaxSeries, quotaMaxBytes, placementRulesHash));
         } finally {
             publishing.set(false);
         }

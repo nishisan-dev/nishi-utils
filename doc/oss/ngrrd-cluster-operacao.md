@@ -570,7 +570,94 @@ não impede o planejamento das menores que ainda cabem.
    retorne uniformemente a `COUNT`; a proteção de capacidade permanece ativa.
 
 Reverter o modo não significa fazer downgrade dos binários. Cotas de séries/bytes e regras de
-afinidade (item 3 da issue) não fazem parte desta entrega.
+placement são o item 3 da issue, na seção seguinte.
+
+## Cotas e regras de placement (issue #167, item 3)
+
+Cada storage pode declarar uma **cota dura** (`ngrrd.quota.maxSeries`/`maxBytes`) e todos carregam
+a mesma lista de **regras de placement** (`ngrrd.placement.rules`). A cota vale só como destino: o
+líder não coloca nem migra para o nó uma série além dela, e o próprio nó recusa `MIGRATE_PREPARE`
+(`QUOTA_EXCEEDED`) se o líder decidiu com um status defasado. Um nó que já está acima da cota
+(adoção, dono preferido, cota reduzida) não é esvaziado à força: o rebalance o trata como fonte que
+sempre cede, até voltar à cota.
+
+```yaml
+ngrrd:
+  quota:                       # opcional; 0/omitido = sem limite
+    maxSeries: 200000
+    maxBytes: 68719476736
+  placement:
+    rules:                     # avaliadas em ordem; a primeira que casa vence
+      - name: tems-core
+        definition: ifaceStats # metadata.name da definição (opcional)
+        keyPrefix: "br-sp/"    # prefixo da seriesKey (opcional) — ao menos um dos dois
+        pin: [storage-1, storage-2]
+      - name: no-lab-on-3
+        keyPrefix: "lab/"
+        exclude: [storage-3]   # exatamente um de pin/exclude
+```
+
+### Dimensionar a cota
+
+- **`maxSeries` pela RAM.** Cada série aberta custa um handle (`SeriesHandleRegistry`, limitado por
+  `maxOpenHandles`) mais a página da imagem no *page cache*; o que importa é quantas séries o nó
+  consegue manter **quentes** sem trocar página a cada escrita. Regra prática: `maxSeries ≈ (RAM
+  disponível para page cache) / (regionBytes da geometria)`, com folga de 20–30 % para o WAL do
+  catálogo e o NGrid. Uma série típica de interface (≈ 1,6 MiB) num nó com 64 GiB para cache
+  suporta ~30 mil séries quentes; se as escritas chegam a cada 5 min, o cache pode ser bem menor
+  que o conjunto total — meça `NGRRD_NODE_STATUS` (checkpoints, latência de escrita) antes de
+  apertar.
+- **`maxBytes` pelo volume.** Diferente de `volume.capacityBytes` (guarda de 95 % do disco), a cota
+  de bytes é um teto **administrativo**: use-a para reservar disco para outra carga na mesma
+  máquina ou para limitar o *blast radius* de um nó. O que conta é `usados + reservados` (reservas
+  de migrações em curso incluídas) mais os bytes da série a receber.
+- **`0` = sem limite.** Não use a cota para "equilibrar" — para isso existem `CAPACITY`/`WEIGHT`.
+  Em `CAPACITY`/`WEIGHT` os alvos são limitados pela cota (*water-filling*): um nó pesado com cota
+  baixa recebe até a cota e o excedente vai, por peso, para os nós sem teto.
+
+### Mudar regras (reinício coordenado)
+
+As regras são configuração **uniforme**: o líder aplica a cópia dele, e cada nó publica o
+fingerprint da sua lista no status. Para mudar:
+
+1. Edite o YAML de **todos** os storages com a lista nova, na mesma ordem.
+2. Reinicie os storages um a um (ou em janela): enquanto houver nós com listas diferentes, o líder
+   loga `NGRRD_PLACEMENT_RULES divergent leader=<hash> nodes=<id>(<hash|->),…` (uma vez por mudança)
+   e a CLI marca os divergentes com `!` — nada é descartado, mas qual lista vale depende de quem é
+   o líder naquele momento. Termine a janela com `status` mostrando o mesmo fingerprint em todos.
+3. Dispare `rebalance`: a **fase 0** do planejador move as séries que já estão num dono que a lista
+   nova não admite (`rule_pinned_elsewhere`/`rule_excluded`), limitada por `maxMovesPerCycle` por
+   ciclo.
+
+Regras por `definition` só alcançam séries cujo `definitionName` o catálogo conhece — as criadas por
+clientes desta versão em diante, ou as antigas depois de reabertas por um cliente (o `PLACE` preenche
+o nome; não há backfill em lote). Para séries antigas que nunca serão reabertas, prefira `keyPrefix`.
+
+### Ler `QUOTA` e `RULES` no `status`
+
+```
+LIDER: storage-1
+REGRAS: 3f9a1c0e7b2d4e61 (2 regras)
+NODE       STATE   REACHABLE SERIES ... RESERVED        QUOTA     RULES CAT_LAG CAPABILITIES
+storage-1  ACTIVE  true      184320 ... 0    200000/68719476736  3f9a1c0e   lider ...
+storage-2  ACTIVE  true      190011 ... 0    200000/-            3f9a1c0e      12 ...
+storage-3  ACTIVE  true       91004 ... 0             -/-        9c02be77!      8 ...
+```
+
+- `QUOTA` = `<maxSeries|->/<maxBytes|->` do nó; `-` é sem limite.
+- `RULES` = 8 primeiros hex do fingerprint das regras do nó; `-` sem regras; `!` quando difere do
+  fingerprint do líder (linha `REGRAS`). Um `!` durante uma janela de reinício é esperado; fora dela,
+  procure um YAML diferente (ordem das regras conta; ordem dos nós dentro de `pin`/`exclude` não).
+- `rebalance` lista `destino excluído: <nó> (quota_series(<n>/<max>))` ou `(quota_bytes(…))` para
+  nós na cota, além dos motivos de réplica atrasada.
+
+### Drain com séries presas
+
+Um drain só move cada série para um destino que a cota e a regra dela admitem. Uma série fixada
+(`pin`) só no nó drenado, ou cujos outros nós fixados estão cheios/fora, **fica**: o nó permanece
+`DRAINING` (nunca vira `DRAINED` com séries) e o líder loga `NGRRD_DRAIN_PENDING
+reason=no_admissible_destination_or_confirmed_geometry_or_quota_or_rules rulesSkipped=<n>`. Amplie o
+`pin`/cota com um reinício coordenado, ou `activate` o nó de volta.
 
 ## Consultar existência e abrir sem criar (issue #171)
 

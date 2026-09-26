@@ -28,8 +28,10 @@ import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogView;
 import dev.nishisan.utils.oss.cluster.catalog.PlacementState;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
+import dev.nishisan.utils.oss.cluster.placement.DestinationEligibility;
 import dev.nishisan.utils.oss.cluster.placement.PlacementContext;
 import dev.nishisan.utils.oss.cluster.placement.PlacementPolicy;
+import dev.nishisan.utils.oss.cluster.placement.PlacementRules;
 import dev.nishisan.utils.oss.cluster.protocol.CatalogLookupRequest;
 import dev.nishisan.utils.oss.cluster.protocol.CatalogLookupResponse;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
@@ -86,6 +88,8 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
     private final Duration nodeStatusStaleAfter;
     private final Duration placementGraceAfterLeadership;
     private final Clock clock;
+    /** Regras de placement deste líder ({@code ngrrd.placement.rules}, issue #167 item 3); nunca {@code null}. */
+    private final PlacementRules placementRules;
 
     private volatile boolean needsAdmissionRebuild = true;
     private final java.util.concurrent.locks.ReentrantLock admissionLock = new java.util.concurrent.locks.ReentrantLock();
@@ -131,7 +135,20 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
             BooleanSupplier leaderSyncing, PlacementPolicy policy, Duration nodeStatusStaleAfter,
             Duration placementGraceAfterLeadership, Clock clock) {
         this(transport, (CatalogView) catalog, leaderView, leaderSyncing, policy, nodeStatusStaleAfter,
-                placementGraceAfterLeadership, clock);
+                placementGraceAfterLeadership, clock, PlacementRules.NONE);
+    }
+
+    /**
+     * @param leaderSyncing  indica se a réplica deste nó, mesmo já líder, ainda está em catch-up de um
+     *                       mandato anterior ({@code ReplicationManager#isLeaderSyncing()})
+     * @param placementRules regras de placement deste nó ({@code ngrrd.placement.rules}, issue #167 item 3),
+     *                       aplicadas quando ele é o líder; {@code null} = nenhuma
+     */
+    public PlacementRequestHandler(Transport transport, CatalogService catalog, LeaderView leaderView,
+            BooleanSupplier leaderSyncing, PlacementPolicy policy, Duration nodeStatusStaleAfter,
+            Duration placementGraceAfterLeadership, Clock clock, PlacementRules placementRules) {
+        this(transport, (CatalogView) catalog, leaderView, leaderSyncing, policy, nodeStatusStaleAfter,
+                placementGraceAfterLeadership, clock, placementRules);
     }
 
     /**
@@ -141,7 +158,16 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
     PlacementRequestHandler(Transport transport, CatalogView catalog, LeaderView leaderView,
             BooleanSupplier leaderSyncing, PlacementPolicy policy, Duration nodeStatusStaleAfter,
             Duration placementGraceAfterLeadership, Clock clock) {
+        this(transport, catalog, leaderView, leaderSyncing, policy, nodeStatusStaleAfter,
+                placementGraceAfterLeadership, clock, PlacementRules.NONE);
+    }
+
+    /** Construtor de teste com regras de placement (ver acima). */
+    PlacementRequestHandler(Transport transport, CatalogView catalog, LeaderView leaderView,
+            BooleanSupplier leaderSyncing, PlacementPolicy policy, Duration nodeStatusStaleAfter,
+            Duration placementGraceAfterLeadership, Clock clock, PlacementRules placementRules) {
         super(transport, Set.of(Commands.PLACE, Commands.CATALOG_LOOKUP));
+        this.placementRules = Objects.requireNonNullElse(placementRules, PlacementRules.NONE);
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.leaderView = Objects.requireNonNull(leaderView, "leaderView");
         this.leaderSyncing = Objects.requireNonNull(leaderSyncing, "leaderSyncing");
@@ -280,7 +306,8 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
             }
             Optional<SeriesPlacement> alreadyPlaced = catalog.placementStrong(request.seriesKey());
             if (alreadyPlaced.isPresent()) {
-                return new PlaceResponse(SeriesStatus.OK, alreadyPlaced.get(), null, null);
+                return new PlaceResponse(SeriesStatus.OK, backfillDefinitionName(request, alreadyPlaced.get()), null,
+                        null);
             }
 
             // Seção 0 do M3: a série não está no catálogo (nem na leitura STRONG, que já foi ao
@@ -297,10 +324,16 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
                 needsAdmissionRebuild = false;
             }
             Collection<StorageNodeStatus> nodes = catalog.nodesLocal();
+            Set<String> reachable = leaderView.reachableNodeIds();
             long now = clock.millis();
-            PlacementContext ctx = new PlacementContext(nodes, leaderView.reachableNodeIds(),
+            // Issue #167 (item 3): as regras são uniformes por configuração; um nó alcançável com um
+            // fingerprint diferente do deste líder gera um WARNING (uma vez por mudança), nunca descarte.
+            DestinationEligibility.warnIfRulesDiverge(placementRules,
+                    nodes.stream().filter(node -> reachable.contains(node.nodeId())).toList());
+            PlacementContext ctx = new PlacementContext(nodes, reachable,
                     snapshotPending(nodes), now, nodeStatusStaleAfter, request.preferredOwnerNodeId(),
-                    request.geometry() == null ? 0 : request.geometry().regionBytes(), catalog.pendingBytesByNode());
+                    request.geometry() == null ? 0 : request.geometry().regionBytes(), catalog.pendingBytesByNode(),
+                    request.seriesKey(), request.definitionName(), placementRules);
 
             Optional<String> chosen = policy.choose(ctx);
             if (chosen.isEmpty()) {
@@ -315,7 +348,8 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
                 return notLeaderResponse();
             }
 
-            SeriesPlacement placement = SeriesPlacement.active(chosen.get(), now);
+            SeriesPlacement placement = SeriesPlacement.active(chosen.get(), now)
+                    .withDefinitionName(request.definitionName(), now);
             if (request.geometry() != null) {
                 catalog.putGeometry(request.geometry());
                 placement = placement.withGeometry(request.geometry().id(), false, now);
@@ -331,6 +365,29 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
             }
             recordPending(chosen.get(), nodes);
             return new PlaceResponse(SeriesStatus.OK, placement, null, null);
+        }
+    }
+
+    /**
+     * Issue #167 (item 3): preenchimento oportunista do {@code definitionName} de um placement legado
+     * ({@code ACTIVE}, sem nome) quando o {@code PLACE} do cliente traz o nome — sob o mesmo lock de
+     * stripe já adquirido por {@link #handlePlace}. Não reescreve um placement já nomeado, nem um em
+     * migração (a transição de conclusão/aborto o reescreveria por cima). Uma falha ao gravar não
+     * atrapalha o {@code PLACE}: responde o placement como estava. Não há backfill em lote — só o
+     * próximo {@code PLACE} de cada série (limitação documentada).
+     */
+    private SeriesPlacement backfillDefinitionName(PlaceRequest request, SeriesPlacement current) {
+        String name = request.definitionName();
+        if (name == null || name.isBlank() || current.definitionName() != null
+                || current.state() != PlacementState.ACTIVE || !leaderView.isLeader()) {
+            return current;
+        }
+        SeriesPlacement named = current.withDefinitionName(name, clock.millis());
+        try {
+            catalog.putPlacement(request.seriesKey(), named);
+            return named;
+        } catch (RuntimeException e) {
+            return current;
         }
     }
 
