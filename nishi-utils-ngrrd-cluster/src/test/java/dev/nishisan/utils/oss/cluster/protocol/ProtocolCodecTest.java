@@ -145,6 +145,17 @@ class ProtocolCodecTest {
     }
 
     @Test
+    void adminForgetSobreviveAoRoundTrip() throws IOException {
+        AdminNodeRequest request = new AdminNodeRequest("storage-old", true);
+        assertEquals(request, roundTripRequestBody(Commands.ADMIN_FORGET, request));
+        AdminForgetResponse response = new AdminForgetResponse(SeriesStatus.OK, "storage-1", "storage-old",
+                List.of("storage-1", "storage-2"), List.of("storage-3"), "repita em storage-3");
+        assertEquals(response, roundTripResponseBody(Commands.ADMIN_FORGET, response));
+        AdminForgetResponse refusal = AdminForgetResponse.of(SeriesStatus.ERROR, "storage-1", "storage-old", "motivo");
+        assertEquals(refusal, roundTripResponseBody(Commands.ADMIN_FORGET, refusal));
+    }
+
+    @Test
     void placeResponseComPlacementMigrandoSobreviveAoRoundTrip() throws IOException {
         SeriesPlacement placement = new SeriesPlacement("node-a", "node-b", PlacementState.MIGRATING,
                 "migration-1", 1_000L, 2_000L);

@@ -23,6 +23,7 @@ import dev.nishisan.utils.oss.NgrrdHandle;
 import dev.nishisan.utils.oss.api.SeriesNotFoundException;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
+import dev.nishisan.utils.oss.cluster.protocol.AdminForgetResponse;
 import dev.nishisan.utils.oss.cluster.protocol.AdminStatusResponse;
 
 import java.io.Closeable;
@@ -234,6 +235,23 @@ public interface NgrrdClusterClient extends Closeable {
      * @throws NgrrdClusterException se {@code nodeId} não é conhecido pelo catálogo do líder
      */
     StorageNodeStatus activateNode(String nodeId);
+
+    /**
+     * Esquece um storage node substituído ou desativado ({@code ngrrd.admin.forget}, revisão #178 B9;
+     * desde a 8.8.0): o líder remove {@code nodeId} do catálogo e ordena a todos os storages alcançáveis
+     * que o esqueçam no transporte do NGrid — ele deixa de contar na maioria de votantes da eleição, que
+     * de outro modo ficaria inflada para sempre por um storage substituído sob outro id. Mesma
+     * re-resolução automática de {@code NOT_LEADER} de {@link #clusterStatus()}. Pré-condições, verificadas
+     * pelo líder: o nó já não está alcançável e não tem séries nem migrações de entrada no catálogo
+     * (drene-o e pare o processo antes). Storages que não confirmaram voltam em
+     * {@link AdminForgetResponse#failedOn()}: repita o comando quando voltarem.
+     *
+     * @throws NgrrdClusterException {@code REMOTE_ERROR} se o líder recusou (pré-condições) ou o comando
+     *                               não é suportado pelo cluster
+     */
+    default AdminForgetResponse forgetNode(String nodeId) {
+        throw new UnsupportedOperationException("forgetNode não suportado por " + getClass().getName());
+    }
 
     /** Identificador deste cliente no cluster NGrid. */
     NodeId clientNodeId();

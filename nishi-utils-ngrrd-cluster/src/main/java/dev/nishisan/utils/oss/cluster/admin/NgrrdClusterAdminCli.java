@@ -25,6 +25,7 @@ import dev.nishisan.utils.oss.cluster.api.RebalanceTrigger;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogReplicaStatus;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
+import dev.nishisan.utils.oss.cluster.protocol.AdminForgetResponse;
 import dev.nishisan.utils.oss.cluster.protocol.AdminStatusResponse;
 import dev.nishisan.utils.oss.cluster.protocol.NodeStatusView;
 
@@ -41,7 +42,7 @@ import java.util.stream.Collectors;
 /**
  * CLI de administração do cluster ngrrd (seção 4 da spec do M4):
  * {@code java -cp ... dev.nishisan.utils.oss.cluster.admin.NgrrdClusterAdminCli --seed host:port
- * [--client-id x] <status|metrics <nodeId>|drain <nodeId>|activate <nodeId>|rebalance>}.
+ * [--client-id x] <status|metrics <nodeId>|drain <nodeId>|activate <nodeId>|forget-node <nodeId>|rebalance>}.
  *
  * <p>Entra na malha como cliente transparente ({@code roles client+leader-ineligible}, o mesmo papel de
  * {@link NgrrdClusterClient}), executa um único comando e sai — sem dependência de nenhuma biblioteca de
@@ -51,7 +52,7 @@ import java.util.stream.Collectors;
 public final class NgrrdClusterAdminCli {
 
     private static final String USAGE = "uso: NgrrdClusterAdminCli --seed host:port [--client-id x] "
-            + "<status|metrics <nodeId>|drain <nodeId>|activate <nodeId>|rebalance>";
+            + "<status|metrics <nodeId>|drain <nodeId>|activate <nodeId>|forget-node <nodeId>|rebalance>";
 
     public static void main(String[] args) {
         int exitCode = new NgrrdClusterAdminCli().run(args, System.out, System.err);
@@ -119,6 +120,9 @@ public final class NgrrdClusterAdminCli {
                 case "activate" -> {
                     printNodeStatus("activate", client.activateNode(parsed.nodeId), out);
                     return 0;
+                }
+                case "forget-node" -> {
+                    return printForget(client.forgetNode(parsed.nodeId), out, err);
                 }
                 case "rebalance" -> {
                     printRebalance(client.triggerRebalance(), out);
@@ -228,6 +232,24 @@ public final class NgrrdClusterAdminCli {
                 out.println("destino excluído: " + nodeId + " (" + reason + ")"));
     }
 
+    /** Código de saída 1 quando algum storage não confirmou: o operador precisa repetir o comando nele. */
+    private int printForget(AdminForgetResponse response, PrintStream out, PrintStream err) {
+        out.println("forget-node OK: " + response.nodeId() + " removido do catálogo pelo líder "
+                + response.leaderNodeId());
+        for (String nodeId : response.forgottenOn()) {
+            out.println("esquecido em: " + nodeId);
+        }
+        if (response.failedOn().isEmpty()) {
+            return 0;
+        }
+        for (String nodeId : response.failedOn()) {
+            err.println("NAO confirmado em: " + nodeId);
+        }
+        err.println("erro: repita 'forget-node " + response.nodeId() + "' quando esses storages voltarem; "
+                + "até lá continuam a contar o nó na maioria de votantes");
+        return 1;
+    }
+
     private void printNodeStatus(String command, StorageNodeStatus status, PrintStream out) {
         out.println(command + " OK");
         out.printf(Locale.ROOT, "%-24s %-10s %8s %14s%n", "NODE", "STATE", "SERIES", "BYTES");
@@ -238,7 +260,7 @@ public final class NgrrdClusterAdminCli {
     /** Argumentos já parseados e validados de {@link #run(String[], PrintStream, PrintStream)}. */
     private record ParsedArgs(String seed, String clientId, String command, String nodeId) {
 
-        private static final List<String> NODE_ID_COMMANDS = List.of("metrics", "drain", "activate");
+        private static final List<String> NODE_ID_COMMANDS = List.of("metrics", "drain", "activate", "forget-node");
 
         static ParsedArgs parse(String[] args) {
             if (args == null) {
@@ -265,7 +287,8 @@ public final class NgrrdClusterAdminCli {
                 throw new IllegalArgumentException("--seed é obrigatório");
             }
             if (positional.isEmpty()) {
-                throw new IllegalArgumentException("comando é obrigatório: status|metrics|drain|activate|rebalance");
+                throw new IllegalArgumentException(
+                        "comando é obrigatório: status|metrics|drain|activate|forget-node|rebalance");
             }
             String command = positional.get(0).toLowerCase(Locale.ROOT);
             String nodeId = positional.size() > 1 ? positional.get(1) : null;

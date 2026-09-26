@@ -39,6 +39,7 @@ import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
 import dev.nishisan.utils.oss.cluster.placement.DistributionMode;
 import dev.nishisan.utils.oss.cluster.placement.PlacementRule;
 import dev.nishisan.utils.oss.cluster.placement.PlacementRules;
+import dev.nishisan.utils.oss.cluster.protocol.AdminForgetResponse;
 import dev.nishisan.utils.oss.cluster.protocol.AdminNodeRequest;
 import dev.nishisan.utils.oss.cluster.protocol.AdminNodeStatusResponse;
 import dev.nishisan.utils.oss.cluster.protocol.AdminRebalanceResponse;
@@ -68,6 +69,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Predicate;
 import java.util.function.BooleanSupplier;
 import java.util.stream.Collectors;
 
@@ -394,6 +396,143 @@ class AdminRequestHandlerTest {
 
         assertEquals(SeriesStatus.OK, response.status());
         assertEquals(NodeState.DRAINING, response.nodeStatus().state());
+    }
+
+    // ---- ngrrd.admin.forget (revisão #178, B9) ----
+
+    private AdminRequestHandler forgetHandler(List<String> decommissioned) {
+        Predicate<String> decommissioner = nodeId -> decommissioned.add(nodeId);
+        return new AdminRequestHandler(node.transport(), SELF, leaderView, catalog, () -> localSnapshot, rpc,
+                rebalancer, adminService, coordinator, PlacementRules.NONE, decommissioner);
+    }
+
+    private static AdminNodeRequest forget(String nodeId, boolean forwarded) {
+        return new AdminNodeRequest(nodeId, forwarded);
+    }
+
+    @Test
+    void forgetForaDoLiderRespondeNotLeaderComOIdDoLiderConhecido() {
+        leaderView.leader = false;
+        leaderView.leaderId = Optional.of("storage-b");
+        List<String> decommissioned = new CopyOnWriteArrayList<>();
+
+        AdminForgetResponse response = (AdminForgetResponse) forgetHandler(decommissioned)
+                .handle(Commands.ADMIN_FORGET, forget("storage-old", false), CLIENT);
+
+        assertEquals(SeriesStatus.NOT_LEADER, response.status());
+        assertEquals("storage-b", response.leaderNodeId());
+        assertTrue(decommissioned.isEmpty(), "fora do líder nada é esquecido");
+    }
+
+    @Test
+    void forgetSemDecommissionerRespondeError() {
+        leaderView.leader = true;
+
+        AdminForgetResponse response =
+                (AdminForgetResponse) handler.handle(Commands.ADMIN_FORGET, forget("storage-old", false), CLIENT);
+
+        assertEquals(SeriesStatus.ERROR, response.status());
+        assertTrue(response.message().contains("não suportado"), response.message());
+    }
+
+    @Test
+    void forgetRecusaNoAindaAlcancavel() {
+        leaderView.leader = true;
+        leaderView.reachable.add("storage-old");
+        List<String> decommissioned = new CopyOnWriteArrayList<>();
+        catalog.putNodeStatus(new StorageNodeStatus("storage-old", NodeState.DRAINED, 0, 0, 0, 1_000L));
+
+        AdminForgetResponse response = (AdminForgetResponse) forgetHandler(decommissioned)
+                .handle(Commands.ADMIN_FORGET, forget("storage-old", false), CLIENT);
+
+        assertEquals(SeriesStatus.ERROR, response.status());
+        assertTrue(response.message().contains("alcançável"), response.message());
+        assertTrue(decommissioned.isEmpty());
+        assertTrue(catalog.nodeStatusLocal("storage-old").isPresent(), "o catálogo não é tocado numa recusa");
+    }
+
+    @Test
+    void forgetRecusaNoComSeriesOuMigracoesDeEntradaNoCatalogo() {
+        leaderView.leader = true;
+        List<String> decommissioned = new CopyOnWriteArrayList<>();
+        catalog.putNodeStatus(new StorageNodeStatus("storage-old", NodeState.DRAINING, 1, 0, 0, 1_000L));
+        catalog.putPlacement("series-1", SeriesPlacement.active("storage-old", 1_000L));
+
+        AdminForgetResponse owned = (AdminForgetResponse) forgetHandler(decommissioned)
+                .handle(Commands.ADMIN_FORGET, forget("storage-old", false), CLIENT);
+        assertEquals(SeriesStatus.ERROR, owned.status());
+        assertTrue(owned.message().contains("1 série(s)"), owned.message());
+
+        catalog.removePlacement("series-1");
+        catalog.putPlacement("series-2", SeriesPlacement.migrating(
+                SeriesPlacement.active("storage-a", 1_000L), "storage-old", "m-1", 1_000L));
+        AdminForgetResponse inbound = (AdminForgetResponse) forgetHandler(decommissioned)
+                .handle(Commands.ADMIN_FORGET, forget("storage-old", false), CLIENT);
+        assertEquals(SeriesStatus.ERROR, inbound.status());
+        assertTrue(inbound.message().contains("1 migração(ões) de entrada"), inbound.message());
+        assertTrue(decommissioned.isEmpty());
+    }
+
+    @Test
+    void forgetRecusaOProprioLider() {
+        leaderView.leader = true;
+        List<String> decommissioned = new CopyOnWriteArrayList<>();
+
+        AdminForgetResponse response = (AdminForgetResponse) forgetHandler(decommissioned)
+                .handle(Commands.ADMIN_FORGET, forget(SELF.value(), false), CLIENT);
+
+        assertEquals(SeriesStatus.ERROR, response.status());
+        assertTrue(decommissioned.isEmpty());
+    }
+
+    @Test
+    void forgetNoLiderPropagaAosStoragesAlcancaveisEsqueceLocalmenteERemoveDoCatalogo() {
+        leaderView.leader = true;
+        leaderView.reachable.add("storage-a");
+        // "storage-c" está no catálogo mas caído: não recebe a ordem e volta em failedOn.
+        List<String> decommissioned = new CopyOnWriteArrayList<>();
+        catalog.putNodeStatus(new StorageNodeStatus(SELF.value(), NodeState.ACTIVE, 2, 0, 0, 1_000L));
+        catalog.putNodeStatus(new StorageNodeStatus("storage-a", NodeState.ACTIVE, 2, 0, 0, 1_000L));
+        catalog.putNodeStatus(new StorageNodeStatus("storage-c", NodeState.ACTIVE, 2, 0, 0, 1_000L));
+        catalog.putNodeStatus(new StorageNodeStatus("storage-old", NodeState.DRAINED, 0, 0, 0, 1_000L));
+        catalog.putPlacement("series-1", SeriesPlacement.active("storage-a", 1_000L));
+        rpc.responseFor("storage-a", new AdminForgetResponse(SeriesStatus.OK, null, "storage-old",
+                List.of("storage-a"), List.of(), null));
+
+        AdminForgetResponse response = (AdminForgetResponse) forgetHandler(decommissioned)
+                .handle(Commands.ADMIN_FORGET, forget("storage-old", false), CLIENT);
+
+        assertEquals(SeriesStatus.OK, response.status());
+        assertEquals(SELF.value(), response.leaderNodeId());
+        assertEquals("storage-old", response.nodeId());
+        assertEquals(List.of("storage-a", SELF.value()), response.forgottenOn());
+        assertEquals(List.of("storage-c"), response.failedOn());
+        assertTrue(response.message().contains("storage-c"), response.message());
+        assertEquals(List.of("storage-old"), decommissioned, "o líder esquece o peer no seu próprio transporte");
+        assertTrue(catalog.nodeStatusLocal("storage-old").isEmpty(), "o nó sai do catálogo");
+        assertTrue(catalog.placementsLocal().containsKey("series-1"), "placements de outros nós ficam");
+        List<RecordingRpc.Call> forwarded = rpc.calls.stream()
+                .filter(call -> Commands.ADMIN_FORGET.equals(call.command())).toList();
+        assertEquals(1, forwarded.size(), "só o storage alcançável recebe a ordem: " + rpc.calls);
+        assertEquals(NodeId.of("storage-a"), forwarded.get(0).target());
+        assertEquals(new AdminNodeRequest("storage-old", true), forwarded.get(0).body());
+    }
+
+    @Test
+    void forgetPropagadoPeloLiderSoEsqueceNoTransporteLocal() {
+        leaderView.leader = false;
+        List<String> decommissioned = new CopyOnWriteArrayList<>();
+        catalog.putNodeStatus(new StorageNodeStatus("storage-old", NodeState.DRAINED, 0, 0, 0, 1_000L));
+
+        AdminForgetResponse response = (AdminForgetResponse) forgetHandler(decommissioned)
+                .handle(Commands.ADMIN_FORGET, forget("storage-old", true), CLIENT);
+
+        assertEquals(SeriesStatus.OK, response.status());
+        assertEquals(List.of(SELF.value()), response.forgottenOn());
+        assertEquals(List.of("storage-old"), decommissioned);
+        assertTrue(rpc.calls.stream().noneMatch(call -> Commands.ADMIN_FORGET.equals(call.command())),
+                "um seguidor nunca re-propaga");
+        assertTrue(catalog.nodeStatusLocal("storage-old").isPresent(), "só o líder mexe no catálogo");
     }
 
     /** {@link PlacementRequestHandler.LeaderView} fake, sem {@code ClusterCoordinator}/{@code Transport} reais. */
