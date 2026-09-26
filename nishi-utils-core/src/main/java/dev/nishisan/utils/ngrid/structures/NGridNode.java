@@ -293,6 +293,10 @@ public final class NGridNode implements Closeable {
 
     }
 
+    private static Duration max(Duration a, Duration b) {
+        return a.compareTo(b) >= 0 ? a : b;
+    }
+
     private void startServices() {
         Duration requestTimeout = config.requestTimeout();
         Duration replicationTimeout = config.replicationOperationTimeout();
@@ -309,7 +313,11 @@ public final class NGridNode implements Closeable {
                 .workerThreads(config.transportWorkerThreads())
                 .outboundQueueCapacity(config.outboundQueueCapacity())
                 .compressionEnabled(config.transportCompressionEnabled())
-                .compressionMinSize(config.transportCompressionMinSize());
+                .compressionMinSize(config.transportCompressionMinSize())
+                // Backstop for ephemeral members (clients) that vanish without a LEAVE: forgotten once
+                // disconnected for two heartbeat timeouts (3 x interval, as the coordinator below), and
+                // never before one minute.
+                .departedPeerForgetAfter(max(Duration.ofMinutes(1), config.heartbeatInterval().multipliedBy(6)));
         config.peers().forEach(transportBuilder::addPeer);
         transport = new TcpTransport(transportBuilder.build(), stats);
 

@@ -88,6 +88,9 @@ public final class TcpTransport implements Transport {
     // Tombstones of forgotten (departed) peers: id -> expiry (epoch millis). While present, second-hand
     // sources cannot re-admit the id (see forget). Written under peerTableLock; purged lazily.
     private final Map<NodeId, Long> departedPeers = new ConcurrentHashMap<>();
+    // Since when (epoch millis) each known ephemeral peer has had no open connection; drives the
+    // forget-after-disconnection backstop (forgetLongDisconnectedEphemeralPeers). Scheduler thread only.
+    private final Map<NodeId, Long> disconnectedSince = new ConcurrentHashMap<>();
     private final Map<NodeId, Connection> connections = new ConcurrentHashMap<>();
     // Includes accepted sockets that have not supplied a handshake/peer identity yet.
     private final Set<Connection> liveSockets = ConcurrentHashMap.newKeySet();
@@ -441,7 +444,9 @@ public final class TcpTransport implements Transport {
         if (!running) {
             return;
         }
-        purgeExpiredTombstones(System.currentTimeMillis());
+        long nowMs = System.currentTimeMillis();
+        purgeExpiredTombstones(nowMs);
+        forgetLongDisconnectedEphemeralPeers(nowMs);
         // Fast path: skip iteration if all known peers are connected
         boolean allConnected = knownPeers.values().stream()
                 .filter(p -> !p.nodeId().equals(config.local().nodeId()) && p.port() > 0)
@@ -1146,6 +1151,44 @@ public final class TcpTransport implements Transport {
                 connectionLocks.remove(nodeId, lock);
             } finally {
                 lock.unlock();
+            }
+        }
+    }
+
+    /**
+     * Whether {@code peer} is an ephemeral member: leader-ineligible (a client) or without a listen port
+     * (a discovery client / placeholder). Only ephemeral peers are ever forgotten: a voter is kept even
+     * after it left, so the leadership majority is never shrunk without consensus.
+     */
+    private static boolean isEphemeral(NodeInfo peer) {
+        return peer.port() <= 0 || !peer.isLeaderEligible();
+    }
+
+    /**
+     * Backstop for departures that never announced themselves (kill -9, OOM, network loss): an
+     * ephemeral peer without an open connection for longer than
+     * {@link TcpTransportConfig#departedPeerForgetAfter()} is forgotten and tombstoned. Before this, such
+     * a peer stayed known forever and every heartbeat broadcast dialed it (up to connectTimeout each),
+     * logging "No connection available". A live ephemeral peer keeps a direct connection to every
+     * listening node it heartbeats, so it is not affected; one reachable only through a relay (partial
+     * partition) is forgotten here too and returns with its next direct handshake.
+     */
+    private void forgetLongDisconnectedEphemeralPeers(long nowMs) {
+        long forgetAfterMs = config.departedPeerForgetAfter().toMillis();
+        NodeId localId = config.local().nodeId();
+        disconnectedSince.keySet().removeIf(id -> !knownPeers.containsKey(id));
+        for (NodeInfo peer : List.copyOf(knownPeers.values())) {
+            NodeId id = peer.nodeId();
+            if (id.equals(localId) || !isEphemeral(peer) || isConnected(id)) {
+                disconnectedSince.remove(id);
+                continue;
+            }
+            long since = disconnectedSince.computeIfAbsent(id, k -> nowMs);
+            long disconnectedForMs = nowMs - since;
+            if (disconnectedForMs >= forgetAfterMs) {
+                disconnectedSince.remove(id);
+                forget(id, config.departedPeerTombstoneTtl().toMillis(),
+                        "ephemeral peer without connection for " + disconnectedForMs + " ms");
             }
         }
     }

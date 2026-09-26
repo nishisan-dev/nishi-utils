@@ -40,6 +40,7 @@ public final class TcpTransportConfig {
     private final boolean compressionEnabled;
     private final int compressionMinSize;
     private final Duration departedPeerTombstoneTtl;
+    private final Duration departedPeerForgetAfter;
 
     private TcpTransportConfig(Builder builder) {
         this.local = builder.local;
@@ -53,6 +54,7 @@ public final class TcpTransportConfig {
         this.compressionEnabled = builder.compressionEnabled;
         this.compressionMinSize = builder.compressionMinSize;
         this.departedPeerTombstoneTtl = builder.departedPeerTombstoneTtl;
+        this.departedPeerForgetAfter = builder.departedPeerForgetAfter;
     }
 
     public NodeInfo local() {
@@ -145,6 +147,21 @@ public final class TcpTransportConfig {
         return departedPeerTombstoneTtl;
     }
 
+    /**
+     * How long an <b>ephemeral</b> peer (leader-ineligible, or without a listen port) may stay without
+     * an open connection before the transport forgets it (and tombstones its id, see
+     * {@link #departedPeerTombstoneTtl()}). It is the backstop for departures that never announced
+     * themselves (kill -9, OOM, network loss); a graceful close announces itself with a LEAVE.
+     * Leader-eligible peers are never forgotten this way. Defaults to 1 minute; {@code NGridNode} uses
+     * {@code max(1 min, 2 x heartbeatTimeout)}.
+     *
+     * @return the disconnection time after which an ephemeral peer is forgotten
+     * @since 8.7.0
+     */
+    public Duration departedPeerForgetAfter() {
+        return departedPeerForgetAfter;
+    }
+
     public static Builder builder(NodeInfo local) {
         return new Builder(local);
     }
@@ -161,6 +178,7 @@ public final class TcpTransportConfig {
         private boolean compressionEnabled = true;
         private int compressionMinSize = 512;
         private Duration departedPeerTombstoneTtl = Duration.ofMinutes(10);
+        private Duration departedPeerForgetAfter = Duration.ofMinutes(1);
 
         private Builder(NodeInfo local) {
             this.local = Objects.requireNonNull(local, "local");
@@ -265,6 +283,23 @@ public final class TcpTransportConfig {
                 throw new IllegalArgumentException("departedPeerTombstoneTtl must be positive");
             }
             this.departedPeerTombstoneTtl = ttl;
+            return this;
+        }
+
+        /**
+         * Sets how long an ephemeral peer may stay disconnected before it is forgotten (default 1
+         * minute).
+         *
+         * @param after the disconnection time, must be positive
+         * @return this builder
+         * @since 8.7.0
+         */
+        public Builder departedPeerForgetAfter(Duration after) {
+            Objects.requireNonNull(after, "after");
+            if (after.isZero() || after.isNegative()) {
+                throw new IllegalArgumentException("departedPeerForgetAfter must be positive");
+            }
+            this.departedPeerForgetAfter = after;
             return this;
         }
 

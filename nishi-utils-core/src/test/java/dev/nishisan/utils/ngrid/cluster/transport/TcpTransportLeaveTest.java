@@ -166,6 +166,49 @@ class TcpTransportLeaveTest {
         assertInstanceOf(PeerDisconnectedException.class, failure.getCause());
     }
 
+    /**
+     * Saída sem LEAVE (kill -9, OOM, perda de rede): o peer efêmero é esquecido depois de
+     * {@code departedPeerForgetAfter} sem conexão; um peer elegível a líder nunca é esquecido assim, e
+     * um efêmero ainda conectado também não.
+     */
+    @Test
+    void ephemeralPeerDisconnectedBeyondTheForgetWindowIsForgottenButVotersAreKept() throws Exception {
+        Duration forgetAfter = Duration.ofMillis(600);
+        TcpTransport storage = start(TcpTransportConfig.builder(info("a-storage", freePort(), false))
+                .reconnectInterval(RECONNECT)
+                .connectTimeout(Duration.ofMillis(200))
+                .departedPeerForgetAfter(forgetAfter));
+        RecordingListener events = listen(storage);
+        NodeInfo killedClient = info("z-client", freePort(), true);
+        NodeInfo liveClient = info("y-client", 0, true);
+        NodeInfo voter = info("m-storage", freePort(), false);
+
+        RawPeer killed = raw(storage);
+        killed.send(handshake(killedClient, storage.local(), Set.of()));
+        RawPeer live = raw(storage);
+        live.send(handshake(liveClient, storage.local(), Set.of()));
+        RawPeer voterLink = raw(storage);
+        voterLink.send(handshake(voter, storage.local(), Set.of()));
+        awaitTrue(() -> storage.isConnected(killedClient.nodeId()) && storage.isConnected(liveClient.nodeId())
+                && storage.isConnected(voter.nodeId()), "peers não conectaram");
+
+        long killedAt = System.currentTimeMillis();
+        killed.close();
+        voterLink.close();
+
+        awaitTrue(() -> !knows(storage, killedClient.nodeId()), "cliente morto sem LEAVE não foi esquecido");
+        long forgottenAfterMs = System.currentTimeMillis() - killedAt;
+        assertTrue(forgottenAfterMs >= forgetAfter.toMillis(),
+                "esquecido cedo demais: " + forgottenAfterMs + " ms < " + forgetAfter);
+        assertTrue(storage.isDeparted(killedClient.nodeId()));
+        assertTrue(events.peerEvents(killedClient.nodeId()).contains("left:z-client"));
+
+        Thread.sleep(forgetAfter.toMillis() * 2);
+        assertTrue(knows(storage, voter.nodeId()), "um peer elegível a líder nunca é esquecido por timeout");
+        assertFalse(storage.isDeparted(voter.nodeId()));
+        assertTrue(knows(storage, liveClient.nodeId()), "um efêmero conectado não pode ser esquecido");
+    }
+
     // ---- helpers ----
 
     static NodeInfo info(String id, int port, boolean ephemeral) {
