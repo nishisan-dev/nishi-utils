@@ -173,6 +173,42 @@ class ProxyRoutingIntegrationTest {
         }
     }
 
+    /**
+     * B2: um membro inelegível a líder (cliente) não serve de relay entre storages, mesmo que tenha
+     * link vivo com o destino — o tráfego storage↔storage não pode depender de um cliente efêmero.
+     */
+    @Test
+    void leaderIneligiblePeerIsNeverChosenAsRelay() throws Exception {
+        int portA = allocateFreeLocalPort();
+        int portB = allocateFreeLocalPort(Set.of(portA));
+        int portC = allocateFreeLocalPort(Set.of(portA, portB));
+        NodeInfo infoA = new NodeInfo(NodeId.of("node-a"), "localhost", portA);
+        NodeInfo infoB = new NodeInfo(NodeId.of("node-b"), "localhost", portB,
+                Set.of("client", NodeInfo.ROLE_LEADER_INELIGIBLE));
+        NodeInfo infoC = new NodeInfo(NodeId.of("node-c"), "localhost", portC);
+        TcpTransportConfig confA = TcpTransportConfig.builder(infoA).addPeer(infoB).build();
+        TcpTransportConfig confB = TcpTransportConfig.builder(infoB).build();
+        TcpTransportConfig confC = TcpTransportConfig.builder(infoC).addPeer(infoB).build();
+
+        try (TcpTransport transA = new TcpTransport(confA);
+             TcpTransport transB = new TcpTransport(confB);
+             TcpTransport transC = new TcpTransport(confC)) {
+            transB.start();
+            transC.start();
+            transA.start();
+            waitForDiscovery(transA, infoC.nodeId());
+            waitForConnected(transA, infoB.nodeId());
+            waitForConnected(transB, infoC.nodeId());
+            waitForStableLink(transA, transC);
+
+            transA.getRouter().markDirectFailure(infoC.nodeId());
+
+            assertEquals(Optional.of(infoC.nodeId()), transA.getRouter().nextHop(infoC.nodeId()),
+                    "um peer inelegível a líder não pode ser relay");
+            assertFalse(transA.isProxied(infoC.nodeId()));
+        }
+    }
+
     private void waitForDiscovery(TcpTransport transport, NodeId target) throws InterruptedException {
         long start = System.currentTimeMillis();
         while (System.currentTimeMillis() - start < 5000) {

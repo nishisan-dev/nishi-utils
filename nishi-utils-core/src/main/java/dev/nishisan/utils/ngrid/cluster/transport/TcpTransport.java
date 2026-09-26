@@ -141,7 +141,7 @@ public final class TcpTransport implements Transport {
     public TcpTransport(TcpTransportConfig config, StatsUtils stats) {
         this.config = Objects.requireNonNull(config, "config");
         this.stats = stats;
-        this.router = new NetworkRouter(this::collectLatencies, this::isConnected,
+        this.router = new NetworkRouter(this::collectLatencies, this::canRelay,
                 config.routeProbeInterval().multipliedBy(2));
         knownPeers.put(config.local().nodeId(), config.local());
         config.initialPeers().forEach(p -> knownPeers.putIfAbsent(p.nodeId(), p));
@@ -401,6 +401,20 @@ public final class TcpTransport implements Transport {
     public boolean isConnected(NodeId nodeId) {
         Connection conn = connections.get(nodeId);
         return conn != null && conn.isOpen();
+    }
+
+    /**
+     * Whether {@code nodeId} may relay our messages: a peer we hold an open connection to AND a
+     * leader-eligible member. A leader-ineligible client is ephemeral and must not carry storage
+     * traffic (a client relaying between two storage nodes tied their replication to its lifetime).
+     * A peer whose role is unknown counts as eligible (conservative).
+     */
+    private boolean canRelay(NodeId nodeId) {
+        if (!isConnected(nodeId)) {
+            return false;
+        }
+        NodeInfo info = knownPeers.get(nodeId);
+        return info == null || info.isLeaderEligible();
     }
 
     @Override
