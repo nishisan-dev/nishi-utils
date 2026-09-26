@@ -49,6 +49,14 @@ public final class HandshakePayload {
      * peers that can decode it.
      */
     private final boolean supportsLeave;
+    /**
+     * Ids of the peers the sender currently holds an open connection to (8.8.0), i.e. the peers it can
+     * relay to right now. {@code null} in handshakes of older nodes: the receiver then falls back to the
+     * peer list (gossip) as reachability evidence, as before. A relay is chosen for a target only when
+     * it reports that target here; a peer that merely lists a dead leader in {@link #peers()} no longer
+     * counts as a route to it.
+     */
+    private final Set<NodeId> connectedPeers;
 
     /**
      * Creates a handshake payload without latency information.
@@ -106,6 +114,22 @@ public final class HandshakePayload {
         this(local, peers, latencies, supportsCompression, supportsUndeliverable, false);
     }
 
+    /**
+     * Creates a handshake payload with every capability flag known up to 8.7.0 and no connected-peer
+     * report ({@code connectedPeers} absent, as in the wire form of those versions).
+     *
+     * @param local                 the local node information
+     * @param peers                 the set of known peers
+     * @param latencies             measured latencies to known peers
+     * @param supportsCompression   whether this node accepts LZ4-compressed transport frames
+     * @param supportsUndeliverable whether this node understands {@link MessageType#UNDELIVERABLE}
+     * @param supportsLeave         whether this node understands {@link MessageType#LEAVE}
+     */
+    public HandshakePayload(NodeInfo local, Set<NodeInfo> peers, Map<NodeId, Double> latencies,
+            boolean supportsCompression, boolean supportsUndeliverable, boolean supportsLeave) {
+        this(local, peers, latencies, supportsCompression, supportsUndeliverable, supportsLeave, null);
+    }
+
     @JsonCreator
     public HandshakePayload(
             @JsonProperty("local") NodeInfo local,
@@ -113,13 +137,26 @@ public final class HandshakePayload {
             @JsonProperty("latencies") Map<NodeId, Double> latencies,
             @JsonProperty("supportsCompression") boolean supportsCompression,
             @JsonProperty("supportsUndeliverable") boolean supportsUndeliverable,
-            @JsonProperty("supportsLeave") boolean supportsLeave) {
+            @JsonProperty("supportsLeave") boolean supportsLeave,
+            @JsonProperty("connectedPeers") Set<NodeId> connectedPeers) {
         this.local = Objects.requireNonNull(local, "local");
         this.peers = Collections.unmodifiableSet(new HashSet<>(Objects.requireNonNull(peers, "peers")));
         this.latencies = Collections.unmodifiableMap(new HashMap<>(Objects.requireNonNull(latencies, "latencies")));
         this.supportsCompression = supportsCompression;
         this.supportsUndeliverable = supportsUndeliverable;
         this.supportsLeave = supportsLeave;
+        this.connectedPeers = connectedPeers == null ? null : Collections.unmodifiableSet(new HashSet<>(connectedPeers));
+    }
+
+    /**
+     * Ids of the peers the sender holds an open connection to, or {@code null} when the handshake
+     * predates the field (the receiver then treats the peer list as reachability evidence, as before).
+     *
+     * @return the sender's connected peer ids, or {@code null} for handshakes without the field
+     * @since 8.8.0
+     */
+    public Set<NodeId> connectedPeers() {
+        return connectedPeers;
     }
 
     /**

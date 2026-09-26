@@ -21,6 +21,7 @@ import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -28,6 +29,7 @@ import java.util.Set;
 import java.util.concurrent.CopyOnWriteArraySet;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -108,5 +110,91 @@ class NetworkRouterTest {
         router.markDirectFailure(DEAD_CLIENT);
         assertEquals(Optional.of(DEAD_CLIENT), router.nextHop(DEAD_CLIENT),
                 "no peer may still be recorded as knowing the forgotten id");
+    }
+
+    // ---- connected-peer reports (B1): a relay is a candidate only with a live link to the target ----
+
+    /**
+     * Um peer que apenas LISTA o alvo no gossip, mas declara não ter conexão com ele, não pode ser
+     * relay: todo nó continua listando um líder morto por muito tempo.
+     */
+    @Test
+    void aPeerThatReportsTheTargetAsNotConnectedIsNeverChosenAsRelay() {
+        connected.add(LIVE_PEER);
+        router.updateReachability(LIVE_PEER, List.of(info(TARGET)), Map.of(), Set.of());
+
+        router.markDirectFailure(TARGET);
+
+        assertEquals(Optional.of(TARGET), router.nextHop(TARGET),
+                "um peer sem link vivo ao alvo não pode ser relay");
+        assertFalse(router.isProxy(TARGET));
+    }
+
+    @Test
+    void aSenderWithoutTheConnectedFieldKeepsTheLegacyBehaviour() {
+        connected.add(LIVE_PEER);
+        router.updateReachability(LIVE_PEER, List.of(info(TARGET)), Map.of(), null);
+
+        router.markDirectFailure(TARGET);
+
+        assertEquals(Optional.of(LIVE_PEER), router.nextHop(TARGET),
+                "sem o campo (8.7.0) o gossip ainda vale como alcançabilidade");
+        assertTrue(router.isProxy(TARGET), "sem o campo, isProxy segue como antes");
+    }
+
+    /** O relay perde o link ao alvo (o alvo morreu): a rota volta a DIRECT e isProxy fica falso. */
+    @Test
+    void relayThatLosesItsLinkToTheTargetReturnsTheRouteToDirect() {
+        connected.add(LIVE_PEER);
+        router.updateReachability(LIVE_PEER, List.of(info(TARGET)), Map.of(), Set.of(TARGET));
+        router.markDirectFailure(TARGET);
+        assertEquals(Optional.of(LIVE_PEER), router.nextHop(TARGET), "precondição: proxy via o peer vivo");
+        assertTrue(router.isProxy(TARGET));
+
+        router.updateReachability(LIVE_PEER, List.of(info(TARGET)), Map.of(), Set.of());
+
+        assertEquals(Optional.of(TARGET), router.nextHop(TARGET), "sem relay candidato a rota volta a DIRECT");
+        assertFalse(router.isProxy(TARGET));
+    }
+
+    /** UNDELIVERABLE vindo do relay R para o alvo T retira R dos candidatos de T. */
+    @Test
+    void undeliverableFromTheRelayDropsItAsCandidate() {
+        connected.add(LIVE_PEER);
+        connected.add(DEAD_CLIENT);
+        router.updateReachability(LIVE_PEER, List.of(info(TARGET)), Map.of(), Set.of(TARGET));
+        router.markDirectFailure(TARGET);
+        assertEquals(Optional.of(LIVE_PEER), router.nextHop(TARGET), "precondição: proxy via o peer vivo");
+
+        router.relayFailed(LIVE_PEER, TARGET);
+
+        assertEquals(Optional.of(TARGET), router.nextHop(TARGET), "sem outro candidato a rota volta a DIRECT");
+        assertFalse(router.isProxy(TARGET));
+
+        // With a second candidate the route moves to it instead.
+        router.updateReachability(LIVE_PEER, List.of(info(TARGET)), Map.of(), Set.of(TARGET));
+        router.updateReachability(DEAD_CLIENT, List.of(info(TARGET)), Map.of(), Set.of(TARGET));
+        router.markDirectFailure(TARGET);
+        NodeId first = router.nextHop(TARGET).orElseThrow();
+        router.relayFailed(first, TARGET);
+        NodeId second = router.nextHop(TARGET).orElseThrow();
+        assertTrue(!second.equals(first) && !second.equals(TARGET),
+                "com outro candidato a rota deveria migrar para ele, mas foi para " + second);
+    }
+
+    /** isProxy só vale enquanto o relatório de conexão do relay está fresco. */
+    @Test
+    void isProxyRequiresAFreshConnectedReport() throws InterruptedException {
+        NetworkRouter shortLived = new NetworkRouter(Map::of, connected::contains, Duration.ofMillis(100));
+        connected.add(LIVE_PEER);
+        shortLived.updateReachability(LIVE_PEER, List.of(info(TARGET)), Map.of(), Set.of(TARGET));
+        shortLived.markDirectFailure(TARGET);
+        assertTrue(shortLived.isProxy(TARGET), "relatório fresco: rota via proxy conta");
+
+        Thread.sleep(250);
+
+        assertFalse(shortLived.isProxy(TARGET), "relatório vencido: só o gossip não sustenta isProxy");
+        shortLived.updateReachability(LIVE_PEER, List.of(info(TARGET)), Map.of(), Set.of(TARGET));
+        assertTrue(shortLived.isProxy(TARGET), "relatório renovado volta a contar");
     }
 }

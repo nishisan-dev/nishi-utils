@@ -106,8 +106,10 @@ public final class TcpTransport implements Transport {
     private final Map<UUID, PendingResponse> pendingResponses = new ConcurrentHashMap<>();
     // Use Virtual Threads for per-task execution
     private final ExecutorService workerPool = Executors.newVirtualThreadPerTaskExecutor();
-    // A relay must be a peer we currently hold an open connection to (see NetworkRouter.relayCandidate).
-    private final NetworkRouter router = new NetworkRouter(this::collectLatencies, this::isConnected);
+    // A relay must be a peer we currently hold an open connection to (see NetworkRouter.relayCandidate),
+    // and it vouches for a target only through a fresh connected-peer report: refreshed by the
+    // periodic gossip of probeLoop (every routeProbeInterval), so it stays fresh for twice that.
+    private final NetworkRouter router;
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "ngrid-transport-scheduler");
         t.setDaemon(true);
@@ -139,6 +141,8 @@ public final class TcpTransport implements Transport {
     public TcpTransport(TcpTransportConfig config, StatsUtils stats) {
         this.config = Objects.requireNonNull(config, "config");
         this.stats = stats;
+        this.router = new NetworkRouter(this::collectLatencies, this::isConnected,
+                config.routeProbeInterval().multipliedBy(2));
         knownPeers.put(config.local().nodeId(), config.local());
         config.initialPeers().forEach(p -> knownPeers.putIfAbsent(p.nodeId(), p));
         Set<NodeId> seedIds = new HashSet<>();
@@ -723,6 +727,9 @@ public final class TcpTransport implements Transport {
         if (!running) {
             return;
         }
+        // Keep the peers' view of our connections fresh: their PROXY routes through us are vouched for
+        // only by a recent report (see NetworkRouter.isProxy).
+        publishConnectedPeers();
         for (Map.Entry<NodeId, NetworkRouter.Route> entry : router.routesSnapshot().entrySet()) {
             if (entry.getValue().type() == NetworkRouter.RouteType.PROXY) {
                 NodeId target = entry.getKey();
@@ -770,11 +777,28 @@ public final class TcpTransport implements Transport {
         return peers;
     }
 
+    /**
+     * Ids of the peers this node holds an open connection to right now — the peers it can relay to.
+     * Reported in the handshake and in PEER_UPDATE so that a peer chooses this node as relay for a
+     * target only while the link to that target is live. Unresolved seed aliases are left out, as in
+     * {@link #gossipablePeers()}.
+     */
+    private Set<NodeId> connectedPeerIds() {
+        Set<NodeId> ids = new HashSet<>();
+        connections.forEach((id, connection) -> {
+            if (connection.isOpen() && !(initialPeerIds.contains(id) && !verifiedPeers.contains(id))) {
+                ids.add(id);
+            }
+        });
+        ids.remove(config.local().nodeId());
+        return ids;
+    }
+
     private void sendHandshake(Connection connection) {
         NodeInfo localInfo = config.local();
         Set<NodeInfo> peers = gossipablePeers();
         HandshakePayload payload = new HandshakePayload(localInfo, peers, collectLatencies(),
-                config.compressionEnabled(), true, true);
+                config.compressionEnabled(), true, true, connectedPeerIds());
         ClusterMessage message = ClusterMessage.request(MessageType.HANDSHAKE,
                 "hello",
                 localInfo.nodeId(),
@@ -849,7 +873,8 @@ public final class TcpTransport implements Transport {
                 && !entry.getKey().equals(remoteNodeId));
         if (live == null) { return; }
         if (live != connection) {
-            router.updateReachability(remoteNodeId, admissible(payload.peers()), admissible(payload.latencies()));
+            router.updateReachability(remoteNodeId, admissible(payload.peers()), admissible(payload.latencies()),
+                    admissibleIds(payload.connectedPeers()));
             return;
         }
 
@@ -857,7 +882,8 @@ public final class TcpTransport implements Transport {
         router.promoteToDirect(remoteNodeId);
 
         // Feed router with reachability info
-        router.updateReachability(remoteInfo.nodeId(), admissible(payload.peers()), admissible(payload.latencies()));
+        router.updateReachability(remoteInfo.nodeId(), admissible(payload.peers()), admissible(payload.latencies()),
+                admissibleIds(payload.connectedPeers()));
 
         listeners.forEach(listener -> listener.onPeerConnected(remoteInfo));
         // Merge peers and attempt connections
@@ -874,13 +900,36 @@ public final class TcpTransport implements Transport {
     }
 
     private void broadcastPeerList() {
-        PeerUpdatePayload payload = new PeerUpdatePayload(gossipablePeers(), collectLatencies(), departedSnapshot());
+        PeerUpdatePayload payload = new PeerUpdatePayload(gossipablePeers(), collectLatencies(), departedSnapshot(),
+                connectedPeerIds());
         ClusterMessage update = ClusterMessage.request(MessageType.PEER_UPDATE,
                 "peer-update",
                 config.local().nodeId(),
                 null,
                 payload);
         broadcast(update);
+    }
+
+    /**
+     * Sends the current peer list, with the connected-peer report, over every open connection — and
+     * only there: unlike {@link #broadcastPeerList()} it never dials. Used when the set of connected
+     * peers shrinks (a confirmed disconnect: the peers routing through this node must stop at once)
+     * and periodically by {@link #probeLoop()} to keep the report fresh.
+     */
+    private void publishConnectedPeers() {
+        if (!running || leaving) {
+            return;
+        }
+        PeerUpdatePayload payload = new PeerUpdatePayload(gossipablePeers(), collectLatencies(), departedSnapshot(),
+                connectedPeerIds());
+        NodeId localId = config.local().nodeId();
+        for (Map.Entry<NodeId, Connection> entry : connections.entrySet()) {
+            Connection connection = entry.getValue();
+            if (connection.isOpen()) {
+                connection.send(ClusterMessage.request(MessageType.PEER_UPDATE, "peer-update", localId,
+                        entry.getKey(), payload));
+            }
+        }
     }
 
     private Map<NodeId, Double> collectLatencies() {
@@ -903,7 +952,8 @@ public final class TcpTransport implements Transport {
         payload.departed().forEach((id, remainingMs) -> learnDepartureSecondHand(id, remainingMs, message.source()));
         
         // Feed router with reachability info
-        router.updateReachability(message.source(), admissible(payload.peers()), admissible(payload.latencies()));
+        router.updateReachability(message.source(), admissible(payload.peers()), admissible(payload.latencies()),
+                admissibleIds(payload.connectedPeers()));
 
         for (NodeInfo peer : payload.peers()) {
             if (mergeGossipedPeer(peer)) {
@@ -1155,6 +1205,11 @@ public final class TcpTransport implements Transport {
         if (payload == null || payload.messageId() == null) {
             return;
         }
+        // The relay has no link to the destination: stop routing through it (back to DIRECT when no
+        // other relay can reach the destination), whatever the message was.
+        if (notice.source() != null && payload.destination() != null) {
+            router.relayFailed(notice.source(), payload.destination());
+        }
         PendingResponse pending = pendingResponses.get(payload.messageId());
         if (pending == null || !pending.destination.equals(payload.destination())) {
             return; // unknown, already completed, or a notice about some other destination
@@ -1220,6 +1275,8 @@ public final class TcpTransport implements Transport {
             // The per-peer connection lock is deliberately kept (see connectionLocks).
             failPendingResponsesTo(nodeId);
             listeners.forEach(listener -> listener.onPeerDisconnected(nodeId));
+            // Peers routing to nodeId through this node must learn at once that the link is gone.
+            publishConnectedPeers();
         });
     }
 
@@ -1410,6 +1467,16 @@ public final class TcpTransport implements Transport {
                 admissible.add(peer);
             }
         }
+        return admissible;
+    }
+
+    /** Connected-peer report minus departed (tombstoned) ids; {@code null} stays {@code null} (no report). */
+    private Set<NodeId> admissibleIds(Set<NodeId> ids) {
+        if (ids == null || departedPeers.isEmpty()) {
+            return ids;
+        }
+        Set<NodeId> admissible = new HashSet<>(ids);
+        admissible.removeIf(this::isDeparted);
         return admissible;
     }
 

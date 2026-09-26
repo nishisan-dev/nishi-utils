@@ -27,6 +27,7 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.time.Duration;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -77,6 +78,10 @@ class UndeliverableRequestIntegrationTest {
             // Wait for both readers to observe EOF before testing the relay-only path.
             await(() -> !transB.isConnected(infoC.nodeId()) && !transA.isConnected(infoC.nodeId()),
                     "A and B see C gone");
+            // Since 8.8.0 B reports at once that it lost its link to C, so A would dial C directly. The
+            // fail-fast under test is the relay's notice for a STALE route: re-inject B's earlier report
+            // (as if its PEER_UPDATE were still in flight) so A routes to C via B.
+            transA.getRouter().updateReachability(infoB.nodeId(), Set.of(infoC), Map.of(), Set.of(infoC.nodeId()));
             transA.getRouter().markDirectFailure(infoC.nodeId());
             Optional<NodeId> hop = transA.getRouter().nextHop(infoC.nodeId());
             assertTrue(hop.isPresent());

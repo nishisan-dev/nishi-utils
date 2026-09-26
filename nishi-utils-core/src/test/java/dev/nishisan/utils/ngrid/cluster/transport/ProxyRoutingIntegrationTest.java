@@ -1,12 +1,14 @@
 package dev.nishisan.utils.ngrid.cluster.transport;
 
 import dev.nishisan.utils.ngrid.common.ClusterMessage;
+import dev.nishisan.utils.ngrid.common.HandshakePayload;
 import dev.nishisan.utils.ngrid.common.MessageType;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -14,6 +16,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ProxyRoutingIntegrationTest {
@@ -91,6 +94,82 @@ class ProxyRoutingIntegrationTest {
             // Assert delivery
             boolean received = latch.await(5, TimeUnit.SECONDS);
             assertTrue(received, "Message should have been delivered to C via proxy");
+        }
+    }
+
+    /**
+     * B1: um peer que apenas lista o alvo no handshake (gossip) mas declara não ter conexão viva com
+     * ele não pode ser escolhido como relay — todo nó segue listando um líder morto por muito tempo.
+     */
+    @Test
+    void relayWithoutLiveLinkToTheTargetIsNotChosen() throws Exception {
+        int portA = allocateFreeLocalPort();
+        int deadPort = allocateFreeLocalPort(Set.of(portA));
+        NodeInfo infoA = new NodeInfo(NodeId.of("node-a"), "127.0.0.1", portA);
+        NodeInfo relay = new NodeInfo(NodeId.of("node-relay"), "127.0.0.1", 1);
+        NodeInfo target = new NodeInfo(NodeId.of("node-target"), "127.0.0.1", deadPort); // nobody listens
+
+        try (TcpTransport transA = new TcpTransport(TcpTransportConfig.builder(infoA).build())) {
+            transA.start();
+            try (RawPeer relayLink = new RawPeer(infoA.host(), portA)) {
+            // The relay knows the target (peer list) but holds no connection to it (connected = {}).
+            relayLink.send(ClusterMessage.request(MessageType.HANDSHAKE, "hello", relay.nodeId(), infoA.nodeId(),
+                    new HandshakePayload(relay, Set.of(target), Map.of(), false, true, true, Set.of())));
+            waitForConnected(transA, relay.nodeId());
+            waitForDiscovery(transA, target.nodeId());
+
+            transA.getRouter().markDirectFailure(target.nodeId());
+
+            assertEquals(Optional.of(target.nodeId()), transA.getRouter().nextHop(target.nodeId()),
+                    "um relay sem link vivo ao alvo não pode ser escolhido");
+            assertFalse(transA.isProxied(target.nodeId()));
+            }
+        }
+    }
+
+    /**
+     * B1: quando o alvo morre, o relay deixa de reportá-lo como conectado e a rota do remetente volta
+     * a DIRECT (isProxied falso) — em vez de ficar PROXY para sempre, entregando UNDELIVERABLE a cada
+     * request e concedendo ao coordenador a carência de "alcançável via proxy" a um nó morto.
+     */
+    @Test
+    void targetDeathReturnsTheRouteToDirectAndClearsIsProxied() throws Exception {
+        int portA = allocateFreeLocalPort();
+        int portB = allocateFreeLocalPort(Set.of(portA));
+        int portC = allocateFreeLocalPort(Set.of(portA, portB));
+        NodeInfo infoA = new NodeInfo(NodeId.of("node-a"), "localhost", portA);
+        NodeInfo infoB = new NodeInfo(NodeId.of("node-b"), "localhost", portB);
+        NodeInfo infoC = new NodeInfo(NodeId.of("node-c"), "localhost", portC);
+        TcpTransportConfig confA = TcpTransportConfig.builder(infoA).addPeer(infoB).build();
+        TcpTransportConfig confB = TcpTransportConfig.builder(infoB).build();
+        TcpTransportConfig confC = TcpTransportConfig.builder(infoC).addPeer(infoB).build();
+
+        try (TcpTransport transA = new TcpTransport(confA);
+             TcpTransport transB = new TcpTransport(confB);
+             TcpTransport transC = new TcpTransport(confC)) {
+            transB.start();
+            transC.start();
+            transA.start();
+            waitForDiscovery(transA, infoC.nodeId());
+            waitForConnected(transA, infoB.nodeId());
+            waitForConnected(transB, infoC.nodeId());
+            waitForStableLink(transA, transC);
+
+            transA.getRouter().markDirectFailure(infoC.nodeId());
+            waitForProxyRoute(transA, infoC.nodeId(), infoB.nodeId());
+            assertTrue(transA.isProxied(infoC.nodeId()), "precondição: rota via proxy B");
+
+            transC.close();
+
+            long deadline = System.currentTimeMillis() + 10_000;
+            while (System.currentTimeMillis() < deadline
+                    && (transA.isProxied(infoC.nodeId())
+                        || !Optional.of(infoC.nodeId()).equals(transA.getRouter().nextHop(infoC.nodeId())))) {
+                Thread.sleep(50);
+            }
+            assertFalse(transA.isProxied(infoC.nodeId()), "o alvo morreu: a rota não pode seguir PROXY");
+            assertEquals(Optional.of(infoC.nodeId()), transA.getRouter().nextHop(infoC.nodeId()),
+                    "sem relay com link vivo, a rota volta a DIRECT");
         }
     }
 
