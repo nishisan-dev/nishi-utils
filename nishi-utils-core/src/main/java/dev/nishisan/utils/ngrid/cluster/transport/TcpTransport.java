@@ -832,6 +832,12 @@ public final class TcpTransport implements Transport {
         // already drives this peer.
         NodeId remoteNodeId = remoteInfo.nodeId();
         Connection live = registerLiveConnection(remoteNodeId, connection);
+        // The socket is now known by its canonical id only: drop every other key still pointing to it
+        // (typically the seed alias it was dialed under, when gossip already removed that alias from
+        // knownPeers so the address-collision cleanup above did not see it). Left behind, the alias
+        // stayed published forever and was reported as a live peer.
+        connections.entrySet().removeIf(entry -> entry.getValue() == connection
+                && !entry.getKey().equals(remoteNodeId));
         if (live == null) { return; }
         if (live != connection) {
             router.updateReachability(remoteNodeId, admissible(payload.peers()), admissible(payload.latencies()));

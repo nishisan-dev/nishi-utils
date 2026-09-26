@@ -185,6 +185,41 @@ class SeedAliasHandshakeTest {
         }, "o id canônico nunca foi discado: o socket do alias sem handshake o substituiu indefinidamente");
     }
 
+    /**
+     * Depois que o handshake resolve o id canônico de um seed discado por alias, nenhuma chave antiga
+     * (o alias) continua apontando para a mesma conexão — mesmo quando o alias já tinha saído de
+     * knownPeers por gossip antes da resposta.
+     */
+    @Test
+    void handshakeLeavesNoAliasKeyPointingToTheResolvedConnection() throws Exception {
+        NodeInfo a = node("storage-a", freePort());
+        NodeInfo c = node("storage-c", freePort());
+        NodeInfo client = node("client-1", freePort());
+        NodeInfo aliasA = node("127.0.0.1:" + a.port(), a.port());
+        NodeInfo aliasC = node("127.0.0.1:" + c.port(), c.port());
+        TcpTransport storageA = transport(a, c);
+        TcpTransport storageC = transport(c, a);
+        TcpTransport clientT = transport(client, aliasA, aliasC);
+        CountDownLatch published = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        closeables.add(release::countDown);
+        holdAfterPublish(clientT, aliasC.nodeId(), published, release);
+        storageA.start();
+        storageC.start();
+        awaitMesh(List.of(storageA, storageC), List.of(a, c));
+        clientT.start();
+        assertTrue(published.await(5, TimeUnit.SECONDS), "alias de storage-c não foi publicado");
+        // storage-c's canonical id arrives by gossip (storage-a) before the alias link's handshake reply.
+        awaitTrue(() -> TcpTransportLeaveTest.knows(clientT, c.nodeId()), "cliente não aprendeu storage-c");
+        release.countDown();
+
+        awaitMesh(List.of(storageA, storageC, clientT), List.of(a, c, client));
+        awaitTrue(() -> clientT.outboundQueueDepths().keySet().equals(Set.of(a.nodeId(), c.nodeId())),
+                "chaves antigas seguem apontando para conexões já resolvidas");
+        assertFalse(clientT.isConnected(aliasA.nodeId()) || clientT.isConnected(aliasC.nodeId()),
+                "alias ainda publicado: " + clientT.outboundQueueDepths().keySet());
+    }
+
     // ---- helpers ----
 
     /**
