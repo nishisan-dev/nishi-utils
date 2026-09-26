@@ -1313,7 +1313,8 @@ public final class TcpTransport implements Transport {
     /**
      * Backstop for departures that never announced themselves (kill -9, OOM, network loss): an
      * ephemeral peer without an open connection for longer than
-     * {@link TcpTransportConfig#departedPeerForgetAfter()} is forgotten and tombstoned. Before this, such
+     * {@link TcpTransportConfig#departedPeerForgetAfter()} is forgotten and tombstoned for that same
+     * window (the departure is inferred, not announced). Before this, such
      * a peer stayed known forever and every heartbeat broadcast dialed it (up to connectTimeout each),
      * logging "No connection available". A peer is only taken for gone when, for that same window,
      * nothing sourced by it arrived either — directly or through a relay: in a partial mesh (firewall,
@@ -1338,7 +1339,11 @@ public final class TcpTransport implements Transport {
             boolean silent = lastInbound == null || nowMs - lastInbound >= forgetAfterMs;
             if (disconnectedForMs >= forgetAfterMs && silent) {
                 disconnectedSince.remove(id);
-                forget(id, config.departedPeerTombstoneTtl().toMillis(),
+                // Short tombstone: this departure is only inferred. The long TTL is for a first-hand
+                // LEAVE; here a live peer cut off for a while (e.g. its only relay was down) must be
+                // re-admitted by gossip, and its relayed traffic accepted, once the window passes. A dead
+                // peer re-admitted that way is simply forgotten again after another window.
+                forget(id, Math.min(forgetAfterMs, config.departedPeerTombstoneTtl().toMillis()),
                         "ephemeral peer without connection nor traffic for " + disconnectedForMs + " ms");
             }
         }

@@ -233,8 +233,12 @@ heartbeat tentava discar para ele (até `connectTimeout`, com o log "No connecti
   nenhuma mensagem vinda dele (direta ou retransmitida por um relay) por mais de
   `departedPeerForgetAfter` é esquecido (kill -9, OOM, perda de rede). Numa malha parcial (firewall,
   link de um lado só), um cliente vivo que este nó não consegue discar segue falando por relay e não é
-  esquecido. O `NGridNode` usa `max(1 min, 2 × heartbeatTimeout)`.
-- **Tombstone:** o id esquecido fica bloqueado por `departedPeerTombstoneTtl` (10 min) contra
+  esquecido. O `NGridNode` usa `max(1 min, 2 × heartbeatTimeout)`. Como a saída aqui é só inferida,
+  o tombstone dura a mesma janela (`departedPeerForgetAfter`), não os 10 min do LEAVE: um cliente vivo
+  que ficou isolado (ex.: o único relay caiu) volta a ser aceito por gossip e tráfego retransmitido logo
+  depois, e um cliente morto readmitido assim é esquecido de novo na janela seguinte.
+- **Tombstone:** o id esquecido por LEAVE fica bloqueado por `departedPeerTombstoneTtl` (10 min; o
+  gatilho lento usa a janela curta acima) contra
   readmissão de segunda mão — gossip, lista de peers de handshake de terceiros, alcançabilidade do
   roteador, mensagens retransmitidas e sockets sem handshake. Um **handshake direto** do mesmo id
   (nova encarnação), um `addPeer` explícito ou a expiração limpam o tombstone; heartbeats de um id em

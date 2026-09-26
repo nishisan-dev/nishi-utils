@@ -139,7 +139,9 @@ public final class TcpTransportConfig {
     }
 
     /**
-     * How long the id of a forgotten (departed) peer stays tombstoned. While tombstoned, second-hand
+     * How long the id of a peer that announced its departure (LEAVE, first-hand) stays tombstoned; the
+     * departure disseminated from it carries the remaining time. A departure only inferred by
+     * {@link #departedPeerForgetAfter()} is tombstoned for that window instead. While tombstoned, second-hand
      * sources (gossip, a third node's handshake peer list, relayed messages, an inbound connection
      * without handshake) cannot bring the id back; a direct handshake from that id (a new incarnation)
      * or an explicit {@link TcpTransport#addPeer} clears it at once. Defaults to 10 minutes.
@@ -153,8 +155,9 @@ public final class TcpTransportConfig {
 
     /**
      * How long an <b>ephemeral</b> peer (leader-ineligible, or without a listen port) may stay without
-     * an open connection before the transport forgets it (and tombstones its id, see
-     * {@link #departedPeerTombstoneTtl()}). It is the backstop for departures that never announced
+     * an open connection, and without any traffic from it (direct or relayed), before the transport
+     * forgets it; its id is then tombstoned for this same window only, not for
+     * {@link #departedPeerTombstoneTtl()}, since the departure is inferred. It is the backstop for departures that never announced
      * themselves (kill -9, OOM, network loss); a graceful close announces itself with a LEAVE.
      * Leader-eligible peers are never forgotten this way. Defaults to 1 minute; {@code NGridNode} uses
      * {@code max(1 min, 2 x heartbeatTimeout)}.

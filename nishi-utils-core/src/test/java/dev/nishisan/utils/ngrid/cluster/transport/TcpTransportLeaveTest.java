@@ -257,6 +257,47 @@ class TcpTransportLeaveTest {
     }
 
     /**
+     * O gatilho lento só infere a saída (sem LEAVE): o tombstone dele é curto. Um cliente vivo
+     * alcançável só por relay, esquecido enquanto o relay estava fora, volta a ser aceito — gossip e
+     * tráfego retransmitido — logo depois, e não só quando o TTL longo do LEAVE expirar.
+     */
+    @Test
+    void peerForgottenByTheSlowTriggerIsReadmittedAfterAShortTombstone() throws Exception {
+        Duration forgetAfter = Duration.ofMillis(500);
+        TcpTransport storage = start(TcpTransportConfig.builder(info("a-storage", freePort(), false))
+                .reconnectInterval(RECONNECT)
+                .connectTimeout(Duration.ofMillis(200))
+                .departedPeerForgetAfter(forgetAfter)
+                .departedPeerTombstoneTtl(Duration.ofMinutes(10)));
+        RecordingListener events = listen(storage);
+        NodeInfo client = info("z-client", freePort(), true); // nobody listens: reachable only via the relay
+        NodeInfo relay = info("m-storage", freePort(), false);
+        RawPeer relayLink = raw(storage);
+        relayLink.send(handshake(relay, storage.local(), Set.of(client)));
+        awaitTrue(() -> storage.isConnected(relay.nodeId()) && knows(storage, client.nodeId()),
+                "cliente não foi aprendido pelo gossip do relay");
+
+        relayLink.close(); // the relay goes down: nothing from the client reaches the storage any more
+        awaitTrue(() -> !knows(storage, client.nodeId()), "o gatilho lento deveria esquecer o cliente");
+        long forgottenAt = System.currentTimeMillis();
+        assertTrue(storage.isDeparted(client.nodeId()));
+
+        awaitTrue(() -> !storage.isDeparted(client.nodeId()),
+                "o tombstone do gatilho lento deveria ser curto, não o TTL de 10 min do LEAVE");
+        long tombstonedForMs = System.currentTimeMillis() - forgottenAt;
+        assertTrue(tombstonedForMs < forgetAfter.toMillis() * 6, "tombstone longo demais: " + tombstonedForMs + " ms");
+
+        // The relay is back: its gossip re-admits the client and the client's relayed traffic is accepted.
+        RawPeer relayBack = raw(storage);
+        relayBack.send(handshake(relay, storage.local(), Set.of(client)));
+        awaitTrue(() -> knows(storage, client.nodeId()), "gossip do relay de volta deveria readmitir o cliente");
+        relayBack.send(ClusterMessage.request(MessageType.CLIENT_REQUEST, "relayed-after-return", client.nodeId(),
+                storage.local().nodeId(), "hb"));
+        awaitTrue(() -> events.qualifiers().contains("relayed-after-return"),
+                "tráfego retransmitido do cliente deveria voltar a ser aceito");
+    }
+
+    /**
      * Um socket que chega durante o flush do LEAVE (transporte saindo) é fechado em silêncio: não é
      * erro do accept loop.
      */
