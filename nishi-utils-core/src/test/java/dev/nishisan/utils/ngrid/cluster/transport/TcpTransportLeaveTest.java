@@ -257,6 +257,76 @@ class TcpTransportLeaveTest {
     }
 
     /**
+     * Um socket que chega durante o flush do LEAVE (transporte saindo) é fechado em silêncio: não é
+     * erro do accept loop.
+     */
+    @Test
+    void socketArrivingWhileLeavingIsClosedQuietly() throws Exception {
+        TcpTransport closing = start(TcpTransportConfig.builder(info("z-client", freePort(), true))
+                .compressionEnabled(false)
+                .leaveFlushTimeout(Duration.ofSeconds(3)));
+        NodeInfo stuck = info("a-storage", freePort(), false);
+        // A peer that announced LEAVE support but never reads: its socket buffers fill up, so the LEAVE
+        // queued behind the backlog cannot be flushed and close() waits out the flush timeout.
+        java.net.Socket stuckSocket = new java.net.Socket();
+        closeables.add(stuckSocket);
+        stuckSocket.setReceiveBufferSize(4096);
+        stuckSocket.connect(new InetSocketAddress(closing.local().host(), closing.local().port()), 5_000);
+        byte[] hs = new dev.nishisan.utils.ngrid.cluster.transport.codec.JacksonMessageCodec()
+                .encode(handshake(stuck, closing.local(), Set.of()));
+        java.io.DataOutputStream out = new java.io.DataOutputStream(stuckSocket.getOutputStream());
+        out.writeInt(hs.length);
+        out.write(hs);
+        out.flush();
+        awaitTrue(() -> closing.announcesLeaveTo(stuck.nodeId()), "handshake não concluiu");
+        String chunk = "x".repeat(64 * 1024);
+        for (int i = 0; i < 400; i++) {
+            closing.send(ClusterMessage.request(MessageType.CLIENT_REQUEST, "backlog", closing.local().nodeId(),
+                    stuck.nodeId(), chunk + i));
+        }
+
+        List<String> warnings = new CopyOnWriteArrayList<>();
+        java.util.logging.Handler capture = new java.util.logging.Handler() {
+            @Override
+            public void publish(java.util.logging.LogRecord record) {
+                if (record.getLevel().intValue() >= java.util.logging.Level.WARNING.intValue()) {
+                    warnings.add(record.getMessage());
+                }
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        java.util.logging.Logger logger = java.util.logging.Logger.getLogger(TcpTransport.class.getName());
+        logger.addHandler(capture);
+        try {
+            Thread closer = Thread.ofVirtual().start(() -> {
+                try {
+                    closing.close();
+                } catch (IOException ignored) {
+                    // best-effort
+                }
+            });
+            Thread.sleep(300); // close() is now waiting for the LEAVE flush
+            assertTrue(closer.isAlive(), "precondição: close() deveria estar esperando o flush do LEAVE");
+            try (java.net.Socket late = new java.net.Socket()) {
+                late.connect(new InetSocketAddress(closing.local().host(), closing.local().port()), 1_000);
+                Thread.sleep(200);
+            }
+            closer.join(10_000);
+            assertTrue(warnings.stream().noneMatch(w -> w.startsWith("Error accepting connection")),
+                    "socket que chega durante o LEAVE não é erro do accept loop: " + warnings);
+        } finally {
+            logger.removeHandler(capture);
+        }
+    }
+
+    /**
      * Saída sem LEAVE (kill -9, OOM, perda de rede): o peer efêmero é esquecido depois de
      * {@code departedPeerForgetAfter} sem conexão; um peer elegível a líder nunca é esquecido assim, e
      * um efêmero ainda conectado também não.

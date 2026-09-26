@@ -449,12 +449,17 @@ public final class TcpTransport implements Transport {
                 }
                 break;
             } catch (EOFException e) {
-                if (running) {
+                if (running && !leaving) {
                     LOGGER.log(Level.INFO, "Connection closed immediately during handshake (EOF): {0}", e.getMessage());
                 }
             } catch (IOException e) {
-                if (running) {
+                // While leaving (close() flushing its LEAVE), registerConnection refuses and closes new
+                // sockets on purpose: that is the shutdown, not an accept error.
+                if (running && !leaving) {
                     LOGGER.log(Level.WARNING, "Error accepting connection", e);
+                } else {
+                    LOGGER.fine(() -> "Connection refused on " + config.local().nodeId() + " while closing: "
+                            + e.getMessage());
                 }
             }
         }
