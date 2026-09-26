@@ -37,6 +37,11 @@ com teste de reprodução e correção para cada achado. Plano em
   diferentes de tópicos, o desempate ordena a união dos nomes após os tópicos prioritários. Antes,
   cada nó comparava seus próprios tópicos primeiro e ambos podiam se considerar à frente.
   Dois testes de regressão cobrem o caso sem prioridade e com prioridade empatada.
+- **Reentrada durante a expiração de um membro.** Heartbeats, conexão e expiração compartilham
+  a sincronização da eleição: a limpeza da sessão antiga e a notificação de saída terminam antes
+  de reativar o membro. Isso impede apagar o watermark fresco e perder o reengajamento do
+  join-quiesce. O teste de carga de streaming também aguarda a liberação dos gates de escrita
+  após o consenso, pois o líder recém-eleito ainda pode estar drenando o relay.
 - **Líder recém-eleito cede ao estado mais novo.** A eleição pode correr com o heartbeat (3 s): o
   sobrevivente de maior afinidade era eleito com vetores desatualizados e, ao ver o outro à frente no
   catálogo, retinha (F2) — a op confirmada se perdia (`LeaderFailoverDuringMigrationClusterTest`, 1

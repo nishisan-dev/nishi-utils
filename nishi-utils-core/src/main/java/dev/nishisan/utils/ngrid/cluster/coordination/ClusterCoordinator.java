@@ -1014,6 +1014,12 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
      * actions.
      */
     private void evictDeadMembers() {
+        synchronized (leaderComputationLock) {
+            evictDeadMembersUnderLock();
+        }
+    }
+
+    private void evictDeadMembersUnderLock() {
         try {
             if (!running) {
                 return;
@@ -2126,6 +2132,12 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
 
     @Override
     public void onPeerConnected(NodeInfo peer) {
+        synchronized (leaderComputationLock) {
+            onPeerConnectedUnderLock(peer);
+        }
+    }
+
+    private void onPeerConnectedUnderLock(NodeInfo peer) {
         if (peer != null) {
             leavingUntilMs.remove(peer.nodeId()); // a new incarnation (or a reconnect) speaks again
         }
@@ -2281,6 +2293,18 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
 
     @Override
     public void onMessage(ClusterMessage message) {
+        if (message.type() != MessageType.HEARTBEAT) {
+            return;
+        }
+        // Eviction must finish clearing the old session and notifying membership before a new
+        // heartbeat can reactivate the peer. Otherwise its fresh watermark can be erased by the
+        // old sweep, and listeners can miss the inactive -> active transition entirely.
+        synchronized (leaderComputationLock) {
+            onMessageUnderLock(message);
+        }
+    }
+
+    private void onMessageUnderLock(ClusterMessage message) {
         if (message.type() == MessageType.HEARTBEAT) {
             HeartbeatPayload payload = message.payload(HeartbeatPayload.class);
             NodeId source = message.source();

@@ -66,6 +66,8 @@ class RelayStreamReplicationTest {
             NGridNode leader = a.coordinator().isLeader() ? a : b;
             NGridNode follower = (leader == a) ? b : a;
 
+            awaitLeaderReady(leader);
+
             int n = 200;
             DistributedQueue<String> queue = leader.getQueue("stream-queue", String.class);
             DistributedMap<String, String> map = leader.getMap("stream-map", String.class, String.class);
@@ -127,6 +129,8 @@ class RelayStreamReplicationTest {
             NGridNode leader = a.coordinator().isLeader() ? a : b;
             NGridNode follower = (leader == a) ? b : a;
 
+            awaitLeaderReady(leader);
+
             int n = 3000; // > 6x SYNC_THRESHOLD: the follower lags well past the snapshot threshold
             DistributedQueue<String> queue = leader.getQueue("firehose", String.class);
             for (int i = 0; i < n; i++) {
@@ -145,6 +149,20 @@ class RelayStreamReplicationTest {
 
             DistributedQueue<String> followerQueue = follower.getQueue("firehose", String.class);
             assertEquals("item-0", followerQueue.peek().orElse(null));
+        }
+    }
+
+    private static void awaitLeaderReady(NGridNode leader) throws InterruptedException {
+        // Consensus identifies the leader; its promotion drain and join gates can still be held.
+        // These tests exercise steady-state streaming, so begin the firehose only after bootstrap.
+        long deadline = System.currentTimeMillis() + 10_000;
+        while (leader.replicationManager().isLeaderSyncing()
+                || leader.replicationManager().isJoinQuiescing()
+                || leader.replicationManager().isReclaimQuiescing()) {
+            if (System.currentTimeMillis() > deadline) {
+                fail("leader did not release its bootstrap write gates");
+            }
+            Thread.sleep(25);
         }
     }
 
