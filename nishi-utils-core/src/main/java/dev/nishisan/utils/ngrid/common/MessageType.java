@@ -75,5 +75,11 @@ public enum MessageType {
      * relay holds no direct connection to its destination (payload {@code UndeliverablePayload}). Lets
      * a request/response caller fail fast instead of waiting out the request timeout for a dead peer.
      */
-    UNDELIVERABLE
+    UNDELIVERABLE,
+    /**
+     * Closing node → each directly connected peer that announced support in its handshake: the node is
+     * leaving for good (payload {@code LeavePayload}). Honored first-hand only, never forwarded; an
+     * ephemeral leaver is forgotten at once instead of being redialed until a timeout (8.7.0).
+     */
+    LEAVE
 }

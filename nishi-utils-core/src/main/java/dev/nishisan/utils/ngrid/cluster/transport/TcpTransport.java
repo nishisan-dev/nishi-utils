@@ -19,6 +19,7 @@ package dev.nishisan.utils.ngrid.cluster.transport;
 
 import dev.nishisan.utils.ngrid.common.ClusterMessage;
 import dev.nishisan.utils.ngrid.common.HandshakePayload;
+import dev.nishisan.utils.ngrid.common.LeavePayload;
 import dev.nishisan.utils.ngrid.common.MessageType;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
@@ -42,6 +43,7 @@ import java.util.Collections;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -50,6 +52,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -116,6 +119,9 @@ public final class TcpTransport implements Transport {
     private volatile java.util.function.Consumer<NodeId> handshakeIdentityHook = id -> { };
 
     private volatile boolean running;
+    // Set by close() before it announces the departure (LEAVE): from then on no new connection is
+    // registered or published, so the set of peers told about the departure is final.
+    private volatile boolean leaving;
     private ServerSocket serverSocket;
 
     public TcpTransport(TcpTransportConfig config) {
@@ -571,6 +577,13 @@ public final class TcpTransport implements Transport {
         return connectionLocks.computeIfAbsent(nodeId, id -> new ReentrantLock());
     }
 
+    // Visible for tests in this package: whether close() would announce LEAVE to this peer (its tracked
+    // connection is open and the peer's handshake on it announced support).
+    boolean announcesLeaveTo(NodeId nodeId) {
+        Connection connection = connections.get(nodeId);
+        return connection != null && connection.isOpen() && connection.handshaked() && connection.peerSupportsLeave();
+    }
+
     // Visible for tests in this package: the per-peer lock serializing dials/publication.
     ReentrantLock connectionLockFor(NodeId nodeId) {
         return getLockFor(nodeId);
@@ -580,7 +593,7 @@ public final class TcpTransport implements Transport {
         Connection connection;
         lifecycleLock.lock();
         try {
-            if (!running) { throw new IOException("Transport closed during connect"); }
+            if (!running || leaving) { throw new IOException("Transport closed during connect"); }
             socket.setTcpNoDelay(true);
             connection = new Connection(socket, preResolved != null);
             liveSockets.add(connection);
@@ -631,6 +644,11 @@ public final class TcpTransport implements Transport {
             Connection existing = connections.get(remoteId);
             if (existing == candidate) {
                 return candidate;
+            }
+            if (leaving) {
+                // Closing: the peers to announce the departure to were already chosen.
+                candidate.closeQuietly();
+                return null;
             }
             if (existing == null || !existing.isOpen()) {
                 connections.put(remoteId, candidate);
@@ -707,7 +725,7 @@ public final class TcpTransport implements Transport {
         NodeInfo localInfo = config.local();
         Set<NodeInfo> peers = gossipablePeers();
         HandshakePayload payload = new HandshakePayload(localInfo, peers, collectLatencies(),
-                config.compressionEnabled(), true);
+                config.compressionEnabled(), true, true);
         ClusterMessage message = ClusterMessage.request(MessageType.HANDSHAKE,
                 "hello",
                 localInfo.nodeId(),
@@ -726,6 +744,8 @@ public final class TcpTransport implements Transport {
         // simultaneous-open tie-break already has the correct flag.
         connection.setPeerSupportsCompression(payload.supportsCompression());
         connection.setPeerSupportsUndeliverable(payload.supportsUndeliverable());
+        connection.setPeerSupportsLeave(payload.supportsLeave());
+        connection.markHandshaked();
         handshakeIdentityHook.accept(remoteInfo.nodeId());
         // A direct handshake is first-hand and authoritative: whatever other id we held for the
         // remote's listen address (typically the provisional "host:port" seed alias) is replaced
@@ -980,6 +1000,37 @@ public final class TcpTransport implements Transport {
     }
 
     /**
+     * A peer announced it is closing for good. Honored only first-hand: on the connection currently
+     * tracked for that peer, identified by a handshake, and only when the announced node is that
+     * connection's identity — which rejects a spoofed LEAVE and a delayed LEAVE of an old incarnation
+     * arriving on a replaced socket. Never forwarded. An ephemeral leaver (leader-ineligible or without
+     * a listen port, in its own announcement and in this node's view alike) is forgotten at once; a
+     * leader-eligible one stays a known voter, so the majority is never shrunk without consensus.
+     */
+    private void handleLeave(Connection connection, ClusterMessage message) {
+        LeavePayload payload = message.payload(LeavePayload.class);
+        NodeId remoteId = connection.remoteId().orElse(null);
+        NodeInfo leaver = payload != null ? payload.node() : null;
+        if (leaver == null || remoteId == null || !connection.handshaked()
+                || !leaver.nodeId().equals(remoteId) || !remoteId.equals(message.source())
+                || connections.get(remoteId) != connection) {
+            LOGGER.fine(() -> "Ignoring LEAVE of " + (leaver != null ? leaver.nodeId() : null) + " on "
+                    + config.local().nodeId() + ": not first-hand on the connection tracked for it (remote="
+                    + remoteId + ")");
+            return;
+        }
+        String reason = payload.reason();
+        NodeInfo known = knownPeers.get(remoteId);
+        if (isEphemeral(leaver) && (known == null || isEphemeral(known))) {
+            LOGGER.info(() -> "Peer " + remoteId + " announced LEAVE (" + reason + ") on " + config.local().nodeId());
+            forget(remoteId, config.departedPeerTombstoneTtl().toMillis(), "LEAVE: " + reason);
+            return;
+        }
+        LOGGER.info(() -> "Leader-eligible peer " + remoteId + " announced LEAVE (" + reason + ") on "
+                + config.local().nodeId() + "; kept as a known voter");
+    }
+
+    /**
      * A relay could not forward one of our messages (no direct connection to its destination): fail
      * the matching pending request/response now rather than at the request timeout.
      */
@@ -1228,6 +1279,25 @@ public final class TcpTransport implements Transport {
 
     @Override
     public void close() throws IOException {
+        List<Connection> leaveTargets = List.of();
+        lifecycleLock.lock();
+        try {
+            if (running && !leaving && config.leaveOnClose()) {
+                leaving = true;
+                Set<Connection> distinct = Collections.newSetFromMap(new IdentityHashMap<>());
+                for (Connection connection : connections.values()) {
+                    if (connection.isOpen() && connection.peerSupportsLeave()) {
+                        distinct.add(connection);
+                    }
+                }
+                leaveTargets = List.copyOf(distinct);
+            }
+        } finally {
+            lifecycleLock.unlock();
+        }
+        // Before the connections are dropped: each peer learns first-hand that this node is gone for
+        // good (an ephemeral member is then forgotten instead of redialed until a timeout).
+        announceLeave(leaveTargets);
         List<Connection> socketsToClose;
         lifecycleLock.lock();
         try {
@@ -1261,6 +1331,39 @@ public final class TcpTransport implements Transport {
         pendingResponses.clear();
     }
 
+    /**
+     * Sends a LEAVE directly on each connection (not through broadcast(), which is fire-and-forget on
+     * the worker pool) and waits, up to {@link TcpTransportConfig#leaveFlushTimeout()}, until each one
+     * has been flushed to its socket. A large outbound backlog ahead of the LEAVE may exceed the
+     * timeout: the close then proceeds as a plain close and those peers fall back to the
+     * disconnection timeout.
+     */
+    private void announceLeave(List<Connection> targets) {
+        if (targets.isEmpty()) {
+            return;
+        }
+        NodeInfo localInfo = config.local();
+        LeavePayload payload = new LeavePayload(localInfo, "close");
+        List<CompletableFuture<Void>> flushed = new ArrayList<>(targets.size());
+        for (Connection connection : targets) {
+            flushed.add(connection.sendAndAwaitFlush(ClusterMessage.request(MessageType.LEAVE, "leave",
+                    localInfo.nodeId(), connection.remoteId().orElse(null), payload)));
+        }
+        try {
+            CompletableFuture.allOf(flushed.toArray(CompletableFuture[]::new))
+                    .get(config.leaveFlushTimeout().toMillis(), TimeUnit.MILLISECONDS);
+            LOGGER.fine(() -> "LEAVE flushed to " + targets.size() + " peer(s) by " + localInfo.nodeId());
+        } catch (TimeoutException e) {
+            long pending = flushed.stream().filter(f -> !f.isDone()).count();
+            LOGGER.info(() -> "LEAVE of " + localInfo.nodeId() + " not flushed to " + pending + " peer(s) within "
+                    + config.leaveFlushTimeout() + "; closing anyway");
+        } catch (ExecutionException e) {
+            LOGGER.fine(() -> "LEAVE of " + localInfo.nodeId() + " not delivered to every peer: " + e.getCause());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     private final class Connection implements Closeable {
         private final Socket socket;
         private final OutputStream outputStream;
@@ -1275,6 +1378,12 @@ public final class TcpTransport implements Transport {
         private volatile boolean peerSupportsCompression;
         // Negotiated in the handshake (8.3.0): only a peer that announced it receives UNDELIVERABLE.
         private volatile boolean peerSupportsUndeliverable;
+        // Negotiated in the handshake (8.7.0): only a peer that announced it receives LEAVE.
+        private volatile boolean peerSupportsLeave;
+        // Whether the remote identity was set by a handshake on this socket (not inferred).
+        private volatile boolean handshaked;
+        // Messages whose flush to the socket someone waits for (sendAndAwaitFlush), by messageId.
+        private final Map<UUID, CompletableFuture<Void>> flushWaiters = new ConcurrentHashMap<>();
         private volatile boolean open = true;
 
         private Connection(Socket socket, boolean outboundInitiated) throws IOException {
@@ -1311,6 +1420,22 @@ public final class TcpTransport implements Transport {
             return peerSupportsUndeliverable;
         }
 
+        void setPeerSupportsLeave(boolean peerSupports) {
+            this.peerSupportsLeave = peerSupports;
+        }
+
+        boolean peerSupportsLeave() {
+            return peerSupportsLeave;
+        }
+
+        void markHandshaked() {
+            this.handshaked = true;
+        }
+
+        boolean handshaked() {
+            return handshaked;
+        }
+
         Optional<NodeId> remoteId() {
             return Optional.ofNullable(remote).map(NodeInfo::nodeId);
         }
@@ -1334,6 +1459,32 @@ public final class TcpTransport implements Transport {
             outbound.enqueue(message);
         }
 
+        /**
+         * Enqueues {@code message} (which must carry a unique messageId) and returns a future completed
+         * by the writer right after that exact message was flushed to the socket, or exceptionally when
+         * the connection closes or the writer fails first.
+         */
+        CompletableFuture<Void> sendAndAwaitFlush(ClusterMessage message) {
+            CompletableFuture<Void> flushed = new CompletableFuture<>();
+            flushWaiters.put(message.messageId(), flushed);
+            if (isOpen()) {
+                outbound.enqueue(message);
+            }
+            if (!isOpen()) {
+                failFlushWaiters(); // closed before (or while) enqueuing: the writer may be gone
+            }
+            return flushed;
+        }
+
+        private void failFlushWaiters() {
+            for (UUID id : List.copyOf(flushWaiters.keySet())) {
+                CompletableFuture<Void> waiter = flushWaiters.remove(id);
+                if (waiter != null) {
+                    waiter.completeExceptionally(new IOException("Connection to " + remote + " closed before flush"));
+                }
+            }
+        }
+
         private void drainOutbound() {
             byte[] lengthPrefix = new byte[Integer.BYTES];
             try {
@@ -1352,6 +1503,12 @@ public final class TcpTransport implements Transport {
                     outputStream.write(lengthPrefix);
                     outputStream.write(data);
                     outputStream.flush();
+                    if (!flushWaiters.isEmpty()) {
+                        CompletableFuture<Void> waiter = flushWaiters.remove(message.messageId());
+                        if (waiter != null) {
+                            waiter.complete(null);
+                        }
+                    }
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -1360,6 +1517,8 @@ public final class TcpTransport implements Transport {
                     LOGGER.log(Level.FINE, "Writer terminating for {0}: {1}", new Object[]{remote, e.getMessage()});
                 }
                 closeQuietly();
+            } finally {
+                failFlushWaiters();
             }
         }
 
@@ -1394,6 +1553,8 @@ public final class TcpTransport implements Transport {
                     }
                     if (message.type() == MessageType.HANDSHAKE) {
                         handleHandshake(this, message);
+                    } else if (message.type() == MessageType.LEAVE) {
+                        handleLeave(this, message);
                     } else {
                         if (remote == null && message.source() != null) {
                             NodeInfo inferred = new NodeInfo(

@@ -66,6 +66,18 @@ class ProtocolCompatibilityIntegrationTest {
     }
 
     @Test
+    void handshakeWithoutSupportsLeaveMeansNoSupport() throws Exception {
+        NodeInfo old = new NodeInfo(NodeId.of("old-node"), "localhost", 1);
+        byte[] encoded = json.encode(ClusterMessage.request(MessageType.HANDSHAKE, "hello", old.nodeId(), null,
+                new HandshakePayload(old, Set.of(), Map.of(), true, true, false)));
+        String legacy = new String(encoded, StandardCharsets.UTF_8).replace(",\"supportsLeave\":false", "");
+        assertFalse(legacy.contains("supportsLeave"), "precondition: field removed from the wire form");
+        HandshakePayload decoded = json.decode(legacy.getBytes(StandardCharsets.UTF_8)).payload(HandshakePayload.class);
+        assertFalse(decoded.supportsLeave(), "an old handshake must not announce LEAVE support");
+        assertTrue(decoded.supportsUndeliverable());
+    }
+
+    @Test
     void oldPeerNeverReceivesUndeliverableAndUnknownTypeDoesNotCloseTheConnection() throws Exception {
         int port = allocateFreeLocalPort();
         NodeInfo local = new NodeInfo(NodeId.of("new-node"), "localhost", port);

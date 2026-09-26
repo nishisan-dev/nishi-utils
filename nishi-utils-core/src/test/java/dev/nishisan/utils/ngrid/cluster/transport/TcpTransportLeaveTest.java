@@ -19,6 +19,7 @@ package dev.nishisan.utils.ngrid.cluster.transport;
 
 import dev.nishisan.utils.ngrid.common.ClusterMessage;
 import dev.nishisan.utils.ngrid.common.HandshakePayload;
+import dev.nishisan.utils.ngrid.common.LeavePayload;
 import dev.nishisan.utils.ngrid.common.MessageType;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
@@ -209,6 +210,111 @@ class TcpTransportLeaveTest {
         assertTrue(knows(storage, liveClient.nodeId()), "um efêmero conectado não pode ser esquecido");
     }
 
+    /**
+     * Fechamento gracioso de um cliente: o LEAVE faz o storage esquecê-lo na hora (sem esperar o prazo
+     * de desconexão), não discá-lo mais e aceitá-lo de volta quando religar com o mesmo id.
+     */
+    @Test
+    void closingAnIneligibleClientMakesTheStorageForgetItAtOnce() throws Exception {
+        TcpTransport storage = start(TcpTransportConfig.builder(info("a-storage", freePort(), false))
+                .reconnectInterval(RECONNECT));
+        RecordingListener events = listen(storage);
+        int clientPort = freePort();
+        TcpTransport client = client("z-client", clientPort, storage);
+        NodeId clientId = client.local().nodeId();
+        awaitTrue(() -> storage.isConnected(clientId) && client.isConnected(storage.local().nodeId()),
+                "cliente não conectou");
+
+        client.close();
+        AtomicInteger dialsToClient = countDials(storage, clientId);
+
+        // Well below departedPeerForgetAfter (1 min by default): only the LEAVE explains it.
+        awaitTrue(() -> !knows(storage, clientId), "o storage não esqueceu o cliente que saiu com LEAVE");
+        assertTrue(storage.isDeparted(clientId));
+        Thread.sleep(RECONNECT.toMillis() * 6);
+        assertEquals(0, dialsToClient.get(), "o cliente que saiu não pode ser discado");
+        assertEquals(List.of("left:z-client"), events.peerEvents(clientId),
+                "a saída é reportada uma vez, como onPeerLeft");
+
+        TcpTransport reborn = client("z-client", clientPort, storage);
+        awaitTrue(() -> storage.isConnected(clientId) && knows(storage, clientId),
+                "o mesmo id religando deveria ser aceito");
+        assertFalse(storage.isDeparted(clientId));
+        reborn.close();
+        awaitTrue(() -> !knows(storage, clientId), "a nova encarnação também sai com LEAVE");
+    }
+
+    @Test
+    void closingALeaderEligibleNodeKeepsItAsAKnownVoter() throws Exception {
+        TcpTransport storage = start(TcpTransportConfig.builder(info("a-storage", freePort(), false))
+                .reconnectInterval(RECONNECT));
+        TcpTransport voter = start(TcpTransportConfig.builder(info("m-storage", freePort(), false))
+                .reconnectInterval(RECONNECT)
+                .addPeer(storage.local()));
+        NodeId voterId = voter.local().nodeId();
+        awaitHandshaked(voter, storage);
+
+        voter.close();
+        awaitTrue(() -> !storage.isConnected(voterId), "desconexão não percebida");
+        Thread.sleep(RECONNECT.toMillis() * 4);
+        assertTrue(knows(storage, voterId), "um membro elegível a líder nunca é esquecido pelo LEAVE");
+        assertFalse(storage.isDeparted(voterId));
+    }
+
+    @Test
+    void leaveIsSentOnlyToPeersThatAnnouncedSupport() throws Exception {
+        TcpTransport closing = start(TcpTransportConfig.builder(info("z-client", freePort(), true)));
+        NodeInfo modern = info("a-storage", freePort(), false);
+        NodeInfo legacy = info("b-storage", freePort(), false);
+        RawPeer modernLink = raw(closing);
+        modernLink.send(handshake(modern, closing.local(), Set.of()));
+        RawPeer legacyLink = raw(closing);
+        legacyLink.send(legacyHandshake(legacy, closing.local()));
+        awaitTrue(() -> closing.isConnected(modern.nodeId()) && closing.isConnected(legacy.nodeId()),
+                "peers não conectaram");
+
+        closing.close();
+
+        awaitTrue(() -> modernLink.received().stream().anyMatch(m -> m.type() == MessageType.LEAVE),
+                "o peer que anunciou suporte deveria receber o LEAVE");
+        LeavePayload payload = modernLink.received().stream().filter(m -> m.type() == MessageType.LEAVE)
+                .findFirst().orElseThrow().payload(LeavePayload.class);
+        assertEquals(closing.local().nodeId(), payload.node().nodeId());
+        Thread.sleep(200);
+        assertTrue(legacyLink.received().stream().noneMatch(m -> m.type() == MessageType.LEAVE),
+                "um peer antigo (sem supportsLeave) nunca recebe LEAVE: " + legacyLink.received());
+    }
+
+    /** O LEAVE só vale de primeira mão: na conexão rastreada para aquele peer, com a identidade dela. */
+    @Test
+    void leaveThatIsNotFirstHandIsIgnored() throws Exception {
+        TcpTransport storage = start(TcpTransportConfig.builder(info("a-storage", freePort(), false)));
+        // Distinct listen addresses: two portless peers on one host would collide by address.
+        NodeInfo client = info("z-client", freePort(), true);
+        NodeInfo other = info("y-client", freePort(), true);
+        RawPeer clientLink = raw(storage);
+        clientLink.send(handshake(client, storage.local(), Set.of()));
+        RawPeer otherLink = raw(storage);
+        otherLink.send(handshake(other, storage.local(), Set.of(client)));
+        awaitTrue(() -> storage.isConnected(client.nodeId()) && storage.isConnected(other.nodeId()),
+                "peers não conectaram");
+
+        // Spoofed: announced on another peer's connection (both as the client and as the sender).
+        otherLink.send(leave(client.nodeId(), client));
+        otherLink.send(leave(other.nodeId(), client));
+        // Announced on a socket that never identified itself with a handshake.
+        RawPeer anonymous = raw(storage);
+        anonymous.send(leave(client.nodeId(), client));
+        Thread.sleep(400);
+        assertTrue(knows(storage, client.nodeId()) && storage.isConnected(client.nodeId()),
+                "LEAVE que não é de primeira mão não pode esquecer o peer");
+        assertFalse(storage.isDeparted(client.nodeId()));
+
+        clientLink.send(leave(client.nodeId(), client));
+        awaitTrue(() -> !knows(storage, client.nodeId()), "o LEAVE de primeira mão deveria ser honrado");
+        assertTrue(knows(storage, other.nodeId()));
+    }
+
     // ---- helpers ----
 
     static NodeInfo info(String id, int port, boolean ephemeral) {
@@ -218,7 +324,32 @@ class TcpTransportLeaveTest {
 
     static ClusterMessage handshake(NodeInfo self, NodeInfo target, Set<NodeInfo> peers) {
         return ClusterMessage.request(MessageType.HANDSHAKE, "hello", self.nodeId(), target.nodeId(),
-                new HandshakePayload(self, peers, Map.of(), false, true));
+                new HandshakePayload(self, peers, Map.of(), false, true, true));
+    }
+
+    /** Handshake of a node that predates LEAVE: the {@code supportsLeave} field is absent. */
+    static ClusterMessage legacyHandshake(NodeInfo self, NodeInfo target) {
+        return ClusterMessage.request(MessageType.HANDSHAKE, "hello", self.nodeId(), target.nodeId(),
+                new HandshakePayload(self, Set.of(), Map.of(), false, true));
+    }
+
+    static ClusterMessage leave(NodeId source, NodeInfo announced) {
+        return ClusterMessage.request(MessageType.LEAVE, "leave", source, null, new LeavePayload(announced, "test"));
+    }
+
+    /** Starts an ineligible client seeded with {@code seed} and waits until both handshakes completed. */
+    private TcpTransport client(String id, int port, TcpTransport seed) throws InterruptedException {
+        TcpTransport client = start(TcpTransportConfig.builder(info(id, port, true))
+                .reconnectInterval(RECONNECT)
+                .addPeer(seed.local()));
+        awaitHandshaked(client, seed);
+        return client;
+    }
+
+    /** Both sides processed the other's handshake on their tracked connection (LEAVE is negotiated). */
+    static void awaitHandshaked(TcpTransport a, TcpTransport b) throws InterruptedException {
+        awaitTrue(() -> a.announcesLeaveTo(b.local().nodeId()) && b.announcesLeaveTo(a.local().nodeId()),
+                "handshake entre " + a.local().nodeId() + " e " + b.local().nodeId() + " não concluiu");
     }
 
     private TcpTransport start(TcpTransportConfig.Builder builder) {

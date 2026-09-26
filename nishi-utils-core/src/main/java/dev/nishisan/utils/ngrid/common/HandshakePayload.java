@@ -43,6 +43,12 @@ public final class HandshakePayload {
      * that announced it — an unknown enum value would otherwise break their decoder.
      */
     private final boolean supportsUndeliverable;
+    /**
+     * Whether this node understands {@link MessageType#LEAVE} (graceful departure, 8.7.0). Absent in
+     * handshakes of older nodes, hence {@code false}: a closing node only announces its departure to
+     * peers that can decode it.
+     */
+    private final boolean supportsLeave;
 
     /**
      * Creates a handshake payload without latency information.
@@ -82,7 +88,22 @@ public final class HandshakePayload {
      */
     public HandshakePayload(NodeInfo local, Set<NodeInfo> peers, Map<NodeId, Double> latencies,
             boolean supportsCompression) {
-        this(local, peers, latencies, supportsCompression, true);
+        this(local, peers, latencies, supportsCompression, true, true);
+    }
+
+    /**
+     * Creates a handshake payload with the capability flags known before 8.7.0; {@code supportsLeave}
+     * is {@code false}, as in the wire form of those versions.
+     *
+     * @param local                 the local node information
+     * @param peers                 the set of known peers
+     * @param latencies             measured latencies to known peers
+     * @param supportsCompression   whether this node accepts LZ4-compressed transport frames
+     * @param supportsUndeliverable whether this node understands {@link MessageType#UNDELIVERABLE}
+     */
+    public HandshakePayload(NodeInfo local, Set<NodeInfo> peers, Map<NodeId, Double> latencies,
+            boolean supportsCompression, boolean supportsUndeliverable) {
+        this(local, peers, latencies, supportsCompression, supportsUndeliverable, false);
     }
 
     @JsonCreator
@@ -91,12 +112,25 @@ public final class HandshakePayload {
             @JsonProperty("peers") Set<NodeInfo> peers,
             @JsonProperty("latencies") Map<NodeId, Double> latencies,
             @JsonProperty("supportsCompression") boolean supportsCompression,
-            @JsonProperty("supportsUndeliverable") boolean supportsUndeliverable) {
+            @JsonProperty("supportsUndeliverable") boolean supportsUndeliverable,
+            @JsonProperty("supportsLeave") boolean supportsLeave) {
         this.local = Objects.requireNonNull(local, "local");
         this.peers = Collections.unmodifiableSet(new HashSet<>(Objects.requireNonNull(peers, "peers")));
         this.latencies = Collections.unmodifiableMap(new HashMap<>(Objects.requireNonNull(latencies, "latencies")));
         this.supportsCompression = supportsCompression;
         this.supportsUndeliverable = supportsUndeliverable;
+        this.supportsLeave = supportsLeave;
+    }
+
+    /**
+     * Whether the peer understands {@link MessageType#LEAVE}; {@code false} for handshakes that predate
+     * the field.
+     *
+     * @return {@code true} if a graceful departure may be announced to this peer
+     * @since 8.7.0
+     */
+    public boolean supportsLeave() {
+        return supportsLeave;
     }
 
     /**

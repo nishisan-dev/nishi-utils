@@ -130,4 +130,35 @@ class JacksonMessageCodecTest {
         assertEquals("queue:offer", dp.command());
         assertEquals("hello", dp.body());
     }
+
+    @Test
+    void shouldRoundTripLeaveMessage() throws Exception {
+        NodeInfo leaver = new NodeInfo(NodeId.of("client-1"), "127.0.0.1", 7000,
+                Set.of("client", NodeInfo.ROLE_LEADER_INELIGIBLE), 0);
+        ClusterMessage message = ClusterMessage.request(MessageType.LEAVE, "leave", leaver.nodeId(),
+                NodeId.of("node-2"), new LeavePayload(leaver, "close"));
+
+        ClusterMessage decoded = codec.decode(codec.encode(message));
+
+        assertEquals(MessageType.LEAVE, decoded.type());
+        LeavePayload payload = decoded.payload(LeavePayload.class);
+        assertEquals(leaver, payload.node());
+        assertFalse(payload.node().isLeaderEligible(), "os papéis do nó que sai sobrevivem ao round-trip");
+        assertEquals("close", payload.reason());
+    }
+
+    @Test
+    void handshakeCarriesLeaveSupport() throws Exception {
+        NodeInfo local = new NodeInfo(NodeId.of("node-1"), "127.0.0.1", 5000);
+        ClusterMessage message = ClusterMessage.request(MessageType.HANDSHAKE, "hello", local.nodeId(), null,
+                new HandshakePayload(local, Set.of(), Map.of(), true, true, true));
+
+        HandshakePayload decoded = codec.decode(codec.encode(message)).payload(HandshakePayload.class);
+
+        assertTrue(decoded.supportsLeave());
+        assertTrue(new HandshakePayload(local, Set.of(), Map.of()).supportsLeave(),
+                "os construtores de conveniência anunciam suporte, como os demais flags");
+        assertFalse(new HandshakePayload(local, Set.of(), Map.of(), true, true).supportsLeave(),
+                "a forma de cinco flags é a de antes do LEAVE");
+    }
 }

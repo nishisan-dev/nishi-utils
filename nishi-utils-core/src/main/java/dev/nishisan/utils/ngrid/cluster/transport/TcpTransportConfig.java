@@ -41,6 +41,8 @@ public final class TcpTransportConfig {
     private final int compressionMinSize;
     private final Duration departedPeerTombstoneTtl;
     private final Duration departedPeerForgetAfter;
+    private final boolean leaveOnClose;
+    private final Duration leaveFlushTimeout;
 
     private TcpTransportConfig(Builder builder) {
         this.local = builder.local;
@@ -55,6 +57,8 @@ public final class TcpTransportConfig {
         this.compressionMinSize = builder.compressionMinSize;
         this.departedPeerTombstoneTtl = builder.departedPeerTombstoneTtl;
         this.departedPeerForgetAfter = builder.departedPeerForgetAfter;
+        this.leaveOnClose = builder.leaveOnClose;
+        this.leaveFlushTimeout = builder.leaveFlushTimeout;
     }
 
     public NodeInfo local() {
@@ -162,6 +166,30 @@ public final class TcpTransportConfig {
         return departedPeerForgetAfter;
     }
 
+    /**
+     * Whether {@link TcpTransport#close()} announces the departure with a {@code LEAVE} on each open
+     * connection whose peer supports it, so ephemeral members are forgotten at once instead of after
+     * {@link #departedPeerForgetAfter()}. Defaults to {@code true}.
+     *
+     * @return whether a closing transport sends LEAVE
+     * @since 8.7.0
+     */
+    public boolean leaveOnClose() {
+        return leaveOnClose;
+    }
+
+    /**
+     * Upper bound {@link TcpTransport#close()} waits for the LEAVE messages to be flushed to the sockets
+     * before closing them. A large outbound backlog ahead of the LEAVE may exceed it; the close then
+     * proceeds as a plain close (the peers fall back to the disconnection timeout). Defaults to 500 ms.
+     *
+     * @return the LEAVE flush timeout
+     * @since 8.7.0
+     */
+    public Duration leaveFlushTimeout() {
+        return leaveFlushTimeout;
+    }
+
     public static Builder builder(NodeInfo local) {
         return new Builder(local);
     }
@@ -179,6 +207,8 @@ public final class TcpTransportConfig {
         private int compressionMinSize = 512;
         private Duration departedPeerTombstoneTtl = Duration.ofMinutes(10);
         private Duration departedPeerForgetAfter = Duration.ofMinutes(1);
+        private boolean leaveOnClose = true;
+        private Duration leaveFlushTimeout = Duration.ofMillis(500);
 
         private Builder(NodeInfo local) {
             this.local = Objects.requireNonNull(local, "local");
@@ -300,6 +330,34 @@ public final class TcpTransportConfig {
                 throw new IllegalArgumentException("departedPeerForgetAfter must be positive");
             }
             this.departedPeerForgetAfter = after;
+            return this;
+        }
+
+        /**
+         * Enables or disables the LEAVE announcement on close (default {@code true}).
+         *
+         * @param enabled whether a closing transport sends LEAVE
+         * @return this builder
+         * @since 8.7.0
+         */
+        public Builder leaveOnClose(boolean enabled) {
+            this.leaveOnClose = enabled;
+            return this;
+        }
+
+        /**
+         * Sets how long close() waits for the LEAVE messages to be flushed (default 500 ms).
+         *
+         * @param timeout the flush timeout, must not be negative
+         * @return this builder
+         * @since 8.7.0
+         */
+        public Builder leaveFlushTimeout(Duration timeout) {
+            Objects.requireNonNull(timeout, "timeout");
+            if (timeout.isNegative()) {
+                throw new IllegalArgumentException("leaveFlushTimeout must not be negative");
+            }
+            this.leaveFlushTimeout = timeout;
             return this;
         }
 
