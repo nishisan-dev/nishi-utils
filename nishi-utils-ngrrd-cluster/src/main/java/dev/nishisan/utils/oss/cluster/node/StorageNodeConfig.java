@@ -165,6 +165,16 @@ import java.util.function.Function;
  *                                 {@code 0} = sem limite
  * @param placementRules           regras de placement ({@code ngrrd.placement.rules}), uniformes em todos os
  *                                 nós; o líder aplica a cópia dele. Nunca {@code null} ({@link PlacementRules#NONE})
+ * @param placementInspectTimeout  prazo de cada inspeção ({@code ngrrd.series.inspect}) do gate de criação de
+ *                                 série nova e da espera total por elas, que correm em paralelo
+ *                                 ({@code ngrrd.placement.inspectTimeout}, default
+ *                                 {@link #DEFAULT_PLACEMENT_INSPECT_TIMEOUT}); um participante que não responde
+ *                                 nesse prazo faz o líder responder {@code PLACEMENT_UNAVAILABLE}. Positivo.
+ *                                 O prazo efetivo de cada inspeção é
+ *                                 {@code min(requestTimeout, placementInspectTimeout)} (o rpc do storage nunca
+ *                                 espera mais que o seu {@code requestTimeout}). Mantenha-o bem abaixo do
+ *                                 timeout de {@code PLACE} dos clientes: o gate roda dentro do atendimento do
+ *                                 {@code PLACE}, e um valor próximo dele faz o cliente estourar antes da resposta
  */
 public record StorageNodeConfig(
         String nodeId,
@@ -210,7 +220,68 @@ public record StorageNodeConfig(
         long maxDestinationCatalogLag,
         long quotaMaxSeries,
         long quotaMaxBytes,
+        PlacementRules placementRules,
+        Duration placementInspectTimeout) {
+
+    /** Default de {@link #placementInspectTimeout()}. */
+    public static final Duration DEFAULT_PLACEMENT_INSPECT_TIMEOUT = Duration.ofSeconds(2);
+
+    /** Construtor de compatibilidade (forma da 8.9.0), com {@code placementInspectTimeout} no default. */
+    public StorageNodeConfig(
+        String nodeId,
+        String host,
+        int port,
+        String seed,
+        List<String> peers,
+        Path dataDir,
+        int priority,
+        Path volumeDir,
+        String volumeName,
+        int shardCount,
+        long segmentBytes,
+        long initialShardCapacityBytes,
+        long capacityBytes,
+        Duration statusReportInterval,
+        Duration nodeStatusStaleAfter,
+        Duration handleIdleTtl,
+        int maxOpenHandles,
+        Duration requestTimeout,
+        Durability defaultDurability,
+        OnGeometryChange defaultOnGeometryChange,
+        NgrrdClusterMetricsListener metricsListener,
+        Duration bootDiscoveryWindow,
+        boolean affinityHandbackMode,
+        Duration placementGraceAfterLeadership,
+        boolean rebalanceEnabled,
+        Duration rebalanceInterval,
+        long rebalanceMinDelta,
+        double rebalanceTolerance,
+        int maxConcurrentMigrations,
+        int maxMovesPerCycle,
+        Duration migrationTimeout,
+        long migrationChunkBytes,
+        long maxSeriesBytes,
+        Duration migrationStatusPollInterval,
+        Duration reconcileInterval,
+        Duration orphanGrace,
+        String seriesObjectPrefix,
+        DistributionMode distributionMode,
+        double weight,
+        long migrationBytesPerSecond,
+        long maxDestinationCatalogLag,
+        long quotaMaxSeries,
+        long quotaMaxBytes,
         PlacementRules placementRules) {
+        this(nodeId, host, port, seed, peers, dataDir, priority, volumeDir, volumeName, shardCount, segmentBytes,
+                initialShardCapacityBytes, capacityBytes, statusReportInterval, nodeStatusStaleAfter,
+                handleIdleTtl, maxOpenHandles, requestTimeout, defaultDurability, defaultOnGeometryChange,
+                metricsListener, bootDiscoveryWindow, affinityHandbackMode, placementGraceAfterLeadership,
+                rebalanceEnabled, rebalanceInterval, rebalanceMinDelta, rebalanceTolerance,
+                maxConcurrentMigrations, maxMovesPerCycle, migrationTimeout, migrationChunkBytes, maxSeriesBytes,
+                migrationStatusPollInterval, reconcileInterval, orphanGrace, seriesObjectPrefix,
+                distributionMode, weight, migrationBytesPerSecond, maxDestinationCatalogLag,
+                quotaMaxSeries, quotaMaxBytes, placementRules, DEFAULT_PLACEMENT_INSPECT_TIMEOUT);
+    }
 
     /** Construtor de compatibilidade (forma da 8.7.0), sem cota nem regras de placement. */
     public StorageNodeConfig(
@@ -435,6 +506,10 @@ public record StorageNodeConfig(
             throw new IllegalArgumentException("ngrrd.quota.maxBytes deve ser >= 0 (0 = sem limite): " + quotaMaxBytes);
         }
         placementRules = Objects.requireNonNullElse(placementRules, PlacementRules.NONE);
+        Objects.requireNonNull(placementInspectTimeout, "placementInspectTimeout é obrigatório");
+        if (placementInspectTimeout.isNegative() || placementInspectTimeout.isZero()) {
+            throw new IllegalArgumentException("ngrrd.placement.inspectTimeout deve ser > 0: " + placementInspectTimeout);
+        }
         Objects.requireNonNull(nodeId, "nodeId é obrigatório");
         if (nodeId.isBlank()) {
             throw new IllegalArgumentException("nodeId não pode ser vazio");
@@ -655,6 +730,10 @@ public record StorageNodeConfig(
             if (ngrrd.placement != null && ngrrd.placement.rules != null) {
                 builder.placementRules(parseRules(ngrrd.placement.rules));
             }
+            if (ngrrd.placement != null) {
+                applyDuration(ngrrd.placement.inspectTimeout, "ngrrd.placement.inspectTimeout",
+                        builder::placementInspectTimeout);
+            }
             RebalanceSection rebalance = ngrrd.rebalance;
             if (rebalance != null) {
                 if (rebalance.enabled != null) {
@@ -776,6 +855,7 @@ public record StorageNodeConfig(
     @JsonIgnoreProperties(ignoreUnknown = true)
     private static final class PlacementSection {
         public List<RuleSection> rules;
+        public String inspectTimeout;
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
@@ -844,6 +924,7 @@ public record StorageNodeConfig(
         private long quotaMaxSeries = 0L;
         private long quotaMaxBytes = 0L;
         private PlacementRules placementRules = PlacementRules.NONE;
+        private Duration placementInspectTimeout = DEFAULT_PLACEMENT_INSPECT_TIMEOUT;
         private Duration statusReportInterval = Duration.ofSeconds(10);
         /** {@code null} = calculado em {@link #build()} a partir de {@link #statusReportInterval}. */
         private Duration nodeStatusStaleAfter;
@@ -1115,6 +1196,17 @@ public record StorageNodeConfig(
         /** Regras de placement ({@code ngrrd.placement.rules}); default {@link PlacementRules#NONE}. */
         public Builder placementRules(PlacementRules placementRules) { this.placementRules = placementRules; return this; }
 
+        /**
+         * Prazo de cada inspeção do gate de criação de série nova e da espera total por elas
+         * ({@code ngrrd.placement.inspectTimeout}); default {@link StorageNodeConfig#DEFAULT_PLACEMENT_INSPECT_TIMEOUT}.
+         * O prazo efetivo é {@code min(requestTimeout, placementInspectTimeout)}; mantenha-o bem abaixo do
+         * timeout de {@code PLACE} dos clientes.
+         */
+        public Builder placementInspectTimeout(Duration placementInspectTimeout) {
+            this.placementInspectTimeout = placementInspectTimeout;
+            return this;
+        }
+
         public StorageNodeConfig build() {
             Duration resolvedStaleAfter = nodeStatusStaleAfter != null
                     ? nodeStatusStaleAfter
@@ -1128,7 +1220,7 @@ public record StorageNodeConfig(
                     maxConcurrentMigrations, maxMovesPerCycle, migrationTimeout, migrationChunkBytes,
                     maxSeriesBytes, migrationStatusPollInterval, reconcileInterval, orphanGrace,
                     seriesObjectPrefix, distributionMode, weight, migrationBytesPerSecond, maxDestinationCatalogLag,
-                    quotaMaxSeries, quotaMaxBytes, placementRules);
+                    quotaMaxSeries, quotaMaxBytes, placementRules, placementInspectTimeout);
         }
 
         private static Duration maxDuration(Duration a, Duration b) {

@@ -299,6 +299,29 @@ class StorageNodeConfigYamlTest {
     }
 
     @Test
+    void placementInspectTimeoutELidoDoYamlEValidado() {
+        String base = """
+                node:
+                  id: storage-0
+                  host: 127.0.0.1
+                  port: 9100
+                  dataDir: /var/ngrrd/storage-0/data
+                ngrrd:
+                  volume:
+                    dir: /var/ngrrd/storage-0/volume
+                    name: ngrrd
+                """;
+
+        assertEquals(Duration.ofMillis(1500), StorageNodeConfig.fromYaml(
+                base + "  placement:\n    inspectTimeout: 1500ms\n", NO_ENV).placementInspectTimeout());
+        assertEquals(StorageNodeConfig.DEFAULT_PLACEMENT_INSPECT_TIMEOUT,
+                StorageNodeConfig.fromYaml(base, NO_ENV).placementInspectTimeout());
+        IllegalArgumentException error = assertThrows(IllegalArgumentException.class, () -> StorageNodeConfig.fromYaml(
+                base + "  placement:\n    inspectTimeout: 0s\n", NO_ENV));
+        assertTrue(error.getMessage().contains("ngrrd.placement.inspectTimeout"), error.getMessage());
+    }
+
+    @Test
     void semCotaNemRegrasOsDefaultsSaoSemLimiteESemRegras() {
         String yaml = """
                 node:

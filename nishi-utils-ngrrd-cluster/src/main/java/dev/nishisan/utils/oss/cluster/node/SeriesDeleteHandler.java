@@ -7,9 +7,12 @@ import dev.nishisan.utils.oss.cluster.catalog.*;
 import dev.nishisan.utils.oss.cluster.protocol.*;
 import dev.nishisan.utils.oss.cluster.rpc.*;
 import java.time.Clock;
+import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
+import java.util.function.Supplier;
 import java.util.logging.*;
 import static dev.nishisan.utils.oss.cluster.node.SeriesLifecycleJournal.Phase.*;
 
@@ -21,19 +24,45 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
     private final SeriesLifecycleService lifecycle;
     private final BooleanSupplier leader, synced;
     private final Clock clock;
+    /** Storages alcançáveis na visão do líder; um participante fora dela fecha o gate sem RPC. */
+    private final Supplier<Set<String>> reachableNodeIds;
+    /** Prazo de cada inspeção do gate de criação e, com {@link #INSPECT_WAIT_SLACK}, da espera total. */
+    private final Duration placementInspectTimeout;
+    /** Inspeções do gate em paralelo, uma thread virtual por participante; nenhuma segura lock. */
+    private final ExecutorService inspections = Executors.newThreadPerTaskExecutor(
+            Thread.ofVirtual().name("ngrrd-creation-gate-", 0).factory());
     private final Object[] driveLocks = java.util.stream.IntStream.range(0, 256).mapToObj(i -> new Object()).toArray();
     private final ScheduledExecutorService recovery = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread thread = new Thread(r, "ngrrd-series-deletion-recovery"); thread.setDaemon(true); return thread;
     });
     private volatile boolean closed;
+    /** Folga da espera total do gate sobre {@code placementInspectTimeout}, para a entrega da resposta. */
+    static final Duration INSPECT_WAIT_SLACK = Duration.ofMillis(250);
+    /** Janela do log com taxa limitada de {@code NGRRD_PLACEMENT_UNAVAILABLE}. */
+    private static final Duration UNAVAILABLE_LOG_WINDOW = Duration.ofSeconds(10);
+    private static final long NEVER_LOGGED = Long.MIN_VALUE;
+    /** Instante ({@link #clock}) do último WARNING {@code NGRRD_PLACEMENT_UNAVAILABLE}. */
+    private final AtomicLong unavailableLoggedAtMs = new AtomicLong(NEVER_LOGGED);
+    /** Ocorrências suprimidas desde o último WARNING {@code NGRRD_PLACEMENT_UNAVAILABLE}. */
+    private final AtomicLong unavailableSuppressed = new AtomicLong();
 
+    /**
+     * @param reachableNodeIds        storages alcançáveis na visão do líder (o próprio nó é sempre
+     *                                considerado alcançável: a inspeção local não passa pela rede)
+     * @param placementInspectTimeout prazo de cada {@code ngrrd.series.inspect} do gate de criação; positivo
+     */
     public SeriesDeleteHandler(Transport transport, CatalogView catalog, ClusterRpc rpc,
-            SeriesLifecycleService lifecycle, BooleanSupplier leader, BooleanSupplier synced, Clock clock) {
+            SeriesLifecycleService lifecycle, BooleanSupplier leader, BooleanSupplier synced, Clock clock,
+            Supplier<Set<String>> reachableNodeIds, Duration placementInspectTimeout) {
         super(transport, Set.of(Commands.SERIES_DELETE, Commands.SERIES_DELETE_BATCH, Commands.DELETE_PREPARE,
                 Commands.DELETE_COMMIT, Commands.DELETE_APPLY, Commands.DELETE_ABORT, Commands.DELETE_FINISH,
                 Commands.DELETE_RECOVER, Commands.SERIES_INSPECT, Commands.RECONCILE));
         this.catalog = catalog; this.rpc = rpc; this.lifecycle = lifecycle;
         this.leader = leader; this.synced = synced; this.clock = clock;
+        this.reachableNodeIds = Objects.requireNonNull(reachableNodeIds, "reachableNodeIds");
+        this.placementInspectTimeout = Objects.requireNonNull(placementInspectTimeout, "placementInspectTimeout");
+        if (placementInspectTimeout.isNegative() || placementInspectTimeout.isZero())
+            throw new IllegalArgumentException("placementInspectTimeout deve ser > 0");
     }
     public void start() { recovery.scheduleWithFixedDelay(this::recover, 1, 1, TimeUnit.SECONDS); }
 
@@ -57,16 +86,91 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
         };
     }
 
-    /** Protect creation against unplaced surviving data anywhere in the registered cluster. */
-    public SeriesStatus creationGate(String key) {
+    /**
+     * Gate de criação de série nova: protege contra dados sobreviventes não posicionados em qualquer
+     * storage registrado. Participantes são os nós do catálogo que anunciam
+     * {@link StorageCapabilities#SERIES_DELETE} (nós legados ficam de fora durante a atualização).
+     *
+     * <p>Um participante fora de {@code reachableNodeIds} fica indisponível sem RPC. Os alcançáveis são
+     * inspecionados em paralelo, cada um com {@code placementInspectTimeout}, e a espera total é limitada a
+     * esse prazo mais uma folga curta; timeout ou falha conta como indisponível. Precedência:
+     * {@code QUARANTINED} &gt; {@code MIGRATING} (remoção em curso) &gt; {@code PLACEMENT_UNAVAILABLE}.</p>
+     *
+     * <p>Chamado pelo {@link PlacementRequestHandler} fora de qualquer lock de placement.</p>
+     */
+    public PlacementRequestHandler.CreationGateResult creationGate(String key) {
+        List<String> participants = new ArrayList<>();
         for (var node : catalog.nodesLocal()) {
-            if (!node.capabilities().contains(StorageCapabilities.SERIES_DELETE)) continue; // legacy placement during rolling upgrade
-            var inspected = rpc.call(NodeId.of(node.nodeId()), Commands.SERIES_INSPECT,
-                    new SeriesCommandRequest(key), SeriesInspectResponse.class);
-            if (inspected.quarantined()) return SeriesStatus.QUARANTINED;
-            if (inspected.deleting()) return SeriesStatus.MIGRATING;
+            if (node.capabilities().contains(StorageCapabilities.SERIES_DELETE)) participants.add(node.nodeId());
         }
-        return null;
+        participants.sort(String::compareTo);
+        if (participants.isEmpty()) return PlacementRequestHandler.CreationGateResult.OPEN;
+        Set<String> reachable = reachableNodeIds.get();
+        String self = rpc.localId().value();
+        SortedSet<String> unavailable = new TreeSet<>();
+        Map<String, Future<SeriesInspectResponse>> pending = new LinkedHashMap<>();
+        for (String nodeId : participants) {
+            if (!nodeId.equals(self) && !reachable.contains(nodeId)) { unavailable.add(nodeId); continue; }
+            try {
+                pending.put(nodeId, inspections.submit(() -> rpc.call(NodeId.of(nodeId), Commands.SERIES_INSPECT,
+                        new SeriesCommandRequest(key), SeriesInspectResponse.class, placementInspectTimeout)));
+            } catch (RejectedExecutionException e) {
+                unavailable.add(nodeId); // handler fechado: o nó está parando
+            }
+        }
+        boolean quarantined = false, deleting = false;
+        long deadline = System.nanoTime() + placementInspectTimeout.plus(INSPECT_WAIT_SLACK).toNanos();
+        try {
+            for (var entry : pending.entrySet()) {
+                try {
+                    SeriesInspectResponse inspected = entry.getValue()
+                            .get(Math.max(0L, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+                    if (inspected == null) { unavailable.add(entry.getKey()); continue; }
+                    quarantined |= inspected.quarantined();
+                    deleting |= inspected.deleting();
+                } catch (TimeoutException e) {
+                    unavailable.add(entry.getKey());
+                } catch (ExecutionException e) {
+                    unavailable.add(entry.getKey());
+                    LOG.log(Level.FINE, "creation gate inspection failed: series=" + key + " node=" + entry.getKey(),
+                            e.getCause());
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new NgrrdClusterException(ErrorCode.REMOTE_ERROR,
+                    "interrompido aguardando " + Commands.SERIES_INSPECT + " de " + key, e);
+        } finally {
+            // A inspeção que não respondeu a tempo é abandonada sem interrupção: a inspeção local pode estar
+            // em I/O de canal de arquivo (interromper fecharia o canal), e a remota já tem o próprio prazo.
+            for (var future : pending.values()) future.cancel(false);
+        }
+        if (quarantined) return PlacementRequestHandler.CreationGateResult.blocked(SeriesStatus.QUARANTINED);
+        if (deleting) return PlacementRequestHandler.CreationGateResult.blocked(SeriesStatus.MIGRATING);
+        if (!unavailable.isEmpty()) {
+            logPlacementUnavailable(key, unavailable);
+            return PlacementRequestHandler.CreationGateResult.unavailable(List.copyOf(unavailable));
+        }
+        return PlacementRequestHandler.CreationGateResult.OPEN;
+    }
+
+    /**
+     * {@code NGRRD_PLACEMENT_UNAVAILABLE} com taxa limitada: no máximo um WARNING por
+     * {@link #UNAVAILABLE_LOG_WINDOW}, com os nós da ocorrência atual e quantas ocorrências foram suprimidas
+     * desde o último log — com um storage fora e séries novas chegando, um WARNING por PLACE inundaria o log.
+     * Só contadores atômicos; o log em si sai fora de qualquer lock.
+     */
+    private void logPlacementUnavailable(String key, Collection<String> unavailable) {
+        long now = clock.millis();
+        long last = unavailableLoggedAtMs.get();
+        boolean due = last == NEVER_LOGGED || now - last >= UNAVAILABLE_LOG_WINDOW.toMillis();
+        if (!due || !unavailableLoggedAtMs.compareAndSet(last, now)) {
+            unavailableSuppressed.incrementAndGet();
+            return;
+        }
+        long suppressed = unavailableSuppressed.getAndSet(0);
+        LOG.log(Level.WARNING, "NGRRD_PLACEMENT_UNAVAILABLE series=" + key + " nodes=" + unavailable
+                + " suppressed=" + suppressed);
     }
 
     public DeleteResult delete(DeleteRequest request) {
@@ -234,6 +338,9 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
 
     @Override public void close() {
         closed = true; recovery.shutdownNow();
+        // shutdown (não shutdownNow): as inspeções já têm prazo, e interromper a auto-inspeção durante o
+        // journal.put/force fecharia o FileChannel do SeriesLifecycleJournal.
+        inspections.shutdown();
         try { recovery.awaitTermination(5, TimeUnit.SECONDS); }
         catch (InterruptedException e) { Thread.currentThread().interrupt(); }
     }

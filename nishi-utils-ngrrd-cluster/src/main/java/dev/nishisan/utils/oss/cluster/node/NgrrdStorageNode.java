@@ -212,6 +212,8 @@ public final class NgrrdStorageNode implements Closeable {
                 CatalogService catalog = CatalogService.from(node);
                 TransportClusterRpc rpc = new TransportClusterRpc(node.transport(), node.coordinator(),
                         cfg.requestTimeout());
+                placementInspectTimeoutWarning(cfg.placementInspectTimeout(), cfg.requestTimeout())
+                        .ifPresent(LOGGER::warning);
                 SeriesHandleRegistry registry = new SeriesHandleRegistry(volume, cfg.volumeName(),
                         cfg.handleIdleTtl(), cfg.maxOpenHandles(), Clock.systemUTC());
 
@@ -286,7 +288,8 @@ public final class NgrrdStorageNode implements Closeable {
                     return drained && caughtUp;
                 };
                 SeriesDeleteHandler deleteHandler = new SeriesDeleteHandler(node.transport(), catalog, rpc,
-                        lifecycle, node.coordinator()::isLeader, catalogFence, Clock.systemUTC());
+                        lifecycle, node.coordinator()::isLeader, catalogFence, Clock.systemUTC(),
+                        leaderView::reachableNodeIds, cfg.placementInspectTimeout());
                 startupDeleteHandler = deleteHandler;
                 placementHandler.creationGate(deleteHandler::creationGate);
                 node.transport().addListener(deleteHandler);
@@ -414,6 +417,20 @@ public final class NgrrdStorageNode implements Closeable {
      * reler a réplica até o prazo inteiro da confirmação, a cada fim de cooldown; aqui a falha é imediata e o
      * handler responde pela réplica local.
      */
+    /**
+     * Aviso de subida quando {@code placementInspectTimeout >= requestTimeout}: o rpc do storage nunca espera
+     * mais que o {@code requestTimeout}, então o prazo configurado para as inspeções do gate de criação não
+     * vale por inteiro. Não impede a subida.
+     */
+    static Optional<String> placementInspectTimeoutWarning(Duration placementInspectTimeout, Duration requestTimeout) {
+        if (placementInspectTimeout.compareTo(requestTimeout) < 0) {
+            return Optional.empty();
+        }
+        return Optional.of("ngrrd.placement.inspectTimeout=" + placementInspectTimeout
+                + " >= ngrrd.requestTimeout=" + requestTimeout + ": cada inspeção do gate de criação fica limitada a "
+                + requestTimeout + "; use um valor bem abaixo do requestTimeout e do timeout de PLACE dos clientes");
+    }
+
     static NodeCapabilities leaderCapabilitiesFromLocal(Function<String, Optional<StorageNodeStatus>> localStatus) {
         Function<String, Optional<StorageNodeStatus>> presentOrFail = nodeId -> {
             Optional<StorageNodeStatus> status = localStatus.apply(nodeId);
