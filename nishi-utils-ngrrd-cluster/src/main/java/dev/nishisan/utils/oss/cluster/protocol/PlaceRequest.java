@@ -29,9 +29,22 @@ package dev.nishisan.utils.oss.cluster.protocol;
  * @param definitionName {@code metadata.name} da definição ngrrd da série (issue #167, item 3), usado pelas
  *                       regras de placement do líder e gravado no catálogo; {@code null} num pedido de
  *                       adoção ({@code LocalReconciler}) ou vindo de um cliente anterior a este campo
+ * @param explicitAdoption adoção administrativa explícita de dados já existentes: dispensa o gate de criação
+ * @param acceptsPlacementUnavailable o cliente entende {@link SeriesStatus#PLACEMENT_UNAVAILABLE} (8.10.0+).
+ *                       Sem a flag (cliente anterior, ou JSON sem o campo), o líder responde a falha do gate
+ *                       de criação como erro de aplicação cuja mensagem cita {@code ngrrd.series.inspect},
+ *                       como na 8.9.0
  */
 public record PlaceRequest(String seriesKey, String definitionHashHex, String preferredOwnerNodeId,
-        dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor geometry, String definitionName, boolean explicitAdoption) {
+        dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor geometry, String definitionName, boolean explicitAdoption,
+        boolean acceptsPlacementUnavailable) {
+
+    /** Forma da 8.9.0, sem {@code acceptsPlacementUnavailable}. */
+    public PlaceRequest(String seriesKey, String definitionHashHex, String preferredOwnerNodeId,
+            dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor geometry, String definitionName,
+            boolean explicitAdoption) {
+        this(seriesKey, definitionHashHex, preferredOwnerNodeId, geometry, definitionName, explicitAdoption, false);
+    }
     public PlaceRequest(String seriesKey, String definitionHashHex, String preferredOwnerNodeId,
             dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor geometry, String definitionName) {
         this(seriesKey, definitionHashHex, preferredOwnerNodeId, geometry, definitionName, false);

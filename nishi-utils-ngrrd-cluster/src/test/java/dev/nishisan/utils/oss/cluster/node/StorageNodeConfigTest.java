@@ -53,6 +53,30 @@ class StorageNodeConfigTest {
     }
 
     @Test
+    void placementInspectTimeoutTemDefaultDeDoisSegundosEExigeValorPositivo(@TempDir Path base) {
+        assertEquals(Duration.ofSeconds(2), minimal(base).build().placementInspectTimeout());
+        assertEquals(StorageNodeConfig.DEFAULT_PLACEMENT_INSPECT_TIMEOUT, minimal(base).build().placementInspectTimeout());
+        assertEquals(Duration.ofMillis(750),
+                minimal(base).placementInspectTimeout(Duration.ofMillis(750)).build().placementInspectTimeout());
+        assertThrows(IllegalArgumentException.class,
+                () -> minimal(base).placementInspectTimeout(Duration.ZERO).build());
+        assertThrows(IllegalArgumentException.class,
+                () -> minimal(base).placementInspectTimeout(Duration.ofMillis(-1)).build());
+        assertThrows(NullPointerException.class, () -> minimal(base).placementInspectTimeout(null).build());
+    }
+
+    @Test
+    void avisoDeSubidaQuandoPlacementInspectTimeoutNaoFicaAbaixoDoRequestTimeout() {
+        assertTrue(NgrrdStorageNode.placementInspectTimeoutWarning(Duration.ofSeconds(2), Duration.ofSeconds(20))
+                .isEmpty());
+        String equal = NgrrdStorageNode.placementInspectTimeoutWarning(Duration.ofSeconds(20), Duration.ofSeconds(20))
+                .orElseThrow();
+        assertTrue(equal.contains("ngrrd.placement.inspectTimeout=PT20S"), equal);
+        assertTrue(NgrrdStorageNode.placementInspectTimeoutWarning(Duration.ofSeconds(30), Duration.ofSeconds(20))
+                .isPresent());
+    }
+
+    @Test
     void defaultsDeCoordenacaoSaoJanelaDeTresSegundosEHandbackLigado(@TempDir Path base) {
         StorageNodeConfig config = minimal(base).build();
 

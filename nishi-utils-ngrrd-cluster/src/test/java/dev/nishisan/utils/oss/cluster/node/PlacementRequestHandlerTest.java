@@ -21,9 +21,12 @@ import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.structures.NGrid;
 import dev.nishisan.utils.ngrid.structures.NGridCluster;
 import dev.nishisan.utils.ngrid.structures.NGridNode;
+import dev.nishisan.utils.oss.cluster.api.ErrorCode;
+import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogView;
 import dev.nishisan.utils.oss.cluster.catalog.NodeState;
+import dev.nishisan.utils.oss.cluster.catalog.SeriesDeletion;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.catalog.StorageCapabilities;
@@ -44,6 +47,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -56,11 +61,15 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import java.util.logging.Handler;
@@ -97,6 +106,8 @@ class PlacementRequestHandlerTest {
     private final AtomicBoolean leaderSyncing = new AtomicBoolean(false);
     private MutableClock clock;
     private PlacementRequestHandler handler;
+    /** Threads dos {@code PLACE} concorrentes dos testes do gate de criação. */
+    private final ExecutorService placeExecutor = Executors.newCachedThreadPool();
 
     @BeforeEach
     void setUp() throws Exception {
@@ -115,6 +126,7 @@ class PlacementRequestHandlerTest {
 
     @AfterEach
     void tearDown() throws Exception {
+        placeExecutor.shutdownNow();
         cluster.close();
     }
 
@@ -544,6 +556,288 @@ class PlacementRequestHandlerTest {
         assertTrue(fakeCatalog.placementsLocal().isEmpty(), "nenhum placement deveria ter sido gravado após a falha");
     }
 
+    // ---------------------------------------------------------------- gate de criação fora dos locks (8.10.0)
+
+    /** Uma chave diferente de {@code key} que cai no mesmo stripe de {@code CatalogService.placementLock}. */
+    private String sameStripeKey(String key) {
+        for (int i = 0; ; i++) {
+            String candidate = key + "-stripe-" + i;
+            if (Math.floorMod(candidate.hashCode(), 256) == Math.floorMod(key.hashCode(), 256)) {
+                assertTrue(catalog.placementLock(candidate) == catalog.placementLock(key), "mesmo lock de stripe");
+                return candidate;
+            }
+        }
+    }
+
+    /** Envia {@code request} numa thread própria; o resultado sai pelo futuro. */
+    private CompletableFuture<PlaceResponse> placeAsync(PlacementRequestHandler target, PlaceRequest request) {
+        return CompletableFuture.supplyAsync(
+                () -> (PlaceResponse) target.handle(Commands.PLACE, request, NodeId.of("client")), placeExecutor);
+    }
+
+    @Test
+    void placeDeOutraSerieDoMesmoStripeConcluiEnquantoOGateEstaBloqueado() throws Exception {
+        leaderView.leader = true;
+        putNode("node-a", 0, clock.millis());
+        String blockedKey = "series-blocked";
+        String otherKey = sameStripeKey(blockedKey);
+        BlockingGate gate = new BlockingGate(blockedKey);
+        handler.creationGate(gate);
+
+        CompletableFuture<PlaceResponse> blocked = placeAsync(handler, new PlaceRequest(blockedKey, "h", null));
+        try {
+            assertTrue(gate.entered.await(5, TimeUnit.SECONDS), "o gate da série bloqueada deveria ter começado");
+
+            PlaceResponse other = placeAsync(handler, new PlaceRequest(otherKey, "h", null)).get(5, TimeUnit.SECONDS);
+
+            assertEquals(SeriesStatus.OK, other.status(), "o stripe e a admissão não ficam presos ao gate");
+            assertFalse(blocked.isDone());
+        } finally {
+            gate.release.countDown();
+        }
+        assertEquals(SeriesStatus.OK, blocked.get(5, TimeUnit.SECONDS).status());
+    }
+
+    @Test
+    void placeConcorrenteDaMesmaSerieDuranteOGateNaoDuplicaOPlacement() throws Exception {
+        leaderView.leader = true;
+        putNode("node-a", 0, clock.millis());
+        putNode("node-b", 0, clock.millis());
+        AtomicInteger puts = new AtomicInteger();
+        PlacementRequestHandler counted = new PlacementRequestHandler(cluster.node(0).transport(),
+                countingPuts(catalog, puts), leaderView, leaderSyncing::get, new LeastLoadedPlacementPolicy(),
+                INTERVAL, GRACE, clock);
+        BlockingGate gate = new BlockingGate("series-1");
+        counted.creationGate(gate);
+
+        CompletableFuture<PlaceResponse> first = placeAsync(counted, new PlaceRequest("series-1", "h", null));
+        PlaceResponse second;
+        try {
+            assertTrue(gate.entered.await(5, TimeUnit.SECONDS));
+            second = placeAsync(counted, new PlaceRequest("series-1", "h", null)).get(5, TimeUnit.SECONDS);
+            assertEquals(SeriesStatus.OK, second.status());
+        } finally {
+            gate.release.countDown();
+        }
+        PlaceResponse firstResponse = first.get(5, TimeUnit.SECONDS);
+
+        assertEquals(SeriesStatus.OK, firstResponse.status());
+        assertEquals(second.placement(), firstResponse.placement(), "o primeiro devolve o placement já gravado");
+        assertEquals(1, puts.get(), "um único putPlacement para a série");
+        assertEquals(second.placement(), catalog.placementStrong("series-1").orElseThrow());
+    }
+
+    @Test
+    void remocaoEmCursoQueApareceDuranteOGateRespondeMigrating() throws Exception {
+        leaderView.leader = true;
+        putNode("node-a", 0, clock.millis());
+        BlockingGate gate = new BlockingGate("series-1");
+        handler.creationGate(gate);
+
+        CompletableFuture<PlaceResponse> pending = placeAsync(handler, new PlaceRequest("series-1", "h", null));
+        SeriesPlacement deleting = SeriesPlacement.active("node-a", clock.millis()).withDeletion(
+                new SeriesDeletion("op-1", clock.millis(), List.of("node-a"), false), clock.millis());
+        try {
+            assertTrue(gate.entered.await(5, TimeUnit.SECONDS));
+            catalog.putPlacement("series-1", deleting);
+        } finally {
+            gate.release.countDown();
+        }
+        PlaceResponse response = pending.get(5, TimeUnit.SECONDS);
+
+        assertEquals(SeriesStatus.MIGRATING, response.status());
+        assertEquals(deleting, response.placement());
+        assertEquals("series deletion in progress", response.message());
+        assertNull(response.leaderNodeId());
+        assertEquals(deleting, catalog.placementStrong("series-1").orElseThrow(), "nada foi regravado");
+    }
+
+    @Test
+    void perdaDeLiderancaDuranteOGateRespondeNotLeaderSemGravar() throws Exception {
+        leaderView.leader = true;
+        putNode("node-a", 0, clock.millis());
+        BlockingGate gate = new BlockingGate("series-1");
+        handler.creationGate(gate);
+
+        CompletableFuture<PlaceResponse> pending = placeAsync(handler, new PlaceRequest("series-1", "h", null));
+        try {
+            assertTrue(gate.entered.await(5, TimeUnit.SECONDS));
+            leaderView.leader = false;
+            leaderView.leaderId = Optional.of("node-b");
+        } finally {
+            gate.release.countDown();
+        }
+        PlaceResponse response = pending.get(5, TimeUnit.SECONDS);
+
+        assertEquals(SeriesStatus.NOT_LEADER, response.status());
+        assertEquals("node-b", response.leaderNodeId());
+        assertEquals(Optional.empty(), catalog.placementStrong("series-1"));
+    }
+
+    @Test
+    void liderancaQueVaiEVoltaDuranteOGateReabreACarenciaERespondeNotLeaderSemGravar() throws Exception {
+        // A fase 1 vê a carência vencida (nenhuma posse registrada); durante o gate a liderança vai a outro
+        // nó e volta (A→B→A), o que reinicia a janela de graça. A fase 2 precisa enxergar isso.
+        leaderView.leader = true;
+        leaderView.leaderId = Optional.of("node-self");
+        putNode("node-a", 0, clock.millis());
+        BlockingGate gate = new BlockingGate("series-1");
+        handler.creationGate(gate);
+
+        CompletableFuture<PlaceResponse> pending = placeAsync(handler, new PlaceRequest("series-1", "h", null));
+        try {
+            assertTrue(gate.entered.await(5, TimeUnit.SECONDS));
+            leaderView.leader = false;
+            handler.onLeaderChanged(NodeId.of("node-b"));
+            leaderView.leader = true;
+            handler.onLeaderChanged(NodeId.of("node-self"));
+        } finally {
+            gate.release.countDown();
+        }
+        PlaceResponse response = pending.get(5, TimeUnit.SECONDS);
+
+        assertEquals(SeriesStatus.NOT_LEADER, response.status(), "recém-reeleito: dentro da janela de graça");
+        assertEquals("node-self", response.leaderNodeId());
+        assertEquals(Optional.empty(), catalog.placementStrong("series-1"), "nada gravado");
+    }
+
+    @Test
+    void gateIndisponivelParaClienteNovoRespondePlacementUnavailableComOsNos() {
+        leaderView.leader = true;
+        putNode("node-a", 0, clock.millis());
+        handler.creationGate(key -> PlacementRequestHandler.CreationGateResult.unavailable(List.of("node-b", "node-c")));
+
+        PlaceResponse response = (PlaceResponse) handler.handle(Commands.PLACE,
+                new PlaceRequest("series-1", "h", null, null, null, false, true), NodeId.of("client"));
+
+        assertEquals(SeriesStatus.PLACEMENT_UNAVAILABLE, response.status());
+        assertEquals(List.of("node-b", "node-c"), response.unavailableNodeIds());
+        assertNull(response.placement());
+        assertTrue(response.message().contains(Commands.SERIES_INSPECT), response.message());
+        assertEquals(Optional.empty(), catalog.placementStrong("series-1"));
+    }
+
+    @Test
+    void gateIndisponivelParaClienteAntigoViraErroDeAplicacaoComNgrrdSeriesInspect() {
+        leaderView.leader = true;
+        putNode("node-a", 0, clock.millis());
+        handler.creationGate(key -> PlacementRequestHandler.CreationGateResult.unavailable(List.of("node-b")));
+        PlaceRequest legacy = new PlaceRequest("series-1", "h", null, null, null, false);
+
+        NgrrdClusterException direct = assertThrows(NgrrdClusterException.class,
+                () -> handler.handle(Commands.PLACE, legacy, NodeId.of("client")));
+        assertEquals(ErrorCode.PLACEMENT_UNAVAILABLE, direct.code());
+        assertEquals(List.of("node-b"), direct.unavailableNodeIds());
+        assertTrue(direct.getMessage().contains("ngrrd.series.inspect"), direct.getMessage());
+        assertTrue(direct.getMessage().contains("node-b"), direct.getMessage());
+
+        // O que um cliente da 8.9.0 recebe (aqui pelo despacho local; pela rede a mensagem é a mesma).
+        NgrrdClusterException seenByLegacyClient = assertThrows(NgrrdClusterException.class,
+                () -> handler.handleLocal(Commands.PLACE, legacy));
+        assertEquals(ErrorCode.REMOTE_ERROR, seenByLegacyClient.code());
+        assertTrue(seenByLegacyClient.getMessage().contains("ngrrd.series.inspect"), seenByLegacyClient.getMessage());
+        assertEquals(Optional.empty(), catalog.placementStrong("series-1"));
+    }
+
+    @Test
+    void gateEmQuarentenaLevaAOrientacaoNaMensagem() {
+        leaderView.leader = true;
+        putNode("node-a", 0, clock.millis());
+        handler.creationGate(key -> PlacementRequestHandler.CreationGateResult.blocked(SeriesStatus.QUARANTINED));
+
+        PlaceResponse response = (PlaceResponse) handler.handle(Commands.PLACE,
+                new PlaceRequest("series-1", "h", null), NodeId.of("client"));
+
+        assertEquals(SeriesStatus.QUARANTINED, response.status());
+        assertTrue(response.message().contains("reconcile"), response.message());
+        assertNull(response.leaderNodeId());
+        assertTrue(response.unavailableNodeIds().isEmpty());
+    }
+
+    @Test
+    void adocaoExplicitaNaoPassaPeloGate() {
+        leaderView.leader = true;
+        putNode("node-a", 0, clock.millis());
+        AtomicInteger gateCalls = new AtomicInteger();
+        handler.creationGate(key -> {
+            gateCalls.incrementAndGet();
+            return PlacementRequestHandler.CreationGateResult.blocked(SeriesStatus.QUARANTINED);
+        });
+
+        PlaceResponse response = (PlaceResponse) handler.handle(Commands.PLACE,
+                new PlaceRequest("series-1", null, "node-a", null, null, true), NodeId.of("client"));
+
+        assertEquals(SeriesStatus.OK, response.status());
+        assertEquals("node-a", response.placement().ownerNodeId());
+        assertEquals(0, gateCalls.get());
+    }
+
+    @Test
+    void serieJaPosicionadaNaoConsultaOGate() {
+        leaderView.leader = true;
+        putNode("node-a", 0, clock.millis());
+        SeriesPlacement existing = SeriesPlacement.active("node-a", clock.millis());
+        catalog.putPlacement("series-1", existing);
+        AtomicInteger gateCalls = new AtomicInteger();
+        handler.creationGate(key -> {
+            gateCalls.incrementAndGet();
+            return PlacementRequestHandler.CreationGateResult.unavailable(List.of("node-b"));
+        });
+
+        PlaceResponse response = (PlaceResponse) handler.handle(Commands.PLACE,
+                new PlaceRequest("series-1", "h", null), NodeId.of("client"));
+
+        assertEquals(SeriesStatus.OK, response.status());
+        assertEquals(existing, response.placement());
+        assertEquals(0, gateCalls.get(), "o gate só protege a criação de série nova");
+    }
+
+    /** {@link CatalogView} que delega ao catálogo real e conta os {@code putPlacement}. */
+    private static CatalogView countingPuts(CatalogService delegate, AtomicInteger puts) {
+        return (CatalogView) Proxy.newProxyInstance(CatalogView.class.getClassLoader(),
+                new Class<?>[]{CatalogView.class}, (proxy, method, args) -> {
+                    if (method.getName().equals("putPlacement")) {
+                        puts.incrementAndGet();
+                    }
+                    try {
+                        return method.invoke(delegate, args);
+                    } catch (InvocationTargetException e) {
+                        throw e.getCause();
+                    }
+                });
+    }
+
+    /**
+     * Gate que bloqueia a PRIMEIRA inspeção de {@code blockedKey} até {@link #release} e libera todas as
+     * demais na hora.
+     */
+    private static final class BlockingGate implements PlacementRequestHandler.CreationGate {
+        private final String blockedKey;
+        private final AtomicBoolean blockedOnce = new AtomicBoolean();
+        private final CountDownLatch entered = new CountDownLatch(1);
+        private final CountDownLatch release = new CountDownLatch(1);
+
+        BlockingGate(String blockedKey) {
+            this.blockedKey = blockedKey;
+        }
+
+        @Override
+        public PlacementRequestHandler.CreationGateResult inspect(String seriesKey) {
+            if (seriesKey.equals(blockedKey) && blockedOnce.compareAndSet(false, true)) {
+                entered.countDown();
+                try {
+                    if (!release.await(10, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("gate não foi liberado a tempo");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("interrompido no gate", e);
+                }
+            }
+            return PlacementRequestHandler.CreationGateResult.OPEN;
+        }
+    }
+
     // ---------------------------------------------------------------- ngrrd.catalog.lookup
 
     @Test
@@ -946,8 +1240,8 @@ class PlacementRequestHandlerTest {
 
     /** {@link PlacementRequestHandler.LeaderView} fake, sem {@code ClusterCoordinator}/{@code Transport} reais. */
     private static final class LeaderViewFake implements PlacementRequestHandler.LeaderView {
-        private boolean leader;
-        private Optional<String> leaderId = Optional.empty();
+        private volatile boolean leader;
+        private volatile Optional<String> leaderId = Optional.empty();
         private final Set<String> reachable = ConcurrentHashMap.newKeySet();
 
         @Override

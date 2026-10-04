@@ -24,6 +24,8 @@ import dev.nishisan.utils.ngrid.cluster.coordination.LeadershipListener;
 import dev.nishisan.utils.ngrid.cluster.transport.Transport;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
+import dev.nishisan.utils.oss.cluster.api.ErrorCode;
+import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogView;
 import dev.nishisan.utils.oss.cluster.catalog.PlacementState;
@@ -45,6 +47,7 @@ import java.time.Clock;
 import java.time.Duration;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -52,6 +55,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.function.BooleanSupplier;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 /**
@@ -81,8 +85,65 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
         Set<String> reachableNodeIds();
     }
 
-    private java.util.function.Function<String, SeriesStatus> creationGate = key -> null;
-    public void creationGate(java.util.function.Function<String, SeriesStatus> gate) { creationGate = gate; }
+    /**
+     * Gate de criação de série nova: consulta os storages antes de o líder posicionar uma série que
+     * não está no catálogo. Chamado SEM nenhum lock deste handler (pode bloquear até o prazo de
+     * inspeção configurado) e só para pedidos sem adoção explícita.
+     */
+    @FunctionalInterface
+    public interface CreationGate {
+        /** Veredito do gate para {@code seriesKey}; nunca {@code null}. */
+        CreationGateResult inspect(String seriesKey);
+    }
+
+    /**
+     * Veredito do {@link CreationGate}.
+     *
+     * @param status             {@code null} quando a criação está liberada; senão
+     *                           {@link SeriesStatus#QUARANTINED}, {@link SeriesStatus#MIGRATING} (remoção em
+     *                           curso) ou {@link SeriesStatus#PLACEMENT_UNAVAILABLE}
+     * @param unavailableNodeIds participantes inalcançáveis ou sem resposta, em ordem crescente — não vazia
+     *                           só com {@link SeriesStatus#PLACEMENT_UNAVAILABLE}
+     */
+    public record CreationGateResult(SeriesStatus status, List<String> unavailableNodeIds) {
+
+        /** Criação liberada. */
+        public static final CreationGateResult OPEN = new CreationGateResult(null, List.of());
+
+        public CreationGateResult {
+            unavailableNodeIds = unavailableNodeIds == null ? List.of() : List.copyOf(unavailableNodeIds);
+            if (status != null && status != SeriesStatus.QUARANTINED && status != SeriesStatus.MIGRATING
+                    && status != SeriesStatus.PLACEMENT_UNAVAILABLE) {
+                throw new IllegalArgumentException("status de gate inválido: " + status);
+            }
+            if ((status == SeriesStatus.PLACEMENT_UNAVAILABLE) == unavailableNodeIds.isEmpty()) {
+                throw new IllegalArgumentException("unavailableNodeIds só (e sempre) com PLACEMENT_UNAVAILABLE: "
+                        + status + " " + unavailableNodeIds);
+            }
+        }
+
+        /** Criação bloqueada por dados existentes ({@code QUARANTINED}) ou remoção em curso ({@code MIGRATING}). */
+        public static CreationGateResult blocked(SeriesStatus status) {
+            return new CreationGateResult(Objects.requireNonNull(status, "status"), List.of());
+        }
+
+        /** Participantes inalcançáveis ou sem resposta: o líder não pode garantir a ausência de dados. */
+        public static CreationGateResult unavailable(List<String> unavailableNodeIds) {
+            return new CreationGateResult(SeriesStatus.PLACEMENT_UNAVAILABLE, unavailableNodeIds);
+        }
+
+        /** Indica se a criação está liberada. */
+        public boolean open() {
+            return status == null;
+        }
+    }
+
+    private volatile CreationGate creationGate = key -> CreationGateResult.OPEN;
+
+    /** Instala o gate de criação de série nova (default: sempre liberado). */
+    public void creationGate(CreationGate gate) {
+        creationGate = Objects.requireNonNull(gate, "gate");
+    }
     private final CatalogView catalog;
     private final LeaderView leaderView;
     private final BooleanSupplier leaderSyncing;
@@ -212,13 +273,7 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
             // Leitura pura: não disputa o admissionLock do PLACE.
             return handleCatalogLookup((CatalogLookupRequest) body);
         }
-        // One admission decision at a time also serializes pending-count updates across keys.
-        admissionLock.lock();
-        try {
-            return handlePlace((PlaceRequest) body);
-        } finally {
-            admissionLock.unlock();
-        }
+        return handlePlace((PlaceRequest) body);
     }
 
     @Override
@@ -296,86 +351,163 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
         }
     }
 
+    /**
+     * Atende {@link Commands#PLACE} em até duas fases sob os locks de admissão ({@code admissionLock} e o
+     * stripe da série), com o {@link CreationGate} rodando ENTRE elas, sem lock nenhum.
+     *
+     * <p>Por que é seguro soltar os locks durante o gate: as mutações do líder que interessam ao gate
+     * (PLACE, adoção, remoção, migração) exigem um placement presente ou o criam. A segunda fase readquire
+     * os locks e repete a pré-checagem (liderança, placement, janela de graça): se um placement apareceu
+     * nesse meio-tempo, segue o caminho de placement existente ({@code OK}, ou {@code MIGRATING} com
+     * remoção em curso) e nunca grava um segundo. "Ausente antes, ausente depois" só acontece com uma
+     * remoção já finalizada — o placement só sai do catálogo depois que todos os participantes aplicaram
+     * a remoção —, e criar depois dela é legítimo. O lock de stripe nunca protegeu o estado remoto dos
+     * storages (ex.: a quarentena feita pelo reconciliador), que é exatamente o que o gate inspeciona.
+     * Em troca, um storage lento na inspeção não segura mais o PLACE das outras séries do mesmo stripe
+     * nem a admissão do líder inteiro.</p>
+     *
+     * <p>A adoção explícita ({@link PlaceRequest#explicitAdoption()}) não passa pelo gate e roda numa fase
+     * só, como antes.</p>
+     */
     private PlaceResponse handlePlace(PlaceRequest request) {
         if (!leaderView.isLeader()) {
             return notLeaderResponse();
         }
-        Object lock = catalog.placementLock(request.seriesKey());
-        try (var guard = CoordinationLocks.acquire(lock)) {
-            // m4: a liderança pode ter mudado entre a checagem acima e a aquisição do lock de stripe.
-            if (!leaderView.isLeader()) {
-                return notLeaderResponse();
+        CreationGateResult gate = CreationGateResult.OPEN;
+        if (!request.explicitAdoption()) {
+            PlaceResponse decided = underAdmission(request.seriesKey(), () -> precheck(request));
+            if (decided != null) {
+                return decided;
             }
-            Optional<SeriesPlacement> alreadyPlaced = catalog.placementStrong(request.seriesKey());
-            if (alreadyPlaced.isPresent()) {
-                if (alreadyPlaced.get().deletion() != null)
-                    return new PlaceResponse(SeriesStatus.MIGRATING, alreadyPlaced.get(), null, "series deletion in progress");
-                return new PlaceResponse(SeriesStatus.OK, backfillDefinitionName(request, alreadyPlaced.get()), null,
+            gate = Objects.requireNonNull(creationGate.inspect(request.seriesKey()), "veredito do gate");
+        }
+        CreationGateResult verdict = gate;
+        return underAdmission(request.seriesKey(), () -> {
+            // Revalida tudo o que a primeira fase viu: o gate rodou sem lock.
+            PlaceResponse decided = precheck(request);
+            if (decided != null) {
+                return decided;
+            }
+            if (!verdict.open()) {
+                return gateRefusal(request, verdict);
+            }
+            return placeNew(request);
+        });
+    }
+
+    /**
+     * Executa {@code action} sob o {@code admissionLock} (uma decisão de admissão por vez, o que também
+     * serializa a contagem de pendências entre séries) e o lock de stripe da série, nessa ordem.
+     */
+    private PlaceResponse underAdmission(String seriesKey, Supplier<PlaceResponse> action) {
+        admissionLock.lock();
+        try (var guard = CoordinationLocks.acquire(catalog.placementLock(seriesKey))) {
+            return action.get();
+        } finally {
+            admissionLock.unlock();
+        }
+    }
+
+    /**
+     * Pré-checagem de um {@code PLACE}, feita sob os locks de {@link #underAdmission}: devolve a resposta
+     * quando já há decisão (não líder, placement existente, janela de graça) ou {@code null} quando a série
+     * é nova e pode seguir para a criação.
+     */
+    private PlaceResponse precheck(PlaceRequest request) {
+        // m4: a liderança pode ter mudado entre a checagem anterior e a aquisição do lock de stripe.
+        if (!leaderView.isLeader()) {
+            return notLeaderResponse();
+        }
+        Optional<SeriesPlacement> alreadyPlaced = catalog.placementStrong(request.seriesKey());
+        if (alreadyPlaced.isPresent()) {
+            if (alreadyPlaced.get().deletion() != null) {
+                return new PlaceResponse(SeriesStatus.MIGRATING, alreadyPlaced.get(), "series deletion in progress",
                         null);
             }
-
-            // Seção 0 do M3: a série não está no catálogo (nem na leitura STRONG, que já foi ao
-            // líder). Antes de decidir criar uma série NOVA, garante que não estamos ainda na janela
-            // de sincronização logo após assumir a liderança — é exatamente essa janela que permitia
-            // ao líder "não achar" uma série que na verdade já existe (réplica local do catálogo ainda
-            // convergindo) e criar uma cópia vazia noutro nó.
-            if (clock.millis() - becameLeaderAtMs < placementGraceAfterLeadership.toMillis()) {
-                return notLeaderResponse();
-            }
-
-            if (!request.explicitAdoption()) {
-                SeriesStatus blocked = creationGate.apply(request.seriesKey());
-                if (blocked != null) return new PlaceResponse(blocked, null, null,
-                        "series=" + request.seriesKey() + "; inspect ngrrd-admin reconcile <node> --adopt");
-            }
-
-            if (needsAdmissionRebuild) {
-                catalog.resetAdmissionTracking();
-                needsAdmissionRebuild = false;
-            }
-            Collection<StorageNodeStatus> nodes = catalog.nodesLocal();
-            Set<String> reachable = leaderView.reachableNodeIds();
-            long now = clock.millis();
-            // Issue #167 (item 3): as regras são uniformes por configuração; um nó alcançável com um
-            // fingerprint diferente do deste líder gera um WARNING (uma vez por mudança), nunca descarte.
-            DestinationEligibility.warnIfRulesDiverge(placementRules,
-                    nodes.stream().filter(node -> reachable.contains(node.nodeId())).toList());
-            PlacementContext ctx = new PlacementContext(nodes, reachable,
-                    snapshotPending(nodes), now, nodeStatusStaleAfter, request.preferredOwnerNodeId(),
-                    request.geometry() == null ? 0 : request.geometry().regionBytes(), catalog.pendingBytesByNode(),
-                    request.seriesKey(), request.definitionName(), placementRules);
-
-            Optional<String> chosen = policy.choose(ctx);
-            if (chosen.isEmpty()) {
-                return new PlaceResponse(SeriesStatus.NO_STORAGE_NODE_AVAILABLE, null,
-                        "nenhum storage node candidato disponível para a série " + request.seriesKey(), null);
-            }
-
-            // m4: re-checa de novo, o mais perto possível da escrita — decidir o placement (leitura do
-            // catálogo + policy.choose) pode levar um tempo perceptível; se a liderança já mudou nesse
-            // meio tempo, não grava (evita dois nós escreverem placements divergentes para a mesma série).
-            if (!leaderView.isLeader()) {
-                return notLeaderResponse();
-            }
-
-            SeriesPlacement placement = SeriesPlacement.active(chosen.get(), now)
-                    .withDefinitionName(request.definitionName(), now);
-            if (request.geometry() != null) {
-                catalog.putGeometry(request.geometry());
-                placement = placement.withGeometry(request.geometry().id(), false, now);
-            }
-            try {
-                catalog.putPlacement(request.seriesKey(), placement);
-            } catch (RuntimeException e) {
-                // Seção 0 do M3: cobre, entre outras, LeaderSyncingException (o ReplicationManager do
-                // core recusa a escrita porque este líder ainda está em catch-up de um mandato
-                // anterior) — qualquer falha aqui significa que NADA foi gravado, então não há
-                // placement órfão a desfazer. NOT_LEADER (não ERROR): o cliente já sabe retentar.
-                return notLeaderResponse();
-            }
-            recordPending(chosen.get(), nodes);
-            return new PlaceResponse(SeriesStatus.OK, placement, null, null);
+            return new PlaceResponse(SeriesStatus.OK, backfillDefinitionName(request, alreadyPlaced.get()), null,
+                    null);
         }
+
+        // Seção 0 do M3: a série não está no catálogo (nem na leitura STRONG, que já foi ao
+        // líder). Antes de decidir criar uma série NOVA, garante que não estamos ainda na janela
+        // de sincronização logo após assumir a liderança — é exatamente essa janela que permitia
+        // ao líder "não achar" uma série que na verdade já existe (réplica local do catálogo ainda
+        // convergindo) e criar uma cópia vazia noutro nó.
+        if (clock.millis() - becameLeaderAtMs < placementGraceAfterLeadership.toMillis()) {
+            return notLeaderResponse();
+        }
+        return null;
+    }
+
+    /**
+     * Resposta a um gate fechado. {@code PLACEMENT_UNAVAILABLE} só vai como status para quem anuncia
+     * {@link PlaceRequest#acceptsPlacementUnavailable()}; para um cliente anterior à 8.10.0 vira erro de
+     * aplicação (exceção convertida em resposta de falha pelo {@code RequestHandlerSupport}) cuja mensagem
+     * cita {@code ngrrd.series.inspect} e os nós — o formato que esses clientes já discriminam.
+     */
+    private PlaceResponse gateRefusal(PlaceRequest request, CreationGateResult verdict) {
+        if (verdict.status() != SeriesStatus.PLACEMENT_UNAVAILABLE) {
+            return new PlaceResponse(verdict.status(), null,
+                    "series=" + request.seriesKey() + "; inspect ngrrd-admin reconcile <node> --adopt", null);
+        }
+        String message = "series=" + request.seriesKey() + "; " + Commands.SERIES_INSPECT
+                + " sem resposta de " + verdict.unavailableNodeIds()
+                + "; criação de série nova suspensa até os participantes responderem";
+        if (!request.acceptsPlacementUnavailable()) {
+            throw new NgrrdClusterException(ErrorCode.PLACEMENT_UNAVAILABLE, message, verdict.unavailableNodeIds());
+        }
+        return new PlaceResponse(SeriesStatus.PLACEMENT_UNAVAILABLE, null, message, null,
+                verdict.unavailableNodeIds());
+    }
+
+    /** Escolhe o dono e grava o placement de uma série nova; chamado sob os locks de {@link #underAdmission}. */
+    private PlaceResponse placeNew(PlaceRequest request) {
+        if (needsAdmissionRebuild) {
+            catalog.resetAdmissionTracking();
+            needsAdmissionRebuild = false;
+        }
+        Collection<StorageNodeStatus> nodes = catalog.nodesLocal();
+        Set<String> reachable = leaderView.reachableNodeIds();
+        long now = clock.millis();
+        // Issue #167 (item 3): as regras são uniformes por configuração; um nó alcançável com um
+        // fingerprint diferente do deste líder gera um WARNING (uma vez por mudança), nunca descarte.
+        DestinationEligibility.warnIfRulesDiverge(placementRules,
+                nodes.stream().filter(node -> reachable.contains(node.nodeId())).toList());
+        PlacementContext ctx = new PlacementContext(nodes, reachable,
+                snapshotPending(nodes), now, nodeStatusStaleAfter, request.preferredOwnerNodeId(),
+                request.geometry() == null ? 0 : request.geometry().regionBytes(), catalog.pendingBytesByNode(),
+                request.seriesKey(), request.definitionName(), placementRules);
+
+        Optional<String> chosen = policy.choose(ctx);
+        if (chosen.isEmpty()) {
+            return new PlaceResponse(SeriesStatus.NO_STORAGE_NODE_AVAILABLE, null,
+                    "nenhum storage node candidato disponível para a série " + request.seriesKey(), null);
+        }
+
+        // m4: re-checa de novo, o mais perto possível da escrita — decidir o placement (leitura do
+        // catálogo + policy.choose) pode levar um tempo perceptível; se a liderança já mudou nesse
+        // meio tempo, não grava (evita dois nós escreverem placements divergentes para a mesma série).
+        if (!leaderView.isLeader()) {
+            return notLeaderResponse();
+        }
+
+        SeriesPlacement placement = SeriesPlacement.active(chosen.get(), now)
+                .withDefinitionName(request.definitionName(), now);
+        if (request.geometry() != null) {
+            catalog.putGeometry(request.geometry());
+            placement = placement.withGeometry(request.geometry().id(), false, now);
+        }
+        try {
+            catalog.putPlacement(request.seriesKey(), placement);
+        } catch (RuntimeException e) {
+            // Seção 0 do M3: cobre, entre outras, LeaderSyncingException (o ReplicationManager do
+            // core recusa a escrita porque este líder ainda está em catch-up de um mandato
+            // anterior) — qualquer falha aqui significa que NADA foi gravado, então não há
+            // placement órfão a desfazer. NOT_LEADER (não ERROR): o cliente já sabe retentar.
+            return notLeaderResponse();
+        }
+        recordPending(chosen.get(), nodes);
+        return new PlaceResponse(SeriesStatus.OK, placement, null, null);
     }
 
     /**

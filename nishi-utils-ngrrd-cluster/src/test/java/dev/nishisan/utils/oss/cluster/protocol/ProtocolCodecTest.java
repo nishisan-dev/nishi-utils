@@ -50,6 +50,7 @@ import java.util.Set;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -142,6 +143,51 @@ class ProtocolCodecTest {
                 PlaceRequest.class);
         assertEquals(new PlaceRequest("s", "h", null), legacy);
         assertEquals(null, legacy.definitionName());
+    }
+
+    @Test
+    void placeRequestDaVersao890SemAcceptsPlacementUnavailableLeFlagFalsa() throws Exception {
+        PlaceRequest legacy = JacksonMessageCodec.createDefaultMapper().readValue(
+                "{\"seriesKey\":\"s\",\"definitionHashHex\":\"h\",\"preferredOwnerNodeId\":null,\"geometry\":null,"
+                        + "\"definitionName\":\"ifaceStats\",\"explicitAdoption\":false}",
+                PlaceRequest.class);
+        assertEquals(new PlaceRequest("s", "h", null, null, "ifaceStats"), legacy);
+        assertFalse(legacy.acceptsPlacementUnavailable());
+    }
+
+    @Test
+    void placeRequestComAcceptsPlacementUnavailableSobreviveAoRoundTrip() throws IOException {
+        PlaceRequest original = new PlaceRequest("series-1", "h", null, null, "ifaceStats", false, true);
+        PlaceRequest roundTripped = roundTripRequestBody(Commands.PLACE, original);
+        assertEquals(original, roundTripped);
+        assertTrue(roundTripped.acceptsPlacementUnavailable());
+    }
+
+    @Test
+    void placeResponseDaVersao890SemUnavailableNodeIdsLeListaVazia() throws Exception {
+        PlaceResponse legacy = JacksonMessageCodec.createDefaultMapper().readValue(
+                "{\"status\":\"NO_STORAGE_NODE_AVAILABLE\",\"placement\":null,\"message\":\"m\",\"leaderNodeId\":null}",
+                PlaceResponse.class);
+        assertEquals(new PlaceResponse(SeriesStatus.NO_STORAGE_NODE_AVAILABLE, null, "m", null), legacy);
+        assertEquals(List.of(), legacy.unavailableNodeIds());
+    }
+
+    @Test
+    void placeResponsePlacementUnavailableComNosSobreviveAoRoundTrip() throws IOException {
+        PlaceResponse original = new PlaceResponse(SeriesStatus.PLACEMENT_UNAVAILABLE, null,
+                "series=s; ngrrd.series.inspect sem resposta de [storage-2]", null, List.of("storage-2"));
+        PlaceResponse roundTripped = roundTripResponseBody(Commands.PLACE, original);
+        assertEquals(original, roundTripped);
+        assertEquals(List.of("storage-2"), roundTripped.unavailableNodeIds());
+    }
+
+    @Test
+    void placeResponseComStatusDesconhecidoLeStatusNulo() throws Exception {
+        // Como um cliente lê o status de um líder mais novo: o resolver trata null como REMOTE_ERROR.
+        PlaceResponse future = JacksonMessageCodec.createDefaultMapper().readValue(
+                "{\"status\":\"STATUS_FUTURO\",\"placement\":null,\"message\":\"m\",\"leaderNodeId\":null}",
+                PlaceResponse.class);
+        assertNull(future.status());
     }
 
     @Test

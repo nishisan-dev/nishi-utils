@@ -309,8 +309,9 @@ public final class PlacementResolver implements PlacementLookup {
             leaderHint = null;
             PlaceResponse response;
             try {
+                // acceptsPlacementUnavailable=true: este cliente entende PLACEMENT_UNAVAILABLE (8.10.0+).
                 response = rpc.call(leader, Commands.PLACE,
-                        new PlaceRequest(seriesKey, definitionHashHex, null, geometry, definitionName),
+                        new PlaceRequest(seriesKey, definitionHashHex, null, geometry, definitionName, false, true),
                         PlaceResponse.class,
                         LeaderCalls.remainingUntil(clock, deadline, description));
             } catch (NgrrdClusterException e) {
@@ -323,6 +324,12 @@ public final class PlacementResolver implements PlacementLookup {
                 TransportRetry.awaitConnectionOrBackoff(rpc, leader,
                         LeaderCalls.cappedBackoff(clock, retry.backoffFor(attempt), deadline, description));
                 continue;
+            }
+            if (response == null || response.status() == null) {
+                // Status que esta versão não conhece (o codec lê enum desconhecido como null): líder mais novo.
+                throw new NgrrdClusterException(ErrorCode.REMOTE_ERROR, "PLACE respondeu um status desconhecido"
+                        + " para " + seriesKey + (response != null && response.message() != null
+                                ? ": " + response.message() : ""));
             }
             switch (response.status()) {
                 case OK -> {
@@ -341,6 +348,10 @@ public final class PlacementResolver implements PlacementLookup {
                         retry.backoffFor(attempt), deadline, description));
                 case NO_STORAGE_NODE_AVAILABLE -> throw new NgrrdClusterException(
                         ErrorCode.NO_STORAGE_NODE_AVAILABLE, response.message());
+                // Falha transitória do gate de criação: sem retry aqui — o chamador do open decide se e
+                // quando tentar de novo; séries já posicionadas não passam por este caminho.
+                case PLACEMENT_UNAVAILABLE -> throw new NgrrdClusterException(ErrorCode.PLACEMENT_UNAVAILABLE,
+                        response.message(), response.unavailableNodeIds());
                 default -> throw new NgrrdClusterException(ErrorCode.REMOTE_ERROR,
                         "PLACE respondeu " + response.status() + " para " + seriesKey);
             }

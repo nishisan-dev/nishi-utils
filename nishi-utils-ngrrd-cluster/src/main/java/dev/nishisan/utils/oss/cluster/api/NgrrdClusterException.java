@@ -17,6 +17,7 @@
 
 package dev.nishisan.utils.oss.cluster.api;
 
+import java.util.List;
 import java.util.Objects;
 
 /**
@@ -27,19 +28,51 @@ import java.util.Objects;
 public class NgrrdClusterException extends RuntimeException {
 
     private final ErrorCode code;
+    private final List<String> unavailableNodeIds;
 
     public NgrrdClusterException(ErrorCode code, String message) {
-        super(message);
-        this.code = Objects.requireNonNull(code, "code");
+        this(code, message, List.of());
     }
 
     public NgrrdClusterException(ErrorCode code, String message, Throwable cause) {
+        this(code, message, List.of(), cause);
+    }
+
+    /**
+     * @param unavailableNodeIds storages inalcançáveis ou sem resposta que motivaram a falha (ver
+     *                           {@link ErrorCode#PLACEMENT_UNAVAILABLE}); {@code null} equivale a vazia
+     */
+    public NgrrdClusterException(ErrorCode code, String message, List<String> unavailableNodeIds) {
+        // Sem causa: deixa initCause disponível, como no construtor de dois argumentos.
+        super(message);
+        this.code = Objects.requireNonNull(code, "code");
+        this.unavailableNodeIds = copyOf(unavailableNodeIds);
+    }
+
+    /**
+     * @param unavailableNodeIds storages inalcançáveis ou sem resposta que motivaram a falha (ver
+     *                           {@link ErrorCode#PLACEMENT_UNAVAILABLE}); {@code null} equivale a vazia
+     */
+    public NgrrdClusterException(ErrorCode code, String message, List<String> unavailableNodeIds, Throwable cause) {
         super(message, cause);
         this.code = Objects.requireNonNull(code, "code");
+        this.unavailableNodeIds = copyOf(unavailableNodeIds);
+    }
+
+    private static List<String> copyOf(List<String> nodeIds) {
+        return nodeIds == null ? List.of() : List.copyOf(nodeIds);
     }
 
     /** Código de erro que motivou a exceção. */
     public ErrorCode code() {
         return code;
+    }
+
+    /**
+     * Storages inalcançáveis ou sem resposta que motivaram a falha, em ordem crescente — preenchida em
+     * {@link ErrorCode#PLACEMENT_UNAVAILABLE}; lista imutável e vazia nos demais casos.
+     */
+    public List<String> unavailableNodeIds() {
+        return unavailableNodeIds;
     }
 }

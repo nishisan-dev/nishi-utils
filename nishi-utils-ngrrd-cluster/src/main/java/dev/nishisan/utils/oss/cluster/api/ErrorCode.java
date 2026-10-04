@@ -69,5 +69,17 @@ public enum ErrorCode {
     SERIES_DELETED,
 
     /** Existing data requires explicit administrative adoption. */
-    QUARANTINED
+    QUARANTINED,
+
+    /**
+     * Falha transitória do gate de criação de série nova: algum storage participante ficou inalcançável
+     * ou não respondeu à inspeção ({@code ngrrd.series.inspect}) dentro do prazo, e o líder não pode
+     * garantir que não há dados sobreviventes da série nele. Os nós afetados estão em
+     * {@link NgrrdClusterException#unavailableNodeIds()}.
+     *
+     * <p>O cliente não retenta por conta própria: a decisão de tentar de novo (e quando) fica com o
+     * chamador do {@code open}. Séries já posicionadas continuam operando normalmente — só a criação de
+     * séries novas fica suspensa enquanto algum participante não responde.</p>
+     */
+    PLACEMENT_UNAVAILABLE
 }

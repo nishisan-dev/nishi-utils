@@ -19,6 +19,8 @@ package dev.nishisan.utils.oss.cluster.protocol;
 
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
 
+import java.util.List;
+
 /**
  * Resposta do líder (ou de quem pensava ser o líder) a um {@link PlaceRequest}.
  *
@@ -31,6 +33,19 @@ import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
  *                     ao líder indicado na próxima tentativa, em vez de reconsultar
  *                     {@code ClusterRpc#leaderId()} (que pode estar vazio/desatualizado bem no meio
  *                     de um handoff).
+ * @param unavailableNodeIds quando {@code status == PLACEMENT_UNAVAILABLE}, os storages participantes
+ *                     inalcançáveis ou sem resposta à inspeção, em ordem crescente; vazia nos demais
+ *                     casos. Uma resposta de líder anterior à 8.10.0 (sem o campo) desserializa como vazia
  */
-public record PlaceResponse(SeriesStatus status, SeriesPlacement placement, String message, String leaderNodeId) {
+public record PlaceResponse(SeriesStatus status, SeriesPlacement placement, String message, String leaderNodeId,
+        List<String> unavailableNodeIds) {
+
+    public PlaceResponse {
+        unavailableNodeIds = unavailableNodeIds == null ? List.of() : List.copyOf(unavailableNodeIds);
+    }
+
+    /** Forma anterior à 8.10.0, sem {@code unavailableNodeIds}. */
+    public PlaceResponse(SeriesStatus status, SeriesPlacement placement, String message, String leaderNodeId) {
+        this(status, placement, message, leaderNodeId, List.of());
+    }
 }

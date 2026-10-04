@@ -170,7 +170,7 @@ class SeriesLifecycleTest {
         announce("owner", StorageCapabilities.ALL); announce("z-copy", StorageCapabilities.ALL);
         var rpc = new PhaseRpc(); rpc.fail = true; rpc.failCommand = Commands.DELETE_APPLY; rpc.failNode = "z-copy";
         var original = placements.get("s");
-        try (var grid = NGrid.local(1).start(); var handler = new SeriesDeleteHandler(grid.node(0).transport(), catalog, rpc, service, () -> true, () -> true, clock)) {
+        try (var grid = NGrid.local(1).start(); var handler = new SeriesDeleteHandler(grid.node(0).transport(), catalog, rpc, service, () -> true, () -> true, clock, Set::of, Duration.ofSeconds(2))) {
             var request = new DeleteRequest("s", new DeletePrecondition(now - Duration.ofDays(30).toMillis()), "operation", original.generationId());
             assertEquals(DeleteStatus.ERROR, handler.delete(request).status());
             assertTrue(placements.get("s").deletion().committed());
@@ -182,7 +182,7 @@ class SeriesLifecycleTest {
             handles.lifecycle(service); rpc.fail = false;
             // Simulate an async catalogue WAL restored before its commit, on a newly elected leader.
             placements.put("s", original);
-            try (var nextLeader = new SeriesDeleteHandler(grid.node(0).transport(), catalog, rpc, service, () -> true, () -> true, clock)) {
+            try (var nextLeader = new SeriesDeleteHandler(grid.node(0).transport(), catalog, rpc, service, () -> true, () -> true, clock, Set::of, Duration.ofSeconds(2))) {
                 var recovered = (DeleteResult) nextLeader.handle(Commands.DELETE_RECOVER, new DeleteControlRequest("s", committed), NodeId.of("owner"));
                 assertEquals(DeleteStatus.DELETED, recovered.status()); assertFalse(placements.containsKey("s"));
                 assertEquals(SeriesLifecycleJournal.Phase.FINISHED, journal.get("s").phase());
@@ -200,7 +200,7 @@ class SeriesLifecycleTest {
         legacy("s", now - Duration.ofDays(40).toMillis());
         announce("owner", StorageCapabilities.ALL); announce("z-old", Set.of());
         var rpc = new PhaseRpc();
-        try (var grid = NGrid.local(1).start(); var handler = new SeriesDeleteHandler(grid.node(0).transport(), catalog, rpc, service, () -> true, () -> true, clock)) {
+        try (var grid = NGrid.local(1).start(); var handler = new SeriesDeleteHandler(grid.node(0).transport(), catalog, rpc, service, () -> true, () -> true, clock, Set::of, Duration.ofSeconds(2))) {
             var request = new DeleteRequest("s", new DeletePrecondition(now - Duration.ofDays(30).toMillis()), "op");
             var old = handler.delete(request);
             assertEquals(DeleteStatus.ERROR, old.status()); assertEquals(ErrorCode.UNSUPPORTED_BY_NODE, old.errorCode());

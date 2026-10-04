@@ -116,6 +116,23 @@ class RemoteSeriesHandleTest {
     }
 
     @Test
+    void openComPlacementUnavailableSobeIntactoSemOpenRemotoNemRetentativa() {
+        RemoteSeriesHandle handle = newHandle();
+        NgrrdClusterException unavailable = new NgrrdClusterException(ErrorCode.PLACEMENT_UNAVAILABLE,
+                "series=" + SERIES_KEY + "; ngrrd.series.inspect sem resposta de [storage-b]", List.of("storage-b"));
+        resolver.resolveFailure = unavailable;
+
+        NgrrdClusterException thrown = assertThrows(NgrrdClusterException.class, handle::open);
+
+        assertSame(unavailable, thrown, "código e nós chegam ao chamador do open sem reembrulho");
+        assertEquals(ErrorCode.PLACEMENT_UNAVAILABLE, thrown.code());
+        assertEquals(List.of("storage-b"), thrown.unavailableNodeIds());
+        assertEquals(1, resolver.resolveCalls.get(), "o handle não reabre em laço");
+        assertTrue(rpc.calls().isEmpty(), "nenhum OPEN sem placement");
+        assertFalse(handle.isOpen());
+    }
+
+    @Test
     void openComWrongOwnerNaPrimeiraTentativaAbreNoSegundoDono() {
         RemoteSeriesHandle handle = newHandle();
         rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.WRONG_OWNER, OWNER_B.value(), null));
@@ -871,6 +888,8 @@ class RemoteSeriesHandleTest {
         private final AtomicInteger resolveExistingCalls = new AtomicInteger();
         private final AtomicInteger resolveExistingAtLeaderCalls = new AtomicInteger();
         private volatile RuntimeException resolveExistingFailure;
+        /** Falha lançada por {@link #resolve} (o {@code PLACE} no líder), quando definida. */
+        private volatile RuntimeException resolveFailure;
 
         FakePlacementLookup(String initialOwner) {
             this.owner = initialOwner;
@@ -879,6 +898,9 @@ class RemoteSeriesHandleTest {
         @Override
         public SeriesPlacement resolve(String seriesKey, String definitionHashHex) {
             resolveCalls.incrementAndGet();
+            if (resolveFailure != null) {
+                throw resolveFailure;
+            }
             return new SeriesPlacement(owner, null, dev.nishisan.utils.oss.cluster.catalog.PlacementState.ACTIVE, null, 0L, 0L, null, false, null, "fixture-generation", null);
         }
 
