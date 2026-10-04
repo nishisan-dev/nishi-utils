@@ -32,6 +32,9 @@ registre a causa e repita a operação. Uma exclusão já confirmada continua na
 A criação de uma chave sem placement consulta todos os storages registrados para excluir
 a possibilidade de dados em quarentena; se algum estiver indisponível, o OPEN dessa chave
 falha até que seja possível verificar seu volume. Handles de séries já posicionadas continuam operando.
+A partir da 8.10.0, essa falha chega rápido, com `ErrorCode.PLACEMENT_UNAVAILABLE` e os nós em
+`NgrrdClusterException.unavailableNodeIds()`, sem retry interno. Trate-a como transitória por série,
+com backoff próprio, sem discriminar pela mensagem (ver seção 6.6 de [ngrrd-cluster.md](ngrrd-cluster.md)).
 
 `SERIES_DELETED` exige remover o handle antigo do cache da aplicação e reabrir com criação.
 O cliente também invalida seu cache ao receber esse status. Não reutilize buffers ou barreiras

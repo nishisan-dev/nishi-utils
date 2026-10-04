@@ -415,6 +415,7 @@ ngrrd:
     maxSeries: 200000
     maxBytes: 68719476736
   placement:
+    inspectTimeout: 2s                 # opcional, default 2s — prazo do gate de criação (seção 6.6)
     rules:                             # avaliadas em ordem; a primeira que casa vence
       - name: tems-core
         definition: ifaceStats         # metadata.name da definição (opcional)
@@ -551,6 +552,37 @@ o único objeto físico por série é o `.ngrr`. O alocador recupera bytes usado
 `receiptFsyncs`, `quarantinedSeries` e `quarantinedBytes`. O dono registra
 `NGRRD_SERIES_DELETED série=... dono=...`; quarentena registra `NGRRD_SERIES_QUARANTINED`.
 Consulte o [runbook de purga e recuperação](ngrrd-cluster-purga.md) antes de habilitar a purga.
+
+### 6.6. Gate de criação e `PLACEMENT_UNAVAILABLE` (8.10.0)
+
+Antes de posicionar uma série **nova**, o líder consulta (`ngrrd.series.inspect`) todos os
+storages registrados que anunciam `series.delete`, para não criar uma geração nova por cima de
+dados em quarentena ou de uma remoção em curso. Séries já posicionadas e a adoção explícita
+(`reconcile --adopt`) não passam pelo gate.
+
+- Participante fora da lista de nós alcançáveis do líder é considerado indisponível na hora,
+  sem RPC. Os alcançáveis são inspecionados em paralelo, cada um com o prazo
+  `ngrrd.placement.inspectTimeout` (padrão 2 s). Timeout ou falha de transporte também contam
+  como indisponibilidade. O prazo efetivo é o menor entre esse valor e o `requestTimeout`;
+  mantenha-o bem abaixo do timeout de `PLACE` dos clientes.
+- Precedência do resultado: `QUARANTINED` > remoção em curso (`MIGRATING`, retentado pelo
+  cliente) > `PLACEMENT_UNAVAILABLE`.
+- As inspeções rodam **fora** do lock de stripe do placement e do lock de admissão. Ao voltar,
+  o líder revalida liderança, ausência de placement e janela de carência antes de gravar. Um
+  storage lento não bloqueia mais a criação de outras séries.
+- `PLACEMENT_UNAVAILABLE` chega ao cliente como `NgrrdClusterException` com
+  `ErrorCode.PLACEMENT_UNAVAILABLE` e `unavailableNodeIds()` com os nós que não responderam.
+  O cliente **não** retenta: a falha é transitória por série e a aplicação decide o backoff.
+  O líder registra `NGRRD_PLACEMENT_UNAVAILABLE` com taxa limitada.
+
+**Compatibilidade.** O `PlaceRequest` 8.10.0 anuncia `acceptsPlacementUnavailable`. Para clientes
+anteriores, o líder mantém o erro de aplicação legado (`REMOTE_ERROR`, mensagem contendo
+`ngrrd.series.inspect`), agora sem esperar o nó pendurado. Clientes 8.10.0 tratam status
+desconhecido como `REMOTE_ERROR`. A ordem de deploy continua: storages primeiro.
+
+**Operação.** Um storage desligado ou drenado que não passou por `ngrrd-admin forget` continua
+participante do gate e bloqueia a criação de **qualquer** série nova até voltar. Restaure o nó
+ou conclua sua retirada operacional.
 
 ## 7. Placement (`LeastLoadedPlacementPolicy`)
 

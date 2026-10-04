@@ -4,6 +4,30 @@
 
 ---
 
+## 2026-10-04 — Gate de criação rápido e `PLACEMENT_UNAVAILABLE` — 8.10.0
+
+Pedido do tems/ngrrd-server após integrar a purga da 8.9.0. Plano em
+`planning/2026-10-04-ngrrd-placement-unavailable-8.10.0.md`.
+
+- **Gate de criação de série nova:** participante inalcançável é recusado na hora, sem RPC; os
+  demais são inspecionados em paralelo com `ngrrd.placement.inspectTimeout` (padrão 2 s). Timeout
+  ou falha de transporte resultam em `PLACEMENT_UNAVAILABLE`.
+- **Fora dos locks:** as inspeções saíram do lock de stripe do placement e do lock de admissão. O
+  líder revalida liderança, ausência de placement e carência antes de gravar. Na 8.9.0, um storage
+  pendurado bloqueava a criação de todas as séries novas; em 2.000 criações com concorrência 128,
+  a 8.9.0 estourava o timeout de `ngrrd.place` e a 8.10.0 concluiu em 6,5 s.
+- **Contrato novo (API pública):** `SeriesStatus.PLACEMENT_UNAVAILABLE`,
+  `ErrorCode.PLACEMENT_UNAVAILABLE`, `NgrrdClusterException.unavailableNodeIds()`,
+  `PlaceResponse.unavailableNodeIds` e `PlaceRequest.acceptsPlacementUnavailable`. O cliente lança
+  na hora, sem retry interno. Status desconhecido vira `REMOTE_ERROR` em vez de `NullPointerException`.
+- **Compatibilidade:** clientes 8.9.0 continuam recebendo `REMOTE_ERROR` com `ngrrd.series.inspect`
+  na mensagem. Storages primeiro no deploy. Um `switch` exaustivo sobre `ErrorCode` no consumidor
+  precisa tratar a constante nova.
+- **Correção:** as respostas `MIGRATING` (remoção em curso) e `QUARANTINED` do `PLACE` gravavam o
+  texto em `leaderNodeId`; o `QUARANTINED` chegava ao cliente sem mensagem.
+- Log `NGRRD_PLACEMENT_UNAVAILABLE` com taxa limitada; documentação na seção 6.6 de
+  [ngrrd-cluster.md](oss/ngrrd-cluster.md).
+
 ## 2026-10-04 — Purga condicional de séries e quarentena — 8.9.0
 
 - API individual e em lote de exclusão com resultados por série e capacidade `series.delete`.
