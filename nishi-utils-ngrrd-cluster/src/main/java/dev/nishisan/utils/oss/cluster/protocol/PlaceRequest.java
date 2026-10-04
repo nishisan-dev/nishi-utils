@@ -31,7 +31,11 @@ package dev.nishisan.utils.oss.cluster.protocol;
  *                       adoção ({@code LocalReconciler}) ou vindo de um cliente anterior a este campo
  */
 public record PlaceRequest(String seriesKey, String definitionHashHex, String preferredOwnerNodeId,
-        dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor geometry, String definitionName) {
+        dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor geometry, String definitionName, boolean explicitAdoption) {
+    public PlaceRequest(String seriesKey, String definitionHashHex, String preferredOwnerNodeId,
+            dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor geometry, String definitionName) {
+        this(seriesKey, definitionHashHex, preferredOwnerNodeId, geometry, definitionName, false);
+    }
     public PlaceRequest(String seriesKey, String definitionHashHex, String preferredOwnerNodeId) {
         this(seriesKey, definitionHashHex, preferredOwnerNodeId, null);
     }

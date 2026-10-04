@@ -104,10 +104,52 @@ public record NodeMetricsSnapshot(
         long redirectConfirmations,
         long redirectOverrides,
         long redirectConfirmationFailures,
+        long redirectCacheHits,
+        Map<String, Long> lifecycleMetrics) {
+
+    /** Previous wire/API shape, without series lifecycle metrics. */
+    public NodeMetricsSnapshot(
+        String nodeId,
+        long capturedAtEpochMs,
+        boolean leader,
+        long seriesCount,
+        long usedBytes,
+        long capacityBytes,
+        int openHandles,
+        long writeBatches,
+        long samplesWritten,
+        long samplesFailed,
+        long checkpoints,
+        long flushes,
+        long reads,
+        LatencySnapshot writeBatchLatency,
+        LatencySnapshot checkpointLatency,
+        LatencySnapshot readLatency,
+        Map<SeriesStatus, Long> errorsByStatus,
+        BlobVolumeSummary blobStats,
+        long migrationsIn,
+        long migrationsOut,
+        long reconcileAdopted,
+        long reconcileOrphansDeleted,
+        long reconcileUnplaced,
+        long reconcileMissing,
+        long reconcileLastDurationMs,
+        long leaderConfirmations,
+        LatencySnapshot leaderConfirmationLatency,
+        long redirectConfirmations,
+        long redirectOverrides,
+        long redirectConfirmationFailures,
         long redirectCacheHits) {
+        this(nodeId, capturedAtEpochMs, leader, seriesCount, usedBytes, capacityBytes, openHandles, writeBatches, samplesWritten, samplesFailed, checkpoints, flushes, reads, writeBatchLatency, checkpointLatency, readLatency, errorsByStatus, blobStats, migrationsIn, migrationsOut, reconcileAdopted, reconcileOrphansDeleted, reconcileUnplaced, reconcileMissing, reconcileLastDurationMs, leaderConfirmations, leaderConfirmationLatency, redirectConfirmations, redirectOverrides, redirectConfirmationFailures, redirectCacheHits, Map.of());
+    }
+
+    public NodeMetricsSnapshot withLifecycleMetrics(Map<String, Long> metrics) {
+        return new NodeMetricsSnapshot(nodeId, capturedAtEpochMs, leader, seriesCount, usedBytes, capacityBytes, openHandles, writeBatches, samplesWritten, samplesFailed, checkpoints, flushes, reads, writeBatchLatency, checkpointLatency, readLatency, errorsByStatus, blobStats, migrationsIn, migrationsOut, reconcileAdopted, reconcileOrphansDeleted, reconcileUnplaced, reconcileMissing, reconcileLastDurationMs, leaderConfirmations, leaderConfirmationLatency, redirectConfirmations, redirectOverrides, redirectConfirmationFailures, redirectCacheHits, metrics);
+    }
 
     public NodeMetricsSnapshot {
         Objects.requireNonNull(nodeId, "nodeId é obrigatório");
+        lifecycleMetrics = Map.copyOf(Objects.requireNonNullElse(lifecycleMetrics, Map.of()));
         errorsByStatus = Map.copyOf(Objects.requireNonNullElse(errorsByStatus, Map.of()));
         writeBatchLatency = Objects.requireNonNullElse(writeBatchLatency, LatencySnapshot.EMPTY);
         checkpointLatency = Objects.requireNonNullElse(checkpointLatency, LatencySnapshot.EMPTY);

@@ -49,6 +49,10 @@ jobs:
           JAVA_TOOL_OPTIONS: -Djdk.virtualThreadScheduler.parallelism=2
         run: mvn -B test -pl nishi-utils-ngrrd-cluster -am -Pngrrd-cluster -Dtest=ContinuousIngestionRebalanceClusterTest -Dsurefire.failIfNoSpecifiedTests=false
 
+      - name: Validate conditional series deletion and catalog quarantine
+        run: mvn -B test -pl nishi-utils-ngrrd-cluster -am -Pngrrd-cluster -Dtest=SeriesDeleteClusterTest -Dsurefire.failIfNoSpecifiedTests=false
+
+
       - name: Upload coverage report
         if: always()
         uses: actions/upload-artifact@v4

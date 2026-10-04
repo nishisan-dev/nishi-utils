@@ -45,6 +45,12 @@ public interface PlacementLookup {
      */
     SeriesPlacement resolve(String seriesKey, String definitionHashHex);
 
+    /** Fresh explicit open must bypass a removed generation in local caches. */
+    default SeriesPlacement resolveFresh(String key, String hash,
+            dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor geometry, Duration wait, String definitionName) {
+        return resolve(key, hash, geometry, wait, definitionName);
+    }
+
     /** Placement with exact requested physical geometry. */
     default SeriesPlacement resolve(String key, String hash,
             dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor geometry) { return resolve(key, hash); }
@@ -146,4 +152,7 @@ public interface PlacementLookup {
      * correto.
      */
     void noteOwner(String seriesKey, String ownerNodeId);
+    /** Invalidate a removed generation even while a local positive replica is stale. */
+    default void noteDeleted(String seriesKey, String generation) { invalidate(seriesKey); }
+
 }

@@ -78,6 +78,16 @@ import java.util.stream.Collectors;
  */
 public final class SeriesHandleRegistry implements Closeable {
 
+    private SeriesLifecycleService lifecycle;
+    public void lifecycle(SeriesLifecycleService value) { this.lifecycle = value; }
+    public SeriesLifecycleService lifecycle() { return lifecycle; }
+    public void invalidateOwnership(String key) { fireOwnershipChange(key); }
+    /** Deterministic unique stripe ordering avoids cross-series deadlocks for grouped receipts. */
+    public java.util.List<Object> operationLocks(java.util.Collection<String> keys) {
+        return keys.stream().map(key -> Math.floorMod(key.hashCode(), operationLocks.length)).distinct().sorted()
+                .map(index -> operationLocks[index]).toList();
+    }
+
     private static final Logger LOGGER = Logger.getLogger(SeriesHandleRegistry.class.getName());
 
     private final BlobVolume volume;
@@ -387,8 +397,9 @@ public final class SeriesHandleRegistry implements Closeable {
         }
         entry.lock.lock();
         try {
-            if (entries.remove(seriesKey, entry)) {
+            if (entries.get(seriesKey) == entry) {
                 closeQuietly(seriesKey, entry.handle);
+                entries.remove(seriesKey, entry);
             }
         } finally {
             entry.lock.unlock();
@@ -411,6 +422,23 @@ public final class SeriesHandleRegistry implements Closeable {
      * uma órfã permanente: reproduzido por {@code RebalanceClusterTest} ("imagem ... não deveria mais
      * existir no dono antigo"). Marcar a série como esquecida fecha o caminho na raiz.</p>
      */
+    /** Remove the handle only after deletion shutdown is confirmed; never checkpoint it. */
+    public void closeForDeletion(String seriesKey) {
+        HandleEntry entry = entries.get(seriesKey);
+        if (entry != null) {
+            entry.lock.lock();
+            try {
+                if (entries.get(seriesKey) == entry) {
+                    if (entry.handle != null) entry.handle.closeForDeletion();
+                    entries.remove(seriesKey, entry);
+                }
+            } finally { entry.lock.unlock(); }
+        }
+        hashBySeriesKey.remove(seriesKey);
+        forgotten.add(seriesKey);
+        fireOwnershipChange(seriesKey);
+    }
+
     public void forget(String seriesKey) {
         Objects.requireNonNull(seriesKey, "seriesKey");
         // isForgotten é consultada por StorageRequestHandler#ownership para nunca confiar na réplica
@@ -577,8 +605,9 @@ public final class SeriesHandleRegistry implements Closeable {
             // An acknowledged write must reach the image before migration closes its writer.
             // A failed checkpoint leaves the handle available for a safe abort/retry.
             if (entries.get(seriesKey) == entry && entry.handle != null) { entry.handle.checkpoint(); }
-            if (entries.remove(seriesKey, entry)) {
+            if (entries.get(seriesKey) == entry) {
                 closeQuietly(seriesKey, entry.handle);
+                entries.remove(seriesKey, entry);
             }
         } finally {
             entry.lock.unlock();
@@ -649,12 +678,17 @@ public final class SeriesHandleRegistry implements Closeable {
             }
             entry.lock.lock();
             try {
-                if (entries.remove(seriesKey, entry) && entry.handle != null) {
+                if (entries.get(seriesKey) == entry && entry.handle != null) {
                     closeQuietly(seriesKey, entry.handle);
+                    entries.remove(seriesKey, entry);
                 }
             } finally {
                 entry.lock.unlock();
             }
+        }
+        if (lifecycle != null) {
+            try { lifecycle.journal().close(); }
+            catch (java.io.IOException e) { throw new java.io.UncheckedIOException(e); }
         }
     }
 
@@ -701,6 +735,7 @@ public final class SeriesHandleRegistry implements Closeable {
             handle.close();
         } catch (RuntimeException e) {
             LOGGER.log(Level.WARNING, "Falha ao fechar handle da série " + seriesKey, e);
+            throw e;
         }
     }
 

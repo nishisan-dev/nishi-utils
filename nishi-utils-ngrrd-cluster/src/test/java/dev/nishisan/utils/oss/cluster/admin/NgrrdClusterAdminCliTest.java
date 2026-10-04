@@ -46,6 +46,11 @@ import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import dev.nishisan.utils.oss.cluster.api.DeleteResult;
+import dev.nishisan.utils.oss.cluster.api.DeleteStatus;
+import dev.nishisan.utils.oss.cluster.api.DeletePrecondition;
+import dev.nishisan.utils.oss.cluster.protocol.ReconcileRequest;
+import dev.nishisan.utils.oss.cluster.protocol.ReconcileResponse;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -405,6 +410,25 @@ class NgrrdClusterAdminCliTest {
         assertTrue(capture.err.contains("exige <nodeId>"), capture.err);
     }
 
+    @Test
+    void seriesDeletePassesCutoffAndReportsItsOutcome() {
+        var client = new ClientFake();
+        var capture = run(new String[]{"--seed", "127.0.0.1:9000", "series-delete", "s", "--last-write-before", "123"}, cfg -> client);
+        assertEquals(0, capture.exitCode); assertTrue(capture.out.contains("DELETED"));
+        assertEquals(123, client.deleteCutoff.lastWriteBefore()); assertTrue(client.closed.get());
+    }
+    @Test
+    void reconcileRequiresExplicitMutuallyExclusiveResolution() {
+        var client = new ClientFake();
+        var report = run(new String[]{"--seed", "127.0.0.1:9000", "reconcile", "storage-1"}, cfg -> client);
+        assertEquals(0, report.exitCode); assertEquals(ReconcileRequest.Action.REPORT, client.reconcileRequest.action());
+        var adopted = run(new String[]{"--seed", "127.0.0.1:9000", "reconcile", "storage-1", "--adopt", "--series", "s"}, cfg -> client);
+        assertEquals(0, adopted.exitCode); assertEquals(ReconcileRequest.Action.ADOPT, client.reconcileRequest.action());
+        assertEquals("s", client.reconcileRequest.seriesKey());
+        var conflicting = run(new String[]{"--seed", "127.0.0.1:9000", "reconcile", "storage-1", "--adopt", "--purge-orphans"}, cfg -> { throw new AssertionError("must validate before connection"); });
+        assertEquals(1, conflicting.exitCode);
+    }
+
     private Capture run(String[] args, Function<NgrrdClusterConfig, NgrrdClusterClient> factory) {
         ByteArrayOutputStream outBytes = new ByteArrayOutputStream();
         ByteArrayOutputStream errBytes = new ByteArrayOutputStream();
@@ -421,6 +445,14 @@ class NgrrdClusterAdminCliTest {
 
     /** {@link NgrrdClusterClient} fake: cada método devolve/lança o que o teste configurou. */
     private static final class ClientFake implements NgrrdClusterClient {
+        DeletePrecondition deleteCutoff;
+        ReconcileRequest reconcileRequest;
+        public DeleteResult deleteSeries(String key, DeletePrecondition condition) {
+            deleteCutoff = condition; return DeleteResult.of(DeleteStatus.DELETED, "owner");
+        }
+        public ReconcileResponse reconcile(String node, ReconcileRequest request) {
+            reconcileRequest = request; return new ReconcileResponse(Map.of("s", "QUARANTINED"), 100);
+        }
         AdminStatusResponse statusResponse;
         NodeMetricsSnapshot metricsResponse;
         StorageNodeStatus drainResponse;

@@ -63,5 +63,11 @@ public enum ErrorCode {
      * </ul>
      * Atualize os storages antes dos clientes.
      */
-    UNSUPPORTED_BY_NODE
+    UNSUPPORTED_BY_NODE,
+
+    /** The handle refers to a removed generation; explicitly open a new handle. */
+    SERIES_DELETED,
+
+    /** Existing data requires explicit administrative adoption. */
+    QUARANTINED
 }

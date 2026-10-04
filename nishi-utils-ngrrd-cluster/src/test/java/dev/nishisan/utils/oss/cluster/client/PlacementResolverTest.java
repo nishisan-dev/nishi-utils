@@ -94,6 +94,19 @@ class PlacementResolverTest {
     }
 
     @Test
+    void deletedGenerationMasksALaggingPositiveReplicaButNeverANewGeneration() {
+        var old = SeriesPlacement.active("storage-a", 1_000L);
+        catalog.putPlacement("s", old);
+        resolver.noteDeleted("s", old.generationId());
+        assertTrue(resolver.placementCached("s").isEmpty());
+        var fresh = SeriesPlacement.active("storage-a", 2_000L);
+        catalog.putPlacement("s", fresh);
+        assertEquals(fresh, resolver.placementCached("s").orElseThrow());
+        resolver.noteDeleted("s", old.generationId());
+        assertEquals(fresh, resolver.placementCached("s").orElseThrow());
+    }
+
+    @Test
     void devolveOverrideLocalSemChamarOLiderQuandoJaConhecido() {
         resolver.noteOwner("series-1", "storage-b");
 

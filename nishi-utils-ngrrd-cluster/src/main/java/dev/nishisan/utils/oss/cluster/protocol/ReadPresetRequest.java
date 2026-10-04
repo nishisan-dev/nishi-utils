@@ -25,5 +25,8 @@ package dev.nishisan.utils.oss.cluster.protocol;
  * @param presetName           nome do preset configurado na série
  * @param endExclusiveEpochMs  fim exclusivo da janela; {@code null} = agora
  */
-public record ReadPresetRequest(String seriesKey, String presetName, Long endExclusiveEpochMs) {
+public record ReadPresetRequest(String seriesKey, String presetName, Long endExclusiveEpochMs, String generationId) {
+    public ReadPresetRequest(String seriesKey, String presetName, Long endExclusiveEpochMs) {
+        this(seriesKey, presetName, endExclusiveEpochMs, null);
+    }
 }

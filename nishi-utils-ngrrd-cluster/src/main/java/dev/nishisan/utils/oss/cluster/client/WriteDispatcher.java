@@ -154,7 +154,66 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     /** Último WARNING de falha da consulta ao líder — rate limit global (uma consulta cobre várias séries). */
     private final AtomicLong lastOwnerLookupFailureLogMs = new AtomicLong(Long.MIN_VALUE);
     private final Thread tickThread;
+    record OwnerHint(String seriesKey, String generation, String owner) { }
+    private volatile java.util.function.Consumer<OwnerHint> generationOwnerListener = hint -> { };
+    void generationOwnerListener(java.util.function.Consumer<OwnerHint> listener) { generationOwnerListener = listener; }
+    private void notifyOwner(String key, String owner, SeriesRoute route) {
+        ownerChanged.accept(key, owner);
+        generationOwnerListener.accept(new OwnerHint(key, route.generation, owner));
+    }
+
     private volatile boolean closed;
+    private volatile java.util.function.BiConsumer<SeriesWrite, NgrrdClusterException> terminalListener = (key, failure) -> { };
+    public void terminalListener(java.util.function.BiConsumer<SeriesWrite, NgrrdClusterException> listener) {
+        terminalListener = listener;
+    }
+
+    @Override public void beginGeneration(String key, String generation, String owner) {
+        routes.compute(key, (ignored, previous) -> {
+            if (previous == null) return new SeriesRoute(owner, generation);
+            previous.lock.lock();
+            try {
+                if (Objects.equals(previous.generation, generation)) return previous;
+                // Explicit OPEN retires a removed generation, including buffered and in-flight writes.
+                for (NodeBuffer buffer : buffers.values()) extractSeriesFrom(buffer, key);
+                long remaining = previous.submitted - previous.completed;
+                samplesFailedCount.add(remaining);
+                previous.completed = previous.submitted;
+                previous.firstFailedSequence = 0;
+                previous.failureCode = ErrorCode.SERIES_DELETED;
+                previous.failureMessage = "generation replaced: " + key;
+                previous.progress.signalAll();
+                synchronized (pendingLock) { pendingRoutes.remove(previous); }
+                return new SeriesRoute(owner, generation);
+            } finally { previous.lock.unlock(); }
+        });
+    }
+
+    @Override public void checkGeneration(String key, String generation) {
+        SeriesRoute route = routes.get(key);
+        if (route == null) return;
+        route.lock.lock();
+        try {
+            if (!Objects.equals(route.generation, generation))
+                throw new NgrrdClusterException(ErrorCode.SERIES_DELETED, "generation replaced: " + key);
+            if (route.failureCode == ErrorCode.SERIES_DELETED || route.failureCode == ErrorCode.QUARANTINED)
+                throw new NgrrdClusterException(route.failureCode, route.failureMessage);
+        } finally { route.lock.unlock(); }
+    }
+
+    @Override public void flushGenerationSync(String key, String generation, String owner, Duration wait) {
+        SeriesRoute route = routes.get(key);
+        if (route == null) return;
+        long boundary;
+        route.lock.lock();
+        try {
+            if (!Objects.equals(route.generation, generation))
+                throw new NgrrdClusterException(ErrorCode.SERIES_DELETED, "generation replaced: " + key);
+            boundary = route.submitted;
+        } finally { route.lock.unlock(); }
+        awaitBarriers(Map.of(route, boundary), wait);
+    }
+
     /**
      * {@code true} a partir do descarte final do {@code close()}: uma consulta ao líder que termine depois
      * disso não move mais nada entre buffers (criaria um buffer fora da contabilidade de
@@ -248,7 +307,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     public void enqueue(String ownerNodeId, SeriesWrite write) {
         Objects.requireNonNull(ownerNodeId, "ownerNodeId");
         Objects.requireNonNull(write, "write");
-        SeriesRoute route = routes.computeIfAbsent(write.seriesKey(), key -> new SeriesRoute(ownerNodeId));
+        SeriesRoute route = routes.computeIfAbsent(write.seriesKey(), key -> new SeriesRoute(ownerNodeId, write.generationId()));
         for (;;) {
             NodeBuffer buf;
             String owner;
@@ -256,9 +315,20 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             boolean triggerFlush = false;
             route.lock.lock();
             try {
+                while (route.redirectPending) {
+                    try { route.progress.await(); }
+                    catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new NgrrdClusterException(ErrorCode.CLOSED, "admission interrupted", e);
+                    }
+                }
                 if (closed) {
                     throw new NgrrdClusterException(ErrorCode.CLOSED, "dispatcher fechado");
                 }
+                if (routes.get(write.seriesKey()) != route || !Objects.equals(route.generation, write.generationId()))
+                    throw new NgrrdClusterException(ErrorCode.SERIES_DELETED, "generation replaced: " + write.seriesKey());
+                if (route.failureCode == ErrorCode.SERIES_DELETED || route.failureCode == ErrorCode.QUARANTINED)
+                    throw new NgrrdClusterException(route.failureCode, route.failureMessage);
                 // The caller may have read RemoteSeriesHandle.owner before a concurrent redirect.
                 // Every admission uses the same route as the backlog, under the series lock.
                 owner = route.owner;
@@ -374,7 +444,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 route.lock.lock();
                 try {
                     if (route.firstFailedSequence <= entry.getValue()) {
-                        throw new NgrrdClusterException(ErrorCode.REMOTE_ERROR, route.failureMessage);
+                        throw new NgrrdClusterException(route.failureCode, route.failureMessage);
                     }
                     if (route.completed >= entry.getValue()) {
                         break;
@@ -612,7 +682,8 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             for (int i = 0; i < n; i++) {
                 SeriesWrite write = buf.queue.pollFirst(clock.millis());
                 if (write == null) { break; }
-                batch.add(write);
+                SeriesRoute current = routes.get(write.seriesKey());
+                if (current != null && Objects.equals(current.generation, write.generationId())) batch.add(write);
             }
             buf.notFull.signalAll();
             return batch;
@@ -644,6 +715,11 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
 
     private void applyStatus(String owner, NodeBuffer buf, String seriesKey, List<SeriesWrite> writes,
             WriteBatchResponse response) {
+        SeriesRoute currentRoute = routes.get(seriesKey);
+        if (currentRoute == null) return;
+        currentRoute.lock.lock();
+        try {
+        if (routes.get(seriesKey) != currentRoute || !Objects.equals(currentRoute.generation, writes.get(0).generationId())) return;
         SeriesStatus status = response.statusBySeries().getOrDefault(seriesKey, SeriesStatus.ERROR);
         switch (status) {
             case OK -> {
@@ -657,7 +733,9 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 recordRetry(SeriesStatus.WRONG_OWNER);
                 String newOwner = response.ownerBySeries().get(seriesKey);
                 if (newOwner != null) {
-                    followOwnerHint(owner, buf, seriesKey, writes, newOwner);
+                    currentRoute.lock.unlock();
+                    try { followOwnerHint(owner, buf, seriesKey, writes, newOwner, currentRoute); }
+                    finally { currentRoute.lock.lock(); }
                 } else {
                     // "Não sei de quem é" (resposta sem ownerBySeries) NÃO é o mesmo que "sei que não é
                     // meu": pode ser exatamente este nó, só que com a réplica local do catálogo ainda
@@ -681,6 +759,15 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 requeueFrontAt(owner, writes);
                 deferSeries(buf, seriesKey, -1);
             }
+            case SERIES_DELETED, QUARANTINED -> {
+                ErrorCode code = status == SeriesStatus.SERIES_DELETED ? ErrorCode.SERIES_DELETED : ErrorCode.QUARANTINED;
+                currentRoute.lock.lock();
+                try { currentRoute.failureCode = code; } finally { currentRoute.lock.unlock(); }
+                samplesFailedCount.add(writes.size());
+                String message = response.errorBySeries().getOrDefault(seriesKey, status + ": " + seriesKey);
+                completeWrites(seriesKey, writes.size(), message);
+                terminalListener.accept(writes.get(0), new NgrrdClusterException(code, message));
+            }
             case ERROR -> {
                 recordRetry(SeriesStatus.ERROR);
                 samplesFailedCount.add(writes.size());
@@ -696,6 +783,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 LOGGER.warning("WRITE_BATCH respondeu status inesperado " + status + " para " + seriesKey);
             }
         }
+        } finally { currentRoute.lock.unlock(); }
     }
 
     /**
@@ -708,14 +796,14 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
      * Isso também encerra o laço quente de um nó que aponta a si mesmo.</p>
      */
     private void followOwnerHint(String owner, NodeBuffer buf, String seriesKey, List<SeriesWrite> writes,
-            String newOwner) {
-        SeriesRoute route = routes.get(seriesKey);
+            String newOwner, SeriesRoute route) {
         boolean contradictory;
         boolean lookup = false;
         long delayMs;
         String visited;
         route.lock.lock();
         try {
+            if (routes.get(seriesKey) != route) return;
             contradictory = isContradictory(route, owner, newOwner);
             route.redirectAttempts++;
             route.redirectedBy.add(owner);
@@ -739,7 +827,8 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 delayMs = rerouteLocked(route, buf, seriesKey, writes, newOwner,
                         retryPolicy.backoffFor(route.redirectAttempts).toMillis());
                 placementLookup.noteOwner(seriesKey, newOwner);
-                ownerChanged.accept(seriesKey, newOwner);
+                route.redirectPending = true;
+
             }
         } finally {
             route.lock.unlock();
@@ -752,6 +841,13 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 scheduleOwnerLookup(seriesKey);
             }
             return;
+        }
+        try {
+            if (routes.get(seriesKey) == route) notifyOwner(seriesKey, newOwner, route);
+        } finally {
+            route.lock.lock();
+            try { route.redirectPending = false; route.progress.signalAll(); }
+            finally { route.lock.unlock(); }
         }
         logRetryRateLimited(seriesKey, SeriesStatus.WRONG_OWNER, "novo dono informado: " + newOwner);
         // O dono novo tem seu próprio NodeBuffer, fora do drainLoop atual (que só itera o buffer de
@@ -850,6 +946,8 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 ? OWNER_LOOKUP_MAX_WAIT : retryPolicy.timeout();
         Map<String, SeriesPlacement> found = null;
         Throwable failure = null;
+        Map<String, SeriesRoute> expectedRoutes = new HashMap<>();
+        for (String key : keys) expectedRoutes.put(key, routes.get(key));
         ownerLookupsCount.increment();
         try {
             found = placementLookup.resolveExistingAtLeader(keys, maxWait);
@@ -863,7 +961,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         Error error = failure instanceof Error lookupError ? lookupError : null;
         for (String seriesKey : keys) {
             try {
-                applyOwnerLookup(seriesKey, found, failure);
+                applyOwnerLookup(seriesKey, found, failure, expectedRoutes.get(seriesKey));
             } catch (Throwable e) {
                 LOGGER.log(Level.WARNING, "Falha ao aplicar o dono confirmado pelo líder para " + seriesKey, e);
                 if (error == null && e instanceof Error applyError) {
@@ -900,8 +998,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
      * atualiza). Cada nova contradição volta a consultar o líder, que desempata assim que responder.
      * Depois do descarte final do {@code close()}, não faz nada além de liberar a flag de consulta.
      */
-    private void applyOwnerLookup(String seriesKey, Map<String, SeriesPlacement> found, Throwable failure) {
-        SeriesRoute route = routes.get(seriesKey);
+    private void applyOwnerLookup(String seriesKey, Map<String, SeriesPlacement> found, Throwable failure, SeriesRoute route) {
         if (route == null) {
             return;
         }
@@ -911,6 +1008,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         String changedOwner = null;
         route.lock.lock();
         try {
+            if (routes.get(seriesKey) != route || !route.ownerLookupPending) return;
             if (drained) {
                 route.ownerLookupPending = false;
                 return;
@@ -961,7 +1059,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 route.ownerLookupPending = false;
             }
             if (changedOwner != null) {
-                ownerChanged.accept(seriesKey, changedOwner);
+                notifyOwner(seriesKey, changedOwner, route);
             }
         } finally {
             route.lock.unlock();
@@ -1091,6 +1189,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     }
 
     private void reopenAsync(String owner, NodeBuffer buf, String key, List<SeriesWrite> writes) {
+        SeriesRoute expected = routes.get(key);
         buf.lock.lock();
         try {
             for (int i = writes.size() - 1; i >= 0; i--) { buf.queue.addFirst(writes.get(i)); }
@@ -1099,11 +1198,13 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         try {
             recoveryPool.execute(() -> {
                 boolean opened = false;
-                try { opened = Boolean.TRUE.equals(reopener.apply(key)); }
+                try { if (routes.get(key) == expected) opened = Boolean.TRUE.equals(reopener.apply(key)); }
                 catch (RuntimeException e) { LOGGER.log(Level.FINE, "Reabertura pendente de " + key, e); }
                 finally {
-                    deferSeries(buf, key, opened ? 0 : -1);
-                    scheduleFlush(owner, buf);
+                    if (routes.get(key) == expected) {
+                        deferSeries(buf, key, opened ? 0 : -1);
+                        scheduleFlush(owner, buf);
+                    }
                 }
             });
         } catch (RejectedExecutionException closing) {
@@ -1172,6 +1273,8 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         private long completed;
         private long firstFailedSequence = Long.MAX_VALUE;
         private String failureMessage;
+        private ErrorCode failureCode = ErrorCode.REMOTE_ERROR;
+        private final String generation;
         // Redirect episode (#177), from the first WRONG_OWNER to the next OK of the series.
         /** Nós que responderam WRONG_OWNER no episódio atual, na ordem. */
         private final Set<String> redirectedBy = new LinkedHashSet<>();
@@ -1181,10 +1284,12 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         private String confirmedOwner;
         /** Série pausada aguardando a consulta ao líder ({@code scheduleOwnerLookup}). */
         private boolean ownerLookupPending;
+        private boolean redirectPending;
         /** Última dica de dono recebida no episódio; seguida quando a consulta ao líder falha. */
         private String lastHint;
 
-        SeriesRoute(String owner) {
+        SeriesRoute(String owner, String generation) {
+            this.generation = generation;
             this.owner = owner;
             destinations.add(owner);
         }

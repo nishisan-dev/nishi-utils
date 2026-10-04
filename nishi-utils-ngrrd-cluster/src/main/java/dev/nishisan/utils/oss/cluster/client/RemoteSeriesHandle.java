@@ -104,6 +104,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
     private final Duration requestTimeout;
     /** Orçamento TOTAL do {@link #close()} público (achado do Refuter, B1: antes usava {@code retryPolicy.timeout()}). */
     private final Duration closeTimeout;
+    private volatile String generation;
     private final Clock clock;
     /**
      * Recebe {@code (seriesKey, this)} — a instância, não só a chave — para que quem remove do mapa do
@@ -230,6 +231,8 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
         for (;;) {
             boolean writable = state.get().writable();
             SeriesPlacement placement = resolvePlacement(writable, retry.remaining());
+            if (generation != null && !generation.equals(placement.generationId()))
+                throw terminal(SeriesStatus.SERIES_DELETED, "series generation changed: " + seriesKey);
             String candidateOwner = placement.ownerNodeId();
             if (!writable) {
                 // Dono de versão anterior ignoraria createIfMissing=false e criaria a série.
@@ -250,7 +253,9 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
                     markTerminal(unsupported);
                     throw unsupported;
                 }
+                generation = placement.generationId();
                 owner = candidateOwner;
+                dispatcher.beginGeneration(seriesKey, generation, owner);
                 return;
             }
             switch (response.status()) {
@@ -261,6 +266,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
                     }
                 }
                 // NOT_FOUND: o dono confirmou com o líder que a série é dele e o arquivo não existe.
+                case SERIES_DELETED, QUARANTINED -> throw terminal(response.status(), response.message());
                 case NOT_FOUND -> throw new SeriesNotFoundException(seriesKey,
                         SeriesNotFoundException.Reason.MISSING_ON_OWNER);
                 default -> throw new NgrrdClusterException(ErrorCode.REMOTE_ERROR,
@@ -276,8 +282,15 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
      * {@link SeriesNotFoundException} se o líder confirmar que não há placement.
      */
     private SeriesPlacement resolvePlacement(boolean writable, Duration maxWait) {
-        return writable ? resolver.resolve(seriesKey, definitionHashHex, geometry, maxWait, definitionName)
-                : resolver.resolveExisting(seriesKey, maxWait);
+        if (writable && generation == null)
+            return resolver.resolveFresh(seriesKey, definitionHashHex, geometry, maxWait, definitionName);
+        try {
+            // Reopening a bound handle can only locate its existing generation; it never creates.
+            return resolver.resolveExisting(seriesKey, maxWait);
+        } catch (SeriesNotFoundException absent) {
+            if (writable && generation != null) throw terminal(SeriesStatus.SERIES_DELETED, "series removed: " + seriesKey);
+            throw absent;
+        }
     }
 
     /**
@@ -323,12 +336,14 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
      * ({@link ErrorCode#UNSUPPORTED_BY_NODE}): as operações passam a relançar a causa e o handle sai do
      * mapa do cliente ({@link #onClose}, remoção condicional à instância), de modo que um {@code open}
      * posterior refaz o fluxo do zero. Sem {@code CLOSE} remoto. Não faz nada num handle já fechado (a
-     * operação em curso recebe a exceção, mas o estado fechado pelo chamador é preservado) nem num gravável.
+     * operação em curso recebe a exceção, mas o estado fechado pelo chamador é preservado).
+     * Handles graváveis também tornam SERIES_DELETED e QUARANTINED terminais.
      */
     private void markTerminal(RuntimeException cause) {
         for (;;) {
             State current = state.get();
-            if (current.closed() || current.writable()) {
+            if (current.closed() || (current.writable() && !(cause instanceof NgrrdClusterException n
+                    && (n.code() == ErrorCode.SERIES_DELETED || n.code() == ErrorCode.QUARANTINED)))) {
                 return;
             }
             if (state.compareAndSet(current, current.closedByTerminalFailure(cause))) {
@@ -337,6 +352,11 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
             }
         }
     }
+
+    void failGeneration(String expected, NgrrdClusterException failure) {
+        if (java.util.Objects.equals(generation, expected)) markTerminal(failure);
+    }
+    String generationId() { return generation; }
 
     /** Se o handle ainda pode ser reaproveitado por um {@code open} futuro da mesma chave. */
     boolean isOpen() {
@@ -366,7 +386,10 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
     @Override
     public void write(String dsName, Sample sample) {
         ensureWritable();
-        dispatcher.enqueue(owner, new SeriesWrite(seriesKey, dsName, sample.tsEpochMs(), sample.value()));
+        try {
+            dispatcher.checkGeneration(seriesKey, generation);
+            dispatcher.enqueue(owner, new SeriesWrite(seriesKey, dsName, sample.tsEpochMs(), sample.value(), generation));
+        } catch (NgrrdClusterException e) { markTerminal(e); throw e; }
     }
 
     /**
@@ -387,7 +410,8 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
     public void flush() {
         ensureWritable();
         OperationRetry retry = new OperationRetry(Commands.FLUSH);
-        dispatcher.flushSeriesSync(seriesKey, owner, retry.remaining());
+        try { dispatcher.flushGenerationSync(seriesKey, generation, owner, retry.remaining()); }
+        catch (NgrrdClusterException e) { markTerminal(e); throw e; }
         executeSeriesCommand(Commands.FLUSH, retry);
     }
 
@@ -395,7 +419,8 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
     public void checkpoint() {
         ensureWritable();
         OperationRetry retry = new OperationRetry(Commands.CHECKPOINT);
-        dispatcher.flushSeriesSync(seriesKey, owner, retry.remaining());
+        try { dispatcher.flushGenerationSync(seriesKey, generation, owner, retry.remaining()); }
+        catch (NgrrdClusterException e) { markTerminal(e); throw e; }
         executeSeriesCommand(Commands.CHECKPOINT, retry);
     }
 
@@ -411,7 +436,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
 
     private SeriesResult read(String dsName, ViewQuery query, Long endExclusiveEpochMs) {
         ensureOpen();
-        ReadRequest request = ReadRequest.of(seriesKey, dsName, query, endExclusiveEpochMs);
+        ReadRequest request = ReadRequest.of(seriesKey, dsName, query, endExclusiveEpochMs).withGeneration(generation);
         OperationRetry retry = new OperationRetry(Commands.READ);
         for (;;) {
             retry.remaining();
@@ -438,7 +463,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
 
     private Map<String, SeriesResult> readPreset(String presetName, Long endExclusiveEpochMs) {
         ensureOpen();
-        ReadPresetRequest request = new ReadPresetRequest(seriesKey, presetName, endExclusiveEpochMs);
+        ReadPresetRequest request = new ReadPresetRequest(seriesKey, presetName, endExclusiveEpochMs, generation);
         OperationRetry retry = new OperationRetry(Commands.READ_PRESET);
         for (;;) {
             retry.remaining();
@@ -510,7 +535,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
                     + " (orçamento esgotado ou dono inalcançável) — a referência local é liberada mesmo assim");
         } else {
             try {
-                callWithTransportRetry(ownerNodeId, Commands.CLOSE, new SeriesCommandRequest(seriesKey),
+                callWithTransportRetry(ownerNodeId, Commands.CLOSE, new SeriesCommandRequest(seriesKey, generation),
                         SeriesStatusResponse.class, deadlineMs);
             } catch (RuntimeException e) {
                 LOGGER.log(Level.WARNING, "Falha ao fechar remotamente a série " + seriesKey, e);
@@ -541,7 +566,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
             retry.remaining();
             String target = owner;
             SeriesStatusResponse response = callWithTransportRetry(NodeId.of(target), command,
-                    new SeriesCommandRequest(seriesKey), SeriesStatusResponse.class, retry.deadlineMs);
+                    new SeriesCommandRequest(seriesKey, generation), SeriesStatusResponse.class, retry.deadlineMs);
             if (response.status() == SeriesStatus.OK) {
                 return;
             }
@@ -553,6 +578,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
     private void handleRetryableStatus(String command, String target, SeriesStatus status, String ownerNodeId,
             String message, OperationRetry retry) {
         switch (status) {
+            case SERIES_DELETED, QUARANTINED -> throw terminal(status, message);
             case WRONG_OWNER, NOT_OPEN, MIGRATING -> {
                 retry.pause(command, target, status, ownerNodeId);
                 if (status == SeriesStatus.WRONG_OWNER) {
@@ -645,8 +671,8 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
      * Redireciona depois de um {@code WRONG_OWNER} de {@code target}. Com o dono informado e uma cadeia de
      * saltos plausível, segue com ele. Com uma dica contraditória (#177 — o destino com a réplica do catálogo
      * atrasada aponta a origem, que aponta o destino), confirma o dono no líder
-     * ({@link #confirmOwnerAtLeader}). Sem dono, um handle gravável re-resolve como sempre
-     * ({@link PlacementLookup#resolve}); um handle somente leitura confirma direto com o líder
+     * ({@link #confirmOwnerAtLeader}). Sem dono, um handle gravável já vinculado procura sua geração
+     * existente ({@link PlacementLookup#resolveExisting}); um handle somente leitura confirma direto com o líder
      * ({@link PlacementLookup#resolveExistingAtLeader}) — a réplica local pode estar atrasada e devolveria o
      * mesmo dono até o prazo se esgotar. Ausente no líder, a leitura termina em
      * {@link SeriesNotFoundException} com {@code NOT_PLACED} e o handle se fecha.
@@ -679,7 +705,8 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
     /**
      * Desempata no líder uma dica de dono contraditória, com prazo {@code min(restante, requestTimeout)}:
      * encontrado, o dono do líder passa a ser o alvo e o dono confirmado da operação; ausente, um handle
-     * gravável re-resolve com criação e um somente leitura se fecha com {@code NOT_PLACED}; falha ao
+     * gravável já vinculado termina com {@code SERIES_DELETED} e um somente leitura se fecha com
+     * {@code NOT_PLACED}; falha ao
      * consultar segue a dica recebida (a pausa exponencial e o prazo da operação seguem valendo).
      */
     private void confirmOwnerAtLeader(String target, String hint, OperationRetry retry) {
@@ -694,6 +721,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
             if (!writable) {
                 throw absent;
             }
+            if (generation != null) throw terminal(SeriesStatus.SERIES_DELETED, "series removed: " + seriesKey);
             resolver.invalidate(seriesKey);
             owner = resolvePlacement(true, retry.remaining()).ownerNodeId();
             return;
@@ -712,6 +740,15 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
         owner = confirmed.ownerNodeId();
         retry.confirmedOwner = confirmed.ownerNodeId();
         retry.redirectedBy.clear();
+    }
+
+    private NgrrdClusterException terminal(SeriesStatus status, String message) {
+        if (status == SeriesStatus.SERIES_DELETED) resolver.noteDeleted(seriesKey, generation);
+        NgrrdClusterException failure = new NgrrdClusterException(status == SeriesStatus.QUARANTINED
+                ? ErrorCode.QUARANTINED : ErrorCode.SERIES_DELETED, message == null ? status.name() : message);
+        markTerminal(failure);
+        resolver.invalidate(seriesKey);
+        return failure;
     }
 
     private void ensureOpen() {

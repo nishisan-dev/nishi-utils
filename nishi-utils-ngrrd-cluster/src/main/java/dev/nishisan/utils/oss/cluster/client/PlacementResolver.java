@@ -70,6 +70,21 @@ public final class PlacementResolver implements PlacementLookup {
     private final CatalogLookupClient catalogLookupClient;
 
     private final ConcurrentMap<String, CachedOverride> overrides = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, String> deletedGenerations = new ConcurrentHashMap<>();
+
+    /** Mask this generation even while the local replicated placement still lags its removal. */
+    @Override public void noteDeleted(String key, String generation) {
+        if (generation != null) deletedGenerations.put(key, generation);
+        overrides.remove(key);
+    }
+
+    private SeriesPlacement visible(String key, SeriesPlacement placement) {
+        String removed = deletedGenerations.get(key);
+        if (placement == null || removed == null) return placement;
+        if (removed.equals(placement.generationId())) return null;
+        deletedGenerations.remove(key, removed);
+        return placement;
+    }
 
     /**
      * Override local de uma série.
@@ -124,7 +139,7 @@ public final class PlacementResolver implements PlacementLookup {
         // conhecido, não com o relógio do cliente — ver noteOwner).
         SeriesPlacement cached = cachedOverride(seriesKey);
         SeriesPlacement local = catalog.placementLocal(seriesKey).orElse(null);
-        SeriesPlacement freshest = freshest(cached, local);
+        SeriesPlacement freshest = visible(seriesKey, freshest(cached, local));
         if (freshest != null && freshest.state() == PlacementState.ACTIVE) {
             return freshest;
         }
@@ -137,7 +152,7 @@ public final class PlacementResolver implements PlacementLookup {
         Objects.requireNonNull(maxWait, "maxWait");
         SeriesPlacement cached = cachedOverride(seriesKey);
         SeriesPlacement local = catalog.placementLocal(seriesKey).orElse(null);
-        SeriesPlacement freshest = freshest(cached, local);
+        SeriesPlacement freshest = visible(seriesKey, freshest(cached, local));
         if (freshest != null && freshest.state() == PlacementState.ACTIVE) {
             return freshest;
         }
@@ -195,11 +210,15 @@ public final class PlacementResolver implements PlacementLookup {
     @Override
     public Optional<SeriesPlacement> placementCached(String seriesKey) {
         Objects.requireNonNull(seriesKey, "seriesKey");
-        return Optional.ofNullable(freshest(cachedOverride(seriesKey), catalog.placementLocal(seriesKey).orElse(null)));
+        return Optional.ofNullable(visible(seriesKey, freshest(cachedOverride(seriesKey), catalog.placementLocal(seriesKey).orElse(null))));
     }
 
     private SeriesPlacement cachedOverride(String seriesKey) {
         CachedOverride cached = overrides.get(seriesKey);
+        if (cached != null && clock.millis() - cached.storedAtMs() > AUTHORITATIVE_HINT_HOLD.toMillis()) {
+            overrides.remove(seriesKey, cached);
+            return null;
+        }
         return cached != null ? cached.placement() : null;
     }
 
@@ -259,8 +278,18 @@ public final class PlacementResolver implements PlacementLookup {
             if (stamp == Long.MIN_VALUE) {
                 stamp = now;
             }
-            return new CachedOverride(SeriesPlacement.active(ownerNodeId, stamp), false, now);
+            SeriesPlacement known = current != null ? current.placement() : local;
+            SeriesPlacement hint = known == null ? SeriesPlacement.active(ownerNodeId, stamp)
+                    : new SeriesPlacement(ownerNodeId, null, PlacementState.ACTIVE, null, known.createdAtEpochMs(),
+                            stamp, known.geometryId(), known.geometryConfirmed(), known.definitionName(), known.generationId(), null);
+            return new CachedOverride(hint, false, now);
         });
+    }
+
+    @Override public SeriesPlacement resolveFresh(String key, String hash,
+            dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor geometry, Duration wait, String definitionName) {
+        return placeAtLeader(key, hash, geometry, definitionName,
+                clock.millis() + Math.min(wait.toMillis(), retry.timeout().toMillis()));
     }
 
     private SeriesPlacement placeAtLeader(String seriesKey, String definitionHashHex,
@@ -307,6 +336,9 @@ public final class PlacementResolver implements PlacementLookup {
                     LeaderCalls.sleepQuietly(LeaderCalls.cappedBackoff(clock, retry.backoffFor(attempt), deadline,
                             description));
                 }
+                case QUARANTINED -> throw new NgrrdClusterException(ErrorCode.QUARANTINED, response.message());
+                case MIGRATING -> LeaderCalls.sleepQuietly(LeaderCalls.cappedBackoff(clock,
+                        retry.backoffFor(attempt), deadline, description));
                 case NO_STORAGE_NODE_AVAILABLE -> throw new NgrrdClusterException(
                         ErrorCode.NO_STORAGE_NODE_AVAILABLE, response.message());
                 default -> throw new NgrrdClusterException(ErrorCode.REMOTE_ERROR,

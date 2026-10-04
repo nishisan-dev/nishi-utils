@@ -441,6 +441,7 @@ public final class Ngrrd {
         private final ViewExecutor viewExecutor;
         private final boolean ownsStorage;
         private volatile boolean closed;
+        private final java.util.concurrent.atomic.AtomicBoolean storageClosed = new java.util.concurrent.atomic.AtomicBoolean();
 
         DefaultHandle(NgrrdDefinition def, NgrrdStorage storage, String seriesKey,
                       NgrrdWriter writer, NgrrdMetrics metrics,
@@ -499,24 +500,22 @@ public final class Ngrrd {
         }
 
         @Override
-        public void close() {
-            if (closed) {
-                return;
-            }
+        public void closeForDeletion() {
             closed = true;
-            try {
-                writer.close();
-            } finally {
-                // Volumes SHARDED_BLOB são compartilhados (ownsStorage=false) e
-                // fechados pelo BlobVolumeRegistry, não por handle.
-                if (ownsStorage && storage instanceof AutoCloseable ac) {
-                    try {
-                        ac.close();
-                    } catch (Exception e) {
-                        // log opcional — não bloqueia shutdown.
-                    }
-                }
-            }
+            writer.closeForDeletion();
+            closeOwnedStorageOnce();
+        }
+
+        @Override
+        public void close() {
+            closed = true;
+            writer.close();
+            closeOwnedStorageOnce();
+        }
+
+        private void closeOwnedStorageOnce() {
+            // Shared blob volumes belong to the registry, rather than to individual handles.
+            if (storageClosed.compareAndSet(false, true)) closeOwnedStorage(storage, ownsStorage, null);
         }
     }
 }

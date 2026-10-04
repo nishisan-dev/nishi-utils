@@ -25,5 +25,8 @@ package dev.nishisan.utils.oss.cluster.protocol;
  * @param tsEpochMs timestamp da amostra em epoch ms
  * @param value     valor da amostra
  */
-public record SeriesWrite(String seriesKey, String dsName, long tsEpochMs, double value) {
+public record SeriesWrite(String seriesKey, String dsName, long tsEpochMs, double value, String generationId) {
+    public SeriesWrite(String seriesKey, String dsName, long tsEpochMs, double value) {
+        this(seriesKey, dsName, tsEpochMs, value, null);
+    }
 }

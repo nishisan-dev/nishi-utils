@@ -66,6 +66,9 @@ public interface CatalogView {
     /** Grava o placement da série; roteado ao líder pelo próprio {@code DistributedMap}. */
     void putPlacement(String seriesKey, SeriesPlacement placement);
 
+    /** Remove a placement; implementations must route through the leader. */
+    default void removePlacement(String seriesKey) { throw new UnsupportedOperationException("removePlacement"); }
+
     /**
      * Publica/atualiza o status de um storage node; roteado ao líder pelo próprio {@code DistributedMap}
      * — usado por {@code NodeStatusReporter} (isolamento do {@code CatalogService}/{@code DistributedMap}

@@ -49,7 +49,7 @@ class RemoteSeriesRetryBudgetTest {
     /** Quando presente, substitui {@link #responder} e recebe também o nó de destino. */
     private TargetResponder targetResponder;
     /** Resposta do líder a {@code resolveExistingAtLeader}; por padrão, o dono corrente do fake. */
-    private Function<String, SeriesPlacement> atLeader = key -> SeriesPlacement.active(owner, 0);
+    private Function<String, SeriesPlacement> atLeader = key -> new SeriesPlacement(owner, null, dev.nishisan.utils.oss.cluster.catalog.PlacementState.ACTIVE, null, 0, 0, null, false, null, "fixture-generation", null);
 
     private interface Responder {
         SeriesStatusResponse respond(String command, Duration timeout);
@@ -153,7 +153,7 @@ class RemoteSeriesRetryBudgetTest {
     @Test
     void checkpointComDicasAlternadasConsultaOLiderUmaVez() {
         RemoteSeriesHandle handle = handle(0);
-        atLeader = key -> SeriesPlacement.active("c", 0);
+        atLeader = key -> new SeriesPlacement("c", null, dev.nishisan.utils.oss.cluster.catalog.PlacementState.ACTIVE, null, 0, 0, null, false, null, "fixture-generation", null);
         // #177: a origem "a" aponta o destino "c"; "c" (réplica atrasada) aponta de volta "a".
         targetResponder = (target, command, timeout) -> {
             clock.advance(10);
@@ -170,7 +170,7 @@ class RemoteSeriesRetryBudgetTest {
     @Test
     void leituraSomenteLeituraComDicasAlternadasConsultaOLiderUmaVez() {
         RemoteSeriesHandle handle = handle(0, false);
-        atLeader = key -> SeriesPlacement.active("c", 0);
+        atLeader = key -> new SeriesPlacement("c", null, dev.nishisan.utils.oss.cluster.catalog.PlacementState.ACTIVE, null, 0, 0, null, false, null, "fixture-generation", null);
         targetResponder = (target, command, timeout) -> {
             clock.advance(10);
             if (target.equals("a")) return status(SeriesStatus.WRONG_OWNER, "c");
@@ -249,12 +249,15 @@ class RemoteSeriesRetryBudgetTest {
 
     private RemoteSeriesHandle handle(long writeDrainMillis, boolean writable) {
         var lookup = new PlacementLookup() {
-            public SeriesPlacement resolve(String key, String hash) { return SeriesPlacement.active(owner, 0); }
+            public SeriesPlacement resolve(String key, String hash) { return new SeriesPlacement(owner, null, dev.nishisan.utils.oss.cluster.catalog.PlacementState.ACTIVE, null, 0, 0, null, false, null, "fixture-generation", null); }
             public SeriesPlacement resolve(String key, String hash, GeometryDescriptor geometry, Duration maxWait) {
                 if (!initialOpen) lookupBudgets.add(maxWait);
                 return resolve(key, hash);
             }
-            public SeriesPlacement resolveExisting(String key, Duration maxWait) { return resolve(key, null); }
+            public SeriesPlacement resolveExisting(String key, Duration maxWait) {
+                if (!initialOpen) lookupBudgets.add(maxWait);
+                return resolve(key, null);
+            }
             public SeriesPlacement resolveExistingAtLeader(String key, Duration maxWait) {
                 atLeaderBudgets.add(maxWait);
                 return atLeader.apply(key);

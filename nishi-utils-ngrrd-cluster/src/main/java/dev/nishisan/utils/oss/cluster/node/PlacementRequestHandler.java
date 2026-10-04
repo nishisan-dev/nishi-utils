@@ -81,6 +81,8 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
         Set<String> reachableNodeIds();
     }
 
+    private java.util.function.Function<String, SeriesStatus> creationGate = key -> null;
+    public void creationGate(java.util.function.Function<String, SeriesStatus> gate) { creationGate = gate; }
     private final CatalogView catalog;
     private final LeaderView leaderView;
     private final BooleanSupplier leaderSyncing;
@@ -306,6 +308,8 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
             }
             Optional<SeriesPlacement> alreadyPlaced = catalog.placementStrong(request.seriesKey());
             if (alreadyPlaced.isPresent()) {
+                if (alreadyPlaced.get().deletion() != null)
+                    return new PlaceResponse(SeriesStatus.MIGRATING, alreadyPlaced.get(), null, "series deletion in progress");
                 return new PlaceResponse(SeriesStatus.OK, backfillDefinitionName(request, alreadyPlaced.get()), null,
                         null);
             }
@@ -317,6 +321,12 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
             // convergindo) e criar uma cópia vazia noutro nó.
             if (clock.millis() - becameLeaderAtMs < placementGraceAfterLeadership.toMillis()) {
                 return notLeaderResponse();
+            }
+
+            if (!request.explicitAdoption()) {
+                SeriesStatus blocked = creationGate.apply(request.seriesKey());
+                if (blocked != null) return new PlaceResponse(blocked, null, null,
+                        "series=" + request.seriesKey() + "; inspect ngrrd-admin reconcile <node> --adopt");
             }
 
             if (needsAdmissionRebuild) {

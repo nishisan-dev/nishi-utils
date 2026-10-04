@@ -69,6 +69,23 @@ class NgrrdWriterDurabilityTest {
     }
 
     @Test
+    void deletionStopsTheWorkerWithoutWritingFinalLiveState(@TempDir Path tempDir) throws Exception {
+        var def = definition();
+        var storage = new ForceCountingStorage(tempDir);
+        var writer = writer(def, storage, Durability.FSYNC);
+        writer.write("in_octets", new Sample(START_MS, 1_000_000));
+        writer.closeForDeletion();
+        writer.closeForDeletion(); // retry observes the same completed shutdown
+        try (var channel = storage.openSeries(dev.nishisan.utils.oss.storage.StorageKey.series(
+                def.spec().storage().objectNaming(), SERIES_KEY))) {
+            assertEquals(0, dev.nishisan.utils.oss.format.SeriesMetadataReader.lastUpdate(channel),
+                    "deletion shutdown must not checkpoint the live state");
+        }
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+                () -> writer.write("in_octets", new Sample(START_MS + STEP_MS, 2_000_000)));
+    }
+
+    @Test
     void fsyncForcaPorCheckpoint(@TempDir Path tempDir) throws Exception {
         NgrrdDefinition def = definition();
         ForceCountingStorage storage = new ForceCountingStorage(tempDir);

@@ -386,22 +386,22 @@ class SeriesHandleCacheTest {
     private static final class FixedPlacementLookup implements PlacementLookup {
         @Override
         public SeriesPlacement resolve(String seriesKey, String definitionHashHex) {
-            return SeriesPlacement.active(OWNER.value(), 0L);
+            return new SeriesPlacement(OWNER.value(), null, dev.nishisan.utils.oss.cluster.catalog.PlacementState.ACTIVE, null, 0L, 0L, null, false, null, "fixture-generation", null);
         }
 
         @Override
         public SeriesPlacement resolveExisting(String seriesKey, Duration maxWait) {
-            return SeriesPlacement.active(OWNER.value(), 0L);
+            return new SeriesPlacement(OWNER.value(), null, dev.nishisan.utils.oss.cluster.catalog.PlacementState.ACTIVE, null, 0L, 0L, null, false, null, "fixture-generation", null);
         }
 
         @Override
         public SeriesPlacement resolveExistingAtLeader(String seriesKey, Duration maxWait) {
-            return SeriesPlacement.active(OWNER.value(), 0L);
+            return new SeriesPlacement(OWNER.value(), null, dev.nishisan.utils.oss.cluster.catalog.PlacementState.ACTIVE, null, 0L, 0L, null, false, null, "fixture-generation", null);
         }
 
         @Override
         public Optional<SeriesPlacement> placementCached(String seriesKey) {
-            return Optional.of(SeriesPlacement.active(OWNER.value(), 0L));
+            return Optional.of(new SeriesPlacement(OWNER.value(), null, dev.nishisan.utils.oss.cluster.catalog.PlacementState.ACTIVE, null, 0L, 0L, null, false, null, "fixture-generation", null));
         }
 
         @Override

@@ -24,8 +24,17 @@ import dev.nishisan.utils.ngrid.structures.NGridNode;
 import dev.nishisan.utils.ngrid.structures.NGridNodeBuilder;
 import dev.nishisan.utils.oss.Ngrrd;
 import dev.nishisan.utils.oss.NgrrdHandle;
+import dev.nishisan.utils.oss.cluster.api.DeleteResult;
+import dev.nishisan.utils.oss.cluster.protocol.DeleteRequest;
+import dev.nishisan.utils.oss.cluster.protocol.DeleteBatchRequest;
+import dev.nishisan.utils.oss.cluster.protocol.DeleteBatchResponse;
+import dev.nishisan.utils.oss.cluster.protocol.ReconcileRequest;
+import dev.nishisan.utils.oss.cluster.protocol.ReconcileResponse;
+import dev.nishisan.utils.oss.cluster.catalog.StorageCapabilities;
 import dev.nishisan.utils.oss.cluster.api.ClientMetricsSnapshot;
 import dev.nishisan.utils.oss.cluster.api.ErrorCode;
+import dev.nishisan.utils.oss.cluster.api.DeletePrecondition;
+import dev.nishisan.utils.oss.cluster.api.DeleteStatus;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterClient;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterConfig;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
@@ -61,6 +70,10 @@ import java.time.Duration;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.UUID;
+import java.util.Collections;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -124,6 +137,14 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
         this.dispatcher = dispatcher;
         this.handles = handles;
         this.capabilities = capabilities;
+        dispatcher.terminalListener((write, failure) -> {
+            if (failure.code() == ErrorCode.SERIES_DELETED) resolver.noteDeleted(write.seriesKey(), write.generationId());
+            handles.fail(write.seriesKey(), write.generationId(), failure);
+        });
+        dispatcher.generationOwnerListener(hint -> {
+            var handle = handles.get(hint.seriesKey());
+            if (handle != null && Objects.equals(handle.generationId(), hint.generation())) handle.ownerChanged(hint.owner());
+        });
     }
 
     /** Conecta ao cluster ngrrd e devolve um cliente pronto para {@link #open}. */
@@ -203,12 +224,7 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
                     cfg.closeTimeout(), seriesKey -> {
                         RemoteSeriesHandle handle = handles.get(seriesKey);
                         return handle != null && handle.reopen();
-                    }, (seriesKey, newOwner) -> {
-                        RemoteSeriesHandle handle = handles.get(seriesKey);
-                        if (handle != null) {
-                            handle.ownerChanged(newOwner);
-                        }
-                    }, Clock.systemUTC(), cfg.metricsListener(), metricsSupplier);
+                    }, (seriesKey, newOwner) -> { }, Clock.systemUTC(), cfg.metricsListener(), metricsSupplier);
             DefaultNgrrdClusterClient client = new DefaultNgrrdClusterClient(cfg, node, dataDir, temporaryDataDir,
                     rpc, resolver, existence, verifier, dispatcher, handles, capabilities);
             clientRef.set(client);
@@ -309,6 +325,14 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
         String template = SeriesKeyTemplate.templateOf(yaml);
         String seriesKey = SeriesKeyTemplate.resolve(template, tags);
         Ngrrd.OpenOptions effective = options != null ? options : Ngrrd.OpenOptions.defaults();
+        RemoteSeriesHandle cached = handles.get(seriesKey);
+        if (cached != null && cached.isOpen()) {
+            var current = resolver.resolveExistingAtLeader(List.of(seriesKey), config.retryTimeout()).get(seriesKey);
+            if (current == null || !current.generationId().equals(cached.generationId())) {
+                handles.fail(seriesKey, cached.generationId(), new NgrrdClusterException(
+                        ErrorCode.SERIES_DELETED, "series generation removed: " + seriesKey));
+            }
+        }
         return handles.open(seriesKey, effective.createIfMissing(),
                 () -> openNewHandle(seriesKey, yaml, tags, effective));
     }
@@ -322,6 +346,88 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
         } catch (IOException e) {
             throw new UncheckedIOException("falha ao ler a definição YAML: " + yamlFile, e);
         }
+    }
+
+    @Override
+    public DeleteResult deleteSeries(String key, DeletePrecondition precondition) {
+        return deleteSeriesBatch(Map.of(key, precondition)).get(key);
+    }
+
+    @Override
+    public Map<String, DeleteResult> deleteSeriesBatch(Map<String, DeletePrecondition> requests) {
+        ensureOpen();
+        List<DeleteRequest> pending = new ArrayList<>();
+        requests.forEach((key, condition) -> pending.add(new DeleteRequest(
+                key, condition, UUID.randomUUID().toString())));
+        Map<String, DeleteResult> results = new LinkedHashMap<>();
+        long deadline = System.currentTimeMillis() + config.retryTimeout().toMillis();
+        for (int offset = 0; offset < pending.size(); offset += config.catalogLookupBatchSize()) {
+            var inputPage = pending.subList(offset, Math.min(pending.size(), offset + config.catalogLookupBatchSize()));
+            List<DeleteRequest> page = new ArrayList<>();
+            try {
+                Map<String, String> cachedGenerations = new LinkedHashMap<>();
+                for (var request : inputPage) resolver.placementCached(request.seriesKey())
+                        .ifPresent(p -> cachedGenerations.put(request.seriesKey(), p.generationId()));
+                var placements = resolver.resolveExistingAtLeader(inputPage.stream().map(r -> r.seriesKey()).toList(),
+                        LeaderCalls.remainingUntil(Clock.systemUTC(), deadline, "series.delete lookup"));
+                for (var request : inputPage) {
+                    var placement = placements.get(request.seriesKey());
+                    if (placement == null) {
+                        results.put(request.seriesKey(), DeleteResult.of(DeleteStatus.NOT_FOUND, null));
+                        String knownGeneration = cachedGenerations.get(request.seriesKey());
+                        resolver.noteDeleted(request.seriesKey(), knownGeneration);
+                        if (knownGeneration != null) handles.fail(request.seriesKey(), knownGeneration,
+                                new NgrrdClusterException(ErrorCode.SERIES_DELETED, "series absent: " + request.seriesKey()));
+                    } else page.add(new DeleteRequest(request.seriesKey(),
+                            request.precondition(), request.operationId(), placement.generationId()));
+                }
+                if (page.isEmpty()) continue;
+                var response = callDeletePage(page, deadline);
+                for (var request : page) {
+                    var result = response.results().getOrDefault(request.seriesKey(),
+                            DeleteResult.error(ErrorCode.REMOTE_ERROR, "incomplete deletion response"));
+                    results.put(request.seriesKey(), result);
+                    if (result.status() == DeleteStatus.DELETED || result.status() == DeleteStatus.NOT_FOUND)
+                    {
+                        resolver.noteDeleted(request.seriesKey(), request.generationId());
+                        handles.fail(request.seriesKey(), request.generationId(), new NgrrdClusterException(
+                                ErrorCode.SERIES_DELETED, "series deleted: " + request.seriesKey()));
+                    }
+                }
+            } catch (NgrrdClusterException e) {
+                for (var request : inputPage) results.putIfAbsent(request.seriesKey(), DeleteResult.error(e.code(), e.getMessage()));
+            }
+        }
+        return Collections.unmodifiableMap(results);
+    }
+
+    private DeleteBatchResponse callDeletePage(
+            List<DeleteRequest> page, long deadline) {
+        for (;;) {
+            NodeId leader = LeaderCalls.awaitLeaderOrThrow(rpc, Clock.systemUTC(), deadline, "series.delete");
+            capabilities.require(leader.value(), StorageCapabilities.SERIES_DELETE,
+                    LeaderCalls.remainingUntil(Clock.systemUTC(), deadline, "series.delete"));
+            try {
+                var response = rpc.call(leader, Commands.SERIES_DELETE_BATCH,
+                        new DeleteBatchRequest(page),
+                        DeleteBatchResponse.class,
+                        LeaderCalls.remainingUntil(Clock.systemUTC(), deadline, "series.delete"));
+                boolean retry = response.results().values().stream().anyMatch(r -> r.errorCode() == ErrorCode.NO_LEADER);
+                if (!retry) return response;
+            } catch (NgrrdClusterException e) {
+                if (!TransportRetry.isTransportFailure(e)) throw e;
+            }
+            LeaderCalls.sleepQuietly(LeaderCalls.cappedBackoff(Clock.systemUTC(), config.retryBackoffMin(), deadline, "series.delete"));
+        }
+    }
+
+    @Override
+    public ReconcileResponse reconcile(String nodeId,
+            ReconcileRequest request) {
+        ensureOpen();
+        capabilities.require(nodeId, StorageCapabilities.RECONCILE, config.retryTimeout());
+        return rpc.call(NodeId.of(nodeId), Commands.RECONCILE, request,
+                ReconcileResponse.class, config.retryTimeout());
     }
 
     @Override

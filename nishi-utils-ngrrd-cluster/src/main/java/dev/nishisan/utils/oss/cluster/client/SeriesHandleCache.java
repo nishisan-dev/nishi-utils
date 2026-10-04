@@ -56,6 +56,11 @@ import java.util.function.Supplier;
 final class SeriesHandleCache {
 
     private final ConcurrentMap<String, RemoteSeriesHandle> handles = new ConcurrentHashMap<>();
+    void fail(String key, String generation, dev.nishisan.utils.oss.cluster.api.NgrrdClusterException failure) {
+        RemoteSeriesHandle handle = handles.get(key);
+        if (handle != null) handle.failGeneration(generation, failure);
+    }
+
     private final ConcurrentMap<String, Object> openLocks = new ConcurrentHashMap<>();
 
     /**

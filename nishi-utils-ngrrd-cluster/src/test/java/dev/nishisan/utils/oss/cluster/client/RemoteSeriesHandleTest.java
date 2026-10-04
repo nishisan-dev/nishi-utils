@@ -105,6 +105,17 @@ class RemoteSeriesHandleTest {
     }
 
     @Test
+    void boundHandleWhosePlacementDisappearedNeverCreatesAnotherGeneration() {
+        var handle = openedHandle();
+        resolver.resolveExistingFailure = new SeriesNotFoundException(SERIES_KEY, SeriesNotFoundException.Reason.NOT_PLACED);
+        rpc.respondNext((cmd, body) -> response(cmd, SeriesStatus.NOT_OPEN, OWNER_A.value()));
+        assertEquals(ErrorCode.SERIES_DELETED, assertThrows(NgrrdClusterException.class, () -> handle.read("daily")).code());
+        assertEquals(1, resolver.resolveCalls.get());
+        assertEquals(1, resolver.resolveExistingCalls.get());
+        assertFalse(handle.isOpen());
+    }
+
+    @Test
     void openComWrongOwnerNaPrimeiraTentativaAbreNoSegundoDono() {
         RemoteSeriesHandle handle = newHandle();
         rpc.respondNext((cmd, body) -> new SeriesStatusResponse(SeriesStatus.WRONG_OWNER, OWNER_B.value(), null));
@@ -581,9 +592,9 @@ class RemoteSeriesHandleTest {
 
         handle.read("daily");
 
-        assertEquals(2, resolver.resolveCalls.get(), "gravável re-resolve pelo caminho de sempre");
+        assertEquals(1, resolver.resolveCalls.get(), "só o primeiro open pode criar uma geração");
         assertEquals(0, resolver.resolveExistingAtLeaderCalls.get());
-        assertEquals(0, resolver.resolveExistingCalls.get());
+        assertEquals(1, resolver.resolveExistingCalls.get());
     }
 
     @Test
@@ -868,7 +879,7 @@ class RemoteSeriesHandleTest {
         @Override
         public SeriesPlacement resolve(String seriesKey, String definitionHashHex) {
             resolveCalls.incrementAndGet();
-            return SeriesPlacement.active(owner, 0L);
+            return new SeriesPlacement(owner, null, dev.nishisan.utils.oss.cluster.catalog.PlacementState.ACTIVE, null, 0L, 0L, null, false, null, "fixture-generation", null);
         }
 
         @Override
@@ -877,7 +888,7 @@ class RemoteSeriesHandleTest {
             if (resolveExistingFailure != null) {
                 throw resolveExistingFailure;
             }
-            return SeriesPlacement.active(owner, 0L);
+            return new SeriesPlacement(owner, null, dev.nishisan.utils.oss.cluster.catalog.PlacementState.ACTIVE, null, 0L, 0L, null, false, null, "fixture-generation", null);
         }
 
         @Override
@@ -886,12 +897,12 @@ class RemoteSeriesHandleTest {
             if (resolveExistingFailure != null) {
                 throw resolveExistingFailure;
             }
-            return SeriesPlacement.active(owner, 0L);
+            return new SeriesPlacement(owner, null, dev.nishisan.utils.oss.cluster.catalog.PlacementState.ACTIVE, null, 0L, 0L, null, false, null, "fixture-generation", null);
         }
 
         @Override
         public Optional<SeriesPlacement> placementCached(String seriesKey) {
-            return Optional.of(SeriesPlacement.active(owner, 0L));
+            return Optional.of(new SeriesPlacement(owner, null, dev.nishisan.utils.oss.cluster.catalog.PlacementState.ACTIVE, null, 0L, 0L, null, false, null, "fixture-generation", null));
         }
 
         @Override

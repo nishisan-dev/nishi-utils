@@ -54,6 +54,7 @@ import java.util.function.Function;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * Cobre {@link WriteDispatcher} com {@link RecordingClusterRpc} fake: batching
@@ -1059,6 +1060,50 @@ class WriteDispatcherTest {
      * {@link PlacementLookup} fake: grava as chamadas de {@code noteOwner}/{@code invalidate} e responde a
      * consulta em lote ao líder com {@link #atLeader} (contando as chamadas).
      */
+    @Test
+    void explicitNewGenerationRetiresQueuedWritesAndIgnoresLateReply() throws Exception {
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        newDispatcher(1, Duration.ofMillis(10), 1000, NgrrdClusterConfig.BufferFullPolicy.BLOCK,
+                key -> { fail("retired generation must not reopen"); return false; });
+        dispatcher.beginGeneration("s", "old", OWNER_A.value());
+        rpc.respondNext((command, body) -> {
+            entered.countDown(); awaitLatch(release);
+            return new WriteBatchResponse(Map.of("s", SeriesStatus.NOT_OPEN), Map.of(), Map.of());
+        });
+        rpc.respondDefault((command, body) -> okFor((WriteBatchRequest) body));
+        try {
+            dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 1, 1, "old"));
+            assertTrue(entered.await(2, TimeUnit.SECONDS));
+            dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 2, 2, "old"));
+            dispatcher.beginGeneration("s", "new", OWNER_B.value());
+            assertEquals(ErrorCode.SERIES_DELETED, assertThrows(NgrrdClusterException.class,
+                    () -> dispatcher.flushGenerationSync("s", "old", OWNER_A.value(), AWAIT_TIMEOUT)).code());
+            dispatcher.enqueue(OWNER_B.value(), new SeriesWrite("s", "in_octets", 3, 3, "new"));
+            dispatcher.flushGenerationSync("s", "new", OWNER_B.value(), AWAIT_TIMEOUT);
+            assertEquals(2, dispatcher.samplesFailed());
+            assertEquals(1, dispatcher.samplesSent());
+        } finally { release.countDown(); }
+        dispatcher.flushAllSync();
+        assertEquals(ErrorCode.SERIES_DELETED, assertThrows(NgrrdClusterException.class,
+                () -> dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 4, 4, "old"))).code());
+    }
+
+    @Test
+    void quarantineIsTerminalAndDoesNotRetryCreation() {
+        newDispatcher(1, Duration.ofMillis(10), 1000, NgrrdClusterConfig.BufferFullPolicy.BLOCK,
+                key -> { fail("quarantine must not reopen"); return false; });
+        dispatcher.beginGeneration("s", "g", OWNER_A.value());
+        rpc.respondDefault((command, body) -> new WriteBatchResponse(Map.of("s", SeriesStatus.QUARANTINED),
+                Map.of(), Map.of("s", "execute reconcile --adopt")));
+        dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 1, 1, "g"));
+        assertEquals(ErrorCode.QUARANTINED, assertThrows(NgrrdClusterException.class,
+                () -> dispatcher.flushGenerationSync("s", "g", OWNER_A.value(), AWAIT_TIMEOUT)).code());
+        assertEquals(ErrorCode.QUARANTINED, assertThrows(NgrrdClusterException.class,
+                () -> dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 2, 2, "g"))).code());
+        assertEquals(1, rpc.calls().size());
+    }
+
     private static final class FakePlacementLookup implements PlacementLookup {
         final List<String> notedOwners = new CopyOnWriteArrayList<>();
         final List<String> invalidated = new CopyOnWriteArrayList<>();

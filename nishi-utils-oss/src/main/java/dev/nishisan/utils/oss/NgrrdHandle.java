@@ -94,6 +94,9 @@ public interface NgrrdHandle extends AutoCloseable {
      */
     SeriesResult read(String dsName, ViewQuery query, long endExclusiveEpochMs);
 
+    /** Stop without a final checkpoint, before deletion. Unsupported implementations must fail closed. */
+    default void closeForDeletion() { throw new UnsupportedOperationException("closeForDeletion"); }
+
     @Override
     void close();
 }

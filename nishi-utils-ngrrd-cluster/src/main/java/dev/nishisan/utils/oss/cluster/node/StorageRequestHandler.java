@@ -344,9 +344,28 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
 
     @Override
     protected Object handle(String command, Object body, NodeId source) {
+        if (command.equals(Commands.OPEN)) return handleOpen((OpenRequest) body);
+        if (command.equals(Commands.WRITE_BATCH)) return handleWriteBatch((WriteBatchRequest) body);
+        String key = body instanceof SeriesCommandRequest r ? r.seriesKey()
+                : body instanceof ReadRequest r ? r.seriesKey() : body instanceof ReadPresetRequest r ? r.seriesKey() : null;
+        String generation = body instanceof SeriesCommandRequest r ? r.generationId()
+                : body instanceof ReadRequest r ? r.generationId() : body instanceof ReadPresetRequest r ? r.generationId() : null;
+        if (key == null) return dispatch(command, body);
+        try (var guard = CoordinationLocks.acquire(registry.operationLock(key))) {
+            SeriesStatus blocked = registry.lifecycle() == null ? null : registry.lifecycle().gate(key, generation);
+            if (blocked != null) {
+                recordError(blocked);
+                String message = registry.lifecycle().message(blocked, key);
+                if (body instanceof ReadRequest) return new ReadResponse(blocked, self.value(), null, message);
+                if (body instanceof ReadPresetRequest) return new ReadPresetResponse(blocked, self.value(), null, message);
+                return new SeriesStatusResponse(blocked, self.value(), message);
+            }
+            return dispatch(command, body);
+        }
+    }
+
+    private Object dispatch(String command, Object body) {
         return switch (command) {
-            case Commands.OPEN -> handleOpen((OpenRequest) body);
-            case Commands.WRITE_BATCH -> handleWriteBatch((WriteBatchRequest) body);
             case Commands.CHECKPOINT -> handleCheckpoint((SeriesCommandRequest) body);
             case Commands.FLUSH -> handleFlush((SeriesCommandRequest) body);
             case Commands.READ -> handleRead((ReadRequest) body);
@@ -354,7 +373,7 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
             case Commands.CLOSE -> handleClose((SeriesCommandRequest) body);
             case Commands.SERIES_EXISTS -> handleSeriesExists((SeriesExistsRequest) body);
             case Commands.SERIES_EXISTS_BATCH -> handleSeriesExistsBatch((SeriesExistsBatchRequest) body);
-            default -> throw new IllegalArgumentException("Comando não suportado por StorageRequestHandler: " + command);
+            default -> throw new IllegalArgumentException(command);
         };
     }
 
@@ -405,6 +424,15 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
 
     private SeriesStatusResponse handleOpen(OpenRequest request) {
         try (var guard = CoordinationLocks.acquire(registry.operationLock(request.seriesKey()))) {
+            if (registry.lifecycle() != null) {
+                String generation = request.placementHint() == null ? null : request.placementHint().generationId();
+                SeriesStatus blocked = registry.lifecycle().beforeOpen(request.seriesKey(), generation);
+                if (blocked != null) {
+                    recordError(blocked);
+                    String owner = blocked == SeriesStatus.WRONG_OWNER ? registry.lifecycle().ownerHint(request.seriesKey()) : self.value();
+                    return new SeriesStatusResponse(blocked, owner, registry.lifecycle().message(blocked, request.seriesKey()));
+                }
+            }
             if (registry.isMigrating(request.seriesKey())) {
                 return new SeriesStatusResponse(SeriesStatus.MIGRATING, self.value(), null);
             }
@@ -542,6 +570,17 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
     }
 
     private WriteBatchResponse handleWriteBatch(WriteBatchRequest request) {
+        java.util.List<CoordinationLocks.Guard> locks = new java.util.ArrayList<>();
+        try {
+            for (Object lock : registry.operationLocks(request.writes().stream().map(SeriesWrite::seriesKey).toList()))
+                locks.add(CoordinationLocks.acquire(lock));
+            return handleWriteBatchLocked(request);
+        } finally {
+            for (int i = locks.size() - 1; i >= 0; i--) locks.get(i).close();
+        }
+    }
+
+    private WriteBatchResponse handleWriteBatchLocked(WriteBatchRequest request) {
         writeBatchesCount.increment();
         Map<String, SeriesStatus> statusBySeries = new LinkedHashMap<>();
         Map<String, String> ownerBySeries = new LinkedHashMap<>();
@@ -553,8 +592,41 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
         // Dono de todas as séries do lote de uma vez: os redirecionamentos que precisam de confirmação no
         // líder saem numa única consulta (issue #177).
         Map<String, Ownership> ownerships = ownershipBatch(writesBySeries.keySet(), null);
+        Map<String, SeriesStatus> gates = new LinkedHashMap<>();
+        if (registry.lifecycle() != null) {
+            for (var series : writesBySeries.entrySet()) {
+                SeriesStatus blocked = null;
+                for (SeriesWrite write : series.getValue()) {
+                    blocked = registry.lifecycle().gate(series.getKey(), write.generationId());
+                    if (blocked != null) break;
+                }
+                if (blocked != null) gates.put(series.getKey(), blocked);
+            }
+            var admitted = writesBySeries.keySet().stream().filter(key -> !gates.containsKey(key)
+                    && ownerships.get(key).status() == SeriesStatus.OK).toList();
+            try {
+                registry.lifecycle().receipts(admitted);
+                // A legacy writer may have had no local journal yet. Check its tokens against
+                // the generation initialized by the authoritative placement before admitting samples.
+                for (String key : admitted) for (var write : writesBySeries.get(key)) {
+                    var blocked = registry.lifecycle().gate(key, write.generationId());
+                    if (blocked != null) gates.put(key, blocked);
+                }
+            }
+            catch (RuntimeException e) {
+                for (String key : admitted) { gates.put(key, SeriesStatus.ERROR); errorBySeries.put(key, describe(e)); }
+            }
+        }
         for (Map.Entry<String, List<SeriesWrite>> entry : writesBySeries.entrySet()) {
             String seriesKey = entry.getKey();
+            if (gates.containsKey(seriesKey)) {
+                SeriesStatus blocked = gates.get(seriesKey);
+                statusBySeries.put(seriesKey, blocked);
+                errorBySeries.putIfAbsent(seriesKey, registry.lifecycle().message(blocked, seriesKey));
+                recordError(blocked);
+                samplesFailedCount.add(entry.getValue().size());
+                continue;
+            }
             Ownership ownership = ownerships.get(seriesKey);
             if (ownership.status() != SeriesStatus.OK) {
                 statusBySeries.put(seriesKey, ownership.status());
@@ -847,6 +919,7 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
     private void onOwnershipChanged(String seriesKey) {
         ownershipGenerations.incrementAndGet(generationStripe(seriesKey));
         confirmedPlacements.remove(seriesKey);
+        negativeLookupCacheExpiryMs.remove(seriesKey);
     }
 
     private static int generationStripe(String seriesKey) {

@@ -378,7 +378,8 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
                 handlerMetrics.redirectConfirmations(),
                 handlerMetrics.redirectOverrides(),
                 handlerMetrics.redirectConfirmationFailures(),
-                handlerMetrics.redirectCacheHits());
+                handlerMetrics.redirectCacheHits()).withLifecycleMetrics(registry.lifecycle() == null
+                        ? java.util.Map.of() : registry.lifecycle().metrics());
     }
 
     /**

@@ -37,6 +37,8 @@ import java.util.Objects;
  * @param updatedAtEpochMs instante da última transição desta entrada
  * @param geometryId reference to the immutable physical descriptor, or null for legacy records
  * @param geometryConfirmed whether the current owner confirmed the persisted geometry
+ * @param generationId stable series generation; a fresh placement gets a new token
+ * @param deletion durable deletion reservation, or null
  * @param definitionName {@code metadata.name} da definição ngrrd da série (issue #167, item 3), alimentado
  *                       pelo {@code PlaceRequest} do cliente e usado pelas regras de placement no rebalance;
  *                       {@code null} num placement legado (criado antes deste campo ou por adoção) — o
@@ -50,7 +52,7 @@ public record SeriesPlacement(
         long createdAtEpochMs,
         long updatedAtEpochMs,
         String geometryId, boolean geometryConfirmed,
-        String definitionName) implements Serializable {
+        String definitionName, String generationId, SeriesDeletion deletion) implements Serializable {
 
     /**
      * B1 (achado do Debugger): o {@code NMapPersistence} do core grava o WAL via
@@ -59,6 +61,18 @@ public record SeriesPlacement(
      * mesmo com {@code persistenceMode = ASYNC_WITH_FSYNC} configurado.
      */
     private static final long serialVersionUID = 1L;
+
+    public SeriesPlacement(String ownerNodeId, String targetNodeId, PlacementState state, String migrationId,
+            long createdAtEpochMs, long updatedAtEpochMs, String geometryId, boolean geometryConfirmed,
+            String definitionName) {
+        this(ownerNodeId, targetNodeId, state, migrationId, createdAtEpochMs, updatedAtEpochMs,
+                geometryId, geometryConfirmed, definitionName, null, null);
+    }
+
+    public SeriesPlacement withDeletion(SeriesDeletion value, long now) {
+        return new SeriesPlacement(ownerNodeId, targetNodeId, state, migrationId, createdAtEpochMs,
+                now, geometryId, geometryConfirmed, definitionName, generationId, value);
+    }
 
     public SeriesPlacement(String ownerNodeId, String targetNodeId, PlacementState state, String migrationId,
             long createdAtEpochMs, long updatedAtEpochMs) {
@@ -75,16 +89,18 @@ public record SeriesPlacement(
     /** Changes only geometry metadata; ownership, migration identity and definition name are preserved. */
     public SeriesPlacement withGeometry(String id, boolean confirmed, long now) {
         return new SeriesPlacement(ownerNodeId, targetNodeId, state, migrationId, createdAtEpochMs, now, id, confirmed,
-                definitionName);
+                definitionName, generationId, deletion);
     }
 
     /** Grava o nome da definição (branco = {@code null}); dono, migração e geometria são preservados. */
     public SeriesPlacement withDefinitionName(String name, long now) {
         return new SeriesPlacement(ownerNodeId, targetNodeId, state, migrationId, createdAtEpochMs, now, geometryId,
-                geometryConfirmed, name);
+                geometryConfirmed, name, generationId, deletion);
     }
 
     public SeriesPlacement {
+        // Stable identity for records written before generation fencing existed.
+        if (generationId == null) generationId = "legacy:" + createdAtEpochMs;
         if (geometryConfirmed && geometryId == null) {
             throw new IllegalArgumentException("confirmed geometry requires an id");
         }
@@ -109,7 +125,8 @@ public record SeriesPlacement(
 
     /** Cria o placement inicial de uma série recém-colocada em {@code owner}. */
     public static SeriesPlacement active(String owner, long now) {
-        return new SeriesPlacement(owner, null, PlacementState.ACTIVE, null, now, now);
+        return new SeriesPlacement(owner, null, PlacementState.ACTIVE, null, now, now, null, false, null,
+                java.util.UUID.randomUUID().toString(), null);
     }
 
     /**
@@ -124,7 +141,7 @@ public record SeriesPlacement(
         }
         return new SeriesPlacement(current.ownerNodeId(), target, PlacementState.MIGRATING, migrationId,
                 current.createdAtEpochMs(), now, current.geometryId(), current.geometryConfirmed(),
-                current.definitionName());
+                current.definitionName(), current.generationId(), current.deletion());
     }
 
     /**
@@ -139,7 +156,7 @@ public record SeriesPlacement(
         }
         return new SeriesPlacement(migrating.targetNodeId(), null, PlacementState.ACTIVE, null,
                 migrating.createdAtEpochMs(), now, migrating.geometryId(), migrating.geometryConfirmed(),
-                migrating.definitionName());
+                migrating.definitionName(), migrating.generationId(), migrating.deletion());
     }
 
     /**
@@ -154,7 +171,7 @@ public record SeriesPlacement(
         }
         return new SeriesPlacement(migrating.ownerNodeId(), null, PlacementState.ACTIVE, null,
                 migrating.createdAtEpochMs(), now, migrating.geometryId(), migrating.geometryConfirmed(),
-                migrating.definitionName());
+                migrating.definitionName(), migrating.generationId(), migrating.deletion());
     }
 
     /** Indica se {@code nodeId} é o dono atual desta série. */

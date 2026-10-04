@@ -17,6 +17,9 @@
 
 package dev.nishisan.utils.oss.cluster.admin;
 
+import dev.nishisan.utils.oss.cluster.api.*;
+import dev.nishisan.utils.oss.cluster.protocol.ReconcileRequest;
+
 import dev.nishisan.utils.oss.cluster.NgrrdCluster;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterClient;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterConfig;
@@ -42,7 +45,7 @@ import java.util.stream.Collectors;
 /**
  * CLI de administração do cluster ngrrd (seção 4 da spec do M4):
  * {@code java -cp ... dev.nishisan.utils.oss.cluster.admin.NgrrdClusterAdminCli --seed host:port
- * [--client-id x] <status|metrics <nodeId>|drain <nodeId>|activate <nodeId>|forget-node <nodeId>|rebalance>}.
+ * [--client-id x] <status|metrics <nodeId>|drain <nodeId>|activate <nodeId>|forget-node <nodeId>|rebalance|series-delete <seriesKey> [--last-write-before <epoch-ms>]|reconcile <nodeId> [--adopt|--purge-orphans] [--series <seriesKey>]>}.
  *
  * <p>Entra na malha como cliente transparente ({@code roles client+leader-ineligible}, o mesmo papel de
  * {@link NgrrdClusterClient}), executa um único comando e sai — sem dependência de nenhuma biblioteca de
@@ -52,7 +55,7 @@ import java.util.stream.Collectors;
 public final class NgrrdClusterAdminCli {
 
     private static final String USAGE = "uso: NgrrdClusterAdminCli --seed host:port [--client-id x] "
-            + "<status|metrics <nodeId>|drain <nodeId>|activate <nodeId>|forget-node <nodeId>|rebalance>";
+            + "<status|metrics <nodeId>|drain <nodeId>|activate <nodeId>|forget-node <nodeId>|rebalance|series-delete <seriesKey> [--last-write-before <epoch-ms>]|reconcile <nodeId> [--adopt|--purge-orphans] [--series <seriesKey>]>";
 
     public static void main(String[] args) {
         int exitCode = new NgrrdClusterAdminCli().run(args, System.out, System.err);
@@ -105,6 +108,18 @@ public final class NgrrdClusterAdminCli {
     private int execute(ParsedArgs parsed, NgrrdClusterClient client, PrintStream out, PrintStream err) {
         try {
             switch (parsed.command) {
+                case "series-delete" -> {
+                    DeleteResult result = client.deleteSeries(parsed.nodeId, new DeletePrecondition(parsed.cutoff));
+                    out.println(result.status() + " série=" + parsed.nodeId + " dono=" + result.ownerNodeId());
+                    if (result.message() != null) err.println(result.errorCode() + ": " + result.message());
+                    return result.status() == DeleteStatus.DELETED || result.status() == DeleteStatus.NOT_FOUND ? 0 : 1;
+                }
+                case "reconcile" -> {
+                    var response = client.reconcile(parsed.nodeId, new ReconcileRequest(parsed.reconcileAction, parsed.series));
+                    response.results().forEach((key, result) -> out.println(result + " série=" + key));
+                    out.println("QUARANTINED_BYTES: " + response.quarantinedBytes());
+                    return response.results().values().stream().anyMatch(value -> value.startsWith("ERROR") || value.startsWith("REFUSED")) ? 1 : 0;
+                }
                 case "status" -> {
                     printStatus(client.clusterStatus(), out);
                     return 0;
@@ -215,6 +230,8 @@ public final class NgrrdClusterAdminCli {
         out.println("REDIRECT_OVERRIDES: " + snapshot.redirectOverrides());
         out.println("REDIRECT_CONFIRMATION_FAILURES: " + snapshot.redirectConfirmationFailures());
         out.println("REDIRECT_CACHE_HITS: " + snapshot.redirectCacheHits());
+        snapshot.lifecycleMetrics().entrySet().stream().sorted(java.util.Map.Entry.comparingByKey())
+                .forEach(entry -> out.println(entry.getKey() + ": " + entry.getValue()));
     }
 
     /**
@@ -258,9 +275,10 @@ public final class NgrrdClusterAdminCli {
     }
 
     /** Argumentos já parseados e validados de {@link #run(String[], PrintStream, PrintStream)}. */
-    private record ParsedArgs(String seed, String clientId, String command, String nodeId) {
+    private record ParsedArgs(String seed, String clientId, String command, String nodeId,
+                              long cutoff, ReconcileRequest.Action reconcileAction, String series) {
 
-        private static final List<String> NODE_ID_COMMANDS = List.of("metrics", "drain", "activate", "forget-node");
+        private static final List<String> NODE_ID_COMMANDS = List.of("metrics", "drain", "activate", "forget-node", "reconcile", "series-delete");
 
         static ParsedArgs parse(String[] args) {
             if (args == null) {
@@ -268,6 +286,10 @@ public final class NgrrdClusterAdminCli {
             }
             String seed = null;
             String clientId = null;
+            long cutoff = System.currentTimeMillis();
+            boolean cutoffSpecified = false;
+            ReconcileRequest.Action action = ReconcileRequest.Action.REPORT;
+            String series = null;
             List<String> positional = new ArrayList<>();
             int i = 0;
             while (i < args.length) {
@@ -278,6 +300,14 @@ public final class NgrrdClusterAdminCli {
                 } else if ("--client-id".equals(arg)) {
                     clientId = requireValue(args, i + 1, "--client-id");
                     i += 2;
+                } else if ("--last-write-before".equals(arg)) {
+                    cutoff = Long.parseLong(requireValue(args, i + 1, arg)); cutoffSpecified = true; i += 2;
+                } else if ("--series".equals(arg)) {
+                    series = requireValue(args, i + 1, arg); i += 2;
+                } else if ("--adopt".equals(arg) || "--purge-orphans".equals(arg)) {
+                    if (action != ReconcileRequest.Action.REPORT) throw new IllegalArgumentException("--adopt and --purge-orphans are mutually exclusive");
+                    action = "--adopt".equals(arg) ? ReconcileRequest.Action.ADOPT : ReconcileRequest.Action.PURGE;
+                    i++;
                 } else {
                     positional.add(arg);
                     i += 1;
@@ -298,7 +328,13 @@ public final class NgrrdClusterAdminCli {
             String resolvedClientId = clientId != null && !clientId.isBlank()
                     ? clientId
                     : "ngrrd-cluster-admin-" + UUID.randomUUID().toString().substring(0, 8);
-            return new ParsedArgs(seed, resolvedClientId, command, nodeId);
+            if ((action != ReconcileRequest.Action.REPORT || series != null) && !"reconcile".equals(command))
+                throw new IllegalArgumentException("reconcile options require reconcile");
+            if (cutoff < 0 || (cutoffSpecified && !"series-delete".equals(command)))
+                throw new IllegalArgumentException("--last-write-before requires series-delete and a non-negative epoch-ms");
+            if (("reconcile".equals(command) || "series-delete".equals(command)) && positional.size() != 2)
+                throw new IllegalArgumentException("unexpected arguments for " + command);
+            return new ParsedArgs(seed, resolvedClientId, command, nodeId, cutoff, action, series);
         }
 
         private static String requireValue(String[] args, int index, String flag) {

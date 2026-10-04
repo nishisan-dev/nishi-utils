@@ -170,7 +170,8 @@ class MigrationCoordinatorTest {
     @Test
     void destinoComReplicaDoCatalogoAtrasadaNaExecucaoResultaEmSkipped() throws Exception {
         newCoordinator(2);
-        catalog.putPlacement("s1", SeriesPlacement.active(SRC, 1_000L));
+        var before = SeriesPlacement.active(SRC, 1_000L);
+        catalog.putPlacement("s1", before);
         catalog.putNodeStatus(withReplica(DST, new CatalogReplicaStatus(false, 5_000L, 9_000L, 4_001L, false, false,
                 true)));
 
@@ -179,7 +180,7 @@ class MigrationCoordinatorTest {
         assertEquals(MigrationOutcome.SKIPPED, result.outcome());
         assertEquals("destino " + DST + " com réplica do catálogo atrasada: lag=5000>1000", result.reason());
         assertTrue(rpc.calls().isEmpty(), "não deveria ter feito nenhuma chamada RPC");
-        assertEquals(SeriesPlacement.active(SRC, 1_000L), catalog.placementStrong("s1").orElseThrow());
+        assertEquals(before, catalog.placementStrong("s1").orElseThrow());
     }
 
     @Test
@@ -234,7 +235,8 @@ class MigrationCoordinatorTest {
     @Test
     void destinoNaCotaDeSeriesNaExecucaoResultaEmSkipped() throws Exception {
         newCoordinator(2);
-        catalog.putPlacement("s1", SeriesPlacement.active(SRC, 1_000L));
+        var before = SeriesPlacement.active(SRC, 1_000L);
+        catalog.putPlacement("s1", before);
         catalog.putNodeStatus(new StorageNodeStatus(DST, NodeState.ACTIVE, 5, 0, 0, 1L, DistributionMode.COUNT, 1, 0,
                 StorageCapabilities.ALL, CatalogReplicaStatus.ofLeader(), 5, 0, null));
 
@@ -243,7 +245,7 @@ class MigrationCoordinatorTest {
         assertEquals(MigrationOutcome.SKIPPED, result.outcome());
         assertEquals("destino " + DST + " inelegível: quota_series(6/5)", result.reason());
         assertTrue(rpc.calls().isEmpty(), "não deveria ter feito nenhuma chamada RPC");
-        assertEquals(SeriesPlacement.active(SRC, 1_000L), catalog.placementStrong("s1").orElseThrow());
+        assertEquals(before, catalog.placementStrong("s1").orElseThrow());
     }
 
     @Test

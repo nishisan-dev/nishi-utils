@@ -120,6 +120,17 @@ public final class Commands {
     public static final Set<String> MIGRATION_COMMANDS = Set.of(
             MIGRATE_START, MIGRATE_PREPARE, MIGRATE_CHUNK, MIGRATE_PATCH, MIGRATE_COMMIT, MIGRATE_ABORT, MIGRATE_FINISH, MIGRATE_STATUS);
 
+    public static final String SERIES_DELETE = "ngrrd.series.delete";
+    public static final String SERIES_DELETE_BATCH = "ngrrd.series.delete.batch";
+    public static final String DELETE_PREPARE = "ngrrd.series.delete.prepare";
+    public static final String DELETE_COMMIT = "ngrrd.series.delete.commit";
+    public static final String DELETE_APPLY = "ngrrd.series.delete.apply";
+    public static final String DELETE_ABORT = "ngrrd.series.delete.abort";
+    public static final String DELETE_FINISH = "ngrrd.series.delete.finish";
+    public static final String DELETE_RECOVER = "ngrrd.series.delete.recover";
+    public static final String SERIES_INSPECT = "ngrrd.series.inspect";
+    public static final String RECONCILE = "ngrrd.admin.reconcile";
+
     private Commands() {
     }
 }

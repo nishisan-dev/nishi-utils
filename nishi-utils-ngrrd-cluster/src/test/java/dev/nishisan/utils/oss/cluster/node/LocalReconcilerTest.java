@@ -146,17 +146,13 @@ class LocalReconcilerTest {
     // ---------------------------------------------------------------- adoção
 
     @Test
-    void serieNoVolumeAusenteDoCatalogoEAdotadaViaPlaceQuandoSelfEstaActive() {
+    void serieNoVolumeAusenteDoCatalogoFicaPreservadaSemPlace() {
         putSeriesObject("s1");
-        rpc.placementFor = key -> SeriesPlacement.active(SELF, 1_000L);
-
-        LocalReconciler.ReconcileReport report = reconciler(Clock.systemUTC()).reconcileOnce();
-
-        assertEquals(1, report.adopted());
-        assertEquals(0, report.unplaced());
-        assertEquals(1, rpc.placeRequests.size());
-        assertEquals("s1", rpc.placeRequests.get(0).seriesKey());
-        assertEquals(SELF, rpc.placeRequests.get(0).preferredOwnerNodeId());
+        var report = reconciler(Clock.systemUTC()).reconcileOnce();
+        assertEquals(0, report.adopted());
+        assertEquals(1, report.unplaced());
+        assertTrue(rpc.placeRequests.isEmpty());
+        assertTrue(volume.storage().exists(objectKey("s1")));
     }
 
     @Test
@@ -228,48 +224,25 @@ class LocalReconcilerTest {
     }
 
     @Test
-    void noNovoSemStatusAindaContaComoElegivelEAdota() {
-        // MÉDIO-A do Refuter: Optional.empty() (nó novo, ainda sem entrada em ngrrd.nodes) conta como
-        // ACTIVE — coerente com o default do NodeStatusReporter. Sem isso, um storage node recém-subido
-        // nunca conseguiria adotar as séries do próprio volume no primeiro reconcileOnce().
+    void noNovoSemStatusTambemPreservaSemAdotar() {
         catalog.nodeStatuses.remove(SELF);
         putSeriesObject("s1");
-        rpc.placementFor = key -> SeriesPlacement.active(SELF, 1_000L);
-
-        LocalReconciler.ReconcileReport report = reconciler(Clock.systemUTC()).reconcileOnce();
-
-        assertEquals(1, report.adopted());
-        assertEquals(0, report.unplaced());
-        assertEquals(1, rpc.placeRequests.size());
+        var report = reconciler(Clock.systemUTC()).reconcileOnce();
+        assertEquals(0, report.adopted());
+        assertEquals(1, report.unplaced());
+        assertTrue(rpc.placeRequests.isEmpty());
     }
 
     @Test
-    void adocaoBemSucedidaRemoveDoExemptEReabilitaOGcDeOrfaParaMigracaoLegitimaFutura() {
-        // MÉDIO-A do Refuter: (1) ciclo 1 — self DRAINING, chave ausente do catálogo -> unplaced, entra
-        // no exempt; (2) self volta a ACTIVE e a chave é finalmente adotada de verdade -> sai do exempt;
-        // (3) uma migração LEGÍTIMA move a série para outro dono depois -- agora o GC de órfã tem de
-        // conseguir apagar a cópia local, já que a chave não está mais isenta.
+    void recuperarStatusActiveNaoAdotaAutomaticamente() {
         putSeriesObject("s1");
         catalog.nodeStatuses.put(SELF, new StorageNodeStatus(SELF, NodeState.DRAINING, 0, 0, 0, 1_000L));
-        LocalReconciler reconciler = reconciler(Clock.systemUTC());
-        LocalReconciler.ReconcileReport first = reconciler.reconcileOnce();
-        assertEquals(0, first.adopted());
-        assertEquals(1, first.unplaced());
-
+        var reconciler = reconciler(Clock.systemUTC());
+        assertEquals(1, reconciler.reconcileOnce().unplaced());
         catalog.nodeStatuses.put(SELF, new StorageNodeStatus(SELF, NodeState.ACTIVE, 0, 0, 0, 2_000L));
-        rpc.placementFor = key -> SeriesPlacement.active(SELF, 2_000L);
-        LocalReconciler.ReconcileReport second = reconciler.reconcileOnce();
-        assertEquals(1, second.adopted(), "self voltou a ACTIVE — a adoção deveria ter sucesso agora");
-
-        // Simula a migração legítima: o catálogo agora mostra a série ACTIVE noutro dono, há muito
-        // tempo, e esse dono confirma via SERIES_EXISTS.
-        catalog.placements.put("s1", new SeriesPlacement("storage-other", null,
-                PlacementState.ACTIVE, null, 3_000L, 3_000L));
-        rpc.existsFor = key -> true;
-        LocalReconciler.ReconcileReport third = reconciler.reconcileOnce();
-
-        assertEquals(1, third.orphansDeleted(), "chave adotada com sucesso deveria voltar a ser elegível ao GC de órfã");
-        assertFalse(volume.storage().exists(objectKey("s1")));
+        assertEquals(1, reconciler.reconcileOnce().unplaced());
+        assertTrue(rpc.placeRequests.isEmpty());
+        assertTrue(volume.storage().exists(objectKey("s1")));
     }
 
     // ---------------------------------------------------------------- ALTO-1: salvaguardas de deleção

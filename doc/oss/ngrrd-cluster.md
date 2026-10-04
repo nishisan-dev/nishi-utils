@@ -491,31 +491,66 @@ devolve. Nenhuma marca por série fechada fica em memória. Migração de uma s�
 `checkpoint` + `close` do handle local e marca a série `MIGRATING` (rejeita writes locais nesse
 meio-tempo).
 
-### 6.4. `LocalReconciler` — reconciliação e adoção
+### 6.4. `LocalReconciler` — reconciliação e quarentena
 
-Roda no start do nó (após o catálogo estabilizar), a cada `reconcileInterval` e imediatamente ao
-virar líder (só reconcilia o **próprio** volume). Reconhece objetos de série pela convenção
-`{seriesObjectPrefix}/{seriesKey}.ngrr`; qualquer outro prefixo no volume é ignorado.
+Executa no boot, depois de confirmar a conectividade com o catálogo, a cada
+`reconcileInterval` e ao virar líder. Reconhece `{seriesObjectPrefix}/{seriesKey}.ngrr`.
 
-- **Adoção — também o caminho de migração do ngrrd single-node.** Uma série presente no volume mas
-  ausente do catálogo é adotada: o nó chama `ngrrd.place` com `preferredOwnerNodeId = self`. Isso
-  significa que **apontar um storage node novo para um volume blob de um ngrrd single-node
-  existente adota todas as séries dele automaticamente** — não existe uma ferramenta de migração
-  separada; o próprio boot do reconciliador é a migração.
-- **Órfã — só apagada com confirmação forte, nunca por suspeita.** Uma série presente no volume
-  local, mas cujo catálogo diz `ACTIVE` em **outro** dono, só é apagada se **todas** as condições
-  seguirem verdadeiras: (a) o handle não está aberto nem em migração localmente; (b) uma leitura
-  **forte** ao líder (`placementStrong`, não a cópia eventual do início do ciclo) reconfirma
-  `ACTIVE` no outro dono; (c) já se passou `orphanGrace` (default 5 min) desde a última transição
-  desse placement; (d) o dono forte confirma, via `ngrrd.series.exists`, que **de fato possui** o
-  objeto físico — qualquer falha/timeout dessa checagem é tratada como "não confirmado" (não
-  apaga); (e) não é o **primeiro** ciclo desta instância do reconciliador (o primeiro ciclo depois
-  de um restart nunca apaga nada, só adota e conta). Essas salvaguardas existem porque uma versão
-  anterior chegou a apagar a única cópia viva de uma série durante uma corrida entre migração e
-  reconciliação — ver seção 8 sobre a correção do `abort()`.
-- **Ausente — nunca inventa dados.** Uma série `ACTIVE` no catálogo local de `self`, mas ausente do
-  volume físico, é só logada (marker `MISSING_SERIES`, nível `SEVERE`) e contada
-  (`reconcileMissing`); o reconciliador jamais recria uma imagem vazia por conta própria.
+- **Sem placement:** confirma a ausência com leitura forte e coloca o objeto em quarentena
+  persistente. Nunca adota nem apaga automaticamente. Falha na consulta preserva o objeto.
+  `OPEN` e escrita respondem `QUARANTINED`, com o comando de recuperação na mensagem.
+  `ngrrd-admin reconcile <nó>` inventaria; `--adopt` ou `--purge-orphans` resolvem explicitamente.
+- **Cópia antiga de migração:** coleta somente depois do primeiro ciclo, sem handle aberto
+  nem migração local, após `orphanGrace`, reconfirmando fortemente `ACTIVE` em outro dono
+  e a existência física nesse dono. Objetos em quarentena continuam preservados.
+- **Placement local sem objeto:** registra `MISSING_SERIES` e incrementa `reconcileMissing`;
+  nunca inventa uma série vazia.
+
+O campo histórico `ReconcileReport.adopted` permanece por compatibilidade, com valor zero
+nos ciclos automáticos. `reconcileMaxAdoptionsPerCycle` permanece aceito, mas não autoriza adoção.
+
+### 6.5. Exclusão condicional de séries (8.9.0)
+
+`NgrrdClusterClient.deleteSeries(key, new DeletePrecondition(lastWriteBefore))` e
+`deleteSeriesBatch(Map<String, DeletePrecondition>)` retornam um resultado por chave:
+`DELETED`, `NOT_FOUND`, `REFUSED_RECENT_WRITE`, `REFUSED_MIGRATING` ou `ERROR`.
+A ausência de placement é `NOT_FOUND`; `ERROR` inclui `errorCode` e `message` e não confirma ausência.
+O lote não é atômico. O cliente pagina pelo `catalogLookupBatchSize`, com máximo protocolar
+10.000 pedidos por RPC, e usa um prazo total de `retryTimeout` para a chamada.
+
+O líder reserva a geração no catálogo. Todos os storages registrados precisam anunciar
+`series.delete` e preparar uma marca durável antes do commit. O dono compara o limite
+superior da última **recepção** com o corte: marca **menor** permite excluir, igualdade recusa.
+Migração ou rebalance em curso recusa. A preparação bloqueia novas admissões e opens;
+escritas admitidas anteriormente precedem a reserva ou estão protegidas pela marca durável.
+Depois de todos os participantes gravarem o commit local, cada um encerra o writer confirmado,
+sem checkpoint final de exclusão, e remove sua cópia física. Só então o líder remove o placement.
+
+`series-lifecycle.wal`, ao lado dos shards no diretório do volume, guarda marcas, quarentena
+e tombstones por geração, com CRC, fsync e compactação atômica. Reinícios e troca de líder
+retomam operações confirmadas; preparações canceladas liberam a série. O journal deve ser
+incluído no backup do volume. Restaurar um catálogo anterior ao commit não ressuscita a
+mesma geração. Pedidos atrasados com a geração antiga nunca excluem a recriação.
+
+A marca inicial de séries sem journal usa `lastUpdate` validado do `.ngrr`, incluindo CRC;
+só séries válidas vazias usam o relógio atual. Metadado ilegível bloqueia a exclusão.
+Recepções posteriores usam limites superiores arredondados para o próximo intervalo de uma
+hora: um fsync por `WRITE_BATCH` que avance qualquer marca, nenhum no intervalo já coberto.
+Configure igualmente nos storages com `-Dngrrd.series.receiptIntervalMillis=3600000`.
+A migração transporta essa marca. O arredondamento pode atrasar a elegibilidade em até um intervalo.
+
+Handles e buffers carregam a geração. A geração removida retorna `SERIES_DELETED`,
+invalida o handle no cache do cliente e falha as barreiras das escritas antigas. A aplicação
+remove também seu próprio cache e executa um novo `open(..., createIfMissing=true)`.
+Quarentena retorna `QUARANTINED`: registre a causa, alerte na tela Sistema com o comando
+`ngrrd-admin reconcile <nó> --adopt` e suspenda tentativas de recriação até a recuperação.
+As definições YAML e descritores de geometria são compartilhados e permanecem intactos;
+o único objeto físico por série é o `.ngrr`. O alocador recupera bytes usados, sem reduzir os shards.
+
+`ngrrd-admin metrics <nó>` inclui `seriesDeleted`, `seriesDelete.<motivo>`,
+`receiptFsyncs`, `quarantinedSeries` e `quarantinedBytes`. O dono registra
+`NGRRD_SERIES_DELETED série=... dono=...`; quarentena registra `NGRRD_SERIES_QUARANTINED`.
+Consulte o [runbook de purga e recuperação](ngrrd-cluster-purga.md) antes de habilitar a purga.
 
 ## 7. Placement (`LeastLoadedPlacementPolicy`)
 
@@ -540,7 +575,7 @@ Ordem total e determinística — o resultado nunca depende da ordem de iteraç�
    candidatos, o líder loga `NGRRD_PLACEMENT_NO_CANDIDATE series=<chave> excluded=<id>(<motivo>),…`.
    A ordem completa de elegibilidade é: `ACTIVE` → alcançável → capacidade (95 %) → cota → regras →
    frescor → dono preferido.
-3. Se `preferredOwnerNodeId` (adoção do `LocalReconciler`, ou reafirmação de um dono já existente)
+3. Se `preferredOwnerNodeId` (adoção administrativa, ou reafirmação de um dono já existente)
    sobreviver aos filtros acima, ele vence direto, sem passar pelo desempate — e **ignora cota e
    regras** (log `FINE`): a série já existe naquele volume; o rebalance corrige depois (fase 0).
 4. Caso contrário, desempate em ordem: **(a)** menor carga efetiva dividida pelo peso (`COUNT` usa peso 1). A carga efetiva soma `seriesCount` reportado +
@@ -823,7 +858,7 @@ imprime só a confirmação do disparo, como antes.
   estabiliza depois que a liderança assenta.
 - **Cota e regras de placement (issue #167, item 3).** (a) `SeriesPlacement.definitionName` só é
   conhecido a partir do `PLACE` de um cliente desta versão: um placement legado (ou criado por
-  adoção do `LocalReconciler`) fica com `null` e **só casa regras sem o critério `definition`**; o
+  adoção administrativa) fica com `null` e **só casa regras sem o critério `definition`**; o
   próximo `PLACE` do cliente para a série (todo `open` que não a encontra no cache local) preenche o
   nome oportunisticamente — **não há backfill em lote**, então uma regra por `definition` só passa a
   valer para as séries antigas depois que os clientes as reabrirem (ou, se for preciso, use
@@ -893,13 +928,12 @@ encontrados no caminho e afetam a base sobre a qual este módulo é construído.
 
 ## 14. Migração de um ngrrd single-node existente
 
-Não existe (nem é necessária) uma ferramenta de migração dedicada: subir um storage node apontando
-`ngrrd.volume.dir`/`ngrrd.volume.name` para o volume blob de uma instalação single-node existente
-faz o `LocalReconciler` adotar automaticamente todas as séries dele no primeiro ciclo de
-reconciliação (seção 6.4) — o mesmo mecanismo usado para reconhecer séries "órfãs" de qualquer
-outro motivo. Não há downtime imposto pelo cluster: o volume pode continuar sendo servido
-single-node até o storage node estar pronto, desde que não haja escrita concorrente ao mesmo volume
-por dois processos simultaneamente.
+Pare as escritas do processo single-node antes de abrir seu volume no storage do cluster.
+Aponte `ngrrd.volume.dir`/`ngrrd.volume.name` para o volume existente e aguarde o consenso.
+Os objetos sem placement entram em quarentena. Confira o inventário e execute explicitamente
+`ngrrd-admin reconcile <nó> --adopt`. Repita em todos os storages com dados importados e
+verifique catálogo e métricas antes de retomar a ingestão. O `.ngrr` continua intacto.
+Veja o [runbook](ngrrd-cluster-purga.md); nunca mantenha dois processos escrevendo no mesmo volume.
 
 ## Diagramas
 

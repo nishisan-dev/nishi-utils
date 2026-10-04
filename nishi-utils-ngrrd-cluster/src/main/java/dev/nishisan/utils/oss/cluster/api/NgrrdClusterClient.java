@@ -140,6 +140,22 @@ public interface NgrrdClusterClient extends Closeable {
      */
     boolean exists(String seriesKey);
 
+    /** Conditional, retry-safe deletion. An ERROR never certifies absence. */
+    default DeleteResult deleteSeries(String seriesKey, DeletePrecondition precondition) {
+        throw new UnsupportedOperationException("series.delete");
+    }
+
+    /** Independent outcomes for every key; the batch is not atomic. */
+    default Map<String, DeleteResult> deleteSeriesBatch(Map<String, DeletePrecondition> requests) {
+        throw new UnsupportedOperationException("series.delete.batch");
+    }
+
+    /** Explicit inventory/adoption/purge of unplaced objects on one storage. */
+    default dev.nishisan.utils.oss.cluster.protocol.ReconcileResponse reconcile(String nodeId,
+            dev.nishisan.utils.oss.cluster.protocol.ReconcileRequest request) {
+        throw new UnsupportedOperationException("series.reconcile");
+    }
+
     /**
      * Variante em lote de {@link #exists(String)}: devolve um mapa com TODAS as chaves pedidas — nunca
      * uma resposta parcial; qualquer falha ao consultar propaga {@link NgrrdClusterException} em vez de

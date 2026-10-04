@@ -23,5 +23,6 @@ package dev.nishisan.utils.oss.cluster.protocol;
  *
  * @param seriesKey chave lógica da série
  */
-public record SeriesCommandRequest(String seriesKey) {
+public record SeriesCommandRequest(String seriesKey, String generationId) {
+    public SeriesCommandRequest(String seriesKey) { this(seriesKey, null); }
 }

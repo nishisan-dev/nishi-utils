@@ -97,6 +97,8 @@ public final class NgrrdWriter implements AutoCloseable {
     private final AtomicBoolean scheduled = new AtomicBoolean(false);
 
     private volatile boolean closed;
+    private final CountDownLatch shutdownComplete = new CountDownLatch(1);
+    private final java.util.concurrent.atomic.AtomicBoolean schedulerReleased = new java.util.concurrent.atomic.AtomicBoolean();
     // A failed asynchronous write poisons this handle: a later checkpoint must
     // never acknowledge a prefix containing a sample that was not persisted.
     private volatile RuntimeException writeFailure;
@@ -313,18 +315,30 @@ public final class NgrrdWriter implements AutoCloseable {
 
     @Override
     public void close() {
-        if (closed) {
-            return;
+        stop(true);
+    }
+
+    /** Wait for the worker to stop before its region can be returned to the allocator. */
+    public void closeForDeletion() {
+        stop(false);
+    }
+
+    private void stop(boolean checkpoint) {
+        synchronized (this) {
+            if (!closed) {
+                closed = true;
+                enqueue(new Command.Shutdown(shutdownComplete, checkpoint));
+            }
         }
-        closed = true;
-        CountDownLatch latch = new CountDownLatch(1);
-        enqueue(new Command.Shutdown(latch));
         try {
-            latch.await(30, TimeUnit.SECONDS);
+            if (!shutdownComplete.await(30, TimeUnit.SECONDS)) {
+                throw new IllegalStateException("writer shutdown timed out");
+            }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            throw new IllegalStateException("writer shutdown interrupted", e);
         }
-        scheduler.release();
+        if (schedulerReleased.compareAndSet(false, true)) scheduler.release();
     }
 
     public String seriesKey() {
@@ -397,8 +411,10 @@ public final class NgrrdWriter implements AutoCloseable {
                 }
                 case Command.Shutdown s -> {
                     try {
-                        throwIfWriteFailed();
-                        checkpointAndForce();
+                        if (s.checkpoint()) {
+                            throwIfWriteFailed();
+                            checkpointAndForce();
+                        }
                     } catch (RuntimeException e) {
                         System.err.println("ngrrd-writer: falha no checkpoint final: " + e);
                     } finally {
@@ -716,7 +732,7 @@ public final class NgrrdWriter implements AutoCloseable {
         record Sync(CountDownLatch latch, AtomicReference<RuntimeException> error) implements Command {
         }
 
-        record Shutdown(CountDownLatch latch) implements Command {
+        record Shutdown(CountDownLatch latch, boolean checkpoint) implements Command {
         }
     }
 }

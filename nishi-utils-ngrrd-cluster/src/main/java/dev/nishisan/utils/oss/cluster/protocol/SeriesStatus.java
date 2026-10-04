@@ -48,5 +48,11 @@ public enum SeriesStatus {
     NOT_FOUND,
 
     /** Falha de aplicação não coberta pelos demais status. */
-    ERROR
+    ERROR,
+
+    /** This handle generation was removed. */
+    SERIES_DELETED,
+
+    /** Existing data requires reconcile --adopt before use. */
+    QUARANTINED
 }

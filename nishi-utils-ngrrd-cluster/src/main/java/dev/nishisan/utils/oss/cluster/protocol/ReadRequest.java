@@ -52,7 +52,14 @@ public record ReadRequest(
         int targetStepSec,
         ConsolidationFunction cf,
         int maxPoints,
-        Long endExclusiveEpochMs) {
+        Long endExclusiveEpochMs, String generationId) {
+    public ReadRequest(String seriesKey, String dsName, long windowMs, int targetStepSec,
+            ConsolidationFunction cf, int maxPoints, Long endExclusiveEpochMs) {
+        this(seriesKey, dsName, windowMs, targetStepSec, cf, maxPoints, endExclusiveEpochMs, null);
+    }
+    public ReadRequest withGeneration(String id) {
+        return new ReadRequest(seriesKey, dsName, windowMs, targetStepSec, cf, maxPoints, endExclusiveEpochMs, id);
+    }
 
     public ReadRequest {
         Objects.requireNonNull(seriesKey, "seriesKey é obrigatório");

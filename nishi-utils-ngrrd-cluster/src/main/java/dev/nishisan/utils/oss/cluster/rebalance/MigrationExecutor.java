@@ -375,7 +375,9 @@ public final class MigrationExecutor extends RequestHandlerSupport {
         MigrateResponse commitResponse;
         try {
             commitResponse = rpc.call(target, Commands.MIGRATE_COMMIT,
-                    new MigrateCommitRequest(seriesKey, migrationId, sha256Hex, bytes.length, storageKey),
+                    new MigrateCommitRequest(seriesKey, migrationId, sha256Hex, bytes.length, storageKey,
+                            registry.lifecycle() == null || registry.lifecycle().journal().get(seriesKey) == null ? null
+                                    : registry.lifecycle().journal().get(seriesKey).receivedThrough()),
                     MigrateResponse.class);
         } catch (NgrrdClusterException e) {
             LOGGER.log(Level.WARNING, "Falha de transporte no commit da série " + seriesKey
@@ -811,6 +813,13 @@ public final class MigrationExecutor extends RequestHandlerSupport {
         try {
             registry.discard(request.seriesKey());
             volume.storage().atomicReplaceReserved(request.storageKey(), bytes, request.migrationId());
+            if (registry.lifecycle() != null) {
+                var placement = catalog.placementStrong(request.seriesKey()).orElseThrow();
+                long upper = request.receivedThrough() != null ? request.receivedThrough()
+                        : dev.nishisan.utils.oss.cluster.node.SeriesLifecycleJournal.upperBound(clock.millis(), 3_600_000L);
+                registry.lifecycle().journal().put(request.seriesKey(), new dev.nishisan.utils.oss.cluster.node.SeriesLifecycleJournal.Entry(
+                        placement.generationId(), upper, dev.nishisan.utils.oss.cluster.node.SeriesLifecycleJournal.Phase.ACTIVE, placement));
+            }
         } catch (RuntimeException e) {
             return failTarget(request.seriesKey(), request.migrationId(), describe(e));
         }

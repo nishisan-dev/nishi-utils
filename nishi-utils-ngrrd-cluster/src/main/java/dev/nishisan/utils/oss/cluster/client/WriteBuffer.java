@@ -31,6 +31,13 @@ public interface WriteBuffer {
     /** Enfileira {@code write} no buffer do nó {@code ownerNodeId}. */
     void enqueue(String ownerNodeId, SeriesWrite write);
 
+    /** Explicit open starts a distinct admission/barrier generation. */
+    default void beginGeneration(String key, String generation, String owner) { }
+    default void checkGeneration(String key, String generation) { }
+    default void flushGenerationSync(String key, String generation, String owner, Duration wait) {
+        flushSeriesSync(key, owner, wait);
+    }
+
     /** Força o flush do buffer de {@code ownerNodeId} e espera sua conclusão, com o prazo padrão do dispatcher. */
     void flushNodeSync(String ownerNodeId);
 

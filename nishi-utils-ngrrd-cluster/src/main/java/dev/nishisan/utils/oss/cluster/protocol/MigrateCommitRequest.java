@@ -31,5 +31,8 @@ package dev.nishisan.utils.oss.cluster.protocol;
  *                    viu essa definição antes de receber a migração
  */
 public record MigrateCommitRequest(String seriesKey, String migrationId, String sha256Hex, long totalBytes,
-        String storageKey) {
+        String storageKey, Long receivedThrough) {
+    public MigrateCommitRequest(String seriesKey, String migrationId, String sha256Hex, long totalBytes, String storageKey) {
+        this(seriesKey, migrationId, sha256Hex, totalBytes, storageKey, null);
+    }
 }

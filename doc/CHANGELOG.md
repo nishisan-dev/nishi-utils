@@ -4,6 +4,19 @@
 
 ---
 
+## 2026-10-04 — Purga condicional de séries e quarentena — 8.9.0
+
+- API individual e em lote de exclusão com resultados por série e capacidade `series.delete`.
+- Reserva por geração, commit durável nos participantes e recuperação de interrupções; remoção
+  de todas as cópias antes do placement, encerrando o writer sem checkpoint final de exclusão.
+- Marca inicial pelo `lastUpdate` do `.ngrr` legado; recepção nova arredondada para cima, com
+  fsync agrupado por lote somente quando o intervalo avança. A migração preserva a marca.
+- Objetos sem placement entram em quarentena; adoção e purga são administrativas explícitas.
+  Status `SERIES_DELETED` e `QUARANTINED` distinguem recuperação e impedem retries de recriação.
+- CLI `series-delete` e `reconcile`, métricas, log de exclusão e
+  [runbook de recuperação](oss/ngrrd-cluster-purga.md).
+- Testes de legado, corrupção, falhas de fases e cluster de três nós; gate de exclusão no CI.
+
 ## 2026-09-26 — Fronteiras por tópico no heartbeat, cotas e regras de placement, revisão do NGrid — release 8.8.0
 
 Atende a [issue #178](https://github.com/nishisan-dev/nishi-utils/issues/178) (escala do odômetro

@@ -44,8 +44,13 @@ public final class StorageCapabilities {
     /** O dono responde {@code ngrrd.series.exists.batch} (existência de objetos em lote no volume). */
     public static final String SERIES_EXISTS_BATCH = "series.exists.batch";
 
+    /** Conditional, durable deletion of every physical copy of a series generation. */
+    public static final String SERIES_DELETE = "series.delete";
+    /** Explicit reporting/adoption/purging of quarantined series. */
+    public static final String RECONCILE = "series.reconcile";
     /** Todas as capacidades anunciadas por um storage node desta versão. */
-    public static final Set<String> ALL = Set.of(CATALOG_LOOKUP, OPEN_CREATE_IF_MISSING, SERIES_EXISTS_BATCH);
+    public static final Set<String> ALL = Set.of(CATALOG_LOOKUP, OPEN_CREATE_IF_MISSING, SERIES_EXISTS_BATCH,
+            SERIES_DELETE, RECONCILE);
 
     private StorageCapabilities() {
     }

@@ -330,7 +330,7 @@ public final class MigrationCoordinator implements LeadershipListener {
                 return new MigrationResult(MigrationOutcome.SKIPPED, "este nó não é mais líder", 0L, 0L);
             }
             Optional<SeriesPlacement> current = catalog.placementStrong(seriesKey);
-            if (current.isEmpty() || current.get().state() != PlacementState.ACTIVE
+            if (current.isEmpty() || current.get().deletion() != null || current.get().state() != PlacementState.ACTIVE
                     || !current.get().isOwnedBy(src)) {
                 return new MigrationResult(MigrationOutcome.SKIPPED,
                         "placement de " + seriesKey + " não está ACTIVE em " + src, 0L, 0L);
@@ -378,7 +378,7 @@ public final class MigrationCoordinator implements LeadershipListener {
                 // condição puramente transitória. Nada foi gravado se todas falharem, então SKIPPED
                 // continua sendo o resultado seguro.
                 if (!putPlacementWithRetries(seriesKey, migratingPlacement, "MIGRATING de " + seriesKey,
-                        () -> catalog.placementStrong(seriesKey).filter(activePlacement::equals).isPresent())) {
+                        () -> catalog.placementStrong(seriesKey).filter(p -> p.deletion() == null && activePlacement.equals(p)).isPresent())) {
                     return new MigrationResult(MigrationOutcome.SKIPPED,
                             "falha ao gravar placement MIGRATING de " + seriesKey, 0L, clock.millis() - startedAt);
                 }
@@ -632,7 +632,7 @@ public final class MigrationCoordinator implements LeadershipListener {
     /** {@code true} se a leitura FORTE do placement confirma {@code MIGRATING} com este {@code migrationId}. */
     private boolean isStillMigratingWithId(String seriesKey, String migrationId) {
         Optional<SeriesPlacement> current = catalog.placementStrong(seriesKey);
-        return current.isPresent() && current.get().state() == PlacementState.MIGRATING
+        return current.isPresent() && current.get().deletion() == null && current.get().state() == PlacementState.MIGRATING
                 && migrationId.equals(current.get().migrationId());
     }
 

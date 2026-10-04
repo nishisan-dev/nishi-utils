@@ -217,11 +217,11 @@ class StorageNodeStatusTest {
     }
 
     @Test
-    void capacidadesAnunciadasSaoAsTresDoProtocolo() {
+    void capacidadesAnunciadasIncluemExclusaoEReconciliacao() {
         assertEquals("catalog.lookup", StorageCapabilities.CATALOG_LOOKUP);
         assertEquals("open.createIfMissing", StorageCapabilities.OPEN_CREATE_IF_MISSING);
         assertEquals("series.exists.batch", StorageCapabilities.SERIES_EXISTS_BATCH);
-        assertEquals(Set.of("catalog.lookup", "open.createIfMissing", "series.exists.batch"), StorageCapabilities.ALL);
+        assertEquals(Set.of("catalog.lookup", "open.createIfMissing", "series.exists.batch", "series.delete", "series.reconcile"), StorageCapabilities.ALL);
     }
 
     @Test
@@ -232,7 +232,7 @@ class StorageNodeStatusTest {
 
             assertEquals("legacy-860", status.nodeId());
             assertEquals(11, status.seriesCount());
-            assertEquals(StorageCapabilities.ALL, status.capabilities());
+            assertEquals(Set.of("catalog.lookup", "open.createIfMissing", "series.exists.batch"), status.capabilities());
             assertNull(status.catalogReplica());
         }
     }
@@ -309,7 +309,7 @@ class StorageNodeStatusTest {
             assertEquals(DistributionMode.CAPACITY, status.distributionMode());
             assertEquals(3.0, status.weight());
             assertEquals(300, status.reservedBytes());
-            assertEquals(StorageCapabilities.ALL, status.capabilities());
+            assertEquals(Set.of("catalog.lookup", "open.createIfMissing", "series.exists.batch"), status.capabilities());
             assertEquals(new CatalogReplicaStatus(false, 12L, 5_000L, 4_989L, false, false, true),
                     status.catalogReplica());
             assertEquals(0L, status.quotaMaxSeries(), "sem cota de séries num status da 8.7.0");

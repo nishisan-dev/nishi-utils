@@ -98,13 +98,14 @@ public final class NgrrdStorageNode implements Closeable {
     private final Rebalancer rebalancer;
     private final LocalReconciler localReconciler;
     private final GeometryService geometryService;
+    private final SeriesDeleteHandler deleteHandler;
 
     private NgrrdStorageNode(StorageNodeConfig config, BlobVolumeRegistry volumeRegistry, BlobVolume volume,
             NGridNode node, CatalogService catalog, TransportClusterRpc rpc, SeriesHandleRegistry registry,
             StorageRequestHandler storageHandler, PlacementRequestHandler placementHandler,
             NodeStatusReporter statusReporter, AdminRequestHandler adminHandler,
             MigrationExecutor migrationExecutor, MigrationCoordinator migrationCoordinator, Rebalancer rebalancer,
-            LocalReconciler localReconciler, GeometryService geometryService) {
+            LocalReconciler localReconciler, GeometryService geometryService, SeriesDeleteHandler deleteHandler) {
         this.config = config;
         this.volumeRegistry = volumeRegistry;
         this.volume = volume;
@@ -121,6 +122,7 @@ public final class NgrrdStorageNode implements Closeable {
         this.rebalancer = rebalancer;
         this.localReconciler = localReconciler;
         this.geometryService = geometryService;
+        this.deleteHandler = deleteHandler;
     }
 
     /**
@@ -203,6 +205,9 @@ public final class NgrrdStorageNode implements Closeable {
                 builder.peers(cfg.peers().toArray(new String[0]));
             }
             NGridNode node = builder.start();
+            SeriesLifecycleJournal startupJournal = null;
+            SeriesHandleRegistry startupRegistry = null;
+            SeriesDeleteHandler startupDeleteHandler = null;
             try {
                 CatalogService catalog = CatalogService.from(node);
                 TransportClusterRpc rpc = new TransportClusterRpc(node.transport(), node.coordinator(),
@@ -210,6 +215,12 @@ public final class NgrrdStorageNode implements Closeable {
                 SeriesHandleRegistry registry = new SeriesHandleRegistry(volume, cfg.volumeName(),
                         cfg.handleIdleTtl(), cfg.maxOpenHandles(), Clock.systemUTC());
 
+                startupRegistry = registry;
+                var lifecycleJournal = new SeriesLifecycleJournal(cfg.volumeDir().resolve(cfg.volumeName()));
+                startupJournal = lifecycleJournal;
+                var lifecycle = new SeriesLifecycleService(lifecycleJournal, volume, catalog, registry, cfg.nodeId(),
+                        cfg.seriesObjectPrefix(), Clock.systemUTC(), Long.getLong("ngrrd.series.receiptIntervalMillis", 3_600_000L));
+                registry.lifecycle(lifecycle);
                 NodeId self = node.transport().local().nodeId();
                 // Adaptador em vez de método de referência: StorageRequestHandler.PlacementLookup agora
                 // também exige placementStrong (round-trip ao líder), usado quando a réplica local do
@@ -274,6 +285,12 @@ public final class NgrrdStorageNode implements Closeable {
                             || status.nextExpectedSequence() - 1 >= status.maxPeerFrontier();
                     return drained && caughtUp;
                 };
+                SeriesDeleteHandler deleteHandler = new SeriesDeleteHandler(node.transport(), catalog, rpc,
+                        lifecycle, node.coordinator()::isLeader, catalogFence, Clock.systemUTC());
+                startupDeleteHandler = deleteHandler;
+                placementHandler.creationGate(deleteHandler::creationGate);
+                node.transport().addListener(deleteHandler);
+                rpc.registerLocalHandler(deleteHandler);
                 MigrationCoordinator migrationCoordinator = new MigrationCoordinator(catalog, rpc, leaderView,
                         cfg.maxConcurrentMigrations(), cfg.migrationStatusPollInterval(), cfg.migrationTimeout(),
                         Clock.systemUTC(), migrationHooks, cfg.maxDestinationCatalogLag(), cfg.placementRules(),
@@ -324,6 +341,7 @@ public final class NgrrdStorageNode implements Closeable {
                 statusReporter.start();
                 localReconciler.start();
                 geometryService.start();
+                deleteHandler.start();
 
                 // Seed: addLeadershipListener não dispara um callback sintético para quem já registra o
                 // listener com o nó JÁ líder — ex.: o primeiro líder eleito, decidido durante
@@ -337,8 +355,13 @@ public final class NgrrdStorageNode implements Closeable {
 
                 return new NgrrdStorageNode(cfg, volumeRegistry, volume, node, catalog, rpc, registry,
                         storageHandler, placementHandler, statusReporter, adminHandler, migrationExecutor,
-                        migrationCoordinator, rebalancer, localReconciler, geometryService);
-            } catch (RuntimeException e) {
+                        migrationCoordinator, rebalancer, localReconciler, geometryService, deleteHandler);
+            } catch (IOException | RuntimeException e) {
+                if (startupDeleteHandler != null) startupDeleteHandler.close();
+                try {
+                    if (startupRegistry != null) startupRegistry.close();
+                    if (startupJournal != null) startupJournal.close();
+                } catch (IOException | RuntimeException closeError) { e.addSuppressed(closeError); }
                 try {
                     node.close();
                 } catch (IOException | RuntimeException closeError) {
@@ -492,6 +515,7 @@ public final class NgrrdStorageNode implements Closeable {
      */
     @Override
     public void close() {
+        safely("series deletion recovery", deleteHandler::close);
         safely("geometry service", geometryService::close);
         safely("status reporter", statusReporter::close);
         safely("local reconciler", localReconciler::close);
@@ -499,6 +523,8 @@ public final class NgrrdStorageNode implements Closeable {
         safely("migration coordinator", migrationCoordinator::close);
         safely("migration executor", migrationExecutor::close);
         safely("handlers", () -> {
+            node.transport().removeListener(deleteHandler);
+            rpc.unregisterLocalHandler(deleteHandler);
             node.transport().removeListener(geometryService);
             rpc.unregisterLocalHandler(geometryService);
             node.transport().removeListener(storageHandler);

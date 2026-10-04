@@ -889,3 +889,9 @@ os storages antes dos clientes** para colher o lado que mais importa primeiro:
   nó. Um valor muito baixo (perto de `0`) pode reduzir a quantidade de destinos elegíveis por
   ciclo em clusters com replicação lenta — acompanhe `NGRRD_REBALANCE_DEST_EXCLUDED` antes de
   apertar o limite.
+
+## Purga e quarentena (8.9.0)
+
+Consulte o [runbook de purga e recuperação](ngrrd-cluster-purga.md) para habilitação por capacidades,
+exclusão condicional, tratamento de `SERIES_DELETED`/`QUARANTINED` e adoção explícita em todos os
+storages depois de perda ou restauração do catálogo. Objetos sem placement são preservados.

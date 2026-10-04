@@ -20,15 +20,10 @@ package dev.nishisan.utils.oss.cluster.node;
 import dev.nishisan.utils.ngrid.cluster.coordination.LeadershipListener;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.oss.blob.BlobVolume;
-import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogView;
-import dev.nishisan.utils.oss.cluster.catalog.NodeState;
 import dev.nishisan.utils.oss.cluster.catalog.PlacementState;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
-import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
 import dev.nishisan.utils.oss.cluster.protocol.Commands;
-import dev.nishisan.utils.oss.cluster.protocol.PlaceRequest;
-import dev.nishisan.utils.oss.cluster.protocol.PlaceResponse;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesExistsRequest;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesExistsResponse;
 import dev.nishisan.utils.oss.cluster.rpc.ClusterRpc;
@@ -52,61 +47,16 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * Reconcilia o volume local de um storage node com o catálogo do cluster: adota séries presentes no
- * volume mas ausentes do catálogo (também o caminho de <b>migração do ngrrd single-node</b> — apontar
- * um storage node novo para um volume blob existente adota todas as séries), apaga cópias órfãs
- * (placement {@code ACTIVE} confirmado noutro dono há mais de {@code orphanGrace}), e reporta séries
- * {@code ACTIVE} no catálogo local mas ausentes do volume (nunca inventa dados).
- *
- * <h2>Salvaguardas contra deleção indevida (ALTO-1/ALTO-2 do Refuter)</h2>
- * <ul>
- *   <li>Uma chave com {@link SeriesHandleRegistry#isOpen} ou {@link SeriesHandleRegistry#isMigrating}
- *       nunca é tocada neste ciclo — nem adotada, nem apagada.</li>
- *   <li>Antes de apagar, a decisão é sempre revalidada com {@link CatalogView#placementStrong} (não a
- *       visão em lote/eventual do início do ciclo); se divergir (já não {@code ACTIVE} noutro dono),
- *       nada é apagado.</li>
- *   <li>Mesmo com o placement forte confirmando {@code ACTIVE} noutro dono há mais de
- *       {@code orphanGrace}, só apaga se esse dono confirmar, via {@link Commands#SERIES_EXISTS}, que
- *       de fato possui o objeto — qualquer falha/timeout do RPC é tratada como "não confirmado" (não
- *       apaga).</li>
- *   <li>O primeiro ciclo depois de {@link #start()} (ou da construção, para quem chama
- *       {@link #reconcileOnce()} diretamente) nunca apaga nada — só adota e conta; um segundo ciclo é
- *       necessário para qualquer deleção.</li>
- *   <li>Antes de adotar (chave ausente do catálogo), o estado do PRÓPRIO nó é confirmado com leitura
- *       FORTE ({@link CatalogView#nodeStatusStrong}) — um nó novo, sem status algum ainda publicado
- *       ({@link Optional#empty()}), conta como elegível (mesmo critério de default do
- *       {@code NodeStatusReporter}); só {@link NodeState#DRAINING}/{@link NodeState#DRAINED} (ou a
- *       ausência de um líder alcançável para responder) bloqueiam. Quando bloqueado, a chave só é
- *       contada como {@code unplaced} — nenhum {@code PLACE} é enviado — e entra num conjunto isento do
- *       ramo de deleção, para nunca ser apagada por engano caso o catálogo mais tarde mostre um dono
- *       aparentemente órfão. A isenção não é permanente de verdade: uma adoção bem-sucedida <em>mais
- *       tarde</em> (self voltou a {@code ACTIVE}) remove a chave do conjunto, tornando-a elegível de
- *       novo ao GC de órfã caso uma migração legítima a mova para fora depois.</li>
- * </ul>
- *
- * <p>Ao fim de cada ciclo, descarta as marcas de {@link SeriesHandleRegistry#isForgotten esquecida} das
- * séries cuja réplica local já mostra outro dono ({@link SeriesHandleRegistry#pruneForgotten}) — a marca
- * só protege enquanto a réplica ainda pode dizer {@code ACTIVE(self)} logo após o {@code FINISH} de uma
- * migração, e sem esta varredura cresceria sem limite (issue #174).</p>
- *
- * <p>Executa no start do nó (após {@link #awaitCatalogStable} — líder eleito, uma leitura forte bem
- * sucedida e a réplica local estável por 2 ticks seguidos ou até 30 s), a cada {@code reconcileInterval}
- * (agendamento próprio), e imediatamente ao este nó virar líder (só reconcilia o próprio volume — nunca
- * o de outro nó).</p>
- *
- * <p>Reconhece objetos de série pela convenção de nomeação configurada no nó
- * ({@link StorageNodeConfig#seriesObjectPrefix()} — {@code {prefix}/<seriesKey>.ngrr}, ver
- * {@link SeriesObjectKeys}) — qualquer outro prefixo no volume (ex.: snapshots de schema) é ignorado
- * silenciosamente, por não ser um objeto de série.</p>
+ * Reconciles the local volume with authoritative placements. Unplaced data is quarantined
+ * and preserved until an explicit administrator action. It never automatically adopts it.
+ * Stale migration copies require a confirmed live owner, a grace interval and two cycles
+ * before collection. Open handles and local migrations are preserved.
  */
 public final class LocalReconciler implements Closeable, LeadershipListener {
 
     private static final Logger LOGGER = Logger.getLogger(LocalReconciler.class.getName());
 
     /** Teto de adoções (chamadas {@code PLACE}) por ciclo — seção 2 da spec do M4. */
-    private static final int MAX_ADOPTIONS_PER_CYCLE = 200;
-    private static final int PLACE_ATTEMPTS = 5;
-    private static final Duration PLACE_BACKOFF = Duration.ofMillis(200L);
 
     private static final int STABLE_TICKS_REQUIRED = 2;
     private static final Duration STABLE_POLL_INTERVAL = Duration.ofMillis(200L);
@@ -141,12 +91,7 @@ public final class LocalReconciler implements Closeable, LeadershipListener {
     private final AtomicBoolean running = new AtomicBoolean(false);
     /** ALTO-1(d): nenhum ciclo apaga nada antes do segundo — protege o primeiro reporte após um restart. */
     private volatile boolean firstCycleDone = false;
-    /**
-     * ALTO-2: chaves cuja adoção foi adiada porque {@code self} não estava confirmadamente
-     * {@code ACTIVE} (ou não havia líder) — isentas do ramo de deleção pelo resto da vida desta
-     * instância, mesmo que uma leitura eventual mais tarde pareça indicar uma órfã. Também usado para
-     * qualquer chave que o líder recusou adotar em {@code self} (ex.: nó DRAINING no momento do PLACE).
-     */
+    /** Unplaced objects stay exempt; explicit adoption clears this after the durable state becomes ACTIVE. */
     private final Set<String> unplacedExempt = ConcurrentHashMap.newKeySet();
     private volatile ReconcileReport lastReport = ReconcileReport.EMPTY;
     private volatile ScheduledFuture<?> periodicTask;
@@ -232,59 +177,51 @@ public final class LocalReconciler implements Closeable, LeadershipListener {
     public ReconcileReport reconcileOnce() {
         long startedAt = clock.millis();
         boolean allowDelete = firstCycleDone;
-        int adopted = 0;
+        int adopted = 0; // Kept in the public report for compatibility; adoption is administrative.
         int orphansDeleted = 0;
         int unplaced = 0;
         int missing = 0;
 
         Map<String, SeriesPlacement> placements = catalog.placementsLocal();
         List<String> seriesKeys = seriesKeysInVolume();
-        Boolean selfActiveStrong = null; // calculado sob demanda, uma vez, só se alguma chave precisar
-
-        int adoptionsThisCycle = 0;
         for (String seriesKey : seriesKeys) {
-            if (registry.isOpen(seriesKey) || registry.isMigrating(seriesKey)) {
-                // ALTO-1(a): handle aberto ou em migração — nunca adota nem apaga neste ciclo.
+            if (registry.isMigrating(seriesKey)) {
+                // Preserve local migrations; unplaced open handles are still quarantined below.
                 continue;
             }
             SeriesPlacement placement = placements.get(seriesKey);
             if (placement == null) {
-                if (selfActiveStrong == null) {
-                    selfActiveStrong = isSelfActiveStrong();
-                }
-                if (!selfActiveStrong) {
-                    unplaced++;
-                    unplacedExempt.add(seriesKey);
-                    LOGGER.log(Level.WARNING, "RECONCILE_UNPLACED série=" + seriesKey
-                            + " — self não confirmado ACTIVE (ou sem líder); adoção adiada");
+                // A lost/restored catalog must never turn surviving data into automatic deletion.
+                // Failure of the strong read leaves the object untouched and unknown.
+                try {
+                    Optional<SeriesPlacement> strong = catalog.placementStrong(seriesKey);
+                    if (strong.isEmpty()) {
+                        unplaced++;
+                        unplacedExempt.add(seriesKey);
+                        if (registry.lifecycle() != null) registry.lifecycle().inspect(seriesKey);
+                        else LOGGER.warning("NGRRD_SERIES_QUARANTINED série=" + seriesKey + " nó=" + self
+                                + " ação='ngrrd-admin reconcile " + self + " --adopt'");
+                        continue;
+                    }
+                    placement = strong.get();
+                } catch (RuntimeException e) {
+                    LOGGER.log(Level.FINE, "Unknown placement; preserving " + seriesKey, e);
                     continue;
                 }
-                if (adoptionsThisCycle >= MAX_ADOPTIONS_PER_CYCLE) {
-                    continue;
-                }
-                adoptionsThisCycle++;
-                SeriesPlacement result = placeSelf(seriesKey);
-                if (result == null) {
-                    // Líder indisponível/instável — nem adotado nem unplaced; o próximo ciclo tenta de novo.
-                    continue;
-                }
-                if (result.isOwnedBy(self)) {
-                    adopted++;
-                    // MÉDIO-A do Refuter: uma adoção bem-sucedida agora reabilita a chave para o ramo
-                    // de deleção — ela pode ter ficado isenta num ciclo anterior (ex.: self estava
-                    // DRAINING então) e, uma vez adotada de verdade, uma migração LEGÍTIMA para fora
-                    // dela mais tarde precisa poder acionar o GC de órfã normalmente.
-                    unplacedExempt.remove(seriesKey);
-                } else {
-                    // O líder não aceitou self como candidato (ex.: DRAINING no instante do PLACE): a
-                    // cópia local vira órfã de migração, mas NÃO é apagada — nem agora nem depois.
-                    unplaced++;
-                    unplacedExempt.add(seriesKey);
-                    LOGGER.log(Level.WARNING, "RECONCILE_UNPLACED série=" + seriesKey + " dono=self "
-                            + "candidato recusado pelo líder; colocada em " + result.ownerNodeId());
-                }
-                continue;
             }
+            if (registry.lifecycle() != null) {
+                var state = registry.lifecycle().journal().get(seriesKey);
+                if (state != null && state.phase() == SeriesLifecycleJournal.Phase.ACTIVE
+                        && !state.generationId().equals(placement.generationId())) {
+                    try { registry.lifecycle().inspect(seriesKey); }
+                    catch (RuntimeException unknown) { continue; }
+                    state = registry.lifecycle().journal().get(seriesKey);
+                }
+                if (state != null && state.phase() == SeriesLifecycleJournal.Phase.ACTIVE) unplacedExempt.remove(seriesKey);
+            }
+            if (registry.isOpen(seriesKey) || placement.deletion() != null
+                    || (registry.lifecycle() != null && registry.lifecycle().journal().get(seriesKey) != null
+                    && registry.lifecycle().journal().get(seriesKey).phase() == SeriesLifecycleJournal.Phase.QUARANTINED)) continue;
             if (placement.state() == PlacementState.MIGRATING) {
                 // Origem ou destino de uma migração em curso — o coordenador resolve, nada a fazer aqui.
                 continue;
@@ -298,7 +235,7 @@ public final class LocalReconciler implements Closeable, LeadershipListener {
                 continue;
             }
             if (!allowDelete) {
-                // ALTO-1(d): primeiro ciclo desta instância — nunca apaga, só adoção/contagem.
+                // First cycle never collects migration remnants.
                 continue;
             }
             // ALTO-1(b): revalida com leitura FORTE, não a visão em lote já obsoleta por definição (o
@@ -355,26 +292,6 @@ public final class LocalReconciler implements Closeable, LeadershipListener {
         return report;
     }
 
-    /**
-     * ALTO-2: confirma, com leitura FORTE (round-trip ao líder), se {@code self} pode adotar séries
-     * agora — nunca a réplica local. MÉDIO-A do Refuter: um nó novo, ainda sem entrada alguma em
-     * {@code ngrrd.nodes} ({@link Optional#empty()}), conta como elegível — é exatamente o mesmo
-     * critério que {@code NodeStatusReporter#report()} usa para o próprio default (nenhum histórico
-     * ainda não é o mesmo que "não pode adotar"; um nó legitimamente novo tem de conseguir adotar as
-     * séries do seu próprio volume). Só {@link NodeState#DRAINING}/{@link NodeState#DRAINED} bloqueiam
-     * de fato. Qualquer falha (tipicamente sem líder eleito) é tratada como "não elegível", nunca lança.
-     */
-    private boolean isSelfActiveStrong() {
-        try {
-            Optional<StorageNodeStatus> status = catalog.nodeStatusStrong(self);
-            return status.isEmpty() || status.get().state() == NodeState.ACTIVE;
-        } catch (RuntimeException e) {
-            LOGGER.log(Level.FINE, "Leitura forte do próprio estado (" + self + ") falhou (sem líder?); "
-                    + "adoção adiada neste ciclo", e);
-            return false;
-        }
-    }
-
     /** {@link CatalogView#placementStrong}, mas nunca lança — falha vira {@link Optional#empty()} (não apaga). */
     private Optional<SeriesPlacement> safePlacementStrong(String seriesKey) {
         try {
@@ -413,68 +330,6 @@ public final class LocalReconciler implements Closeable, LeadershipListener {
         return SeriesObjectKeys.objectKey(seriesObjectPrefix, seriesKey);
     }
 
-    /**
-     * Pede ao líder para colocar {@code seriesKey} com {@code preferredOwnerNodeId=self} (adoção).
-     * Retenta um número limitado de vezes com backoff curto em {@code NOT_LEADER}/indisponibilidade de
-     * transporte; devolve {@code null} se não resolveu dentro do orçamento — o próximo ciclo tenta de
-     * novo, nunca lança.
-     */
-    private SeriesPlacement placeSelf(String seriesKey) {
-        NodeId leaderHint = null;
-        for (int attempt = 1; attempt <= PLACE_ATTEMPTS; attempt++) {
-            NodeId leader = leaderHint != null ? leaderHint : rpc.leaderId().orElse(null);
-            leaderHint = null;
-            if (leader == null) {
-                sleepQuietly(PLACE_BACKOFF);
-                continue;
-            }
-            PlaceResponse response;
-            try {
-                response = rpc.call(leader, Commands.PLACE, new PlaceRequest(seriesKey, null, self),
-                        PlaceResponse.class);
-            } catch (NgrrdClusterException e) {
-                LOGGER.log(Level.FINE, "Falha de transporte ao adotar " + seriesKey + " (tentativa " + attempt + ")", e);
-                sleepQuietly(PLACE_BACKOFF);
-                continue;
-            }
-            switch (response.status()) {
-                case OK -> {
-                    return response.placement();
-                }
-                case NOT_LEADER -> {
-                    if (response.leaderNodeId() != null) {
-                        leaderHint = NodeId.of(response.leaderNodeId());
-                    }
-                    sleepQuietly(PLACE_BACKOFF);
-                }
-                default -> {
-                    LOGGER.log(Level.WARNING, "PLACE de " + seriesKey + " (adoção) falhou: " + response.status()
-                            + (response.message() != null ? " (" + response.message() + ")" : ""));
-                    return null;
-                }
-            }
-        }
-        LOGGER.log(Level.WARNING, "Adoção de " + seriesKey + " não resolvida após " + PLACE_ATTEMPTS
-                + " tentativas (líder indisponível) — tentando de novo no próximo ciclo");
-        return null;
-    }
-
-    /**
-     * MÉDIO-7: espera {@code placementsLocal()} ficar estável (mesmo tamanho) por
-     * {@value #STABLE_TICKS_REQUIRED} verificações seguidas — cada uma delas exigindo TAMBÉM um líder
-     * presente e uma leitura FORTE bem-sucedida (qualquer chave; usa {@link #STABLE_PROBE_KEY}, que não
-     * existe de verdade — só interessa que o round-trip não lance) — ou até
-     * {@value #STABLE_AWAIT_TIMEOUT}, o que vier primeiro. Combinado com ALTO-1(d) (primeiro ciclo nunca
-     * apaga), garante que o primeiro {@code reconcileOnce()} de produção só roda depois de confirmar
-     * conectividade real com o líder, não apenas um {@code placementsLocal()} vazio por coincidência.
-     * Best-effort: nunca lança, mesmo se a malha nunca estabilizar (o primeiro ciclo roda de qualquer
-     * forma com o que houver, e os seguintes reconvergem).
-     *
-     * <p>MÉDIO-C do Refuter: o laço também checa {@link #closed} e a interrupção da própria thread a
-     * cada volta — {@link #close()} chamado enquanto este método está preso aqui (ex.: sem líder algum
-     * na malha) precisa sair em bem menos que {@value #STABLE_AWAIT_TIMEOUT}, sem fazer mais nenhuma
-     * chamada a {@link #rpc}/{@link #catalog}.</p>
-     */
     private void awaitCatalogStable() {
         long deadline = clock.millis() + STABLE_AWAIT_TIMEOUT.toMillis();
         int stableTicks = 0;
@@ -521,7 +376,7 @@ public final class LocalReconciler implements Closeable, LeadershipListener {
      * {@link #awaitCatalogStable}), depois {@code shutdownNow()} — não a parada graciosa usada por
      * {@code NodeStatusReporter} — porque este scheduler nunca segura um recurso de I/O do volume
      * durante o próprio {@code sleepQuietly}/espera de rede de {@link #awaitCatalogStable} ou
-     * {@link #placeSelf}; interromper a thread aí é seguro e é o que garante saída em bem menos de 1 s
+     * uma consulta ao líder; interromper a thread aí é seguro e é o que garante saída em bem menos de 1 s
      * mesmo com a malha sem líder algum, em vez de esperar o {@link #STABLE_AWAIT_TIMEOUT} inteiro
      * (30 s por padrão).
      */
