@@ -54,5 +54,14 @@ public enum SeriesStatus {
     SERIES_DELETED,
 
     /** Existing data requires reconcile --adopt before use. */
-    QUARANTINED
+    QUARANTINED,
+
+    /**
+     * Falha transitória do gate de criação de série nova: algum storage participante da purga ficou
+     * inalcançável ou não respondeu à inspeção ({@code ngrrd.series.inspect}) dentro do
+     * {@code placementInspectTimeout}. Os nós afetados vão em {@link PlaceResponse#unavailableNodeIds()}.
+     * Só é emitido para quem anuncia {@link PlaceRequest#acceptsPlacementUnavailable()}; séries já
+     * posicionadas continuam operando normalmente.
+     */
+    PLACEMENT_UNAVAILABLE
 }
