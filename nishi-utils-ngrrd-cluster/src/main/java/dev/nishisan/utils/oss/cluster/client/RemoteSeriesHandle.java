@@ -765,7 +765,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
             throw new SeriesNotFoundException(seriesKey, notFound.reason());
         }
         if (terminal instanceof NgrrdClusterException failure) {
-            throw new NgrrdClusterException(failure.code(), failure.getMessage(), failure);
+            throw new NgrrdClusterException(failure.code(), failure.getMessage(), failure.unavailableNodeIds(), failure);
         }
         if (current.closed()) {
             throw new NgrrdClusterException(ErrorCode.CLOSED, "handle fechado: " + seriesKey);

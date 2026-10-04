@@ -132,7 +132,8 @@ class PlacementResolverTest {
         SeriesPlacement placed = SeriesPlacement.active("storage-a", 1_000L);
         rpc.respondNext((cmd, body) -> {
             assertEquals(Commands.PLACE, cmd);
-            assertEquals(new PlaceRequest("series-1", "hash-1", null), body);
+            // 8.10.0: o resolver anuncia que entende PLACEMENT_UNAVAILABLE.
+            assertEquals(new PlaceRequest("series-1", "hash-1", null, null, null, false, true), body);
             return new PlaceResponse(SeriesStatus.OK, placed, null, null);
         });
 
@@ -148,7 +149,7 @@ class PlacementResolverTest {
         SeriesPlacement placed = SeriesPlacement.active("storage-a", 1_000L).withDefinitionName("ifaceStats", 1_000L);
         rpc.respondNext((cmd, body) -> {
             assertEquals(Commands.PLACE, cmd);
-            assertEquals(new PlaceRequest("series-1", "hash-1", null, null, "ifaceStats"), body);
+            assertEquals(new PlaceRequest("series-1", "hash-1", null, null, "ifaceStats", false, true), body);
             return new PlaceResponse(SeriesStatus.OK, placed, null, null);
         });
 
@@ -245,6 +246,35 @@ class PlacementResolverTest {
         NgrrdClusterException ex = assertThrows(NgrrdClusterException.class,
                 () -> resolver.resolve("series-1", "hash-1"));
         assertEquals(ErrorCode.NO_STORAGE_NODE_AVAILABLE, ex.code());
+    }
+
+    @Test
+    void placementUnavailableLancaNaHoraComCodigoENosSemRetentar() {
+        rpc.respondDefault((cmd, body) -> new PlaceResponse(SeriesStatus.PLACEMENT_UNAVAILABLE, null,
+                "series=series-1; ngrrd.series.inspect sem resposta de [storage-b, storage-c]", null,
+                List.of("storage-b", "storage-c")));
+
+        NgrrdClusterException ex = assertThrows(NgrrdClusterException.class,
+                () -> resolver.resolve("series-1", "hash-1"));
+
+        assertEquals(ErrorCode.PLACEMENT_UNAVAILABLE, ex.code());
+        assertEquals(List.of("storage-b", "storage-c"), ex.unavailableNodeIds());
+        assertTrue(ex.getMessage().contains("ngrrd.series.inspect"), ex.getMessage());
+        assertEquals(1, rpc.calls().size(), "falha transitória do gate não é retentada pelo resolver");
+    }
+
+    @Test
+    void statusDesconhecidoDoLiderViraRemoteErrorSemNpe() {
+        // Líder mais novo: o codec lê um status que esta versão não conhece como null.
+        rpc.respondDefault((cmd, body) -> new PlaceResponse(null, null, "status futuro", null));
+
+        NgrrdClusterException ex = assertThrows(NgrrdClusterException.class,
+                () -> resolver.resolve("series-1", "hash-1"));
+
+        assertEquals(ErrorCode.REMOTE_ERROR, ex.code());
+        assertTrue(ex.getMessage().contains("status desconhecido"), ex.getMessage());
+        assertTrue(ex.unavailableNodeIds().isEmpty());
+        assertEquals(1, rpc.calls().size());
     }
 
     @Test
