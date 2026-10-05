@@ -4,6 +4,61 @@
 
 ---
 
+## 2026-10-05 — Handback sem cutover parcial e sem reancoragem de tópicos não instalados — 8.11.2
+
+Incidente no CTP (tems), 2026-10-05 às 17:23:36, com os três storages na 8.11.1. A storage de
+maior afinidade reiniciou de forma graciosa e, cerca de 1 s depois de subir, recebeu o handback.
+Instalou só `map:_ngrid-queue-offsets`, declarou o cutover e assumiu; o incumbente renumerou
+`map:ngrrd.nodes` para baixo (278876 → 278872), o novo líder cedeu ao terceiro nó ("holds state
+this node lacks") e o terceiro assumiu pelo escape D9. Um segundo handback, 60 s depois, instalou
+tudo e corrigiu. O coordenador estava parado, por isso o catálogo não divergiu e o diff de valores
+deu zero. Plano em `planning/2026-10-05-ngrid-handback-partial-cutover-8.11.2.md`.
+
+### Causa
+- `NGridNode.start()` inicia o `ReplicationManager` e o `ClusterCoordinator` antes de registrar
+  as filas e os mapas configurados, e cada mapa só registra o handler depois de carregar do disco.
+  Nessa janela o nó já anunciava as fronteiras de disco de todos os tópicos, era elegível e podia
+  pedir handback com um conjunto parcial de handlers.
+- O candidato armava o bootstrap só para os handlers registrados; o `frozenByTopic` do GRANT nunca
+  era lido. Concluía no último tópico pendente e enviava, no `cutoverByTopic`, as fronteiras **de
+  disco** dos tópicos que não instalou.
+- O incumbente fazia SET incondicional do vetor, sem comparar com a fronteira congelada.
+- O papel do candidato era zerado antes da promoção: o tick de 200 ms reenviava o REQUEST, que
+  voltava como `HANDBACK_ABORT: handback already in progress`, com cooldown espúrio de 60 s.
+- `aheadEligiblePeer` devolvia o primeiro peer à frente na ordem de iteração, não o melhor.
+
+### Correções (`nishi-utils-core`, NGrid)
+- **Contrato do GRANT:** o candidato só conclui o cutover quando instalou **todos** os tópicos do
+  `frozenByTopic`. Um tópico exigido sem handler é armado quando o handler registra, dentro de
+  `handoverSnapshotTimeout`; ao estourar, aborta e fica seguidor. O `cutoverByTopic` contém só os
+  tópicos instalados. Incumbente anterior à 8.8.0 (sem vetor): o conjunto é o dos handlers locais.
+- **Validação no incumbente:** cada entrada do `HANDBACK_COMPLETE` precisa ser igual à fronteira
+  congelada do tópico; entradas divergentes não são aplicadas (fronteira, contador, op-log e relay
+  ficam) e emitem o marcador SEVERE `NGRID_HANDBACK_VECTOR_MISMATCH`.
+- **Gate de prontidão:** `ReplicationManager.deferHandlersReady()`/`markHandlersReady()`, armado
+  pelo `NGridNode` antes de iniciar o manager e liberado após registrar o último mapa configurado.
+  Enquanto engajado, o nó não anuncia fronteira, não é elegível e não pede nem aceita handback. O
+  mesmo gate fecha o bootstrap parcial em restart sujo, que soltava no primeiro tópico instalado.
+- **Papel durante a promoção:** `CANDIDATE_PROMOTING` até o envio do COMPLETE — um único REQUEST
+  por tentativa.
+- **Yield do líder recém-eleito:** o alvo é o peer com o estado mais novo
+  (`compareAdvertisedState`), não o primeiro da iteração.
+- Testes: `HandbackRequiresAllGrantedTopicsTest`, `HandbackCompleteVectorMismatchTest`,
+  `HandlersReadyGateTest`, `DelayedMapRegistrationHandbackClusterTest` (cluster de 3 nós com um
+  mapa registrado tarde e escrita contínua durante o handback) e duas variantes em
+  `TopicFrontierElectionGateTest`. Cada correção foi provada por mutação.
+
+### Versões afetadas e operação
+- O defeito existe desde a 8.8.0 (vetor por tópico, C2) e está presente na 8.10.1, 8.10.2, 8.11.0
+  e 8.11.1 — não é regressão da 8.11.x. Antes da 8.8.0 o caminho escalar tinha o defeito análogo
+  corrigido na 8.10.1.
+- Com escrita no catálogo durante o handback, a mesma sequência renumeraria o catálogo para baixo
+  no incumbente, o novo líder serviria um snapshot stale ao terceiro nó e as operações entre a
+  fronteira de disco do candidato e a congelada se perderiam no cluster; os detectores de seguidor
+  à frente convergem para o líder e não curam esse caso.
+- Ordem de deploy e retirada da mitigação de `priority`: seção "Atualização para 8.11.2" de
+  `doc/oss/ngrrd-cluster-operacao.md`.
+
 ## 2026-10-05 — Correções da revisão de persistência e instalação — 8.11.1
 
 Corrige os bloqueadores apontados na revisão da PR #196. A 8.11.0 foi publicada antes de

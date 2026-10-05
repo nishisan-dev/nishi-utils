@@ -1152,3 +1152,53 @@ flock /tmp/nishi-utils-maven.lock mvn -B -pl nishi-utils-ngrrd-cluster -am test 
   -Dtest=SeriesLifecycleJournalSizingBenchmarkTest \
   -Dsurefire.failIfNoSpecifiedTests=false -Dngrrd.journal.benchmark=true -DargLine=-Xmx1g
 ```
+
+## Atualização para 8.11.2
+
+### O que a 8.11.2 corrige
+
+Incidente no CTP (2026-10-05): a storage de maior afinidade reiniciou e, com o catálogo ainda
+carregando do disco, pediu e recebeu o handback com um conjunto parcial de handlers. Instalou só
+`_ngrid-queue-offsets`, declarou o cutover e enviou ao incumbente as fronteiras de disco dos
+tópicos que não instalou; o incumbente renumerou `ngrrd.nodes` para baixo. Só não houve perda no
+catálogo porque o coordenador estava parado. O defeito existe desde a 8.8.0.
+
+Na 8.11.2 o handback é seguro nas duas pontas:
+
+- o candidato só conclui o cutover depois de instalar **todos** os tópicos que o GRANT nomeia, e
+  espera o registro dos handlers que faltam dentro de `handoverSnapshotTimeout` (120 s por padrão);
+  ao estourar, aborta e fica seguidor;
+- o nó não anuncia fronteira, não é elegível e não pede nem aceita handback enquanto `start()` não
+  registrou o último mapa configurado (log `Replication handlers ready`);
+- o incumbente só reancora um tópico quando o cutover recebido é igual à fronteira que congelou;
+  caso contrário mantém fronteira, contador, op-log e relay e emite o marcador abaixo.
+
+### Ordem de deploy
+
+1. Pare o coordenador (único escritor do catálogo) durante a janela.
+2. Troque o jar dos storages **um por vez**, com restart gracioso, e espere `NGRRD_STORAGE_NODE_STARTED`
+   e `Replication handlers ready` antes do próximo. Comece pelos de menor `priority`.
+3. Deixe o storage de maior afinidade (maior `priority`) **por último**: é ele que pede o handback
+   ao voltar. Confirme no log dele `Affinity handback: cutover complete` e, no incumbente,
+   `demoted incumbent re-anchored per topic` com os três mapas (`ngrrd.catalog`, `ngrrd.nodes`,
+   `ngrrd.geometries`) e `_ngrid-queue-offsets`, sem o marcador de divergência.
+4. Compare o conteúdo do catálogo entre os três nós (diff de valores, como na seção da 8.10.1) e só
+   então religue o coordenador.
+
+### Retirar a mitigação de `priority`
+
+A mitigação adotada no incidente — deixar o storage reiniciado com `priority` igual ou menor que a
+do incumbente para evitar o handback — só pode ser retirada com **todos** os nós na 8.11.2: um
+incumbente anterior ainda aceita o REQUEST de um candidato parcial e faz o SET incondicional do
+vetor; um candidato anterior ainda conclui o cutover com instalação parcial. Com o cluster inteiro
+na 8.11.2, restaure as prioridades originais um nó por vez, com restart gracioso, e confirme o
+handback pelos logs acima.
+
+### Marcador `NGRID_HANDBACK_VECTOR_MISMATCH`
+
+Emitido em SEVERE pelo incumbente rebaixado quando uma entrada do `HANDBACK_COMPLETE` difere da
+fronteira congelada (`topic=`, `cutover=`, `frozen=`, `peer=`). Significa que o candidato não
+instalou o snapshot deste nó para o tópico — com todos os nós na 8.11.2 não deve ocorrer. Se
+ocorrer: o nó manteve o seu estado e segue à frente do novo líder nesse tópico; verifique as
+versões dos dois nós, compare o conteúdo do tópico entre eles e, se o novo líder estiver atrás,
+force o handback de volta (restart gracioso do novo líder) antes de aceitar escrita no tópico.
