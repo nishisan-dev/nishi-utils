@@ -169,6 +169,14 @@ public interface ReplicationHandler {
     default boolean onSnapshotAborted() throws Exception { return false; }
 
     /**
+     * Internal infrastructure opt-in for transactional map snapshot installation and rollback.
+     * Legacy queue handlers retain their existing failover behavior and do not opt in.
+     * @return true when incomplete snapshot installation must block promotion until safely restored
+     * @since 8.11.1
+     */
+    default boolean usesTransactionalSnapshotInstallation() { return false; }
+
+    /**
      * Internal infrastructure marker for the Sync durable diagnostic, not an application API.
      * @return true only when snapshot installation includes a persistent durability barrier
      * @since 8.11.1

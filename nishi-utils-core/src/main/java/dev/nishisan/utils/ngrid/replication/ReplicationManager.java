@@ -1606,7 +1606,12 @@ public class ReplicationManager
     /** Caller owns the topic install lock; never performs I/O under the global lifecycle lock. */
     private void restoreSnapshotInstallation(String topic, SnapshotInstall install) throws Exception {
         if (physicalSnapshotInstalls.get(topic) != install) return;
-        if (!handlers.get(topic).onSnapshotAborted()) install.failed = true;
+        ReplicationHandler handler = handlers.get(topic);
+        if (!handler.usesTransactionalSnapshotInstallation() || !handler.onSnapshotAborted()) {
+            // Legacy queue installation has no rollback guarantee. Retain unclean-shutdown evidence,
+            // but do not introduce a permanent promotion gate into its existing failover behavior.
+            install.failed = true;
+        }
         physicalSnapshotInstalls.remove(topic, install);
         snapshotLifecycleLock.lock();
         try {
@@ -3288,14 +3293,14 @@ public class ReplicationManager
                     }
                     if (running && coordinator.isLeader() && leadershipGeneration.get() == promotionGeneration
                             && snapshotInstalls.isEmpty() && physicalSnapshotInstalls.isEmpty()
-                            && failedSnapshotInstalls.isEmpty()) finishLeaderPromotion();
+                            && !hasTransactionalSnapshotFailures()) finishLeaderPromotion();
                 } catch (Exception e) {
                     LOGGER.log(Level.SEVERE, "Promotion cannot restore trusted map state", e);
                 }
             });
             return;
         }
-        if (!failedSnapshotInstalls.isEmpty()) {
+        if (hasTransactionalSnapshotFailures()) {
             leaderSyncing.set(true);
             return;
         }
@@ -3375,13 +3380,26 @@ public class ReplicationManager
         }
     }
 
+    private boolean hasTransactionalSnapshotFailures() {
+        return failedSnapshotInstalls.stream().anyMatch(this::isTransactionalSnapshotTopic);
+    }
+
+    private boolean hasTransactionalPhysicalInstalls() {
+        return physicalSnapshotInstalls.keySet().stream().anyMatch(this::isTransactionalSnapshotTopic);
+    }
+
+    private boolean isTransactionalSnapshotTopic(String topic) {
+        ReplicationHandler handler = handlers.get(topic);
+        return handler != null && handler.usesTransactionalSnapshotInstallation();
+    }
+
     /**
      * Called by a topic's apply consumer when its relay has fully drained. While a failover drain-gate
      * is held (leaderSyncing), this releases the topic; once all gated topics have drained, the write
      * gate opens and the promoted node may lead.
      */
     private void maybeReleaseRelayDrainGate(String topic) {
-        if (!failedSnapshotInstalls.isEmpty() || !physicalSnapshotInstalls.isEmpty()) return;
+        if (hasTransactionalSnapshotFailures() || hasTransactionalPhysicalInstalls()) return;
         if (!leaderSyncing.get()) {
             return;
         }

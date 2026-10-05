@@ -157,7 +157,7 @@ class LeaderSyncGateTest {
             Thread.sleep(20);
         }
         assertEquals(5L, manager.getLastAppliedSequence(), "initial snapshot should advance applied sequence");
-        Thread.sleep(200); // nextExpected is set just after lastAppliedSequence under the lock
+        awaitSnapshotSettled(); // The frontier is published before installation cleanup is complete.
 
         // Simulate promotion: leaderSyncing becomes true with the active peer as sync source.
         manager.onLeaderChanged(local.nodeId());
@@ -180,7 +180,28 @@ class LeaderSyncGateTest {
 
     // ── Helpers ──
 
+    private void awaitSnapshotSettled() throws Exception {
+        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
+        while (System.nanoTime() < deadline) {
+            boolean settled = true;
+            for (String name : List.of("snapshotInstalls", "physicalSnapshotInstalls", "failedSnapshotInstalls")) {
+                var field = ReplicationManager.class.getDeclaredField(name);
+                field.setAccessible(true);
+                Object state = field.get(manager);
+                settled &= state instanceof java.util.Map<?, ?> map ? map.isEmpty()
+                        : ((java.util.Set<?>) state).isEmpty();
+            }
+            if (settled) return;
+            Thread.sleep(10);
+        }
+        fail("initial snapshot must finish its full installation lifecycle before simulated promotion");
+    }
+
     private void requestSnapshot() throws Exception {
+        var syncing = ReplicationManager.class.getDeclaredField("syncingTopics");
+        syncing.setAccessible(true);
+        @SuppressWarnings("unchecked") var topics = (java.util.Set<String>) syncing.get(manager);
+        topics.add(TOPIC);
         var request = ReplicationManager.class.getDeclaredMethod("requestSync", String.class);
         request.setAccessible(true);
         assertTrue((boolean) request.invoke(manager, TOPIC), "the follower must request its snapshot");

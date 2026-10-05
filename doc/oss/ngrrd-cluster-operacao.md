@@ -980,7 +980,9 @@ regressões de persistência e não deve ser usada como destino de implantação
 de #195/#190 continuam presentes: o disco é carregado antes do registro do handler, e a instalação
 completa é persistida antes do cutover. `Sync completed for ...` permanece com o texto conhecido;
 `Sync durable for map:<mapa>` confirma checkpoint e cutover de mapas persistentes. Filas e
-mapas sem persistência não emitem esse marcador. A API pública
+mapas sem persistência não emitem esse marcador. O controle transacional de rollback e
+bloqueio de promoção é exclusivo dos mapas, inclusive em memória; filas mantêm o failover
+e o drain anteriores, sem adquirir uma garantia de rollback ou checkpoint durável. A API pública
 `NMapPersistence.forceSnapshot()` foi introduzida na 8.11.0, é síncrona e pode lançar `IOException`; o controle
 `setSnapshotsSuspended(boolean)` serve à infraestrutura de instalação. Não há mudança nos
 records públicos de métricas. Também há um overload de construtor que recebe o `ReentrantLock`

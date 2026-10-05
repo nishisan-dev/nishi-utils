@@ -351,8 +351,8 @@ class SnapshotCheckpointFenceTest {
     }
 
     @Test @Timeout(20)
-    void genericQueueAbortKeepsFailedGuardsUntilFreshFullSnapshot() throws Exception {
-        String topic = "queue:abort";
+    void transactionalHandlerWithoutRollbackKeepsFailedGuardsUntilFreshFullSnapshot() throws Exception {
+        String topic = "map:abort-unsupported";
         BlockingCheckpoint queue = new BlockingCheckpoint();
         queue.release.countDown();
         manager.registerHandler(topic, queue);
@@ -368,6 +368,47 @@ class SnapshotCheckpointFenceTest {
         await(() -> manager.appliedFrontiers().byTopic().getOrDefault(topic, 0L) == 60L
                 && !((Set<?>) uncheckedGet("failedSnapshotInstalls")).contains(topic));
         assertFalse(((Set<?>) get("relayPendingBootstrap")).contains(topic));
+    }
+
+    @Test @Timeout(20)
+    void legacyPartialQueuePromotionDrainsAndRetainsUncleanShutdownEvidence() throws Exception {
+        String topic = "queue:legacy-failover";
+        BlockingCheckpoint queue = new BlockingCheckpoint() {
+            public boolean usesTransactionalSnapshotInstallation() { return false; }
+        };
+        manager.registerHandler(topic, queue);
+        respond(request(topic), true, 0, 50L);
+        await(() -> queue.resets.get() == 1);
+        coordinator.assumeLeadershipForHandback(7L);
+        await(() -> coordinator.isLeader() && !manager.isLeaderSyncing());
+        assertDoesNotThrow(() -> manager.replicate(topic, new byte[]{1}).get(2, TimeUnit.SECONDS));
+        assertTrue(((Set<?>) get("failedSnapshotInstalls")).contains(topic),
+                "legacy partial queue has no durable rollback; shutdown must remain unclean");
+        manager.stop();
+        assertFalse(manager.markCleanShutdownIfEligible(true));
+    }
+
+    @Test @Timeout(20)
+    void legacyQueueAbandonCannotReleaseAnotherMapsFailedPromotionGuard() throws Exception {
+        handler.fail = true;
+        handler.release.countDown();
+        respond(request(), false, 0, 50L);
+        await(() -> handler.completed.get() == 1
+                && ((Map<?, ?>) uncheckedGet("physicalSnapshotInstalls")).isEmpty());
+        String topic = "queue:legacy-with-failed-map";
+        BlockingCheckpoint queue = new BlockingCheckpoint() {
+            public boolean usesTransactionalSnapshotInstallation() { return false; }
+        };
+        manager.registerHandler(topic, queue);
+        respond(request(topic), true, 0, 50L);
+        await(() -> queue.resets.get() == 1);
+        coordinator.assumeLeadershipForHandback(7L);
+        await(() -> ((Map<?, ?>) uncheckedGet("physicalSnapshotInstalls")).isEmpty());
+        assertTrue(manager.isLeaderSyncing());
+        assertTrue(((Set<?>) get("failedSnapshotInstalls")).contains(TOPIC));
+        assertThrows(LeaderSyncingException.class, () -> manager.replicate(topic, new byte[]{1}));
+        manager.stop();
+        assertFalse(manager.markCleanShutdownIfEligible(true));
     }
 
     @Test @Timeout(20)
@@ -414,6 +455,7 @@ class SnapshotCheckpointFenceTest {
         CountDownLatch entered = new CountDownLatch(1), release = new CountDownLatch(1);
         AtomicInteger resets = new AtomicInteger(), completed = new AtomicInteger();
         volatile boolean fail;
+        public boolean usesTransactionalSnapshotInstallation() { return true; }
         public void apply(UUID operationId, Object payload) { }
         public void resetState() { resets.incrementAndGet(); }
         public void installSnapshot(Object payload) { }

@@ -691,6 +691,11 @@ public final class MapClusterService<K, V>
     }
 
     @Override
+    public boolean usesTransactionalSnapshotInstallation() {
+        return true;
+    }
+
+    @Override
     public boolean hasDurableSnapshotCheckpoint() {
         return persistence != null;
     }

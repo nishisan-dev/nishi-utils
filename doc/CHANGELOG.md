@@ -18,7 +18,9 @@ incorporá-los; não deve ser usada como destino de implantação.
   preservados e impedem abertura confiável, em vez de autorizar perda silenciosa.
 - Destruição pode remover arquivos após falha histórica de persistência, depois de confirmar
   que writer e canais encerraram. Um timeout de encerramento continua impedindo a remoção.
-- Instalações abandonadas não deixam o mapa permanentemente suspenso; recuperação e conclusão
+- O controle transacional de instalações é exclusivo dos mapas, inclusive em memória;
+  o failover e o drain das filas mantêm o comportamento anterior. Instalações abandonadas
+  não deixam o mapa permanentemente suspenso; recuperação e conclusão
   continuam vinculadas à sessão válida, sem promover candidatos após aborto ou timeout.
 - Callbacks de promoção não executam sob o lock global da instalação. `Sync durable` fica
   restrito aos mapas persistentes que concluíram o checkpoint e o cutover.
