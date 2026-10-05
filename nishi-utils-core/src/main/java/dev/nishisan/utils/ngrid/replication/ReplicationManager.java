@@ -276,6 +276,11 @@ public class ReplicationManager
     // registration. handbackInstalledTopics collects the topics installed under the current attempt.
     private volatile Set<String> handbackRequiredTopics = Set.of();
     private final Set<String> handbackInstalledTopics = ConcurrentHashMap.newKeySet();
+    // Readiness gate (8.11.2): false between deferHandlersReady() and markHandlersReady() — the window
+    // in which the owning NGridNode is still registering its configured queues and maps. While not
+    // ready the node advertises no frontier, is not leader-eligible and neither requests nor accepts a
+    // handback. Manual assemblies (tests) never defer, so they stay ready.
+    private volatile boolean handlersReady = true;
     /** Log marker of a HANDBACK_COMPLETE vector entry that does not match the frozen frontier (8.11.2). */
     public static final String HANDBACK_VECTOR_MISMATCH_MARKER = "NGRID_HANDBACK_VECTOR_MISMATCH";
     // INTERIM-LEADER production freeze: gates replicate() so nothing is produced above the frozen
@@ -724,6 +729,44 @@ public class ReplicationManager
     }
 
     /**
+     * Declares that the owner of this manager still has handlers to register (8.11.2): until
+     * {@link #markHandlersReady()} the node advertises no frontier, is not leader-eligible and neither
+     * requests nor accepts an affinity handback. {@code NGridNode.start()} calls this before starting the
+     * manager and {@link #markHandlersReady()} once every configured queue and map is registered — the
+     * window in which a map still loading from disk left the node with a partial handler set while
+     * the coordinator and the handback tick were already live (CTP incident, 8.11.2).
+     *
+     * <p><b>Internal:</b> part of the {@code NGridNode} lifecycle; not meant for application code.
+     */
+    public void deferHandlersReady() {
+        handlersReady = false;
+    }
+
+    /**
+     * Releases the readiness gate armed by {@link #deferHandlersReady()} and re-evaluates leadership so
+     * the deferred election or handback happens promptly.
+     *
+     * <p><b>Internal:</b> part of the {@code NGridNode} lifecycle; not meant for application code.
+     */
+    public void markHandlersReady() {
+        if (!handlersReady) {
+            handlersReady = true;
+            LOGGER.info("Replication handlers ready: the node may now advertise, lead and request a handback");
+            coordinator.reevaluateLeadership();
+        }
+    }
+
+    /**
+     * Whether the owner finished registering its handlers (8.11.2). Observability mirror of the
+     * readiness gate; always {@code true} for a manually assembled manager.
+     *
+     * @return {@code true} when the node may advertise, lead and take part in a handback
+     */
+    public boolean isHandlersReady() {
+        return handlersReady;
+    }
+
+    /**
      * Whether an affinity handback is in flight on this node, in any role (8.11.2). On the candidate it
      * stays {@code true} from the request through the promotion until the {@code HANDBACK_COMPLETE} has
      * been sent — the window in which a second request must not be issued.
@@ -776,7 +819,11 @@ public class ReplicationManager
      * lineage would otherwise leak into the first heartbeats as a real watermark).
      */
     private boolean bootstrapGateEngaged() {
+        // 8.11.2: also engaged while the owner is still registering handlers — the D8 clause below only
+        // held until the FIRST handler registered, so a later map (still loading from disk) left the
+        // node advertising its disk frontier and eligible with a partial handler set.
         return hasPendingRelayBootstrap()
+                || !handlersReady
                 || (isStreamMode() && uncleanWithPriorRelayData && handlers.isEmpty());
     }
 
@@ -3784,9 +3831,10 @@ public class ReplicationManager
                 || System.currentTimeMillis() < handbackCooldownUntilMs) {
             return;
         }
-        // Must be a STABLE follower: not leader, not bootstrapping, not mid-sync, with handlers ready.
+        // Must be a STABLE follower: not leader, not bootstrapping, not mid-sync, with handlers ready
+        // (8.11.2: every configured handler registered, not merely the first one — see handlersReady).
         if (coordinator.isLeader() || bootstrapGateEngaged() || isLeaderSyncing()
-                || !relayPendingBootstrap.isEmpty() || handlers.isEmpty()) {
+                || !relayPendingBootstrap.isEmpty() || handlers.isEmpty() || !handlersReady) {
             return;
         }
         if (!coordinator.localIsPreferredLeader() || !coordinator.isAgreedLeaderHealthy()) {
@@ -3961,6 +4009,13 @@ public class ReplicationManager
         if (handlers.isEmpty()) {
             sendHandbackAbort(message.source(), "candidate has no topics");
             clearCandidateHandback("no topics", true);
+            return;
+        }
+        if (!handlersReady) {
+            // 8.11.2: the owner is still registering handlers; the request should not have gone out
+            // (maybeInitiateHandback gates on it), but a GRANT must never start a partial install.
+            sendHandbackAbort(message.source(), "candidate handlers not ready");
+            clearCandidateHandback("handlers not ready", true);
             return;
         }
         // 8.11.2: the GRANT's frozen vector is the contract — every topic it names must be installed
