@@ -28,6 +28,18 @@ incorporá-los; não deve ser usada como destino de implantação.
   restrito aos mapas persistentes que concluíram o checkpoint e o cutover.
 - Inicialização não exige abrir para leitura todos os ancestrais até a raiz. A CI executa
   compatibilidade com o código real do leitor publicado na 8.10.2.
+- O snapshot periódico grava no WAL antigo, em ordem e com fsync em `ASYNC_WITH_FSYNC`, as
+  admissões assíncronas ainda na fila no momento da captura, antes da rotação. Antes, elas
+  eram descartadas da fila e existiam só na imagem em memória. Um crash durante a serialização
+  recuperava então o snapshot antigo, o WAL antigo e as escritas posteriores, com um buraco no
+  meio da história: por exemplo, uma chave voltava depois de um `CLEAR`. Em
+  `ASYNC_WITH_FSYNC`, a recuperação agora produz sempre um prefixo da história.
+- **Mudanças de comportamento público:**
+  - `NMap.open` lança `IllegalStateException` quando a carga ou o início da persistência falha,
+    em vez de devolver um mapa aberto sem o estado do disco.
+  - Mutações num mapa persistente fechado ou em fail-stop lançam `IllegalStateException`, em
+    vez de entrar na fila em silêncio. Vale para `put`/`putAll`/`remove`/`clear` do `NMap` e para
+    `NMapPersistence.appendAsync`/`appendSync`.
 
 O runbook inclui tratamento de snapshot corrompido, falha de checkpoint e recuperação ambígua.
 Os prazos de handback e a forma dos records públicos de métricas permanecem os mesmos.

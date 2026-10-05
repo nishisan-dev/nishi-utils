@@ -1017,6 +1017,28 @@ início da tentativa conforme o código existente. Transferência e checkpoint c
 orçamento. O checkpoint não roda na thread de transporte nem nos schedulers. Não aumentar
 prazos para mascarar falhas sem medir o catálogo real e a pausa de escrita do líder.
 
+### Folga de heap durante bootstrap ou handback
+
+Para permitir o rollback, a instalação de um mapa retém em memória a imagem anterior até o
+cutover, enquanto a imagem nova é carregada. Antes da 8.11.1, o reset liberava os valores
+antigos. Por isso, durante um bootstrap ou handback, o catálogo ocupa temporariamente cerca do
+dobro da memória.
+
+Medição local com 900 mil `SeriesPlacement`:
+
+- o mapa vivo ocupa cerca de 280 MB;
+- durante a instalação, os valores antigos (cerca de 280 MB) continuam retidos enquanto a
+  imagem nova, de tamanho semelhante, é carregada;
+- a cópia estrutural do mapa usada no rollback acrescenta cerca de 39 MB;
+- o pico fica, portanto, cerca de **+320 MB** acima do regime normal;
+- a esse pico somam-se a cópia feita pelo checkpoint (`forceSnapshot`) e a tabela de handles
+  da serialização.
+
+Dimensione o heap dos storages com folga de **cerca de 2× o tamanho do catálogo** em memória,
+e confira o pico no piloto, durante o bootstrap intencional e o handback. Se o heap se esgotar
+nessa janela, o processo deixa de ser confiável: pare o nó e siga o procedimento de falha de
+checkpoint descrito abaixo.
+
 ### Compatibilidade e rollback
 
 O journal de séries conserva o formato da 8.10.2; `ACTIVE` aceita `placement=null`. Fases de
