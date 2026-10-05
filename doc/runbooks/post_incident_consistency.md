@@ -164,3 +164,19 @@ do follower como em "Epoch divergente" e compare o conteúdo dos mapas afetados.
 | `gapsDetected` | `NGridOperationalSnapshot.gapsDetected()` |
 | `resendSuccessCount` | `NGridOperationalSnapshot.resendSuccessCount()` |
 | `pendingOperationsCount` | `NGridOperationalSnapshot.pendingOperationsCount()` |
+
+
+## Checkpoint durável na 8.11.0 (#195/#190)
+
+Em nós 8.11.0, confirmar `Sync durable for map:<mapa>` para todos os mapas persistentes antes de
+considerar completo o bootstrap/cutover. O marcador tradicional `Sync completed for ...` foi
+preservado para compatibilidade com o MOP, mas a validação de durabilidade usa o marcador novo.
+Falha de checkpoint ou instalação parcial impede shutdown limpo e promoção de handback.
+
+A retirada do contorno exige piloto com disco não vazio: ressincronizar sem mover `maps/`,
+comparar conteúdo com o líder, reiniciar imediatamente e repetir a comparação. Validar handback
+e uma virada de hora antes de expandir. Até isso ocorrer, manter o contorno nos nós antigos ou
+não validados. `CAT_LAG 0` não comprova igualdade de conteúdo (#188 permanece aberta).
+
+Não remover `snapshot.pending` manualmente. Se esse arquivo estiver presente após interrupção,
+concluir recuperação usando 8.11.0 antes de tentar downgrade para um leitor antigo.

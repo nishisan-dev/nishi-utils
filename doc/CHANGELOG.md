@@ -4,6 +4,41 @@
 
 ---
 
+## 2026-10-05 — Instalação durável de mapas e journal menor — 8.11.0
+
+Correção de integridade das issues #195/#190, rastreamento de applies #191 e teste de adoção #192.
+
+- Mapas persistentes carregam o disco e iniciam a persistência antes de publicar seu handler.
+  A carga é idempotente; carga, reset, instalação e apply são serializados. Nenhum snapshot
+  periódico é salvo durante uma instalação parcial.
+- O callback de conclusão força o snapshot completo e a limpeza durável do WAL antes de liberar
+  bootstrap, reancorar sequências ou promover um candidato de handback. Falha ou instalação
+  incompleta impede o marcador de shutdown limpo.
+- **API pública nova (minor):** `NMapPersistence.forceSnapshot()` é síncrono e lança `IOException`.
+  `setSnapshotsSuspended(boolean)` é controle de infraestrutura para instalação de snapshots;
+  o novo overload de construtor com `ReentrantLock` permite compartilhar o lock de estado
+  com os mutadores. O construtor anterior continua disponível; consumidores comuns não
+  precisam usar esses controles. Records públicos de métricas permanecem iguais.
+- O texto `Sync completed for ...` continua disponível. O marcador adicional
+  `Sync durable for ...` confirma checkpoint e cutover completos. O checkpoint roda no executor
+  de replicação, e sua conclusão fica vinculada à sessão e tentativa ainda válidas.
+- Entradas `ACTIVE` de `series-lifecycle.wal` passam a carregar `placement=null`; as outras fases
+  mantêm evidências de recuperação. Replay normaliza entradas antigas, sem trocar framing/JSON/CRC.
+  A política de compactação amortizada e o fsync antes da admissão das amostras são mantidos.
+- Submit rejeitado remove o apply rastreado e falha a operação; timeout de operação continua
+  limitando o rótulo até o apply efetivamente terminar. O teste de volume existente exige
+  quarentena e `reconcile ADOPT` explícito, preservando os bytes.
+- Medições temporárias: `NGRRD_LIFECYCLE_COMPACT` (INFO), `NGRRD_LIFECYCLE_FSYNC` e
+  `NGRRD_WRITE_BATCH_TOTAL` (FINE). Não acrescentam métricas públicas.
+
+**Operação:** veja a seção "Atualização para 8.11.0" no guia operacional. Validar primeiro
+ressincronização com disco não vazio, restart imediato e comparação de conteúdo em um storage.
+Retirar o contorno de mover `maps/` e esperar cinco minutos só para nós atualizados e validados.
+Não ajustar prioridades durante o deploy. O snapshot de uma rotação interrompida usa
+`snapshot.pending`: completar sua recuperação com 8.11.0 antes de voltar para um leitor antigo.
+
+Compactação em segundo plano, group commit, #193 e novas métricas por etapa seguem fora desta entrega.
+
 ## 2026-10-05 — Compactação amortizada do journal de ciclo de vida das séries — 8.10.2
 
 Hotfix de produção (CTP/tems). Depois da atualização para a 8.10.x, a reabertura de handles caiu
