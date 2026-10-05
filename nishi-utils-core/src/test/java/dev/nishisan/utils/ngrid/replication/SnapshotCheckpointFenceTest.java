@@ -218,8 +218,12 @@ class SnapshotCheckpointFenceTest {
     }
 
     void respondMap(ClusterMessage request, boolean more, Map<String, String> data) {
+        respondMap(request, 0, more, data);
+    }
+
+    void respondMap(ClusterMessage request, int chunk, boolean more, Map<String, String> data) {
         transport.deliver(new ClusterMessage(null, request.messageId(), MessageType.SYNC_RESPONSE,
-                "sync", LEADER, LOCAL, new SyncResponsePayload(TOPIC, 50L, 0, more,
+                "sync", LEADER, LOCAL, new SyncResponsePayload(TOPIC, 50L, chunk, more,
                 MapReplicationCodec.encodeSnapshot(new HashMap<>(data))), 5));
     }
 
@@ -271,6 +275,38 @@ class SnapshotCheckpointFenceTest {
         respondMap(request(), false, Map.of("replacement", "accepted"));
         await(() -> manager.appliedFrontiers().byTopic().getOrDefault(TOPIC, 0L) == 50L);
         assertEquals(Set.of("replacement"), service.keySet());
+    }
+
+    @Test @Timeout(20)
+    void delayedRestoreOfAbandonedAttemptCannotRollBackReplacementInProgress() throws Exception {
+        var service = durableMap();
+        service.apply(UUID.randomUUID(), MapReplicationCommand.put("prior", "trusted"));
+        Map<?, ?> physical = (Map<?, ?>) get("physicalSnapshotInstalls");
+        respondMap(request(), true, Map.of("partial", "attempt-a"));
+        await(() -> service.keySet().contains("partial") && physical.containsKey(TOPIC));
+        Object attemptA = physical.get(TOPIC);
+        invoke("abandonSyncChain", new Class<?>[]{String.class}, TOPIC);
+        await(() -> service.isHealthy() && service.keySet().equals(Set.of("prior")) && physical.isEmpty());
+        respondMap(request(), true, Map.of("first", "attempt-b"));
+        await(() -> service.keySet().equals(Set.of("first")) && physical.containsKey(TOPIC));
+        Object attemptB = physical.get(TOPIC);
+        assertNotSame(attemptA, attemptB);
+        // Attempt A's restoration task only now acquires the topic install lock, mid attempt B.
+        @SuppressWarnings("unchecked")
+        var locks = (Map<String, java.util.concurrent.locks.ReentrantLock>) get("snapshotInstallLocks");
+        var lock = locks.get(TOPIC);
+        lock.lock();
+        try { invoke("restoreSnapshotInstallation", new Class<?>[]{String.class, attemptA.getClass()}, TOPIC, attemptA); }
+        finally { lock.unlock(); }
+        assertEquals(Set.of("first"), service.keySet(), "a stale restoration must not roll back the current attempt");
+        assertSame(attemptB, physical.get(TOPIC));
+        handler.release.countDown();
+        respondMap(transport.sentOfType(MessageType.SYNC_REQUEST).getLast(), 1, false, Map.of("second", "attempt-b"));
+        await(() -> manager.appliedFrontiers().byTopic().getOrDefault(TOPIC, 0L) == 50L);
+        settled(TOPIC);
+        assertEquals(Set.of("first", "second"), service.keySet());
+        assertTrue(physical.isEmpty());
+        assertFalse(((Set<?>) get("failedSnapshotInstalls")).contains(TOPIC));
     }
 
     @Test @Timeout(20)
