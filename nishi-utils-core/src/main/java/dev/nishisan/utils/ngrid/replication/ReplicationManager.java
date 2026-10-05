@@ -3384,10 +3384,6 @@ public class ReplicationManager
         return failedSnapshotInstalls.stream().anyMatch(this::isTransactionalSnapshotTopic);
     }
 
-    private boolean hasTransactionalPhysicalInstalls() {
-        return physicalSnapshotInstalls.keySet().stream().anyMatch(this::isTransactionalSnapshotTopic);
-    }
-
     private boolean isTransactionalSnapshotTopic(String topic) {
         ReplicationHandler handler = handlers.get(topic);
         return handler != null && handler.usesTransactionalSnapshotInstallation();
@@ -3399,7 +3395,7 @@ public class ReplicationManager
      * gate opens and the promoted node may lead.
      */
     private void maybeReleaseRelayDrainGate(String topic) {
-        if (hasTransactionalSnapshotFailures() || hasTransactionalPhysicalInstalls()) return;
+        if (hasTransactionalSnapshotFailures() || !physicalSnapshotInstalls.isEmpty()) return;
         if (!leaderSyncing.get()) {
             return;
         }

@@ -373,14 +373,29 @@ class SnapshotCheckpointFenceTest {
     @Test @Timeout(20)
     void legacyPartialQueuePromotionDrainsAndRetainsUncleanShutdownEvidence() throws Exception {
         String topic = "queue:legacy-failover";
+        CountDownLatch installing = new CountDownLatch(1), finishInstall = new CountDownLatch(1);
         BlockingCheckpoint queue = new BlockingCheckpoint() {
             public boolean usesTransactionalSnapshotInstallation() { return false; }
+            public void installSnapshot(Object payload) throws Exception {
+                installing.countDown();
+                finishInstall.await();
+            }
         };
         manager.registerHandler(topic, queue);
-        respond(request(topic), true, 0, 50L);
-        await(() -> queue.resets.get() == 1);
-        coordinator.assumeLeadershipForHandback(7L);
+        try {
+            respond(request(topic), true, 0, 50L);
+            assertTrue(installing.await(5, TimeUnit.SECONDS));
+            coordinator.assumeLeadershipForHandback(7L);
+            @SuppressWarnings("unchecked") Set<String> draining = (Set<String>) get("leaderSyncTopics");
+            draining.add(topic);
+            invoke("maybeReleaseRelayDrainGate", new Class<?>[]{String.class}, topic);
+            assertTrue(manager.isLeaderSyncing(), "an active queue reset must finish before writes resume");
+            assertTrue(((Map<?, ?>) get("physicalSnapshotInstalls")).containsKey(topic));
+        } finally {
+            finishInstall.countDown();
+        }
         await(() -> coordinator.isLeader() && !manager.isLeaderSyncing());
+        assertTrue(((Map<?, ?>) get("physicalSnapshotInstalls")).isEmpty());
         assertDoesNotThrow(() -> manager.replicate(topic, new byte[]{1}).get(2, TimeUnit.SECONDS));
         assertTrue(((Set<?>) get("failedSnapshotInstalls")).contains(topic),
                 "legacy partial queue has no durable rollback; shutdown must remain unclean");
@@ -458,7 +473,7 @@ class SnapshotCheckpointFenceTest {
         public boolean usesTransactionalSnapshotInstallation() { return true; }
         public void apply(UUID operationId, Object payload) { }
         public void resetState() { resets.incrementAndGet(); }
-        public void installSnapshot(Object payload) { }
+        public void installSnapshot(Object payload) throws Exception { }
         public void onSnapshotInstalled() throws Exception {
             entered.countDown(); release.await(); completed.incrementAndGet();
             if (fail) throw new java.io.IOException("injected checkpoint failure");

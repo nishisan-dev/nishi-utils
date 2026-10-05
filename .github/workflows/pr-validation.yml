@@ -41,7 +41,7 @@ jobs:
         run: flock /tmp/nishi-utils-maven.lock mvn -B verify -pl nishi-utils-core,nishi-utils-oss,nishi-utils-ngrrd-cluster -am -DexcludeNgrid=true -Dsurefire.rerunFailingTestsCount=1
 
       - name: Verify map checkpoint and interrupted-install regression tests
-        run: flock /tmp/nishi-utils-maven.lock mvn -B test -pl nishi-utils-core -Dtest=NMapCheckpointTest,NMapPersistenceCloseTest,MapSnapshotDurabilityTest,SnapshotCheckpointFenceTest,LocalApplyTrackingTest
+        run: flock /tmp/nishi-utils-maven.lock mvn -B test -pl nishi-utils-core -Dtest=NMapCheckpointTest,NMapPersistenceCloseTest,MapSnapshotDurabilityTest,SnapshotCheckpointFenceTest,LocalApplyTrackingTest,LeaderSyncGateTest
 
       - name: Verify journal compatibility with the real 8.10.2 reader
         run: |
