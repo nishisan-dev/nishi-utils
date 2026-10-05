@@ -1030,7 +1030,9 @@ compactação e preserva o WAL original. Medir também o fsync final e a memóri
 Habilitar FINE temporariamente apenas nas classes `SeriesLifecycleJournal` e
 `StorageRequestHandler` por configuração JUL, depois voltar ao nível anterior. Os eventos
 `NGRRD_LIFECYCLE_FSYNC` mostram duração do force e número de entradas; `NGRRD_WRITE_BATCH_TOTAL`
-mede a requisição completa, incluindo locks, ownership, receipts e handles. O campo
+mede o processamento completo no handler do storage, incluindo locks, ownership, receipts
+e handles. Não inclui a ida/volta TCP nem o tempo do poll Kafka no cliente; correlacione
+também a duração completa da chamada no tems para avaliar o p99 de ponta a ponta. O campo
 `lifecycleFsyncDelta` é a variação **global do journal durante a requisição**: com concorrência,
 não atribuir todos esses fsyncs ao lote. A proporção exata de lotes com force requer correlação
 por thread na coleta temporária, por exemplo via profiler. Os eventos são diagnósticos, sem
