@@ -63,6 +63,6 @@ class SeriesLifecycleJournalCompactionTest {
     private static SeriesLifecycleJournal.Entry entry(int i, int round) {
         long createdAt = 1_790_000_000_000L + i;
         return new SeriesLifecycleJournal.Entry("legacy:" + createdAt, 3_600_000L * round,
-                SeriesLifecycleJournal.Phase.ACTIVE, SeriesPlacement.active("storage-209", createdAt));
+                SeriesLifecycleJournal.Phase.ACTIVE, null);
     }
 }

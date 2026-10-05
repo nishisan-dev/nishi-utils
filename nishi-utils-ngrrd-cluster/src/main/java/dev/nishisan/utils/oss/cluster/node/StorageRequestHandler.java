@@ -570,6 +570,10 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
     }
 
     private WriteBatchResponse handleWriteBatch(WriteBatchRequest request) {
+        boolean diagnostics = LOGGER.isLoggable(Level.FINE);
+        long started = diagnostics ? System.nanoTime() : 0;
+        long forcesBefore = diagnostics && registry.lifecycle() != null
+                ? registry.lifecycle().journal().fsyncCount() : 0;
         java.util.List<CoordinationLocks.Guard> locks = new java.util.ArrayList<>();
         try {
             for (Object lock : registry.operationLocks(request.writes().stream().map(SeriesWrite::seriesKey).toList()))
@@ -577,6 +581,12 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
             return handleWriteBatchLocked(request);
         } finally {
             for (int i = locks.size() - 1; i >= 0; i--) locks.get(i).close();
+            if (diagnostics) {
+                long forcesAfter = registry.lifecycle() == null ? 0 : registry.lifecycle().journal().fsyncCount();
+                LOGGER.fine("NGRRD_WRITE_BATCH_TOTAL samples=" + request.writes().size()
+                        + " elapsedNanos=" + (System.nanoTime() - started)
+                        + " lifecycleFsyncDelta=" + (forcesAfter - forcesBefore));
+            }
         }
     }
 

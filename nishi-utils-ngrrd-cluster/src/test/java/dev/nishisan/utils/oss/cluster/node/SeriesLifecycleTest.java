@@ -66,6 +66,8 @@ class SeriesLifecycleTest {
         long old = now - Duration.ofDays(40).toMillis();
         legacy("old", old); legacy("empty", 0);
         service.initialize("old", placements.get("old")); service.initialize("empty", placements.get("empty"));
+        assertNull(journal.get("old").placement());
+        assertNull(journal.get("empty").placement());
         assertEquals(SeriesLifecycleJournal.upperBound(old, HOUR), journal.get("old").receivedThrough());
         assertEquals(SeriesLifecycleJournal.upperBound(now, HOUR), journal.get("empty").receivedThrough());
         var p = placements.get("old").withDeletion(new SeriesDeletion("op", now - Duration.ofDays(30).toMillis(), List.of("owner"), false), now);
@@ -89,6 +91,7 @@ class SeriesLifecycleTest {
         service.receipts(keys);
         assertEquals(start + 2, journal.fsyncCount());
         assertEquals(upper + HOUR, journal.get("a").receivedThrough());
+        assertNull(journal.get("a").placement());
         var p = placements.get("a").withDeletion(new SeriesDeletion("recent", now, keys, false), now);
         placements.put("a", p);
         assertEquals(DeleteStatus.REFUSED_RECENT_WRITE, service.prepare(new DeleteControlRequest("a", p)).status());
@@ -210,6 +213,7 @@ class SeriesLifecycleTest {
             assertEquals(DeleteStatus.ERROR, handler.delete(request).status());
             assertNull(placements.get("s").deletion());
             assertEquals(SeriesLifecycleJournal.Phase.ACTIVE, journal.get("s").phase());
+            assertNull(journal.get("s").placement());
             assertNull(service.gate("s", placements.get("s").generationId()));
             assertTrue(volume.storage().exists("series/s.ngrr"));
             rpc.fail = false;

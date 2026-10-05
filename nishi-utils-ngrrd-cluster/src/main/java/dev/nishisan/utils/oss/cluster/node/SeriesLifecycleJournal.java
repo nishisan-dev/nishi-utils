@@ -10,10 +10,13 @@ import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import java.util.zip.CRC32;
 
 /** Durable local fences and hourly receipt upper bounds. Mutations are grouped before one fsync. */
 public final class SeriesLifecycleJournal implements AutoCloseable {
+    private static final Logger LOG = Logger.getLogger(SeriesLifecycleJournal.class.getName());
     public enum Phase { ACTIVE, PREPARED, COMMITTED, DELETED, FINISHED, QUARANTINED }
     public record Entry(String generationId, long receivedThrough, Phase phase, SeriesPlacement placement) { }
     private static final int MAX_RECORD = 16 * 1024 * 1024;
@@ -72,7 +75,7 @@ public final class SeriesLifecycleJournal implements AutoCloseable {
             CRC32 crc = new CRC32(); crc.update(payload.array());
             if ((int) crc.getValue() != expected) throw new IOException("corrupt lifecycle journal at " + valid);
             Update update = mapper.readValue(payload.array(), Update.class);
-            entries.put(update.key(), update.entry());
+            entries.put(update.key(), normalize(update.entry()));
             valid = channel.position();
         }
         channel.truncate(valid);
@@ -91,17 +94,29 @@ public final class SeriesLifecycleJournal implements AutoCloseable {
 
     public void put(String key, Entry entry) { putAll(Map.of(key, entry)); }
 
+    /** Placement is only recovery evidence for non-active lifecycle phases. */
+    private static Entry normalize(Entry entry) {
+        return entry.phase() == Phase.ACTIVE && entry.placement() != null
+                ? new Entry(entry.generationId(), entry.receivedThrough(), entry.phase(), null) : entry;
+    }
+
     /** No-op updates require no disk I/O. After an I/O error, fail closed until restart. */
     public void putAll(Map<String, Entry> updates) {
         lock.lock();
         try {
             if (failed) throw new IllegalStateException("lifecycle journal unavailable; restart required");
             Map<String, Entry> changed = new LinkedHashMap<>();
-            updates.forEach((key, entry) -> { if (!entry.equals(entries.get(key))) changed.put(key, entry); });
+            updates.forEach((key, entry) -> {
+                Entry normalized = normalize(entry);
+                if (!normalized.equals(entries.get(key))) changed.put(key, normalized);
+            });
             if (changed.isEmpty()) return;
             try {
                 for (var update : changed.entrySet()) append(channel, new Update(update.getKey(), update.getValue()));
+                long forceStart = LOG.isLoggable(Level.FINE) ? System.nanoTime() : 0;
                 channel.force(true); forces++;
+                if (forceStart != 0) LOG.fine("NGRRD_LIFECYCLE_FSYNC entries=" + changed.size()
+                        + " elapsedNanos=" + (System.nanoTime() - forceStart));
                 entries.putAll(changed);
                 if (channel.size() >= compactThreshold) compact();
             } catch (IOException e) {
@@ -124,10 +139,12 @@ public final class SeriesLifecycleJournal implements AutoCloseable {
     }
 
     private void compact() throws IOException {
+        long compactStart = System.nanoTime();
+        long beforeBytes = channel.size();
         Path tmp = path.resolveSibling(path.getFileName() + ".tmp");
         try (FileChannel output = FileChannel.open(tmp, StandardOpenOption.CREATE,
                 StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
-            for (var entry : entries.entrySet()) append(output, new Update(entry.getKey(), entry.getValue()));
+            for (var entry : entries.entrySet()) append(output, new Update(entry.getKey(), normalize(entry.getValue())));
             output.force(true);
         }
         Files.move(tmp, path, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
@@ -139,6 +156,8 @@ public final class SeriesLifecycleJournal implements AutoCloseable {
         channel.position(channel.size());
         compactThreshold = Math.max(minCompactBytes, 2 * channel.size());
         compactions++;
+        LOG.info("NGRRD_LIFECYCLE_COMPACT entries=" + entries.size() + " beforeBytes=" + beforeBytes
+                + " afterBytes=" + channel.size() + " lockHeldNanos=" + (System.nanoTime() - compactStart));
     }
 
     /** Ceiling, with saturation instead of overflow for malformed/future timestamps. */
