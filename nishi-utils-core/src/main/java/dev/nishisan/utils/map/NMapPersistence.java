@@ -35,6 +35,7 @@ import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -46,6 +47,8 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.Condition;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -81,13 +84,27 @@ public final class NMapPersistence<K, V> implements Closeable {
     private final Path metaPath;
     private final Path tempSnapshotPath;
     private final Path oldWalPath;
+    private final Path pendingSnapshotPath;
+    private volatile boolean snapshotsSuspended;
+    private volatile IOException checkpointFailure;
+    @FunctionalInterface
+    interface CheckpointFaultInjector {
+        void beforeForce(Path path) throws IOException;
+    }
+    private volatile CheckpointFaultInjector checkpointFaultInjector = path -> { };
+
+    void checkpointFaultInjector(CheckpointFaultInjector injector) {
+        checkpointFaultInjector = Objects.requireNonNull(injector, "injector");
+    }
 
     private final LinkedBlockingQueue<NMapWALEntry> queue = new LinkedBlockingQueue<>();
     private final AtomicBoolean running = new AtomicBoolean();
     /** Bound of the writer join in {@link #close()}; package-visible setter for tests. */
     private volatile long closeJoinTimeoutMillis = TimeUnit.SECONDS.toMillis(10);
     private final AtomicLong lastMutationTimeMillis = new AtomicLong();
-    private final Object walLock = new Object();
+    private final ReentrantLock walLock = new ReentrantLock();
+    private final Condition queueAvailable = walLock.newCondition();
+    private final ReentrantLock stateLock;
 
     private volatile RandomAccessFile walRaf;
     private volatile FileChannel walChannel;
@@ -98,6 +115,8 @@ public final class NMapPersistence<K, V> implements Closeable {
 
     /**
      * Creates a new persistence instance.
+     * Direct users must quiesce mutations during snapshots. Concurrent mutation integrations
+     * should use the shared-lock overload for both periodic and explicit snapshots.
      *
      * @param config  the persistence configuration
      * @param data    the in-memory map to persist
@@ -105,6 +124,24 @@ public final class NMapPersistence<K, V> implements Closeable {
      * @param mapName the map name (used as subdirectory)
      */
     public NMapPersistence(NMapConfig config, Map<K, V> data, Path baseDir, String mapName) {
+        this(config, data, baseDir, mapName, new ReentrantLock());
+    }
+
+    /**
+     * Creates a persistence engine with a shared mutation lock for infrastructure integrations.
+     * Callers hold this lock through a state mutation and its WAL admission. Acquisition order
+     * is mutation lock followed by the engine's WAL lock; neither pins virtual thread carriers.
+     *
+     * @param config the persistence configuration
+     * @param data the in-memory map
+     * @param baseDir the persistence base directory
+     * @param mapName the logical map name
+     * @param stateLock the lock shared with every mutator of the supplied map
+     * @since 8.11.0
+     */
+    public NMapPersistence(NMapConfig config, Map<K, V> data, Path baseDir, String mapName,
+            ReentrantLock stateLock) {
+        this.stateLock = Objects.requireNonNull(stateLock, "stateLock");
         this.config = Objects.requireNonNull(config, "config");
         this.data = Objects.requireNonNull(data, "data");
         this.healthListener = config.healthListener() != null
@@ -119,6 +156,7 @@ public final class NMapPersistence<K, V> implements Closeable {
         this.metaPath = mapDir.resolve(META_FILE);
         this.tempSnapshotPath = mapDir.resolve(SNAPSHOT_FILE + ".tmp");
         this.oldWalPath = mapDir.resolve(WAL_FILE + ".old");
+        this.pendingSnapshotPath = mapDir.resolve("snapshot.pending");
     }
 
     /**
@@ -150,6 +188,7 @@ public final class NMapPersistence<K, V> implements Closeable {
         }
         try {
             Files.createDirectories(mapDir);
+            recoverPendingSnapshot();
             loadSnapshot();
             if (Files.exists(oldWalPath)) {
                 LOGGER.info("Detected incomplete rotation. Replaying old WAL.");
@@ -162,6 +201,7 @@ public final class NMapPersistence<K, V> implements Closeable {
             });
         } catch (IOException e) {
             LOGGER.log(Level.WARNING, "Failed to load map persistence state", e);
+            failureCount.incrementAndGet();
         }
     }
 
@@ -178,6 +218,15 @@ public final class NMapPersistence<K, V> implements Closeable {
         try {
             Files.createDirectories(mapDir);
             openWalForAppend();
+            // Publish a new map only after its WAL and every newly created directory entry
+            // are durable. load() may already have created the hierarchy, so force the chain
+            // rather than infer creation from the directory's existence at start().
+            forceCheckpointChannel(requireWal(), walPath);
+            for (Path directory = mapDir.toAbsolutePath(); directory != null; directory = directory.getParent()) {
+                try (FileChannel channel = FileChannel.open(directory, StandardOpenOption.READ)) {
+                    forceCheckpointChannel(channel, directory);
+                }
+            }
             if (lastSnapshotTimeMillis <= 0) {
                 lastSnapshotTimeMillis = System.currentTimeMillis();
             }
@@ -223,7 +272,13 @@ public final class NMapPersistence<K, V> implements Closeable {
             Objects.requireNonNull(key, "key");
         }
         lastMutationTimeMillis.accumulateAndGet(timestamp, Math::max);
-        queue.offer(new NMapWALEntry(timestamp, type, key, value));
+        walLock.lock();
+        try {
+            queue.offer(new NMapWALEntry(timestamp, type, key, value));
+            queueAvailable.signalAll();
+        } finally {
+            walLock.unlock();
+        }
     }
 
     /**
@@ -254,14 +309,12 @@ public final class NMapPersistence<K, V> implements Closeable {
         if (type != NMapOperationType.CLEAR) {
             Objects.requireNonNull(key, "key");
         }
-        FileChannel ch = walChannel;
-        if (ch == null) {
-            return;
-        }
         lastMutationTimeMillis.accumulateAndGet(timestamp, Math::max);
         NMapWALEntry entry = new NMapWALEntry(timestamp, type, key, value);
-        synchronized (walLock) {
+        walLock.lock();
+        try {
             try {
+                FileChannel ch = requireWal();
                 ByteBuffer buffer = encode(entry);
                 while (buffer.hasRemaining()) {
                     ch.write(buffer);
@@ -273,8 +326,10 @@ public final class NMapPersistence<K, V> implements Closeable {
                 LOGGER.log(Level.WARNING, "Failed to append WAL entry synchronously", e);
                 failureCount.incrementAndGet();
                 healthListener.onPersistenceFailure(mapDir.getFileName().toString(),
-                        NMapHealthListener.PersistenceFailureType.WAL_WRITE, e);
+                    NMapHealthListener.PersistenceFailureType.WAL_WRITE, e);
             }
+        } finally {
+            walLock.unlock();
         }
     }
 
@@ -303,10 +358,18 @@ public final class NMapPersistence<K, V> implements Closeable {
             // it (closing it under the writer would turn the pending writes into failures) and report the
             // failure, so a caller deciding on a clean-shutdown marker does not trust an incomplete WAL.
             throw new IOException("NMap persistence writer for " + mapDir.getFileName()
-                    + " did not terminate within " + closeJoinTimeoutMillis + " ms; " + queue.size()
-                    + " WAL entries may not have been written");
+                + " did not terminate within " + closeJoinTimeoutMillis + " ms; " + queue.size()
+                + " WAL entries may not have been written");
         }
-        closeWalQuietly();
+        walLock.lock();
+        try {
+            if (walChannel != null) walChannel.force(true);
+            closeWalQuietly();
+        } finally {
+            walLock.unlock();
+        }
+        if (checkpointFailure != null) throw new IOException("Map checkpoint failed", checkpointFailure);
+        if (failureCount.get() != 0) throw new IOException("Map persistence recorded " + failureCount.get() + " failure(s)");
     }
 
     /** Whether the WAL channel is open (tests only). */
@@ -325,69 +388,74 @@ public final class NMapPersistence<K, V> implements Closeable {
      * been exceeded.
      */
     public void maybeSnapshot() {
+        if (snapshotsSuspended || !running.get()) return;
         boolean byOps = config.snapshotIntervalOperations() > 0
-                && opsSinceSnapshot >= config.snapshotIntervalOperations();
+            && opsSinceSnapshot >= config.snapshotIntervalOperations();
         boolean byTime = config.snapshotIntervalTime() != null
-                && !config.snapshotIntervalTime().isZero()
-                && (System.currentTimeMillis() - lastSnapshotTimeMillis) >= config.snapshotIntervalTime().toMillis();
+            && !config.snapshotIntervalTime().isZero()
+            && (System.currentTimeMillis() - lastSnapshotTimeMillis) >= config.snapshotIntervalTime().toMillis();
         if (!byOps && !byTime) {
             return;
         }
         try {
-            createSnapshotAndRotateWal();
-            opsSinceSnapshot = 0;
-            lastSnapshotTimeMillis = System.currentTimeMillis();
+            if (!stateLock.tryLock()) return;
+            try {
+                walLock.lock();
+                try {
+                    if (snapshotsSuspended || !running.get()) return;
+                    createSnapshotAndRotateWal();
+                    opsSinceSnapshot = 0;
+                    lastSnapshotTimeMillis = System.currentTimeMillis();
+                } finally {
+                    walLock.unlock();
+                }
+            } finally {
+                stateLock.unlock();
+            }
         } catch (Exception e) {
             LOGGER.log(Level.WARNING, "Failed to create map snapshot", e);
             failureCount.incrementAndGet();
             healthListener.onPersistenceFailure(mapDir.getFileName().toString(),
-                    NMapHealthListener.PersistenceFailureType.SNAPSHOT_WRITE, e);
+                NMapHealthListener.PersistenceFailureType.SNAPSHOT_WRITE, e);
         }
     }
 
     // ── Writer Loop ──────────────────────────────────────────────────────
 
     private void runWriterLoop() {
-        Duration batchTimeout = config.batchTimeout();
-        long batchTimeoutMs = Math.max(1L, batchTimeout.toMillis());
-
+        long batchTimeoutMs = Math.max(1L, config.batchTimeout().toMillis());
         while (running.get() || !queue.isEmpty()) {
             try {
-                NMapWALEntry first = queue.poll(batchTimeoutMs, TimeUnit.MILLISECONDS);
-                if (first == null) {
-                    maybeSnapshot();
-                    continue;
+                // Dequeue and write share the rotation lock: no removed batch can land after
+                // the snapshot has covered it and rotated away its WAL.
+                walLock.lock();
+                try {
+                    if (queue.isEmpty() && running.get()) queueAvailable.await(batchTimeoutMs, TimeUnit.MILLISECONDS);
+                    List<NMapWALEntry> batch = new ArrayList<>(config.batchSize());
+                    queue.drainTo(batch, config.batchSize());
+                    writeBatch(batch);
+                    opsSinceSnapshot += batch.size();
+                } finally {
+                    walLock.unlock();
                 }
-                List<NMapWALEntry> batch = new ArrayList<>(config.batchSize());
-                batch.add(first);
-                queue.drainTo(batch, Math.max(0, config.batchSize() - 1));
-
-                writeBatch(batch);
-                opsSinceSnapshot += batch.size();
                 maybeSnapshot();
             } catch (InterruptedException e) {
                 running.set(false);
                 Thread.interrupted();
-                continue;
             } catch (Exception e) {
                 LOGGER.log(Level.WARNING, "Unexpected error in persistence writer loop", e);
             }
         }
-
-        // Final best-effort flush on shutdown
+        walLock.lock();
         try {
-            List<NMapWALEntry> remaining = new ArrayList<>();
-            queue.drainTo(remaining);
-            if (!remaining.isEmpty()) {
-                writeBatch(remaining);
+            try {
+                if (walChannel != null) walChannel.force(true);
+            } catch (IOException e) {
+                checkpointFailure = e;
             }
-        } catch (Exception e) {
-            LOGGER.log(Level.WARNING, "Failed to flush remaining WAL entries on shutdown", e);
-        }
-        if (!running.get()) {
-            // 8.10.1: a writer that outlived the join in close() (which then left the channel open for it)
-            // closes the WAL itself once the final flush is done; closing again is a no-op.
             closeWalQuietly();
+        } finally {
+            walLock.unlock();
         }
     }
 
@@ -395,12 +463,10 @@ public final class NMapPersistence<K, V> implements Closeable {
         if (batch.isEmpty()) {
             return;
         }
-        FileChannel ch = walChannel;
-        if (ch == null) {
-            return;
-        }
-        synchronized (walLock) {
+        walLock.lock();
+        try {
             try {
+                FileChannel ch = requireWal();
                 for (NMapWALEntry entry : batch) {
                     ByteBuffer buffer = encode(entry);
                     while (buffer.hasRemaining()) {
@@ -414,63 +480,141 @@ public final class NMapPersistence<K, V> implements Closeable {
                 LOGGER.log(Level.WARNING, "Failed to append WAL batch", e);
                 failureCount.incrementAndGet();
                 healthListener.onPersistenceFailure(mapDir.getFileName().toString(),
-                        NMapHealthListener.PersistenceFailureType.WAL_WRITE, e);
+                    NMapHealthListener.PersistenceFailureType.WAL_WRITE, e);
             }
+        } finally {
+            walLock.unlock();
         }
     }
 
     // ── Snapshot ─────────────────────────────────────────────────────────
 
-    private void createSnapshotAndRotateWal() throws IOException {
-        List<NMapWALEntry> preRotate = new ArrayList<>();
-        queue.drainTo(preRotate, config.batchSize());
-        if (!preRotate.isEmpty()) {
-            writeBatch(preRotate);
-        }
-
-        closeWalQuietly();
+    /**
+     * Durably checkpoints the complete map and removes the WAL entries covered by it.
+     * Mutators must hold the shared mutation lock through mutation and WAL admission;
+     * direct users of the original constructor must quiesce writes for an explicit checkpoint.
+     *
+     * @throws IOException if writing, syncing or replacing the checkpoint fails
+     * @since 8.11.0
+     */
+    public void forceSnapshot() throws IOException {
+        if (config.mode() == NMapPersistenceMode.DISABLED) return;
+        stateLock.lock();
         try {
-            Files.deleteIfExists(oldWalPath);
-            if (Files.exists(walPath)) {
-                Files.move(walPath, oldWalPath, StandardCopyOption.REPLACE_EXISTING);
+            walLock.lock();
+            try {
+                try {
+                    requireWal();
+                    createSnapshotAndRotateWal();
+                    opsSinceSnapshot = 0;
+                    lastSnapshotTimeMillis = System.currentTimeMillis();
+                } catch (IOException e) {
+                    failureCount.incrementAndGet();
+                    checkpointFailure = e;
+                    healthListener.onPersistenceFailure(mapDir.getFileName().toString(),
+                        NMapHealthListener.PersistenceFailureType.SNAPSHOT_WRITE, e);
+                    throw e;
+                }
+            } finally {
+                walLock.unlock();
             }
-        } catch (IOException e) {
-            LOGGER.log(Level.WARNING, "Failed to rotate WAL before snapshot", e);
+        } finally {
+            stateLock.unlock();
         }
-        openWalForAppend();
-
-        Map<K, V> snapshot;
-        if (data instanceof ConcurrentMap<?, ?>) {
-            snapshot = new HashMap<>(data);
-        } else {
-            synchronized (data) {
-                snapshot = new HashMap<>(data);
-            }
-        }
-        writeSnapshot(snapshot);
-
-        try {
-            Files.deleteIfExists(oldWalPath);
-        } catch (IOException e) {
-            LOGGER.log(Level.WARNING, "Failed to delete rotated WAL after snapshot", e);
-        }
-
-        writeMeta(new NMapMetadata(0L, System.currentTimeMillis(), lastMutationTimeMillis.get(), META_VERSION));
     }
 
-    private void writeSnapshot(Map<K, V> snapshot) throws IOException {
+    /**
+     * Internal lifecycle control: prevents periodic snapshots during a partial installation.
+     * Explicit {@link #forceSnapshot()} remains available to finish the installation.
+     *
+     * @param suspended whether periodic snapshots must be suspended
+     * @since 8.11.0
+     */
+    public void setSnapshotsSuspended(boolean suspended) {
+        walLock.lock();
+        try {
+            snapshotsSuspended = suspended;
+        } finally {
+            walLock.unlock();
+        }
+    }
+
+    private void createSnapshotAndRotateWal() throws IOException {
+        // The caller holds stateLock then walLock. All queued mutations are already reflected in
+        // this frozen state; discard them only once the complete checkpoint is durable.
+        Map<K, V> snapshot = new HashMap<>(data);
+        writeSnapshotTemp(snapshot);
+        forceCheckpointChannel(requireWal(), walPath);
+        closeWalQuietly();
+        try {
+            Files.move(walPath, oldWalPath, StandardCopyOption.REPLACE_EXISTING);
+            forceDirectory();
+            // A durable marker means recovery finishes the forced temporary snapshot and
+            // never replays its covered old WAL on top of the replacement state.
+            try (FileChannel marker = FileChannel.open(pendingSnapshotPath,
+                StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
+                forceCheckpointChannel(marker, pendingSnapshotPath);
+            }
+            forceDirectory();
+            installSnapshotTemp();
+            forceDirectory();
+            Files.deleteIfExists(oldWalPath);
+            forceDirectory();
+            Files.deleteIfExists(pendingSnapshotPath);
+            forceDirectory();
+            queue.clear();
+            openWalForAppend();
+            forceCheckpointChannel(requireWal(), walPath);
+            forceDirectory();
+            writeMeta(new NMapMetadata(0L, System.currentTimeMillis(), lastMutationTimeMillis.get(), META_VERSION));
+        } catch (IOException e) {
+            checkpointFailure = e;
+            throw e;
+        }
+    }
+
+    private void writeSnapshotTemp(Map<K, V> snapshot) throws IOException {
         Files.deleteIfExists(tempSnapshotPath);
         try (BufferedOutputStream bos = new BufferedOutputStream(Files.newOutputStream(tempSnapshotPath));
-                ObjectOutputStream oos = new ObjectOutputStream(bos)) {
+        ObjectOutputStream oos = new ObjectOutputStream(bos)) {
             oos.writeObject(snapshot);
             oos.flush();
         }
-        try {
-            Files.move(tempSnapshotPath, snapshotPath, StandardCopyOption.ATOMIC_MOVE,
-                    StandardCopyOption.REPLACE_EXISTING);
-        } catch (AtomicMoveNotSupportedException e) {
-            Files.move(tempSnapshotPath, snapshotPath, StandardCopyOption.REPLACE_EXISTING);
+        try (FileChannel channel = FileChannel.open(tempSnapshotPath, StandardOpenOption.WRITE)) {
+            forceCheckpointChannel(channel, tempSnapshotPath);
         }
+    }
+
+    private void installSnapshotTemp() throws IOException {
+        Files.move(tempSnapshotPath, snapshotPath, StandardCopyOption.ATOMIC_MOVE,
+            StandardCopyOption.REPLACE_EXISTING);
+    }
+
+    private void recoverPendingSnapshot() throws IOException {
+        if (!Files.exists(pendingSnapshotPath)) return;
+        if (Files.exists(tempSnapshotPath)) installSnapshotTemp();
+        if (!Files.exists(snapshotPath)) throw new IOException("Pending checkpoint has no snapshot");
+        forceDirectory();
+        Files.deleteIfExists(oldWalPath);
+        forceDirectory();
+        Files.deleteIfExists(pendingSnapshotPath);
+        forceDirectory();
+    }
+
+    private void forceDirectory() throws IOException {
+        try (FileChannel directory = FileChannel.open(mapDir, StandardOpenOption.READ)) {
+            forceCheckpointChannel(directory, mapDir);
+        }
+    }
+
+    private void forceCheckpointChannel(FileChannel channel, Path path) throws IOException {
+        checkpointFaultInjector.beforeForce(path);
+        channel.force(true);
+    }
+
+    private FileChannel requireWal() throws IOException {
+        if (walChannel == null || !walChannel.isOpen()) throw new IOException("Map WAL is unavailable");
+        return walChannel;
     }
 
     private void loadSnapshot() throws IOException {
@@ -695,6 +839,7 @@ public final class NMapPersistence<K, V> implements Closeable {
         Files.deleteIfExists(oldWalPath);
         Files.deleteIfExists(snapshotPath);
         Files.deleteIfExists(tempSnapshotPath);
+        Files.deleteIfExists(pendingSnapshotPath);
         Files.deleteIfExists(metaPath);
         // Remove directory only if empty (offload files may still live there)
         try {
@@ -707,20 +852,19 @@ public final class NMapPersistence<K, V> implements Closeable {
 
     // ── Metadata ────────────────────────────────────────────────────────
 
-    private void writeMeta(NMapMetadata meta) {
-        try {
-            Files.deleteIfExists(metaPath);
-            try (DataOutputStream out = new DataOutputStream(
-                    new BufferedOutputStream(Files.newOutputStream(metaPath)))) {
-                out.writeInt(meta.version());
-                out.writeLong(meta.lastSnapshotOffset());
-                out.writeLong(meta.lastSnapshotTimestamp());
-                out.writeLong(meta.lastMutationTimestamp());
-                out.flush();
-            }
-        } catch (IOException e) {
-            LOGGER.log(Level.WARNING, "Failed to write map meta", e);
+    private void writeMeta(NMapMetadata meta) throws IOException {
+        try (DataOutputStream out = new DataOutputStream(
+                new BufferedOutputStream(Files.newOutputStream(metaPath)))) {
+            out.writeInt(meta.version());
+            out.writeLong(meta.lastSnapshotOffset());
+            out.writeLong(meta.lastSnapshotTimestamp());
+            out.writeLong(meta.lastMutationTimestamp());
+            out.flush();
         }
+        try (FileChannel metadata = FileChannel.open(metaPath, StandardOpenOption.WRITE)) {
+            forceCheckpointChannel(metadata, metaPath);
+        }
+        forceDirectory();
     }
 
     private java.util.Optional<NMapMetadata> readMeta() {

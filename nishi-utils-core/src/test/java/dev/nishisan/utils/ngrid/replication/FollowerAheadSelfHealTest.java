@@ -250,7 +250,7 @@ class FollowerAheadSelfHealTest {
         void installLeaderSnapshotAndFollow(long label) throws InterruptedException {
             ClusterMessage syncRequest = awaitSent(env.transport, MessageType.SYNC_REQUEST, 10_000);
             assertEquals(LEADER, syncRequest.destination(), "o snapshot é pedido ao líder");
-            env.transport.deliver(ClusterMessage.request(MessageType.SYNC_RESPONSE, "sync", LEADER, FOLLOWER,
+            env.transport.deliver(ScriptedTransport.syncResponse(env.transport.sentOfType(MessageType.SYNC_REQUEST), LEADER,
                     new SyncResponsePayload(TOPIC, label, new byte[0])));
             awaitCondition(() -> !status(env.manager).relayPendingBootstrap(), 10_000,
                     "a instalação do snapshot desarma o bootstrap");

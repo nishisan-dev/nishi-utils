@@ -240,8 +240,7 @@ class DualLeaderYieldResyncTest {
         }
 
         void deliverSyncResponse(long watermark) {
-            transport.deliverToListeners(ClusterMessage.request(MessageType.SYNC_RESPONSE, "sync",
-                    RIVAL, LOCAL, new SyncResponsePayload(TOPIC, watermark, new byte[0])));
+            transport.deliverToListeners(ScriptedTransport.syncResponse(transport.getSentMessages(), RIVAL, new SyncResponsePayload(TOPIC, watermark, new byte[0])));
         }
 
         void awaitSelfLeadership(long timeoutMs) throws InterruptedException {

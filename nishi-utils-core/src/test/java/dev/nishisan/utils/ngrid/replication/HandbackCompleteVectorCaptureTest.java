@@ -148,7 +148,7 @@ class HandbackCompleteVectorCaptureTest {
             // O candidato pede o snapshot e instala o rótulo W; o cutover o promove.
             awaitCondition(() -> !transport.sentOfType(MessageType.SYNC_REQUEST).isEmpty(), 10_000,
                     "o candidato deve pedir o snapshot ao interino");
-            transport.deliver(ClusterMessage.request(MessageType.SYNC_RESPONSE, "sync", INTERIM, CANDIDATE,
+            transport.deliver(ScriptedTransport.syncResponse(transport.sentOfType(MessageType.SYNC_REQUEST), INTERIM,
                     new SyncResponsePayload(TOPIC, WATERMARK, new byte[0])));
 
             awaitCondition(() -> !transport.sentOfType(MessageType.HANDBACK_COMPLETE).isEmpty(), 15_000,

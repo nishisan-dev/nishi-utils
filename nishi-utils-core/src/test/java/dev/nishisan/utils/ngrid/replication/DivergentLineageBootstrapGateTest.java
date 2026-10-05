@@ -170,7 +170,9 @@ class DivergentLineageBootstrapGateTest {
             h.manager.start();
             h.awaitSelfLeadership(10_000);
 
-            h.deliverSyncResponse(999L);
+            // Deliberately unsolicited late response: no active request exists on a sole leader.
+            h.transport.deliverToListeners(ClusterMessage.request(MessageType.SYNC_RESPONSE, "sync",
+                    LEADER, FOLLOWER, new SyncResponsePayload(TOPIC, 999L, new byte[0])));
             // A resposta tardia não pode resetar o estado nem re-ancorar contadores do líder ativo.
             Thread.sleep(300);
             assertFalse(h.resetCalled.get(),
@@ -284,8 +286,7 @@ class DivergentLineageBootstrapGateTest {
         }
 
         void deliverSyncResponse(long watermark) {
-            transport.deliverToListeners(ClusterMessage.request(MessageType.SYNC_RESPONSE, "sync",
-                    LEADER, FOLLOWER, new SyncResponsePayload(TOPIC, watermark, new byte[0])));
+            transport.deliverToListeners(ScriptedTransport.syncResponse(transport.getSentMessages(), LEADER, new SyncResponsePayload(TOPIC, watermark, new byte[0])));
         }
 
         @Override
