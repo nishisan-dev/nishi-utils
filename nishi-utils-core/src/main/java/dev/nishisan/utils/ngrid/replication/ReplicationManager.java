@@ -276,6 +276,8 @@ public class ReplicationManager
     // registration. handbackInstalledTopics collects the topics installed under the current attempt.
     private volatile Set<String> handbackRequiredTopics = Set.of();
     private final Set<String> handbackInstalledTopics = ConcurrentHashMap.newKeySet();
+    /** Log marker of a HANDBACK_COMPLETE vector entry that does not match the frozen frontier (8.11.2). */
+    public static final String HANDBACK_VECTOR_MISMATCH_MARKER = "NGRID_HANDBACK_VECTOR_MISMATCH";
     // INTERIM-LEADER production freeze: gates replicate() so nothing is produced above the frozen
     // watermark while the candidate installs the snapshot (defense in depth vs the app's consumer pause).
     private final java.util.concurrent.atomic.AtomicBoolean handoverFreezing =
@@ -3306,7 +3308,7 @@ public class ReplicationManager
                 handoverFrozenByTopic = Map.of();
                 handbackRole.set(HandbackRole.NONE);
                 handbackPeer = null;
-                reanchorAsDemotedIncumbent(frozenByTopic);
+                reanchorAsDemotedIncumbent(frozenByTopic, frozenByTopic);
             }
             // C6: an in-flight fetch deadline against the OLD leader must not delay the first fetch to
             // the new one by a full relayStreamFetchTimeout; refusal backoffs restart as well.
@@ -4068,7 +4070,7 @@ public class ReplicationManager
         // incumbent keeps its pre-handback odometer base and reappears as a permanent lineage offset
         // (the counter-scale desync the new leader then logs forever). Runs before acceptHandbackWinner
         // so the first follower heartbeat already advertises W.
-        reanchorAsDemotedIncumbent(payload.cutoverByTopic());
+        reanchorAsDemotedIncumbent(payload.cutoverByTopic(), handoverFrozenByTopic);
         handoverFreezing.set(false);
         handoverFrozenWatermark = -1L;
         handoverFrozenByTopic = Map.of();
@@ -4107,34 +4109,51 @@ public class ReplicationManager
      * per topic with this node's own frontier ({@link #getSyncSequenceForTopic}), so its numbering already
      * equals ours topic by topic and there is nothing to align.
      *
-     * @param byTopic the candidate's cutover frontier per topic (the frozen vector on the backstop path);
-     *                empty from a pre-8.8.0 candidate
+     * <p>8.11.2: every entry is VALIDATED against the frontier this node froze for the topic before the
+     * SET. The candidate installed the snapshot this node served, labeled with that frozen frontier
+     * ({@link #getSyncSequenceForTopic}, after {@link #awaitLocalAppliesDrained}), so a correct cutover value
+     * is exactly the frozen one. Any other value means the candidate did NOT install this node's snapshot
+     * of the topic — in the CTP incident the vector carried the candidate's stale DISK frontier of a topic
+     * whose handler had not registered yet, and the SET renumbered the incumbent downwards, truncating its
+     * op-log and purging its relay. Such an entry is skipped (frontier, counter, op-log and relay kept) and
+     * logged with {@link #HANDBACK_VECTOR_MISMATCH_MARKER}; the node stays ahead of the new leader on that
+     * topic, which the fresh-leader yield and the follower-ahead detectors then resolve instead of a silent
+     * loss. A topic absent from the frozen vector (frontier {@code 0} at the GRANT) is validated against
+     * the current frontier, which production freeze keeps equal to the frozen one.
+     *
+     * @param byTopic       the candidate's cutover frontier per topic (the frozen vector on the backstop
+     *                      path); empty from a pre-8.8.0 candidate
+     * @param frozenByTopic the per-topic frontier this node froze at the GRANT
      */
-    private void reanchorAsDemotedIncumbent(Map<String, Long> byTopic) {
+    private void reanchorAsDemotedIncumbent(Map<String, Long> byTopic, Map<String, Long> frozenByTopic) {
         if (byTopic == null || byTopic.isEmpty()) {
             LOGGER.warning(() -> "Affinity handback: no per-topic cutover vector (candidate older than 8.8.0);"
                     + " keeping the per-topic frontiers, which already match the snapshot labels this node"
                     + " served — a scalar watermark carries no topic identity (issue tems#9, D11)");
             return;
         }
-        // 8.10.1 (audit of downward SETs): the candidate installed OUR snapshot, so both hold the same content
-        // and the SET only aligns the numbering with the node taking over. With the corrected label
-        // (getSyncSequenceForTopic) the value matches our frontier. A lower value means the candidate
-        // installed a stale label (an older version during a rolling-upgrade window): the SET is still correct
-        // — keeping the higher frontier would leave this node ahead of the new leader, discarding its new
-        // operations as duplicates — but the fact is logged.
+        Map<String, Long> frozen = frozenByTopic == null ? Map.of() : frozenByTopic;
+        Map<String, Long> accepted = new TreeMap<>();
         byTopic.forEach((topic, cutover) -> {
-            long local = topicFrontier(topic);
-            if (cutover != null && cutover < local) {
-                LOGGER.warning(() -> "Affinity handback: cutover frontier of topic " + topic + " (" + cutover
-                        + ") is below the demoted incumbent's applied frontier (" + local
-                        + "); re-anchoring on the new leader's numbering");
+            if (topic == null || topic.isEmpty()) {
+                return;
             }
+            Long frozenFrontier = frozen.get(topic);
+            long expected = frozenFrontier != null ? frozenFrontier : topicFrontier(topic);
+            if (cutover == null || cutover != expected) {
+                LOGGER.severe(() -> HANDBACK_VECTOR_MISMATCH_MARKER + " topic=" + topic + " cutover=" + cutover
+                        + " frozen=" + expected + " peer=" + handbackPeer
+                        + " action=keep: the candidate did not install this node's snapshot of the topic;"
+                        + " frontier, counter, op-log and relay kept (8.11.2)");
+                return;
+            }
+            accepted.put(topic, cutover);
         });
         // Revisão #178 (C2): every topic re-anchors on ITS OWN cutover frontier.
-        byTopic.forEach(this::reanchorTopicAsDemotedIncumbent);
-        LOGGER.info(() -> "Affinity handback: demoted incumbent re-anchored per topic " + byTopic
-                + " (issue tems#9, D11)");
+        accepted.forEach(this::reanchorTopicAsDemotedIncumbent);
+        LOGGER.info(() -> "Affinity handback: demoted incumbent re-anchored per topic " + accepted
+                + (accepted.size() == byTopic.size() ? "" : " (" + (byTopic.size() - accepted.size())
+                        + " mismatching entries kept)") + " (issue tems#9, D11)");
     }
 
     /** Re-anchors one topic's produced counter, frontier, op-log and relay cursor at {@code watermark}. */
