@@ -895,3 +895,76 @@ os storages antes dos clientes** para colher o lado que mais importa primeiro:
 Consulte o [runbook de purga e recuperação](ngrrd-cluster-purga.md) para habilitação por capacidades,
 exclusão condicional, tratamento de `SERIES_DELETED`/`QUARANTINED` e adoção explícita em todos os
 storages depois de perda ou restauração do catálogo. Objetos sem placement são preservados.
+
+## Réplica à frente do líder e atualização para 8.10.1
+
+### O problema (8.8.0 a 8.10.0)
+
+Até a 8.7.0, o handback de afinidade reancorava o incumbente rebaixado com um único valor
+escalar (o watermark do último tópico instalado) aplicado a um tópico escolhido arbitrariamente.
+Isso podia gravar, por exemplo, o contador de `map:_ngrid-queue-offsets` no contador de
+`map:ngrrd.catalog`. O contador contaminado fica persistido no `sequence-state.dat`.
+
+Até a 8.10.0, um líder recém-promovido rotula o snapshot com esse contador cru. O nó que instala o
+snapshot renumera o tópico para baixo, e quem ficou de fora passa a estar **à frente** do líder:
+- a busca a partir do próprio cursor volta vazia e o lag aparece como 0;
+- as operações novas do líder com sequência menor ou igual ao cursor são descartadas como
+  duplicadas, sem log;
+- o resultado são entradas ausentes ou com valor antigo na réplica.
+
+O líder só registrava `Current leader observes a peer watermark above its own applied ...
+retaining`. O reconciliador da 8.8.0 tornava o problema visível por `adopted>0` constante.
+
+### O que a 8.10.1 corrige
+
+- O rótulo do snapshot e o contador do líder usam o maior entre o contador produzido e a
+  fronteira aplicada do **próprio** tópico, e o contador é normalizado na promoção.
+- O reancoramento do incumbente é feito só por tópico: um valor de um tópico nunca é aplicado a
+  outro.
+- Seguidor à frente: o líder que já produziu responde com snapshot completo, e o seguidor que vê
+  o líder abaixo do próprio cursor de forma persistente arma o bootstrap. Ambos registram
+  `NGRID_FOLLOWER_AHEAD_OF_LEADER` (SEVERE no seguidor, WARNING no líder), e a réplica se
+  reinstala sozinha.
+- No shutdown gracioso, os mapas são drenados para o disco antes de o marcador de shutdown limpo
+  ser gravado. Uma drenagem incompleta leva a bootstrap no próximo start.
+
+### Ordem de atualização
+
+- Atualize direto para a 8.10.1; não pare na 8.10.0.
+- Não deixe um líder 8.6.x ou anterior com seguidores 8.10.1: o rótulo e o HWM crus do líder
+  antigo podem disparar bootstrap repetido no seguidor.
+- Um storage por vez, nunca dois parados. Mantenha o rebalance desligado e, se possível, a
+  ingestão ativa: com o líder produzindo, o contador dele se corrige.
+- Atualize por último o nó de maior afinidade. Com `node.priority` igual, desempata o
+  `NodeId` em ordem de string. Para evitar handback na volta dele, suba-o com `node.priority`
+  menor que a dos outros (ex.: 50 contra 100) e restaure o valor numa troca planejada.
+- Antes de parar o líder, confirme que o sucessor tem `CAT_LAG 0` e não está em bootstrap.
+
+### Reinstalar a réplica de um storage (bootstrap limpo)
+
+Um restart limpo **não** reinstala a réplica: o nó recarrega o WAL e continua do cursor. Até a
+8.10.0, o snapshot em chunks pode pular chaves quando há inserts no mapa durante a transferência.
+Se o líder que vai servir o snapshot ainda não estiver na 8.10.1, pare a ingestão (o coordenador)
+e mantenha o rebalance desligado até o `Sync completed`. Para forçar o snapshot completo do líder:
+
+1. Com o líder estável, pare o storage de forma graciosa. Não faça isso no líder.
+2. Remova `<node.dataDir>/replication/relay/.clean-shutdown`.
+3. Suba o storage. Ele fica inelegível a líder até concluir o bootstrap.
+4. Aguarde `Sync completed for map:<mapa>` de todos os mapas e `CAT_LAG 0` no `ngrrd-admin status`.
+5. Não reinicie o nó antes de o `mtime` de `maps/<mapa>/snapshot.dat` ficar posterior ao sync
+   (até ~5 min): o snapshot instalado só chega ao disco no próximo snapshot do NMap.
+
+**Não** apague só `maps/ngrrd.catalog`: a fronteira em `replication/` continuaria dizendo que
+está tudo aplicado, e o nó subiria com o catálogo vazio e lag 0.
+
+Depois de atualizar todos os storages, um bootstrap limpo de cada um, um por vez, elimina
+contadores contaminados que tenham ficado em disco. Ele é obrigatório num nó com divergência
+comprovada.
+
+### Verificar a réplica
+
+`CAT_LAG`, o fence e a eleição comparam números de sequência e não enxergam buraco de conteúdo.
+Para comparar o conteúdo, copie `<node.dataDir>/maps/ngrrd.catalog/` do líder e do nó suspeito
+sem parar nada. Carregue as **cópias** com `NMapPersistence.load()` usando o classpath do storage
+e compare as entradas campo a campo. Nunca carregue o diretório vivo: `load()` abre o WAL para
+escrita e pode truncar o fim.

@@ -125,13 +125,24 @@ node.getQueue("test-queue", Serializable.class).offer("probe-" + System.nanoTime
 
 ### Epoch divergente
 
-1. Forçar restart do follower com epoch menor.
-2. O follower vai sincronizar do zero (snapshot fallback).
+1. Force o bootstrap do follower com epoch menor: pare-o de forma graciosa, remova
+   `<dataDir>/replication/relay/.clean-shutdown` e suba-o de novo.
+2. O follower sincroniza do zero (snapshot fallback). Um restart limpo **não** basta no modo
+   RELAY_STREAM: o nó recarrega o WAL e continua do próprio cursor.
 
 ### Gaps não resolvidos
 
 1. Verificar logs por `RetransmitFailed` ou `GapDetected`.
-2. Se resend falhou repetidamente, reiniciar o follower para forçar snapshot fallback.
+2. Se o resend falhou repetidamente, force o bootstrap do follower (remova o marcador
+   `.clean-shutdown` antes de subir; um restart limpo não força snapshot).
+
+### Follower à frente do líder
+
+Sintoma: o líder registra `Current leader observes a peer watermark above its own applied` ou
+aparece `NGRID_FOLLOWER_AHEAD_OF_LEADER` no log. A partir da 8.10.1, a réplica se reinstala
+sozinha: confirme `Sync completed` para o tópico no follower. Em versões anteriores, o follower
+descarta em silêncio as operações do líder até ele alcançar o cursor, com lag 0. Force o bootstrap
+do follower como em "Epoch divergente" e compare o conteúdo dos mapas afetados.
 
 ### PendingOperations crescente
 
