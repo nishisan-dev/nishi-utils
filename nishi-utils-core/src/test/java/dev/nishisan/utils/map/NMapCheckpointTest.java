@@ -117,7 +117,12 @@ class NMapCheckpointTest {
         try (ObjectOutputStream out = new ObjectOutputStream(Files.newOutputStream(prepared))) {
             out.writeObject(new HashMap<>(Map.of("correct", "leader")));
         }
-        Files.createFile(map.resolve("snapshot.pending"));
+        try (DataOutputStream marker = new DataOutputStream(Files.newOutputStream(map.resolve("snapshot.pending")))) {
+            marker.writeInt(0x4E4D4350);
+            marker.writeInt(1);
+            marker.writeLong(Files.size(prepared));
+            marker.write(java.security.MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(prepared)));
+        }
         Map<String, String> recovered = new ConcurrentHashMap<>();
         NMapPersistence<String, String> reopened = new NMapPersistence<>(config(), recovered, directory, "map");
         reopened.load();
@@ -208,8 +213,295 @@ class NMapCheckpointTest {
         assertNull(field.get(persistence));
     }
 
+    @Test @Timeout(20)
+    void asyncAdmissionNeverWaitsForWriterFsync() throws Exception {
+        Map<String, Serializable> state = new ConcurrentHashMap<>();
+        java.util.concurrent.locks.ReentrantLock stateLock = new java.util.concurrent.locks.ReentrantLock();
+        NMapPersistence<String, Serializable> persistence = new NMapPersistence<>(config(), state, directory, "admission", stateLock);
+        persistence.start();
+        java.lang.reflect.Field channelField = NMapPersistence.class.getDeclaredField("walChannel");
+        channelField.setAccessible(true);
+        BlockingForceChannel channel = new BlockingForceChannel((java.nio.channels.FileChannel) channelField.get(persistence));
+        channelField.set(persistence, channel);
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            stateLock.lock();
+            try { state.put("first", "one"); persistence.appendAsync(NMapOperationType.PUT, "first", "one"); }
+            finally { stateLock.unlock(); }
+            assertTrue(channel.entered.await(5, TimeUnit.SECONDS));
+            pool.submit(() -> {
+                stateLock.lock();
+                try { state.put("second", "two"); persistence.appendAsync(NMapOperationType.PUT, "second", "two"); }
+                finally { stateLock.unlock(); }
+            }).get(1, TimeUnit.SECONDS);
+            channel.release.countDown();
+            persistence.close();
+            Map<String, Serializable> recovered = new ConcurrentHashMap<>();
+            new NMapPersistence<>(config(), recovered, directory, "admission").load();
+            assertEquals(Map.of("first", "one", "second", "two"), recovered);
+        } finally { channel.release.countDown(); pool.shutdownNow(); persistence.close(); }
+    }
+
+    @Test @Timeout(20)
+    void periodicSerializationDoesNotHoldMutationLockAndCloseCanFinish() throws Exception {
+        assertPeriodicDoesNotBlock(true);
+    }
+
+    @Test @Timeout(20)
+    void periodicTempFsyncDoesNotHoldMutationLockAndPreservesQueuedTail() throws Exception {
+        assertPeriodicDoesNotBlock(false);
+    }
+
+    private void assertPeriodicDoesNotBlock(boolean serialization) throws Exception {
+        Map<String, Serializable> state = new ConcurrentHashMap<>();
+        BlockingValue blockingValue = new BlockingValue();
+        state.put("base", serialization ? blockingValue : "original");
+        java.util.concurrent.locks.ReentrantLock stateLock = new java.util.concurrent.locks.ReentrantLock();
+        NMapConfig cfg = NMapConfig.builder().mode(NMapPersistenceMode.ASYNC_WITH_FSYNC)
+                .snapshotIntervalOperations(0).snapshotIntervalTime(Duration.ofMillis(1))
+                .batchTimeout(Duration.ofMillis(2)).build();
+        NMapPersistence<String, Serializable> persistence = new NMapPersistence<>(cfg, state, directory, "periodic", stateLock);
+        CountDownLatch forceEntered = new CountDownLatch(1), forceRelease = new CountDownLatch(1);
+        if (!serialization) persistence.checkpointFaultInjector(path -> {
+            if (path.getFileName().toString().equals("snapshot.dat.tmp")) {
+                forceEntered.countDown();
+                try { forceRelease.await(); } catch (InterruptedException e) { throw new IOException(e); }
+            }
+        });
+        persistence.start();
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            assertTrue((serialization ? blockingValue.entered : forceEntered).await(5, TimeUnit.SECONDS));
+            pool.submit(() -> {
+                stateLock.lock();
+                try { state.put("tail", "new"); persistence.appendAsync(NMapOperationType.PUT, "tail", "new"); }
+                finally { stateLock.unlock(); }
+            }).get(1, TimeUnit.SECONDS);
+            // A cluster service closes while owning the shared lifecycle state lock.
+            Future<?> closing = pool.submit(() -> {
+                stateLock.lock();
+                try { persistence.close(); return null; }
+                finally { stateLock.unlock(); }
+            });
+            blockingValue.release.countDown(); forceRelease.countDown();
+            closing.get(5, TimeUnit.SECONDS);
+            Map<String, Serializable> recovered = new ConcurrentHashMap<>();
+            new NMapPersistence<>(cfg, recovered, directory, "periodic").load();
+            assertEquals(Set.of("base", "tail"), recovered.keySet());
+            assertEquals("new", recovered.get("tail"));
+        } finally {
+            blockingValue.release.countDown(); forceRelease.countDown(); pool.shutdownNow(); persistence.close();
+        }
+    }
+
+    @Test @Timeout(20)
+    void markerFsyncFailureIsFailStopAndPreservesConfirmedOldAndTailWrites() throws Exception {
+        Map<String, String> state = new ConcurrentHashMap<>(Map.of("base", "original"));
+        java.util.concurrent.locks.ReentrantLock stateLock = new java.util.concurrent.locks.ReentrantLock();
+        NMapPersistence<String, String> persistence = new NMapPersistence<>(config(), state, directory, "marker-failure", stateLock);
+        persistence.start(); persistence.forceSnapshot();
+        stateLock.lock();
+        try { state.put("confirmed-old", "before"); persistence.appendSync(NMapOperationType.PUT, "confirmed-old", "before"); }
+        finally { stateLock.unlock(); }
+        CountDownLatch markerEntered = new CountDownLatch(1), markerRelease = new CountDownLatch(1);
+        persistence.checkpointFaultInjector(path -> {
+            if (path.getFileName().toString().equals("snapshot.pending")) {
+                markerEntered.countDown();
+                try { markerRelease.await(); } catch (InterruptedException e) { throw new IOException(e); }
+                throw new IOException("injected marker fsync failure");
+            }
+        });
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            Future<?> checkpoint = pool.submit(() -> { persistence.forceSnapshot(); return null; });
+            assertTrue(markerEntered.await(5, TimeUnit.SECONDS));
+            stateLock.lock();
+            try { state.put("confirmed-tail", "after"); persistence.appendSync(NMapOperationType.PUT, "confirmed-tail", "after"); }
+            finally { stateLock.unlock(); }
+            markerRelease.countDown();
+            assertThrows(ExecutionException.class, () -> checkpoint.get(5, TimeUnit.SECONDS));
+            Path temporary = directory.resolve("marker-failure/snapshot.dat.tmp");
+            byte[] immutable = Files.readAllBytes(temporary);
+            for (int i = 0; i < 100; i++) persistence.maybeSnapshot();
+            assertThrows(IOException.class, persistence::forceSnapshot);
+            assertThrows(IllegalStateException.class, () -> persistence.appendSync(NMapOperationType.PUT, "rejected", "value"));
+            assertThrows(IllegalStateException.class, () -> persistence.appendAsync(NMapOperationType.PUT, "rejected", "value"));
+            assertArrayEquals(immutable, Files.readAllBytes(temporary));
+            assertEquals(1, persistence.failureCount(), "no retry storm and no repeated failure count");
+            assertThrows(IOException.class, persistence::close);
+            Map<String, String> recovered = new ConcurrentHashMap<>();
+            NMapPersistence<String, String> reopened = new NMapPersistence<>(config(), recovered, directory, "marker-failure");
+            reopened.load();
+            assertEquals(state, recovered);
+            assertEquals(0, reopened.failureCount());
+        } finally { markerRelease.countDown(); pool.shutdownNow(); assertThrows(IOException.class, persistence::close); }
+    }
+
+    @Test
+    void invalidBoundMarkerPreventsRawOpenAndPreservesRecoveryEvidence() throws Exception {
+        Map<String, String> state = new ConcurrentHashMap<>(Map.of("base", "original"));
+        NMapPersistence<String, String> persistence = new NMapPersistence<>(config(), state, directory, "bad-marker");
+        persistence.start();
+        java.util.concurrent.atomic.AtomicInteger directoryForces = new java.util.concurrent.atomic.AtomicInteger();
+        persistence.checkpointFaultInjector(path -> {
+            if (path.equals(directory.resolve("bad-marker")) && directoryForces.incrementAndGet() == 2)
+                throw new IOException("crash after marker rename");
+        });
+        assertThrows(IOException.class, persistence::forceSnapshot);
+        assertThrows(IOException.class, persistence::close);
+        Path map = directory.resolve("bad-marker");
+        assertTrue(Files.exists(map.resolve("snapshot.pending")));
+        byte[] temporary = Files.readAllBytes(map.resolve("snapshot.dat.tmp"));
+        temporary[temporary.length - 1] ^= 1;
+        Files.write(map.resolve("snapshot.dat.tmp"), temporary);
+        byte[] oldWal = Files.readAllBytes(map.resolve("wal.log.old"));
+        assertThrows(IllegalStateException.class, () -> NMap.open(directory, "bad-marker", config()));
+        assertArrayEquals(oldWal, Files.readAllBytes(map.resolve("wal.log.old")));
+        assertArrayEquals(temporary, Files.readAllBytes(map.resolve("snapshot.dat.tmp")));
+        assertTrue(Files.exists(map.resolve("snapshot.pending")));
+    }
+
+    @Test
+    void ambiguousEmptyLegacyMarkerFailsClosedWithoutDeletingOldWal() throws Exception {
+        Path map = directory.resolve("legacy-pending"); Files.createDirectories(map);
+        try (ObjectOutputStream out = new ObjectOutputStream(Files.newOutputStream(map.resolve("snapshot.dat.tmp")))) {
+            out.writeObject(new HashMap<>(Map.of("incoming", "unidentified")));
+        }
+        Files.write(map.resolve("wal.log.old"), new byte[]{1, 2, 3});
+        Files.createFile(map.resolve("snapshot.pending"));
+        assertThrows(IllegalStateException.class, () -> NMap.open(directory, "legacy-pending", config()));
+        assertArrayEquals(new byte[]{1, 2, 3}, Files.readAllBytes(map.resolve("wal.log.old")));
+        assertTrue(Files.exists(map.resolve("snapshot.dat.tmp")));
+    }
+
+    @Test
+    void legacyMarkerWithoutOldWalOrTempCanFinishProvablyCommittedSnapshot() throws Exception {
+        Path map = directory.resolve("legacy-committed"); Files.createDirectories(map);
+        try (ObjectOutputStream out = new ObjectOutputStream(Files.newOutputStream(map.resolve("snapshot.dat")))) {
+            out.writeObject(new HashMap<>(Map.of("confirmed", "committed")));
+        }
+        Files.createFile(map.resolve("snapshot.pending"));
+        try (NMap<String, String> recovered = NMap.open(directory, "legacy-committed", config())) {
+            assertEquals(Optional.of("committed"), recovered.get("confirmed"));
+        }
+        assertFalse(Files.exists(map.resolve("snapshot.pending")));
+    }
+
+    @Test
+    void historicalLoadFailureDoesNotPreventExplicitDestroyAfterTermination() throws Exception {
+        Path map = directory.resolve("destroy-corrupt"); Files.createDirectories(map);
+        Files.writeString(map.resolve("snapshot.dat"), "invalid snapshot");
+        NMapPersistence<String, String> persistence = new NMapPersistence<>(config(), new ConcurrentHashMap<>(), directory, "destroy-corrupt");
+        persistence.load();
+        assertEquals(1, persistence.failureCount());
+        persistence.destroy();
+        assertFalse(Files.exists(map));
+    }
+
+    @Test @Timeout(20)
+    void destroyNeverDeletesFilesWhileWriterStillOwnsThem() throws Exception {
+        NMapPersistence<String, Serializable> persistence = new NMapPersistence<>(config(), new ConcurrentHashMap<>(), directory, "destroy-live");
+        persistence.start();
+        BlockingValue value = new BlockingValue();
+        persistence.appendAsync(NMapOperationType.PUT, "blocked", value);
+        assertTrue(value.entered.await(5, TimeUnit.SECONDS));
+        persistence.closeJoinTimeoutMillis(100);
+        try {
+            assertThrows(IOException.class, persistence::destroy);
+            assertTrue(Files.exists(directory.resolve("destroy-live/wal.log")));
+        } finally { value.release.countDown(); }
+        persistence.closeJoinTimeoutMillis(5_000);
+        persistence.destroy();
+        assertFalse(Files.exists(directory.resolve("destroy-live")));
+    }
+
+    @Test
+    void startupOnlySyncsParentsOfActuallyCreatedDirectories() throws Exception {
+        Path existing = directory.resolve("existing"); Files.createDirectories(existing);
+        NMapPersistence<String, String> persistence = new NMapPersistence<>(config(), new ConcurrentHashMap<>(), existing.resolve("new/nested"), "map");
+        Set<Path> forced = new HashSet<>();
+        persistence.checkpointFaultInjector(path -> {
+            forced.add(path);
+            if (path.equals(directory) || path.equals(directory.getParent())) throw new IOException("unnecessary ancestor access");
+        });
+        persistence.load(); persistence.start();
+        assertEquals(0, persistence.failureCount());
+        assertTrue(forced.contains(existing));
+        assertTrue(forced.contains(existing.resolve("new")));
+        assertTrue(forced.contains(existing.resolve("new/nested")));
+        assertFalse(forced.contains(directory));
+        persistence.close();
+    }
+
+    @Test
+    void recoveryTruncatesTornOldWalBeforeMergingConfirmedNewTail() throws Exception {
+        NMapPersistence<String, String> old = new NMapPersistence<>(config(), new ConcurrentHashMap<>(), directory, "torn-old");
+        old.start(); old.appendSync(NMapOperationType.PUT, "old", "confirmed"); old.close();
+        Path map = directory.resolve("torn-old");
+        Files.move(map.resolve("wal.log"), map.resolve("wal.log.old"));
+        Files.write(map.resolve("wal.log.old"), new byte[]{7, 8, 9}, StandardOpenOption.APPEND);
+        NMapPersistence<String, String> tail = new NMapPersistence<>(config(), new ConcurrentHashMap<>(), directory, "torn-old");
+        tail.start(); tail.appendSync(NMapOperationType.PUT, "tail", "confirmed"); tail.close();
+        Map<String, String> recovered = new ConcurrentHashMap<>();
+        NMapPersistence<String, String> reopened = new NMapPersistence<>(config(), recovered, directory, "torn-old");
+        reopened.load();
+        assertEquals(0, reopened.failureCount());
+        assertEquals(Map.of("old", "confirmed", "tail", "confirmed"), recovered);
+        assertFalse(Files.exists(map.resolve("wal.log.old")));
+        recovered.clear(); reopened.load();
+        assertEquals(Map.of("old", "confirmed", "tail", "confirmed"), recovered);
+    }
+
+    @Test @Timeout(20)
+    void destroyNeverDeletesFilesUnderExternalCheckpointSerialization() throws Exception {
+        Map<String, Serializable> state = new ConcurrentHashMap<>();
+        BlockingValue value = new BlockingValue(); state.put("base", value);
+        NMapPersistence<String, Serializable> persistence = new NMapPersistence<>(config(), state, directory, "external-checkpoint");
+        persistence.start(); persistence.closeJoinTimeoutMillis(100);
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            Future<?> checkpoint = pool.submit(() -> { persistence.forceSnapshot(); return null; });
+            assertTrue(value.entered.await(5, TimeUnit.SECONDS));
+            assertThrows(IOException.class, persistence::destroy);
+            assertTrue(Files.exists(directory.resolve("external-checkpoint/wal.log.old")));
+            assertTrue(Files.exists(directory.resolve("external-checkpoint/snapshot.dat.tmp")));
+            value.release.countDown(); checkpoint.get(5, TimeUnit.SECONDS);
+            persistence.closeJoinTimeoutMillis(5_000); persistence.destroy();
+            assertFalse(Files.exists(directory.resolve("external-checkpoint")));
+        } finally { value.release.countDown(); pool.shutdownNow(); }
+    }
+
+    @Test
+    void interruptedCloseAfterFailedStartupReleasesIdleDescriptor() throws Exception {
+        NMapPersistence<String, String> persistence = new NMapPersistence<>(config(), new ConcurrentHashMap<>(), directory, "interrupted-start");
+        persistence.checkpointFaultInjector(path -> {
+            if (path.getFileName().toString().equals("interrupted-start")) throw new IOException("startup failure");
+        });
+        persistence.start();
+        assertTrue(persistence.walOpen());
+        Thread.currentThread().interrupt();
+        try {
+            assertThrows(IOException.class, persistence::close);
+            assertTrue(Thread.currentThread().isInterrupted());
+            assertFalse(persistence.walOpen());
+        } finally { Thread.interrupted(); }
+    }
+
+    private static class BlockingForceChannel extends ForceFailingChannel {
+        final CountDownLatch entered = new CountDownLatch(1), release = new CountDownLatch(1);
+        final java.util.concurrent.atomic.AtomicBoolean first = new java.util.concurrent.atomic.AtomicBoolean(true);
+        BlockingForceChannel(java.nio.channels.FileChannel delegate) { super(delegate); }
+        @Override public void force(boolean metadata) throws IOException {
+            if (first.compareAndSet(true, false)) {
+                entered.countDown();
+                try { release.await(); } catch (InterruptedException e) { throw new IOException(e); }
+            }
+            delegate.force(metadata);
+        }
+    }
+
     private static class ForceFailingChannel extends java.nio.channels.FileChannel {
-        private final java.nio.channels.FileChannel delegate;
+        protected final java.nio.channels.FileChannel delegate;
         ForceFailingChannel(java.nio.channels.FileChannel delegate) { this.delegate = delegate; }
         public void force(boolean metadata) throws IOException { throw new IOException("injected final force failure"); }
         protected void implCloseChannel() throws IOException { delegate.close(); }
