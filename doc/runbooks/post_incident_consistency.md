@@ -166,9 +166,10 @@ do follower como em "Epoch divergente" e compare o conteúdo dos mapas afetados.
 | `pendingOperationsCount` | `NGridOperationalSnapshot.pendingOperationsCount()` |
 
 
-## Checkpoint durável na 8.11.0 (#195/#190)
+## Checkpoint durável na 8.11.1 (#195/#190 e revisão #196)
 
-Em nós 8.11.0, confirmar `Sync durable for map:<mapa>` para todos os mapas persistentes antes de
+A 8.11.0 foi publicada antes de resolver os bloqueadores da revisão e não deve ser implantada.
+Em nós 8.11.1, confirmar `Sync durable for map:<mapa>` para todos os mapas persistentes antes de
 considerar completo o bootstrap/cutover. O marcador tradicional `Sync completed for ...` foi
 preservado para compatibilidade com o MOP, mas a validação de durabilidade usa o marcador novo.
 Falha de checkpoint ou instalação parcial impede shutdown limpo e promoção de handback.
@@ -179,4 +180,10 @@ e uma virada de hora antes de expandir. Até isso ocorrer, manter o contorno nos
 não validados. `CAT_LAG 0` não comprova igualdade de conteúdo (#188 permanece aberta).
 
 Não remover `snapshot.pending` manualmente. Se esse arquivo estiver presente após interrupção,
-concluir recuperação usando 8.11.0 antes de tentar downgrade para um leitor antigo.
+tentar recuperação usando 8.11.1 antes de downgrade. Um marcador vazio legado da 8.11.0
+pode ser ambíguo e exigir recuperação a partir de réplica confiável. Não apagar WALs ou
+temporários para contornar a recusa. Para snapshot corrompido ou falha de checkpoint, seguir
+["Falha de checkpoint ou snapshot corrompido"](../oss/ngrrd-cluster-operacao.md#falha-de-checkpoint-ou-snapshot-corrompido):
+parar o nó, preservar todos os arquivos e verificar uma réplica íntegra antes de substituir
+a cópia local e executar bootstrap como seguidor. `Sync durable` não é emitido para filas ou
+mapas sem persistência.

@@ -4,6 +4,32 @@
 
 ---
 
+## 2026-10-05 — Correções da revisão de persistência e instalação — 8.11.1
+
+Corrige os bloqueadores apontados na revisão da PR #196. A 8.11.0 foi publicada antes de
+incorporá-los; não deve ser usada como destino de implantação.
+
+- Admissão assíncrona usa um lock curto da fila e não espera o fsync do writer. A fronteira
+  entre batches retirados da fila, snapshot e WAL continua serializada.
+- O snapshot periódico copia o estado e separa o prefixo do WAL sob os locks; serialização e
+  fsync da imagem ocorrem fora do lock de mutação, preservando escritas posteriores no WAL.
+- Falha de checkpoint interrompe novas tentativas. A recuperação valida a identidade da
+  imagem antes de substituir o snapshot ou descartar o WAL antigo; arquivos ambíguos são
+  preservados e impedem abertura confiável, em vez de autorizar perda silenciosa.
+- Destruição pode remover arquivos após falha histórica de persistência, depois de confirmar
+  que writer e canais encerraram. Um timeout de encerramento continua impedindo a remoção.
+- Instalações abandonadas não deixam o mapa permanentemente suspenso; recuperação e conclusão
+  continuam vinculadas à sessão válida, sem promover candidatos após aborto ou timeout.
+- Callbacks de promoção não executam sob o lock global da instalação. `Sync durable` fica
+  restrito aos mapas persistentes que concluíram o checkpoint e o cutover.
+- Inicialização não exige abrir para leitura todos os ancestrais até a raiz. A CI executa
+  compatibilidade com o código real do leitor publicado na 8.10.2.
+
+O runbook inclui tratamento de snapshot corrompido, falha de checkpoint e recuperação ambígua.
+Os prazos de handback e a forma dos records públicos de métricas permanecem os mesmos.
+A PR corretiva deve passar por revisão antes de merge e publicação. O piloto de implantação
+continua exigindo disco não vazio, restart imediato, comparação de conteúdo e handback.
+
 ## 2026-10-05 — Instalação durável de mapas e journal menor — 8.11.0
 
 Correção de integridade das issues #195/#190, rastreamento de applies #191 e teste de adoção #192.
@@ -31,11 +57,11 @@ Correção de integridade das issues #195/#190, rastreamento de applies #191 e t
 - Medições temporárias: `NGRRD_LIFECYCLE_COMPACT` (INFO), `NGRRD_LIFECYCLE_FSYNC` e
   `NGRRD_WRITE_BATCH_TOTAL` (FINE). Não acrescentam métricas públicas.
 
-**Operação:** veja a seção "Atualização para 8.11.0" no guia operacional. Validar primeiro
+**Operação:** **não implantar a 8.11.0; usar a correção 8.11.1 após revisão.** Veja a seção "Atualização para 8.11.1" no guia operacional. Validar primeiro
 ressincronização com disco não vazio, restart imediato e comparação de conteúdo em um storage.
 Retirar o contorno de mover `maps/` e esperar cinco minutos só para nós atualizados e validados.
 Não ajustar prioridades durante o deploy. O snapshot de uma rotação interrompida usa
-`snapshot.pending`: completar sua recuperação com 8.11.0 antes de voltar para um leitor antigo.
+`snapshot.pending`: consultar o runbook da 8.11.1 antes de voltar para um leitor antigo; um marcador legado pode ser ambíguo.
 
 Compactação em segundo plano, group commit, #193 e novas métricas por etapa seguem fora desta entrega.
 

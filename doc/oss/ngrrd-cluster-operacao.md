@@ -954,7 +954,7 @@ e mantenha o rebalance desligado até o `Sync completed`. Para forçar o snapsho
 4. Aguarde `Sync completed for map:<mapa>` de todos os mapas e `CAT_LAG 0` no `ngrrd-admin status`.
 5. Até 8.10.2, não reinicie antes de o `mtime` de `snapshot.dat` ficar posterior ao sync
    (até ~5 min). A carga do disco antigo pode sobrescrever chunks recebidos.
-   Em 8.11.0, após a validação abaixo, mantenha `maps/` e aguarde `Sync durable for map:<mapa>`;
+   Em 8.11.1, após a validação abaixo, mantenha `maps/` e aguarde `Sync durable for map:<mapa>`;
    não é necessário esperar o snapshot periódico.
 
 **Não** apague só `maps/ngrrd.catalog`: a fronteira em `replication/` continuaria dizendo que
@@ -973,12 +973,15 @@ e compare as entradas campo a campo. Nunca carregue o diretório vivo: `load()` 
 escrita e pode truncar o fim.
 
 
-## Atualização para 8.11.0
+## Atualização para 8.11.1
 
-A 8.11.0 corrige #195/#190: o disco é carregado antes do registro do handler, e a instalação
+A 8.11.1 incorpora as correções da revisão da PR #196. A 8.11.0 já foi publicada com
+regressões de persistência e não deve ser usada como destino de implantação. As correções
+de #195/#190 continuam presentes: o disco é carregado antes do registro do handler, e a instalação
 completa é persistida antes do cutover. `Sync completed for ...` permanece com o texto conhecido;
-`Sync durable for ...` é a confirmação adicional de checkpoint e cutover. A API pública
-`NMapPersistence.forceSnapshot()` é nova, síncrona e pode lançar `IOException`; o controle
+`Sync durable for map:<mapa>` confirma checkpoint e cutover de mapas persistentes. Filas e
+mapas sem persistência não emitem esse marcador. A API pública
+`NMapPersistence.forceSnapshot()` foi introduzida na 8.11.0, é síncrona e pode lançar `IOException`; o controle
 `setSnapshotsSuspended(boolean)` serve à infraestrutura de instalação. Não há mudança nos
 records públicos de métricas. Também há um overload de construtor que recebe o `ReentrantLock`
 compartilhado com os mutadores do mapa; o construtor anterior continua disponível.
@@ -1015,9 +1018,69 @@ prazos para mascarar falhas sem medir o catálogo real e a pausa de escrita do l
 O journal de séries conserva o formato da 8.10.2; `ACTIVE` aceita `placement=null`. Fases de
 exclusão conservam seu placement. Os arquivos de snapshot/WAL completos mantêm o formato
 anterior, mas uma rotação interrompida deixa `snapshot.pending`. Nesse caso, completar a
-recuperação com 8.11.0 antes de downgrade; leitores antigos não reconhecem esse marcador.
+recuperação com 8.11.1 antes de downgrade; leitores antigos não reconhecem esse marcador.
+O marcador vazio da 8.11.0 pode representar uma tentativa interrompida ambígua: a 8.11.1
+recusa recuperação sem evidência suficiente e conserva os arquivos. Nesse caso, seguir o
+procedimento de falha abaixo, sem apagar o marcador ou o WAL antigo.
 Em caso de falha de checkpoint, não interpretar `Sync completed` isoladamente como permissão
 para restart limpo ou promoção. Não remover manualmente marcadores de recuperação.
+
+### Falha de checkpoint ou snapshot corrompido
+
+Uma falha de persistência bloqueia a confirmação de shutdown limpo. Um snapshot corrompido
+ou checkpoint ambíguo impede a publicação do handler do mapa. O nó não deve servir um mapa
+vazio como se tivesse carregado o disco com sucesso.
+
+1. Parar o nó afetado e preservar uma cópia completa do diretório de dados, incluindo mapas,
+   WALs, temporários e marcadores. Não abrir o diretório vivo com ferramentas de recuperação.
+2. Corrigir a causa de I/O (espaço, permissões ou armazenamento) e tentar a recuperação pela
+   8.11.1. Não remover `snapshot.pending`, `snapshot.dat.tmp` ou `wal.log.old` manualmente.
+3. Se a abertura continuar recusada por corrupção ou ambiguidade, verificar uma réplica de
+   referência íntegra e maioria disponível, usando comparação de conteúdo. Sem uma cópia
+   confiável, manter os arquivos e encaminhar para recuperação offline.
+4. Com uma referência confiável, manter o nó afetado como seguidor. Guardar `maps/<mapa>/`
+   em backup, preparar uma nova cópia local e forçar bootstrap retirando o marcador de
+   shutdown limpo **com o nó parado**. Esse procedimento excepcional continua necessário
+   para corrupção existente; não significa retirar o contorno geral antes do piloto.
+5. Confirmar `Sync durable for map:<mapa>`, comparar conteúdo, reiniciar imediatamente e
+   comparar novamente. Somente depois liberar o nó para a troca planejada de liderança.
+
+Não tentar sucessivos checkpoints no mesmo processo após uma falha. A nova implementação
+preserva a evidência para recuperação no restart; um `destroy` explícito continua removendo
+os arquivos após encerramento efetivo, mas não é um procedimento de reparação de conteúdo.
+
+### Medição local da correção de persistência
+
+Comparação no mesmo computador (JDK 21.0.12.1, ext4 sobre NVMe), usando o bytecode publicado
+na 8.11.0 e a implementação corretiva. Cada rodada de admissão executa 20 mil `put` numa
+thread, após aquecimento, com valores `SeriesPlacement`; snapshots automáticos são desativados
+nessa etapa. Os valores são latência de **admissão assíncrona**, não confirmação em disco.
+
+| Medição | 8.11.0 publicada | Correção 8.11.1 |
+| --- | --- | --- |
+| Admissão com fsync, média de cada uma das três rodadas | 129–225 µs/put | 0,43–0,79 µs/put |
+| Admissão sem fsync, média de cada uma das três rodadas | 5,99–6,23 µs/put | 0,20–0,42 µs/put |
+| Snapshot periódico, 900 mil placements, duração completa (duas rodadas) | 1,77–1,87 s | 1,87–2,09 s |
+| Maior latência de mutação durante o snapshot, em cada rodada | 1,77–1,86 s | 99–139 ms |
+| Mutações admitidas durante cada snapshot, amostradas a cada 1 ms | 1 | 1.617–1.781 |
+
+A imagem mede 104.068.386 bytes. A correção conserva uma pausa para copiar o estado e separar
+o WAL; não promete ausência de I/O sob lock. A serialização, o fsync da imagem e o cálculo de
+integridade ocorrem fora do lock de mutação. O writer pode acumular admissões enquanto ele
+mesmo produz o snapshot periódico, e `close()` precisa concluir esse trabalho e drenar a fila.
+O benchmark espera o término do checkpoint, além da existência do arquivo renomeado.
+
+Esses resultados não medem TCP, Kafka ou latência de escrita durável no CTP. Não foi usado
+HDD ou SSD comum; medir no piloto o catálogo real, a pausa residual e o backlog de persistência.
+O teste é opt-in e não impõe limites de tempo dependentes do hardware:
+
+```bash
+JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 \
+PATH=/usr/lib/jvm/java-21-openjdk-amd64/bin:$PATH \
+flock /tmp/nishi-utils-maven.lock mvn -B -pl nishi-utils-ngrrd-cluster -am test \
+  -Dtest=NMapCatalogPersistenceBenchmarkTest -Dsurefire.failIfNoSpecifiedTests=false \
+  -Dngrrd.catalog.benchmark=true -DargLine=-Xmx3g
+```
 
 ### Medição antes de outra mudança de desempenho
 
