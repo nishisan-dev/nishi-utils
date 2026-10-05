@@ -623,6 +623,41 @@ class NMapCheckpointTest {
         assertTrue(prefixes.contains(recovered), "recovered state is not a history prefix: " + recovered);
     }
 
+    @Test
+    void boundMarkerRejectsSameSizeTemporaryThatStillDeserializes() throws Exception {
+        Map<String, String> state = new ConcurrentHashMap<>();
+        NMapPersistence<String, String> persistence = new NMapPersistence<>(config(), state, directory, "digest");
+        persistence.start();
+        state.put("base", "checkpoint-value-A");
+        persistence.appendSync(NMapOperationType.PUT, "base", "checkpoint-value-A");
+        java.util.concurrent.atomic.AtomicInteger directoryForces = new java.util.concurrent.atomic.AtomicInteger();
+        persistence.checkpointFaultInjector(path -> {
+            if (path.equals(directory.resolve("digest")) && directoryForces.incrementAndGet() == 2)
+                throw new IOException("crash after marker rename");
+        });
+        assertThrows(IOException.class, persistence::forceSnapshot);
+        assertThrows(IOException.class, persistence::close);
+        Path map = directory.resolve("digest");
+        assertTrue(Files.exists(map.resolve("snapshot.pending")));
+        byte[] temporary = Files.readAllBytes(map.resolve("snapshot.dat.tmp"));
+        byte[] value = "checkpoint-value-A".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+        int at = indexOf(temporary, value);
+        assertTrue(at >= 0, "serialized value must be present in the temporary snapshot");
+        temporary[at + value.length - 1] = 'B';
+        Files.write(map.resolve("snapshot.dat.tmp"), temporary);
+        // Same size and still a valid serialized map: only the bound digest tells it apart.
+        try (ObjectInputStream in = new ObjectInputStream(Files.newInputStream(map.resolve("snapshot.dat.tmp")))) {
+            assertEquals(Map.of("base", "checkpoint-value-B"), in.readObject());
+        }
+        byte[] oldWal = Files.readAllBytes(map.resolve("wal.log.old"));
+        byte[] marker = Files.readAllBytes(map.resolve("snapshot.pending"));
+        assertThrows(IllegalStateException.class, () -> NMap.open(directory, "digest", config()));
+        assertFalse(Files.exists(map.resolve("snapshot.dat")), "a mismatched temporary must not be installed");
+        assertArrayEquals(oldWal, Files.readAllBytes(map.resolve("wal.log.old")));
+        assertArrayEquals(marker, Files.readAllBytes(map.resolve("snapshot.pending")));
+        assertArrayEquals(temporary, Files.readAllBytes(map.resolve("snapshot.dat.tmp")));
+    }
+
     private static java.util.concurrent.locks.ReentrantLock walLock(NMapPersistence<?, ?> persistence) throws Exception {
         java.lang.reflect.Field field = NMapPersistence.class.getDeclaredField("walLock");
         field.setAccessible(true);
@@ -637,6 +672,15 @@ class NMapCheckpointTest {
                 else Files.copy(path, target, StandardCopyOption.REPLACE_EXISTING);
             }
         }
+    }
+
+    private static int indexOf(byte[] haystack, byte[] needle) {
+        outer:
+        for (int i = 0; i <= haystack.length - needle.length; i++) {
+            for (int j = 0; j < needle.length; j++) if (haystack[i + j] != needle[j]) continue outer;
+            return i;
+        }
+        return -1;
     }
 
     private static class BlockingValue implements Serializable {
