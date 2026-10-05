@@ -90,6 +90,7 @@ class RelayStreamRobustnessTest {
     void snapshotChunksOutsideTheLeaderChainAreIgnored() throws Exception {
         try (Follower f = new Follower(tempDir, false)) {
             f.awaitAgreedLeader();
+            f.requestSnapshot();
             f.deliverSyncChunk(LEADER, 10L, 0, true);
             f.awaitInstalls(1, 5_000);
             // Chunk 1 do impostor: ignorado, e a cadeia é abandonada.
@@ -100,7 +101,8 @@ class RelayStreamRobustnessTest {
             f.deliverSyncChunk(LEADER, 10L, 1, true);
             Thread.sleep(300);
             assertEquals(1, f.installs.get(), "chunk fora da ordem da cadeia não é instalado");
-            // Recomeço legítimo: chunk 0 e 1 do líder, em ordem.
+            // Recomeço legítimo: um novo request inicia a cadeia de chunks 0 e 1.
+            f.requestSnapshot();
             f.deliverSyncChunk(LEADER, 10L, 0, true);
             f.awaitInstalls(2, 5_000);
             f.deliverSyncChunk(LEADER, 10L, 1, false);
@@ -259,9 +261,14 @@ class RelayStreamRobustnessTest {
                     LEADER, FOLLOWER, batch));
         }
 
+        void requestSnapshot() throws Exception {
+            var request = ReplicationManager.class.getDeclaredMethod("requestSync", String.class);
+            request.setAccessible(true);
+            assertTrue((boolean) request.invoke(manager, TOPIC));
+        }
+
         void deliverSyncChunk(NodeId from, long watermark, int chunk, boolean hasMore) {
-            transport.deliverToListeners(ClusterMessage.request(MessageType.SYNC_RESPONSE, "sync",
-                    from, FOLLOWER, new SyncResponsePayload(TOPIC, watermark, chunk, hasMore, new byte[0])));
+            transport.deliverToListeners(ScriptedTransport.syncResponse(transport.sent, from, new SyncResponsePayload(TOPIC, watermark, chunk, hasMore, new byte[0])));
         }
 
         void awaitInstalls(int target, long timeoutMs) throws InterruptedException {

@@ -34,6 +34,7 @@ import dev.nishisan.utils.oss.cluster.catalog.PlacementState;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
 import dev.nishisan.utils.oss.cluster.client.SeriesKeyTemplate;
 import dev.nishisan.utils.oss.cluster.node.NgrrdStorageNode;
+import dev.nishisan.utils.oss.cluster.protocol.ReconcileRequest;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -50,6 +51,7 @@ import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -57,8 +59,8 @@ import static org.junit.jupiter.api.Assertions.fail;
  * Seção 5 da spec do M4 — também o caminho de <b>migração do ngrrd single-node para o cluster</b>
  * (seção 2 da spec): 20 séries são criadas com o oss single-node ({@code Ngrrd.open} direto sobre um
  * {@link BlobVolume}, sem cluster nenhum), e só então um storage node novo sobe apontando para esse
- * MESMO volume, dentro de um cluster de 2 nós. O {@code LocalReconciler} do nó novo deve adotar as 20
- * séries (uma a uma, via {@code ngrrd.place}) sem que nenhum dado seja perdido — o cliente do cluster lê
+ * MESMO volume, dentro de um cluster de 2 nós. O nó novo coloca as 20 séries em quarentena;
+ * a adoção administrativa explícita deve preservar todos os dados — o cliente do cluster lê
  * de volta os dados escritos antes do cluster sequer existir.
  */
 @Timeout(value = 180, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
@@ -80,13 +82,14 @@ class AdoptExistingVolumeClusterTest {
     }
 
     @Test
-    void storageNodeNovoApontandoParaVolumeExistenteAdotaTodasAsSeries(@TempDir Path base) throws Exception {
+    void volumeExistenteFicaEmQuarentenaAteAdocaoExplicita(@TempDir Path base) throws Exception {
         String yaml = Files.readString(Path.of("src/test/resources/iface-traffic-blob.yaml"), StandardCharsets.UTF_8);
         Path legacyBase = base.resolve("legacy-volume-base");
 
         // 1) Cria as 20 séries com o oss single-node, SEM cluster algum — mesma API que um usuário do
         // ngrrd standalone usaria hoje.
         Map<String, Long> sampleCountBySeriesKey = new LinkedHashMap<>();
+        Map<String, byte[]> bytesBySeriesKey = new LinkedHashMap<>();
         String template = SeriesKeyTemplate.templateOf(yaml);
         BlobVolumeRegistry legacyRegistry = NgrrdBlob.registry()
                 .basePath(legacyBase)
@@ -111,6 +114,7 @@ class AdoptExistingVolumeClusterTest {
                 }
                 handle.checkpoint();
                 handle.close();
+                bytesBySeriesKey.put(seriesKey, legacyVolume.storage().get("series/" + seriesKey + ".ngrr").orElseThrow());
                 sampleCountBySeriesKey.put(seriesKey, (long) SETUP_SAMPLES);
             }
         } finally {
@@ -122,12 +126,16 @@ class AdoptExistingVolumeClusterTest {
         // o MESMO diretório físico usado acima — reconcileInterval/orphanGrace curtos só para não
         // esperar os defaults de produção (10 min / 5 min) num teste.
         harness = NgrrdClusterTestHarness.start(base, 1, builder -> builder
+                .rebalanceEnabled(false)
+                .placementGraceAfterLeadership(Duration.ZERO)
                 .reconcileInterval(Duration.ofSeconds(2))
                 .orphanGrace(Duration.ofSeconds(5)));
         harness.awaitLeader();
         harness.awaitNodeStatuses(1);
 
         NgrrdStorageNode adopter = harness.addStorageNode(builder -> builder
+                .rebalanceEnabled(false)
+                .placementGraceAfterLeadership(Duration.ZERO)
                 .volumeDir(legacyBase)
                 .volumeName(LEGACY_VOLUME_NAME)
                 .shardCount(BlobVolumeConfig.DEFAULT_SHARD_COUNT)
@@ -137,21 +145,33 @@ class AdoptExistingVolumeClusterTest {
                 .orphanGrace(Duration.ofSeconds(5)));
         harness.awaitNodeStatuses(2);
 
-        // 3) O LocalReconciler do nó novo adota as 20 séries — todas ACTIVE, todas no nó novo.
-        harness.awaitPlacements(SERIES_COUNT);
-        awaitTrue("as " + SERIES_COUNT + " séries adotadas deveriam pertencer ao nó novo (" + adopter.nodeId() + ")",
-                () -> {
-                    Map<String, SeriesPlacement> placements = harness.nodes().get(0).catalog().placementsLocal();
-                    return placements.size() == SERIES_COUNT && placements.values().stream()
-                            .allMatch(p -> p.state() == PlacementState.ACTIVE && p.ownerNodeId().equals(adopter.nodeId()));
-                });
-
-        // 4) O cliente do cluster lê de volta os dados escritos ANTES do cluster existir.
+        // 3) Sem placement, o volume é protegido por quarentena, nunca adotado automaticamente.
+        adopter.localReconciler().reconcileOnce();
         NgrrdClusterClient client = harness.connectClient(builder -> builder
                 .requestTimeout(Duration.ofSeconds(5))
                 .retryTimeout(Duration.ofSeconds(30))
                 .closeTimeout(Duration.ofSeconds(20)));
         try {
+            var report = client.reconcile(adopter.nodeId(), new ReconcileRequest(ReconcileRequest.Action.REPORT, null));
+            assertEquals(sampleCountBySeriesKey.keySet(), report.results().keySet());
+            assertTrue(report.results().values().stream().allMatch("QUARANTINED"::equals));
+            assertTrue(report.quarantinedBytes() > 0);
+            assertTrue(harness.leaderNode().catalog().placementsLocal().isEmpty(), "quarentena não cria placements");
+            var adopted = client.reconcile(adopter.nodeId(), new ReconcileRequest(ReconcileRequest.Action.ADOPT, null));
+            assertEquals(sampleCountBySeriesKey.keySet(), adopted.results().keySet());
+            assertTrue(adopted.results().values().stream().allMatch("ADOPTED"::equals), adopted.results().toString());
+            for (var entry : bytesBySeriesKey.entrySet()) {
+                assertArrayEquals(entry.getValue(), adopter.volume().storage().get("series/" + entry.getKey() + ".ngrr").orElseThrow());
+            }
+            harness.awaitPlacements(SERIES_COUNT);
+            awaitTrue("as " + SERIES_COUNT + " séries adotadas deveriam pertencer ao nó novo (" + adopter.nodeId() + ")",
+                    () -> {
+                        Map<String, SeriesPlacement> placements = harness.nodes().get(0).catalog().placementsLocal();
+                        return placements.size() == SERIES_COUNT && placements.values().stream()
+                                .allMatch(p -> p.state() == PlacementState.ACTIVE && p.ownerNodeId().equals(adopter.nodeId()));
+                    });
+
+            // 4) O cliente do cluster lê de volta os dados escritos ANTES do cluster existir.
             for (int i = 0; i < SERIES_COUNT; i++) {
                 Map<String, String> tags = Map.of("deviceId", "legacy" + i, "interfaceId", "eth0",
                         "region", "br-sp", "vendor", "x", "role", "core");

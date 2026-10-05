@@ -43,6 +43,34 @@ não tente recriar a série em loop. A integração do purger e da tela Sistema 
 
 ## Operação manual
 
+### Tamanho dos lotes no CTP
+
+Cada página de `deleteSeriesBatch` usa um pedido ao líder, que processa as séries
+sequencialmente. O `requestTimeout` limita a espera pela resposta de cada pedido;
+`retryTimeout` limita as retentativas. Um `TIMEOUT` não cancela a exclusão em andamento
+nem confirma que nenhuma série foi removida. Confira os resultados por série e o
+catálogo antes de registrar a conclusão da varredura.
+
+Na ocorrência relatada pelo tems, a página de 500 séries terminou no servidor após
+o cliente esgotar a espera. A estimativa de 0,2–0,45 s por série ainda não foi medida
+por etapa: 500 séries não caberiam nos 20 s atuais. Use inicialmente páginas de
+20–25 séries, com apenas uma chamada em andamento, e acompanhe a duração completa.
+Esse tamanho é um ponto de partida, sem garantia em picos. Mantenha o timeout global;
+a integração ainda precisa tratar o timeout de abertura sem derrubar o coordenador.
+A purga pode continuar com páginas menores, observadas as condições de habilitação
+acima e a correção do cache da aplicação.
+
+O tems também relatou uma varredura de aproximadamente 884 mil handles sob o lock
+do cache, bloqueando a ingestão por cerca de 70 s. Essa correção pertence ao tems.
+Meça separadamente o tempo da varredura, da chamada de exclusão e do lote do poll
+Kafka; os aproximadamente 0,9 s observados correspondem ao processamento completo
+desse lote, e não demonstram uma espera fixa da biblioteca.
+
+Para escrita, avaliar `batchMaxSamples` de 1000 até 4000 em passos, acompanhando
+latência completa, vazão e ocupação das filas. O limite de frame do transporte é
+64 MiB; tamanho de frame disponível não garante ganho de vazão nem latência aceitável.
+Não misture essa avaliação com a correção do lock do cache ou atribua seu tempo ao fsync.
+
 Use o launcher `ngrrd-admin` do seu deploy, ou `NgrrdClusterAdminCli` com o classpath completo
 descrito no guia de execução. Todos os comandos abaixo exigem `--seed host:port`.
 

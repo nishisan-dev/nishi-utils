@@ -207,6 +207,26 @@ public class ReplicationManager
     /** C1: source and next expected chunk of the snapshot chain in flight, per topic. */
     private final Map<String, NodeId> syncChainSource = new ConcurrentHashMap<>();
     private final Map<String, Integer> syncChainNextChunk = new ConcurrentHashMap<>();
+    private final java.util.concurrent.locks.ReentrantLock snapshotLifecycleLock = new java.util.concurrent.locks.ReentrantLock();
+    private final Map<String, SnapshotInstall> snapshotInstalls = new ConcurrentHashMap<>();
+    private final Map<String, java.util.concurrent.locks.ReentrantLock> snapshotInstallLocks = new ConcurrentHashMap<>();
+    private final Set<String> failedSnapshotInstalls = ConcurrentHashMap.newKeySet();
+    private long handbackAttempt;
+    private record SnapshotRequest(UUID requestId, NodeId source, int chunkIndex) { }
+    private final Map<String, SnapshotRequest> snapshotRequests = new ConcurrentHashMap<>();
+
+    private static final class SnapshotInstall {
+        final NodeId source;
+        final long handbackAttempt;
+        final long watermark;
+        volatile boolean checkpointing;
+        SnapshotInstall(NodeId source, long handbackAttempt, long watermark) {
+            this.source = source;
+            this.handbackAttempt = handbackAttempt;
+            this.watermark = watermark;
+        }
+    }
+
     private final Set<NodeId> quiescingFor = ConcurrentHashMap.newKeySet();
     private volatile long joinQuiesceStartedMs;
     // Active members observed on the previous membership change, to detect newly-joined nodes.
@@ -530,6 +550,16 @@ public class ReplicationManager
             return;
         }
         stopped = true;
+        boolean snapshotInstallsComplete;
+        snapshotLifecycleLock.lock();
+        try {
+            snapshotInstallsComplete = snapshotInstalls.isEmpty() && failedSnapshotInstalls.isEmpty()
+                    && relayPendingBootstrap.isEmpty();
+            snapshotInstalls.clear();
+            snapshotRequests.clear();
+        } finally {
+            snapshotLifecycleLock.unlock();
+        }
         running = false;
         // Stop the RELAY_STREAM fetch loops first: they only pull and persist to the relay (no apply
         // state), so quiescing them before the apply loops keeps shutdown ordering simple and avoids a
@@ -566,7 +596,8 @@ public class ReplicationManager
         // marker so the next start bootstraps (the safe side — a clean marker over a stale frontier
         // would replay/skip ops on restart).
         boolean frontierFlushed = flushSequenceStateIfDirty();
-        cleanShutdownEligible = allAppliersTerminated && frontierFlushed;
+        cleanShutdownEligible = allAppliersTerminated && frontierFlushed && snapshotInstallsComplete
+                && !hasPendingLocalApplies();
         if (!cleanShutdownEligible) {
             LOGGER.warning("Skipping clean-shutdown marker (appliersTerminated=" + allAppliersTerminated
                     + ", frontierFlushed=" + frontierFlushed
@@ -1191,32 +1222,38 @@ public class ReplicationManager
                     java.util.NavigableSet<Long> inFlight = localAppliesInFlight(operation.topic);
                     long inFlightSequence = operation.sequence;
                     inFlight.add(inFlightSequence);
-                    executor.submit(() -> {
-                        try {
-                            handler.apply(operation.operationId, operation.localApplyPayload);
-                            acquireSequenceLock();
+                    try {
+                        executor.submit(() -> {
                             try {
-                                applied.add(operation.operationId);
-                                trimApplied();
-                            } finally {
-                                sequenceBufferLock.unlock();
-                            }
-                            operation.markLocalApplied();
-                            // Applied: no longer in flight (before the future completes, so a caller that
-                            // saw its write commit never sees it still holding the snapshot label down).
-                            inFlight.remove(inFlightSequence);
+                                handler.apply(operation.operationId, operation.localApplyPayload);
+                                acquireSequenceLock();
+                                try {
+                                    applied.add(operation.operationId);
+                                    trimApplied();
+                                } finally {
+                                    sequenceBufferLock.unlock();
+                                }
+                                operation.markLocalApplied();
+                                // Applied: no longer in flight (before the future completes, so a caller that
+                                // saw its write commit never sees it still holding the snapshot label down).
+                                inFlight.remove(inFlightSequence);
 
-                            // Complete operation after successful apply
-                            completeOperation(operation);
-                        } catch (Throwable e) {
-                            // Throwable (not Exception): an Error (OOM/StackOverflow) must not kill
-                            // the pool worker silently nor skip cleanup — log it and fail the op.
-                            LOGGER.log(Level.SEVERE, "Failed to apply committed operation locally", e);
-                            failOperation(operation, e);
-                        } finally {
-                            inFlight.remove(inFlightSequence);
-                        }
-                    });
+                                // Complete operation after successful apply
+                                completeOperation(operation);
+                            } catch (Throwable e) {
+                                // Throwable (not Exception): an Error (OOM/StackOverflow) must not kill
+                                // the pool worker silently nor skip cleanup — log it and fail the op.
+                                LOGGER.log(Level.SEVERE, "Failed to apply committed operation locally", e);
+                                failOperation(operation, e);
+                            } finally {
+                                inFlight.remove(inFlightSequence);
+                            }
+                        });
+                    } catch (RejectedExecutionException e) {
+                        // No task will run its finally block when submission is rejected.
+                        inFlight.remove(inFlightSequence);
+                        failOperation(operation, e);
+                    }
                 }
                 return; // Completion happens in callback
             }
@@ -1363,136 +1400,163 @@ public class ReplicationManager
 
     private void handleSyncResponse(ClusterMessage message) {
         SyncResponsePayload payload = message.payload(SyncResponsePayload.class);
-        ReplicationHandler handler = handlers.get(payload.topic());
-        if (handler == null)
-            return;
-        // C1: only the AGREED leader's chunks are installed, and only in the order of ONE chain. A
-        // leader change mid-transfer used to stitch chunk 0 from the old leader with chunk 1+ from
-        // the new one into a single install; a stale chunk from a superseded chain now drops the
-        // chain and releases the guard so the next tick restarts from chunk 0 against the current leader.
         String topic = payload.topic();
+        ReplicationHandler handler = handlers.get(topic);
+        if (handler == null) return;
         NodeId source = message.source();
-        NodeId agreedLeader = coordinator.leaderInfo().map(NodeInfo::nodeId).orElse(null);
-        if (agreedLeader == null || !agreedLeader.equals(source)) {
-            LOGGER.warning(() -> "Ignoring snapshot chunk " + payload.chunkIndex() + " for " + topic + " from "
-                    + source + " (agreed leader: " + agreedLeader + ")");
-            abandonSyncChain(topic);
-            return;
-        }
-        if (payload.chunkIndex() == 0) {
-            syncChainSource.put(topic, source);
-            syncChainNextChunk.put(topic, 1);
-        } else {
-            Integer expected = syncChainNextChunk.get(topic);
-            NodeId chainSource = syncChainSource.get(topic);
-            if (expected == null || expected != payload.chunkIndex() || !source.equals(chainSource)) {
-                LOGGER.warning(() -> "Ignoring out-of-chain snapshot chunk " + payload.chunkIndex() + " for " + topic
-                        + " from " + source + " (expected chunk " + expected + " from " + chainSource + ")");
+        SnapshotInstall install;
+        snapshotLifecycleLock.lock();
+        try {
+            SnapshotRequest expectedRequest = snapshotRequests.get(topic);
+            if (expectedRequest == null || !expectedRequest.source().equals(source)
+                || expectedRequest.chunkIndex() != payload.chunkIndex()
+                || !message.correlationId().filter(expectedRequest.requestId()::equals).isPresent()) {
+                // Stale responses never invalidate a current attempt, including after leader change.
+                return;
+            }
+            NodeId agreedLeader = coordinator.leaderInfo().map(NodeInfo::nodeId).orElse(null);
+            if (stopped || coordinator.isLeader() || !source.equals(agreedLeader)) {
                 abandonSyncChain(topic);
                 return;
             }
-            syncChainNextChunk.put(topic, payload.chunkIndex() + 1);
+            snapshotRequests.remove(topic, expectedRequest);
+            if (payload.chunkIndex() == 0) {
+                SnapshotInstall existing = snapshotInstalls.get(topic);
+                // A checkpoint is progress, not a stuck transfer. Do not reset its state while
+                // the final checkpoint is still running; a changed leader invalidates it below.
+                if (existing != null && existing.checkpointing && existing.source.equals(source)) return;
+                install = new SnapshotInstall(source,
+                    handbackRole.get() == HandbackRole.CANDIDATE_INSTALLING ? handbackAttempt : 0L, payload.sequence());
+                snapshotInstalls.put(topic, install);
+                syncChainSource.put(topic, source);
+                syncChainNextChunk.put(topic, 1);
+            } else {
+                install = snapshotInstalls.get(topic);
+                Integer expected = syncChainNextChunk.get(topic);
+                if (install == null || expected == null || expected != payload.chunkIndex()
+                    || !source.equals(install.source) || payload.sequence() != install.watermark) {
+                    abandonSyncChain(topic);
+                    return;
+                }
+                syncChainNextChunk.put(topic, payload.chunkIndex() + 1);
+            }
+        } finally {
+            snapshotLifecycleLock.unlock();
         }
-        if (coordinator.isLeader()) {
-            // Role guard (issue tems#9, D8): an ACTIVE LEADER never installs a peer snapshot. A late
-            // chunk from a sync requested while this node was still a follower (the server may answer
-            // around a leadership flip) used to resetState() the live leader mid-write — and the
-            // chunk chain then died on a self-addressed follow-up request. Drop it and release the
-            // sync guard; the leader's own op-log is the source of truth.
-            LOGGER.warning(() -> "Ignoring snapshot chunk for " + payload.topic()
-                    + " received while LEADER (late response from a pre-promotion sync)");
-            syncingTopics.remove(payload.topic());
-            return;
-        }
-
-        executor.submit(() -> {
-            try {
-                // Mark sync activity so the stuck-sync janitor does not kill a healthy in-flight
-                // multi-chunk transfer — nextExpected only advances on the final chunk, so without
-                // this a large byte-sliced snapshot would be torn down mid-way (resetState) and the
-                // follower would never converge.
-                lastSyncActivityByTopic.put(payload.topic(), System.currentTimeMillis());
-                long currentNext;
-                acquireSequenceLock();
+        try {
+            executor.submit(() -> {
+                java.util.concurrent.locks.ReentrantLock lock = snapshotInstallLocks.computeIfAbsent(topic,
+                    key -> new java.util.concurrent.locks.ReentrantLock());
+                lock.lock();
                 try {
-                    currentNext = nextExpectedSequenceByTopic.getOrDefault(payload.topic(), 1L);
-                } finally {
-                    sequenceBufferLock.unlock();
-                }
-                long currentApplied = Math.max(0L, currentNext - 1L);
-                // The stale-sync guard NEVER applies while a bootstrap is pending for the topic (issue
-                // tems#9, D8/D9): the local lineage is untrusted by definition (unclean restart) and
-                // sequence numbers across divergent lineages are incomparable — a returning ex-leader's
-                // re-anchored frontier is routinely ABOVE the incumbent's honest watermark, yet the
-                // incumbent's snapshot is exactly what must replace the local state.
-                if (!relayPendingBootstrap.contains(payload.topic()) && payload.sequence() < currentApplied) {
-                    LOGGER.warning(() -> "Ignoring stale sync for " + payload.topic()
-                            + " (sequence=" + payload.sequence() + ", current=" + currentApplied + ")");
-                    syncingTopics.remove(payload.topic());
-                    // The local (newly promoted) leader already holds newer state than the peer's
-                    // snapshot, so this topic is effectively caught up. Release its leader-sync guard
-                    // too — otherwise leaderSyncing stays true forever (retryLeaderSync keeps pulling
-                    // the same older snapshot) and the write gate in replicate() rejects every write
-                    // even though the leader has the latest state.
-                    if (leaderSyncTopics.remove(payload.topic()) && leaderSyncTopics.isEmpty()) {
-                        leaderSyncing.set(false);
+                    snapshotLifecycleLock.lock();
+                    try {
+                        if (!isCurrentSnapshotInstall(topic, install)) return;
+                    } finally {
+                        snapshotLifecycleLock.unlock();
                     }
-                    return;
-                }
-                if (coordinator.isLeader()) {
-                    // C1: promoted between receipt and install — never reset/cut over a live leader.
-                    LOGGER.warning(() -> "Dropping snapshot chunk for " + payload.topic()
-                            + ": this node was promoted before the install ran");
-                    abandonSyncChain(payload.topic());
-                    return;
-                }
-                if (payload.chunkIndex() == 0) {
-                    LOGGER.info(() -> "Starting sync for " + payload.topic() + " at sequence " + payload.sequence());
-                    handler.resetState();
-                }
-                handler.installSnapshot(payload.data());
-
-                if (payload.hasMore()) {
-                    if (!requestSync(payload.topic(), payload.chunkIndex() + 1)) {
-                        // The chain cannot continue (leader changed, or this node got promoted):
-                        // release the guard so the next apply tick restarts the sync from chunk 0
-                        // against the current leader instead of stalling until the watchdog.
-                        syncingTopics.remove(payload.topic());
-                    }
-                } else {
-                    // Last chunk installed: let the handler reassemble/decode a multi-chunk
-                    // (byte-sliced) snapshot before the follower is considered caught up.
-                    handler.onSnapshotInstalled();
-                    if (coordinator.isLeader()) {
-                        LOGGER.warning(() -> "Dropping snapshot cutover for " + payload.topic()
-                                + ": this node was promoted during the install");
-                        abandonSyncChain(payload.topic());
+                    lastSyncActivityByTopic.put(topic, System.currentTimeMillis());
+                    long currentApplied = Math.max(0L, currentNextExpected(topic) - 1L);
+                    if (!relayPendingBootstrap.contains(topic) && payload.sequence() < currentApplied) {
+                        snapshotLifecycleLock.lock();
+                        try {
+                            if (snapshotInstalls.get(topic) == install) abandonSyncChain(topic);
+                        } finally {
+                            snapshotLifecycleLock.unlock();
+                        }
+                        if (leaderSyncTopics.remove(topic) && leaderSyncTopics.isEmpty()) leaderSyncing.set(false);
                         return;
                     }
-                    LOGGER.info(
-                            () -> "Sync completed for " + payload.topic() + ". Final sequence: " + payload.sequence());
-                    syncChainSource.remove(payload.topic());
-                    syncChainNextChunk.remove(payload.topic());
-                    completeSnapshotCutover(payload.topic(), payload.sequence());
-                    syncingTopics.remove(payload.topic());
-                    if (leaderSyncTopics.remove(payload.topic()) && leaderSyncTopics.isEmpty()) {
-                        leaderSyncing.set(false);
+                    if (payload.chunkIndex() == 0) {
+                        LOGGER.info(() -> "Starting sync for " + topic + " at sequence " + payload.sequence());
+                        failedSnapshotInstalls.add(topic);
+                        relayPendingBootstrap.add(topic);
+                        handler.resetState();
                     }
+                    handler.installSnapshot(payload.data());
+                    if (payload.hasMore()) {
+                        snapshotLifecycleLock.lock();
+                        try {
+                            if (isCurrentSnapshotInstall(topic, install)
+                                && !requestSync(topic, payload.chunkIndex() + 1)) abandonSyncChain(topic);
+                        } finally {
+                            snapshotLifecycleLock.unlock();
+                        }
+                    } else {
+                        snapshotLifecycleLock.lock();
+                        try {
+                            if (!isCurrentSnapshotInstall(topic, install)) return;
+                            install.checkpointing = true;
+                        } finally {
+                            snapshotLifecycleLock.unlock();
+                        }
+                        // Full checkpoint runs on the replication executor, never a transport or
+                        // heartbeat thread. Its completion is fenced by session and handback attempt.
+                        handler.onSnapshotInstalled();
+                        snapshotLifecycleLock.lock();
+                        try {
+                            if (!isCurrentSnapshotInstall(topic, install)) {
+                                if (snapshotInstalls.get(topic) == install) abandonSyncChain(topic);
+                                return;
+                            }
+                            completeSnapshotCutover(topic, payload.sequence());
+                            LOGGER.info(() -> "Sync completed for " + topic + ". Final sequence: " + payload.sequence());
+                            LOGGER.info(() -> "Sync durable for " + topic + ". Final sequence: " + payload.sequence());
+                            failedSnapshotInstalls.remove(topic);
+                            abandonSyncChain(topic);
+                            if (leaderSyncTopics.remove(topic) && leaderSyncTopics.isEmpty()) leaderSyncing.set(false);
+                        } finally {
+                            snapshotLifecycleLock.unlock();
+                        }
+                    }
+                } catch (Throwable e) {
+                    LOGGER.log(Level.SEVERE, "Failed to install snapshot chunk", e);
+                    failedSnapshotInstalls.add(topic);
+                    relayPendingBootstrap.add(topic);
+                    snapshotLifecycleLock.lock();
+                    try {
+                        if (snapshotInstalls.get(topic) == install) abandonSyncChain(topic);
+                    } finally {
+                        snapshotLifecycleLock.unlock();
+                    }
+                } finally {
+                    install.checkpointing = false;
+                    lock.unlock();
                 }
-            } catch (Throwable e) {
-                // Throwable (not Exception): an Error here (e.g. OOM decoding a large snapshot) must
-                // not kill the pool worker silently; log it and release the sync guard to allow retry.
-                LOGGER.log(Level.SEVERE, "Failed to install snapshot chunk", e);
-                syncingTopics.remove(payload.topic()); // allow retry
+            });
+        } catch (java.util.concurrent.RejectedExecutionException e) {
+            failedSnapshotInstalls.add(topic);
+            snapshotLifecycleLock.lock();
+            try {
+                if (snapshotInstalls.get(topic) == install) abandonSyncChain(topic);
+            } finally {
+                snapshotLifecycleLock.unlock();
             }
-        });
+        }
     }
 
-    /** C1: drops the snapshot chain in flight for {@code topic} and releases its sync guard. */
+    private boolean isCurrentSnapshotInstall(String topic, SnapshotInstall install) {
+        if (stopped || coordinator.isLeader() || snapshotInstalls.get(topic) != install
+            || !coordinator.leaderInfo().map(NodeInfo::nodeId).filter(install.source::equals).isPresent()) return false;
+        return install.handbackAttempt == 0L
+            || (handbackRole.get() == HandbackRole.CANDIDATE_INSTALLING
+            && handbackAttempt == install.handbackAttempt
+            && install.source.equals(handbackPeer)
+            && System.currentTimeMillis() - handbackStartedMs <= config.handoverSnapshotTimeout().toMillis());
+    }
+
+    /** Drops a snapshot chain and invalidates any outstanding completion for it. */
     private void abandonSyncChain(String topic) {
-        syncChainSource.remove(topic);
-        syncChainNextChunk.remove(topic);
-        syncingTopics.remove(topic);
+        snapshotLifecycleLock.lock();
+        try {
+            snapshotInstalls.remove(topic);
+            snapshotRequests.remove(topic);
+            syncChainSource.remove(topic);
+            syncChainNextChunk.remove(topic);
+            syncingTopics.remove(topic);
+        } finally {
+            snapshotLifecycleLock.unlock();
+        }
     }
 
     /** C5: relay entries moved out of the stream because they could not be applied. */
@@ -1609,6 +1673,12 @@ public class ReplicationManager
                 transport.local().nodeId(),
                 leader.nodeId(),
                 payload);
+        snapshotLifecycleLock.lock();
+        try {
+            snapshotRequests.put(topic, new SnapshotRequest(request.messageId(), leader.nodeId(), chunkIndex));
+        } finally {
+            snapshotLifecycleLock.unlock();
+        }
         transport.send(request);
         return true;
     }
@@ -2698,25 +2768,29 @@ public class ReplicationManager
      * would loop logging "Large gap" without ever recovering.
      */
     private void checkStuckSyncs() {
-        if (!running || coordinator.isLeader()) {
-            return;
-        }
+        if (!running || coordinator.isLeader()) return;
         long now = System.currentTimeMillis();
         for (String topic : syncingTopics) {
-            // A sync stays "alive" as long as chunks keep arriving. Seed the stamp the first time a
-            // guard is observed so a sync that never receives a single chunk (lost SYNC_REQUEST) is
-            // still eventually released; healthy multi-chunk transfers refresh it on every chunk.
-            long lastActivity = lastSyncActivityByTopic.computeIfAbsent(topic, k -> now);
-            if (now - lastActivity > SYNC_STUCK_TIMEOUT_MS) {
-                long stuckMs = now - lastActivity;
-                LOGGER.warning(() -> String.format(
-                        "Sync for topic=%s stuck without a chunk for %dms; releasing sync guard to allow a fresh sync.",
-                        topic, stuckMs));
-                syncingTopics.remove(topic);
-                lastSyncActivityByTopic.remove(topic);
+            snapshotLifecycleLock.lock();
+            try {
+                if (!syncingTopics.contains(topic)) continue;
+                SnapshotInstall install = snapshotInstalls.get(topic);
+                // The checkpoint phase transition and this expiry decision use one lock.
+                // A healthy checkpoint cannot be invalidated by a stale inactivity observation.
+                if (install != null && install.checkpointing) continue;
+                long lastActivity = lastSyncActivityByTopic.computeIfAbsent(topic, k -> now);
+                if (now - lastActivity > SYNC_STUCK_TIMEOUT_MS) {
+                    long stuckMs = now - lastActivity;
+                    LOGGER.warning(() -> String.format(
+                            "Sync for topic=%s stuck without a chunk for %dms; releasing sync guard to allow a fresh sync.",
+                            topic, stuckMs));
+                    abandonSyncChain(topic);
+                    lastSyncActivityByTopic.remove(topic);
+                }
+            } finally {
+                snapshotLifecycleLock.unlock();
             }
         }
-        // Drop activity entries for topics that are no longer syncing.
         lastSyncActivityByTopic.keySet().removeIf(t -> !syncingTopics.contains(t));
     }
 
@@ -2996,7 +3070,11 @@ public class ReplicationManager
         executor.shutdownNow();
         timeoutScheduler.shutdownNow();
         try {
-            executor.awaitTermination(3, TimeUnit.SECONDS);
+            if (executor.awaitTermination(3, TimeUnit.SECONDS)) {
+                // Queued tasks discarded by shutdownNow never run their finally blocks.
+                // Keep active applies tracked if they ignore interruption and outlive close.
+                localAppliesInFlightByTopic.clear();
+            }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
@@ -3710,7 +3788,13 @@ public class ReplicationManager
             clearCandidateHandback("leader-ineligible", true);
             return;
         }
-        handbackGrantedEpoch = payload.leaderEpoch();
+        snapshotLifecycleLock.lock();
+        try {
+            handbackAttempt++;
+            handbackGrantedEpoch = payload.leaderEpoch();
+        } finally {
+            snapshotLifecycleLock.unlock();
+        }
         if (handlers.isEmpty()) {
             sendHandbackAbort(message.source(), "candidate has no topics");
             clearCandidateHandback("no topics", true);
@@ -3724,7 +3808,7 @@ public class ReplicationManager
         // snapshot replaces our (possibly numerically higher) stale frontier. When the last topic cuts
         // over we assert leadership (completeSnapshotCutover tail → completeHandbackAsCandidate).
         for (String topic : handlers.keySet()) {
-            syncingTopics.remove(topic);
+            abandonSyncChain(topic);
             relayPendingBootstrap.add(topic);
             signalRelay(topic);
         }
@@ -3957,8 +4041,14 @@ public class ReplicationManager
     }
 
     private void clearCandidateHandback(String reason, boolean cooldown) {
-        handbackRole.set(HandbackRole.NONE);
-        handbackPeer = null;
+        snapshotLifecycleLock.lock();
+        try {
+            handbackAttempt++;
+            handbackRole.set(HandbackRole.NONE);
+            handbackPeer = null;
+        } finally {
+            snapshotLifecycleLock.unlock();
+        }
         if (cooldown) {
             handbackCooldownUntilMs = System.currentTimeMillis() + config.handoverCooldown().toMillis();
         }

@@ -46,7 +46,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.TimeUnit;
-import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
@@ -66,6 +65,7 @@ public final class MapClusterService<K, V>
 
     private static final Logger LOGGER = Logger.getLogger(MapClusterService.class.getName());
 
+    private final java.util.concurrent.locks.ReentrantLock stateLock = new java.util.concurrent.locks.ReentrantLock();
     private final ConcurrentMap<K, V> data = new ConcurrentHashMap<>();
     /** Entries per snapshot chunk. */
     private static final int SNAPSHOT_CHUNK_SIZE = 1000;
@@ -74,6 +74,9 @@ public final class MapClusterService<K, V>
     private final ReplicationManager replicationManager;
     private final NMapPersistence<K, V> persistence;
     private final String topic;
+    private boolean diskLoaded;
+    private volatile boolean installationInProgress;
+    private volatile boolean installationFailed;
     /**
      * When {@code true}, the leader stores the original value instance in its local
      * {@code data} (ConcurrentHashMap reference semantics) instead of a deserialized
@@ -122,9 +125,10 @@ public final class MapClusterService<K, V>
         if (this.topic.isBlank()) {
             throw new IllegalArgumentException("topic cannot be blank");
         }
-        this.replicationManager.registerHandler(this.topic, this);
         this.persistence = null;
         this.leaderLocalByReference = leaderLocalByReference;
+        this.diskLoaded = true;
+        this.replicationManager.registerHandler(this.topic, this);
     }
 
     /**
@@ -161,13 +165,14 @@ public final class MapClusterService<K, V>
         if (this.topic.isBlank()) {
             throw new IllegalArgumentException("topic cannot be blank");
         }
-        this.replicationManager.registerHandler(this.topic, this);
         if (nmapConfig != null && nmapConfig.mode() != NMapPersistenceMode.DISABLED) {
-            this.persistence = new NMapPersistence<>(nmapConfig, data, baseDir, mapName);
+            this.persistence = new NMapPersistence<>(nmapConfig, data, baseDir, mapName, stateLock);
         } else {
             this.persistence = null;
         }
         this.leaderLocalByReference = leaderLocalByReference;
+        loadFromDisk();
+        this.replicationManager.registerHandler(this.topic, this);
     }
 
     /**
@@ -253,6 +258,15 @@ public final class MapClusterService<K, V>
      */
     @SuppressWarnings("unchecked")
     public void clearLocalByPrefix(String prefix) {
+        stateLock.lock();
+        try {
+            clearLocalByPrefixLocked(prefix);
+        } finally {
+            stateLock.unlock();
+        }
+    }
+
+    private void clearLocalByPrefixLocked(String prefix) {
         Objects.requireNonNull(prefix, "prefix");
         for (K key : new java.util.ArrayList<>(data.keySet())) {
             if (key instanceof String s && s.startsWith(prefix)) {
@@ -338,11 +352,21 @@ public final class MapClusterService<K, V>
      * This is a no-op when persistence is disabled.
      */
     public void loadFromDisk() {
-        if (persistence == null) {
-            return;
+        stateLock.lock();
+        try {
+            if (diskLoaded) return;
+            if (persistence != null) {
+                persistence.load();
+                if (persistence.failureCount() == 0) persistence.start();
+                if (persistence.failureCount() != 0) {
+                    try { persistence.close(); } catch (IOException ignored) { }
+                    throw new IllegalStateException("Failed to initialize persistence for " + topic);
+                }
+            }
+            diskLoaded = true;
+        } finally {
+            stateLock.unlock();
         }
-        persistence.load();
-        persistence.start();
     }
 
     private void waitForReplication(CompletableFuture<ReplicationResult> future) {
@@ -379,6 +403,25 @@ public final class MapClusterService<K, V>
     @Override
     @SuppressWarnings("unchecked")
     public void apply(UUID operationId, Object payload) {
+        stateLock.lock();
+        try {
+            MapReplicationCommand command = payload instanceof MapReplicationCommand mrc
+                ? mrc : MapReplicationCodec.decode((byte[]) payload);
+            if (command.type() == NMapOperationType.DESTROY) {
+                try { destroy(); } catch (IOException e) {
+                    throw new IllegalStateException("Failed to destroy persistence for " + topic, e);
+                }
+                return;
+            }
+
+            applyLocked(operationId, command);
+        } finally {
+            stateLock.unlock();
+        }
+    }
+
+    private void applyLocked(UUID operationId, Object payload) {
+        if (installationInProgress) throw new IllegalStateException("Map installation in progress for " + topic);
         // Two payload shapes reach apply():
         //  - byte[]: the wire form (followers, resend, and the default leader path).
         //    Decoded here to preserve concrete POJO types across the Jackson boundary
@@ -407,17 +450,7 @@ public final class MapClusterService<K, V>
                 }
             }
             case REMOVE -> data.remove((K) command.key());
-            case DESTROY -> {
-                data.clear();
-                if (persistence != null) {
-                    try {
-                        persistence.destroy();
-                    } catch (IOException e) {
-                        LOGGER.log(Level.WARNING, "Failed to destroy persistence files for topic: " + topic, e);
-                    }
-                }
-                return; // skip normal persistence append below
-            }
+            case DESTROY -> throw new IllegalStateException("DESTROY must use the lifecycle path");
             case CLEAR -> {
                 // Empty the map but keep the persistence engine alive (reusable):
                 // record a CLEAR marker in the WAL so the empty state survives restart.
@@ -523,13 +556,29 @@ public final class MapClusterService<K, V>
     /** {@inheritDoc} */
     @Override
     public void resetState() {
-        data.clear();
+        stateLock.lock();
+        try {
+            installationInProgress = true;
+            if (persistence != null) persistence.setSnapshotsSuspended(true);
+            data.clear();
+        } finally {
+            stateLock.unlock();
+        }
     }
 
     /** {@inheritDoc} */
     @Override
     @SuppressWarnings("unchecked")
     public void installSnapshot(Object snapshot) {
+        stateLock.lock();
+        try {
+            installSnapshotLocked(snapshot);
+        } finally {
+            stateLock.unlock();
+        }
+    }
+
+    private void installSnapshotLocked(Object snapshot) {
         // Snapshots are transported as byte[] (produced by MapReplicationCodec.encodeSnapshot)
         // to preserve the concrete types of POJO values across the Jackson boundary.
         Map<Object, Object> newMap = MapReplicationCodec.decodeSnapshot((byte[]) snapshot);
@@ -555,16 +604,38 @@ public final class MapClusterService<K, V>
         } else {
             data.putAll((Map<? extends K, ? extends V>) newMap);
         }
-        if (persistence != null) {
-            persistence.maybeSnapshot();
-        }
     }
 
     /** {@inheritDoc} */
     @Override
     public void close() throws IOException {
-        if (persistence != null) {
-            persistence.close();
+        stateLock.lock();
+        try {
+            if (persistence != null) persistence.close();
+            if (installationInProgress || installationFailed) {
+                throw new IOException("Incomplete or failed snapshot installation for " + topic);
+            }
+        } finally {
+            stateLock.unlock();
+        }
+    }
+
+    /** Completes a snapshot installation only after its complete state is durable. */
+    @Override
+    public void onSnapshotInstalled() throws IOException {
+        stateLock.lock();
+        try {
+            try {
+                if (persistence != null) persistence.forceSnapshot();
+                installationInProgress = false;
+                installationFailed = false;
+                if (persistence != null) persistence.setSnapshotsSuspended(false);
+            } catch (IOException e) {
+                installationFailed = true;
+                throw e;
+            }
+        } finally {
+            stateLock.unlock();
         }
     }
 
@@ -584,9 +655,14 @@ public final class MapClusterService<K, V>
      * @throws IOException se ocorrer erro de I/O ao remover arquivos de persistência
      */
     public void destroy() throws IOException {
-        data.clear();
-        if (persistence != null) {
-            persistence.destroy();
+        stateLock.lock();
+        try {
+            data.clear();
+
+            // Periodic snapshots use tryLock, so the writer never waits for this mutation lock during close.
+            if (persistence != null) persistence.destroy();
+        } finally {
+            stateLock.unlock();
         }
     }
 
@@ -597,7 +673,8 @@ public final class MapClusterService<K, V>
      * @return {@code true} if healthy
      */
     public boolean isHealthy() {
-        return persistence == null || persistence.failureCount() == 0;
+        return !installationInProgress && !installationFailed
+                && (persistence == null || persistence.failureCount() == 0);
     }
 
     /**

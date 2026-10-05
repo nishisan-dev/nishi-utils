@@ -335,8 +335,7 @@ class RelayStreamConcurrentIngestTest {
         }
 
         void deliverSyncResponse(long watermark) {
-            transport.deliverToListeners(ClusterMessage.request(MessageType.SYNC_RESPONSE, "sync",
-                    LEADER, FOLLOWER, new SyncResponsePayload(TOPIC, watermark, new byte[0])));
+            transport.deliverToListeners(ScriptedTransport.syncResponse(transport.getSentMessages(), LEADER, new SyncResponsePayload(TOPIC, watermark, new byte[0])));
         }
 
         void awaitApplied(int target, long timeoutMs) throws InterruptedException {

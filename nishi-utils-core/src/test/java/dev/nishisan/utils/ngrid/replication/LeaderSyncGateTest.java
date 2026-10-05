@@ -149,8 +149,9 @@ class LeaderSyncGateTest {
         manager.start();
 
         // Advance local applied state to sequence 5 via a normal (non-stale) snapshot.
-        manager.onMessage(ClusterMessage.request(MessageType.SYNC_RESPONSE, TOPIC,
-                peer.nodeId(), local.nodeId(), new SyncResponsePayload(TOPIC, 5L, 0, false, "snap")));
+        requestSnapshot();
+        manager.onMessage(ScriptedTransport.syncResponse(transport.sent, peer.nodeId(),
+                new SyncResponsePayload(TOPIC, 5L, 0, false, "snap")));
         long deadline = System.currentTimeMillis() + 5000;
         while (System.currentTimeMillis() < deadline && manager.getLastAppliedSequence() < 5L) {
             Thread.sleep(20);
@@ -165,8 +166,9 @@ class LeaderSyncGateTest {
         // A behind peer answers with an OLDER snapshot (seq 3 < applied 5): the stale-sync path must
         // release the leader-sync guard, otherwise the write gate would reject writes forever even
         // though this leader already holds the newer state.
-        manager.onMessage(ClusterMessage.request(MessageType.SYNC_RESPONSE, TOPIC,
-                peer.nodeId(), local.nodeId(), new SyncResponsePayload(TOPIC, 3L, 0, false, "old")));
+        requestSnapshot();
+        manager.onMessage(ScriptedTransport.syncResponse(transport.sent, peer.nodeId(),
+                new SyncResponsePayload(TOPIC, 3L, 0, false, "old")));
 
         long clearDeadline = System.currentTimeMillis() + 5000;
         while (System.currentTimeMillis() < clearDeadline && manager.isLeaderSyncing()) {
@@ -177,6 +179,12 @@ class LeaderSyncGateTest {
     }
 
     // ── Helpers ──
+
+    private void requestSnapshot() throws Exception {
+        var request = ReplicationManager.class.getDeclaredMethod("requestSync", String.class);
+        request.setAccessible(true);
+        assertTrue((boolean) request.invoke(manager, TOPIC), "the follower must request its snapshot");
+    }
 
     private ReplicationManager newManager() {
         return new ReplicationManager(transport, coordinator,
@@ -209,6 +217,7 @@ class LeaderSyncGateTest {
 
     private static final class FakeTransport implements Transport {
 
+        private final List<ClusterMessage> sent = new java.util.concurrent.CopyOnWriteArrayList<>();
         private final NodeInfo local;
         private final List<NodeInfo> peers;
         private final CopyOnWriteArraySet<TransportListener> listeners = new CopyOnWriteArraySet<>();
@@ -261,6 +270,7 @@ class LeaderSyncGateTest {
 
         @Override
         public void send(ClusterMessage message) {
+            sent.add(message);
         }
 
         @Override

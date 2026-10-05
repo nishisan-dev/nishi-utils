@@ -948,11 +948,14 @@ Se o líder que vai servir o snapshot ainda não estiver na 8.10.1, pare a inges
 e mantenha o rebalance desligado até o `Sync completed`. Para forçar o snapshot completo do líder:
 
 1. Com o líder estável, pare o storage de forma graciosa. Não faça isso no líder.
-2. Remova `<node.dataDir>/replication/relay/.clean-shutdown`.
+2. Remova `<node.dataDir>/replication/relay/.clean-shutdown`. Até 8.10.2, com o nó ainda
+   parado, mova `maps/<mapa>/` para backup antes de iniciar a reinstalação (#195).
 3. Suba o storage. Ele fica inelegível a líder até concluir o bootstrap.
 4. Aguarde `Sync completed for map:<mapa>` de todos os mapas e `CAT_LAG 0` no `ngrrd-admin status`.
-5. Não reinicie o nó antes de o `mtime` de `maps/<mapa>/snapshot.dat` ficar posterior ao sync
-   (até ~5 min): o snapshot instalado só chega ao disco no próximo snapshot do NMap.
+5. Até 8.10.2, não reinicie antes de o `mtime` de `snapshot.dat` ficar posterior ao sync
+   (até ~5 min). A carga do disco antigo pode sobrescrever chunks recebidos.
+   Em 8.11.0, após a validação abaixo, mantenha `maps/` e aguarde `Sync durable for map:<mapa>`;
+   não é necessário esperar o snapshot periódico.
 
 **Não** apague só `maps/ngrrd.catalog`: a fronteira em `replication/` continuaria dizendo que
 está tudo aplicado, e o nó subiria com o catálogo vazio e lag 0.
@@ -968,3 +971,95 @@ Para comparar o conteúdo, copie `<node.dataDir>/maps/ngrrd.catalog/` do líder 
 sem parar nada. Carregue as **cópias** com `NMapPersistence.load()` usando o classpath do storage
 e compare as entradas campo a campo. Nunca carregue o diretório vivo: `load()` abre o WAL para
 escrita e pode truncar o fim.
+
+
+## Atualização para 8.11.0
+
+A 8.11.0 corrige #195/#190: o disco é carregado antes do registro do handler, e a instalação
+completa é persistida antes do cutover. `Sync completed for ...` permanece com o texto conhecido;
+`Sync durable for ...` é a confirmação adicional de checkpoint e cutover. A API pública
+`NMapPersistence.forceSnapshot()` é nova, síncrona e pode lançar `IOException`; o controle
+`setSnapshotsSuspended(boolean)` serve à infraestrutura de instalação. Não há mudança nos
+records públicos de métricas. Também há um overload de construtor que recebe o `ReentrantLock`
+compartilhado com os mutadores do mapa; o construtor anterior continua disponível.
+Integrações diretas que alteram o mapa concorrentemente devem compartilhar esse lock através
+da mutação e admissão no WAL, inclusive para snapshots periódicos. `NMap` e `MapClusterService`
+já fazem isso; usuários do construtor antigo precisam interromper mutações durante snapshots.
+O consumidor tems deve ser avisado dessas alterações.
+
+### Piloto e retirada do contorno
+
+1. Confirmar backup, líder estável e maioria disponível. Atualizar um storage seguidor, mantendo
+   as prioridades existentes (no CTP, .79 e .209 continuam em 50 durante esta etapa).
+2. Executar o bootstrap intencional retirando apenas o marcador de shutdown limpo com o nó
+   parado, **mantendo `maps/` não vazio**. Confirmar bootstrap pendente e `Sync durable` de todos
+   os mapas persistentes. Não executar simultaneamente em dois storages.
+3. Comparar conteúdo com o líder numa fronteira estável; `CAT_LAG 0` sozinho não basta.
+   Usar cópias consistentes/offline e nunca abrir o diretório vivo com `NMapPersistence.load()`.
+4. Reiniciar imediatamente, sem esperar cinco minutos, e repetir a comparação. Confirmar que
+   nenhum valor antigo ou chave ausente voltou do disco.
+5. Validar handback com checkpoint, heartbeats e ausência de abortos recorrentes; observar uma
+   virada de hora e a compactação do journal. Só então expandir o deploy, um nó por vez.
+6. Retirar o contorno de mover `maps/` e aguardar o snapshot periódico somente nos nós
+   atualizados e validados. Os nós antigos e divergências previamente existentes continuam
+   exigindo o procedimento de recuperação e comparação de conteúdo.
+
+O handback já possui prazos próprios: GRANT `handoverRequestTimeout=30s`, instalação
+`handoverSnapshotTimeout=120s` e máximo do líder `handoverMaxDuration=120s`, contados desde o
+início da tentativa conforme o código existente. Transferência e checkpoint consomem esse
+orçamento. O checkpoint não roda na thread de transporte nem nos schedulers. Não aumentar
+prazos para mascarar falhas sem medir o catálogo real e a pausa de escrita do líder.
+
+### Compatibilidade e rollback
+
+O journal de séries conserva o formato da 8.10.2; `ACTIVE` aceita `placement=null`. Fases de
+exclusão conservam seu placement. Os arquivos de snapshot/WAL completos mantêm o formato
+anterior, mas uma rotação interrompida deixa `snapshot.pending`. Nesse caso, completar a
+recuperação com 8.11.0 antes de downgrade; leitores antigos não reconhecem esse marcador.
+Em caso de falha de checkpoint, não interpretar `Sync completed` isoladamente como permissão
+para restart limpo ou promoção. Não remover manualmente marcadores de recuperação.
+
+### Medição antes de outra mudança de desempenho
+
+`NGRRD_LIFECYCLE_COMPACT` (INFO) informa `entries`, `beforeBytes`, `afterBytes` e
+`lockHeldNanos`. A compactação continua síncrona nesta entrega. Se o tempo sob lock superar
+2 s em duas compactações representativas com entradas menores, reabrir a implementação
+assíncrona com snapshot + buffer de mutações confirmadas, limitado a 64 MiB; overflow aborta a
+compactação e preserva o WAL original. Medir também o fsync final e a memória adicional.
+
+Habilitar FINE temporariamente apenas nas classes `SeriesLifecycleJournal` e
+`StorageRequestHandler` por configuração JUL, depois voltar ao nível anterior. Os eventos
+`NGRRD_LIFECYCLE_FSYNC` mostram duração do force e número de entradas; `NGRRD_WRITE_BATCH_TOTAL`
+mede o processamento completo no handler do storage, incluindo locks, ownership, receipts
+e handles. Não inclui a ida/volta TCP nem o tempo do poll Kafka no cliente; correlacione
+também a duração completa da chamada no tems para avaliar o p99 de ponta a ponta. O campo
+`lifecycleFsyncDelta` é a variação **global do journal durante a requisição**: com concorrência,
+não atribuir todos esses fsyncs ao lote. A proporção exata de lotes com force requer correlação
+por thread na coleta temporária, por exemplo via profiler. Os eventos são diagnósticos, sem
+mudança da forma dos records de métricas.
+
+Reabrir group commit se o p99 do WRITE_BATCH completo superar 200 ms em duas viradas de hora e
+o fsync explicar ao menos metade da latência dos lotes lentos. Registrar a proporção de lotes
+com fsync; 40% isoladamente não decide a mudança. `writeBatchP99us` atual é por handle e não
+substitui essa medição. Não atribuir o campo `barrier` do tems ao journal: ele mede processamento
+do lote retornado pelo poll Kafka, incluindo contenção no `NgrrdHandleCache.mapLock`.
+
+
+#### Experimento local de tamanho e compactação
+
+Em JDK 21.0.12.1/ext4, `SeriesLifecycleJournalSizingBenchmarkTest` usou 500 mil séries com
+chaves e placements representativos. O formato 8.10.2 estimado pelo mesmo JSON e cabeçalho
+ocupou 267.784.720 bytes; o journal reduzido medido ocupou 107.284.720 bytes: redução de 2,496×.
+Duas compactações após avanço de receipts reduziram 214.569.440 para 107.284.720 bytes,
+com aproximadamente 605 e 606 ms sob lock.
+
+O teste usa um único fsync por rodada de 500 mil entradas, diferente dos lotes reais. Esses
+números não estimam a pausa do CTP e não substituem as duas medições em produção. Execução:
+
+```bash
+JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 \
+PATH=/usr/lib/jvm/java-21-openjdk-amd64/bin:$PATH \
+flock /tmp/nishi-utils-maven.lock mvn -B -pl nishi-utils-ngrrd-cluster -am test \
+  -Dtest=SeriesLifecycleJournalSizingBenchmarkTest \
+  -Dsurefire.failIfNoSpecifiedTests=false -Dngrrd.journal.benchmark=true -DargLine=-Xmx1g
+```

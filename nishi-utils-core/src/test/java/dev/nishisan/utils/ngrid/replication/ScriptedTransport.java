@@ -79,6 +79,33 @@ final class ScriptedTransport implements Transport {
         return out;
     }
 
+    /** Builds a wire-shaped snapshot response correlated to the latest requested topic/chunk. */
+    static ClusterMessage syncResponse(Collection<ClusterMessage> sent, NodeId source,
+                                       dev.nishisan.utils.ngrid.common.SyncResponsePayload payload) {
+        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
+        while (System.nanoTime() < deadline) {
+            ClusterMessage request = null;
+            for (ClusterMessage message : sent) {
+                if (message.type() != MessageType.SYNC_REQUEST) continue;
+                var requested = message.payload(dev.nishisan.utils.ngrid.common.SyncRequestPayload.class);
+                if (requested.topic().equals(payload.topic()) && requested.chunkIndex() == payload.chunkIndex()) {
+                    request = message;
+                }
+            }
+            if (request != null) {
+                return new ClusterMessage(null, request.messageId(), MessageType.SYNC_RESPONSE,
+                        request.qualifier(), source, request.source(), payload, 5);
+            }
+            try {
+                Thread.sleep(10);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new AssertionError("interrupted awaiting snapshot request", e);
+            }
+        }
+        throw new AssertionError("no snapshot request for " + payload.topic() + " chunk " + payload.chunkIndex());
+    }
+
     /** Descarta o histórico de mensagens enviadas. */
     void clearSent() {
         sent.clear();

@@ -73,6 +73,8 @@ public final class NMap<K, V> implements Closeable {
 
     private final NMapOffloadStrategy<K, V> storage;
     private final NMapPersistence<K, V> persistence;
+    private final Map<K, V> persistenceData;
+    private final java.util.concurrent.locks.ReentrantLock stateLock = new java.util.concurrent.locks.ReentrantLock();
     private final NMapConfig config;
     private final String name;
     private final AtomicLong lastMutationTimestamp = new AtomicLong();
@@ -84,9 +86,11 @@ public final class NMap<K, V> implements Closeable {
         // Instantiate storage strategy
         this.storage = buildStrategy(baseDir, name, config);
 
+        this.persistenceData = storage.asMap();
+
         // Persistence engine: only for non-inherently-persistent strategies
         if (config.mode() != NMapPersistenceMode.DISABLED && !storage.isInherentlyPersistent()) {
-            this.persistence = new NMapPersistence<>(config, storage.asMap(), baseDir, name);
+            this.persistence = new NMapPersistence<>(config, persistenceData, baseDir, name, stateLock);
         } else {
             this.persistence = null;
         }
@@ -168,6 +172,16 @@ public final class NMap<K, V> implements Closeable {
      * @return the previous value, or {@code empty}
      */
     public Optional<V> put(K key, V value) {
+        if (persistence == null) return putLocked(key, value);
+        stateLock.lock();
+        try {
+            return putLocked(key, value);
+        } finally {
+            stateLock.unlock();
+        }
+    }
+
+    private Optional<V> putLocked(K key, V value) {
         Objects.requireNonNull(key, "key");
         Objects.requireNonNull(value, "value");
         V prev = storage.put(key, value);
@@ -185,6 +199,16 @@ public final class NMap<K, V> implements Closeable {
      * @return the previous value, or {@code empty}
      */
     public Optional<V> remove(K key) {
+        if (persistence == null) return removeLocked(key);
+        stateLock.lock();
+        try {
+            return removeLocked(key);
+        } finally {
+            stateLock.unlock();
+        }
+    }
+
+    private Optional<V> removeLocked(K key) {
         Objects.requireNonNull(key, "key");
         V prev = storage.remove(key);
         if (prev != null) {
@@ -210,6 +234,16 @@ public final class NMap<K, V> implements Closeable {
      * Removes all entries from this map.
      */
     public void clear() {
+        if (persistence == null) { clearLocked(); return; }
+        stateLock.lock();
+        try {
+            clearLocked();
+        } finally {
+            stateLock.unlock();
+        }
+    }
+
+    private void clearLocked() {
         if (storage.isEmpty()) {
             return;
         }

@@ -156,7 +156,7 @@ public final class SeriesLifecycleService {
         long upper = SeriesLifecycleJournal.upperBound(timestamp, interval);
         if (old != null && old.phase() == QUARANTINED) upper = Math.max(upper, old.receivedThrough());
         return new SeriesLifecycleJournal.Entry(placement.generationId(),
-                upper, ACTIVE, placement.withDeletion(null, placement.updatedAtEpochMs()));
+                upper, ACTIVE, null);
     }
     public void initialize(String key, SeriesPlacement placement) { journal.put(key, initialEntry(key, placement)); }
 
@@ -172,7 +172,7 @@ public final class SeriesLifecycleService {
             }
             if (entry.phase() != ACTIVE) throw new IllegalStateException("series not active: " + key);
             if (upper > entry.receivedThrough() || journal.get(key) == null)
-                updates.put(key, new SeriesLifecycleJournal.Entry(entry.generationId(), Math.max(upper, entry.receivedThrough()), ACTIVE, entry.placement()));
+                updates.put(key, new SeriesLifecycleJournal.Entry(entry.generationId(), Math.max(upper, entry.receivedThrough()), ACTIVE, null));
         }
         journal.putAll(updates);
         if (!updates.isEmpty()) receiptForces.increment();
@@ -260,8 +260,7 @@ public final class SeriesLifecycleService {
                 return DeleteResult.of(DeleteStatus.NOT_FOUND, self);
             var current = catalog.placementStrong(key);
             if (current.isPresent() && current.get().deletion() != null) throw new IllegalStateException("reservation not cancelled");
-            journal.put(key, new SeriesLifecycleJournal.Entry(entry.generationId(), entry.receivedThrough(), ACTIVE,
-                    entry.placement().withDeletion(null, clock.millis())));
+            journal.put(key, new SeriesLifecycleJournal.Entry(entry.generationId(), entry.receivedThrough(), ACTIVE, null));
             registry.invalidateOwnership(key);
             return DeleteResult.of(DeleteStatus.NOT_FOUND, self);
         }

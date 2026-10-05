@@ -64,6 +64,7 @@ class RelayStreamObservabilityTest {
 
             int n = 300;
             DistributedQueue<String> queue = leader.getQueue("obs-queue", String.class);
+            awaitLeaderReady(leader);
             for (int i = 0; i < n; i++) {
                 queue.offer("item-" + i);
             }
@@ -106,6 +107,20 @@ class RelayStreamObservabilityTest {
                 .replicationOperationTimeout(Duration.ofSeconds(10))
                 .heartbeatInterval(Duration.ofMillis(200))
                 .build());
+    }
+
+    private static void awaitLeaderReady(NGridNode leader) throws InterruptedException {
+        // Consensus covers election/connectivity, not the promotion drain after registering queues.
+        // Observe steady-state stream metrics only after the leader releases its write gates.
+        long deadline = System.currentTimeMillis() + 10_000;
+        while (leader.replicationManager().isLeaderSyncing()
+                || leader.replicationManager().isJoinQuiescing()
+                || leader.replicationManager().isReclaimQuiescing()) {
+            if (System.currentTimeMillis() > deadline) {
+                fail("leader did not release its bootstrap write gates");
+            }
+            Thread.sleep(25);
+        }
     }
 
     private static void awaitApplied(NGridNode node, long target, long timeoutMs) throws InterruptedException {
