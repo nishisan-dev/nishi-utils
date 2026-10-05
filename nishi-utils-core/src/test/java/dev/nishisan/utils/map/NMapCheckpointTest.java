@@ -190,6 +190,46 @@ class NMapCheckpointTest {
         assertFalse(persistence.walOpen());
     }
 
+    @Test
+    void failedFinalFsyncStillClosesDescriptorWhenStartupDidNotPublishWriter() throws Exception {
+        NMapPersistence<String, String> persistence = new NMapPersistence<>(config(),
+                new ConcurrentHashMap<>(), directory, "startup-close");
+        persistence.checkpointFaultInjector(path -> {
+            if (path.getFileName().toString().equals("startup-close")) throw new IOException("startup failure");
+        });
+        persistence.start();
+        java.lang.reflect.Field field = NMapPersistence.class.getDeclaredField("walChannel");
+        field.setAccessible(true);
+        java.nio.channels.FileChannel original = (java.nio.channels.FileChannel) field.get(persistence);
+        assertTrue(original.isOpen());
+        field.set(persistence, new ForceFailingChannel(original));
+        assertThrows(IOException.class, persistence::close);
+        assertFalse(original.isOpen(), "failure in final force must not leak the underlying descriptor");
+        assertNull(field.get(persistence));
+    }
+
+    private static class ForceFailingChannel extends java.nio.channels.FileChannel {
+        private final java.nio.channels.FileChannel delegate;
+        ForceFailingChannel(java.nio.channels.FileChannel delegate) { this.delegate = delegate; }
+        public void force(boolean metadata) throws IOException { throw new IOException("injected final force failure"); }
+        protected void implCloseChannel() throws IOException { delegate.close(); }
+        public int read(java.nio.ByteBuffer dst) throws IOException { return delegate.read(dst); }
+        public long read(java.nio.ByteBuffer[] dst, int offset, int length) throws IOException { return delegate.read(dst, offset, length); }
+        public int write(java.nio.ByteBuffer src) throws IOException { return delegate.write(src); }
+        public long write(java.nio.ByteBuffer[] src, int offset, int length) throws IOException { return delegate.write(src, offset, length); }
+        public long position() throws IOException { return delegate.position(); }
+        public java.nio.channels.FileChannel position(long value) throws IOException { delegate.position(value); return this; }
+        public long size() throws IOException { return delegate.size(); }
+        public java.nio.channels.FileChannel truncate(long size) throws IOException { delegate.truncate(size); return this; }
+        public long transferTo(long position, long count, java.nio.channels.WritableByteChannel target) throws IOException { return delegate.transferTo(position, count, target); }
+        public long transferFrom(java.nio.channels.ReadableByteChannel src, long position, long count) throws IOException { return delegate.transferFrom(src, position, count); }
+        public int read(java.nio.ByteBuffer dst, long position) throws IOException { return delegate.read(dst, position); }
+        public int write(java.nio.ByteBuffer src, long position) throws IOException { return delegate.write(src, position); }
+        public java.nio.MappedByteBuffer map(MapMode mode, long position, long size) throws IOException { return delegate.map(mode, position, size); }
+        public java.nio.channels.FileLock lock(long position, long size, boolean shared) throws IOException { return delegate.lock(position, size, shared); }
+        public java.nio.channels.FileLock tryLock(long position, long size, boolean shared) throws IOException { return delegate.tryLock(position, size, shared); }
+    }
+
     private static class BlockingValue implements Serializable {
         final transient CountDownLatch entered = new CountDownLatch(1);
         final transient CountDownLatch release = new CountDownLatch(1);

@@ -363,8 +363,13 @@ public final class NMapPersistence<K, V> implements Closeable {
         }
         walLock.lock();
         try {
-            if (walChannel != null) walChannel.force(true);
-            closeWalQuietly();
+            try {
+                if (walChannel != null) walChannel.force(true);
+            } finally {
+                // No writer can still own this channel here: close must release it even
+                // when the final fsync fails, including a failed start before writer creation.
+                closeWalQuietly();
+            }
         } finally {
             walLock.unlock();
         }
