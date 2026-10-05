@@ -76,6 +76,9 @@ class HandbackRequiresAllGrantedTopicsTest {
     private static final long NODES_W = 76L;
     /** Fronteira de disco do candidato para `nodes`: abaixo da congelada (os 4 ticks de status do incidente). */
     private static final long NODES_DISK = 72L;
+    /** Tópico que só existe no disco do candidato (sem handler, fora do GRANT): não pode entrar no vetor. */
+    private static final String GEOMETRIES = "map:ngrrd.geometries";
+    private static final long GEOMETRIES_DISK = 5L;
     private static final Map<String, Long> FROZEN = Map.of(OFFSETS, OFFSETS_W, CATALOG, CATALOG_W, NODES, NODES_W);
     private static final NodeId CANDIDATE = NodeId.of("storage-217");
     private static final NodeId INTERIM = NodeId.of("storage-079");
@@ -137,7 +140,8 @@ class HandbackRequiresAllGrantedTopicsTest {
             HandbackCompletePayload complete = f.transport.sentOfType(MessageType.HANDBACK_COMPLETE).get(0)
                     .payload(HandbackCompletePayload.class);
             assertEquals(FROZEN, complete.cutoverByTopic(),
-                    "o vetor de cutover é exatamente o vetor congelado do GRANT: só tópicos instalados");
+                    "o vetor de cutover é exatamente o vetor congelado do GRANT: só tópicos instalados,"
+                            + " sem a fronteira de disco de " + GEOMETRIES);
             assertTrue(f.coordinator.isLeader(), "com todos os tópicos instalados o candidato assume");
             assertEquals(NODES_W, frontier(f.manager, NODES),
                     "nodes foi instalado com o rótulo do incumbente, não com a fronteira de disco");
@@ -195,9 +199,11 @@ class HandbackRequiresAllGrantedTopicsTest {
             state.put(OFFSETS, OFFSETS_W - 10L + 1L);
             state.put(CATALOG, CATALOG_W + 1L);
             state.put(NODES, NODES_DISK + 1L);
+            state.put(GEOMETRIES, GEOMETRIES_DISK + 1L); // só no disco: fora do GRANT, sem handler
             state.put("_topic:" + OFFSETS, OFFSETS_W - 10L);
             state.put("_topic:" + CATALOG, CATALOG_W);
             state.put("_topic:" + NODES, NODES_DISK);
+            state.put("_topic:" + GEOMETRIES, GEOMETRIES_DISK);
             state.put("_global", CATALOG_W);
             writeSequenceState(state);
 
