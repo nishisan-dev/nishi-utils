@@ -2,6 +2,9 @@ package dev.nishisan.utils.ngrid.replication;
 
 import dev.nishisan.utils.ngrid.cluster.coordination.*;
 import dev.nishisan.utils.ngrid.common.*;
+import dev.nishisan.utils.map.*;
+import dev.nishisan.utils.ngrid.map.*;
+import dev.nishisan.utils.ngrid.HandoverListener;
 import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.io.TempDir;
 import java.lang.reflect.*;
@@ -22,6 +25,7 @@ class SnapshotCheckpointFenceTest {
     ClusterCoordinator coordinator;
     ReplicationManager manager;
     BlockingCheckpoint handler;
+    MapClusterService<String, String> map;
     @BeforeEach void setup() throws Exception {
         scheduler = Executors.newScheduledThreadPool(2);
         transport = new ScriptedTransport(new NodeInfo(LOCAL, "127.0.0.1", 1, Set.of(), 50),
@@ -45,6 +49,7 @@ class SnapshotCheckpointFenceTest {
     @AfterEach void close() throws Exception {
         handler.release.countDown();
         manager.close();
+        if (map != null) map.close();
         coordinator.close();
         scheduler.shutdownNow();
     }
@@ -192,6 +197,200 @@ class SnapshotCheckpointFenceTest {
         manager.stop();
         assertEquals(0L, manager.appliedFrontiers().byTopic().getOrDefault(TOPIC, 0L));
         assertFalse(manager.markCleanShutdownIfEligible(true));
+    }
+
+    MapClusterService<String, String> durableMap() {
+        map = new MapClusterService<>(manager, TOPIC, directory.resolve("maps"), "catalog",
+                NMapConfig.builder().mode(NMapPersistenceMode.ASYNC_WITH_FSYNC)
+                        .snapshotIntervalTime(Duration.ofHours(1)).build());
+        manager.registerHandler(TOPIC, new BlockingCheckpoint() {
+            public void resetState() { map.resetState(); resets.incrementAndGet(); }
+            public void installSnapshot(Object payload) { map.installSnapshot(payload); }
+            public void onSnapshotInstalled() throws Exception {
+                map.onSnapshotInstalled(); // Disk can contain stale state before session validation.
+                handler.entered.countDown(); handler.release.await(); handler.completed.incrementAndGet();
+            }
+            public boolean onSnapshotAborted() throws Exception { return map.onSnapshotAborted(); }
+            public void onSnapshotCommitted() { map.onSnapshotCommitted(); }
+            public boolean hasDurableSnapshotCheckpoint() { return true; }
+        });
+        return map;
+    }
+
+    void respondMap(ClusterMessage request, boolean more, Map<String, String> data) {
+        transport.deliver(new ClusterMessage(null, request.messageId(), MessageType.SYNC_RESPONSE,
+                "sync", LEADER, LOCAL, new SyncResponsePayload(TOPIC, 50L, 0, more,
+                MapReplicationCodec.encodeSnapshot(new HashMap<>(data))), 5));
+    }
+
+    @Test @Timeout(20)
+    void promotionDuringPartialInstallRestoresMapBeforeReleasingWriteGate() throws Exception {
+        var service = durableMap();
+        service.apply(UUID.randomUUID(), MapReplicationCommand.put("prior", "trusted"));
+        respondMap(request(), true, Map.of("partial", "untrusted"));
+        await(() -> service.keySet().contains("partial"));
+        coordinator.assumeLeadershipForHandback(7L); // Simulates legacy promotion without eligibility gate.
+        await(() -> coordinator.isLeader() && !manager.isLeaderSyncing() && service.isHealthy());
+        assertEquals(Set.of("prior"), service.keySet());
+        assertDoesNotThrow(() -> service.apply(UUID.randomUUID(), MapReplicationCommand.put("after", "works")));
+        assertTrue(((Map<?, ?>) get("physicalSnapshotInstalls")).isEmpty());
+        assertTrue(((Set<?>) get("failedSnapshotInstalls")).isEmpty());
+    }
+
+    @Test @Timeout(20)
+    void timeoutAfterCheckpointDurabilityRestoresPriorDiskAndDoesNotPromote() throws Exception {
+        var service = durableMap();
+        service.apply(UUID.randomUUID(), MapReplicationCommand.put("prior", "admitted-async"));
+        candidate(1L, System.currentTimeMillis());
+        respondMap(request(), false, Map.of("stale", "checkpointed"));
+        assertTrue(handler.entered.await(5, TimeUnit.SECONDS));
+        set("handbackStartedMs", System.currentTimeMillis() - 10_000L);
+        invoke("checkHandover", new Class<?>[0]);
+        handler.release.countDown();
+        await(() -> service.isHealthy() && service.keySet().equals(Set.of("prior")));
+        assertFalse(coordinator.isLeader());
+        assertEquals(0L, manager.appliedFrontiers().byTopic().getOrDefault(TOPIC, 0L));
+        assertTrue(transport.sentOfType(MessageType.HANDBACK_COMPLETE).isEmpty());
+        service.close();
+        map = null;
+        try (var restarted = new MapClusterService<String, String>(manager, TOPIC,
+                directory.resolve("maps"), "catalog", NMapConfig.builder().mode(NMapPersistenceMode.ASYNC_WITH_FSYNC).build())) {
+            assertEquals(Set.of("prior"), restarted.keySet());
+        }
+    }
+
+    @Test @Timeout(20)
+    void explicitAbandonRestoresMapAndAllowsAnotherSnapshotSession() throws Exception {
+        var service = durableMap();
+        service.apply(UUID.randomUUID(), MapReplicationCommand.put("prior", "trusted"));
+        respondMap(request(), true, Map.of("partial", "untrusted"));
+        await(() -> service.keySet().contains("partial"));
+        invoke("abandonSyncChain", new Class<?>[]{String.class}, TOPIC);
+        await(() -> service.isHealthy() && service.keySet().equals(Set.of("prior")));
+        handler.release.countDown();
+        respondMap(request(), false, Map.of("replacement", "accepted"));
+        await(() -> manager.appliedFrontiers().byTopic().getOrDefault(TOPIC, 0L) == 50L);
+        assertEquals(Set.of("replacement"), service.keySet());
+    }
+
+    @Test @Timeout(20)
+    void cutoverFailureRestoresImageButKeepsPromotionAndCleanShutdownBlocked() throws Exception {
+        var service = durableMap();
+        service.apply(UUID.randomUUID(), MapReplicationCommand.put("prior", "trusted"));
+        java.nio.file.Path obstruction = directory.resolve("resend-obstruction");
+        java.nio.file.Files.writeString(obstruction, "not a directory");
+        ((ResendLogStore) get("resendLogStore")).close();
+        set("resendLogStore", new ResendLogStore(obstruction, 100, Duration.ZERO, 0,
+                Duration.ZERO, 1000, 0, true));
+        handler.release.countDown();
+        respondMap(request(), false, Map.of("replacement", "must-not-be-advertised"));
+        await(() -> handler.completed.get() == 1
+                && ((Map<?, ?>) uncheckedGet("physicalSnapshotInstalls")).isEmpty()
+                && ((Set<?>) uncheckedGet("failedSnapshotInstalls")).contains(TOPIC)
+                && service.isHealthy() && service.keySet().equals(Set.of("prior")));
+        assertTrue(((Set<?>) get("failedSnapshotInstalls")).contains(TOPIC));
+        assertTrue(((Set<?>) get("relayPendingBootstrap")).contains(TOPIC));
+        assertEquals(-1L, manager.getAdvertisedHighWatermark());
+        coordinator.assumeLeadershipForHandback(7L);
+        assertTrue(manager.isLeaderSyncing(), "promotion cannot release a partially reanchored frontier");
+        assertThrows(LeaderSyncingException.class, () -> manager.replicate(TOPIC, new byte[0]));
+        manager.stop();
+        assertFalse(manager.markCleanShutdownIfEligible(true));
+    }
+
+    @Test @Timeout(20)
+    void delayedOldCleanupCannotClearNewerFailedInstallationGuards() throws Exception {
+        respond(request(), true, 0, 50L);
+        await(() -> handler.resets.get() == 1);
+        Object old = ((Map<?, ?>) get("snapshotInstalls")).get(TOPIC);
+        invoke("abandonSyncChain", new Class<?>[]{String.class}, TOPIC);
+        await(() -> ((Map<?, ?>) uncheckedGet("physicalSnapshotInstalls")).isEmpty());
+        handler.fail = true;
+        handler.release.countDown();
+        respond(request(), false, 0, 60L);
+        await(() -> handler.completed.get() == 1 && ((Map<?, ?>) uncheckedGet("physicalSnapshotInstalls")).isEmpty());
+        assertTrue(((Set<?>) get("failedSnapshotInstalls")).contains(TOPIC));
+        @SuppressWarnings("unchecked")
+        var locks = (Map<String, java.util.concurrent.locks.ReentrantLock>) get("snapshotInstallLocks");
+        var lock = locks.get(TOPIC);
+        lock.lock();
+        try { invoke("restoreSnapshotInstallation", new Class<?>[]{String.class, old.getClass()}, TOPIC, old); }
+        finally { lock.unlock(); }
+        assertTrue(((Set<?>) get("failedSnapshotInstalls")).contains(TOPIC));
+        assertTrue(((Set<?>) get("relayPendingBootstrap")).contains(TOPIC));
+    }
+
+    Object uncheckedGet(String name) {
+        try { return get(name); } catch (Exception e) { throw new AssertionError(e); }
+    }
+
+    @Test @Timeout(20)
+    void slowPromotionListenerDoesNotHoldLifecycleLockOrBlockScheduler() throws Exception {
+        CountDownLatch listenerEntered = new CountDownLatch(1), listenerRelease = new CountDownLatch(1);
+        manager.addHandoverListener(new HandoverListener() {
+            @Override public void onPromotionComplete() {
+                listenerEntered.countDown();
+                try { listenerRelease.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            }
+        });
+        try {
+            candidate(1L, System.currentTimeMillis());
+            handler.release.countDown();
+            respond(request(), false, 0, 50L);
+            assertTrue(listenerEntered.await(5, TimeUnit.SECONDS));
+            var lifecycle = (java.util.concurrent.locks.ReentrantLock) get("snapshotLifecycleLock");
+            CountDownLatch schedulerCompleted = new CountDownLatch(1);
+            scheduler.execute(() -> {
+                lifecycle.lock();
+                try { schedulerCompleted.countDown(); } finally { lifecycle.unlock(); }
+            });
+            assertTrue(schedulerCompleted.await(1, TimeUnit.SECONDS), "listener must not block lifecycle checks");
+        } finally {
+            listenerRelease.countDown();
+        }
+    }
+
+    @Test @Timeout(20)
+    void genericQueueAbortKeepsFailedGuardsUntilFreshFullSnapshot() throws Exception {
+        String topic = "queue:abort";
+        BlockingCheckpoint queue = new BlockingCheckpoint();
+        queue.release.countDown();
+        manager.registerHandler(topic, queue);
+        respond(request(topic), true, 0, 50L);
+        await(() -> queue.resets.get() == 1);
+        invoke("abandonSyncChain", new Class<?>[]{String.class}, topic);
+        await(() -> !((Map<?, ?>) uncheckedGet("physicalSnapshotInstalls")).containsKey(topic));
+        assertTrue(((Set<?>) get("failedSnapshotInstalls")).contains(topic),
+                "a handler without rollback cannot make partial state trusted");
+        assertTrue(((Set<?>) get("relayPendingBootstrap")).contains(topic));
+        assertFalse(manager.isLeadershipEligible());
+        respond(request(topic), false, 0, 60L);
+        await(() -> manager.appliedFrontiers().byTopic().getOrDefault(topic, 0L) == 60L
+                && !((Set<?>) uncheckedGet("failedSnapshotInstalls")).contains(topic));
+        assertFalse(((Set<?>) get("relayPendingBootstrap")).contains(topic));
+    }
+
+    @Test @Timeout(20)
+    void queueWithoutDurabilityBarrierDoesNotEmitSyncDurable() throws Exception {
+        String queueTopic = "queue:test";
+        BlockingCheckpoint queue = new BlockingCheckpoint();
+        queue.release.countDown();
+        manager.registerHandler(queueTopic, queue);
+        List<String> logs = new CopyOnWriteArrayList<>();
+        java.util.logging.Handler capture = new java.util.logging.Handler() {
+            public void publish(java.util.logging.LogRecord record) { logs.add(record.getMessage()); }
+            public void flush() { }
+            public void close() { }
+        };
+        java.util.logging.Logger logger = java.util.logging.Logger.getLogger(ReplicationManager.class.getName());
+        logger.addHandler(capture);
+        try {
+            respond(request(queueTopic), false, 0, 50L);
+            await(() -> logs.stream().anyMatch(line -> line.startsWith("Sync completed for " + queueTopic)));
+            assertFalse(logs.stream().anyMatch(line -> line.startsWith("Sync durable for " + queueTopic)));
+        } finally {
+            logger.removeHandler(capture);
+        }
     }
 
     @SuppressWarnings("unchecked") void settled(String topic) throws Exception {

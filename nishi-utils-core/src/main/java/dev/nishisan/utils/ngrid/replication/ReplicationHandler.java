@@ -151,6 +151,30 @@ public interface ReplicationHandler {
         // no-op by default
     }
 
+    /**
+     * Internal infrastructure callback after the manager accepts the checkpoint and its session fence.
+     * Not a supported application extension point.
+     * @throws Exception if installation commit cannot be completed
+     * @since 8.11.1
+     */
+    default void onSnapshotCommitted() throws Exception { }
+
+    /**
+     * Internal infrastructure callback to restore the trusted state before an abandoned installation.
+     * Not a supported application extension point.
+     * @return true only when the complete prior trusted state was restored safely
+     * @throws Exception if the prior trusted state cannot be restored safely
+     * @since 8.11.1
+     */
+    default boolean onSnapshotAborted() throws Exception { return false; }
+
+    /**
+     * Internal infrastructure marker for the Sync durable diagnostic, not an application API.
+     * @return true only when snapshot installation includes a persistent durability barrier
+     * @since 8.11.1
+     */
+    default boolean hasDurableSnapshotCheckpoint() { return false; }
+
     record SnapshotChunk(Object data, boolean hasMore) {
     }
 
