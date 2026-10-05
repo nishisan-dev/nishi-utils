@@ -354,6 +354,23 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
     }
 
     /**
+     * Whether {@code peer}'s last heartbeat carried a non-empty per-topic frontier vector (issue #178),
+     * i.e. the peer runs 8.8.0 or later: it advertises a leader high watermark that already covers its
+     * applied frontier (#177) instead of the raw production counter. Used by the follower-ahead self-heal
+     * (8.10.1) to stay inert against older leaders, whose raw watermark would read as "behind".
+     *
+     * <p><b>Internal:</b> used by the NGrid replication layer that {@code NGridNode} wires; not meant for
+     * application code.
+     *
+     * @param peer the peer
+     * @return {@code true} when a frontier vector from {@code peer} is known
+     */
+    public boolean peerAdvertisesTopicFrontiers(NodeId peer) {
+        TopicFrontiers frontiers = peer == null ? null : peerTopicFrontiers.get(peer);
+        return frontiers != null && !frontiers.isEmpty();
+    }
+
+    /**
      * Highest applied frontier any ACTIVE, LEADER-ELIGIBLE peer advertises for {@code topic} (issue
      * #178), or {@code -1} when no such peer advertises a frontier vector. Lets a subsystem fence on a
      * single topic (e.g. the ngrrd catalog before resuming in-flight migrations on a new leader).
@@ -1231,7 +1248,9 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
                     LOGGER.warning(() -> "Current leader observes a peer watermark above its own applied ("
                             + safeLocalApplied() + " < " + maxActivePeerHighWatermark()
                             + describeAheadPeerDivergence(localId)
-                            + "); retaining leadership (counter-scale desync symptom — see issue tems#9/D9)");
+                            + "); retaining leadership (counter-scale desync symptom — see issue tems#9/D9;"
+                            + " a follower whose stream cursor stays above this leader's watermark"
+                            + " re-bootstraps itself, see NGRID_FOLLOWER_AHEAD_OF_LEADER)");
                 }
             }
             boolean behindAheadPeer = weWouldLead && !isLeaderInternal(localId) && !isCaughtUpToCluster();

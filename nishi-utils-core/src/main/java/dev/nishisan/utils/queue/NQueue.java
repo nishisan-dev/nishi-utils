@@ -164,6 +164,8 @@ public class NQueue<T> implements Closeable {
     private final AtomicLong globalSequence;
 
     private long consumerOffset, producerOffset, recordCount, lastIndex;
+    /** Bumped whenever byte offsets are invalidated (compaction, truncation); guarded by {@code lock}. */
+    private long layoutGeneration;
     private long lastDeliveredIndex = -1;
     private long outOfOrderCount = 0;
     private final boolean orderDetectionEnabled;
@@ -251,6 +253,7 @@ public class NQueue<T> implements Closeable {
         }
         this.raf = result.newRaf();
         this.dataChannel = result.newChannel();
+        this.layoutGeneration++;
         this.consumerOffset = result.newConsumerOffset();
         this.producerOffset = result.newProducerOffset();
         // Recompute recordCount from the surviving live segment. TIME_BASED compaction
@@ -700,6 +703,103 @@ public class NQueue<T> implements Closeable {
     }
 
     /**
+     * Opens a cursor over the records currently durable in the log, bounded by the last durable logical
+     * index at this moment (8.10.1). Records offered later are outside the cursor; records consumed
+     * (polled) later are skipped when reached. Callers that need the staged records too must
+     * {@link #flush()} first.
+     *
+     * <p><b>Internal:</b> used by the NGrid replication (snapshot transfer); no compatibility guarantee.
+     *
+     * @return a cursor positioned at the head of the queue
+     */
+    public IndexCursor openIndexCursor() {
+        lock.lock();
+        try {
+            return new IndexCursor(0L, lastIndex, consumerOffset, layoutGeneration);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Reads, without consuming, the next records of an {@link IndexCursor} by LOGICAL index (8.10.1).
+     * Unlike {@link #readRange(int, int)}, whose positions are relative to the current head and shift
+     * when records are consumed between two calls, a cursor addresses records by their stable logical
+     * index, so a paged traversal never skips a record that stayed in the queue. The byte offset kept in
+     * the cursor makes each page O(page) while the log layout is unchanged; after a compaction or a
+     * truncation the read restarts from the head and skips by index.
+     *
+     * <p><b>Internal:</b> used by the NGrid replication (snapshot transfer); no compatibility guarantee.
+     *
+     * @param cursor   the cursor returned by {@link #openIndexCursor()} or a previous read
+     * @param maxItems maximum number of items to read
+     * @return the items, whether more remain within the cursor bound, and the advanced cursor
+     * @throws IOException if reading fails
+     */
+    public IndexedRangeResult<T> readIndexRange(IndexCursor cursor, int maxItems) throws IOException {
+        Objects.requireNonNull(cursor, "cursor");
+        lock.lock();
+        try {
+            long offset = cursor.generation() == layoutGeneration && cursor.offset() >= consumerOffset
+                    && cursor.offset() <= producerOffset ? cursor.offset() : consumerOffset;
+            long nextIndex = cursor.nextIndex();
+            List<T> items = new ArrayList<>();
+            boolean hasMore = false;
+            while (offset < producerOffset) {
+                Optional<NQueueReadResult> result = readAtInternal(offset);
+                if (result.isEmpty()) {
+                    break;
+                }
+                long index = result.get().getRecord().meta().getIndex();
+                if (index < nextIndex) {
+                    offset = result.get().getNextOffset();
+                    continue;
+                }
+                if (index > cursor.toIndex()) {
+                    break;
+                }
+                if (items.size() >= Math.max(1, maxItems)) {
+                    hasMore = true;
+                    break;
+                }
+                items.add(safeDeserialize(result.get().getRecord()));
+                nextIndex = index + 1L;
+                offset = result.get().getNextOffset();
+            }
+            return new IndexedRangeResult<>(items, hasMore,
+                    new IndexCursor(nextIndex, cursor.toIndex(), offset, layoutGeneration));
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Position of a paged read by logical index (see {@link #readIndexRange(IndexCursor, int)}).
+     *
+     * <p><b>Internal:</b> used by the NGrid replication (snapshot transfer); no compatibility guarantee.
+     *
+     * @param nextIndex  smallest logical index still to read
+     * @param toIndex    last logical index included in the traversal
+     * @param offset     byte offset where the next read resumes (a hint, validated by {@code generation})
+     * @param generation log layout generation the offset belongs to
+     */
+    public record IndexCursor(long nextIndex, long toIndex, long offset, long generation) {
+    }
+
+    /**
+     * Result of {@link #readIndexRange(IndexCursor, int)}.
+     *
+     * <p><b>Internal:</b> used by the NGrid replication (snapshot transfer); no compatibility guarantee.
+     *
+     * @param items   the items read
+     * @param hasMore whether records within the cursor bound remain
+     * @param next    the cursor to continue from
+     * @param <T>     the element type
+     */
+    public record IndexedRangeResult<T>(List<T> items, boolean hasMore, IndexCursor next) {
+    }
+
+    /**
      * Result of a range read operation.
      *
      * @param items     the items read
@@ -854,6 +954,7 @@ public class NQueue<T> implements Closeable {
         this.metaChannel = this.metaRaf.getChannel();
 
         // Reset all cursors to zero
+        this.layoutGeneration++;
         this.consumerOffset = 0;
         this.producerOffset = 0;
         this.recordCount = 0;

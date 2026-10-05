@@ -25,6 +25,7 @@ import dev.nishisan.utils.ngrid.replication.QuorumUnreachableException;
 import dev.nishisan.utils.ngrid.replication.ReplicationHandler;
 import dev.nishisan.utils.ngrid.replication.ReplicationManager;
 import dev.nishisan.utils.ngrid.replication.ReplicationResult;
+import dev.nishisan.utils.ngrid.replication.SnapshotSessionRegistry;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -66,6 +67,10 @@ public final class MapClusterService<K, V>
     private static final Logger LOGGER = Logger.getLogger(MapClusterService.class.getName());
 
     private final ConcurrentMap<K, V> data = new ConcurrentHashMap<>();
+    /** Entries per snapshot chunk. */
+    private static final int SNAPSHOT_CHUNK_SIZE = 1000;
+    /** 8.10.1: entries captured on chunk 0 of each in-flight snapshot transfer. */
+    private final SnapshotSessionRegistry<List<Map.Entry<K, V>>> snapshotSessions = new SnapshotSessionRegistry<>();
     private final ReplicationManager replicationManager;
     private final NMapPersistence<K, V> persistence;
     private final String topic;
@@ -442,24 +447,71 @@ public final class MapClusterService<K, V>
         }
     }
 
-    /** {@inheritDoc} */
+    /**
+     * Serves a chunk with an anonymous session: chunk {@code 0} captures, later chunks slice that capture.
+     * Kept for callers without a session identifier; the replication manager uses
+     * {@link #getSnapshotChunk(String, int)}.
+     */
     @Override
     public SnapshotChunk getSnapshotChunk(int chunkIndex) {
-        int chunkSize = 1000;
-        List<Map.Entry<K, V>> entries = new ArrayList<>(data.entrySet());
-        int start = chunkIndex * chunkSize;
+        return getSnapshotChunk("", chunkIndex);
+    }
+
+    /**
+     * Serves one chunk of a snapshot session (8.10.1). Chunk {@code 0} copies the entries ONCE — a single
+     * traversal of the {@link ConcurrentHashMap} sees every entry present during the whole traversal —
+     * and every chunk slices that copy. Up to 8.10.0 each chunk re-copied the LIVE map and sliced it by
+     * position: a removal or a resize between two chunks shifted positions, and an entry that existed for
+     * the whole transfer could land in a range already served and never be sent (silently, since the
+     * snapshot label only promises the operations up to it and the stream resumes above it). It also
+     * cost a full copy per chunk.
+     *
+     * <p>The copy may also hold operations applied after the label was read; the stream replays them in
+     * order on the installer, and map operations replayed in sequence converge to the same state.
+     */
+    @Override
+    public SnapshotChunk getSnapshotChunk(String sessionId, int chunkIndex) {
+        List<Map.Entry<K, V>> entries = chunkIndex == 0
+                ? snapshotSessions.open(sessionId, this::captureEntries)
+                : snapshotSessions.get(sessionId);
+        if (entries == null) {
+            LOGGER.warning(() -> "Snapshot chunk " + chunkIndex + " of " + topic + " requested for an unknown or"
+                    + " expired session " + sessionId + "; the requester restarts the transfer");
+            return null;
+        }
+        int start = chunkIndex * SNAPSHOT_CHUNK_SIZE;
         if (start >= entries.size()) {
+            snapshotSessions.release(sessionId);
             return new SnapshotChunk(MapReplicationCodec.encodeSnapshot(new HashMap<>()), false);
         }
-        int end = Math.min(start + chunkSize, entries.size());
+        int end = Math.min(start + SNAPSHOT_CHUNK_SIZE, entries.size());
         Map<K, V> chunk = new HashMap<>();
         for (int i = start; i < end; i++) {
             Map.Entry<K, V> e = entries.get(i);
             chunk.put(e.getKey(), e.getValue());
         }
+        boolean hasMore = end < entries.size();
+        if (!hasMore) {
+            snapshotSessions.release(sessionId);
+        }
         // Encode to byte[] so that the transport layer preserves concrete POJO types
         // inside the snapshot values (see MapReplicationCodec for rationale).
-        return new SnapshotChunk(MapReplicationCodec.encodeSnapshot(chunk), end < entries.size());
+        return new SnapshotChunk(MapReplicationCodec.encodeSnapshot(chunk), hasMore);
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public void releaseSnapshotSession(String sessionId) {
+        snapshotSessions.release(sessionId);
+    }
+
+    /** One consistent traversal of the live map into an immutable list of entries. */
+    private List<Map.Entry<K, V>> captureEntries() {
+        List<Map.Entry<K, V>> copy = new ArrayList<>(data.size());
+        for (Map.Entry<K, V> e : data.entrySet()) {
+            copy.add(new java.util.AbstractMap.SimpleImmutableEntry<>(e.getKey(), e.getValue()));
+        }
+        return copy;
     }
 
     /** {@inheritDoc} */

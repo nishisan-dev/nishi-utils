@@ -84,6 +84,8 @@ public final class NMapPersistence<K, V> implements Closeable {
 
     private final LinkedBlockingQueue<NMapWALEntry> queue = new LinkedBlockingQueue<>();
     private final AtomicBoolean running = new AtomicBoolean();
+    /** Bound of the writer join in {@link #close()}; package-visible setter for tests. */
+    private volatile long closeJoinTimeoutMillis = TimeUnit.SECONDS.toMillis(10);
     private final AtomicLong lastMutationTimeMillis = new AtomicLong();
     private final Object walLock = new Object();
 
@@ -276,6 +278,12 @@ public final class NMapPersistence<K, V> implements Closeable {
         }
     }
 
+    /**
+     * Stops the writer thread after it drains the queued WAL entries, then closes the WAL channel.
+     *
+     * @throws IOException when the writer did not terminate within the join bound (the queued entries
+     *                     may not be on disk; the WAL channel is left open for the writer)
+     */
     @Override
     public void close() throws IOException {
         if (config.mode() == NMapPersistenceMode.DISABLED) {
@@ -285,12 +293,31 @@ public final class NMapPersistence<K, V> implements Closeable {
         Thread t = writerThread;
         if (t != null) {
             try {
-                t.join(TimeUnit.SECONDS.toMillis(10));
+                t.join(closeJoinTimeoutMillis);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
         }
+        if (t != null && t.isAlive()) {
+            // 8.10.1: the writer did not finish draining the queue in time. Leave the WAL channel open for
+            // it (closing it under the writer would turn the pending writes into failures) and report the
+            // failure, so a caller deciding on a clean-shutdown marker does not trust an incomplete WAL.
+            throw new IOException("NMap persistence writer for " + mapDir.getFileName()
+                    + " did not terminate within " + closeJoinTimeoutMillis + " ms; " + queue.size()
+                    + " WAL entries may not have been written");
+        }
         closeWalQuietly();
+    }
+
+    /** Whether the WAL channel is open (tests only). */
+    boolean walOpen() {
+        FileChannel ch = walChannel;
+        return ch != null && ch.isOpen();
+    }
+
+    /** Overrides the writer join bound of {@link #close()} (tests only). */
+    void closeJoinTimeoutMillis(long millis) {
+        this.closeJoinTimeoutMillis = millis;
     }
 
     /**
@@ -356,6 +383,11 @@ public final class NMapPersistence<K, V> implements Closeable {
             }
         } catch (Exception e) {
             LOGGER.log(Level.WARNING, "Failed to flush remaining WAL entries on shutdown", e);
+        }
+        if (!running.get()) {
+            // 8.10.1: a writer that outlived the join in close() (which then left the channel open for it)
+            // closes the WAL itself once the final flush is done; closing again is a no-op.
+            closeWalQuietly();
         }
     }
 

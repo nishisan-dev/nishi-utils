@@ -4,6 +4,63 @@
 
 ---
 
+## 2026-10-04 — Réplica à frente do líder e drenagem dos mapas no shutdown — 8.10.1
+
+Incidente no CTP (tems): a réplica de `map:ngrrd.catalog` de um storage descartou operações do
+líder por três dias, com lag 0. O resultado foram entradas ausentes e valores atrasados. Plano em
+`planning/2026-10-04-ngrid-sync-label-follower-ahead-8.10.1.md`.
+
+### Causa
+- Até a 8.7.0, o handback de afinidade reancorava o incumbente rebaixado com o watermark escalar
+  do último tópico instalado, aplicado a um tópico escolhido arbitrariamente. Em produção, o
+  contador do catálogo recebeu o valor de `_ngrid-queue-offsets`.
+- Até a 8.10.0, o líder recém-promovido rotulava o snapshot com o contador de produção cru. O nó
+  que instalou o snapshot renumerou o catálogo para baixo, e o nó que ficou de fora passou a
+  estar à frente: buscas vazias, lag truncado em 0 e deduplicação por sequência descartando as
+  operações novas.
+- O líder só registrava "peer watermark above its own applied ... retaining".
+
+### Correções (`nishi-utils-core`, NGrid)
+- **Rótulo do snapshot:** usa `max(produzido, fronteira aplicada)` do próprio tópico, como o HWM
+  desde o #177. O contador é normalizado na promoção. O líder em `leaderSyncing` anuncia HWM `-1`.
+- **Reancoramento do incumbente:** é feito só por tópico. O caminho escalar foi removido.
+- **Seguidor à frente:** o líder que já produziu responde com snapshot completo, e o seguidor que
+  vê o HWM do líder abaixo do cursor de forma persistente arma o bootstrap. Marcador:
+  `NGRID_FOLLOWER_AHEAD_OF_LEADER`.
+- **Handback:** o vetor do `HANDBACK_COMPLETE` é capturado antes da promoção. Uma escrita no
+  intervalo podia se perder no incumbente. O handback é recusado enquanto o líder ainda drena o
+  relay.
+- **Shutdown gracioso:** o `NGridNode.close` fecha e drena todos os `MapClusterService`. O
+  callback de destroy os removia antes, e o writer do NMap nunca era drenado. O marcador de
+  shutdown limpo só é gravado depois da drenagem.
+- **Snapshot em chunks consistente:** cada chunk refazia a lista do mapa vivo e fatiava por
+  índice. Um insert durante a transferência podia fazer uma chave existente nunca ser enviada, e
+  ela ficava ausente em silêncio na réplica instalada. Agora a cópia é capturada uma vez por
+  sessão de sync. Na fila, o mesmo defeito acontecia com `poll` entre chunks; a leitura agora usa
+  um cursor por índice lógico.
+- **Rótulo coerente com o apply assíncrono:** o rótulo do snapshot não passa da menor operação
+  ainda não aplicada localmente pelo líder. O handback de afinidade espera esses applies antes do
+  GRANT e é abortado se o prazo vencer.
+- **Detecção no líder:** só ocorre com o handler do tópico registrado e sem backlog de relay, para
+  não deixar o seguidor esperando um snapshot que o líder ainda não pode servir.
+- `ReplicationManager.deferCleanShutdownMarker`/`markCleanShutdownIfEligible` e
+  `ClusterCoordinator.peerAdvertisesTopicFrontiers` são de uso interno do ciclo de vida do
+  `NGridNode`.
+
+### Operação
+- Atualize direto para a 8.10.1. Não deixe um líder 8.6.x ou anterior com seguidores 8.10.1.
+- Um bootstrap servido por um líder anterior à 8.10.1 pode perder chaves se houver inserts no
+  mapa durante a transferência. Nesse caso, pause a ingestão até o `Sync completed` e compare o
+  conteúdo depois.
+- Um seguidor anterior à 8.10.1 que esteja à frente de um líder 8.10.1 descarta o snapshot pedido
+  e repete o pedido a cada poucos segundos, sem se curar. Atualize-o e faça o bootstrap limpo.
+- Restart limpo não reinstala a réplica no RELAY_STREAM. O runbook de consistência foi corrigido,
+  e o procedimento de bootstrap limpo está na seção "Réplica à frente do líder e atualização
+  para 8.10.1" de `doc/oss/ngrrd-cluster-operacao.md`.
+- Ficam como issues: anti-entropia de conteúdo entre réplicas; duplicação de `OFFER` de fila
+  aplicado entre o rótulo e a captura do snapshot; snapshot instalado não persistido
+  imediatamente no NMap.
+
 ## 2026-10-04 — Gate de criação rápido e `PLACEMENT_UNAVAILABLE` — 8.10.0
 
 Pedido do tems/ngrrd-server após integrar a purga da 8.9.0. Plano em

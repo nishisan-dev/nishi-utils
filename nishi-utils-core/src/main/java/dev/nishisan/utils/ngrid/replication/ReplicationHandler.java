@@ -79,6 +79,36 @@ public interface ReplicationHandler {
     }
 
     /**
+     * Returns a chunk of the snapshot served to one sync session (8.10.1). The serving
+     * {@link ReplicationManager} passes a session identifier stable across the chunks of one transfer
+     * (requester and topic) and calls {@link #releaseSnapshotSession(String)} once the transfer ends.
+     * Handlers whose state can change between two chunks must capture a consistent view on chunk
+     * {@code 0} and slice THAT view in the following chunks: re-reading live state per chunk and slicing
+     * it by position shifts the positions under concurrent writes (removals, rehashing) and silently
+     * skips entries that existed during the whole transfer. The default delegates to
+     * {@link #getSnapshotChunk(int)}.
+     *
+     * @param sessionId  identifier of the sync session (stable across its chunks)
+     * @param chunkIndex index of the chunk requested
+     * @return a SnapshotChunk, or {@code null} when it cannot be served (e.g. the session expired)
+     */
+    default SnapshotChunk getSnapshotChunk(String sessionId, int chunkIndex) {
+        return getSnapshotChunk(chunkIndex);
+    }
+
+    /**
+     * Releases the resources held for a sync session opened by
+     * {@link #getSnapshotChunk(String, int)} (8.10.1). Called by the serving {@link ReplicationManager}
+     * when the last chunk was served or the transfer was abandoned; handlers must also expire idle
+     * sessions on their own, since a requester may vanish mid-transfer. The default is a no-op.
+     *
+     * @param sessionId identifier of the sync session
+     */
+    default void releaseSnapshotSession(String sessionId) {
+        // no-op by default
+    }
+
+    /**
      * Returns a full snapshot of the current state.
      *
      * @return the snapshot, or {@code null} if unavailable
