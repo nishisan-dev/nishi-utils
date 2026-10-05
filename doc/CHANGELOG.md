@@ -4,6 +4,24 @@
 
 ---
 
+## 2026-10-05 — Compactação amortizada do journal de ciclo de vida das séries — 8.10.2
+
+Hotfix de produção (CTP/tems). Depois da atualização para a 8.10.x, a reabertura de handles caiu
+para ~400 por minuto, e os `WRITE_BATCH` para o storage com mais séries passaram a estourar o
+timeout, parando a ingestão.
+
+- **Causa:** o `SeriesLifecycleJournal` (`series-lifecycle.wal`, introduzido na 8.9.0) compactava
+  sempre que o arquivo passava de 16 MB. Cada entrada leva o placement da série, cerca de 0,5 KB.
+  Acima de ~35 mil séries, o arquivo compactado já ficava maior que o limiar, e **cada mutação**
+  reescrevia o journal inteiro com fsync, dentro de um `synchronized` que serializava o nó. São
+  mutações o primeiro OPEN de cada série e as marcas de recepção do `WRITE_BATCH`.
+- **Correção:** a compactação passa a ser amortizada e só ocorre quando o arquivo dobra em relação
+  à última compactação, nunca abaixo de 16 MB. A escrita usa `ReentrantLock` em vez de monitor,
+  para não prender carriers de virtual threads no JDK 21, e as leituras do caminho de escrita não
+  esperam fsync.
+- **Operação:** troque o jar dos storages um por vez, com restart gracioso e sem bootstrap. O
+  formato do journal não muda.
+
 ## 2026-10-04 — Réplica à frente do líder e drenagem dos mapas no shutdown — 8.10.1
 
 Incidente no CTP (tems): a réplica de `map:ngrrd.catalog` de um storage descartou operações do

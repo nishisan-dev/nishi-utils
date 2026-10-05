@@ -8,6 +8,8 @@ import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.*;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.zip.CRC32;
 
 /** Durable local fences and hourly receipt upper bounds. Mutations are grouped before one fsync. */
@@ -17,20 +19,38 @@ public final class SeriesLifecycleJournal implements AutoCloseable {
     private static final int MAX_RECORD = 16 * 1024 * 1024;
     private static final long COMPACT_BYTES = 16L * 1024 * 1024;
     private final ObjectMapper mapper = new ObjectMapper();
-    private final Map<String, Entry> entries = new HashMap<>();
+    // Reads on the write path (gate) never wait behind an fsync; mutations publish only after durability.
+    private final Map<String, Entry> entries = new ConcurrentHashMap<>();
+    // Disk I/O happens under this lock; a monitor would pin virtual-thread carriers on JDK 21.
+    private final ReentrantLock lock = new ReentrantLock();
     private final Path path;
+    private final long minCompactBytes;
     private FileChannel channel;
-    private long forces;
+    private volatile long forces;
+    private volatile long compactions;
+    private long compactThreshold;
     private boolean failed;
     public record Update(String key, Entry entry) { }
 
     public SeriesLifecycleJournal(Path directory) throws IOException {
+        this(directory, COMPACT_BYTES);
+    }
+
+    /**
+     * Compaction is amortized: it runs only when the file doubles relative to the last compacted
+     * size (never below {@code minCompactBytes}). A fixed threshold below the live size rewrote the
+     * whole journal on every mutation once a node held tens of thousands of series.
+     */
+    SeriesLifecycleJournal(Path directory, long minCompactBytes) throws IOException {
+        if (minCompactBytes <= 0) throw new IllegalArgumentException("minCompactBytes must be positive");
+        this.minCompactBytes = minCompactBytes;
         Files.createDirectories(directory);
         path = directory.resolve("series-lifecycle.wal");
         // Snapshot replacement is atomic; an uninstalled temp file is not part of recovery.
         channel = FileChannel.open(path, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE);
         try {
             replay();
+            compactThreshold = Math.max(minCompactBytes, 2 * channel.size());
             channel.force(true);
             try (FileChannel parent = FileChannel.open(directory, StandardOpenOption.READ)) { parent.force(true); }
         } catch (IOException | RuntimeException e) {
@@ -64,26 +84,32 @@ public final class SeriesLifecycleJournal implements AutoCloseable {
         return true;
     }
 
-    public synchronized Entry get(String key) { return entries.get(key); }
-    public synchronized Map<String, Entry> snapshot() { return Map.copyOf(entries); }
-    public synchronized long fsyncCount() { return forces; }
+    public Entry get(String key) { return entries.get(key); }
+    public Map<String, Entry> snapshot() { return Map.copyOf(entries); }
+    public long fsyncCount() { return forces; }
+    long compactionCount() { return compactions; }
 
-    public synchronized void put(String key, Entry entry) { putAll(Map.of(key, entry)); }
+    public void put(String key, Entry entry) { putAll(Map.of(key, entry)); }
 
     /** No-op updates require no disk I/O. After an I/O error, fail closed until restart. */
-    public synchronized void putAll(Map<String, Entry> updates) {
-        if (failed) throw new IllegalStateException("lifecycle journal unavailable; restart required");
-        Map<String, Entry> changed = new LinkedHashMap<>();
-        updates.forEach((key, entry) -> { if (!entry.equals(entries.get(key))) changed.put(key, entry); });
-        if (changed.isEmpty()) return;
+    public void putAll(Map<String, Entry> updates) {
+        lock.lock();
         try {
-            for (var update : changed.entrySet()) append(channel, new Update(update.getKey(), update.getValue()));
-            channel.force(true); forces++;
-            entries.putAll(changed);
-            if (channel.size() >= COMPACT_BYTES) compact();
-        } catch (IOException e) {
-            failed = true;
-            throw new UncheckedIOException("cannot persist series lifecycle", e);
+            if (failed) throw new IllegalStateException("lifecycle journal unavailable; restart required");
+            Map<String, Entry> changed = new LinkedHashMap<>();
+            updates.forEach((key, entry) -> { if (!entry.equals(entries.get(key))) changed.put(key, entry); });
+            if (changed.isEmpty()) return;
+            try {
+                for (var update : changed.entrySet()) append(channel, new Update(update.getKey(), update.getValue()));
+                channel.force(true); forces++;
+                entries.putAll(changed);
+                if (channel.size() >= compactThreshold) compact();
+            } catch (IOException e) {
+                failed = true;
+                throw new UncheckedIOException("cannot persist series lifecycle", e);
+            }
+        } finally {
+            lock.unlock();
         }
     }
 
@@ -111,6 +137,8 @@ public final class SeriesLifecycleJournal implements AutoCloseable {
         channel.close();
         channel = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE);
         channel.position(channel.size());
+        compactThreshold = Math.max(minCompactBytes, 2 * channel.size());
+        compactions++;
     }
 
     /** Ceiling, with saturation instead of overflow for malformed/future timestamps. */
@@ -122,5 +150,12 @@ public final class SeriesLifecycleJournal implements AutoCloseable {
         return timestamp > Long.MAX_VALUE - increment ? Long.MAX_VALUE : timestamp + increment;
     }
 
-    @Override public synchronized void close() throws IOException { channel.close(); }
+    @Override public void close() throws IOException {
+        lock.lock();
+        try {
+            channel.close();
+        } finally {
+            lock.unlock();
+        }
+    }
 }
