@@ -239,6 +239,37 @@ class NGridSeedWithQueueIntegrationTest {
         assertEquals(3, seedNode.coordinator().activeMembers().size());
         assertEquals(3, producerNode.coordinator().activeMembers().size());
         assertEquals(3, consumerNode.coordinator().activeMembers().size());
+
+        // poll() confirms the leader's offset, not the followers' durable offset-map applies.
+        // This scenario tests consumption/autodiscovery; close only after those replicas drain.
+        awaitOffsetReplicas();
+    }
+
+    private void awaitOffsetReplicas() throws InterruptedException {
+        String topic = "map:_ngrid-queue-offsets";
+        List<NGridNode> nodes = List.of(seedNode, producerNode, consumerNode);
+        NGridNode leader = nodes.stream().filter(node -> node.coordinator().isLeader()).findFirst().orElseThrow();
+        var committed = leader.replicationManager().getTopicReplicationStatuses().get(topic);
+        assertNotNull(committed, "the persistent offset map must have a leader frontier");
+        long target = committed.nextExpectedSequence() - 1;
+        assertTrue(target > 0, "consumption must have advanced the offset-map frontier");
+        // The producer uses legacy queueDirectory and a local file offset store; seed/consumer
+        // use the internal persistent map and must finish its synchronous WAL apply before close.
+        for (NGridNode node : List.of(seedNode, consumerNode)) {
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+            while (true) {
+                var status = node.replicationManager().getTopicReplicationStatuses().get(topic);
+                if (status != null && status.nextExpectedSequence() - 1 >= target
+                        && status.relayBacklog() == 0 && !status.syncing() && !status.relayPendingBootstrap()) {
+                    break;
+                }
+                if (System.nanoTime() >= deadline) {
+                    fail("offset replica did not durably drain before close: node="
+                            + node.transport().local().nodeId() + " target=" + target + " status=" + status);
+                }
+                Thread.sleep(25);
+            }
+        }
     }
 
     private static int allocateFreeLocalPort() throws IOException {
