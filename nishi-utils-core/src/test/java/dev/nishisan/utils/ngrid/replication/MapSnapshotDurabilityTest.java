@@ -65,6 +65,7 @@ class MapSnapshotDurabilityTest {
             service.resetState();
             service.installSnapshot(MapReplicationCodec.encodeSnapshot(new HashMap<>(Map.of("leader", "full-state"))));
             service.onSnapshotInstalled();
+            service.onSnapshotCommitted();
             service.loadFromDisk();
             assertEquals(Set.of("leader"), service.keySet());
             service.close();
@@ -113,6 +114,39 @@ class MapSnapshotDurabilityTest {
         assertThrows(IOException.class, service::onSnapshotInstalled);
         assertFalse(service.isHealthy());
         assertThrows(IOException.class, service::close);
+    }
+
+    @Test @Timeout(20)
+    void abandonedPartialInstallRestoresPreInstallAsyncMutationsAndResumesWrites() throws Exception {
+        MapClusterService<String, Serializable> service = open();
+        service.apply(UUID.randomUUID(), MapReplicationCommand.put("before", "trusted"));
+        service.apply(UUID.randomUUID(), MapReplicationCommand.put("admitted", "queued-wal"));
+        service.resetState();
+        service.installSnapshot(MapReplicationCodec.encodeSnapshot(new HashMap<>(Map.of("partial", "bad"))));
+        service.onSnapshotAborted();
+        assertTrue(service.isHealthy());
+        assertEquals(Set.of("before", "admitted"), service.keySet());
+        service.apply(UUID.randomUUID(), MapReplicationCommand.put("after", "works"));
+        service.close();
+        try (var restarted = open()) {
+            assertEquals(Set.of("before", "admitted", "after"), restarted.keySet());
+        }
+    }
+
+    @Test @Timeout(20)
+    void staleSuccessfulCheckpointRollbackRestoresDiskBeforeUnblocking() throws Exception {
+        MapClusterService<String, Serializable> service = open();
+        service.apply(UUID.randomUUID(), MapReplicationCommand.put("before", "trusted"));
+        service.resetState();
+        service.installSnapshot(MapReplicationCodec.encodeSnapshot(new HashMap<>(Map.of("stale", "installed"))));
+        service.onSnapshotInstalled();
+        service.onSnapshotAborted();
+        assertTrue(service.isHealthy());
+        assertEquals(Set.of("before"), service.keySet());
+        service.close();
+        try (var restarted = open()) {
+            assertEquals(Set.of("before"), restarted.keySet());
+        }
     }
 
     private static class BlockingRead implements Serializable {

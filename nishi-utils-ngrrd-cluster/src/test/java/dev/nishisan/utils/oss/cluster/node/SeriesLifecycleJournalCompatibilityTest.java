@@ -4,7 +4,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesDeletion;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
+import org.junit.jupiter.api.condition.EnabledIf;
+import javax.tools.ToolProvider;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.DataInputStream;
@@ -64,13 +65,13 @@ class SeriesLifecycleJournalCompatibilityTest {
     }
 
     @Test
-    @EnabledIfSystemProperty(named = "ngrrd.journal.legacyClasses", matches = ".+")
+    @EnabledIf("legacyReaderConfigured")
     void actual8102ReaderAcceptsNewActiveEntriesAndAdvancesReceipts() throws Exception {
         try (var journal = new SeriesLifecycleJournal(base, 1)) {
             journal.put("active", new SeriesLifecycleJournal.Entry("generation", 3_600_000L, ACTIVE, null));
         }
         String name = SeriesLifecycleJournal.class.getName();
-        try (var loader = new URLClassLoader(new java.net.URL[]{Path.of(System.getProperty("ngrrd.journal.legacyClasses")).toUri().toURL()}, getClass().getClassLoader()) {
+        try (var loader = new URLClassLoader(new java.net.URL[]{legacyReaderClasses().toUri().toURL()}, getClass().getClassLoader()) {
             @Override protected synchronized Class<?> loadClass(String className, boolean resolve) throws ClassNotFoundException {
                 if (!className.equals(name) && !className.startsWith(name + "$")) return super.loadClass(className, resolve);
                 Class<?> loaded = findLoadedClass(className);
@@ -97,6 +98,24 @@ class SeriesLifecycleJournalCompatibilityTest {
             assertEquals(7_200_000L, journal.get("active").receivedThrough());
             assertNull(journal.get("active").placement());
         }
+    }
+
+    private static boolean legacyReaderConfigured() {
+        return System.getProperty("ngrrd.journal.legacyClasses") != null
+                || System.getProperty("ngrrd.journal.legacySource") != null;
+    }
+
+    private Path legacyReaderClasses() throws Exception {
+        String source = System.getProperty("ngrrd.journal.legacySource");
+        if (source == null) return Path.of(System.getProperty("ngrrd.journal.legacyClasses"));
+        Path classes = Files.createDirectories(base.resolve("legacy-reader-classes"));
+        var compiler = ToolProvider.getSystemJavaCompiler();
+        assertNotNull(compiler, "The real 8.10.2 reader gate requires a JDK");
+        int result = compiler.run(null, null, null, "--release", "21", "-classpath",
+                System.getProperty("surefire.test.class.path", System.getProperty("java.class.path")),
+                "-d", classes.toString(), source);
+        assertEquals(0, result, "Compile the unmodified reader from the pinned 8.10.2 release");
+        return classes;
     }
 
     private void writeLegacy(DataOutputStream out, LegacyUpdate update) throws Exception {

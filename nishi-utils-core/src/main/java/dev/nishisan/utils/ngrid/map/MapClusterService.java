@@ -77,6 +77,8 @@ public final class MapClusterService<K, V>
     private boolean diskLoaded;
     private volatile boolean installationInProgress;
     private volatile boolean installationFailed;
+    private Map<K, V> preInstallationState;
+    private boolean installationCheckpointed;
     /**
      * When {@code true}, the leader stores the original value instance in its local
      * {@code data} (ConcurrentHashMap reference semantics) instead of a deserialized
@@ -558,6 +560,9 @@ public final class MapClusterService<K, V>
     public void resetState() {
         stateLock.lock();
         try {
+            if (preInstallationState != null) throw new IllegalStateException("Previous map installation unresolved");
+            preInstallationState = new HashMap<>(data);
+            installationCheckpointed = false;
             installationInProgress = true;
             if (persistence != null) persistence.setSnapshotsSuspended(true);
             data.clear();
@@ -627,9 +632,13 @@ public final class MapClusterService<K, V>
         try {
             try {
                 if (persistence != null) persistence.forceSnapshot();
-                installationInProgress = false;
+                installationCheckpointed = preInstallationState != null;
                 installationFailed = false;
-                if (persistence != null) persistence.setSnapshotsSuspended(false);
+                // Keep the map frozen until the manager validates session/attempt and commits cutover.
+                if (preInstallationState == null) {
+                    installationInProgress = false;
+                    if (persistence != null) persistence.setSnapshotsSuspended(false);
+                }
             } catch (IOException e) {
                 installationFailed = true;
                 throw e;
@@ -637,6 +646,58 @@ public final class MapClusterService<K, V>
         } finally {
             stateLock.unlock();
         }
+    }
+
+    /** Internal: releases rollback evidence only after the manager accepts this installation. */
+    @Override
+    public void onSnapshotCommitted() {
+        stateLock.lock();
+        try {
+            preInstallationState = null;
+            installationCheckpointed = false;
+            installationInProgress = false;
+            if (persistence != null) persistence.setSnapshotsSuspended(false);
+        } finally {
+            stateLock.unlock();
+        }
+    }
+
+    /** Internal: restores the prior image, including pre-install admitted async WAL mutations. */
+    @Override
+    public boolean onSnapshotAborted() throws IOException {
+        stateLock.lock();
+        try {
+            if (preInstallationState == null) return true;
+            data.clear();
+            data.putAll(preInstallationState);
+            try {
+                // A stale but successful checkpoint may already have replaced disk state.
+                // Replace it with the trusted image before advertising the prior frontier again.
+                if (persistence != null && installationCheckpointed) persistence.forceSnapshot();
+                if (installationFailed) throw new IOException("Failed checkpoint requires restart for " + topic);
+                preInstallationState = null;
+                installationCheckpointed = false;
+                installationInProgress = false;
+                if (persistence != null) persistence.setSnapshotsSuspended(false);
+                return true;
+            } catch (IOException e) {
+                installationFailed = true;
+                installationInProgress = true;
+                throw e;
+            }
+        } finally {
+            stateLock.unlock();
+        }
+    }
+
+    @Override
+    public boolean usesTransactionalSnapshotInstallation() {
+        return true;
+    }
+
+    @Override
+    public boolean hasDurableSnapshotCheckpoint() {
+        return persistence != null;
     }
 
     /**

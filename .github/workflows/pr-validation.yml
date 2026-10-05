@@ -19,12 +19,14 @@ jobs:
   unit-tests:
     name: Standard Unit Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     permissions:
       contents: read
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
@@ -36,21 +38,32 @@ jobs:
       # resource sensitive and does not pass reliably on hosted runners. Run it locally with
       # `mvn test -Presilience` / `mvn verify -Pdocker-resilience`.
       - name: Run unit tests with coverage (NGrid resilience suite excluded)
-        run: mvn -B verify -pl nishi-utils-core,nishi-utils-oss,nishi-utils-ngrrd-cluster -am -DexcludeNgrid=true -Dsurefire.rerunFailingTestsCount=1
+        run: flock /tmp/nishi-utils-maven.lock mvn -B verify -pl nishi-utils-core,nishi-utils-oss,nishi-utils-ngrrd-cluster -am -DexcludeNgrid=true -Dsurefire.rerunFailingTestsCount=1
+
+      - name: Verify map checkpoint and interrupted-install regression tests
+        run: flock /tmp/nishi-utils-maven.lock mvn -B test -pl nishi-utils-core -Dtest=NMapCheckpointTest,NMapPersistenceCloseTest,MapSnapshotDurabilityTest,SnapshotCheckpointFenceTest,LocalApplyTrackingTest,LeaderSyncGateTest
+
+      - name: Verify journal compatibility with the real 8.10.2 reader
+        run: |
+          legacy_source_dir="$(mktemp -d)"
+          trap 'rm -rf "$legacy_source_dir"' EXIT
+          # Pin the published implementation rather than reconstructing a legacy reader.
+          git show 20cff18c8ee4fc2e85e4497972a9b5683d7b02ce:nishi-utils-ngrrd-cluster/src/main/java/dev/nishisan/utils/oss/cluster/node/SeriesLifecycleJournal.java > "$legacy_source_dir/SeriesLifecycleJournal.java"
+          flock /tmp/nishi-utils-maven.lock mvn -B test -pl nishi-utils-ngrrd-cluster -am -Dtest=SeriesLifecycleJournalCompatibilityTest -Dsurefire.failIfNoSpecifiedTests=false -Dngrrd.journal.legacySource="$legacy_source_dir/SeriesLifecycleJournal.java"
 
       - name: Verify checkpoint recovery after migration
-        run: mvn -B test -pl nishi-utils-ngrrd-cluster -am -Pngrrd-cluster -Dtest=CheckpointAfterMigrationClusterTest -Dsurefire.failIfNoSpecifiedTests=false
+        run: flock /tmp/nishi-utils-maven.lock mvn -B test -pl nishi-utils-ngrrd-cluster -am -Pngrrd-cluster -Dtest=CheckpointAfterMigrationClusterTest -Dsurefire.failIfNoSpecifiedTests=false
 
       - name: Verify seed discovery and TCP routing
-        run: mvn -B test -pl nishi-utils-core -Dtest=TcpTransportConcurrentMeshTest,ProxyRoutingIntegrationTest,UndeliverableRequestIntegrationTest,TransportCompressionClusterTest
+        run: flock /tmp/nishi-utils-maven.lock mvn -B test -pl nishi-utils-core -Dtest=TcpTransportConcurrentMeshTest,ProxyRoutingIntegrationTest,UndeliverableRequestIntegrationTest,TransportCompressionClusterTest
 
       - name: Verify continuous ingestion with two virtual-thread carriers
         env:
           JAVA_TOOL_OPTIONS: -Djdk.virtualThreadScheduler.parallelism=2
-        run: mvn -B test -pl nishi-utils-ngrrd-cluster -am -Pngrrd-cluster -Dtest=ContinuousIngestionRebalanceClusterTest -Dsurefire.failIfNoSpecifiedTests=false
+        run: flock /tmp/nishi-utils-maven.lock mvn -B test -pl nishi-utils-ngrrd-cluster -am -Pngrrd-cluster -Dtest=ContinuousIngestionRebalanceClusterTest -Dsurefire.failIfNoSpecifiedTests=false
 
       - name: Validate conditional series deletion and catalog quarantine
-        run: mvn -B test -pl nishi-utils-ngrrd-cluster -am -Pngrrd-cluster -Dtest=SeriesDeleteClusterTest -Dsurefire.failIfNoSpecifiedTests=false
+        run: flock /tmp/nishi-utils-maven.lock mvn -B test -pl nishi-utils-ngrrd-cluster -am -Pngrrd-cluster -Dtest=SeriesDeleteClusterTest -Dsurefire.failIfNoSpecifiedTests=false
 
 
       - name: Upload coverage report

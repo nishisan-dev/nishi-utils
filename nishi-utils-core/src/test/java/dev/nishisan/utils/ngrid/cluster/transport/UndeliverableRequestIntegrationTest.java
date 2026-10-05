@@ -43,6 +43,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -132,9 +133,23 @@ class UndeliverableRequestIntegrationTest {
         TcpTransportConfig confB = TcpTransportConfig.builder(infoB).build();
         TcpTransportConfig confC = TcpTransportConfig.builder(infoC).addPeer(infoB).build();
 
+        CountDownLatch releaseDials = new CountDownLatch(1);
+        CountDownLatch receivedByC = new CountDownLatch(1);
+
         try (TcpTransport transA = new TcpTransport(confA);
              TcpTransport transB = new TcpTransport(confB);
              TcpTransport transC = new TcpTransport(confC)) {
+            // Keep the request on the relay path. Gossip may otherwise create A-C between
+            // choosing B and sending, or offer a direct retry route when B disconnects.
+            transA.setBeforeDialHook(holdDialsTo(infoC.nodeId(), releaseDials));
+            transC.setBeforeDialHook(holdDialsTo(infoA.nodeId(), releaseDials));
+            transC.addListener(new TransportListener() {
+                public void onPeerConnected(NodeInfo peer) { }
+                public void onPeerDisconnected(NodeId peer) { }
+                public void onMessage(ClusterMessage message) {
+                    if ("via-relay".equals(message.qualifier())) receivedByC.countDown();
+                }
+            });
             transB.start();
             transC.start();
             transA.start();
@@ -145,16 +160,19 @@ class UndeliverableRequestIntegrationTest {
                 return Optional.of(infoB.nodeId()).equals(transA.getRouter().nextHop(infoC.nodeId()));
             }, "A routes to C via B");
 
-            // C never answers (no listener). The request is forwarded by B and stays pending on A.
+            // C observes the forwarded request without answering; it stays pending on A.
             CompletableFuture<ClusterMessage> future = transA.sendAndAwait(ClusterMessage.request(
                     MessageType.CLIENT_REQUEST, "via-relay", infoA.nodeId(), infoC.nodeId(), "ping"));
-            Thread.sleep(200);
+            assertTrue(receivedByC.await(10, TimeUnit.SECONDS), "B must have forwarded the request to C");
+            assertFalse(transA.isConnected(infoC.nodeId()), "precondition: A has no direct link to C");
             transB.close();
 
             ExecutionException failure = assertThrows(ExecutionException.class,
                     () -> future.get(10, TimeUnit.SECONDS),
                     "the request must fail when its relay disconnects, not wait out the 60 s timeout");
             assertInstanceOf(PeerDisconnectedException.class, failure.getCause());
+        } finally {
+            releaseDials.countDown();
         }
     }
 

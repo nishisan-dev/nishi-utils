@@ -156,8 +156,12 @@ public final class NMap<K, V> implements Closeable {
         NMap<K, V> map = new NMap<>(baseDir, name, config);
         if (map.persistence != null) {
             map.persistence.load();
+            if (map.persistence.failureCount() == 0) map.persistence.start();
+            if (map.persistence.failureCount() != 0) {
+                try { map.persistence.close(); } catch (IOException ignored) { }
+                throw new IllegalStateException("Failed to initialize map persistence: " + name);
+            }
             map.lastMutationTimestamp.set(map.persistence.lastMutationTimestamp());
-            map.persistence.start();
         }
         return map;
     }
@@ -182,6 +186,7 @@ public final class NMap<K, V> implements Closeable {
     }
 
     private Optional<V> putLocked(K key, V value) {
+        if (persistence != null) persistence.ensureWritable();
         Objects.requireNonNull(key, "key");
         Objects.requireNonNull(value, "value");
         V prev = storage.put(key, value);
@@ -209,6 +214,7 @@ public final class NMap<K, V> implements Closeable {
     }
 
     private Optional<V> removeLocked(K key) {
+        if (persistence != null) persistence.ensureWritable();
         Objects.requireNonNull(key, "key");
         V prev = storage.remove(key);
         if (prev != null) {
@@ -244,6 +250,7 @@ public final class NMap<K, V> implements Closeable {
     }
 
     private void clearLocked() {
+        if (persistence != null) persistence.ensureWritable();
         if (storage.isEmpty()) {
             return;
         }
