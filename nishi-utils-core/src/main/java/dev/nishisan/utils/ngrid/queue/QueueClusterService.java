@@ -23,6 +23,7 @@ import dev.nishisan.utils.ngrid.replication.QuorumUnreachableException;
 import dev.nishisan.utils.ngrid.replication.ReplicationHandler;
 import dev.nishisan.utils.ngrid.replication.ReplicationManager;
 import dev.nishisan.utils.ngrid.replication.ReplicationResult;
+import dev.nishisan.utils.ngrid.replication.SnapshotSessionRegistry;
 import dev.nishisan.utils.queue.NQueue;
 import dev.nishisan.utils.queue.NQueueHeaders;
 
@@ -510,27 +511,84 @@ public final class QueueClusterService<T> implements Closeable, ReplicationHandl
 
     private static final int SNAPSHOT_CHUNK_SIZE = 1000;
 
-    /** {@inheritDoc} */
+    /** 8.10.1: logical-index cursor of each in-flight snapshot transfer. */
+    private final SnapshotSessionRegistry<SnapshotCursor> snapshotSessions = new SnapshotSessionRegistry<>();
+
+    /**
+     * Position of one snapshot transfer: the logical-index cursor and the chunk it serves next. Chunks of
+     * one session are requested one at a time (the requester asks for the next only after installing the
+     * previous), so the fields are only read and written by that sequence of calls.
+     */
+    private static final class SnapshotCursor {
+        private volatile NQueue.IndexCursor cursor;
+        private volatile int nextChunk;
+
+        private SnapshotCursor(NQueue.IndexCursor cursor) {
+            this.cursor = cursor;
+        }
+    }
+
+    /**
+     * Serves a chunk with an anonymous session (see {@link #getSnapshotChunk(String, int)}). Kept for
+     * callers without a session identifier.
+     */
     @Override
     public SnapshotChunk getSnapshotChunk(int chunkIndex) {
+        return getSnapshotChunk("", chunkIndex);
+    }
+
+    /**
+     * Serves one chunk of a snapshot session (8.10.1). Chunk {@code 0} flushes the staged records and
+     * opens a cursor bounded by the last durable logical index; every chunk continues that cursor by
+     * LOGICAL index. Up to 8.10.0 each chunk re-read the queue from its current head by position: a
+     * record consumed between two chunks shifted every position and the record right after the served
+     * range was skipped, while each chunk re-scanned the log from the head.
+     */
+    @Override
+    public SnapshotChunk getSnapshotChunk(String sessionId, int chunkIndex) {
         try {
+            SnapshotCursor session;
             if (chunkIndex == 0) {
                 queue.flush();
+                session = snapshotSessions.open(sessionId, () -> new SnapshotCursor(queue.openIndexCursor()));
+            } else {
+                session = snapshotSessions.get(sessionId);
             }
-            int startIndex = chunkIndex * SNAPSHOT_CHUNK_SIZE;
-            NQueue.ReadRangeResult<T> result = queue.readRange(startIndex, SNAPSHOT_CHUNK_SIZE);
-
-            if (result.items().isEmpty() && !result.hasMore()) {
-                // No more data
-                return new SnapshotChunk(new java.util.ArrayList<>(), false);
+            if (session == null) {
+                LOGGER.warning(() -> "Snapshot chunk " + chunkIndex + " of queue " + queueName
+                        + " requested for an unknown or expired session " + sessionId
+                        + "; the requester restarts the transfer");
+                return null;
             }
-
-            java.util.ArrayList<Object> chunk = new java.util.ArrayList<>(result.items());
-            return new SnapshotChunk(chunk, result.hasMore());
+            if (chunkIndex != session.nextChunk) {
+                // The cursor only moves forward: serving a duplicate (or out-of-order) request would hand out
+                // the page AFTER the one asked for and the requester would skip a page. Drop the session and
+                // let the requester restart from chunk 0.
+                int expected = session.nextChunk;
+                snapshotSessions.release(sessionId);
+                LOGGER.warning(() -> "Snapshot chunk " + chunkIndex + " of queue " + queueName + " requested out of"
+                        + " order for session " + sessionId + " (expected " + expected
+                        + "); the requester restarts the transfer");
+                return null;
+            }
+            NQueue.IndexedRangeResult<T> result = queue.readIndexRange(session.cursor, SNAPSHOT_CHUNK_SIZE);
+            session.cursor = result.next();
+            session.nextChunk = chunkIndex + 1;
+            if (!result.hasMore()) {
+                snapshotSessions.release(sessionId);
+            }
+            return new SnapshotChunk(new java.util.ArrayList<Object>(result.items()), result.hasMore());
         } catch (IOException e) {
+            snapshotSessions.release(sessionId);
             LOGGER.log(Level.WARNING, "Failed to get snapshot chunk " + chunkIndex, e);
             return null;
         }
+    }
+
+    /** {@inheritDoc} */
+    @Override
+    public void releaseSnapshotSession(String sessionId) {
+        snapshotSessions.release(sessionId);
     }
 
     /** {@inheritDoc} */
