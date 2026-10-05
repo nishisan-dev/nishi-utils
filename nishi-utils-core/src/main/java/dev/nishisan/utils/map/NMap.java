@@ -404,9 +404,13 @@ public final class NMap<K, V> implements Closeable {
 
     @Override
     public void close() throws IOException {
-        if (persistence != null) {
-            persistence.close();
+        try {
+            if (persistence != null) {
+                persistence.close();
+            }
+        } finally {
+            // The persistence close may now fail (writer not drained in time); the storage still closes.
+            storage.close();
         }
-        storage.close();
     }
 }
