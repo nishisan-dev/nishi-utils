@@ -113,9 +113,16 @@ class RelayStreamFetchProtocolTest {
             l.manager.replicate(TOPIC, bytes("op-1")).get(2, TimeUnit.SECONDS);
             Thread.sleep(200);
 
-            RelayStreamBatchPayload batch = l.fetch(100L, 10);
+            RelayStreamBatchPayload batch = l.fetch(2L, 10);
             assertTrue(batch.frames().isEmpty(), "caught-up follower gets an empty run");
-            assertFalse(batch.needSnapshot(), "being ahead of the log is not a snapshot condition");
+            assertFalse(batch.needSnapshot(), "being caught up is not a snapshot condition");
+
+            // 8.10.1: a fetch from ABOVE the leader's watermark (cursor 99 > hwm 1) is no longer answered
+            // with an empty run once the leader produced in its term — the follower holds a tail of another
+            // lineage and must bootstrap (see LeaderSideFollowerAheadTest).
+            RelayStreamBatchPayload ahead = l.fetch(100L, 10);
+            assertTrue(ahead.frames().isEmpty());
+            assertTrue(ahead.needSnapshot(), "a follower ahead of a producing leader must bootstrap");
         }
     }
 

@@ -99,6 +99,13 @@ public final class NGridNode implements Closeable {
     private DistributedQueue<Serializable> queue;
     private final Map<String, MapClusterService<Serializable, Serializable>> mapServices = new ConcurrentHashMap<>();
     private final Map<String, DistributedMap<Serializable, Serializable>> maps = new ConcurrentHashMap<>();
+    /**
+     * Every {@link MapClusterService} created by this node, including those the {@code close}/{@code
+     * destroy} callback of the {@link DistributedMap} already removed from {@link #mapServices}. {@link
+     * #close()} closes and drains each one (8.10.1).
+     */
+    private final Set<MapClusterService<Serializable, Serializable>> createdMapServices =
+            ConcurrentHashMap.newKeySet();
     /** Maps map names to their per-map persistence mode override (from YAML config). */
     private final Map<String, NMapPersistenceMode> mapPersistenceOverrides = new ConcurrentHashMap<>();
     /** Maps map names to their per-map leader-local by-reference override. */
@@ -405,6 +412,8 @@ public final class NGridNode implements Closeable {
         replicationBuilder.dataDirectory(replicationDataDir);
 
         replicationManager = new ReplicationManager(transport, coordinator, replicationBuilder.build());
+        // 8.10.1: the clean-shutdown marker is written by close() only after the map services drained.
+        replicationManager.deferCleanShutdownMarker();
         // The leader high-watermark supplier is wired by ReplicationManager.start() itself (#131), so
         // it is correct for manual assemblies too — no external wiring needed here.
         replicationManager.start();
@@ -861,19 +870,10 @@ public final class NGridNode implements Closeable {
                 }
             }
         }
-        for (MapClusterService<Serializable, Serializable> service : mapServices.values()) {
-            try {
-                service.close();
-            } catch (IOException e) {
-                if (first == null) {
-                    first = e;
-                }
-            }
-        }
-        // Revisão #178 (C4): step down BEFORE closing the replication manager. Closing it first left a
-        // window where the node still answered isLeader()/hasValidLease() with its op-log already
-        // closed, so every write failed "op-log append failed … write not durable" while clients kept
-        // being routed here.
+        // 8.10.1 (M1): each DistributedMap.close() fires the callback that removes its service from
+        // mapServices, so iterating mapServices here closed no service at all and the NMap async writer was
+        // never drained. The services are closed from createdMapServices, AFTER the replicationManager: its
+        // stop() joins the relay apply threads, so no operation can reach a map whose persistence is closed.
         try {
             if (coordinator != null) {
                 coordinator.stop();
@@ -891,6 +891,15 @@ public final class NGridNode implements Closeable {
             if (first == null) {
                 first = e;
             }
+        }
+        IOException mapServicesFailure = closeMapServices();
+        if (first == null) {
+            first = mapServicesFailure;
+        }
+        // 8.10.1: only now is the handlers' durable state (the NMap WALs) drained; a kill before this
+        // point leaves no clean marker, so the next start bootstraps instead of trusting an incomplete WAL.
+        if (replicationManager != null) {
+            replicationManager.markCleanShutdownIfEligible(mapServicesFailure == null);
         }
         try {
             if (rttMonitor != null) {
@@ -1042,9 +1051,35 @@ public final class NGridNode implements Closeable {
                 .build();
     }
 
+    /**
+     * Closes and drains every {@link MapClusterService} created by this node (8.10.1, M1). {@link
+     * MapClusterService#close()} closes the {@code NMapPersistence}, whose writer empties the asynchronous
+     * write queue before terminating. Idempotent: a closed service leaves the set, and closing an already
+     * closed persistence again has no effect.
+     *
+     * @return the first close failure, or {@code null}
+     */
+    private IOException closeMapServices() {
+        IOException first = null;
+        for (MapClusterService<Serializable, Serializable> service : new ArrayList<>(createdMapServices)) {
+            try {
+                service.close();
+            } catch (IOException e) {
+                if (first == null) {
+                    first = e;
+                }
+            } finally {
+                createdMapServices.remove(service);
+            }
+        }
+        mapServices.clear();
+        return first;
+    }
+
     private DistributedMap<Serializable, Serializable> createDistributedMap(String mapName) {
         MapClusterService<Serializable, Serializable> service = mapServices.computeIfAbsent(mapName,
                 this::createMapService);
+        createdMapServices.add(service);
         DistributedMap<Serializable, Serializable> m = new DistributedMap<>(transport, coordinator, service, mapName,
                 stats, replicationManager);
         m.setOnDestroyCallback(() -> {
