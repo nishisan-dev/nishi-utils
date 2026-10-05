@@ -558,6 +558,87 @@ class NMapCheckpointTest {
         } finally { release.countDown(); applier.join(5_000); persistence.close(); }
     }
 
+    /**
+     * Async admissions still queued at capture are covered by the frozen map. Tail writes made
+     * durable while that map is serialized must never recover over a gap: a crash in this window
+     * recovers old snapshot + wal.old + new tail, which must be a prefix of the history.
+     */
+    @Test @Timeout(30)
+    void crashDuringSnapshotSerializationRecoversOnlyAHistoryPrefix() throws Exception {
+        NMapConfig cfg = NMapConfig.builder().mode(NMapPersistenceMode.ASYNC_WITH_FSYNC)
+                .snapshotIntervalOperations(0).snapshotIntervalTime(Duration.ZERO)
+                .batchSize(1).batchTimeout(Duration.ofMillis(5)).build();
+        Map<String, Serializable> state = new ConcurrentHashMap<>();
+        java.util.concurrent.locks.ReentrantLock stateLock = new java.util.concurrent.locks.ReentrantLock();
+        NMapPersistence<String, Serializable> persistence = new NMapPersistence<>(cfg, state, directory, "prefix", stateLock);
+        persistence.start();
+        stateLock.lock();
+        try { state.put("a", "old"); persistence.appendSync(NMapOperationType.PUT, "a", "old"); }
+        finally { stateLock.unlock(); }
+        persistence.forceSnapshot();
+
+        java.util.concurrent.locks.ReentrantLock walLock = walLock(persistence);
+        Path crash = directory.resolve("crash");
+        java.util.concurrent.atomic.AtomicReference<Throwable> failure = new java.util.concurrent.atomic.AtomicReference<>();
+        persistence.checkpointFaultInjector(path -> {
+            if (!path.getFileName().toString().equals("snapshot.dat.tmp")) return;
+            try {
+                // The frozen map is serialized; release the writer so the tail drains concurrently.
+                walLock.unlock();
+                stateLock.lock();
+                try { state.put("later", "L"); persistence.appendAsync(NMapOperationType.PUT, "later", "L"); }
+                finally { stateLock.unlock(); }
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+                while (Files.size(directory.resolve("prefix/wal.log")) == 0 && System.nanoTime() < deadline) Thread.sleep(5);
+                // The writer holds walLock through the batch write and its fsync.
+                walLock.lock();
+                try { copyTree(directory.resolve("prefix"), crash.resolve("prefix")); }
+                finally { walLock.unlock(); }
+            } catch (Throwable error) { failure.set(error); }
+        });
+        Thread checkpoint = new Thread(() -> {
+            try {
+                walLock.lock(); // the writer cannot drain: the admissions below stay queued at capture
+                stateLock.lock();
+                try {
+                    state.clear(); persistence.appendAsync(NMapOperationType.CLEAR, null, null);
+                    state.put("q", "1"); persistence.appendAsync(NMapOperationType.PUT, "q", "1");
+                } finally { stateLock.unlock(); }
+                persistence.forceSnapshot();
+            } catch (Throwable error) { failure.compareAndSet(null, error); }
+            finally { if (walLock.isHeldByCurrentThread()) walLock.unlock(); }
+        });
+        checkpoint.start();
+        checkpoint.join();
+        assertNull(failure.get());
+        assertTrue(Files.exists(crash.resolve("prefix/wal.log.old")), "crash copy must be taken mid-checkpoint");
+        persistence.close();
+
+        Map<String, Serializable> recovered = new ConcurrentHashMap<>();
+        NMapPersistence<String, Serializable> reopened = new NMapPersistence<>(cfg, recovered, crash, "prefix");
+        reopened.load();
+        assertEquals(0, reopened.failureCount());
+        Set<Map<String, Serializable>> prefixes = Set.of(Map.of("a", "old"), Map.of(), Map.of("q", "1"),
+                Map.of("q", "1", "later", "L"));
+        assertTrue(prefixes.contains(recovered), "recovered state is not a history prefix: " + recovered);
+    }
+
+    private static java.util.concurrent.locks.ReentrantLock walLock(NMapPersistence<?, ?> persistence) throws Exception {
+        java.lang.reflect.Field field = NMapPersistence.class.getDeclaredField("walLock");
+        field.setAccessible(true);
+        return (java.util.concurrent.locks.ReentrantLock) field.get(persistence);
+    }
+
+    private static void copyTree(Path from, Path to) throws IOException {
+        try (var files = Files.walk(from)) {
+            for (Path path : files.sorted(Comparator.naturalOrder()).toList()) {
+                Path target = to.resolve(from.relativize(path).toString());
+                if (Files.isDirectory(path)) Files.createDirectories(target);
+                else Files.copy(path, target, StandardCopyOption.REPLACE_EXISTING);
+            }
+        }
+    }
+
     private static class BlockingValue implements Serializable {
         final transient CountDownLatch entered = new CountDownLatch(1);
         final transient CountDownLatch release = new CountDownLatch(1);

@@ -571,22 +571,38 @@ public final class NMapPersistence<K, V> implements Closeable {
                 }
                 Map<K, V> snapshot = new HashMap<>(data);
                 long timestamp = lastMutationTimeMillis.get();
-                // WITH_FSYNC batches and synchronous writes have already forced this WAL.
+                // Admissions still queued are covered by the frozen map but not yet by this WAL.
+                // Until the snapshot is durable, recovery replays old snapshot + wal.old + new
+                // tail, so they must reach the rotated WAL in admission order: dropping them
+                // would let later tail writes recover over a gap in the history. Mutators cannot
+                // admit while stateLock is held, and walLock serializes this with the writer.
+                drainQueueToWal();
+                // WITH_FSYNC batches, synchronous writes and the drain above have forced this WAL.
                 // NO_FSYNC mutations become durable when the complete snapshot is forced below.
                 closeWalQuietly();
                 Files.move(walPath, oldWalPath); // never overwrite recovery evidence
                 openWalForAppend();
                 forceCheckpointChannel(requireWal(), walPath);
                 forceDirectory();
-                // Only the prefix covered by the frozen map is discarded. Mutators cannot
-                // admit while stateLock is held; later admissions go to the new WAL tail.
-                queueLock.lock();
-                try { queue.clear(); }
-                finally { queueLock.unlock(); }
                 opsSinceSnapshot = 0;
                 return new Checkpoint(snapshot, timestamp);
             } finally { walLock.unlock(); }
         } finally { stateLock.unlock(); }
+    }
+
+    /**
+     * Writes every queued admission to the current WAL, in queue order, before rotation.
+     * Caller holds walLock. A failure propagates and fail-stops the checkpoint before the
+     * WAL is rotated, so no later write can be recovered after the missing entries.
+     */
+    private void drainQueueToWal() throws IOException {
+        List<NMapWALEntry> pending = new ArrayList<>();
+        queueLock.lock();
+        try { queue.drainTo(pending); }
+        finally { queueLock.unlock(); }
+        if (pending.isEmpty()) return;
+        for (NMapWALEntry entry : pending) writeWalEntry(entry);
+        if (config.mode() == NMapPersistenceMode.ASYNC_WITH_FSYNC) forceWal();
     }
 
     private void finishCheckpoint(Checkpoint checkpoint) throws IOException {
