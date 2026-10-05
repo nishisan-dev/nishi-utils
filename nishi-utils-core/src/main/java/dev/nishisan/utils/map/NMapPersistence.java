@@ -324,14 +324,8 @@ public final class NMapPersistence<K, V> implements Closeable {
         try {
             try {
                 ensureWritable();
-                FileChannel ch = requireWal();
-                ByteBuffer buffer = encode(entry);
-                while (buffer.hasRemaining()) {
-                    ch.write(buffer);
-                }
-                if (config.mode() == NMapPersistenceMode.ASYNC_WITH_FSYNC) {
-                    ch.force(true);
-                }
+                writeWalEntry(entry);
+                if (config.mode() == NMapPersistenceMode.ASYNC_WITH_FSYNC) forceWal();
             } catch (IOException e) {
                 LOGGER.log(Level.WARNING, "Failed to append WAL entry synchronously", e);
                 failureCount.incrementAndGet();
@@ -374,7 +368,7 @@ public final class NMapPersistence<K, V> implements Closeable {
             if (!acquired) throw new IOException("Map checkpoint did not terminate within " + closeJoinTimeoutMillis + " ms");
             walLock.lock();
             try {
-                try { if (walChannel != null) walChannel.force(true); }
+                try { if (walChannel != null) forceWal(); }
                 finally { closeWalQuietly(); }
             } finally { walLock.unlock(); }
         } catch (InterruptedException e) {
@@ -459,8 +453,8 @@ public final class NMapPersistence<K, V> implements Closeable {
         }
         walLock.lock();
         try {
-            try { if (walChannel != null) walChannel.force(true); }
-            catch (IOException e) { checkpointFailure = e; }
+            try { if (walChannel != null) forceWal(); }
+            catch (IOException e) { if (checkpointFailure == null) checkpointFailure = e; }
             closeWalQuietly();
         } finally { walLock.unlock(); }
     }
@@ -502,16 +496,8 @@ public final class NMapPersistence<K, V> implements Closeable {
         walLock.lock();
         try {
             try {
-                FileChannel ch = requireWal();
-                for (NMapWALEntry entry : batch) {
-                    ByteBuffer buffer = encode(entry);
-                    while (buffer.hasRemaining()) {
-                        ch.write(buffer);
-                    }
-                }
-                if (config.mode() == NMapPersistenceMode.ASYNC_WITH_FSYNC) {
-                    ch.force(true);
-                }
+                for (NMapWALEntry entry : batch) writeWalEntry(entry);
+                if (config.mode() == NMapPersistenceMode.ASYNC_WITH_FSYNC) forceWal();
             } catch (IOException e) {
                 LOGGER.log(Level.WARNING, "Failed to append WAL batch", e);
                 failureCount.incrementAndGet();
@@ -751,6 +737,22 @@ public final class NMapPersistence<K, V> implements Closeable {
     private void forceCheckpointChannel(FileChannel channel, Path path) throws IOException {
         checkpointFaultInjector.beforeForce(path);
         channel.force(true);
+    }
+
+    // Live WAL IO must finish even if a relay applier is interrupted during shutdown.
+    // Interruptible FileChannel IO would close the shared descriptor and break the writer's
+    // final drain. RAF/FD operations preserve interruption without canceling confirmed writes;
+    // walLock still serializes every write, fsync and rotation.
+    private void writeWalEntry(NMapWALEntry entry) throws IOException {
+        requireWal();
+        ByteBuffer buffer = encode(entry);
+        walRaf.write(buffer.array(), buffer.arrayOffset() + buffer.position(), buffer.remaining());
+    }
+
+    private void forceWal() throws IOException {
+        requireWal();
+        checkpointFaultInjector.beforeForce(walPath);
+        walRaf.getFD().sync();
     }
 
     private FileChannel requireWal() throws IOException {

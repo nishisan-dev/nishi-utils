@@ -207,7 +207,7 @@ class NMapCheckpointTest {
         field.setAccessible(true);
         java.nio.channels.FileChannel original = (java.nio.channels.FileChannel) field.get(persistence);
         assertTrue(original.isOpen());
-        field.set(persistence, new ForceFailingChannel(original));
+        persistence.checkpointFaultInjector(path -> { throw new IOException("injected final fsync failure"); });
         assertThrows(IOException.class, persistence::close);
         assertFalse(original.isOpen(), "failure in final force must not leak the underlying descriptor");
         assertNull(field.get(persistence));
@@ -219,27 +219,31 @@ class NMapCheckpointTest {
         java.util.concurrent.locks.ReentrantLock stateLock = new java.util.concurrent.locks.ReentrantLock();
         NMapPersistence<String, Serializable> persistence = new NMapPersistence<>(config(), state, directory, "admission", stateLock);
         persistence.start();
-        java.lang.reflect.Field channelField = NMapPersistence.class.getDeclaredField("walChannel");
-        channelField.setAccessible(true);
-        BlockingForceChannel channel = new BlockingForceChannel((java.nio.channels.FileChannel) channelField.get(persistence));
-        channelField.set(persistence, channel);
+        CountDownLatch entered = new CountDownLatch(1), release = new CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicBoolean first = new java.util.concurrent.atomic.AtomicBoolean(true);
+        persistence.checkpointFaultInjector(path -> {
+            if (path.getFileName().toString().equals("wal.log") && first.compareAndSet(true, false)) {
+                entered.countDown();
+                try { release.await(); } catch (InterruptedException e) { throw new IOException(e); }
+            }
+        });
         ExecutorService pool = Executors.newSingleThreadExecutor();
         try {
             stateLock.lock();
             try { state.put("first", "one"); persistence.appendAsync(NMapOperationType.PUT, "first", "one"); }
             finally { stateLock.unlock(); }
-            assertTrue(channel.entered.await(5, TimeUnit.SECONDS));
+            assertTrue(entered.await(5, TimeUnit.SECONDS));
             pool.submit(() -> {
                 stateLock.lock();
                 try { state.put("second", "two"); persistence.appendAsync(NMapOperationType.PUT, "second", "two"); }
                 finally { stateLock.unlock(); }
             }).get(1, TimeUnit.SECONDS);
-            channel.release.countDown();
+            release.countDown();
             persistence.close();
             Map<String, Serializable> recovered = new ConcurrentHashMap<>();
             new NMapPersistence<>(config(), recovered, directory, "admission").load();
             assertEquals(Map.of("first", "one", "second", "two"), recovered);
-        } finally { channel.release.countDown(); pool.shutdownNow(); persistence.close(); }
+        } finally { release.countDown(); pool.shutdownNow(); persistence.close(); }
     }
 
     @Test @Timeout(20)
@@ -487,39 +491,71 @@ class NMapCheckpointTest {
         } finally { Thread.interrupted(); }
     }
 
-    private static class BlockingForceChannel extends ForceFailingChannel {
-        final CountDownLatch entered = new CountDownLatch(1), release = new CountDownLatch(1);
-        final java.util.concurrent.atomic.AtomicBoolean first = new java.util.concurrent.atomic.AtomicBoolean(true);
-        BlockingForceChannel(java.nio.channels.FileChannel delegate) { super(delegate); }
-        @Override public void force(boolean metadata) throws IOException {
-            if (first.compareAndSet(true, false)) {
-                entered.countDown();
-                try { release.await(); } catch (InterruptedException e) { throw new IOException(e); }
-            }
-            delegate.force(metadata);
-        }
+    @Test @Timeout(20)
+    void interruptedSynchronousApplyDoesNotCloseSharedWalOrBreakFinalDrain() throws Exception {
+        NMapPersistence<String, Serializable> persistence = new NMapPersistence<>(config(), new ConcurrentHashMap<>(), directory, "interrupted-apply");
+        persistence.start();
+        BlockingValue value = new BlockingValue();
+        java.util.concurrent.atomic.AtomicReference<Throwable> failure = new java.util.concurrent.atomic.AtomicReference<>();
+        Thread applier = new Thread(() -> {
+            try {
+                Thread.currentThread().interrupt();
+                persistence.appendSync(NMapOperationType.PUT, "already-interrupted", "confirmed");
+                assertTrue(Thread.currentThread().isInterrupted());
+                Thread.interrupted();
+                persistence.appendSync(NMapOperationType.PUT, "interrupted-during-apply", value);
+                assertTrue(Thread.currentThread().isInterrupted());
+            } catch (Throwable error) { failure.set(error); }
+        });
+        try {
+            applier.start();
+            assertTrue(value.entered.await(5, TimeUnit.SECONDS));
+            applier.interrupt(); // Simulates stop() interrupting a relay applier inside apply.
+            applier.join(5_000);
+            assertFalse(applier.isAlive());
+            assertNull(failure.get());
+            assertTrue(persistence.walOpen());
+            assertEquals(0, persistence.failureCount());
+            persistence.appendAsync(NMapOperationType.PUT, "writer-tail", "drained");
+            persistence.close();
+            Map<String, Serializable> recovered = new ConcurrentHashMap<>();
+            new NMapPersistence<>(config(), recovered, directory, "interrupted-apply").load();
+            assertEquals("confirmed", recovered.get("already-interrupted"));
+            assertInstanceOf(BlockingValue.class, recovered.get("interrupted-during-apply"));
+            assertEquals("drained", recovered.get("writer-tail"));
+        } finally { value.release.countDown(); applier.join(5_000); persistence.close(); }
     }
 
-    private static class ForceFailingChannel extends java.nio.channels.FileChannel {
-        protected final java.nio.channels.FileChannel delegate;
-        ForceFailingChannel(java.nio.channels.FileChannel delegate) { this.delegate = delegate; }
-        public void force(boolean metadata) throws IOException { throw new IOException("injected final force failure"); }
-        protected void implCloseChannel() throws IOException { delegate.close(); }
-        public int read(java.nio.ByteBuffer dst) throws IOException { return delegate.read(dst); }
-        public long read(java.nio.ByteBuffer[] dst, int offset, int length) throws IOException { return delegate.read(dst, offset, length); }
-        public int write(java.nio.ByteBuffer src) throws IOException { return delegate.write(src); }
-        public long write(java.nio.ByteBuffer[] src, int offset, int length) throws IOException { return delegate.write(src, offset, length); }
-        public long position() throws IOException { return delegate.position(); }
-        public java.nio.channels.FileChannel position(long value) throws IOException { delegate.position(value); return this; }
-        public long size() throws IOException { return delegate.size(); }
-        public java.nio.channels.FileChannel truncate(long size) throws IOException { delegate.truncate(size); return this; }
-        public long transferTo(long position, long count, java.nio.channels.WritableByteChannel target) throws IOException { return delegate.transferTo(position, count, target); }
-        public long transferFrom(java.nio.channels.ReadableByteChannel src, long position, long count) throws IOException { return delegate.transferFrom(src, position, count); }
-        public int read(java.nio.ByteBuffer dst, long position) throws IOException { return delegate.read(dst, position); }
-        public int write(java.nio.ByteBuffer src, long position) throws IOException { return delegate.write(src, position); }
-        public java.nio.MappedByteBuffer map(MapMode mode, long position, long size) throws IOException { return delegate.map(mode, position, size); }
-        public java.nio.channels.FileLock lock(long position, long size, boolean shared) throws IOException { return delegate.lock(position, size, shared); }
-        public java.nio.channels.FileLock tryLock(long position, long size, boolean shared) throws IOException { return delegate.tryLock(position, size, shared); }
+    @Test @Timeout(20)
+    void interruptArrivingAtLiveFsyncBoundaryPreservesConfirmedWriteAndWriterTail() throws Exception {
+        NMapPersistence<String, String> persistence = new NMapPersistence<>(config(), new ConcurrentHashMap<>(), directory, "interrupted-fsync");
+        persistence.start();
+        CountDownLatch entered = new CountDownLatch(1), release = new CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicBoolean first = new java.util.concurrent.atomic.AtomicBoolean(true);
+        persistence.checkpointFaultInjector(path -> {
+            if (path.getFileName().toString().equals("wal.log") && first.compareAndSet(true, false)) {
+                entered.countDown();
+                try { release.await(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            }
+        });
+        java.util.concurrent.atomic.AtomicReference<Throwable> failure = new java.util.concurrent.atomic.AtomicReference<>();
+        Thread applier = new Thread(() -> {
+            try {
+                persistence.appendSync(NMapOperationType.PUT, "confirmed", "value");
+                assertTrue(Thread.currentThread().isInterrupted());
+            } catch (Throwable error) { failure.set(error); }
+        });
+        try {
+            applier.start(); assertTrue(entered.await(5, TimeUnit.SECONDS));
+            applier.interrupt(); applier.join(5_000);
+            assertFalse(applier.isAlive()); assertNull(failure.get());
+            assertTrue(persistence.walOpen()); assertEquals(0, persistence.failureCount());
+            persistence.appendAsync(NMapOperationType.PUT, "tail", "drained");
+            persistence.close();
+            Map<String, String> recovered = new ConcurrentHashMap<>();
+            new NMapPersistence<>(config(), recovered, directory, "interrupted-fsync").load();
+            assertEquals(Map.of("confirmed", "value", "tail", "drained"), recovered);
+        } finally { release.countDown(); applier.join(5_000); persistence.close(); }
     }
 
     private static class BlockingValue implements Serializable {

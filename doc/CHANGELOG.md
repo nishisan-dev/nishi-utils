@@ -13,6 +13,8 @@ incorporá-los; não deve ser usada como destino de implantação.
   entre batches retirados da fila, snapshot e WAL continua serializada.
 - O snapshot periódico copia o estado e separa o prefixo do WAL sob os locks; serialização e
   fsync da imagem ocorrem fora do lock de mutação, preservando escritas posteriores no WAL.
+- Escrita e fsync do WAL preservam a interrupção de appliers durante shutdown sem fechar
+  o descritor compartilhado; o writer ainda conclui a drenagem e reporta falhas reais de disco.
 - Falha de checkpoint interrompe novas tentativas. A recuperação valida a identidade da
   imagem antes de substituir o snapshot ou descartar o WAL antigo; arquivos ambíguos são
   preservados e impedem abertura confiável, em vez de autorizar perda silenciosa.

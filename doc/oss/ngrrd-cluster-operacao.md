@@ -975,7 +975,9 @@ escrita e pode truncar o fim.
 
 ## Atualização para 8.11.1
 
-A 8.11.1 incorpora as correções da revisão da PR #196. A 8.11.0 já foi publicada com
+A 8.11.1 incorpora as correções da revisão da PR #196. Interrupções dos appliers no
+encerramento não fecham o WAL compartilhado durante a escrita ou fsync; a drenagem final
+continua obrigatória, com propagação de falhas reais de persistência. A 8.11.0 já foi publicada com
 regressões de persistência e não deve ser usada como destino de implantação. As correções
 de #195/#190 continuam presentes: o disco é carregado antes do registro do handler, e a instalação
 completa é persistida antes do cutover. `Sync completed for ...` permanece com o texto conhecido;
@@ -1060,11 +1062,11 @@ nessa etapa. Os valores são latência de **admissão assíncrona**, não confir
 
 | Medição | 8.11.0 publicada | Correção 8.11.1 |
 | --- | --- | --- |
-| Admissão com fsync, média de cada uma das três rodadas | 129–225 µs/put | 0,43–0,79 µs/put |
-| Admissão sem fsync, média de cada uma das três rodadas | 5,99–6,23 µs/put | 0,20–0,42 µs/put |
-| Snapshot periódico, 900 mil placements, duração completa (duas rodadas) | 1,77–1,87 s | 1,87–2,09 s |
-| Maior latência de mutação durante o snapshot, em cada rodada | 1,77–1,86 s | 99–139 ms |
-| Mutações admitidas durante cada snapshot, amostradas a cada 1 ms | 1 | 1.617–1.781 |
+| Admissão com fsync, média de cada uma das três rodadas | 129–225 µs/put | 0,41–1,23 µs/put |
+| Admissão sem fsync, média de cada uma das três rodadas | 5,99–6,23 µs/put | 0,20–0,46 µs/put |
+| Snapshot periódico, 900 mil placements, duração completa (duas rodadas) | 1,77–1,87 s | 1,89–1,97 s |
+| Maior latência de mutação durante o snapshot, em cada rodada | 1,77–1,86 s | 72–122 ms |
+| Mutações admitidas durante cada snapshot, amostradas a cada 1 ms | 1 | 1.607–1.669 |
 
 A imagem mede 104.068.386 bytes. A correção conserva uma pausa para copiar o estado e separar
 o WAL; não promete ausência de I/O sob lock. A serialização, o fsync da imagem e o cálculo de
