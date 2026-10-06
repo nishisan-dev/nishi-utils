@@ -55,6 +55,7 @@ class NgrrdClusterConfigYamlTest {
                   closeTimeout: 45s
                   leaderWaitTimeout: 20s
                   catalogLookupBatchSize: 500
+                  writeFailureReporting: marks
                 """;
 
         NgrrdClusterConfig config = NgrrdClusterConfig.fromYaml(yaml, NO_ENV);
@@ -74,6 +75,7 @@ class NgrrdClusterConfigYamlTest {
         assertEquals(Duration.ofSeconds(45), config.closeTimeout());
         assertEquals(Duration.ofSeconds(20), config.leaderWaitTimeout());
         assertEquals(500, config.catalogLookupBatchSize());
+        assertEquals(NgrrdClusterConfig.WriteFailureReporting.MARKS, config.writeFailureReporting());
     }
 
     @Test
@@ -98,6 +100,8 @@ class NgrrdClusterConfigYamlTest {
         assertEquals(defaults.leaderWaitTimeout(), config.leaderWaitTimeout());
         assertEquals(2_000, config.catalogLookupBatchSize());
         assertEquals(defaults.catalogLookupBatchSize(), config.catalogLookupBatchSize());
+        assertEquals(NgrrdClusterConfig.WriteFailureReporting.BARRIER, config.writeFailureReporting());
+        assertEquals(defaults.writeFailureReporting(), config.writeFailureReporting());
     }
 
     @Test
