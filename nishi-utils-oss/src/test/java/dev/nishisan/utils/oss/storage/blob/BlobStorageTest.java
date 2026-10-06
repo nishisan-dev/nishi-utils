@@ -1,5 +1,6 @@
 package dev.nishisan.utils.oss.storage.blob;
 
+import dev.nishisan.utils.oss.blob.VolumeWriteMode;
 import dev.nishisan.utils.oss.metrics.BlobVolumeMetrics;
 import dev.nishisan.utils.oss.metrics.BlobVolumeMetricsListener;
 import dev.nishisan.utils.oss.metrics.BlobVolumeStats;
@@ -9,6 +10,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
@@ -21,6 +23,8 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Backend de storage sharded blob (ver doc/oss/ngrrd-blob-volume.md). */
@@ -319,5 +323,102 @@ class BlobStorageTest {
                         "série conc-" + i + " corrompida");
             }
         }
+    }
+
+    // ---------------------------------------------------------------- modo de escrita dos shards
+
+    private static BlobStorage openOrCreate(Path dir, VolumeWriteMode mode) {
+        return BlobStorage.openOrCreate(dir, SHARDS, SEG, INITIAL_CAP, mode, null);
+    }
+
+    /** Escreve uma série em {@code key} e devolve a soma dos contadores por caminho depois da escrita. */
+    private static void writeSeries(BlobStorage bs, String key) {
+        try (SeriesChannel ch = bs.openSeries(key)) {
+            ch.allocate(8192);
+            ch.writeRegion(0, pattern(8192, 3));
+        }
+    }
+
+    private static void assertEveryShardHasMode(BlobStorage bs, VolumeWriteMode expected) {
+        for (int i = 0; i < SHARDS; i++) {
+            assertEquals(expected, bs.shard(i).writeMode(), "shard " + i);
+        }
+        assertEquals(expected, bs.writeMode());
+    }
+
+    @Test
+    void criarEReabrirPropagamOModoPedidoATodosOsShardsEAEscritaCaiNoCaminhoCerto(@TempDir Path dir) {
+        // criação em PWRITE
+        try (BlobStorage bs = openOrCreate(dir, VolumeWriteMode.PWRITE)) {
+            assertEveryShardHasMode(bs, VolumeWriteMode.PWRITE);
+            writeSeries(bs, "series/a.ngrr");
+            assertEquals(0L, bs.mappedBytesWritten());
+            assertTrue(bs.positionalBytesWritten() >= 8192L);
+            assertEquals(VolumeWriteMode.PWRITE, bs.stats().writeMode());
+        }
+        // reabre no modo oposto
+        try (BlobStorage bs = openOrCreate(dir, VolumeWriteMode.MMAP)) {
+            assertEveryShardHasMode(bs, VolumeWriteMode.MMAP);
+            writeSeries(bs, "series/b.ngrr");
+            assertEquals(0L, bs.positionalBytesWritten());
+            assertTrue(bs.mappedBytesWritten() >= 8192L);
+            assertEquals(bs.bytesWritten(), bs.mappedBytesWritten());
+            assertEquals(VolumeWriteMode.MMAP, bs.stats().writeMode());
+        }
+        // e de volta para PWRITE
+        try (BlobStorage bs = BlobStorage.open(dir, VolumeWriteMode.PWRITE, null)) {
+            assertEveryShardHasMode(bs, VolumeWriteMode.PWRITE);
+            writeSeries(bs, "series/c.ngrr");
+            assertEquals(0L, bs.mappedBytesWritten());
+            assertTrue(bs.positionalBytesWritten() >= 8192L);
+            assertArrayEquals(pattern(8192, 3), bs.get("series/a.ngrr").orElseThrow());
+            assertArrayEquals(pattern(8192, 3), bs.get("series/b.ngrr").orElseThrow());
+        }
+    }
+
+    @Test
+    void metodosSemModoUsamMmapNosShards(@TempDir Path dir) {
+        try (BlobStorage bs = open(dir)) {
+            assertEveryShardHasMode(bs, VolumeWriteMode.MMAP);
+        }
+    }
+
+    @Test
+    void closeAllExecutaTodosOsFechamentosMesmoQuandoUmFalhaEAcumulaAsFalhas() {
+        List<String> ran = new ArrayList<>();
+        RuntimeException first = new IllegalStateException("primeira");
+        RuntimeException second = new IllegalStateException("segunda");
+        List<Runnable> closers = List.of(
+                () -> ran.add("a"),
+                () -> {
+                    ran.add("b");
+                    throw first;
+                },
+                () -> ran.add("c"),
+                () -> {
+                    ran.add("d");
+                    throw second;
+                },
+                () -> ran.add("e"));
+
+        RuntimeException failure = BlobStorage.closeAll(closers);
+
+        assertEquals(List.of("a", "b", "c", "d", "e"), ran, "todos os fechamentos devem rodar");
+        assertSame(first, failure);
+        assertEquals(List.of(second), List.of(failure.getSuppressed()));
+        assertNull(BlobStorage.closeAll(List.of(() -> ran.add("f"))));
+    }
+
+    @Test
+    void closeDoVolumeEIdempotenteEMarcaFechadoDeFormaConsistente(@TempDir Path dir) {
+        BlobStorage bs = openOrCreate(dir, VolumeWriteMode.PWRITE);
+        writeSeries(bs, "series/a.ngrr");
+        bs.close();
+        bs.close();
+        // reabre sem problema: o volume foi fechado e checkpointado por inteiro
+        try (BlobStorage reopened = openOrCreate(dir, VolumeWriteMode.PWRITE)) {
+            assertArrayEquals(pattern(8192, 3), reopened.get("series/a.ngrr").orElseThrow());
+        }
+        assertThrows(BlobVolumeException.class, () -> bs.shard(0).writeAt(8192L, pattern(8, 1)));
     }
 }

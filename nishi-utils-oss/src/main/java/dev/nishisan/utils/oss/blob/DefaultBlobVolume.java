@@ -35,7 +35,7 @@ final class DefaultBlobVolume implements BlobVolume {
     static DefaultBlobVolume open(BlobVolumeConfig config, NgrrdMetricsListener qualityListener,
                                   BlobVolumeMetricsListener volumeMetricsListener) {
         BlobStorage storage = BlobStorage.openOrCreate(config.directory(), config.shardCount(),
-                config.segmentBytes(), config.initialShardCapacityBytes(), volumeMetricsListener);
+                config.segmentBytes(), config.initialShardCapacityBytes(), config.writeMode(), volumeMetricsListener);
         return new DefaultBlobVolume(config.name(), config.directory(), config.shardCount(), storage,
                 qualityListener, volumeMetricsListener);
     }

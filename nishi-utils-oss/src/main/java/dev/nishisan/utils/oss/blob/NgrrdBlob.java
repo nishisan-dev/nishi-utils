@@ -36,6 +36,7 @@ public final class NgrrdBlob {
         private int shardCount = BlobVolumeConfig.DEFAULT_SHARD_COUNT;
         private long segmentBytes = BlobVolumeConfig.DEFAULT_SEGMENT_BYTES;
         private long initialCapacity = -1;
+        private VolumeWriteMode writeMode = VolumeWriteMode.MMAP;
         private NgrrdMetricsListener qualityListener;
         private BlobVolumeMetricsListener volumeMetricsListener;
         private final List<BlobVolumeConfig> configs = new ArrayList<>();
@@ -62,6 +63,15 @@ public final class NgrrdBlob {
         }
 
         /**
+         * Modo de escrita dos shards dos volumes registrados por nome (default
+         * {@link VolumeWriteMode#MMAP}). Ver {@link VolumeWriteMode}.
+         */
+        public Builder writeMode(VolumeWriteMode writeMode) {
+            this.writeMode = Objects.requireNonNull(writeMode, "writeMode é obrigatório");
+            return this;
+        }
+
+        /**
          * Listener de qualidade default aplicado a todos os volumes do registro,
          * propagado a cada handle aberto via {@code Ngrrd.open(...)}.
          */
@@ -80,7 +90,8 @@ public final class NgrrdBlob {
         public Builder volume(String name) {
             Objects.requireNonNull(basePath, "basePath é obrigatório para registrar volume por nome");
             long capacity = initialCapacity > 0 ? initialCapacity : segmentBytes;
-            configs.add(new BlobVolumeConfig(name, basePath.resolve(name), shardCount, segmentBytes, capacity));
+            configs.add(new BlobVolumeConfig(name, basePath.resolve(name), shardCount, segmentBytes, capacity,
+                    writeMode));
             return this;
         }
 
