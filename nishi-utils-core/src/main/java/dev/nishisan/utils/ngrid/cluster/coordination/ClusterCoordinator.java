@@ -404,19 +404,27 @@ public final class ClusterCoordinator implements TransportListener, Closeable {
         return aheadEligiblePeer(transport.local().nodeId()) != null;
     }
 
-    /** The active, eligible peer AHEAD of the local node (the first found), or {@code null}. */
+    /**
+     * The active, eligible peer AHEAD of the local node holding the NEWEST advertised state, or
+     * {@code null} when none is ahead. 8.11.2: ranked with {@link #compareAdvertisedState} instead of
+     * returning the first match of the map iteration — the fresh-leader yield hands leadership to this
+     * peer, and with two peers ahead the iteration order picked an arbitrary one (the CTP incident:
+     * the demoted incumbent and the third node were both candidates).
+     */
     private NodeId aheadEligiblePeer(NodeId localId) {
+        NodeId best = null;
         for (Map.Entry<NodeId, Long> e : peerHighWatermark.entrySet()) {
             if (e.getKey().equals(localId) || e.getValue() == null) {
                 continue;
             }
             ClusterMember member = members.get(e.getKey());
             if (member != null && member.isActive() && member.info().isLeaderEligible()
-                    && peerAheadOfLocal(e.getKey())) {
-                return e.getKey();
+                    && peerAheadOfLocal(e.getKey())
+                    && (best == null || compareAdvertisedState(e.getKey(), best) > 0)) {
+                best = e.getKey();
             }
         }
-        return null;
+        return best;
     }
 
     /** Local frontier vector, or {@code null} when the local node advertises none. */

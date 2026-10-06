@@ -1152,3 +1152,64 @@ flock /tmp/nishi-utils-maven.lock mvn -B -pl nishi-utils-ngrrd-cluster -am test 
   -Dtest=SeriesLifecycleJournalSizingBenchmarkTest \
   -Dsurefire.failIfNoSpecifiedTests=false -Dngrrd.journal.benchmark=true -DargLine=-Xmx1g
 ```
+
+## Atualização para 8.11.2
+
+### O que a 8.11.2 corrige
+
+Incidente no CTP (2026-10-05): a storage de maior afinidade reiniciou e, com o catálogo ainda
+carregando do disco, pediu e recebeu o handback com um conjunto parcial de handlers. Instalou só
+`_ngrid-queue-offsets`, declarou o cutover e enviou ao incumbente as fronteiras de disco dos
+tópicos que não instalou; o incumbente renumerou `ngrrd.nodes` para baixo. Só não houve perda no
+catálogo porque o coordenador estava parado. O defeito existe desde a 8.8.0.
+
+Na 8.11.2 o handback é seguro nas duas pontas:
+
+- o GRANT nomeia só os tópicos que o incumbente **serve** (mapas com handler registrado); um mapa
+  removido da configuração, que só existe no `sequence-state.dat`, fica de fora e não trava mais o
+  handback;
+- o candidato instala exatamente esses tópicos e só conclui o cutover com **todos** instalados; se
+  não tiver o handler de um deles (os storages precisam declarar os mesmos mapas), aborta **na
+  hora** com o log `GRANT names topics this node has no handler for [...]` e tenta de novo após o
+  cooldown — corrija a configuração do candidato, pois cada tentativa congela a produção do líder por
+  alguns milissegundos; o prazo de `handoverSnapshotTimeout` (120 s) só se aplica a um snapshot que o
+  incumbente não entrega;
+- o nó não anuncia fronteira, não é elegível e não pede nem aceita handback enquanto `start()` não
+  registrou o último mapa configurado (log `Replication handlers ready`);
+- o incumbente só reancora um tópico do seu vetor congelado, e só quando o cutover recebido é igual à
+  fronteira que congelou; caso contrário mantém fronteira, contador, op-log e relay e emite o
+  marcador abaixo.
+
+### Ordem de deploy
+
+1. Pare o coordenador (único escritor do catálogo) durante a janela.
+2. Troque o jar dos storages **um por vez**, com restart gracioso, e espere `NGRRD_STORAGE_NODE_STARTED`
+   e `Replication handlers ready` antes do próximo. Comece pelos de menor `priority`.
+3. Deixe o storage de maior afinidade (maior `priority`) **por último**: é ele que pede o handback
+   ao voltar. Confirme no log dele `Affinity handback: cutover complete` e, no incumbente,
+   `demoted incumbent re-anchored per topic` com os três mapas (`ngrrd.catalog`, `ngrrd.nodes`,
+   `ngrrd.geometries`) e `_ngrid-queue-offsets`, sem o marcador de divergência.
+4. Compare o conteúdo do catálogo entre os três nós (diff de valores, como na seção da 8.10.1) e só
+   então religue o coordenador.
+
+### Retirar a mitigação de `priority`
+
+A mitigação adotada no incidente — deixar o storage reiniciado com `priority` igual ou menor que a
+do incumbente para evitar o handback — só pode ser retirada com **todos** os nós na 8.11.2: um
+incumbente anterior ainda aceita o REQUEST de um candidato parcial e faz o SET incondicional do
+vetor; um candidato anterior ainda conclui o cutover com instalação parcial. Com o cluster inteiro
+na 8.11.2, restaure as prioridades originais um nó por vez, com restart gracioso, e confirme o
+handback pelos logs acima.
+
+### Marcador `NGRID_HANDBACK_VECTOR_MISMATCH`
+
+Emitido em SEVERE pelo incumbente rebaixado quando uma entrada do `HANDBACK_COMPLETE` difere da
+fronteira congelada ou nomeia um tópico fora do vetor congelado (`topic=`, `cutover=`, `frozen=`,
+`peer=`; `frozen=<not served>` no segundo caso). Significa que o candidato não instalou o snapshot
+deste nó para o tópico — com todos os nós na 8.11.2 não deve ocorrer; aparece só com versões
+misturadas. A validação **não repara** a divergência: o novo líder lidera com um estado mais antigo
+do tópico e, quando a autocura de seguidor à frente convergir este nó a ele, as operações entre o
+rótulo antigo e a fronteira congelada se perdem no tópico. Por isso, ao ver o marcador: pare a
+escrita no tópico, verifique as versões dos dois nós, compare o conteúdo entre eles e force o
+handback de volta (restart gracioso do novo líder, com o nó que emitiu o marcador servindo o
+snapshot) antes de aceitar escrita de novo.

@@ -64,6 +64,7 @@ class TopicFrontierElectionGateTest {
     private static final String NODES = "map:ngrrd.nodes";
     private static final NodeId PREFERRED = NodeId.of("node-1"); // afinidade MAIOR (prioridade 100)
     private static final NodeId INCUMBENT = NodeId.of("node-2"); // afinidade MENOR (prioridade 50)
+    private static final NodeId THIRD = NodeId.of("node-3");     // terceiro nó (prioridade 10)
 
     private final List<AutoCloseable> closeables = new ArrayList<>();
 
@@ -151,6 +152,44 @@ class TopicFrontierElectionGateTest {
         h.startPeerHeartbeats(INCUMBENT, 7L, 24L, Map.of(CATALOG, 4L, NODES, 20L));
         awaitLeader(h, INCUMBENT);
         assertFalse(h.coord.isLeader(), "sem nada produzido, ceder não perde nenhuma op");
+    }
+
+    /**
+     * 8.11.2: com DOIS peers à frente, o líder recém-eleito cede ao que tem o estado mais novo, não ao
+     * primeiro da iteração do mapa. O "já produziu" segura a cessão até os dois serem conhecidos; depois
+     * a produção é zerada e a reavaliação decide com o par completo. As duas variantes trocam qual peer
+     * está mais à frente, de modo que uma escolha por ordem de iteração falha em pelo menos uma.
+     */
+    @Test
+    void freshLeaderYieldsToTheMostAdvancedOfTwoPeersAhead_thirdAhead() throws Exception {
+        assertYieldTarget(Map.of(CATALOG, 4L, NODES, 20L), Map.of(CATALOG, 5L, NODES, 20L), THIRD);
+    }
+
+    @Test
+    void freshLeaderYieldsToTheMostAdvancedOfTwoPeersAhead_incumbentAhead() throws Exception {
+        assertYieldTarget(Map.of(CATALOG, 5L, NODES, 20L), Map.of(CATALOG, 4L, NODES, 20L), INCUMBENT);
+    }
+
+    private void assertYieldTarget(Map<String, Long> incumbentFrontiers, Map<String, Long> thirdFrontiers,
+            NodeId expected) throws Exception {
+        Harness h = harness(PREFERRED, 100, INCUMBENT, 50, Duration.ofMillis(200),
+                List.of(new NodeInfo(THIRD, "127.0.0.1", 3, Collections.emptySet(), 10)));
+        h.localFrontiers.set(Map.of(CATALOG, 3L, NODES, 20L));
+        java.util.concurrent.atomic.AtomicBoolean produced = new java.util.concurrent.atomic.AtomicBoolean(true);
+        h.coord.setLeaderProductionSupplier(produced::get);
+        h.start();
+        awaitLeader(h, PREFERRED);
+        h.startPeerHeartbeats(INCUMBENT, 7L, TopicFrontiers.of(incumbentFrontiers).total(), incumbentFrontiers);
+        h.startPeerHeartbeats(THIRD, 7L, TopicFrontiers.of(thirdFrontiers).total(), thirdFrontiers);
+        long deadline = System.currentTimeMillis() + 600;
+        while (System.currentTimeMillis() < deadline) {
+            assertTrue(h.coord.isLeader(), "enquanto 'produziu', o líder retém (F2) e conhece os dois peers");
+            Thread.sleep(50);
+        }
+        produced.set(false);
+        h.coord.reevaluateLeadership();
+        awaitLeader(h, expected);
+        assertFalse(h.coord.isLeader());
     }
 
     /** (d) O líder corrente que JÁ produziu nunca abdica por um vetor de seguidor acima do seu (F2 do D9). */

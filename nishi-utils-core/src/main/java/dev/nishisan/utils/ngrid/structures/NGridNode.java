@@ -76,6 +76,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -121,14 +122,28 @@ public final class NGridNode implements Closeable {
     private final AtomicBoolean started = new AtomicBoolean();
     private final List<Runnable> resourceListeners = new ArrayList<>();
 
+    /**
+     * Test seam (8.11.2): invoked with the map name right before a configured map's service is created
+     * (disk load + handler registration) during {@link #start()}. Lets a test hold the registration of
+     * one map to reproduce a node whose handler set is still partial while the coordinator is live. The
+     * default does nothing; package-private on purpose, never part of the public API.
+     */
+    private final Consumer<String> mapRegistrationBarrier;
+
     public NGridNode(NGridConfig config) {
+        this(config, name -> { });
+    }
+
+    NGridNode(NGridConfig config, Consumer<String> mapRegistrationBarrier) {
         this.config = config;
+        this.mapRegistrationBarrier = Objects.requireNonNull(mapRegistrationBarrier, "mapRegistrationBarrier");
     }
 
     public NGridNode(Path configFile) throws IOException {
         this.configFile = Objects.requireNonNull(configFile, "configFile");
         this.yamlConfig = NGridConfigLoader.load(configFile);
         this.config = NGridConfigLoader.convertToDomain(this.yamlConfig);
+        this.mapRegistrationBarrier = name -> { };
     }
 
     public void addResourceListener(Runnable listener) {
@@ -414,6 +429,11 @@ public final class NGridNode implements Closeable {
         replicationManager = new ReplicationManager(transport, coordinator, replicationBuilder.build());
         // 8.10.1: the clean-shutdown marker is written by close() only after the map services drained.
         replicationManager.deferCleanShutdownMarker();
+        // 8.11.2: the node is not leader-eligible, advertises no frontier and takes part in no handback
+        // until every configured queue and map below is registered (markHandlersReady). The coordinator
+        // and the handback tick start now, but a map still loading from disk must not leave the node
+        // with a partial handler set in an election or a handback (CTP incident, 2026-10-05).
+        replicationManager.deferHandlersReady();
         // The leader high-watermark supplier is wired by ReplicationManager.start() itself (#131), so
         // it is correct for manual assemblies too — no external wiring needed here.
         replicationManager.start();
@@ -489,6 +509,8 @@ public final class NGridNode implements Closeable {
                 maps.computeIfAbsent(mapConfig.name(), this::createDistributedMap);
             }
         }
+        // 8.11.2: every configured queue and map is registered — release the readiness gate.
+        replicationManager.markHandlersReady();
 
         // Defensive handler: responds with error for CLIENT_REQUEST targeting
         // maps that are not registered on this node, preventing followers from
@@ -1091,6 +1113,7 @@ public final class NGridNode implements Closeable {
     }
 
     private MapClusterService<Serializable, Serializable> createMapService(String mapName) {
+        mapRegistrationBarrier.accept(mapName);
         // Infrastructure maps (like offset tracking) always persist regardless of user
         // configuration
         NMapPersistenceMode effectiveMode = mapPersistenceOverrides.getOrDefault(mapName, config.mapPersistenceMode());
