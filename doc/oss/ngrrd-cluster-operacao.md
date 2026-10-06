@@ -1213,3 +1213,63 @@ rótulo antigo e a fronteira congelada se perdem no tópico. Por isso, ao ver o 
 escrita no tópico, verifique as versões dos dois nós, compare o conteúdo entre eles e force o
 handback de volta (restart gracioso do novo líder, com o nó que emitiu o marcador servindo o
 snapshot) antes de aceitar escrita de novo.
+
+## Durabilidade das amostras
+
+### O que o ACK do `WRITE_BATCH` garante
+
+O ACK do `WRITE_BATCH` confirma **admissão**, não durabilidade:
+
+1. O storage grava no journal de ciclo de vida, com fsync, as marcas de recepção que avançaram.
+2. Ele chama `handle.write()`, que só **enfileira** a amostra na fila em memória da worker do
+   `NgrrdWriter`, e responde.
+3. A worker aplica a amostra no estado em memória (PDP/CDP em progresso) e grava as células do ring
+   no mmap do shard (page cache), sem fsync.
+
+Não existe WAL de amostras. A amostra fica durável no `checkpoint()`, que materializa o CDP parcial
+e o live state e, conforme a durabilidade da série, força a gravação: `BlobSeriesChannel.force` →
+`MappedShard.forceRange`, um msync do range da série.
+
+Se o cliente faz commit do offset do Kafka só com o ACK, um crash do storage perde, sem
+reprocessamento, as amostras aceitas depois do último checkpoint de cada série naquele nó.
+**Recomendação:** fazer o commit do offset só até o último checkpoint concluído. Assim, um crash do
+processo vira reprocessamento. Depende de o reprocessamento de amostras já aplicadas ser inofensivo
+na definição usada.
+
+### `FSYNC` × `OS_CACHE`
+
+| | `FSYNC` (padrão) | `OS_CACHE` |
+|---|---|---|
+| Checkpoint | materializa e faz msync do range | materializa no mmap e **não** faz msync; o SO descarrega |
+| Crash do processo (OOM, kill) | perde a fila e o estado em memória desde o último checkpoint | igual; o que já foi materializado sobrevive no page cache |
+| Crash do SO ou falta de energia | perde o que veio depois do último checkpoint | perde o que ainda estava sujo no page cache (até o `vm.dirty_expire_centisecs`, ~30 s por padrão) e pode deixar a série inconsistente (ver abaixo) |
+| `close()` limpo | força tudo | força tudo |
+| Custo | um msync por série por checkpoint: cresce com o número de séries (#202) | só a materialização |
+
+- **Onde configurar:**
+  - no storage, `ngrrd.defaultDurability: OS_CACHE` (YAML);
+  - no OPEN ou na definição da série (`storage.durability`), que têm precedência sobre o default do storage.
+- **Quando vale:** só para handles abertos depois da mudança (restart do storage ou reabertura).
+- **Restrição:** `OS_CACHE` não é suportado em `OBJECT_STORAGE`.
+- **Fora do alcance:** os **metadados não mudam com isso**. O journal de ciclo de vida (gerações, marcas da
+  purga, quarentena) e os mapas do NGrid (catálogo) continuam com fsync.
+
+Com um único dono por série (sem réplica das amostras), o fsync protege só contra crash do SO ou
+falta de energia, não contra a perda do nó ou do disco. O `OS_CACHE` segue a mesma troca do Kafka:
+confirma em memória e deixa a descarga para o SO.
+
+### Risco do formato NGRR v1 em crash do SO com `OS_CACHE`
+
+O formato v1 é um ring sobrescrito no lugar. Só o cabeçalho e o live state têm CRC; as células, não.
+Sem fsync, o kernel não garante a ordem de gravação entre as células e o ponteiro do ring. Depois de
+um crash do SO ou de falta de energia, uma série pode ficar:
+
+- **com CRC inválido no cabeçalho ou no live state:** a série não abre de forma confiável e é
+  considerada perdida. O contorno é recuperar os dados do archive, mesmo com menos definições;
+- **com valor antigo apontado como novo, sem nenhum sinal**, porque a linha do ring não é
+  autodescritiva.
+
+Com o cache da controladora protegido por bateria, o que já desceu para a controladora fica
+preservado, e o risco se restringe ao que estava sujo no page cache. Para quem não aceita esse
+risco, mantenha `FSYNC`. O formato v2, com recuperação de crash, está em desenho (#206) e
+transforma as escritas interrompidas em lacunas detectáveis (NaN).
