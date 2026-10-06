@@ -224,7 +224,8 @@ espaço não usado (recuperado pela próxima alocação).
 - **Hot path (escrita de célula):** não toca catálogo nem lock estrutural. Escritas
   de séries distintas atingem **regiões disjuntas** do mesmo `MappedByteBuffer` e
   usam acessadores absolutos (`putDouble(index,…)`/`get(index)`), logo são
-  concorrentes sem corrida de `position`.
+  concorrentes sem corrida de `position`. Em `PWRITE` (§10.1) a escrita é um `seek`+`write`
+  serializado por um lock por shard (o kernel já serializa por inode).
 - **`force()` por série:** `MappedByteBuffer.force(index, length)` (Java 13+)
   sincroniza só as páginas da própria região.
 - **Mutação estrutural (create/delete/grow):** serializada por um `structuralLock`
@@ -233,6 +234,82 @@ espaço não usado (recuperado pela próxima alocação).
 - **Migração offline:** a ferramenta Python deve rodar **sem writer Java ativo**
   sobre as mesmas séries (janela de manutenção). Único escritor dos shards durante
   a migração são os próprios workers, particionados por shard.
+
+### 10.1. Modo de escrita (`writeMode`, 8.13.0)
+
+> **Não-normativa.** O modo de escrita não altera o layout on-disk nem a compatibilidade
+> cross-language: um volume escrito num modo pode ser reaberto no outro.
+
+O caminho de escrita dos shards é configurável por volume (`BlobVolumeConfig.writeMode`,
+`NgrrdBlob.Builder.writeMode(...)`, `ngrrd.volume.writeMode` no storage node do cluster):
+
+| Modo | Escrita (`MappedShard.writeAt`) | Leitura (`readAt`) |
+|---|---|---|
+| `MMAP` (default) | `MappedByteBuffer.put(index, …)` — comportamento histórico | mmap |
+| `PWRITE` | `RandomAccessFile.seek(pos)` + `write(byte[], off, len)` sob um lock por shard | mmap |
+
+**Motivação.** Em kernels recentes o page cache usa *folios* grandes (16–128 KB no XFS). Uma
+escrita via mmap suja o folio **inteiro**, e o writeback grava o folio inteiro: numa carga de
+produção (kernel 6.8, XFS) observaram-se ~290 KB regravados por série a cada virada para escritas
+lógicas de dezenas de bytes. Com escrita bufferizada (`write()`/`pwrite`), o XFS (iomap, kernel
+6.6+) rastreia a sujeira **por bloco de 4 KB**, e o writeback grava só os blocos tocados.
+
+**Nome.** `pwrite` designa a escrita bufferizada posicional (`lseek`+`write` via `java.io`, sob um lock
+por shard), não o syscall `pwrite(2)` literalmente; o efeito no kernel é o mesmo caminho bufferizado
+(page cache, rastreio de sujeira por bloco no XFS/ext4 recentes).
+
+**Coerência.** O mapeamento é `MAP_SHARED`: mmap e `write()` compartilham o mesmo page cache, então
+uma leitura via mmap enxerga imediatamente o que o `pwrite` acabou de gravar, sem `force` e sem cópia
+extra. Por isso a leitura continua sempre pelo mmap, nos dois modos. A escrita `PWRITE` é um
+`seek`+`write` do `java.io.RandomAccessFile`, serializado por um lock por shard, e **não é tão
+concorrente quanto o mmap**: o custo da serialização no processo é pequeno porque no XFS a escrita
+bufferizada já toma o lock exclusivo do inode (`IOLOCK_EXCL`, `i_rwsem`) durante o `write()`, então
+escritas no mesmo arquivo de shard são **serializadas no kernel** de qualquer forma; além disso, cada
+`write()` pode atualizar o `mtime` (`file_update_time`; mitigável montando com `lazytime`). O ganho do
+`PWRITE` é em **bytes gravados no disco** (writeback por bloco), não em vazão de escrita. Antes de
+ligar em produção, valide a vazão com muitas threads de escrita para poucos shards e acompanhe a
+métrica `bytesWritten`.
+
+**Posição do arquivo.** O `seek` muda a posição compartilhada do descritor. Nada no shard depende dela:
+as leituras são pelo mmap, e o `setLength` do crescimento (que no JDK salva e restaura a posição sem
+atomicidade) roda sob o mesmo lock do `PWRITE`.
+
+**Interrupção de thread.** A escrita `PWRITE` **não** usa `FileChannel`: ele é um
+`InterruptibleChannel`, e interromper a thread que escreve fecha o canal para todas as threads — e, no
+JDK 21 com virtual threads, interrupções em rajada na mesma escritora podem travá-la para sempre. O
+`RandomAccessFile` não é interrompível, então interromper uma thread no meio do `PWRITE` (ou do `fsync`
+e do `close()` do shard, que usam `FileDescriptor.sync()`) não fecha nem trava nada, e a flag de
+interrupção é preservada. O único uso de `FileChannel` é o `map` do `create`/`open`/`grow`, num canal
+temporário e exclusivo da chamada (os mapeamentos sobrevivem ao fechamento do canal): a flag é limpa e
+restaurada em volta dele e, se uma interrupção fechar esse canal, o `map` é repetido, com número limitado
+de tentativas. O `grow` é raro e serializado pelo lock estrutural do volume, e cada canal temporário é
+usado por uma única thread. Essa proteção vale **para os shards**: o journal do catálogo
+(`catalog.wal`) e o checkpoint do volume usam `FileChannel` e continuam sensíveis a interrupção, como já
+eram, nos dois modos de escrita; isso está fora desta mudança.
+
+**Durabilidade.** Inalterada. O `force` por série (`Durability.FSYNC`) continua sendo
+`MappedByteBuffer.force(index, length)` — `msync(MS_SYNC)` da faixa. No Linux o `msync` chama
+`vfs_fsync_range` sobre a faixa do arquivo e grava as páginas sujas **venham elas do mmap ou de
+`write()`**. Com `Durability.OS_CACHE` não há `force`, como antes: a persistência fica a cargo do
+writeback do kernel (o `close()` do shard continua fazendo `fsync` do arquivo).
+
+**Métricas.** `BlobVolumeStats` (e `BlobStorage.stats()`) expõe `writeMode` e `bytesWritten`: bytes
+**lógicos** entregues a `writeAt` em todos os shards desde a abertura do volume (contador acumulado,
+não persistido, igual nos dois modos; por shard há contadores separados por caminho —
+`mappedBytesWritten` e `positionalBytesWritten`). Compare a taxa de `bytesWritten` com os bytes de
+disco do dispositivo (`/proc/diskstats`, `iostat`) para medir a amplificação de escrita. No cluster,
+o `BlobVolumeSummary` do `NodeMetricsSnapshot` carrega os dois campos (`writeMode` é `null` e
+`bytesWritten` é `0` quando o nó que reportou é anterior à 8.13.0).
+
+**Recomendação.**
+
+- `PWRITE` em XFS/ext4 recentes com folios grandes (kernel 6.6+), quando o volume sofre muitas
+  escritas pequenas e dispersas (milhares de séries virando de bloco).
+- Com `MMAP`, reduzir o folio criado no *fault* ajuda: `read_ahead_kb=0` no dispositivo de bloco do
+  volume (`/sys/block/<dev>/queue/read_ahead_kb`). É um ajuste de sistema, fora do ngrrd.
+- `MADV_RANDOM` **não** é oferecido: em Java 21 exigiria FFM (preview) ou JNI.
+- O modo é uma decisão por processo: trocar de `MMAP` para `PWRITE` (ou o inverso) exige apenas
+  reabrir o volume; não há migração de dados.
 
 ## 11. Observabilidade do volume
 
@@ -266,7 +343,7 @@ volume observa a camada física:
 
 Gauges são lidos por **pull** via `BlobVolume.stats()` → `BlobVolumeStats`
 (`fillRatioPerShard`, `seriesPerShard`, `shardUsedBytes` — **uso líquido**, recua no
-free —, `catalogImageBytes`, `walBytes`), desacoplando a coleta da frequência de
+free —, `catalogImageBytes`, `walBytes`, `writeMode` e `bytesWritten` — ver §10.1), desacoplando a coleta da frequência de
 checkpoint.
 
 **Contrato de thread-safety.** `onShardGrow`/`onRegionAllocate`/`onRegionFree` são

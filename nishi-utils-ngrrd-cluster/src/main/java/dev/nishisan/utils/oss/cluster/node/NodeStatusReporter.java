@@ -494,6 +494,16 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
         } catch (RuntimeException e) {
             LOGGER.log(Level.FINE, "Falha ao ler estatísticas do volume do nó " + nodeId
                     + " (provavelmente já fechado) — snapshot de métricas degradado", e);
+            return emptyVolumeStats();
+        }
+    }
+
+    /** Placeholder degradado preservando o modo de escrita configurado (campo imutável do storage, lido sem I/O). */
+    private BlobVolumeStats emptyVolumeStats() {
+        try {
+            return new BlobVolumeStats(0, new long[0], new long[0], new long[0], new double[0], 0, 0L, 0L,
+                    volume.storage().writeMode(), 0L);
+        } catch (RuntimeException e) {
             return EMPTY_VOLUME_STATS;
         }
     }

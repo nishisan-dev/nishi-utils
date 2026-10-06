@@ -1,5 +1,6 @@
 package dev.nishisan.utils.oss.storage.blob;
 
+import dev.nishisan.utils.oss.blob.VolumeWriteMode;
 import dev.nishisan.utils.oss.metrics.BlobVolumeMetricsListener;
 import dev.nishisan.utils.oss.metrics.BlobVolumeStats;
 import dev.nishisan.utils.oss.storage.NgrrdStorage;
@@ -101,9 +102,16 @@ public final class BlobStorage implements NgrrdStorage, SeriesChannelProvider, A
 
     public static BlobStorage openOrCreate(Path volumeDir, int shardCount, long segmentBytes, long initialCapacity,
                                            BlobVolumeMetricsListener volumeMetrics) {
+        return openOrCreate(volumeDir, shardCount, segmentBytes, initialCapacity, VolumeWriteMode.MMAP,
+                volumeMetrics);
+    }
+
+    public static BlobStorage openOrCreate(Path volumeDir, int shardCount, long segmentBytes, long initialCapacity,
+                                           VolumeWriteMode writeMode, BlobVolumeMetricsListener volumeMetrics) {
         Objects.requireNonNull(volumeDir, "volumeDir é obrigatório");
+        Objects.requireNonNull(writeMode, "writeMode é obrigatório");
         if (Files.exists(volumeDir.resolve(VOLUME_META))) {
-            BlobStorage bs = open(volumeDir, volumeMetrics);
+            BlobStorage bs = open(volumeDir, writeMode, volumeMetrics);
             if (bs.shardCount != shardCount) {
                 throw new BlobVolumeException("volume " + volumeDir + " tem shardCount=" + bs.shardCount
                         + " (≠ " + shardCount + "); resharding não é suportado");
@@ -114,7 +122,7 @@ public final class BlobStorage implements NgrrdStorage, SeriesChannelProvider, A
             }
             return bs;
         }
-        return create(volumeDir, shardCount, segmentBytes, initialCapacity, volumeMetrics);
+        return create(volumeDir, shardCount, segmentBytes, initialCapacity, writeMode, volumeMetrics);
     }
 
     public static BlobStorage create(Path volumeDir, int shardCount, long segmentBytes, long initialCapacity) {
@@ -123,6 +131,12 @@ public final class BlobStorage implements NgrrdStorage, SeriesChannelProvider, A
 
     public static BlobStorage create(Path volumeDir, int shardCount, long segmentBytes, long initialCapacity,
                                      BlobVolumeMetricsListener volumeMetrics) {
+        return create(volumeDir, shardCount, segmentBytes, initialCapacity, VolumeWriteMode.MMAP, volumeMetrics);
+    }
+
+    public static BlobStorage create(Path volumeDir, int shardCount, long segmentBytes, long initialCapacity,
+                                     VolumeWriteMode writeMode, BlobVolumeMetricsListener volumeMetrics) {
+        Objects.requireNonNull(writeMode, "writeMode é obrigatório");
         if (shardCount <= 0) {
             throw new BlobVolumeException("shardCount deve ser > 0: " + shardCount);
         }
@@ -143,7 +157,8 @@ public final class BlobStorage implements NgrrdStorage, SeriesChannelProvider, A
             for (int i = 0; i < shardCount; i++) {
                 ShardSuperblock sb = new ShardSuperblock(ShardSuperblock.FORMAT_VERSION, i, shardCount,
                         ShardSuperblock.HEADER_BYTES, capacity, ShardSuperblock.HEADER_BYTES, uuid, gen);
-                shards[i] = MappedShard.create(shardFile(volumeDir, i, shardCount), sb, segmentBytes);
+                shards[i] = MappedShard.create(shardFile(volumeDir, i, shardCount), sb, segmentBytes,
+                        writeMode);
                 allocators[i] = ShardAllocator.fresh(ShardSuperblock.HEADER_BYTES, segmentBytes, capacity);
             }
             writeFileSync(volumeDir.resolve(CATALOG_BIN),
@@ -161,6 +176,12 @@ public final class BlobStorage implements NgrrdStorage, SeriesChannelProvider, A
     }
 
     public static BlobStorage open(Path volumeDir, BlobVolumeMetricsListener volumeMetrics) {
+        return open(volumeDir, VolumeWriteMode.MMAP, volumeMetrics);
+    }
+
+    public static BlobStorage open(Path volumeDir, VolumeWriteMode writeMode,
+                                   BlobVolumeMetricsListener volumeMetrics) {
+        Objects.requireNonNull(writeMode, "writeMode é obrigatório");
         try {
             VolumeMetadata meta = VolumeMetadata.decode(Files.readAllBytes(volumeDir.resolve(VOLUME_META)));
             int shardCount = meta.shardCount();
@@ -169,7 +190,8 @@ public final class BlobStorage implements NgrrdStorage, SeriesChannelProvider, A
 
             MappedShard[] shards = new MappedShard[shardCount];
             for (int i = 0; i < shardCount; i++) {
-                MappedShard shard = MappedShard.open(shardFile(volumeDir, i, shardCount), segmentBytes);
+                MappedShard shard = MappedShard.open(shardFile(volumeDir, i, shardCount), segmentBytes,
+                        writeMode);
                 ShardSuperblock sb = shard.superblock();
                 if (sb.shardId() != i || sb.shardCount() != shardCount || !sb.volumeUuid().equals(uuid)) {
                     throw new BlobVolumeException("shard " + i + " inconsistente com volume.meta");
@@ -559,16 +581,21 @@ public final class BlobStorage implements NgrrdStorage, SeriesChannelProvider, A
     @Override
     public void close() {
         CheckpointInfo info = null;
+        RuntimeException failure = null;
         structuralLock.lock();
         try {
             if (closed) {
                 return;
             }
             info = writeCheckpointLocked();
-            journal.close();
+            // Depois do checkpoint todos os recursos são fechados mesmo que algum falhe: acumula as
+            // falhas e relança no fim, em vez de abortar e deixar shards abertos.
+            List<Runnable> closers = new ArrayList<>(shards.length + 1);
+            closers.add(journal::close);
             for (MappedShard shard : shards) {
-                shard.close();
+                closers.add(shard::close);
             }
+            failure = closeAll(closers);
             closed = true;
         } finally {
             structuralLock.unlock();
@@ -577,10 +604,70 @@ public final class BlobStorage implements NgrrdStorage, SeriesChannelProvider, A
         if (info != null) {
             volumeMetrics.onCheckpoint(info.durationMs(), info.entryCount());
         }
+        if (failure != null) {
+            throw failure;
+        }
+    }
+
+    /**
+     * Executa todos os {@code closers} mesmo que algum falhe e devolve a primeira falha (as demais ficam
+     * como {@code suppressed}), ou {@code null} se nenhuma falhou.
+     */
+    static RuntimeException closeAll(List<Runnable> closers) {
+        RuntimeException failure = null;
+        for (Runnable closer : closers) {
+            try {
+                closer.run();
+            } catch (RuntimeException e) {
+                if (failure == null) {
+                    failure = e;
+                } else {
+                    failure.addSuppressed(e);
+                }
+            }
+        }
+        return failure;
     }
 
     public int shardCount() {
         return shardCount;
+    }
+
+    /** Modo de escrita dos shards deste volume (derivado dos shards, que são todos abertos no mesmo modo). */
+    public VolumeWriteMode writeMode() {
+        return shards[0].writeMode();
+    }
+
+    /** Bytes lógicos entregues a {@code writeAt} em todos os shards desde a abertura (soma dos shards). */
+    public long bytesWritten() {
+        long total = 0L;
+        for (MappedShard shard : shards) {
+            total += shard.bytesWritten();
+        }
+        return total;
+    }
+
+    /** Bytes lógicos gravados pelo caminho do mmap em todos os shards (soma dos shards). */
+    public long mappedBytesWritten() {
+        long total = 0L;
+        for (MappedShard shard : shards) {
+            total += shard.mappedBytesWritten();
+        }
+        return total;
+    }
+
+    /** Bytes lógicos gravados pelo caminho posicional ({@code pwrite}) em todos os shards (soma dos shards). */
+    public long positionalBytesWritten() {
+        long total = 0L;
+        for (MappedShard shard : shards) {
+            total += shard.positionalBytesWritten();
+        }
+        return total;
+    }
+
+    /** Shard {@code shardId}, para testes do pacote. */
+    MappedShard shard(int shardId) {
+        return shards[shardId];
     }
 
     /**
@@ -614,7 +701,7 @@ public final class BlobStorage implements NgrrdStorage, SeriesChannelProvider, A
                 throw new BlobVolumeException("falha ao ler o tamanho de " + CATALOG_BIN, ex);
             }
             return new BlobVolumeStats(shardCount, capacity, used, series, fill,
-                    catalog.size(), catalogImageBytes, journal.size());
+                    catalog.size(), catalogImageBytes, journal.size(), writeMode(), bytesWritten());
         } finally {
             structuralLock.unlock();
         }

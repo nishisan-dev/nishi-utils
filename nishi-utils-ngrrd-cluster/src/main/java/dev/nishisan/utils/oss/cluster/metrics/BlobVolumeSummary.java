@@ -17,6 +17,7 @@
 
 package dev.nishisan.utils.oss.cluster.metrics;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import dev.nishisan.utils.oss.metrics.BlobVolumeStats;
 
 import java.util.Objects;
@@ -32,20 +33,35 @@ import java.util.Objects;
  * @param maxFillRatio      maior {@code fillRatio} entre os shards, em [0,1]
  * @param catalogEntryCount total de entradas vivas no catálogo do volume
  * @param walBytes          tamanho atual do journal do catálogo do volume
+ * @param writeMode         modo de escrita dos shards ({@code MMAP}|{@code PWRITE}); {@code null} quando o nó
+ *                          que reportou roda uma versão anterior à 8.13.0 (modo desconhecido)
+ * @param bytesWritten      bytes lógicos entregues a {@code writeAt} em todos os shards desde a abertura do
+ *                          volume (contador acumulado, não persistido); {@code 0} quando o nó reportante é
+ *                          anterior à 8.13.0
  */
+@JsonIgnoreProperties(ignoreUnknown = true)
 public record BlobVolumeSummary(
         int shardCount,
         long usedBytes,
         long capacityBytes,
         double maxFillRatio,
         int catalogEntryCount,
-        long walBytes) {
+        long walBytes,
+        String writeMode,
+        long bytesWritten) {
+
+    /** Construtor de compatibilidade (forma da 8.12.0): modo de escrita desconhecido e {@code bytesWritten} zero. */
+    public BlobVolumeSummary(int shardCount, long usedBytes, long capacityBytes, double maxFillRatio,
+                             int catalogEntryCount, long walBytes) {
+        this(shardCount, usedBytes, capacityBytes, maxFillRatio, catalogEntryCount, walBytes, null, 0L);
+    }
 
     /** Deriva o resumo a partir do {@link BlobVolumeStats} bruto de um {@code BlobVolume}. */
     public static BlobVolumeSummary from(BlobVolumeStats stats) {
         Objects.requireNonNull(stats, "stats");
         return new BlobVolumeSummary(stats.shardCount(), sum(stats.shardUsedBytes()), sum(stats.shardCapacityBytes()),
-                max(stats.fillRatioPerShard()), stats.catalogEntryCount(), stats.walBytes());
+                max(stats.fillRatioPerShard()), stats.catalogEntryCount(), stats.walBytes(),
+                stats.writeMode().name(), stats.bytesWritten());
     }
 
     private static long sum(long[] values) {

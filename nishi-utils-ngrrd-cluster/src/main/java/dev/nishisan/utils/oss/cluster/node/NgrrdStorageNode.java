@@ -172,6 +172,7 @@ public final class NgrrdStorageNode implements Closeable {
                 .shardCount(cfg.shardCount())
                 .segmentBytes(cfg.segmentBytes())
                 .initialShardCapacityBytes(cfg.initialShardCapacityBytes())
+                .writeMode(cfg.volumeWriteMode())
                 .volume(cfg.volumeName())
                 .build();
         try {

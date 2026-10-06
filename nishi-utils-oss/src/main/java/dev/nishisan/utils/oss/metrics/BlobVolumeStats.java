@@ -1,5 +1,9 @@
 package dev.nishisan.utils.oss.metrics;
 
+import dev.nishisan.utils.oss.blob.VolumeWriteMode;
+
+import java.util.Objects;
+
 /**
  * Snapshot imutável dos gauges operacionais de um blob volume, lido sob demanda
  * (modelo <em>pull</em>) via {@code BlobVolume.stats()} / {@code BlobStorage.stats()}.
@@ -20,8 +24,24 @@ package dev.nishisan.utils.oss.metrics;
  * @param catalogEntryCount  total de entradas vivas no catálogo
  * @param catalogImageBytes  tamanho do snapshot durável do catálogo ({@code catalog.bin})
  * @param walBytes           tamanho atual do journal do catálogo ({@code catalog.wal})
+ * @param writeMode          modo de escrita dos shards do volume
+ * @param bytesWritten       bytes lógicos entregues a {@code writeAt} em todos os shards desde a
+ *                           abertura do volume (contador acumulado, não persistido)
  */
 public record BlobVolumeStats(int shardCount, long[] shardCapacityBytes, long[] shardUsedBytes,
                               long[] seriesPerShard, double[] fillRatioPerShard,
-                              int catalogEntryCount, long catalogImageBytes, long walBytes) {
+                              int catalogEntryCount, long catalogImageBytes, long walBytes,
+                              VolumeWriteMode writeMode, long bytesWritten) {
+
+    public BlobVolumeStats {
+        Objects.requireNonNull(writeMode, "writeMode é obrigatório");
+    }
+
+    /** Compatibilidade: snapshot sem modo de escrita (assume {@link VolumeWriteMode#MMAP}) e sem bytes escritos. */
+    public BlobVolumeStats(int shardCount, long[] shardCapacityBytes, long[] shardUsedBytes,
+                           long[] seriesPerShard, double[] fillRatioPerShard,
+                           int catalogEntryCount, long catalogImageBytes, long walBytes) {
+        this(shardCount, shardCapacityBytes, shardUsedBytes, seriesPerShard, fillRatioPerShard,
+                catalogEntryCount, catalogImageBytes, walBytes, VolumeWriteMode.MMAP, 0L);
+    }
 }

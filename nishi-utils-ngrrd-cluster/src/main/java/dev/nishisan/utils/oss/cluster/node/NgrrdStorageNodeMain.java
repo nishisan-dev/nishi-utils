@@ -30,7 +30,7 @@ import java.util.logging.Logger;
  * registra um shutdown hook que fecha o nó na ordem correta ({@link NgrrdStorageNode#close()}) e
  * bloqueia a thread principal até o processo ser encerrado (SIGTERM/Ctrl-C).
  *
- * <p>Loga {@code NGRRD_STORAGE_NODE_STARTED nodeId=... port=...} assim que o nó está pronto — marker de
+ * <p>Loga {@code NGRRD_STORAGE_NODE_STARTED nodeId=... port=... writeMode=...} assim que o nó está pronto — marker de
  * log usado por futuros testes de integração via Docker (ver convenção de markers do módulo
  * {@code ngrid-test}, documentada em {@code CLAUDE.md}); não renomear sem atualizar quem depende dele.</p>
  *
@@ -73,7 +73,8 @@ public final class NgrrdStorageNodeMain {
             }
         }, "ngrrd-storage-node-shutdown"));
 
-        LOGGER.info("NGRRD_STORAGE_NODE_STARTED nodeId=" + node.nodeId() + " port=" + node.config().port());
+        LOGGER.info("NGRRD_STORAGE_NODE_STARTED nodeId=" + node.nodeId() + " port=" + node.config().port()
+                + " writeMode=" + node.config().volumeWriteMode());
         awaitUninterruptibly(shutdownLatch);
     }
 

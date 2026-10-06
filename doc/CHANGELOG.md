@@ -4,6 +4,58 @@
 
 ---
 
+## 2026-10-06 — Modo de escrita do blob volume (`writeMode`: mmap | pwrite) — 8.13.0
+
+Medição no CTP (storage .217, kernel 6.8, XFS): o processo sujava ~80 GB por ciclo de virada, e o
+disco gravava os mesmos ~80 GB. Por série, eram ~290 KB regravados para escritas lógicas de dezenas
+de bytes. A escrita via mmap suja o folio inteiro do page cache (16–128 KB nos shards). A escrita
+bufferizada no XFS/iomap (6.6+) suja e grava só os blocos de 4 KB tocados. Plano em
+`planning/v8.13.0-volume-write-mode.md`.
+
+### Novidades
+- **`nishi-utils-oss`:** `VolumeWriteMode { MMAP, PWRITE }`.
+  - Configurável em `BlobVolumeConfig` (o construtor antigo é mantido) e em
+    `NgrrdBlob.registry().writeMode(...)`.
+  - Em `PWRITE`, o shard escreve com escrita bufferizada posicional via `java.io`
+    (`RandomAccessFile` seek+write sob lock por shard) e continua lendo pelo mmap, que usa o mesmo
+    page cache.
+  - Contadores de bytes escritos por caminho.
+- **`nishi-utils-ngrrd-cluster`:**
+  - YAML do storage `ngrrd.volume.writeMode: mmap|pwrite` (padrão `mmap`);
+  - log `NGRRD_STORAGE_NODE_STARTED ... writeMode=`;
+  - `BlobVolumeSummary.writeMode`/`bytesWritten`;
+  - `ngrrd-admin metrics` com `VOLUME_WRITE_MODE`/`VOLUME_BYTES_WRITTEN`.
+
+### Robustez do caminho PWRITE (achados da revisão)
+- A escrita não usa `FileChannel`, para não ser interrompível:
+  - uma interrupção de thread fecharia o canal compartilhado do shard;
+  - a recuperação por reabertura expunha um deadlock do JDK 21 com virtual threads (reproduzido
+    em 4 de 5 execuções; não ocorre no JDK 25).
+- O `fsync` usa `getFD().sync()`. O `map` roda num canal temporário por chamada, com retry quando
+  uma interrupção o fecha.
+- `setLength` do crescimento roda sob o mesmo lock da escrita, por causa da posição compartilhada
+  do arquivo.
+- `BlobStorage.close()` fecha todos os shards mesmo que algum falhe.
+
+### Compatibilidade e operação
+- O padrão `mmap` mantém o comportamento anterior. Construtores antigos de `BlobVolumeConfig`,
+  `BlobVolumeStats`, `BlobVolumeSummary` e `StorageNodeConfig` são mantidos. O JSON de métricas é
+  tolerante a versões mistas.
+- Com `mmap`, `read_ahead_kb=0` no dispositivo reduz o folio criado no fault, que é a mitigação
+  operacional já aplicada no CTP.
+- No XFS, a escrita bufferizada é serializada por inode (`i_rwsem`); valide a vazão com a carga
+  real antes de ligar `pwrite` em todos os nós.
+- Pendência pré-existente, fora desta release: o WAL do catálogo e o checkpoint do volume
+  continuam sensíveis a interrupção de thread.
+
+### Validação
+- `nishi-utils-oss`: 290 testes; `nishi-utils-ngrrd-cluster`: 875 testes (5 skipped); JDK 21;
+  `-Pvalidate-javadoc` sem avisos novos.
+- 4 rodadas de revisão independente com mutações; o caminho de escrita, a propagação do modo e os
+  locks são cobertos por testes.
+
+---
+
 ## 2026-10-06 — Marcas de escrita não bloqueantes no cliente do cluster ngrrd — 8.12.0
 
 Pedido do coordinator do `ngrrd-server` (tems). O laço de ingestão fazia `poll → escrita →

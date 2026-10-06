@@ -441,6 +441,7 @@ ngrrd:
     segmentBytes: 1073741824           # opcional
     initialShardCapacityBytes: 1073741824  # opcional
     capacityBytes: 2000000000000       # opcional, <= 0/omitido = desconhecida
+    writeMode: mmap                    # opcional, mmap|pwrite (sem diferenciar caixa), default mmap — 8.13.0
   statusReportInterval: 10s            # opcional, default 10s
   nodeStatusStaleAfter: 50s            # opcional, default max(5x statusReportInterval, 15s)
   handleIdleTtl: 15m                   # opcional, default 15m
@@ -477,6 +478,18 @@ ngrrd:
         keyPrefix: "lab/"
         exclude: [storage-3]           # exatamente um de pin/exclude
 ```
+
+**Modo de escrita do volume (`ngrrd.volume.writeMode`, 8.13.0).** `mmap` (default, ausente = `mmap`) grava
+os shards por `MappedByteBuffer.put`; `pwrite` grava por `seek`+`write` do `RandomAccessFile` (serializado por shard) e continua lendo
+pelo mmap (mesmo page cache, coerente sem `force`). Em XFS/ext4 recentes com folios grandes no page cache
+(kernel 6.6+), a escrita via mmap suja o folio inteiro e o writeback o regrava por completo; o `pwrite`
+rastreia por bloco de 4 KB e reduz essa amplificação. O valor é case-insensitive; um valor desconhecido
+falha o boot com `ngrrd.volume.writeMode: writeMode inválido: '…'; valores aceitos: mmap, pwrite`. Isso inclui a string vazia explícita (`writeMode: ""`), que **falha a subida** com essa mesma mensagem. Atenção: `writeMode: ${VAR:}` com a variável ausente expande para `writeMode: ` (nulo em YAML), que equivale a omitir a chave e cai no default `mmap`, como nos demais campos opcionais; se a variável for obrigatória, não declare default vazio. O nome `pwrite` designa a escrita bufferizada posicional (`lseek`+`write` via `java.io` sob lock por shard), não o
+syscall `pwrite(2)` literalmente; o efeito no kernel é o mesmo caminho bufferizado. Dá
+para alternar entre os modos apenas reiniciando o nó (o formato on-disk é o mesmo). O modo aparece no
+log de subida (`NGRRD_STORAGE_NODE_STARTED nodeId=… port=… writeMode=…`) e em `blobStats` do
+`NodeMetricsSnapshot` (`writeMode`, `bytesWritten`). Detalhes e recomendação em
+[`ngrrd-blob-volume.md`](./ngrrd-blob-volume.md) §10.1.
 
 **Cota e regras de placement (issue #167, item 3).** `ngrrd.quota.maxSeries`/`maxBytes` são a cota
 **dura** deste nó como destino (`0`/omitido = sem limite; negativo falha o boot): o líder não coloca

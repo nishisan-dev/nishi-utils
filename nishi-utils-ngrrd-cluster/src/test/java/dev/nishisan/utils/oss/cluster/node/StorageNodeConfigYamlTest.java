@@ -19,6 +19,7 @@ package dev.nishisan.utils.oss.cluster.node;
 
 import dev.nishisan.utils.oss.api.Durability;
 import dev.nishisan.utils.oss.api.OnGeometryChange;
+import dev.nishisan.utils.oss.blob.VolumeWriteMode;
 import dev.nishisan.utils.oss.cluster.placement.PlacementRule;
 import dev.nishisan.utils.oss.cluster.placement.PlacementRules;
 import org.junit.jupiter.api.Test;
@@ -319,6 +320,79 @@ class StorageNodeConfigYamlTest {
         IllegalArgumentException error = assertThrows(IllegalArgumentException.class, () -> StorageNodeConfig.fromYaml(
                 base + "  placement:\n    inspectTimeout: 0s\n", NO_ENV));
         assertTrue(error.getMessage().contains("ngrrd.placement.inspectTimeout"), error.getMessage());
+    }
+
+    @Test
+    void volumeWriteModeELidoDoYamlSemDiferenciarCaixaEAusenteEMmap() {
+        String base = """
+                node:
+                  id: storage-0
+                  host: 127.0.0.1
+                  port: 9100
+                  dataDir: /var/ngrrd/storage-0/data
+                ngrrd:
+                  volume:
+                    dir: /var/ngrrd/storage-0/volume
+                    name: ngrrd
+                """;
+
+        assertEquals(VolumeWriteMode.MMAP, StorageNodeConfig.fromYaml(base, NO_ENV).volumeWriteMode());
+        assertEquals(VolumeWriteMode.PWRITE, StorageNodeConfig.fromYaml(
+                base + "    writeMode: pwrite\n", NO_ENV).volumeWriteMode());
+        assertEquals(VolumeWriteMode.PWRITE, StorageNodeConfig.fromYaml(
+                base + "    writeMode: PWrite\n", NO_ENV).volumeWriteMode());
+        assertEquals(VolumeWriteMode.MMAP, StorageNodeConfig.fromYaml(
+                base + "    writeMode: mmap\n", NO_ENV).volumeWriteMode());
+        assertEquals(VolumeWriteMode.PWRITE, StorageNodeConfig.fromYaml(
+                base + "    writeMode: ${WRITE_MODE:pwrite}\n", NO_ENV).volumeWriteMode());
+    }
+
+    @Test
+    void volumeWriteModeInvalidoFalhaNoBootComMensagemClara() {
+        String yaml = """
+                node:
+                  id: storage-0
+                  host: 127.0.0.1
+                  port: 9100
+                  dataDir: /var/ngrrd/storage-0/data
+                ngrrd:
+                  volume:
+                    dir: /var/ngrrd/storage-0/volume
+                    name: ngrrd
+                    writeMode: directio
+                """;
+
+        IllegalArgumentException error = assertThrows(IllegalArgumentException.class,
+                () -> StorageNodeConfig.fromYaml(yaml, NO_ENV));
+        assertTrue(error.getMessage().contains("ngrrd.volume.writeMode"), error.getMessage());
+        assertTrue(error.getMessage().contains("directio"), error.getMessage());
+        assertTrue(error.getMessage().contains("mmap") && error.getMessage().contains("pwrite"), error.getMessage());
+    }
+
+    @Test
+    void volumeWriteModeStringVaziaFalhaNoBootMasValorNuloDoYamlEOmissao() {
+        String base = """
+                node:
+                  id: storage-0
+                  host: 127.0.0.1
+                  port: 9100
+                  dataDir: /var/ngrrd/storage-0/data
+                ngrrd:
+                  volume:
+                    dir: /var/ngrrd/storage-0/volume
+                    name: ngrrd
+                """;
+
+        // string vazia explícita: falha a subida com mensagem clara
+        IllegalArgumentException error = assertThrows(IllegalArgumentException.class,
+                () -> StorageNodeConfig.fromYaml(base + "    writeMode: \"\"\n", NO_ENV));
+        assertTrue(error.getMessage().contains("ngrrd.volume.writeMode"), error.getMessage());
+        assertTrue(error.getMessage().contains("mmap") && error.getMessage().contains("pwrite"), error.getMessage());
+
+        // "${VAR:}" com a variável ausente expande para "writeMode: " (nulo em YAML), igual a omitir a chave,
+        // como em todos os demais campos opcionais: cai no default MMAP
+        assertEquals(VolumeWriteMode.MMAP, StorageNodeConfig.fromYaml(
+                base + "    writeMode: ${WRITE_MODE_AUSENTE:}\n", NO_ENV).volumeWriteMode());
     }
 
     @Test

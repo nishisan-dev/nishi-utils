@@ -230,6 +230,11 @@ public final class NgrrdClusterAdminCli {
         out.println("REDIRECT_OVERRIDES: " + snapshot.redirectOverrides());
         out.println("REDIRECT_CONFIRMATION_FAILURES: " + snapshot.redirectConfirmationFailures());
         out.println("REDIRECT_CACHE_HITS: " + snapshot.redirectCacheHits());
+        if (snapshot.blobStats() != null) {
+            // Modo de escrita do volume e bytes lógicos gravados pela camada de volume (8.13.0); "-" = nó anterior.
+            out.println("VOLUME_WRITE_MODE: " + orDash(snapshot.blobStats().writeMode()));
+            out.println("VOLUME_BYTES_WRITTEN: " + snapshot.blobStats().bytesWritten());
+        }
         snapshot.lifecycleMetrics().entrySet().stream().sorted(java.util.Map.Entry.comparingByKey())
                 .forEach(entry -> out.println(entry.getKey() + ": " + entry.getValue()));
     }
