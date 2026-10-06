@@ -200,7 +200,9 @@ retentativa transparente:
   cada nó tem capacidade limitada (`maxBufferedSamplesPerNode`, default 100 000); ao encher, a
   política default é `BLOCK` (o `write()` do chamador bloqueia até haver espaço — backpressure real
   para quem produz via Kafka, por exemplo) ou `FAIL` (lança `BUFFER_FULL` imediatamente). Não existe
-  política `DROP`.
+  política `DROP`. Uma escrita admitida **não tem prazo**: `MIGRATING`, troca de dono, reabertura e
+  falha de transporte retentam até uma resposta final do cluster ou o `close()` do cliente. O
+  `retryTimeout` vale só para as operações síncronas (`open`, `flush`, `checkpoint`, `read`).
 - **`flush`/`checkpoint`:** aguardam as escritas pendentes da série, inclusive as redirecionadas,
   antes de enviar o comando. A espera e a recuperação usam o mesmo `retryTimeout`.
 - **`read`/`readPreset`:** RPC direto ao dono; `Consistency` não se aplica (dono único da série).
@@ -353,6 +355,56 @@ diferenças em relação à 8.5.0:
 - `PLACE` de séries novas aguarda `placementGraceAfterLeadership` (3 s por padrão) também depois
   que o **primeiro** líder do boot assume: a criação das primeiras séries logo após subir o
   cluster atrasa até esse prazo (o cliente retenta `NOT_LEADER` dentro do `retryTimeout`).
+
+### 5.2. Marcas de escrita (8.12.0)
+
+Para quem precisa confirmar lotes sem parar a produção, como um consumidor Kafka que faz commit
+de offset por janela, o cliente oferece **marcas** no lugar do `flushAll()` síncrono. É preciso
+ligar o modo na configuração:
+
+```yaml
+client:
+  writeFailureReporting: marks   # default: barrier (comportamento anterior)
+```
+
+```java
+WriteMark mark = client.mark();            // não espera ACK; captura tudo o que foi admitido até aqui
+// ... continua produzindo ...
+if (mark.isDone()) {                       // consulta sem bloqueio (ou mark.completion())
+    WriteMarkResult r = mark.result().orElseThrow();
+    if (r.samplesFailed() > limite) { /* política do chamador */ }
+    // commit do offset correspondente
+}
+```
+
+- **Fronteira:** `mark()` fotografa a posição de cada série com escrita pendente, a um custo
+  proporcional a essas séries. A marca conclui quando toda escrita admitida antes dela recebe
+  resposta final do cluster, com sucesso ou falha, segundo a política de confirmação vigente. Hoje
+  essa política é o ACK do dono, sem fsync. Escritas em retentativa só atrasam a conclusão, e a
+  biblioteca não aplica prazo.
+- **Ordem:** o resultado da marca N só fica disponível depois do da N−1. A conclusão é dirigida
+  pelas próprias confirmações, sem varredura periódica. Callbacks de `completion()` sem `*Async`
+  rodam numa thread interna.
+- **Falhas:** cada falha final de escrita é atribuída a **exatamente uma** marca, a primeira cuja
+  fronteira cobre a amostra. Entram ERROR, `SERIES_DELETED`, `QUARANTINED`, `NOT_FOUND`, status
+  inesperado e geração substituída (contada como `SERIES_DELETED`). Uma recusa síncrona em
+  `write()` não foi admitida e não entra. Um `ERROR` parcial do nó conta o grupo inteiro da série
+  no lote, então `samplesFailed` é um teto. `samplesAdmitted` é aproximado na fronteira e serve
+  para taxa e métrica. `failedSeriesSample` lista até 100 séries.
+- **Barreiras no modo `marks`:** `flushAll()` e o `flush()`/`checkpoint()` do handle esperam as
+  escritas, mas **não lançam por falha de escrita**, que chega só pela marca. Série removida ou em
+  quarentena continua sinalizada nas operações da série (`write`, `flush`, `checkpoint`) como
+  `NgrrdClusterException` com `code()` `SERIES_DELETED` ou `QUARANTINED`. A causa pode vir
+  encadeada. `QUARANTINED` exige recuperação operacional ([purga](ngrrd-cluster-purga.md)). Falhas
+  do próprio comando (`CHECKPOINT`/`FLUSH` com erro, prazo de `retryTimeout`) continuam lançando.
+- **Modo `barrier` (default):** comportamento anterior. A primeira falha de escrita de uma série
+  faz toda barreira que a cubra lançar exceção até o restart do cliente, e `mark()` lança
+  `IllegalStateException`.
+- **`close()`:** marcas não concluídas falham com `NgrrdClusterException(CLOSED)`.
+- **Storage node fora:** como não há re-placement nem prazo por escrita, a marca só conclui quando
+  o nó volta. Com `BLOCK`, o buffer daquele nó enche e `write()` bloqueia o produtor. O consumidor
+  deve tratar isso como pausa (por exemplo, `pause()` das partições Kafka mantendo o `poll()`), não
+  como erro.
 
 ## 6. Storage node
 
