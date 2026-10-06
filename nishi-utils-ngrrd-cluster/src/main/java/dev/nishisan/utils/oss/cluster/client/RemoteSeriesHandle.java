@@ -83,6 +83,15 @@ import java.util.logging.Logger;
  * {@code SeriesStatusResponse.createIfMissingHonored}. Sem uma ou outra, a operação falha com
  * {@code ErrorCode.UNSUPPORTED_BY_NODE} — um storage de versão anterior criaria a série. Handles
  * graváveis não conferem nada disso.</p>
+ *
+ * <p><strong>Ciclo de vida da série.</strong> Num handle gravável, série removida ou em quarentena é sempre
+ * sinalizada em {@link #write}, {@link #flush} e {@link #checkpoint} como {@link NgrrdClusterException} de nível
+ * superior com {@link ErrorCode#SERIES_DELETED} ou {@link ErrorCode#QUARANTINED} (a causa pode vir encadeada);
+ * a partir daí o handle fica terminal e sai do mapa do cliente — um {@code open} novo refaz o fluxo.
+ * {@code QUARANTINED} exige recuperação operacional. Com
+ * {@link dev.nishisan.utils.oss.cluster.api.NgrrdClusterConfig.WriteFailureReporting#MARKS}, a falha de uma
+ * escrita (amostra perdida) não lança em {@link #flush}/{@link #checkpoint}: ela é reportada pela marca
+ * ({@code NgrrdClusterClient#mark()}).</p>
  */
 public final class RemoteSeriesHandle implements NgrrdHandle {
 

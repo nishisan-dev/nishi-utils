@@ -41,6 +41,7 @@ import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.api.RebalanceTrigger;
 import dev.nishisan.utils.oss.cluster.api.SeriesInfo;
 import dev.nishisan.utils.oss.cluster.api.SeriesVerification;
+import dev.nishisan.utils.oss.cluster.api.WriteMark;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
 import dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
@@ -224,7 +225,8 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
                     cfg.closeTimeout(), seriesKey -> {
                         RemoteSeriesHandle handle = handles.get(seriesKey);
                         return handle != null && handle.reopen();
-                    }, (seriesKey, newOwner) -> { }, Clock.systemUTC(), cfg.metricsListener(), metricsSupplier);
+                    }, (seriesKey, newOwner) -> { }, Clock.systemUTC(), cfg.metricsListener(), metricsSupplier,
+                    cfg.writeFailureReporting());
             DefaultNgrrdClusterClient client = new DefaultNgrrdClusterClient(cfg, node, dataDir, temporaryDataDir,
                     rpc, resolver, existence, verifier, dispatcher, handles, capabilities);
             clientRef.set(client);
@@ -478,6 +480,12 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
     public void flushAll() {
         ensureOpen();
         dispatcher.flushAllSync();
+    }
+
+    @Override
+    public WriteMark mark() {
+        ensureOpen();
+        return dispatcher.mark();
     }
 
     @Override

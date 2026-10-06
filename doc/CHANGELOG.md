@@ -4,6 +4,45 @@
 
 ---
 
+## 2026-10-06 — Marcas de escrita não bloqueantes no cliente do cluster ngrrd — 8.12.0
+
+Pedido do coordinator do `ngrrd-server` (tems). O laço de ingestão fazia `poll → escrita →
+client.flushAll() → commitSync`, e o `flushAll()` bloqueava a thread de poll até o ACK de cada série.
+No bench de 18–19/09, isso deu ~10 s parados a cada 40 s e workers ociosos 28–36 s. Além disso, uma
+falha de escrita "grudava": toda barreira lançava exceção até o restart. Plano em
+`planning/v8.12.0-marcas-de-escrita.md`.
+
+### Novidades (`nishi-utils-ngrrd-cluster`, só cliente)
+- `NgrrdClusterClient.mark()` devolve uma `WriteMark`: fronteira de tudo o que foi admitido, sem
+  esperar ACK. `isDone()`/`result()`/`completion()` concluem em ordem de marca, quando toda escrita da
+  fronteira recebe resposta final do cluster.
+- `WriteMarkResult`: `samplesFailed` (exato) e `failuresByStatus`, até 100 séries de amostra e
+  `samplesAdmitted` (aproximado na fronteira). Cada falha final de escrita vai para exatamente uma marca.
+- `NgrrdClusterConfig.writeFailureReporting` (`client.writeFailureReporting` no YAML):
+  - `barrier` (padrão) mantém o comportamento anterior;
+  - `marks` habilita `mark()` e faz as barreiras (`flushAll`, `flush`/`checkpoint` do handle) só
+    esperarem, sem lançar por falha de escrita. Série removida ou em quarentena continua sinalizada
+    nas operações da série com `SERIES_DELETED`/`QUARANTINED`.
+- Marcas com a mesma fronteira compartilham a espera numa série parada (nó fora), sem crescer com o
+  número de marcas. `close()` falha as marcas pendentes com `CLOSED`.
+
+### Correção de documentação
+- `retryTimeout` não limita as escritas já admitidas no buffer: elas retentam até a resposta final ou
+  o `close()`. A Javadoc dizia o contrário.
+
+### Compatibilidade e deploy
+- Só cliente: os storage nodes não precisam ser reimplantados. `mark()` é método `default` na interface.
+  O record `NgrrdClusterConfig` ganhou um componente, então quem chama o construtor canônico direto
+  precisa ajustar; Builder e `fromYaml` não mudam.
+- Sem prazo por escrita: com um storage node fora, a marca espera o nó voltar. Com `BLOCK`, o produtor
+  bloqueia (tratar como pausa, ver `doc/oss/ngrrd-cluster.md` §5.2).
+
+### Validação
+- `nishi-utils-ngrrd-cluster`: 864 testes, com 21 novos em `WriteMarkTest`, e `-Pngrrd-cluster` 33, em JDK 21.
+- Revisão independente com 10 mutações; a única sobrevivente é equivalente.
+
+---
+
 ## 2026-10-05 — Handback sem cutover parcial e sem reancoragem de tópicos não instalados — 8.11.2
 
 Incidente no CTP (tems), 2026-10-05 às 17:23:36, com os três storages na 8.11.1. A storage de

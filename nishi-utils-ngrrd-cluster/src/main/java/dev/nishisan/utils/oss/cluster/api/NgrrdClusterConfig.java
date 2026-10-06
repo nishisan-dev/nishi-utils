@@ -51,7 +51,13 @@ import java.util.function.Function;
  * @param maxBufferedSamplesPerNode capacidade do buffer de escrita de cada nó de destino
  * @param bufferFullPolicy          política aplicada quando o buffer de um nó atinge a capacidade
  * @param requestTimeout            prazo de espera por resposta a um RPC síncrono do cluster
- * @param retryTimeout              prazo total de retentativa (ex.: série em migração) antes de desistir
+ * @param retryTimeout              prazo total de retentativa das operações síncronas (abertura, reabertura,
+ *                                  {@code flush}/{@code checkpoint}/leitura de um handle, consultas ao líder)
+ *                                  antes de desistir. <strong>Não</strong> limita as escritas já admitidas no
+ *                                  buffer do {@code WriteDispatcher}: elas retentam ({@code MIGRATING},
+ *                                  {@code NOT_OPEN}, {@code WRONG_OWNER}, falha de transporte) até uma resposta
+ *                                  final do cluster ou o {@code close()} do cliente — com um storage node fora,
+ *                                  ficam no buffer até ele voltar
  * @param retryBackoffMin           backoff mínimo entre retentativas
  * @param retryBackoffMax           teto do backoff exponencial entre retentativas
  * @param leaderWaitTimeout         prazo de espera por um líder eleito (conexão e resolução de placement)
@@ -64,6 +70,8 @@ import java.util.function.Function;
  *                                  {@code #find})
  * @param metricsListener           integração opcional de métricas (ver {@link NgrrdClusterMetricsListener});
  *                                  {@code null} = nenhuma
+ * @param writeFailureReporting     como falhas de escrita chegam ao chamador (ver {@link WriteFailureReporting});
+ *                                  default {@link WriteFailureReporting#BARRIER}
  */
 public record NgrrdClusterConfig(
         String clientId,
@@ -83,7 +91,8 @@ public record NgrrdClusterConfig(
         Duration leaderWaitTimeout,
         Duration closeTimeout,
         int catalogLookupBatchSize,
-        NgrrdClusterMetricsListener metricsListener) {
+        NgrrdClusterMetricsListener metricsListener,
+        WriteFailureReporting writeFailureReporting) {
 
     /** Menor {@code catalogLookupBatchSize} aceito. */
     public static final int MIN_CATALOG_LOOKUP_BATCH_SIZE = 1;
@@ -145,6 +154,7 @@ public record NgrrdClusterConfig(
                     + MIN_CATALOG_LOOKUP_BATCH_SIZE + " e " + MAX_CATALOG_LOOKUP_BATCH_SIZE + ": "
                     + catalogLookupBatchSize);
         }
+        Objects.requireNonNull(writeFailureReporting, "writeFailureReporting é obrigatório");
     }
 
     /** Política aplicada quando o buffer de escrita de um nó atinge a capacidade configurada. */
@@ -153,6 +163,28 @@ public record NgrrdClusterConfig(
         BLOCK,
         /** Lança {@link NgrrdClusterException} com {@link ErrorCode#BUFFER_FULL} imediatamente. */
         FAIL
+    }
+
+    /**
+     * Como as falhas finais de escrita (status diferente de {@code OK} para uma amostra já admitida no buffer)
+     * chegam ao chamador.
+     */
+    public enum WriteFailureReporting {
+        /**
+         * Comportamento histórico: a falha fica registrada na série, e toda barreira que a cubra
+         * ({@code flushAll}, {@code flush}/{@code checkpoint} do handle) lança exceção, para sempre, até o
+         * restart do cliente. {@link NgrrdClusterClient#mark()} é recusado.
+         */
+        BARRIER,
+        /**
+         * Falhas de escrita são reportadas <strong>somente</strong> pelas marcas
+         * ({@link NgrrdClusterClient#mark()}, {@link WriteMarkResult}); cada falha é reportada uma única vez.
+         * As barreiras apenas esperam a conclusão das escritas e não lançam exceção por falha de escrita.
+         * Série removida ou em quarentena continua sinalizada nas operações por série
+         * ({@code write}/{@code flush}/{@code checkpoint} do handle), com {@link ErrorCode#SERIES_DELETED}
+         * ou {@link ErrorCode#QUARANTINED}.
+         */
+        MARKS
     }
 
     public static Builder builder() {
@@ -236,6 +268,10 @@ public record NgrrdClusterConfig(
             if (client.catalogLookupBatchSize != null) {
                 builder.catalogLookupBatchSize(client.catalogLookupBatchSize);
             }
+            if (client.writeFailureReporting != null && !client.writeFailureReporting.isBlank()) {
+                builder.writeFailureReporting(WriteFailureReporting.valueOf(
+                        client.writeFailureReporting.trim().toUpperCase(java.util.Locale.ROOT)));
+            }
             return builder.build();
         }
 
@@ -264,6 +300,7 @@ public record NgrrdClusterConfig(
         public String closeTimeout;
         public String leaderWaitTimeout;
         public Integer catalogLookupBatchSize;
+        public String writeFailureReporting;
     }
 
     private static String defaultClientId() {
@@ -291,6 +328,7 @@ public record NgrrdClusterConfig(
         private Duration closeTimeout = Duration.ofSeconds(30);
         private int catalogLookupBatchSize = 2_000;
         private NgrrdClusterMetricsListener metricsListener;
+        private WriteFailureReporting writeFailureReporting = WriteFailureReporting.BARRIER;
 
         private Builder() {
         }
@@ -396,11 +434,17 @@ public record NgrrdClusterConfig(
             return this;
         }
 
+        /** Como falhas de escrita chegam ao chamador; default {@link WriteFailureReporting#BARRIER}. */
+        public Builder writeFailureReporting(WriteFailureReporting writeFailureReporting) {
+            this.writeFailureReporting = writeFailureReporting;
+            return this;
+        }
+
         public NgrrdClusterConfig build() {
             return new NgrrdClusterConfig(clientId, host, port, seed, peers, dataDir, batchMaxSamples,
                     batchMaxDelay, maxBufferedSamplesPerNode, bufferFullPolicy, requestTimeout, retryTimeout,
                     retryBackoffMin, retryBackoffMax, leaderWaitTimeout, closeTimeout, catalogLookupBatchSize,
-                    metricsListener);
+                    metricsListener, writeFailureReporting);
         }
     }
 }

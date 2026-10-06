@@ -202,8 +202,37 @@ public interface NgrrdClusterClient extends Closeable {
      */
     Map<String, SeriesVerification> verify(Collection<String> seriesKeys);
 
-    /** Drena os buffers de escrita de todos os nós de destino conhecidos, de forma síncrona. */
+    /**
+     * Drena os buffers de escrita de todos os nós de destino conhecidos, de forma síncrona: espera a resposta
+     * final de toda escrita admitida antes da chamada, até {@link NgrrdClusterConfig#closeTimeout()}.
+     *
+     * <p>Em {@link NgrrdClusterConfig.WriteFailureReporting#BARRIER} lança a primeira falha de escrita coberta
+     * (e continua lançando até o restart). Em {@link NgrrdClusterConfig.WriteFailureReporting#MARKS} só espera:
+     * falhas de escrita chegam pelas marcas ({@link #mark()}).</p>
+     *
+     * @throws NgrrdClusterException {@link ErrorCode#TIMEOUT} se o prazo esgotar
+     */
     void flushAll();
+
+    /**
+     * Captura, sem esperar ACK, a fronteira de todas as escritas admitidas até agora (ver {@link WriteMark}).
+     * Custo proporcional às séries com escrita pendente. Exige
+     * {@link NgrrdClusterConfig.WriteFailureReporting#MARKS}.
+     *
+     * <p>Contrato de ciclo de vida, nesse modo: falha de escrita (amostra perdida) chega só pelo
+     * {@link WriteMarkResult}; série removida ou em quarentena continua sinalizada em {@code write},
+     * {@code flush} e {@code checkpoint} do handle sempre como {@link NgrrdClusterException} com
+     * {@link ErrorCode#SERIES_DELETED} ou {@link ErrorCode#QUARANTINED} ({@link NgrrdClusterException#code()};
+     * a causa pode vir encadeada). {@code QUARANTINED} não se resolve sozinho: exige recuperação operacional.</p>
+     *
+     * @throws IllegalStateException  se o cliente não estiver em {@code MARKS}
+     * @throws NgrrdClusterException {@link ErrorCode#CLOSED} se o cliente já foi fechado
+     * @throws UnsupportedOperationException numa implementação que não suporta marcas (default desta interface)
+     * @since 8.12.0
+     */
+    default WriteMark mark() {
+        throw new UnsupportedOperationException("mark() não suportado por " + getClass().getName());
+    }
 
     /** Snapshot atual das métricas do cliente. */
     ClientMetricsSnapshot metrics();

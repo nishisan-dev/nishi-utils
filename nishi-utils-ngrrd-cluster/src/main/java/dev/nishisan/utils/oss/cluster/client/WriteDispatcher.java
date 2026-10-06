@@ -22,6 +22,8 @@ import dev.nishisan.utils.oss.cluster.api.ClientMetricsSnapshot;
 import dev.nishisan.utils.oss.cluster.api.ErrorCode;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterConfig;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
+import dev.nishisan.utils.oss.cluster.api.WriteMark;
+import dev.nishisan.utils.oss.cluster.api.WriteMarkResult;
 import dev.nishisan.utils.oss.cluster.catalog.PlacementState;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
 import dev.nishisan.utils.oss.cluster.metrics.NgrrdClusterMetricsListener;
@@ -46,6 +48,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.HashSet;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.PriorityQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -60,6 +63,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.Condition;
+import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiConsumer;
 import java.util.function.Function;
@@ -87,6 +91,14 @@ import java.util.stream.Collectors;
  * saltos —, só aquela série é pausada e o dono é confirmado no líder por uma consulta em lote
  * ({@link PlacementLookup#resolveExistingAtLeader(java.util.Collection, Duration)}), coalescida entre as
  * séries. O primeiro {@code OK} da série encerra o episódio.</p>
+ *
+ * <p><strong>Marcas de escrita ({@link NgrrdClusterConfig.WriteFailureReporting#MARKS}).</strong> {@link #mark()}
+ * fotografa {@code submitted} das rotas pendentes e registra em cada uma um waiter (marca, fronteira), sem esperar.
+ * {@code completeWrites} libera os waiters cuja fronteira foi alcançada e atribui a cada marca as falhas ainda não
+ * reportadas até a fronteira — cada falha vai para exatamente uma marca. Uma rota com falha não reportada fica no
+ * índice de pendentes até ser colhida; as barreiras, nesse modo, não lançam por falha de escrita. As marcas concluem
+ * em ordem, num executor próprio e fora de qualquer lock interno. Ordem de locks: {@code markLock → route.lock →}
+ * lock da marca; nunca {@code route.lock → markLock}.</p>
  */
 public final class WriteDispatcher implements WriteBuffer, Closeable {
 
@@ -163,14 +175,33 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     }
 
     private volatile boolean closed;
+
+    /** {@code true} em {@link NgrrdClusterConfig.WriteFailureReporting#MARKS}. */
+    private final boolean marksMode;
+    /** Serializa {@link #mark()} e protege {@link #openMarks}, {@link #nextMarkId} e {@link #lastMarkAdmitted}. */
+    private final ReentrantLock markLock = new ReentrantLock();
+    /** Marcas ainda não concluídas, em ordem de criação. */
+    private final ArrayDeque<Mark> openMarks = new ArrayDeque<>();
+    private long nextMarkId = 1L;
+    private long lastMarkAdmitted;
+    /** Uma drenagem de marcas prontas por vez — garante a conclusão em ordem. */
+    private final AtomicBoolean markCompletionRunning = new AtomicBoolean(false);
+    /**
+     * Conclui as marcas fora de qualquer lock interno: {@code completeWrites} roda sob {@code route.lock} (que o
+     * {@code applyStatus} segura em volta dele) e callbacks não assíncronos do chamador rodam na thread que conclui.
+     */
+    private final ExecutorService markCompletionPool = Executors.newThreadPerTaskExecutor(
+            Thread.ofVirtual().name("ngrrd-write-mark-", 0).factory());
+
     private volatile java.util.function.BiConsumer<SeriesWrite, NgrrdClusterException> terminalListener = (key, failure) -> { };
     public void terminalListener(java.util.function.BiConsumer<SeriesWrite, NgrrdClusterException> listener) {
         terminalListener = listener;
     }
 
     @Override public void beginGeneration(String key, String generation, String owner) {
+        boolean[] marksReady = {false};
         routes.compute(key, (ignored, previous) -> {
-            if (previous == null) return new SeriesRoute(owner, generation);
+            if (previous == null) return new SeriesRoute(key, owner, generation);
             previous.lock.lock();
             try {
                 if (Objects.equals(previous.generation, generation)) return previous;
@@ -178,15 +209,23 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 for (NodeBuffer buffer : buffers.values()) extractSeriesFrom(buffer, key);
                 long remaining = previous.submitted - previous.completed;
                 samplesFailedCount.add(remaining);
+                if (marksMode && remaining > 0) {
+                    previous.recordFailure(previous.completed + 1, previous.submitted, SeriesStatus.SERIES_DELETED);
+                }
                 previous.completed = previous.submitted;
                 previous.firstFailedSequence = 0;
                 previous.failureCode = ErrorCode.SERIES_DELETED;
                 previous.failureMessage = "generation replaced: " + key;
+                marksReady[0] = releaseWaiters(previous);
                 previous.progress.signalAll();
-                synchronized (pendingLock) { pendingRoutes.remove(previous); }
-                return new SeriesRoute(owner, generation);
+                // MARKS: the retired route stays indexed until a mark collects its unreported failures.
+                if (!marksMode || isIdle(previous)) {
+                    synchronized (pendingLock) { pendingRoutes.remove(previous); }
+                }
+                return new SeriesRoute(key, owner, generation);
             } finally { previous.lock.unlock(); }
         });
+        if (marksReady[0]) scheduleMarkCompletion();
     }
 
     @Override public void checkGeneration(String key, String generation) {
@@ -211,7 +250,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 throw new NgrrdClusterException(ErrorCode.SERIES_DELETED, "generation replaced: " + key);
             boundary = route.submitted;
         } finally { route.lock.unlock(); }
-        awaitBarriers(Map.of(route, boundary), wait);
+        awaitBarriers(Map.of(route, boundary), wait, true);
     }
 
     /**
@@ -268,6 +307,23 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             NgrrdClusterConfig.BufferFullPolicy bufferFullPolicy, Duration closeTimeout,
             Function<String, Boolean> reopener, BiConsumer<String, String> ownerChanged, Clock clock,
             NgrrdClusterMetricsListener metricsListener, Supplier<ClientMetricsSnapshot> metricsSupplier) {
+        this(rpc, placementLookup, retryPolicy, batchMaxSamples, batchMaxDelay, maxBufferedSamplesPerNode,
+                bufferFullPolicy, closeTimeout, reopener, ownerChanged, clock, metricsListener, metricsSupplier,
+                NgrrdClusterConfig.WriteFailureReporting.BARRIER);
+    }
+
+    /**
+     * Variante completa com o modo de reporte de falhas de escrita ({@code failureReporting}) — usada por
+     * {@code DefaultNgrrdClusterClient} a partir de {@link NgrrdClusterConfig#writeFailureReporting()}.
+     */
+    public WriteDispatcher(ClusterRpc rpc, PlacementLookup placementLookup, RetryPolicy retryPolicy,
+            int batchMaxSamples, Duration batchMaxDelay, long maxBufferedSamplesPerNode,
+            NgrrdClusterConfig.BufferFullPolicy bufferFullPolicy, Duration closeTimeout,
+            Function<String, Boolean> reopener, BiConsumer<String, String> ownerChanged, Clock clock,
+            NgrrdClusterMetricsListener metricsListener, Supplier<ClientMetricsSnapshot> metricsSupplier,
+            NgrrdClusterConfig.WriteFailureReporting failureReporting) {
+        this.marksMode = Objects.requireNonNull(failureReporting, "failureReporting")
+                == NgrrdClusterConfig.WriteFailureReporting.MARKS;
         this.rpc = Objects.requireNonNull(rpc, "rpc");
         this.placementLookup = Objects.requireNonNull(placementLookup, "placementLookup");
         this.retryPolicy = Objects.requireNonNull(retryPolicy, "retryPolicy");
@@ -307,7 +363,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     public void enqueue(String ownerNodeId, SeriesWrite write) {
         Objects.requireNonNull(ownerNodeId, "ownerNodeId");
         Objects.requireNonNull(write, "write");
-        SeriesRoute route = routes.computeIfAbsent(write.seriesKey(), key -> new SeriesRoute(ownerNodeId, write.generationId()));
+        SeriesRoute route = routes.computeIfAbsent(write.seriesKey(), key -> new SeriesRoute(key, ownerNodeId, write.generationId()));
         for (;;) {
             NodeBuffer buf;
             String owner;
@@ -337,7 +393,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 try {
                     if (buf.queue.size() < maxBufferedSamplesPerNode) {
                         buf.queue.addLast(write);
-                        if (route.submitted == route.completed && route.firstFailedSequence == Long.MAX_VALUE) {
+                        if (isIdle(route)) {
                             synchronized (pendingLock) {
                                 pendingRoutes.add(route);
                             }
@@ -385,7 +441,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
 
     @Override
     public void flushNodeSync(String ownerNodeId, Duration maxWait) {
-        awaitBarriers(snapshotBarriers(ownerNodeId), maxWait);
+        awaitBarriers(snapshotBarriers(ownerNodeId), maxWait, false);
     }
 
     @Override
@@ -406,12 +462,64 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         } finally {
             route.lock.unlock();
         }
-        awaitBarriers(Map.of(route, boundary), maxWait);
+        awaitBarriers(Map.of(route, boundary), maxWait, true);
     }
 
     /** Waits for all writes admitted before this call, even if they change destination. */
     public void flushAllSync() {
-        awaitBarriers(snapshotBarriers(null), Duration.ofMillis(closeTimeoutMillis));
+        awaitBarriers(snapshotBarriers(null), Duration.ofMillis(closeTimeoutMillis), false);
+    }
+
+    /**
+     * Captura a fronteira de tudo o que foi admitido até agora, sem esperar ACK (ver {@link WriteMark}).
+     * Custo O(rotas pendentes); serializado com outras chamadas de {@code mark()}.
+     *
+     * @throws IllegalStateException  fora de {@link NgrrdClusterConfig.WriteFailureReporting#MARKS}
+     * @throws NgrrdClusterException {@link ErrorCode#CLOSED} se o dispatcher já foi fechado
+     */
+    public WriteMark mark() {
+        if (!marksMode) {
+            throw new IllegalStateException("mark() exige writeFailureReporting=MARKS na configuração do cliente");
+        }
+        markLock.lock();
+        try {
+            if (closed) {
+                throw new NgrrdClusterException(ErrorCode.CLOSED, "dispatcher fechado");
+            }
+            long admitted = samplesEnqueuedCount.sum();
+            Mark mark = new Mark(nextMarkId++, Math.max(0L, admitted - lastMarkAdmitted));
+            lastMarkAdmitted = admitted;
+            openMarks.addLast(mark);
+            for (SeriesRoute route : snapshotPendingRoutes()) {
+                route.lock.lock();
+                try {
+                    if (route.completed >= route.submitted) {
+                        // Nothing in flight: collect what is still unreported right away.
+                        route.collectFailures(mark, route.submitted);
+                        if (isIdle(route)) {
+                            synchronized (pendingLock) {
+                                pendingRoutes.remove(route);
+                            }
+                        }
+                    } else if (route.waiters.isEmpty() || route.waiters.peekLast().boundary() < route.submitted) {
+                        mark.acquire();
+                        route.waiters.addLast(new MarkWaiter(mark, route.submitted));
+                    }
+                    // Same boundary as the previous mark's waiter: that mark collects every failure up to
+                    // it and completes first (in-order completion), so this one needs no waiter here. A
+                    // stuck owner (node down, no write deadline) keeps one waiter per route, not one per mark.
+                } finally {
+                    route.lock.unlock();
+                }
+            }
+            // Guard released under markLock: mark N is released before mark N+1 exists, so
+            // releases (and completions) are monotonic in mark order.
+            mark.release();
+            scheduleMarkCompletion();
+            return mark;
+        } finally {
+            markLock.unlock();
+        }
     }
 
     private Map<SeriesRoute, Long> snapshotBarriers(String owner) {
@@ -435,7 +543,12 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         }
     }
 
-    private void awaitBarriers(Map<SeriesRoute, Long> barriers, Duration maxWait) {
+    /**
+     * Espera cada rota alcançar a fronteira. {@code BARRIER}: lança na primeira falha de escrita coberta.
+     * {@code MARKS}: falha de escrita não lança (vai para as marcas); só uma barreira por série
+     * ({@code perSeries}) lança se a série estiver terminal ({@code SERIES_DELETED}/{@code QUARANTINED}).
+     */
+    private void awaitBarriers(Map<SeriesRoute, Long> barriers, Duration maxWait, boolean perSeries) {
         long startedAt = System.nanoTime();
         long budgetNanos = Math.max(0L, maxWait.toNanos());
         for (Map.Entry<SeriesRoute, Long> entry : barriers.entrySet()) {
@@ -443,7 +556,11 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             for (;;) {
                 route.lock.lock();
                 try {
-                    if (route.firstFailedSequence <= entry.getValue()) {
+                    if (marksMode) {
+                        if (perSeries && isLifecycleTerminal(route.failureCode)) {
+                            throw new NgrrdClusterException(route.failureCode, route.failureMessage);
+                        }
+                    } else if (route.firstFailedSequence <= entry.getValue()) {
                         throw new NgrrdClusterException(route.failureCode, route.failureMessage);
                     }
                     if (route.completed >= entry.getValue()) {
@@ -507,6 +624,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             sleepQuietly(DRAIN_POLL_MS);
         }
 
+        settleMarksOnClose();
         recoveryPool.shutdownNow();
         ownerLookupPool.shutdownNow();
         flushPool.shutdown();
@@ -524,6 +642,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+        markCompletionPool.shutdown();
         try {
             tickThread.join(1_000L);
         } catch (InterruptedException e) {
@@ -546,6 +665,20 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 LOGGER.log(Level.SEVERE, remaining + " amostra(s) pendente(s) para " + entry.getKey()
                         + " descartada(s) ao fechar o dispatcher (orçamento de " + budgetMillis + " ms esgotado)");
             }
+        }
+    }
+
+    /** Waiters de marca registrados na rota de {@code seriesKey} — visível para testes. */
+    int markWaiters(String seriesKey) {
+        SeriesRoute route = routes.get(seriesKey);
+        if (route == null) {
+            return 0;
+        }
+        route.lock.lock();
+        try {
+            return route.waiters.size();
+        } finally {
+            route.lock.unlock();
         }
     }
 
@@ -727,7 +860,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 try { buf.queue.succeeded(seriesKey); }
                 finally { buf.lock.unlock(); }
                 samplesSentCount.add(writes.size());
-                completeWrites(seriesKey, writes.size(), null);
+                completeWrites(currentRoute, writes.size(), null, SeriesStatus.OK);
             }
             case WRONG_OWNER -> {
                 recordRetry(SeriesStatus.WRONG_OWNER);
@@ -761,25 +894,26 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             }
             case SERIES_DELETED, QUARANTINED -> {
                 ErrorCode code = status == SeriesStatus.SERIES_DELETED ? ErrorCode.SERIES_DELETED : ErrorCode.QUARANTINED;
-                currentRoute.lock.lock();
-                try { currentRoute.failureCode = code; } finally { currentRoute.lock.unlock(); }
-                samplesFailedCount.add(writes.size());
                 String message = response.errorBySeries().getOrDefault(seriesKey, status + ": " + seriesKey);
-                completeWrites(seriesKey, writes.size(), message);
+                currentRoute.failureCode = code;
+                if (marksMode) currentRoute.failureMessage = message;
+                samplesFailedCount.add(writes.size());
+                completeWrites(currentRoute, writes.size(), message, status);
                 terminalListener.accept(writes.get(0), new NgrrdClusterException(code, message));
             }
             case ERROR -> {
                 recordRetry(SeriesStatus.ERROR);
                 samplesFailedCount.add(writes.size());
-                completeWrites(seriesKey, writes.size(), "WRITE_BATCH falhou para " + seriesKey + ": "
-                        + response.errorBySeries().get(seriesKey));
+                completeWrites(currentRoute, writes.size(), "WRITE_BATCH falhou para " + seriesKey + ": "
+                        + response.errorBySeries().get(seriesKey), SeriesStatus.ERROR);
                 LOGGER.warning("WRITE_BATCH respondeu ERROR para " + seriesKey + ": "
                         + response.errorBySeries().get(seriesKey));
             }
             default -> {
                 recordRetry(status);
                 samplesFailedCount.add(writes.size());
-                completeWrites(seriesKey, writes.size(), "WRITE_BATCH respondeu " + status + " para " + seriesKey);
+                completeWrites(currentRoute, writes.size(), "WRITE_BATCH respondeu " + status + " para " + seriesKey,
+                        status);
                 LOGGER.warning("WRITE_BATCH respondeu status inesperado " + status + " para " + seriesKey);
             }
         }
@@ -1092,20 +1226,26 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
 
     // FIFO admission/rerouting ensures completions form a prefix of each series. A failed
     // prefix remains observable: a later checkpoint cannot certify those lost samples.
-    private void completeWrites(String seriesKey, int count, String failure) {
-        SeriesRoute route = routes.get(seriesKey);
+    // BARRIER: until restart. MARKS: until a mark reports it.
+    private void completeWrites(SeriesRoute route, int count, String failure, SeriesStatus status) {
+        boolean marksReady;
         route.lock.lock();
         try {
-            if (failure != null && route.firstFailedSequence == Long.MAX_VALUE) {
-                route.firstFailedSequence = route.completed + 1;
-                route.failureMessage = failure;
+            if (failure != null) {
+                if (marksMode) {
+                    route.recordFailure(route.completed + 1, route.completed + count, status);
+                } else if (route.firstFailedSequence == Long.MAX_VALUE) {
+                    route.firstFailedSequence = route.completed + 1;
+                    route.failureMessage = failure;
+                }
             }
             route.completed += count;
             if (failure == null) {
                 // OK do dono: o episódio de redirecionamento (#177) terminou.
                 route.resetRedirectEpisode();
             }
-            if (route.completed == route.submitted && route.firstFailedSequence == Long.MAX_VALUE) {
+            marksReady = releaseWaiters(route);
+            if (isIdle(route)) {
                 synchronized (pendingLock) {
                     pendingRoutes.remove(route);
                 }
@@ -1115,6 +1255,117 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             route.progress.signalAll();
         } finally {
             route.lock.unlock();
+        }
+        // Still possibly under the caller's route.lock (applyStatus): completion is asynchronous.
+        if (marksReady) {
+            scheduleMarkCompletion();
+        }
+    }
+
+    /**
+     * Rota sem escrita em voo e sem falha a reportar: fora do índice de pendentes. {@code BARRIER}: uma falha
+     * mantém a rota indexada para sempre; {@code MARKS}: até uma marca colhê-la. Chamado sob {@code route.lock}.
+     */
+    private boolean isIdle(SeriesRoute route) {
+        return route.submitted == route.completed
+                && (marksMode ? route.unreportedFailures.isEmpty() : route.firstFailedSequence == Long.MAX_VALUE);
+    }
+
+    private static boolean isLifecycleTerminal(ErrorCode code) {
+        return code == ErrorCode.SERIES_DELETED || code == ErrorCode.QUARANTINED;
+    }
+
+    /**
+     * Libera os waiters cuja fronteira já foi alcançada, colhendo as falhas até cada fronteira. Chamado sob
+     * {@code route.lock}; devolve {@code true} se alguma marca ficou pronta.
+     */
+    private static boolean releaseWaiters(SeriesRoute route) {
+        boolean ready = false;
+        while (!route.waiters.isEmpty() && route.waiters.peekFirst().boundary() <= route.completed) {
+            MarkWaiter waiter = route.waiters.pollFirst();
+            route.collectFailures(waiter.mark(), waiter.boundary());
+            ready |= waiter.mark().release();
+        }
+        return ready;
+    }
+
+    /** Garante uma drenagem das marcas prontas, sem segurar lock (ver {@link #markCompletionPool}). */
+    private void scheduleMarkCompletion() {
+        if (!markCompletionRunning.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            markCompletionPool.execute(this::completeReadyMarks);
+        } catch (RejectedExecutionException closing) {
+            // close() conclui ou falha as marcas restantes em settleMarksOnClose().
+            markCompletionRunning.set(false);
+        }
+    }
+
+    private void completeReadyMarks() {
+        try {
+            for (Mark mark; (mark = pollReadyMark()) != null; ) {
+                mark.complete();
+            }
+        } finally {
+            markCompletionRunning.set(false);
+            // A mark released between the last poll and set(false) cannot be left behind.
+            if (peekReadyMark()) {
+                scheduleMarkCompletion();
+            }
+        }
+    }
+
+    private Mark pollReadyMark() {
+        markLock.lock();
+        try {
+            Mark head = openMarks.peekFirst();
+            return head != null && head.released() ? openMarks.pollFirst() : null;
+        } finally {
+            markLock.unlock();
+        }
+    }
+
+    private boolean peekReadyMark() {
+        markLock.lock();
+        try {
+            Mark head = openMarks.peekFirst();
+            return head != null && head.released();
+        } finally {
+            markLock.unlock();
+        }
+    }
+
+    /**
+     * Fim do dreno do {@code close()}: conclui, em ordem, as marcas já liberadas e falha, a partir da primeira
+     * não liberada, todas as seguintes com {@link ErrorCode#CLOSED} — uma marca posterior pode estar liberada
+     * só porque deixou à anterior a espera de uma rota com a mesma fronteira. Fora de qualquer lock interno.
+     */
+    private void settleMarksOnClose() {
+        // Takes the drain flag for good (scheduleMarkCompletion becomes a no-op): an in-flight drain must
+        // finish its mark before later marks are settled here, or results would leave out of order.
+        long waitUntil = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
+        while (!markCompletionRunning.compareAndSet(false, true) && System.nanoTime() < waitUntil
+                && !Thread.currentThread().isInterrupted()) {
+            sleepQuietly(1L);
+        }
+        List<Mark> pending;
+        markLock.lock();
+        try {
+            pending = new ArrayList<>(openMarks);
+            openMarks.clear();
+        } finally {
+            markLock.unlock();
+        }
+        boolean failing = false;
+        for (Mark mark : pending) {
+            failing |= !mark.released();
+            if (!failing) {
+                mark.complete();
+            } else {
+                mark.fail(new NgrrdClusterException(ErrorCode.CLOSED,
+                        "cliente fechado antes da conclusão da marca " + mark.id()));
+            }
         }
     }
 
@@ -1265,6 +1516,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
 
     /** Routing and admission order for one series, independent of the caller's owner hint. */
     private static final class SeriesRoute {
+        private final String key;
         private final ReentrantLock lock = new ReentrantLock();
         private final Condition progress = lock.newCondition();
         private String owner;
@@ -1287,8 +1539,13 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         private boolean redirectPending;
         /** Última dica de dono recebida no episódio; seguida quando a consulta ao líder falha. */
         private String lastHint;
+        /** MARKS: faixas de sequência com falha final ainda não reportadas por uma marca, em ordem. */
+        private final ArrayDeque<FailedRange> unreportedFailures = new ArrayDeque<>();
+        /** MARKS: marcas esperando esta rota, em ordem de marca (fronteiras não decrescentes). */
+        private final ArrayDeque<MarkWaiter> waiters = new ArrayDeque<>();
 
-        SeriesRoute(String owner, String generation) {
+        SeriesRoute(String key, String owner, String generation) {
+            this.key = key;
             this.generation = generation;
             this.owner = owner;
             destinations.add(owner);
@@ -1300,6 +1557,111 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             confirmedOwner = null;
             lastHint = null;
         }
+
+        /** Registra {@code [from, to]} como falha final; junta com a faixa anterior contígua de mesmo status. */
+        void recordFailure(long from, long to, SeriesStatus status) {
+            FailedRange last = unreportedFailures.peekLast();
+            if (last != null && last.to() + 1 == from && last.status() == status) {
+                unreportedFailures.pollLast();
+                unreportedFailures.addLast(new FailedRange(last.from(), to, status));
+            } else {
+                unreportedFailures.addLast(new FailedRange(from, to, status));
+            }
+        }
+
+        /** Atribui a {@code mark} as falhas com sequência {@code <= boundary}, partindo a faixa que cruza a fronteira. */
+        void collectFailures(Mark mark, long boundary) {
+            while (!unreportedFailures.isEmpty() && unreportedFailures.peekFirst().from() <= boundary) {
+                FailedRange range = unreportedFailures.pollFirst();
+                if (range.to() > boundary) {
+                    unreportedFailures.addFirst(new FailedRange(boundary + 1, range.to(), range.status()));
+                    mark.addFailures(key, range.status(), boundary - range.from() + 1);
+                } else {
+                    mark.addFailures(key, range.status(), range.to() - range.from() + 1);
+                }
+            }
+        }
+    }
+
+    /** Faixa {@code [from, to]} de sequências de uma série que terminou com {@code status} final. */
+    private record FailedRange(long from, long to, SeriesStatus status) { }
+
+    /** Marca esperando a rota alcançar {@code boundary}. */
+    private record MarkWaiter(Mark mark, long boundary) { }
+
+    /**
+     * Implementação de {@link WriteMark}. {@link #remaining} começa em 1 (guarda liberada no fim do registro em
+     * {@link WriteDispatcher#mark()}) e soma um por waiter registrado.
+     */
+    private static final class Mark implements WriteMark {
+        private final long id;
+        private final long samplesAdmitted;
+        private final AtomicLong remaining = new AtomicLong(1L);
+        private final CompletableFuture<WriteMarkResult> future = new CompletableFuture<>();
+        private final Lock stateLock = new ReentrantLock();
+        private long samplesFailed;
+        private final Map<SeriesStatus, Long> failuresByStatus = new LinkedHashMap<>();
+        private final Set<String> failedSeries = new LinkedHashSet<>();
+        private boolean failedSeriesTruncated;
+        private volatile WriteMarkResult result;
+
+        Mark(long id, long samplesAdmitted) {
+            this.id = id;
+            this.samplesAdmitted = samplesAdmitted;
+        }
+
+        void acquire() {
+            remaining.incrementAndGet();
+        }
+
+        /** {@code true} se esta liberação deixou a marca pronta. */
+        boolean release() {
+            return remaining.decrementAndGet() == 0L;
+        }
+
+        boolean released() {
+            return remaining.get() == 0L;
+        }
+
+        void addFailures(String seriesKey, SeriesStatus status, long count) {
+            stateLock.lock();
+            try {
+                samplesFailed += count;
+                failuresByStatus.merge(status, count, Long::sum);
+                if (!failedSeries.contains(seriesKey)) {
+                    if (failedSeries.size() < WriteMarkResult.MAX_FAILED_SERIES_SAMPLE) {
+                        failedSeries.add(seriesKey);
+                    } else {
+                        failedSeriesTruncated = true;
+                    }
+                }
+            } finally {
+                stateLock.unlock();
+            }
+        }
+
+        void complete() {
+            WriteMarkResult built;
+            stateLock.lock();
+            try {
+                built = new WriteMarkResult(id, samplesAdmitted, samplesFailed, failuresByStatus,
+                        List.copyOf(failedSeries), failedSeriesTruncated);
+            } finally {
+                stateLock.unlock();
+            }
+            result = built;
+            future.complete(built);
+        }
+
+        void fail(NgrrdClusterException failure) {
+            future.completeExceptionally(failure);
+        }
+
+        @Override public long id() { return id; }
+        @Override public boolean isDone() { return future.isDone(); }
+        @Override public Optional<WriteMarkResult> result() { return Optional.ofNullable(result); }
+        @Override public CompletableFuture<WriteMarkResult> completion() { return future.copy(); }
+        @Override public String toString() { return "WriteMark[" + id + "]"; }
     }
 
     /** Escritas de uma série retiradas de um buffer, com as tentativas que ela acumulava ali. */

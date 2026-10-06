@@ -297,7 +297,9 @@ Durante essa janela:
   no storage. Use as barreiras `flush()`/`checkpoint()` conforme a necessidade da aplicação.
 - Leituras e barreiras podem esperar e falhar se o orçamento de retentativa se esgotar.
   O padrão de `retryTimeout` do cliente é 5 minutos; ele é independente do
-  `migrationTimeout` de 10 minutos do storage.
+  `migrationTimeout` de 10 minutos do storage. O `retryTimeout` limita as barreiras e as
+  operações síncronas, não as escritas já admitidas no buffer: essas retentam até a resposta
+  final do storage ou o `close()` do cliente.
 - O buffer padrão comporta 100.000 amostras **por nó de destino**. Quando enche, a política
   `BLOCK` bloqueia o produtor; `FAIL` lança `BUFFER_FULL`. O buffer é em memória.
 - O limite de memória permanece por destino e inclui as séries em espera. Se esse limite
