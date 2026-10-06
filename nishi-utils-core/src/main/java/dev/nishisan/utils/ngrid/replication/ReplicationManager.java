@@ -282,7 +282,7 @@ public class ReplicationManager
     // handback. Manual assemblies (tests) never defer, so they stay ready.
     private volatile boolean handlersReady = true;
     /** Log marker of a HANDBACK_COMPLETE vector entry that does not match the frozen frontier (8.11.2). */
-    public static final String HANDBACK_VECTOR_MISMATCH_MARKER = "NGRID_HANDBACK_VECTOR_MISMATCH";
+    static final String HANDBACK_VECTOR_MISMATCH_MARKER = "NGRID_HANDBACK_VECTOR_MISMATCH";
     // INTERIM-LEADER production freeze: gates replicate() so nothing is produced above the frozen
     // watermark while the candidate installs the snapshot (defense in depth vs the app's consumer pause).
     private final java.util.concurrent.atomic.AtomicBoolean handoverFreezing =
@@ -753,6 +753,9 @@ public class ReplicationManager
      * Whether the owner finished registering its handlers (8.11.2). Observability mirror of the
      * readiness gate; always {@code true} for a manually assembled manager.
      *
+     * <p><b>Internal:</b> part of the {@code NGridNode} lifecycle and its tests; not meant for
+     * application code.
+     *
      * @return {@code true} when the node may advertise, lead and take part in a handback
      */
     public boolean isHandlersReady() {
@@ -763,6 +766,9 @@ public class ReplicationManager
      * Whether an affinity handback is in flight on this node, in any role (8.11.2). On the candidate it
      * stays {@code true} from the request through the promotion until the {@code HANDBACK_COMPLETE} has
      * been sent — the window in which a second request must not be issued.
+     *
+     * <p><b>Internal:</b> observability hook of the handback state machine for the {@code NGridNode}
+     * lifecycle and its tests; not meant for application code.
      *
      * @return {@code true} while a handback is in progress
      */
@@ -4194,9 +4200,12 @@ public class ReplicationManager
      * install this node's snapshot of the topic — in the CTP incident the vector carried the candidate's
      * stale DISK frontier of a topic whose handler had not registered yet, and the SET renumbered the
      * incumbent downwards, truncating its op-log and purging its relay. Such an entry is skipped
-     * (frontier, counter, op-log and relay kept) and logged with {@link #HANDBACK_VECTOR_MISMATCH_MARKER};
-     * the node stays ahead of the new leader on that topic, which the fresh-leader yield and the
-     * follower-ahead detectors then resolve instead of a silent loss.
+     * (frontier, counter, op-log and relay kept) and logged with {@link #HANDBACK_VECTOR_MISMATCH_MARKER}.
+     * With every node on 8.11.2 the candidate never sends such an entry (it installs every topic of the
+     * GRANT or aborts); the check guards the mixed-version window. It does NOT repair the divergence: the
+     * new leader holds an older state of the topic, and the follower-ahead self-heal later converges this
+     * node to it — the operations between that older label and the frozen frontier are lost on the topic.
+     * The marker is the signal to intervene (see the operations runbook) before accepting writes.
      *
      * @param byTopic       the candidate's cutover frontier per topic (the frozen vector on the backstop
      *                      path); empty from a pre-8.8.0 candidate
