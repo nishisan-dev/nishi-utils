@@ -16,6 +16,7 @@
  */
 package dev.nishisan.utils.ngrid.structures;
 
+import dev.nishisan.utils.map.NMapPersistenceMode;
 import dev.nishisan.utils.ngrid.cluster.transport.TransportListener;
 import dev.nishisan.utils.ngrid.common.ClusterMessage;
 import dev.nishisan.utils.ngrid.common.MessageType;
@@ -24,6 +25,7 @@ import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.ngrid.map.MapClusterService;
 import dev.nishisan.utils.ngrid.replication.ReplicationManager;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
@@ -39,6 +41,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -46,6 +49,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
+import java.util.logging.Handler;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -74,12 +80,45 @@ class DelayedMapRegistrationHandbackClusterTest {
     private static final String NODES_TOPIC = MapClusterService.TOPIC_PREFIX + NODES_MAP;
     private static final int WARMUP_OPS = 20;
 
+    private static final String LOCAL_ONLY_MAP = "local-only";
+    private static final String LOCAL_ONLY_TOPIC = MapClusterService.TOPIC_PREFIX + LOCAL_ONLY_MAP;
+    private static final List<String> SHARED_MAPS = List.of(CATALOG_MAP, NODES_MAP);
+    private static final int LOCAL_ONLY_OPS = 7;
+
     private final List<NGridNode> running = new ArrayList<>();
     /** HANDBACK_REQUESTs que chegam ao incumbente B (contados no transporte de B). */
     private final AtomicInteger handbackRequests = new AtomicInteger();
+    /** Marcadores de divergência do vetor emitidos por qualquer nó do processo. */
+    private final List<String> mismatchMarkers = new CopyOnWriteArrayList<>();
+    // Referência forte: o LogManager guarda os loggers por referência fraca.
+    private final Logger managerLogger = Logger.getLogger(ReplicationManager.class.getName());
+    private Handler markerCapture;
+
+    @BeforeEach
+    void setUp() {
+        markerCapture = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                String message = record.getMessage();
+                if (message != null && message.contains("NGRID_HANDBACK_VECTOR_MISMATCH")) {
+                    mismatchMarkers.add(message);
+                }
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        managerLogger.addHandler(markerCapture);
+    }
 
     @AfterEach
     void tearDown() {
+        managerLogger.removeHandler(markerCapture);
         for (NGridNode node : running) {
             closeQuietly(node);
         }
@@ -223,6 +262,131 @@ class DelayedMapRegistrationHandbackClusterTest {
         assertEquals(1, handbackRequests.get(), "um único HANDBACK_REQUEST na tentativa");
     }
 
+    /**
+     * Forma do incidente: o nó de maior afinidade reinicia com o diretório de dados ANTIGO (fronteira de
+     * disco abaixo da do líder, que seguiu escrevendo) e com um mapa configurado que o incumbente não
+     * serve. O GRANT só nomeia os tópicos do incumbente; o candidato instala exatamente esses, não arma o
+     * mapa local, envia no vetor só o que instalou e o incumbente não reancora nada fora do vetor
+     * congelado — nenhuma fronteira diminui, nenhum marcador de divergência, um único REQUEST.
+     */
+    @Test
+    @Timeout(value = 300, unit = TimeUnit.SECONDS)
+    void reinicioComDiscoAntigoEMapaLocalExtraInstalaOsTopicosDoGrantSemRebaixarNinguem() throws Exception {
+        Set<Integer> ports = new HashSet<>();
+        NodeInfo infoA = new NodeInfo(NodeId.of("stale-a"), "127.0.0.1", allocateFreeLocalPort(ports), Set.of(), 100);
+        NodeInfo infoB = new NodeInfo(NodeId.of("stale-b"), "127.0.0.1", allocateFreeLocalPort(ports), Set.of(), 50);
+        NodeInfo infoC = new NodeInfo(NodeId.of("stale-c"), "127.0.0.1", allocateFreeLocalPort(ports), Set.of(), 10);
+        Path base = Files.createTempDirectory("ngrid-stale-disk");
+        Path dirA = Files.createDirectories(base.resolve("a"));
+        Path dirB = Files.createDirectories(base.resolve("b"));
+        Path dirC = Files.createDirectories(base.resolve("c"));
+        List<String> mapsOfA = List.of(CATALOG_MAP, NODES_MAP, LOCAL_ONLY_MAP);
+
+        // (1) Os três sobem; A lidera e aquece catalog, nodes e o seu mapa local.
+        NGridNode a = start(newNode(infoA, dirA, name -> { }, mapsOfA, infoB, infoC));
+        NGridNode b = start(newNode(infoB, dirB, name -> { }, SHARED_MAPS, infoA, infoC));
+        NGridNode c = start(newNode(infoC, dirC, name -> { }, SHARED_MAPS, infoA, infoB));
+        awaitReadyLeader(a, 60_000);
+        b.transport().addListener(new TransportListener() {
+            @Override
+            public void onPeerConnected(NodeInfo peer) {
+            }
+
+            @Override
+            public void onPeerDisconnected(NodeId peerId) {
+            }
+
+            @Override
+            public void onMessage(ClusterMessage message) {
+                if (message.type() == MessageType.HANDBACK_REQUEST) {
+                    handbackRequests.incrementAndGet();
+                }
+            }
+        });
+        DistributedMap<String, String> localOnlyA = a.getMap(LOCAL_ONLY_MAP, String.class, String.class);
+        for (int i = 0; i < WARMUP_OPS; i++) {
+            putWithRetry(catalog(a), "warm-" + i, "v");
+            putWithRetry(nodes(a), "warm-" + i, "v");
+        }
+        for (int i = 0; i < LOCAL_ONLY_OPS; i++) {
+            putWithRetry(localOnlyA, "local-" + i, "v");
+        }
+        awaitFrontier(b, CATALOG_TOPIC, frontier(a, CATALOG_TOPIC), 30_000);
+        awaitFrontier(c, CATALOG_TOPIC, frontier(a, CATALOG_TOPIC), 30_000);
+        awaitFrontier(b, NODES_TOPIC, frontier(a, NODES_TOPIC), 30_000);
+        awaitFrontier(c, NODES_TOPIC, frontier(a, NODES_TOPIC), 30_000);
+
+        // (2) A sai de forma graciosa; B assume e segue escrevendo: a fronteira de disco de A fica para trás.
+        closeQuietly(a);
+        running.remove(a);
+        awaitReadyLeader(b, 60_000);
+        awaitFollowerOf(c, b, 30_000);
+        DistributedMap<String, String> catalogB = catalog(b);
+        Set<String> confirmed = ConcurrentHashMap.newKeySet();
+        AtomicBoolean writing = new AtomicBoolean(true);
+        AtomicReference<Throwable> writerFailure = new AtomicReference<>();
+        Thread writer = new Thread(() -> {
+            int i = 0;
+            try {
+                while (writing.get()) {
+                    String key = "live-" + i++;
+                    putWithRetry(catalogB, key, "v");
+                    confirmed.add(key);
+                    Thread.sleep(5);
+                }
+            } catch (Throwable t) {
+                writerFailure.set(t);
+            }
+        }, "catalog-writer-stale");
+        writer.start();
+        FrontierMonitor monitorB = new FrontierMonitor(b);
+        monitorB.start();
+        Thread.sleep(1_000);
+        assertTrue(confirmed.size() > 10, "B deve ter avançado o catálogo enquanto A estava fora");
+
+        // (3) A volta com o disco antigo; o handback instala os tópicos do GRANT e A assume.
+        NGridNode aBack = start(newNode(infoA, dirA, name -> { }, mapsOfA, infoB, infoC));
+        awaitCondition(() -> aBack.coordinator().isLeader(), 120_000, 20L,
+                () -> "A não assumiu via handback (líder visto por A: "
+                        + aBack.coordinator().leaderInfo().map(NodeInfo::nodeId).orElse(null) + ")");
+        awaitReadyLeader(aBack, 60_000);
+        Thread.sleep(1_000); // mais escrita já com A líder
+        writing.set(false);
+        writer.join(TimeUnit.SECONDS.toMillis(60));
+        if (writerFailure.get() != null) {
+            throw new AssertionError("o writer falhou", writerFailure.get());
+        }
+        awaitFollowerOf(b, aBack, 30_000);
+        awaitFollowerOf(c, aBack, 30_000);
+
+        for (NGridNode node : List.of(aBack, b, c)) {
+            DistributedMap<String, String> map = catalog(node);
+            awaitCondition(() -> missing(map, confirmed).isEmpty(), 60_000, 100L,
+                    () -> "nó " + node.transport().local().nodeId() + " sem as chaves confirmadas: "
+                            + missing(map, confirmed));
+        }
+        monitorB.stop();
+        assertTrue(monitorB.decreases.isEmpty(), "fronteiras de B diminuíram: " + monitorB.decreases);
+        for (String topic : List.of(CATALOG_TOPIC, NODES_TOPIC)) {
+            awaitFrontier(c, topic, frontier(aBack, topic), 30_000);
+            assertTrue(frontier(c, topic) <= frontier(aBack, topic), "C à frente de A em " + topic);
+            assertTrue(c.replicationManager().getRelayStreamCursor(topic) <= frontier(aBack, topic),
+                    "cursor de C acima da fronteira de A em " + topic);
+            assertTrue(frontier(b, topic) <= frontier(aBack, topic), "B à frente de A em " + topic);
+        }
+        // O mapa que só A serve não entrou no handback: nem armado, nem reancorado, nem perdido.
+        DistributedMap<String, String> localOnlyBack = aBack.getMap(LOCAL_ONLY_MAP, String.class, String.class);
+        for (int i = 0; i < LOCAL_ONLY_OPS; i++) {
+            assertTrue(localOnlyBack.getOptional("local-" + i, Consistency.EVENTUAL).isPresent(),
+                    "o mapa local de A perdeu local-" + i);
+        }
+        assertEquals(LOCAL_ONLY_OPS, frontier(aBack, LOCAL_ONLY_TOPIC), "fronteira do mapa local intocada");
+        assertFalse(b.replicationManager().appliedFrontiers().byTopic().containsKey(LOCAL_ONLY_TOPIC),
+                "B não ganha um tópico que não serve");
+        assertEquals(1, handbackRequests.get(), "um único HANDBACK_REQUEST na tentativa");
+        assertTrue(mismatchMarkers.isEmpty(), "nenhum marcador de divergência: " + mismatchMarkers);
+    }
+
     @Test
     @Timeout(value = 120, unit = TimeUnit.SECONDS)
     void noSozinhoComMapaPresoNaoFicaElegivelNemLideraAteOUltimoMapaRegistrar() throws Exception {
@@ -345,6 +509,11 @@ class DelayedMapRegistrationHandbackClusterTest {
 
     private static NGridNode newNode(NodeInfo self, Path dir, java.util.function.Consumer<String> barrier,
             NodeInfo... peers) {
+        return newNode(self, dir, barrier, SHARED_MAPS, peers);
+    }
+
+    private static NGridNode newNode(NodeInfo self, Path dir, java.util.function.Consumer<String> barrier,
+            List<String> maps, NodeInfo... peers) {
         NGridConfig.Builder builder = NGridConfig.builder(self)
                 .dataDirectory(dir)
                 .replicationFactor(1)
@@ -356,9 +525,11 @@ class DelayedMapRegistrationHandbackClusterTest {
                 .handoverMaxDuration(Duration.ofSeconds(30))
                 .handoverSnapshotTimeout(Duration.ofSeconds(30))
                 .handoverRequestTimeout(Duration.ofSeconds(5))
-                .handoverCooldown(Duration.ofSeconds(3))
-                .addMap(MapConfig.builder(CATALOG_MAP).build())
-                .addMap(MapConfig.builder(NODES_MAP).build());
+                .handoverCooldown(Duration.ofSeconds(3));
+        for (String mapName : maps) {
+            // Persistentes: um reinício com o mesmo diretório recupera conteúdo e fronteira de disco.
+            builder.addMap(MapConfig.builder(mapName).persistenceMode(NMapPersistenceMode.ASYNC_WITH_FSYNC).build());
+        }
         for (NodeInfo peer : peers) {
             builder.addPeer(peer);
         }

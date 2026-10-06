@@ -19,6 +19,8 @@ package dev.nishisan.utils.ngrid.replication;
 import dev.nishisan.utils.ngrid.cluster.coordination.ClusterCoordinator;
 import dev.nishisan.utils.ngrid.cluster.coordination.ClusterCoordinatorConfig;
 import dev.nishisan.utils.ngrid.common.ClusterMessage;
+import dev.nishisan.utils.ngrid.common.HandbackAbortPayload;
+import dev.nishisan.utils.ngrid.common.HandbackGrantPayload;
 import dev.nishisan.utils.ngrid.common.HeartbeatPayload;
 import dev.nishisan.utils.ngrid.common.MessageType;
 import dev.nishisan.utils.ngrid.common.NodeId;
@@ -122,6 +124,73 @@ class HandlersReadyGateTest {
                 interimHeartbeat(transport);
                 return !transport.sentOfType(MessageType.HANDBACK_REQUEST).isEmpty();
             }, 15_000, "com os handlers prontos o candidato pede o handback");
+        } finally {
+            try {
+                manager.close();
+            } catch (Exception ignored) {
+                // teardown best-effort
+            }
+            try {
+                coordinator.close();
+            } catch (Exception ignored) {
+                // teardown best-effort
+            }
+        }
+    }
+
+    /**
+     * Guarda do GRANT: mesmo que o REQUEST tenha saído pronto, um GRANT recebido com o gate rearmado não
+     * inicia instalação alguma — é abortado com a razão explícita. (Em produção o gate não volta a
+     * engajar; a guarda é defesa em profundidade contra um GRANT que chegue com o conjunto parcial.)
+     */
+    @Test
+    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    void grantRecebidoComHandlersNaoProntosEAbortadoSemInstalarNada() throws Exception {
+        ScriptedTransport transport = new ScriptedTransport(new NodeInfo(CANDIDATE, "127.0.0.1", 1, Set.of(), 100),
+                List.of(new NodeInfo(INTERIM, "127.0.0.1", 2, Set.of(), 50)));
+        ClusterCoordinator coordinator = new ClusterCoordinator(transport,
+                ClusterCoordinatorConfig.of(Duration.ofMillis(100), Duration.ofSeconds(5),
+                        Duration.ofSeconds(60), 2, null),
+                scheduler);
+        ReplicationManager manager = new ReplicationManager(transport, coordinator,
+                ReplicationConfig.builder(1)
+                        .strictConsistency(false)
+                        .leaderLocalApply(false)
+                        .followerIngestMode(FollowerIngestMode.RELAY_STREAM)
+                        .operationTimeout(Duration.ofSeconds(5))
+                        .affinityHandbackMode(true)
+                        .dataDirectory(tempDir)
+                        .build());
+        try {
+            manager.registerHandler(TOPIC, new ReplicationHandler() {
+                @Override
+                public void apply(UUID operationId, Object payload) {
+                }
+
+                @Override
+                public Object getSnapshot() {
+                    return new byte[] {1};
+                }
+            });
+            manager.start();
+            coordinator.start();
+            awaitCondition(() -> {
+                interimHeartbeat(transport);
+                return !transport.sentOfType(MessageType.HANDBACK_REQUEST).isEmpty();
+            }, 15_000, "o candidato pronto pede o handback");
+
+            manager.deferHandlersReady(); // o gate rearma antes de o GRANT chegar
+            transport.deliver(ClusterMessage.request(MessageType.HANDBACK_GRANT, "handback", INTERIM, CANDIDATE,
+                    new HandbackGrantPayload(TOPIC, 10L, 3L, Map.of(TOPIC, 10L))));
+            awaitCondition(() -> !transport.sentOfType(MessageType.HANDBACK_ABORT).isEmpty(), 5_000,
+                    "o GRANT com handlers não prontos deve ser abortado");
+            HandbackAbortPayload abort = transport.sentOfType(MessageType.HANDBACK_ABORT).get(0)
+                    .payload(HandbackAbortPayload.class);
+            assertTrue(abort.reason().contains("not ready"), "razão: " + abort.reason());
+            assertTrue(transport.sentOfType(MessageType.SYNC_REQUEST).isEmpty(), "nenhum snapshot é pedido");
+            assertTrue(transport.sentOfType(MessageType.HANDBACK_COMPLETE).isEmpty(), "nenhum COMPLETE");
+            assertFalse(coordinator.isLeader());
+            awaitCondition(() -> !manager.isHandbackInProgress(), 5_000, "o papel é liberado no abort");
         } finally {
             try {
                 manager.close();

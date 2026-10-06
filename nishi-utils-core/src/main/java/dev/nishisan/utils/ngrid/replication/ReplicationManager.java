@@ -718,13 +718,6 @@ public class ReplicationManager
             // but apply must not begin until the handler is available.
             ensureRelayApplyLoop(topic);
             ensureRelayFetchLoop(topic);
-            // 8.11.2: a topic the GRANT requires, registered while the handback is installing — arm
-            // its bootstrap now; the cutover waits for it (see completeBootstrapPromotion).
-            if (handbackRole.get() == HandbackRole.CANDIDATE_INSTALLING && handbackRequiredTopics.contains(topic)) {
-                LOGGER.info(() -> "Affinity handback: required topic " + topic
-                        + " registered during the installation; arming its bootstrap (8.11.2)");
-                armHandbackBootstrap(topic);
-            }
         }
     }
 
@@ -1596,7 +1589,8 @@ public class ReplicationManager
                                 if (snapshotInstalls.get(topic) == install) abandonSyncChain(topic);
                                 return;
                             }
-                            boolean completedBootstrap = completeSnapshotCutover(topic, payload.sequence());
+                            boolean completedBootstrap = completeSnapshotCutover(topic, payload.sequence(),
+                                    install.handbackAttempt != 0L);
                             handler.onSnapshotCommitted();
                             physicalSnapshotInstalls.remove(topic, install);
                             finishSyncChain(topic);
@@ -1719,7 +1713,12 @@ public class ReplicationManager
         return deadLetteredCount.get();
     }
 
-    private boolean completeSnapshotCutover(String topic, long watermark) {
+    /**
+     * @param handbackInstall whether the installed snapshot belongs to the current handback attempt
+     *                        (8.11.2) — only those count toward the GRANT's required set; a bootstrap
+     *                        armed for another reason may carry a label older than the frozen frontier
+     */
+    private boolean completeSnapshotCutover(String topic, long watermark, boolean handbackInstall) {
         // The installed snapshot REPLACES the local state (resetState + install), so every counter
         // re-anchors on the serving leader's lineage at the watermark — SET, not max (issue tems#9,
         // D8). The old max() kept the seeded frontier of a dead lineage (an unclean ex-leader whose
@@ -1738,7 +1737,7 @@ public class ReplicationManager
         sequenceByTopic.computeIfAbsent(topic, k -> new java.util.concurrent.atomic.AtomicLong())
                 .set(watermark);
         boolean completedBootstrap = relayPendingBootstrap.remove(topic);
-        if (handbackRole.get() == HandbackRole.CANDIDATE_INSTALLING) {
+        if (handbackInstall && handbackRole.get() == HandbackRole.CANDIDATE_INSTALLING) {
             handbackInstalledTopics.add(topic); // 8.11.2: counts toward the GRANT's required set
         }
 
@@ -3932,8 +3931,16 @@ public class ReplicationManager
         // Revisão #178 (C2): freeze EVERY topic's frontier, not an arbitrary "primary" one — the
         // demotion re-anchors each topic on its own watermark (backstop path) and the candidate
         // bootstraps all of them.
-        Map<String, Long> frozenByTopic = appliedFrontiers().byTopic();
-        handoverFrozenByTopic = frozenByTopic;
+        // 8.11.2: only the topics this node SERVES (registered handler), including those at frontier 0.
+        // appliedFrontiers() also lists topics that exist only in sequence-state.dat (a map removed from
+        // the configuration): the candidate would require them, this node could not serve their snapshot
+        // (handleSyncRequest ignores a topic without handler) and the handback would loop — INSTALLING
+        // until the snapshot timeout, abort, cooldown, again — with production frozen on every attempt.
+        Map<String, Long> frozenByTopic = new TreeMap<>();
+        for (String servedTopic : handlers.keySet()) {
+            frozenByTopic.put(servedTopic, topicFrontier(servedTopic));
+        }
+        handoverFrozenByTopic = Collections.unmodifiableMap(frozenByTopic);
         handbackRole.set(HandbackRole.LEADER_SERVING);
         String topic = primaryTopic();
         LOGGER.info(() -> "Affinity handback: granting handover to " + candidate + " at W=" + frozen
@@ -3984,8 +3991,26 @@ public class ReplicationManager
                 || !message.source().equals(handbackPeer)) {
             return;
         }
-        if (!handbackRole.compareAndSet(HandbackRole.CANDIDATE_REQUESTING, HandbackRole.CANDIDATE_INSTALLING)) {
-            return;
+        // 8.11.2: the GRANT's frozen vector is the contract — every topic it names must be installed
+        // before the cutover. An incumbent older than 8.8.0 sends no vector: fall back to the local
+        // handler set (the pre-8.11.2 behaviour). The required set is published under the lifecycle lock
+        // BEFORE the role flips to INSTALLING, so no cutover can observe INSTALLING with an empty (or
+        // stale) required set — a non-handback bootstrap finishing in that window would otherwise
+        // promote this node with nothing installed for the handback.
+        Set<String> required = payload.frozenByTopic().isEmpty()
+                ? Set.copyOf(handlers.keySet())
+                : Set.copyOf(payload.frozenByTopic().keySet());
+        snapshotLifecycleLock.lock();
+        try {
+            handbackInstalledTopics.clear();
+            handbackRequiredTopics = required;
+            if (!handbackRole.compareAndSet(HandbackRole.CANDIDATE_REQUESTING, HandbackRole.CANDIDATE_INSTALLING)) {
+                return;
+            }
+            handbackAttempt++;
+            handbackGrantedEpoch = payload.leaderEpoch();
+        } finally {
+            snapshotLifecycleLock.unlock();
         }
         if (!transport.local().isLeaderEligible()) {
             // Defense in depth (M0 role safety): a leader-ineligible node must never assume
@@ -3999,13 +4024,6 @@ public class ReplicationManager
             clearCandidateHandback("leader-ineligible", true);
             return;
         }
-        snapshotLifecycleLock.lock();
-        try {
-            handbackAttempt++;
-            handbackGrantedEpoch = payload.leaderEpoch();
-        } finally {
-            snapshotLifecycleLock.unlock();
-        }
         if (handlers.isEmpty()) {
             sendHandbackAbort(message.source(), "candidate has no topics");
             clearCandidateHandback("no topics", true);
@@ -4018,28 +4036,32 @@ public class ReplicationManager
             clearCandidateHandback("handlers not ready", true);
             return;
         }
-        // 8.11.2: the GRANT's frozen vector is the contract — every topic it names must be installed
-        // before the cutover. An incumbent older than 8.8.0 sends no vector: fall back to the local
-        // handler set (the pre-8.11.2 behaviour).
-        Set<String> required = payload.frozenByTopic().isEmpty()
-                ? Set.copyOf(handlers.keySet())
-                : Set.copyOf(payload.frozenByTopic().keySet());
-        handbackInstalledTopics.clear();
-        handbackRequiredTopics = required;
         Set<String> missing = new TreeSet<>(required);
         missing.removeAll(handlers.keySet());
+        if (!missing.isEmpty()) {
+            // 8.11.2: the handlers are complete (readiness gate) and still a required topic has none —
+            // this node does not replicate a topic the incumbent serves (configuration mismatch, or a map
+            // the application opens lazily and has not opened here). Waiting for a registration that may
+            // never come would hold the incumbent's production frozen until the snapshot timeout on every
+            // attempt; abort at once, naming the topics, and let the next attempt follow the cooldown.
+            LOGGER.severe(() -> "Affinity handback: GRANT names topics this node has no handler for "
+                    + missing + "; aborting — the candidate must replicate every topic the incumbent serves"
+                    + " (8.11.2)");
+            sendHandbackAbort(message.source(), "candidate lacks handlers for " + missing);
+            clearCandidateHandback("missing handlers " + missing, true);
+            return;
+        }
         LOGGER.info(() -> "Affinity handback: GRANT received (frozenWatermark=" + payload.frozenWatermark()
                 + ", leaderEpoch=" + payload.leaderEpoch() + "); installing full snapshot of " + required
-                + (missing.isEmpty() ? "" : "; waiting for the handlers of " + missing + " to register")
                 + " (issue tems#9, D11)");
-        // Arm bootstrap for every topic we follow — the same machinery as the dual-leader yield: the
+        // Arm bootstrap for every REQUIRED topic — the same machinery as the dual-leader yield: the
         // apply loop requests the snapshot, completeSnapshotCutover installs it (SET — lineage offset
         // zeroed), and the stale-sync guard is skipped while the bootstrap is pending so the incumbent's
-        // snapshot replaces our (possibly numerically higher) stale frontier. When the last REQUIRED
+        // snapshot replaces our (possibly numerically higher) stale frontier. When the last required
         // topic cuts over we assert leadership (completeSnapshotCutover tail → completeBootstrapPromotion
-        // → completeHandbackAsCandidate). A required topic without a handler yet is armed by
-        // registerHandler; the wait is bounded by handoverSnapshotTimeout (checkHandover).
-        for (String topic : handlers.keySet()) {
+        // → completeHandbackAsCandidate). A local topic the incumbent does not serve is left alone: it
+        // has no incumbent lineage to install, and a snapshot request for it would never be answered.
+        for (String topic : required) {
             armHandbackBootstrap(topic);
         }
         coordinator.reevaluateLeadership();
@@ -4167,18 +4189,19 @@ public class ReplicationManager
      * <p>8.11.2: every entry is VALIDATED against the frontier this node froze for the topic before the
      * SET. The candidate installed the snapshot this node served, labeled with that frozen frontier
      * ({@link #getSyncSequenceForTopic}, after {@link #awaitLocalAppliesDrained}), so a correct cutover value
-     * is exactly the frozen one. Any other value means the candidate did NOT install this node's snapshot
-     * of the topic — in the CTP incident the vector carried the candidate's stale DISK frontier of a topic
-     * whose handler had not registered yet, and the SET renumbered the incumbent downwards, truncating its
-     * op-log and purging its relay. Such an entry is skipped (frontier, counter, op-log and relay kept) and
-     * logged with {@link #HANDBACK_VECTOR_MISMATCH_MARKER}; the node stays ahead of the new leader on that
-     * topic, which the fresh-leader yield and the follower-ahead detectors then resolve instead of a silent
-     * loss. A topic absent from the frozen vector (frontier {@code 0} at the GRANT) is validated against
-     * the current frontier, which production freeze keeps equal to the frozen one.
+     * is exactly the frozen one, and only topics of the frozen vector (the topics this node serves) can
+     * be re-anchored. Any other value, or a topic outside the frozen vector, means the candidate did NOT
+     * install this node's snapshot of the topic — in the CTP incident the vector carried the candidate's
+     * stale DISK frontier of a topic whose handler had not registered yet, and the SET renumbered the
+     * incumbent downwards, truncating its op-log and purging its relay. Such an entry is skipped
+     * (frontier, counter, op-log and relay kept) and logged with {@link #HANDBACK_VECTOR_MISMATCH_MARKER};
+     * the node stays ahead of the new leader on that topic, which the fresh-leader yield and the
+     * follower-ahead detectors then resolve instead of a silent loss.
      *
      * @param byTopic       the candidate's cutover frontier per topic (the frozen vector on the backstop
      *                      path); empty from a pre-8.8.0 candidate
-     * @param frozenByTopic the per-topic frontier this node froze at the GRANT
+     * @param frozenByTopic the per-topic frontier this node froze at the GRANT, restricted to the topics it
+     *                      serves
      */
     private void reanchorAsDemotedIncumbent(Map<String, Long> byTopic, Map<String, Long> frozenByTopic) {
         if (byTopic == null || byTopic.isEmpty()) {
@@ -4194,7 +4217,15 @@ public class ReplicationManager
                 return;
             }
             Long frozenFrontier = frozen.get(topic);
-            long expected = frozenFrontier != null ? frozenFrontier : topicFrontier(topic);
+            if (frozenFrontier == null) {
+                // 8.11.2: not a topic this node served at the GRANT — nothing of ours was installed for it.
+                LOGGER.severe(() -> HANDBACK_VECTOR_MISMATCH_MARKER + " topic=" + topic + " cutover=" + cutover
+                        + " frozen=<not served> peer=" + handbackPeer
+                        + " action=keep: the topic is not in this node's frozen vector; frontier, counter,"
+                        + " op-log and relay kept (8.11.2)");
+                return;
+            }
+            long expected = frozenFrontier;
             if (cutover == null || cutover != expected) {
                 LOGGER.severe(() -> HANDBACK_VECTOR_MISMATCH_MARKER + " topic=" + topic + " cutover=" + cutover
                         + " frozen=" + expected + " peer=" + handbackPeer

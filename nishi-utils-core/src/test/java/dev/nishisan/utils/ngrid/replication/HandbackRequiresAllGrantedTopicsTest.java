@@ -56,29 +56,29 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 /**
- * Lado candidato do handback (8.11.2, incidente do CTP de 2026-10-05): o GRANT nomeia três tópicos,
- * mas o candidato — recém-reiniciado — só tem o handler de {@code _ngrid-queue-offsets}; os mapas do
- * catálogo ainda carregam do disco. Até a 8.11.1 o candidato instalava só o que tinha handler,
- * declarava o cutover e enviava ao incumbente, no vetor, as fronteiras de DISCO dos tópicos que não
- * instalou — e o incumbente renumerava {@code ngrrd.nodes} para baixo.
- *
- * <p>Agora o candidato espera o registro dos handlers exigidos (armados em {@code registerHandler}),
- * só conclui com todos instalados, envia só os tópicos instalados e mantém o papel "em andamento"
- * durante a promoção (um único REQUEST por tentativa). Se o prazo do snapshot estoura, aborta.
+ * Lado candidato do handback (8.11.2, incidente do CTP de 2026-10-05). O GRANT nomeia os tópicos que o
+ * incumbente serve; o candidato só conclui o cutover depois de instalar todos eles, envia no vetor só o
+ * que instalou (nunca a fronteira de disco de um tópico sem handler), arma só os tópicos exigidos (um
+ * mapa local que o incumbente não serve fica intocado), aborta na hora se lhe falta o handler de um
+ * tópico exigido, mantém o papel "em andamento" durante a promoção (um único REQUEST por tentativa) e
+ * não é abortado pelo prazo enquanto a promoção corre.
  */
 class HandbackRequiresAllGrantedTopicsTest {
 
     private static final String OFFSETS = "map:_ngrid-queue-offsets";
     private static final String CATALOG = "map:ngrrd.catalog";
     private static final String NODES = "map:ngrrd.nodes";
+    /** Mapa que só o candidato tem: fora do GRANT, não pode ser armado nem entrar no vetor. */
+    private static final String LOCAL_ONLY = "map:local-only";
+    /** Tópico que só existe no disco do candidato (sem handler, fora do GRANT): não pode entrar no vetor. */
+    private static final String GEOMETRIES = "map:ngrrd.geometries";
     private static final long OFFSETS_W = 40L;
     private static final long CATALOG_W = 300L;
     private static final long NODES_W = 76L;
     /** Fronteira de disco do candidato para `nodes`: abaixo da congelada (os 4 ticks de status do incidente). */
     private static final long NODES_DISK = 72L;
-    /** Tópico que só existe no disco do candidato (sem handler, fora do GRANT): não pode entrar no vetor. */
-    private static final String GEOMETRIES = "map:ngrrd.geometries";
     private static final long GEOMETRIES_DISK = 5L;
+    private static final long LOCAL_ONLY_DISK = 9L;
     private static final Map<String, Long> FROZEN = Map.of(OFFSETS, OFFSETS_W, CATALOG, CATALOG_W, NODES, NODES_W);
     private static final NodeId CANDIDATE = NodeId.of("storage-217");
     private static final NodeId INTERIM = NodeId.of("storage-079");
@@ -101,7 +101,7 @@ class HandbackRequiresAllGrantedTopicsTest {
     @Test
     @Timeout(value = 60, unit = TimeUnit.SECONDS)
     void candidatoSoConcluiDepoisDeInstalarTodosOsTopicosDoGrant() throws Exception {
-        Fixture f = new Fixture(Duration.ofSeconds(20));
+        Fixture f = new Fixture(Duration.ofSeconds(20), Set.of(OFFSETS, CATALOG, NODES, LOCAL_ONLY));
         try {
             AtomicReference<Boolean> inProgressAtPromotion = new AtomicReference<>();
             f.coordinator.addLeadershipListener(newLeader -> {
@@ -112,26 +112,20 @@ class HandbackRequiresAllGrantedTopicsTest {
             });
             f.requestAndGrant();
 
-            // Só o tópico com handler é pedido e instalado.
+            // Um tópico instalado não basta: o cutover espera os outros dois do GRANT.
             f.awaitSyncRequest(OFFSETS);
+            f.awaitSyncRequest(CATALOG);
+            f.awaitSyncRequest(NODES);
             f.serveSnapshot(OFFSETS, OFFSETS_W);
             long deadline = System.currentTimeMillis() + 800;
             while (System.currentTimeMillis() < deadline) {
                 f.interimHeartbeat();
                 assertTrue(f.transport.sentOfType(MessageType.HANDBACK_COMPLETE).isEmpty(),
-                        "o cutover não pode ser declarado com os tópicos do catálogo por instalar");
+                        "o cutover não pode ser declarado com catalog e nodes por instalar");
                 assertFalse(f.coordinator.isLeader(), "o candidato não pode assumir com instalação parcial");
-                assertTrue(f.manager.isHandbackInProgress(), "o handback segue em andamento, esperando os handlers");
-                assertFalse(f.syncRequested(CATALOG) || f.syncRequested(NODES),
-                        "sem handler não há pedido de snapshot do catálogo nem de nodes");
+                assertTrue(f.manager.isHandbackInProgress(), "o handback segue em andamento");
                 Thread.sleep(50);
             }
-
-            // Os handlers que faltavam registram (fim da carga do disco): cada um é armado e instalado.
-            f.manager.registerHandler(CATALOG, new SnapshotHandler());
-            f.manager.registerHandler(NODES, new SnapshotHandler());
-            f.awaitSyncRequest(CATALOG);
-            f.awaitSyncRequest(NODES);
             f.serveSnapshot(CATALOG, CATALOG_W);
             f.serveSnapshot(NODES, NODES_W);
 
@@ -141,12 +135,16 @@ class HandbackRequiresAllGrantedTopicsTest {
                     .payload(HandbackCompletePayload.class);
             assertEquals(FROZEN, complete.cutoverByTopic(),
                     "o vetor de cutover é exatamente o vetor congelado do GRANT: só tópicos instalados,"
-                            + " sem a fronteira de disco de " + GEOMETRIES);
+                            + " sem a fronteira de disco de " + GEOMETRIES + " nem de " + LOCAL_ONLY);
             assertTrue(f.coordinator.isLeader(), "com todos os tópicos instalados o candidato assume");
             assertEquals(NODES_W, frontier(f.manager, NODES),
                     "nodes foi instalado com o rótulo do incumbente, não com a fronteira de disco");
+            assertFalse(f.syncRequested(LOCAL_ONLY),
+                    "um mapa que o incumbente não serve não é armado: não há snapshot a pedir");
+            assertEquals(LOCAL_ONLY_DISK, frontier(f.manager, LOCAL_ONLY), "o mapa local fica intocado");
             assertEquals(1, f.transport.sentOfType(MessageType.HANDBACK_REQUEST).size(),
                     "um único HANDBACK_REQUEST por tentativa");
+            assertTrue(f.transport.sentOfType(MessageType.HANDBACK_ABORT).isEmpty(), "nenhum ABORT");
             assertNotNull(inProgressAtPromotion.get(), "a promoção deve ter sido observada");
             assertTrue(inProgressAtPromotion.get(),
                     "o papel do candidato não pode ser zerado antes da promoção (reenvio espúrio do REQUEST)");
@@ -159,14 +157,37 @@ class HandbackRequiresAllGrantedTopicsTest {
 
     @Test
     @Timeout(value = 60, unit = TimeUnit.SECONDS)
-    void prazoDoSnapshotEstouradoComTopicoExigidoSemHandlerAbortaEFicaSeguidor() throws Exception {
-        Fixture f = new Fixture(Duration.ofSeconds(2));
+    void candidatoProntoSemHandlerDeTopicoExigidoAbortaNaHora() throws Exception {
+        // Pronto (todos os handlers configurados registrados), mas sem o catálogo: diferença de configuração.
+        Fixture f = new Fixture(Duration.ofSeconds(20), Set.of(OFFSETS, NODES));
+        try {
+            f.requestAndGrant();
+            // Bem antes do prazo do snapshot (20 s): o abort é imediato, não uma espera por registro.
+            f.awaitCondition(() -> !f.transport.sentOfType(MessageType.HANDBACK_ABORT).isEmpty(), 5_000,
+                    "o candidato deve abortar na hora quando lhe falta o handler de um tópico do GRANT");
+            HandbackAbortPayload abort = f.transport.sentOfType(MessageType.HANDBACK_ABORT).get(0)
+                    .payload(HandbackAbortPayload.class);
+            assertTrue(abort.reason().contains(CATALOG), "o abort nomeia o tópico que falta: " + abort.reason());
+            assertFalse(f.syncRequested(OFFSETS) || f.syncRequested(NODES),
+                    "nada é instalado quando o conjunto exigido não pode ser cumprido");
+            assertTrue(f.transport.sentOfType(MessageType.HANDBACK_COMPLETE).isEmpty(), "nenhum COMPLETE");
+            assertFalse(f.coordinator.isLeader(), "o candidato fica seguidor");
+            f.awaitCondition(() -> !f.manager.isHandbackInProgress(), 5_000, "o papel é liberado no abort");
+        } finally {
+            f.close();
+        }
+    }
+
+    @Test
+    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    void prazoDoSnapshotEstouradoSemOSnapshotAbortaEFicaSeguidor() throws Exception {
+        Fixture f = new Fixture(Duration.ofSeconds(2), Set.of(OFFSETS, CATALOG, NODES));
         try {
             f.requestAndGrant();
             f.awaitSyncRequest(OFFSETS);
             f.serveSnapshot(OFFSETS, OFFSETS_W);
 
-            // O handler do catálogo nunca registra: o prazo (handoverSnapshotTimeout) vence.
+            // O incumbente nunca serve catalog/nodes: o prazo (handoverSnapshotTimeout) vence.
             f.awaitCondition(() -> !f.transport.sentOfType(MessageType.HANDBACK_ABORT).isEmpty(), 15_000,
                     "o candidato deve abortar ao estourar o prazo com tópicos exigidos por instalar");
             HandbackAbortPayload abort = f.transport.sentOfType(MessageType.HANDBACK_ABORT).get(0)
@@ -188,22 +209,24 @@ class HandbackRequiresAllGrantedTopicsTest {
         return manager.getTopicReplicationStatuses().get(topic).nextExpectedSequence() - 1L;
     }
 
-    /** Candidato com estado de disco dos três tópicos e só o handler de offsets registrado. */
+    /** Candidato pronto, com estado de disco dos tópicos e os handlers indicados registrados. */
     private final class Fixture {
         final ScriptedTransport transport;
         final ClusterCoordinator coordinator;
         final ReplicationManager manager;
 
-        Fixture(Duration snapshotTimeout) throws Exception {
+        Fixture(Duration snapshotTimeout, Set<String> handlerTopics) throws Exception {
             Map<String, Long> state = new HashMap<>();
             state.put(OFFSETS, OFFSETS_W - 10L + 1L);
             state.put(CATALOG, CATALOG_W + 1L);
             state.put(NODES, NODES_DISK + 1L);
-            state.put(GEOMETRIES, GEOMETRIES_DISK + 1L); // só no disco: fora do GRANT, sem handler
+            state.put(GEOMETRIES, GEOMETRIES_DISK + 1L);
+            state.put(LOCAL_ONLY, LOCAL_ONLY_DISK + 1L);
             state.put("_topic:" + OFFSETS, OFFSETS_W - 10L);
             state.put("_topic:" + CATALOG, CATALOG_W);
             state.put("_topic:" + NODES, NODES_DISK);
             state.put("_topic:" + GEOMETRIES, GEOMETRIES_DISK);
+            state.put("_topic:" + LOCAL_ONLY, LOCAL_ONLY_DISK);
             state.put("_global", CATALOG_W);
             writeSequenceState(state);
 
@@ -225,13 +248,20 @@ class HandbackRequiresAllGrantedTopicsTest {
                             .handoverCooldown(Duration.ofSeconds(60))
                             .dataDirectory(tempDir)
                             .build());
-            manager.registerHandler(OFFSETS, new SnapshotHandler());
+            for (String topic : handlerTopics) {
+                manager.registerHandler(topic, new SnapshotHandler());
+            }
             manager.start();
             coordinator.start();
         }
 
         /** O interino serve; o candidato (maior afinidade) pede o handback e recebe o GRANT com os três tópicos. */
         void requestAndGrant() throws InterruptedException {
+            requestAndGrant(FROZEN);
+        }
+
+        /** Idem, com o vetor congelado que o incumbente anuncia no GRANT. */
+        void requestAndGrant(Map<String, Long> frozenByTopic) throws InterruptedException {
             awaitCondition(() -> {
                 interimHeartbeat();
                 return INTERIM.equals(coordinator.leaderInfo().map(NodeInfo::nodeId).orElse(null))
@@ -241,9 +271,9 @@ class HandbackRequiresAllGrantedTopicsTest {
                 interimHeartbeat();
                 return !transport.sentOfType(MessageType.HANDBACK_REQUEST).isEmpty();
             }, 15_000, "o candidato deve pedir o handback");
-            long frozenTotal = FROZEN.values().stream().mapToLong(Long::longValue).sum();
+            long frozenTotal = frozenByTopic.values().stream().mapToLong(Long::longValue).sum();
             transport.deliver(ClusterMessage.request(MessageType.HANDBACK_GRANT, "handback", INTERIM, CANDIDATE,
-                    new HandbackGrantPayload(OFFSETS, frozenTotal, INTERIM_EPOCH, FROZEN)));
+                    new HandbackGrantPayload(OFFSETS, frozenTotal, INTERIM_EPOCH, frozenByTopic)));
         }
 
         void interimHeartbeat() {
@@ -258,10 +288,7 @@ class HandbackRequiresAllGrantedTopicsTest {
         }
 
         void awaitSyncRequest(String topic) throws InterruptedException {
-            awaitCondition(() -> {
-                interimHeartbeat();
-                return syncRequested(topic);
-            }, 10_000, "o candidato deve pedir o snapshot de " + topic);
+            awaitCondition(() -> syncRequested(topic), 10_000, "o candidato deve pedir o snapshot de " + topic);
         }
 
         void serveSnapshot(String topic, long label) {
