@@ -1165,13 +1165,20 @@ catálogo porque o coordenador estava parado. O defeito existe desde a 8.8.0.
 
 Na 8.11.2 o handback é seguro nas duas pontas:
 
-- o candidato só conclui o cutover depois de instalar **todos** os tópicos que o GRANT nomeia, e
-  espera o registro dos handlers que faltam dentro de `handoverSnapshotTimeout` (120 s por padrão);
-  ao estourar, aborta e fica seguidor;
+- o GRANT nomeia só os tópicos que o incumbente **serve** (mapas com handler registrado); um mapa
+  removido da configuração, que só existe no `sequence-state.dat`, fica de fora e não trava mais o
+  handback;
+- o candidato instala exatamente esses tópicos e só conclui o cutover com **todos** instalados; se
+  não tiver o handler de um deles (os storages precisam declarar os mesmos mapas), aborta **na
+  hora** com o log `GRANT names topics this node has no handler for [...]` e tenta de novo após o
+  cooldown — corrija a configuração do candidato, pois cada tentativa congela a produção do líder por
+  alguns milissegundos; o prazo de `handoverSnapshotTimeout` (120 s) só se aplica a um snapshot que o
+  incumbente não entrega;
 - o nó não anuncia fronteira, não é elegível e não pede nem aceita handback enquanto `start()` não
   registrou o último mapa configurado (log `Replication handlers ready`);
-- o incumbente só reancora um tópico quando o cutover recebido é igual à fronteira que congelou;
-  caso contrário mantém fronteira, contador, op-log e relay e emite o marcador abaixo.
+- o incumbente só reancora um tópico do seu vetor congelado, e só quando o cutover recebido é igual à
+  fronteira que congelou; caso contrário mantém fronteira, contador, op-log e relay e emite o
+  marcador abaixo.
 
 ### Ordem de deploy
 
@@ -1197,8 +1204,12 @@ handback pelos logs acima.
 ### Marcador `NGRID_HANDBACK_VECTOR_MISMATCH`
 
 Emitido em SEVERE pelo incumbente rebaixado quando uma entrada do `HANDBACK_COMPLETE` difere da
-fronteira congelada (`topic=`, `cutover=`, `frozen=`, `peer=`). Significa que o candidato não
-instalou o snapshot deste nó para o tópico — com todos os nós na 8.11.2 não deve ocorrer. Se
-ocorrer: o nó manteve o seu estado e segue à frente do novo líder nesse tópico; verifique as
-versões dos dois nós, compare o conteúdo do tópico entre eles e, se o novo líder estiver atrás,
-force o handback de volta (restart gracioso do novo líder) antes de aceitar escrita no tópico.
+fronteira congelada ou nomeia um tópico fora do vetor congelado (`topic=`, `cutover=`, `frozen=`,
+`peer=`; `frozen=<not served>` no segundo caso). Significa que o candidato não instalou o snapshot
+deste nó para o tópico — com todos os nós na 8.11.2 não deve ocorrer; aparece só com versões
+misturadas. A validação **não repara** a divergência: o novo líder lidera com um estado mais antigo
+do tópico e, quando a autocura de seguidor à frente convergir este nó a ele, as operações entre o
+rótulo antigo e a fronteira congelada se perdem no tópico. Por isso, ao ver o marcador: pare a
+escrita no tópico, verifique as versões dos dois nós, compare o conteúdo entre eles e force o
+handback de volta (restart gracioso do novo líder, com o nó que emitiu o marcador servindo o
+snapshot) antes de aceitar escrita de novo.

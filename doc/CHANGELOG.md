@@ -28,24 +28,35 @@ deu zero. Plano em `planning/2026-10-05-ngrid-handback-partial-cutover-8.11.2.md
 - `aheadEligiblePeer` devolvia o primeiro peer à frente na ordem de iteração, não o melhor.
 
 ### Correções (`nishi-utils-core`, NGrid)
-- **Contrato do GRANT:** o candidato só conclui o cutover quando instalou **todos** os tópicos do
-  `frozenByTopic`. Um tópico exigido sem handler é armado quando o handler registra, dentro de
-  `handoverSnapshotTimeout`; ao estourar, aborta e fica seguidor. O `cutoverByTopic` contém só os
-  tópicos instalados. Incumbente anterior à 8.8.0 (sem vetor): o conjunto é o dos handlers locais.
-- **Validação no incumbente:** cada entrada do `HANDBACK_COMPLETE` precisa ser igual à fronteira
-  congelada do tópico; entradas divergentes não são aplicadas (fronteira, contador, op-log e relay
-  ficam) e emitem o marcador SEVERE `NGRID_HANDBACK_VECTOR_MISMATCH`.
+- **Contrato do GRANT:** o vetor congelado do GRANT traz só os tópicos que o incumbente **serve**
+  (handler registrado, inclusive com fronteira zero) — nunca um tópico que só existe no
+  `sequence-state.dat` (mapa removido da configuração), que o incumbente não conseguiria servir e
+  deixaria o candidato em ciclo de instalação, abort e cooldown, com a produção congelada a cada
+  tentativa. O candidato arma e instala exatamente esses tópicos e só conclui o cutover com **todos**
+  instalados; se lhe falta o handler de um tópico do GRANT (diferença de configuração), aborta **na
+  hora**, nomeando os tópicos, em vez de esperar o prazo. Um mapa que só o candidato serve fica
+  intocado. O `cutoverByTopic` contém só os tópicos instalados nesta tentativa. Incumbente anterior à
+  8.8.0 (sem vetor): o conjunto é o dos handlers locais.
+- **Validação no incumbente:** cada entrada do `HANDBACK_COMPLETE` precisa pertencer ao vetor
+  congelado e ser igual à fronteira congelada do tópico; entradas fora do vetor ou divergentes não são
+  aplicadas (fronteira, contador, op-log e relay ficam) e emitem o marcador SEVERE
+  `NGRID_HANDBACK_VECTOR_MISMATCH`. A validação não repara a divergência — só ocorre com versões
+  misturadas, e o novo líder fica com um estado mais antigo do tópico — por isso o marcador pede
+  intervenção (runbook).
 - **Gate de prontidão:** `ReplicationManager.deferHandlersReady()`/`markHandlersReady()`, armado
   pelo `NGridNode` antes de iniciar o manager e liberado após registrar o último mapa configurado.
   Enquanto engajado, o nó não anuncia fronteira, não é elegível e não pede nem aceita handback. O
   mesmo gate fecha o bootstrap parcial em restart sujo, que soltava no primeiro tópico instalado.
 - **Papel durante a promoção:** `CANDIDATE_PROMOTING` até o envio do COMPLETE — um único REQUEST
-  por tentativa.
+  por tentativa; o prazo do candidato não aborta uma promoção em curso (um ABORT que chegasse antes
+  do COMPLETE deixaria dois líderes). O conjunto exigido é publicado antes de o papel virar
+  INSTALLING, para nenhum cutover observar um conjunto vazio.
 - **Yield do líder recém-eleito:** o alvo é o peer com o estado mais novo
   (`compareAdvertisedState`), não o primeiro da iteração.
-- Testes: `HandbackRequiresAllGrantedTopicsTest`, `HandbackCompleteVectorMismatchTest`,
-  `HandlersReadyGateTest`, `DelayedMapRegistrationHandbackClusterTest` (cluster de 3 nós com um
-  mapa registrado tarde e escrita contínua durante o handback) e duas variantes em
+- Testes: `HandbackRequiresAllGrantedTopicsTest`, `HandbackGrantExcludesUnservedTopicsTest`,
+  `HandbackCompleteVectorMismatchTest`, `HandlersReadyGateTest`,
+  `DelayedMapRegistrationHandbackClusterTest` (cluster de 3 nós: mapa registrado tarde com escrita
+  contínua; reinício com disco antigo e um mapa que só o candidato serve) e duas variantes em
   `TopicFrontierElectionGateTest`. Cada correção foi provada por mutação.
 
 ### Versões afetadas e operação
