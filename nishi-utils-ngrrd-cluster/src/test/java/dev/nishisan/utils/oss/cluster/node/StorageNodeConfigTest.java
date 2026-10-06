@@ -17,6 +17,7 @@
 
 package dev.nishisan.utils.oss.cluster.node;
 
+import dev.nishisan.utils.oss.blob.VolumeWriteMode;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -63,6 +64,14 @@ class StorageNodeConfigTest {
         assertThrows(IllegalArgumentException.class,
                 () -> minimal(base).placementInspectTimeout(Duration.ofMillis(-1)).build());
         assertThrows(NullPointerException.class, () -> minimal(base).placementInspectTimeout(null).build());
+    }
+
+    @Test
+    void volumeWriteModeTemDefaultMmapENaoAceitaNulo(@TempDir Path base) {
+        assertEquals(VolumeWriteMode.MMAP, minimal(base).build().volumeWriteMode());
+        assertEquals(VolumeWriteMode.PWRITE,
+                minimal(base).volumeWriteMode(VolumeWriteMode.PWRITE).build().volumeWriteMode());
+        assertThrows(NullPointerException.class, () -> minimal(base).volumeWriteMode(null).build());
     }
 
     @Test

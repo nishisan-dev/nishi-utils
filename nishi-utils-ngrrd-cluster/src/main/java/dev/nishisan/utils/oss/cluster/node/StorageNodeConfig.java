@@ -27,6 +27,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import dev.nishisan.utils.oss.api.Durability;
 import dev.nishisan.utils.oss.api.OnGeometryChange;
 import dev.nishisan.utils.oss.blob.BlobVolumeConfig;
+import dev.nishisan.utils.oss.blob.VolumeWriteMode;
 import dev.nishisan.utils.oss.cluster.config.NgrrdYamlSupport;
 import dev.nishisan.utils.oss.cluster.metrics.NgrrdClusterMetricsListener;
 import dev.nishisan.utils.oss.definition.ObjectNaming;
@@ -175,6 +176,11 @@ import java.util.function.Function;
  *                                 espera mais que o seu {@code requestTimeout}). Mantenha-o bem abaixo do
  *                                 timeout de {@code PLACE} dos clientes: o gate roda dentro do atendimento do
  *                                 {@code PLACE}, e um valor próximo dele faz o cliente estourar antes da resposta
+ * @param volumeWriteMode          modo de escrita dos shards do blob volume
+ *                                 ({@code ngrrd.volume.writeMode}: {@code mmap}|{@code pwrite}, sem diferenciar
+ *                                 maiúsculas de minúsculas). Default {@link VolumeWriteMode#MMAP}. {@code PWRITE}
+ *                                 evita que o mmap suje o folio inteiro do page cache (ver
+ *                                 {@code doc/oss/ngrrd-blob-volume.md}); a leitura continua pelo mmap
  */
 public record StorageNodeConfig(
         String nodeId,
@@ -221,10 +227,69 @@ public record StorageNodeConfig(
         long quotaMaxSeries,
         long quotaMaxBytes,
         PlacementRules placementRules,
-        Duration placementInspectTimeout) {
+        Duration placementInspectTimeout,
+        VolumeWriteMode volumeWriteMode) {
 
     /** Default de {@link #placementInspectTimeout()}. */
     public static final Duration DEFAULT_PLACEMENT_INSPECT_TIMEOUT = Duration.ofSeconds(2);
+
+    /** Construtor de compatibilidade (forma da 8.12.0), com {@code volumeWriteMode} no default ({@code MMAP}). */
+    public StorageNodeConfig(
+        String nodeId,
+        String host,
+        int port,
+        String seed,
+        List<String> peers,
+        Path dataDir,
+        int priority,
+        Path volumeDir,
+        String volumeName,
+        int shardCount,
+        long segmentBytes,
+        long initialShardCapacityBytes,
+        long capacityBytes,
+        Duration statusReportInterval,
+        Duration nodeStatusStaleAfter,
+        Duration handleIdleTtl,
+        int maxOpenHandles,
+        Duration requestTimeout,
+        Durability defaultDurability,
+        OnGeometryChange defaultOnGeometryChange,
+        NgrrdClusterMetricsListener metricsListener,
+        Duration bootDiscoveryWindow,
+        boolean affinityHandbackMode,
+        Duration placementGraceAfterLeadership,
+        boolean rebalanceEnabled,
+        Duration rebalanceInterval,
+        long rebalanceMinDelta,
+        double rebalanceTolerance,
+        int maxConcurrentMigrations,
+        int maxMovesPerCycle,
+        Duration migrationTimeout,
+        long migrationChunkBytes,
+        long maxSeriesBytes,
+        Duration migrationStatusPollInterval,
+        Duration reconcileInterval,
+        Duration orphanGrace,
+        String seriesObjectPrefix,
+        DistributionMode distributionMode,
+        double weight,
+        long migrationBytesPerSecond,
+        long maxDestinationCatalogLag,
+        long quotaMaxSeries,
+        long quotaMaxBytes,
+        PlacementRules placementRules,
+        Duration placementInspectTimeout) {
+        this(nodeId, host, port, seed, peers, dataDir, priority, volumeDir, volumeName, shardCount, segmentBytes,
+                initialShardCapacityBytes, capacityBytes, statusReportInterval, nodeStatusStaleAfter,
+                handleIdleTtl, maxOpenHandles, requestTimeout, defaultDurability, defaultOnGeometryChange,
+                metricsListener, bootDiscoveryWindow, affinityHandbackMode, placementGraceAfterLeadership,
+                rebalanceEnabled, rebalanceInterval, rebalanceMinDelta, rebalanceTolerance,
+                maxConcurrentMigrations, maxMovesPerCycle, migrationTimeout, migrationChunkBytes, maxSeriesBytes,
+                migrationStatusPollInterval, reconcileInterval, orphanGrace, seriesObjectPrefix,
+                distributionMode, weight, migrationBytesPerSecond, maxDestinationCatalogLag,
+                quotaMaxSeries, quotaMaxBytes, placementRules, placementInspectTimeout, VolumeWriteMode.MMAP);
+    }
 
     /** Construtor de compatibilidade (forma da 8.9.0), com {@code placementInspectTimeout} no default. */
     public StorageNodeConfig(
@@ -506,6 +571,7 @@ public record StorageNodeConfig(
             throw new IllegalArgumentException("ngrrd.quota.maxBytes deve ser >= 0 (0 = sem limite): " + quotaMaxBytes);
         }
         placementRules = Objects.requireNonNullElse(placementRules, PlacementRules.NONE);
+        Objects.requireNonNull(volumeWriteMode, "volumeWriteMode é obrigatório");
         Objects.requireNonNull(placementInspectTimeout, "placementInspectTimeout é obrigatório");
         if (placementInspectTimeout.isNegative() || placementInspectTimeout.isZero()) {
             throw new IllegalArgumentException("ngrrd.placement.inspectTimeout deve ser > 0: " + placementInspectTimeout);
@@ -699,6 +765,13 @@ public record StorageNodeConfig(
             if (volume.capacityBytes != null) {
                 builder.capacityBytes(volume.capacityBytes);
             }
+            if (volume.writeMode != null) {
+                try {
+                    builder.volumeWriteMode(VolumeWriteMode.parse(volume.writeMode));
+                } catch (IllegalArgumentException e) {
+                    throw new IllegalArgumentException("ngrrd.volume.writeMode: " + e.getMessage(), e);
+                }
+            }
             applyDuration(ngrrd.statusReportInterval, "ngrrd.statusReportInterval", builder::statusReportInterval);
             applyDuration(ngrrd.nodeStatusStaleAfter, "ngrrd.nodeStatusStaleAfter", builder::nodeStatusStaleAfter);
             applyDuration(ngrrd.handleIdleTtl, "ngrrd.handleIdleTtl", builder::handleIdleTtl);
@@ -875,6 +948,7 @@ public record StorageNodeConfig(
         public Long segmentBytes;
         public Long initialShardCapacityBytes;
         public Long capacityBytes;
+        public String writeMode;
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
@@ -925,6 +999,7 @@ public record StorageNodeConfig(
         private long quotaMaxBytes = 0L;
         private PlacementRules placementRules = PlacementRules.NONE;
         private Duration placementInspectTimeout = DEFAULT_PLACEMENT_INSPECT_TIMEOUT;
+        private VolumeWriteMode volumeWriteMode = VolumeWriteMode.MMAP;
         private Duration statusReportInterval = Duration.ofSeconds(10);
         /** {@code null} = calculado em {@link #build()} a partir de {@link #statusReportInterval}. */
         private Duration nodeStatusStaleAfter;
@@ -1207,6 +1282,15 @@ public record StorageNodeConfig(
             return this;
         }
 
+        /**
+         * Modo de escrita dos shards do blob volume ({@code ngrrd.volume.writeMode}); default
+         * {@link VolumeWriteMode#MMAP}. Ver {@link VolumeWriteMode}.
+         */
+        public Builder volumeWriteMode(VolumeWriteMode volumeWriteMode) {
+            this.volumeWriteMode = volumeWriteMode;
+            return this;
+        }
+
         public StorageNodeConfig build() {
             Duration resolvedStaleAfter = nodeStatusStaleAfter != null
                     ? nodeStatusStaleAfter
@@ -1220,7 +1304,7 @@ public record StorageNodeConfig(
                     maxConcurrentMigrations, maxMovesPerCycle, migrationTimeout, migrationChunkBytes,
                     maxSeriesBytes, migrationStatusPollInterval, reconcileInterval, orphanGrace,
                     seriesObjectPrefix, distributionMode, weight, migrationBytesPerSecond, maxDestinationCatalogLag,
-                    quotaMaxSeries, quotaMaxBytes, placementRules, placementInspectTimeout);
+                    quotaMaxSeries, quotaMaxBytes, placementRules, placementInspectTimeout, volumeWriteMode);
         }
 
         private static Duration maxDuration(Duration a, Duration b) {
