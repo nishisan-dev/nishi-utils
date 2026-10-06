@@ -203,6 +203,35 @@ class HandbackRequiresAllGrantedTopicsTest {
         }
     }
 
+    @Test
+    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    void promocaoEmCursoNoInstanteDoPrazoNaoGeraAbort() throws Exception {
+        Fixture f = new Fixture(Duration.ofSeconds(3), Set.of(OFFSETS));
+        try {
+            // A aplicação segura a promoção (listener síncrono) por mais tempo que o prazo do snapshot.
+            f.coordinator.addLeadershipListener(newLeader -> {
+                if (CANDIDATE.equals(newLeader)) {
+                    try {
+                        Thread.sleep(4_000);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            });
+            f.requestAndGrant(Map.of(OFFSETS, OFFSETS_W)); // o incumbente só serve offsets neste cenário
+            f.awaitSyncRequest(OFFSETS);
+            f.serveSnapshot(OFFSETS, OFFSETS_W);
+            f.awaitCondition(() -> !f.transport.sentOfType(MessageType.HANDBACK_COMPLETE).isEmpty(), 20_000,
+                    "o candidato deve concluir o handback depois da promoção demorada");
+            assertTrue(f.transport.sentOfType(MessageType.HANDBACK_ABORT).isEmpty(),
+                    "o prazo não pode abortar uma promoção em curso (ABORT antes do COMPLETE = dois líderes)");
+            assertTrue(f.coordinator.isLeader());
+            f.awaitCondition(() -> !f.manager.isHandbackInProgress(), 5_000, "o papel é liberado após o COMPLETE");
+        } finally {
+            f.close();
+        }
+    }
+
     // ---- apoio ----
 
     private static long frontier(ReplicationManager manager, String topic) {

@@ -4310,7 +4310,14 @@ public class ReplicationManager
                         + " left the membership; aborting and retaining leadership");
                 abortHandover("candidate left");
             }
-        } else { // CANDIDATE_REQUESTING / CANDIDATE_INSTALLING / CANDIDATE_PROMOTING
+        } else if (role == HandbackRole.CANDIDATE_PROMOTING) {
+            // 8.11.2: every required topic is installed and the promotion is running (under the lifecycle
+            // lock, on the replication executor). Aborting here would send a HANDBACK_ABORT that can reach
+            // the incumbent BEFORE the HANDBACK_COMPLETE: the incumbent un-freezes and keeps leading while
+            // this node asserts leadership — a dual-leader whose loser's tail D10c discards. The promotion
+            // is not a wait that can hang; it finishes and clears the role itself.
+            return;
+        } else { // CANDIDATE_REQUESTING / CANDIDATE_INSTALLING
             long bound = role == HandbackRole.CANDIDATE_REQUESTING
                     ? config.handoverRequestTimeout().toMillis()
                     : config.handoverSnapshotTimeout().toMillis();
