@@ -4,6 +4,58 @@
 
 ---
 
+## 2026-10-07 — Checkpoint local no storage node e fim do comboio de locks do FLUSH/CHECKPOINT — 8.14.0
+
+Medição no CTP com o coordinator 8.12.0: o buffer do cliente para a storage-209 (56% das séries)
+ficava no teto e os workers travavam, com a 209 folgada em disco e CPU. Cada ida e volta de
+WRITE_BATCH levava ~70 ms, embora o `handle.write` no nó leve µs. ~98% dos RPCs eram FLUSH/CHECKPOINT
+por série do flush periódico remoto (~2 mil/s). Plano em
+`planning/v8.14.0-checkpoint-local-e-escopo-de-lock.md`.
+
+### Causa
+- FLUSH/CHECKPOINT seguravam o stripe de operação da série (um de 256) e o lock da série durante
+  todo o `sync()` do writer: a fila da série no `ngrrd-writer-pool`, mais o fsync em `FSYNC`.
+- O WRITE_BATCH pega os stripes de todas as séries do lote, até 256, e por isso esperava o
+  checkpoint de qualquer série que caísse num desses stripes.
+
+### Correções e novidades
+- **`nishi-utils-oss`:**
+  - `NgrrdHandle.checkpointAsync()` (`default` síncrono). No `DefaultHandle`, o Sync entra na fila
+    FIFO do writer e uma `CompletableFuture` conclui quando ele é processado.
+  - `sync()` passa a ser a espera dessa future, com os mesmos tipos de exceção.
+  - Syncs que entram depois do Shutdown não ficam mais pendurados.
+- **`nishi-utils-ngrrd-cluster`, FLUSH/CHECKPOINT remoto:**
+  - gate, dono e autocura continuam sob o stripe e o lock da série;
+  - o checkpoint só é enfileirado, e a espera acontece fora dos dois locks;
+  - `checkpointLatency` passa a medir de ponta a ponta.
+- **Checkpoint local opt-in (`ngrrd.checkpoint: {enabled, interval, maxInFlight}`):**
+  - só séries sujas (contador de escritas por série);
+  - `tryLock` sem renovar a ociosidade;
+  - cadência espalhada em ~80% do intervalo e `maxInFlight` checkpoints em voo;
+  - WARNING `NGRRD_LOCAL_CHECKPOINT_OVERRUN` quando o ciclo passa do intervalo;
+  - métricas `localCheckpoint.*` em `lifecycleMetrics` (impressas pelo `ngrrd-admin metrics`) e
+    campos `lc*` no fim do `NGRRD_NODE_STATUS`.
+- **Stripes:** os stripes de operação usam lock próprio, sem o monitor global do
+  `CoordinationLocks`.
+
+### Compatibilidade e deploy
+- O protocolo não mudou. Coordinator 8.12.0/8.13.0 e storage 8.14.0 convivem nas duas direções.
+- O checkpoint local é desligado por padrão. Com ele ligado nos nós, o consumidor pode desligar o
+  flush periódico remoto; o CLOSE remoto já faz checkpoint + close.
+- Ordem: nós primeiro, depois ligar o checkpoint local, depois o coordinator.
+- Janela de perda: tipicamente até ~1,8 × `interval`. Série ocupada, com falha ou com overrun fica
+  para o ciclo seguinte.
+- Falha de checkpoint no close de handle só é logada no nó; não chega ao cliente.
+
+### Validação
+- `nishi-utils-oss` 302 testes; `nishi-utils-ngrrd-cluster` 902 testes (5 skipped); JDK 21;
+  `-Pvalidate-javadoc` sem avisos novos.
+- Revisão independente aprovada, com 20 mutações; as que sobreviveram ganharam testes.
+- Flaky conhecido e pré-existente: `WeightedGeometryClusterTest:70` (leitura `geometryStrong` logo
+  depois do restart do líder) falha de forma intermitente nas duas versões.
+
+---
+
 ## 2026-10-06 — Modo de escrita do blob volume (`writeMode`: mmap | pwrite) — 8.13.0
 
 Medição no CTP (storage .217, kernel 6.8, XFS): o processo sujava ~80 GB por ciclo de virada, e o

@@ -27,11 +27,12 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -97,6 +98,12 @@ public final class NgrrdWriter implements AutoCloseable {
     private final AtomicBoolean scheduled = new AtomicBoolean(false);
 
     private volatile boolean closed;
+    // Marcado pela worker depois de processar o Shutdown: a fila não é mais drenada. Um Sync
+    // enfileirado depois disso (corrida entre a checagem de `closed` e o enqueue) é concluído por
+    // completeOrphanedSyncs() com o desfecho do checkpoint final, nunca fica pendurado.
+    private volatile boolean terminated;
+    // Desfecho entregue aos Syncs órfãos: null = checkpoint final concluído com sucesso.
+    private volatile RuntimeException orphanedSyncFailure;
     private final CountDownLatch shutdownComplete = new CountDownLatch(1);
     private final java.util.concurrent.atomic.AtomicBoolean schedulerReleased = new java.util.concurrent.atomic.AtomicBoolean();
     // A failed asynchronous write poisons this handle: a later checkpoint must
@@ -290,26 +297,91 @@ public final class NgrrdWriter implements AutoCloseable {
     }
 
     /**
+     * Versão assíncrona de {@link #checkpoint()}: enfileira o checkpoint na fila FIFO
+     * desta série e devolve na hora, sem esperar a worker. A future é concluída pela
+     * worker depois de processar todas as escritas enfileiradas antes dela.
+     *
+     * <ul>
+     *   <li>Writer já fechado: future já concluída com sucesso (mesma semântica de
+     *       {@link #checkpoint()}, que retorna sem fazer nada).</li>
+     *   <li>Falha de persistência no checkpoint, ou falha anterior de uma escrita
+     *       assíncrona: future concluída com a mesma exceção que {@link #checkpoint()}
+     *       lançaria.</li>
+     *   <li>Um {@link #close()}/{@link #closeForDeletion()} posterior enfileira o
+     *       Shutdown atrás deste checkpoint (FIFO), então ele é processado antes. Na
+     *       corrida em que o checkpoint entra na fila depois do Shutdown, a future é
+     *       concluída com o desfecho do checkpoint final: sucesso se o {@code close()}
+     *       materializou e forçou a série; senão, falha com
+     *       {@link IllegalStateException}. Nenhuma future fica pendente para sempre.</li>
+     * </ul>
+     *
+     * <p>Callbacks encadeados na future podem rodar na thread do pool de writers:
+     * devem ser curtos e nunca bloquear.</p>
+     *
+     * @return future concluída quando o checkpoint termina
+     */
+    public CompletableFuture<Void> checkpointAsync() {
+        return syncAsync();
+    }
+
+    /**
+     * Enfileira um checkpoint e devolve a future que a worker conclui ao processá-lo.
+     * Uma falha de persistência (ex.: PUT no S3 / fsync) conclui a future com a
+     * exceção em vez de deixá-la pendente.
+     */
+    private CompletableFuture<Void> syncAsync() {
+        if (closed) {
+            return CompletableFuture.completedFuture(null);
+        }
+        CompletableFuture<Void> future = new CompletableFuture<>();
+        enqueue(new Command.Sync(future));
+        if (terminated) {
+            completeOrphanedSyncs();
+        }
+        return future;
+    }
+
+    /**
      * Enfileira um checkpoint síncrono e bloqueia até a worker thread concluí-lo.
      * Uma falha de persistência (ex.: PUT no S3 / fsync) é propagada ao chamador
-     * em vez de travar indefinidamente em {@code await()}.
+     * com o mesmo tipo de exceção, em vez de travar indefinidamente.
      */
     private void sync() {
-        if (closed) {
-            return;
-        }
-        CountDownLatch latch = new CountDownLatch(1);
-        AtomicReference<RuntimeException> error = new AtomicReference<>();
-        enqueue(new Command.Sync(latch, error));
+        CompletableFuture<Void> future = syncAsync();
         try {
-            latch.await();
+            future.get();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new RuntimeException("comando do writer interrompido", e);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof RuntimeException runtime) {
+                throw runtime;
+            }
+            if (cause instanceof Error error) {
+                throw error;
+            }
+            throw new IllegalStateException("checkpoint do writer falhou", cause);
         }
-        RuntimeException failure = error.get();
-        if (failure != null) {
-            throw failure;
+    }
+
+    /**
+     * Conclui os Syncs que ficaram na fila depois do Shutdown, com o desfecho do
+     * checkpoint final. Pode rodar na worker e em produtores ao mesmo tempo: cada
+     * comando sai da fila uma única vez. Escritas órfãs continuam descartadas, como
+     * antes.
+     */
+    private void completeOrphanedSyncs() {
+        RuntimeException failure = orphanedSyncFailure;
+        Command cmd;
+        while ((cmd = queue.poll()) != null) {
+            if (cmd instanceof Command.Sync orphan) {
+                if (failure == null) {
+                    orphan.future().complete(null);
+                } else {
+                    orphan.future().completeExceptionally(failure);
+                }
+            }
         }
     }
 
@@ -399,27 +471,49 @@ public final class NgrrdWriter implements AutoCloseable {
                     }
                 }
                 case Command.Sync s -> {
-                    // Sempre libera o latch; uma falha vai para o chamador via error ref.
+                    // Sempre conclui a future; uma falha vai para o chamador por ela.
                     try {
                         throwIfWriteFailed();
                         checkpointAndForce();
+                        s.future().complete(null);
                     } catch (RuntimeException e) {
-                        s.error().set(e);
-                    } finally {
-                        s.latch().countDown();
+                        s.future().completeExceptionally(e);
+                    } catch (Error e) {
+                        s.future().completeExceptionally(e);
+                        throw e;
                     }
                 }
                 case Command.Shutdown s -> {
+                    // Throwable, não só RuntimeException: um Error no checkpoint final também precisa
+                    // falhar os Syncs órfãos. RuntimeException segue só logada; Error é relançado
+                    // depois de concluir as futures e liberar o close(), como antes.
+                    Throwable finalFailure = null;
                     try {
                         if (s.checkpoint()) {
                             throwIfWriteFailed();
                             checkpointAndForce();
                         }
-                    } catch (RuntimeException e) {
+                    } catch (Throwable e) {
+                        finalFailure = e;
                         System.err.println("ngrrd-writer: falha no checkpoint final: " + e);
                     } finally {
-                        closeChannelQuietly();
-                        s.latch().countDown();
+                        try {
+                            closeChannelQuietly();
+                        } finally {
+                            if (!s.checkpoint()) {
+                                orphanedSyncFailure = new IllegalStateException(
+                                        "Writer encerrado sem checkpoint final (closeForDeletion)");
+                            } else if (finalFailure != null) {
+                                orphanedSyncFailure = new IllegalStateException(
+                                        "Falha no checkpoint final do writer", finalFailure);
+                            }
+                            terminated = true;
+                            completeOrphanedSyncs();
+                            s.latch().countDown();
+                        }
+                    }
+                    if (finalFailure instanceof Error error) {
+                        throw error;
                     }
                     return true;
                 }
@@ -674,8 +768,8 @@ public final class NgrrdWriter implements AutoCloseable {
      * nenhuma amostra foi aplicada desde o último force ({@code changedSinceForce
      * == false}), é um no-op de durabilidade (idle-skip): a re-emissão parcial
      * seria byte-idêntica e o canal já está limpo, então o {@code force()} seria
-     * inócuo. O early-return é normal (nunca via exceção): o {@code latch} do
-     * comando é liberado no {@code finally} do chamador em {@link #processOne}.
+     * inócuo. O early-return é normal (nunca via exceção): a future do Sync é
+     * concluída com sucesso pelo chamador em {@link #processOne}.
      */
     private void checkpointAndForce() {
         if (!changedSinceForce) {
@@ -728,8 +822,8 @@ public final class NgrrdWriter implements AutoCloseable {
         record Write(String dsName, Sample sample, long receivedAtMs) implements Command {
         }
 
-        /** Checkpoint síncrono; {@code error} carrega uma eventual falha de volta ao chamador. */
-        record Sync(CountDownLatch latch, AtomicReference<RuntimeException> error) implements Command {
+        /** Checkpoint; {@code future} é concluída pela worker com o desfecho (sucesso ou a exceção). */
+        record Sync(CompletableFuture<Void> future) implements Command {
         }
 
         record Shutdown(CountDownLatch latch, boolean checkpoint) implements Command {

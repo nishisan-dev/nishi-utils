@@ -141,4 +141,47 @@ class StorageNodeConfigTest {
         // Só barras (nada sobra após normalizar) continua sendo rejeitado como vazio.
         assertThrows(IllegalArgumentException.class, () -> minimal(base).seriesObjectPrefix("///").build());
     }
+
+    @Test
+    void checkpointLocalTemDefaultDesligadoENaoAceitaNulo(@TempDir Path base) {
+        assertEquals(LocalCheckpointSettings.disabled(), minimal(base).build().localCheckpoint());
+        LocalCheckpointSettings enabled = new LocalCheckpointSettings(true, Duration.ofSeconds(30), 4);
+        assertEquals(enabled, minimal(base).localCheckpoint(enabled).build().localCheckpoint());
+        assertThrows(NullPointerException.class, () -> minimal(base).localCheckpoint(null).build());
+    }
+
+    @Test
+    void localCheckpointSettingsValidaIntervaloEMaxInFlight() {
+        int processors = Runtime.getRuntime().availableProcessors();
+        assertEquals(Math.min(8, Math.max(2, processors)), LocalCheckpointSettings.defaultMaxInFlight());
+        assertFalse(LocalCheckpointSettings.disabled().enabled());
+        assertEquals(Duration.ofSeconds(300), LocalCheckpointSettings.disabled().interval());
+        assertThrows(IllegalArgumentException.class, () -> new LocalCheckpointSettings(true, Duration.ZERO, 1));
+        assertThrows(IllegalArgumentException.class,
+                () -> new LocalCheckpointSettings(true, Duration.ofSeconds(-1), 1));
+        assertThrows(IllegalArgumentException.class,
+                () -> new LocalCheckpointSettings(true, Duration.ofSeconds(1), 0));
+        assertThrows(NullPointerException.class, () -> new LocalCheckpointSettings(true, null, 1));
+    }
+
+    @Test
+    void construtorDeCompatibilidadeDa8130DeixaOCheckpointLocalDesligado(@TempDir Path base) {
+        StorageNodeConfig c = minimal(base).localCheckpoint(new LocalCheckpointSettings(true, Duration.ofSeconds(9), 1))
+                .build();
+        StorageNodeConfig legacy = new StorageNodeConfig(c.nodeId(), c.host(), c.port(), c.seed(), c.peers(),
+                c.dataDir(), c.priority(), c.volumeDir(), c.volumeName(), c.shardCount(), c.segmentBytes(),
+                c.initialShardCapacityBytes(), c.capacityBytes(), c.statusReportInterval(), c.nodeStatusStaleAfter(),
+                c.handleIdleTtl(), c.maxOpenHandles(), c.requestTimeout(), c.defaultDurability(),
+                c.defaultOnGeometryChange(), c.metricsListener(), c.bootDiscoveryWindow(), c.affinityHandbackMode(),
+                c.placementGraceAfterLeadership(), c.rebalanceEnabled(), c.rebalanceInterval(), c.rebalanceMinDelta(),
+                c.rebalanceTolerance(), c.maxConcurrentMigrations(), c.maxMovesPerCycle(), c.migrationTimeout(),
+                c.migrationChunkBytes(), c.maxSeriesBytes(), c.migrationStatusPollInterval(), c.reconcileInterval(),
+                c.orphanGrace(), c.seriesObjectPrefix(), c.distributionMode(), c.weight(), c.migrationBytesPerSecond(),
+                c.maxDestinationCatalogLag(), c.quotaMaxSeries(), c.quotaMaxBytes(), c.placementRules(),
+                c.placementInspectTimeout(), c.volumeWriteMode());
+
+        assertEquals(LocalCheckpointSettings.disabled(), legacy.localCheckpoint());
+        assertEquals(c.volumeWriteMode(), legacy.volumeWriteMode());
+        assertEquals(c.nodeId(), legacy.nodeId());
+    }
 }

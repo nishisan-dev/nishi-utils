@@ -32,6 +32,7 @@ import java.util.Set;
 import java.util.function.Function;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -483,4 +484,72 @@ class StorageNodeConfigYamlTest {
 
         assertThrows(IllegalArgumentException.class, () -> StorageNodeConfig.fromYaml(yaml, NO_ENV));
     }
+
+    @Test
+    void checkpointLocalAusenteDoYamlFicaDesligadoComOsPadroes() {
+        StorageNodeConfig config = StorageNodeConfig.fromYaml(CHECKPOINT_BASE, NO_ENV);
+
+        assertEquals(LocalCheckpointSettings.disabled(), config.localCheckpoint());
+        assertFalse(config.localCheckpoint().enabled());
+        assertEquals(Duration.ofSeconds(300), config.localCheckpoint().interval());
+        assertEquals(LocalCheckpointSettings.defaultMaxInFlight(), config.localCheckpoint().maxInFlight());
+    }
+
+    @Test
+    void checkpointLocalLigadoNoYamlLeIntervaloEMaxInFlight() {
+        StorageNodeConfig config = StorageNodeConfig.fromYaml(CHECKPOINT_BASE + """
+                  checkpoint:
+                    enabled: true
+                    interval: 2m
+                    maxInFlight: 3
+                """, NO_ENV);
+
+        assertEquals(new LocalCheckpointSettings(true, Duration.ofMinutes(2), 3), config.localCheckpoint());
+
+        LocalCheckpointSettings onlyEnabled = StorageNodeConfig.fromYaml(CHECKPOINT_BASE + """
+                  checkpoint:
+                    enabled: ${CHECKPOINT_ENABLED:true}
+                """, NO_ENV).localCheckpoint();
+        assertTrue(onlyEnabled.enabled());
+        assertEquals(LocalCheckpointSettings.DEFAULT_INTERVAL, onlyEnabled.interval());
+        assertEquals(LocalCheckpointSettings.defaultMaxInFlight(), onlyEnabled.maxInFlight());
+    }
+
+    @Test
+    void checkpointLocalComValoresInvalidosFalhaNoBootComOCampoNaMensagem() {
+        IllegalArgumentException zeroInterval = assertThrows(IllegalArgumentException.class,
+                () -> StorageNodeConfig.fromYaml(CHECKPOINT_BASE + """
+                          checkpoint:
+                            enabled: true
+                            interval: 0s
+                        """, NO_ENV));
+        assertTrue(zeroInterval.getMessage().contains("ngrrd.checkpoint.interval"), zeroInterval.getMessage());
+
+        IllegalArgumentException badInterval = assertThrows(IllegalArgumentException.class,
+                () -> StorageNodeConfig.fromYaml(CHECKPOINT_BASE + """
+                          checkpoint:
+                            interval: cinco minutos
+                        """, NO_ENV));
+        assertTrue(badInterval.getMessage().contains("ngrrd.checkpoint.interval"), badInterval.getMessage());
+
+        IllegalArgumentException zeroInFlight = assertThrows(IllegalArgumentException.class,
+                () -> StorageNodeConfig.fromYaml(CHECKPOINT_BASE + """
+                          checkpoint:
+                            enabled: true
+                            maxInFlight: 0
+                        """, NO_ENV));
+        assertTrue(zeroInFlight.getMessage().contains("ngrrd.checkpoint.maxInFlight"), zeroInFlight.getMessage());
+    }
+
+    private static final String CHECKPOINT_BASE = """
+            node:
+              id: storage-0
+              host: 127.0.0.1
+              port: 9100
+              dataDir: /var/ngrrd/storage-0/data
+            ngrrd:
+              volume:
+                dir: /var/ngrrd/storage-0/volume
+                name: ngrrd
+            """;
 }

@@ -23,6 +23,7 @@ import dev.nishisan.utils.ngrid.common.ClusterMessage;
 import dev.nishisan.utils.ngrid.common.NodeId;
 import dev.nishisan.utils.ngrid.common.NodeInfo;
 import dev.nishisan.utils.oss.Ngrrd;
+import dev.nishisan.utils.oss.NgrrdHandle;
 import dev.nishisan.utils.oss.api.ConsolidationFunction;
 import dev.nishisan.utils.oss.api.Durability;
 import dev.nishisan.utils.oss.api.OnGeometryChange;
@@ -47,6 +48,7 @@ import dev.nishisan.utils.oss.cluster.protocol.SeriesWrite;
 import dev.nishisan.utils.oss.cluster.protocol.WriteBatchRequest;
 import dev.nishisan.utils.oss.cluster.protocol.WriteBatchResponse;
 import dev.nishisan.utils.oss.cluster.rpc.ClusterRpc;
+import dev.nishisan.utils.oss.cluster.rpc.CoordinationLocks;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -77,6 +79,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.function.UnaryOperator;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
@@ -139,6 +142,222 @@ class StorageRequestHandlerTest {
 
     private OpenRequest openRequestNoCreate(String seriesKey, SeriesPlacement hint) {
         return new OpenRequest(seriesKey, yaml, Map.of(), null, null, hint, false);
+    }
+
+    // ------------------------------------------------------------------ escopo de lock do checkpoint (8.14.0)
+
+    @Test
+    void checkpointRemotoNaoSeguraStripeNemLockDaSerieEnquantoEsperaOWriter() throws Exception {
+        String keyX = "series-x";
+        String keyY = sameStripeKey(keyX);
+        for (String key : List.of(keyX, keyY)) {
+            placementLookup.put(key, SeriesPlacement.active(SELF.value(), 1_000L));
+            assertEquals(SeriesStatus.OK, ((SeriesStatusResponse) handler.handle(Commands.OPEN,
+                    openRequest(key, null), SOURCE)).status());
+        }
+        long t0 = 1_700_000_100_000L;
+        assertEquals(SeriesStatus.OK, writeOne(keyX, t0));
+        CompletableFuture<Void> syncGate = new CompletableFuture<>();
+        CountDownLatch syncEnqueued = new CountDownLatch(1);
+        wrapHandle(keyX, original -> gatedCheckpoint(original, syncGate, syncEnqueued));
+
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<Object> checkpoint = executor.submit(() -> handler.handle(Commands.CHECKPOINT,
+                    new SeriesCommandRequest(keyX), SOURCE));
+            assertTrue(syncEnqueued.await(10, TimeUnit.SECONDS), "o checkpoint deveria ter sido enfileirado");
+            assertFalse(checkpoint.isDone(), "a resposta espera o writer");
+
+            // Mesmo stripe de X: até a 8.13.0 este lote esperava o checkpoint inteiro.
+            Future<SeriesStatus> otherSeries = executor.submit(() -> writeOne(keyY, t0));
+            assertEquals(SeriesStatus.OK, otherSeries.get(5, TimeUnit.SECONDS));
+            // A própria série X: o lock dela também já foi solto.
+            assertEquals(SeriesStatus.OK, writeOne(keyX, t0 + 300_000L));
+            assertFalse(checkpoint.isDone());
+
+            syncGate.complete(null);
+            SeriesStatusResponse response = (SeriesStatusResponse) checkpoint.get(10, TimeUnit.SECONDS);
+            assertEquals(SeriesStatus.OK, response.status());
+            assertEquals(1L, handler.metricsSnapshot().checkpoints());
+            assertEquals(1L, handler.metricsSnapshot().checkpointLatency().count());
+            assertTrue(registry.isDirty(keyX),
+                    "a escrita feita durante a espera não estava coberta pela seq capturada no enfileiramento");
+        } finally {
+            syncGate.complete(null);
+            executor.shutdownNow();
+        }
+
+        assertEquals(SeriesStatus.OK, ((SeriesStatusResponse) handler.handle(Commands.FLUSH,
+                new SeriesCommandRequest(keyX), SOURCE)).status());
+        assertFalse(registry.isDirty(keyX), "um flush remoto bem-sucedido marca a série como limpa");
+        assertEquals(1L, handler.metricsSnapshot().flushes());
+    }
+
+    @Test
+    void checkpointRemotoComFalhaDoWriterRespondeErroEDeixaASerieSuja() {
+        String key = "series-falha";
+        placementLookup.put(key, SeriesPlacement.active(SELF.value(), 1_000L));
+        assertEquals(SeriesStatus.OK, ((SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequest(key, null), SOURCE)).status());
+        assertEquals(SeriesStatus.OK, writeOne(key, 1_700_000_100_000L));
+        wrapHandle(key, original -> failingCheckpointAsync(original,
+                new IllegalStateException("fsync simulado falhou")));
+
+        SeriesStatusResponse response = (SeriesStatusResponse) handler.handle(Commands.CHECKPOINT,
+                new SeriesCommandRequest(key), SOURCE);
+
+        assertEquals(SeriesStatus.ERROR, response.status());
+        assertEquals("IllegalStateException: fsync simulado falhou", response.message());
+        assertTrue(registry.isDirty(key));
+        assertEquals(0L, handler.metricsSnapshot().checkpoints());
+        assertEquals(1L, handler.metricsSnapshot().checkpointLatency().count());
+    }
+
+    @Test
+    void autoCuraDoCheckpointContinuaSobOStripeEDeleteConcorrenteNaoRessuscitaOHandle() throws Exception {
+        String key = "series-delete";
+        openThenCloseByIdleness(key);
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<Object> checkpoint;
+            try (var stripe = CoordinationLocks.acquire(registry.operationLock(key))) {
+                // Quem apaga segura o stripe: o CHECKPOINT não pode reabrir a série no meio do caminho.
+                checkpoint = executor.submit(() -> handler.handle(Commands.CHECKPOINT,
+                        new SeriesCommandRequest(key), SOURCE));
+                Thread.sleep(200);
+                assertFalse(checkpoint.isDone(), "o CHECKPOINT deveria esperar o stripe");
+                assertFalse(registry.isOpen(key), "a autocura não pode rodar fora do stripe");
+                registry.closeForDeletion(key);
+            }
+            SeriesStatusResponse response = (SeriesStatusResponse) checkpoint.get(10, TimeUnit.SECONDS);
+            assertEquals(SeriesStatus.NOT_OPEN, response.status());
+            assertFalse(registry.isOpen(key), "a série apagada não pode voltar a ficar aberta");
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void autoCuraDoCheckpointSoReabreDepoisDoCommitDeMigracaoSoltarOStripe() throws Exception {
+        String key = "series-migrate-commit";
+        openThenCloseByIdleness(key);
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<Object> checkpoint;
+            try (var stripe = CoordinationLocks.acquire(registry.operationLock(key))) {
+                // MIGRATE_COMMIT: discard + atomicReplaceReserved sob o stripe. Nenhum handle pode abrir
+                // a imagem antiga entre os dois passos.
+                checkpoint = executor.submit(() -> handler.handle(Commands.CHECKPOINT,
+                        new SeriesCommandRequest(key), SOURCE));
+                registry.discard(key);
+                Thread.sleep(200);
+                assertFalse(checkpoint.isDone(), "o CHECKPOINT deveria esperar o stripe");
+                assertEquals(0, registry.openCount(), "nenhum handle pode abrir enquanto o commit segura o stripe");
+            }
+            SeriesStatusResponse response = (SeriesStatusResponse) checkpoint.get(10, TimeUnit.SECONDS);
+            assertEquals(SeriesStatus.OK, response.status(), "depois do commit a autocura abre a imagem já trocada");
+            assertTrue(registry.isOpen(key));
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void writeBatchEsperaOStripeSeguradoPorUmaOperacaoDeLifecycle() throws Exception {
+        String key = "series-lifecycle-stripe";
+        placementLookup.put(key, SeriesPlacement.active(SELF.value(), 1_000L));
+        assertEquals(SeriesStatus.OK, ((SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequest(key, null), SOURCE)).status());
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<SeriesStatus> write;
+            // Delete e migração (SeriesLifecycleService, SeriesDeleteHandler, MigrationExecutor.seriesLock)
+            // seguram exatamente este stripe; o WRITE_BATCH precisa da mesma identidade de lock.
+            try (var stripe = CoordinationLocks.acquire(registry.operationLock(key))) {
+                write = executor.submit(() -> writeOne(key, 1_700_000_100_000L));
+                Thread.sleep(300);
+                assertFalse(write.isDone(), "o WRITE_BATCH deveria esperar a operação de lifecycle");
+            }
+            assertEquals(SeriesStatus.OK, write.get(10, TimeUnit.SECONDS));
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    private SeriesStatus writeOne(String key, long tsEpochMs) {
+        WriteBatchResponse response = (WriteBatchResponse) handler.handle(Commands.WRITE_BATCH,
+                new WriteBatchRequest(List.of(new SeriesWrite(key, "in_octets", tsEpochMs, 1_000d))), SOURCE);
+        return response.statusBySeries().get(key);
+    }
+
+    private void openThenCloseByIdleness(String key) {
+        placementLookup.put(key, SeriesPlacement.active(SELF.value(), 1_000L));
+        assertEquals(SeriesStatus.OK, ((SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequest(key, null), SOURCE)).status());
+        assertEquals(SeriesStatus.OK, writeOne(key, 1_700_000_100_000L));
+        clock.advance(Duration.ofMinutes(16));
+        assertEquals(1, registry.closeIdle());
+        assertFalse(registry.isOpen(key));
+    }
+
+    /** Uma chave diferente de {@code key} que cai no mesmo stripe de operação do registry. */
+    private String sameStripeKey(String key) {
+        Object stripe = registry.operationLock(key);
+        for (int i = 0; ; i++) {
+            String candidate = "series-y-" + i;
+            if (registry.operationLock(candidate) == stripe) {
+                return candidate;
+            }
+        }
+    }
+
+    /** Troca o handle aberto da série por um embrulho (mesmo padrão de reflexão de {@code SeriesHandleRegistryTest}). */
+    private void wrapHandle(String key, UnaryOperator<NgrrdHandle> wrapper) {
+        try {
+            Field entriesField = SeriesHandleRegistry.class.getDeclaredField("entries");
+            entriesField.setAccessible(true);
+            Object entry = ((Map<?, ?>) entriesField.get(registry)).get(key);
+            Field handleField = entry.getClass().getDeclaredField("handle");
+            handleField.setAccessible(true);
+            handleField.set(entry, wrapper.apply((NgrrdHandle) handleField.get(entry)));
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    /** {@code checkpointAsync} real seguido de um portão: simula o Sync preso no writer (fsync lento). */
+    private static NgrrdHandle gatedCheckpoint(NgrrdHandle original, CompletableFuture<Void> gate,
+            CountDownLatch enqueued) {
+        return delegating(original, (method, args) -> {
+            if (method.getName().equals("checkpointAsync")) {
+                CompletableFuture<Void> real = original.checkpointAsync();
+                enqueued.countDown();
+                return real.thenCompose(ignored -> gate);
+            }
+            return null;
+        });
+    }
+
+    private static NgrrdHandle failingCheckpointAsync(NgrrdHandle original, RuntimeException failure) {
+        return delegating(original, (method, args) -> method.getName().equals("checkpointAsync")
+                ? CompletableFuture.failedFuture(failure) : null);
+    }
+
+    /** Proxy que delega tudo ao original, exceto o que {@code override} devolver não nulo. */
+    private static NgrrdHandle delegating(NgrrdHandle original,
+            java.util.function.BiFunction<java.lang.reflect.Method, Object[], Object> override) {
+        return (NgrrdHandle) java.lang.reflect.Proxy.newProxyInstance(NgrrdHandle.class.getClassLoader(),
+                new Class<?>[]{NgrrdHandle.class}, (proxy, method, args) -> {
+                    Object overridden = override.apply(method, args);
+                    if (overridden != null) {
+                        return overridden;
+                    }
+                    try {
+                        return method.invoke(original, args);
+                    } catch (java.lang.reflect.InvocationTargetException e) {
+                        throw e.getCause();
+                    }
+                });
     }
 
     @Test

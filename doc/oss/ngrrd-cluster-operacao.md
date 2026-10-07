@@ -1215,3 +1215,67 @@ rótulo antigo e a fronteira congelada se perdem no tópico. Por isso, ao ver o 
 escrita no tópico, verifique as versões dos dois nós, compare o conteúdo entre eles e force o
 handback de volta (restart gracioso do novo líder, com o nó que emitiu o marcador servindo o
 snapshot) antes de aceitar escrita de novo.
+
+## Checkpoint local e fim do comboio do FLUSH (8.14.0)
+
+### O que muda
+
+- **`FLUSH`/`CHECKPOINT` remotos sem comboio.** O storage node enfileira o checkpoint sob o stripe e
+  o lock da série, solta os dois e só então espera o writer. Um `WRITE_BATCH` que cai no mesmo
+  stripe, ou escreve na mesma série, deixa de esperar o `fsync` de um checkpoint em curso. Vale com
+  ou sem o checkpoint local e não exige configuração. `checkpointLatency` passa a medir o checkpoint
+  de ponta a ponta, então o p99 pode subir no painel sem piora real.
+- **Checkpoint local (`ngrrd.checkpoint`, opt-in).** O nó faz o checkpoint das séries sujas a cada
+  `interval`, sem depender do flush remoto. Desligado por padrão. Referência completa na
+  [seção 6.7 da referência técnica](ngrrd-cluster.md#67-checkpoint-local-8140).
+
+```yaml
+ngrrd:
+  checkpoint:
+    enabled: true
+    interval: 300s      # default 300s
+    maxInFlight: 8      # default min(8, max(2, nCPU))
+```
+
+### Com o checkpoint local ligado
+
+- **Desligue o flush periódico remoto no coordinator.** Com o checkpoint local cuidando da
+  durabilidade, o `flush()`/`checkpoint()` periódico por série da aplicação (no tems, o `flushMode`)
+  só gera RPC. Use `flushMode onShutdown`: o `CLOSE` remoto de cada série, no desalojamento do cache
+  ou no shutdown do coordinator, já faz checkpoint + close no nó. O commit no modo janela das marcas
+  ([seção 5.2](ngrrd-cluster.md#52-marcas-de-escrita-8120)) não depende do flush remoto.
+- **Janela de perda.** Uma escrita confirmada pelo dono fica durável no próximo ciclo local,
+  tipicamente em até ~1,8 × `interval`: a pausa entre ciclos mais os ~80% do intervalo que o ciclo
+  leva para espalhar os disparos. Uma série ocupada no disparo (`skippedBusy`), um checkpoint que
+  falhou ou um ciclo com overrun fica para o ciclo seguinte, e aí a janela passa de ~2,8 × `interval`.
+  Um `CLOSE` ou um fechamento por ociosidade antecipa o checkpoint. Escolha o `interval` pela perda
+  aceitável num crash abrupto do nó.
+- **Falha no checkpoint do `CLOSE`.** O nó só loga a falha (`WARNING`, `closeQuietly`) e responde
+  `OK`, e o cliente não recebe o erro. Se a aplicação precisa da confirmação, peça `CHECKPOINT`
+  antes do `CLOSE`.
+
+### Ordem de deploy
+
+1. Atualize os **storage nodes primeiro**, um por vez, com o checkpoint local ainda desligado. A
+   correção do escopo de lock já entra nesse passo. Clientes 8.13.x funcionam sem mudança, porque o
+   protocolo não muda.
+2. Ligue `ngrrd.checkpoint.enabled: true` nos nós, com restart gracioso de um por vez. Confirme o
+   `NGRRD_LOCAL_CHECKPOINT started` no log e, depois do primeiro `interval`, `lcCycles` maior que 0 na
+   linha `NGRRD_NODE_STATUS`.
+3. Só então mude o coordinator para `flushMode onShutdown`. Na ordem inversa, as séries ficariam sem
+   checkpoint periódico até o `CLOSE`.
+
+### Acompanhar
+
+| Métrica (`ngrrd-admin metrics <nodeId>`) | Leitura |
+|---|---|
+| `localCheckpoint.dirtySeries` | Séries com escrita ainda não coberta por checkpoint. Oscila com a ingestão e cai a cada ciclo. Crescer sem parar indica ciclo que não dá conta. |
+| `localCheckpoint.lastCycleMs` / `.lastCycleSeries` | Duração e tamanho do último ciclo. Pela cadência, o normal é ~80% do `interval`. |
+| `localCheckpoint.overruns` | Ciclos mais longos que o `interval`, cada um com `NGRRD_LOCAL_CHECKPOINT_OVERRUN` em `WARNING`. Aumente `maxInFlight` se o disco tiver folga, ou o `interval`. |
+| `localCheckpoint.skippedBusy` | Séries puladas porque o lock estava ocupado (escrita ou leitura em curso). Voltam no ciclo seguinte. Um valor alto e constante para as mesmas séries merece investigação. |
+| `localCheckpoint.failures` | Checkpoints que falharam. A série segue suja e entra no próximo ciclo. O log de `WARNING` sai no máximo uma vez por minuto. |
+
+### Rollback
+
+Volte o coordinator para o flush periódico **antes** de desligar o checkpoint local ou de voltar o
+jar dos nós. O formato em disco não muda.

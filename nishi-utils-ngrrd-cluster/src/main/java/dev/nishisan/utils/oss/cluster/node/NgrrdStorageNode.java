@@ -99,13 +99,16 @@ public final class NgrrdStorageNode implements Closeable {
     private final LocalReconciler localReconciler;
     private final GeometryService geometryService;
     private final SeriesDeleteHandler deleteHandler;
+    /** {@code null} com o checkpoint local desligado ({@code ngrrd.checkpoint.enabled=false}, o padrão). */
+    private final LocalCheckpointer localCheckpointer;
 
     private NgrrdStorageNode(StorageNodeConfig config, BlobVolumeRegistry volumeRegistry, BlobVolume volume,
             NGridNode node, CatalogService catalog, TransportClusterRpc rpc, SeriesHandleRegistry registry,
             StorageRequestHandler storageHandler, PlacementRequestHandler placementHandler,
             NodeStatusReporter statusReporter, AdminRequestHandler adminHandler,
             MigrationExecutor migrationExecutor, MigrationCoordinator migrationCoordinator, Rebalancer rebalancer,
-            LocalReconciler localReconciler, GeometryService geometryService, SeriesDeleteHandler deleteHandler) {
+            LocalReconciler localReconciler, GeometryService geometryService, SeriesDeleteHandler deleteHandler,
+            LocalCheckpointer localCheckpointer) {
         this.config = config;
         this.volumeRegistry = volumeRegistry;
         this.volume = volume;
@@ -123,6 +126,7 @@ public final class NgrrdStorageNode implements Closeable {
         this.localReconciler = localReconciler;
         this.geometryService = geometryService;
         this.deleteHandler = deleteHandler;
+        this.localCheckpointer = localCheckpointer;
     }
 
     /**
@@ -209,6 +213,7 @@ public final class NgrrdStorageNode implements Closeable {
             SeriesLifecycleJournal startupJournal = null;
             SeriesHandleRegistry startupRegistry = null;
             SeriesDeleteHandler startupDeleteHandler = null;
+            LocalCheckpointer startupCheckpointer = null;
             try {
                 CatalogService catalog = CatalogService.from(node);
                 TransportClusterRpc rpc = new TransportClusterRpc(node.transport(), node.coordinator(),
@@ -328,6 +333,12 @@ public final class NgrrdStorageNode implements Closeable {
                 String catalogTopic = MapClusterService.topicFor(CatalogService.CATALOG_MAP);
                 statusReporter.catalogReplication(() -> CatalogReplicaStatus.from(node.coordinator().isLeader(),
                         node.replicationManager().getTopicReplicationStatuses().get(catalogTopic)));
+                LocalCheckpointer localCheckpointer = cfg.localCheckpoint().enabled()
+                        ? new LocalCheckpointer(registry, cfg.localCheckpoint()) : null;
+                startupCheckpointer = localCheckpointer;
+                if (localCheckpointer != null) {
+                    statusReporter.localCheckpointMetrics(localCheckpointer::metrics);
+                }
                 node.transport().addListener(geometryService);
                 rpc.registerLocalHandler(geometryService);
                 node.transport().addListener(storageHandler);
@@ -346,6 +357,9 @@ public final class NgrrdStorageNode implements Closeable {
                 localReconciler.start();
                 geometryService.start();
                 deleteHandler.start();
+                if (localCheckpointer != null) {
+                    localCheckpointer.start();
+                }
 
                 // Seed: addLeadershipListener não dispara um callback sintético para quem já registra o
                 // listener com o nó JÁ líder — ex.: o primeiro líder eleito, decidido durante
@@ -359,8 +373,10 @@ public final class NgrrdStorageNode implements Closeable {
 
                 return new NgrrdStorageNode(cfg, volumeRegistry, volume, node, catalog, rpc, registry,
                         storageHandler, placementHandler, statusReporter, adminHandler, migrationExecutor,
-                        migrationCoordinator, rebalancer, localReconciler, geometryService, deleteHandler);
+                        migrationCoordinator, rebalancer, localReconciler, geometryService, deleteHandler,
+                        localCheckpointer);
             } catch (IOException | RuntimeException e) {
+                if (startupCheckpointer != null) startupCheckpointer.close();
                 if (startupDeleteHandler != null) startupDeleteHandler.close();
                 try {
                     if (startupRegistry != null) startupRegistry.close();
@@ -512,6 +528,11 @@ public final class NgrrdStorageNode implements Closeable {
         return localReconciler;
     }
 
+    /** Checkpoint local deste nó; vazio com {@code ngrrd.checkpoint.enabled=false} (o padrão). */
+    public Optional<LocalCheckpointer> localCheckpointer() {
+        return Optional.ofNullable(localCheckpointer);
+    }
+
     /** Snapshot completo das métricas operacionais deste nó (ver {@link NodeMetricsSnapshot}). */
     public NodeMetricsSnapshot metricsSnapshot() {
         return statusReporter.metricsSnapshot();
@@ -522,7 +543,9 @@ public final class NgrrdStorageNode implements Closeable {
      * o(s) próprio(s) executor(es) pararem antes de devolver — {@code NodeStatusReporter} tem DOIS:
      * o scheduler de manutenção e o executor de publicação dedicado, ver seu Javadoc — de propósito
      * ANTES de qualquer coisa tocar o volume/registry, para que nenhum tick tardio de
-     * {@code publishMetrics}/reconciliação ainda em voo encontre o volume já fechado) → rebalancer →
+     * {@code publishMetrics}/reconciliação ainda em voo encontre o volume já fechado) → checkpoint local
+     * (se ligado: para o agendamento e espera, com prazo, os checkpoints em voo — antes dos handlers e do
+     * registry, que faz o checkpoint final de tudo) → rebalancer →
      * migrationCoordinator → migrationExecutor → handlers (removidos do transporte/coordenador, o que
      * impede qualquer NOVA requisição de entrar — uma já em trânsito ainda pode concluir de forma
      * concorrente com os passos seguintes: best-effort, não uma garantia dura, por isso
@@ -537,6 +560,9 @@ public final class NgrrdStorageNode implements Closeable {
         safely("geometry service", geometryService::close);
         safely("status reporter", statusReporter::close);
         safely("local reconciler", localReconciler::close);
+        if (localCheckpointer != null) {
+            safely("local checkpointer", localCheckpointer::close);
+        }
         safely("rebalancer", rebalancer::close);
         safely("migration coordinator", migrationCoordinator::close);
         safely("migration executor", migrationExecutor::close);
