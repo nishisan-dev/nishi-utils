@@ -24,6 +24,7 @@ import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import dev.nishisan.utils.ngrid.common.ClusterMessage;
+import dev.nishisan.utils.ngrid.common.JsonFactories;
 
 import java.io.IOException;
 
@@ -94,7 +95,8 @@ public final class JacksonMessageCodec implements MessageCodec {
      * @return a new ObjectMapper
      */
     public static ObjectMapper createDefaultMapper() {
-        ObjectMapper mapper = new ObjectMapper();
+        // Message payloads carry maps keyed by data (series keys): no field-name canonicalization/intern.
+        ObjectMapper mapper = new ObjectMapper(JsonFactories.dynamicKeys());
         // Use field access — our domain classes use final fields without setters
         mapper.setVisibility(PropertyAccessor.FIELD, JsonAutoDetect.Visibility.ANY);
         mapper.setVisibility(PropertyAccessor.GETTER, JsonAutoDetect.Visibility.NONE);

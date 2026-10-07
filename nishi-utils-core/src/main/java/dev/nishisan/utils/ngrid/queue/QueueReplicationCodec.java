@@ -24,6 +24,7 @@ import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.databind.jsontype.BasicPolymorphicTypeValidator;
+import dev.nishisan.utils.ngrid.common.JsonFactories;
 
 import java.io.IOException;
 
@@ -82,7 +83,8 @@ public final class QueueReplicationCodec {
     }
 
     private static ObjectMapper buildMapper() {
-        ObjectMapper mapper = new ObjectMapper();
+        // Queue payloads may carry maps keyed by data: no field-name canonicalization/intern.
+        ObjectMapper mapper = new ObjectMapper(JsonFactories.dynamicKeys());
         mapper.setVisibility(PropertyAccessor.FIELD, JsonAutoDetect.Visibility.ANY);
         mapper.setVisibility(PropertyAccessor.GETTER, JsonAutoDetect.Visibility.NONE);
         mapper.setVisibility(PropertyAccessor.IS_GETTER, JsonAutoDetect.Visibility.NONE);
