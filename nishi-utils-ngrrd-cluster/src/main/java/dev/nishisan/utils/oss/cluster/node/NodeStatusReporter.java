@@ -34,7 +34,9 @@ import dev.nishisan.utils.oss.metrics.BlobVolumeStats;
 import java.io.Closeable;
 import java.time.Clock;
 import java.time.Duration;
+import java.util.LinkedHashMap;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.Executors;
@@ -148,6 +150,18 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
      */
     public void catalogReplication(Supplier<CatalogReplicaStatus> supplier) {
         this.catalogReplication = supplier;
+    }
+
+    /**
+     * Métricas do checkpoint local ({@code localCheckpoint.*}, 8.14.0) mescladas em
+     * {@link NodeMetricsSnapshot#lifecycleMetrics()}; {@code null} = checkpoint local desligado
+     * ({@link LocalCheckpointer#disabledMetrics}).
+     */
+    private volatile Supplier<Map<String, Long>> localCheckpointMetrics;
+
+    /** Configura a fonte das métricas do checkpoint local; {@code null} volta ao "desligado". */
+    public void localCheckpointMetrics(Supplier<Map<String, Long>> supplier) {
+        this.localCheckpointMetrics = supplier;
     }
     private final Duration interval;
     private final Clock clock;
@@ -300,13 +314,20 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
                 "NGRRD_NODE_STATUS nodeId=%s leader=%s series=%d usedBytes=%d openHandles=%d samples/s=%.1f "
                         + "writeBatchP99us=%d checkpointP99us=%d readP99us=%d leaderConfirmations=%d "
                         + "leaderConfirmationP99us=%d catalogLag=%s redirectConfirmations=%d redirectOverrides=%d "
-                        + "redirectConfirmationFailures=%d redirectCacheHits=%d",
+                        + "redirectConfirmationFailures=%d redirectCacheHits=%d lcEnabled=%d lcDirty=%d lcCycles=%d "
+                        + "lcLastCycleMs=%d lcLastCycleSeries=%d lcCheckpointed=%d lcSkippedBusy=%d lcFailures=%d "
+                        + "lcOverruns=%d",
                 snapshot.nodeId(), snapshot.leader(), snapshot.seriesCount(), snapshot.usedBytes(),
                 snapshot.openHandles(), samplesPerSecond, snapshot.writeBatchLatency().p99Micros(),
                 snapshot.checkpointLatency().p99Micros(), snapshot.readLatency().p99Micros(),
                 snapshot.leaderConfirmations(), snapshot.leaderConfirmationLatency().p99Micros(),
                 CatalogReplicaStatus.describeLag(safeCatalogReplica()), snapshot.redirectConfirmations(),
-                snapshot.redirectOverrides(), snapshot.redirectConfirmationFailures(), snapshot.redirectCacheHits()));
+                snapshot.redirectOverrides(), snapshot.redirectConfirmationFailures(), snapshot.redirectCacheHits(),
+                localCheckpointMetric(snapshot, "enabled"), localCheckpointMetric(snapshot, "dirtySeries"),
+                localCheckpointMetric(snapshot, "cycles"), localCheckpointMetric(snapshot, "lastCycleMs"),
+                localCheckpointMetric(snapshot, "lastCycleSeries"), localCheckpointMetric(snapshot, "checkpointed"),
+                localCheckpointMetric(snapshot, "skippedBusy"), localCheckpointMetric(snapshot, "failures"),
+                localCheckpointMetric(snapshot, "overruns")));
         if (metricsListener != null) {
             metricsListener.onNodeMetrics(snapshot);
         }
@@ -378,8 +399,22 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
                 handlerMetrics.redirectConfirmations(),
                 handlerMetrics.redirectOverrides(),
                 handlerMetrics.redirectConfirmationFailures(),
-                handlerMetrics.redirectCacheHits()).withLifecycleMetrics(registry.lifecycle() == null
-                        ? java.util.Map.of() : registry.lifecycle().metrics());
+                handlerMetrics.redirectCacheHits()).withLifecycleMetrics(lifecycleMetrics());
+    }
+
+    /** Métricas do lifecycle das séries e do checkpoint local, num mapa só. */
+    private Map<String, Long> lifecycleMetrics() {
+        Map<String, Long> merged = new LinkedHashMap<>();
+        if (registry.lifecycle() != null) {
+            merged.putAll(registry.lifecycle().metrics());
+        }
+        Supplier<Map<String, Long>> checkpointMetrics = localCheckpointMetrics;
+        merged.putAll(checkpointMetrics != null ? checkpointMetrics.get() : LocalCheckpointer.disabledMetrics(registry));
+        return merged;
+    }
+
+    private static long localCheckpointMetric(NodeMetricsSnapshot snapshot, String name) {
+        return snapshot.lifecycleMetrics().getOrDefault("localCheckpoint." + name, 0L);
     }
 
     /**

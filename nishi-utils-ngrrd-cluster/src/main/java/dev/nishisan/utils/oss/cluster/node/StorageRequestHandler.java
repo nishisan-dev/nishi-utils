@@ -64,13 +64,14 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.concurrent.atomic.LongAdder;
-import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -102,6 +103,15 @@ import java.util.stream.Stream;
  * próprio registro — {@link SeriesHandleRegistry#close(String)} descarta a
  * definição em cache e {@link SeriesHandleRegistry#reopenIfKnown} não reabre
  * sem ela, então a auto-cura aqui só se aplica ao caso de ociosidade/LRU.</p>
+ *
+ * <p><b>Escopo de lock do {@code checkpoint}/{@code flush} (8.14.0).</b> O gate de lifecycle, a
+ * checagem de dono, a auto-cura e o <em>enfileiramento</em> do checkpoint
+ * ({@link SeriesHandleRegistry.SeriesAccess#checkpointAsync()}) continuam sob o stripe de operação da
+ * série e sob o lock dela, como antes. A espera pelo checkpoint (fila da série + fsync no pool de
+ * writers) acontece depois de soltar os dois: um {@code writeBatch} que pega o mesmo stripe, ou que
+ * escreve na mesma série, não espera mais o I/O de durabilidade de um checkpoint em curso. A auto-cura
+ * nunca sai do stripe: ela corre contra {@code closeForDeletion} (delete) e contra
+ * {@code discard}+{@code atomicReplaceReserved} ({@code MIGRATE_COMMIT}), que também o seguram.</p>
  */
 public final class StorageRequestHandler extends RequestHandlerSupport {
 
@@ -350,7 +360,8 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
                 : body instanceof ReadRequest r ? r.seriesKey() : body instanceof ReadPresetRequest r ? r.seriesKey() : null;
         String generation = body instanceof SeriesCommandRequest r ? r.generationId()
                 : body instanceof ReadRequest r ? r.generationId() : body instanceof ReadPresetRequest r ? r.generationId() : null;
-        if (key == null) return dispatch(command, body);
+        if (key == null) return awaitIfPending(dispatch(command, body));
+        Object result;
         try (var guard = CoordinationLocks.acquire(registry.operationLock(key))) {
             SeriesStatus blocked = registry.lifecycle() == null ? null : registry.lifecycle().gate(key, generation);
             if (blocked != null) {
@@ -360,8 +371,14 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
                 if (body instanceof ReadPresetRequest) return new ReadPresetResponse(blocked, self.value(), null, message);
                 return new SeriesStatusResponse(blocked, self.value(), message);
             }
-            return dispatch(command, body);
+            result = dispatch(command, body);
         }
+        // Checkpoint/flush: o stripe (e o lock da série) já foram soltos; só agora espera o writer.
+        return awaitIfPending(result);
+    }
+
+    private static Object awaitIfPending(Object result) {
+        return result instanceof PendingCheckpoint pending ? pending.await() : result;
     }
 
     private Object dispatch(String command, Object body) {
@@ -652,9 +669,12 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
             long[] writtenSoFar = {0L};
             long startNanos = System.nanoTime();
             try {
-                Optional<Long> written = withHandleSelfHealing(seriesKey, handle -> {
+                Optional<Long> written = withSeriesSelfHealing(seriesKey, access -> {
+                    NgrrdHandle handle = access.handle();
                     for (SeriesWrite write : entry.getValue()) {
                         handle.write(write.dsName(), new Sample(write.tsEpochMs(), write.value()));
+                        // Escrita admitida (já na fila do writer): a série fica suja para o checkpoint local.
+                        access.recordWrite();
                         writtenSoFar[0]++;
                     }
                     return writtenSoFar[0];
@@ -679,29 +699,31 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
         return new WriteBatchResponse(statusBySeries, ownerBySeries, errorBySeries);
     }
 
-    private SeriesStatusResponse handleCheckpoint(SeriesCommandRequest request) {
-        SeriesStatusResponse response = handleSeriesOp(request.seriesKey(), NgrrdHandle::checkpoint, checkpointLatency);
-        if (response.status() == SeriesStatus.OK) {
-            checkpointsCount.increment();
-        }
-        return response;
-    }
-
-    private SeriesStatusResponse handleFlush(SeriesCommandRequest request) {
-        SeriesStatusResponse response = handleSeriesOp(request.seriesKey(), NgrrdHandle::flush, null);
-        if (response.status() == SeriesStatus.OK) {
-            flushesCount.increment();
-        }
-        return response;
+    private Object handleCheckpoint(SeriesCommandRequest request) {
+        return startCheckpoint(request.seriesKey(), checkpointLatency, checkpointsCount);
     }
 
     /**
-     * @param latency histograma a alimentar com a duração da chamada ao handle (dentro do lock de
-     *                {@link SeriesHandleRegistry#withHandle}); {@code null} = não medir (ex.: {@code flush},
-     *                sem campo dedicado em {@link StorageHandlerMetrics})
+     * {@code flush} e {@code checkpoint} são a mesma operação no formato de série única do oss
+     * ({@code NgrrdWriter.flush()} e {@code checkpoint()} chamam o mesmo {@code sync()}); os dois usam
+     * {@link SeriesHandleRegistry.SeriesAccess#checkpointAsync()} e diferem só nas métricas.
      */
-    private SeriesStatusResponse handleSeriesOp(String seriesKey, Consumer<NgrrdHandle> operation,
-            LatencyHistogram latency) {
+    private Object handleFlush(SeriesCommandRequest request) {
+        return startCheckpoint(request.seriesKey(), null, flushesCount);
+    }
+
+    /**
+     * Fase sob o stripe do {@code checkpoint}/{@code flush}: dono, auto-cura e enfileiramento do
+     * checkpoint, tudo sob o lock da série (via {@link #withSeriesSelfHealing}). Não espera o writer:
+     * devolve um {@link PendingCheckpoint} que {@link #handle} conclui depois de soltar o stripe. As
+     * respostas imediatas (dono errado, {@code NOT_OPEN}, falha ao enfileirar) saem direto.
+     *
+     * @param latency   histograma alimentado com a duração de ponta a ponta, incluindo a espera pelo
+     *                  writer; {@code null} = não medir (ex.: {@code flush}, sem campo dedicado em
+     *                  {@link StorageHandlerMetrics})
+     * @param successes contador incrementado quando o checkpoint conclui com sucesso
+     */
+    private Object startCheckpoint(String seriesKey, LatencyHistogram latency, LongAdder successes) {
         Ownership ownership = ownership(seriesKey, null);
         if (ownership.status() != SeriesStatus.OK) {
             recordError(ownership.status());
@@ -709,24 +731,52 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
         }
         long startNanos = System.nanoTime();
         try {
-            Optional<Boolean> executed = withHandleSelfHealing(seriesKey, handle -> {
-                operation.accept(handle);
-                return Boolean.TRUE;
-            });
-            if (latency != null) {
-                latency.record(System.nanoTime() - startNanos);
-            }
-            if (executed.isEmpty()) {
+            Optional<CompletableFuture<Void>> pending = withSeriesSelfHealing(seriesKey,
+                    SeriesHandleRegistry.SeriesAccess::checkpointAsync);
+            if (pending.isEmpty()) {
+                recordLatency(latency, startNanos);
                 recordError(SeriesStatus.NOT_OPEN);
                 return new SeriesStatusResponse(SeriesStatus.NOT_OPEN, self.value(), null);
             }
-            return new SeriesStatusResponse(SeriesStatus.OK, self.value(), null);
+            return new PendingCheckpoint(this, pending.get(), startNanos, latency, successes);
         } catch (RuntimeException e) {
-            if (latency != null) {
-                latency.record(System.nanoTime() - startNanos);
-            }
+            recordLatency(latency, startNanos);
             recordError(SeriesStatus.ERROR);
             return new SeriesStatusResponse(SeriesStatus.ERROR, self.value(), describe(e));
+        }
+    }
+
+    private static void recordLatency(LatencyHistogram latency, long startNanos) {
+        if (latency != null) {
+            latency.record(System.nanoTime() - startNanos);
+        }
+    }
+
+    /**
+     * Checkpoint já enfileirado sob o stripe, à espera de ser concluído fora dele. Nunca sai do
+     * handler: {@link #handle} sempre o troca pela resposta. A espera não tem prazo próprio, como o
+     * {@code checkpoint()} síncrono de antes: quem limita é o {@code requestTimeout} do cliente.
+     */
+    private record PendingCheckpoint(StorageRequestHandler owner, CompletableFuture<Void> future, long startNanos,
+            LatencyHistogram latency, LongAdder successes) {
+
+        SeriesStatusResponse await() {
+            try {
+                future.get();
+                recordLatency(latency, startNanos);
+                successes.increment();
+                return new SeriesStatusResponse(SeriesStatus.OK, owner.self.value(), null);
+            } catch (ExecutionException e) {
+                recordLatency(latency, startNanos);
+                owner.recordError(SeriesStatus.ERROR);
+                Throwable cause = e.getCause() != null ? e.getCause() : e;
+                return new SeriesStatusResponse(SeriesStatus.ERROR, owner.self.value(), describe(cause));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                recordLatency(latency, startNanos);
+                owner.recordError(SeriesStatus.ERROR);
+                return new SeriesStatusResponse(SeriesStatus.ERROR, owner.self.value(), describe(e));
+            }
         }
     }
 
@@ -797,14 +847,20 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
      * por {@code reopenIfKnown}.
      */
     private <R> Optional<R> withHandleSelfHealing(String seriesKey, Function<NgrrdHandle, R> fn) {
-        Optional<R> result = registry.withHandle(seriesKey, fn);
+        return withSeriesSelfHealing(seriesKey, access -> fn.apply(access.handle()));
+    }
+
+    /** Como {@link #withHandleSelfHealing}, entregando o {@link SeriesHandleRegistry.SeriesAccess}. */
+    private <R> Optional<R> withSeriesSelfHealing(String seriesKey,
+            Function<SeriesHandleRegistry.SeriesAccess, R> fn) {
+        Optional<R> result = registry.withSeries(seriesKey, fn);
         if (result.isPresent()) {
             return result;
         }
         if (registry.reopenIfKnown(seriesKey).isEmpty()) {
             return Optional.empty();
         }
-        return registry.withHandle(seriesKey, fn);
+        return registry.withSeries(seriesKey, fn);
     }
 
     private Ownership ownership(String seriesKey, SeriesPlacement placementHint) {
@@ -1183,7 +1239,7 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
         errorsByStatus.computeIfAbsent(status, ignored -> new LongAdder()).increment();
     }
 
-    private static String describe(RuntimeException e) {
+    private static String describe(Throwable e) {
         String message = e.getMessage();
         return e.getClass().getSimpleName() + (message != null ? ": " + message : "");
     }

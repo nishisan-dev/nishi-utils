@@ -34,9 +34,11 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -75,6 +77,17 @@ import java.util.stream.Collectors;
  * silencioso quando fechado — só {@code write()} lança "Writer já fechado").
  * {@link StorageRequestHandler} não recebe mais {@link NgrrdHandle} cru: toda
  * operação passa por {@link #withHandle}.</p>
+ *
+ * <h2>Séries sujas (8.14.0)</h2>
+ *
+ * <p>Cada entrada guarda {@code writeSeq} (escritas admitidas, incrementado sob o lock da série por
+ * {@link SeriesAccess#recordWrite()}) e {@code checkpointedSeq} (a maior {@code writeSeq} já coberta
+ * por um checkpoint concluído com sucesso). A série está suja enquanto {@code writeSeq >
+ * checkpointedSeq}. Todo checkpoint feito por este registro (remoto via {@link
+ * SeriesAccess#checkpointAsync()}, local via {@link #tryCheckpointAsync}, de fechamento e de migração)
+ * captura a {@code writeSeq} sob o lock, no enfileiramento, e só a grava como {@code checkpointedSeq}
+ * quando conclui com sucesso. Uma entrada nova nasce limpa: o fechamento faz checkpoint+close antes de
+ * remover a entrada.</p>
  */
 public final class SeriesHandleRegistry implements Closeable {
 
@@ -94,7 +107,14 @@ public final class SeriesHandleRegistry implements Closeable {
     private final String volumeName;
     private final Duration idleTtl;
     private final int maxOpenHandles;
-    private final Object[] operationLocks = java.util.stream.IntStream.range(0, 256).mapToObj(i -> new Object()).toArray();
+    /**
+     * Stripes de operação. Criados por {@link dev.nishisan.utils.oss.cluster.rpc.CoordinationLocks#newStripe()}:
+     * o {@code CoordinationLocks.acquire} trava direto o lock embutido em cada um, sem passar pelo mapa
+     * fraco global. Nenhum código faz {@code synchronized} sobre eles; todo acesso é por
+     * {@code CoordinationLocks.acquire}.
+     */
+    private final Object[] operationLocks = java.util.stream.IntStream.range(0, 256)
+            .mapToObj(i -> dev.nishisan.utils.oss.cluster.rpc.CoordinationLocks.newStripe()).toArray();
     /** Lock identity shared by OPEN, metadata inspection and migration; use {@code CoordinationLocks.acquire}. */
     public Object operationLock(String key) { return operationLocks[Math.floorMod(key.hashCode(), operationLocks.length)]; }
     private final Clock clock;
@@ -240,6 +260,20 @@ public final class SeriesHandleRegistry implements Closeable {
      *         não está aberta (nunca foi, foi fechada, ou está migrando)
      */
     public <R> Optional<R> withHandle(String seriesKey, Function<NgrrdHandle, R> fn) {
+        Objects.requireNonNull(fn, "fn");
+        return withSeries(seriesKey, access -> fn.apply(access.handle()));
+    }
+
+    /**
+     * Como {@link #withHandle}, mas entrega um {@link SeriesAccess}: além do handle, registra escritas
+     * admitidas ({@link SeriesAccess#recordWrite()}) e enfileira checkpoints que marcam a série como
+     * limpa ao concluir ({@link SeriesAccess#checkpointAsync()}). Mesmas garantias de lock, mesma
+     * renovação de {@code lastAccess}.
+     *
+     * @throws NullPointerException se {@code seriesKey} ou {@code fn} forem {@code null}
+     * @return o resultado de {@code fn}, ou {@link Optional#empty()} se a série não está aberta
+     */
+    public <R> Optional<R> withSeries(String seriesKey, Function<SeriesAccess, R> fn) {
         Objects.requireNonNull(seriesKey, "seriesKey");
         Objects.requireNonNull(fn, "fn");
         if (isMigrationFrozen(seriesKey)) {
@@ -257,10 +291,85 @@ public final class SeriesHandleRegistry implements Closeable {
                 return Optional.empty();
             }
             entry.touch(clock.millis());
-            return Optional.ofNullable(fn.apply(entry.handle));
+            return Optional.ofNullable(fn.apply(new SeriesAccess(entry)));
         } finally {
             entry.lock.unlock();
         }
+    }
+
+    /**
+     * Tenta enfileirar um checkpoint local da série, sem nunca esperar o lock dela: usa
+     * {@link ReentrantLock#tryLock()} e <strong>não</strong> renova {@code lastAccess} (um checkpoint de
+     * fundo não pode adiar o fechamento por ociosidade). Sob o lock, reconfere que a entrada ainda é a
+     * corrente, que não está congelada por migração e que está suja; só então captura a
+     * {@code writeSeq} e chama {@link NgrrdHandle#checkpointAsync()}. O lock é solto antes de devolver:
+     * quem chama espera a future fora dele.
+     *
+     * @return o desfecho; a future só existe em {@link CheckpointAttempt.Outcome#STARTED}
+     * @throws RuntimeException se o próprio enfileiramento falhar (raro: pool de writers recusando tarefa)
+     */
+    public CheckpointAttempt tryCheckpointAsync(String seriesKey) {
+        Objects.requireNonNull(seriesKey, "seriesKey");
+        if (isMigrationFrozen(seriesKey)) {
+            return CheckpointAttempt.UNAVAILABLE;
+        }
+        HandleEntry entry = entries.get(seriesKey);
+        if (entry == null) {
+            return CheckpointAttempt.UNAVAILABLE;
+        }
+        if (!entry.lock.tryLock()) {
+            return CheckpointAttempt.BUSY;
+        }
+        try {
+            if (entries.get(seriesKey) != entry || entry.handle == null || isMigrationFrozen(seriesKey)) {
+                return CheckpointAttempt.UNAVAILABLE;
+            }
+            if (!entry.dirty()) {
+                return CheckpointAttempt.CLEAN;
+            }
+            return new CheckpointAttempt(CheckpointAttempt.Outcome.STARTED, checkpointAsyncLocked(entry));
+        } finally {
+            entry.lock.unlock();
+        }
+    }
+
+    /** Indica se a série está aberta e com escritas admitidas ainda não cobertas por checkpoint. */
+    public boolean isDirty(String seriesKey) {
+        HandleEntry entry = entries.get(seriesKey);
+        return entry != null && entry.handle != null && entry.dirty();
+    }
+
+    /** Instantâneo das séries abertas e sujas (ver {@link #isDirty}). */
+    public Set<String> dirtySeries() {
+        return entries.entrySet().stream()
+                .filter(entry -> entry.getValue().handle != null && entry.getValue().dirty())
+                .map(Map.Entry::getKey)
+                .collect(Collectors.toUnmodifiableSet());
+    }
+
+    /** Quantidade de séries abertas e sujas agora (instantâneo, sem lock). */
+    public int dirtyCount() {
+        return (int) entries.values().stream().filter(entry -> entry.handle != null && entry.dirty()).count();
+    }
+
+    /**
+     * Enfileira o checkpoint com a entrada travada pelo chamador: captura a {@code writeSeq} agora e a
+     * grava como {@code checkpointedSeq} só no sucesso. A future devolvida conclui depois dessa marcação.
+     */
+    private static CompletableFuture<Void> checkpointAsyncLocked(HandleEntry entry) {
+        long seq = entry.writeSeq;
+        return entry.handle.checkpointAsync().whenComplete((ignored, failure) -> {
+            if (failure == null) {
+                entry.markCheckpointed(seq);
+            }
+        });
+    }
+
+    /** Checkpoint síncrono com a entrada travada; marca a série como limpa até a seq capturada. */
+    private static void checkpointLocked(HandleEntry entry) {
+        long seq = entry.writeSeq;
+        entry.handle.checkpoint();
+        entry.markCheckpointed(seq);
     }
 
     /**
@@ -398,7 +507,7 @@ public final class SeriesHandleRegistry implements Closeable {
         entry.lock.lock();
         try {
             if (entries.get(seriesKey) == entry) {
-                closeQuietly(seriesKey, entry.handle);
+                closeQuietly(seriesKey, entry);
                 entries.remove(seriesKey, entry);
             }
         } finally {
@@ -525,7 +634,7 @@ public final class SeriesHandleRegistry implements Closeable {
                 if (now - entry.lastAccessMs < ttlMillis) {
                     continue;
                 }
-                closeQuietly(seriesKey, entry.handle);
+                closeQuietly(seriesKey, entry);
                 entries.remove(seriesKey, entry);
                 closedCount++;
             } finally {
@@ -556,7 +665,7 @@ public final class SeriesHandleRegistry implements Closeable {
                     if (entries.get(seriesKey) != entry || entry.handle == null) {
                         continue;
                     }
-                    closeQuietly(seriesKey, entry.handle);
+                    closeQuietly(seriesKey, entry);
                     entries.remove(seriesKey, entry);
                     evictedOne = true;
                 } finally {
@@ -604,9 +713,9 @@ public final class SeriesHandleRegistry implements Closeable {
         try {
             // An acknowledged write must reach the image before migration closes its writer.
             // A failed checkpoint leaves the handle available for a safe abort/retry.
-            if (entries.get(seriesKey) == entry && entry.handle != null) { entry.handle.checkpoint(); }
+            if (entries.get(seriesKey) == entry && entry.handle != null) { checkpointLocked(entry); }
             if (entries.get(seriesKey) == entry) {
-                closeQuietly(seriesKey, entry.handle);
+                closeQuietly(seriesKey, entry);
                 entries.remove(seriesKey, entry);
             }
         } finally {
@@ -643,7 +752,7 @@ public final class SeriesHandleRegistry implements Closeable {
             entry.lock.lock();
             try {
                 if (entries.get(seriesKey) != entry) { continue; }
-                if (entry.handle != null) { entry.handle.checkpoint(); }
+                if (entry.handle != null) { checkpointLocked(entry); }
                 return image.get();
             } finally {
                 if (entry.handle == null) { entries.remove(seriesKey, entry); }
@@ -679,7 +788,7 @@ public final class SeriesHandleRegistry implements Closeable {
             entry.lock.lock();
             try {
                 if (entries.get(seriesKey) == entry && entry.handle != null) {
-                    closeQuietly(seriesKey, entry.handle);
+                    closeQuietly(seriesKey, entry);
                     entries.remove(seriesKey, entry);
                 }
             } finally {
@@ -721,13 +830,18 @@ public final class SeriesHandleRegistry implements Closeable {
      * checkpointAndForce()}), então o {@code checkpoint()} explícito aqui é
      * redundante em condições normais; mantido por clareza de intenção e como
      * rede de segurança. Chamado sempre com a entrada travada.
+     *
+     * <p>Uma falha nesse checkpoint final só é logada (WARNING): quem pediu o fechamento — inclusive
+     * um {@code CLOSE} remoto — não recebe o erro; o {@code close()} do handle ainda tenta o checkpoint
+     * final do writer.</p>
      */
-    private void closeQuietly(String seriesKey, NgrrdHandle handle) {
+    private void closeQuietly(String seriesKey, HandleEntry entry) {
+        NgrrdHandle handle = entry.handle;
         if (handle == null) {
             return;
         }
         try {
-            handle.checkpoint();
+            checkpointLocked(entry);
         } catch (RuntimeException e) {
             LOGGER.log(Level.WARNING, "Falha no checkpoint final da série " + seriesKey + " antes de fechar", e);
         }
@@ -755,9 +869,86 @@ public final class SeriesHandleRegistry implements Closeable {
         private final ReentrantLock lock = new ReentrantLock();
         private volatile NgrrdHandle handle;
         private volatile long lastAccessMs;
+        /** Escritas admitidas; só muda sob {@link #lock}, lida sem lock pelos instantâneos. */
+        private volatile long writeSeq;
+        /** Maior {@link #writeSeq} já coberta por um checkpoint concluído com sucesso. */
+        private final AtomicLong checkpointedSeq = new AtomicLong();
 
         void touch(long now) {
             this.lastAccessMs = now;
+        }
+
+        boolean dirty() {
+            return writeSeq > checkpointedSeq.get();
+        }
+
+        void markCheckpointed(long seq) {
+            checkpointedSeq.accumulateAndGet(seq, Math::max);
+        }
+    }
+
+    /**
+     * Acesso a uma série aberta, entregue por {@link #withSeries} e válido só dentro dele, com o lock
+     * da série na thread chamadora. Usar fora disso lança {@link IllegalStateException}.
+     */
+    public static final class SeriesAccess {
+        private final HandleEntry entry;
+
+        private SeriesAccess(HandleEntry entry) {
+            this.entry = entry;
+        }
+
+        /** Handle da série; o mesmo contrato de {@link #withHandle}. */
+        public NgrrdHandle handle() {
+            requireHeld();
+            return entry.handle;
+        }
+
+        /** Registra uma escrita admitida (já enfileirada no writer): a série passa a estar suja. */
+        public void recordWrite() {
+            requireHeld();
+            entry.writeSeq++;
+        }
+
+        /**
+         * Enfileira {@link NgrrdHandle#checkpointAsync()} e devolve sem esperar. A {@code writeSeq} é
+         * capturada agora, sob o lock; no sucesso ela vira a {@code checkpointedSeq} da série antes de a
+         * future devolvida concluir. Espere a future depois de soltar o lock (e o stripe).
+         */
+        public CompletableFuture<Void> checkpointAsync() {
+            requireHeld();
+            return checkpointAsyncLocked(entry);
+        }
+
+        private void requireHeld() {
+            if (!entry.lock.isHeldByCurrentThread()) {
+                throw new IllegalStateException("SeriesAccess usado fora de withSeries");
+            }
+        }
+    }
+
+    /**
+     * Desfecho de {@link #tryCheckpointAsync}.
+     *
+     * @param outcome o que aconteceu
+     * @param future  future do checkpoint enfileirado; {@code null} fora de {@link Outcome#STARTED}
+     */
+    public record CheckpointAttempt(Outcome outcome, CompletableFuture<Void> future) {
+
+        static final CheckpointAttempt BUSY = new CheckpointAttempt(Outcome.BUSY, null);
+        static final CheckpointAttempt CLEAN = new CheckpointAttempt(Outcome.CLEAN, null);
+        static final CheckpointAttempt UNAVAILABLE = new CheckpointAttempt(Outcome.UNAVAILABLE, null);
+
+        /** Desfechos possíveis. */
+        public enum Outcome {
+            /** Checkpoint enfileirado; espere {@link CheckpointAttempt#future()}. */
+            STARTED,
+            /** Lock da série ocupado agora; tente no próximo ciclo. */
+            BUSY,
+            /** Série aberta, mas sem escrita nova desde o último checkpoint. */
+            CLEAN,
+            /** Série fechada, ausente ou congelada por migração. */
+            UNAVAILABLE
         }
     }
 }

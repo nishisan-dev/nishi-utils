@@ -181,6 +181,9 @@ import java.util.function.Function;
  *                                 maiúsculas de minúsculas). Default {@link VolumeWriteMode#MMAP}. {@code PWRITE}
  *                                 evita que o mmap suje o folio inteiro do page cache (ver
  *                                 {@code doc/oss/ngrrd-blob-volume.md}); a leitura continua pelo mmap
+ * @param localCheckpoint          checkpoint local periódico das séries sujas ({@code ngrrd.checkpoint}:
+ *                                 {@code enabled}, {@code interval}, {@code maxInFlight}). Default
+ *                                 {@link LocalCheckpointSettings#disabled()}; ver {@link LocalCheckpointer}
  */
 public record StorageNodeConfig(
         String nodeId,
@@ -228,10 +231,71 @@ public record StorageNodeConfig(
         long quotaMaxBytes,
         PlacementRules placementRules,
         Duration placementInspectTimeout,
-        VolumeWriteMode volumeWriteMode) {
+        VolumeWriteMode volumeWriteMode,
+        LocalCheckpointSettings localCheckpoint) {
 
     /** Default de {@link #placementInspectTimeout()}. */
     public static final Duration DEFAULT_PLACEMENT_INSPECT_TIMEOUT = Duration.ofSeconds(2);
+
+    /** Construtor de compatibilidade (forma da 8.13.0), com {@code localCheckpoint} desligado. */
+    public StorageNodeConfig(
+        String nodeId,
+        String host,
+        int port,
+        String seed,
+        List<String> peers,
+        Path dataDir,
+        int priority,
+        Path volumeDir,
+        String volumeName,
+        int shardCount,
+        long segmentBytes,
+        long initialShardCapacityBytes,
+        long capacityBytes,
+        Duration statusReportInterval,
+        Duration nodeStatusStaleAfter,
+        Duration handleIdleTtl,
+        int maxOpenHandles,
+        Duration requestTimeout,
+        Durability defaultDurability,
+        OnGeometryChange defaultOnGeometryChange,
+        NgrrdClusterMetricsListener metricsListener,
+        Duration bootDiscoveryWindow,
+        boolean affinityHandbackMode,
+        Duration placementGraceAfterLeadership,
+        boolean rebalanceEnabled,
+        Duration rebalanceInterval,
+        long rebalanceMinDelta,
+        double rebalanceTolerance,
+        int maxConcurrentMigrations,
+        int maxMovesPerCycle,
+        Duration migrationTimeout,
+        long migrationChunkBytes,
+        long maxSeriesBytes,
+        Duration migrationStatusPollInterval,
+        Duration reconcileInterval,
+        Duration orphanGrace,
+        String seriesObjectPrefix,
+        DistributionMode distributionMode,
+        double weight,
+        long migrationBytesPerSecond,
+        long maxDestinationCatalogLag,
+        long quotaMaxSeries,
+        long quotaMaxBytes,
+        PlacementRules placementRules,
+        Duration placementInspectTimeout,
+        VolumeWriteMode volumeWriteMode) {
+        this(nodeId, host, port, seed, peers, dataDir, priority, volumeDir, volumeName, shardCount, segmentBytes,
+                initialShardCapacityBytes, capacityBytes, statusReportInterval, nodeStatusStaleAfter,
+                handleIdleTtl, maxOpenHandles, requestTimeout, defaultDurability, defaultOnGeometryChange,
+                metricsListener, bootDiscoveryWindow, affinityHandbackMode, placementGraceAfterLeadership,
+                rebalanceEnabled, rebalanceInterval, rebalanceMinDelta, rebalanceTolerance,
+                maxConcurrentMigrations, maxMovesPerCycle, migrationTimeout, migrationChunkBytes, maxSeriesBytes,
+                migrationStatusPollInterval, reconcileInterval, orphanGrace, seriesObjectPrefix,
+                distributionMode, weight, migrationBytesPerSecond, maxDestinationCatalogLag,
+                quotaMaxSeries, quotaMaxBytes, placementRules, placementInspectTimeout, volumeWriteMode,
+                LocalCheckpointSettings.disabled());
+    }
 
     /** Construtor de compatibilidade (forma da 8.12.0), com {@code volumeWriteMode} no default ({@code MMAP}). */
     public StorageNodeConfig(
@@ -572,6 +636,7 @@ public record StorageNodeConfig(
         }
         placementRules = Objects.requireNonNullElse(placementRules, PlacementRules.NONE);
         Objects.requireNonNull(volumeWriteMode, "volumeWriteMode é obrigatório");
+        Objects.requireNonNull(localCheckpoint, "localCheckpoint é obrigatório");
         Objects.requireNonNull(placementInspectTimeout, "placementInspectTimeout é obrigatório");
         if (placementInspectTimeout.isNegative() || placementInspectTimeout.isZero()) {
             throw new IllegalArgumentException("ngrrd.placement.inspectTimeout deve ser > 0: " + placementInspectTimeout);
@@ -845,7 +910,22 @@ public record StorageNodeConfig(
                 applyDuration(reconcile.interval, "ngrrd.reconcile.interval", builder::reconcileInterval);
                 applyDuration(reconcile.orphanGrace, "ngrrd.reconcile.orphanGrace", builder::orphanGrace);
             }
+            if (ngrrd.checkpoint != null) {
+                builder.localCheckpoint(parseCheckpoint(ngrrd.checkpoint));
+            }
             return builder.build();
+        }
+
+        /**
+         * Converte {@code ngrrd.checkpoint}; campos ausentes ficam no padrão de
+         * {@link LocalCheckpointSettings#disabled()}. Valor inválido falha o boot com o campo na mensagem.
+         */
+        private static LocalCheckpointSettings parseCheckpoint(CheckpointSection section) {
+            LocalCheckpointSettings defaults = LocalCheckpointSettings.disabled();
+            boolean enabled = section.enabled != null ? section.enabled : defaults.enabled();
+            Duration interval = NgrrdYamlSupport.duration(section.interval, "ngrrd.checkpoint.interval");
+            int maxInFlight = section.maxInFlight != null ? section.maxInFlight : defaults.maxInFlight();
+            return new LocalCheckpointSettings(enabled, interval != null ? interval : defaults.interval(), maxInFlight);
         }
 
         private static void applyDuration(String raw, String fieldName, java.util.function.Consumer<Duration> setter) {
@@ -917,6 +997,14 @@ public record StorageNodeConfig(
         public ReconcileSection reconcile;
         public QuotaSection quota;
         public PlacementSection placement;
+        public CheckpointSection checkpoint;
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private static final class CheckpointSection {
+        public Boolean enabled;
+        public String interval;
+        public Integer maxInFlight;
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
@@ -1000,6 +1088,7 @@ public record StorageNodeConfig(
         private PlacementRules placementRules = PlacementRules.NONE;
         private Duration placementInspectTimeout = DEFAULT_PLACEMENT_INSPECT_TIMEOUT;
         private VolumeWriteMode volumeWriteMode = VolumeWriteMode.MMAP;
+        private LocalCheckpointSettings localCheckpoint = LocalCheckpointSettings.disabled();
         private Duration statusReportInterval = Duration.ofSeconds(10);
         /** {@code null} = calculado em {@link #build()} a partir de {@link #statusReportInterval}. */
         private Duration nodeStatusStaleAfter;
@@ -1291,6 +1380,15 @@ public record StorageNodeConfig(
             return this;
         }
 
+        /**
+         * Checkpoint local periódico das séries sujas ({@code ngrrd.checkpoint}); default
+         * {@link LocalCheckpointSettings#disabled()}. Ver {@link LocalCheckpointer}.
+         */
+        public Builder localCheckpoint(LocalCheckpointSettings localCheckpoint) {
+            this.localCheckpoint = localCheckpoint;
+            return this;
+        }
+
         public StorageNodeConfig build() {
             Duration resolvedStaleAfter = nodeStatusStaleAfter != null
                     ? nodeStatusStaleAfter
@@ -1304,7 +1402,8 @@ public record StorageNodeConfig(
                     maxConcurrentMigrations, maxMovesPerCycle, migrationTimeout, migrationChunkBytes,
                     maxSeriesBytes, migrationStatusPollInterval, reconcileInterval, orphanGrace,
                     seriesObjectPrefix, distributionMode, weight, migrationBytesPerSecond, maxDestinationCatalogLag,
-                    quotaMaxSeries, quotaMaxBytes, placementRules, placementInspectTimeout, volumeWriteMode);
+                    quotaMaxSeries, quotaMaxBytes, placementRules, placementInspectTimeout, volumeWriteMode,
+                    localCheckpoint);
         }
 
         private static Duration maxDuration(Duration a, Duration b) {
