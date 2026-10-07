@@ -31,6 +31,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
@@ -477,6 +478,12 @@ public final class Ngrrd {
         @Override
         public void checkpoint() {
             writer.checkpoint();
+        }
+
+        /** Enfileira o checkpoint na fila FIFO do writer sem esperar (ver {@link NgrrdWriter#checkpointAsync()}). */
+        @Override
+        public CompletableFuture<Void> checkpointAsync() {
+            return writer.checkpointAsync();
         }
 
         @Override

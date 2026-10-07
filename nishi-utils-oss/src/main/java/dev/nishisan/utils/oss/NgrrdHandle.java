@@ -5,6 +5,7 @@ import dev.nishisan.utils.oss.api.SeriesResult;
 import dev.nishisan.utils.oss.api.ViewQuery;
 
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * Contrato público de operação de um pipeline ngrrd já configurado. Devolvido
@@ -32,6 +33,8 @@ import java.util.Map;
  *       das amostras.</li>
  *   <li>{@link #checkpoint()} / {@link #flush()} são síncronos: drenam a fila
  *       do writer antes de retornar.</li>
+ *   <li>{@link #checkpointAsync()} enfileira o mesmo checkpoint e devolve na hora;
+ *       a future conclui depois das escritas enfileiradas antes dela.</li>
  * </ul>
  *
  * <p><strong>Visibilidade por backend:</strong> no disco local, CDPs de passos
@@ -74,6 +77,34 @@ public interface NgrrdHandle extends AutoCloseable {
      * último estado materializado.</p>
      */
     void checkpoint();
+
+    /**
+     * Versão assíncrona de {@link #checkpoint()}: enfileira o checkpoint atrás das
+     * escritas já aceitas e devolve uma future, sem esperar o I/O de durabilidade.
+     * Permite ao chamador soltar os próprios locks antes de esperar.
+     *
+     * <p>A future conclui com sucesso quando o checkpoint termina (ou é um no-op de
+     * idle-skip) e falha com a mesma exceção que {@link #checkpoint()} lançaria.
+     * Handle já fechado: future concluída com sucesso, como {@link #checkpoint()}.
+     * Callbacks encadeados nela podem rodar na thread do writer: devem ser curtos e
+     * nunca bloquear.</p>
+     *
+     * <p>O padrão desta interface executa {@link #checkpoint()} de forma síncrona na
+     * thread chamadora e devolve a future já concluída (ou falha com a exceção):
+     * serve às implementações que não têm fila própria, como um handle remoto. O
+     * handle local devolvido por {@link Ngrrd} sobrescreve com a versão que não
+     * bloqueia.</p>
+     *
+     * @return future concluída quando o checkpoint termina
+     */
+    default CompletableFuture<Void> checkpointAsync() {
+        try {
+            checkpoint();
+            return CompletableFuture.completedFuture(null);
+        } catch (RuntimeException e) {
+            return CompletableFuture.failedFuture(e);
+        }
+    }
 
     /** Lê uma série materializada com base em uma {@link ViewQuery} explícita. */
     SeriesResult read(String dsName, ViewQuery query);
