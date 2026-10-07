@@ -1,5 +1,7 @@
 package dev.nishisan.utils.oss.cluster.node;
 
+import com.fasterxml.jackson.core.JsonFactory;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -9,6 +11,7 @@ import java.util.HashMap;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class SeriesLifecycleJournalCompactionTest {
@@ -64,5 +67,16 @@ class SeriesLifecycleJournalCompactionTest {
         long createdAt = 1_790_000_000_000L + i;
         return new SeriesLifecycleJournal.Entry("legacy:" + createdAt, 3_600_000L * round,
                 SeriesLifecycleJournal.Phase.ACTIVE, null);
+    }
+
+    @Test
+    void journalDecodificaSemCanonicalizarNomesDeCampo() throws Exception {
+        // O snapshot é um mapa por seriesKey: sem canonicalização/intern (ver JsonFactories).
+        try (var journal = new SeriesLifecycleJournal(base, MIN_COMPACT_BYTES)) {
+            var field = SeriesLifecycleJournal.class.getDeclaredField("mapper");
+            field.setAccessible(true);
+            ObjectMapper mapper = (ObjectMapper) field.get(journal);
+            assertFalse(mapper.getFactory().isEnabled(JsonFactory.Feature.CANONICALIZE_FIELD_NAMES));
+        }
     }
 }

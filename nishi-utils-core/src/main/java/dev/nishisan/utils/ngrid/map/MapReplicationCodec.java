@@ -25,6 +25,7 @@ import com.fasterxml.jackson.databind.Module;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.databind.jsontype.BasicPolymorphicTypeValidator;
+import dev.nishisan.utils.ngrid.common.JsonFactories;
 
 import java.io.IOException;
 import java.util.List;
@@ -220,7 +221,8 @@ public final class MapReplicationCodec {
     // -------------------------------------------------------------------------
 
     private static ObjectMapper buildMapper() {
-        ObjectMapper mapper = new ObjectMapper();
+        // Replicated map keys are data (e.g. series keys): no field-name canonicalization/intern.
+        ObjectMapper mapper = new ObjectMapper(JsonFactories.dynamicKeys());
 
         // Field access — domain classes typically use final fields without setters
         mapper.setVisibility(PropertyAccessor.FIELD, JsonAutoDetect.Visibility.ANY);

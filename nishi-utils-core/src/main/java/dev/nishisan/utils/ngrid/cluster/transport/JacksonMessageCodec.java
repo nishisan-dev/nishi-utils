@@ -26,6 +26,7 @@ import com.fasterxml.jackson.databind.jsontype.BasicPolymorphicTypeValidator;
 import com.fasterxml.jackson.databind.jsontype.PolymorphicTypeValidator;
 
 import dev.nishisan.utils.ngrid.common.ClusterMessage;
+import dev.nishisan.utils.ngrid.common.JsonFactories;
 
 import java.io.IOException;
 
@@ -50,7 +51,7 @@ public final class JacksonMessageCodec implements MessageCodec {
                 .allowIfBaseType(Object.class)
                 .build();
 
-        this.mapper = new ObjectMapper()
+        this.mapper = new ObjectMapper(JsonFactories.dynamicKeys())
                 .setVisibility(PropertyAccessor.ALL, JsonAutoDetect.Visibility.NONE)
                 .setVisibility(PropertyAccessor.FIELD, JsonAutoDetect.Visibility.ANY)
                 .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)

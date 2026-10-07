@@ -4,6 +4,48 @@
 
 ---
 
+## 2026-10-07 — Decodificação JSON sem canonicalização de nomes de campo — 8.14.1
+
+Medido no CTP com a 8.14.0: o buffer do cliente para a storage-209 seguia no teto com o nó ocioso.
+Cada WRITE_BATCH levava ~300 ms. A vazão ficava em ~25 mil amostras/s, constante com lotes de 2.000
+ou 8.000. Os dumps simultâneos (TEMS) mostraram a thread leitora da conexão no cliente em
+`JacksonMessageCodec.decode` → `ByteQuadsCanonicalizer.addName/rehash` → `String.intern`.
+
+### Causa
+- A resposta do WRITE_BATCH (`statusBySeries`, `ownerBySeries`, `errorBySeries`) é um mapa com o
+  seriesKey como nome de campo JSON: até 8.000 nomes novos por resposta, ~880 mil distintos no total.
+- Com o `JsonFactory` padrão, o Jackson canonicaliza e interna cada nome de campo. A tabela de
+  símbolos vive em rehash e o `String.intern` cresce sem limite.
+- Tudo isso roda na única thread leitora da conexão, enquanto o próximo lote espera (um em voo por nó).
+
+### Correção (`nishi-utils-core`, `nishi-utils-ngrrd-cluster`)
+- `JsonFactories.dynamicKeys()`: `JsonFactory` com `CANONICALIZE_FIELD_NAMES` e
+  `INTERN_FIELD_NAMES` desligados.
+- Usado nos mappers com chaves dinâmicas:
+  - os codecs de mensagem do transporte NGrid (`JacksonMessageCodec`, nas duas variantes);
+  - `MapReplicationCodec`, `QueueReplicationCodec`;
+  - o journal de lifecycle do storage.
+
+### Compatibilidade e deploy
+- O formato no fio e em disco é idêntico; muda só o custo do parse. Não há ordem de deploy.
+- O ganho no WRITE_BATCH vem de trocar o jar do **cliente** (coordinator), que decodifica a resposta.
+  Os nós podem subir depois.
+- Trade-off medido: sem canonicalização, nomes de schema fixo viram uma `String` nova por parse.
+  - Benchmark de resposta com 8.000 chaves novas: ~15–22 ms → ~2 ms.
+  - Mensagem pequena de 8 campos: ~0,6 → ~1,3 µs.
+  - Decode de um WRITE_BATCH de 8.000 amostras no nó: ~2,3 → ~3,1 ms.
+  - Heartbeat e ping usam o codec binário e não mudam.
+
+### Validação
+- `JsonFactoriesTest`:
+  - features desligadas no codec de mensagens, nos codecs de replicação e no codec legado;
+  - chave de mapa decodificada sem intern, com contraprova usando a fábrica padrão;
+  - ida e volta de 10 mil chaves.
+- Suítes: core 804 testes (8 skipped), mais a suíte do cluster; revisão independente aprovada, com
+  mutações.
+
+---
+
 ## 2026-10-07 — Checkpoint local no storage node e fim do comboio de locks do FLUSH/CHECKPOINT — 8.14.0
 
 Medição no CTP com o coordinator 8.12.0: o buffer do cliente para a storage-209 (56% das séries)
