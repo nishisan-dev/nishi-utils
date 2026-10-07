@@ -477,6 +477,10 @@ ngrrd:
       - name: no-lab-on-3
         keyPrefix: "lab/"
         exclude: [storage-3]           # exatamente um de pin/exclude
+  checkpoint:                          # opcional — checkpoint local das séries sujas (8.14.0, seção 6.7)
+    enabled: false                     # opcional, default false (nenhum executor é criado)
+    interval: 300s                     # opcional, default 300s; > 0
+    maxInFlight: 8                     # opcional, default min(8, max(2, nCPU)); >= 1
 ```
 
 **Modo de escrita do volume (`ngrrd.volume.writeMode`, 8.13.0).** `mmap` (default, ausente = `mmap`) grava
@@ -648,6 +652,63 @@ desconhecido como `REMOTE_ERROR`. A ordem de deploy continua: storages primeiro.
 **Operação.** Um storage desligado ou drenado que não passou por `ngrrd-admin forget` continua
 participante do gate e bloqueia a criação de **qualquer** série nova até voltar. Restaure o nó
 ou conclua sua retirada operacional.
+
+### 6.7. Checkpoint local (8.14.0)
+
+**Fim do comboio do `FLUSH`/`CHECKPOINT` remoto.** Até a 8.13.0, o `StorageRequestHandler` segurava
+o stripe de operação da série (um de 256) e o lock da série durante todo o checkpoint: a fila FIFO
+da série no `ngrrd-writer-pool` mais o `fsync` (em `FSYNC`). Um `WRITE_BATCH` pega o stripe de
+cada série do lote, até 256, e por isso esperava o checkpoint de qualquer série que caísse num
+desses stripes. Com o flush periódico remoto do coordinator, ~2 mil `FLUSH`/s por nó, a ida e volta
+de um `WRITE_BATCH` chegava a ~70 ms com `handle.write` em microssegundos.
+
+Desde a 8.14.0, sob o stripe e o lock da série ficam só o gate de lifecycle, a checagem de dono,
+a autocura (`reopenIfKnown`) e o **enfileiramento** do checkpoint
+(`NgrrdHandle.checkpointAsync()`, que devolve uma `CompletableFuture`). Os dois locks são soltos e
+só então a resposta espera a future. A autocura não sai do stripe, porque corre contra o delete
+(`closeForDeletion`) e contra o `MIGRATE_COMMIT` (`discard` + `atomicReplaceReserved`), que seguram
+o mesmo stripe. Como a fila do writer é FIFO, um `close`/`closeForDeletion` posterior é processado
+depois do checkpoint já enfileirado. `checkpointLatency` passa a medir de ponta a ponta, com a
+espera. `READ`, `READ_PRESET`, `OPEN`, `CLOSE` e `WRITE_BATCH` não mudam. Os stripes de operação
+agora carregam o próprio `ReentrantLock` (`CoordinationLocks.newStripe()`): adquiri-los não passa
+mais pelo monitor global do `CoordinationLocks`.
+
+**Checkpoint local (`ngrrd.checkpoint`, opt-in).** Com `enabled: true`, o nó faz o checkpoint das
+séries sujas por conta própria e o flush periódico remoto do coordinator fica dispensável (ver a
+[operação](ngrrd-cluster-operacao.md#checkpoint-local-e-fim-do-comboio-do-flush-8140)).
+
+- **Série suja:** cada entrada do `SeriesHandleRegistry` conta as escritas admitidas (`writeSeq`,
+  sob o lock da série) e guarda a maior `writeSeq` já coberta por um checkpoint bem-sucedido
+  (`checkpointedSeq`). Todo checkpoint, seja local, remoto, de close ou de migração, captura a seq no
+  enfileiramento e só a grava no sucesso. Um checkpoint que falha deixa a série suja.
+- **Ciclo:** um executor de thread única (`ngrrd-local-checkpoint`) roda com
+  `scheduleWithFixedDelay(interval)`: o próximo ciclo começa `interval` depois do fim do anterior e
+  nunca se sobrepõe a ele. O ciclo tira um instantâneo das séries sujas e espalha os disparos por
+  ~80% do intervalo, com cadência por prazo: o disparo `i` de `n` sai em
+  `início + i × 0,8 × interval / n`.
+- **Por série:** `tryLock` do lock da série, sem renovar o TTL de ociosidade (`handleIdleTtl`). Série
+  ocupada fica para o próximo ciclo (`skippedBusy`). Série congelada por migração, fechada ou ausente
+  é pulada. O checkpoint é enfileirado sob o lock, que é solto na hora. Um semáforo de `maxInFlight`
+  limita os checkpoints em voo: a vaga é pega antes do enfileiramento, fora de qualquer lock, e
+  devolvida quando a future conclui.
+- **Falhas:** contadas em `failures` e logadas em `WARNING` no máximo uma vez por minuto (as demais
+  em `FINE`). Ciclo mais longo que `interval`: `WARNING` `NGRRD_LOCAL_CHECKPOINT_OVERRUN` com a
+  duração e o número de séries, contado em `overruns`.
+- **Encerramento:** `NgrrdStorageNode.close()` para o checkpoint local antes dos handlers e do
+  `registry.close()`. Espera até 5 s o executor e até 5 s os checkpoints em voo. Depois disso, eles
+  são abandonados sem risco, porque o `registry.close()` faz checkpoint e close de cada handle atrás
+  deles na mesma fila.
+- **Métricas:** em `NodeMetricsSnapshot.lifecycleMetrics`, impressas pelo `ngrrd-admin metrics`:
+  `localCheckpoint.enabled` (0/1), `.dirtySeries`, `.cycles`, `.lastCycleMs`, `.lastCycleSeries`
+  (séries sujas no instantâneo), `.checkpointed`, `.skippedBusy`, `.failures` e `.overruns`. Com a
+  opção desligada saem `enabled=0`, contadores zerados e `dirtySeries` calculado. A linha
+  `NGRRD_NODE_STATUS` ganha no fim `lcEnabled`, `lcDirty`, `lcCycles`, `lcLastCycleMs`,
+  `lcLastCycleSeries`, `lcCheckpointed`, `lcSkippedBusy`, `lcFailures` e `lcOverruns`.
+
+**Falha de checkpoint no close.** Ao fechar um handle (`CLOSE` remoto, ociosidade, LRU, shutdown do
+nó), o registry faz checkpoint e close. Uma falha desse checkpoint final só é logada
+(`closeQuietly`, `WARNING`): o cliente que pediu o `CLOSE` recebe `OK` e não fica sabendo da falha.
+Quem precisa de confirmação de durabilidade deve pedir `CHECKPOINT` antes do `CLOSE`.
 
 ## 7. Placement (`LeastLoadedPlacementPolicy`)
 
@@ -844,7 +905,9 @@ derivado da réplica local do catálogo (issue #177): `redirectConfirmations` co
 confirmadas numa consulta ao líder, `redirectOverrides` quantas vezes o líder divergiu da réplica
 local, `redirectConfirmationFailures` quantas vezes a resposta caiu para a réplica local por falha
 ou indisponibilidade do líder, e `redirectCacheHits` quantas foram respondidas por uma confirmação
-recente em cache (TTL de 5 s) sem nova consulta.
+recente em cache (TTL de 5 s) sem nova consulta. Desde a 8.14.0, `checkpointLatency` mede o
+checkpoint remoto de ponta a ponta, incluindo a espera pelo writer, e `lifecycleMetrics` traz as
+chaves `localCheckpoint.*` (seção 6.7).
 
 `ClientMetricsSnapshot` (no cliente): `samplesEnqueued`/`samplesSent`/`samplesFailed`,
 `batchesSent`, `retriesByStatus`, `bufferedSamples` por nó de destino, `openHandles`,
@@ -858,7 +921,7 @@ Integração opcional via `NgrrdClusterMetricsListener` (storage node e cliente)
 `leaderConfirmations`/`leaderConfirmationP99us`, as confirmações de dono no líder antes de criar
 uma série ou responder `NOT_FOUND`, `catalogLag=` — forma curta do lag da réplica local do
 catálogo, seção 3 — e `redirectConfirmations`/`redirectOverrides`/`redirectConfirmationFailures`/
-`redirectCacheHits`), `NGRRD_REBALANCE`/
+`redirectCacheHits` e, desde a 8.14.0, os campos `lc*` do checkpoint local, seção 6.7), `NGRRD_REBALANCE`/
 `NGRRD_REBALANCE_MOVE` a cada ciclo de rebalanceamento, `NGRRD_REBALANCE_DEST_EXCLUDED` quando o
 conjunto de destinos excluídos por lag do catálogo muda de um ciclo para o outro (issue #177),
 `NGRRD_NODE_DRAINED` quando o `Rebalancer`
