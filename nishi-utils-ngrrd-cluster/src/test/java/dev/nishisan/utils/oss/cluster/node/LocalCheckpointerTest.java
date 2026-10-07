@@ -300,6 +300,125 @@ class LocalCheckpointerTest {
         assertEquals(0, registry.dirtyCount());
     }
 
+    @Test
+    void closeDuranteACadenciaDeUmCicloRetornaNaHora() throws Exception {
+        for (String key : List.of("c0", "c1", "c2")) {
+            open(key);
+            write(key, T0);
+        }
+        // Intervalo grande: entre um disparo e o próximo a thread dorme ~16 s na cadência.
+        LocalCheckpointer checkpointer = new LocalCheckpointer(registry,
+                new LocalCheckpointSettings(true, Duration.ofSeconds(60), 2));
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<?> cycle = executor.submit(() -> {
+                checkpointer.runCycle();
+                return null;
+            });
+            awaitTrue(() -> checkpointer.metrics().get("localCheckpoint.checkpointed") == 1L);
+            Thread.sleep(100);
+            assertFalse(cycle.isDone(), "o ciclo deveria estar dormindo na cadência");
+
+            long started = System.nanoTime();
+            checkpointer.close();
+            cycle.get(1, TimeUnit.SECONDS);
+            long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+            assertTrue(elapsedMs < 1_000, "close() levou " + elapsedMs + " ms");
+            assertEquals(2, registry.dirtyCount(), "o restante do ciclo é abandonado no close");
+        } finally {
+            checkpointer.close();
+            executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void serieLimpaOuIndisponivelDevolveAVagaDoSemaforo() throws Exception {
+        open("clean");
+        open("frozen");
+        write("frozen", T0);
+        registry.beginMigrationCopy("frozen");
+        registry.markMigrating("frozen");
+        try (LocalCheckpointer checkpointer = new LocalCheckpointer(registry,
+                new LocalCheckpointSettings(true, Duration.ofMillis(100), 1))) {
+            checkpointer.checkpointOne("clean");
+            assertEquals(0, checkpointer.inFlightCount(), "CLEAN devolve a vaga");
+            checkpointer.checkpointOne("absent");
+            checkpointer.checkpointOne("frozen");
+            assertEquals(0, checkpointer.inFlightCount(), "UNAVAILABLE devolve a vaga");
+            assertEquals(0L, checkpointer.metrics().get("localCheckpoint.failures"));
+        }
+    }
+
+    @Test
+    void excecaoAoEnfileirarOCheckpointDevolveAVagaEContaFalha() throws Exception {
+        open("rejecting");
+        write("rejecting", T0);
+        wrapHandle("rejecting", original -> delegating(original, method -> {
+            if (method.equals("checkpointAsync")) {
+                throw new IllegalStateException("pool de writers recusou a tarefa");
+            }
+            return null;
+        }));
+        try (LocalCheckpointer checkpointer = new LocalCheckpointer(registry,
+                new LocalCheckpointSettings(true, Duration.ofMillis(100), 1))) {
+            checkpointer.checkpointOne("rejecting");
+            assertEquals(0, checkpointer.inFlightCount(), "a exceção não pode prender a vaga");
+            assertEquals(1L, checkpointer.metrics().get("localCheckpoint.failures"));
+            assertTrue(registry.isDirty("rejecting"));
+        }
+    }
+
+    @Test
+    void checkpointSincronoComFalhaNaoMarcaASerieComoLimpa() {
+        open("sync-fail");
+        write("sync-fail", T0);
+        AtomicBoolean failCheckpoint = new AtomicBoolean(true);
+        wrapHandle("sync-fail", original -> delegating(original, method -> {
+            if (method.equals("checkpoint") && failCheckpoint.get()) {
+                throw new IllegalStateException("fsync simulado falhou");
+            }
+            return null;
+        }));
+        registry.beginMigrationCopy("sync-fail");
+        assertThrows(IllegalStateException.class, () -> registry.migrationSnapshot("sync-fail", () -> new byte[0]));
+        assertTrue(registry.isDirty("sync-fail"), "snapshot de migração com falha deixa a série suja");
+
+        failCheckpoint.set(false);
+        registry.migrationSnapshot("sync-fail", () -> new byte[0]);
+        assertFalse(registry.isDirty("sync-fail"), "o mesmo caminho com sucesso marca a série como limpa");
+    }
+
+    @Test
+    void serieCongeladaComHandleAbertoNaoEnfileiraCheckpointLocal() throws Exception {
+        open("frozen-open");
+        write("frozen-open", T0);
+        AtomicInteger asyncCalls = new AtomicInteger();
+        AtomicBoolean failSyncCheckpoint = new AtomicBoolean(true);
+        wrapHandle("frozen-open", original -> delegating(original, method -> {
+            if (method.equals("checkpointAsync")) {
+                asyncCalls.incrementAndGet();
+            }
+            if (method.equals("checkpoint") && failSyncCheckpoint.getAndSet(false)) {
+                throw new IllegalStateException("checkpoint do cutover falhou");
+            }
+            return null;
+        }));
+        registry.beginMigrationCopy("frozen-open");
+        // O checkpoint do cutover falha: a série fica congelada e o handle continua aberto.
+        assertThrows(IllegalStateException.class, () -> registry.markMigrating("frozen-open"));
+        assertTrue(registry.isMigrationFrozen("frozen-open"));
+        assertEquals(1, registry.openCount());
+        assertTrue(registry.isDirty("frozen-open"));
+
+        assertEquals(SeriesHandleRegistry.CheckpointAttempt.Outcome.UNAVAILABLE,
+                registry.tryCheckpointAsync("frozen-open").outcome());
+        try (LocalCheckpointer checkpointer = new LocalCheckpointer(registry, FAST)) {
+            checkpointer.runCycle();
+        }
+        assertEquals(0, asyncCalls.get(), "série congelada não recebe checkpoint local");
+        registry.clearMigrating("frozen-open");
+    }
+
     // ------------------------------------------------------------------ apoio
 
     private void open(String key) {

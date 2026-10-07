@@ -24,6 +24,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -63,8 +64,8 @@ import java.util.logging.Logger;
  *
  * <h2>Encerramento</h2>
  *
- * <p>{@link #close()} cancela o agendamento, encerra o executor (espera até 5 s; depois interrompe, o que
- * aborta a cadência de um ciclo em curso) e espera até 5 s os checkpoints locais ainda em voo. Passado
+ * <p>{@link #close()} acorda na hora a cadência de um ciclo em curso (o ciclo abandona o restante),
+ * cancela o agendamento, interrompe o executor e espera até 5 s os checkpoints locais ainda em voo. Passado
  * esse prazo, eles são abandonados sem risco: o {@code registry.close()} seguinte faz checkpoint+close
  * de cada handle, e a fila FIFO do writer conclui antes o checkpoint já enfileirado. O
  * {@link NgrrdStorageNode} fecha este componente antes dos handlers e do registry.</p>
@@ -88,6 +89,8 @@ public final class LocalCheckpointer implements Closeable {
     private final ScheduledExecutorService scheduler;
     private volatile ScheduledFuture<?> task;
     private volatile boolean closed;
+    /** Sinalizado pelo {@link #close()}: acorda na hora a cadência de um ciclo em curso. */
+    private final CountDownLatch closeSignal = new CountDownLatch(1);
 
     private final AtomicLong cycles = new AtomicLong();
     private final AtomicLong lastCycleMs = new AtomicLong();
@@ -149,8 +152,8 @@ public final class LocalCheckpointer implements Closeable {
         for (int i = 0; i < count && !closed; i++) {
             long dueNanos = startedNanos + (count > 1 ? spreadNanos / count * i : 0L);
             long aheadNanos = dueNanos - System.nanoTime();
-            if (aheadNanos >= MIN_SLEEP_NANOS) {
-                TimeUnit.NANOSECONDS.sleep(aheadNanos);
+            if (aheadNanos >= MIN_SLEEP_NANOS && closeSignal.await(aheadNanos, TimeUnit.NANOSECONDS)) {
+                break; // close() durante a cadência: abandona o restante do ciclo.
             }
             checkpointOne(dirty.get(i));
         }
@@ -168,7 +171,8 @@ public final class LocalCheckpointer implements Closeable {
         }
     }
 
-    private void checkpointOne(String seriesKey) throws InterruptedException {
+    /** Um disparo do ciclo: vaga do semáforo, {@code tryCheckpointAsync} e contagem. Visível para testes. */
+    void checkpointOne(String seriesKey) throws InterruptedException {
         inFlight.acquire();
         boolean started = false;
         try {
@@ -254,8 +258,11 @@ public final class LocalCheckpointer implements Closeable {
     }
 
     /**
-     * Encerra: cancela o agendamento, encerra o executor (5 s, depois interrompe) e espera até 5 s os
-     * checkpoints em voo. Idempotente. Ver o Javadoc da classe.
+     * Encerra sem esperar a cadência: sinaliza o {@link #closeSignal} (acorda o ciclo que dorme entre
+     * disparos), cancela o agendamento e interrompe o executor na hora ({@code shutdownNow}). A
+     * interrupção só pode encontrar o ciclo dormindo ou à espera de vaga no semáforo: ele nunca segura
+     * lock de série nem vaga nesses pontos, e o enfileiramento em si não é interrompível. Depois espera
+     * até 5 s o executor terminar e até 5 s os checkpoints em voo. Idempotente. Ver o Javadoc da classe.
      */
     @Override
     public void close() {
@@ -263,14 +270,15 @@ public final class LocalCheckpointer implements Closeable {
             return;
         }
         closed = true;
+        closeSignal.countDown();
         ScheduledFuture<?> current = task;
         if (current != null) {
             current.cancel(false);
         }
-        scheduler.shutdown();
+        scheduler.shutdownNow();
         try {
             if (!scheduler.awaitTermination(CLOSE_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
-                scheduler.shutdownNow();
+                LOGGER.warning("NGRRD_LOCAL_CHECKPOINT executor não terminou em " + CLOSE_TIMEOUT_MS + " ms");
             }
             if (!inFlight.tryAcquire(settings.maxInFlight(), CLOSE_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
                 LOGGER.warning("NGRRD_LOCAL_CHECKPOINT " + inFlightCount() + " checkpoints locais ainda em voo após "

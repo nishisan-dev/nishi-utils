@@ -695,7 +695,8 @@ séries sujas por conta própria e o flush periódico remoto do coordinator fica
   em `FINE`). Ciclo mais longo que `interval`: `WARNING` `NGRRD_LOCAL_CHECKPOINT_OVERRUN` com a
   duração e o número de séries, contado em `overruns`.
 - **Encerramento:** `NgrrdStorageNode.close()` para o checkpoint local antes dos handlers e do
-  `registry.close()`. Espera até 5 s o executor e até 5 s os checkpoints em voo. Depois disso, eles
+  `registry.close()`. O close acorda na hora a cadência de um ciclo em curso, que abandona o restante,
+  e espera até 5 s o executor e até 5 s os checkpoints em voo. Depois disso, eles
   são abandonados sem risco, porque o `registry.close()` faz checkpoint e close de cada handle atrás
   deles na mesma fila.
 - **Métricas:** em `NodeMetricsSnapshot.lifecycleMetrics`, impressas pelo `ngrrd-admin metrics`:

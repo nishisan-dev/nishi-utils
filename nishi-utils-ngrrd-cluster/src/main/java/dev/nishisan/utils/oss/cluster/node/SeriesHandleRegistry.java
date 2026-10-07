@@ -310,9 +310,6 @@ public final class SeriesHandleRegistry implements Closeable {
      */
     public CheckpointAttempt tryCheckpointAsync(String seriesKey) {
         Objects.requireNonNull(seriesKey, "seriesKey");
-        if (isMigrationFrozen(seriesKey)) {
-            return CheckpointAttempt.UNAVAILABLE;
-        }
         HandleEntry entry = entries.get(seriesKey);
         if (entry == null) {
             return CheckpointAttempt.UNAVAILABLE;
@@ -321,6 +318,8 @@ public final class SeriesHandleRegistry implements Closeable {
             return CheckpointAttempt.BUSY;
         }
         try {
+            // Congelada por migração conferida só aqui, sob o lock: é a checagem que vale contra um
+            // markMigrating concorrente (que também trava a entrada antes de fechá-la).
             if (entries.get(seriesKey) != entry || entry.handle == null || isMigrationFrozen(seriesKey)) {
                 return CheckpointAttempt.UNAVAILABLE;
             }

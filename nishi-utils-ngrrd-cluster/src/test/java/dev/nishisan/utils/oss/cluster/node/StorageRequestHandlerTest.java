@@ -262,6 +262,28 @@ class StorageRequestHandlerTest {
         }
     }
 
+    @Test
+    void writeBatchEsperaOStripeSeguradoPorUmaOperacaoDeLifecycle() throws Exception {
+        String key = "series-lifecycle-stripe";
+        placementLookup.put(key, SeriesPlacement.active(SELF.value(), 1_000L));
+        assertEquals(SeriesStatus.OK, ((SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequest(key, null), SOURCE)).status());
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        try {
+            Future<SeriesStatus> write;
+            // Delete e migração (SeriesLifecycleService, SeriesDeleteHandler, MigrationExecutor.seriesLock)
+            // seguram exatamente este stripe; o WRITE_BATCH precisa da mesma identidade de lock.
+            try (var stripe = CoordinationLocks.acquire(registry.operationLock(key))) {
+                write = executor.submit(() -> writeOne(key, 1_700_000_100_000L));
+                Thread.sleep(300);
+                assertFalse(write.isDone(), "o WRITE_BATCH deveria esperar a operação de lifecycle");
+            }
+            assertEquals(SeriesStatus.OK, write.get(10, TimeUnit.SECONDS));
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
     private SeriesStatus writeOne(String key, long tsEpochMs) {
         WriteBatchResponse response = (WriteBatchResponse) handler.handle(Commands.WRITE_BATCH,
                 new WriteBatchRequest(List.of(new SeriesWrite(key, "in_octets", tsEpochMs, 1_000d))), SOURCE);

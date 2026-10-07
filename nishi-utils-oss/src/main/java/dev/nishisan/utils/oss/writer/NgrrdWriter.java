@@ -484,27 +484,36 @@ public final class NgrrdWriter implements AutoCloseable {
                     }
                 }
                 case Command.Shutdown s -> {
-                    RuntimeException finalFailure = null;
+                    // Throwable, não só RuntimeException: um Error no checkpoint final também precisa
+                    // falhar os Syncs órfãos. RuntimeException segue só logada; Error é relançado
+                    // depois de concluir as futures e liberar o close(), como antes.
+                    Throwable finalFailure = null;
                     try {
                         if (s.checkpoint()) {
                             throwIfWriteFailed();
                             checkpointAndForce();
                         }
-                    } catch (RuntimeException e) {
+                    } catch (Throwable e) {
                         finalFailure = e;
                         System.err.println("ngrrd-writer: falha no checkpoint final: " + e);
                     } finally {
-                        closeChannelQuietly();
-                        if (!s.checkpoint()) {
-                            orphanedSyncFailure = new IllegalStateException(
-                                    "Writer encerrado sem checkpoint final (closeForDeletion)");
-                        } else if (finalFailure != null) {
-                            orphanedSyncFailure = new IllegalStateException(
-                                    "Falha no checkpoint final do writer", finalFailure);
+                        try {
+                            closeChannelQuietly();
+                        } finally {
+                            if (!s.checkpoint()) {
+                                orphanedSyncFailure = new IllegalStateException(
+                                        "Writer encerrado sem checkpoint final (closeForDeletion)");
+                            } else if (finalFailure != null) {
+                                orphanedSyncFailure = new IllegalStateException(
+                                        "Falha no checkpoint final do writer", finalFailure);
+                            }
+                            terminated = true;
+                            completeOrphanedSyncs();
+                            s.latch().countDown();
                         }
-                        terminated = true;
-                        completeOrphanedSyncs();
-                        s.latch().countDown();
+                    }
+                    if (finalFailure instanceof Error error) {
+                        throw error;
                     }
                     return true;
                 }

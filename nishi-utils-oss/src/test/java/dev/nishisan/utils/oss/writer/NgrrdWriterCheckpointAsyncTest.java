@@ -191,6 +191,28 @@ class NgrrdWriterCheckpointAsyncTest {
         }
     }
 
+    @Test
+    void errorNoCheckpointFinalFalhaOsSyncsOrfaosSemTravarOClose() throws Exception {
+        GatedStorage storage = new GatedStorage();
+        NgrrdWriter writer = new NgrrdWriter(definition(), storage, SERIES);
+        writer.write("in_octets", new Sample(START_MS, 1_000_000L));
+        storage.errorOnForce = true;
+        // O Error do checkpoint final é relançado na thread do pool, depois de liberar o close().
+        assertDoesNotThrow(writer::close);
+        reopenClosedFlag(writer);
+        ExecutionException failure = assertThrows(ExecutionException.class,
+                () -> writer.checkpointAsync().get(5, TimeUnit.SECONDS));
+        assertInstanceOf(IllegalStateException.class, failure.getCause());
+        assertInstanceOf(SimulatedForceError.class, failure.getCause().getCause());
+    }
+
+    /** Error simulado no {@code force()}, para o caminho de Throwable do checkpoint final. */
+    private static final class SimulatedForceError extends Error {
+        SimulatedForceError() {
+            super("Error simulado no force()");
+        }
+    }
+
     private static void reopenClosedFlag(NgrrdWriter writer) throws ReflectiveOperationException {
         Field closed = NgrrdWriter.class.getDeclaredField("closed");
         closed.setAccessible(true);
@@ -208,6 +230,7 @@ class NgrrdWriterCheckpointAsyncTest {
         private volatile CountDownLatch forceGate;
         private final CountDownLatch forceBlocked = new CountDownLatch(1);
         volatile boolean failForce;
+        volatile boolean errorOnForce;
         volatile boolean failWrite;
 
         void gateForces() {
@@ -330,13 +353,17 @@ class NgrrdWriterCheckpointAsyncTest {
                 if (failForce) {
                     throw new NgrrdStorageException("falha simulada de force()");
                 }
+                if (errorOnForce) {
+                    throw new SimulatedForceError();
+                }
                 forces.incrementAndGet();
                 objects.put(key, image.clone());
             }
 
             @Override
             public void close() {
-                force();
+                // Sem portão nem falha simulada: o fechamento do canal só persiste a imagem.
+                objects.put(key, image.clone());
             }
         }
     }

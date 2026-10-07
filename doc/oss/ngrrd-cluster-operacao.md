@@ -1244,10 +1244,12 @@ ngrrd:
   só gera RPC. Use `flushMode onShutdown`: o `CLOSE` remoto de cada série, no desalojamento do cache
   ou no shutdown do coordinator, já faz checkpoint + close no nó. O commit no modo janela das marcas
   ([seção 5.2](ngrrd-cluster.md#52-marcas-de-escrita-8120)) não depende do flush remoto.
-- **Janela de perda.** Uma escrita confirmada pelo dono fica durável no próximo ciclo local. O
-  pior caso é perto de 1,8 × `interval`: a pausa entre ciclos mais os ~80% do intervalo que o ciclo
-  leva para espalhar os disparos. Um `CLOSE` ou um fechamento por ociosidade antecipa o checkpoint.
-  Escolha o `interval` pela perda aceitável num crash abrupto do nó.
+- **Janela de perda.** Uma escrita confirmada pelo dono fica durável no próximo ciclo local,
+  tipicamente em até ~1,8 × `interval`: a pausa entre ciclos mais os ~80% do intervalo que o ciclo
+  leva para espalhar os disparos. Uma série ocupada no disparo (`skippedBusy`), um checkpoint que
+  falhou ou um ciclo com overrun fica para o ciclo seguinte, e aí a janela passa de ~2,8 × `interval`.
+  Um `CLOSE` ou um fechamento por ociosidade antecipa o checkpoint. Escolha o `interval` pela perda
+  aceitável num crash abrupto do nó.
 - **Falha no checkpoint do `CLOSE`.** O nó só loga a falha (`WARNING`, `closeQuietly`) e responde
   `OK`, e o cliente não recebe o erro. Se a aplicação precisa da confirmação, peça `CHECKPOINT`
   antes do `CLOSE`.
