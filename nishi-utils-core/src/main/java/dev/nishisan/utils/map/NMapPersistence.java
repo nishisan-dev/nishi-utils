@@ -89,6 +89,7 @@ public final class NMapPersistence<K, V> implements Closeable {
     private final Path oldWalPath;
     private final Path pendingSnapshotPath;
     private volatile boolean snapshotsSuspended;
+    private volatile boolean recoveredState;
     private volatile IOException checkpointFailure;
     @FunctionalInterface
     interface CheckpointFaultInjector {
@@ -176,6 +177,16 @@ public final class NMapPersistence<K, V> implements Closeable {
     }
 
     /**
+     * Whether the initial load successfully recovered existing snapshot or WAL files.
+     * Newly created persistence files do not establish recovery of a prior replication frontier.
+     *
+     * @return whether existing state was recovered without persistence failures
+     */
+    public boolean hasRecoveredState() {
+        return recoveredState && failureCount() == 0;
+    }
+
+    /**
      * Returns the timestamp of the last mutation known to this persistence
      * engine, or {@code 0} when no mutation has been observed.
      *
@@ -194,6 +205,8 @@ public final class NMapPersistence<K, V> implements Closeable {
             return;
         }
         try {
+            boolean hadRecoveryFiles = Files.isRegularFile(snapshotPath) || Files.isRegularFile(walPath)
+                    || Files.isRegularFile(oldWalPath) || Files.isRegularFile(pendingSnapshotPath);
             createMapDirectories();
             recoverPendingSnapshot();
             loadSnapshot();
@@ -203,6 +216,7 @@ public final class NMapPersistence<K, V> implements Closeable {
             }
             loadWal(walPath);
             consolidateRecoveredWal();
+            recoveredState = hadRecoveryFiles;
             readMeta().ifPresent(meta -> {
                 lastSnapshotTimeMillis = meta.lastSnapshotTimestamp();
                 lastMutationTimeMillis.accumulateAndGet(meta.lastMutationTimestamp(), Math::max);

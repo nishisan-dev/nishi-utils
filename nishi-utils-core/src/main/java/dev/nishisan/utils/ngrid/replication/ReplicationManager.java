@@ -311,7 +311,7 @@ public class ReplicationManager
     // Topics that must bootstrap (fresh snapshot) on this start because the prior shutdown was
     // unclean — the coalesced apply frontier may be behind the durable handler state, which would
     // re-apply (duplicating the non-idempotent queue OFFER). A clean shutdown writes a marker that
-    // makes a clean restart resume without bootstrap.
+    // makes a clean restart resume without bootstrap only when the handler restored its state.
     // Set on an unclean restart (crash): the coalesced apply frontier may be behind — or entirely lost
     // — vs. the durable handler state, so every relay topic with prior data must bootstrap (a fresh
     // snapshot replaces local state) instead of risking a stale/lost-frontier re-apply that duplicates
@@ -322,6 +322,8 @@ public class ReplicationManager
     // from the very first heartbeat, before any handler registers and arms the per-topic pending.
     private volatile boolean uncleanWithPriorRelayData = false;
     private final Set<String> relayPendingBootstrap = ConcurrentHashMap.newKeySet();
+    // Startup-only progress: a saved cursor is usable only if the handler recovered its state (#212).
+    private final Set<String> restoredTopics = ConcurrentHashMap.newKeySet();
 
     // RELAY_STREAM follower IO: a per-topic fetch loop pulls the leader op-log from a durable cursor
     // (the relay tail) and persists contiguous runs in order; the existing apply loop drains the relay.
@@ -450,6 +452,9 @@ public class ReplicationManager
         this.config = Objects.requireNonNull(config, "config");
         this.sequenceStatePath = config.dataDirectory().resolve("sequence-state.dat");
         loadSequenceState();
+        appliedFrontiers().byTopic().forEach((topic, frontier) -> {
+            if (frontier > 0) restoredTopics.add(topic);
+        });
     }
 
     /**
@@ -812,7 +817,7 @@ public class ReplicationManager
 
     /**
      * True while the node must not advertise its frontier nor accept leadership (issue tems#9, D8):
-     * a per-topic bootstrap is pending (unclean restart with prior data, cleared only when the
+     * a per-topic bootstrap is pending (unclean restart or missing handler state, cleared only when the
      * snapshot INSTALLS), or the unclean restart was detected but no handler has registered yet to
      * arm the per-topic pending (the startup window where the seeded frontier of a possibly dead
      * lineage would otherwise leak into the first heartbeats as a real watermark).
@@ -827,22 +832,26 @@ public class ReplicationManager
     }
 
     private void markPendingBootstrapForRegisteredHandlers() {
-        if (!relayUncleanRestart) {
-            return;
-        }
         handlers.keySet().forEach(this::markPendingBootstrapIfNeeded);
     }
 
     private void markPendingBootstrapIfNeeded(String topic) {
-        if (!isStreamMode() || !relayUncleanRestart
-                || !RelayStore.hasTopicData(config.dataDirectory().resolve("relay"), topic)) {
+        if (!isStreamMode()) {
+            return;
+        }
+        ReplicationHandler handler = handlers.get(topic);
+        boolean missingState = restoredTopics.contains(topic) && handler != null && !handler.hasRestoredState();
+        boolean uncleanRelay = relayUncleanRestart
+                && RelayStore.hasTopicData(config.dataDirectory().resolve("relay"), topic);
+        if (!missingState && !uncleanRelay) {
             return;
         }
         if (relayPendingBootstrap.add(topic)) {
-            // Unclean restart and this topic had prior relay data: it must bootstrap before applying
-            // (regardless of any saved frontier, which may be lost). The snapshot is requested by the
+            // Missing handler state or an unclean relay requires bootstrap before applying,
+            // regardless of the saved frontier. The snapshot is requested by the
             // apply loop once a leader is known and this node is a follower.
-            LOGGER.info(() -> "Relay bootstrap pending for topic " + topic + " after unclean restart");
+            LOGGER.info(() -> "Relay bootstrap pending for topic " + topic
+                    + (missingState ? " because handler state was not restored" : " after unclean restart"));
             coordinator.reevaluateLeadership();
         }
     }
@@ -1743,6 +1752,7 @@ public class ReplicationManager
         sequenceByTopic.computeIfAbsent(topic, k -> new java.util.concurrent.atomic.AtomicLong())
                 .set(watermark);
         boolean completedBootstrap = relayPendingBootstrap.remove(topic);
+        restoredTopics.remove(topic);
         if (handbackInstall && handbackRole.get() == HandbackRole.CANDIDATE_INSTALLING) {
             handbackInstalledTopics.add(topic); // 8.11.2: counts toward the GRANT's required set
         }

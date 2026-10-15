@@ -627,6 +627,15 @@ Modos:
 - `ASYNC_NO_FSYNC`
 - `ASYNC_WITH_FSYNC`
 
+Com `DISABLED`, os dados locais do mapa são perdidos ao reiniciar, inclusive após shutdown normal.
+Se o diretório de replicação contém progresso anterior, o nó precisa reconstruir o mapa por snapshot
+de um líder sobrevivente antes de anunciar esse progresso ou assumir liderança. Sem uma réplica
+disponível, permanece inelegível; o cursor persistido sozinho não permite recuperar os dados.
+
+Habilitar persistência em um diretório que antes continha somente os cursores também exige essa
+recuperação: arquivos novos de WAL não recuperam retroativamente o prefixo perdido. Para recuperar
+um cluster após a parada de todos os nós, configure persistência dos mapas antes de produzir dados.
+
 Arquivos por mapa:
 
 ```
