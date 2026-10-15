@@ -18,6 +18,8 @@ package dev.nishisan.utils.ngrid.replication;
 
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -35,6 +37,9 @@ import java.util.concurrent.ScheduledExecutorService;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+import dev.nishisan.utils.ngrid.map.MapClusterService;
 
 import dev.nishisan.utils.ngrid.cluster.coordination.ClusterCoordinator;
 import dev.nishisan.utils.ngrid.cluster.coordination.ClusterCoordinatorConfig;
@@ -140,6 +145,31 @@ class UncleanRestartBootstrapWiringTest {
     private void simulatePriorUncleanRunWithTopicData() throws IOException {
         Path relayDir = tempDir.resolve("relay");
         Files.createDirectories(relayDir.resolve(RelayStore.dirName(TOPIC)));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void cleanRestartWithVolatileHandlerCannotAdvertiseOrLead(boolean registerBeforeStart) throws Exception {
+        // No relay files are needed: an ex-leader may only have a produced counter on disk.
+        try (var out = new java.io.ObjectOutputStream(
+                Files.newOutputStream(tempDir.resolve("sequence-state.dat")))) {
+            out.writeObject(java.util.Map.of("_global", 1L, "_topic:" + TOPIC, 1L));
+        }
+        RelayStore.writeCleanMarker(tempDir.resolve("relay"));
+        ReplicationManager manager = newManager();
+        try {
+            if (registerBeforeStart) new MapClusterService<String, String>(manager, TOPIC, null);
+            manager.start();
+            if (!registerBeforeStart) new MapClusterService<String, String>(manager, TOPIC, null);
+            assertTrue(manager.getTopicReplicationStatuses().get(TOPIC).relayPendingBootstrap());
+            assertEquals(-1L, manager.getAdvertisedHighWatermark());
+            assertFalse(manager.isLeadershipEligible());
+            // Without a surviving peer the node must remain gated rather than silently lead empty.
+            Thread.sleep(300);
+            assertFalse(manager.isLeadershipEligible());
+        } finally {
+            manager.close();
+        }
     }
 
     private ReplicationManager newManager() {

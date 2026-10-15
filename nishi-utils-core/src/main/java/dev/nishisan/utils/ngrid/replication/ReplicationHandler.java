@@ -25,6 +25,18 @@ import java.util.UUID;
  */
 public interface ReplicationHandler {
     /**
+     * Whether this handler restored its state on startup, so a saved replication frontier can be
+     * reused after a clean shutdown. Volatile handlers and durable handlers with no recovery files
+     * must return {@code false}; they need a peer snapshot when the manager restores prior progress.
+     * The default preserves the durable-state contract of existing handlers.
+     *
+     * @return whether the handler restored its local state
+     */
+    default boolean hasRestoredState() {
+        return true;
+    }
+
+    /**
      * Applies a single replicated operation.
      *
      * @param operationId the operation identifier

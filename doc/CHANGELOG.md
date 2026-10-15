@@ -4,6 +4,32 @@
 
 ---
 
+## 2026-10-15 — Recuperação de mapas voláteis após shutdown limpo — 8.14.2
+
+### Correção (#212)
+- Um mapa `DISABLED` podia reiniciar vazio, anunciar o frontier persistido e reassumir a liderança
+  mesmo com dados confirmados ainda presentes em uma réplica sobrevivente.
+- `ReplicationHandler.hasRestoredState()` separa a recuperação do estado do handler do marker de
+  shutdown limpo. Mapas sem estado recuperado exigem snapshot antes de anunciar progresso ou liderar.
+- A proteção cobre também habilitar persistência sobre um diretório com cursores antigos e sem
+  snapshot/WAL do mapa. Persistência nova não comprova recuperação do prefixo perdido.
+- Sem uma réplica disponível para reconstruir os dados voláteis, o nó permanece inelegível à liderança.
+- O formato de mensagens e os arquivos de persistência permanecem compatíveis. Handlers existentes
+  preservam o contrato padrão de estado durável; handlers voláteis devem informar que não restauraram estado.
+
+### Regressões e validação
+- `VolatileMapCleanRestartTest`: quatro cenários TCP com shutdown comprovadamente limpo, cobrindo
+  retorno imediato com quórum 2, prefixo + delta durante ausência, migração para persistência e
+  controle com persistência desde o início. Asserções verificam o conteúdo quando a liderança retorna.
+- `UncleanRestartBootstrapWiringTest`: duas variantes com registro antes/depois de `start()`,
+  verificando bootstrap pendente, watermark `-1` e inelegibilidade sem recuperação por peer.
+- Etapa explícita no CI executa essas regressões, inclusive com a exclusão geral de NGrid na suíte padrão.
+- Validação local: 75 testes direcionados sem falhas; `mvn test -DexcludeNgrid=true` passou em todos
+  os módulos (1.385 testes contabilizados, 6 ignorados). As duas variantes de proteção falham com
+  a condição antiga de bootstrap e passam com a correção.
+
+---
+
 ## 2026-10-07 — Decodificação JSON sem canonicalização de nomes de campo — 8.14.1
 
 Medido no CTP com a 8.14.0: o buffer do cliente para a storage-209 seguia no teto com o nó ocioso.

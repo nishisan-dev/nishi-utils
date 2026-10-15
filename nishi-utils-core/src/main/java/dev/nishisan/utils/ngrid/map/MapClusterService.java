@@ -700,6 +700,11 @@ public final class MapClusterService<K, V>
         return persistence != null;
     }
 
+    @Override
+    public boolean hasRestoredState() {
+        return diskLoaded && persistence != null && persistence.hasRecoveredState();
+    }
+
     /**
      * Limpa todos os dados em memória e remove os arquivos de persistência
      * associados a este serviço de mapa no nó local.

@@ -43,6 +43,9 @@ jobs:
       - name: Verify map checkpoint and interrupted-install regression tests
         run: flock /tmp/nishi-utils-maven.lock mvn -B test -pl nishi-utils-core -Dtest=NMapCheckpointTest,NMapPersistenceCloseTest,MapSnapshotDurabilityTest,SnapshotCheckpointFenceTest,LocalApplyTrackingTest,LeaderSyncGateTest
 
+      - name: Verify volatile map recovery after clean restart
+        run: flock /tmp/nishi-utils-maven.lock mvn -B test -pl nishi-utils-core -Dtest=VolatileMapCleanRestartTest,UncleanRestartBootstrapWiringTest
+
       - name: Verify journal compatibility with the real 8.10.2 reader
         run: |
           legacy_source_dir="$(mktemp -d)"
