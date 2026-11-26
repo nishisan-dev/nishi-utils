@@ -49,6 +49,7 @@ import dev.nishisan.utils.oss.cluster.protocol.WriteBatchRequest;
 import dev.nishisan.utils.oss.cluster.protocol.WriteBatchResponse;
 import dev.nishisan.utils.oss.cluster.rpc.ClusterRpc;
 import dev.nishisan.utils.oss.cluster.rpc.CoordinationLocks;
+import dev.nishisan.utils.oss.writer.WriterAbandonedException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -1279,6 +1280,79 @@ class StorageRequestHandlerTest {
         assertEquals(SeriesHandleRegistry.NotOpenCause.REOPEN_FAILED, registry.notOpenCause(seriesKey));
         registry.recordNotOpen(seriesKey);
         assertEquals(1L, registry.handleMetrics().get("notOpen.reopenFailed"));
+    }
+
+    @Test
+    void primeiroCheckpointDepoisDoAbandonoDoWriterFalhaEOSeguinteSegueNormal() {
+        String seriesKey = "series-abandonada-checkpoint";
+        openAndAbandonByIdleness(seriesKey);
+
+        // Escrita depois do abandono segue o fluxo normal: a autocura reabre a série.
+        assertEquals(SeriesStatus.OK, writeOne(seriesKey, 1_700_000_400_000L));
+
+        SeriesStatusResponse rejected = (SeriesStatusResponse) handler.handle(Commands.CHECKPOINT,
+                new SeriesCommandRequest(seriesKey), SOURCE);
+        assertEquals(SeriesStatus.ERROR, rejected.status(),
+                "amostras confirmadas antes do abandono podem ter sido perdidas: o checkpoint não pode responder OK");
+        assertTrue(rejected.message().contains("abandonado"), rejected.message());
+        assertEquals(1L, registry.handleMetrics().get("handles.abandonedCheckpointRejected"));
+        assertEquals(0L, handler.metricsSnapshot().checkpoints());
+
+        assertEquals(SeriesStatus.OK, ((SeriesStatusResponse) handler.handle(Commands.CHECKPOINT,
+                new SeriesCommandRequest(seriesKey), SOURCE)).status(), "a marca sai no primeiro checkpoint recusado");
+        assertEquals(1L, registry.handleMetrics().get("handles.abandonedCheckpointRejected"));
+        assertEquals(1L, handler.metricsSnapshot().checkpoints());
+    }
+
+    @Test
+    void primeiroFlushDepoisDoAbandonoDoWriterFalhaMesmoSemEscritaNova() {
+        String seriesKey = "series-abandonada-flush";
+        openAndAbandonByIdleness(seriesKey);
+
+        SeriesStatusResponse rejected = (SeriesStatusResponse) handler.handle(Commands.FLUSH,
+                new SeriesCommandRequest(seriesKey), SOURCE);
+        assertEquals(SeriesStatus.ERROR, rejected.status());
+        assertEquals(1L, registry.handleMetrics().get("handles.abandonedCheckpointRejected"));
+
+        assertEquals(SeriesStatus.OK, ((SeriesStatusResponse) handler.handle(Commands.FLUSH,
+                new SeriesCommandRequest(seriesKey), SOURCE)).status());
+        assertEquals(1L, handler.metricsSnapshot().flushes());
+    }
+
+    @Test
+    void checkpointDeOutraSerieNaoEAfetadoPeloAbandono() {
+        String abandonedKey = "series-abandonada-vizinha";
+        String healthyKey = "series-saudavel-vizinha";
+        openAndAbandonByIdleness(abandonedKey);
+        placementLookup.put(healthyKey, SeriesPlacement.active(SELF.value(), 1_000L));
+        assertEquals(SeriesStatus.OK, ((SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequest(healthyKey, null), SOURCE)).status());
+
+        assertEquals(SeriesStatus.OK, ((SeriesStatusResponse) handler.handle(Commands.CHECKPOINT,
+                new SeriesCommandRequest(healthyKey), SOURCE)).status());
+        assertEquals(0L, registry.handleMetrics().get("handles.abandonedCheckpointRejected"));
+    }
+
+    /**
+     * Abre a série, escreve e a fecha por ociosidade com um {@code close()} que fecha o writer real e lança {@link
+     * WriterAbandonedException}, como um force preso além do teto: a entrada sai como abandonada.
+     */
+    private void openAndAbandonByIdleness(String key) {
+        placementLookup.put(key, SeriesPlacement.active(SELF.value(), 1_000L));
+        assertEquals(SeriesStatus.OK, ((SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequest(key, null), SOURCE)).status());
+        assertEquals(SeriesStatus.OK, writeOne(key, 1_700_000_100_000L));
+        wrapHandle(key, original -> delegating(original, (method, args) -> {
+            if (method.getName().equals("close")) {
+                original.close();
+                throw new WriterAbandonedException("force preso", new IllegalStateException("force em voo"));
+            }
+            return null;
+        }));
+        clock.advance(Duration.ofMinutes(16));
+        assertEquals(0, registry.closeIdle(), "o abandono não conta como fechamento por ociosidade");
+        assertFalse(registry.isOpen(key));
+        assertEquals(1L, registry.handleMetrics().get("handles.writerAbandoned"));
     }
 
     @Test

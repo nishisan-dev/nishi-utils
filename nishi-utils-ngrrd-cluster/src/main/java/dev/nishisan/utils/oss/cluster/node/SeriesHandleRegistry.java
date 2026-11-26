@@ -147,6 +147,9 @@ public final class SeriesHandleRegistry implements Closeable {
     /** Teto de chaves de cada LRU usado para classificar {@code NOT_OPEN} por causa. */
     static final int NOT_OPEN_CAUSE_LRU_LIMIT = 65_536;
 
+    /** Teto de chaves do LRU de séries com writer abandonado à espera do primeiro checkpoint remoto. */
+    static final int ABANDONED_WRITER_LRU_LIMIT = 65_536;
+
     /**
      * Causa de uma resposta {@code NOT_OPEN}. A classificação é aproximada: os conjuntos que a sustentam são LRUs
      * limitados e, estourado o teto, uma chave antiga cai em {@link #RESTART}.
@@ -203,9 +206,10 @@ public final class SeriesHandleRegistry implements Closeable {
             }
         }
 
-        void remove(String key) {
+        /** Remove a chave; devolve {@code true} se ela estava no conjunto. */
+        boolean remove(String key) {
             synchronized (lock) {
-                keys.remove(key);
+                return keys.remove(key) != null;
             }
         }
 
@@ -240,6 +244,17 @@ public final class SeriesHandleRegistry implements Closeable {
     private final AtomicLong selfHealed = new AtomicLong();
     /** Entradas removidas por writer abandonado no fechamento ({@code handles.writerAbandoned}). */
     private final AtomicLong writerAbandoned = new AtomicLong();
+    /**
+     * Checkpoints/flushes remotos recusados por serem os primeiros depois do abandono do writer da série
+     * ({@code handles.abandonedCheckpointRejected}).
+     */
+    private final AtomicLong abandonedCheckpointRejected = new AtomicLong();
+    /**
+     * Séries cujo writer foi abandonado no fechamento e que ainda não tiveram um checkpoint remoto recusado ({@link
+     * #consumeAbandonedCheckpoint}). LRU limitado: estourado o teto, a chave mais antiga sai e o checkpoint seguinte
+     * dela responde normalmente.
+     */
+    private final BoundedKeySet abandonedSinceCheckpoint = new BoundedKeySet(ABANDONED_WRITER_LRU_LIMIT);
     /** Espera efetiva pelo checkpoint de fechamento, em ns ({@link #CLOSE_CHECKPOINT_WAIT}); só testes a reduzem. */
     private volatile long closeCheckpointWaitNanos = CLOSE_CHECKPOINT_WAIT.toNanos();
     /** Instante (ms do relógio) do último log completo de falha de fechamento; {@code -1} = nunca. */
@@ -842,6 +857,25 @@ public final class SeriesHandleRegistry implements Closeable {
     }
 
     /**
+     * Consome a marca de writer abandonado da série, para o primeiro {@code CHECKPOINT}/{@code FLUSH} remoto
+     * depois do abandono: devolve {@code true} (e conta em {@code handles.abandonedCheckpointRejected}) se a série
+     * estava marcada, e a marca sai, de modo que o checkpoint seguinte responde normalmente. Quem recebe
+     * {@code true} tem de responder falha: amostras confirmadas desde o último checkpoint concluído podem ter sido
+     * perdidas no abandono, e reabrir a série do disco e responder OK seria um falso positivo de durabilidade.
+     *
+     * <p>Chame com o lock da série tomado (dentro de {@link #withSeries}): a marca é gravada sob o lock da entrada
+     * abandonada, antes de ela sair do mapa, e assim um checkpoint concorrente ao fechamento sempre a enxerga.</p>
+     */
+    public boolean consumeAbandonedCheckpoint(String seriesKey) {
+        Objects.requireNonNull(seriesKey, "seriesKey");
+        if (!abandonedSinceCheckpoint.remove(seriesKey)) {
+            return false;
+        }
+        abandonedCheckpointRejected.incrementAndGet();
+        return true;
+    }
+
+    /**
      * Libera a referência local da série SEM descartar a definição em cache: checkpoint+close do
      * handle, se aberto, e remove a entrada — {@link #reopenIfKnown} continua livre para reabri-la
      * depois. Usado pela migração (M3): o destino chama antes de gravar a imagem recebida (garante
@@ -909,6 +943,8 @@ public final class SeriesHandleRegistry implements Closeable {
             }
         }
         hashBySeriesKey.remove(seriesKey);
+        // A série apagada não tem mais amostras a proteger: uma recriação com a mesma chave não herda a recusa.
+        abandonedSinceCheckpoint.remove(seriesKey);
         forgotten.add(seriesKey);
         fireOwnershipChange(seriesKey);
     }
@@ -1326,6 +1362,8 @@ public final class SeriesHandleRegistry implements Closeable {
      * {@code handles.idleTtlExtended} = entradas abertas cujo TTL efetivo é maior que o global;
      * {@code handles.idleClosed}, {@code handles.evicted} e {@code handles.selfHealed} = churn de fechar e reabrir;
      * {@code handles.writerAbandoned} = entradas removidas porque o writer foi abandonado no fechamento (force preso);
+     * {@code handles.abandonedCheckpointRejected} = checkpoints/flushes remotos recusados por serem os primeiros
+     * depois de um abandono;
      * {@code notOpen.<causa>} = respostas {@code NOT_OPEN} por {@link NotOpenCause}.
      */
     public Map<String, Long> handleMetrics() {
@@ -1335,6 +1373,7 @@ public final class SeriesHandleRegistry implements Closeable {
         metrics.put("handles.evicted", evicted.get());
         metrics.put("handles.selfHealed", selfHealed.get());
         metrics.put("handles.writerAbandoned", writerAbandoned.get());
+        metrics.put("handles.abandonedCheckpointRejected", abandonedCheckpointRejected.get());
         for (NotOpenCause cause : NotOpenCause.values()) {
             metrics.put(cause.metricKey(), notOpenByCause.get(cause).get());
         }
@@ -1388,6 +1427,9 @@ public final class SeriesHandleRegistry implements Closeable {
             return null;
         } catch (WriterAbandonedException e) {
             writerAbandoned.incrementAndGet();
+            // Marcada antes de a entrada sair (ainda sob o lock dela): um checkpoint remoto que esperava esse lock
+            // reconfere a marca sob o lock da entrada nova e não escapa da recusa.
+            abandonedSinceCheckpoint.add(seriesKey);
             LOGGER.log(Level.SEVERE, "NGRRD_WRITER_ABANDONED seriesKey=" + seriesKey
                     + " amostras desde o último checkpoint podem ter sido perdidas; a entrada foi removida", e);
             return e;

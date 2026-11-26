@@ -1502,6 +1502,29 @@ class SeriesHandleRegistryTest {
             assertTrue(records.stream().anyMatch(record -> record.getLevel() == java.util.logging.Level.SEVERE
                             && record.getMessage().contains("NGRRD_WRITER_ABANDONED seriesKey=stuck")),
                     "esperava o marcador SEVERE: " + records);
+            assertTrue(fixture.registry.consumeAbandonedCheckpoint("stuck"),
+                    "o primeiro checkpoint remoto depois do abandono tem que ser recusado");
+            assertFalse(fixture.registry.consumeAbandonedCheckpoint("stuck"), "só o primeiro");
+        }
+    }
+
+    @Test
+    void marcaDeAbandonoSaiNoPrimeiroConsumoENaDelecaoENaoAfetaOutrasSeries() {
+        try (SeriesHandleRegistry registry = lateRegistry(10)) {
+            entries(registry).put("a-stuck",
+                    newEntry(closeFailingHandle(SeriesHandleRegistryTest::abandonedFailure)));
+            entries(registry).put("b-stuck",
+                    newEntry(closeFailingHandle(SeriesHandleRegistryTest::abandonedFailure)));
+            entries(registry).put("c-ok", newEntry(FAKE_HANDLE));
+            registry.closeIdle();
+            assertEquals(2L, abandonedCount(registry));
+
+            assertFalse(registry.consumeAbandonedCheckpoint("c-ok"), "fechamento normal não marca a série");
+            registry.closeForDeletion("b-stuck");
+            assertFalse(registry.consumeAbandonedCheckpoint("b-stuck"), "a deleção descarta a marca");
+            assertTrue(registry.consumeAbandonedCheckpoint("a-stuck"));
+            assertFalse(registry.consumeAbandonedCheckpoint("a-stuck"));
+            assertEquals(1L, registry.handleMetrics().get("handles.abandonedCheckpointRejected"));
         }
     }
 

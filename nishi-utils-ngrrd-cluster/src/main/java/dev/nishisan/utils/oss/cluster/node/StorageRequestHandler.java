@@ -731,8 +731,12 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
         }
         long startNanos = System.nanoTime();
         try {
+            // O primeiro checkpoint depois do abandono do writer falha, mesmo com a série reaberta pela autocura:
+            // amostras confirmadas antes do abandono podem ter sido perdidas. A marca é conferida sob o lock da série.
             Optional<CompletableFuture<Void>> pending = withSeriesSelfHealing(seriesKey,
-                    SeriesHandleRegistry.SeriesAccess::checkpointAsync);
+                    access -> registry.consumeAbandonedCheckpoint(seriesKey)
+                            ? CompletableFuture.<Void>failedFuture(abandonedWriterFailure(seriesKey))
+                            : access.checkpointAsync());
             if (pending.isEmpty()) {
                 recordLatency(latency, startNanos);
                 recordNotOpen(seriesKey);
@@ -744,6 +748,16 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
             recordError(SeriesStatus.ERROR);
             return new SeriesStatusResponse(SeriesStatus.ERROR, self.value(), describe(e));
         }
+    }
+
+    /**
+     * Falha do primeiro {@code checkpoint}/{@code flush} depois do abandono do writer. Vira {@link SeriesStatus#ERROR},
+     * que o cliente trata como falha do checkpoint, sem retentativa.
+     */
+    private static IllegalStateException abandonedWriterFailure(String seriesKey) {
+        return new IllegalStateException("writer da série " + seriesKey + " foi abandonado no fechamento (force "
+                + "preso): amostras confirmadas desde o último checkpoint podem ter sido perdidas; o próximo "
+                + "checkpoint segue normal");
     }
 
     private static void recordLatency(LatencyHistogram latency, long startNanos) {
