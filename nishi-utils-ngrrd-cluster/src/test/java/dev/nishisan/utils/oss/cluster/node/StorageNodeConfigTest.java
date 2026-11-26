@@ -162,6 +162,10 @@ class StorageNodeConfigTest {
         assertThrows(IllegalArgumentException.class,
                 () -> new LocalCheckpointSettings(true, Duration.ofSeconds(1), 0));
         assertThrows(NullPointerException.class, () -> new LocalCheckpointSettings(true, null, 1));
+        assertThrows(IllegalArgumentException.class,
+                () -> new LocalCheckpointSettings(true, Duration.ofSeconds(1), 1, -1));
+        assertEquals(0, new LocalCheckpointSettings(true, Duration.ofSeconds(1), 1).threads());
+        assertEquals(3, new LocalCheckpointSettings(false, Duration.ofSeconds(1), 1, 3).threads());
     }
 
     @Test

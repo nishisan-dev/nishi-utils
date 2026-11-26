@@ -541,6 +541,35 @@ class StorageNodeConfigYamlTest {
         assertTrue(zeroInFlight.getMessage().contains("ngrrd.checkpoint.maxInFlight"), zeroInFlight.getMessage());
     }
 
+    @Test
+    void checkpointThreadsTemPadraoZeroELeODoYaml() {
+        assertEquals(0, StorageNodeConfig.fromYaml(CHECKPOINT_BASE, NO_ENV).localCheckpoint().threads());
+        assertEquals(0, LocalCheckpointSettings.disabled().threads());
+
+        LocalCheckpointSettings withPool = StorageNodeConfig.fromYaml(CHECKPOINT_BASE + """
+                  checkpoint:
+                    threads: 4
+                """, NO_ENV).localCheckpoint();
+        assertEquals(4, withPool.threads());
+        assertFalse(withPool.enabled(), "o pool de force vale mesmo com o checkpoint local desligado");
+
+        assertEquals(2, StorageNodeConfig.fromYaml(CHECKPOINT_BASE + """
+                  checkpoint:
+                    enabled: true
+                    threads: ${CHECKPOINT_THREADS:2}
+                """, NO_ENV).localCheckpoint().threads());
+    }
+
+    @Test
+    void checkpointThreadsNegativoFalhaNoBootComOCampoNaMensagem() {
+        IllegalArgumentException negative = assertThrows(IllegalArgumentException.class,
+                () -> StorageNodeConfig.fromYaml(CHECKPOINT_BASE + """
+                          checkpoint:
+                            threads: -1
+                        """, NO_ENV));
+        assertTrue(negative.getMessage().contains("ngrrd.checkpoint.threads"), negative.getMessage());
+    }
+
     private static final String CHECKPOINT_BASE = """
             node:
               id: storage-0
