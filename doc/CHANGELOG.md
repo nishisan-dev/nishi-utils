@@ -94,7 +94,7 @@ Valor inválido falha a subida do nó com o nome da chave. O cliente não ganha 
 
 ### Validação
 - `nishi-utils-oss`: 354 testes, sem falhas.
-- `nishi-utils-ngrrd-cluster`: cerca de 1,1 mil testes (1.089 na última execução integrada), sem falhas.
+- `nishi-utils-ngrrd-cluster`: 1.113 testes (5 ignorados: benchmarks e compatibilidade), sem falhas; na 8.14.2 eram ~900.
 - Perfil `ngrrd-cluster` (testes de cluster em processo): 26 classes `*ClusterTest`, sem falhas.
 - Falhas intermitentes conhecidas da base, sem relação com a release: `WeightedGeometryClusterTest`,
   `ContinuousIngestionRebalanceClusterTest` sob latência e `IfaceTrafficSmokeIT` (preset yearly).
