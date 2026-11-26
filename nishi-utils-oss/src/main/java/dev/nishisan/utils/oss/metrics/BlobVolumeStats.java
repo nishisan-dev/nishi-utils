@@ -68,7 +68,12 @@ public record BlobVolumeStats(int shardCount, long[] shardCapacityBytes, long[] 
      * {@code fillRatioPerShard}, que é por shard sobre o tamanho atual do arquivo (dente de serra, não serve
      * para alerta).
      *
-     * @return o fill; {@code 0.0} quando não há capacidade declarada ({@code 0} = desconhecido)
+     * <p>O valor pode passar de {@code 1.0}: a capacidade declarada não limita o que já está gravado. Ex.: o
+     * {@code capacityBytes} do nó é reduzido com os dados já no volume, ou reservas aceitas antes da redução
+     * continuam contando. Nesse estado a admissão recusa novas reservas, mas nada é apagado.</p>
+     *
+     * @return o fill (pode ser maior que {@code 1.0}); {@code 0.0} quando não há capacidade declarada
+     *         ({@code 0} = desconhecido)
      */
     public double fillOfDeclaredCapacity() {
         return declaredCapacityBytes > 0

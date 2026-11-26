@@ -210,6 +210,7 @@ class BlobStorageTest {
         Path dir = tmp.resolve("vol");
         List<Long> durations = new CopyOnWriteArrayList<>();
         List<long[]> legacyCalls = new CopyOnWriteArrayList<>();
+        // sobrescreve as duas formas sem delegar: o volume só pode chamar a de 4 argumentos
         BlobVolumeMetricsListener listener = new BlobVolumeMetricsListener() {
             @Override
             public void onShardGrow(int shardId, long oldCapacityBytes, long newCapacityBytes) {
@@ -219,7 +220,6 @@ class BlobStorageTest {
             @Override
             public void onShardGrow(int shardId, long oldCapacityBytes, long newCapacityBytes, long durationNanos) {
                 durations.add(durationNanos);
-                onShardGrow(shardId, oldCapacityBytes, newCapacityBytes);
             }
         };
         // listener que só conhece a forma antiga: o default de 4 argumentos tem que alcançá-lo
@@ -244,7 +244,7 @@ class BlobStorageTest {
         for (long d : durations) {
             assertTrue(d > 0, "durationNanos deve ser > 0");
         }
-        assertEquals(durations.size(), legacyCalls.size());
+        assertTrue(legacyCalls.isEmpty(), "o volume emite só a forma de 4 argumentos");
         assertFalse(oldFormOnly.isEmpty(), "a forma de 3 argumentos continua sendo chamada pelo default");
     }
 
@@ -262,7 +262,7 @@ class BlobStorageTest {
             bs.reserve("move", "series/b.ngrr", 4096);
             BlobVolumeStats stats = bs.stats();
             long live = stats.liveBytes();
-            assertTrue(live >= 8192L, "liveBytes deve cobrir a região alocada");
+            assertEquals(8192L, live, "liveBytes é a região alocada");
             assertEquals(4096L, stats.reservedBytes());
             assertEquals((double) (live + 4096L) / 1_000_000L, stats.fillOfDeclaredCapacity(), 1e-12);
         }
