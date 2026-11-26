@@ -90,6 +90,17 @@ class StorageNodeClusterTest {
     private NGridNode client;
     private TransportClusterRpc clientRpc;
 
+    /** {@code ngrrd.checkpoint.threads} dos dois nós; a variante {@link StorageNodeForcePoolClusterTest} usa 2. */
+    int checkpointThreads() {
+        return 0;
+    }
+
+    private LocalCheckpointSettings forcePoolSettings() {
+        return new LocalCheckpointSettings(false, LocalCheckpointSettings.DEFAULT_INTERVAL,
+                LocalCheckpointSettings.defaultMaxInFlight(), checkpointThreads(),
+                LocalCheckpointSettings.DEFAULT_SPREAD_FRACTION);
+    }
+
     @BeforeEach
     void setUp(@TempDir Path tempDir) throws Exception {
         yaml = Files.readString(Path.of("src/test/resources/iface-traffic-blob.yaml"), StandardCharsets.UTF_8);
@@ -108,6 +119,7 @@ class StorageNodeClusterTest {
                 .dataDir(tempDir.resolve("storage-1/data"))
                 .volumeDir(tempDir.resolve("storage-1/volume"))
                 .statusReportInterval(STATUS_REPORT_INTERVAL)
+                .localCheckpoint(forcePoolSettings())
                 .build();
         StorageNodeConfig cfg2 = StorageNodeConfig.builder()
                 .nodeId("storage-2")
@@ -116,6 +128,7 @@ class StorageNodeClusterTest {
                 .dataDir(tempDir.resolve("storage-2/data"))
                 .volumeDir(tempDir.resolve("storage-2/volume"))
                 .statusReportInterval(STATUS_REPORT_INTERVAL)
+                .localCheckpoint(forcePoolSettings())
                 .build();
 
         storage1 = NgrrdStorageNode.start(cfg1);

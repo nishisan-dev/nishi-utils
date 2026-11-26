@@ -19,6 +19,7 @@ package dev.nishisan.utils.oss.cluster.node;
 
 import dev.nishisan.utils.oss.Ngrrd;
 import dev.nishisan.utils.oss.NgrrdHandle;
+import dev.nishisan.utils.oss.NgrrdHandle.CheckpointTiming;
 import dev.nishisan.utils.oss.api.SeriesNotFoundException;
 import dev.nishisan.utils.oss.blob.BlobVolume;
 import dev.nishisan.utils.oss.blob.NgrrdUri;
@@ -302,8 +303,9 @@ public final class SeriesHandleRegistry implements Closeable {
      * {@link ReentrantLock#tryLock()} e <strong>não</strong> renova {@code lastAccess} (um checkpoint de
      * fundo não pode adiar o fechamento por ociosidade). Sob o lock, reconfere que a entrada ainda é a
      * corrente, que não está congelada por migração e que está suja; só então captura a
-     * {@code writeSeq} e chama {@link NgrrdHandle#checkpointAsync()}. O lock é solto antes de devolver:
-     * quem chama espera a future fora dele.
+     * {@code writeSeq} e chama {@link NgrrdHandle#checkpointAsyncTimed()} (a medida de fila e de force vai
+     * na future). O lock é solto antes de devolver: quem chama espera a future fora dele. Callbacks
+     * encadeados na future podem rodar na thread do pool de force: nunca devem bloquear.
      *
      * @return o desfecho; a future só existe em {@link CheckpointAttempt.Outcome#STARTED}
      * @throws RuntimeException se o próprio enfileiramento falhar (raro: pool de writers recusando tarefa)
@@ -326,7 +328,7 @@ public final class SeriesHandleRegistry implements Closeable {
             if (!entry.dirty()) {
                 return CheckpointAttempt.CLEAN;
             }
-            return new CheckpointAttempt(CheckpointAttempt.Outcome.STARTED, checkpointAsyncLocked(entry));
+            return new CheckpointAttempt(CheckpointAttempt.Outcome.STARTED, checkpointAsyncTimedLocked(entry));
         } finally {
             entry.lock.unlock();
         }
@@ -358,6 +360,16 @@ public final class SeriesHandleRegistry implements Closeable {
     private static CompletableFuture<Void> checkpointAsyncLocked(HandleEntry entry) {
         long seq = entry.writeSeq;
         return entry.handle.checkpointAsync().whenComplete((ignored, failure) -> {
+            if (failure == null) {
+                entry.markCheckpointed(seq);
+            }
+        });
+    }
+
+    /** Como {@link #checkpointAsyncLocked}, mas pelo {@link NgrrdHandle#checkpointAsyncTimed()}: a future traz a medida. */
+    private static CompletableFuture<CheckpointTiming> checkpointAsyncTimedLocked(HandleEntry entry) {
+        long seq = entry.writeSeq;
+        return entry.handle.checkpointAsyncTimed().whenComplete((timing, failure) -> {
             if (failure == null) {
                 entry.markCheckpointed(seq);
             }
@@ -930,9 +942,10 @@ public final class SeriesHandleRegistry implements Closeable {
      * Desfecho de {@link #tryCheckpointAsync}.
      *
      * @param outcome o que aconteceu
-     * @param future  future do checkpoint enfileirado; {@code null} fora de {@link Outcome#STARTED}
+     * @param future  future do checkpoint enfileirado, com a medida de espera em fila e de force
+     *                ({@link CheckpointTiming}); {@code null} fora de {@link Outcome#STARTED}
      */
-    public record CheckpointAttempt(Outcome outcome, CompletableFuture<Void> future) {
+    public record CheckpointAttempt(Outcome outcome, CompletableFuture<CheckpointTiming> future) {
 
         static final CheckpointAttempt BUSY = new CheckpointAttempt(Outcome.BUSY, null);
         static final CheckpointAttempt CLEAN = new CheckpointAttempt(Outcome.CLEAN, null);

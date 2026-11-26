@@ -88,11 +88,16 @@ class NgrrdStorageNodeLocalCheckpointTest {
             assertTrue(line.contains(" redirectCacheHits=") && line.contains(" lcEnabled=1 lcDirty="), line);
             assertTrue(line.indexOf("redirectCacheHits=") < line.indexOf("lcEnabled="),
                     "os campos novos entram só no fim da linha: " + line);
+            assertTrue(line.contains(" lcQwP99=") && line.contains(" lcForceP99="), line);
+            assertTrue(line.indexOf("lcOverruns=") < line.indexOf("lcQwP99="), line);
             assertTrue(node.localCheckpointer().isPresent());
             awaitTrue(() -> node.metricsSnapshot().lifecycleMetrics().get("localCheckpoint.cycles") >= 1);
             Map<String, Long> metrics = node.metricsSnapshot().lifecycleMetrics();
             assertEquals(1L, metrics.get("localCheckpoint.enabled"));
             assertTrue(metrics.containsKey("localCheckpoint.overruns"));
+            for (String key : List.of("queueWaitMsP99", "queueWaitMsMax", "forceMsP99", "forceMsMax", "coalesced")) {
+                assertTrue(metrics.containsKey("localCheckpoint." + key), key + " em lifecycleMetrics: " + metrics);
+            }
             assertTrue(threadAlive());
         } finally {
             node.close();

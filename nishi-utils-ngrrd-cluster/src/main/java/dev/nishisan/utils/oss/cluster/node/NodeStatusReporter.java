@@ -316,7 +316,7 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
                         + "leaderConfirmationP99us=%d catalogLag=%s redirectConfirmations=%d redirectOverrides=%d "
                         + "redirectConfirmationFailures=%d redirectCacheHits=%d lcEnabled=%d lcDirty=%d lcCycles=%d "
                         + "lcLastCycleMs=%d lcLastCycleSeries=%d lcCheckpointed=%d lcSkippedBusy=%d lcFailures=%d "
-                        + "lcOverruns=%d",
+                        + "lcOverruns=%d lcQwP99=%d lcForceP99=%d",
                 snapshot.nodeId(), snapshot.leader(), snapshot.seriesCount(), snapshot.usedBytes(),
                 snapshot.openHandles(), samplesPerSecond, snapshot.writeBatchLatency().p99Micros(),
                 snapshot.checkpointLatency().p99Micros(), snapshot.readLatency().p99Micros(),
@@ -327,7 +327,8 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
                 localCheckpointMetric(snapshot, "cycles"), localCheckpointMetric(snapshot, "lastCycleMs"),
                 localCheckpointMetric(snapshot, "lastCycleSeries"), localCheckpointMetric(snapshot, "checkpointed"),
                 localCheckpointMetric(snapshot, "skippedBusy"), localCheckpointMetric(snapshot, "failures"),
-                localCheckpointMetric(snapshot, "overruns")));
+                localCheckpointMetric(snapshot, "overruns"), localCheckpointMetric(snapshot, "queueWaitMsP99"),
+                localCheckpointMetric(snapshot, "forceMsP99")));
         if (metricsListener != null) {
             metricsListener.onNodeMetrics(snapshot);
         }
