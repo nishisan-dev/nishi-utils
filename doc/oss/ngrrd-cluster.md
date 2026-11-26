@@ -607,6 +607,10 @@ e tombstones por geração, com CRC, fsync e compactação atômica. Reinícios 
 retomam operações confirmadas; preparações canceladas liberam a série. O journal deve ser
 incluído no backup do volume. Restaurar um catálogo anterior ao commit não ressuscita a
 mesma geração. Pedidos atrasados com a geração antiga nunca excluem a recriação.
+A remoção do placement marca a operação como concluída: um participante que pede recuperação
+depois dela (por exemplo, porque o líder trocou antes de finalizar o tombstone) só recebe a
+finalização. O líder, atual ou novo, não recria o placement nem refaz as fases; só conduz de novo
+se o próprio participante ainda não tiver apagado a cópia, sinal de que o catálogo perdeu a reserva.
 
 A marca inicial de séries sem journal usa `lastUpdate` validado do `.ngrr`, incluindo CRC;
 só séries válidas vazias usam o relógio atual. Metadado ilegível bloqueia a exclusão.

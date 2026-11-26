@@ -132,7 +132,7 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
             case Commands.DELETE_APPLY -> lifecycle.apply((DeleteControlRequest) body);
             case Commands.DELETE_ABORT -> lifecycle.abort((DeleteControlRequest) body);
             case Commands.DELETE_FINISH -> lifecycle.finish((DeleteControlRequest) body);
-            case Commands.DELETE_RECOVER -> recoverReservation((DeleteControlRequest) body);
+            case Commands.DELETE_RECOVER -> recoverReservation((DeleteControlRequest) body, source);
             case Commands.SERIES_INSPECT -> lifecycle.inspect(((SeriesCommandRequest) body).seriesKey());
             case Commands.RECONCILE -> lifecycle.reconcile((ReconcileRequest) body, rpc);
             default -> throw new IllegalArgumentException(command);
@@ -367,17 +367,29 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
         }
     }
 
-    private DeleteResult recoverReservation(DeleteControlRequest request) {
+    private DeleteResult recoverReservation(DeleteControlRequest request, NodeId source) {
         beginAttempt(Origin.RECOVERY);
         try {
-            return doRecoverReservation(request);
+            return doRecoverReservation(request, source);
         } catch (RuntimeException e) {
             lifecycle.recordAttemptFailed(DeleteFailureCause.of(e));
             throw e;
         }
     }
 
-    private DeleteResult doRecoverReservation(DeleteControlRequest request) {
+    /**
+     * {@code DELETE_RECOVER} de um participante ({@code source}) com a reserva confirmada do journal dele.
+     *
+     * <ul>
+     *   <li>Placement com a reserva: conduz o que falta.</li>
+     *   <li>Placement da mesma geração sem reserva (catálogo que regrediu): regrava a reserva confirmada e conduz.</li>
+     *   <li>Placement ausente: nunca é regravado só por causa do pedido. A remoção do placement é o marcador
+     *       replicado de conclusão ({@link #drive} só remove depois do {@code DELETE_APPLY} de todos), então o
+     *       participante é sondado: se já aplicou, recebe só o {@code DELETE_FINISH} idempotente
+     *       ({@link #recoverWithoutPlacement}).</li>
+     * </ul>
+     */
+    private DeleteResult doRecoverReservation(DeleteControlRequest request, NodeId source) {
         String key = request.seriesKey();
         try (var drive = CoordinationLocks.acquire(driveLocks[Math.floorMod(key.hashCode(), driveLocks.length)])) {
             ensureLeader();
@@ -395,11 +407,48 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
                 } else {
                     if (placement.deletion() == null || !placement.deletion().committed())
                         return DeleteResult.of(DeleteStatus.NOT_FOUND, null);
-                    catalog.putPlacement(key, placement);
+                    if (current.isEmpty()) placement = null;
+                    else catalog.putPlacement(key, placement);
                 }
             }
+            if (placement == null) return recoverWithoutPlacement(key, request.placement(), source);
             return drive(key, placement);
         }
+    }
+
+    /**
+     * Reserva confirmada cujo placement não está no catálogo. Chamado sob o {@code driveLock} da série, depois da
+     * leitura forte que viu o placement ausente.
+     *
+     * <p>{@link #drive} só remove o placement depois de todo participante responder ao {@code DELETE_APPLY}, e o
+     * participante grava {@code DELETED} no journal antes de responder; o journal de uma geração não volta de
+     * {@code DELETED}/{@code FINISHED} para {@code COMMITTED}. Então o participante que, sondado depois da leitura,
+     * já não está em exclusão naquela geração não tem fase a reconduzir: recebe só o {@code DELETE_FINISH} e a
+     * resposta é {@code DELETED}, sem placement regravado e sem contar {@code completed}. A decisão depende só do
+     * catálogo replicado e do journal durável do participante, e vale igual para um líder novo.</p>
+     *
+     * <p>Se o participante ainda está {@code PREPARED}/{@code COMMITTED} naquela geração, a ausência não veio do
+     * fluxo (o catálogo perdeu a reserva): a reserva confirmada é regravada e conduzida, como antes.</p>
+     */
+    private DeleteResult recoverWithoutPlacement(String key, SeriesPlacement placement, NodeId source) {
+        if (source == null || !placement.deletion().participants().contains(source.value()))
+            return DeleteResult.of(DeleteStatus.NOT_FOUND, null);
+        ensureLeader();
+        SeriesInspectResponse inspected = rpc.call(source, Commands.SERIES_INSPECT, new SeriesCommandRequest(key),
+                SeriesInspectResponse.class);
+        if (inspected == null)
+            throw new NgrrdClusterException(ErrorCode.REMOTE_ERROR, Commands.SERIES_INSPECT + " sem resposta: " + source);
+        if (!inspected.deleting() || !placement.generationId().equals(inspected.generationId())) {
+            phase(source.value(), Commands.DELETE_FINISH, key, placement);
+            return DeleteResult.of(DeleteStatus.DELETED, placement.ownerNodeId());
+        }
+        try (var guard = CoordinationLocks.acquire(catalog.placementLock(key))) {
+            ensureLeader();
+            // Algo gravou a série entre a leitura e a sonda: o próximo pedido decide com o estado novo.
+            if (catalog.placementStrong(key).isPresent()) throw new DeleteFailureCause.StaleReservationException();
+            catalog.putPlacement(key, placement);
+        }
+        return drive(key, placement);
     }
 
     /**
