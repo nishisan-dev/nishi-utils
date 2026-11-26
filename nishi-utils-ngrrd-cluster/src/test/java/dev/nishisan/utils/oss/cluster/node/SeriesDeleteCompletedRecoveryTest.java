@@ -395,6 +395,22 @@ class SeriesDeleteCompletedRecoveryTest {
         assertEquals(1, completed(handler));
     }
 
+    @Test
+    void sondaDaRecuperacaoUsaOPrazoDeInspecao() throws Exception {
+        var handler = leader("leader", new AtomicBoolean(true));
+        rpc.beforeCall = (node, command) -> {
+            if (Commands.DELETE_FINISH.equals(command) && OWNER.equals(node))
+                throw new NgrrdClusterException(ErrorCode.TIMEOUT, "finish perdido");
+        };
+        assertEquals(DeleteStatus.DELETED, handler.delete(request()).status());
+        rpc.beforeCall = (node, command) -> { };
+
+        assertEquals(DeleteStatus.DELETED, recover(handler, OWNER, ownerJournal.get(KEY).placement()).status());
+
+        assertEquals(List.of(Duration.ofSeconds(2)), rpc.inspectTimeouts, "placementInspectTimeout do handler");
+        assertEquals(FINISHED, ownerJournal.get(KEY).phase());
+    }
+
     private static void await(CountDownLatch latch) {
         try {
             if (!latch.await(10, TimeUnit.SECONDS)) throw new IllegalStateException("latch timed out");
@@ -505,6 +521,8 @@ class SeriesDeleteCompletedRecoveryTest {
     /** Fases e sonda roteadas ao participante certo; registra cada chamada e aceita um gancho antes dela. */
     private final class PhaseRpc implements ClusterRpc {
         final List<String> calls = new CopyOnWriteArrayList<>();
+        /** Prazo explícito de cada {@code SERIES_INSPECT}. */
+        final List<Duration> inspectTimeouts = new CopyOnWriteArrayList<>();
         volatile BiConsumer<String, String> beforeCall = (node, command) -> { };
 
         long count(String command, String node) {
@@ -529,6 +547,12 @@ class SeriesDeleteCompletedRecoveryTest {
                 case Commands.DELETE_FINISH -> owner.finish(request);
                 default -> throw new IllegalArgumentException(command);
             });
+        }
+
+        @Override
+        public <R> R call(NodeId target, String command, Object body, Class<R> responseType, Duration timeout) {
+            if (Commands.SERIES_INSPECT.equals(command)) inspectTimeouts.add(timeout);
+            return call(target, command, body, responseType);
         }
 
         @Override

@@ -26,7 +26,10 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
     private final Clock clock;
     /** Storages alcançáveis na visão do líder; um participante fora dela fecha o gate sem RPC. */
     private final Supplier<Set<String>> reachableNodeIds;
-    /** Prazo de cada inspeção do gate de criação e, com {@link #INSPECT_WAIT_SLACK}, da espera total. */
+    /**
+     * Prazo de cada inspeção do gate de criação e, com {@link #INSPECT_WAIT_SLACK}, da espera total. Também é o
+     * prazo da sonda de {@link #recoverWithoutPlacement}.
+     */
     private final Duration placementInspectTimeout;
     /** Inspeções do gate em paralelo, uma thread virtual por participante; nenhuma segura lock. */
     private final ExecutorService inspections = Executors.newThreadPerTaskExecutor(
@@ -467,8 +470,9 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
         if (source == null || !placement.deletion().participants().contains(source.value()))
             return DeleteResult.of(DeleteStatus.NOT_FOUND, null);
         ensureLeader();
+        // Mesmo prazo das inspeções do gate de criação: a sonda roda sob o driveLock da série.
         SeriesInspectResponse inspected = rpc.call(source, Commands.SERIES_INSPECT, new SeriesCommandRequest(key),
-                SeriesInspectResponse.class);
+                SeriesInspectResponse.class, placementInspectTimeout);
         if (inspected == null)
             throw new NgrrdClusterException(ErrorCode.REMOTE_ERROR, Commands.SERIES_INSPECT + " sem resposta: " + source);
         if (!inspected.deleting() || !placement.generationId().equals(inspected.generationId())) {
@@ -687,7 +691,8 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
      * Atualiza o gauge {@code seriesDelete.pending} e emite, no máximo uma vez por
      * {@link #PENDING_LOG_WINDOW}, o WARNING {@code NGRRD_DELETE_PENDING} quando há exclusão pendente por mais
      * de {@link #PENDING_CYCLES_BEFORE_WARNING} ciclos seguidos. A "mais antiga" é a de menor
-     * {@code updatedAtEpochMs} do placement (instante da reserva).
+     * {@code updatedAtEpochMs} do placement (instante da reserva). Relógio que recuou ({@code now < last}) conta
+     * como janela vencida, para que o recuo não silencie o alarme.
      */
     private void trackPending(List<Map.Entry<String, SeriesPlacement>> pending) {
         lifecycle.pendingDeletes(pending.size());
@@ -695,7 +700,7 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
         if (++pendingCycles <= PENDING_CYCLES_BEFORE_WARNING) return;
         long now = clock.millis();
         long last = pendingLoggedAtMs;
-        if (last != NEVER_LOGGED && now - last < PENDING_LOG_WINDOW.toMillis()) return;
+        if (last != NEVER_LOGGED && now >= last && now - last < PENDING_LOG_WINDOW.toMillis()) return;
         pendingLoggedAtMs = now;
         String oldest = pending.stream()
                 .min(Comparator.comparingLong((Map.Entry<String, SeriesPlacement> e) -> e.getValue().updatedAtEpochMs()))

@@ -332,6 +332,48 @@ class SeriesDeleteHandlerMetricsTest {
     }
 
     @Test
+    void relogioQueRecuaNaoSilenciaOAlarmeDePendencia() {
+        placePending(KEY, true);
+        rpc.script((node, command) -> {
+            throw new NgrrdClusterException(ErrorCode.REMOTE_ERROR, "participante caiu");
+        });
+        List<String> warnings = new CopyOnWriteArrayList<>();
+        Logger logger = Logger.getLogger(SeriesDeleteHandler.class.getName());
+        Handler capture = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                if (record.getLevel() == Level.WARNING && record.getMessage() != null
+                        && record.getMessage().startsWith("NGRRD_DELETE_PENDING")) {
+                    warnings.add(record.getMessage());
+                }
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        logger.addHandler(capture);
+        try {
+            for (int i = 0; i <= SeriesDeleteHandler.PENDING_CYCLES_BEFORE_WARNING; i++) {
+                handler.recover();
+            }
+            assertEquals(1, warnings.size());
+
+            clock.advance(Duration.ofMinutes(-10));
+            handler.recover();
+            assertEquals(2, warnings.size(), "recuo do relógio conta como janela vencida");
+            handler.recover();
+            assertEquals(2, warnings.size(), "a janela recomeça no instante recuado");
+        } finally {
+            logger.removeHandler(capture);
+        }
+    }
+
+    @Test
     void ciclosSemPendenciaZeramAContagemSeguida() {
         placePending(KEY, true);
         rpc.script((node, command) -> {
