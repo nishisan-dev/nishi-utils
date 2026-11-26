@@ -342,8 +342,9 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
     /**
      * Emite {@code NGRRD_VOLUME_FILL} só quando a faixa de fill sobre a capacidade declarada muda. Capacidade
      * declarada {@code 0} (snapshot degradado ou nó sem declaração) é "desconhecido" e não conta como descida.
+     * Visível ao pacote para teste.
      */
-    private void logFillBandChange(BlobVolumeSummary blob) {
+    void logFillBandChange(BlobVolumeSummary blob) {
         if (blob.declaredCapacityBytes() <= 0L) {
             return;
         }
@@ -435,8 +436,8 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
         if (registry.lifecycle() != null) {
             merged.putAll(registry.lifecycle().metrics());
         }
-        Supplier<Map<String, Long>> checkpointMetrics = localCheckpointMetrics;
         merged.putAll(volumeMetrics());
+        Supplier<Map<String, Long>> checkpointMetrics = localCheckpointMetrics;
         merged.putAll(checkpointMetrics != null ? checkpointMetrics.get() : LocalCheckpointer.disabledMetrics(registry));
         return merged;
     }

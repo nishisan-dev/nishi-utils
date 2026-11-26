@@ -390,8 +390,8 @@ public final class NgrrdStorageNode implements Closeable {
                         cfg.placementRules(), peerId -> node.decommissionPeer(NodeId.of(peerId)));
 
                 statusReporter.distribution(cfg.distributionMode(), cfg.weight());
-                // Issue #167 (item 3): cota dura e fingerprint das regras de placement em todo status.
                 statusReporter.volumeMetrics(blobMetrics);
+                // Issue #167 (item 3): cota dura e fingerprint das regras de placement em todo status.
                 statusReporter.quota(cfg.quotaMaxSeries(), cfg.quotaMaxBytes());
                 statusReporter.placementRulesHash(cfg.placementRules().fingerprint());
                 LOGGER.info("NGRRD_PLACEMENT_RULES loaded count=" + cfg.placementRules().size() + " hash="

@@ -64,6 +64,10 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -168,6 +172,67 @@ class NodeStatusReporterTest {
         // salto direto sobre faixas intermediárias
         VolumeFillBands jump = new VolumeFillBands();
         assertEquals(VolumeFillBands.Band.REFUSING, jump.update(0.97));
+    }
+
+    @Test
+    void logDeFillEmiteSoNaMudancaDeFaixaERespeitaCapacidadeDesconhecida() {
+        List<LogRecord> records = new CopyOnWriteArrayList<>();
+        Logger logger = Logger.getLogger(NodeStatusReporter.class.getName());
+        Handler capture = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                if (record.getMessage() != null && record.getMessage().startsWith("NGRRD_VOLUME_FILL")) {
+                    records.add(record);
+                }
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        NodeStatusReporter reporter = newReporter(Clock.systemUTC(), null, Duration.ofMinutes(1));
+        logger.addHandler(capture);
+        try {
+            // entrada na faixa WARN: um registro WARNING
+            reporter.logFillBandChange(fillSummary(0.85, 1_000_000L));
+            assertEquals(1, records.size());
+            assertEquals(Level.WARNING, records.get(0).getLevel());
+            assertTrue(records.get(0).getMessage().contains("level=WARN previous=NORMAL fill=0.850"),
+                    records.get(0).getMessage());
+
+            // capacidade declarada 0 é desconhecida: nada é registrado e a faixa WARN permanece
+            reporter.logFillBandChange(fillSummary(0.0, 0L));
+            assertEquals(1, records.size(), "capacidade declarada 0 não pode gerar registro");
+
+            // mesma faixa: sem novo registro (prova indireta de que a faixa continuou WARN)
+            reporter.logFillBandChange(fillSummary(0.85, 1_000_000L));
+            assertEquals(1, records.size(), "mesma faixa não gera registro");
+
+            // descida para NORMAL: um registro INFO
+            reporter.logFillBandChange(fillSummary(0.5, 1_000_000L));
+            assertEquals(2, records.size());
+            assertEquals(Level.INFO, records.get(1).getLevel());
+            assertTrue(records.get(1).getMessage().contains("level=NORMAL previous=WARN"),
+                    records.get(1).getMessage());
+
+            // salto para REFUSING a partir de NORMAL: um registro WARNING
+            reporter.logFillBandChange(fillSummary(1.7, 1_000_000L));
+            assertEquals(3, records.size());
+            assertEquals(Level.WARNING, records.get(2).getLevel());
+            assertTrue(records.get(2).getMessage().contains("level=REFUSING previous=NORMAL"),
+                    records.get(2).getMessage());
+        } finally {
+            logger.removeHandler(capture);
+        }
+    }
+
+    /** Resumo de volume só com o fill sobre a capacidade declarada relevante para a máquina de faixas. */
+    private static BlobVolumeSummary fillSummary(double fill, long declaredCapacityBytes) {
+        return new BlobVolumeSummary(1, 0L, 0L, 0.0, 0, 0L, null, 0L, declaredCapacityBytes, 0L, fill);
     }
 
     @Test
