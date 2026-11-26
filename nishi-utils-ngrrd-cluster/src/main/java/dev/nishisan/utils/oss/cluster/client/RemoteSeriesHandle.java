@@ -352,13 +352,13 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
      * mapa do cliente ({@link #onClose}, remoção condicional à instância), de modo que um {@code open}
      * posterior refaz o fluxo do zero. Sem {@code CLOSE} remoto. Não faz nada num handle já fechado (a
      * operação em curso recebe a exceção, mas o estado fechado pelo chamador é preservado).
-     * Handles graváveis também tornam SERIES_DELETED e QUARANTINED terminais.
+     * Handles graváveis também tornam terminais SERIES_DELETED, QUARANTINED e a rota da geração removida do
+     * dispatcher ({@link #terminalForWritable}).
      */
     private void markTerminal(RuntimeException cause) {
         for (;;) {
             State current = state.get();
-            if (current.closed() || (current.writable() && !(cause instanceof NgrrdClusterException n
-                    && (n.code() == ErrorCode.SERIES_DELETED || n.code() == ErrorCode.QUARANTINED)))) {
+            if (current.closed() || (current.writable() && !terminalForWritable(cause))) {
                 return;
             }
             if (state.compareAndSet(current, current.closedByTerminalFailure(cause))) {
@@ -367,6 +367,19 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
                 return;
             }
         }
+    }
+
+    /**
+     * Causas que fecham um handle gravável: série removida ou em quarentena, ou a rota da sua geração saiu do
+     * dispatcher ({@link RouteClosedException}) com o cliente ainda aberto — sem isso o handle ficaria no mapa do
+     * cliente falhando com {@code CLOSED} para sempre; fechado, o próximo {@code open} cria a rota nova.
+     */
+    private boolean terminalForWritable(RuntimeException cause) {
+        if (cause instanceof RouteClosedException) {
+            return !clientClosed.getAsBoolean();
+        }
+        return cause instanceof NgrrdClusterException n
+                && (n.code() == ErrorCode.SERIES_DELETED || n.code() == ErrorCode.QUARANTINED);
     }
 
     void failGeneration(String expected, NgrrdClusterException failure) {

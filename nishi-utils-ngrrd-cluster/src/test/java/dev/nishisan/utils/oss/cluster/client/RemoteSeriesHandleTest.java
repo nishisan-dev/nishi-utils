@@ -25,6 +25,7 @@ import dev.nishisan.utils.oss.api.SeriesNotFoundException;
 import dev.nishisan.utils.oss.api.SeriesResult;
 import dev.nishisan.utils.oss.api.ViewQuery;
 import dev.nishisan.utils.oss.cluster.api.ErrorCode;
+import dev.nishisan.utils.oss.cluster.api.NgrrdClusterConfig;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
 import dev.nishisan.utils.oss.cluster.catalog.StorageCapabilities;
@@ -718,6 +719,78 @@ class RemoteSeriesHandleTest {
                 dispatcher.generations.getLast(), "o holder religado pela reabertura é liberado de novo");
     }
 
+    /** Handle gravável aberto sobre {@code buffer} (em vez do {@link NoOpWriteBuffer} padrão). */
+    private RemoteSeriesHandle openedHandleWith(WriteBuffer buffer) {
+        newHandle();
+        RetryPolicy retry = new RetryPolicy(Duration.ofSeconds(2), Duration.ofMillis(5), Duration.ofMillis(50));
+        RemoteSeriesHandle handle = new RemoteSeriesHandle(SERIES_KEY, "yaml: fake", "hash-1", Map.of(),
+                Ngrrd.OpenOptions.defaults(), resolver, rpc, buffer, retry, Duration.ofSeconds(5), Duration.ofSeconds(5),
+                Clock.systemUTC(), (key, h) -> onCloseCalls.add(key), capabilities, () -> clientClosed);
+        rpc.respondNext((cmd, body) -> response(cmd, SeriesStatus.OK, OWNER_A.value()));
+        handle.open();
+        onCloseCalls.clear();
+        return handle;
+    }
+
+    private WriteDispatcher newRealDispatcher() {
+        RetryPolicy retry = new RetryPolicy(Duration.ofSeconds(2), Duration.ofMillis(5), Duration.ofMillis(50));
+        return new WriteDispatcher(new RecordingClusterRpc(NodeId.of("client-under-test")), new FakePlacementLookup(
+                OWNER_A.value()), retry, 1, Duration.ofMillis(10), 100, NgrrdClusterConfig.BufferFullPolicy.BLOCK,
+                Duration.ofSeconds(2), key -> false, Clock.systemUTC());
+    }
+
+    @Test
+    void handleGravavelCujaRotaFoiRemovidaSeFechaAoEscrever() {
+        WriteDispatcher realDispatcher = newRealDispatcher();
+        try {
+            RemoteSeriesHandle handle = openedHandleWith(realDispatcher);
+            // A geração do handle foi trocada por uma abertura somente leitura e a rota saiu do mapa.
+            realDispatcher.beginGeneration(SERIES_KEY, "outra-geracao", OWNER_A.value(), null);
+
+            NgrrdClusterException closed = assertThrows(NgrrdClusterException.class,
+                    () -> handle.write("in_octets", new Sample(1L, 1.0)));
+
+            assertEquals(ErrorCode.CLOSED, closed.code());
+            assertFalse(handle.isOpen(), "sem rota para a sua geração, o handle se fecha");
+            assertEquals(List.of(SERIES_KEY), onCloseCalls, "e sai do mapa do cliente");
+            assertEquals(ErrorCode.CLOSED, assertThrows(NgrrdClusterException.class,
+                    () -> handle.write("in_octets", new Sample(2L, 2.0))).code());
+            assertFalse(realDispatcher.hasRoute(SERIES_KEY), "a escrita recusada não recria a rota");
+        } finally {
+            realDispatcher.close();
+        }
+    }
+
+    @Test
+    void flushDeHandleGravavelCujaRotaFoiRemovidaNaoPassaEmSilencio() {
+        WriteDispatcher realDispatcher = newRealDispatcher();
+        try {
+            RemoteSeriesHandle handle = openedHandleWith(realDispatcher);
+            realDispatcher.beginGeneration(SERIES_KEY, "outra-geracao", OWNER_A.value(), null);
+
+            NgrrdClusterException closed = assertThrows(NgrrdClusterException.class, handle::flush);
+
+            assertEquals(ErrorCode.CLOSED, closed.code());
+            assertFalse(handle.isOpen());
+            assertEquals(List.of(SERIES_KEY), onCloseCalls);
+            assertEquals(List.of(Commands.OPEN), commands(), "nenhum FLUSH remoto para uma geração sem rota");
+        } finally {
+            realDispatcher.close();
+        }
+    }
+
+    @Test
+    void closedDoDispatcherSemSerRotaRemovidaNaoFechaOHandle() {
+        RemoteSeriesHandle handle = openedHandle();
+        dispatcher.enqueueFailure = new NgrrdClusterException(ErrorCode.CLOSED, "dispatcher fechado");
+
+        assertEquals(ErrorCode.CLOSED, assertThrows(NgrrdClusterException.class,
+                () -> handle.write("in_octets", new Sample(1L, 1.0))).code());
+
+        assertTrue(handle.isOpen(), "CLOSED por dispatcher fechado ou interrupção não fecha o handle");
+        assertTrue(onCloseCalls.isEmpty(), "o handle continua no mapa do cliente");
+    }
+
     @Test
     void modoDoHandleEhFixoDesdeAConstrucao() {
         assertTrue(openedHandle().isWritable());
@@ -1012,6 +1085,8 @@ class RemoteSeriesHandleTest {
 
         final List<Enqueued> enqueued = new CopyOnWriteArrayList<>();
         final AtomicInteger calls = new AtomicInteger();
+        /** Se não nulo, {@link #enqueue} lança esta falha (ex.: {@code CLOSED} do dispatcher fechado). */
+        volatile NgrrdClusterException enqueueFailure;
         /** {@code beginGeneration}/{@code endGeneration} recebidos, fora de {@link #calls}. */
         final List<GenerationEvent> generations = new CopyOnWriteArrayList<>();
 
@@ -1031,6 +1106,10 @@ class RemoteSeriesHandleTest {
         @Override
         public void enqueue(String ownerNodeId, SeriesWrite write) {
             calls.incrementAndGet();
+            NgrrdClusterException failure = enqueueFailure;
+            if (failure != null) {
+                throw failure;
+            }
             enqueued.add(new Enqueued(ownerNodeId, write));
         }
 

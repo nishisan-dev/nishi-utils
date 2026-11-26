@@ -364,9 +364,13 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         return true;
     }
 
+    /**
+     * Confere a geração de um handle gravável antes da admissão. Sem rota, a geração do handle não tem mais onde
+     * escrever (substituída e depois removida): lança {@link RouteClosedException}, em vez de seguir em silêncio.
+     */
     @Override public void checkGeneration(String key, String generation) {
         SeriesRoute route = routes.get(key);
-        if (route == null) return;
+        if (route == null) throw closedRoute(key);
         route.lock.lock();
         try {
             if (!Objects.equals(route.generation, generation))
@@ -376,9 +380,10 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         } finally { route.lock.unlock(); }
     }
 
+    /** Barreira da geração de um handle gravável; sem rota, como {@link #checkGeneration}, lança {@link RouteClosedException}. */
     @Override public void flushGenerationSync(String key, String generation, String owner, Duration wait) {
         SeriesRoute route = routes.get(key);
-        if (route == null) return;
+        if (route == null) throw closedRoute(key);
         long boundary;
         route.lock.lock();
         try {
@@ -504,6 +509,9 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         // recria a rota depois da remoção (seria admitida sem dreno).
         SeriesRoute route = routes.get(write.seriesKey());
         if (route == null) {
+            if (closed) {
+                throw new NgrrdClusterException(ErrorCode.CLOSED, "dispatcher fechado");
+            }
             throw closedRoute(write.seriesKey());
         }
         for (;;) {
@@ -826,7 +834,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     }
 
     private static NgrrdClusterException closedRoute(String seriesKey) {
-        return new NgrrdClusterException(ErrorCode.CLOSED, "série liberada ou handle fechado: " + seriesKey);
+        return new RouteClosedException(seriesKey);
     }
 
     /** Se há rota de escrita para {@code seriesKey} — visível para testes. */
