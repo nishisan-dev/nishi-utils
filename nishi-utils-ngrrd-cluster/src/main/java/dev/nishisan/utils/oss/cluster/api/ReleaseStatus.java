@@ -42,8 +42,9 @@ public enum ReleaseStatus {
      * Drenou, mas há escritas admitidas antes do release com falha final ainda não reportadas a uma marca. Elas são
      * entregues aqui ({@link SeriesRelease#failedSamplesByStatus()}) e não vão mais para nenhuma marca. Em
      * {@code MARKS}, só as falhas que uma marca aberta antes do release já colheu ficam de fora (foram reportadas
-     * por ela); em {@code BARRIER}, nenhuma barreira consome a falha, que sempre chega aqui. Com releases concorrentes
-     * da mesma série, a mesma falha aparece em cada um cuja fronteira a cobre.
+     * por ela); em {@code BARRIER}, nenhuma barreira consome a falha, que sempre chega aqui. Com releases sobrepostos
+     * da mesma série, a mesma falha aparece em todo release ainda ativo cuja fronteira a cubra; um release que começa
+     * depois de outro já ter colhido a série não a vê de novo, e o release que admitiu a escrita sempre a recebe.
      */
     WRITE_FAILURES,
 

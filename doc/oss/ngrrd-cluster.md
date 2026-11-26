@@ -467,7 +467,9 @@ else { log.warn("não entregues: {}", r.notReleased()); }
    resultado e não vão mais a nenhuma marca. Marcas criadas **depois do início do release** não colhem as
    falhas da série liberada até a fronteira: elas são do release. Só uma marca aberta **antes** do release
    pode tê-las colhido; as que ela colheu foram reportadas por ela e **não aparecem** no `ReleaseResult`.
-   Cada falha é reportada uma única vez, a uma marca ou ao release. No modo `barrier`, a
+   Cada falha vai a uma única marca, ou a todo release ainda ativo da mesma série cuja fronteira a
+   cubra; um release que começa depois de outro já ter colhido a série não a vê de novo, e o release que
+   admitiu a escrita sempre a recebe. No modo `barrier`, a
    primeira falha da série, se estiver até a fronteira, vira `WRITE_FAILURES`, e
    `failedSamplesByStatus` fica vazio.
 3. **Checkpoint opcional**, só nas séries sem falha de escrita.

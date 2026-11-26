@@ -27,7 +27,9 @@ import java.util.Objects;
  *
  * @param status                o desfecho
  * @param failedSamplesByStatus amostras admitidas antes do release com falha final, por status, entregues por este
- *                              release (cada falha é reportada uma única vez, a uma marca ou a um release). Só
+ *                              release (cada falha vai a uma única marca, ou a todo release ainda ativo da mesma
+ *                              série cuja fronteira a cubra; um release que começa depois de outro já ter colhido
+ *                              a série não a vê de novo, e o release que admitiu a escrita sempre a recebe). Só
  *                              preenchido em {@link NgrrdClusterConfig.WriteFailureReporting#MARKS}; em
  *                              {@code BARRIER}, que guarda só a primeira falha da série, fica vazio mesmo com
  *                              {@link ReleaseStatus#WRITE_FAILURES}. Uma geração substituída conta como

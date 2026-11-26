@@ -262,8 +262,9 @@ public interface NgrrdClusterClient extends Closeable {
      *       como sempre. Uma vista somente leitura obtida antes passa a falhar com {@code CLOSED}.</li>
      *   <li><b>Dreno.</b> Espera a resposta final de toda escrita até a fronteira, sem lançar. Em
      *       {@link NgrrdClusterConfig.WriteFailureReporting#MARKS}, as falhas ainda não reportadas a uma marca até a
-     *       fronteira são entregues no resultado e não vão mais para nenhuma marca (cada falha é reportada uma única
-     *       vez, a uma marca ou a um release). Em {@code BARRIER}, a primeira falha da série, se estiver até a
+     *       fronteira são entregues no resultado e não vão mais para nenhuma marca (cada falha vai a uma única marca, ou
+     *       a todo release ainda ativo da mesma série cuja fronteira a cubra; um release que começa depois de outro
+     *       já ter colhido a série não a vê de novo, e o release que admitiu a escrita sempre a recebe). Em {@code BARRIER}, a primeira falha da série, se estiver até a
      *       fronteira, vira {@link ReleaseStatus#WRITE_FAILURES}. Série removida ou em quarentena vira
      *       {@link ReleaseStatus#SERIES_DELETED}.</li>
      *   <li><b>Checkpoint opcional</b> ({@link ReleaseOptions#checkpoint()}): o {@code CHECKPOINT} de sempre, só nas

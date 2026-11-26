@@ -31,8 +31,10 @@ import java.util.Set;
  * <p>Uso na entrega de partições entre clientes: confirme o offset da partição só se {@link #allReleased()}. Senão,
  * não confirme (ou confirme até a última marca concluída sem falha) e registre {@link #notReleased()}.</p>
  *
- * <p>Releases concorrentes da mesma série (no mesmo cliente) veem, cada um, as falhas que a sua fronteira cobre: a
- * mesma falha aparece em todos eles, e as contagens não devem ser somadas entre releases.</p>
+ * <p>Releases sobrepostos da mesma série (no mesmo cliente) veem, cada um, as falhas que a sua fronteira cobre: a
+ * mesma falha aparece em todo release ainda ativo cuja fronteira a cubra, e as contagens não devem ser somadas entre
+ * releases. Um release que começa depois de outro já ter colhido a série não vê a falha de novo, e o release que
+ * admitiu a escrita sempre a recebe.</p>
  *
  * @param series desfecho por chave de série
  * @since 8.15.0

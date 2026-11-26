@@ -61,7 +61,8 @@ import java.util.logging.Logger;
  * </ol>
  * As RPCs de {@code CHECKPOINT}/{@code CLOSE} correm em até {@code maxConcurrentPerNode} workers por nó dono. O prazo
  * TOTAL ({@code timeout}, padrão {@code closeTimeout}) vale para dreno, checkpoint e close. A future só falha com
- * {@link ErrorCode#CLOSED} (cliente fechado) ou {@link NullPointerException} (chaves nulas); nunca por uma série.
+ * {@link ErrorCode#CLOSED} (cliente fechado), {@link NullPointerException} (chaves nulas) ou com um erro
+ * inesperado, repassado sem conversão; nunca por uma série.
  */
 final class SeriesReleaser implements AutoCloseable {
 

@@ -761,7 +761,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
      *
      * <p>Ao alcançar a fronteira, sob {@code route.lock}, conclui os waiters de marca já cobertos e colhe as falhas:
      * em {@code MARKS}, as faixas ainda não reportadas até a fronteira, contadas por status — elas deixam de ir para
-     * uma marca, então cada falha é reportada uma única vez entre marcas e releases; com releases sobrepostos da mesma
+     * uma marca, então uma marca nunca as vê; com releases sobrepostos da mesma
      * rota, cada um deles reporta as falhas que a sua fronteira cobre, inclusive as que outro já colheu; em
      * {@code BARRIER}, a primeira
      * falha da rota, se estiver até a fronteira. Série removida ou em quarentena ({@code failureCode}) vira
@@ -2142,10 +2142,6 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         }
 
         /**
-         * Entrega a {@code sink} as falhas com sequência {@code <= boundary}, partindo a faixa que cruza a fronteira;
-         * o que foi entregue sai de {@link #unreportedFailures} e não vai mais para nenhuma marca.
-         */
-        /**
          * Tira de {@link #unreportedFailures} as faixas com sequência {@code <= boundary}, partindo a que cruza a
          * fronteira, e as acrescenta a {@code into}, na ordem.
          */
@@ -2161,6 +2157,10 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             }
         }
 
+        /**
+         * Entrega a {@code sink} as falhas com sequência {@code <= boundary}, partindo a faixa que cruza a fronteira;
+         * o que foi entregue sai de {@link #unreportedFailures} e não vai mais para nenhuma marca.
+         */
         void collectFailures(FailureSink sink, long boundary) {
             while (!unreportedFailures.isEmpty() && unreportedFailures.peekFirst().from() <= boundary) {
                 FailedRange range = unreportedFailures.pollFirst();
