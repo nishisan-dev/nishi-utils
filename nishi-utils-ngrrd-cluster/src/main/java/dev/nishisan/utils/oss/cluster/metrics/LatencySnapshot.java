@@ -17,6 +17,8 @@
 
 package dev.nishisan.utils.oss.cluster.metrics;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+
 /**
  * Resumo aproximado da distribuição de latências observada por um
  * {@link LatencyHistogram} num instante.
@@ -36,6 +38,7 @@ package dev.nishisan.utils.oss.cluster.metrics;
  *                   baldes), em microssegundos; 0 se não houve amostra nesse período. Campo aditivo: um
  *                   nó anterior à 8.15 não o envia e ele chega como 0
  */
+@JsonIgnoreProperties(ignoreUnknown = true)
 public record LatencySnapshot(long count, long p50Micros, long p99Micros, long maxMicros, long recentMaxMicros) {
 
     /** Snapshot de um histograma sem nenhuma amostra registrada ainda. */

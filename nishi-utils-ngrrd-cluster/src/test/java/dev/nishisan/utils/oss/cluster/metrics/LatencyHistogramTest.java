@@ -17,8 +17,11 @@
 
 package dev.nishisan.utils.oss.cluster.metrics;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import dev.nishisan.utils.ngrid.cluster.transport.codec.JacksonMessageCodec;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
@@ -37,6 +40,18 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * (últimas 1024 amostras) descrita no Javadoc da classe.
  */
 class LatencyHistogramTest {
+
+    @Test
+    void snapshotComCamposDesconhecidosETolerado() throws IOException {
+        String future = "{\"count\":3,\"p50Micros\":10,\"p99Micros\":20,\"maxMicros\":30,\"recentMaxMicros\":25,"
+                + "\"campoDeUmaVersaoFutura\":{\"x\":1}}";
+
+        // Com um ObjectMapper estrito (padrão do Jackson): a anotação do record dispensa a configuração do mapper.
+        for (ObjectMapper mapper : new ObjectMapper[]{JacksonMessageCodec.createDefaultMapper(), new ObjectMapper()}) {
+            LatencySnapshot snapshot = mapper.readValue(future, LatencySnapshot.class);
+            assertEquals(new LatencySnapshot(3L, 10L, 20L, 30L, 25L), snapshot);
+        }
+    }
 
     @Test
     void semAmostrasDevolveSnapshotVazio() {
