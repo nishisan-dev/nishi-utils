@@ -1,5 +1,6 @@
 package dev.nishisan.utils.oss.writer;
 
+import dev.nishisan.utils.oss.NgrrdHandle.CheckpointTiming;
 import dev.nishisan.utils.oss.api.ConsolidationFunction;
 import dev.nishisan.utils.oss.api.Durability;
 import dev.nishisan.utils.oss.api.OnGeometryChange;
@@ -39,6 +40,7 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -367,20 +369,41 @@ public final class NgrrdWriter implements AutoCloseable {
      * @return future concluída quando o checkpoint termina
      */
     public CompletableFuture<Void> checkpointAsync() {
-        return syncAsync();
+        return syncAsync(null);
+    }
+
+    /**
+     * Como {@link #checkpointAsync()}, com os tempos medidos ({@link CheckpointTiming}):
+     * {@code queueWaitNanos} vai do enfileiramento até o início do force (fila FIFO da
+     * série, fila do pool de writers, fase A e, com executor, a fila dele);
+     * {@code forceNanos} é a duração do force. Um checkpoint coalescido (sem amostra
+     * nova) devolve {@code coalesced = true}, {@code forceNanos = 0} e a espera até a
+     * worker processá-lo. Writer já fechado, ou checkpoint concluído pelo fechamento
+     * (corrida com o Shutdown): {@link CheckpointTiming#NONE}. Falhas como em
+     * {@link #checkpointAsync()}.
+     *
+     * @return future com os tempos, concluída quando o checkpoint termina
+     */
+    public CompletableFuture<CheckpointTiming> checkpointAsyncTimed() {
+        if (closed) {
+            return CompletableFuture.completedFuture(CheckpointTiming.NONE);
+        }
+        AtomicReference<CheckpointTiming> measured = new AtomicReference<>(CheckpointTiming.NONE);
+        return syncAsync(measured::set).thenApply(ignored -> measured.get());
     }
 
     /**
      * Enfileira um checkpoint e devolve a future que a worker conclui ao processá-lo.
      * Uma falha de persistência (ex.: PUT no S3 / fsync) conclui a future com a
-     * exceção em vez de deixá-la pendente.
+     * exceção em vez de deixá-la pendente. {@code timing} (opcional) recebe os tempos
+     * medidos antes de a future concluir com sucesso.
      */
-    private CompletableFuture<Void> syncAsync() {
+    private CompletableFuture<Void> syncAsync(TimingSink timing) {
         if (closed) {
             return CompletableFuture.completedFuture(null);
         }
         CompletableFuture<Void> future = new CompletableFuture<>();
-        enqueue(new Command.Sync(future));
+        enqueue(new Command.Sync(future, System.nanoTime(), timing));
         if (terminated) {
             completeOrphanedSyncs();
         }
@@ -393,7 +416,7 @@ public final class NgrrdWriter implements AutoCloseable {
      * com o mesmo tipo de exceção, em vez de travar indefinidamente.
      */
     private void sync() {
-        CompletableFuture<Void> future = syncAsync();
+        CompletableFuture<Void> future = syncAsync(null);
         try {
             future.get();
         } catch (InterruptedException e) {
@@ -847,9 +870,9 @@ public final class NgrrdWriter implements AutoCloseable {
     }
 
     /**
-     * Checkpoint de um {@link Command.Sync}. Sem executor de force, é exatamente o
-     * {@link #checkpointAndForce()} de sempre, com a future concluída na hora. Com
-     * executor:
+     * Checkpoint de um {@link Command.Sync}. Sem executor de force, faz com o canal
+     * exatamente o que o {@link #checkpointAndForce()} faz (mesmas chamadas, mesma
+     * ordem), medindo os tempos, e conclui a future na hora. Com executor:
      * <ul>
      *   <li>sem amostra nova e com force destacado em voo, a future encadeia nesse
      *       force (sucesso → sucesso; falha → falha), qualquer que seja o estado dele;</li>
@@ -857,24 +880,28 @@ public final class NgrrdWriter implements AutoCloseable {
      *       Um ticket não destacado (o force já foi inline) conclui a future; um ticket
      *       destacado vai para o executor, que conclui a future depois do force.</li>
      * </ul>
+     * Sem executor, {@code inFlightForce} é sempre {@code null}.
      */
     private void checkpointForSync(Command.Sync s) {
-        if (forceExecutor == null) {
-            checkpointAndForce();
-            s.future().complete(null);
-            return;
-        }
         if (!changedSinceForce) {
             if (metrics != null) {
                 metrics.onCheckpointCoalesced(seriesKey);
             }
-            completeAfterPendingForce(s);
+            completeAfterPendingForce(s, System.nanoTime(), 0L, true);
             return;
         }
         materializePartials();
+        long forceStart = System.nanoTime();
         if (durability != Durability.FSYNC) {
+            // OS_CACHE: sem force por checkpoint (ver checkpointAndForce).
             changedSinceForce = false;
-            s.future().complete(null);
+            completeSync(s, forceStart, 0L, false);
+            return;
+        }
+        if (forceExecutor == null) {
+            channel.force();
+            changedSinceForce = false;
+            completeSync(s, forceStart, System.nanoTime() - forceStart, false);
             return;
         }
         SeriesChannel.ForceTicket ticket = channel.prepareForce();
@@ -882,26 +909,40 @@ public final class NgrrdWriter implements AutoCloseable {
             // Force inline feito pelo canal. Um force destacado anterior ainda em voo
             // continua valendo para esta future: encadeia nele, como no caso coalescido.
             changedSinceForce = false;
-            completeAfterPendingForce(s);
+            completeAfterPendingForce(s, forceStart, System.nanoTime() - forceStart, false);
             return;
         }
         detachForce(ticket, s);
     }
 
-    /** Conclui a future do Sync na hora, ou, com force destacado em voo, quando ele concluir. */
-    private void completeAfterPendingForce(Command.Sync s) {
+    /**
+     * Conclui a future do Sync na hora, ou, com force destacado em voo, quando ele
+     * concluir (com a falha dele, se falhar).
+     */
+    private void completeAfterPendingForce(Command.Sync s, long forceStartNanos, long forceNanos,
+                                           boolean coalesced) {
         CompletableFuture<Void> pending = inFlightForce;
         if (pending == null) {
-            s.future().complete(null);
+            completeSync(s, forceStartNanos, forceNanos, coalesced);
             return;
         }
         pending.whenComplete((ignored, failure) -> {
             if (failure == null) {
-                s.future().complete(null);
+                completeSync(s, forceStartNanos, forceNanos, coalesced);
             } else {
                 s.future().completeExceptionally(unwrap(failure));
             }
         });
+    }
+
+    /** Entrega os tempos ao {@link TimingSink} do Sync, se houver, e conclui a future com sucesso. */
+    private static void completeSync(Command.Sync s, long forceStartNanos, long forceNanos, boolean coalesced) {
+        TimingSink timing = s.timing();
+        if (timing != null) {
+            timing.accept(new CheckpointTiming(Math.max(0L, forceStartNanos - s.enqueuedNanos()),
+                    forceNanos, coalesced));
+        }
+        s.future().complete(null);
     }
 
     /**
@@ -929,15 +970,17 @@ public final class NgrrdWriter implements AutoCloseable {
      */
     private void runDetachedForce(SeriesChannel.ForceTicket ticket, CompletableFuture<Void> force,
                                   Command.Sync s) {
+        long forceStart = System.nanoTime();
         Throwable failure = null;
         try {
             ticket.run();
         } catch (Throwable e) {
             failure = e;
         }
+        long forceNanos = System.nanoTime() - forceStart;
         if (failure == null) {
             force.complete(null);
-            s.future().complete(null);
+            completeSync(s, forceStart, forceNanos, false);
         } else {
             force.completeExceptionally(failure);
             s.future().completeExceptionally(failure);
@@ -1029,12 +1072,22 @@ public final class NgrrdWriter implements AutoCloseable {
         }
     }
 
+    /** Destino dos tempos medidos de um checkpoint ({@link #checkpointAsyncTimed()}). */
+    @FunctionalInterface
+    private interface TimingSink {
+        void accept(CheckpointTiming timing);
+    }
+
     private sealed interface Command {
         record Write(String dsName, Sample sample, long receivedAtMs) implements Command {
         }
 
-        /** Checkpoint; {@code future} é concluída pela worker com o desfecho (sucesso ou a exceção). */
-        record Sync(CompletableFuture<Void> future) implements Command {
+        /**
+         * Checkpoint; {@code future} é concluída com o desfecho (sucesso ou a exceção), pela
+         * worker ou, com force destacado, pelo executor. {@code enqueuedNanos} marca o
+         * enfileiramento; {@code timing} (opcional) recebe os tempos medidos.
+         */
+        record Sync(CompletableFuture<Void> future, long enqueuedNanos, TimingSink timing) implements Command {
         }
 
         /** Fim de um force destacado; processado na worker (ver {@code onForceDone}). */

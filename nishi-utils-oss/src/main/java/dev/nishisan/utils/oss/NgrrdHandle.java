@@ -34,7 +34,8 @@ import java.util.concurrent.CompletableFuture;
  *   <li>{@link #checkpoint()} / {@link #flush()} são síncronos: drenam a fila
  *       do writer antes de retornar.</li>
  *   <li>{@link #checkpointAsync()} enfileira o mesmo checkpoint e devolve na hora;
- *       a future conclui depois das escritas enfileiradas antes dela.</li>
+ *       a future conclui depois das escritas enfileiradas antes dela.
+ *       {@link #checkpointAsyncTimed()} faz o mesmo e devolve os tempos medidos.</li>
  * </ul>
  *
  * <p><strong>Visibilidade por backend:</strong> no disco local, CDPs de passos
@@ -104,6 +105,37 @@ public interface NgrrdHandle extends AutoCloseable {
         } catch (RuntimeException e) {
             return CompletableFuture.failedFuture(e);
         }
+    }
+
+    /**
+     * Como {@link #checkpointAsync()}, com os tempos medidos ({@link CheckpointTiming}).
+     *
+     * <p>O padrão desta interface não mede nada: devolve {@link CheckpointTiming#NONE}
+     * quando {@link #checkpointAsync()} conclui (e falha como ela). O handle local
+     * devolvido por {@link Ngrrd} sobrescreve com a medida real. Callbacks encadeados
+     * na future seguem a mesma regra de {@link #checkpointAsync()}.</p>
+     *
+     * @return future com os tempos, concluída quando o checkpoint termina
+     */
+    default CompletableFuture<CheckpointTiming> checkpointAsyncTimed() {
+        return checkpointAsync().thenApply(v -> CheckpointTiming.NONE);
+    }
+
+    /**
+     * Tempos de um checkpoint ({@link #checkpointAsyncTimed()}).
+     *
+     * @param queueWaitNanos do enfileiramento do checkpoint até o início do force. Inclui a
+     *                       fila FIFO da série, a fila do pool de writers, a materialização
+     *                       dos parciais e, com executor de force, a fila desse executor. Num
+     *                       checkpoint coalescido, a espera até o writer processá-lo
+     * @param forceNanos     duração do force; {@code 0} quando não houve force (coalescido,
+     *                       ou durabilidade {@code OS_CACHE})
+     * @param coalesced      {@code true} quando nenhuma amostra nova exigiu force (idle-skip)
+     */
+    record CheckpointTiming(long queueWaitNanos, long forceNanos, boolean coalesced) {
+
+        /** Sem medida: implementações sem fila própria, handle fechado ou checkpoint concluído pelo fechamento. */
+        public static final CheckpointTiming NONE = new CheckpointTiming(0, 0, true);
     }
 
     /** Lê uma série materializada com base em uma {@link ViewQuery} explícita. */

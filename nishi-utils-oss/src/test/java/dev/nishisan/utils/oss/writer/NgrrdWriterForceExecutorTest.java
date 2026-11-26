@@ -1,5 +1,6 @@
 package dev.nishisan.utils.oss.writer;
 
+import dev.nishisan.utils.oss.NgrrdHandle.CheckpointTiming;
 import dev.nishisan.utils.oss.api.Durability;
 import dev.nishisan.utils.oss.api.OnGeometryChange;
 import dev.nishisan.utils.oss.api.Sample;
@@ -106,7 +107,12 @@ class NgrrdWriterForceExecutorTest {
 
     private NgrrdWriter writer(SpyStorage storage, Executor forceExecutor, NgrrdMetricsListener metrics)
             throws Exception {
-        return new NgrrdWriter(definition(), storage, SERIES, metrics, new ReentrantReadWriteLock(),
+        return writer(storage, forceExecutor, metrics, new ReentrantReadWriteLock());
+    }
+
+    private NgrrdWriter writer(SpyStorage storage, Executor forceExecutor, NgrrdMetricsListener metrics,
+                               ReentrantReadWriteLock seriesLock) throws Exception {
+        return new NgrrdWriter(definition(), storage, SERIES, metrics, seriesLock,
                 Durability.FSYNC, OnGeometryChange.FAIL, System::currentTimeMillis, true, forceExecutor);
     }
 
@@ -332,6 +338,94 @@ class NgrrdWriterForceExecutorTest {
         String closingThread = storage.forceThreads.get(storage.forceThreads.size() - 2);
         assertTrue(closingThread.startsWith("ngrrd-writer-pool-"), "force inline na worker: " + closingThread);
         assertArrayEquals(storage.image(), storage.durable(), "nada se perde com o force falho no close");
+    }
+
+    @Test
+    void checkpointAsyncTimedMedeFilaEForceNoPool() throws Exception {
+        SpyStorage storage = new SpyStorage(true);
+        TrackingExecutor pool = forcePool(1);
+        try (NgrrdWriter w = writer(storage, pool, null)) {
+            w.write("in_octets", new Sample(START_MS, 1_000_000L));
+            CountDownLatch busy = new CountDownLatch(1);
+            pool.execute(() -> awaitQuietly(busy)); // ocupa a única thread do pool de force
+            CountDownLatch gate = storage.gateNextTicket();
+            CompletableFuture<CheckpointTiming> timed = w.checkpointAsyncTimed();
+            Thread.sleep(200);
+            busy.countDown();
+            storage.awaitTicketStarted();
+            Thread.sleep(200);
+            gate.countDown();
+
+            CheckpointTiming timing = timed.get(10, TimeUnit.SECONDS);
+            assertFalse(timing.coalesced());
+            assertTrue(timing.queueWaitNanos() >= TimeUnit.MILLISECONDS.toNanos(150),
+                    "a espera inclui a fila do pool de force: " + timing);
+            assertTrue(timing.forceNanos() >= TimeUnit.MILLISECONDS.toNanos(150),
+                    "a duração é a do ticket no pool: " + timing);
+
+            CheckpointTiming idle = w.checkpointAsyncTimed().get(10, TimeUnit.SECONDS);
+            assertTrue(idle.coalesced(), "sem amostra nova o checkpoint é coalescido: " + idle);
+            assertEquals(0L, idle.forceNanos());
+        }
+    }
+
+    @Test
+    void checkpointAsyncTimedSemExecutorMedeOForceInline() throws Exception {
+        SpyStorage storage = new SpyStorage(true);
+        ReentrantReadWriteLock seriesLock = new ReentrantReadWriteLock();
+        try (NgrrdWriter w = writer(storage, null, null, seriesLock)) {
+            w.write("in_octets", new Sample(START_MS, 1_000_000L));
+            CompletableFuture<CheckpointTiming> timed;
+            seriesLock.readLock().lock(); // segura a fase A: a espera tem de aparecer na medida
+            try {
+                timed = w.checkpointAsyncTimed();
+                Thread.sleep(200);
+            } finally {
+                seriesLock.readLock().unlock();
+            }
+            CheckpointTiming timing = timed.get(10, TimeUnit.SECONDS);
+            assertFalse(timing.coalesced());
+            assertTrue(timing.queueWaitNanos() >= TimeUnit.MILLISECONDS.toNanos(150), "espera medida: " + timing);
+            assertTrue(timing.forceNanos() >= 0L);
+            assertTrue(storage.ticketThreads.isEmpty(), "sem executor o force é inline");
+            assertFalse(storage.log.contains("prepareForce"));
+            assertTrue(w.checkpointAsyncTimed().get(10, TimeUnit.SECONDS).coalesced());
+        }
+        NgrrdWriter closed = writer(new SpyStorage(true), null, null);
+        closed.close();
+        assertEquals(CheckpointTiming.NONE, closed.checkpointAsyncTimed().get(10, TimeUnit.SECONDS),
+                "writer fechado: sem medida, como o checkpointAsync()");
+    }
+
+    @Test
+    void checkpointAsyncTimedCoalescidoEsperaForceEmVooEFalhaComEle() throws Exception {
+        SpyStorage storage = new SpyStorage(true);
+        CoalescedCounter coalesced = new CoalescedCounter();
+        try (NgrrdWriter w = writer(storage, forcePool(1), coalesced)) {
+            w.write("in_octets", new Sample(START_MS, 1_000_000L));
+            CountDownLatch gate = storage.gateNextTicket();
+            storage.failNextTicket();
+            CompletableFuture<CheckpointTiming> first = w.checkpointAsyncTimed();
+            storage.awaitTicketStarted();
+            CompletableFuture<CheckpointTiming> second = w.checkpointAsyncTimed();
+            coalesced.await();
+            assertFalse(second.isDone());
+            gate.countDown();
+            ExecutionException firstFailure = assertThrows(ExecutionException.class,
+                    () -> first.get(10, TimeUnit.SECONDS));
+            assertInstanceOf(NgrrdStorageException.class, firstFailure.getCause());
+            ExecutionException secondFailure = assertThrows(ExecutionException.class,
+                    () -> second.get(10, TimeUnit.SECONDS));
+            assertInstanceOf(NgrrdStorageException.class, secondFailure.getCause());
+        }
+    }
+
+    private static void awaitQuietly(CountDownLatch latch) {
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     /** Executor que avisa quando cada tarefa terminou (depois de ela enfileirar o ForceDone). */

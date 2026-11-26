@@ -490,6 +490,12 @@ public final class Ngrrd {
             return writer.checkpointAsync();
         }
 
+        /** Checkpoint assíncrono com os tempos medidos pelo writer (ver {@link NgrrdWriter#checkpointAsyncTimed()}). */
+        @Override
+        public CompletableFuture<CheckpointTiming> checkpointAsyncTimed() {
+            return writer.checkpointAsyncTimed();
+        }
+
         @Override
         public SeriesResult read(String dsName, ViewQuery query) {
             return reader.read(dsName, query);
