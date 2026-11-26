@@ -406,6 +406,102 @@ if (mark.isDone()) {                       // consulta sem bloqueio (ou mark.com
   deve tratar isso como pausa (por exemplo, `pause()` das partições Kafka mantendo o `poll()`), não
   como erro.
 
+### 5.3. Liberação de séries e entrega entre clientes (8.15.0)
+
+Quando as séries são particionadas de forma disjunta entre clientes (um consumidor Kafka por
+partição, por exemplo) e uma partição muda de cliente, o cliente que a perde precisa **entregar** as
+séries dela: confirmar que toda escrita admitida teve resposta final do dono e soltar o estado local
+(handle, rota de escrita, dono em cache). É o que o `release` faz.
+
+```java
+CompletableFuture<ReleaseResult> f = client.release(seriesKeys);                  // ReleaseOptions.defaults()
+CompletableFuture<ReleaseResult> g = client.release(seriesKeys, ReleaseOptions.defaults()
+        .withCheckpoint(true).withTimeout(Duration.ofSeconds(20)));
+ReleaseResult r = f.join();
+if (r.allReleased()) { /* confirma o offset da partição */ }
+else { log.warn("não entregues: {}", r.notReleased()); }
+```
+
+**API** (`NgrrdClusterClient`, `dev.nishisan.utils.oss.cluster.api`):
+
+- `release(Collection<String> seriesKeys)` e `release(seriesKeys, ReleaseOptions)` devolvem
+  `CompletableFuture<ReleaseResult>`. Não bloqueiam: a future conclui num executor próprio de virtual
+  threads. Ela **nunca falha por causa de uma série**; só falha com `NgrrdClusterException(CLOSED)`
+  (cliente fechado antes ou durante) ou `NullPointerException` (lista nula ou com `null`).
+- `ReleaseOptions` (record imutável, **por chamada**, não é chave de YAML), com `defaults()` e `withX`:
+
+| Campo | Padrão | Efeito |
+|---|---|---|
+| `checkpoint` | `false` | `true`: depois do dreno, pede `CHECKPOINT` ao dono de cada série sem falha. Custa uma RPC por série |
+| `closeOnNode` | `false` | `true`: manda `CLOSE` ao dono de cada série drenada (desativação planejada) |
+| `timeout` | `null` = `closeTimeout` do cliente | prazo **total** do release (dreno, checkpoint e close); positivo quando informado |
+| `maxConcurrentPerNode` | `32` | teto de RPCs de `CHECKPOINT`/`CLOSE` simultâneas por nó dono; `>= 1` |
+
+- `ReleaseResult` traz um `SeriesRelease` por chave pedida (repetidas contam uma vez, na ordem
+  pedida), com `allReleased()`, `notReleased()` e `failedSamples()`. `SeriesRelease` traz `status`,
+  `failedSamplesByStatus` (amostras com falha final entregues por este release), `errorCode` e `message`.
+- `ReleaseStatus`:
+
+| Status | Significado | Pode confirmar o progresso? |
+|---|---|---|
+| `RELEASED` | toda escrita admitida antes do release teve `OK` final do dono (e o `CHECKPOINT` confirmou, se pedido) | sim |
+| `NOT_HELD` | o cliente não tinha handle nem rota de escrita da série | sim |
+| `WRITE_FAILURES` | drenou, mas há escritas anteriores com falha final ainda não reportadas a uma marca; elas vêm em `failedSamplesByStatus` e não vão mais a nenhuma marca | não |
+| `CHECKPOINT_FAILED` | as escritas tiveram `OK`, mas o `CHECKPOINT` pedido falhou ou estourou o prazo | não |
+| `TIMED_OUT` | o dreno não terminou no prazo (`errorCode` `TIMEOUT`) | não |
+| `SERIES_DELETED` | a geração foi removida ou posta em quarentena durante o release | não |
+
+**Semântica por série**, nesta ordem:
+
+1. **Admissão encerrada.** Sob o lock de abertura da chave (o mesmo do `open`), o handle sai do cache
+   e é fechado localmente, e a rota de escrita é aposentada com a fronteira fotografada (tudo o que
+   foi admitido até ali). Um `write` concorrente no handle liberado lança `CLOSED`: **pare de escrever
+   nas séries antes de chamar o `release`**. Um `open` concorrente espera esse lock; um `open`
+   posterior cria um handle novo.
+2. **Dreno.** Espera a resposta final de toda escrita até a fronteira, sem lançar. No modo `marks`
+   (seção 5.2), as falhas ainda não reportadas a uma marca até a fronteira são entregues no resultado:
+   **cada falha é reportada uma única vez**, a uma marca ou a um release. No modo `barrier`, a
+   primeira falha da série, se estiver até a fronteira, vira `WRITE_FAILURES`, e
+   `failedSamplesByStatus` fica vazio.
+3. **Checkpoint opcional**, só nas séries sem falha de escrita.
+4. **`CLOSE` no nó, opcional.** O padrão é **não mandar**: na entrega entre clientes, o próximo dono
+   reabre a série no mesmo nó, e o `CLOSE` faria o nó fazer checkpoint, fechar e reabrir à toa, além de
+   descartar a definição no nó, o que custa um `NOT_OPEN` e um `OPEN` ao cliente que já abriu a
+   série. Uma série abandonada de vez fecha pela ociosidade do nó (seção 6.3). Use `closeOnNode` na
+   desativação planejada. Uma falha do `CLOSE` só vai para o log.
+5. **Limpeza local.** A rota sai do cliente quando não há mais escrita em voo, e o dono em cache é
+   esquecido.
+6. **`TIMED_OUT`.** O handle já está fechado e a rota fica sem dono: as escritas pendentes continuam
+   sendo entregues em segundo plano, e as falhas que surgirem depois vão para a próxima marca (`marks`)
+   ou ficam na rota (`barrier`). **Não confirme** o progresso dessas séries.
+
+**Durabilidade.** Sem `checkpoint`, `RELEASED` tem a mesma garantia de uma marca de escrita: **ACK do
+dono, sem fsync**. Uma queda abrupta do nó logo depois pode perder as últimas amostras; o checkpoint
+local periódico do nó (seção 6.7) só limita essa janela quando `ngrrd.checkpoint` está ligado. Com
+`checkpoint: true`, a garantia é **fsync confirmado no dono**, ao custo de uma RPC por série. Sem
+`checkpoint` nem `closeOnNode`, o custo do release é só local (dreno e limpeza), sem RPC por série.
+
+**Protocolo de entrega entre clientes** (cliente A perde a partição P; cliente B a ganha):
+
+1. A para de chamar `write` nas séries de P.
+2. No callback de revogação, A chama `release(séries de P).join()`.
+3. A só confirma o offset de P se `ReleaseResult.allReleased()`. Senão, não confirma (ou confirma até
+   a última marca concluída sem falha) e registra `notReleased()`.
+4. B, no callback de atribuição, abre as séries de P sob demanda (`open`) e retoma a partir do offset
+   confirmado.
+
+- **Ordem garantida pelo grupo.** Nos protocolos *eager* e *cooperative*, a atribuição de P a B só
+  acontece depois de o callback de revogação de A terminar. O `release` precisa caber nesse callback:
+  use `timeout` **menor** que o prazo do grupo (`max.poll.interval.ms` ou equivalente), com folga.
+- **Reescrita depois do offset.** B reprocessa a partir do offset confirmado. Amostras que A já tinha
+  gravado depois desse offset são reescritas; com o mesmo timestamp, vale a `lateSamplePolicy` da série.
+- **Limite: entrega sem cerca até a 8.16.** Se A estourar o prazo e o grupo reatribuir P, A e B podem
+  escrever ao mesmo tempo, e vale o último escritor. Esta versão não tem cerca contra esse "zumbi"
+  (seção 13.1).
+- **Sem `release`**, o comportamento é o de sempre: funcional, mas sem garantia de fronteira.
+
+![Sequência de liberação e entrega de séries](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan-dev/nishi-utils/main/doc/oss/diagrams/ngrrd_cluster_sequence_release.puml)
+
 ## 6. Storage node
 
 Para compilar, preparar as dependências, salvar o YAML e iniciar um ou três processos Java,
@@ -482,6 +578,8 @@ ngrrd:
     enabled: false                     # opcional, default false (nenhum executor é criado)
     interval: 300s                     # opcional, default 300s; > 0
     maxInFlight: 8                     # opcional, default min(8, max(2, nCPU)); >= 1
+    threads: 0                         # opcional, default 0; >= 0 — pool dedicado de force (8.15.0, seção 6.7)
+    spreadFraction: 0.8                # opcional, default 0.8; em (0, 1] — espalhamento do ciclo (8.15.0, seção 6.7)
 ```
 
 **Modo de escrita do volume (`ngrrd.volume.writeMode`, 8.13.0).** `mmap` (default, ausente = `mmap`) grava
@@ -558,7 +656,35 @@ Fecha handles ociosos após o TTL efetivo da série, `max(handleIdleTtl, handleI
 passo 900 s fica aberta por 30 min em vez de 15, o que evita fechar e reabrir a série a cada passo; o custo é mais
 handles abertos, limitados por `maxOpenHandles` (confira `openHandles` contra `maxOpenHandles` antes do upgrade).
 `handleIdleTtlStepFactor: 0` restaura o comportamento anterior. A métrica `handles.idleTtlExtended`
-(`lifecycleMetrics`) conta as entradas abertas com TTL maior que o global. Toda operação passa por
+(`lifecycleMetrics`) conta as entradas abertas com TTL maior que o global.
+
+**Efeito de durabilidade do TTL estendido.** O fechamento por ociosidade faz checkpoint do handle. Com
+o TTL global, uma série de passo longo era fechada (e, portanto, recebia um checkpoint incidental) a
+cada passo; com o TTL estendido, ela deixa de receber esse checkpoint. **Sem `ngrrd.checkpoint` ligado e
+sem `CHECKPOINT`/`CLOSE` do cliente**, essas séries só ganham checkpoint no despejo por
+`maxOpenHandles` ou no shutdown do nó. Se a durabilidade dessas séries dependia do fechamento por
+ociosidade, ligue o checkpoint local (seção 6.7) ou volte a `handleIdleTtlStepFactor: 0`.
+
+**Contadores de churn e `NOT_OPEN` (8.15.0).** O fechamento por ociosidade e o despejo LRU **não**
+geram `NOT_OPEN`: a definição continua conhecida e a autocura reabre a série. O custo real de um TTL
+curto aparece nos contadores `handles.idleClosed`, `handles.evicted` e `handles.selfHealed`
+(`lifecycleMetrics`). Já o `NOT_OPEN` só sai quando a definição é desconhecida neste processo ou a
+reabertura falha, e passa a ser contado por causa: `notOpen.restart` (reinício do nó, ou série nunca
+aberta aqui), `notOpen.clientClosed` (`CLOSE` explícito de um cliente), `notOpen.migrated` (destino de
+migração depois do `discard`), `notOpen.reopenFailed` e `notOpen.frozen` (série congelada por
+migração). `errorsByStatus.NOT_OPEN` continua sendo o total. As causas `clientClosed` e `migrated` vêm de
+conjuntos limitados a 65.536 chaves cada: acima disso a classificação cai em `restart`, então ela é
+aproximada.
+
+**Writer abandonado.** O `close()` de um handle com force preso além do teto do writer
+(`WriterAbandonedException`, ver [blob volume §10.0](ngrrd-blob-volume.md)) não trava o registry:
+o fechamento do registry (ociosidade, despejo, migração, shutdown) tem prazo próprio. A série é então
+tratada como **abandonada**: o nó registra `SEVERE` com o marcador `NGRRD_WRITER_ABANDONED seriesKey=...`,
+incrementa `handles.writerAbandoned`, remove a entrada do registry e reabre a série do disco no
+próximo acesso. As amostras confirmadas desde o último checkpoint concluído podem ter sido perdidas.
+Por isso, o **primeiro `CHECKPOINT`/`FLUSH` remoto da série depois do abandono é recusado** (resposta de
+falha, não `OK`), para o cliente não receber uma confirmação de durabilidade falsa; o checkpoint
+seguinte volta ao normal. Escritas depois do abandono seguem o fluxo normal (reabrem a série). Toda operação passa por
 `withHandle`, que serializa contra fechamento concorrente; `withHandleSelfHealing` tenta
 `reopenIfKnown` antes de devolver `NOT_OPEN` — mas **não** reabre uma série fechada por `CLOSE`
 explícito do cliente: o `CLOSE` descarta a definição em cache da série (mesmo que o handle já
@@ -612,6 +738,16 @@ depois dela (por exemplo, porque o líder trocou antes de finalizar o tombstone)
 finalização. O líder, atual ou novo, não recria o placement nem refaz as fases; só conduz de novo
 se o próprio participante ainda não tiver apagado a cópia, sinal de que o catálogo perdeu a reserva.
 
+**Recuperação de exclusões pendentes (8.15.0).** O líder mantém um **índice de exclusões pendentes**
+(placements com `deletion` não nulo) em vez de copiar o catálogo inteiro a cada segundo. O índice é
+ressincronizado com o catálogo a cada 60 s e atualizado de forma oportunista quando uma exclusão é
+reservada; as leituras do laço de recuperação custam O(pendentes). Cada série tem **backoff por
+operação** (`seriesKey` + `operationId`), de 1 s a 60 s: uma exclusão presa deixa de gerar tentativas
+a cada segundo. A recuperação não recria o placement de uma exclusão já concluída (a remoção do
+placement é o marco de conclusão), e o reenvio de recuperação ao participante é limitado por geração.
+Uma exclusão presa por mais de 5 ciclos seguidos emite `NGRRD_DELETE_PENDING count=... oldestOperationId=...`
+em `WARNING`, no máximo uma vez por minuto.
+
 A marca inicial de séries sem journal usa `lastUpdate` validado do `.ngrr`, incluindo CRC;
 só séries válidas vazias usam o relógio atual. Metadado ilegível bloqueia a exclusão.
 Recepções posteriores usam limites superiores arredondados para o próximo intervalo de uma
@@ -627,8 +763,10 @@ Quarentena retorna `QUARANTINED`: registre a causa, alerte na tela Sistema com o
 As definições YAML e descritores de geometria são compartilhados e permanecem intactos;
 o único objeto físico por série é o `.ngrr`. O alocador recupera bytes usados, sem reduzir os shards.
 
-`ngrrd-admin metrics <nó>` inclui `seriesDeleted`, `seriesDelete.<motivo>`,
-`receiptFsyncs`, `quarantinedSeries` e `quarantinedBytes`. O dono registra
+`ngrrd-admin metrics <nó>` inclui `seriesDeleted`, `seriesDelete.<motivo>` (**obsoleto** desde a
+8.15.0, ver abaixo), `receiptFsyncs`, `quarantinedSeries` e `quarantinedBytes`. Na 8.15.0, as
+chaves `seriesDelete.*` ganham a leitura por resultado final e causa (seção 10): o contador sem prefixo
+conta **tentativas**, inclusive as da recuperação, e infla numa exclusão presa. O dono registra
 `NGRRD_SERIES_DELETED série=... dono=...`; quarentena registra `NGRRD_SERIES_QUARANTINED`.
 Consulte o [runbook de purga e recuperação](ngrrd-cluster-purga.md) antes de habilitar a purga.
 
@@ -693,9 +831,15 @@ séries sujas por conta própria e o flush periódico remoto do coordinator fica
   enfileiramento e só a grava no sucesso. Um checkpoint que falha deixa a série suja.
 - **Ciclo:** um executor de thread única (`ngrrd-local-checkpoint`) roda com
   `scheduleWithFixedDelay(interval)`: o próximo ciclo começa `interval` depois do fim do anterior e
-  nunca se sobrepõe a ele. O ciclo tira um instantâneo das séries sujas e espalha os disparos por
-  ~80% do intervalo, com cadência por prazo: o disparo `i` de `n` sai em
-  `início + i × 0,8 × interval / n`.
+  nunca se sobrepõe a ele. O ciclo tira um instantâneo das séries candidatas e espalha os disparos por
+  `spreadFraction` do intervalo (`ngrrd.checkpoint.spreadFraction`, padrão `0.8`, em `(0, 1]`), com
+  cadência por prazo: o disparo `i` de `n` sai em `início + i × spreadFraction × interval / n`. Um valor
+  menor espalha menos e deixa mais folga no fim do intervalo.
+- **Índice incremental de sujas (8.15.0).** Com o checkpoint local ligado, o registry mantém um índice
+  de séries que é um **superconjunto** das sujas, atualizado na escrita e podado sob o lock da entrada,
+  no ciclo e nos fechamentos. O ciclo e as métricas leem o índice em vez de varrer todas as entradas do
+  registry a cada ciclo e a cada tick de status. Com o checkpoint local desligado, não há índice e
+  `dirtySeries` continua calculado por varredura.
 - **Por série:** `tryLock` do lock da série, sem renovar o TTL de ociosidade (`handleIdleTtl`). Série
   ocupada fica para o próximo ciclo (`skippedBusy`). Série congelada por migração, fechada ou ausente
   é pulada. O checkpoint é enfileirado sob o lock, que é solto na hora. Um semáforo de `maxInFlight`
@@ -710,11 +854,37 @@ séries sujas por conta própria e o flush periódico remoto do coordinator fica
   são abandonados sem risco, porque o `registry.close()` faz checkpoint e close de cada handle atrás
   deles na mesma fila.
 - **Métricas:** em `NodeMetricsSnapshot.lifecycleMetrics`, impressas pelo `ngrrd-admin metrics`:
-  `localCheckpoint.enabled` (0/1), `.dirtySeries`, `.cycles`, `.lastCycleMs`, `.lastCycleSeries`
-  (séries sujas no instantâneo), `.checkpointed`, `.skippedBusy`, `.failures` e `.overruns`. Com a
-  opção desligada saem `enabled=0`, contadores zerados e `dirtySeries` calculado. A linha
-  `NGRRD_NODE_STATUS` ganha no fim `lcEnabled`, `lcDirty`, `lcCycles`, `lcLastCycleMs`,
-  `lcLastCycleSeries`, `lcCheckpointed`, `lcSkippedBusy`, `lcFailures` e `lcOverruns`.
+  `localCheckpoint.enabled` (0/1), `.dirtySeries`, `.cycles`, `.lastCycleMs`, `.lastCycleSeries`,
+  `.checkpointed`, `.skippedBusy`, `.failures` e `.overruns`. Com a opção desligada saem `enabled=0`,
+  contadores zerados e `dirtySeries` calculado. A linha `NGRRD_NODE_STATUS` ganha no fim `lcEnabled`,
+  `lcDirty`, `lcCycles`, `lcLastCycleMs`, `lcLastCycleSeries`, `lcCheckpointed`, `lcSkippedBusy`,
+  `lcFailures` e `lcOverruns`. **Semântica desde a 8.15.0** (com o checkpoint local ligado):
+  `.dirtySeries` é o tamanho do índice, um **limite superior atrasado em um ciclo** (uma série limpa só sai
+  do índice na poda seguinte); `.lastCycleSeries` conta as **candidatas** do último ciclo (sujas e limpas
+  ainda no índice), e `.lastCycleStarted` conta os checkpoints de fato enfileirados nele. Desligado,
+  `dirtySeries` é exato e `lastCycleSeries` fica como antes.
+
+**Pool dedicado de force (`ngrrd.checkpoint.threads`, 8.15.0).** Por padrão (`threads: 0`), o
+`msync`/`fdatasync` de cada checkpoint roda dentro da fila FIFO do writer da série, e um disco com
+`fsync` lento segura a fila daquela série e o `ngrrd-writer-pool`. Com `threads` > 0, o nó cria um pool
+fixo `ngrrd-checkpoint-force-N` (threads daemon, fila sem limite; a entrada já é limitada por
+`maxInFlight` e pela concorrência de RPC) e o **force** do checkpoint (local, `CHECKPOINT`/`FLUSH` remoto
+e migração) sai do writer e roda nesse pool, no desenho de duas fases do
+[blob volume §10.0](ngrrd-blob-volume.md): a fase A (materializar o CDP) continua na fila da série, e só a
+fase B (o force) é destacada. Vale também com `ngrrd.checkpoint.enabled: false`. O pool só entra em
+ação com o volume em `SHARDED_BLOB`; o padrão `0` preserva o comportamento da 8.14. Ele é encerrado
+depois do `registry.close()`, que espera os forces em voo de cada writer; passados 5 s, o nó registra
+`NGRRD_CHECKPOINT_FORCE_POOL ... dropped=N` e interrompe o que sobrou.
+
+Métricas do pool e da fila (`lifecycleMetrics`; medem **só o checkpoint local**):
+`localCheckpoint.queueWaitMsP99` e `.queueWaitMsMax` (do enfileiramento até o início do force: fila FIFO,
+fila do pool de writers, fase A e fila do pool de force), `localCheckpoint.forceMsP99` e `.forceMsMax`
+(duração do force) e `localCheckpoint.coalesced` (checkpoints sem amostra nova, que não fizeram force). Os
+valores estão em **milissegundos truncados**: um p99 abaixo de 1 ms aparece como `0`. Os `*Max` são o
+**máximo recente** (60 a 120 s, não o máximo desde a subida). A linha `NGRRD_NODE_STATUS` traz `lcQwP99=` e
+`lcForceP99=`.
+
+![Checkpoint com force destacado](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan-dev/nishi-utils/main/doc/oss/diagrams/checkpoint_force_detached.puml)
 
 **Falha de checkpoint no close.** Ao fechar um handle (`CLOSE` remoto, ociosidade, LRU, shutdown do
 nó), o registry faz checkpoint e close. Uma falha desse checkpoint final só é logada
@@ -920,15 +1090,50 @@ recente em cache (TTL de 5 s) sem nova consulta. Desde a 8.14.0, `checkpointLate
 checkpoint remoto de ponta a ponta, incluindo a espera pelo writer, e `lifecycleMetrics` traz as
 chaves `localCheckpoint.*` (seção 6.7).
 
+**Novas na 8.15.0 (nó).**
+
+- `blobStats` (`BlobVolumeSummary`): `declaredCapacityBytes`, `reservedBytes` e
+  `fillOfDeclaredCapacity` (`(live + reservado) / declarada`, a conta da recusa a 95%; pode passar de
+  1,0; `0` = capacidade declarada desconhecida, inclusive de um nó anterior à 8.15.0). O
+  `maxFillRatio` continua existindo, mas **não serve para alerta** (dente de serra, ver
+  [blob volume §11](ngrrd-blob-volume.md)).
+- `LatencySnapshot.recentMaxMicros` em todos os histogramas: o máximo dos últimos 60 a 120 s (o
+  `maxMicros` segue sendo o máximo desde a subida). Um nó anterior à 8.15.0 devolve `0`.
+- `lifecycleMetrics`:
+  - `volume.shardGrows`, `volume.shardGrowMsTotal`, `.shardGrowMsMax` e `.shardGrowMsLast`: crescimentos
+    de shard e quanto tempo cada um bloqueou o volume (ms truncados);
+  - `localCheckpoint.queueWaitMsP99`/`.queueWaitMsMax`/`.forceMsP99`/`.forceMsMax`/`.coalesced`/
+    `.lastCycleStarted` (seção 6.7);
+  - `handles.idleTtlExtended`, `handles.idleClosed`, `handles.evicted`, `handles.selfHealed` e
+    `handles.writerAbandoned` (seções 6.3);
+  - `notOpen.restart`, `.clientClosed`, `.migrated`, `.reopenFailed` e `.frozen` (seção 6.3);
+  - `seriesDelete.requests.<STATUS>` (resposta a cada pedido de **cliente**, uma por chave),
+    `seriesDelete.completed` (exclusões concluídas, uma por operação), `seriesDelete.cancelled` (reservas
+    canceladas), `seriesDelete.attemptFailed.{NO_LEADER,TIMEOUT,PARTICIPANT,STALE,OTHER}` (tentativas que
+    falharam, por causa), `seriesDelete.recoveryAttempts` (chamadas vindas da recuperação) e
+    `seriesDelete.pending` (gauge: exclusões pendentes no último ciclo de recuperação).
+- **Obsoletas:** as chaves `seriesDelete.<STATUS>` sem prefixo (contam **tentativas**, inclusive as da
+  recuperação a cada ciclo, então uma exclusão presa as infla) continuam preenchidas na 8.15.x e saem na
+  **9.0**; use `seriesDelete.requests.*`, `completed` e `attemptFailed.*`.
+- **Semântica alterada:** com o checkpoint local ligado, `localCheckpoint.dirtySeries` é um limite
+  superior atrasado em um ciclo, e `lastCycleSeries` conta candidatas (seção 6.7).
+
+**Novas na 8.15.0 (cliente, `ClientMetricsSnapshot`).** `rpcLatencyByCommand` (latência por comando,
+cada uma com `recentMaxMicros`; comandos além de 64 entradas vão para `"other"`), `routes` (rotas de escrita
+no buffer agora; uma por série com handle gravável aberto ou com escrita sem desfecho), `routesRemoved`
+(rotas removidas por ficarem sem handle e ociosas) e `internedDefinitions` (definições YAML internadas
+pelo cliente agora; teto fixo de 4.096). O `rpcLatency` agregado é **obsoleto**
+(`@Deprecated(since = "8.15.0")`), continua preenchido na 8.15.x e sai na **9.0**.
+
 `ClientMetricsSnapshot` (no cliente): `samplesEnqueued`/`samplesSent`/`samplesFailed`,
 `batchesSent`, `retriesByStatus`, `bufferedSamples` por nó de destino, `openHandles`,
-`rpcLatency` (agregada, não quebrada por comando), `placeCount` e, desde a 8.7.0, `ownerLookups`
+`rpcLatency` (agregada, não quebrada por comando; **obsoleta** desde a 8.15.0, ver abaixo), `placeCount` e, desde a 8.7.0, `ownerLookups`
 (consultas ao líder feitas pelo `WriteDispatcher` para desempatar uma dica de dono contraditória) e
 `redirectCycles` (dicas de `WRONG_OWNER` classificadas como contraditórias — apontam para o próprio
 nó, para um nó já visitado no episódio, divergem do dono confirmado, ou excedem 4 saltos).
 
 Integração opcional via `NgrrdClusterMetricsListener` (storage node e cliente); log periódico
-`NGRRD_NODE_STATUS` (marker de log do projeto — base para futuros Docker ITs; inclui
+`NGRRD_NODE_STATUS` (a 8.15.0 acrescenta `fillDeclared=`, `lcQwP99=` e `lcForceP99=`; marker de log do projeto — base para futuros Docker ITs; inclui
 `leaderConfirmations`/`leaderConfirmationP99us`, as confirmações de dono no líder antes de criar
 uma série ou responder `NOT_FOUND`, `catalogLag=` — forma curta do lag da réplica local do
 catálogo, seção 3 — e `redirectConfirmations`/`redirectOverrides`/`redirectConfirmationFailures`/
@@ -940,7 +1145,18 @@ promove um nó a `DRAINED`, `NGRRD_RECONCILE`/`NGRRD_RECONCILE_ORPHAN_DELETED`/`
 a cada ciclo do reconciliador (com `forgottenPruned`, marcas de série esquecida descartadas no
 ciclo), `NGRRD_OWNER_REDIRECT_OVERRIDE` (nível `FINE`, por série, quando o líder diverge da réplica
 local ao confirmar um redirecionamento), e `NGRRD_STORAGE_NODE_STARTED` (processo pronto, emitido por
-`NgrrdStorageNodeMain`).
+`NgrrdStorageNodeMain`). Marcadores novos da 8.15.0:
+
+- `NGRRD_VOLUME_FILL nodeId=... level=... previous=... fill=... declaredCapacityBytes=... reservedBytes=...`,
+  emitido **só na mudança de faixa** do `fillOfDeclaredCapacity`: `WARNING` ao subir para
+  `level=WARN` (>= 0,80), `CRITICAL` (>= 0,90) ou `REFUSING` (>= 0,95), e `INFO` com `level=NORMAL` na
+  volta. Histerese de 1 ponto percentual na descida. Capacidade declarada `0` (desconhecida) não muda
+  a faixa. Os limiares não são configuráveis;
+- `NGRRD_DELETE_PENDING count=... oldestOperationId=...` (`WARNING`, no máximo uma vez por minuto):
+  exclusão pendente por mais de 5 ciclos de recuperação seguidos (seção 6.5);
+- `NGRRD_WRITER_ABANDONED seriesKey=...` (`SEVERE`): writer abandonado com force preso (seção 6.3);
+- `NGRRD_CHECKPOINT_FORCE_POOL ... dropped=N` (`WARNING`): forces em voo não terminaram no shutdown
+  do pool (seção 6.7).
 
 ## 11. CLI de administração
 
@@ -1048,6 +1264,13 @@ imprime só a confirmação do disparo, como antes.
   comportamento é **pré-existente no core** (não introduzido por este módulo) e já está
   documentado como tal desde o M4.
 
+- **Entrega entre clientes sem cerca (zumbi), até a 8.16.** O `release` (seção 5.3) garante a
+  fronteira de quem entrega, mas não impede que um cliente que estourou o prazo do grupo continue
+  escrevendo depois que outro assumiu a partição. Nessa janela vale o último escritor. A cerca por época
+  de escritor (`FENCED`) está prevista para a 8.16.
+- **Durabilidade do `release` sem checkpoint.** `RELEASED` sem `checkpoint: true` é ACK do dono, sem
+  fsync (seção 5.3): uma queda abrupta do nó logo depois pode perder as últimas amostras.
+
 ### 13.2. Vermelho conhecido deste módulo
 
 Nenhum desde a 8.8.0. `LeaderFailoverDuringMigrationClusterTest` falhava intermitentemente
@@ -1119,6 +1342,14 @@ Fluxo de escrita/leitura (open → place → open → writeBatch/checkpoint → 
 Fluxo de migração e rebalanceamento (start, chunks, commit, flip, finish; abort e resolução por novo líder):
 
 ![Sequência de migração](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan-dev/nishi-utils/main/doc/oss/diagrams/ngrrd_cluster_sequence_migration.puml)
+
+Liberação de séries e entrega entre clientes (revoke → release → commit; assign → open):
+
+![Sequência de liberação de séries](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan-dev/nishi-utils/main/doc/oss/diagrams/ngrrd_cluster_sequence_release.puml)
+
+Checkpoint com force destacado do writer, no pool `ngrrd.checkpoint.threads`:
+
+![Checkpoint com force destacado](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan-dev/nishi-utils/main/doc/oss/diagrams/checkpoint_force_detached.puml)
 
 Estados de `SeriesPlacement` e do destino durante uma migração (`MigrateStatus`):
 
