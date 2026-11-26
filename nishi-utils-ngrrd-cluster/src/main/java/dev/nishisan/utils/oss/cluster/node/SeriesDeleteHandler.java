@@ -52,6 +52,32 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
     /** Só a thread de recuperação (ou o teste, no lugar dela) toca estes dois campos. */
     private volatile int pendingCycles;
     private volatile long pendingLoggedAtMs = NEVER_LOGGED;
+    /** Primeiro intervalo do backoff da recuperação, depois da primeira tentativa falha de uma operação. */
+    static final Duration RECOVERY_BACKOFF_INITIAL = Duration.ofSeconds(1);
+    /** Teto do backoff da recuperação: toda exclusão pendente é tentada de novo pelo menos a esta cadência. */
+    static final Duration RECOVERY_BACKOFF_MAX = Duration.ofSeconds(60);
+    /**
+     * Período da reconstrução do índice de pendentes do catálogo enquanto este nó segue líder. Cobre a
+     * escrita que chega à réplica do líder sem passar pelo {@code CatalogService} dele (ex.: a de um líder
+     * antigo, encaminhada depois da reconstrução feita ao assumir).
+     */
+    static final Duration PENDING_INDEX_RESYNC = Duration.ofMinutes(5);
+    private static final long NEVER_REBUILT = Long.MIN_VALUE;
+    /**
+     * Instante ({@link #clock}) da última reconstrução do índice de pendentes; {@link #NEVER_REBUILT} força
+     * a próxima. Volta a {@link #NEVER_REBUILT} sempre que o nó deixa de ser líder sincronizado, para que
+     * o novo mandato comece de uma varredura completa. Só a thread de recuperação (ou o teste) toca.
+     */
+    private volatile long pendingIndexRebuiltAtMs = NEVER_REBUILT;
+    /**
+     * Backoff da recuperação por {@code operationId}. Uma entrada só existe enquanto a operação está
+     * pendente: sai quando a tentativa termina ({@code DELETED}/{@code NOT_FOUND}), quando a reserva some
+     * do catálogo e quando o nó deixa de ser líder; o tamanho é limitado ao número de pendentes.
+     */
+    private final Map<String, RecoveryBackoff> recoveryBackoff = new ConcurrentHashMap<>();
+
+    /** Falhas seguidas da recuperação de uma operação e o instante a partir do qual ela é tentada de novo. */
+    private record RecoveryBackoff(int failures, long nextAttemptAtMs) { }
 
     /**
      * @param reachableNodeIds        storages alcançáveis na visão do líder (o próprio nó é sempre
@@ -358,9 +384,18 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
      * {@link #beginAttempt}, chamado por {@code delete(request, Origin.RECOVERY)} e por
      * {@code recoverReservation}; {@code seriesDelete.pending} e o alarme {@code NGRRD_DELETE_PENDING} saem de
      * {@link #trackPending}. Quem reescrever este laço só precisa manter essas chamadas.
+     *
+     * <p>No líder, as pendentes vêm de {@link CatalogView#pendingDeletionsLocal()} (um índice, custo
+     * proporcional aos pendentes) e não de uma cópia do catálogo. O índice é reconstruído por varredura
+     * completa quando o nó passa a ser líder sincronizado e a cada {@link #PENDING_INDEX_RESYNC}. Cada
+     * operação tem backoff exponencial próprio, de {@link #RECOVERY_BACKOFF_INITIAL} a
+     * {@link #RECOVERY_BACKOFF_MAX}; o gauge conta todas as pendentes, inclusive as em espera.</p>
      */
     void recover() {
-        if (closed || !synced.getAsBoolean()) return;
+        if (closed || !synced.getAsBoolean()) {
+            pendingIndexRebuiltAtMs = NEVER_REBUILT;
+            return;
+        }
         try {
             for (var local : lifecycle.journal().snapshot().entrySet()) {
                 var entry = local.getValue(); String key = local.getKey();
@@ -376,19 +411,64 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
                 }
             }
             if (leader.getAsBoolean()) {
-                List<Map.Entry<String, SeriesPlacement>> pending = new ArrayList<>();
-                for (var item : catalog.placementsLocal().entrySet()) {
-                    if (item.getValue().deletion() != null) pending.add(item);
+                long now = clock.millis();
+                long rebuiltAt = pendingIndexRebuiltAtMs;
+                if (rebuiltAt == NEVER_REBUILT || now - rebuiltAt >= PENDING_INDEX_RESYNC.toMillis()) {
+                    int found = catalog.rebuildPendingDeletions();
+                    pendingIndexRebuiltAtMs = now;
+                    LOG.log(Level.FINE, "series deletion pending index rebuilt: found=" + found);
                 }
+                List<Map.Entry<String, SeriesPlacement>> pending = new ArrayList<>(catalog.pendingDeletionsLocal().entrySet());
                 trackPending(pending);
+                Set<String> pendingOperations = new HashSet<>();
+                for (var item : pending) pendingOperations.add(item.getValue().deletion().operationId());
+                recoveryBackoff.keySet().retainAll(pendingOperations);
                 for (var item : pending) {
-                    delete(new DeleteRequest(item.getKey(), new DeletePrecondition(item.getValue().deletion().lastWriteBefore()),
-                            item.getValue().deletion().operationId()), Origin.RECOVERY);
+                    SeriesDeletion deletion = item.getValue().deletion();
+                    RecoveryBackoff backoff = recoveryBackoff.get(deletion.operationId());
+                    if (backoff != null && clock.millis() < backoff.nextAttemptAtMs()) continue;
+                    DeleteResult result = delete(new DeleteRequest(item.getKey(),
+                            new DeletePrecondition(deletion.lastWriteBefore()), deletion.operationId()), Origin.RECOVERY);
+                    recordRecoveryOutcome(deletion.operationId(), backoff, result);
                 }
             } else {
+                pendingIndexRebuiltAtMs = NEVER_REBUILT;
+                recoveryBackoff.clear();
                 trackPending(List.of());
             }
         } catch (RuntimeException e) { LOG.log(Level.FINE, "series deletion recovery deferred", e); }
+    }
+
+    /**
+     * Encerra o backoff da operação quando a tentativa terminou ({@code DELETED} ou {@code NOT_FOUND}); em
+     * qualquer outro desfecho, agenda a próxima tentativa com o intervalo dobrado
+     * ({@link #recoveryBackoffDelay}).
+     */
+    private void recordRecoveryOutcome(String operationId, RecoveryBackoff previous, DeleteResult result) {
+        DeleteStatus status = result == null ? null : result.status();
+        if (status == DeleteStatus.DELETED || status == DeleteStatus.NOT_FOUND) {
+            recoveryBackoff.remove(operationId);
+            return;
+        }
+        int failures = previous == null ? 1 : previous.failures() + 1;
+        recoveryBackoff.put(operationId,
+                new RecoveryBackoff(failures, clock.millis() + recoveryBackoffDelay(failures).toMillis()));
+    }
+
+    /**
+     * Intervalo depois de {@code failures} tentativas falhas seguidas: {@link #RECOVERY_BACKOFF_INITIAL}
+     * dobrado a cada falha, limitado a {@link #RECOVERY_BACKOFF_MAX} (1, 2, 4, …, 32, 60, 60 s).
+     */
+    static Duration recoveryBackoffDelay(int failures) {
+        if (failures < 1) throw new IllegalArgumentException("failures deve ser >= 1");
+        int exponent = Math.min(failures - 1, 30);
+        Duration delay = RECOVERY_BACKOFF_INITIAL.multipliedBy(1L << exponent);
+        return delay.compareTo(RECOVERY_BACKOFF_MAX) > 0 ? RECOVERY_BACKOFF_MAX : delay;
+    }
+
+    /** Operações com backoff de recuperação registrado (diagnóstico e testes). */
+    int recoveryBackoffSize() {
+        return recoveryBackoff.size();
     }
 
     /**

@@ -22,12 +22,16 @@ import dev.nishisan.utils.ngrid.structures.Consistency;
 import dev.nishisan.utils.ngrid.structures.DistributedMap;
 import dev.nishisan.utils.ngrid.structures.NGridNode;
 import dev.nishisan.utils.ngrid.structures.NGridNodeBuilder;
+import dev.nishisan.utils.oss.cluster.rpc.CoordinationLocks;
 
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 /**
@@ -60,6 +64,16 @@ public final class CatalogService implements CatalogView {
     private final java.util.concurrent.ConcurrentMap<String, GeometryDescriptor> geometryCache = new java.util.concurrent.ConcurrentHashMap<>();
     private final Object[] placementLocks = java.util.stream.IntStream.range(0, 256)
             .mapToObj(i -> new Object()).toArray();
+    /**
+     * Índice das séries com exclusão pendente ({@code deletion != null}), para que a recuperação do líder não
+     * varra o catálogo inteiro a cada ciclo. É um <em>superconjunto</em> da verdade: a chave entra antes de a
+     * reserva ser gravada e só sai depois de a gravação sem reserva (ou a remoção) dar certo, sempre sob
+     * {@link #placementLock(String)}. Entradas velhas são podadas por {@link #pendingDeletionsLocal()}, que
+     * confere cada uma no catálogo. Escritas que chegam à réplica local sem passar por esta instância
+     * (replicação, snapshot, carga do disco, escrita encaminhada por outro nó) são cobertas por
+     * {@link #rebuildPendingDeletions()}, que o líder chama ao assumir e periodicamente.
+     */
+    private final Set<String> pendingDeletionKeys = ConcurrentHashMap.newKeySet();
 
     public CatalogService(DistributedMap<String, SeriesPlacement> catalog,
             DistributedMap<String, StorageNodeStatus> nodes) {
@@ -117,17 +131,88 @@ public final class CatalogService implements CatalogView {
         return catalog.getOptional(seriesKey, Consistency.STRONG);
     }
 
-    /** Grava o placement da série; roteado ao líder pelo próprio {@link DistributedMap}. */
+    /**
+     * Grava o placement da série; roteado ao líder pelo próprio {@link DistributedMap}.
+     *
+     * <p>Mantém o índice de exclusões pendentes sob {@link #placementLock(String)} (reentrante: os chamadores
+     * já o seguram). Uma reserva entra no índice antes da gravação, e a saída só acontece depois de uma
+     * gravação sem reserva bem-sucedida: se a gravação falhar, o índice fica com uma chave a mais, nunca
+     * a menos.</p>
+     */
     @Override
     public void putPlacement(String seriesKey, SeriesPlacement placement) {
-        catalog.put(seriesKey, placement);
-        admissionEntries.put(seriesKey, placement);
+        try (var guard = CoordinationLocks.acquire(placementLock(seriesKey))) {
+            boolean pending = placement.deletion() != null;
+            if (pending) {
+                pendingDeletionKeys.add(seriesKey);
+            }
+            catalog.put(seriesKey, placement);
+            admissionEntries.put(seriesKey, placement);
+            if (!pending) {
+                pendingDeletionKeys.remove(seriesKey);
+            }
+        }
     }
 
-    /** Remove o placement da série; roteado ao líder pelo próprio {@link DistributedMap}. */
+    /**
+     * Remove o placement da série; roteado ao líder pelo próprio {@link DistributedMap}. A chave sai do
+     * índice de exclusões pendentes só depois de a remoção dar certo, sob {@link #placementLock(String)}.
+     */
+    @Override
     public void removePlacement(String seriesKey) {
-        catalog.remove(seriesKey);
-        admissionEntries.remove(seriesKey);
+        try (var guard = CoordinationLocks.acquire(placementLock(seriesKey))) {
+            catalog.remove(seriesKey);
+            admissionEntries.remove(seriesKey);
+            pendingDeletionKeys.remove(seriesKey);
+        }
+    }
+
+    /**
+     * Placements com exclusão pendente na visão local, lidos do índice: custo proporcional ao número de
+     * pendentes, não ao tamanho do catálogo. Cada chave do índice é conferida no catálogo; a que não tem
+     * mais reserva é podada sob {@link #placementLock(String)}, relida ali para não perder uma reserva
+     * sendo gravada naquele instante.
+     */
+    @Override
+    public Map<String, SeriesPlacement> pendingDeletionsLocal() {
+        Map<String, SeriesPlacement> pending = new HashMap<>();
+        for (String key : pendingDeletionKeys) {
+            SeriesPlacement placement = catalog.getOptional(key, Consistency.EVENTUAL).orElse(null);
+            if (placement != null && placement.deletion() != null) {
+                pending.put(key, placement);
+                continue;
+            }
+            try (var guard = CoordinationLocks.acquire(placementLock(key))) {
+                SeriesPlacement current = catalog.getOptional(key, Consistency.EVENTUAL).orElse(null);
+                if (current != null && current.deletion() != null) {
+                    pending.put(key, current);
+                } else {
+                    pendingDeletionKeys.remove(key);
+                }
+            }
+        }
+        return pending;
+    }
+
+    /**
+     * Acrescenta ao índice toda série da réplica local com {@code deletion != null}. Percorre as chaves
+     * do mapa sem copiá-lo; só acrescenta (a poda é de {@link #pendingDeletionsLocal()}), então não
+     * disputa com as gravações concorrentes. Custo O(catálogo): o líder chama ao assumir e com período
+     * longo, nunca a cada ciclo.
+     *
+     * @return quantas séries com exclusão pendente a varredura encontrou
+     */
+    @Override
+    public int rebuildPendingDeletions() {
+        int found = 0;
+        for (String key : catalog.keySet()) {
+            SeriesPlacement placement = catalog.getOptional(key, Consistency.EVENTUAL).orElse(null);
+            if (placement != null && placement.deletion() != null) {
+                pendingDeletionKeys.add(key);
+                found++;
+            }
+        }
+        return found;
     }
 
     /** Cópia imutável do catálogo na visão local (eventual) do nó. */

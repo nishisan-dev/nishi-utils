@@ -70,6 +70,27 @@ public interface CatalogView {
     default void removePlacement(String seriesKey) { throw new UnsupportedOperationException("removePlacement"); }
 
     /**
+     * Placements com exclusão pendente ({@code deletion != null}) na visão local do nó. O default filtra
+     * {@link #placementsLocal()} (serve aos fakes); {@link CatalogService} lê de um índice, com custo
+     * proporcional aos pendentes.
+     */
+    default Map<String, SeriesPlacement> pendingDeletionsLocal() {
+        Map<String, SeriesPlacement> pending = new java.util.HashMap<>();
+        placementsLocal().forEach((key, placement) -> {
+            if (placement.deletion() != null) pending.put(key, placement);
+        });
+        return pending;
+    }
+
+    /**
+     * Reconstrói, a partir da réplica local, o índice por trás de {@link #pendingDeletionsLocal()}. Chamado
+     * pelo líder ao assumir e com período longo. O default não tem índice e devolve {@code -1}.
+     *
+     * @return quantas séries com exclusão pendente foram encontradas, ou {@code -1} sem índice
+     */
+    default int rebuildPendingDeletions() { return -1; }
+
+    /**
      * Publica/atualiza o status de um storage node; roteado ao líder pelo próprio {@code DistributedMap}
      * — usado por {@code NodeStatusReporter} (isolamento do {@code CatalogService}/{@code DistributedMap}
      * reais para testes com fake, mesmo padrão dos demais métodos desta interface).

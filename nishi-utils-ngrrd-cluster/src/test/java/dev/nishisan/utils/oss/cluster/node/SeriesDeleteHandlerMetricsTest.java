@@ -271,6 +271,8 @@ class SeriesDeleteHandlerMetricsTest {
         handler.delete(request("k-fail"));
         placePending("k-pending", true);
         handler.recover();
+        // Backoff da recuperação: a segunda tentativa da mesma operação só sai 1 s depois da primeira falha.
+        clock.advance(SeriesDeleteHandler.RECOVERY_BACKOFF_INITIAL);
         handler.recover();
 
         Map<String, Long> metrics = lifecycle.deleteMetrics();
