@@ -761,7 +761,9 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
      *
      * <p>Ao alcançar a fronteira, sob {@code route.lock}, conclui os waiters de marca já cobertos e colhe as falhas:
      * em {@code MARKS}, as faixas ainda não reportadas até a fronteira, contadas por status — elas deixam de ir para
-     * uma marca, então cada falha é reportada uma única vez, à marca ou ao release; em {@code BARRIER}, a primeira
+     * uma marca, então cada falha é reportada uma única vez entre marcas e releases; com releases sobrepostos da mesma
+     * rota, cada um deles reporta as falhas que a sua fronteira cobre, inclusive as que outro já colheu; em
+     * {@code BARRIER}, a primeira
      * falha da rota, se estiver até a fronteira. Série removida ou em quarentena ({@code failureCode}) vira
      * {@link ReleaseDrain.Outcome#SERIES_DELETED}. Uma rota que não alcança a fronteira no prazo vira
      * {@link ReleaseDrain.Outcome#TIMED_OUT}, sem colheita: as escritas seguem em segundo plano e as falhas que
@@ -819,8 +821,27 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         boolean writeFailures;
         String message;
         if (marksMode) {
-            route.collectFailures((status, count) -> failed.merge(status, count, Long::sum), boundary);
+            List<FailedRange> taken = new ArrayList<>();
+            route.takeFailures(boundary, taken);
+            for (FailedRange range : taken) {
+                failed.merge(range.status(), range.to() - range.from() + 1, Long::sum);
+            }
+            // Falhas que outro release sobreposto da mesma rota já colheu continuam valendo para este, até a fronteira
+            // dele: a marca nunca as vê, mas cada release ativo que as cobre as reporta.
+            if (route.releaseHarvested != null) {
+                for (FailedRange range : route.releaseHarvested) {
+                    if (range.from() <= boundary) {
+                        failed.merge(range.status(), Math.min(range.to(), boundary) - range.from() + 1, Long::sum);
+                    }
+                }
+            }
             endReleaseProtection(route, ticket);
+            if (route.activeReleases > 0 && !taken.isEmpty()) {
+                if (route.releaseHarvested == null) {
+                    route.releaseHarvested = new ArrayList<>();
+                }
+                route.releaseHarvested.addAll(taken);
+            }
             if (isIdle(route)) {
                 synchronized (pendingLock) {
                     pendingRoutes.remove(route);
@@ -877,8 +898,8 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
 
     /**
      * O release do ticket deixa de proteger as falhas da rota contra marcas novas, uma única vez por ticket (na
-     * colheita ou no {@link #finishRelease}). A proteção da rota só sai quando o último release ativo termina. Chamado
-     * sob {@code route.lock}.
+     * colheita ou no {@link #finishRelease}). A proteção da rota — e a lista das falhas já colhidas por releases
+     * sobrepostos — só sai quando o último release ativo termina. Chamado sob {@code route.lock}.
      */
     private static void endReleaseProtection(SeriesRoute route, ReleaseTicket ticket) {
         if (!ticket.protecting) {
@@ -887,6 +908,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         ticket.protecting = false;
         if (--route.activeReleases == 0) {
             route.releaseBoundary = NO_RELEASE;
+            route.releaseHarvested = null;
         }
     }
 
@@ -2058,6 +2080,12 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
          * {@link #lock}.
          */
         private int activeReleases;
+        /**
+         * {@code MARKS}: faixas colhidas por um release enquanto outro da mesma rota seguia ativo ({@code null} sem
+         * nenhuma). Cada release ativo soma as que a fronteira dele cobre; sai quando {@code activeReleases} chega a 0.
+         * Só muda sob {@link #lock}.
+         */
+        private List<FailedRange> releaseHarvested;
 
         SeriesRoute(String key, String owner, String generation, Object holder) {
             this.key = key;
@@ -2117,6 +2145,22 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
          * Entrega a {@code sink} as falhas com sequência {@code <= boundary}, partindo a faixa que cruza a fronteira;
          * o que foi entregue sai de {@link #unreportedFailures} e não vai mais para nenhuma marca.
          */
+        /**
+         * Tira de {@link #unreportedFailures} as faixas com sequência {@code <= boundary}, partindo a que cruza a
+         * fronteira, e as acrescenta a {@code into}, na ordem.
+         */
+        void takeFailures(long boundary, List<FailedRange> into) {
+            while (!unreportedFailures.isEmpty() && unreportedFailures.peekFirst().from() <= boundary) {
+                FailedRange range = unreportedFailures.pollFirst();
+                if (range.to() > boundary) {
+                    unreportedFailures.addFirst(new FailedRange(boundary + 1, range.to(), range.status()));
+                    into.add(new FailedRange(range.from(), boundary, range.status()));
+                } else {
+                    into.add(range);
+                }
+            }
+        }
+
         void collectFailures(FailureSink sink, long boundary) {
             while (!unreportedFailures.isEmpty() && unreportedFailures.peekFirst().from() <= boundary) {
                 FailedRange range = unreportedFailures.pollFirst();

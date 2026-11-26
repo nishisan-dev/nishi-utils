@@ -258,10 +258,49 @@ class ReleaseTest {
         var marked = mark.completion().get(10, TimeUnit.SECONDS);
 
         assertEquals(0L, marked.samplesFailed(), "a marca criada durante o release não colhe a falha dele");
-        // A falha vai a exatamente um dos dois releases sobrepostos: o primeiro que colher a rota.
-        assertEquals(1L, r1.failedSamples() + r2.failedSamples(), "r1=" + r1.series() + " r2=" + r2.series());
-        assertTrue(r1.series().get("s").status() == ReleaseStatus.WRITE_FAILURES
-                || r2.series().get("s").status() == ReleaseStatus.WRITE_FAILURES);
+        // Releases sobrepostos da mesma série veem, cada um, a falha que a fronteira dele cobre.
+        assertEquals(ReleaseStatus.WRITE_FAILURES, r1.series().get("s").status(), "r1=" + r1.series());
+        assertEquals(ReleaseStatus.WRITE_FAILURES, r2.series().get("s").status(), "r2=" + r2.series());
+        assertEquals(1L, r1.failedSamples());
+        assertEquals(1L, r2.failedSamples());
+        assertFalse(dispatcher.hasRoute("s"));
+    }
+
+    @Test
+    void releaseSobrepostoQueColheAntesNaoEscondeAFalhaDoOutro() throws Exception {
+        var entered = gate();
+        var ack = gate();
+        rpc.writes = (owner, request) -> {
+            if (request.writes().getFirst().seriesKey().equals("a")) {
+                entered.countDown();
+                awaitGate(ack);
+                return respond(request, k -> SeriesStatus.OK);
+            }
+            return respond(request, k -> SeriesStatus.ERROR);
+        };
+        start(WriteFailureReporting.MARKS);
+        RemoteSeriesHandle stuck = open("a");
+        RemoteSeriesHandle failed = open("s");
+        failed.write("ds", new Sample(1, 1));
+        Await.untilTrue("falha final de s", WAIT, () -> dispatcher.samplesFailed() == 1);
+        stuck.write("ds", new Sample(1, 1));
+        assertTrue(entered.await(5, TimeUnit.SECONDS));
+
+        // R1 admitiu a escrita com falha de s, mas para em "a"; R2 só de s colhe primeiro.
+        CompletableFuture<ReleaseResult> first = releaser.release(List.of("a", "s"), ReleaseOptions.defaults());
+        Await.untilTrue("admissão encerrada", WAIT, () -> !stuck.isOpen() && !failed.isOpen());
+        ReleaseResult r2 = releaser.release(List.of("s"), ReleaseOptions.defaults()).get(10, TimeUnit.SECONDS);
+        assertFalse(first.isDone());
+        ack.countDown();
+        ReleaseResult r1 = first.get(10, TimeUnit.SECONDS);
+
+        assertEquals(ReleaseStatus.WRITE_FAILURES, r2.series().get("s").status(), "r2=" + r2.series());
+        assertEquals(ReleaseStatus.WRITE_FAILURES, r1.series().get("s").status(), "r1=" + r1.series());
+        assertEquals(1L, r1.series().get("s").failedSamples());
+        assertEquals(1L, r2.series().get("s").failedSamples());
+        assertEquals(ReleaseStatus.RELEASED, r1.series().get("a").status());
+        assertEquals(0L, dispatcher.mark().completion().get(10, TimeUnit.SECONDS).samplesFailed(),
+                "a falha entregue aos releases não vai para a marca seguinte");
         assertFalse(dispatcher.hasRoute("s"));
     }
 

@@ -31,6 +31,9 @@ import java.util.Set;
  * <p>Uso na entrega de partições entre clientes: confirme o offset da partição só se {@link #allReleased()}. Senão,
  * não confirme (ou confirme até a última marca concluída sem falha) e registre {@link #notReleased()}.</p>
  *
+ * <p>Releases concorrentes da mesma série (no mesmo cliente) veem, cada um, as falhas que a sua fronteira cobre: a
+ * mesma falha aparece em todos eles, e as contagens não devem ser somadas entre releases.</p>
+ *
  * @param series desfecho por chave de série
  * @since 8.15.0
  */
@@ -61,7 +64,10 @@ public record ReleaseResult(Map<String, SeriesRelease> series) {
         return Collections.unmodifiableSet(keys);
     }
 
-    /** Soma de {@link SeriesRelease#failedSamples()} de todas as séries. */
+    /**
+     * Soma de {@link SeriesRelease#failedSamples()} de todas as séries deste resultado. Com releases concorrentes da
+     * mesma série, a mesma falha aparece em cada um deles: não some esta contagem entre releases.
+     */
     public long failedSamples() {
         long total = 0L;
         for (SeriesRelease release : series.values()) {
