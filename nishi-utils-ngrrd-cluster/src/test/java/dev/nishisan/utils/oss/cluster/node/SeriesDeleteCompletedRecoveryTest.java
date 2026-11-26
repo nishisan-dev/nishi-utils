@@ -52,6 +52,7 @@ import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -82,9 +83,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * {@code DELETE_RECOVER} que chega depois de o condutor remover o placement e antes de o {@code DELETE_FINISH}
  * ser entregue: a exclusão já concluída não tem o placement recriado nem as fases reconduzidas, com o mesmo líder
- * ou com um líder novo. O participante {@link #OWNER} é real (journal, volume e {@link SeriesLifecycleService});
- * {@link #COPY} é um participante em memória com as mesmas fases. O catálogo é um mapa compartilhado pelos
- * handlers, no papel do catálogo replicado.
+ * ou com um líder novo. Também cobre o journal do participante depois que a série é recriada: a entrada da
+ * geração substituída não gera reenvio perpétuo de {@code DELETE_RECOVER}. O participante {@link #OWNER} é real
+ * (journal, volume e {@link SeriesLifecycleService}); {@link #COPY} é um participante em memória com as mesmas
+ * fases. O catálogo é um mapa compartilhado pelos handlers, no papel do catálogo replicado.
  */
 class SeriesDeleteCompletedRecoveryTest {
 
@@ -97,7 +99,7 @@ class SeriesDeleteCompletedRecoveryTest {
     @TempDir
     Path base;
 
-    private final Clock clock = Clock.fixed(Instant.ofEpochMilli(NOW), ZoneOffset.UTC);
+    private final MutableClock clock = new MutableClock(Instant.ofEpochMilli(NOW));
     private final MemoryCatalog catalog = new MemoryCatalog();
     private final CopyParticipant copy = new CopyParticipant();
     private final PhaseRpc rpc = new PhaseRpc();
@@ -159,6 +161,25 @@ class SeriesDeleteCompletedRecoveryTest {
         handlers.add(handler);
         lifecycles.put(handler, lifecycle);
         return handler;
+    }
+
+    /**
+     * Handler do nó {@link #OWNER} como participante (não líder): o laço do journal dele manda
+     * {@code DELETE_RECOVER} a {@code leaderHandler}, com o próprio nó como origem.
+     */
+    private SeriesDeleteHandler participant(SeriesDeleteHandler leaderHandler) {
+        var handler = new SeriesDeleteHandler(fakeTransport(), catalog, new ParticipantRpc(OWNER, leaderHandler),
+                owner, () -> false, () -> true, clock, () -> Set.of(OWNER, COPY), Duration.ofSeconds(2));
+        handlers.add(handler);
+        return handler;
+    }
+
+    /** Roda um ciclo de recuperação por segundo durante {@code seconds} segundos. */
+    private void cyclesEverySecond(SeriesDeleteHandler handler, int seconds) {
+        for (int second = 0; second < seconds; second++) {
+            handler.recover();
+            clock.advance(Duration.ofSeconds(1));
+        }
     }
 
     private long completed(SeriesDeleteHandler handler) {
@@ -300,6 +321,80 @@ class SeriesDeleteCompletedRecoveryTest {
         assertTrue(rpc.calls.isEmpty());
     }
 
+    @Test
+    void participanteComEntradaFinishedDeGeracaoSubstituidaNaoReenvia() throws Exception {
+        var handler = leader("leader", new AtomicBoolean(true));
+        assertEquals(DeleteStatus.DELETED, handler.delete(request()).status());
+        assertEquals(FINISHED, ownerJournal.get(KEY).phase());
+        // Série recriada com outro dono: o journal do dono antigo fica com a entrada FINISHED da geração antiga.
+        SeriesPlacement recreated = SeriesPlacement.active(COPY, NOW);
+        catalog.placements.put(KEY, recreated);
+        int putsBefore = catalog.puts.size();
+        rpc.calls.clear();
+
+        cyclesEverySecond(participant(handler), 200);
+
+        assertEquals(0, rpc.count(Commands.DELETE_RECOVER, "leader"), "nenhum reenvio para geração substituída");
+        assertEquals(0, metric(handler, "seriesDelete.recoveryAttempts"));
+        assertEquals(1, completed(handler));
+        assertEquals(putsBefore, catalog.puts.size());
+        assertEquals(recreated, catalog.placements.get(KEY));
+        assertEquals(FINISHED, ownerJournal.get(KEY).phase());
+    }
+
+    @Test
+    void participanteEmDeletedComGeracaoNovaRecebeFinishUmaVez() throws Exception {
+        var handler = leader("leader", new AtomicBoolean(true));
+        // O FINISH ao dono se perde: ele fica em DELETED depois da remoção do placement.
+        rpc.beforeCall = (node, command) -> {
+            if (Commands.DELETE_FINISH.equals(command) && OWNER.equals(node))
+                throw new NgrrdClusterException(ErrorCode.TIMEOUT, "finish perdido");
+        };
+        assertEquals(DeleteStatus.DELETED, handler.delete(request()).status());
+        assertEquals(DELETED, ownerJournal.get(KEY).phase());
+        rpc.beforeCall = (node, command) -> { };
+        // Geração nova criada antes do reenvio (o gate de criação não conta DELETED como exclusão em curso).
+        SeriesPlacement recreated = SeriesPlacement.active(COPY, NOW);
+        catalog.placements.put(KEY, recreated);
+        int putsBefore = catalog.puts.size();
+        rpc.calls.clear();
+
+        cyclesEverySecond(participant(handler), 200);
+
+        assertEquals(FINISHED, ownerJournal.get(KEY).phase());
+        assertEquals(1, rpc.count(Commands.DELETE_RECOVER, "leader"), "um reenvio e nenhum depois do FINISH");
+        assertEquals(1, rpc.count(Commands.DELETE_FINISH, OWNER));
+        assertEquals(1, metric(handler, "seriesDelete.recoveryAttempts"));
+        assertEquals(1, completed(handler), "completed conta uma vez por operação");
+        assertEquals(putsBefore, catalog.puts.size(), "nenhum placement gravado pela recuperação");
+        assertEquals(recreated, catalog.placements.get(KEY));
+        for (String command : List.of(Commands.DELETE_PREPARE, Commands.DELETE_COMMIT, Commands.DELETE_APPLY)) {
+            assertEquals(0, rpc.count(command, OWNER) + rpc.count(command, COPY), command + " não é reconduzido");
+        }
+    }
+
+    @Test
+    void recuperacaoDeGeracaoSubstituidaPedidaPorQuemNaoEParticipanteNaoMandaFinish() throws Exception {
+        var handler = leader("leader", new AtomicBoolean(true));
+        rpc.beforeCall = (node, command) -> {
+            if (Commands.DELETE_FINISH.equals(command) && OWNER.equals(node))
+                throw new NgrrdClusterException(ErrorCode.TIMEOUT, "finish perdido");
+        };
+        assertEquals(DeleteStatus.DELETED, handler.delete(request()).status());
+        rpc.beforeCall = (node, command) -> { };
+        catalog.placements.put(KEY, SeriesPlacement.active(COPY, NOW));
+        SeriesPlacement journaled = ownerJournal.get(KEY).placement();
+        rpc.calls.clear();
+
+        assertEquals(DeleteStatus.NOT_FOUND, recover(handler, "stranger", journaled).status());
+        assertTrue(rpc.calls.isEmpty());
+        assertEquals(DeleteStatus.NOT_FOUND, recover(handler, OWNER, journaled).status());
+        assertEquals(List.of(OWNER + " " + Commands.DELETE_FINISH), rpc.calls);
+        assertEquals(FINISHED, ownerJournal.get(KEY).phase());
+        assertEquals(2, metric(handler, "seriesDelete.recoveryAttempts"), "uma tentativa por pedido");
+        assertEquals(1, completed(handler));
+    }
+
     private static void await(CountDownLatch latch) {
         try {
             if (!latch.await(10, TimeUnit.SECONDS)) throw new IllegalStateException("latch timed out");
@@ -345,6 +440,65 @@ class SeriesDeleteCompletedRecoveryTest {
                 default -> throw new IllegalArgumentException(command);
             }
             return DeleteResult.of(DeleteStatus.DELETED, request.placement().ownerNodeId());
+        }
+    }
+
+    /** {@link Clock} controlado pelo teste. */
+    private static final class MutableClock extends Clock {
+        private volatile Instant instant;
+
+        MutableClock(Instant start) {
+            this.instant = start;
+        }
+
+        void advance(Duration duration) {
+            instant = instant.plus(duration);
+        }
+
+        @Override
+        public ZoneId getZone() {
+            return ZoneOffset.UTC;
+        }
+
+        @Override
+        public Clock withZone(ZoneId zone) {
+            throw new UnsupportedOperationException("não usado nos testes");
+        }
+
+        @Override
+        public Instant instant() {
+            return instant;
+        }
+    }
+
+    /**
+     * RPC de um participante: {@code DELETE_RECOVER} ao líder vai a {@code leaderHandler} com {@code self} como
+     * origem e fica registrado como {@code "leader DELETE_RECOVER"}; o resto passa pelo {@link PhaseRpc}.
+     */
+    private final class ParticipantRpc implements ClusterRpc {
+        private final String self;
+        private final SeriesDeleteHandler leaderHandler;
+
+        ParticipantRpc(String self, SeriesDeleteHandler leaderHandler) {
+            this.self = self;
+            this.leaderHandler = leaderHandler;
+        }
+
+        @Override
+        public <R> R call(NodeId target, String command, Object body, Class<R> responseType) {
+            if (!"leader".equals(target.value())) return rpc.call(target, command, body, responseType);
+            rpc.calls.add("leader " + command);
+            return responseType.cast(leaderHandler.handle(command, body, NodeId.of(self)));
+        }
+
+        @Override
+        public NodeId localId() {
+            return NodeId.of(self);
+        }
+
+        @Override
+        public Optional<NodeId> leaderId() {
+            return Optional.of(NodeId.of("leader"));
         }
     }
 

@@ -382,6 +382,8 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
      *
      * <ul>
      *   <li>Placement com a reserva: conduz o que falta.</li>
+     *   <li>Placement de outra geração: a do pedido já foi substituída, e o participante recebe só o
+     *       {@code DELETE_FINISH} idempotente ({@link #finishSuperseded}).</li>
      *   <li>Placement da mesma geração sem reserva (catálogo que regrediu): regrava a reserva confirmada e conduz.</li>
      *   <li>Placement ausente: nunca é regravado só por causa do pedido. A remoção do placement é o marcador
      *       replicado de conclusão ({@link #drive} só remove depois do {@code DELETE_APPLY} de todos), então o
@@ -394,13 +396,14 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
         try (var drive = CoordinationLocks.acquire(driveLocks[Math.floorMod(key.hashCode(), driveLocks.length)])) {
             ensureLeader();
             SeriesPlacement placement;
+            boolean superseded = false;
             try (var guard = CoordinationLocks.acquire(catalog.placementLock(key))) {
                 ensureLeader();
                 var current = catalog.placementStrong(key);
-                if (current.isPresent() && !current.get().generationId().equals(request.placement().generationId()))
-                    return DeleteResult.of(DeleteStatus.NOT_FOUND, null);
                 placement = request.placement();
-                if (current.isPresent() && current.get().deletion() != null) {
+                if (current.isPresent() && !current.get().generationId().equals(placement.generationId())) {
+                    superseded = true;
+                } else if (current.isPresent() && current.get().deletion() != null) {
                     catalog.notePendingDeletion(key);
                     requireSame(current.get(), placement);
                     placement = current.get();
@@ -411,9 +414,28 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
                     else catalog.putPlacement(key, placement);
                 }
             }
+            if (superseded) return finishSuperseded(key, request.placement(), source);
             if (placement == null) return recoverWithoutPlacement(key, request.placement(), source);
             return drive(key, placement);
         }
+    }
+
+    /**
+     * {@code DELETE_RECOVER} de uma geração que o catálogo já substituiu por outra. Chamado sob o
+     * {@code driveLock} da série, depois da leitura forte que viu a geração nova.
+     *
+     * <p>Só {@link #drive} remove um placement, e só depois do {@code DELETE_APPLY} de todos; uma geração nova
+     * só nasce com a anterior fora do catálogo. Então a operação do pedido já concluiu: o participante
+     * ({@code source}) recebe o {@code DELETE_FINISH} idempotente, que só muda o tombstone daquela geração e
+     * operação, e a resposta é {@code NOT_FOUND}, sem placement gravado e sem contar {@code completed}. Sem o
+     * FINISH, o participante que ficou em {@code DELETED} (FINISH perdido na janela entre a remoção e a
+     * criação da geração nova) pediria a recuperação para sempre.</p>
+     */
+    private DeleteResult finishSuperseded(String key, SeriesPlacement placement, NodeId source) {
+        if (source != null && placement.deletion() != null
+                && placement.deletion().participants().contains(source.value()))
+            phase(source.value(), Commands.DELETE_FINISH, key, placement);
+        return DeleteResult.of(DeleteStatus.NOT_FOUND, null);
     }
 
     /**
@@ -525,7 +547,7 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
                 var current = catalog.placementStrong(key);
                 if (entry.phase() == PREPARED && (current.isEmpty() || current.get().deletion() == null)) {
                     lifecycle.abort(new DeleteControlRequest(key, entry.placement()));
-                } else if (confirmed && (current.isPresent() || entry.phase() != FINISHED)) {
+                } else if (confirmed && needsLeader(entry, current)) {
                     NodeId target = rpc.leaderId().orElse(null);
                     if (target == null) continue;
                     RecoveryBackoff backoff = journalRecoveryBackoff.get(operation);
@@ -541,6 +563,21 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
             }
         }
         journalRecoveryBackoff.keySet().retainAll(candidates);
+    }
+
+    /**
+     * Se a entrada confirmada do journal ainda tem o que pedir ao líder com {@code DELETE_RECOVER}.
+     * {@code DELETED} sempre: falta o {@code DELETE_FINISH}, e o líder o manda mesmo com a geração já
+     * substituída ({@link #finishSuperseded}). {@code COMMITTED} e {@code FINISHED} só se o placement atual for
+     * da mesma geração da entrada, e o {@code COMMITTED} também sem placement (o líder sonda e decide,
+     * {@link #recoverWithoutPlacement}). Com outra geração no catálogo, a da entrada já saiu dele: o líder não
+     * teria fase a conduzir e só responderia {@code NOT_FOUND}.
+     */
+    private static boolean needsLeader(SeriesLifecycleJournal.Entry entry, Optional<SeriesPlacement> current) {
+        if (entry.phase() == DELETED) return true;
+        boolean sameGeneration = current.isPresent()
+                && current.get().generationId().equals(entry.placement().generationId());
+        return sameGeneration || (entry.phase() == COMMITTED && current.isEmpty());
     }
 
     /**
