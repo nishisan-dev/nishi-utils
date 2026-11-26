@@ -1339,6 +1339,136 @@ class WriteDispatcherTest {
     }
 
     @Test
+    void drenoDoReleaseEsperaAFronteiraFechaAdmissaoESoltaRota() throws Exception {
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        newDispatcher(1, Duration.ofMillis(10), 1000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        rpc.respondNext((command, body) -> {
+            entered.countDown();
+            awaitLatch(release);
+            return okFor((WriteBatchRequest) body);
+        });
+        rpc.respondDefault((command, body) -> okFor((WriteBatchRequest) body));
+        Object handle = new Object();
+        dispatcher.beginGeneration("s", "g", OWNER_A.value(), handle);
+        dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 1, 1, "g"));
+        dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 2, 2, "g"));
+        assertTrue(entered.await(2, TimeUnit.SECONDS));
+
+        WriteDispatcher.ReleaseTicket ticket = dispatcher.beginRelease("s", "g", handle);
+        assertEquals(2L, ticket.boundary());
+        assertEquals(ErrorCode.CLOSED, assertThrows(NgrrdClusterException.class,
+                () -> dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 3, 3, "g"))).code());
+        var drain = CompletableFuture.supplyAsync(() -> dispatcher.drainForRelease(List.of(ticket), AWAIT_TIMEOUT));
+        Thread.sleep(100L);
+        assertFalse(drain.isDone(), "o dreno espera a escrita em voo");
+
+        release.countDown();
+        var outcome = drain.get(10, TimeUnit.SECONDS).get("s");
+        dispatcher.finishRelease(ticket, true);
+
+        assertEquals(WriteDispatcher.ReleaseDrain.Outcome.DRAINED, outcome.outcome());
+        assertEquals(2, dispatcher.samplesSent());
+        assertFalse(dispatcher.hasRoute("s"));
+        assertEquals(1L, dispatcher.routesRemoved());
+    }
+
+    @Test
+    void drenoDoReleaseColheFalhasNaoReportadasUmaUnicaVez() throws Exception {
+        newMarksDispatcher();
+        rpc.respondDefault((command, body) -> statusFor((WriteBatchRequest) body, SeriesStatus.ERROR));
+        Object handle = new Object();
+        dispatcher.beginGeneration("s", "g", OWNER_A.value(), handle);
+        dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 1, 1, "g"));
+        dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 2, 2, "g"));
+        Await.untilTrue("falhas finais", AWAIT_TIMEOUT, () -> dispatcher.samplesFailed() == 2);
+
+        WriteDispatcher.ReleaseTicket ticket = dispatcher.beginRelease("s", "g", handle);
+        var outcome = dispatcher.drainForRelease(List.of(ticket), AWAIT_TIMEOUT).get("s");
+        dispatcher.finishRelease(ticket, true);
+        var mark = dispatcher.mark().completion().get(10, TimeUnit.SECONDS);
+
+        assertEquals(WriteDispatcher.ReleaseDrain.Outcome.WRITE_FAILURES, outcome.outcome());
+        assertEquals(Map.of(SeriesStatus.ERROR, 2L), outcome.failedSamplesByStatus());
+        assertEquals(0L, mark.samplesFailed(), "a falha entregue ao release não vai para a marca");
+        assertFalse(dispatcher.hasRoute("s"), "falha entregue: a rota sai do mapa");
+    }
+
+    @Test
+    void drenoDoReleaseEntregaFalhaDeBarrierERemoveRota() {
+        newDispatcher(1, Duration.ofMillis(10), 1000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        rpc.respondDefault((command, body) -> statusFor((WriteBatchRequest) body, SeriesStatus.ERROR));
+        Object handle = new Object();
+        dispatcher.beginGeneration("s", "g", OWNER_A.value(), handle);
+        dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 1, 1, "g"));
+        Await.untilTrue("falha final", AWAIT_TIMEOUT, () -> dispatcher.samplesFailed() == 1);
+
+        WriteDispatcher.ReleaseTicket ticket = dispatcher.beginRelease("s", "g", handle);
+        var outcome = dispatcher.drainForRelease(List.of(ticket), AWAIT_TIMEOUT).get("s");
+        dispatcher.finishRelease(ticket, true);
+
+        assertEquals(WriteDispatcher.ReleaseDrain.Outcome.WRITE_FAILURES, outcome.outcome());
+        assertEquals(ErrorCode.REMOTE_ERROR, outcome.errorCode());
+        assertFalse(dispatcher.hasRoute("s"), "BARRIER: falha entregue ao release libera a rota");
+        dispatcher.flushAllSync();
+    }
+
+    @Test
+    void drenoDoReleaseNoPrazoDevolveTimedOutEARotaSaiDepois() throws Exception {
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        newDispatcher(1, Duration.ofMillis(10), 1000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        rpc.respondNext((command, body) -> {
+            entered.countDown();
+            awaitLatch(release);
+            return okFor((WriteBatchRequest) body);
+        });
+        rpc.respondDefault((command, body) -> okFor((WriteBatchRequest) body));
+        Object handle = new Object();
+        dispatcher.beginGeneration("s", "g", OWNER_A.value(), handle);
+        try {
+            dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 1, 1, "g"));
+            assertTrue(entered.await(2, TimeUnit.SECONDS));
+
+            WriteDispatcher.ReleaseTicket ticket = dispatcher.beginRelease("s", "g", handle);
+            var outcome = dispatcher.drainForRelease(List.of(ticket), Duration.ofMillis(100)).get("s");
+            dispatcher.finishRelease(ticket, false);
+
+            assertEquals(WriteDispatcher.ReleaseDrain.Outcome.TIMED_OUT, outcome.outcome());
+            assertEquals(ErrorCode.TIMEOUT, outcome.errorCode());
+            assertTrue(dispatcher.hasRoute("s"), "a escrita em voo segura a rota");
+            assertEquals(0, dispatcher.routeHolders("s"));
+        } finally {
+            release.countDown();
+        }
+        Await.untilTrue("rota removida com a última resposta", AWAIT_TIMEOUT, () -> !dispatcher.hasRoute("s"));
+        assertEquals(1, dispatcher.samplesSent());
+    }
+
+    @Test
+    void rotaReligadaDuranteOReleaseNaoEntraNaFronteiraNemSaiDoMapa() {
+        newDispatcher(1, Duration.ofMillis(10), 1000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        rpc.respondDefault((command, body) -> okFor((WriteBatchRequest) body));
+        Object released = new Object();
+        Object reopened = new Object();
+        dispatcher.beginGeneration("s", "g", OWNER_A.value(), released);
+        dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 1, 1, "g"));
+
+        WriteDispatcher.ReleaseTicket ticket = dispatcher.beginRelease("s", "g", released);
+        dispatcher.beginGeneration("s", "g", OWNER_A.value(), reopened);
+        dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 2, 2, "g"));
+        var outcome = dispatcher.drainForRelease(List.of(ticket), AWAIT_TIMEOUT).get("s");
+        dispatcher.finishRelease(ticket, true);
+
+        assertEquals(1L, ticket.boundary(), "a escrita do handle religado fica fora da fronteira");
+        assertEquals(WriteDispatcher.ReleaseDrain.Outcome.DRAINED, outcome.outcome());
+        assertTrue(dispatcher.hasRoute("s"), "a rota voltou a ter holder");
+        assertEquals(1, dispatcher.routeHolders("s"));
+        dispatcher.flushAllSync();
+        assertEquals(2, dispatcher.samplesSent());
+    }
+
+    @Test
     void lastRetryLogMsEAttemptsLimposComARota() throws Exception {
         newMarksDispatcher();
         rpc.respondNext((command, body) -> statusFor((WriteBatchRequest) body, SeriesStatus.MIGRATING));

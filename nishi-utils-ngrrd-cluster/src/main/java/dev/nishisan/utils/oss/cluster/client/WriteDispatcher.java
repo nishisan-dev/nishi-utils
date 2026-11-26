@@ -39,8 +39,10 @@ import java.time.Clock;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
@@ -101,6 +103,11 @@ import java.util.stream.Collectors;
  * índice de pendentes até ser colhida; as barreiras, nesse modo, não lançam por falha de escrita. As marcas concluem
  * em ordem, num executor próprio e fora de qualquer lock interno. Ordem de locks: {@code markLock → route.lock →}
  * lock da marca; nunca {@code route.lock → markLock}.</p>
+ *
+ * <p><strong>Release de séries.</strong> {@link #beginRelease} aposenta a rota e fotografa a fronteira,
+ * {@link #drainForRelease} espera cada fronteira sem lançar e colhe as falhas até ela (cada falha vai para uma marca
+ * ou para um release, nunca para os dois), e {@link #finishRelease} solta o holder e, com a falha entregue, dispensa
+ * {@code isIdle} na remoção da rota.</p>
  */
 public final class WriteDispatcher implements WriteBuffer, Closeable {
 
@@ -234,6 +241,9 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                     if (holder != null) {
                         previous.holders.add(holder);
                         previous.retired = false;
+                        // Religada (por exemplo, open() concorrente a um release): volta a ser uma rota comum, e
+                        // uma falha posterior não pode sair do mapa sem ser reportada.
+                        previous.failuresDelivered = false;
                     }
                     return previous;
                 }
@@ -685,6 +695,148 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             tryRemove(route);
         }
         return mark;
+    }
+
+    /**
+     * Etapa 1 do release de {@code key} (admissão encerrada): sob {@code route.lock}, aposenta a rota ({@code retired})
+     * e fotografa a fronteira ({@code submitted}). Daí em diante, uma admissão na rota recebe {@link ErrorCode#CLOSED};
+     * um {@link #beginGeneration} posterior com a mesma geração religa a rota (zera {@code retired}), e o dreno continua
+     * esperando só a fronteira fotografada.
+     *
+     * <p>A rota só é aposentada se {@code holder} for holder dela na geração {@code generation}, ou se ela já não tiver
+     * holder; a rota de outro holder é só drenada. O holder continua na rota até {@link #finishRelease}. O chamador
+     * segura o lock de abertura da chave no cache de handles, de modo que um {@code open()} concorrente da mesma chave
+     * só religa a rota depois desta fotografia. Devolve {@code null} se não houver rota para a chave.</p>
+     */
+    ReleaseTicket beginRelease(String key, String generation, Object holder) {
+        SeriesRoute route = routes.get(key);
+        if (route == null) {
+            return null;
+        }
+        route.lock.lock();
+        try {
+            boolean owned = holder != null && Objects.equals(route.generation, generation)
+                    && route.holders.contains(holder);
+            if (owned || route.holders.isEmpty()) {
+                route.retired = true;
+            }
+            return new ReleaseTicket(key, route, route.submitted, owned ? holder : null);
+        } finally {
+            route.lock.unlock();
+        }
+    }
+
+    /**
+     * Etapa 2 do release: espera cada rota alcançar a fronteira de {@link #beginRelease}, com {@code budget} como prazo
+     * TOTAL, como {@link #awaitBarriers}, mas sem lançar por falha de escrita: devolve um desfecho por chave, na ordem
+     * dos tickets.
+     *
+     * <p>Ao alcançar a fronteira, sob {@code route.lock}, conclui os waiters de marca já cobertos e colhe as falhas:
+     * em {@code MARKS}, as faixas ainda não reportadas até a fronteira, contadas por status — elas deixam de ir para
+     * uma marca, então cada falha é reportada uma única vez, à marca ou ao release; em {@code BARRIER}, a primeira
+     * falha da rota, se estiver até a fronteira. Série removida ou em quarentena ({@code failureCode}) vira
+     * {@link ReleaseDrain.Outcome#SERIES_DELETED}. Uma rota que não alcança a fronteira no prazo vira
+     * {@link ReleaseDrain.Outcome#TIMED_OUT}, sem colheita: as escritas seguem em segundo plano e as falhas que
+     * surgirem vão para a próxima marca ({@code MARKS}) ou ficam na rota ({@code BARRIER}).</p>
+     *
+     * @throws NgrrdClusterException {@link ErrorCode#CLOSED} se o dispatcher fechar ou a thread for interrompida
+     */
+    Map<String, ReleaseDrain> drainForRelease(Collection<ReleaseTicket> tickets, Duration budget) {
+        long startedAt = System.nanoTime();
+        long budgetNanos = Math.max(0L, budget.toNanos());
+        Map<String, ReleaseDrain> outcomes = new LinkedHashMap<>();
+        boolean marksReady = false;
+        try {
+            for (ReleaseTicket ticket : tickets) {
+                SeriesRoute route = ticket.route;
+                for (;;) {
+                    route.lock.lock();
+                    try {
+                        if (closed) {
+                            throw new NgrrdClusterException(ErrorCode.CLOSED, "dispatcher fechado");
+                        }
+                        if (route.completed >= ticket.boundary) {
+                            marksReady |= releaseWaiters(route);
+                            outcomes.put(ticket.key, harvestForRelease(route, ticket.boundary));
+                            break;
+                        }
+                        long remaining = budgetNanos - (System.nanoTime() - startedAt);
+                        if (remaining <= 0) {
+                            outcomes.put(ticket.key, ReleaseDrain.timedOut(budget));
+                            break;
+                        }
+                        scheduleFlush(route.owner, buffers.get(route.owner));
+                        // Mesmo esquema do awaitBarriers: o ACK acorda na hora; o poll cobre backoff e reroteamento.
+                        route.progress.awaitNanos(Math.min(remaining, TimeUnit.MILLISECONDS.toNanos(DRAIN_POLL_MS)));
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new NgrrdClusterException(ErrorCode.CLOSED, "release interrompido", e);
+                    } finally {
+                        route.lock.unlock();
+                    }
+                }
+            }
+        } finally {
+            if (marksReady) {
+                scheduleMarkCompletion();
+            }
+        }
+        return outcomes;
+    }
+
+    /** Colhe o desfecho de uma rota que alcançou {@code boundary} (ver {@link #drainForRelease}). Chamado sob {@code route.lock}. */
+    private ReleaseDrain harvestForRelease(SeriesRoute route, long boundary) {
+        Map<SeriesStatus, Long> failed = new EnumMap<>(SeriesStatus.class);
+        boolean writeFailures;
+        String message;
+        if (marksMode) {
+            route.collectFailures((status, count) -> failed.merge(status, count, Long::sum), boundary);
+            if (isIdle(route)) {
+                synchronized (pendingLock) {
+                    pendingRoutes.remove(route);
+                }
+            }
+            writeFailures = !failed.isEmpty();
+            message = writeFailures ? "escritas com falha final antes do release de " + route.key + ": " + failed : null;
+        } else {
+            writeFailures = route.firstFailedSequence <= boundary;
+            message = writeFailures ? route.failureMessage : null;
+        }
+        if (isLifecycleTerminal(route.failureCode)) {
+            return new ReleaseDrain(ReleaseDrain.Outcome.SERIES_DELETED, failed, route.failureCode, route.failureMessage);
+        }
+        if (writeFailures) {
+            return new ReleaseDrain(ReleaseDrain.Outcome.WRITE_FAILURES, failed, route.failureCode, message);
+        }
+        return ReleaseDrain.DRAINED;
+    }
+
+    /**
+     * Etapa 5 do release (limpeza local): o holder do ticket deixa a rota, como em {@link #endGeneration}; sem holder,
+     * a rota fica aposentada. Com {@code delivered} (o desfecho do dreno foi entregue ao chamador) e a rota sem holder,
+     * liga {@code failuresDelivered}, que dispensa {@code isIdle} na remoção — exceto se houver, em {@code MARKS}, falha
+     * depois da fronteira ainda não reportada (escrita de um {@code open()} que religou a rota e já a soltou). A remoção
+     * segue a regra de duas fases: sem escrita em voo, sem waiter, sem redirecionamento nem consulta de dono pendentes.
+     * Uma rota religada por outro holder não é tocada além disso. Nunca chamar sob {@code route.lock}.
+     */
+    void finishRelease(ReleaseTicket ticket, boolean delivered) {
+        SeriesRoute route = ticket.route;
+        boolean candidate;
+        route.lock.lock();
+        try {
+            if (ticket.holder != null && route.holders.remove(ticket.holder) && route.holders.isEmpty()) {
+                route.retired = true;
+            }
+            if (delivered && route.holders.isEmpty() && (!marksMode || route.unreportedFailures.isEmpty())) {
+                route.failuresDelivered = true;
+            }
+            candidate = retirable(route);
+        } finally {
+            route.lock.unlock();
+        }
+        if (candidate) {
+            tryRemove(route);
+        }
     }
 
     private Map<SeriesRoute, Long> snapshotBarriers(String owner) {
@@ -1871,20 +2023,99 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
 
         /** Atribui a {@code mark} as falhas com sequência {@code <= boundary}, partindo a faixa que cruza a fronteira. */
         void collectFailures(Mark mark, long boundary) {
+            collectFailures((status, count) -> mark.addFailures(key, status, count), boundary);
+        }
+
+        /**
+         * Entrega a {@code sink} as falhas com sequência {@code <= boundary}, partindo a faixa que cruza a fronteira;
+         * o que foi entregue sai de {@link #unreportedFailures} e não vai mais para nenhuma marca.
+         */
+        void collectFailures(FailureSink sink, long boundary) {
             while (!unreportedFailures.isEmpty() && unreportedFailures.peekFirst().from() <= boundary) {
                 FailedRange range = unreportedFailures.pollFirst();
                 if (range.to() > boundary) {
                     unreportedFailures.addFirst(new FailedRange(boundary + 1, range.to(), range.status()));
-                    mark.addFailures(key, range.status(), boundary - range.from() + 1);
+                    sink.accept(range.status(), boundary - range.from() + 1);
                 } else {
-                    mark.addFailures(key, range.status(), range.to() - range.from() + 1);
+                    sink.accept(range.status(), range.to() - range.from() + 1);
                 }
             }
         }
     }
 
+    /**
+     * Rota de uma série em release, com a fronteira fotografada por {@link #beginRelease} e o holder que a aposentou
+     * ({@code null} se o release só drena a rota). Opaco fora do dispatcher.
+     */
+    static final class ReleaseTicket {
+        private final String key;
+        private final SeriesRoute route;
+        private final long boundary;
+        private final Object holder;
+
+        private ReleaseTicket(String key, SeriesRoute route, long boundary, Object holder) {
+            this.key = key;
+            this.route = route;
+            this.boundary = boundary;
+            this.holder = holder;
+        }
+
+        /** Chave da série. */
+        String key() {
+            return key;
+        }
+
+        /** Fronteira do dreno: escritas admitidas na rota até {@link #beginRelease}. */
+        long boundary() {
+            return boundary;
+        }
+    }
+
+    /**
+     * Desfecho do dreno de uma série em release ({@link #drainForRelease}).
+     *
+     * @param outcome               resultado do dreno
+     * @param failedSamplesByStatus falhas colhidas até a fronteira, por status ({@code MARKS}); vazio em {@code BARRIER},
+     *                              que guarda só a primeira falha da série
+     * @param errorCode             código da falha; {@code null} em {@link Outcome#DRAINED}
+     * @param message               descrição da falha; {@code null} em {@link Outcome#DRAINED}
+     */
+    record ReleaseDrain(Outcome outcome, Map<SeriesStatus, Long> failedSamplesByStatus, ErrorCode errorCode,
+            String message) {
+
+        /** Dreno sem falha. */
+        static final ReleaseDrain DRAINED = new ReleaseDrain(Outcome.DRAINED, Map.of(), null, null);
+
+        ReleaseDrain {
+            failedSamplesByStatus = Map.copyOf(failedSamplesByStatus);
+        }
+
+        static ReleaseDrain timedOut(Duration budget) {
+            return new ReleaseDrain(Outcome.TIMED_OUT, Map.of(), ErrorCode.TIMEOUT,
+                    "escritas anteriores ao release não confirmadas dentro de " + budget);
+        }
+
+        /** Resultado do dreno de uma série. */
+        enum Outcome {
+            /** Toda escrita até a fronteira teve OK final. */
+            DRAINED,
+            /** Drenou, com falha de escrita até a fronteira. */
+            WRITE_FAILURES,
+            /** A geração foi removida ou posta em quarentena. */
+            SERIES_DELETED,
+            /** A rota não alcançou a fronteira no prazo. */
+            TIMED_OUT
+        }
+    }
+
     /** Faixa {@code [from, to]} de sequências de uma série que terminou com {@code status} final. */
     private record FailedRange(long from, long to, SeriesStatus status) { }
+
+    /** Destino das falhas colhidas de uma rota: uma marca ou o resultado de um release. */
+    @FunctionalInterface
+    private interface FailureSink {
+        void accept(SeriesStatus status, long count);
+    }
 
     /** Marca esperando a rota alcançar {@code boundary}. */
     private record MarkWaiter(Mark mark, long boundary) { }
