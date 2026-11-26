@@ -25,7 +25,8 @@ import java.time.Duration;
  * @param checkpoint           {@code true}: depois do dreno, pede {@code CHECKPOINT} ao dono de cada série sem falha
  *                             de escrita — a garantia passa a ser fsync confirmado no dono, ao custo de uma RPC por
  *                             série. {@code false} (padrão): a garantia é a de uma marca de escrita, ACK do dono sem
- *                             fsync; o checkpoint local periódico do nó limita a janela de perda numa queda abrupta
+ *                             fsync; quando o checkpoint local periódico ({@code ngrrd.checkpoint}) está ligado no nó,
+ *                             ele limita a janela de perda numa queda abrupta (vem desligado por padrão)
  * @param closeOnNode          {@code true}: manda {@code CLOSE} ao dono de cada série drenada, para desativação
  *                             planejada. {@code false} (padrão) na entrega entre clientes: o próximo dono reabre a
  *                             mesma série no mesmo nó, e o {@code CLOSE} faria o nó fazer checkpoint, fechar e
@@ -35,7 +36,8 @@ import java.time.Duration;
  * @param timeout              prazo TOTAL do release (dreno, checkpoint e close); {@code null} (padrão) usa
  *                             {@link NgrrdClusterConfig#closeTimeout()}. Positivo quando informado
  * @param maxConcurrentPerNode teto de RPCs de {@code CHECKPOINT}/{@code CLOSE} simultâneas por nó dono, {@code >= 1}
- *                             (padrão 32)
+ *                             (padrão 32). Vale para cada chamada de {@code release}, não para o cliente: releases
+ *                             simultâneos somam seus tetos
  * @since 8.15.0
  */
 public record ReleaseOptions(boolean checkpoint, boolean closeOnNode, Duration timeout, int maxConcurrentPerNode) {

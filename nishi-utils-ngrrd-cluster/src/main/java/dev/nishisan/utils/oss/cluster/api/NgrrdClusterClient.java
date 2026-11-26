@@ -282,14 +282,19 @@ public interface NgrrdClusterClient extends Closeable {
      * </ol>
      *
      * <p><b>Durabilidade.</b> Sem {@code checkpoint}, a garantia de {@link ReleaseStatus#RELEASED} é a mesma de uma
-     * marca de escrita: ACK do dono, sem fsync — uma queda abrupta do nó logo depois pode perder as últimas amostras,
-     * numa janela limitada pelo checkpoint local periódico do nó. Com {@code checkpoint}, é fsync confirmado no dono, ao
+     * marca de escrita: ACK do dono, sem fsync — uma queda abrupta do nó logo depois pode perder as últimas amostras.
+     * Quando o checkpoint local periódico ({@code ngrrd.checkpoint}) está ligado no nó, ele limita essa janela; vem
+     * desligado por padrão, e aí a janela não tem esse limite. Com {@code checkpoint}, é fsync confirmado no dono, ao
      * custo de uma RPC por série.</p>
      *
      * <p><b>Prazo e execução.</b> O prazo TOTAL ({@link ReleaseOptions#timeout()}, padrão
      * {@link NgrrdClusterConfig#closeTimeout()}) vale para dreno, checkpoint e {@code CLOSE}. As RPCs de
-     * {@code CHECKPOINT}/{@code CLOSE} são limitadas a {@link ReleaseOptions#maxConcurrentPerNode()} por nó dono. Sem
-     * {@code checkpoint} nem {@code closeOnNode}, o custo é só local (dreno e limpeza), sem RPC por série.</p>
+     * {@code CHECKPOINT}/{@code CLOSE} são limitadas a {@link ReleaseOptions#maxConcurrentPerNode()} por nó dono, em cada
+     * chamada de {@code release} (o limite não é global: releases simultâneos somam). Sem {@code checkpoint} nem
+     * {@code closeOnNode}, o custo é só local (dreno e limpeza), sem RPC por série. A espera pelo lock de abertura de uma
+     * chave fica fora do prazo: ela só acontece se um {@link #open} da mesma chave estiver em curso neste cliente (o
+     * {@code OPEN} remoto roda sob esse lock, limitado pelo {@code retryTimeout}), o que o protocolo de entrega abaixo
+     * não prevê — quem libera parou de usar as séries, e quem as assume é outro cliente.</p>
      *
      * <p><b>Protocolo de entrega entre clientes</b> (consumidores particionados, com séries particionadas de forma
      * disjunta entre clientes): o cliente que perde a partição P para de chamar {@code write} nas séries de P, chama

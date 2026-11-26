@@ -46,7 +46,11 @@ public enum ReleaseStatus {
      */
     WRITE_FAILURES,
 
-    /** As escritas tiveram {@code OK}, mas o {@code CHECKPOINT} pedido falhou ou estourou o prazo. */
+    /**
+     * As escritas tiveram {@code OK}, mas o {@code CHECKPOINT} pedido falhou, estourou o prazo ou não foi executado: as
+     * escritas da série vieram de um handle que já estava fechando quando o release começou, e não há handle gravável
+     * deste release para mandar o {@code CHECKPOINT} ({@link SeriesRelease#errorCode()} {@link ErrorCode#CLOSED}).
+     */
     CHECKPOINT_FAILED,
 
     /**
