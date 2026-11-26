@@ -39,6 +39,8 @@ import dev.nishisan.utils.oss.cluster.api.NgrrdClusterClient;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterConfig;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.api.RebalanceTrigger;
+import dev.nishisan.utils.oss.cluster.api.ReleaseOptions;
+import dev.nishisan.utils.oss.cluster.api.ReleaseResult;
 import dev.nishisan.utils.oss.cluster.api.SeriesInfo;
 import dev.nishisan.utils.oss.cluster.api.SeriesVerification;
 import dev.nishisan.utils.oss.cluster.api.WriteMark;
@@ -74,6 +76,7 @@ import java.util.Collections;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import java.util.logging.Level;
@@ -117,6 +120,8 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
     private final NodeCapabilities capabilities;
     /** Definições YAML internadas por conteúdo: parse, hash e geometria uma vez por definição distinta. */
     private final DefinitionInterner interner;
+    /** Implementação de {@link #release(Collection, ReleaseOptions)}, com o executor {@code ngrrd-release-}. */
+    private final SeriesReleaser releaser;
 
     private volatile boolean closed;
 
@@ -137,6 +142,7 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
         this.handles = handles;
         this.capabilities = capabilities;
         this.interner = interner;
+        this.releaser = new SeriesReleaser(handles, dispatcher, resolver, config.closeTimeout(), () -> closed);
         dispatcher.terminalListener((write, failure) -> {
             if (failure.code() == ErrorCode.SERIES_DELETED) resolver.noteDeleted(write.seriesKey(), write.generationId());
             handles.fail(write.seriesKey(), write.generationId(), failure);
@@ -485,6 +491,11 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
     }
 
     @Override
+    public CompletableFuture<ReleaseResult> release(Collection<String> seriesKeys, ReleaseOptions options) {
+        return releaser.release(seriesKeys, options);
+    }
+
+    @Override
     public ClientMetricsSnapshot metrics() {
         return new ClientMetricsSnapshot(dispatcher.samplesEnqueued(), dispatcher.samplesSent(),
                 dispatcher.samplesFailed(), dispatcher.batchesSent(), dispatcher.retriesByStatus(),
@@ -675,6 +686,7 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
             return;
         }
         closed = true;
+        releaser.close();
         // B1 (achado do Refuter): UM ÚNICO deadline alimenta handles -> dispatcher -> node.close, não
         // um closeTimeout inteiro "renovado" para cada fase — do contrário N handles lentos, mais o
         // dispatcher, podiam multiplicar o tempo total de close() por várias vezes closeTimeout.

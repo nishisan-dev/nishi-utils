@@ -571,24 +571,63 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
             } catch (RuntimeException e) {
                 LOGGER.log(Level.WARNING, "Falha ao drenar buffer de escrita ao fechar a série " + seriesKey, e);
             }
-            long remainingMs = deadlineMs - clock.millis();
-            NodeId ownerNodeId = NodeId.of(owner);
-            if (remainingMs <= 0 || !rpc.isConnected(ownerNodeId)) {
-                LOGGER.log(Level.WARNING, "Pulando o CLOSE remoto da série " + seriesKey + " em " + owner
-                        + " (orçamento esgotado ou dono inalcançável) — a referência local é liberada mesmo assim");
-            } else {
-                try {
-                    callWithTransportRetry(ownerNodeId, Commands.CLOSE, new SeriesCommandRequest(seriesKey, generation),
-                            SeriesStatusResponse.class, deadlineMs);
-                } catch (RuntimeException e) {
-                    LOGGER.log(Level.WARNING, "Falha ao fechar remotamente a série " + seriesKey, e);
-                }
-            }
+            closeRemote(deadlineMs);
         } finally {
             // Depois do flush/CLOSE: a rota sai do dispatcher quando a última escrita em voo tiver desfecho.
             releaseRoute(closedFrom);
         }
         onClose.accept(seriesKey, this);
+    }
+
+    /**
+     * {@code CLOSE} remoto até {@code deadlineMs}: pulado (WARNING) se o orçamento já acabou ou se o dono está
+     * inalcançável; uma falha só vai para o log (WARNING). Nunca lança.
+     */
+    private void closeRemote(long deadlineMs) {
+        long remainingMs = deadlineMs - clock.millis();
+        NodeId ownerNodeId = NodeId.of(owner);
+        if (remainingMs <= 0 || !rpc.isConnected(ownerNodeId)) {
+            LOGGER.log(Level.WARNING, "Pulando o CLOSE remoto da série " + seriesKey + " em " + owner
+                    + " (orçamento esgotado ou dono inalcançável) — a referência local é liberada mesmo assim");
+            return;
+        }
+        try {
+            callWithTransportRetry(ownerNodeId, Commands.CLOSE, new SeriesCommandRequest(seriesKey, generation),
+                    SeriesStatusResponse.class, deadlineMs);
+        } catch (RuntimeException e) {
+            LOGGER.log(Level.WARNING, "Falha ao fechar remotamente a série " + seriesKey, e);
+        }
+    }
+
+    /**
+     * Release, etapa 1: leva o handle a fechado localmente, sem flush, sem {@code CLOSE} remoto, sem {@link #onClose}
+     * (quem chama já o tirou do mapa do cliente) e sem soltar a rota de escrita — o release solta a rota no fim, depois
+     * do dreno. Devolve {@code true} se esta chamada fechou um handle gravável, que passa a ser o holder entregue ao
+     * release; {@code false} se o handle é somente leitura ou outro encerramento já tinha vencido (e solta a rota ele
+     * mesmo).
+     */
+    boolean closeForRelease() {
+        State closedFrom = closeLocally();
+        return closedFrom != null && closedFrom.writable();
+    }
+
+    /**
+     * Release com {@code checkpoint}: o {@code CHECKPOINT} remoto da geração do handle (já fechado e drenado), com as
+     * mesmas retentativas de {@link #checkpoint()} limitadas a {@code budget}. Lança a falha final.
+     */
+    void checkpointForRelease(Duration budget) {
+        executeSeriesCommand(Commands.CHECKPOINT,
+                new OperationRetry(Commands.CHECKPOINT, clock.millis() + Math.max(0L, budget.toMillis())));
+    }
+
+    /** Release com {@code closeOnNode}: o {@code CLOSE} remoto de {@link #close(Duration)}, limitado a {@code budget}. */
+    void closeOnNodeForRelease(Duration budget) {
+        closeRemote(clock.millis() + Math.max(0L, budget.toMillis()));
+    }
+
+    /** Dono atual conhecido pelo handle. */
+    String owner() {
+        return owner;
     }
 
     /**
@@ -646,7 +685,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
     /** Per-invocation state, also used by nested OPENs. Never shared between concurrent callers. */
     private final class OperationRetry {
         private final String operation;
-        private final long deadlineMs = clock.millis() + retryPolicy.timeout().toMillis();
+        private final long deadlineMs;
         private int attempts;
         private SeriesStatus lastStatus;
         /** Nós que responderam {@code WRONG_OWNER} com dono informado nesta operação, na ordem. */
@@ -657,7 +696,13 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
         private int redirects;
 
         private OperationRetry(String operation) {
+            this(operation, clock.millis() + retryPolicy.timeout().toMillis());
+        }
+
+        /** Com prazo explícito ({@code deadlineMs} no {@link #clock} do handle), por exemplo o de um release. */
+        private OperationRetry(String operation, long deadlineMs) {
             this.operation = operation;
+            this.deadlineMs = deadlineMs;
         }
 
         private Duration remaining() {

@@ -106,6 +106,24 @@ final class SeriesHandleCache {
     }
 
     /**
+     * Executa {@code action} sob o lock de abertura de {@code seriesKey}, o mesmo de {@link #open}: um {@code open}
+     * concorrente da mesma chave só decide e publica depois. Usado pelo release para tirar o handle do mapa e fotografar
+     * a fronteira da rota de escrita numa única seção crítica. {@code action} não deve fazer RPC.
+     */
+    <T> T withOpenLock(String seriesKey, Supplier<T> action) {
+        Objects.requireNonNull(seriesKey, "seriesKey");
+        Objects.requireNonNull(action, "action");
+        Object lock = openLocks.computeIfAbsent(seriesKey, key -> new Object());
+        try {
+            try (var guard = CoordinationLocks.acquire(lock)) {
+                return action.get();
+            }
+        } finally {
+            openLocks.remove(seriesKey, lock);
+        }
+    }
+
+    /**
      * O que um {@code open} com (ou sem) criação recebe do principal {@code current}: o próprio handle,
      * uma vista somente leitura sobre ele, ou {@code null} se for preciso abrir um novo (sem principal,
      * principal fechado, ou somente leitura diante de um pedido de criação).
