@@ -78,9 +78,22 @@ public final class PlacementResolver implements PlacementLookup {
         overrides.remove(key);
     }
 
+    /** Se há máscara de geração apagada para {@code key} — visível para testes. */
+    boolean masksDeletedGeneration(String key) {
+        return deletedGenerations.containsKey(key);
+    }
+
+    /**
+     * Aplica a máscara de geração apagada. Ela sai quando o placement visível mostra outra geração ou quando não
+     * há placement: a réplica local já mostra a remoção, que é definitiva, e a geração mascarada não volta.
+     */
     private SeriesPlacement visible(String key, SeriesPlacement placement) {
         String removed = deletedGenerations.get(key);
-        if (placement == null || removed == null) return placement;
+        if (removed == null) return placement;
+        if (placement == null) {
+            deletedGenerations.remove(key, removed);
+            return null;
+        }
         if (removed.equals(placement.generationId())) return null;
         deletedGenerations.remove(key, removed);
         return placement;
