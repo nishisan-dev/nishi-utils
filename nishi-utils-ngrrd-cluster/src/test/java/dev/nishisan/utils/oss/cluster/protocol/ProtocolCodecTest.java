@@ -573,6 +573,46 @@ class ProtocolCodecTest {
     }
 
     @Test
+    void latencySnapshotComRecentMaxSobreviveAoRoundTripNoNodeMetrics() throws IOException {
+        // recentMaxMicros diferente de maxMicros: prova que o campo novo trafega, não só o construtor de 4 args.
+        LatencySnapshot writeBatchLatency = new LatencySnapshot(120L, 850L, 4_200L, 9_100L, 300L);
+        BlobVolumeSummary blobStats = new BlobVolumeSummary(4, 10_485_760L, 104_857_600L, 0.42, 350, 8_192L);
+        NodeMetricsSnapshot original = new NodeMetricsSnapshot("storage-0", 1_700_000_000_000L, true, 350L,
+                10_485_760L, 104_857_600L, 12, 120L, 4_800L, 7L, 30L, 5L, 75L, writeBatchLatency,
+                LatencySnapshot.EMPTY, LatencySnapshot.EMPTY, Map.of(), blobStats, 0L, 0L, 0L, 0L, 0L, 0L, 0L, 9L,
+                LatencySnapshot.EMPTY);
+
+        NodeMetricsSnapshot roundTripped = roundTripResponseBody(Commands.ADMIN_METRICS, original);
+
+        assertEquals(300L, roundTripped.writeBatchLatency().recentMaxMicros());
+        assertEquals(original, roundTripped);
+    }
+
+    @Test
+    void latencySnapshotDeNoAnteriorSemRecentMaxLeZero() throws Exception {
+        // Nó 8.14.x -> leitor 8.15: o campo ausente chega como 0 (aditivo).
+        LatencySnapshot legacy = JacksonMessageCodec.createDefaultMapper().readValue(
+                "{\"count\":10,\"p50Micros\":1,\"p99Micros\":2,\"maxMicros\":9}", LatencySnapshot.class);
+        assertEquals(new LatencySnapshot(10L, 1L, 2L, 9L, 0L), legacy);
+        assertEquals(0L, legacy.recentMaxMicros());
+    }
+
+    /** Forma do {@code LatencySnapshot} de um nó anterior à 8.15, sem {@code recentMaxMicros}. */
+    private record LegacyLatencySnapshot(long count, long p50Micros, long p99Micros, long maxMicros) {
+    }
+
+    @Test
+    void latencySnapshotNovoELidoPorLeitorAnteriorQueIgnoraCampoDesconhecido() throws Exception {
+        // Nó 8.15 -> leitor 8.14.x: o mesmo mapper tolerante ignora recentMaxMicros.
+        var mapper = JacksonMessageCodec.createDefaultMapper();
+        String json = mapper.writeValueAsString(new LatencySnapshot(10L, 1L, 2L, 9L, 5L));
+
+        LegacyLatencySnapshot legacy = mapper.readValue(json, LegacyLatencySnapshot.class);
+
+        assertEquals(new LegacyLatencySnapshot(10L, 1L, 2L, 9L), legacy);
+    }
+
+    @Test
     void catalogLookupRequestSobreviveAoRoundTrip() throws IOException {
         CatalogLookupRequest original = new CatalogLookupRequest(List.of("series-1", "series-2"));
         assertEquals(original, roundTripRequestBody(Commands.CATALOG_LOOKUP, original));

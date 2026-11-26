@@ -24,8 +24,12 @@ import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.rpc.ClusterRpc;
 
 import java.time.Duration;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.Supplier;
 
@@ -42,7 +46,14 @@ final class MetricsTrackingClusterRpc implements ClusterRpc {
 
     private final ClusterRpc delegate;
     private final LatencyHistogram latency = new LatencyHistogram();
+    /** Latência por comando, criada sob demanda (conjunto fechado em {@link Commands}, com teto de proteção). */
+    private final ConcurrentMap<String, LatencyHistogram> byCommand = new ConcurrentHashMap<>();
     private final LongAdder placeCount = new LongAdder();
+
+    /** Teto de histogramas por comando; nomes além dele vão para {@link #OTHER}. */
+    static final int MAX_COMMANDS = 64;
+    /** Chave dos comandos inesperados, quando o teto de {@link #MAX_COMMANDS} já foi atingido. */
+    static final String OTHER = "other";
 
     MetricsTrackingClusterRpc(ClusterRpc delegate) {
         this.delegate = Objects.requireNonNull(delegate, "delegate");
@@ -65,11 +76,27 @@ final class MetricsTrackingClusterRpc implements ClusterRpc {
         try {
             return call.get();
         } finally {
-            latency.record(System.nanoTime() - startNanos);
+            long elapsedNanos = System.nanoTime() - startNanos;
+            latency.record(elapsedNanos);
+            histogramFor(command).record(elapsedNanos);
             if (Commands.PLACE.equals(command)) {
                 placeCount.increment();
             }
         }
+    }
+
+    /** Histograma do comando; ao atingir o teto, nomes novos (ou nulos) caem em {@link #OTHER}. */
+    private LatencyHistogram histogramFor(String command) {
+        if (command == null) {
+            return byCommand.computeIfAbsent(OTHER, k -> new LatencyHistogram());
+        }
+        LatencyHistogram existing = byCommand.get(command);
+        if (existing != null) {
+            return existing;
+        }
+        // Reserva uma vaga para "other": o total nunca passa de MAX_COMMANDS.
+        String key = byCommand.size() >= MAX_COMMANDS - 1 ? OTHER : command;
+        return byCommand.computeIfAbsent(key, k -> new LatencyHistogram());
     }
 
     @Override
@@ -90,6 +117,13 @@ final class MetricsTrackingClusterRpc implements ClusterRpc {
     /** Snapshot atual da latência agregada de todas as chamadas feitas por este cliente. */
     LatencySnapshot latencySnapshot() {
         return latency.snapshot();
+    }
+
+    /** Snapshot da latência de cada comando já chamado, ordenado por nome. */
+    Map<String, LatencySnapshot> latencySnapshotByCommand() {
+        Map<String, LatencySnapshot> result = new TreeMap<>();
+        byCommand.forEach((command, histogram) -> result.put(command, histogram.snapshot()));
+        return result;
     }
 
     /** Total de chamadas {@link Commands#PLACE} feitas por este cliente. */

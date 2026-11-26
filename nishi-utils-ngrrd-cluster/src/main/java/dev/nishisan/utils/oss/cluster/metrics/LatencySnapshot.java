@@ -32,9 +32,17 @@ package dev.nishisan.utils.oss.cluster.metrics;
  * @param p50Micros  mediana aproximada, em microssegundos, sobre a janela recente
  * @param p99Micros  percentil 99 aproximado, em microssegundos, sobre a janela recente
  * @param maxMicros  maior amostra já registrada, em microssegundos, desde a criação do histograma
+ * @param recentMaxMicros maior amostra dos últimos 60 a 120 s (máximo rotativo por minuto, em dois
+ *                   baldes), em microssegundos; 0 se não houve amostra nesse período. Campo aditivo: um
+ *                   nó anterior à 8.15 não o envia e ele chega como 0
  */
-public record LatencySnapshot(long count, long p50Micros, long p99Micros, long maxMicros) {
+public record LatencySnapshot(long count, long p50Micros, long p99Micros, long maxMicros, long recentMaxMicros) {
 
     /** Snapshot de um histograma sem nenhuma amostra registrada ainda. */
-    public static final LatencySnapshot EMPTY = new LatencySnapshot(0L, 0L, 0L, 0L);
+    public static final LatencySnapshot EMPTY = new LatencySnapshot(0L, 0L, 0L, 0L, 0L);
+
+    /** Compatibilidade com a assinatura anterior à 8.15.0: {@code recentMaxMicros} igual a {@code maxMicros}. */
+    public LatencySnapshot(long count, long p50Micros, long p99Micros, long maxMicros) {
+        this(count, p50Micros, p99Micros, maxMicros, maxMicros);
+    }
 }

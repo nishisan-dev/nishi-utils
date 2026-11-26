@@ -36,14 +36,17 @@ import java.util.Objects;
  * @param retriesByStatus retentativas observadas, agrupadas pelo {@link SeriesStatus} que as motivou
  * @param bufferedSamples amostras atualmente no buffer de cada nó de destino, por {@code nodeId}
  * @param openHandles     quantidade de {@code NgrrdHandle} abertos neste cliente
- * @param rpcLatency      latência de toda chamada RPC síncrona feita por este cliente
- *                        ({@code place}, {@code writeBatch}, {@code checkpoint}, {@code read}, ...),
- *                        agregada num único histograma (não quebrada por comando)
+ * @param rpcLatency      <strong>obsoleto desde a 8.15.0</strong>, use {@code rpcLatencyByCommand}: latência
+ *                        de toda chamada RPC síncrona feita por este cliente, agregada num único histograma
+ *                        (não quebrada por comando); continua preenchido na 8.15.x e sai na 9.0
  * @param placeCount      total de chamadas {@code ngrrd.place} feitas por este cliente
  * @param ownerLookups    consultas ao líder feitas pelo buffer de escrita para desempatar dicas de dono
  *                        ({@code WRONG_OWNER}) contraditórias
  * @param redirectCycles  dicas de {@code WRONG_OWNER} classificadas como contraditórias (ciclo entre nós,
  *                        nó apontando a si mesmo, divergência do dono confirmado ou excesso de saltos)
+ * @param rpcLatencyByCommand latência das chamadas RPC por comando (ex.: {@code ngrrd.place},
+ *                        {@code ngrrd.writeBatch}), cada uma com {@code recentMaxMicros}; comandos além do
+ *                        teto de 64 entradas são agregados em {@code "other"}
  */
 public record ClientMetricsSnapshot(
         long samplesEnqueued,
@@ -53,15 +56,25 @@ public record ClientMetricsSnapshot(
         Map<SeriesStatus, Long> retriesByStatus,
         Map<String, Long> bufferedSamples,
         int openHandles,
-        LatencySnapshot rpcLatency,
+        @Deprecated LatencySnapshot rpcLatency,
         long placeCount,
         long ownerLookups,
-        long redirectCycles) {
+        long redirectCycles,
+        Map<String, LatencySnapshot> rpcLatencyByCommand) {
 
     public ClientMetricsSnapshot {
         retriesByStatus = Map.copyOf(Objects.requireNonNullElse(retriesByStatus, Map.of()));
         bufferedSamples = Map.copyOf(Objects.requireNonNullElse(bufferedSamples, Map.of()));
         rpcLatency = Objects.requireNonNullElse(rpcLatency, LatencySnapshot.EMPTY);
+        rpcLatencyByCommand = Map.copyOf(Objects.requireNonNullElse(rpcLatencyByCommand, Map.of()));
+    }
+
+    /** Compatibilidade com a assinatura anterior à 8.15.0: sem latência por comando. */
+    public ClientMetricsSnapshot(long samplesEnqueued, long samplesSent, long samplesFailed, long batchesSent,
+            Map<SeriesStatus, Long> retriesByStatus, Map<String, Long> bufferedSamples, int openHandles,
+            LatencySnapshot rpcLatency, long placeCount, long ownerLookups, long redirectCycles) {
+        this(samplesEnqueued, samplesSent, samplesFailed, batchesSent, retriesByStatus, bufferedSamples, openHandles,
+                rpcLatency, placeCount, ownerLookups, redirectCycles, Map.of());
     }
 
     /** Compatibilidade com a assinatura anterior à 8.7.0: {@code ownerLookups} e {@code redirectCycles} zerados. */
@@ -69,6 +82,6 @@ public record ClientMetricsSnapshot(
             Map<SeriesStatus, Long> retriesByStatus, Map<String, Long> bufferedSamples, int openHandles,
             LatencySnapshot rpcLatency, long placeCount) {
         this(samplesEnqueued, samplesSent, samplesFailed, batchesSent, retriesByStatus, bufferedSamples, openHandles,
-                rpcLatency, placeCount, 0L, 0L);
+                rpcLatency, placeCount, 0L, 0L, Map.of());
     }
 }
