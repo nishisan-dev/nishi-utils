@@ -1673,7 +1673,13 @@ class WriteDispatcherTest {
 
     @Test
     void reaberturaDeRotaDestacadaNaoPausaAGeracaoNova() throws Exception {
-        newDispatcher(1, Duration.ofMillis(10), 1000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        Map<String, CountDownLatch> replaced = new ConcurrentHashMap<>();
+        // A reabertura da g1 só termina depois que a g2 foi aberta: sem isso, ela podia vencer a thread que abre a g2
+        // e reenviar a escrita da g1 com OK (contada como enviada), o que tornava a contagem final instável.
+        newDispatcher(1, Duration.ofMillis(10), 1000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> {
+            awaitLatch(replaced.get(key));
+            return true;
+        });
         // g1: dica que aponta o próprio nó → consulta ao líder → líder não conhece a série → invalida e reabre.
         Set<String> redirected = ConcurrentHashMap.newKeySet();
         rpc.respondDefault((command, body) -> {
@@ -1683,7 +1689,6 @@ class WriteDispatcherTest {
                     ? moved(request, OWNER_A) : okFor(request);
         });
         placementLookup.atLeader = keys -> Map.of();
-        Map<String, CountDownLatch> replaced = new ConcurrentHashMap<>();
         // Ainda sob o lock da rota g1, antes da reabertura: outra thread abre a g2, que destaca a g1. A janela entre
         // destacar e publicar a g2 é estreita; várias chaves aumentam a chance de a reabertura cair nela.
         placementLookup.onInvalidate = key -> Thread.ofPlatform().start(() -> {
