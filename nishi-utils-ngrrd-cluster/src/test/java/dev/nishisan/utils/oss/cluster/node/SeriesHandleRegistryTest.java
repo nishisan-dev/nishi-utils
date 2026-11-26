@@ -354,7 +354,7 @@ class SeriesHandleRegistryTest {
             var failCheckpoint = new AtomicBoolean(true);
             NgrrdHandle failing = (NgrrdHandle) java.lang.reflect.Proxy.newProxyInstance(
                     NgrrdHandle.class.getClassLoader(), new Class<?>[]{NgrrdHandle.class}, (proxy, method, args) -> {
-                        if (method.getName().equals("checkpoint") && failCheckpoint.getAndSet(false)) {
+                        if (method.getName().equals("checkpointAsync") && failCheckpoint.getAndSet(false)) {
                             throw new IllegalStateException("injected checkpoint failure");
                         }
                         try { return method.invoke(original, args); }
@@ -412,7 +412,7 @@ class SeriesHandleRegistryTest {
                     "o handle tem que ser fechado exatamente uma vez: " + calls);
             assertTrue(calls.stream().allMatch(call -> call.endsWith("@racing-cutover")),
                     "só o markMigrating fecha e faz checkpoint do handle, nunca o open() recusado: " + calls);
-            assertTrue(calls.contains("checkpoint@racing-cutover"),
+            assertTrue(calls.contains("checkpointAsync@racing-cutover"),
                     "a escrita confirmada tem que chegar à imagem antes do corte: " + calls);
             assertEquals("close@racing-cutover", calls.get(calls.size() - 1), "checkpoint antes do close: " + calls);
             assertFalse(entries(registry).containsKey(key), "o markMigrating remove a entrada");
@@ -1217,7 +1217,7 @@ class SeriesHandleRegistryTest {
 
             AtomicBoolean failCheckpoint = new AtomicBoolean(true);
             wrapHandle(registry, "frozen", original -> delegating(original, method -> {
-                if (method.equals("checkpoint") && failCheckpoint.getAndSet(false)) {
+                if (method.equals("checkpointAsync") && failCheckpoint.getAndSet(false)) {
                     throw new IllegalStateException("checkpoint do cutover falhou");
                 }
                 return null;
@@ -1478,6 +1478,233 @@ class SeriesHandleRegistryTest {
                 "esperava o marcador SEVERE: " + records);
     }
 
+    // ------------------------------------------------------------------ force preso com writer real
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void closeIdleComForcePresoTerminaERemoveAEntradaComoAbandonada(@TempDir Path dir) throws Exception {
+        try (StuckForceFixture fixture = new StuckForceFixture(dir, 10)) {
+            fixture.openStuck("stuck");
+            List<java.util.logging.LogRecord> records = new CopyOnWriteArrayList<>();
+            java.util.logging.Handler capture = capturing(records);
+            java.util.logging.Logger logger = java.util.logging.Logger.getLogger(SeriesHandleRegistry.class.getName());
+            logger.addHandler(capture);
+            try {
+                fixture.clock.advance(Duration.ofMinutes(2));
+                assertEquals(0, fixture.registry.closeIdle(), "o abandono não conta como fechamento por ociosidade");
+            } finally {
+                logger.removeHandler(capture);
+            }
+
+            assertFalse(entries(fixture.registry).containsKey("stuck"), "a entrada abandonada tem que sair do mapa");
+            assertEquals(1L, abandonedCount(fixture.registry));
+            assertEquals(0L, fixture.registry.handleMetrics().get("handles.idleClosed"));
+            assertTrue(records.stream().anyMatch(record -> record.getLevel() == java.util.logging.Level.SEVERE
+                            && record.getMessage().contains("NGRRD_WRITER_ABANDONED seriesKey=stuck")),
+                    "esperava o marcador SEVERE: " + records);
+        }
+    }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void discardComForcePresoTerminaELancaOAbandono(@TempDir Path dir) throws Exception {
+        try (StuckForceFixture fixture = new StuckForceFixture(dir, 10)) {
+            fixture.openStuck("stuck");
+
+            assertThrows(WriterAbandonedException.class, () -> fixture.registry.discard("stuck"));
+
+            assertFalse(entries(fixture.registry).containsKey("stuck"));
+            assertFalse(fixture.registry.dirtySeries().contains("stuck"), "a poda roda depois do unlock");
+            assertEquals(1L, abandonedCount(fixture.registry));
+        }
+    }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void markMigratingComForcePresoAbortaERemoveAEntradaAbandonada(@TempDir Path dir) throws Exception {
+        try (StuckForceFixture fixture = new StuckForceFixture(dir, 10)) {
+            fixture.openStuck("stuck");
+            fixture.registry.beginMigrationCopy("stuck");
+
+            assertThrows(WriterAbandonedException.class, () -> fixture.registry.markMigrating("stuck"),
+                    "a migração tem que abortar");
+
+            assertTrue(fixture.registry.isMigrating("stuck"));
+            assertFalse(entries(fixture.registry).containsKey("stuck"));
+            assertEquals(1L, abandonedCount(fixture.registry));
+        }
+    }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void migrationSnapshotComForcePresoFalhaEmTempoFinitoEMantemOHandle(@TempDir Path dir) throws Exception {
+        try (StuckForceFixture fixture = new StuckForceFixture(dir, 10)) {
+            fixture.openStuck("stuck");
+            fixture.registry.beginMigrationCopy("stuck");
+
+            assertThrows(IllegalStateException.class,
+                    () -> fixture.registry.migrationSnapshot("stuck", () -> new byte[0]));
+
+            assertTrue(entries(fixture.registry).containsKey("stuck"),
+                    "o snapshot só falha: quem fecha a série presa é o caminho de fechamento");
+            assertTrue(fixture.registry.isDirty("stuck"), "checkpoint não concluído não marca a série como limpa");
+            fixture.registry.clearMigrating("stuck");
+        }
+    }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void closeDoRegistryComForcePresoTerminaEAbandonaTodasAsPresas(@TempDir Path dir) throws Exception {
+        try (StuckForceFixture fixture = new StuckForceFixture(dir, 10)) {
+            // Todo force deste volume fica preso: as duas séries são abandonadas, uma depois da outra.
+            fixture.openStuck("stuck-a");
+            fixture.openStuck("stuck-b");
+
+            fixture.registry.close();
+
+            assertTrue(entries(fixture.registry).isEmpty(), "o abandono da primeira não impede o fechamento da segunda");
+            assertEquals(2L, abandonedCount(fixture.registry));
+        }
+    }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void openDeOutraSerieNaoTravaNoDespejoDeUmaSerieComForcePreso(@TempDir Path dir) throws Exception {
+        try (StuckForceFixture fixture = new StuckForceFixture(dir, 1)) {
+            fixture.openStuck("stuck");
+
+            fixture.registry.open("fresh", yaml, Ngrrd.OpenOptions.defaults());
+
+            assertFalse(entries(fixture.registry).containsKey("stuck"), "o despejo abandona a série presa");
+            assertTrue(fixture.registry.isOpen("fresh"));
+            assertEquals(1L, abandonedCount(fixture.registry));
+        }
+    }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void outraSerieSegueOperandoEnquantoOFechamentoDaPresaEspera(@TempDir Path dir) throws Exception {
+        try (StuckForceFixture fixture = new StuckForceFixture(dir, 10)) {
+            fixture.openStuck("stuck");
+            ExecutorService closer = Executors.newSingleThreadExecutor();
+            try {
+                ReentrantLock stuckLock = entryLock(fixture.registry, "stuck");
+                Future<?> discard = closer.submit(() -> {
+                    try {
+                        fixture.registry.discard("stuck");
+                    } catch (WriterAbandonedException expected) {
+                        // desfecho esperado: o writer da série presa é abandonado
+                    }
+                });
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+                while (!stuckLock.isLocked() && !discard.isDone()) {
+                    assertTrue(System.nanoTime() < deadline, "o discard não chegou ao lock da série presa");
+                    Thread.sleep(1);
+                }
+
+                fixture.registry.open("other", yaml, Ngrrd.OpenOptions.defaults());
+                assertTrue(fixture.registry.withHandle("other", handle -> {
+                    handle.write("in_octets", new Sample(1_700_000_100_000L, 1_000d));
+                    return true;
+                }).orElse(false), "outra série tem que seguir gravável enquanto a presa fecha");
+
+                discard.get(20, TimeUnit.SECONDS);
+                assertFalse(entries(fixture.registry).containsKey("stuck"));
+                assertTrue(fixture.registry.isOpen("other"));
+            } finally {
+                closer.shutdownNow();
+            }
+        }
+    }
+
+    private static java.util.logging.Handler capturing(List<java.util.logging.LogRecord> records) {
+        return new java.util.logging.Handler() {
+            @Override public void publish(java.util.logging.LogRecord record) { records.add(record); }
+            @Override public void flush() { }
+            @Override public void close() { }
+        };
+    }
+
+    /**
+     * Volume real cujo executor de force prende toda fase B até o fim do teste: um checkpoint com amostra nova
+     * destaca o force, que nunca termina. O registro usa espera curta pelo checkpoint de fechamento e o writer de
+     * cada série presa usa teto curto no Shutdown ({@link #shortenWriterShutdownWait}), para o abandono sair em
+     * frações de segundo em vez dos 20 s padrão.
+     */
+    private final class StuckForceFixture implements AutoCloseable {
+        private final CountDownLatch gate = new CountDownLatch(1);
+        private final ExecutorService forcePool = Executors.newSingleThreadExecutor(task -> {
+            Thread thread = new Thread(task, "stuck-force");
+            thread.setDaemon(true);
+            return thread;
+        });
+        private final BlobVolumeRegistry volumes;
+        private final MutableClock clock = new MutableClock(Instant.parse("2026-01-01T00:00:00Z"));
+        private final SeriesHandleRegistry registry;
+
+        StuckForceFixture(Path dir, int maxOpenHandles) {
+            java.util.concurrent.Executor gated = task -> forcePool.execute(() -> {
+                try {
+                    gate.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+                task.run();
+            });
+            volumes = NgrrdBlob.registry().basePath(dir.resolve("stuck-force")).volume(VOLUME_NAME)
+                    .checkpointForceExecutor(gated).build();
+            registry = new SeriesHandleRegistry(volumes.require(VOLUME_NAME), VOLUME_NAME, Duration.ofMinutes(1),
+                    maxOpenHandles, clock);
+            registry.trackDirtyIndex(true);
+            registry.closeCheckpointWaitForTests(Duration.ofMillis(200));
+        }
+
+        /** Abre a série, escreve e enfileira um checkpoint cujo force destacado fica preso no portão. */
+        void openStuck(String key) {
+            registry.open(key, yaml, Ngrrd.OpenOptions.defaults());
+            assertTrue(registry.withSeries(key, access -> {
+                access.handle().write("in_octets", new Sample(1_700_000_100_000L, 1_000d));
+                access.recordWrite();
+                return true;
+            }).orElse(false));
+            shortenWriterShutdownWait(registry, key, Duration.ofMillis(300));
+            SeriesHandleRegistry.CheckpointAttempt attempt = registry.tryCheckpointAsync(key);
+            assertEquals(SeriesHandleRegistry.CheckpointAttempt.Outcome.STARTED, attempt.outcome());
+        }
+
+        @Override
+        public void close() throws InterruptedException {
+            gate.countDown();
+            try {
+                registry.close();
+            } catch (RuntimeException ignored) {
+                // o registro pode já estar fechado pelo teste, ou guardar falhas que o teste já conferiu
+            }
+            forcePool.shutdown();
+            assertTrue(forcePool.awaitTermination(10, TimeUnit.SECONDS), "os forces liberados têm que terminar");
+            volumes.close();
+        }
+    }
+
+    /**
+     * Reduz o teto de espera do Shutdown do writer real da série pelos forces em voo (20 s no oss). O método é
+     * package-private do pacote {@code writer}, só para testes: acessado por reflexão a partir do handle aberto.
+     */
+    private static void shortenWriterShutdownWait(SeriesHandleRegistry registry, String key, Duration wait) {
+        try {
+            NgrrdHandle handle = registry.existing(key).orElseThrow();
+            Field writerField = handle.getClass().getDeclaredField("writer");
+            writerField.setAccessible(true);
+            Object writer = writerField.get(handle);
+            java.lang.reflect.Method shorten = writer.getClass().getDeclaredMethod("shutdownForceWaitForTests",
+                    long.class);
+            shorten.setAccessible(true);
+            shorten.invoke(writer, wait.toNanos());
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError(e);
+        }
+    }
+
     // ------------------------------------------------------------------ apoio do índice de sujas
 
     /** Handle falso: checkpoints concluem (o assíncrono em outra thread) e o resto não faz nada. */
@@ -1556,13 +1783,13 @@ class SeriesHandleRegistryTest {
     }
 
     /**
-     * Envolve o handle da série num proxy que registra cada {@code checkpoint}/{@code close} como
+     * Envolve o handle da série num proxy que registra cada {@code checkpointAsync}/{@code close} como
      * {@code "método@thread"}, na ordem das chamadas.
      */
     private static List<String> recordHandleCalls(SeriesHandleRegistry registry, String key) {
         List<String> calls = new CopyOnWriteArrayList<>();
         wrapHandle(registry, key, original -> delegating(original, method -> {
-            if (method.equals("checkpoint") || method.equals("close")) {
+            if (method.equals("checkpointAsync") || method.equals("close")) {
                 calls.add(method + "@" + Thread.currentThread().getName());
             }
             return null;

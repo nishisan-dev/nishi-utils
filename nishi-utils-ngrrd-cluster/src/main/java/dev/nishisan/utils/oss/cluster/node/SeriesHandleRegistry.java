@@ -44,6 +44,9 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
@@ -129,6 +132,17 @@ public final class SeriesHandleRegistry implements Closeable {
 
     /** Intervalo mínimo entre logs completos (WARNING) de falha de fechamento por série. */
     private static final long CLOSE_FAILURE_LOG_INTERVAL_MS = 10_000L;
+
+    /**
+     * Teto da espera, com a série travada, pelo checkpoint que o registro faz antes de fechar o handle ({@link
+     * #closeQuietly}), no corte da migração ({@link #markMigrating}) e no snapshot da cópia online ({@link
+     * #migrationSnapshot}). Igual ao teto do writer para os forces em voo no Shutdown ({@code
+     * NgrrdWriter.SHUTDOWN_FORCE_WAIT_SECONDS}, 20 s): um force lento, mas que anda, termina dentro dele; um force
+     * preso não segura o lock da série para sempre. Estourado, o fechamento segue para o {@code close()} do handle,
+     * que aplica o teto do writer e lança {@link WriterAbandonedException} se o force continuar preso. No pior caso,
+     * fechar uma série presa custa este teto mais o do writer.
+     */
+    static final Duration CLOSE_CHECKPOINT_WAIT = Duration.ofSeconds(20);
 
     /** Teto de chaves de cada LRU usado para classificar {@code NOT_OPEN} por causa. */
     static final int NOT_OPEN_CAUSE_LRU_LIMIT = 65_536;
@@ -226,6 +240,8 @@ public final class SeriesHandleRegistry implements Closeable {
     private final AtomicLong selfHealed = new AtomicLong();
     /** Entradas removidas por writer abandonado no fechamento ({@code handles.writerAbandoned}). */
     private final AtomicLong writerAbandoned = new AtomicLong();
+    /** Espera efetiva pelo checkpoint de fechamento, em ns ({@link #CLOSE_CHECKPOINT_WAIT}); só testes a reduzem. */
+    private volatile long closeCheckpointWaitNanos = CLOSE_CHECKPOINT_WAIT.toNanos();
     /** Instante (ms do relógio) do último log completo de falha de fechamento; {@code -1} = nunca. */
     private final AtomicLong lastCloseFailureLogMs = new AtomicLong(-1);
     /** Respostas {@code NOT_OPEN} por causa ({@code notOpen.*}); a soma é o total de {@code NOT_OPEN}. */
@@ -631,11 +647,42 @@ public final class SeriesHandleRegistry implements Closeable {
         });
     }
 
-    /** Checkpoint síncrono com a entrada travada; marca a série como limpa até a seq capturada. */
-    private static void checkpointLocked(HandleEntry entry) {
-        long seq = entry.writeSeq;
-        entry.handle.checkpoint();
-        entry.markCheckpointed(seq);
+    /**
+     * Checkpoint com a entrada travada e espera limitada por {@link #CLOSE_CHECKPOINT_WAIT}: enfileira pelo {@link
+     * #checkpointAsyncLocked} (que marca a série como limpa até a seq capturada, só no sucesso) e espera a future.
+     * Nunca usa o {@code checkpoint()} síncrono do handle, que espera sem prazo e, com um force destacado preso,
+     * não volta mais (o Sync encadeia no force em voo).
+     *
+     * @throws CheckpointWaitTimeoutException se o checkpoint não concluiu no teto; a future segue pendente e a série
+     *                                        continua suja
+     * @throws RuntimeException               a mesma falha que o checkpoint lançaria
+     */
+    private void awaitCheckpointLocked(String seriesKey, HandleEntry entry) {
+        CompletableFuture<Void> checkpoint = checkpointAsyncLocked(entry);
+        long waitNanos = closeCheckpointWaitNanos;
+        try {
+            checkpoint.get(waitNanos, TimeUnit.NANOSECONDS);
+        } catch (TimeoutException e) {
+            throw new CheckpointWaitTimeoutException("checkpoint da série " + seriesKey + " não concluiu em "
+                    + TimeUnit.NANOSECONDS.toMillis(waitNanos) + " ms (force preso?)");
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            if (cause instanceof RuntimeException runtime) {
+                throw runtime;
+            }
+            if (cause instanceof Error error) {
+                throw error;
+            }
+            throw new IllegalStateException("checkpoint da série " + seriesKey + " falhou", cause);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("espera do checkpoint da série " + seriesKey + " interrompida", e);
+        }
+    }
+
+    /** Reduz o teto da espera pelo checkpoint de fechamento ({@link #CLOSE_CHECKPOINT_WAIT}). Só para testes. */
+    void closeCheckpointWaitForTests(Duration wait) {
+        this.closeCheckpointWaitNanos = wait.toNanos();
     }
 
     /**
@@ -817,7 +864,7 @@ public final class SeriesHandleRegistry implements Closeable {
         entry.lock.lock();
         try {
             if (entries.get(seriesKey) == entry) {
-                abandoned = closeQuietly(seriesKey, entry);
+                abandoned = closeQuietly(seriesKey, entry, true);
                 removed = removeEntry(seriesKey, entry);
             }
         } finally {
@@ -955,7 +1002,7 @@ public final class SeriesHandleRegistry implements Closeable {
                     continue;
                 }
                 try {
-                    if (closeQuietly(seriesKey, entry) == null) {
+                    if (closeQuietly(seriesKey, entry, true) == null) {
                         idleClosed.incrementAndGet();
                         closedCount++;
                     }
@@ -998,7 +1045,7 @@ public final class SeriesHandleRegistry implements Closeable {
                         continue;
                     }
                     try {
-                        if (closeQuietly(seriesKey, entry) == null) {
+                        if (closeQuietly(seriesKey, entry, true) == null) {
                             evicted.incrementAndGet();
                         }
                     } catch (RuntimeException e) {
@@ -1041,6 +1088,12 @@ public final class SeriesHandleRegistry implements Closeable {
      * {@link IllegalStateException}; {@link #withHandle}/{@link #reopenIfKnown}
      * passam a devolver {@link Optional#empty()}. Na cópia online, este bloqueio
      * só começa na troca final de dono; uma falha no checkpoint impede o commit.
+     *
+     * <p>A espera pelo checkpoint do corte tem o teto {@link #CLOSE_CHECKPOINT_WAIT}. Uma falha do checkpoint
+     * mantém a entrada (o handle segue disponível para o aborto). Estourado o teto (force preso), a migração também
+     * aborta, mas o handle é fechado antes: com o force ainda preso, o {@code close()} lança {@link
+     * WriterAbandonedException}, a entrada sai como abandonada e é essa exceção que volta; se o {@code close()}
+     * concluir, a entrada sai normalmente e volta a {@link CheckpointWaitTimeoutException}.</p>
      */
     public void markMigrating(String seriesKey) {
         Objects.requireNonNull(seriesKey, "seriesKey");
@@ -1053,13 +1106,22 @@ public final class SeriesHandleRegistry implements Closeable {
         }
         boolean removed = false;
         WriterAbandonedException abandoned = null;
+        CheckpointWaitTimeoutException timedOut = null;
         entry.lock.lock();
         try {
             // An acknowledged write must reach the image before migration closes its writer.
             // A failed checkpoint leaves the handle available for a safe abort/retry.
-            if (entries.get(seriesKey) == entry && entry.handle != null) { checkpointLocked(entry); }
+            if (entries.get(seriesKey) == entry && entry.handle != null) {
+                try {
+                    awaitCheckpointLocked(seriesKey, entry);
+                } catch (CheckpointWaitTimeoutException e) {
+                    // Force preso: segue para o close(), que aplica o teto do writer; a migração aborta de todo jeito.
+                    timedOut = e;
+                }
+            }
             if (entries.get(seriesKey) == entry) {
-                abandoned = closeQuietly(seriesKey, entry);
+                // O checkpoint do corte já foi feito (ou estourou o teto): o close() vai direto, sem nova espera.
+                abandoned = closeQuietly(seriesKey, entry, false);
                 removed = removeEntry(seriesKey, entry);
             }
         } finally {
@@ -1069,6 +1131,9 @@ public final class SeriesHandleRegistry implements Closeable {
             pruneIndex(seriesKey);
         }
         rethrowAbandoned(abandoned);
+        if (timedOut != null) {
+            throw timedOut;
+        }
     }
 
     /** Remove a marca de migração, permitindo {@link #open} novamente. */
@@ -1093,14 +1158,20 @@ public final class SeriesHandleRegistry implements Closeable {
     /** Whether this source still accepts writes while copying an image. */
     public boolean isCopying(String seriesKey) { return copying.contains(seriesKey); }
 
-    /** Checkpoints and snapshots one series under its write lock, then immediately releases writers. */
+    /**
+     * Checkpoints and snapshots one series under its write lock, then immediately releases writers.
+     *
+     * <p>A espera pelo checkpoint tem o teto {@link #CLOSE_CHECKPOINT_WAIT}: estourado, lança {@link
+     * CheckpointWaitTimeoutException} (a migração aborta) e mantém o handle; quem fecha a série presa é o caminho de
+     * fechamento.</p>
+     */
     public byte[] migrationSnapshot(String seriesKey, java.util.function.Supplier<byte[]> image) {
         for (;;) {
             HandleEntry entry = entries.computeIfAbsent(seriesKey, key -> new HandleEntry());
             entry.lock.lock();
             try {
                 if (entries.get(seriesKey) != entry) { continue; }
-                if (entry.handle != null) { checkpointLocked(entry); }
+                if (entry.handle != null) { awaitCheckpointLocked(seriesKey, entry); }
                 return image.get();
             } finally {
                 if (entry.handle == null) { removeEntry(seriesKey, entry); }
@@ -1138,7 +1209,7 @@ public final class SeriesHandleRegistry implements Closeable {
             entry.lock.lock();
             try {
                 if (entries.get(seriesKey) == entry && entry.handle != null) {
-                    closeQuietly(seriesKey, entry);
+                    closeQuietly(seriesKey, entry, true);
                     removed = removeEntry(seriesKey, entry);
                 }
             } catch (RuntimeException e) {
@@ -1279,13 +1350,15 @@ public final class SeriesHandleRegistry implements Closeable {
      * Fecha um handle com checkpoint prévio. {@code NgrrdHandle.close()} já
      * força durabilidade internamente (materializa o CDP em progresso antes de
      * encerrar a thread do writer — ver {@code NgrrdWriter.close()}/{@code
-     * checkpointAndForce()}), então o {@code checkpoint()} explícito aqui é
-     * redundante em condições normais; mantido por clareza de intenção e como
-     * rede de segurança. Chamado sempre com a entrada travada.
+     * checkpointAndForce()}), então o checkpoint explícito aqui é
+     * redundante em condições normais; mantido porque marca a série como limpa e porque, ao contrário do
+     * checkpoint final do {@code close()} (que o writer só registra no stderr), uma falha dele aparece no log do
+     * registro. Chamado sempre com a entrada travada.
      *
-     * <p>Uma falha nesse checkpoint final só é logada: quem pediu o fechamento — inclusive
-     * um {@code CLOSE} remoto — não recebe o erro; o {@code close()} do handle ainda tenta o checkpoint
-     * final do writer.</p>
+     * <p>A espera pelo checkpoint prévio tem o teto {@link #CLOSE_CHECKPOINT_WAIT}: com um force destacado preso, o
+     * Sync encadeia no force em voo e nunca concluiria. Estourado o teto, ou falhando o checkpoint, a falha só é
+     * logada: quem pediu o fechamento — inclusive um {@code CLOSE} remoto — não recebe o erro, e o {@code close()}
+     * do handle segue, com o teto do writer.</p>
      *
      * <p>Se o {@code close()} lançar {@link WriterAbandonedException} (force preso além do teto do writer), o
      * writer não volta mais: a exceção é pegajosa e a entrada nunca fecharia. Aqui ela é registrada (SEVERE,
@@ -1294,17 +1367,21 @@ public final class SeriesHandleRegistry implements Closeable {
      * ({@link #removeEntry}) sem marcar a série como limpa; a próxima abertura reabre do disco. Qualquer outra
      * falha do {@code close()} é logada (com limite de frequência) e propagada, e a entrada permanece.</p>
      *
+     * @param checkpointFirst {@code false} quando o chamador já fez o checkpoint (ou já estourou o teto dele), como
+     *                        o corte da migração: o {@code close()} vai direto, sem uma segunda espera
      * @return {@code null} se fechou normalmente (ou não havia handle); a exceção de abandono, se for o caso
      */
-    private WriterAbandonedException closeQuietly(String seriesKey, HandleEntry entry) {
+    private WriterAbandonedException closeQuietly(String seriesKey, HandleEntry entry, boolean checkpointFirst) {
         NgrrdHandle handle = entry.handle;
         if (handle == null) {
             return null;
         }
-        try {
-            checkpointLocked(entry);
-        } catch (RuntimeException e) {
-            logCloseFailure("Falha no checkpoint final da série " + seriesKey + " antes de fechar", e);
+        if (checkpointFirst) {
+            try {
+                awaitCheckpointLocked(seriesKey, entry);
+            } catch (RuntimeException e) {
+                logCloseFailure("Falha no checkpoint final da série " + seriesKey + " antes de fechar", e);
+            }
         }
         try {
             handle.close();
@@ -1340,6 +1417,18 @@ public final class SeriesHandleRegistry implements Closeable {
             LOGGER.log(Level.WARNING, message, failure);
         } else {
             LOGGER.log(Level.FINE, message, failure);
+        }
+    }
+
+    /**
+     * O checkpoint feito pelo registro com a série travada não concluiu no teto {@link #CLOSE_CHECKPOINT_WAIT}
+     * (tipicamente, force destacado preso). A série continua suja.
+     */
+    static final class CheckpointWaitTimeoutException extends IllegalStateException {
+        private static final long serialVersionUID = 1L;
+
+        CheckpointWaitTimeoutException(String message) {
+            super(message);
         }
     }
 

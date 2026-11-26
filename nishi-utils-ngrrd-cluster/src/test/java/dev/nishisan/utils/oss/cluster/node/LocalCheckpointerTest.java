@@ -482,7 +482,7 @@ class LocalCheckpointerTest {
         write("sync-fail", T0);
         AtomicBoolean failCheckpoint = new AtomicBoolean(true);
         wrapHandle("sync-fail", original -> delegating(original, method -> {
-            if (method.equals("checkpoint") && failCheckpoint.get()) {
+            if (method.equals("checkpointAsync") && failCheckpoint.get()) {
                 throw new IllegalStateException("fsync simulado falhou");
             }
             return null;
@@ -506,7 +506,7 @@ class LocalCheckpointerTest {
             if (method.equals("checkpointAsyncTimed")) {
                 asyncCalls.incrementAndGet();
             }
-            if (method.equals("checkpoint") && failSyncCheckpoint.getAndSet(false)) {
+            if (method.equals("checkpointAsync") && failSyncCheckpoint.getAndSet(false)) {
                 throw new IllegalStateException("checkpoint do cutover falhou");
             }
             return null;
