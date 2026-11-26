@@ -50,7 +50,7 @@ protocolo de comandos não mudam. Guia de atualização em `doc/oss/ngrrd-cluste
 - **Fill sobre a capacidade declarada**: `fillDeclared=` no `NGRRD_NODE_STATUS` e `blobStats.fillOfDeclaredCapacity`
   (`0` = capacidade desconhecida), com o marcador `NGRRD_VOLUME_FILL` nas faixas 80/90/95%.
 - **Duração do crescimento do shard**: `volume.shardGrows`, `volume.shardGrowMsMax` e `volume.shardGrowMsLast`.
-  O crescimento do shard deixa de fazer *probing*: a série sempre vai para o shard calculado pelo hash.
+  A documentação do blob volume deixa de descrever *probing* no crescimento do shard, que o código nunca fez.
 
 ### nishi-utils-oss
 - Force do blob destacável do writer, com `checkpointAsyncTimed` (checkpoint assíncrono com prazo e medição de
@@ -61,8 +61,9 @@ protocolo de comandos não mudam. Guia de atualização em `doc/oss/ngrrd-cluste
 
 ### Correções de defeitos anteriores encontradas no caminho
 - Corrida na troca de geração da rota de escrita (dupla contagem de `completed`/`submitted` e rota presa).
-- Ordem de conclusão das marcas de escrita e proteção de marcas com releases sobrepostos da mesma série.
-- Lock de abertura de séries: `open()` concorrentes da mesma chave não são mais excluídos entre si.
+- Ordem de conclusão das marcas de escrita (callbacks podiam rodar fora de ordem em outra thread).
+- Lock de abertura de séries no cliente: um terceiro `open()`/`release` da mesma chave podia entrar junto com
+  quem já tinha o lock; agora a exclusão mútua vale com qualquer número de participantes.
 - `open()` durante a migração da série não remove mais a entrada de um handle vivo (o writer não vaza sem checkpoint).
 - Laço de recuperação do journal de exclusões: isolado, com backoff, sem reconsultar o histórico `FINISHED` a cada
   segundo em todos os nós e sem reenviar `DELETE_RECOVER` indefinidamente após a recriação da série.
