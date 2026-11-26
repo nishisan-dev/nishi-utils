@@ -225,6 +225,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
      */
     @Override public void beginGeneration(String key, String generation, String owner, Object holder) {
         boolean[] marksReady = {false};
+        boolean[] dropped = {false};
         routes.compute(key, (ignored, previous) -> {
             if (previous == null) return holder == null ? null : new SeriesRoute(key, owner, generation, holder);
             previous.lock.lock();
@@ -253,17 +254,26 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 if (!marksMode || isIdle(previous)) {
                     synchronized (pendingLock) { pendingRoutes.remove(previous); }
                 }
-                return holder == null ? null : new SeriesRoute(key, owner, generation, holder);
+                if (holder == null) {
+                    dropped[0] = true;
+                    return null;
+                }
+                return new SeriesRoute(key, owner, generation, holder);
             } finally { previous.lock.unlock(); }
         });
+        if (dropped[0]) {
+            // Fora do compute: a geração aposentada saiu do mapa sem rota nova (abertura somente leitura).
+            routesRemovedCount.increment();
+            lastRetryLogMs.remove(key);
+        }
         if (marksReady[0]) scheduleMarkCompletion();
     }
 
     /**
      * {@code holder} deixou de usar a rota da geração {@code generation} de {@code key}. Sem holder, a rota fica
      * {@code retired}: novas admissões recebem {@link ErrorCode#CLOSED}, e as escritas já admitidas seguem até o
-     * desfecho. Um holder que não está na rota (ou outra geração no mapa) é no-op. Nunca chamar sob
-     * {@code route.lock}.
+     * desfecho; ociosa, sai do mapa aqui, senão quando a última resposta chegar ({@link #retirable}). Um holder que
+     * não está na rota (ou outra geração no mapa) é no-op. Nunca chamar sob {@code route.lock}.
      */
     @Override public void endGeneration(String key, String generation, Object holder) {
         if (holder == null) {
@@ -273,6 +283,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         if (route == null) {
             return;
         }
+        boolean candidate;
         route.lock.lock();
         try {
             if (!Objects.equals(route.generation, generation) || !route.holders.remove(holder)) {
@@ -281,9 +292,70 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             if (route.holders.isEmpty()) {
                 route.retired = true;
             }
+            candidate = retirable(route);
         } finally {
             route.lock.unlock();
         }
+        if (candidate) {
+            tryRemove(route);
+        }
+    }
+
+    /**
+     * Fase 1 da remoção (marcar): a rota não tem holder, nenhuma escrita sem desfecho (inclusive em disco) e
+     * nenhuma falha a reportar — ou a falha já foi entregue ao chamador ({@code failuresDelivered}) —, nem marca
+     * esperando, redirecionamento ou consulta de dono pendentes. Só avalia, nunca remove. Chamado sob
+     * {@code route.lock}; o chamador roda {@link #tryRemove} depois de soltá-lo.
+     */
+    private boolean retirable(SeriesRoute route) {
+        return route.holders.isEmpty()
+                && (isIdle(route) || (route.failuresDelivered && route.submitted == route.completed))
+                && route.waiters.isEmpty()
+                && !route.redirectPending
+                && !route.ownerLookupPending;
+    }
+
+    /**
+     * Fase 2 da remoção: tira {@code route} do mapa se ela ainda for a rota da chave e continuar
+     * {@link #retirable}. Ordem de locks bin do mapa → {@code route.lock}, a mesma de {@link #beginGeneration};
+     * por isso nunca roda sob um {@code route.lock} nem dentro de outro {@code compute} de {@link #routes}. Depois
+     * da remoção, já sem lock de rota, limpa o índice de pendentes, o rate limit de log e as tentativas da série nos
+     * buffers. Devolve {@code true} se removeu.
+     */
+    private boolean tryRemove(SeriesRoute route) {
+        boolean[] removed = {false};
+        routes.computeIfPresent(route.key, (key, current) -> {
+            if (current != route) {
+                return current;
+            }
+            current.lock.lock();
+            try {
+                if (!retirable(current)) {
+                    return current;
+                }
+                removed[0] = true;
+                return null;
+            } finally {
+                current.lock.unlock();
+            }
+        });
+        if (!removed[0]) {
+            return false;
+        }
+        routesRemovedCount.increment();
+        synchronized (pendingLock) {
+            pendingRoutes.remove(route);
+        }
+        lastRetryLogMs.remove(route.key);
+        for (NodeBuffer buf : buffers.values()) {
+            buf.lock.lock();
+            try {
+                buf.queue.forgetSeries(route.key);
+            } finally {
+                buf.lock.unlock();
+            }
+        }
+        return true;
     }
 
     @Override public void checkGeneration(String key, String generation) {
@@ -325,6 +397,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     private final ConcurrentMap<SeriesStatus, LongAdder> retryCounts = new ConcurrentHashMap<>();
     private final LongAdder ownerLookupsCount = new LongAdder();
     private final LongAdder redirectCyclesCount = new LongAdder();
+    private final LongAdder routesRemovedCount = new LongAdder();
     /** Marca de tempo do último log de retry por série, para o rate limit de {@link #logRetryRateLimited}. */
     private final ConcurrentMap<String, Long> lastRetryLogMs = new ConcurrentHashMap<>();
     private static final long RETRY_LOG_INTERVAL_MS = 10_000L;
@@ -549,13 +622,16 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         if (!marksMode) {
             throw new IllegalStateException("mark() exige writeFailureReporting=MARKS na configuração do cliente");
         }
+        // Rotas sem holder que ficaram ociosas ao colher as falhas: removidas depois de soltar o markLock.
+        List<SeriesRoute> retirable = new ArrayList<>();
+        Mark mark;
         markLock.lock();
         try {
             if (closed) {
                 throw new NgrrdClusterException(ErrorCode.CLOSED, "dispatcher fechado");
             }
             long admitted = samplesEnqueuedCount.sum();
-            Mark mark = new Mark(nextMarkId++, Math.max(0L, admitted - lastMarkAdmitted));
+            mark = new Mark(nextMarkId++, Math.max(0L, admitted - lastMarkAdmitted));
             lastMarkAdmitted = admitted;
             openMarks.addLast(mark);
             for (SeriesRoute route : snapshotPendingRoutes()) {
@@ -568,6 +644,9 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                             synchronized (pendingLock) {
                                 pendingRoutes.remove(route);
                             }
+                        }
+                        if (retirable(route)) {
+                            retirable.add(route);
                         }
                     } else if (route.waiters.isEmpty() || route.waiters.peekLast().boundary() < route.submitted) {
                         mark.acquire();
@@ -584,10 +663,13 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             // releases (and completions) are monotonic in mark order.
             mark.release();
             scheduleMarkCompletion();
-            return mark;
         } finally {
             markLock.unlock();
         }
+        for (SeriesRoute route : retirable) {
+            tryRemove(route);
+        }
+        return mark;
     }
 
     private Map<SeriesRoute, Long> snapshotBarriers(String owner) {
@@ -745,6 +827,24 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         return routes.containsKey(seriesKey);
     }
 
+    /** Se sobrou estado de retentativa de {@code seriesKey} (rate limit de log ou tentativas num buffer) — visível para testes. */
+    boolean hasRetryState(String seriesKey) {
+        if (lastRetryLogMs.containsKey(seriesKey)) {
+            return true;
+        }
+        for (NodeBuffer buf : buffers.values()) {
+            buf.lock.lock();
+            try {
+                if (buf.queue.hasAttempts(seriesKey)) {
+                    return true;
+                }
+            } finally {
+                buf.lock.unlock();
+            }
+        }
+        return false;
+    }
+
     /** Holders da rota de {@code seriesKey} ({@code 0} sem rota) — visível para testes. */
     int routeHolders(String seriesKey) {
         SeriesRoute route = routes.get(seriesKey);
@@ -801,6 +901,16 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     /** Dicas de {@code WRONG_OWNER} classificadas como contraditórias (ciclo, auto-redirecionamento, excesso de saltos). */
     public long redirectCycles() {
         return redirectCyclesCount.sum();
+    }
+
+    /** Rotas de escrita no mapa agora (uma por série com handle gravável ou escrita sem desfecho). */
+    public int routes() {
+        return routes.size();
+    }
+
+    /** Rotas de escrita removidas do mapa desde a criação deste dispatcher (sem holder e ociosas). */
+    public long routesRemoved() {
+        return routesRemovedCount.sum();
     }
 
     /** Retentativas observadas, agrupadas pelo {@link SeriesStatus} que as motivou. */
@@ -941,6 +1051,10 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             WriteBatchResponse response) {
         SeriesRoute currentRoute = routes.get(seriesKey);
         if (currentRoute == null) return;
+        // Fase 2 da remoção e aviso de série terminal: só depois de soltar o route.lock (ordem bin → route.lock;
+        // o aviso pode fechar o handle, que libera a rota).
+        boolean retire = false;
+        NgrrdClusterException terminal = null;
         currentRoute.lock.lock();
         try {
         if (routes.get(seriesKey) != currentRoute || !Objects.equals(currentRoute.generation, writes.get(0).generationId())) return;
@@ -951,7 +1065,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 try { buf.queue.succeeded(seriesKey); }
                 finally { buf.lock.unlock(); }
                 samplesSentCount.add(writes.size());
-                completeWrites(currentRoute, writes.size(), null, SeriesStatus.OK);
+                retire = completeWrites(currentRoute, writes.size(), null, SeriesStatus.OK);
             }
             case WRONG_OWNER -> {
                 recordRetry(SeriesStatus.WRONG_OWNER);
@@ -989,13 +1103,13 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 currentRoute.failureCode = code;
                 if (marksMode) currentRoute.failureMessage = message;
                 samplesFailedCount.add(writes.size());
-                completeWrites(currentRoute, writes.size(), message, status);
-                terminalListener.accept(writes.get(0), new NgrrdClusterException(code, message));
+                retire = completeWrites(currentRoute, writes.size(), message, status);
+                terminal = new NgrrdClusterException(code, message);
             }
             case ERROR -> {
                 recordRetry(SeriesStatus.ERROR);
                 samplesFailedCount.add(writes.size());
-                completeWrites(currentRoute, writes.size(), "WRITE_BATCH falhou para " + seriesKey + ": "
+                retire = completeWrites(currentRoute, writes.size(), "WRITE_BATCH falhou para " + seriesKey + ": "
                         + response.errorBySeries().get(seriesKey), SeriesStatus.ERROR);
                 LOGGER.warning("WRITE_BATCH respondeu ERROR para " + seriesKey + ": "
                         + response.errorBySeries().get(seriesKey));
@@ -1003,12 +1117,18 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             default -> {
                 recordRetry(status);
                 samplesFailedCount.add(writes.size());
-                completeWrites(currentRoute, writes.size(), "WRITE_BATCH respondeu " + status + " para " + seriesKey,
+                retire = completeWrites(currentRoute, writes.size(), "WRITE_BATCH respondeu " + status + " para " + seriesKey,
                         status);
                 LOGGER.warning("WRITE_BATCH respondeu status inesperado " + status + " para " + seriesKey);
             }
         }
         } finally { currentRoute.lock.unlock(); }
+        if (terminal != null) {
+            terminalListener.accept(writes.get(0), terminal);
+        }
+        if (retire) {
+            tryRemove(currentRoute);
+        }
     }
 
     /**
@@ -1231,6 +1351,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         NodeBuffer reopenBuf = null;
         long delayMs = 0L;
         String changedOwner = null;
+        boolean retire;
         route.lock.lock();
         try {
             if (routes.get(seriesKey) != route || !route.ownerLookupPending) return;
@@ -1283,11 +1404,16 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             } finally {
                 route.ownerLookupPending = false;
             }
+            retire = retirable(route);
             if (changedOwner != null) {
                 notifyOwner(seriesKey, changedOwner, route);
             }
         } finally {
             route.lock.unlock();
+        }
+        if (retire && tryRemove(route)) {
+            // Sem escrita a reenviar: nada a reabrir nem a acordar para uma rota que saiu do mapa.
+            return;
         }
         if (reopenBuf != null) {
             logRetryRateLimited(seriesKey, SeriesStatus.WRONG_OWNER, "líder não conhece a série — reabrindo");
@@ -1303,6 +1429,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         if (route == null) {
             return;
         }
+        boolean retire;
         route.lock.lock();
         try {
             route.ownerLookupPending = false;
@@ -1310,16 +1437,22 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             if (buf != null) {
                 deferSeries(buf, seriesKey, -1);
             }
+            retire = retirable(route);
         } finally {
             route.lock.unlock();
+        }
+        if (retire) {
+            tryRemove(route);
         }
     }
 
     // FIFO admission/rerouting ensures completions form a prefix of each series. A failed
     // prefix remains observable: a later checkpoint cannot certify those lost samples.
-    // BARRIER: until restart. MARKS: until a mark reports it.
-    private void completeWrites(SeriesRoute route, int count, String failure, SeriesStatus status) {
+    // BARRIER: until restart (or a release that delivers it). MARKS: until a mark reports it.
+    // Returns whether the route became retirable (phase 1); the caller removes it after releasing route.lock.
+    private boolean completeWrites(SeriesRoute route, int count, String failure, SeriesStatus status) {
         boolean marksReady;
+        boolean retire;
         route.lock.lock();
         try {
             if (failure != null) {
@@ -1344,6 +1477,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             // Failed routes stay indexed: subsequent successful writes cannot erase
             // an earlier failure and allow a Kafka commit to certify a lost prefix.
             route.progress.signalAll();
+            retire = retirable(route);
         } finally {
             route.lock.unlock();
         }
@@ -1351,6 +1485,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         if (marksReady) {
             scheduleMarkCompletion();
         }
+        return retire;
     }
 
     /**
@@ -1532,6 +1667,10 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
 
     private void reopenAsync(String owner, NodeBuffer buf, String key, List<SeriesWrite> writes) {
         SeriesRoute expected = routes.get(key);
+        if (expected == null && writes.isEmpty()) {
+            // Rota já removida (ociosa): uma pausa sem prazo aqui nunca seria desfeita.
+            return;
+        }
         buf.lock.lock();
         try {
             for (int i = writes.size() - 1; i >= 0; i--) { buf.queue.addFirst(writes.get(i)); }
@@ -1638,6 +1777,11 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         private final Set<Object> holders = Collections.newSetFromMap(new IdentityHashMap<>());
         /** Sem holder (fechamento ou release): novas admissões recebem {@code CLOSED}. Só muda sob {@link #lock}. */
         private boolean retired;
+        /**
+         * A falha da rota já foi entregue ao chamador (por um {@code release}): dispensa {@code isIdle} na remoção,
+         * mas não {@code submitted == completed}. Só muda sob {@link #lock}.
+         */
+        private boolean failuresDelivered;
 
         SeriesRoute(String key, String owner, String generation, Object holder) {
             this.key = key;
@@ -1806,6 +1950,18 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         }
         int nextAttempt(String key) { return attempts.merge(key, 1, Integer::sum); }
         void succeeded(String key) { attempts.remove(key); }
+        boolean hasAttempts(String key) { return attempts.containsKey(key); }
+        /**
+         * A rota da série saiu do mapa: esquece as tentativas dela e, se não houver escrita da série neste buffer,
+         * também uma pausa que ficou para trás (uma pausa sem prazo prenderia a próxima rota da mesma chave).
+         */
+        void forgetSeries(String key) {
+            attempts.remove(key);
+            if (!series.containsKey(key)) {
+                Delay delay = paused.remove(key);
+                if (delay != null) { wakeups.remove(delay); }
+            }
+        }
         /** Keeps the per-series retry count across buffers when a series is rerouted. */
         void carryAttempts(String key, int count) {
             if (count > 0) { attempts.merge(key, count, Math::max); }

@@ -47,6 +47,10 @@ import java.util.Objects;
  * @param rpcLatencyByCommand latência das chamadas RPC por comando (ex.: {@code ngrrd.place},
  *                        {@code ngrrd.writeBatch}), cada uma com {@code recentMaxMicros}; comandos além do
  *                        teto de 64 entradas são agregados em {@code "other"}
+ * @param routes          rotas de escrita no buffer agora (gauge): uma por série com handle gravável aberto ou
+ *                        com escrita ainda sem desfecho
+ * @param routesRemoved   rotas de escrita removidas desde a conexão, por ficarem sem handle e ociosas
+ * @param internedDefinitions definições (YAML) internadas pelo cliente agora (gauge)
  */
 public record ClientMetricsSnapshot(
         long samplesEnqueued,
@@ -60,7 +64,10 @@ public record ClientMetricsSnapshot(
         long placeCount,
         long ownerLookups,
         long redirectCycles,
-        Map<String, LatencySnapshot> rpcLatencyByCommand) {
+        Map<String, LatencySnapshot> rpcLatencyByCommand,
+        int routes,
+        long routesRemoved,
+        int internedDefinitions) {
 
     public ClientMetricsSnapshot {
         retriesByStatus = Map.copyOf(Objects.requireNonNullElse(retriesByStatus, Map.of()));
@@ -74,7 +81,7 @@ public record ClientMetricsSnapshot(
             Map<SeriesStatus, Long> retriesByStatus, Map<String, Long> bufferedSamples, int openHandles,
             LatencySnapshot rpcLatency, long placeCount, long ownerLookups, long redirectCycles) {
         this(samplesEnqueued, samplesSent, samplesFailed, batchesSent, retriesByStatus, bufferedSamples, openHandles,
-                rpcLatency, placeCount, ownerLookups, redirectCycles, Map.of());
+                rpcLatency, placeCount, ownerLookups, redirectCycles, Map.of(), 0, 0L, 0);
     }
 
     /** Compatibilidade com a assinatura anterior à 8.7.0: {@code ownerLookups} e {@code redirectCycles} zerados. */
@@ -82,6 +89,6 @@ public record ClientMetricsSnapshot(
             Map<SeriesStatus, Long> retriesByStatus, Map<String, Long> bufferedSamples, int openHandles,
             LatencySnapshot rpcLatency, long placeCount) {
         this(samplesEnqueued, samplesSent, samplesFailed, batchesSent, retriesByStatus, bufferedSamples, openHandles,
-                rpcLatency, placeCount, 0L, 0L, Map.of());
+                rpcLatency, placeCount, 0L, 0L, Map.of(), 0, 0L, 0);
     }
 }

@@ -33,6 +33,8 @@ import dev.nishisan.utils.oss.cluster.protocol.WriteBatchResponse;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadMXBean;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -45,14 +47,19 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiConsumer;
 import java.util.function.Function;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -1199,6 +1206,284 @@ class WriteDispatcherTest {
         }
         dispatcher.flushAllSync();
         assertEquals(2, dispatcher.samplesSent());
+    }
+
+    private WriteDispatcher newMarksDispatcher() {
+        rpc = new RecordingClusterRpc(NodeId.of("client-under-test"));
+        placementLookup = new FakePlacementLookup();
+        RetryPolicy retry = new RetryPolicy(Duration.ofSeconds(5), Duration.ofMillis(10), Duration.ofMillis(200));
+        dispatcher = new WriteDispatcher(rpc, placementLookup, retry, 1, Duration.ofMillis(10), 1000,
+                NgrrdClusterConfig.BufferFullPolicy.BLOCK, Duration.ofSeconds(5), key -> true, (key, owner) -> { },
+                Clock.systemUTC(), null, null, NgrrdClusterConfig.WriteFailureReporting.MARKS);
+        return dispatcher;
+    }
+
+    private static WriteBatchResponse statusFor(WriteBatchRequest request, SeriesStatus status) {
+        Map<String, SeriesStatus> statuses = new LinkedHashMap<>();
+        Map<String, String> errors = new LinkedHashMap<>();
+        for (SeriesWrite w : request.writes()) {
+            statuses.put(w.seriesKey(), status);
+            if (status == SeriesStatus.ERROR) {
+                errors.put(w.seriesKey(), "disk failure");
+            }
+        }
+        return new WriteBatchResponse(statuses, Map.of(), errors);
+    }
+
+    @Test
+    void rotaSaiDoMapaQuandoUltimoHolderFechaEOcioso() {
+        newDispatcher(1, Duration.ofMillis(10), 1000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        rpc.respondDefault((command, body) -> okFor((WriteBatchRequest) body));
+        Object handle = new Object();
+        dispatcher.beginGeneration("s", "g", OWNER_A.value(), handle);
+        dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 1, 1, "g"));
+        dispatcher.flushAllSync();
+        assertTrue(dispatcher.hasRoute("s"), "o holder ainda usa a rota");
+
+        dispatcher.endGeneration("s", "g", handle);
+
+        assertFalse(dispatcher.hasRoute("s"));
+        assertEquals(0, dispatcher.routes());
+        assertEquals(1L, dispatcher.routesRemoved());
+        assertEquals(ErrorCode.CLOSED, assertThrows(NgrrdClusterException.class,
+                () -> dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 2, 2, "g"))).code());
+        assertFalse(dispatcher.hasRoute("s"), "o enqueue não recria a rota");
+    }
+
+    @Test
+    void rotaComEscritaEmVooSaiQuandoUltimaRespostaChega() throws Exception {
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        newDispatcher(1, Duration.ofMillis(10), 1000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        rpc.respondNext((command, body) -> {
+            entered.countDown();
+            awaitLatch(release);
+            return okFor((WriteBatchRequest) body);
+        });
+        rpc.respondDefault((command, body) -> okFor((WriteBatchRequest) body));
+        Object handle = new Object();
+        dispatcher.beginGeneration("s", "g", OWNER_A.value(), handle);
+        try {
+            dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 1, 1, "g"));
+            assertTrue(entered.await(2, TimeUnit.SECONDS));
+
+            dispatcher.endGeneration("s", "g", handle);
+
+            assertTrue(dispatcher.hasRoute("s"), "a escrita em voo segura a rota");
+        } finally {
+            release.countDown();
+        }
+        Await.untilTrue("rota removida com a última resposta", AWAIT_TIMEOUT, () -> !dispatcher.hasRoute("s"));
+        assertEquals(1, dispatcher.samplesSent());
+        assertEquals(1L, dispatcher.routesRemoved());
+    }
+
+    @Test
+    void rotaComFalhaNaoReportadaFicaAteMarcaColher() throws Exception {
+        newMarksDispatcher();
+        rpc.respondDefault((command, body) -> statusFor((WriteBatchRequest) body, SeriesStatus.ERROR));
+        Object handle = new Object();
+        dispatcher.beginGeneration("s", "g", OWNER_A.value(), handle);
+        dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 1, 1, "g"));
+        Await.untilTrue("falha final", AWAIT_TIMEOUT, () -> dispatcher.samplesFailed() == 1);
+
+        dispatcher.endGeneration("s", "g", handle);
+        assertTrue(dispatcher.hasRoute("s"), "falha não reportada segura a rota");
+
+        var result = dispatcher.mark().completion().get(10, TimeUnit.SECONDS);
+
+        assertEquals(1L, result.samplesFailed(), "a marca colhe a falha da rota fechada");
+        Await.untilTrue("rota removida depois da colheita", AWAIT_TIMEOUT, () -> !dispatcher.hasRoute("s"));
+        assertEquals(1L, dispatcher.routesRemoved());
+    }
+
+    @Test
+    void rotaComFalhaEmBarrierNaoSaiSemRelease() {
+        newDispatcher(1, Duration.ofMillis(10), 1000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        rpc.respondDefault((command, body) -> statusFor((WriteBatchRequest) body, SeriesStatus.ERROR));
+        Object handle = new Object();
+        dispatcher.beginGeneration("s", "g", OWNER_A.value(), handle);
+        dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 1, 1, "g"));
+        Await.untilTrue("falha final", AWAIT_TIMEOUT, () -> dispatcher.samplesFailed() == 1);
+
+        dispatcher.endGeneration("s", "g", handle);
+
+        assertTrue(dispatcher.hasRoute("s"), "BARRIER: a falha mantém a rota");
+        assertEquals(0L, dispatcher.routesRemoved());
+        assertEquals(ErrorCode.REMOTE_ERROR,
+                assertThrows(NgrrdClusterException.class, dispatcher::flushAllSync).code(),
+                "a barreira global continua vendo a falha");
+    }
+
+    @Test
+    void segundoHandleMesmaGeracaoMantemRota() {
+        newDispatcher(1, Duration.ofMillis(10), 1000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        rpc.respondDefault((command, body) -> okFor((WriteBatchRequest) body));
+        Object first = new Object();
+        Object second = new Object();
+        dispatcher.beginGeneration("s", "g", OWNER_A.value(), first);
+        dispatcher.beginGeneration("s", "g", OWNER_A.value(), second);
+        assertEquals(2, dispatcher.routeHolders("s"));
+
+        dispatcher.endGeneration("s", "g", first);
+
+        assertTrue(dispatcher.hasRoute("s"));
+        dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 1, 1, "g"));
+        dispatcher.flushAllSync();
+        assertEquals(1, dispatcher.samplesSent());
+        dispatcher.endGeneration("s", "g", second);
+        assertFalse(dispatcher.hasRoute("s"));
+    }
+
+    @Test
+    void lastRetryLogMsEAttemptsLimposComARota() throws Exception {
+        newMarksDispatcher();
+        rpc.respondNext((command, body) -> statusFor((WriteBatchRequest) body, SeriesStatus.MIGRATING));
+        rpc.respondDefault((command, body) -> statusFor((WriteBatchRequest) body, SeriesStatus.ERROR));
+        Object handle = new Object();
+        dispatcher.beginGeneration("s", "g", OWNER_A.value(), handle);
+        dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 1, 1, "g"));
+        Await.untilTrue("falha final depois do MIGRATING", AWAIT_TIMEOUT, () -> dispatcher.samplesFailed() == 1);
+        assertTrue(dispatcher.hasRetryState("s"), "MIGRATING deixa log e tentativas da série");
+        dispatcher.endGeneration("s", "g", handle);
+
+        dispatcher.mark().completion().get(10, TimeUnit.SECONDS);
+
+        Await.untilTrue("rota removida", AWAIT_TIMEOUT, () -> !dispatcher.hasRoute("s"));
+        assertFalse(dispatcher.hasRetryState("s"), "a remoção leva o rate limit de log e as tentativas");
+    }
+
+    @Test
+    void handleSomenteLeituraNaoCriaRotaNemRetemRota() {
+        newDispatcher(1, Duration.ofMillis(10), 1000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        rpc.respondDefault((command, body) -> okFor((WriteBatchRequest) body));
+        dispatcher.beginGeneration("s", "g1", OWNER_A.value(), null);
+        assertFalse(dispatcher.hasRoute("s"), "somente leitura não cria rota");
+
+        Object writer = new Object();
+        dispatcher.beginGeneration("s", "g1", OWNER_A.value(), writer);
+        dispatcher.beginGeneration("s", "g1", OWNER_A.value(), null);
+        assertEquals(1, dispatcher.routeHolders("s"));
+        dispatcher.endGeneration("s", "g1", writer);
+        assertFalse(dispatcher.hasRoute("s"), "o somente leitura não segura a rota");
+
+        dispatcher.beginGeneration("s", "g1", OWNER_A.value(), new Object());
+        dispatcher.beginGeneration("s", "g2", OWNER_A.value(), null);
+        assertFalse(dispatcher.hasRoute("s"), "geração nova vista só por leitura aposenta a antiga sem publicar outra");
+        assertEquals(2L, dispatcher.routesRemoved());
+    }
+
+    @Test
+    void corridaDeAberturaEscritaEFechamentoNaoPerdeDesfechoEEsvaziaOMapa() throws Exception {
+        newDispatcher(4, Duration.ofMillis(5), 100_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        rpc.respondDefault((command, body) -> {
+            if (ThreadLocalRandom.current().nextInt(4) == 0) {
+                Thread.yield();
+            }
+            return okFor((WriteBatchRequest) body);
+        });
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+        List<Throwable> failures = new CopyOnWriteArrayList<>();
+        List<Thread> threads = new ArrayList<>();
+        for (int t = 0; t < 8; t++) {
+            threads.add(Thread.ofPlatform().name("route-race-" + t).start(() -> {
+                ThreadLocalRandom random = ThreadLocalRandom.current();
+                long ts = 0;
+                try {
+                    while (System.nanoTime() < deadline) {
+                        Object handle = new Object();
+                        dispatcher.beginGeneration("s", "g", OWNER_A.value(), handle);
+                        int writes = random.nextInt(1, 6);
+                        for (int i = 0; i < writes; i++) {
+                            dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", ++ts, i, "g"));
+                            if (random.nextInt(4) == 0) {
+                                // Reabertura do mesmo handle: idempotente.
+                                dispatcher.beginGeneration("s", "g", OWNER_A.value(), handle);
+                            }
+                        }
+                        dispatcher.endGeneration("s", "g", handle);
+                    }
+                } catch (Throwable e) {
+                    failures.add(e);
+                }
+            }));
+        }
+        for (Thread thread : threads) {
+            thread.join(TimeUnit.SECONDS.toMillis(10));
+        }
+
+        assertEquals(List.of(), failures, "nenhuma escrita com holder ativo é recusada");
+        Await.untilTrue("toda escrita admitida tem desfecho", AWAIT_TIMEOUT,
+                () -> dispatcher.samplesEnqueued() == dispatcher.samplesSent() + dispatcher.samplesFailed());
+        Await.untilTrue("mapa de rotas vazio", AWAIT_TIMEOUT, () -> dispatcher.routes() == 0);
+        assertTrue(dispatcher.samplesEnqueued() > 0);
+        assertEquals(0, dispatcher.samplesFailed());
+    }
+
+    @Test
+    void geracaoNovaConcorrenteComLotesEFechamentosNaoTravaEmDeadlock() throws Exception {
+        newDispatcher(2, Duration.ofMillis(2), 100_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        rpc.respondDefault((command, body) -> okFor((WriteBatchRequest) body));
+        ThreadMXBean threadMx = ManagementFactory.getThreadMXBean();
+        AtomicLong generations = new AtomicLong();
+        AtomicBoolean stop = new AtomicBoolean();
+        List<Throwable> failures = new CopyOnWriteArrayList<>();
+        ExecutorService workers = Executors.newFixedThreadPool(16);
+        for (int t = 0; t < 8; t++) {
+            workers.execute(() -> {
+                try {
+                    while (!stop.get()) {
+                        String generation = "g" + generations.incrementAndGet();
+                        Object handle = new Object();
+                        dispatcher.beginGeneration("s", generation, OWNER_A.value(), handle);
+                        dispatcher.endGeneration("s", generation, handle);
+                    }
+                } catch (Throwable e) {
+                    failures.add(e);
+                }
+            });
+            workers.execute(() -> {
+                long ts = 0;
+                try {
+                    while (!stop.get()) {
+                        // Geração própria e nunca reaproveitada, como as do líder: reusar o id de uma geração já
+                        // substituída faria a resposta tardia dela cair na rota nova (ABA), o que não acontece.
+                        String generation = "w" + generations.incrementAndGet();
+                        Object handle = new Object();
+                        dispatcher.beginGeneration("s", generation, OWNER_A.value(), handle);
+                        for (int i = 0; i < 3; i++) {
+                            try {
+                                dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", ++ts, i, generation));
+                            } catch (NgrrdClusterException replaced) {
+                                // Geração trocada no meio: SERIES_DELETED, ou CLOSED se a rota da geração nova
+                                // já saiu do mapa (sem holder e ociosa); nunca outra coisa.
+                                if (replaced.code() != ErrorCode.SERIES_DELETED
+                                        && replaced.code() != ErrorCode.CLOSED) {
+                                    throw replaced;
+                                }
+                            }
+                        }
+                        dispatcher.endGeneration("s", generation, handle);
+                    }
+                } catch (Throwable e) {
+                    failures.add(e);
+                }
+            });
+        }
+        long runUntil = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        try {
+            while (System.nanoTime() < runUntil) {
+                assertNull(threadMx.findDeadlockedThreads(), "deadlock entre beginGeneration e a remoção da rota");
+                Thread.sleep(100);
+            }
+        } finally {
+            stop.set(true);
+            workers.shutdown();
+        }
+        assertTrue(workers.awaitTermination(10, TimeUnit.SECONDS), "as threads terminam dentro de 10 s");
+        assertNull(threadMx.findDeadlockedThreads());
+        assertEquals(List.of(), failures);
+        Await.untilTrue("mapa de rotas vazio", AWAIT_TIMEOUT, () -> dispatcher.routes() == 0);
     }
 
     private static final class FakePlacementLookup implements PlacementLookup {

@@ -489,7 +489,8 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
         return new ClientMetricsSnapshot(dispatcher.samplesEnqueued(), dispatcher.samplesSent(),
                 dispatcher.samplesFailed(), dispatcher.batchesSent(), dispatcher.retriesByStatus(),
                 dispatcher.bufferedSamples(), handles.size(), metricsRpc.latencySnapshot(), metricsRpc.placeCount(),
-                dispatcher.ownerLookups(), dispatcher.redirectCycles(), metricsRpc.latencySnapshotByCommand());
+                dispatcher.ownerLookups(), dispatcher.redirectCycles(), metricsRpc.latencySnapshotByCommand(),
+                dispatcher.routes(), dispatcher.routesRemoved(), interner.size());
     }
 
     @Override
