@@ -75,6 +75,19 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
      * do catálogo e quando o nó deixa de ser líder; o tamanho é limitado ao número de pendentes.
      */
     private final Map<String, RecoveryBackoff> recoveryBackoff = new ConcurrentHashMap<>();
+    /**
+     * Backoff do reenvio de {@code DELETE_RECOVER} por quem tem a entrada no journal, por {@code operationId},
+     * com a mesma progressão de {@link #recoveryBackoff}. Todo envio avança o intervalo, qualquer que seja a
+     * resposta: a entrada que continua candidata depois de uma resposta não tem nada novo a pedir. Sai quando
+     * a entrada do journal deixa de ser candidata ao reenvio.
+     */
+    private final Map<String, RecoveryBackoff> journalRecoveryBackoff = new ConcurrentHashMap<>();
+    /** Janela do log com taxa limitada de falha do ciclo de recuperação. */
+    static final Duration RECOVERY_LOG_WINDOW = Duration.ofMinutes(1);
+    /** Instante ({@link #clock}) do último log de falha do ciclo de recuperação. */
+    private final AtomicLong recoveryLoggedAtMs = new AtomicLong(NEVER_LOGGED);
+    /** Falhas do ciclo de recuperação suprimidas desde o último log. */
+    private final AtomicLong recoverySuppressed = new AtomicLong();
 
     /** Falhas seguidas da recuperação de uma operação e o instante a partir do qual ela é tentada de novo. */
     private record RecoveryBackoff(int failures, long nextAttemptAtMs) { }
@@ -390,6 +403,9 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
      * completa quando o nó passa a ser líder sincronizado e a cada {@link #PENDING_INDEX_RESYNC}. Cada
      * operação tem backoff exponencial próprio, de {@link #RECOVERY_BACKOFF_INITIAL} a
      * {@link #RECOVERY_BACKOFF_MAX}; o gauge conta todas as pendentes, inclusive as em espera.</p>
+     *
+     * <p>Antes, {@link #recoverJournal()} trata o journal local entrada a entrada: a falha de uma não pula a
+     * parte do líder, e o reenvio de {@code DELETE_RECOVER} tem backoff próprio por operação.</p>
      */
     void recover() {
         if (closed || !synced.getAsBoolean()) {
@@ -397,23 +413,12 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
             return;
         }
         try {
-            for (var local : lifecycle.journal().snapshot().entrySet()) {
-                var entry = local.getValue(); String key = local.getKey();
-                if (entry.placement() == null || entry.placement().deletion() == null) continue;
-                var current = catalog.placementStrong(key);
-                if (entry.phase() == PREPARED && (current.isEmpty() || current.get().deletion() == null)) {
-                    lifecycle.abort(new DeleteControlRequest(key, entry.placement()));
-                } else if ((entry.phase() == COMMITTED || entry.phase() == DELETED || entry.phase() == FINISHED)
-                        && (current.isPresent() || entry.phase() != FINISHED)) {
-                    NodeId target = rpc.leaderId().orElse(null);
-                    if (target != null) rpc.call(target, Commands.DELETE_RECOVER,
-                            new DeleteControlRequest(key, entry.placement()), DeleteResult.class);
-                }
-            }
+            recoverJournal();
             if (leader.getAsBoolean()) {
                 long now = clock.millis();
                 long rebuiltAt = pendingIndexRebuiltAtMs;
-                if (rebuiltAt == NEVER_REBUILT || now - rebuiltAt >= PENDING_INDEX_RESYNC.toMillis()) {
+                // Relógio que recuou (now < rebuiltAt) também força a reconstrução: senão ela ficaria parada.
+                if (rebuiltAt == NEVER_REBUILT || now < rebuiltAt || now - rebuiltAt >= PENDING_INDEX_RESYNC.toMillis()) {
                     int found = catalog.rebuildPendingDeletions();
                     pendingIndexRebuiltAtMs = now;
                     LOG.log(Level.FINE, "series deletion pending index rebuilt: found=" + found);
@@ -426,7 +431,7 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
                 for (var item : pending) {
                     SeriesDeletion deletion = item.getValue().deletion();
                     RecoveryBackoff backoff = recoveryBackoff.get(deletion.operationId());
-                    if (backoff != null && clock.millis() < backoff.nextAttemptAtMs()) continue;
+                    if (!due(backoff, clock.millis())) continue;
                     DeleteResult result = delete(new DeleteRequest(item.getKey(),
                             new DeletePrecondition(deletion.lastWriteBefore()), deletion.operationId()), Origin.RECOVERY);
                     recordRecoveryOutcome(deletion.operationId(), backoff, result);
@@ -436,7 +441,75 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
                 recoveryBackoff.clear();
                 trackPending(List.of());
             }
-        } catch (RuntimeException e) { LOG.log(Level.FINE, "series deletion recovery deferred", e); }
+        } catch (RuntimeException e) { logRecoveryDeferred(e); }
+    }
+
+    /**
+     * Lado de quem tem a entrada no journal: aborta o {@code PREPARED} cuja reserva sumiu e pede ao líder
+     * ({@code DELETE_RECOVER}) que conclua o que já foi confirmado. Cada entrada tem o próprio
+     * {@code try}: a falha de uma (RPC, líder indisponível) não pula as demais nem a parte do líder em
+     * {@link #recover()}. O reenvio de cada operação segue {@link #journalRecoveryBackoff}.
+     */
+    private void recoverJournal() {
+        Set<String> candidates = new HashSet<>();
+        for (var local : lifecycle.journal().snapshot().entrySet()) {
+            var entry = local.getValue(); String key = local.getKey();
+            if (entry.placement() == null || entry.placement().deletion() == null) continue;
+            String operationId = entry.placement().deletion().operationId();
+            boolean confirmed = entry.phase() == COMMITTED || entry.phase() == DELETED || entry.phase() == FINISHED;
+            // Candidata antes da leitura do catálogo: uma falha transitória ali não zera o backoff da operação.
+            if (confirmed) candidates.add(operationId);
+            try {
+                var current = catalog.placementStrong(key);
+                if (entry.phase() == PREPARED && (current.isEmpty() || current.get().deletion() == null)) {
+                    lifecycle.abort(new DeleteControlRequest(key, entry.placement()));
+                } else if (confirmed && (current.isPresent() || entry.phase() != FINISHED)) {
+                    NodeId target = rpc.leaderId().orElse(null);
+                    if (target == null) continue;
+                    RecoveryBackoff backoff = journalRecoveryBackoff.get(operationId);
+                    if (!due(backoff, clock.millis())) continue;
+                    journalRecoveryBackoff.put(operationId, nextBackoff(backoff));
+                    rpc.call(target, Commands.DELETE_RECOVER, new DeleteControlRequest(key, entry.placement()),
+                            DeleteResult.class);
+                } else if (confirmed) {
+                    candidates.remove(operationId);
+                }
+            } catch (RuntimeException e) {
+                logRecoveryDeferred(e);
+            }
+        }
+        journalRecoveryBackoff.keySet().retainAll(candidates);
+    }
+
+    /**
+     * {@code series deletion recovery deferred} com taxa limitada: no máximo um log por
+     * {@link #RECOVERY_LOG_WINDOW}, com quantas ocorrências foram suprimidas desde o anterior. Com o
+     * {@code try} por entrada do journal, um líder fora do ar geraria um log por entrada a cada ciclo.
+     */
+    private void logRecoveryDeferred(RuntimeException e) {
+        long now = clock.millis();
+        long last = recoveryLoggedAtMs.get();
+        boolean due = last == NEVER_LOGGED || now - last >= RECOVERY_LOG_WINDOW.toMillis() || now < last;
+        if (!due || !recoveryLoggedAtMs.compareAndSet(last, now)) {
+            recoverySuppressed.incrementAndGet();
+            return;
+        }
+        LOG.log(Level.FINE, "series deletion recovery deferred: suppressed=" + recoverySuppressed.getAndSet(0), e);
+    }
+
+    /**
+     * Se a operação pode ser tentada em {@code now}. Uma espera maior que {@link #RECOVERY_BACKOFF_MAX} só
+     * acontece com relógio que recuou; ela é tratada como vencida, para não esconder a operação.
+     */
+    private static boolean due(RecoveryBackoff backoff, long now) {
+        return backoff == null || now >= backoff.nextAttemptAtMs()
+                || backoff.nextAttemptAtMs() - now > RECOVERY_BACKOFF_MAX.toMillis();
+    }
+
+    /** Próximo estado do backoff depois de mais uma tentativa falha (ou envio, no lado do journal). */
+    private RecoveryBackoff nextBackoff(RecoveryBackoff previous) {
+        int failures = previous == null ? 1 : previous.failures() + 1;
+        return new RecoveryBackoff(failures, clock.millis() + recoveryBackoffDelay(failures).toMillis());
     }
 
     /**
@@ -450,9 +523,7 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
             recoveryBackoff.remove(operationId);
             return;
         }
-        int failures = previous == null ? 1 : previous.failures() + 1;
-        recoveryBackoff.put(operationId,
-                new RecoveryBackoff(failures, clock.millis() + recoveryBackoffDelay(failures).toMillis()));
+        recoveryBackoff.put(operationId, nextBackoff(previous));
     }
 
     /**
@@ -469,6 +540,11 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
     /** Operações com backoff de recuperação registrado (diagnóstico e testes). */
     int recoveryBackoffSize() {
         return recoveryBackoff.size();
+    }
+
+    /** Operações com backoff de reenvio de {@code DELETE_RECOVER} registrado (diagnóstico e testes). */
+    int journalRecoveryBackoffSize() {
+        return journalRecoveryBackoff.size();
     }
 
     /**

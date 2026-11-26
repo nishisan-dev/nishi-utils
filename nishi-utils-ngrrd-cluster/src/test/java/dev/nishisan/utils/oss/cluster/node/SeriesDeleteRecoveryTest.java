@@ -56,6 +56,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -63,6 +64,10 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiFunction;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -314,6 +319,99 @@ class SeriesDeleteRecoveryTest {
         assertEquals(0, handler.recoveryBackoffSize(), "NOT_FOUND da recuperação encerra a operação");
         assertTrue(service.placementLocal("s").isEmpty());
         assertTrue(service.pendingDeletionsLocal().isEmpty());
+    }
+
+    @Test
+    void falhaNoJournalNaoPulaARecuperacaoDoLiderEOReenvioTemBackoff() {
+        // Líder com a própria entrada COMMITTED no journal, a reserva pendente no catálogo e todas as fases
+        // falhando, inclusive o DELETE_RECOVER enviado a si mesmo.
+        SeriesPlacement placement = pending("op-s", true);
+        rawMap.put("s", placement);
+        journal.put("s", new SeriesLifecycleJournal.Entry(placement.generationId(), 0,
+                SeriesLifecycleJournal.Phase.COMMITTED, placement));
+        List<Long> recoverSends = new CopyOnWriteArrayList<>();
+        long start = clock.millis();
+        rpc.script((node, command) -> {
+            if (Commands.DELETE_RECOVER.equals(command)) recoverSends.add((clock.millis() - start) / 1000);
+            throw new NgrrdClusterException(ErrorCode.REMOTE_ERROR, "participante caiu");
+        });
+        List<String> warnings = new CopyOnWriteArrayList<>();
+        Handler capture = pendingWarnings(warnings);
+        Logger logger = Logger.getLogger(SeriesDeleteHandler.class.getName());
+        logger.addHandler(capture);
+        try {
+            List<Long> attempts = cyclesEverySecond(10);
+
+            assertEquals(1, metric("seriesDelete.pending"));
+            assertEquals(1, catalog.rebuilds.get(), "a reconstrução acontece mesmo com o journal falhando");
+            assertEquals(List.of("NGRRD_DELETE_PENDING count=1 oldestOperationId=op-s"), warnings);
+            assertEquals(List.of(0L, 1L, 3L, 7L), recoverSends, "reenvio espaçado: 1, 2, 4 s");
+            assertEquals(List.of(0L, 1L, 3L, 7L), attempts);
+            assertEquals(1, handler.journalRecoveryBackoffSize());
+        } finally {
+            logger.removeHandler(capture);
+        }
+    }
+
+    @Test
+    void entradaDoJournalQueDeixaDeSerCandidataSaiDoBackoffDeReenvio() {
+        SeriesPlacement placement = pending("op-s", true);
+        journal.put("s", new SeriesLifecycleJournal.Entry(placement.generationId(), 0,
+                SeriesLifecycleJournal.Phase.FINISHED, placement));
+        rawMap.put("s", placement);
+        failPhases();
+        handler.recover();
+        assertEquals(1, handler.journalRecoveryBackoffSize());
+
+        rawMap.remove("s"); // FINISHED e sem placement: nada mais a pedir ao líder
+        handler.recover();
+
+        assertEquals(0, handler.journalRecoveryBackoffSize());
+    }
+
+    @Test
+    void relogioQueRecuaNaoPrendeOBackoff() {
+        service.putPlacement("s", pending("op-s", true));
+        failPhases();
+        cyclesEverySecond(200); // backoff no teto: próxima tentativa até 60 s à frente
+        long before = metric("seriesDelete.recoveryAttempts");
+
+        clock.advance(Duration.ofMinutes(-10));
+        handler.recover();
+
+        assertEquals(before + 1, metric("seriesDelete.recoveryAttempts"),
+                "espera maior que o teto só vem de relógio que recuou: conta como vencida");
+    }
+
+    @Test
+    void relogioQueRecuaRefazAReconstrucaoDoIndice() {
+        handler.recover();
+        assertEquals(1, catalog.rebuilds.get());
+
+        clock.advance(Duration.ofSeconds(-1));
+        handler.recover();
+
+        assertEquals(2, catalog.rebuilds.get());
+    }
+
+    private static Handler pendingWarnings(List<String> warnings) {
+        return new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                if (record.getLevel() == Level.WARNING && record.getMessage() != null
+                        && record.getMessage().startsWith("NGRRD_DELETE_PENDING")) {
+                    warnings.add(record.getMessage());
+                }
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
     }
 
     /**
