@@ -1446,6 +1446,29 @@ class WriteDispatcherTest {
     }
 
     @Test
+    void falhaDepoisDaFronteiraEmBarrierNaoEDadaComoEntregue() {
+        newDispatcher(1, Duration.ofMillis(10), 1000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        rpc.respondDefault((command, body) -> statusFor((WriteBatchRequest) body, SeriesStatus.ERROR));
+        Object released = new Object();
+        Object reopened = new Object();
+        dispatcher.beginGeneration("s", "g", OWNER_A.value(), released);
+        WriteDispatcher.ReleaseTicket ticket = dispatcher.beginRelease("s", "g", released);
+        // Um open() religa a rota, escreve depois da fronteira (falha) e fecha antes do fim do release.
+        dispatcher.beginGeneration("s", "g", OWNER_A.value(), reopened);
+        dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 1, 1, "g"));
+        Await.untilTrue("falha final", AWAIT_TIMEOUT, () -> dispatcher.samplesFailed() == 1);
+        dispatcher.endGeneration("s", "g", reopened);
+
+        var outcome = dispatcher.drainForRelease(List.of(ticket), AWAIT_TIMEOUT).get("s");
+        dispatcher.finishRelease(ticket, true);
+
+        assertEquals(WriteDispatcher.ReleaseDrain.Outcome.DRAINED, outcome.outcome());
+        assertTrue(dispatcher.hasRoute("s"), "a falha depois da fronteira não foi entregue: a rota fica");
+        assertEquals(ErrorCode.REMOTE_ERROR,
+                assertThrows(NgrrdClusterException.class, dispatcher::flushAllSync).code());
+    }
+
+    @Test
     void rotaReligadaDuranteOReleaseNaoEntraNaFronteiraNemSaiDoMapa() {
         newDispatcher(1, Duration.ofMillis(10), 1000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
         rpc.respondDefault((command, body) -> okFor((WriteBatchRequest) body));

@@ -187,6 +187,44 @@ class ReleaseTest {
     }
 
     @Test
+    void marcaCriadaDuranteOReleaseNaoConsomeAsFalhasDaSerieLiberada() throws Exception {
+        var entered = gate();
+        var ack = gate();
+        rpc.writes = (owner, request) -> {
+            String key = request.writes().getFirst().seriesKey();
+            if (key.equals("a")) {
+                entered.countDown();
+                awaitGate(ack);
+                return respond(request, k -> SeriesStatus.OK);
+            }
+            return respond(request, k -> SeriesStatus.ERROR);
+        };
+        start(WriteFailureReporting.MARKS);
+        RemoteSeriesHandle stuck = open("a");
+        RemoteSeriesHandle failed = open("s");
+        failed.write("ds", new Sample(1, 1));
+        Await.untilTrue("falha final de s", WAIT, () -> dispatcher.samplesFailed() == 1);
+        stuck.write("ds", new Sample(1, 1));
+        assertTrue(entered.await(5, TimeUnit.SECONDS));
+
+        // O dreno para em "a" (dono parado); a marca nasce depois da admissão encerrada de "s".
+        CompletableFuture<ReleaseResult> future = releaser.release(List.of("a", "s"), ReleaseOptions.defaults());
+        Await.untilTrue("admissão encerrada", WAIT, () -> !stuck.isOpen() && !failed.isOpen());
+        Thread.sleep(50L);
+        var mark = dispatcher.mark();
+        ack.countDown();
+        ReleaseResult result = future.get(10, TimeUnit.SECONDS);
+        var marked = mark.completion().get(10, TimeUnit.SECONDS);
+
+        SeriesRelease series = result.series().get("s");
+        assertEquals(ReleaseStatus.WRITE_FAILURES, series.status(), "a falha de s é do release, não da marca nova");
+        assertEquals(Map.of(SeriesStatus.ERROR, 1L), series.failedSamplesByStatus());
+        assertEquals(ReleaseStatus.RELEASED, result.series().get("a").status());
+        assertEquals(0L, marked.samplesFailed(), "a marca criada durante o release não colhe a falha de s");
+        assertFalse(dispatcher.hasRoute("s"));
+    }
+
+    @Test
     void releaseComBarrierRemoveRotaComFalha() throws Exception {
         rpc.writes = (owner, request) -> respond(request, key -> SeriesStatus.ERROR);
         start(WriteFailureReporting.BARRIER);

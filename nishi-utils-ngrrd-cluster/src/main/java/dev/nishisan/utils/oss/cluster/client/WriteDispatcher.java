@@ -123,6 +123,8 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     static final int MAX_REDIRECT_HOPS = 4;
     /** Teto de cada consulta ao líder para desempatar dicas contraditórias (limitado também por {@code retryPolicy.timeout()}). */
     static final Duration OWNER_LOOKUP_MAX_WAIT = Duration.ofSeconds(5);
+    /** Sem release em curso numa rota ({@code SeriesRoute.releaseBoundary}). */
+    private static final long NO_RELEASE = -1L;
     /** Holder das rotas abertas sem holder explícito ({@link #beginGeneration(String, String, String)}): nunca sai. */
     private static final Object PINNED_HOLDER = new Object();
 
@@ -707,22 +709,40 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
      * holder; a rota de outro holder é só drenada. O holder continua na rota até {@link #finishRelease}. O chamador
      * segura o lock de abertura da chave no cache de handles, de modo que um {@code open()} concorrente da mesma chave
      * só religa a rota depois desta fotografia. Devolve {@code null} se não houver rota para a chave.</p>
+     *
+     * <p>Em {@code MARKS}, a fronteira também fica guardada na rota, junto com o id da primeira marca criada depois
+     * daqui (sob {@code markLock}, então nenhuma marca fica pela metade): marcas criadas durante o release não colhem as
+     * falhas até a fronteira, que são do release. Uma marca aberta antes continua colhendo-as (spec 8.15.0, 3.7).</p>
      */
     ReleaseTicket beginRelease(String key, String generation, Object holder) {
         SeriesRoute route = routes.get(key);
         if (route == null) {
             return null;
         }
-        route.lock.lock();
+        // Ordem de locks markLock → route.lock, a mesma de mark().
+        if (marksMode) {
+            markLock.lock();
+        }
         try {
-            boolean owned = holder != null && Objects.equals(route.generation, generation)
-                    && route.holders.contains(holder);
-            if (owned || route.holders.isEmpty()) {
-                route.retired = true;
+            route.lock.lock();
+            try {
+                boolean owned = holder != null && Objects.equals(route.generation, generation)
+                        && route.holders.contains(holder);
+                if (owned || route.holders.isEmpty()) {
+                    route.retired = true;
+                }
+                if (marksMode) {
+                    route.releaseBoundary = route.submitted;
+                    route.releaseFirstMarkId = nextMarkId;
+                }
+                return new ReleaseTicket(key, route, route.submitted, owned ? holder : null);
+            } finally {
+                route.lock.unlock();
             }
-            return new ReleaseTicket(key, route, route.submitted, owned ? holder : null);
         } finally {
-            route.lock.unlock();
+            if (marksMode) {
+                markLock.unlock();
+            }
         }
     }
 
@@ -791,6 +811,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         String message;
         if (marksMode) {
             route.collectFailures((status, count) -> failed.merge(status, count, Long::sum), boundary);
+            route.releaseBoundary = NO_RELEASE;
             if (isIdle(route)) {
                 synchronized (pendingLock) {
                     pendingRoutes.remove(route);
@@ -817,7 +838,10 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
      * liga {@code failuresDelivered}, que dispensa {@code isIdle} na remoção — exceto se houver, em {@code MARKS}, falha
      * depois da fronteira ainda não reportada (escrita de um {@code open()} que religou a rota e já a soltou). A remoção
      * segue a regra de duas fases: sem escrita em voo, sem waiter, sem redirecionamento nem consulta de dono pendentes.
-     * Uma rota religada por outro holder não é tocada além disso. Nunca chamar sob {@code route.lock}.
+     * Em {@code BARRIER}, só a falha até a fronteira foi entregue: uma primeira falha depois dela mantém a rota. Uma
+     * rota religada por outro holder não é tocada além disso. Desfaz a proteção das falhas até a fronteira contra marcas
+     * novas (a partir daqui, elas vão para a próxima marca, como depois de um {@code TIMED_OUT}). Nunca chamar sob
+     * {@code route.lock}.
      */
     void finishRelease(ReleaseTicket ticket, boolean delivered) {
         SeriesRoute route = ticket.route;
@@ -827,9 +851,12 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             if (ticket.holder != null && route.holders.remove(ticket.holder) && route.holders.isEmpty()) {
                 route.retired = true;
             }
-            if (delivered && route.holders.isEmpty() && (!marksMode || route.unreportedFailures.isEmpty())) {
+            boolean onlyDeliveredFailures = marksMode ? route.unreportedFailures.isEmpty()
+                    : route.firstFailedSequence <= ticket.boundary || route.firstFailedSequence == Long.MAX_VALUE;
+            if (delivered && route.holders.isEmpty() && onlyDeliveredFailures) {
                 route.failuresDelivered = true;
             }
+            route.releaseBoundary = NO_RELEASE;
             candidate = retirable(route);
         } finally {
             route.lock.unlock();
@@ -1994,6 +2021,14 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
          * mas não {@code submitted == completed}. Só muda sob {@link #lock}.
          */
         private boolean failuresDelivered;
+        /**
+         * {@code MARKS}: fronteira de um release em curso ({@link #NO_RELEASE} sem release). Marcas com id
+         * {@code >= releaseFirstMarkId} (criadas depois do {@code beginRelease}) não colhem falhas até ela. Só muda sob
+         * {@link #lock}.
+         */
+        private long releaseBoundary = NO_RELEASE;
+        /** Id da primeira marca criada depois do {@code beginRelease} em curso. Só muda sob {@link #lock}. */
+        private long releaseFirstMarkId;
 
         SeriesRoute(String key, String owner, String generation, Object holder) {
             this.key = key;
@@ -2021,9 +2056,32 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             }
         }
 
-        /** Atribui a {@code mark} as falhas com sequência {@code <= boundary}, partindo a faixa que cruza a fronteira. */
+        /**
+         * Atribui a {@code mark} as falhas com sequência {@code <= boundary}, partindo a faixa que cruza a fronteira. Uma
+         * marca criada durante um release desta rota não leva as falhas até a fronteira do release, que ficam para ele.
+         */
         void collectFailures(Mark mark, long boundary) {
-            collectFailures((status, count) -> mark.addFailures(key, status, count), boundary);
+            long reserved = releaseBoundary != NO_RELEASE && mark.id() >= releaseFirstMarkId ? releaseBoundary : 0L;
+            FailureSink sink = (status, count) -> mark.addFailures(key, status, count);
+            if (reserved <= 0L) {
+                collectFailures(sink, boundary);
+                return;
+            }
+            // Separa o prefixo até a fronteira do release, colhe o resto e devolve o prefixo à frente, na ordem.
+            ArrayDeque<FailedRange> kept = new ArrayDeque<>();
+            while (!unreportedFailures.isEmpty() && unreportedFailures.peekFirst().from() <= reserved) {
+                FailedRange range = unreportedFailures.pollFirst();
+                if (range.to() > reserved) {
+                    kept.addLast(new FailedRange(range.from(), reserved, range.status()));
+                    unreportedFailures.addFirst(new FailedRange(reserved + 1, range.to(), range.status()));
+                    break;
+                }
+                kept.addLast(range);
+            }
+            collectFailures(sink, boundary);
+            for (var it = kept.descendingIterator(); it.hasNext(); ) {
+                unreportedFailures.addFirst(it.next());
+            }
         }
 
         /**

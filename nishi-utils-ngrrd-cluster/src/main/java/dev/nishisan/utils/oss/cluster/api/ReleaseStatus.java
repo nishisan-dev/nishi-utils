@@ -27,9 +27,11 @@ package dev.nishisan.utils.oss.cluster.api;
 public enum ReleaseStatus {
 
     /**
-     * Toda escrita admitida antes do release teve {@code OK} final do dono (e o {@code CHECKPOINT} confirmou, se
-     * pedido). Durabilidade: sem checkpoint, ACK do dono sem fsync, a mesma garantia de uma marca de escrita; com
-     * checkpoint, fsync confirmado no dono.
+     * Toda escrita admitida antes do release teve resposta final do dono, sem falha ainda não reportada (e o
+     * {@code CHECKPOINT} confirmou, se pedido). Em {@code MARKS}, uma falha que uma marca aberta ANTES do release já
+     * colheu foi reportada por essa marca e não aparece aqui; marcas criadas durante o release não colhem as falhas
+     * da série liberada. Durabilidade: sem checkpoint, ACK do dono sem fsync, a mesma garantia de uma marca de escrita;
+     * com checkpoint, fsync confirmado no dono.
      */
     RELEASED,
 
@@ -38,7 +40,9 @@ public enum ReleaseStatus {
 
     /**
      * Drenou, mas há escritas admitidas antes do release com falha final ainda não reportadas a uma marca. Elas são
-     * entregues aqui ({@link SeriesRelease#failedSamplesByStatus()}) e não vão mais para nenhuma marca.
+     * entregues aqui ({@link SeriesRelease#failedSamplesByStatus()}) e não vão mais para nenhuma marca. Em
+     * {@code MARKS}, só as falhas que uma marca aberta antes do release já colheu ficam de fora (foram reportadas
+     * por ela); em {@code BARRIER}, nenhuma barreira consome a falha, que sempre chega aqui.
      */
     WRITE_FAILURES,
 
