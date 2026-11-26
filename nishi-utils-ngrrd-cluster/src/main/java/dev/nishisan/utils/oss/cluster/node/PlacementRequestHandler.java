@@ -421,6 +421,8 @@ public final class PlacementRequestHandler extends RequestHandlerSupport impleme
         Optional<SeriesPlacement> alreadyPlaced = catalog.placementStrong(request.seriesKey());
         if (alreadyPlaced.isPresent()) {
             if (alreadyPlaced.get().deletion() != null) {
+                // Reserva vista pelo líder: entra já no índice de recuperação, sem esperar a reconstrução.
+                catalog.notePendingDeletion(request.seriesKey());
                 return new PlaceResponse(SeriesStatus.MIGRATING, alreadyPlaced.get(), "series deletion in progress",
                         null);
             }

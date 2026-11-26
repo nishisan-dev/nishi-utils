@@ -232,6 +232,41 @@ class SeriesDeleteRecoveryTest {
     }
 
     @Test
+    void mesmaOperacaoEmSeriesDiferentesTemBackoffsSeparados() {
+        service.putPlacement("a", pending("op-lote", true));
+        service.putPlacement("b", pending("op-lote", true));
+        failPhases();
+        handler.recover();
+        assertEquals(2, handler.recoveryBackoffSize());
+        assertEquals(2, metric("seriesDelete.recoveryAttempts"));
+
+        // A reserva de "a" some: o backoff de "b", com o mesmo operationId, continua.
+        rawMap.remove("a");
+        clock.advance(Duration.ofSeconds(1));
+        handler.recover();
+
+        assertEquals(1, handler.recoveryBackoffSize());
+        assertEquals(3, metric("seriesDelete.recoveryAttempts"));
+    }
+
+    @Test
+    void pedidoDeClienteAnotaReservaForaDoIndice() {
+        handler.recover();
+        // Reserva de outro líder, recebida depois da reconstrução: fora do índice até alguém vê-la.
+        rawMap.put("s", pending("op-s", true));
+        failPhases();
+
+        assertEquals(DeleteStatus.ERROR,
+                handler.delete(new DeleteRequest("s", new DeletePrecondition(0), "op-client")).status());
+        clock.advance(Duration.ofSeconds(1));
+        handler.recover();
+
+        assertEquals(1, catalog.rebuilds.get(), "sem reconstrução: a anotação do delete basta");
+        assertEquals(1, metric("seriesDelete.recoveryAttempts"));
+        assertEquals(1, metric("seriesDelete.pending"));
+    }
+
+    @Test
     void novoLiderRecuperaReservaQueJaEstavaNoCatalogo() {
         // Reserva gravada pelo líder anterior e recebida por replicação: o índice deste nó não a viu.
         rawMap.put("s", pending("op-s", true));
@@ -416,8 +451,8 @@ class SeriesDeleteRecoveryTest {
 
     /**
      * Carga: 500 mil placements e 1 exclusão pendente. Só o primeiro ciclo (reconstrução ao assumir) percorre o
-     * catálogo; os seguintes leem só o índice. O custo por ciclo é comparado ao de uma única cópia do catálogo,
-     * que era o piso do ciclo até a 8.14.
+     * catálogo; os seguintes, dentro do período de reconstrução, leem só o índice. O custo por ciclo é comparado
+     * ao de uma única cópia do catálogo, que era o piso do ciclo até a 8.14.
      */
     @Test
     void cicloComQuinhentosMilPlacementsEUmPendenteCustaOPendentes() throws Exception {
@@ -456,7 +491,7 @@ class SeriesDeleteRecoveryTest {
         long firstNanos = System.nanoTime() - firstStart;
         assertEquals(1, catalog.rebuilds.get());
 
-        int cycles = 249;
+        int cycles = (int) SeriesDeleteHandler.PENDING_INDEX_RESYNC.toSeconds() - 1;
         catalog.resetCounters();
         long steadyStart = System.nanoTime();
         for (int i = 0; i < cycles; i++) {
@@ -475,7 +510,7 @@ class SeriesDeleteRecoveryTest {
         assertEquals(0, catalog.rebuilds.get(), "sem reconstrução dentro do período");
         assertEquals(cycles, catalog.pendingReads.get());
         assertEquals(1, metric("seriesDelete.pending"));
-        assertEquals(10, attempts, "backoff: 1 tentativa no primeiro ciclo e 9 nos 249 seguintes");
+        assertEquals(6, attempts, "backoff: tentativas em 0, 1, 3, 7, 15 e 31 s");
         // Leituras do catálogo proporcionais às tentativas sobre pendentes, não ao tamanho do catálogo.
         assertTrue(catalog.strongReads.get() <= 4 * (attempts - 1),
                 "leituras fortes por ciclo devem ser O(pendentes): " + catalog.strongReads.get());
@@ -585,6 +620,11 @@ class SeriesDeleteRecoveryTest {
         public int rebuildPendingDeletions() {
             rebuilds.incrementAndGet();
             return delegate.rebuildPendingDeletions();
+        }
+
+        @Override
+        public void notePendingDeletion(String seriesKey) {
+            delegate.notePendingDeletion(seriesKey);
         }
 
         @Override

@@ -118,6 +118,18 @@ class CatalogServicePendingDeletionsTest {
     }
 
     @Test
+    void anotacaoDoLiderPoeAReservaNoIndiceEAChaveSemReservaEPodada() {
+        rawMap.put("r", pending("op-r"));
+        catalog.putPlacement("a", active());
+        assertTrue(catalog.pendingDeletionsLocal().isEmpty());
+
+        catalog.notePendingDeletion("r");
+        catalog.notePendingDeletion("a");
+
+        assertEquals(scanPending(), catalog.pendingDeletionsLocal());
+    }
+
+    @Test
     void entradaVelhaDoIndiceEPodadaNaConsulta() {
         catalog.putPlacement("x", pending("op-x"));
         catalog.putPlacement("y", pending("op-y"));

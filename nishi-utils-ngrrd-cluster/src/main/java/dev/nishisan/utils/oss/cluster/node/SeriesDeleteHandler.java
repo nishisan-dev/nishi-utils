@@ -61,7 +61,7 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
      * escrita que chega à réplica do líder sem passar pelo {@code CatalogService} dele (ex.: a de um líder
      * antigo, encaminhada depois da reconstrução feita ao assumir).
      */
-    static final Duration PENDING_INDEX_RESYNC = Duration.ofMinutes(5);
+    static final Duration PENDING_INDEX_RESYNC = Duration.ofSeconds(60);
     private static final long NEVER_REBUILT = Long.MIN_VALUE;
     /**
      * Instante ({@link #clock}) da última reconstrução do índice de pendentes; {@link #NEVER_REBUILT} força
@@ -70,18 +70,19 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
      */
     private volatile long pendingIndexRebuiltAtMs = NEVER_REBUILT;
     /**
-     * Backoff da recuperação por {@code operationId}. Uma entrada só existe enquanto a operação está
+     * Backoff da recuperação por série e {@code operationId}. Uma entrada só existe enquanto a operação está
      * pendente: sai quando a tentativa termina ({@code DELETED}/{@code NOT_FOUND}), quando a reserva some
      * do catálogo e quando o nó deixa de ser líder; o tamanho é limitado ao número de pendentes.
      */
-    private final Map<String, RecoveryBackoff> recoveryBackoff = new ConcurrentHashMap<>();
+    private final Map<RecoveryKey, RecoveryBackoff> recoveryBackoff = new ConcurrentHashMap<>();
     /**
-     * Backoff do reenvio de {@code DELETE_RECOVER} por quem tem a entrada no journal, por {@code operationId},
+     * Backoff do reenvio de {@code DELETE_RECOVER} por quem tem a entrada no journal, por série e
+     * {@code operationId},
      * com a mesma progressão de {@link #recoveryBackoff}. Todo envio avança o intervalo, qualquer que seja a
      * resposta: a entrada que continua candidata depois de uma resposta não tem nada novo a pedir. Sai quando
      * a entrada do journal deixa de ser candidata ao reenvio.
      */
-    private final Map<String, RecoveryBackoff> journalRecoveryBackoff = new ConcurrentHashMap<>();
+    private final Map<RecoveryKey, RecoveryBackoff> journalRecoveryBackoff = new ConcurrentHashMap<>();
     /** Janela do log com taxa limitada de falha do ciclo de recuperação. */
     static final Duration RECOVERY_LOG_WINDOW = Duration.ofMinutes(1);
     /** Instante ({@link #clock}) do último log de falha do ciclo de recuperação. */
@@ -91,6 +92,12 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
 
     /** Falhas seguidas da recuperação de uma operação e o instante a partir do qual ela é tentada de novo. */
     private record RecoveryBackoff(int failures, long nextAttemptAtMs) { }
+
+    /**
+     * Chave do backoff: série e operação. O {@code operationId} vem do cliente e não precisa ser único entre
+     * séries (um lote pode reusar o mesmo), então só ele não identifica a reserva.
+     */
+    private record RecoveryKey(String seriesKey, String operationId) { }
 
     /**
      * @param reachableNodeIds        storages alcançáveis na visão do líder (o próprio nó é sempre
@@ -249,6 +256,8 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
                 var current = catalog.placementStrong(key);
                 if (current.isEmpty()) return DeleteResult.of(DeleteStatus.NOT_FOUND, null);
                 placement = current.get();
+                // Reserva vista pelo líder: entra já no índice de recuperação, sem esperar a reconstrução.
+                if (placement.deletion() != null) catalog.notePendingDeletion(key);
                 if (request.generationId() != null && !request.generationId().equals(placement.generationId()))
                     return DeleteResult.of(DeleteStatus.NOT_FOUND, null);
                 if (placement.state() == PlacementState.MIGRATING) return refusal(DeleteStatus.REFUSED_MIGRATING, placement.ownerNodeId());
@@ -380,6 +389,7 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
                     return DeleteResult.of(DeleteStatus.NOT_FOUND, null);
                 placement = request.placement();
                 if (current.isPresent() && current.get().deletion() != null) {
+                    catalog.notePendingDeletion(key);
                     requireSame(current.get(), placement);
                     placement = current.get();
                 } else {
@@ -425,16 +435,19 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
                 }
                 List<Map.Entry<String, SeriesPlacement>> pending = new ArrayList<>(catalog.pendingDeletionsLocal().entrySet());
                 trackPending(pending);
-                Set<String> pendingOperations = new HashSet<>();
-                for (var item : pending) pendingOperations.add(item.getValue().deletion().operationId());
+                Set<RecoveryKey> pendingOperations = new HashSet<>();
+                for (var item : pending) {
+                    pendingOperations.add(new RecoveryKey(item.getKey(), item.getValue().deletion().operationId()));
+                }
                 recoveryBackoff.keySet().retainAll(pendingOperations);
                 for (var item : pending) {
                     SeriesDeletion deletion = item.getValue().deletion();
-                    RecoveryBackoff backoff = recoveryBackoff.get(deletion.operationId());
+                    RecoveryKey operation = new RecoveryKey(item.getKey(), deletion.operationId());
+                    RecoveryBackoff backoff = recoveryBackoff.get(operation);
                     if (!due(backoff, clock.millis())) continue;
                     DeleteResult result = delete(new DeleteRequest(item.getKey(),
                             new DeletePrecondition(deletion.lastWriteBefore()), deletion.operationId()), Origin.RECOVERY);
-                    recordRecoveryOutcome(deletion.operationId(), backoff, result);
+                    recordRecoveryOutcome(operation, backoff, result);
                 }
             } else {
                 pendingIndexRebuiltAtMs = NEVER_REBUILT;
@@ -451,14 +464,14 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
      * {@link #recover()}. O reenvio de cada operação segue {@link #journalRecoveryBackoff}.
      */
     private void recoverJournal() {
-        Set<String> candidates = new HashSet<>();
+        Set<RecoveryKey> candidates = new HashSet<>();
         for (var local : lifecycle.journal().snapshot().entrySet()) {
             var entry = local.getValue(); String key = local.getKey();
             if (entry.placement() == null || entry.placement().deletion() == null) continue;
-            String operationId = entry.placement().deletion().operationId();
+            RecoveryKey operation = new RecoveryKey(key, entry.placement().deletion().operationId());
             boolean confirmed = entry.phase() == COMMITTED || entry.phase() == DELETED || entry.phase() == FINISHED;
             // Candidata antes da leitura do catálogo: uma falha transitória ali não zera o backoff da operação.
-            if (confirmed) candidates.add(operationId);
+            if (confirmed) candidates.add(operation);
             try {
                 var current = catalog.placementStrong(key);
                 if (entry.phase() == PREPARED && (current.isEmpty() || current.get().deletion() == null)) {
@@ -466,13 +479,13 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
                 } else if (confirmed && (current.isPresent() || entry.phase() != FINISHED)) {
                     NodeId target = rpc.leaderId().orElse(null);
                     if (target == null) continue;
-                    RecoveryBackoff backoff = journalRecoveryBackoff.get(operationId);
+                    RecoveryBackoff backoff = journalRecoveryBackoff.get(operation);
                     if (!due(backoff, clock.millis())) continue;
-                    journalRecoveryBackoff.put(operationId, nextBackoff(backoff));
+                    journalRecoveryBackoff.put(operation, nextBackoff(backoff));
                     rpc.call(target, Commands.DELETE_RECOVER, new DeleteControlRequest(key, entry.placement()),
                             DeleteResult.class);
                 } else if (confirmed) {
-                    candidates.remove(operationId);
+                    candidates.remove(operation);
                 }
             } catch (RuntimeException e) {
                 logRecoveryDeferred(e);
@@ -517,13 +530,13 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
      * qualquer outro desfecho, agenda a próxima tentativa com o intervalo dobrado
      * ({@link #recoveryBackoffDelay}).
      */
-    private void recordRecoveryOutcome(String operationId, RecoveryBackoff previous, DeleteResult result) {
+    private void recordRecoveryOutcome(RecoveryKey operation, RecoveryBackoff previous, DeleteResult result) {
         DeleteStatus status = result == null ? null : result.status();
         if (status == DeleteStatus.DELETED || status == DeleteStatus.NOT_FOUND) {
-            recoveryBackoff.remove(operationId);
+            recoveryBackoff.remove(operation);
             return;
         }
-        recoveryBackoff.put(operationId, nextBackoff(previous));
+        recoveryBackoff.put(operation, nextBackoff(previous));
     }
 
     /**

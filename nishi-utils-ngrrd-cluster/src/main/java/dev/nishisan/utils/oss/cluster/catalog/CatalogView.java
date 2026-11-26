@@ -70,9 +70,14 @@ public interface CatalogView {
     default void removePlacement(String seriesKey) { throw new UnsupportedOperationException("removePlacement"); }
 
     /**
-     * Placements com exclusão pendente ({@code deletion != null}) na visão local do nó. O default filtra
-     * {@link #placementsLocal()} (serve aos fakes); {@link CatalogService} lê de um índice, com custo
-     * proporcional aos pendentes.
+     * Placements com exclusão pendente ({@code deletion != null}) segundo o índice de recuperação do líder.
+     * Não é API de consulta nem de visibilidade: em {@link CatalogService} o índice pode atrasar até a
+     * próxima {@link #rebuildPendingDeletions()}. O default filtra {@link #placementsLocal()} (serve aos
+     * fakes); {@link CatalogService} lê do índice, com custo proporcional aos pendentes.
+     *
+     * <p>Um decorator deve delegar os três métodos do índice juntos ({@link #pendingDeletionsLocal()},
+     * {@link #rebuildPendingDeletions()} e {@link #notePendingDeletion(String)}): delegar só parte deles
+     * deixa o {@code recover()} lendo um índice que ninguém mantém.</p>
      */
     default Map<String, SeriesPlacement> pendingDeletionsLocal() {
         Map<String, SeriesPlacement> pending = new java.util.HashMap<>();
@@ -83,12 +88,19 @@ public interface CatalogView {
     }
 
     /**
-     * Reconstrói, a partir da réplica local, o índice por trás de {@link #pendingDeletionsLocal()}. Chamado
-     * pelo líder ao assumir e com período longo. O default não tem índice e devolve {@code -1}.
+     * Reconstrói, a partir da réplica local, o índice de recuperação por trás de
+     * {@link #pendingDeletionsLocal()}. Chamado pelo líder ao assumir e com período longo. O default não tem
+     * índice e devolve {@code -1}.
      *
      * @return quantas séries com exclusão pendente foram encontradas, ou {@code -1} sem índice
      */
     default int rebuildPendingDeletions() { return -1; }
+
+    /**
+     * Anota no índice de recuperação a série cujo placement o líder acabou de ler com
+     * {@code deletion != null}. O default (sem índice) não faz nada.
+     */
+    default void notePendingDeletion(String seriesKey) { }
 
     /**
      * Publica/atualiza o status de um storage node; roteado ao líder pelo próprio {@code DistributedMap}
