@@ -456,3 +456,27 @@ Medido com `sar -B 60` e `iostat -dxm 60`.
 - `lastCycleMs ≈ 240 s` de 300 s **é o valor esperado pelo desenho**: o ciclo espalha as séries sujas em 80% do intervalo (`SPREAD_FRACTION = 0.8`). Esse número não indica teto.
 - O sinal real de saturação é `overruns`, que está em 2 no nó A.
 - A pergunta "escala para 1,5 M de séries por nó" continua de pé por causa do custo de um force por série. O pool dedicado, a métrica `forceMs` (8.15) e o force agrupado por shard (8.19) seguem como planejado.
+
+## Decisões de desenho aprovadas na onda 1 de specs (25/11)
+
+As specs da 8.15, 8.16 e 8.18 passaram por revisão independente e foram revisadas. O Lucas aprovou estas decisões:
+
+1. **Definições sem mapa replicado.**
+   - O nó persiste localmente a definição das suas séries, e a migração transporta o vínculo e a definição.
+   - Na 8.17, quando o nó responde "definição desconhecida", o cliente reenvia o YAML do `DefinitionRef`.
+   - Isto substitui o mapa replicado previsto em R5(a).
+2. **`REJECT` como padrão.** Escrita sem época numa série cercada é recusada. Um cliente antigo recebe `ERROR` com a mensagem `FENCED`, em vez de um status desconhecido.
+3. **TTL de ociosidade por série.** O TTL efetivo é `max(handleIdleTtl, 2 × stepSec)`. O fator `0` restaura o comportamento antigo.
+4. **Métricas e campos obsoletos.** Na 8.x são só depreciados; a remoção fica para a 9.0. Nenhum componente sai de um record público numa minor.
+5. **`lastWrite` (8.18) em índice próprio do nó.**
+   - Não fica no checkpoint nem no journal.
+   - Cada valor carrega uma qualidade: `EXACT`, `RECOVERED`, `ESTIMATED` ou `UNKNOWN`.
+   - A promessa de atraso é "intervalo + atraso" (~30–45 s).
+6. **API da 8.18.**
+   - `SeriesMeta` ganha `lastWriteQuality` e `generationId`.
+   - A varredura é exata por padrão (`STRICT`), com opção por chamada para aceitar resultado parcial com aviso.
+7. **`recover()` do delete.** Na 8.15, passa a usar um índice de exclusões pendentes com backoff, em vez de copiar o catálogo inteiro.
+8. **Rollback e época.** A garantia da época do escritor não sobrevive a um rollback 8.16 → 8.15. Depois de um rollback, os escritores precisam subir a época.
+9. **Época fornecida pela lib.** A 8.16 entrega `acquireWriterEpoch(scope)`: monotônica, durável no cluster e incrementada pelo líder, para que o consumidor não precise de uma fonte própria de época.
+10. **Exportação nativa `.ngrr` sai da 8.18.** Os clientes precisam de leitura de pontos em lote para o tier frio. A exportação nativa fica para uma release futura (backup, DR, migração entre clusters).
+11. **Teto do spill (8.16).** O padrão passa a ser derivado de taxa × prazo de manutenção, ou ao menos documentado com essa conta: 1 GiB não cobre 15 min num nó com ~20 mil amostras/s.
