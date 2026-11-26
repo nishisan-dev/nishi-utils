@@ -653,6 +653,23 @@ class PlacementRequestHandlerTest {
     }
 
     @Test
+    void placeQueVeExclusaoEmCursoAnotaOIndiceDeRecuperacao() {
+        leaderView.leader = true;
+        SeriesPlacement deleting = SeriesPlacement.active("node-a", clock.millis()).withDeletion(
+                new SeriesDeletion("op-1", clock.millis(), List.of("node-a"), false), clock.millis());
+        // Reserva recebida por replicação: chega ao mapa sem passar pelo índice deste CatalogService.
+        cluster.node(0).getMap(CatalogService.CATALOG_MAP, String.class, SeriesPlacement.class)
+                .put("series-1", deleting);
+        assertTrue(catalog.pendingDeletionsLocal().isEmpty());
+
+        PlaceResponse response = (PlaceResponse) handler.handle(Commands.PLACE,
+                new PlaceRequest("series-1", "hash-1", null), NodeId.of("client"));
+
+        assertEquals(SeriesStatus.MIGRATING, response.status());
+        assertEquals(Map.of("series-1", deleting), catalog.pendingDeletionsLocal());
+    }
+
+    @Test
     void perdaDeLiderancaDuranteOGateRespondeNotLeaderSemGravar() throws Exception {
         leaderView.leader = true;
         putNode("node-a", 0, clock.millis());

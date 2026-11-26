@@ -541,6 +541,80 @@ class StorageNodeConfigYamlTest {
         assertTrue(zeroInFlight.getMessage().contains("ngrrd.checkpoint.maxInFlight"), zeroInFlight.getMessage());
     }
 
+    @Test
+    void checkpointThreadsTemPadraoZeroELeODoYaml() {
+        assertEquals(0, StorageNodeConfig.fromYaml(CHECKPOINT_BASE, NO_ENV).localCheckpoint().threads());
+        assertEquals(0, LocalCheckpointSettings.disabled().threads());
+
+        LocalCheckpointSettings withPool = StorageNodeConfig.fromYaml(CHECKPOINT_BASE + """
+                  checkpoint:
+                    threads: 4
+                """, NO_ENV).localCheckpoint();
+        assertEquals(4, withPool.threads());
+        assertFalse(withPool.enabled(), "o pool de force vale mesmo com o checkpoint local desligado");
+
+        assertEquals(2, StorageNodeConfig.fromYaml(CHECKPOINT_BASE + """
+                  checkpoint:
+                    enabled: true
+                    threads: ${CHECKPOINT_THREADS:2}
+                """, NO_ENV).localCheckpoint().threads());
+    }
+
+    @Test
+    void checkpointThreadsNegativoFalhaNoBootComOCampoNaMensagem() {
+        IllegalArgumentException negative = assertThrows(IllegalArgumentException.class,
+                () -> StorageNodeConfig.fromYaml(CHECKPOINT_BASE + """
+                          checkpoint:
+                            threads: -1
+                        """, NO_ENV));
+        assertTrue(negative.getMessage().contains("ngrrd.checkpoint.threads"), negative.getMessage());
+    }
+
+    @Test
+    void checkpointSpreadFractionTemPadraoOitentaELeODoYaml() {
+        assertEquals(0.8, StorageNodeConfig.fromYaml(CHECKPOINT_BASE, NO_ENV).localCheckpoint().spreadFraction());
+
+        assertEquals(0.5, StorageNodeConfig.fromYaml(CHECKPOINT_BASE + """
+                  checkpoint:
+                    spreadFraction: 0.5
+                """, NO_ENV).localCheckpoint().spreadFraction());
+        assertEquals(1.0, StorageNodeConfig.fromYaml(CHECKPOINT_BASE + """
+                  checkpoint:
+                    spreadFraction: 1
+                """, NO_ENV).localCheckpoint().spreadFraction());
+    }
+
+    @Test
+    void checkpointSpreadFractionForaDaFaixaFalhaNoBootComOCampoNaMensagem() {
+        for (String invalid : new String[] {"0", "-0.2", "1.5"}) {
+            IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                    () -> StorageNodeConfig.fromYaml(CHECKPOINT_BASE + "  checkpoint:\n    spreadFraction: " + invalid
+                            + "\n", NO_ENV));
+            assertTrue(e.getMessage().contains("ngrrd.checkpoint.spreadFraction"), e.getMessage());
+        }
+    }
+
+    @Test
+    void handleIdleTtlStepFactorTemPadraoDoisELeOValorDoYaml() {
+        assertEquals(2, StorageNodeConfig.fromYaml(CHECKPOINT_BASE, NO_ENV).handleIdleTtlStepFactor());
+
+        assertEquals(0, StorageNodeConfig.fromYaml(CHECKPOINT_BASE + """
+                  handleIdleTtlStepFactor: 0
+                """, NO_ENV).handleIdleTtlStepFactor());
+        assertEquals(5, StorageNodeConfig.fromYaml(CHECKPOINT_BASE + """
+                  handleIdleTtlStepFactor: ${STEP_FACTOR:5}
+                """, NO_ENV).handleIdleTtlStepFactor());
+    }
+
+    @Test
+    void handleIdleTtlStepFactorNegativoFalhaNoBootComOCampoNaMensagem() {
+        IllegalArgumentException negative = assertThrows(IllegalArgumentException.class,
+                () -> StorageNodeConfig.fromYaml(CHECKPOINT_BASE + """
+                          handleIdleTtlStepFactor: -1
+                        """, NO_ENV));
+        assertTrue(negative.getMessage().contains("handleIdleTtlStepFactor"), negative.getMessage());
+    }
+
     private static final String CHECKPOINT_BASE = """
             node:
               id: storage-0

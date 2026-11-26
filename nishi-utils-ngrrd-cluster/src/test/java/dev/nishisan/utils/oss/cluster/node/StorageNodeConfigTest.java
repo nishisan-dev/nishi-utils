@@ -75,6 +75,16 @@ class StorageNodeConfigTest {
     }
 
     @Test
+    void handleIdleTtlStepFactorTemDefaultDoisAceitaZeroERejeitaNegativo(@TempDir Path base) {
+        assertEquals(2, minimal(base).build().handleIdleTtlStepFactor());
+        assertEquals(StorageNodeConfig.DEFAULT_HANDLE_IDLE_TTL_STEP_FACTOR,
+                minimal(base).build().handleIdleTtlStepFactor());
+        assertEquals(0, minimal(base).handleIdleTtlStepFactor(0).build().handleIdleTtlStepFactor());
+        assertEquals(7, minimal(base).handleIdleTtlStepFactor(7).build().handleIdleTtlStepFactor());
+        assertThrows(IllegalArgumentException.class, () -> minimal(base).handleIdleTtlStepFactor(-1).build());
+    }
+
+    @Test
     void avisoDeSubidaQuandoPlacementInspectTimeoutNaoFicaAbaixoDoRequestTimeout() {
         assertTrue(NgrrdStorageNode.placementInspectTimeoutWarning(Duration.ofSeconds(2), Duration.ofSeconds(20))
                 .isEmpty());
@@ -162,6 +172,17 @@ class StorageNodeConfigTest {
         assertThrows(IllegalArgumentException.class,
                 () -> new LocalCheckpointSettings(true, Duration.ofSeconds(1), 0));
         assertThrows(NullPointerException.class, () -> new LocalCheckpointSettings(true, null, 1));
+        assertThrows(IllegalArgumentException.class,
+                () -> new LocalCheckpointSettings(true, Duration.ofSeconds(1), 1, -1, 0.8));
+        assertEquals(0, new LocalCheckpointSettings(true, Duration.ofSeconds(1), 1).threads());
+        assertEquals(3, new LocalCheckpointSettings(false, Duration.ofSeconds(1), 1, 3, 0.8).threads());
+        assertEquals(0.8, new LocalCheckpointSettings(true, Duration.ofSeconds(1), 1).spreadFraction());
+        assertEquals(1.0, new LocalCheckpointSettings(true, Duration.ofSeconds(1), 1, 0, 1.0).spreadFraction());
+        for (double invalid : new double[] {0.0, -0.1, 1.0001, Double.NaN, Double.POSITIVE_INFINITY}) {
+            assertThrows(IllegalArgumentException.class,
+                    () -> new LocalCheckpointSettings(true, Duration.ofSeconds(1), 1, 0, invalid),
+                    "spreadFraction " + invalid);
+        }
     }
 
     @Test

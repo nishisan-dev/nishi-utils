@@ -23,10 +23,12 @@ import dev.nishisan.utils.oss.cluster.api.NgrrdClusterClient;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
+import dev.nishisan.utils.oss.cluster.node.LocalCheckpointSettings;
 import org.junit.jupiter.api.AfterEach;
-import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -38,6 +40,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -68,11 +71,16 @@ class NodeRestartClusterTest {
         }
     }
 
-    @Test
-    void reinicioDoDonoComMesmoIdPortaEDiretoriosRecuperaRapido(@TempDir Path base) throws Exception {
+    /** {@code threads} = {@code ngrrd.checkpoint.threads}: 0 força inline, 2 usa o pool de force do nó. */
+    @ParameterizedTest(name = "checkpoint.threads={0}")
+    @ValueSource(ints = {0, 2})
+    void reinicioDoDonoComMesmoIdPortaEDiretoriosRecuperaRapido(int threads, @TempDir Path base) throws Exception {
         String yaml = Files.readString(Path.of("src/test/resources/iface-traffic-blob.yaml"), StandardCharsets.UTF_8);
 
-        harness = NgrrdClusterTestHarness.start(base, 2, builder -> { });
+        harness = NgrrdClusterTestHarness.start(base, 2, builder -> builder.localCheckpoint(
+                new LocalCheckpointSettings(false, LocalCheckpointSettings.DEFAULT_INTERVAL,
+                        LocalCheckpointSettings.defaultMaxInFlight(), threads,
+                        LocalCheckpointSettings.DEFAULT_SPREAD_FRACTION)));
         harness.awaitLeader();
         harness.awaitNodeStatuses(2);
 
@@ -137,6 +145,13 @@ class NodeRestartClusterTest {
                     "escrita+checkpoint pós-restart para " + seriesKey + " levou " + elapsedMs
                             + " ms, esperava < " + RECOVERY_BUDGET.toMillis() + " ms");
         }
+
+        // F.3: o restart zera a definição em memória do nó; o NOT_OPEN da primeira operação é classificado como
+        // restart e nenhum cliente fez CLOSE, então clientClosed fica em 0. A soma das causas é o total.
+        Map<String, Long> lifecycle = harness.nodes().get(restartedIndex).metricsSnapshot().lifecycleMetrics();
+        assertTrue(lifecycle.getOrDefault("notOpen.restart", 0L) > 0L,
+                "esperava notOpen.restart > 0 depois do restart: " + lifecycle);
+        assertEquals(0L, lifecycle.getOrDefault("notOpen.clientClosed", 0L));
 
         client.close();
     }

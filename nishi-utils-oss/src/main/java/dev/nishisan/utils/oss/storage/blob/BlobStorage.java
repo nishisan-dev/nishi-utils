@@ -434,12 +434,14 @@ public final class BlobStorage implements NgrrdStorage, SeriesChannelProvider, A
         while (offset.isEmpty()) {
             MappedShard shard = shards[shardId];
             long oldCapacity = shard.capacity();
+            long growStart = System.nanoTime();
             shard.grow(oldCapacity + segmentBytes); // setLength + force + map (durável)
             persistSuperblock(shardId); // capacidade durável ANTES de jornalizar a alocação (§9)
+            long growNanos = Math.max(1L, System.nanoTime() - growStart);
             long newCapacity = shard.capacity();
             alloc.grow(newCapacity);
             if (newCapacity > oldCapacity) {
-                volumeMetrics.onShardGrow(shardId, oldCapacity, newCapacity);
+                volumeMetrics.onShardGrow(shardId, oldCapacity, newCapacity, growNanos);
             }
             offset = alloc.allocate(regionBytes);
         }
@@ -701,7 +703,8 @@ public final class BlobStorage implements NgrrdStorage, SeriesChannelProvider, A
                 throw new BlobVolumeException("falha ao ler o tamanho de " + CATALOG_BIN, ex);
             }
             return new BlobVolumeStats(shardCount, capacity, used, series, fill,
-                    catalog.size(), catalogImageBytes, journal.size(), writeMode(), bytesWritten());
+                    catalog.size(), catalogImageBytes, journal.size(), writeMode(), bytesWritten(),
+                    declaredCapacity, liveBytes, reservedBytes());
         } finally {
             structuralLock.unlock();
         }

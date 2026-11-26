@@ -31,6 +31,7 @@ import java.nio.file.Path;
 import java.util.Collection;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * Cliente transparente do cluster ngrrd: entra na malha NGrid como membro sem
@@ -232,6 +233,94 @@ public interface NgrrdClusterClient extends Closeable {
      */
     default WriteMark mark() {
         throw new UnsupportedOperationException("mark() não suportado por " + getClass().getName());
+    }
+
+    /**
+     * {@link #release(Collection, ReleaseOptions)} com {@link ReleaseOptions#defaults()}: sem checkpoint e sem
+     * {@code CLOSE} no nó, com prazo {@link NgrrdClusterConfig#closeTimeout()}.
+     *
+     * @since 8.15.0
+     */
+    default CompletableFuture<ReleaseResult> release(Collection<String> seriesKeys) {
+        return release(seriesKeys, ReleaseOptions.defaults());
+    }
+
+    /**
+     * Entrega as séries {@code seriesKeys}: encerra a admissão de escritas nelas, espera a resposta final do dono para
+     * toda escrita já admitida e solta o estado local do cliente — para confirmar com segurança o progresso que cobre
+     * essas séries (por exemplo, o offset de uma partição) antes de outro cliente assumi-las. Não bloqueia: devolve
+     * uma future, concluída num executor próprio de virtual threads.
+     *
+     * <p><b>Semântica, por série:</b></p>
+     * <ol>
+     *   <li><b>Admissão encerrada.</b> Sob o lock de abertura da chave (o mesmo de {@link #open}), o handle principal
+     *       — gravável ou somente leitura — sai do cache e é fechado localmente, e a rota de escrita é aposentada com a
+     *       fronteira fotografada (tudo o que foi admitido até ali). Um {@code write} concorrente no handle liberado
+     *       lança {@link NgrrdClusterException} com {@link ErrorCode#CLOSED}, nunca {@code SERIES_DELETED}: pare de
+     *       escrever nas séries antes de chamar o {@code release}. Um {@link #open} concorrente da mesma chave espera
+     *       esse lock, então nenhuma escrita dele entra na fronteira; um {@code open} posterior cria um handle novo,
+     *       como sempre. Uma vista somente leitura obtida antes passa a falhar com {@code CLOSED}.</li>
+     *   <li><b>Dreno.</b> Espera a resposta final de toda escrita até a fronteira, sem lançar. Em
+     *       {@link NgrrdClusterConfig.WriteFailureReporting#MARKS}, as falhas ainda não reportadas a uma marca até a
+     *       fronteira são entregues no resultado e não vão mais para nenhuma marca (cada falha vai a uma única marca, ou
+     *       a todo release ainda ativo da mesma série cuja fronteira a cubra; um release que começa depois de outro
+     *       já ter colhido a série não a vê de novo, e o release que admitiu a escrita sempre a recebe). Em {@code BARRIER}, a primeira falha da série, se estiver até a
+     *       fronteira, vira {@link ReleaseStatus#WRITE_FAILURES}. Série removida ou em quarentena vira
+     *       {@link ReleaseStatus#SERIES_DELETED}.</li>
+     *   <li><b>Checkpoint opcional</b> ({@link ReleaseOptions#checkpoint()}): o {@code CHECKPOINT} de sempre, só nas
+     *       séries sem falha de escrita; falha ou prazo vira {@link ReleaseStatus#CHECKPOINT_FAILED}.</li>
+     *   <li><b>{@code CLOSE} no nó opcional</b> ({@link ReleaseOptions#closeOnNode()}), com o orçamento e a regra de
+     *       conexão do {@code close()} do handle; uma falha só vai para o log. <b>Padrão: não manda</b> — na entrega, o
+     *       próximo dono reabre a série no mesmo nó, e o {@code CLOSE} faria o nó fazer checkpoint, fechar e reabrir à
+     *       toa (além de descartar a definição no nó, o que custa um {@code NOT_OPEN} ao cliente que já a abriu). Série
+     *       abandonada de vez fecha pela ociosidade do nó.</li>
+     *   <li><b>Limpeza local.</b> A rota de escrita sai do cliente quando não houver mais escrita em voo — com a falha
+     *       entregue por este release, sai mesmo com falha —, e o dono em cache da série é esquecido. Se outro handle
+     *       gravável deste cliente ainda segura a rota (aberto por fora do release), o release só drena: a rota
+     *       continua, e as escritas desse handle seguem normalmente.</li>
+     *   <li><b>{@link ReleaseStatus#TIMED_OUT}.</b> O handle já está fechado e a rota fica sem dono; as escritas
+     *       pendentes continuam sendo entregues em segundo plano e a rota sai quando ficar ociosa. Falhas que surgirem
+     *       depois vão para a próxima marca ({@code MARKS}) ou ficam na rota ({@code BARRIER}). <b>Não confirme</b> o
+     *       progresso dessas séries.</li>
+     * </ol>
+     *
+     * <p><b>Durabilidade.</b> Sem {@code checkpoint}, a garantia de {@link ReleaseStatus#RELEASED} é a mesma de uma
+     * marca de escrita: ACK do dono, sem fsync — uma queda abrupta do nó logo depois pode perder as últimas amostras.
+     * Quando o checkpoint local periódico ({@code ngrrd.checkpoint}) está ligado no nó, ele limita essa janela; vem
+     * desligado por padrão, e aí a janela não tem esse limite. Com {@code checkpoint}, é fsync confirmado no dono, ao
+     * custo de uma RPC por série.</p>
+     *
+     * <p><b>Prazo e execução.</b> O prazo TOTAL ({@link ReleaseOptions#timeout()}, padrão
+     * {@link NgrrdClusterConfig#closeTimeout()}) vale para dreno, checkpoint e {@code CLOSE}. As RPCs de
+     * {@code CHECKPOINT}/{@code CLOSE} são limitadas a {@link ReleaseOptions#maxConcurrentPerNode()} por nó dono, em cada
+     * chamada de {@code release} (o limite não é global: releases simultâneos somam). Sem {@code checkpoint} nem
+     * {@code closeOnNode}, o custo é só local (dreno e limpeza), sem RPC por série. A espera pelo lock de abertura de uma
+     * chave fica fora do prazo: ela só acontece se um {@link #open} da mesma chave estiver em curso neste cliente (o
+     * {@code OPEN} remoto roda sob esse lock, limitado pelo {@link NgrrdClusterConfig#retryTimeout()}, de 5 min por
+     * padrão), o que o protocolo de entrega abaixo não prevê — quem libera parou de usar as séries, e quem as assume é
+     * outro cliente. Se acontecer, essa espera pode estourar o prazo do grupo de consumo para o callback de revogação:
+     * não abra no mesmo cliente as séries que estão sendo liberadas.</p>
+     *
+     * <p><b>Protocolo de entrega entre clientes</b> (consumidores particionados, com séries particionadas de forma
+     * disjunta entre clientes): o cliente que perde a partição P para de chamar {@code write} nas séries de P, chama
+     * {@code release(séries de P).join()} no callback de revogação e só confirma o offset de P se
+     * {@link ReleaseResult#allReleased()} (senão, não confirma, ou confirma até a última marca concluída sem falha, e
+     * registra {@link ReleaseResult#notReleased()}); o cliente que ganha P abre as séries sob demanda e retoma do offset
+     * confirmado. O {@code timeout} tem de caber, com folga, no prazo do grupo para o callback. Se o cliente antigo
+     * estourar esse prazo e o grupo reatribuir P, os dois podem escrever ao mesmo tempo, e vale o último escritor
+     * (esta versão não tem cerca contra isso). Amostras gravadas depois do offset confirmado são reescritas por quem
+     * assume; com o mesmo timestamp, vale a {@code lateSamplePolicy} da série.</p>
+     *
+     * @param seriesKeys chaves das séries; repetidas contam uma vez. Uma chave que este cliente não usa termina
+     *                   {@link ReleaseStatus#NOT_HELD}
+     * @param options    opções; {@code null} vale {@link ReleaseOptions#defaults()}
+     * @return future com um desfecho por chave. Ela nunca falha por causa de uma série: só falha com
+     *         {@link NgrrdClusterException} {@link ErrorCode#CLOSED} (cliente fechado antes ou durante o release) ou
+     *         com {@link NullPointerException} se {@code seriesKeys} for nulo ou contiver {@code null}
+     * @since 8.15.0
+     */
+    default CompletableFuture<ReleaseResult> release(Collection<String> seriesKeys, ReleaseOptions options) {
+        return CompletableFuture.failedFuture(new UnsupportedOperationException("release"));
     }
 
     /** Snapshot atual das métricas do cliente. */

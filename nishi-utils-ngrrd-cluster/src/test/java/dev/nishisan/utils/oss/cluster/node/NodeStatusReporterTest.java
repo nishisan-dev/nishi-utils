@@ -38,6 +38,7 @@ import dev.nishisan.utils.oss.cluster.metrics.LatencySnapshot;
 import dev.nishisan.utils.oss.cluster.metrics.NgrrdClusterMetricsListener;
 import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesStatus;
+import dev.nishisan.utils.oss.metrics.BlobVolumeMetrics;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -63,6 +64,10 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -152,6 +157,124 @@ class NodeStatusReporterTest {
         BlobVolumeSummary blobStats = snapshot.blobStats();
         assertEquals(1, blobStats.catalogEntryCount());
         assertTrue(blobStats.usedBytes() > 0, "série com amostra escrita deveria ocupar bytes reais no volume");
+    }
+
+    @Test
+    void marcadorDeFillSoNaMudancaDeFaixa() {
+        VolumeFillBands bands = new VolumeFillBands();
+
+        assertEquals(VolumeFillBands.Band.NORMAL, bands.update(0.79));
+        assertEquals(VolumeFillBands.Band.WARN, bands.update(0.80));
+        assertEquals(VolumeFillBands.Band.WARN, bands.update(0.85), "mesma faixa: sem mudança");
+        assertEquals(VolumeFillBands.Band.CRITICAL, bands.update(0.90));
+        assertEquals(VolumeFillBands.Band.REFUSING, bands.update(0.95));
+        assertEquals(VolumeFillBands.Band.REFUSING, bands.update(1.30), "fill pode passar de 1,0");
+        // salto direto sobre faixas intermediárias
+        VolumeFillBands jump = new VolumeFillBands();
+        assertEquals(VolumeFillBands.Band.REFUSING, jump.update(0.97));
+    }
+
+    @Test
+    void logDeFillEmiteSoNaMudancaDeFaixaERespeitaCapacidadeDesconhecida() {
+        List<LogRecord> records = new CopyOnWriteArrayList<>();
+        Logger logger = Logger.getLogger(NodeStatusReporter.class.getName());
+        Handler capture = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                if (record.getMessage() != null && record.getMessage().startsWith("NGRRD_VOLUME_FILL")) {
+                    records.add(record);
+                }
+            }
+
+            @Override
+            public void flush() {
+            }
+
+            @Override
+            public void close() {
+            }
+        };
+        NodeStatusReporter reporter = newReporter(Clock.systemUTC(), null, Duration.ofMinutes(1));
+        logger.addHandler(capture);
+        try {
+            // entrada na faixa WARN: um registro WARNING
+            reporter.logFillBandChange(fillSummary(0.85, 1_000_000L));
+            assertEquals(1, records.size());
+            assertEquals(Level.WARNING, records.get(0).getLevel());
+            assertTrue(records.get(0).getMessage().contains("level=WARN previous=NORMAL fill=0.850"),
+                    records.get(0).getMessage());
+
+            // capacidade declarada 0 é desconhecida: nada é registrado e a faixa WARN permanece
+            reporter.logFillBandChange(fillSummary(0.0, 0L));
+            assertEquals(1, records.size(), "capacidade declarada 0 não pode gerar registro");
+
+            // mesma faixa: sem novo registro (prova indireta de que a faixa continuou WARN)
+            reporter.logFillBandChange(fillSummary(0.85, 1_000_000L));
+            assertEquals(1, records.size(), "mesma faixa não gera registro");
+
+            // descida para NORMAL: um registro INFO
+            reporter.logFillBandChange(fillSummary(0.5, 1_000_000L));
+            assertEquals(2, records.size());
+            assertEquals(Level.INFO, records.get(1).getLevel());
+            assertTrue(records.get(1).getMessage().contains("level=NORMAL previous=WARN"),
+                    records.get(1).getMessage());
+
+            // salto para REFUSING a partir de NORMAL: um registro WARNING
+            reporter.logFillBandChange(fillSummary(1.7, 1_000_000L));
+            assertEquals(3, records.size());
+            assertEquals(Level.WARNING, records.get(2).getLevel());
+            assertTrue(records.get(2).getMessage().contains("level=REFUSING previous=NORMAL"),
+                    records.get(2).getMessage());
+        } finally {
+            logger.removeHandler(capture);
+        }
+    }
+
+    /** Resumo de volume só com o fill sobre a capacidade declarada relevante para a máquina de faixas. */
+    private static BlobVolumeSummary fillSummary(double fill, long declaredCapacityBytes) {
+        return new BlobVolumeSummary(1, 0L, 0L, 0.0, 0, 0L, null, 0L, declaredCapacityBytes, 0L, fill);
+    }
+
+    @Test
+    void histereseNaDescida() {
+        VolumeFillBands bands = new VolumeFillBands();
+        bands.update(0.96);
+
+        assertEquals(VolumeFillBands.Band.REFUSING, bands.update(0.945), "dentro de 1 ponto abaixo de 0,95");
+        assertEquals(VolumeFillBands.Band.CRITICAL, bands.update(0.939));
+        assertEquals(VolumeFillBands.Band.CRITICAL, bands.update(0.895));
+        assertEquals(VolumeFillBands.Band.WARN, bands.update(0.889));
+        assertEquals(VolumeFillBands.Band.WARN, bands.update(0.795));
+        assertEquals(VolumeFillBands.Band.NORMAL, bands.update(0.789));
+        // oscilando em torno do limiar não gera mudança de faixa
+        bands.update(0.81);
+        assertEquals(VolumeFillBands.Band.WARN, bands.update(0.795));
+        assertEquals(VolumeFillBands.Band.WARN, bands.update(0.805));
+        // queda grande desce várias faixas de uma vez
+        bands.update(0.97);
+        assertEquals(VolumeFillBands.Band.NORMAL, bands.update(0.10));
+    }
+
+    @Test
+    void lifecycleMetricsExpoeCrescimentoDoShardEFillDeclarado() {
+        volume.storage().configureCapacity(1_000_000L);
+        BlobVolumeMetrics volumeMetrics = new BlobVolumeMetrics();
+        volumeMetrics.onShardGrow(0, 1_000L, 2_000L, 3_000_000L);
+        volumeMetrics.onShardGrow(1, 1_000L, 2_000L, 9_000_000L);
+        volumeMetrics.onShardGrow(0, 2_000L, 3_000L, 4_000_000L);
+        NodeStatusReporter reporter = newReporter(new MutableClock(Instant.parse("2026-01-01T00:00:00Z")), null,
+                Duration.ofSeconds(10));
+        reporter.volumeMetrics(volumeMetrics);
+
+        NodeMetricsSnapshot snapshot = reporter.metricsSnapshot();
+
+        assertEquals(3L, snapshot.lifecycleMetrics().get("volume.shardGrows"));
+        assertEquals(16L, snapshot.lifecycleMetrics().get("volume.shardGrowMsTotal"));
+        assertEquals(9L, snapshot.lifecycleMetrics().get("volume.shardGrowMsMax"));
+        assertEquals(4L, snapshot.lifecycleMetrics().get("volume.shardGrowMsLast"));
+        assertEquals(1_000_000L, snapshot.blobStats().declaredCapacityBytes());
+        assertEquals(0L, snapshot.blobStats().reservedBytes());
+        assertEquals(0.0, snapshot.blobStats().fillOfDeclaredCapacity(), 1e-9);
     }
 
     @Test

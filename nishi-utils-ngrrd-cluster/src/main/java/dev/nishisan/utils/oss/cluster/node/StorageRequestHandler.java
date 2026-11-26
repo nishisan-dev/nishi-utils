@@ -682,7 +682,7 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
                 writeBatchLatency.record(System.nanoTime() - startNanos);
                 if (written.isEmpty()) {
                     statusBySeries.put(seriesKey, SeriesStatus.NOT_OPEN);
-                    recordError(SeriesStatus.NOT_OPEN);
+                    recordNotOpen(seriesKey);
                 } else {
                     samplesWrittenCount.add(written.get());
                     statusBySeries.put(seriesKey, SeriesStatus.OK);
@@ -731,11 +731,15 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
         }
         long startNanos = System.nanoTime();
         try {
+            // O primeiro checkpoint depois do abandono do writer falha, mesmo com a série reaberta pela autocura:
+            // amostras confirmadas antes do abandono podem ter sido perdidas. A marca é conferida sob o lock da série.
             Optional<CompletableFuture<Void>> pending = withSeriesSelfHealing(seriesKey,
-                    SeriesHandleRegistry.SeriesAccess::checkpointAsync);
+                    access -> registry.consumeAbandonedCheckpoint(seriesKey)
+                            ? CompletableFuture.<Void>failedFuture(abandonedWriterFailure(seriesKey))
+                            : access.checkpointAsync());
             if (pending.isEmpty()) {
                 recordLatency(latency, startNanos);
-                recordError(SeriesStatus.NOT_OPEN);
+                recordNotOpen(seriesKey);
                 return new SeriesStatusResponse(SeriesStatus.NOT_OPEN, self.value(), null);
             }
             return new PendingCheckpoint(this, pending.get(), startNanos, latency, successes);
@@ -744,6 +748,16 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
             recordError(SeriesStatus.ERROR);
             return new SeriesStatusResponse(SeriesStatus.ERROR, self.value(), describe(e));
         }
+    }
+
+    /**
+     * Falha do primeiro {@code checkpoint}/{@code flush} depois do abandono do writer. Vira {@link SeriesStatus#ERROR},
+     * que o cliente trata como falha do checkpoint, sem retentativa.
+     */
+    private static IllegalStateException abandonedWriterFailure(String seriesKey) {
+        return new IllegalStateException("writer da série " + seriesKey + " foi abandonado no fechamento (force "
+                + "preso): amostras confirmadas desde o último checkpoint podem ter sido perdidas; o próximo "
+                + "checkpoint segue normal");
     }
 
     private static void recordLatency(LatencyHistogram latency, long startNanos) {
@@ -796,7 +810,7 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
                             : handle.read(request.dsName(), request.toViewQuery()));
             readLatency.record(System.nanoTime() - startNanos);
             if (result.isEmpty()) {
-                recordError(SeriesStatus.NOT_OPEN);
+                recordNotOpen(request.seriesKey());
                 return new ReadResponse(SeriesStatus.NOT_OPEN, self.value(), null, null);
             }
             return new ReadResponse(SeriesStatus.OK, self.value(), result.get(), null);
@@ -823,7 +837,7 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
                             : handle.read(request.presetName()));
             readLatency.record(System.nanoTime() - startNanos);
             if (results.isEmpty()) {
-                recordError(SeriesStatus.NOT_OPEN);
+                recordNotOpen(request.seriesKey());
                 return new ReadPresetResponse(SeriesStatus.NOT_OPEN, self.value(), null, null);
             }
             return new ReadPresetResponse(SeriesStatus.OK, self.value(), results.get(), null);
@@ -1230,6 +1244,12 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
         if (ownershipGenerations.get(stripe) != generationBefore) {
             confirmedPlacements.remove(seriesKey, entry);
         }
+    }
+
+    /** Conta um {@code NOT_OPEN} no total por status e, por causa, em {@code notOpen.<causa>}. */
+    private void recordNotOpen(String seriesKey) {
+        registry.recordNotOpen(seriesKey);
+        recordError(SeriesStatus.NOT_OPEN);
     }
 
     private void recordError(SeriesStatus status) {

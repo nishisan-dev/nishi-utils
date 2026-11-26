@@ -83,6 +83,10 @@ class SeriesDeleteClusterTest {
             assertFalse(client.exists(key("deleted")));
             assertTrue(h.leaderNode().catalog().placementStrong(key("deleted")).isEmpty());
             assertEquals(DeleteStatus.NOT_FOUND, client.deleteSeries(key("deleted"), new DeletePrecondition(cutoff)).status());
+            // Só o coordenador (líder) conta a exclusão: uma operação concluída em todo o cluster.
+            long completed = h.nodes().stream()
+                    .mapToLong(n -> n.metricsSnapshot().lifecycleMetrics().getOrDefault("seriesDelete.completed", 0L)).sum();
+            assertEquals(1L, completed);
             var stale = assertThrows(NgrrdClusterException.class, deleted::checkpoint);
             assertEquals(ErrorCode.SERIES_DELETED, stale.code());
             assertEquals(ErrorCode.SERIES_DELETED, assertThrows(NgrrdClusterException.class,

@@ -20,6 +20,8 @@ package dev.nishisan.utils.oss.cluster.metrics;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongArray;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.LongSupplier;
 
 /**
  * Histograma de latência thread-safe, sem dependência externa (nada de
@@ -58,15 +60,50 @@ import java.util.concurrent.atomic.AtomicLongArray;
  * INSTANTE — o problema se autocorrige no próximo {@link #snapshot()}, já com o slot preenchido.
  * Aceitável pela mesma razão do parágrafo acima: aproximação de observabilidade, não garantia de
  * correção.</p>
+ *
+ * <h2>Máximo recente</h2>
+ *
+ * <p>O reservatório de {@value #CAPACITY} amostras não serve para achar picos: num comando quente, um
+ * pico sai dele em menos de um segundo. Por isso o histograma mantém à parte um <strong>máximo
+ * rotativo por minuto</strong>, em dois baldes ({@code (minuto, máximo)} do minuto corrente e do
+ * anterior) guardados num {@link AtomicReference} com um record imutável, atualizado por CAS (O(1),
+ * sem lock). {@link LatencySnapshot#recentMaxMicros()} é o maior valor dos baldes que ainda são do
+ * minuto corrente ou do anterior, ou seja, cobre os últimos 60 a 120 s.</p>
  */
 public final class LatencyHistogram {
 
     private static final int CAPACITY = 1024;
+    private static final long NANOS_PER_MINUTE = 60_000_000_000L;
 
     private final AtomicLongArray samples = new AtomicLongArray(CAPACITY);
     private final AtomicLong writeCursor = new AtomicLong();
     private final AtomicLong totalCount = new AtomicLong();
     private final AtomicLong maxNanos = new AtomicLong();
+    private final LongSupplier clockNanos;
+    private final AtomicReference<Window> window = new AtomicReference<>(Window.EMPTY);
+
+    /** Máximo por minuto de um balde; {@code maxNanos < 0} indica balde vazio. */
+    private record Bucket(long minute, long maxNanos) {
+        static final Bucket EMPTY = new Bucket(Long.MIN_VALUE, -1L);
+
+        boolean isEmpty() {
+            return maxNanos < 0;
+        }
+    }
+
+    /** Par imutável de baldes: o do minuto corrente e o do minuto anterior. */
+    private record Window(Bucket current, Bucket previous) {
+        static final Window EMPTY = new Window(Bucket.EMPTY, Bucket.EMPTY);
+    }
+
+    public LatencyHistogram() {
+        this(System::nanoTime);
+    }
+
+    /** Construtor com relógio injetável (nanossegundos), para teste. */
+    LatencyHistogram(LongSupplier clockNanos) {
+        this.clockNanos = clockNanos;
+    }
 
     /** Registra uma latência observada, em nanossegundos. */
     public void record(long nanos) {
@@ -77,6 +114,56 @@ public final class LatencyHistogram {
         samples.set((int) (index % CAPACITY), nanos);
         totalCount.incrementAndGet();
         maxNanos.accumulateAndGet(nanos, Math::max);
+        recordRecentMax(nanos);
+    }
+
+    /** Atualiza, por CAS, o máximo do balde do minuto corrente (rotacionando os baldes na virada). */
+    private void recordRecentMax(long nanos) {
+        long minute = Math.floorDiv(clockNanos.getAsLong(), NANOS_PER_MINUTE);
+        for (;;) {
+            Window current = window.get();
+            Window next;
+            if (current.current().minute() == minute) {
+                if (current.current().maxNanos() >= nanos) {
+                    return;
+                }
+                next = new Window(new Bucket(minute, nanos), current.previous());
+            } else if (current.current().minute() < minute) {
+                Bucket previous = current.current().minute() == minute - 1 && !current.current().isEmpty()
+                        ? current.current()
+                        : Bucket.EMPTY;
+                next = new Window(new Bucket(minute, nanos), previous);
+            } else if (current.previous().minute() == minute
+                    || (current.previous().isEmpty() && minute == current.current().minute() - 1)) {
+                // Amostra atrasada de um minuto que já virou: atualiza o balde anterior — também quando ele ainda
+                // está vazio (a virada aconteceu antes de qualquer amostra daquele minuto chegar). Um balde
+                // vazio tem máximo negativo, então a comparação abaixo nunca o descarta.
+                if (current.previous().maxNanos() >= nanos) {
+                    return;
+                }
+                next = new Window(current.current(), new Bucket(minute, nanos));
+            } else {
+                // Relógio recuou mais de um minuto (ou amostra muito atrasada): ignorada no máximo recente.
+                return;
+            }
+            if (window.compareAndSet(current, next)) {
+                return;
+            }
+        }
+    }
+
+    /** Maior valor, em nanos, dos baldes ainda do minuto corrente ou do anterior; 0 se não houver. */
+    private long recentMaxNanos() {
+        long minute = Math.floorDiv(clockNanos.getAsLong(), NANOS_PER_MINUTE);
+        Window current = window.get();
+        long max = 0L;
+        if (current.current().minute() >= minute - 1) {
+            max = Math.max(max, current.current().maxNanos());
+        }
+        if (current.previous().minute() >= minute - 1) {
+            max = Math.max(max, current.previous().maxNanos());
+        }
+        return max;
     }
 
     /** Snapshot atual — {@link LatencySnapshot#EMPTY} se nenhuma amostra foi registrada ainda. */
@@ -93,7 +180,8 @@ public final class LatencyHistogram {
         Arrays.sort(window);
         long p50Nanos = percentile(window, 0.50);
         long p99Nanos = percentile(window, 0.99);
-        return new LatencySnapshot(count, toMicros(p50Nanos), toMicros(p99Nanos), toMicros(maxNanos.get()));
+        return new LatencySnapshot(count, toMicros(p50Nanos), toMicros(p99Nanos), toMicros(maxNanos.get()),
+                toMicros(recentMaxNanos()));
     }
 
     /** Percentil pelo método do "rank mais próximo" sobre um array já ordenado. */

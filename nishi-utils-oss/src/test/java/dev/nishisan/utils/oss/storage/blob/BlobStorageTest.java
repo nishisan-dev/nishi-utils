@@ -206,6 +206,69 @@ class BlobStorageTest {
     }
 
     @Test
+    void crescimentoEmiteDuracao(@TempDir Path tmp) {
+        Path dir = tmp.resolve("vol");
+        List<Long> durations = new CopyOnWriteArrayList<>();
+        List<long[]> legacyCalls = new CopyOnWriteArrayList<>();
+        // sobrescreve as duas formas sem delegar: o volume só pode chamar a de 4 argumentos
+        BlobVolumeMetricsListener listener = new BlobVolumeMetricsListener() {
+            @Override
+            public void onShardGrow(int shardId, long oldCapacityBytes, long newCapacityBytes) {
+                legacyCalls.add(new long[]{shardId, oldCapacityBytes, newCapacityBytes});
+            }
+
+            @Override
+            public void onShardGrow(int shardId, long oldCapacityBytes, long newCapacityBytes, long durationNanos) {
+                durations.add(durationNanos);
+            }
+        };
+        // listener que só conhece a forma antiga: o default de 4 argumentos tem que alcançá-lo
+        List<long[]> oldFormOnly = new CopyOnWriteArrayList<>();
+        BlobVolumeMetricsListener oldOnly = new BlobVolumeMetricsListener() {
+            @Override
+            public void onShardGrow(int shardId, long oldCapacityBytes, long newCapacityBytes) {
+                oldFormOnly.add(new long[]{shardId, oldCapacityBytes, newCapacityBytes});
+            }
+        };
+        try (BlobStorage bs = BlobStorage.openOrCreate(dir, 1, 64 * 1024, 64 * 1024, listener)) {
+            for (int i = 0; i < 12; i++) {
+                bs.put("series/s" + i + ".ngrr", pattern(8192, i));
+            }
+        }
+        try (BlobStorage bs = BlobStorage.openOrCreate(tmp.resolve("vol2"), 1, 64 * 1024, 64 * 1024, oldOnly)) {
+            for (int i = 0; i < 12; i++) {
+                bs.put("series/s" + i + ".ngrr", pattern(8192, i));
+            }
+        }
+        assertFalse(durations.isEmpty(), "esperado ao menos um onShardGrow de 4 argumentos");
+        for (long d : durations) {
+            assertTrue(d > 0, "durationNanos deve ser > 0");
+        }
+        assertTrue(legacyCalls.isEmpty(), "o volume emite só a forma de 4 argumentos");
+        assertFalse(oldFormOnly.isEmpty(), "a forma de 3 argumentos continua sendo chamada pelo default");
+    }
+
+    @Test
+    void statsExpoeCapacidadeDeclaradaLiveEReservado(@TempDir Path dir) {
+        try (BlobStorage bs = open(dir)) {
+            bs.configureCapacity(1_000_000L, () -> Long.MAX_VALUE);
+            BlobVolumeStats empty = bs.stats();
+            assertEquals(1_000_000L, empty.declaredCapacityBytes());
+            assertEquals(0L, empty.liveBytes());
+            assertEquals(0L, empty.reservedBytes());
+            assertEquals(0.0, empty.fillOfDeclaredCapacity());
+
+            bs.put("series/a.ngrr", pattern(8192, 1));
+            bs.reserve("move", "series/b.ngrr", 4096);
+            BlobVolumeStats stats = bs.stats();
+            long live = stats.liveBytes();
+            assertEquals(8192L, live, "liveBytes é a região alocada");
+            assertEquals(4096L, stats.reservedBytes());
+            assertEquals((double) (live + 4096L) / 1_000_000L, stats.fillOfDeclaredCapacity(), 1e-12);
+        }
+    }
+
+    @Test
     void contabilizaAllocEFreeSemDuplicarEmResize(@TempDir Path dir) {
         BlobVolumeMetrics m = new BlobVolumeMetrics();
         try (BlobStorage bs = BlobStorage.openOrCreate(dir, SHARDS, SEG, INITIAL_CAP, m)) {

@@ -6,6 +6,7 @@ import dev.nishisan.utils.oss.storage.StorageFactory;
 import dev.nishisan.utils.oss.storage.blob.BlobStorage;
 
 import java.nio.file.Path;
+import java.util.concurrent.Executor;
 
 /** Implementação padrão de {@link BlobVolume} sobre um {@link BlobStorage}. */
 final class DefaultBlobVolume implements BlobVolume {
@@ -16,16 +17,19 @@ final class DefaultBlobVolume implements BlobVolume {
     private final BlobStorage storage;
     private final NgrrdMetricsListener qualityListener;
     private final BlobVolumeMetricsListener volumeMetricsListener;
+    private final Executor checkpointForceExecutor;
 
     private DefaultBlobVolume(String name, Path directory, int shardCount, BlobStorage storage,
                               NgrrdMetricsListener qualityListener,
-                              BlobVolumeMetricsListener volumeMetricsListener) {
+                              BlobVolumeMetricsListener volumeMetricsListener,
+                              Executor checkpointForceExecutor) {
         this.name = name;
         this.directory = directory;
         this.shardCount = shardCount;
         this.storage = storage;
         this.qualityListener = qualityListener;
         this.volumeMetricsListener = volumeMetricsListener;
+        this.checkpointForceExecutor = checkpointForceExecutor;
     }
 
     static DefaultBlobVolume open(BlobVolumeConfig config) {
@@ -34,10 +38,16 @@ final class DefaultBlobVolume implements BlobVolume {
 
     static DefaultBlobVolume open(BlobVolumeConfig config, NgrrdMetricsListener qualityListener,
                                   BlobVolumeMetricsListener volumeMetricsListener) {
+        return open(config, qualityListener, volumeMetricsListener, null);
+    }
+
+    static DefaultBlobVolume open(BlobVolumeConfig config, NgrrdMetricsListener qualityListener,
+                                  BlobVolumeMetricsListener volumeMetricsListener,
+                                  Executor checkpointForceExecutor) {
         BlobStorage storage = BlobStorage.openOrCreate(config.directory(), config.shardCount(),
                 config.segmentBytes(), config.initialShardCapacityBytes(), config.writeMode(), volumeMetricsListener);
         return new DefaultBlobVolume(config.name(), config.directory(), config.shardCount(), storage,
-                qualityListener, volumeMetricsListener);
+                qualityListener, volumeMetricsListener, checkpointForceExecutor);
     }
 
     @Override
@@ -73,6 +83,11 @@ final class DefaultBlobVolume implements BlobVolume {
     @Override
     public BlobVolumeMetricsListener volumeMetricsListener() {
         return volumeMetricsListener;
+    }
+
+    @Override
+    public Executor checkpointForceExecutor() {
+        return checkpointForceExecutor;
     }
 
     @Override

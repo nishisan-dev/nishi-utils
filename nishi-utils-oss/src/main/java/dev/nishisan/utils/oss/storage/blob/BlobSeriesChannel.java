@@ -17,7 +17,10 @@ final class BlobSeriesChannel implements SeriesChannel {
     private MappedShard shard;
     private long baseOffset;
     private long length;
-    private boolean dirty;
+    // Volátil: o ticket de prepareForce() pode remarcar o canal como sujo a partir de
+    // outra thread (falha do force destacado). Fora da thread do writer a marca só vai
+    // de false para true; a escrita também só a liga.
+    private volatile boolean dirty;
 
     /** Canal unbound (série inexistente). */
     BlobSeriesChannel(BlobStorage storage, String key) {
@@ -71,6 +74,32 @@ final class BlobSeriesChannel implements SeriesChannel {
         }
         shard.forceRange(baseOffset, length);
         dirty = false;
+    }
+
+    /**
+     * Captura a faixa da série e limpa a marca de sujo; o ticket faz o
+     * {@code forceRange} da faixa capturada em qualquer thread. Uma escrita
+     * posterior (thread do writer) volta a ligar a marca, e o próximo force a
+     * cobre. Em falha, o ticket remarca o canal como sujo e relança. Forces
+     * concorrentes da mesma faixa são seguros: o {@code msync} é idempotente.
+     */
+    @Override
+    public ForceTicket prepareForce() {
+        if (shard == null || !dirty) {
+            return ForceTicket.DONE;
+        }
+        MappedShard target = shard;
+        long offset = baseOffset;
+        long len = length;
+        dirty = false;
+        return () -> {
+            try {
+                target.forceRange(offset, len);
+            } catch (RuntimeException | Error e) {
+                dirty = true;
+                throw e;
+            }
+        };
     }
 
     @Override

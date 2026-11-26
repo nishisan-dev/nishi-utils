@@ -7,6 +7,7 @@ import dev.nishisan.utils.oss.storage.StorageFactory;
 import dev.nishisan.utils.oss.storage.blob.BlobStorage;
 
 import java.nio.file.Path;
+import java.util.concurrent.Executor;
 
 /**
  * Um blob volume aberto: um filesystem virtual de N shards, compartilhado por
@@ -45,6 +46,15 @@ public interface BlobVolume extends AutoCloseable {
 
     /** Listener de métricas operacionais deste volume; {@code null} se não configurado. */
     default BlobVolumeMetricsListener volumeMetricsListener() {
+        return null;
+    }
+
+    /**
+     * Executor da fase B (o force) dos checkpoints dos handles abertos neste volume
+     * via {@code Ngrrd.open(...)}. {@code null} (padrão) = force inline na thread do
+     * writer. Ver {@link NgrrdBlob.Builder#checkpointForceExecutor(Executor)}.
+     */
+    default Executor checkpointForceExecutor() {
         return null;
     }
 

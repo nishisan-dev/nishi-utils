@@ -7,6 +7,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.Executor;
 
 /**
  * Ponto de entrada para configurar blob volumes — a "config geral" com o
@@ -39,6 +40,7 @@ public final class NgrrdBlob {
         private VolumeWriteMode writeMode = VolumeWriteMode.MMAP;
         private NgrrdMetricsListener qualityListener;
         private BlobVolumeMetricsListener volumeMetricsListener;
+        private Executor checkpointForceExecutor;
         private final List<BlobVolumeConfig> configs = new ArrayList<>();
 
         /** Diretório base sob o qual volumes referenciados por nome são criados. */
@@ -86,6 +88,20 @@ public final class NgrrdBlob {
             return this;
         }
 
+        /**
+         * Executor da fase B (o force) dos checkpoints, aplicado a todos os volumes do
+         * registro e propagado a cada handle aberto via {@code Ngrrd.open(...)}. Com ele,
+         * o msync de cada checkpoint sai da thread do writer; a fase A (CDPs parciais e
+         * live-state) continua nela. {@code null} (padrão) = force inline, o comportamento
+         * de sempre. O executor tem de continuar vivo até todos os handles fecharem: o
+         * {@code close()} de cada handle espera os forces em voo. Fica fora de
+         * {@link BlobVolumeConfig}, para não mudar a identidade do volume por nome.
+         */
+        public Builder checkpointForceExecutor(Executor checkpointForceExecutor) {
+            this.checkpointForceExecutor = checkpointForceExecutor;
+            return this;
+        }
+
         /** Registra um volume por nome: diretório = {@code basePath/name}, usando os defaults atuais. */
         public Builder volume(String name) {
             Objects.requireNonNull(basePath, "basePath é obrigatório para registrar volume por nome");
@@ -105,7 +121,7 @@ public final class NgrrdBlob {
         public BlobVolumeRegistry build() {
             BlobVolumeRegistry registry = new BlobVolumeRegistry();
             for (BlobVolumeConfig config : configs) {
-                registry.open(config, qualityListener, volumeMetricsListener);
+                registry.open(config, qualityListener, volumeMetricsListener, checkpointForceExecutor);
             }
             return registry;
         }

@@ -51,10 +51,25 @@ class NgrrdStorageNodeLocalCheckpointTest {
     void checkpointLocalVemDesligadoPorPadraoSemComponenteNemThread(@TempDir Path tempDir) throws Exception {
         try (NgrrdStorageNode node = NgrrdStorageNode.start(config(tempDir, null))) {
             assertTrue(node.localCheckpointer().isEmpty());
+            assertFalse(node.registry().dirtyIndexTracked(), "sem ciclo não há poda: nenhum índice de sujas");
             assertFalse(threadAlive(), "nenhum executor de checkpoint local com a opção desligada");
             Map<String, Long> metrics = node.metricsSnapshot().lifecycleMetrics();
             assertEquals(0L, metrics.get("localCheckpoint.enabled"));
             assertEquals(0L, metrics.get("localCheckpoint.cycles"));
+        }
+    }
+
+    @Test
+    void metricasDeCicloDeVidaDosHandlesAparecemNoSnapshotDoNo(@TempDir Path tempDir) throws Exception {
+        try (NgrrdStorageNode node = NgrrdStorageNode.start(config(tempDir, null))) {
+            Map<String, Long> metrics = node.metricsSnapshot().lifecycleMetrics();
+            for (String key : List.of("handles.idleTtlExtended", "handles.idleClosed", "handles.evicted",
+                    "handles.selfHealed", "handles.writerAbandoned")) {
+                assertEquals(0L, metrics.get(key), key + " em lifecycleMetrics: " + metrics);
+            }
+            for (SeriesHandleRegistry.NotOpenCause cause : SeriesHandleRegistry.NotOpenCause.values()) {
+                assertEquals(0L, metrics.get(cause.metricKey()), cause.metricKey() + " em lifecycleMetrics: " + metrics);
+            }
         }
     }
 
@@ -88,11 +103,18 @@ class NgrrdStorageNodeLocalCheckpointTest {
             assertTrue(line.contains(" redirectCacheHits=") && line.contains(" lcEnabled=1 lcDirty="), line);
             assertTrue(line.indexOf("redirectCacheHits=") < line.indexOf("lcEnabled="),
                     "os campos novos entram só no fim da linha: " + line);
+            assertTrue(line.contains(" lcQwP99=") && line.contains(" lcForceP99="), line);
+            assertTrue(line.indexOf("lcOverruns=") < line.indexOf("lcQwP99="), line);
             assertTrue(node.localCheckpointer().isPresent());
+            assertTrue(node.registry().dirtyIndexTracked(), "checkpoint local ligado mantém o índice de sujas");
             awaitTrue(() -> node.metricsSnapshot().lifecycleMetrics().get("localCheckpoint.cycles") >= 1);
             Map<String, Long> metrics = node.metricsSnapshot().lifecycleMetrics();
             assertEquals(1L, metrics.get("localCheckpoint.enabled"));
             assertTrue(metrics.containsKey("localCheckpoint.overruns"));
+            for (String key : List.of("queueWaitMsP99", "queueWaitMsMax", "forceMsP99", "forceMsMax", "coalesced",
+                    "lastCycleStarted")) {
+                assertTrue(metrics.containsKey("localCheckpoint." + key), key + " em lifecycleMetrics: " + metrics);
+            }
             assertTrue(threadAlive());
         } finally {
             node.close();

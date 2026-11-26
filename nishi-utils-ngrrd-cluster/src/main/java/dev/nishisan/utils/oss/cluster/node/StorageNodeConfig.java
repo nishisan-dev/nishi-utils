@@ -182,8 +182,13 @@ import java.util.function.Function;
  *                                 evita que o mmap suje o folio inteiro do page cache (ver
  *                                 {@code doc/oss/ngrrd-blob-volume.md}); a leitura continua pelo mmap
  * @param localCheckpoint          checkpoint local periódico das séries sujas ({@code ngrrd.checkpoint}:
- *                                 {@code enabled}, {@code interval}, {@code maxInFlight}). Default
+ *                                 {@code enabled}, {@code interval}, {@code maxInFlight}, {@code threads}, {@code spreadFraction}). Default
  *                                 {@link LocalCheckpointSettings#disabled()}; ver {@link LocalCheckpointer}
+ * @param handleIdleTtlStepFactor  fator {@code k} do TTL de ociosidade por série ({@code ngrrd.handleIdleTtlStepFactor},
+ *                                 inteiro &gt;= 0, default {@value #DEFAULT_HANDLE_IDLE_TTL_STEP_FACTOR}). O TTL efetivo de
+ *                                 cada série é {@code max(handleIdleTtl, k × baseStepSec)}, o que evita fechar
+ *                                 e reabrir uma série escrita no ritmo do seu passo. {@code 0} desliga a extensão
+ *                                 (só {@code handleIdleTtl}). Ver {@link IdleTtlPolicy}
  */
 public record StorageNodeConfig(
         String nodeId,
@@ -232,10 +237,76 @@ public record StorageNodeConfig(
         PlacementRules placementRules,
         Duration placementInspectTimeout,
         VolumeWriteMode volumeWriteMode,
-        LocalCheckpointSettings localCheckpoint) {
+        LocalCheckpointSettings localCheckpoint,
+        int handleIdleTtlStepFactor) {
+
+    /** Default de {@link #handleIdleTtlStepFactor()}. */
+    public static final int DEFAULT_HANDLE_IDLE_TTL_STEP_FACTOR = 2;
 
     /** Default de {@link #placementInspectTimeout()}. */
     public static final Duration DEFAULT_PLACEMENT_INSPECT_TIMEOUT = Duration.ofSeconds(2);
+
+    /** Construtor de compatibilidade (forma da 8.14.0 sem o fator), com {@code handleIdleTtlStepFactor} no default. */
+    public StorageNodeConfig(
+        String nodeId,
+        String host,
+        int port,
+        String seed,
+        List<String> peers,
+        Path dataDir,
+        int priority,
+        Path volumeDir,
+        String volumeName,
+        int shardCount,
+        long segmentBytes,
+        long initialShardCapacityBytes,
+        long capacityBytes,
+        Duration statusReportInterval,
+        Duration nodeStatusStaleAfter,
+        Duration handleIdleTtl,
+        int maxOpenHandles,
+        Duration requestTimeout,
+        Durability defaultDurability,
+        OnGeometryChange defaultOnGeometryChange,
+        NgrrdClusterMetricsListener metricsListener,
+        Duration bootDiscoveryWindow,
+        boolean affinityHandbackMode,
+        Duration placementGraceAfterLeadership,
+        boolean rebalanceEnabled,
+        Duration rebalanceInterval,
+        long rebalanceMinDelta,
+        double rebalanceTolerance,
+        int maxConcurrentMigrations,
+        int maxMovesPerCycle,
+        Duration migrationTimeout,
+        long migrationChunkBytes,
+        long maxSeriesBytes,
+        Duration migrationStatusPollInterval,
+        Duration reconcileInterval,
+        Duration orphanGrace,
+        String seriesObjectPrefix,
+        DistributionMode distributionMode,
+        double weight,
+        long migrationBytesPerSecond,
+        long maxDestinationCatalogLag,
+        long quotaMaxSeries,
+        long quotaMaxBytes,
+        PlacementRules placementRules,
+        Duration placementInspectTimeout,
+        VolumeWriteMode volumeWriteMode,
+        LocalCheckpointSettings localCheckpoint) {
+        this(nodeId, host, port, seed, peers, dataDir, priority, volumeDir, volumeName, shardCount,
+                segmentBytes, initialShardCapacityBytes, capacityBytes, statusReportInterval,
+                nodeStatusStaleAfter, handleIdleTtl, maxOpenHandles, requestTimeout, defaultDurability,
+                defaultOnGeometryChange, metricsListener, bootDiscoveryWindow, affinityHandbackMode,
+                placementGraceAfterLeadership, rebalanceEnabled, rebalanceInterval, rebalanceMinDelta,
+                rebalanceTolerance, maxConcurrentMigrations, maxMovesPerCycle, migrationTimeout,
+                migrationChunkBytes, maxSeriesBytes, migrationStatusPollInterval, reconcileInterval,
+                orphanGrace, seriesObjectPrefix, distributionMode, weight, migrationBytesPerSecond,
+                maxDestinationCatalogLag, quotaMaxSeries, quotaMaxBytes, placementRules,
+                placementInspectTimeout, volumeWriteMode, localCheckpoint,
+                DEFAULT_HANDLE_IDLE_TTL_STEP_FACTOR);
+    }
 
     /** Construtor de compatibilidade (forma da 8.13.0), com {@code localCheckpoint} desligado. */
     public StorageNodeConfig(
@@ -677,6 +748,10 @@ public record StorageNodeConfig(
         if (handleIdleTtl.isNegative() || handleIdleTtl.isZero()) {
             throw new IllegalArgumentException("handleIdleTtl deve ser > 0");
         }
+        if (handleIdleTtlStepFactor < 0) {
+            throw new IllegalArgumentException(
+                    "ngrrd.handleIdleTtlStepFactor deve ser >= 0 (0 = só handleIdleTtl): " + handleIdleTtlStepFactor);
+        }
         if (maxOpenHandles <= 0) {
             throw new IllegalArgumentException("maxOpenHandles deve ser > 0: " + maxOpenHandles);
         }
@@ -840,6 +915,9 @@ public record StorageNodeConfig(
             applyDuration(ngrrd.statusReportInterval, "ngrrd.statusReportInterval", builder::statusReportInterval);
             applyDuration(ngrrd.nodeStatusStaleAfter, "ngrrd.nodeStatusStaleAfter", builder::nodeStatusStaleAfter);
             applyDuration(ngrrd.handleIdleTtl, "ngrrd.handleIdleTtl", builder::handleIdleTtl);
+            if (ngrrd.handleIdleTtlStepFactor != null) {
+                builder.handleIdleTtlStepFactor(ngrrd.handleIdleTtlStepFactor);
+            }
             if (ngrrd.maxOpenHandles != null) {
                 builder.maxOpenHandles(ngrrd.maxOpenHandles);
             }
@@ -925,7 +1003,11 @@ public record StorageNodeConfig(
             boolean enabled = section.enabled != null ? section.enabled : defaults.enabled();
             Duration interval = NgrrdYamlSupport.duration(section.interval, "ngrrd.checkpoint.interval");
             int maxInFlight = section.maxInFlight != null ? section.maxInFlight : defaults.maxInFlight();
-            return new LocalCheckpointSettings(enabled, interval != null ? interval : defaults.interval(), maxInFlight);
+            int threads = section.threads != null ? section.threads : defaults.threads();
+            double spreadFraction = section.spreadFraction != null ? section.spreadFraction
+                    : defaults.spreadFraction();
+            return new LocalCheckpointSettings(enabled, interval != null ? interval : defaults.interval(), maxInFlight,
+                    threads, spreadFraction);
         }
 
         private static void applyDuration(String raw, String fieldName, java.util.function.Consumer<Duration> setter) {
@@ -986,6 +1068,7 @@ public record StorageNodeConfig(
         public String statusReportInterval;
         public String nodeStatusStaleAfter;
         public String handleIdleTtl;
+        public Integer handleIdleTtlStepFactor;
         public Integer maxOpenHandles;
         public String requestTimeout;
         public String defaultDurability;
@@ -1005,6 +1088,8 @@ public record StorageNodeConfig(
         public Boolean enabled;
         public String interval;
         public Integer maxInFlight;
+        public Integer threads;
+        public Double spreadFraction;
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
@@ -1093,6 +1178,7 @@ public record StorageNodeConfig(
         /** {@code null} = calculado em {@link #build()} a partir de {@link #statusReportInterval}. */
         private Duration nodeStatusStaleAfter;
         private Duration handleIdleTtl = Duration.ofMinutes(15);
+        private int handleIdleTtlStepFactor = DEFAULT_HANDLE_IDLE_TTL_STEP_FACTOR;
         private int maxOpenHandles = 10_000;
         private Duration requestTimeout = Duration.ofSeconds(20);
         private Durability defaultDurability = Durability.FSYNC;
@@ -1203,6 +1289,12 @@ public record StorageNodeConfig(
 
         public Builder handleIdleTtl(Duration handleIdleTtl) {
             this.handleIdleTtl = handleIdleTtl;
+            return this;
+        }
+
+        /** Fator {@code k} do TTL de ociosidade por série; ver {@link StorageNodeConfig#handleIdleTtlStepFactor()}. */
+        public Builder handleIdleTtlStepFactor(int handleIdleTtlStepFactor) {
+            this.handleIdleTtlStepFactor = handleIdleTtlStepFactor;
             return this;
         }
 
@@ -1403,7 +1495,7 @@ public record StorageNodeConfig(
                     maxSeriesBytes, migrationStatusPollInterval, reconcileInterval, orphanGrace,
                     seriesObjectPrefix, distributionMode, weight, migrationBytesPerSecond, maxDestinationCatalogLag,
                     quotaMaxSeries, quotaMaxBytes, placementRules, placementInspectTimeout, volumeWriteMode,
-                    localCheckpoint);
+                    localCheckpoint, handleIdleTtlStepFactor);
         }
 
         private static Duration maxDuration(Duration a, Duration b) {

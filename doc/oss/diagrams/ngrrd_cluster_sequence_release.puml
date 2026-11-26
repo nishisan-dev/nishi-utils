@@ -1,0 +1,65 @@
+@startuml ngrrd_cluster_sequence_release
+title ngrrd Cluster — liberação de séries e entrega entre clientes (release, 8.15.0)
+
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+
+participant "Grupo de consumo\n(coordenador)" as group
+participant "Cliente A\n(perde a partição P)" as a
+participant "WriteDispatcher\n(cliente A)" as dispatcher
+participant "Dono da série\n(StorageRequestHandler)" as owner
+participant "Cliente B\n(ganha a partição P)" as b
+
+== Revogação (cliente A) ==
+group -> a : onPartitionsRevoked(P)
+a -> a : 1. para de chamar write()\nnas séries de P
+a -> dispatcher : 2. release(séries de P, ReleaseOptions)
+note right of dispatcher
+  Por série, sob o lock de abertura da chave:
+  fecha o handle local e aposenta a rota de escrita
+  com a fronteira fotografada. Um write concorrente
+  recebe CLOSED.
+end note
+
+group Dreno (sem RPC por série)
+  dispatcher -> dispatcher : espera a resposta final do dono\npara toda escrita até a fronteira
+  dispatcher -> dispatcher : entrega no resultado as falhas finais\nainda não reportadas a uma marca
+end
+
+opt ReleaseOptions.checkpoint = true (séries sem falha)
+  dispatcher -> owner : CHECKPOINT(série)\n(até maxConcurrentPerNode por nó)
+  owner --> dispatcher : OK (fsync confirmado no dono)\nou falha → CHECKPOINT_FAILED
+end
+
+opt ReleaseOptions.closeOnNode = true
+  dispatcher -> owner : CLOSE(série)
+  note right of owner
+    Padrão: não manda. O CLOSE descarta a definição
+    no nó e custaria um NOT_OPEN + OPEN ao próximo
+    cliente. Uma série abandonada fecha pela
+    ociosidade do nó.
+  end note
+end
+
+dispatcher -> dispatcher : limpa a rota e esquece o dono em cache
+dispatcher --> a : ReleaseResult\n(RELEASED | NOT_HELD | WRITE_FAILURES |\nCHECKPOINT_FAILED | TIMED_OUT | SERIES_DELETED)
+
+alt ReleaseResult.allReleased()
+  a -> group : 3. commit do offset de P
+else alguma série não entregue
+  a -> a : não confirma o offset\n(ou só até a última marca sem falha);\nregistra notReleased()
+end
+a --> group : fim do callback de revogação
+
+== Atribuição (cliente B) ==
+group -> b : onPartitionsAssigned(P)
+b -> owner : 4. open(séries de P), sob demanda
+owner --> b : handle aberto (mesmo nó dono)
+b -> b : 5. retoma a partir do offset confirmado\n(reescreve o que A gravou depois dele)
+
+note over a, b
+  Sem cerca até a 8.16: se A estoura o prazo do grupo e P é
+  reatribuída, A e B podem escrever ao mesmo tempo
+  (vale o último escritor).
+end note
+@enduml

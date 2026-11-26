@@ -27,14 +27,29 @@ import java.util.Objects;
  *
  * @param enabled     liga o checkpoint local; desligado por padrão (nenhum executor é criado)
  * @param interval    intervalo entre o fim de um ciclo e o início do próximo; o ciclo espalha os
- *                    checkpoints por ~80% dele. Positivo; padrão {@link #DEFAULT_INTERVAL}
+ *                    checkpoints pela fração {@code spreadFraction} dele. Positivo; padrão {@link #DEFAULT_INTERVAL}
  * @param maxInFlight teto de checkpoints locais em voo (enfileirados e ainda não concluídos) ao mesmo
  *                    tempo; {@code >= 1}. Padrão {@link #defaultMaxInFlight()}
+ * @param threads     tamanho do pool dedicado de force ({@code ngrrd.checkpoint.threads}, 8.15.0): o
+ *                    msync/fdatasync de todo checkpoint do nó (local, {@code CHECKPOINT}/{@code FLUSH}
+ *                    remoto e migração) sai da thread do writer da série e roda nesse pool. {@code >= 0};
+ *                    {@code 0} (padrão) = force inline no writer, o comportamento anterior. Vale
+ *                    também com {@code enabled=false}
+ * @param spreadFraction fração do {@code interval} pela qual os disparos de um ciclo são espalhados
+ *                    ({@code ngrrd.checkpoint.spreadFraction}, 8.15.0); em {@code (0, 1]}. Padrão
+ *                    {@link #DEFAULT_SPREAD_FRACTION}. Menor espalha menos e deixa folga no fim do intervalo
  */
-public record LocalCheckpointSettings(boolean enabled, Duration interval, int maxInFlight) {
+public record LocalCheckpointSettings(boolean enabled, Duration interval, int maxInFlight, int threads,
+        double spreadFraction) {
 
     /** Intervalo padrão entre ciclos: 300 s. */
     public static final Duration DEFAULT_INTERVAL = Duration.ofSeconds(300);
+
+    /** Pool de force desligado por padrão: o force roda inline no writer, como antes da 8.15.0. */
+    public static final int DEFAULT_THREADS = 0;
+
+    /** Fração padrão do intervalo para espalhar os disparos de um ciclo: 0,8 (o valor fixo da 8.14). */
+    public static final double DEFAULT_SPREAD_FRACTION = 0.8;
 
     public LocalCheckpointSettings {
         Objects.requireNonNull(interval, "ngrrd.checkpoint.interval é obrigatório");
@@ -44,6 +59,18 @@ public record LocalCheckpointSettings(boolean enabled, Duration interval, int ma
         if (maxInFlight < 1) {
             throw new IllegalArgumentException("ngrrd.checkpoint.maxInFlight deve ser >= 1: " + maxInFlight);
         }
+        if (threads < 0) {
+            throw new IllegalArgumentException("ngrrd.checkpoint.threads deve ser >= 0: " + threads);
+        }
+        if (!(spreadFraction > 0.0 && spreadFraction <= 1.0)) {
+            throw new IllegalArgumentException(
+                    "ngrrd.checkpoint.spreadFraction deve estar em (0, 1]: " + spreadFraction);
+        }
+    }
+
+    /** Forma da 8.14.0: sem pool de force ({@code threads=0}) e {@link #DEFAULT_SPREAD_FRACTION}. */
+    public LocalCheckpointSettings(boolean enabled, Duration interval, int maxInFlight) {
+        this(enabled, interval, maxInFlight, DEFAULT_THREADS, DEFAULT_SPREAD_FRACTION);
     }
 
     /** {@code min(8, max(2, processadores disponíveis))}: o tamanho do pool de writers, limitado a 8. */
@@ -51,8 +78,9 @@ public record LocalCheckpointSettings(boolean enabled, Duration interval, int ma
         return Math.min(8, Math.max(2, Runtime.getRuntime().availableProcessors()));
     }
 
-    /** Desligado, com {@link #DEFAULT_INTERVAL} e {@link #defaultMaxInFlight()}: o padrão do nó. */
+    /** Desligado, com {@link #DEFAULT_INTERVAL}, {@link #defaultMaxInFlight()}, sem pool de force e com {@link #DEFAULT_SPREAD_FRACTION}: o padrão do nó. */
     public static LocalCheckpointSettings disabled() {
-        return new LocalCheckpointSettings(false, DEFAULT_INTERVAL, defaultMaxInFlight());
+        return new LocalCheckpointSettings(false, DEFAULT_INTERVAL, defaultMaxInFlight(), DEFAULT_THREADS,
+                DEFAULT_SPREAD_FRACTION);
     }
 }

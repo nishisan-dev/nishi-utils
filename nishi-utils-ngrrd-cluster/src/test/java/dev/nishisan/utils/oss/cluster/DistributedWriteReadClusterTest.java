@@ -175,6 +175,16 @@ class DistributedWriteReadClusterTest {
             }
         }
 
+        // Rotas de escrita: uma por handle gravável aberto, todas com a mesma definição internada; fechar os
+        // handles esvazia o mapa de rotas do cliente.
+        assertEquals(SERIES_COUNT, client.metrics().routes());
+        assertEquals(1, client.metrics().internedDefinitions());
+        for (NgrrdHandle handle : handlesBySeriesKey.values()) {
+            handle.close();
+        }
+        awaitTrue("rotas removidas depois de fechar os handles", AWAIT_TIMEOUT, () -> client.metrics().routes() == 0);
+        assertEquals(SERIES_COUNT, client.metrics().routesRemoved());
+
         // Reabertura: fecha o cliente, conecta um novo, reabre as mesmas séries e confirma que os
         // dados sobrevivem à reconexão.
         client.close();

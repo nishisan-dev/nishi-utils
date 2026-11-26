@@ -34,7 +34,8 @@ import java.util.concurrent.CompletableFuture;
  *   <li>{@link #checkpoint()} / {@link #flush()} são síncronos: drenam a fila
  *       do writer antes de retornar.</li>
  *   <li>{@link #checkpointAsync()} enfileira o mesmo checkpoint e devolve na hora;
- *       a future conclui depois das escritas enfileiradas antes dela.</li>
+ *       a future conclui depois das escritas enfileiradas antes dela.
+ *       {@link #checkpointAsyncTimed()} faz o mesmo e devolve os tempos medidos.</li>
  * </ul>
  *
  * <p><strong>Visibilidade por backend:</strong> no disco local, CDPs de passos
@@ -86,8 +87,9 @@ public interface NgrrdHandle extends AutoCloseable {
      * <p>A future conclui com sucesso quando o checkpoint termina (ou é um no-op de
      * idle-skip) e falha com a mesma exceção que {@link #checkpoint()} lançaria.
      * Handle já fechado: future concluída com sucesso, como {@link #checkpoint()}.
-     * Callbacks encadeados nela podem rodar na thread do writer: devem ser curtos e
-     * nunca bloquear.</p>
+     * Callbacks encadeados nela podem rodar na thread do writer ou, com executor de
+     * force configurado ({@code NgrrdBlob.Builder.checkpointForceExecutor}), na thread
+     * desse executor: devem ser curtos e nunca bloquear.</p>
      *
      * <p>O padrão desta interface executa {@link #checkpoint()} de forma síncrona na
      * thread chamadora e devolve a future já concluída (ou falha com a exceção):
@@ -104,6 +106,39 @@ public interface NgrrdHandle extends AutoCloseable {
         } catch (RuntimeException e) {
             return CompletableFuture.failedFuture(e);
         }
+    }
+
+    /**
+     * Como {@link #checkpointAsync()}, com os tempos medidos ({@link CheckpointTiming}).
+     *
+     * <p>O padrão desta interface não mede nada: devolve {@link CheckpointTiming#NONE}
+     * quando {@link #checkpointAsync()} conclui (e falha como ela). O handle local
+     * devolvido por {@link Ngrrd} sobrescreve com a medida real. Callbacks encadeados
+     * na future podem rodar na thread do writer ou na thread do executor de force
+     * ({@code NgrrdBlob.Builder.checkpointForceExecutor}): devem ser curtos e nunca
+     * bloquear.</p>
+     *
+     * @return future com os tempos, concluída quando o checkpoint termina
+     */
+    default CompletableFuture<CheckpointTiming> checkpointAsyncTimed() {
+        return checkpointAsync().thenApply(v -> CheckpointTiming.NONE);
+    }
+
+    /**
+     * Tempos de um checkpoint ({@link #checkpointAsyncTimed()}).
+     *
+     * @param queueWaitNanos do enfileiramento do checkpoint até o início do force. Inclui a
+     *                       fila FIFO da série, a fila do pool de writers, a materialização
+     *                       dos parciais e, com executor de force, a fila desse executor. Num
+     *                       checkpoint coalescido, a espera até o writer processá-lo
+     * @param forceNanos     duração do force; {@code 0} quando não houve force (coalescido,
+     *                       ou durabilidade {@code OS_CACHE})
+     * @param coalesced      {@code true} quando nenhuma amostra nova exigiu force (idle-skip)
+     */
+    record CheckpointTiming(long queueWaitNanos, long forceNanos, boolean coalesced) {
+
+        /** Sem medida: implementações sem fila própria, handle fechado ou checkpoint concluído pelo fechamento. */
+        public static final CheckpointTiming NONE = new CheckpointTiming(0, 0, true);
     }
 
     /** Lê uma série materializada com base em uma {@link ViewQuery} explícita. */
@@ -125,9 +160,23 @@ public interface NgrrdHandle extends AutoCloseable {
      */
     SeriesResult read(String dsName, ViewQuery query, long endExclusiveEpochMs);
 
-    /** Stop without a final checkpoint, before deletion. Unsupported implementations must fail closed. */
+    /**
+     * Stop without a final checkpoint, before deletion. Unsupported implementations must fail closed.
+     *
+     * <p>No handle local, lança {@link IllegalStateException} enquanto um force do checkpoint,
+     * preso no fechamento, continuar em voo sobre a região; terminado o force, uma nova chamada
+     * volta normalmente (ver {@code NgrrdWriter.closeForDeletion()}).</p>
+     */
     default void closeForDeletion() { throw new UnsupportedOperationException("closeForDeletion"); }
 
+    /**
+     * Fecha o handle (ver o Javadoc da interface).
+     *
+     * @throws dev.nishisan.utils.oss.writer.WriterAbandonedException no handle local, se o fechamento encontrou um force do
+     *         checkpoint preso e encerrou o writer sem checkpoint final (amostras desde o último
+     *         checkpoint podem ter sido perdidas). Repassada sem embrulho e lançada em toda chamada
+     *         seguinte; descarte o handle (ver {@code NgrrdWriter.close()})
+     */
     @Override
     void close();
 }

@@ -18,11 +18,13 @@
 package dev.nishisan.utils.oss.cluster;
 
 import dev.nishisan.utils.oss.api.*;
+import dev.nishisan.utils.oss.cluster.node.LocalCheckpointSettings;
 import dev.nishisan.utils.oss.cluster.node.NgrrdStorageNode;
 import dev.nishisan.utils.oss.cluster.rebalance.MigrationCoordinator.MigrationOutcome;
-import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -34,10 +36,13 @@ import static org.junit.jupiter.api.Assertions.*;
 
 @Timeout(value = 240, unit = TimeUnit.SECONDS, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
 class CheckpointAfterMigrationClusterTest {
-    @Test
-    void existingHandlesRecoverOnTheirFirstOperationAfterMigration(@TempDir Path base) throws Exception {
+    /** {@code threads} = {@code ngrrd.checkpoint.threads}: 0 força inline no writer, 2 usa o pool de force do nó. */
+    @ParameterizedTest(name = "checkpoint.threads={0}")
+    @ValueSource(ints = {0, 2})
+    void existingHandlesRecoverOnTheirFirstOperationAfterMigration(int threads, @TempDir Path base) throws Exception {
         String yaml = Files.readString(Path.of("src/test/resources/iface-traffic-blob.yaml"));
-        try (var harness = NgrrdClusterTestHarness.start(base, 2, builder -> builder.rebalanceEnabled(false))) {
+        try (var harness = NgrrdClusterTestHarness.start(base, 2, builder -> builder.rebalanceEnabled(false)
+                .localCheckpoint(forcePool(threads)))) {
             harness.awaitNodeStatuses(2);
             try (var client = harness.connectClient(builder -> builder.requestTimeout(Duration.ofSeconds(5))
                     .retryTimeout(Duration.ofSeconds(30)))) {
@@ -83,5 +88,10 @@ class CheckpointAfterMigrationClusterTest {
                 }
             }
         }
+    }
+
+    private static LocalCheckpointSettings forcePool(int threads) {
+        return new LocalCheckpointSettings(false, LocalCheckpointSettings.DEFAULT_INTERVAL,
+                LocalCheckpointSettings.defaultMaxInFlight(), threads, LocalCheckpointSettings.DEFAULT_SPREAD_FRACTION);
     }
 }

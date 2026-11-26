@@ -49,6 +49,7 @@ import dev.nishisan.utils.oss.cluster.protocol.WriteBatchRequest;
 import dev.nishisan.utils.oss.cluster.protocol.WriteBatchResponse;
 import dev.nishisan.utils.oss.cluster.rpc.ClusterRpc;
 import dev.nishisan.utils.oss.cluster.rpc.CoordinationLocks;
+import dev.nishisan.utils.oss.writer.WriterAbandonedException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -1206,6 +1207,200 @@ class StorageRequestHandlerTest {
 
         assertEquals(2, placementLookup.leaderBatchCalls(), "a ficha da consulta que lançou Error não pode vazar");
         assertEquals(THIRD.value(), response.ownerBySeries().get(seriesKey));
+    }
+
+    // ------------------------------------------------------------------ NOT_OPEN por causa (8.15.0)
+
+    /** Soma de {@code notOpen.*} deve ser sempre igual ao total de {@code errorsByStatus.NOT_OPEN}. */
+    private void assertNotOpenCausesSumToTotal() {
+        Map<String, Long> metrics = registry.handleMetrics();
+        long sum = 0;
+        for (SeriesHandleRegistry.NotOpenCause cause : SeriesHandleRegistry.NotOpenCause.values()) {
+            sum += metrics.get(cause.metricKey());
+        }
+        assertEquals(handler.metricsSnapshot().errorsByStatus().getOrDefault(SeriesStatus.NOT_OPEN, 0L), sum,
+                "a soma das causas deve ser igual a errorsByStatus.NOT_OPEN");
+    }
+
+    @Test
+    void notOpenDepoisDeCloseExplicitoEClientClosed() {
+        String seriesKey = "series-close-explicito";
+        placementLookup.put(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+        handler.handle(Commands.OPEN, openRequest(seriesKey, null), SOURCE);
+        handler.handle(Commands.CLOSE, new SeriesCommandRequest(seriesKey), SOURCE);
+
+        assertEquals(SeriesStatus.NOT_OPEN, writeOne(seriesKey, 1_700_000_100_000L));
+
+        assertEquals(1L, registry.handleMetrics().get("notOpen.clientClosed"));
+        assertEquals(0L, registry.handleMetrics().get("notOpen.restart"));
+        assertNotOpenCausesSumToTotal();
+
+        // Um novo OPEN limpa a marca: a série volta a aceitar escrita e deixa de ser clientClosed.
+        handler.handle(Commands.OPEN, openRequest(seriesKey, null), SOURCE);
+        assertEquals(SeriesStatus.OK, writeOne(seriesKey, 1_700_000_200_000L));
+        assertNotEquals(SeriesHandleRegistry.NotOpenCause.CLIENT_CLOSED, registry.notOpenCause(seriesKey));
+    }
+
+    @Test
+    void notOpenNoDestinoDepoisDoCommitEMigrated() {
+        String seriesKey = "series-destino-commit";
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+        // Destino: descarta qualquer handle e anota a série como recebida (MIGRATE_COMMIT).
+        registry.discard(seriesKey);
+        registry.noteMigratedIn(seriesKey);
+
+        assertEquals(SeriesStatus.NOT_OPEN, writeOne(seriesKey, 1_700_000_100_000L));
+
+        assertEquals(1L, registry.handleMetrics().get("notOpen.migrated"));
+        assertNotOpenCausesSumToTotal();
+    }
+
+    @Test
+    void notOpenSemDefinicaoERestart() {
+        String seriesKey = "series-sem-definicao";
+        placementLookup.putStrongOnly(seriesKey, SeriesPlacement.active(SELF.value(), 1_000L));
+
+        assertEquals(SeriesStatus.NOT_OPEN, writeOne(seriesKey, 1_700_000_100_000L));
+
+        assertEquals(1L, registry.handleMetrics().get("notOpen.restart"));
+        assertEquals(0L, registry.handleMetrics().get("notOpen.clientClosed"));
+        assertNotOpenCausesSumToTotal();
+    }
+
+    @Test
+    void notOpenComSerieCongeladaEFrozenEComDefinicaoConhecidaEReopenFailed() {
+        String seriesKey = "series-congelada";
+        assertEquals(SeriesHandleRegistry.NotOpenCause.RESTART, registry.notOpenCause(seriesKey));
+        registry.open(seriesKey, yaml, Ngrrd.OpenOptions.defaults());
+        registry.markMigrating(seriesKey);
+        assertEquals(SeriesHandleRegistry.NotOpenCause.FROZEN, registry.notOpenCause(seriesKey));
+        registry.clearMigrating(seriesKey);
+
+        // Definição conhecida (a abertura a cacheou): a causa residual é a reabertura que falhou.
+        assertEquals(SeriesHandleRegistry.NotOpenCause.REOPEN_FAILED, registry.notOpenCause(seriesKey));
+        registry.recordNotOpen(seriesKey);
+        assertEquals(1L, registry.handleMetrics().get("notOpen.reopenFailed"));
+    }
+
+    @Test
+    void primeiroCheckpointDepoisDoAbandonoDoWriterFalhaEOSeguinteSegueNormal() {
+        String seriesKey = "series-abandonada-checkpoint";
+        openAndAbandonByIdleness(seriesKey);
+
+        // Escrita depois do abandono segue o fluxo normal: a autocura reabre a série.
+        assertEquals(SeriesStatus.OK, writeOne(seriesKey, 1_700_000_400_000L));
+
+        SeriesStatusResponse rejected = (SeriesStatusResponse) handler.handle(Commands.CHECKPOINT,
+                new SeriesCommandRequest(seriesKey), SOURCE);
+        assertEquals(SeriesStatus.ERROR, rejected.status(),
+                "amostras confirmadas antes do abandono podem ter sido perdidas: o checkpoint não pode responder OK");
+        assertTrue(rejected.message().contains("abandonado"), rejected.message());
+        assertEquals(1L, registry.handleMetrics().get("handles.abandonedCheckpointRejected"));
+        assertEquals(0L, handler.metricsSnapshot().checkpoints());
+
+        assertEquals(SeriesStatus.OK, ((SeriesStatusResponse) handler.handle(Commands.CHECKPOINT,
+                new SeriesCommandRequest(seriesKey), SOURCE)).status(), "a marca sai no primeiro checkpoint recusado");
+        assertEquals(1L, registry.handleMetrics().get("handles.abandonedCheckpointRejected"));
+        assertEquals(1L, handler.metricsSnapshot().checkpoints());
+    }
+
+    @Test
+    void primeiroFlushDepoisDoAbandonoDoWriterFalhaMesmoSemEscritaNova() {
+        String seriesKey = "series-abandonada-flush";
+        openAndAbandonByIdleness(seriesKey);
+
+        SeriesStatusResponse rejected = (SeriesStatusResponse) handler.handle(Commands.FLUSH,
+                new SeriesCommandRequest(seriesKey), SOURCE);
+        assertEquals(SeriesStatus.ERROR, rejected.status());
+        assertEquals(1L, registry.handleMetrics().get("handles.abandonedCheckpointRejected"));
+
+        assertEquals(SeriesStatus.OK, ((SeriesStatusResponse) handler.handle(Commands.FLUSH,
+                new SeriesCommandRequest(seriesKey), SOURCE)).status());
+        assertEquals(1L, handler.metricsSnapshot().flushes());
+    }
+
+    @Test
+    void checkpointDeOutraSerieNaoEAfetadoPeloAbandono() {
+        String abandonedKey = "series-abandonada-vizinha";
+        String healthyKey = "series-saudavel-vizinha";
+        openAndAbandonByIdleness(abandonedKey);
+        placementLookup.put(healthyKey, SeriesPlacement.active(SELF.value(), 1_000L));
+        assertEquals(SeriesStatus.OK, ((SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequest(healthyKey, null), SOURCE)).status());
+
+        assertEquals(SeriesStatus.OK, ((SeriesStatusResponse) handler.handle(Commands.CHECKPOINT,
+                new SeriesCommandRequest(healthyKey), SOURCE)).status());
+        assertEquals(0L, registry.handleMetrics().get("handles.abandonedCheckpointRejected"));
+    }
+
+    /**
+     * Abre a série, escreve e a fecha por ociosidade com um {@code close()} que fecha o writer real e lança {@link
+     * WriterAbandonedException}, como um force preso além do teto: a entrada sai como abandonada.
+     */
+    private void openAndAbandonByIdleness(String key) {
+        placementLookup.put(key, SeriesPlacement.active(SELF.value(), 1_000L));
+        assertEquals(SeriesStatus.OK, ((SeriesStatusResponse) handler.handle(Commands.OPEN,
+                openRequest(key, null), SOURCE)).status());
+        assertEquals(SeriesStatus.OK, writeOne(key, 1_700_000_100_000L));
+        wrapHandle(key, original -> delegating(original, (method, args) -> {
+            if (method.getName().equals("close")) {
+                original.close();
+                throw new WriterAbandonedException("force preso", new IllegalStateException("force em voo"));
+            }
+            return null;
+        }));
+        clock.advance(Duration.ofMinutes(16));
+        assertEquals(0, registry.closeIdle(), "o abandono não conta como fechamento por ociosidade");
+        assertFalse(registry.isOpen(key));
+        assertEquals(1L, registry.handleMetrics().get("handles.writerAbandoned"));
+    }
+
+    @Test
+    void fechamentoPorOciosidadeNaoGeraNotOpen() {
+        String seriesKey = "series-ociosa-sem-notopen";
+        openThenCloseByIdleness(seriesKey);
+        assertEquals(1L, registry.handleMetrics().get("handles.idleClosed"));
+        assertEquals(0L, registry.handleMetrics().get("handles.selfHealed"));
+
+        // A definição continua em cache: a autocura reabre e a escrita é aceita.
+        assertEquals(SeriesStatus.OK, writeOne(seriesKey, 1_700_000_200_000L));
+
+        assertEquals(1L, registry.handleMetrics().get("handles.selfHealed"));
+        assertEquals(0L, handler.metricsSnapshot().errorsByStatus().getOrDefault(SeriesStatus.NOT_OPEN, 0L));
+        assertNotOpenCausesSumToTotal();
+    }
+
+    @Test
+    void despejoPorLimiteContaEvicted() {
+        SeriesHandleRegistry limited = new SeriesHandleRegistry(volume, "ngrrd", Duration.ofMinutes(15), 1, clock);
+        try {
+            limited.open("series-evict-a", yaml, Ngrrd.OpenOptions.defaults());
+            clock.advance(Duration.ofSeconds(1));
+            limited.open("series-evict-b", yaml, Ngrrd.OpenOptions.defaults());
+
+            assertEquals(1L, limited.handleMetrics().get("handles.evicted"));
+        } finally {
+            limited.close();
+        }
+    }
+
+    @Test
+    void lruDeCausasRespeitaTeto() {
+        int limit = SeriesHandleRegistry.NOT_OPEN_CAUSE_LRU_LIMIT;
+        for (int i = 0; i < limit + 100; i++) {
+            registry.noteMigratedIn("series-lru-" + i);
+        }
+
+        assertEquals(limit, registry.notOpenCauseSetSizes()[1]);
+        // A mais antiga foi despejada e cai em RESTART (classificação aproximada); a recente segue MIGRATED.
+        assertEquals(SeriesHandleRegistry.NotOpenCause.RESTART, registry.notOpenCause("series-lru-0"));
+        assertEquals(SeriesHandleRegistry.NotOpenCause.MIGRATED,
+                registry.notOpenCause("series-lru-" + (limit + 99)));
+
+        for (int i = 0; i < limit + 100; i++) {
+            registry.close("series-closed-" + i);
+        }
+        assertEquals(limit, registry.notOpenCauseSetSizes()[0]);
     }
 
     private static WriteBatchRequest singleWrite(String seriesKey) {

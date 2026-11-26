@@ -1,5 +1,7 @@
 package dev.nishisan.utils.oss.writer;
 
+import dev.nishisan.utils.oss.api.Durability;
+import dev.nishisan.utils.oss.api.OnGeometryChange;
 import dev.nishisan.utils.oss.api.Sample;
 import dev.nishisan.utils.oss.config.NgrrdYamlLoader;
 import dev.nishisan.utils.oss.definition.NgrrdDefinition;
@@ -7,17 +9,22 @@ import dev.nishisan.utils.oss.storage.NgrrdStorage;
 import dev.nishisan.utils.oss.storage.NgrrdStorageException;
 import dev.nishisan.utils.oss.storage.SeriesChannel;
 import dev.nishisan.utils.oss.storage.SeriesChannelProvider;
-import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
@@ -25,7 +32,8 @@ import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 /**
  * Garante que uma falha de persistência durante o {@code checkpoint()} (ex.: PUT
  * no S3 / fsync) é <strong>propagada</strong> ao chamador em vez de travá-lo
- * indefinidamente em {@code latch.await()}.
+ * indefinidamente em {@code latch.await()}. Cada caso roda também com
+ * {@code checkpointForceExecutor} e um canal que destaca o force.
  */
 class NgrrdWriterFailureTest {
 
@@ -37,12 +45,25 @@ class NgrrdWriterFailureTest {
         }
     }
 
-    @Test
-    void checkpointPropagaFalhaDeForceSemTravar() throws Exception {
-        NgrrdDefinition def = definition();
-        FailingStorage storage = new FailingStorage();
+    private final ExecutorService forcePool = Executors.newFixedThreadPool(2);
 
-        NgrrdWriter writer = new NgrrdWriter(def, storage, "device:r1/iface:eth0");
+    @AfterEach
+    void shutdownForcePool() {
+        forcePool.shutdownNow();
+    }
+
+    private NgrrdWriter writer(FailingStorage storage) throws Exception {
+        return new NgrrdWriter(definition(), storage, "device:r1/iface:eth0", null, new ReentrantReadWriteLock(),
+                Durability.FSYNC, OnGeometryChange.FAIL, System::currentTimeMillis, true,
+                storage.detached ? forcePool : null);
+    }
+
+    @ParameterizedTest(name = "forceExecutor={0}")
+    @ValueSource(booleans = {false, true})
+    void checkpointPropagaFalhaDeForceSemTravar(boolean forceExecutor) throws Exception {
+        FailingStorage storage = new FailingStorage(forceExecutor);
+
+        NgrrdWriter writer = writer(storage);
         try {
             writer.write("in_octets", new Sample(START_MS, 1_000_000L));
             storage.failForce = true; // o create inicial já foi forçado com sucesso
@@ -55,10 +76,11 @@ class NgrrdWriterFailureTest {
         }
     }
 
-    @Test
-    void asynchronousWriteFailureRemainsVisibleAtCheckpoint() throws Exception {
-        FailingStorage storage = new FailingStorage();
-        try (NgrrdWriter writer = new NgrrdWriter(definition(), storage, "device:r1/iface:eth0")) {
+    @ParameterizedTest(name = "forceExecutor={0}")
+    @ValueSource(booleans = {false, true})
+    void asynchronousWriteFailureRemainsVisibleAtCheckpoint(boolean forceExecutor) throws Exception {
+        FailingStorage storage = new FailingStorage(forceExecutor);
+        try (NgrrdWriter writer = writer(storage)) {
             storage.failWrite = true;
             for (int i = 0; i < 5; i++) {
                 try {
@@ -76,10 +98,18 @@ class NgrrdWriterFailureTest {
         }
     }
 
-    /** Storage em memória cujo {@code force()} pode ser configurado para falhar. */
+    /**
+     * Storage em memória cujo {@code force()} pode ser configurado para falhar. Com
+     * {@code detached}, o canal destaca o force num ticket.
+     */
     private static final class FailingStorage implements NgrrdStorage, SeriesChannelProvider {
 
-        private final Map<String, byte[]> objects = new HashMap<>();
+        private final Map<String, byte[]> objects = new ConcurrentHashMap<>();
+        private final boolean detached;
+
+        FailingStorage(boolean detached) {
+            this.detached = detached;
+        }
         volatile boolean failForce = false;
         volatile boolean failWrite = false;
 
@@ -176,6 +206,11 @@ class NgrrdWriterFailureTest {
                     throw new NgrrdStorageException("falha simulada de force()");
                 }
                 objects.put(key, image.clone());
+            }
+
+            @Override
+            public ForceTicket prepareForce() {
+                return detached ? this::force : SeriesChannel.super.prepareForce();
             }
 
             @Override

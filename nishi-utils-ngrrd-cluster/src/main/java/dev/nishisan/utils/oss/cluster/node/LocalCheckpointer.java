@@ -17,6 +17,10 @@
 
 package dev.nishisan.utils.oss.cluster.node;
 
+import dev.nishisan.utils.oss.NgrrdHandle.CheckpointTiming;
+import dev.nishisan.utils.oss.cluster.metrics.LatencyHistogram;
+import dev.nishisan.utils.oss.cluster.metrics.LatencySnapshot;
+
 import java.io.Closeable;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -45,9 +49,13 @@ import java.util.logging.Logger;
  * {@code scheduleWithFixedDelay(interval)}: o próximo só começa {@code interval} depois do fim do
  * anterior, então ciclos nunca se sobrepõem. Cada ciclo:</p>
  * <ol>
- *   <li>tira um instantâneo das séries sujas ({@link SeriesHandleRegistry#dirtySeries()});</li>
- *   <li>espalha os disparos por ~80% do intervalo com cadência por prazo: o disparo {@code i} de
- *       {@code n} sai no instante {@code início + i × 0,8 × interval / n}. A thread só dorme quando está
+ *   <li>tira um instantâneo das séries candidatas ({@link SeriesHandleRegistry#dirtySeries()}). Com o
+ *       checkpoint local ligado, o registro mantém um índice incremental de sujas (8.15.0) e o instantâneo é
+ *       uma cópia dele, sem varrer o registro: um superconjunto das sujas, que inclui séries checkpointadas
+ *       desde a última poda. Elas saem rápido ({@code CLEAN}, que poda a chave do índice), mas ocupam uma
+ *       vaga da cadência, então a fração útil do espalhamento fica um pouco menor;</li>
+ *   <li>espalha os disparos por {@code spreadFraction} do intervalo (padrão 0,8) com cadência por prazo: o
+ *       disparo {@code i} de {@code n} sai no instante {@code início + i × spreadFraction × interval / n}. A thread só dorme quando está
  *       adiantada em pelo menos 1 ms, então a cadência se mantém mesmo com centenas de milhares de séries
  *       (pausas de microssegundos viram rajadas curtas de poucos disparos, sem acumular atraso);</li>
  *   <li>para cada série, adquire uma vaga do semáforo de {@code maxInFlight} (fora de qualquer lock) e
@@ -74,8 +82,6 @@ public final class LocalCheckpointer implements Closeable {
 
     private static final Logger LOGGER = Logger.getLogger(LocalCheckpointer.class.getName());
 
-    /** Fração do intervalo pela qual os disparos de um ciclo são espalhados. */
-    private static final double SPREAD_FRACTION = 0.8;
     /** Folga mínima para a thread dormir em vez de seguir disparando. */
     private static final long MIN_SLEEP_NANOS = TimeUnit.MILLISECONDS.toNanos(1);
     /** Prazo de cada etapa do encerramento. */
@@ -94,13 +100,22 @@ public final class LocalCheckpointer implements Closeable {
 
     private final AtomicLong cycles = new AtomicLong();
     private final AtomicLong lastCycleMs = new AtomicLong();
+    /** Candidatas do último ciclo (sujas e limpas ainda no índice de sujas). */
     private final AtomicLong lastCycleSeries = new AtomicLong();
+    /** Checkpoints de fato enfileirados ({@code STARTED}) no último ciclo. */
+    private final AtomicLong lastCycleStarted = new AtomicLong();
     private final LongAdder checkpointed = new LongAdder();
     private final LongAdder skippedBusy = new LongAdder();
     private final LongAdder failures = new LongAdder();
     private final AtomicLong overruns = new AtomicLong();
     private final AtomicLong lastFailureLogNanos = new AtomicLong(System.nanoTime() - FAILURE_LOG_INTERVAL_NANOS);
     private final LongAdder suppressedFailureLogs = new LongAdder();
+    /** Espera em fila até o início do force, só dos checkpoints locais que forçaram (não coalescidos). */
+    private final LatencyHistogram queueWait = new LatencyHistogram();
+    /** Duração do force, só dos checkpoints locais que forçaram (não coalescidos). */
+    private final LatencyHistogram force = new LatencyHistogram();
+    /** Checkpoints locais coalescidos: sem escrita nova desde o último force, não forçaram nada. */
+    private final LongAdder coalesced = new LongAdder();
 
     /**
      * @throws IllegalArgumentException se {@code settings} estiver desligado: com o checkpoint local
@@ -148,31 +163,39 @@ public final class LocalCheckpointer implements Closeable {
         long startedNanos = System.nanoTime();
         List<String> dirty = new ArrayList<>(registry.dirtySeries());
         int count = dirty.size();
-        long spreadNanos = (long) (settings.interval().toNanos() * SPREAD_FRACTION);
+        long spreadNanos = (long) (settings.interval().toNanos() * settings.spreadFraction());
+        int started = 0;
         for (int i = 0; i < count && !closed; i++) {
             long dueNanos = startedNanos + (count > 1 ? spreadNanos / count * i : 0L);
             long aheadNanos = dueNanos - System.nanoTime();
             if (aheadNanos >= MIN_SLEEP_NANOS && closeSignal.await(aheadNanos, TimeUnit.NANOSECONDS)) {
                 break; // close() durante a cadência: abandona o restante do ciclo.
             }
-            checkpointOne(dirty.get(i));
+            if (checkpointOne(dirty.get(i))) {
+                started++;
+            }
         }
         long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNanos);
         cycles.incrementAndGet();
         lastCycleMs.set(elapsedMs);
         lastCycleSeries.set(count);
+        lastCycleStarted.set(started);
         if (elapsedMs > settings.interval().toMillis()) {
             overruns.incrementAndGet();
             LOGGER.warning("NGRRD_LOCAL_CHECKPOINT_OVERRUN ciclo de checkpoint local levou " + elapsedMs
-                    + " ms para " + count + " séries sujas, acima do intervalo de " + settings.interval()
+                    + " ms para " + count + " séries candidatas, acima do intervalo de " + settings.interval()
                     + " — considere aumentar ngrrd.checkpoint.interval ou maxInFlight");
         } else {
             LOGGER.fine(() -> "NGRRD_LOCAL_CHECKPOINT cycle series=" + count + " elapsedMs=" + elapsedMs);
         }
     }
 
-    /** Um disparo do ciclo: vaga do semáforo, {@code tryCheckpointAsync} e contagem. Visível para testes. */
-    void checkpointOne(String seriesKey) throws InterruptedException {
+    /**
+     * Um disparo do ciclo: vaga do semáforo, {@code tryCheckpointAsync} e contagem. Visível para testes.
+     *
+     * @return {@code true} se o checkpoint foi de fato enfileirado ({@code STARTED})
+     */
+    boolean checkpointOne(String seriesKey) throws InterruptedException {
         inFlight.acquire();
         boolean started = false;
         try {
@@ -180,7 +203,7 @@ public final class LocalCheckpointer implements Closeable {
             switch (attempt.outcome()) {
                 case STARTED -> {
                     started = true;
-                    attempt.future().whenComplete((ignored, failure) -> onCompleted(seriesKey, failure));
+                    attempt.future().whenComplete((timing, failure) -> onCompleted(seriesKey, timing, failure));
                 }
                 case BUSY -> skippedBusy.increment();
                 case CLEAN, UNAVAILABLE -> { }
@@ -192,18 +215,38 @@ public final class LocalCheckpointer implements Closeable {
                 inFlight.release();
             }
         }
+        return started;
     }
 
-    private void onCompleted(String seriesKey, Throwable failure) {
+    /**
+     * Conclusão de um checkpoint local. Pode rodar na thread do pool de force (ou na do writer): só conta e
+     * grava em estruturas sem bloqueio, nunca espera nada.
+     */
+    private void onCompleted(String seriesKey, CheckpointTiming timing, Throwable failure) {
         try {
             if (failure == null) {
                 checkpointed.increment();
+                recordTiming(timing);
             } else {
                 recordFailure(seriesKey, failure instanceof CompletionException && failure.getCause() != null
                         ? failure.getCause() : failure);
             }
         } finally {
             inFlight.release();
+        }
+    }
+
+    private void recordTiming(CheckpointTiming timing) {
+        // NONE significa "sem medida" (default da interface, writer fechado, Sync concluído pelo
+        // fechamento), apesar de coalesced=true: comparado por identidade, não entra em nenhuma métrica.
+        if (timing == null || timing == CheckpointTiming.NONE) {
+            return;
+        }
+        if (timing.coalesced()) {
+            coalesced.increment();
+        } else {
+            queueWait.record(Math.max(0L, timing.queueWaitNanos()));
+            force.record(Math.max(0L, timing.forceNanos()));
         }
     }
 
@@ -223,10 +266,24 @@ public final class LocalCheckpointer implements Closeable {
         }
     }
 
-    /** Métricas para {@code NodeMetricsSnapshot.lifecycleMetrics}, chaves {@code localCheckpoint.*}. */
+    /**
+     * Métricas para {@code NodeMetricsSnapshot.lifecycleMetrics}, chaves {@code localCheckpoint.*}. Além dos
+     * contadores do ciclo (8.14.0), a 8.15.0 mede só os checkpoints disparados por este componente (via
+     * {@code checkpointAsyncTimed()}), em milissegundos: {@code queueWaitMsP99}/{@code queueWaitMsMax} (do
+     * enfileiramento do Sync até o início do force: fila FIFO da série, pool de writers e pool de force),
+     * {@code forceMsP99}/{@code forceMsMax} (duração do force) e {@code coalesced} (checkpoints sem escrita
+     * nova, que não forçaram; resultados sem medida, {@code CheckpointTiming.NONE}, não contam). Os percentis e o
+     * máximo cobrem só os que forçaram; o máximo é o recente (janela de 60 a 120 s, {@code recentMaxMicros}). O
+     * checkpoint remoto tem a própria métrica ({@code checkpointLatency}).
+     *
+     * <p>Com o índice incremental de sujas (8.15.0), {@code dirtySeries} é o tamanho do índice: um limite
+     * superior atrasado em um ciclo. {@code lastCycleSeries} conta as candidatas do último ciclo (sujas e
+     * limpas ainda no índice) e {@code lastCycleStarted}, os checkpoints de fato enfileirados nele.</p>
+     */
     public Map<String, Long> metrics() {
         return metricsMap(1L, registry.dirtyCount(), cycles.get(), lastCycleMs.get(), lastCycleSeries.get(),
-                checkpointed.sum(), skippedBusy.sum(), failures.sum(), overruns.get());
+                checkpointed.sum(), skippedBusy.sum(), failures.sum(), overruns.get(), queueWait.snapshot(),
+                force.snapshot(), coalesced.sum(), lastCycleStarted.get());
     }
 
     /**
@@ -234,11 +291,13 @@ public final class LocalCheckpointer implements Closeable {
      * {@code dirtySeries} ainda calculado (mostra quanto depende do checkpoint remoto ou do close).
      */
     public static Map<String, Long> disabledMetrics(SeriesHandleRegistry registry) {
-        return metricsMap(0L, registry.dirtyCount(), 0L, 0L, 0L, 0L, 0L, 0L, 0L);
+        return metricsMap(0L, registry.dirtyCount(), 0L, 0L, 0L, 0L, 0L, 0L, 0L, LatencySnapshot.EMPTY,
+                LatencySnapshot.EMPTY, 0L, 0L);
     }
 
     private static Map<String, Long> metricsMap(long enabled, long dirtySeries, long cycles, long lastCycleMs,
-            long lastCycleSeries, long checkpointed, long skippedBusy, long failures, long overruns) {
+            long lastCycleSeries, long checkpointed, long skippedBusy, long failures, long overruns,
+            LatencySnapshot queueWait, LatencySnapshot force, long coalesced, long lastCycleStarted) {
         Map<String, Long> metrics = new LinkedHashMap<>();
         metrics.put("localCheckpoint.enabled", enabled);
         metrics.put("localCheckpoint.dirtySeries", dirtySeries);
@@ -249,6 +308,12 @@ public final class LocalCheckpointer implements Closeable {
         metrics.put("localCheckpoint.skippedBusy", skippedBusy);
         metrics.put("localCheckpoint.failures", failures);
         metrics.put("localCheckpoint.overruns", overruns);
+        metrics.put("localCheckpoint.queueWaitMsP99", queueWait.p99Micros() / 1_000L);
+        metrics.put("localCheckpoint.queueWaitMsMax", queueWait.recentMaxMicros() / 1_000L);
+        metrics.put("localCheckpoint.forceMsP99", force.p99Micros() / 1_000L);
+        metrics.put("localCheckpoint.forceMsMax", force.recentMaxMicros() / 1_000L);
+        metrics.put("localCheckpoint.coalesced", coalesced);
+        metrics.put("localCheckpoint.lastCycleStarted", lastCycleStarted);
         return metrics;
     }
 

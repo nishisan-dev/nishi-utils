@@ -45,6 +45,7 @@ import dev.nishisan.utils.oss.cluster.rebalance.RebalanceSettings;
 import dev.nishisan.utils.oss.cluster.rebalance.Rebalancer;
 import dev.nishisan.utils.oss.cluster.rpc.LocalRequestHandler;
 import dev.nishisan.utils.oss.cluster.rpc.TransportClusterRpc;
+import dev.nishisan.utils.oss.metrics.BlobVolumeMetrics;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -55,6 +56,11 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.UnaryOperator;
@@ -101,6 +107,11 @@ public final class NgrrdStorageNode implements Closeable {
     private final SeriesDeleteHandler deleteHandler;
     /** {@code null} com o checkpoint local desligado ({@code ngrrd.checkpoint.enabled=false}, o padrão). */
     private final LocalCheckpointer localCheckpointer;
+    /**
+     * Pool dedicado do force dos checkpoints ({@code ngrrd.checkpoint.threads}); {@code null} com
+     * {@code threads=0} (o padrão: force inline no writer). Só termina depois do {@code registry.close()}.
+     */
+    private final ThreadPoolExecutor forcePool;
 
     private NgrrdStorageNode(StorageNodeConfig config, BlobVolumeRegistry volumeRegistry, BlobVolume volume,
             NGridNode node, CatalogService catalog, TransportClusterRpc rpc, SeriesHandleRegistry registry,
@@ -108,7 +119,7 @@ public final class NgrrdStorageNode implements Closeable {
             NodeStatusReporter statusReporter, AdminRequestHandler adminHandler,
             MigrationExecutor migrationExecutor, MigrationCoordinator migrationCoordinator, Rebalancer rebalancer,
             LocalReconciler localReconciler, GeometryService geometryService, SeriesDeleteHandler deleteHandler,
-            LocalCheckpointer localCheckpointer) {
+            LocalCheckpointer localCheckpointer, ThreadPoolExecutor forcePool) {
         this.config = config;
         this.volumeRegistry = volumeRegistry;
         this.volume = volume;
@@ -127,6 +138,49 @@ public final class NgrrdStorageNode implements Closeable {
         this.geometryService = geometryService;
         this.deleteHandler = deleteHandler;
         this.localCheckpointer = localCheckpointer;
+        this.forcePool = forcePool;
+    }
+
+    /** Prazo de espera pelos forces em voo ao encerrar o pool de force. */
+    private static final long FORCE_POOL_TERMINATION_SECONDS = 5L;
+
+    /**
+     * Cria o pool fixo {@code ngrrd-checkpoint-force-N} (threads daemon, fila sem limite: a entrada já é
+     * limitada por {@code maxInFlight} e pela concorrência de RPC), ou {@code null} com {@code threads=0}.
+     */
+    private static ThreadPoolExecutor newForcePool(int threads) {
+        if (threads <= 0) {
+            return null;
+        }
+        AtomicInteger sequence = new AtomicInteger();
+        return new ThreadPoolExecutor(threads, threads, 0L, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<>(),
+                runnable -> {
+                    Thread thread = new Thread(runnable, "ngrrd-checkpoint-force-" + sequence.incrementAndGet());
+                    thread.setDaemon(true);
+                    return thread;
+                });
+    }
+
+    /**
+     * Encerra o pool de force: {@code shutdown()} (os forces já aceitos terminam) e espera até 5 s. Só
+     * deve rodar depois do {@code registry.close()}, que espera os forces em voo de cada writer. Passado o
+     * prazo, loga (com a quantidade de tarefas descartadas) e interrompe o que sobrou. {@code null} é ignorado.
+     */
+    private static void shutdownForcePool(ExecutorService pool, String nodeId) {
+        if (pool == null) {
+            return;
+        }
+        pool.shutdown();
+        try {
+            if (!pool.awaitTermination(FORCE_POOL_TERMINATION_SECONDS, TimeUnit.SECONDS)) {
+                int dropped = pool.shutdownNow().size();
+                LOGGER.warning("NGRRD_CHECKPOINT_FORCE_POOL storage node " + nodeId + ": forces em voo não terminaram em "
+                        + FORCE_POOL_TERMINATION_SECONDS + " s; interrompendo dropped=" + dropped);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            pool.shutdownNow();
+        }
     }
 
     /**
@@ -171,14 +225,24 @@ public final class NgrrdStorageNode implements Closeable {
         Objects.requireNonNull(migrationHooks, "migrationHooks");
         Objects.requireNonNull(lookupDecorator, "lookupDecorator");
 
-        BlobVolumeRegistry volumeRegistry = NgrrdBlob.registry()
-                .basePath(cfg.volumeDir())
-                .shardCount(cfg.shardCount())
-                .segmentBytes(cfg.segmentBytes())
-                .initialShardCapacityBytes(cfg.initialShardCapacityBytes())
-                .writeMode(cfg.volumeWriteMode())
-                .volume(cfg.volumeName())
-                .build();
+        ThreadPoolExecutor forcePool = newForcePool(cfg.localCheckpoint().threads());
+        BlobVolumeMetrics blobMetrics = new BlobVolumeMetrics();
+        BlobVolumeRegistry volumeRegistry;
+        try {
+            volumeRegistry = NgrrdBlob.registry()
+                    .basePath(cfg.volumeDir())
+                    .shardCount(cfg.shardCount())
+                    .segmentBytes(cfg.segmentBytes())
+                    .initialShardCapacityBytes(cfg.initialShardCapacityBytes())
+                    .writeMode(cfg.volumeWriteMode())
+                    .checkpointForceExecutor(forcePool)
+                    .volumeMetricsListener(blobMetrics)
+                    .volume(cfg.volumeName())
+                    .build();
+        } catch (RuntimeException e) {
+            shutdownForcePool(forcePool, cfg.nodeId());
+            throw e;
+        }
         try {
             BlobVolume volume = volumeRegistry.require(cfg.volumeName());
             volume.storage().configureCapacity(cfg.capacityBytes());
@@ -221,7 +285,10 @@ public final class NgrrdStorageNode implements Closeable {
                 placementInspectTimeoutWarning(cfg.placementInspectTimeout(), cfg.requestTimeout())
                         .ifPresent(LOGGER::warning);
                 SeriesHandleRegistry registry = new SeriesHandleRegistry(volume, cfg.volumeName(),
-                        cfg.handleIdleTtl(), cfg.maxOpenHandles(), Clock.systemUTC());
+                        cfg.handleIdleTtl(), cfg.handleIdleTtlStepFactor(), cfg.maxOpenHandles(),
+                        Clock.systemUTC());
+                // Índice incremental de sujas só com o checkpoint local ligado: é o ciclo dele que poda.
+                registry.trackDirtyIndex(cfg.localCheckpoint().enabled());
 
                 startupRegistry = registry;
                 var lifecycleJournal = new SeriesLifecycleJournal(cfg.volumeDir().resolve(cfg.volumeName()));
@@ -323,6 +390,7 @@ public final class NgrrdStorageNode implements Closeable {
                         cfg.placementRules(), peerId -> node.decommissionPeer(NodeId.of(peerId)));
 
                 statusReporter.distribution(cfg.distributionMode(), cfg.weight());
+                statusReporter.volumeMetrics(blobMetrics);
                 // Issue #167 (item 3): cota dura e fingerprint das regras de placement em todo status.
                 statusReporter.quota(cfg.quotaMaxSeries(), cfg.quotaMaxBytes());
                 statusReporter.placementRulesHash(cfg.placementRules().fingerprint());
@@ -374,7 +442,7 @@ public final class NgrrdStorageNode implements Closeable {
                 return new NgrrdStorageNode(cfg, volumeRegistry, volume, node, catalog, rpc, registry,
                         storageHandler, placementHandler, statusReporter, adminHandler, migrationExecutor,
                         migrationCoordinator, rebalancer, localReconciler, geometryService, deleteHandler,
-                        localCheckpointer);
+                        localCheckpointer, forcePool);
             } catch (IOException | RuntimeException e) {
                 if (startupCheckpointer != null) startupCheckpointer.close();
                 if (startupDeleteHandler != null) startupDeleteHandler.close();
@@ -390,6 +458,8 @@ public final class NgrrdStorageNode implements Closeable {
                 throw e;
             }
         } catch (IOException | RuntimeException e) {
+            // O registry de séries (aberto no try interno) já foi fechado: o pool pode terminar.
+            shutdownForcePool(forcePool, cfg.nodeId());
             try {
                 volumeRegistry.close();
             } catch (RuntimeException closeError) {
@@ -528,6 +598,11 @@ public final class NgrrdStorageNode implements Closeable {
         return localReconciler;
     }
 
+    /** Pool de force dos checkpoints; vazio com {@code ngrrd.checkpoint.threads=0} (o padrão). */
+    Optional<ExecutorService> checkpointForcePool() {
+        return Optional.ofNullable(forcePool);
+    }
+
     /** Checkpoint local deste nó; vazio com {@code ngrrd.checkpoint.enabled=false} (o padrão). */
     public Optional<LocalCheckpointer> localCheckpointer() {
         return Optional.ofNullable(localCheckpointer);
@@ -550,7 +625,8 @@ public final class NgrrdStorageNode implements Closeable {
      * impede qualquer NOVA requisição de entrar — uma já em trânsito ainda pode concluir de forma
      * concorrente com os passos seguintes: best-effort, não uma garantia dura, por isso
      * {@code metricsSnapshot()}/{@code NodeStatusReporter} toleram um volume já fechado sem logar
-     * SEVERE) → registry (checkpoint+close de tudo que estiver aberto) → nó NGrid → registro de
+     * SEVERE) → registry (checkpoint+close de tudo que estiver aberto; espera os forces em voo) → pool
+     * de force ({@code shutdown} + espera de 5 s, só depois do registry) → nó NGrid → registro de
      * volumes. Erros de cada etapa são logados, não propagados — um recurso não fechado não deve
      * impedir o fechamento dos demais.
      */
@@ -587,6 +663,11 @@ public final class NgrrdStorageNode implements Closeable {
             rpc.unregisterLocalHandler(migrationExecutor);
         });
         safely("series handle registry", registry::close);
+        // Só agora: o registry.close() espera os forces em voo de cada writer, e esses forces rodam neste
+        // pool. Encerrá-lo antes faria o shutdownNow descartar as fases B (force) de writers ainda abertos,
+        // com Sync pendurado ou writer abandonado (o teto de espera do Shutdown do writer é de 20 s,
+        // SHUTDOWN_FORCE_WAIT_SECONDS). O volume fecha por último.
+        safely("checkpoint force pool", () -> shutdownForcePool(forcePool, config.nodeId()));
         safely("NGrid node", () -> {
             try {
                 node.close();

@@ -26,6 +26,13 @@ public final class SeriesLifecycleService {
     private final LongAdder deleted = new LongAdder();
     private final LongAdder receiptForces = new LongAdder();
     private final Map<DeleteStatus, LongAdder> outcomes = new java.util.concurrent.ConcurrentHashMap<>();
+    /** Respostas devolvidas a pedidos de cliente, por status (uma por chave pedida). */
+    private final Map<DeleteStatus, LongAdder> requestOutcomes = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Map<DeleteFailureCause, LongAdder> attemptFailures = new java.util.concurrent.ConcurrentHashMap<>();
+    private final LongAdder deletesCompleted = new LongAdder();
+    private final LongAdder deletesCancelled = new LongAdder();
+    private final LongAdder recoveryAttempts = new LongAdder();
+    private final java.util.concurrent.atomic.AtomicLong pendingDeletes = new java.util.concurrent.atomic.AtomicLong();
 
     public SeriesLifecycleService(SeriesLifecycleJournal journal, BlobVolume volume, CatalogView catalog,
             SeriesHandleRegistry registry, String self, String prefix, Clock clock, long interval) {
@@ -44,7 +51,7 @@ public final class SeriesLifecycleService {
     public Map<String, Long> metrics() {
         Map<String, Long> metrics = new LinkedHashMap<>();
         metrics.put("seriesDeleted", deleted.sum());
-        outcomes.forEach((status, count) -> metrics.put("seriesDelete." + status.name(), count.sum()));
+        metrics.putAll(deleteMetrics());
         metrics.put("receiptFsyncs", receiptForces.sum());
         metrics.put("lifecycleFsyncs", journal.fsyncCount());
         long count = 0, bytes = 0;
@@ -63,6 +70,37 @@ public final class SeriesLifecycleService {
         return Map.copyOf(metrics);
     }
 
+    /**
+     * Métricas de exclusão de série. As chaves {@code seriesDelete.<STATUS>} (sem prefixo) contam tentativas,
+     * inclusive as da recuperação, e são obsoletas até a 9.0; valem as chaves {@code seriesDelete.requests.*},
+     * {@code completed}, {@code cancelled}, {@code attemptFailed.*}, {@code recoveryAttempts} e {@code pending}.
+     */
+    Map<String, Long> deleteMetrics() {
+        Map<String, Long> metrics = new LinkedHashMap<>();
+        outcomes.forEach((status, count) -> metrics.put("seriesDelete." + status.name(), count.sum()));
+        requestOutcomes.forEach((status, count) -> metrics.put("seriesDelete.requests." + status.name(), count.sum()));
+        metrics.put("seriesDelete.completed", deletesCompleted.sum());
+        metrics.put("seriesDelete.cancelled", deletesCancelled.sum());
+        for (DeleteFailureCause cause : DeleteFailureCause.values()) {
+            LongAdder count = attemptFailures.get(cause);
+            metrics.put("seriesDelete.attemptFailed." + cause.name(), count == null ? 0L : count.sum());
+        }
+        metrics.put("seriesDelete.recoveryAttempts", recoveryAttempts.sum());
+        metrics.put("seriesDelete.pending", pendingDeletes.get());
+        return metrics;
+    }
+    /** Resposta devolvida a um pedido de cliente. */
+    void recordRequest(DeleteStatus status) { requestOutcomes.computeIfAbsent(status, ignored -> new LongAdder()).increment(); }
+    /** Exclusão concluída (placement removido), venha do cliente ou da recuperação. */
+    void recordCompleted() { deletesCompleted.increment(); }
+    /** Reserva cancelada porque um participante recusou o prepare. */
+    void recordCancelled() { deletesCancelled.increment(); }
+    void recordAttemptFailed(DeleteFailureCause cause) { attemptFailures.computeIfAbsent(cause, ignored -> new LongAdder()).increment(); }
+    void recordRecoveryAttempt() { recoveryAttempts.increment(); }
+    /** Placements com exclusão pendente vistos no último ciclo de recuperação. */
+    void pendingDeletes(long count) { pendingDeletes.set(count); }
+
+    /** Contador obsoleto (tentativas por status, inclusive da recuperação); mantido até a 9.0. */
     public void record(DeleteStatus status) {
         if (status != DeleteStatus.DELETED && status != DeleteStatus.NOT_FOUND)
             outcomes.computeIfAbsent(status, ignored -> new LongAdder()).increment();

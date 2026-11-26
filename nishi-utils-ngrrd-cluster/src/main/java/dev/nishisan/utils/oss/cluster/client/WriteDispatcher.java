@@ -39,8 +39,12 @@ import java.time.Clock;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.Comparator;
+import java.util.EnumMap;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -99,6 +103,11 @@ import java.util.stream.Collectors;
  * índice de pendentes até ser colhida; as barreiras, nesse modo, não lançam por falha de escrita. As marcas concluem
  * em ordem, num executor próprio e fora de qualquer lock interno. Ordem de locks: {@code markLock → route.lock →}
  * lock da marca; nunca {@code route.lock → markLock}.</p>
+ *
+ * <p><strong>Release de séries.</strong> {@link #beginRelease} aposenta a rota e fotografa a fronteira,
+ * {@link #drainForRelease} espera cada fronteira sem lançar e colhe as falhas até ela (cada falha vai para uma marca
+ * ou para um release, nunca para os dois), e {@link #finishRelease} solta o holder e, com a falha entregue, dispensa
+ * {@code isIdle} na remoção da rota.</p>
  */
 public final class WriteDispatcher implements WriteBuffer, Closeable {
 
@@ -114,6 +123,10 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     static final int MAX_REDIRECT_HOPS = 4;
     /** Teto de cada consulta ao líder para desempatar dicas contraditórias (limitado também por {@code retryPolicy.timeout()}). */
     static final Duration OWNER_LOOKUP_MAX_WAIT = Duration.ofSeconds(5);
+    /** Sem release em curso numa rota ({@code SeriesRoute.releaseBoundary}). */
+    private static final long NO_RELEASE = -1L;
+    /** Holder das rotas abertas sem holder explícito ({@link #beginGeneration(String, String, String)}): nunca sai. */
+    private static final Object PINNED_HOLDER = new Object();
 
     private final ClusterRpc rpc;
     private final PlacementLookup placementLookup;
@@ -198,14 +211,48 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         terminalListener = listener;
     }
 
+    /**
+     * Sem holder explícito: a rota fica presa a um holder permanente ({@link #PINNED_HOLDER}) e nunca sai do
+     * mapa, como antes da 8.15.0. Os handles usam {@link #beginGeneration(String, String, String, Object)}.
+     */
     @Override public void beginGeneration(String key, String generation, String owner) {
+        beginGeneration(key, generation, owner, PINNED_HOLDER);
+    }
+
+    /**
+     * Abre (ou reaproveita) a rota da geração {@code generation} de {@code key} para {@code holder}.
+     *
+     * <ul>
+     *   <li>Mesma geração: adiciona o holder (por identidade; a reabertura do mesmo handle é idempotente) e zera
+     *       {@code retired}. Sem holder ({@code null}, handle somente leitura), mantém a rota como está.</li>
+     *   <li>Geração diferente: aposenta a rota anterior, com as escritas em buffer e em voo, e cria a nova com
+     *       {@code {holder}}. Sem holder, não cria rota: a geração antiga sai do mapa e nenhuma é publicada.</li>
+     *   <li>Sem rota: cria com {@code {holder}}; sem holder, não cria.</li>
+     * </ul>
+     *
+     * <p>Roda dentro de {@code routes.compute} (bin do mapa → {@code route.lock}); nunca remove outra rota daqui.</p>
+     */
+    @Override public void beginGeneration(String key, String generation, String owner, Object holder) {
         boolean[] marksReady = {false};
+        boolean[] dropped = {false};
         routes.compute(key, (ignored, previous) -> {
-            if (previous == null) return new SeriesRoute(key, owner, generation);
+            if (previous == null) return holder == null ? null : new SeriesRoute(key, owner, generation, holder);
             previous.lock.lock();
             try {
-                if (Objects.equals(previous.generation, generation)) return previous;
+                if (Objects.equals(previous.generation, generation)) {
+                    if (holder != null) {
+                        previous.holders.add(holder);
+                        previous.retired = false;
+                        // Religada (por exemplo, open() concorrente a um release): volta a ser uma rota comum, e
+                        // uma falha posterior não pode sair do mapa sem ser reportada.
+                        previous.failuresDelivered = false;
+                    }
+                    return previous;
+                }
                 // Explicit OPEN retires a removed generation, including buffered and in-flight writes.
+                // Destacada já aqui, sob previous.lock: o compute só publica a rota nova depois que este lambda
+                // solta o lock, e quem pegar o lock nessa janela ainda veria previous no mapa.
+                previous.detached = true;
                 for (NodeBuffer buffer : buffers.values()) extractSeriesFrom(buffer, key);
                 long remaining = previous.submitted - previous.completed;
                 samplesFailedCount.add(remaining);
@@ -222,15 +269,120 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 if (!marksMode || isIdle(previous)) {
                     synchronized (pendingLock) { pendingRoutes.remove(previous); }
                 }
-                return new SeriesRoute(key, owner, generation);
+                if (holder == null) {
+                    dropped[0] = true;
+                    return null;
+                }
+                return new SeriesRoute(key, owner, generation, holder);
             } finally { previous.lock.unlock(); }
         });
+        if (dropped[0]) {
+            // Fora do compute: a geração aposentada saiu do mapa sem rota nova (abertura somente leitura).
+            routesRemovedCount.increment();
+            lastRetryLogMs.remove(key);
+        }
         if (marksReady[0]) scheduleMarkCompletion();
     }
 
+    /**
+     * {@code holder} deixou de usar a rota da geração {@code generation} de {@code key}. Sem holder, a rota fica
+     * {@code retired}: novas admissões recebem {@link ErrorCode#CLOSED}, e as escritas já admitidas seguem até o
+     * desfecho; ociosa, sai do mapa aqui, senão quando a última resposta chegar ({@link #retirable}). Um holder que
+     * não está na rota (ou outra geração no mapa) é no-op. Nunca chamar sob {@code route.lock}.
+     */
+    @Override public void endGeneration(String key, String generation, Object holder) {
+        if (holder == null) {
+            return;
+        }
+        SeriesRoute route = routes.get(key);
+        if (route == null) {
+            return;
+        }
+        boolean candidate;
+        route.lock.lock();
+        try {
+            if (!Objects.equals(route.generation, generation) || !route.holders.remove(holder)) {
+                return;
+            }
+            if (route.holders.isEmpty()) {
+                route.retired = true;
+            }
+            candidate = retirable(route);
+        } finally {
+            route.lock.unlock();
+        }
+        if (candidate) {
+            tryRemove(route);
+        }
+    }
+
+    /**
+     * Fase 1 da remoção (marcar): a rota não tem holder, nenhuma escrita sem desfecho (inclusive em disco) e
+     * nenhuma falha a reportar — ou a falha já foi entregue ao chamador ({@code failuresDelivered}) —, nem marca
+     * esperando, redirecionamento ou consulta de dono pendentes. Só avalia, nunca remove. Chamado sob
+     * {@code route.lock}; o chamador roda {@link #tryRemove} depois de soltá-lo.
+     */
+    private boolean retirable(SeriesRoute route) {
+        return route.retired
+                && route.holders.isEmpty()
+                && (isIdle(route) || (route.failuresDelivered && route.submitted == route.completed))
+                && route.waiters.isEmpty()
+                && !route.redirectPending
+                && !route.ownerLookupPending;
+    }
+
+    /**
+     * Fase 2 da remoção: tira {@code route} do mapa se ela ainda for a rota da chave e continuar
+     * {@link #retirable}. Ordem de locks bin do mapa → {@code route.lock}, a mesma de {@link #beginGeneration};
+     * por isso nunca roda sob um {@code route.lock} nem dentro de outro {@code compute} de {@link #routes}. Depois
+     * da remoção, já sem lock de rota, limpa o índice de pendentes, o rate limit de log e as tentativas da série nos
+     * buffers. Devolve {@code true} se removeu.
+     */
+    private boolean tryRemove(SeriesRoute route) {
+        boolean[] removed = {false};
+        routes.computeIfPresent(route.key, (key, current) -> {
+            if (current != route) {
+                return current;
+            }
+            current.lock.lock();
+            try {
+                if (!retirable(current)) {
+                    return current;
+                }
+                // Mesma janela do beginGeneration: o mapa só remove depois que o lambda solta o lock.
+                current.detached = true;
+                removed[0] = true;
+                return null;
+            } finally {
+                current.lock.unlock();
+            }
+        });
+        if (!removed[0]) {
+            return false;
+        }
+        routesRemovedCount.increment();
+        synchronized (pendingLock) {
+            pendingRoutes.remove(route);
+        }
+        lastRetryLogMs.remove(route.key);
+        for (NodeBuffer buf : buffers.values()) {
+            buf.lock.lock();
+            try {
+                buf.queue.forgetSeries(route.key);
+            } finally {
+                buf.lock.unlock();
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Confere a geração de um handle gravável antes da admissão. Sem rota, a geração do handle não tem mais onde
+     * escrever (substituída e depois removida): lança {@link RouteClosedException}, em vez de seguir em silêncio.
+     */
     @Override public void checkGeneration(String key, String generation) {
         SeriesRoute route = routes.get(key);
-        if (route == null) return;
+        if (route == null) throw closedRoute(key);
         route.lock.lock();
         try {
             if (!Objects.equals(route.generation, generation))
@@ -240,9 +392,10 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         } finally { route.lock.unlock(); }
     }
 
+    /** Barreira da geração de um handle gravável; sem rota, como {@link #checkGeneration}, lança {@link RouteClosedException}. */
     @Override public void flushGenerationSync(String key, String generation, String owner, Duration wait) {
         SeriesRoute route = routes.get(key);
-        if (route == null) return;
+        if (route == null) throw closedRoute(key);
         long boundary;
         route.lock.lock();
         try {
@@ -267,6 +420,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     private final ConcurrentMap<SeriesStatus, LongAdder> retryCounts = new ConcurrentHashMap<>();
     private final LongAdder ownerLookupsCount = new LongAdder();
     private final LongAdder redirectCyclesCount = new LongAdder();
+    private final LongAdder routesRemovedCount = new LongAdder();
     /** Marca de tempo do último log de retry por série, para o rate limit de {@link #logRetryRateLimited}. */
     private final ConcurrentMap<String, Long> lastRetryLogMs = new ConcurrentHashMap<>();
     private static final long RETRY_LOG_INTERVAL_MS = 10_000L;
@@ -363,7 +517,15 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     public void enqueue(String ownerNodeId, SeriesWrite write) {
         Objects.requireNonNull(ownerNodeId, "ownerNodeId");
         Objects.requireNonNull(write, "write");
-        SeriesRoute route = routes.computeIfAbsent(write.seriesKey(), key -> new SeriesRoute(key, ownerNodeId, write.generationId()));
+        // Só beginGeneration cria rota: uma escrita que passou do ensureWritable antes de um close/release não
+        // recria a rota depois da remoção (seria admitida sem dreno).
+        SeriesRoute route = routes.get(write.seriesKey());
+        if (route == null) {
+            if (closed) {
+                throw new NgrrdClusterException(ErrorCode.CLOSED, "dispatcher fechado");
+            }
+            throw closedRoute(write.seriesKey());
+        }
         for (;;) {
             NodeBuffer buf;
             String owner;
@@ -381,7 +543,13 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 if (closed) {
                     throw new NgrrdClusterException(ErrorCode.CLOSED, "dispatcher fechado");
                 }
-                if (routes.get(write.seriesKey()) != route || !Objects.equals(route.generation, write.generationId()))
+                // Fora do mapa (ou destacada, ainda a caminho de sair) ou aposentada: por fechamento/release
+                // (CLOSED) ou por geração nova (SERIES_DELETED).
+                if (route.detached || routes.get(write.seriesKey()) != route || route.retired) {
+                    throw route.retired ? closedRoute(write.seriesKey())
+                            : new NgrrdClusterException(ErrorCode.SERIES_DELETED, "generation replaced: " + write.seriesKey());
+                }
+                if (!Objects.equals(route.generation, write.generationId()))
                     throw new NgrrdClusterException(ErrorCode.SERIES_DELETED, "generation replaced: " + write.seriesKey());
                 if (route.failureCode == ErrorCode.SERIES_DELETED || route.failureCode == ErrorCode.QUARANTINED)
                     throw new NgrrdClusterException(route.failureCode, route.failureMessage);
@@ -481,13 +649,16 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         if (!marksMode) {
             throw new IllegalStateException("mark() exige writeFailureReporting=MARKS na configuração do cliente");
         }
+        // Rotas sem holder que ficaram ociosas ao colher as falhas: removidas depois de soltar o markLock.
+        List<SeriesRoute> retirable = new ArrayList<>();
+        Mark mark;
         markLock.lock();
         try {
             if (closed) {
                 throw new NgrrdClusterException(ErrorCode.CLOSED, "dispatcher fechado");
             }
             long admitted = samplesEnqueuedCount.sum();
-            Mark mark = new Mark(nextMarkId++, Math.max(0L, admitted - lastMarkAdmitted));
+            mark = new Mark(nextMarkId++, Math.max(0L, admitted - lastMarkAdmitted));
             lastMarkAdmitted = admitted;
             openMarks.addLast(mark);
             for (SeriesRoute route : snapshotPendingRoutes()) {
@@ -500,6 +671,9 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                             synchronized (pendingLock) {
                                 pendingRoutes.remove(route);
                             }
+                        }
+                        if (retirable(route)) {
+                            retirable.add(route);
                         }
                     } else if (route.waiters.isEmpty() || route.waiters.peekLast().boundary() < route.submitted) {
                         mark.acquire();
@@ -516,9 +690,225 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             // releases (and completions) are monotonic in mark order.
             mark.release();
             scheduleMarkCompletion();
-            return mark;
         } finally {
             markLock.unlock();
+        }
+        for (SeriesRoute route : retirable) {
+            tryRemove(route);
+        }
+        return mark;
+    }
+
+    /**
+     * Etapa 1 do release de {@code key} (admissão encerrada): sob {@code route.lock}, aposenta a rota ({@code retired})
+     * e fotografa a fronteira ({@code submitted}). Daí em diante, uma admissão na rota recebe {@link ErrorCode#CLOSED};
+     * um {@link #beginGeneration} posterior com a mesma geração religa a rota (zera {@code retired}), e o dreno continua
+     * esperando só a fronteira fotografada.
+     *
+     * <p>A rota só é aposentada se {@code holder} for o ÚNICO holder dela na geração {@code generation}, ou se ela já
+     * não tiver holder; com outro holder (um handle aberto por fora do release), a rota segue viva e é só drenada. O
+     * holder continua na rota até {@link #finishRelease}. O chamador segura o lock de abertura da chave no cache de
+     * handles, de modo que um {@code open()} concorrente da mesma chave só religa a rota depois desta fotografia.
+     * Devolve {@code null} se não houver rota para a chave.</p>
+     *
+     * <p>Em {@code MARKS}, a fronteira também fica guardada na rota, junto com o id da primeira marca criada depois
+     * daqui (sob {@code markLock}, então nenhuma marca fica pela metade): marcas criadas durante o release não colhem as
+     * falhas até a fronteira, que são do release. Uma marca aberta antes continua colhendo-as (spec 8.15.0, 3.7). Com
+     * releases sobrepostos da mesma rota, vale a união: o menor id de marca (o do primeiro release ativo) e a maior
+     * fronteira; a proteção só sai quando o último release ativo termina ({@link #endReleaseProtection}).</p>
+     */
+    ReleaseTicket beginRelease(String key, String generation, Object holder) {
+        SeriesRoute route = routes.get(key);
+        if (route == null) {
+            return null;
+        }
+        // Ordem de locks markLock → route.lock, a mesma de mark().
+        if (marksMode) {
+            markLock.lock();
+        }
+        try {
+            route.lock.lock();
+            try {
+                boolean owned = holder != null && Objects.equals(route.generation, generation)
+                        && route.holders.contains(holder);
+                if ((owned && route.holders.size() == 1) || route.holders.isEmpty()) {
+                    route.retired = true;
+                }
+                if (marksMode) {
+                    if (route.activeReleases == 0) {
+                        route.releaseFirstMarkId = nextMarkId;
+                        route.releaseBoundary = route.submitted;
+                    } else {
+                        route.releaseBoundary = Math.max(route.releaseBoundary, route.submitted);
+                    }
+                    route.activeReleases++;
+                }
+                return new ReleaseTicket(key, route, route.submitted, owned ? holder : null, marksMode);
+            } finally {
+                route.lock.unlock();
+            }
+        } finally {
+            if (marksMode) {
+                markLock.unlock();
+            }
+        }
+    }
+
+    /**
+     * Etapa 2 do release: espera cada rota alcançar a fronteira de {@link #beginRelease}, com {@code budget} como prazo
+     * TOTAL, como {@link #awaitBarriers}, mas sem lançar por falha de escrita: devolve um desfecho por chave, na ordem
+     * dos tickets.
+     *
+     * <p>Ao alcançar a fronteira, sob {@code route.lock}, conclui os waiters de marca já cobertos e colhe as falhas:
+     * em {@code MARKS}, as faixas ainda não reportadas até a fronteira, contadas por status — elas deixam de ir para
+     * uma marca, então uma marca nunca as vê; com releases sobrepostos da mesma
+     * rota, cada um deles reporta as falhas que a sua fronteira cobre, inclusive as que outro já colheu; em
+     * {@code BARRIER}, a primeira
+     * falha da rota, se estiver até a fronteira. Série removida ou em quarentena ({@code failureCode}) vira
+     * {@link ReleaseDrain.Outcome#SERIES_DELETED}. Uma rota que não alcança a fronteira no prazo vira
+     * {@link ReleaseDrain.Outcome#TIMED_OUT}, sem colheita: as escritas seguem em segundo plano e as falhas que
+     * surgirem vão para a próxima marca ({@code MARKS}) ou ficam na rota ({@code BARRIER}).</p>
+     *
+     * @throws NgrrdClusterException {@link ErrorCode#CLOSED} se o dispatcher fechar ou a thread for interrompida
+     */
+    Map<String, ReleaseDrain> drainForRelease(Collection<ReleaseTicket> tickets, Duration budget) {
+        long startedAt = System.nanoTime();
+        long budgetNanos = Math.max(0L, budget.toNanos());
+        Map<String, ReleaseDrain> outcomes = new LinkedHashMap<>();
+        boolean marksReady = false;
+        try {
+            for (ReleaseTicket ticket : tickets) {
+                SeriesRoute route = ticket.route;
+                for (;;) {
+                    route.lock.lock();
+                    try {
+                        if (closed) {
+                            throw new NgrrdClusterException(ErrorCode.CLOSED, "dispatcher fechado");
+                        }
+                        if (route.completed >= ticket.boundary) {
+                            marksReady |= releaseWaiters(route);
+                            outcomes.put(ticket.key, harvestForRelease(route, ticket));
+                            break;
+                        }
+                        long remaining = budgetNanos - (System.nanoTime() - startedAt);
+                        if (remaining <= 0) {
+                            outcomes.put(ticket.key, ReleaseDrain.timedOut(budget));
+                            break;
+                        }
+                        scheduleFlush(route.owner, buffers.get(route.owner));
+                        // Mesmo esquema do awaitBarriers: o ACK acorda na hora; o poll cobre backoff e reroteamento.
+                        route.progress.awaitNanos(Math.min(remaining, TimeUnit.MILLISECONDS.toNanos(DRAIN_POLL_MS)));
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new NgrrdClusterException(ErrorCode.CLOSED, "release interrompido", e);
+                    } finally {
+                        route.lock.unlock();
+                    }
+                }
+            }
+        } finally {
+            if (marksReady) {
+                scheduleMarkCompletion();
+            }
+        }
+        return outcomes;
+    }
+
+    /** Colhe o desfecho de uma rota que alcançou {@code boundary} (ver {@link #drainForRelease}). Chamado sob {@code route.lock}. */
+    private ReleaseDrain harvestForRelease(SeriesRoute route, ReleaseTicket ticket) {
+        long boundary = ticket.boundary;
+        Map<SeriesStatus, Long> failed = new EnumMap<>(SeriesStatus.class);
+        boolean writeFailures;
+        String message;
+        if (marksMode) {
+            List<FailedRange> taken = new ArrayList<>();
+            route.takeFailures(boundary, taken);
+            for (FailedRange range : taken) {
+                failed.merge(range.status(), range.to() - range.from() + 1, Long::sum);
+            }
+            // Falhas que outro release sobreposto da mesma rota já colheu continuam valendo para este, até a fronteira
+            // dele: a marca nunca as vê, mas cada release ativo que as cobre as reporta.
+            if (route.releaseHarvested != null) {
+                for (FailedRange range : route.releaseHarvested) {
+                    if (range.from() <= boundary) {
+                        failed.merge(range.status(), Math.min(range.to(), boundary) - range.from() + 1, Long::sum);
+                    }
+                }
+            }
+            endReleaseProtection(route, ticket);
+            if (route.activeReleases > 0 && !taken.isEmpty()) {
+                if (route.releaseHarvested == null) {
+                    route.releaseHarvested = new ArrayList<>();
+                }
+                route.releaseHarvested.addAll(taken);
+            }
+            if (isIdle(route)) {
+                synchronized (pendingLock) {
+                    pendingRoutes.remove(route);
+                }
+            }
+            writeFailures = !failed.isEmpty();
+            message = writeFailures ? "escritas com falha final antes do release de " + route.key + ": " + failed : null;
+        } else {
+            writeFailures = route.firstFailedSequence <= boundary;
+            message = writeFailures ? route.failureMessage : null;
+        }
+        if (isLifecycleTerminal(route.failureCode)) {
+            return new ReleaseDrain(ReleaseDrain.Outcome.SERIES_DELETED, failed, route.failureCode, route.failureMessage);
+        }
+        if (writeFailures) {
+            return new ReleaseDrain(ReleaseDrain.Outcome.WRITE_FAILURES, failed, route.failureCode, message);
+        }
+        return ReleaseDrain.DRAINED;
+    }
+
+    /**
+     * Etapa 5 do release (limpeza local): o holder do ticket deixa a rota, como em {@link #endGeneration}; sem holder,
+     * a rota fica aposentada. Com {@code delivered} (o desfecho do dreno foi entregue ao chamador) e a rota sem holder,
+     * liga {@code failuresDelivered}, que dispensa {@code isIdle} na remoção — exceto se houver, em {@code MARKS}, falha
+     * depois da fronteira ainda não reportada (escrita de um {@code open()} que religou a rota e já a soltou). A remoção
+     * segue a regra de duas fases: sem escrita em voo, sem waiter, sem redirecionamento nem consulta de dono pendentes.
+     * Em {@code BARRIER}, só a falha até a fronteira foi entregue: uma primeira falha depois dela mantém a rota. Uma
+     * rota religada por outro holder não é tocada além disso. Desfaz a proteção das falhas até a fronteira contra marcas
+     * novas (a partir daqui, elas vão para a próxima marca, como depois de um {@code TIMED_OUT}). Nunca chamar sob
+     * {@code route.lock}.
+     */
+    void finishRelease(ReleaseTicket ticket, boolean delivered) {
+        SeriesRoute route = ticket.route;
+        boolean candidate;
+        route.lock.lock();
+        try {
+            if (ticket.holder != null && route.holders.remove(ticket.holder) && route.holders.isEmpty()) {
+                route.retired = true;
+            }
+            boolean onlyDeliveredFailures = marksMode ? route.unreportedFailures.isEmpty()
+                    : route.firstFailedSequence <= ticket.boundary || route.firstFailedSequence == Long.MAX_VALUE;
+            if (delivered && route.holders.isEmpty() && onlyDeliveredFailures) {
+                route.failuresDelivered = true;
+            }
+            endReleaseProtection(route, ticket);
+            candidate = retirable(route);
+        } finally {
+            route.lock.unlock();
+        }
+        if (candidate) {
+            tryRemove(route);
+        }
+    }
+
+    /**
+     * O release do ticket deixa de proteger as falhas da rota contra marcas novas, uma única vez por ticket (na
+     * colheita ou no {@link #finishRelease}). A proteção da rota — e a lista das falhas já colhidas por releases
+     * sobrepostos — só sai quando o último release ativo termina. Chamado sob {@code route.lock}.
+     */
+    private static void endReleaseProtection(SeriesRoute route, ReleaseTicket ticket) {
+        if (!ticket.protecting) {
+            return;
+        }
+        ticket.protecting = false;
+        if (--route.activeReleases == 0) {
+            route.releaseBoundary = NO_RELEASE;
+            route.releaseHarvested = null;
         }
     }
 
@@ -668,6 +1058,47 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         }
     }
 
+    private static NgrrdClusterException closedRoute(String seriesKey) {
+        return new RouteClosedException(seriesKey);
+    }
+
+    /** Se há rota de escrita para {@code seriesKey} — visível para testes. */
+    boolean hasRoute(String seriesKey) {
+        return routes.containsKey(seriesKey);
+    }
+
+    /** Se sobrou estado de retentativa de {@code seriesKey} (rate limit de log ou tentativas num buffer) — visível para testes. */
+    boolean hasRetryState(String seriesKey) {
+        if (lastRetryLogMs.containsKey(seriesKey)) {
+            return true;
+        }
+        for (NodeBuffer buf : buffers.values()) {
+            buf.lock.lock();
+            try {
+                if (buf.queue.hasAttempts(seriesKey)) {
+                    return true;
+                }
+            } finally {
+                buf.lock.unlock();
+            }
+        }
+        return false;
+    }
+
+    /** Holders da rota de {@code seriesKey} ({@code 0} sem rota) — visível para testes. */
+    int routeHolders(String seriesKey) {
+        SeriesRoute route = routes.get(seriesKey);
+        if (route == null) {
+            return 0;
+        }
+        route.lock.lock();
+        try {
+            return route.holders.size();
+        } finally {
+            route.lock.unlock();
+        }
+    }
+
     /** Waiters de marca registrados na rota de {@code seriesKey} — visível para testes. */
     int markWaiters(String seriesKey) {
         SeriesRoute route = routes.get(seriesKey);
@@ -710,6 +1141,16 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     /** Dicas de {@code WRONG_OWNER} classificadas como contraditórias (ciclo, auto-redirecionamento, excesso de saltos). */
     public long redirectCycles() {
         return redirectCyclesCount.sum();
+    }
+
+    /** Rotas de escrita no mapa agora (uma por série com handle gravável ou escrita sem desfecho). */
+    public int routes() {
+        return routes.size();
+    }
+
+    /** Rotas de escrita removidas do mapa desde a criação deste dispatcher (sem holder e ociosas). */
+    public long routesRemoved() {
+        return routesRemovedCount.sum();
     }
 
     /** Retentativas observadas, agrupadas pelo {@link SeriesStatus} que as motivou. */
@@ -850,9 +1291,14 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             WriteBatchResponse response) {
         SeriesRoute currentRoute = routes.get(seriesKey);
         if (currentRoute == null) return;
+        // Fase 2 da remoção e aviso de série terminal: só depois de soltar o route.lock (ordem bin → route.lock;
+        // o aviso pode fechar o handle, que libera a rota).
+        boolean retire = false;
+        NgrrdClusterException terminal = null;
         currentRoute.lock.lock();
         try {
-        if (routes.get(seriesKey) != currentRoute || !Objects.equals(currentRoute.generation, writes.get(0).generationId())) return;
+        if (currentRoute.detached || routes.get(seriesKey) != currentRoute
+                || !Objects.equals(currentRoute.generation, writes.get(0).generationId())) return;
         SeriesStatus status = response.statusBySeries().getOrDefault(seriesKey, SeriesStatus.ERROR);
         switch (status) {
             case OK -> {
@@ -860,7 +1306,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 try { buf.queue.succeeded(seriesKey); }
                 finally { buf.lock.unlock(); }
                 samplesSentCount.add(writes.size());
-                completeWrites(currentRoute, writes.size(), null, SeriesStatus.OK);
+                retire = completeWrites(currentRoute, writes.size(), null, SeriesStatus.OK);
             }
             case WRONG_OWNER -> {
                 recordRetry(SeriesStatus.WRONG_OWNER);
@@ -878,13 +1324,13 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                     logRetryRateLimited(seriesKey, SeriesStatus.WRONG_OWNER,
                             "dono desconhecido — invalidando placement e reabrindo");
                     placementLookup.invalidate(seriesKey);
-                    reopenAsync(owner, buf, seriesKey, writes);
+                    reopenAsync(owner, buf, currentRoute, writes);
                 }
             }
             case NOT_OPEN -> {
                 recordRetry(SeriesStatus.NOT_OPEN);
                 logRetryRateLimited(seriesKey, SeriesStatus.NOT_OPEN, "reabrindo via reopener");
-                reopenAsync(owner, buf, seriesKey, writes);
+                reopenAsync(owner, buf, currentRoute, writes);
             }
             case MIGRATING -> {
                 recordRetry(SeriesStatus.MIGRATING);
@@ -898,13 +1344,13 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 currentRoute.failureCode = code;
                 if (marksMode) currentRoute.failureMessage = message;
                 samplesFailedCount.add(writes.size());
-                completeWrites(currentRoute, writes.size(), message, status);
-                terminalListener.accept(writes.get(0), new NgrrdClusterException(code, message));
+                retire = completeWrites(currentRoute, writes.size(), message, status);
+                terminal = new NgrrdClusterException(code, message);
             }
             case ERROR -> {
                 recordRetry(SeriesStatus.ERROR);
                 samplesFailedCount.add(writes.size());
-                completeWrites(currentRoute, writes.size(), "WRITE_BATCH falhou para " + seriesKey + ": "
+                retire = completeWrites(currentRoute, writes.size(), "WRITE_BATCH falhou para " + seriesKey + ": "
                         + response.errorBySeries().get(seriesKey), SeriesStatus.ERROR);
                 LOGGER.warning("WRITE_BATCH respondeu ERROR para " + seriesKey + ": "
                         + response.errorBySeries().get(seriesKey));
@@ -912,12 +1358,18 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             default -> {
                 recordRetry(status);
                 samplesFailedCount.add(writes.size());
-                completeWrites(currentRoute, writes.size(), "WRITE_BATCH respondeu " + status + " para " + seriesKey,
+                retire = completeWrites(currentRoute, writes.size(), "WRITE_BATCH respondeu " + status + " para " + seriesKey,
                         status);
                 LOGGER.warning("WRITE_BATCH respondeu status inesperado " + status + " para " + seriesKey);
             }
         }
         } finally { currentRoute.lock.unlock(); }
+        if (terminal != null) {
+            terminalListener.accept(writes.get(0), terminal);
+        }
+        if (retire) {
+            tryRemove(currentRoute);
+        }
     }
 
     /**
@@ -937,7 +1389,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         String visited;
         route.lock.lock();
         try {
-            if (routes.get(seriesKey) != route) return;
+            if (route.detached || routes.get(seriesKey) != route) return;
             contradictory = isContradictory(route, owner, newOwner);
             route.redirectAttempts++;
             route.redirectedBy.add(owner);
@@ -1140,9 +1592,10 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         NodeBuffer reopenBuf = null;
         long delayMs = 0L;
         String changedOwner = null;
+        boolean retire;
         route.lock.lock();
         try {
-            if (routes.get(seriesKey) != route || !route.ownerLookupPending) return;
+            if (route.detached || routes.get(seriesKey) != route || !route.ownerLookupPending) return;
             if (drained) {
                 route.ownerLookupPending = false;
                 return;
@@ -1192,15 +1645,20 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             } finally {
                 route.ownerLookupPending = false;
             }
+            retire = retirable(route);
             if (changedOwner != null) {
                 notifyOwner(seriesKey, changedOwner, route);
             }
         } finally {
             route.lock.unlock();
         }
+        if (retire && tryRemove(route)) {
+            // Sem escrita a reenviar: nada a reabrir nem a acordar para uma rota que saiu do mapa.
+            return;
+        }
         if (reopenBuf != null) {
             logRetryRateLimited(seriesKey, SeriesStatus.WRONG_OWNER, "líder não conhece a série — reabrindo");
-            reopenAsync(flushOwner, reopenBuf, seriesKey, List.of());
+            reopenAsync(flushOwner, reopenBuf, route, List.of());
         } else {
             triggerRetryAfter(flushOwner, Duration.ofMillis(delayMs));
         }
@@ -1212,6 +1670,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         if (route == null) {
             return;
         }
+        boolean retire;
         route.lock.lock();
         try {
             route.ownerLookupPending = false;
@@ -1219,16 +1678,22 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             if (buf != null) {
                 deferSeries(buf, seriesKey, -1);
             }
+            retire = retirable(route);
         } finally {
             route.lock.unlock();
+        }
+        if (retire) {
+            tryRemove(route);
         }
     }
 
     // FIFO admission/rerouting ensures completions form a prefix of each series. A failed
     // prefix remains observable: a later checkpoint cannot certify those lost samples.
-    // BARRIER: until restart. MARKS: until a mark reports it.
-    private void completeWrites(SeriesRoute route, int count, String failure, SeriesStatus status) {
+    // BARRIER: until restart (or a release that delivers it). MARKS: until a mark reports it.
+    // Returns whether the route became retirable (phase 1); the caller removes it after releasing route.lock.
+    private boolean completeWrites(SeriesRoute route, int count, String failure, SeriesStatus status) {
         boolean marksReady;
+        boolean retire;
         route.lock.lock();
         try {
             if (failure != null) {
@@ -1253,6 +1718,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             // Failed routes stay indexed: subsequent successful writes cannot erase
             // an earlier failure and allow a Kafka commit to certify a lost prefix.
             route.progress.signalAll();
+            retire = retirable(route);
         } finally {
             route.lock.unlock();
         }
@@ -1260,6 +1726,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         if (marksReady) {
             scheduleMarkCompletion();
         }
+        return retire;
     }
 
     /**
@@ -1439,27 +1906,69 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         } finally { buf.lock.unlock(); }
     }
 
-    private void reopenAsync(String owner, NodeBuffer buf, String key, List<SeriesWrite> writes) {
-        SeriesRoute expected = routes.get(key);
-        buf.lock.lock();
+    /**
+     * Pausa a série de {@code expected} em {@code buf} (com {@code writes} na frente) até a reabertura terminar. A
+     * pausa sem prazo só é aplicada a uma rota ainda no mapa, sob o lock dela: uma rota destacada (substituída ou
+     * removida) não pausa a chave, que já pode ser de outra geração. Ao terminar, se a rota tiver saído do mapa
+     * nesse meio tempo, desfaz só a própria pausa (a da geração nova, se houver, fica).
+     */
+    private void reopenAsync(String owner, NodeBuffer buf, SeriesRoute expected, List<SeriesWrite> writes) {
+        String key = expected.key;
+        PendingWrites.Delay pause;
+        expected.lock.lock();
         try {
-            for (int i = writes.size() - 1; i >= 0; i--) { buf.queue.addFirst(writes.get(i)); }
-            buf.queue.defer(key, Long.MAX_VALUE);
-        } finally { buf.lock.unlock(); }
+            if (!isCurrent(expected)) {
+                // Desfecho já contado na troca/remoção; nada a reenviar nem a pausar.
+                return;
+            }
+            buf.lock.lock();
+            try {
+                for (int i = writes.size() - 1; i >= 0; i--) { buf.queue.addFirst(writes.get(i)); }
+                pause = buf.queue.pause(key, Long.MAX_VALUE);
+            } finally { buf.lock.unlock(); }
+        } finally { expected.lock.unlock(); }
         try {
             recoveryPool.execute(() -> {
                 boolean opened = false;
-                try { if (routes.get(key) == expected) opened = Boolean.TRUE.equals(reopener.apply(key)); }
+                try { if (isCurrentLocked(expected)) opened = Boolean.TRUE.equals(reopener.apply(key)); }
                 catch (RuntimeException e) { LOGGER.log(Level.FINE, "Reabertura pendente de " + key, e); }
-                finally {
-                    if (routes.get(key) == expected) {
-                        deferSeries(buf, key, opened ? 0 : -1);
-                        scheduleFlush(owner, buf);
-                    }
-                }
+                finally { finishReopen(owner, buf, expected, pause, opened); }
             });
         } catch (RejectedExecutionException closing) {
             deferSeries(buf, key, -1);
+        }
+    }
+
+    /** Fim da reabertura: libera a série com o atraso devido, ou desfaz a própria pausa de uma rota que saiu do mapa. */
+    private void finishReopen(String owner, NodeBuffer buf, SeriesRoute expected, PendingWrites.Delay pause,
+            boolean opened) {
+        boolean current;
+        expected.lock.lock();
+        try {
+            current = isCurrent(expected);
+            if (current) {
+                deferSeries(buf, expected.key, opened ? 0 : -1);
+            } else {
+                buf.lock.lock();
+                try {
+                    buf.queue.resume(expected.key, pause);
+                } finally { buf.lock.unlock(); }
+            }
+        } finally { expected.lock.unlock(); }
+        scheduleFlush(owner, buf);
+    }
+
+    /** {@code route} ainda é a rota da chave no mapa. Chamado sob {@code route.lock}. */
+    private boolean isCurrent(SeriesRoute route) {
+        return !route.detached && routes.get(route.key) == route;
+    }
+
+    private boolean isCurrentLocked(SeriesRoute route) {
+        route.lock.lock();
+        try {
+            return isCurrent(route);
+        } finally {
+            route.lock.unlock();
         }
     }
 
@@ -1543,12 +2052,47 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         private final ArrayDeque<FailedRange> unreportedFailures = new ArrayDeque<>();
         /** MARKS: marcas esperando esta rota, em ordem de marca (fronteiras não decrescentes). */
         private final ArrayDeque<MarkWaiter> waiters = new ArrayDeque<>();
+        /** Handles graváveis que usam a rota, por identidade (normalmente um). Só muda sob {@link #lock}. */
+        private final Set<Object> holders = Collections.newSetFromMap(new IdentityHashMap<>());
+        /** Sem holder (fechamento ou release): novas admissões recebem {@code CLOSED}. Só muda sob {@link #lock}. */
+        private boolean retired;
+        /**
+         * A rota saiu (ou está saindo) do mapa: substituída por outra geração ou removida. Ligado sob {@link #lock}
+         * dentro do {@code compute} que a tira do mapa, antes da publicação; quem pega o lock depois trata a rota
+         * como fora do mapa mesmo que {@code routes.get} ainda a devolva. Nunca volta a {@code false}.
+         */
+        private boolean detached;
+        /**
+         * A falha da rota já foi entregue ao chamador (por um {@code release}): dispensa {@code isIdle} na remoção,
+         * mas não {@code submitted == completed}. Só muda sob {@link #lock}.
+         */
+        private boolean failuresDelivered;
+        /**
+         * {@code MARKS}: fronteira de um release em curso ({@link #NO_RELEASE} sem release). Marcas com id
+         * {@code >= releaseFirstMarkId} (criadas depois do {@code beginRelease}) não colhem falhas até ela. Só muda sob
+         * {@link #lock}.
+         */
+        private long releaseBoundary = NO_RELEASE;
+        /** Id da primeira marca criada depois do {@code beginRelease} em curso. Só muda sob {@link #lock}. */
+        private long releaseFirstMarkId;
+        /**
+         * {@code MARKS}: releases desta rota com proteção ativa (tickets ainda sem colheita nem fim). Só muda sob
+         * {@link #lock}.
+         */
+        private int activeReleases;
+        /**
+         * {@code MARKS}: faixas colhidas por um release enquanto outro da mesma rota seguia ativo ({@code null} sem
+         * nenhuma). Cada release ativo soma as que a fronteira dele cobre; sai quando {@code activeReleases} chega a 0.
+         * Só muda sob {@link #lock}.
+         */
+        private List<FailedRange> releaseHarvested;
 
-        SeriesRoute(String key, String owner, String generation) {
+        SeriesRoute(String key, String owner, String generation, Object holder) {
             this.key = key;
             this.generation = generation;
             this.owner = owner;
             destinations.add(owner);
+            holders.add(holder);
         }
 
         void resetRedirectEpisode() {
@@ -1569,22 +2113,143 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             }
         }
 
-        /** Atribui a {@code mark} as falhas com sequência {@code <= boundary}, partindo a faixa que cruza a fronteira. */
+        /**
+         * Atribui a {@code mark} as falhas com sequência {@code <= boundary}, partindo a faixa que cruza a fronteira. Uma
+         * marca criada durante um release desta rota não leva as falhas até a fronteira do release, que ficam para ele.
+         */
         void collectFailures(Mark mark, long boundary) {
+            long reserved = releaseBoundary != NO_RELEASE && mark.id() >= releaseFirstMarkId ? releaseBoundary : 0L;
+            FailureSink sink = (status, count) -> mark.addFailures(key, status, count);
+            if (reserved <= 0L) {
+                collectFailures(sink, boundary);
+                return;
+            }
+            // Separa o prefixo até a fronteira do release, colhe o resto e devolve o prefixo à frente, na ordem.
+            ArrayDeque<FailedRange> kept = new ArrayDeque<>();
+            while (!unreportedFailures.isEmpty() && unreportedFailures.peekFirst().from() <= reserved) {
+                FailedRange range = unreportedFailures.pollFirst();
+                if (range.to() > reserved) {
+                    kept.addLast(new FailedRange(range.from(), reserved, range.status()));
+                    unreportedFailures.addFirst(new FailedRange(reserved + 1, range.to(), range.status()));
+                    break;
+                }
+                kept.addLast(range);
+            }
+            collectFailures(sink, boundary);
+            for (var it = kept.descendingIterator(); it.hasNext(); ) {
+                unreportedFailures.addFirst(it.next());
+            }
+        }
+
+        /**
+         * Tira de {@link #unreportedFailures} as faixas com sequência {@code <= boundary}, partindo a que cruza a
+         * fronteira, e as acrescenta a {@code into}, na ordem.
+         */
+        void takeFailures(long boundary, List<FailedRange> into) {
             while (!unreportedFailures.isEmpty() && unreportedFailures.peekFirst().from() <= boundary) {
                 FailedRange range = unreportedFailures.pollFirst();
                 if (range.to() > boundary) {
                     unreportedFailures.addFirst(new FailedRange(boundary + 1, range.to(), range.status()));
-                    mark.addFailures(key, range.status(), boundary - range.from() + 1);
+                    into.add(new FailedRange(range.from(), boundary, range.status()));
                 } else {
-                    mark.addFailures(key, range.status(), range.to() - range.from() + 1);
+                    into.add(range);
+                }
+            }
+        }
+
+        /**
+         * Entrega a {@code sink} as falhas com sequência {@code <= boundary}, partindo a faixa que cruza a fronteira;
+         * o que foi entregue sai de {@link #unreportedFailures} e não vai mais para nenhuma marca.
+         */
+        void collectFailures(FailureSink sink, long boundary) {
+            while (!unreportedFailures.isEmpty() && unreportedFailures.peekFirst().from() <= boundary) {
+                FailedRange range = unreportedFailures.pollFirst();
+                if (range.to() > boundary) {
+                    unreportedFailures.addFirst(new FailedRange(boundary + 1, range.to(), range.status()));
+                    sink.accept(range.status(), boundary - range.from() + 1);
+                } else {
+                    sink.accept(range.status(), range.to() - range.from() + 1);
                 }
             }
         }
     }
 
+    /**
+     * Rota de uma série em release, com a fronteira fotografada por {@link #beginRelease} e o holder que a aposentou
+     * ({@code null} se o release só drena a rota). Opaco fora do dispatcher.
+     */
+    static final class ReleaseTicket {
+        private final String key;
+        private final SeriesRoute route;
+        private final long boundary;
+        private final Object holder;
+        /** Este ticket ainda conta em {@code route.activeReleases}. Só muda sob o {@code route.lock} da rota. */
+        private boolean protecting;
+
+        private ReleaseTicket(String key, SeriesRoute route, long boundary, Object holder, boolean protecting) {
+            this.key = key;
+            this.route = route;
+            this.boundary = boundary;
+            this.holder = holder;
+            this.protecting = protecting;
+        }
+
+        /** Chave da série. */
+        String key() {
+            return key;
+        }
+
+        /** Fronteira do dreno: escritas admitidas na rota até {@link #beginRelease}. */
+        long boundary() {
+            return boundary;
+        }
+    }
+
+    /**
+     * Desfecho do dreno de uma série em release ({@link #drainForRelease}).
+     *
+     * @param outcome               resultado do dreno
+     * @param failedSamplesByStatus falhas colhidas até a fronteira, por status ({@code MARKS}); vazio em {@code BARRIER},
+     *                              que guarda só a primeira falha da série
+     * @param errorCode             código da falha; {@code null} em {@link Outcome#DRAINED}
+     * @param message               descrição da falha; {@code null} em {@link Outcome#DRAINED}
+     */
+    record ReleaseDrain(Outcome outcome, Map<SeriesStatus, Long> failedSamplesByStatus, ErrorCode errorCode,
+            String message) {
+
+        /** Dreno sem falha. */
+        static final ReleaseDrain DRAINED = new ReleaseDrain(Outcome.DRAINED, Map.of(), null, null);
+
+        ReleaseDrain {
+            failedSamplesByStatus = Map.copyOf(failedSamplesByStatus);
+        }
+
+        static ReleaseDrain timedOut(Duration budget) {
+            return new ReleaseDrain(Outcome.TIMED_OUT, Map.of(), ErrorCode.TIMEOUT,
+                    "escritas anteriores ao release não confirmadas dentro de " + budget);
+        }
+
+        /** Resultado do dreno de uma série. */
+        enum Outcome {
+            /** Toda escrita até a fronteira teve OK final. */
+            DRAINED,
+            /** Drenou, com falha de escrita até a fronteira. */
+            WRITE_FAILURES,
+            /** A geração foi removida ou posta em quarentena. */
+            SERIES_DELETED,
+            /** A rota não alcançou a fronteira no prazo. */
+            TIMED_OUT
+        }
+    }
+
     /** Faixa {@code [from, to]} de sequências de uma série que terminou com {@code status} final. */
     private record FailedRange(long from, long to, SeriesStatus status) { }
+
+    /** Destino das falhas colhidas de uma rota: uma marca ou o resultado de um release. */
+    @FunctionalInterface
+    private interface FailureSink {
+        void accept(SeriesStatus status, long count);
+    }
 
     /** Marca esperando a rota alcançar {@code boundary}. */
     private record MarkWaiter(Mark mark, long boundary) { }
@@ -1599,6 +2264,14 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         private final AtomicLong remaining = new AtomicLong(1L);
         private final CompletableFuture<WriteMarkResult> future = new CompletableFuture<>();
         private final Lock stateLock = new ReentrantLock();
+        /**
+         * Futures entregues por {@link #completion()} antes da conclusão, sob {@link #stateLock}. Só quem conclui a
+         * marca as completa, em ordem e na própria thread: um {@code future.copy()} deixaria uma thread que chama
+         * {@code completion()} durante a conclusão executar os callbacks já registrados nesta marca (o
+         * {@code postComplete} do {@code CompletableFuture} é cooperativo), enquanto a thread de conclusão já
+         * conclui a marca seguinte — callbacks de marcas diferentes sairiam fora de ordem.
+         */
+        private final List<CompletableFuture<WriteMarkResult>> dependents = new ArrayList<>();
         private long samplesFailed;
         private final Map<SeriesStatus, Long> failuresByStatus = new LinkedHashMap<>();
         private final Set<String> failedSeries = new LinkedHashSet<>();
@@ -1642,25 +2315,60 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
 
         void complete() {
             WriteMarkResult built;
+            List<CompletableFuture<WriteMarkResult>> pending;
             stateLock.lock();
             try {
                 built = new WriteMarkResult(id, samplesAdmitted, samplesFailed, failuresByStatus,
                         List.copyOf(failedSeries), failedSeriesTruncated);
+                result = built;
+                future.complete(built);
+                pending = takeDependents();
             } finally {
                 stateLock.unlock();
             }
-            result = built;
-            future.complete(built);
+            for (CompletableFuture<WriteMarkResult> dependent : pending) {
+                dependent.complete(built);
+            }
         }
 
         void fail(NgrrdClusterException failure) {
-            future.completeExceptionally(failure);
+            List<CompletableFuture<WriteMarkResult>> pending;
+            stateLock.lock();
+            try {
+                future.completeExceptionally(failure);
+                pending = takeDependents();
+            } finally {
+                stateLock.unlock();
+            }
+            for (CompletableFuture<WriteMarkResult> dependent : pending) {
+                dependent.completeExceptionally(failure);
+            }
+        }
+
+        /** Chamado sob {@link #stateLock}. */
+        private List<CompletableFuture<WriteMarkResult>> takeDependents() {
+            List<CompletableFuture<WriteMarkResult>> pending = List.copyOf(dependents);
+            dependents.clear();
+            return pending;
         }
 
         @Override public long id() { return id; }
         @Override public boolean isDone() { return future.isDone(); }
         @Override public Optional<WriteMarkResult> result() { return Optional.ofNullable(result); }
-        @Override public CompletableFuture<WriteMarkResult> completion() { return future.copy(); }
+        @Override public CompletableFuture<WriteMarkResult> completion() {
+            stateLock.lock();
+            try {
+                if (!future.isDone()) {
+                    CompletableFuture<WriteMarkResult> dependent = new CompletableFuture<>();
+                    dependents.add(dependent);
+                    return dependent;
+                }
+            } finally {
+                stateLock.unlock();
+            }
+            // Já concluída: a cópia nasce concluída e não toca os dependentes de outras threads.
+            return future.copy();
+        }
         @Override public String toString() { return "WriteMark[" + id + "]"; }
     }
 
@@ -1675,7 +2383,24 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         private final PriorityQueue<Delay> wakeups = new PriorityQueue<>(Comparator.comparingLong(Delay::until));
         private final Map<String, Integer> attempts = new HashMap<>();
         private int size;
-        private record Delay(String key, long until) { }
+        /**
+         * Pausa de uma série. Igualdade por identidade, de propósito: toda pausa sem prazo de uma chave vale
+         * {@code (key, Long.MAX_VALUE)}, e {@link #resume} só pode desfazer a pausa que o chamador aplicou — nunca a
+         * de outra geração da mesma chave aplicada depois ({@code paused.remove(key, delay)} e
+         * {@code wakeups.remove(delay)} comparam por {@code equals}).
+         */
+        private static final class Delay {
+            private final String key;
+            private final long until;
+
+            private Delay(String key, long until) {
+                this.key = key;
+                this.until = until;
+            }
+
+            String key() { return key; }
+            long until() { return until; }
+        }
 
         int size() { return size; }
         boolean isEmpty() { return size == 0; }
@@ -1702,6 +2427,18 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             if (queue.isEmpty()) { series.remove(key); } else { ready.add(key); }
             return write;
         }
+        /** Como {@link #defer}, devolvendo a pausa aplicada, para desfazê-la depois só se ainda for ela. */
+        Delay pause(String key, long until) {
+            defer(key, until);
+            return paused.get(key);
+        }
+        /** Desfaz {@code delay} se ela ainda for a pausa de {@code key}; a série volta a ficar pronta se tiver escrita. */
+        void resume(String key, Delay delay) {
+            if (delay != null && paused.remove(key, delay)) {
+                wakeups.remove(delay);
+                if (series.containsKey(key)) { ready.add(key); }
+            }
+        }
         void defer(String key, long until) {
             Delay old = paused.put(key, new Delay(key, until));
             if (old != null) { wakeups.remove(old); }
@@ -1710,6 +2447,18 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         }
         int nextAttempt(String key) { return attempts.merge(key, 1, Integer::sum); }
         void succeeded(String key) { attempts.remove(key); }
+        boolean hasAttempts(String key) { return attempts.containsKey(key); }
+        /**
+         * A rota da série saiu do mapa: esquece as tentativas dela e, se não houver escrita da série neste buffer,
+         * também uma pausa que ficou para trás (uma pausa sem prazo prenderia a próxima rota da mesma chave).
+         */
+        void forgetSeries(String key) {
+            attempts.remove(key);
+            if (!series.containsKey(key)) {
+                Delay delay = paused.remove(key);
+                if (delay != null) { wakeups.remove(delay); }
+            }
+        }
         /** Keeps the per-series retry count across buffers when a series is rerouted. */
         void carryAttempts(String key, int count) {
             if (count > 0) { attempts.merge(key, count, Math::max); }

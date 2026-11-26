@@ -36,6 +36,10 @@ Idle-skip de checkpoint redundante (coalescing):
 
 ![Idle-skip de checkpoint](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan-dev/nishi-utils/main/doc/oss/diagrams/checkpoint_idle_skip.puml)
 
+Checkpoint com force destacado do writer (8.15.0):
+
+![Checkpoint com force destacado](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan-dev/nishi-utils/main/doc/oss/diagrams/checkpoint_force_detached.puml)
+
 ## 2. Convenções
 
 - **Endianness:** big-endian em **tudo** (paridade com o `.ngrr`/`SeriesFileCodec`).
@@ -188,12 +192,16 @@ preferred  = h64 mod N                                # unsigned
 - **Java:** `Long.remainderUnsigned(ByteBuffer.wrap(digest).getLong(), N)`.
 - **Python:** `int.from_bytes(hashlib.sha256(key.encode("utf-8")).digest()[:8], "big") % N`.
 
-`preferred` é apenas o shard **preferencial** na criação. Se ele estiver cheio,
-aplica-se *linear probing* determinístico `(preferred + p) mod N`, `p = 1..N-1`. A
-localização **efetiva** é gravada no catálogo (`shardId`), que é a fonte de verdade
-em qualquer leitura/reabertura. Numa migração para volume vazio não há probing
-relevante (há espaço); Java e Python concordam no `preferred` para distribuição
-consistente de alocações futuras.
+`preferred` é o shard **de destino** da série: a alocação sempre acontece nele. **Não há *probing***
+(nem linear, nem outro): se o shard não tem espaço livre contíguo para a região, ele **cresce** em um
+passo de `segmentBytes` (ver *Crescimento de shard* na §9) até a região caber. Um shard "cheio" nunca
+desvia a série para outro shard, e o volume só recusa uma criação pela capacidade **declarada**
+(`capacityBytes` do nó, ver §11), não por falta de espaço num shard.
+
+A localização **efetiva** continua gravada no catálogo (`shardId`), que é a fonte de verdade em qualquer
+leitura/reabertura, e a implementação Java grava sempre o `preferred`. Um leitor nunca deve **recalcular** o
+shard a partir da chave: lê o `shardId` do catálogo. Java e Python concordam no `preferred` para
+distribuição consistente de alocações futuras.
 
 ## 9. Modelo de verdade e reconstrução do alocador
 
@@ -214,9 +222,12 @@ consistente de alocações futuras.
 - Isso elimina qualquer necessidade de atomicidade cross-file: só o catálogo
   (WAL+snapshot) precisa ser durável-atômico; superblock e free-lists são regeneráveis.
 
-**Crescimento de shard:** `setLength(newCapacity)` + `force` do arquivo → atualiza
-`shardCapacityBytes` no superblock (msync) → só então a alocação é jornalizada e
-publicada. `setLength` é idempotente; um crash entre grow e journal apenas deixa
+**Crescimento de shard (automático, sem probing):** quando o alocador do shard de destino não
+tem espaço para a região, o volume faz `setLength(capacidade + segmentBytes)` + `force` do arquivo
+(+ novo mapeamento) → atualiza `shardCapacityBytes` no superblock (msync) → só então a alocação é
+jornalizada e publicada. Repete o passo até a região caber (uma região maior que um segmento
+cresce em vários passos). O crescimento roda **sob o `structuralLock`**: enquanto dura, toda criação,
+remoção e crescimento do volume espera; por isso a duração é medida e exposta (§11). `setLength` é idempotente; um crash entre grow e journal apenas deixa
 espaço não usado (recuperado pela próxima alocação).
 
 ## 10. Durabilidade e concorrência
@@ -234,6 +245,59 @@ espaço não usado (recuperado pela próxima alocação).
 - **Migração offline:** a ferramenta Python deve rodar **sem writer Java ativo**
   sobre as mesmas séries (janela de manutenção). Único escritor dos shards durante
   a migração são os próprios workers, particionados por shard.
+
+### 10.0. Force destacável do checkpoint (8.15.0)
+
+> **Não-normativa.** Nada muda no layout on-disk nem na garantia de durabilidade de um checkpoint
+> concluído; muda **onde** o `force` roda.
+
+O checkpoint de uma série é um comando `Sync` na fila FIFO do writer da série (ordem total e escritor
+único). Ele tem duas fases:
+
+- **Fase A (na worker do writer):** materializa o CDP parcial e o estado vivo na região (`persistLiveState`).
+  Continua na fila da série, então a ordem em relação às escritas não muda.
+- **Fase B (o *force*):** `msync`/`fdatasync` da faixa da região. É a parte lenta e dependente do disco.
+
+Por padrão (sem executor configurado) as duas fases rodam na worker, exatamente como antes. Com
+`NgrrdBlob.Builder.checkpointForceExecutor(Executor)` (no cluster, `ngrrd.checkpoint.threads` > 0), a
+fase B sai da worker:
+
+1. a worker chama `SeriesChannel.prepareForce()`, que **captura** a faixa e limpa a marca de sujo, e
+   devolve um `ForceTicket`;
+2. um ticket `detached()` é executado no executor (`ForceTicket.run()`, em qualquer thread), e a worker
+   volta a processar a fila da série;
+3. ao terminar, o executor conclui a future do `Sync` e enfileira um `ForceDone` na série.
+
+**Contrato do `ForceTicket`:** `run()` pode rodar em qualquer thread; em falha, **remarca o canal como
+sujo** e relança, para que o próximo force (ou o `close()`) tente de novo. `ForceTicket.DONE` (não
+destacado) indica force desnecessário ou já concluído. Só o `BlobSeriesChannel` destaca o force; os canais
+de disco local e S3 usam o padrão (força inline, devolvem `DONE`).
+
+**Sync coalescido encadeado.** Um `Sync` sem amostra nova desde o último force continua sendo
+coalescido (idle-skip, §11.3), mas, se há um force destacado em voo, a future dele **encadeia nesse
+force** em vez de concluir na hora: o `ACK` de um checkpoint nunca antecede o force que cobre os
+mesmos bytes. Se o executor recusa a tarefa (`RejectedExecutionException`), a fase B roda inline
+na worker. Os callbacks de `checkpointAsync()`/`checkpointAsyncTimed()` podem rodar na thread do
+writer ou na do executor: devem ser curtos e não bloquear.
+
+**Fechamento com force preso.** O `close()` espera os forces destacados em voo por até
+`SHUTDOWN_FORCE_WAIT_SECONDS = 20` s (abaixo do `STOP_TIMEOUT` de 30 s do `close()`). Estourado o teto,
+o writer registra `SEVERE`, falha os `Sync` encadeados e **encerra a worker sem o checkpoint final**; a
+partir daí:
+
+- `close()` lança `WriterAbandonedException` **em toda chamada**, concorrente ou posterior, mesmo
+  depois de o force terminar (o desfecho é pegajoso: o writer está abandonado e as amostras desde o
+  último checkpoint concluído podem ter sido perdidas; descarte a referência);
+- `closeForDeletion()` (sem checkpoint final) lança `IllegalStateException` enquanto o force preso
+  ainda estiver em voo sobre a região, e **converge** (volta normalmente) quando ele termina, porque
+  a exclusão não precisa de durabilidade.
+
+A série continua usável por um novo `open`, cujo primeiro checkpoint força a região de novo. A medida
+do checkpoint (`checkpointAsyncTimed()`, `CheckpointTiming`) separa `queueWaitNanos` (fila FIFO,
+materialização e fila do executor, até o início do force) de `forceNanos` (duração do force; `0`
+se coalescido ou com `OS_CACHE`).
+
+![Checkpoint com force destacado](https://uml.nishisan.dev/proxy?src=https://raw.githubusercontent.com/nishisan-dev/nishi-utils/main/doc/oss/diagrams/checkpoint_force_detached.puml)
 
 ### 10.1. Modo de escrita (`writeMode`, 8.13.0)
 
@@ -336,15 +400,43 @@ volume observa a camada física:
 
 | Evento (push) | Quando |
 |---|---|
-| `onShardGrow(shardId, oldCap, newCap)` | shard cresce em disco (`setLength`+map) |
+| `onShardGrow(shardId, oldCap, newCap, durationNanos)` | shard cresce em disco (`setLength`+map+superblock) |
 | `onRegionAllocate(shardId, regionBytes)` | nova região alocada (não no resize same-size) |
 | `onRegionFree(shardId, regionBytes)` | região liberada (delete ou realocação) |
 | `onCheckpoint(durationMs, entryCount)` | snapshot do catálogo concluído |
 
+`onShardGrow` tem duas formas. A de **4 argumentos** (8.15.0) traz `durationNanos`: o tempo de
+`setLength`+`force`+map+superblock, medido **sob o `structuralLock`**, ou seja, o tempo em que toda
+criação no volume ficou bloqueada (mínimo 1 ns). O volume emite sempre a forma de 4; a implementação
+padrão dela delega à de 3 argumentos, então listeners escritos para a 8.14 continuam funcionando
+sem alteração. `BlobVolumeMetrics` acumula `shardGrows`, o total, o máximo e o último tempo.
+
 Gauges são lidos por **pull** via `BlobVolume.stats()` → `BlobVolumeStats`
 (`fillRatioPerShard`, `seriesPerShard`, `shardUsedBytes` — **uso líquido**, recua no
 free —, `catalogImageBytes`, `walBytes`, `writeMode` e `bytesWritten` — ver §10.1), desacoplando a coleta da frequência de
-checkpoint.
+checkpoint. A 8.15.0 acrescenta:
+
+| Campo | Significado |
+|---|---|
+| `declaredCapacityBytes` | capacidade lógica declarada do volume (`capacityBytes`); `0` = não declarada ou desconhecida |
+| `liveBytes` | soma dos bytes de região das séries vivas no catálogo |
+| `reservedBytes` | bytes de crescimento reservados pela admissão e ainda em aberto |
+| `fillOfDeclaredCapacity()` | `(liveBytes + reservedBytes) / declaredCapacityBytes`; `0.0` se não há capacidade declarada |
+
+`fillOfDeclaredCapacity()` é a **mesma conta da recusa de admissão**, então o alerta e a recusa
+falam a mesma língua. O valor **pode passar de 1,0**: a capacidade declarada não limita o que já está
+gravado (ex.: o `capacityBytes` do nó foi reduzido com os dados no volume). Nesse estado a admissão
+recusa novas reservas, mas nada é apagado.
+
+**Limiares (80 / 90 / 95 %).** O storage node do cluster classifica `fillOfDeclaredCapacity` em faixas
+`NORMAL` → `WARN` (≥ 0,80) → `CRITICAL` (≥ 0,90) → `REFUSING` (≥ 0,95, onde a admissão passa a recusar
+criações). Os limiares **não são configuráveis** e só alimentam o marcador de log `NGRRD_VOLUME_FILL`
+(ver `ngrrd-cluster-operacao.md`); nenhuma decisão de placement muda por causa deles.
+
+**`maxFillRatio` não serve para alerta.** O `maxFillRatio` do `BlobVolumeSummary` (e o
+`fillRatioPerShard`) é `usado / tamanho atual do arquivo` do shard: como o shard cresce em passos de
+`segmentBytes`, o valor anda em **dente de serra** (cai a cada crescimento) e não diz o quanto falta
+até a capacidade declarada. Alerte sobre `fillOfDeclaredCapacity`.
 
 **Contrato de thread-safety.** `onShardGrow`/`onRegionAllocate`/`onRegionFree` são
 emitidos **sob o `structuralLock`** do volume; as implementações **devem** ser

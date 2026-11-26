@@ -52,6 +52,7 @@ import java.util.Optional;
 import dev.nishisan.utils.oss.cluster.rpc.ClusterRpc;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -104,6 +105,20 @@ class PlacementResolverTest {
         assertEquals(fresh, resolver.placementCached("s").orElseThrow());
         resolver.noteDeleted("s", old.generationId());
         assertEquals(fresh, resolver.placementCached("s").orElseThrow());
+    }
+
+    @Test
+    void geracaoApagadaSaiDaMascaraQuandoReplicaMostraRemocao() {
+        var old = SeriesPlacement.active("storage-a", 1_000L);
+        catalog.putPlacement("s", old);
+        resolver.noteDeleted("s", old.generationId());
+        assertTrue(resolver.placementCached("s").isEmpty(), "a réplica atrasada ainda é mascarada");
+        assertTrue(resolver.masksDeletedGeneration("s"));
+
+        catalog.removePlacement("s");
+
+        assertTrue(resolver.placementCached("s").isEmpty());
+        assertFalse(resolver.masksDeletedGeneration("s"), "a réplica já mostra a remoção: a máscara sai");
     }
 
     @Test

@@ -1,0 +1,54 @@
+@startuml checkpoint_force_detached
+title ngrrd — Checkpoint com force destacado (fase A no writer, fase B no pool, 8.15.0)
+
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+
+participant "Chamador\n(local, CHECKPOINT remoto, migração)" as caller
+participant "NgrrdWriter\n(worker da série, FIFO)" as writer
+participant "SeriesChannel\n(BlobSeriesChannel)" as channel
+participant "Pool de force\nngrrd-checkpoint-force-N\n(ngrrd.checkpoint.threads)" as pool
+
+== Sync com amostra nova ==
+caller -> writer : checkpointAsyncTimed()\n(enfileira Command.Sync)
+writer -> writer : fase A: materializa o CDP parcial\ne o estado vivo na região
+writer -> channel : prepareForce()
+channel --> writer : ForceTicket destacado\n(captura a faixa e limpa a marca de sujo)
+writer -> writer : changedSinceForce = false\ninFlightForce = force (em voo)
+writer -> pool : execute(fase B)
+note right of writer
+  A worker volta a processar a fila da série
+  (escritas, leituras) sem esperar o fsync.
+end note
+
+pool -> channel : ticket.run()\nmsync/fdatasync da faixa
+alt force ok
+  channel --> pool : ok
+  pool --> caller : conclui a future do Sync\n(CheckpointTiming: queueWait, force)
+else falha do force
+  channel -> channel : remarca o canal como sujo
+  pool --> caller : future do Sync falha
+end
+pool -> writer : enfileira Command.ForceDone(force)
+writer -> writer : onForceDone:\nlimpa inFlightForce\n(com falha: changedSinceForce = true)
+
+== Sync coalescido enquanto há force em voo ==
+caller -> writer : checkpointAsyncTimed()\n(sem amostra nova)
+writer -> writer : onCheckpointCoalesced
+writer -> writer : encadeia a future no force em voo\n(o ACK não antecede o force que cobre os mesmos bytes)
+pool --> caller : conclui o Sync coalescido quando o force termina
+
+== Fechamento com force preso ==
+caller -> writer : close()
+writer -> writer : Shutdown espera os forces em voo\naté 20 s (SHUTDOWN_FORCE_WAIT_SECONDS < STOP_TIMEOUT 30 s)
+alt force termina no prazo
+  writer -> writer : checkpoint final + fecha o canal
+else prazo estourado
+  writer -> writer : SEVERE; falha os Syncs encadeados;\nencerra sem checkpoint final
+  writer --> caller : WriterAbandonedException\n(em toda chamada de close(), mesmo depois de o force terminar)
+  note right of writer
+    closeForDeletion() lança enquanto o force
+    estiver em voo e converge quando ele termina.
+  end note
+end
+@enduml

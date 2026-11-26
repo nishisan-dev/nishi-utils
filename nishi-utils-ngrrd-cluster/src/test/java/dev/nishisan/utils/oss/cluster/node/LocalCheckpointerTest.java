@@ -52,6 +52,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -62,7 +63,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * Cobre o {@link LocalCheckpointer} sobre um {@link SeriesHandleRegistry} real (blob volume em
  * {@code @TempDir}): só séries sujas, série ocupada pulada e retomada, TTL de ociosidade intacto, teto de
  * checkpoints em voo, falha contada e retentada, encerramento e métricas. Os ciclos são disparados direto
- * por {@link LocalCheckpointer#runCycle()}, com intervalo curto para a cadência não atrasar o teste.
+ * por {@link LocalCheckpointer#runCycle()}, com intervalo curto para a cadência não atrasar o teste. Como no
+ * nó, o registro mantém o índice incremental de sujas: {@code dirtySeries} é limite superior atrasado em um
+ * ciclo, e {@code lastCycleSeries} conta candidatas.
  */
 @Timeout(value = 60, unit = TimeUnit.SECONDS)
 class LocalCheckpointerTest {
@@ -84,6 +87,8 @@ class LocalCheckpointerTest {
         volume = volumeRegistry.require(VOLUME_NAME);
         clock = new MutableClock(Instant.parse("2026-01-01T00:00:00Z"));
         registry = new SeriesHandleRegistry(volume, VOLUME_NAME, Duration.ofMinutes(10), 10_000, clock);
+        // Como no nó: com o checkpoint local ligado, o registro mantém o índice incremental de sujas.
+        registry.trackDirtyIndex(true);
     }
 
     @AfterEach
@@ -112,12 +117,20 @@ class LocalCheckpointerTest {
             assertEquals(1L, metrics.get("localCheckpoint.enabled"));
             assertEquals(1L, metrics.get("localCheckpoint.cycles"));
             assertEquals(1L, metrics.get("localCheckpoint.lastCycleSeries"));
+            assertEquals(1L, metrics.get("localCheckpoint.lastCycleStarted"));
             assertEquals(1L, metrics.get("localCheckpoint.checkpointed"));
-            assertEquals(0L, metrics.get("localCheckpoint.dirtySeries"));
+            assertEquals(1L, metrics.get("localCheckpoint.dirtySeries"),
+                    "limite superior atrasado em um ciclo: a série checkpointada só sai na próxima poda");
             assertEquals(0L, metrics.get("localCheckpoint.failures"));
 
             checkpointer.runCycle();
-            assertEquals(1, dirtySyncs.get(), "sem escrita nova a série não entra no ciclo seguinte");
+            assertEquals(1, dirtySyncs.get(), "sem escrita nova a série não gera checkpoint no ciclo seguinte");
+            Map<String, Long> second = checkpointer.metrics();
+            assertEquals(1L, second.get("localCheckpoint.lastCycleSeries"), "candidata limpa ainda no índice");
+            assertEquals(0L, second.get("localCheckpoint.lastCycleStarted"));
+            assertEquals(0L, second.get("localCheckpoint.dirtySeries"), "o ciclo a encontrou limpa e a podou");
+
+            checkpointer.runCycle();
             assertEquals(0L, checkpointer.metrics().get("localCheckpoint.lastCycleSeries"));
         }
     }
@@ -171,17 +184,17 @@ class LocalCheckpointerTest {
     @Test
     void maxInFlightLimitaOsCheckpointsEmVoo() throws Exception {
         List<String> keys = List.of("s0", "s1", "s2", "s3", "s4");
-        CompletableFuture<Void> gate = new CompletableFuture<>();
+        CompletableFuture<NgrrdHandle.CheckpointTiming> gate = new CompletableFuture<>();
         AtomicInteger calls = new AtomicInteger();
         for (String key : keys) {
             open(key);
             write(key, T0);
             wrapHandle(key, original -> delegating(original, method -> {
-                if (!method.equals("checkpointAsync")) {
+                if (!method.equals("checkpointAsyncTimed")) {
                     return null;
                 }
                 calls.incrementAndGet();
-                return original.checkpointAsync().thenCompose(ignored -> gate);
+                return original.checkpointAsyncTimed().thenCompose(ignored -> gate);
             }));
         }
         LocalCheckpointSettings two = new LocalCheckpointSettings(true, Duration.ofMillis(100), 2);
@@ -202,7 +215,10 @@ class LocalCheckpointerTest {
             awaitTrue(() -> checkpointer.inFlightCount() == 0);
             assertEquals(5, calls.get());
             assertEquals(5L, checkpointer.metrics().get("localCheckpoint.checkpointed"));
-            assertTrue(registry.dirtySeries().isEmpty());
+            assertTrue(keys.stream().noneMatch(registry::isDirty));
+            checkpointer.runCycle();
+            assertEquals(5, calls.get(), "candidatas limpas não geram checkpoint");
+            assertTrue(registry.dirtySeries().isEmpty(), "o ciclo seguinte poda as limpas do índice");
         } finally {
             gate.complete(null);
             executor.shutdownNow();
@@ -215,7 +231,7 @@ class LocalCheckpointerTest {
         write("flaky", T0);
         AtomicBoolean failNext = new AtomicBoolean(true);
         wrapHandle("flaky", original -> delegating(original, method -> {
-            if (method.equals("checkpointAsync") && failNext.getAndSet(false)) {
+            if (method.equals("checkpointAsyncTimed") && failNext.getAndSet(false)) {
                 return CompletableFuture.failedFuture(new IllegalStateException("fsync simulado falhou"));
             }
             return null;
@@ -259,7 +275,8 @@ class LocalCheckpointerTest {
                 new LocalCheckpointSettings(true, Duration.ofMillis(50), 2));
         checkpointer.start();
         awaitTrue(() -> checkpointer.metrics().get("localCheckpoint.cycles") >= 2);
-        assertFalse(registry.isDirty("scheduled"));
+        // O ciclo termina ao enfileirar o checkpoint; a série só fica limpa quando ele conclui (assíncrono).
+        awaitTrue(() -> !registry.isDirty("scheduled"));
         assertTrue(threadAlive("ngrrd-local-checkpoint"));
 
         checkpointer.close();
@@ -274,15 +291,26 @@ class LocalCheckpointerTest {
     void desligadoNaoCriaOComponenteEAsMetricasSaemZeradas() {
         assertThrows(IllegalArgumentException.class,
                 () -> new LocalCheckpointer(registry, LocalCheckpointSettings.disabled()));
-        open("pending");
-        write("pending", T0);
-        Map<String, Long> metrics = LocalCheckpointer.disabledMetrics(registry);
-        assertEquals(0L, metrics.get("localCheckpoint.enabled"));
-        assertEquals(1L, metrics.get("localCheckpoint.dirtySeries"));
-        assertEquals(List.of("localCheckpoint.enabled", "localCheckpoint.dirtySeries", "localCheckpoint.cycles",
-                "localCheckpoint.lastCycleMs", "localCheckpoint.lastCycleSeries", "localCheckpoint.checkpointed",
-                "localCheckpoint.skippedBusy", "localCheckpoint.failures", "localCheckpoint.overruns"),
-                List.copyOf(metrics.keySet()));
+        // Como no nó com o checkpoint local desligado: registro sem índice de sujas.
+        try (SeriesHandleRegistry untracked = new SeriesHandleRegistry(volume, VOLUME_NAME, Duration.ofMinutes(10),
+                10_000, clock)) {
+            untracked.open("pending", yaml, Ngrrd.OpenOptions.defaults());
+            assertTrue(untracked.withSeries("pending", access -> {
+                access.handle().write("in_octets", new Sample(T0, 1_000d));
+                access.recordWrite();
+                return true;
+            }).orElse(false));
+            Map<String, Long> metrics = LocalCheckpointer.disabledMetrics(untracked);
+            assertEquals(0L, metrics.get("localCheckpoint.enabled"));
+            assertEquals(1L, metrics.get("localCheckpoint.dirtySeries"));
+            assertEquals(0L, metrics.get("localCheckpoint.lastCycleStarted"));
+            assertEquals(List.of("localCheckpoint.enabled", "localCheckpoint.dirtySeries", "localCheckpoint.cycles",
+                    "localCheckpoint.lastCycleMs", "localCheckpoint.lastCycleSeries", "localCheckpoint.checkpointed",
+                    "localCheckpoint.skippedBusy", "localCheckpoint.failures", "localCheckpoint.overruns",
+                    "localCheckpoint.queueWaitMsP99", "localCheckpoint.queueWaitMsMax", "localCheckpoint.forceMsP99",
+                    "localCheckpoint.forceMsMax", "localCheckpoint.coalesced", "localCheckpoint.lastCycleStarted"),
+                    List.copyOf(metrics.keySet()));
+        }
     }
 
     @Test
@@ -324,10 +352,91 @@ class LocalCheckpointerTest {
             cycle.get(1, TimeUnit.SECONDS);
             long elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
             assertTrue(elapsedMs < 1_000, "close() levou " + elapsedMs + " ms");
-            assertEquals(2, registry.dirtyCount(), "o restante do ciclo é abandonado no close");
+            assertEquals(2L, Stream.of("c0", "c1", "c2").filter(registry::isDirty).count(),
+                    "o restante do ciclo é abandonado no close");
         } finally {
             checkpointer.close();
             executor.shutdownNow();
+        }
+    }
+
+    @Test
+    void spreadFractionConfiguravelDefineAduracaoDaCadenciaDoCiclo() throws Exception {
+        List<String> keys = List.of("p0", "p1", "p2");
+        for (String key : keys) {
+            open(key);
+            write(key, T0);
+        }
+        // Intervalo de 3 s e fração 1,0: o disparo i de 3 sai em i × 1 s, então o ciclo dura ~2 s.
+        try (LocalCheckpointer wide = new LocalCheckpointer(registry,
+                new LocalCheckpointSettings(true, Duration.ofSeconds(3), 3, 0, 1.0))) {
+            wide.runCycle();
+            awaitTrue(() -> wide.inFlightCount() == 0);
+            assertTrue(wide.metrics().get("localCheckpoint.lastCycleMs") >= 1_900L,
+                    "fração 1,0 espalha pelo intervalo inteiro: " + wide.metrics());
+        }
+        for (String key : keys) {
+            write(key, T0 + 300_000L);
+        }
+        // Mesma entrada com fração 0,1: os disparos se espalham por 300 ms, e o ciclo dura ~200 ms.
+        try (LocalCheckpointer narrow = new LocalCheckpointer(registry,
+                new LocalCheckpointSettings(true, Duration.ofSeconds(3), 3, 0, 0.1))) {
+            narrow.runCycle();
+            awaitTrue(() -> narrow.inFlightCount() == 0);
+            long elapsed = narrow.metrics().get("localCheckpoint.lastCycleMs");
+            assertTrue(elapsed < 1_000L, "fração 0,1 espalha por ~300 ms: " + elapsed + " ms");
+            assertEquals(3L, narrow.metrics().get("localCheckpoint.checkpointed"));
+        }
+    }
+
+    @Test
+    void metricasDeFilaEForceContamSoOsCheckpointsLocaisQueForcaram() throws Exception {
+        for (String key : List.of("forced-a", "forced-b", "coalesced", "unmeasured", "failing")) {
+            open(key);
+            write(key, T0);
+        }
+        stubTiming("forced-a", CompletableFuture.completedFuture(
+                new NgrrdHandle.CheckpointTiming(TimeUnit.MILLISECONDS.toNanos(5), TimeUnit.MILLISECONDS.toNanos(12),
+                        false)));
+        stubTiming("forced-b", CompletableFuture.completedFuture(
+                new NgrrdHandle.CheckpointTiming(TimeUnit.MILLISECONDS.toNanos(40), TimeUnit.MILLISECONDS.toNanos(7),
+                        false)));
+        stubTiming("coalesced", CompletableFuture.completedFuture(
+                new NgrrdHandle.CheckpointTiming(TimeUnit.MILLISECONDS.toNanos(3), 0L, true)));
+        stubTiming("unmeasured", CompletableFuture.completedFuture(NgrrdHandle.CheckpointTiming.NONE));
+        stubTiming("failing", CompletableFuture.failedFuture(new IllegalStateException("force falhou")));
+
+        try (LocalCheckpointer checkpointer = new LocalCheckpointer(registry, FAST)) {
+            Map<String, Long> before = checkpointer.metrics();
+            assertEquals(0L, before.get("localCheckpoint.queueWaitMsMax"));
+            assertEquals(0L, before.get("localCheckpoint.coalesced"));
+
+            checkpointer.runCycle();
+            awaitTrue(() -> checkpointer.inFlightCount() == 0);
+
+            Map<String, Long> metrics = checkpointer.metrics();
+            assertEquals(4L, metrics.get("localCheckpoint.checkpointed"));
+            assertEquals(1L, metrics.get("localCheckpoint.failures"));
+            assertEquals(1L, metrics.get("localCheckpoint.coalesced"),
+                    "só o coalescido medido conta; NONE (sem medida) não conta em nada");
+            assertEquals(40L, metrics.get("localCheckpoint.queueWaitMsP99"));
+            assertEquals(40L, metrics.get("localCheckpoint.queueWaitMsMax"));
+            assertEquals(12L, metrics.get("localCheckpoint.forceMsP99"));
+            assertEquals(12L, metrics.get("localCheckpoint.forceMsMax"));
+        }
+    }
+
+    @Test
+    void checkpointLocalRealMedeFilaEForceSemExecutor() throws Exception {
+        open("real");
+        write("real", T0);
+        try (LocalCheckpointer checkpointer = new LocalCheckpointer(registry, FAST)) {
+            checkpointer.runCycle();
+            awaitTrue(() -> checkpointer.inFlightCount() == 0);
+            Map<String, Long> metrics = checkpointer.metrics();
+            assertEquals(1L, metrics.get("localCheckpoint.checkpointed"));
+            assertEquals(0L, metrics.get("localCheckpoint.coalesced"), "série suja força: não é coalescida");
+            assertTrue(metrics.get("localCheckpoint.forceMsMax") >= 0L);
         }
     }
 
@@ -354,7 +463,7 @@ class LocalCheckpointerTest {
         open("rejecting");
         write("rejecting", T0);
         wrapHandle("rejecting", original -> delegating(original, method -> {
-            if (method.equals("checkpointAsync")) {
+            if (method.equals("checkpointAsyncTimed")) {
                 throw new IllegalStateException("pool de writers recusou a tarefa");
             }
             return null;
@@ -374,7 +483,7 @@ class LocalCheckpointerTest {
         write("sync-fail", T0);
         AtomicBoolean failCheckpoint = new AtomicBoolean(true);
         wrapHandle("sync-fail", original -> delegating(original, method -> {
-            if (method.equals("checkpoint") && failCheckpoint.get()) {
+            if (method.equals("checkpointAsync") && failCheckpoint.get()) {
                 throw new IllegalStateException("fsync simulado falhou");
             }
             return null;
@@ -395,10 +504,10 @@ class LocalCheckpointerTest {
         AtomicInteger asyncCalls = new AtomicInteger();
         AtomicBoolean failSyncCheckpoint = new AtomicBoolean(true);
         wrapHandle("frozen-open", original -> delegating(original, method -> {
-            if (method.equals("checkpointAsync")) {
+            if (method.equals("checkpointAsyncTimed")) {
                 asyncCalls.incrementAndGet();
             }
-            if (method.equals("checkpoint") && failSyncCheckpoint.getAndSet(false)) {
+            if (method.equals("checkpointAsync") && failSyncCheckpoint.getAndSet(false)) {
                 throw new IllegalStateException("checkpoint do cutover falhou");
             }
             return null;
@@ -436,12 +545,16 @@ class LocalCheckpointerTest {
     private AtomicInteger countCheckpoints(String key) {
         AtomicInteger counter = new AtomicInteger();
         wrapHandle(key, original -> delegating(original, method -> {
-            if (method.equals("checkpointAsync")) {
+            if (method.equals("checkpointAsyncTimed")) {
                 counter.incrementAndGet();
             }
             return null;
         }));
         return counter;
+    }
+
+    private void stubTiming(String key, CompletableFuture<NgrrdHandle.CheckpointTiming> timing) {
+        wrapHandle(key, original -> delegating(original, method -> method.equals("checkpointAsyncTimed") ? timing : null));
     }
 
     private void wrapHandle(String key, java.util.function.UnaryOperator<NgrrdHandle> wrapper) {

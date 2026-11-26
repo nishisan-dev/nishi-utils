@@ -48,9 +48,11 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
+import java.util.function.Function;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -90,6 +92,53 @@ class SeriesHandleCacheTest {
                 : new SeriesStatusResponse(SeriesStatus.OK, OWNER.value(), null, Boolean.TRUE));
         dispatcher = new RecordingWriteBuffer();
         opened = new AtomicInteger();
+    }
+
+    @Test
+    void lockDeAberturaExcluiUmTerceiroQueChegaDepoisDaTroca() throws Exception {
+        var firstInside = new CountDownLatch(1);
+        var firstRelease = new CountDownLatch(1);
+        var secondInside = new CountDownLatch(1);
+        var secondRelease = new CountDownLatch(1);
+        var thirdInside = new CountDownLatch(1);
+        AtomicInteger inside = new AtomicInteger();
+        AtomicInteger maxInside = new AtomicInteger();
+        Function<Runnable, Object> critical = body -> {
+            maxInside.accumulateAndGet(inside.incrementAndGet(), Math::max);
+            try {
+                body.run();
+            } finally {
+                inside.decrementAndGet();
+            }
+            return null;
+        };
+        Thread first = Thread.ofPlatform().start(() -> cache.withOpenLock("k", () -> critical.apply(() -> {
+            firstInside.countDown();
+            awaitQuietly(firstRelease);
+        })));
+        assertTrue(firstInside.await(5, TimeUnit.SECONDS));
+        Thread second = Thread.ofPlatform().start(() -> cache.withOpenLock("k", () -> critical.apply(() -> {
+            secondInside.countDown();
+            awaitQuietly(secondRelease);
+        })));
+        Await.untilTrue("segundo esperando o lock", Duration.ofSeconds(5),
+                () -> second.getState() == Thread.State.WAITING);
+
+        // O primeiro sai: o segundo entra com o lock que já tinha; o terceiro chega depois e tem de esperar.
+        firstRelease.countDown();
+        assertTrue(secondInside.await(5, TimeUnit.SECONDS));
+        first.join(5_000L);
+        Thread third = Thread.ofPlatform().start(() -> cache.withOpenLock("k", () -> critical.apply(
+                thirdInside::countDown)));
+        boolean thirdEnteredEarly = thirdInside.await(300, TimeUnit.MILLISECONDS);
+        secondRelease.countDown();
+        assertTrue(thirdInside.await(5, TimeUnit.SECONDS));
+        second.join(5_000L);
+        third.join(5_000L);
+
+        assertFalse(thirdEnteredEarly, "o terceiro entrou com o segundo ainda na seção crítica");
+        assertEquals(1, maxInside.get());
+        assertEquals(0, cache.openLocks(), "o lock sai do mapa com o último usuário");
     }
 
     @Test

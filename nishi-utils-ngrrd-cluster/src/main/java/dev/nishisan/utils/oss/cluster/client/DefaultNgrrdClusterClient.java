@@ -39,12 +39,14 @@ import dev.nishisan.utils.oss.cluster.api.NgrrdClusterClient;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterConfig;
 import dev.nishisan.utils.oss.cluster.api.NgrrdClusterException;
 import dev.nishisan.utils.oss.cluster.api.RebalanceTrigger;
+import dev.nishisan.utils.oss.cluster.api.ReleaseOptions;
+import dev.nishisan.utils.oss.cluster.api.ReleaseResult;
 import dev.nishisan.utils.oss.cluster.api.SeriesInfo;
 import dev.nishisan.utils.oss.cluster.api.SeriesVerification;
 import dev.nishisan.utils.oss.cluster.api.WriteMark;
 import dev.nishisan.utils.oss.cluster.catalog.CatalogService;
-import dev.nishisan.utils.oss.cluster.catalog.GeometryDescriptor;
 import dev.nishisan.utils.oss.cluster.catalog.StorageNodeStatus;
+import dev.nishisan.utils.oss.cluster.client.DefinitionInterner.InternedDefinition;
 import dev.nishisan.utils.oss.cluster.metrics.LatencySnapshot;
 import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
 import dev.nishisan.utils.oss.cluster.protocol.AdminForgetResponse;
@@ -56,10 +58,6 @@ import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesStatus;
 import dev.nishisan.utils.oss.cluster.rpc.ClusterRpc;
 import dev.nishisan.utils.oss.cluster.rpc.TransportClusterRpc;
-import dev.nishisan.utils.oss.config.NgrrdYamlLoader;
-import dev.nishisan.utils.oss.definition.NgrrdDefinition;
-import dev.nishisan.utils.oss.format.DefinitionHash;
-import dev.nishisan.utils.oss.format.SeriesGeometry;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -78,6 +76,7 @@ import java.util.Collections;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import java.util.logging.Level;
@@ -119,13 +118,17 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
     private final SeriesHandleCache handles;
     /** Capacidades anunciadas pelos storages, conferidas antes de operações que dependem delas. */
     private final NodeCapabilities capabilities;
+    /** Definições YAML internadas por conteúdo: parse, hash e geometria uma vez por definição distinta. */
+    private final DefinitionInterner interner;
+    /** Implementação de {@link #release(Collection, ReleaseOptions)}, com o executor {@code ngrrd-release-}. */
+    private final SeriesReleaser releaser;
 
     private volatile boolean closed;
 
     private DefaultNgrrdClusterClient(NgrrdClusterConfig config, NGridNode node, Path dataDir,
             boolean temporaryDataDir, MetricsTrackingClusterRpc rpc, PlacementResolver resolver,
             SeriesExistence existence, SeriesVerifier verifier, WriteDispatcher dispatcher,
-            SeriesHandleCache handles, NodeCapabilities capabilities) {
+            SeriesHandleCache handles, NodeCapabilities capabilities, DefinitionInterner interner) {
         this.config = config;
         this.node = node;
         this.dataDir = dataDir;
@@ -138,6 +141,8 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
         this.dispatcher = dispatcher;
         this.handles = handles;
         this.capabilities = capabilities;
+        this.interner = interner;
+        this.releaser = new SeriesReleaser(handles, dispatcher, resolver, config.closeTimeout(), () -> closed);
         dispatcher.terminalListener((write, failure) -> {
             if (failure.code() == ErrorCode.SERIES_DELETED) resolver.noteDeleted(write.seriesKey(), write.generationId());
             handles.fail(write.seriesKey(), write.generationId(), failure);
@@ -228,7 +233,7 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
                     }, (seriesKey, newOwner) -> { }, Clock.systemUTC(), cfg.metricsListener(), metricsSupplier,
                     cfg.writeFailureReporting());
             DefaultNgrrdClusterClient client = new DefaultNgrrdClusterClient(cfg, node, dataDir, temporaryDataDir,
-                    rpc, resolver, existence, verifier, dispatcher, handles, capabilities);
+                    rpc, resolver, existence, verifier, dispatcher, handles, capabilities, new DefinitionInterner());
             clientRef.set(client);
             return client;
         } catch (RuntimeException e) {
@@ -324,8 +329,8 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
         ensureOpen();
         Objects.requireNonNull(yaml, "yaml");
         Objects.requireNonNull(tags, "tags");
-        String template = SeriesKeyTemplate.templateOf(yaml);
-        String seriesKey = SeriesKeyTemplate.resolve(template, tags);
+        InternedDefinition definition = interner.intern(yaml);
+        String seriesKey = SeriesKeyTemplate.resolve(definition.seriesKeyTemplate(), tags);
         Ngrrd.OpenOptions effective = options != null ? options : Ngrrd.OpenOptions.defaults();
         RemoteSeriesHandle cached = handles.get(seriesKey);
         if (cached != null && cached.isOpen()) {
@@ -336,7 +341,7 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
             }
         }
         return handles.open(seriesKey, effective.createIfMissing(),
-                () -> openNewHandle(seriesKey, yaml, tags, effective));
+                () -> openNewHandle(seriesKey, definition, tags, effective));
     }
 
     @Override
@@ -460,18 +465,15 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
         return verifier.verify(seriesKeys);
     }
 
-    private RemoteSeriesHandle openNewHandle(String seriesKey, String yaml, Map<String, String> tags,
-            Ngrrd.OpenOptions options) {
-        String definitionHashHex = DefinitionHash.hex(yaml);
+    private RemoteSeriesHandle openNewHandle(String seriesKey, InternedDefinition definition,
+            Map<String, String> tags, Ngrrd.OpenOptions options) {
         RetryPolicy opRetry = new RetryPolicy(config.retryTimeout(), config.retryBackoffMin(),
                 config.retryBackoffMax());
-        NgrrdDefinition definition = NgrrdYamlLoader.parse(yaml, System::getenv);
-        GeometryDescriptor geometry = GeometryDescriptor.from(new SeriesGeometry(definition));
         // Issue #167 (item 3): o metadata.name vai ao líder no PLACE para as regras de placement.
-        RemoteSeriesHandle handle = new RemoteSeriesHandle(seriesKey, yaml, definitionHashHex, tags, options,
-                resolver, rpc, dispatcher, opRetry, config.requestTimeout(), config.closeTimeout(),
-                Clock.systemUTC(), handles::remove, capabilities, () -> closed, geometry,
-                definition.metadata().name());
+        RemoteSeriesHandle handle = new RemoteSeriesHandle(seriesKey, definition.yaml(), definition.hashHex(), tags,
+                options, resolver, rpc, dispatcher, opRetry, config.requestTimeout(), config.closeTimeout(),
+                Clock.systemUTC(), handles::remove, capabilities, () -> closed, definition.geometry(),
+                definition.definitionName());
         handle.open();
         return handle;
     }
@@ -489,11 +491,17 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
     }
 
     @Override
+    public CompletableFuture<ReleaseResult> release(Collection<String> seriesKeys, ReleaseOptions options) {
+        return releaser.release(seriesKeys, options);
+    }
+
+    @Override
     public ClientMetricsSnapshot metrics() {
         return new ClientMetricsSnapshot(dispatcher.samplesEnqueued(), dispatcher.samplesSent(),
                 dispatcher.samplesFailed(), dispatcher.batchesSent(), dispatcher.retriesByStatus(),
                 dispatcher.bufferedSamples(), handles.size(), metricsRpc.latencySnapshot(), metricsRpc.placeCount(),
-                dispatcher.ownerLookups(), dispatcher.redirectCycles());
+                dispatcher.ownerLookups(), dispatcher.redirectCycles(), metricsRpc.latencySnapshotByCommand(),
+                dispatcher.routes(), dispatcher.routesRemoved(), interner.size());
     }
 
     @Override
@@ -678,6 +686,7 @@ public final class DefaultNgrrdClusterClient implements NgrrdClusterClient {
             return;
         }
         closed = true;
+        releaser.close();
         // B1 (achado do Refuter): UM ÚNICO deadline alimenta handles -> dispatcher -> node.close, não
         // um closeTimeout inteiro "renovado" para cada fase — do contrário N handles lentos, mais o
         // dispatcher, podiam multiplicar o tempo total de close() por várias vezes closeTimeout.

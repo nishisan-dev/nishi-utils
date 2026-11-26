@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executor;
 
 /**
  * Registro thread-safe de blob volumes abertos no processo. Cada volume é aberto
@@ -31,9 +32,22 @@ public final class BlobVolumeRegistry implements AutoCloseable {
      */
     public BlobVolume open(BlobVolumeConfig config, NgrrdMetricsListener qualityListener,
                            BlobVolumeMetricsListener volumeMetricsListener) {
+        return open(config, qualityListener, volumeMetricsListener, null);
+    }
+
+    /**
+     * Como {@link #open(BlobVolumeConfig, NgrrdMetricsListener, BlobVolumeMetricsListener)},
+     * associando também o executor da fase B (o force) dos checkpoints
+     * ({@link BlobVolume#checkpointForceExecutor()}); {@code null} = force inline. Como os
+     * listeners, o executor não faz parte da identidade do volume: num volume já
+     * aberto, o desta chamada é ignorado.
+     */
+    public BlobVolume open(BlobVolumeConfig config, NgrrdMetricsListener qualityListener,
+                           BlobVolumeMetricsListener volumeMetricsListener, Executor checkpointForceExecutor) {
         Objects.requireNonNull(config, "config é obrigatório");
         return volumes.computeIfAbsent(config.name(),
-                name -> DefaultBlobVolume.open(config, qualityListener, volumeMetricsListener));
+                name -> DefaultBlobVolume.open(config, qualityListener, volumeMetricsListener,
+                        checkpointForceExecutor));
     }
 
     /** Volume registrado pelo nome; lança se ausente. */
