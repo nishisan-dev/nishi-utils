@@ -812,6 +812,7 @@ public final class MigrationExecutor extends RequestHandlerSupport {
         // SeriesHandleRegistry#discard).
         try {
             registry.discard(request.seriesKey());
+            registry.noteMigratedIn(request.seriesKey());
             volume.storage().atomicReplaceReserved(request.storageKey(), bytes, request.migrationId());
             if (registry.lifecycle() != null) {
                 var placement = catalog.placementStrong(request.seriesKey()).orElseThrow();

@@ -682,7 +682,7 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
                 writeBatchLatency.record(System.nanoTime() - startNanos);
                 if (written.isEmpty()) {
                     statusBySeries.put(seriesKey, SeriesStatus.NOT_OPEN);
-                    recordError(SeriesStatus.NOT_OPEN);
+                    recordNotOpen(seriesKey);
                 } else {
                     samplesWrittenCount.add(written.get());
                     statusBySeries.put(seriesKey, SeriesStatus.OK);
@@ -735,7 +735,7 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
                     SeriesHandleRegistry.SeriesAccess::checkpointAsync);
             if (pending.isEmpty()) {
                 recordLatency(latency, startNanos);
-                recordError(SeriesStatus.NOT_OPEN);
+                recordNotOpen(seriesKey);
                 return new SeriesStatusResponse(SeriesStatus.NOT_OPEN, self.value(), null);
             }
             return new PendingCheckpoint(this, pending.get(), startNanos, latency, successes);
@@ -796,7 +796,7 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
                             : handle.read(request.dsName(), request.toViewQuery()));
             readLatency.record(System.nanoTime() - startNanos);
             if (result.isEmpty()) {
-                recordError(SeriesStatus.NOT_OPEN);
+                recordNotOpen(request.seriesKey());
                 return new ReadResponse(SeriesStatus.NOT_OPEN, self.value(), null, null);
             }
             return new ReadResponse(SeriesStatus.OK, self.value(), result.get(), null);
@@ -823,7 +823,7 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
                             : handle.read(request.presetName()));
             readLatency.record(System.nanoTime() - startNanos);
             if (results.isEmpty()) {
-                recordError(SeriesStatus.NOT_OPEN);
+                recordNotOpen(request.seriesKey());
                 return new ReadPresetResponse(SeriesStatus.NOT_OPEN, self.value(), null, null);
             }
             return new ReadPresetResponse(SeriesStatus.OK, self.value(), results.get(), null);
@@ -1230,6 +1230,12 @@ public final class StorageRequestHandler extends RequestHandlerSupport {
         if (ownershipGenerations.get(stripe) != generationBefore) {
             confirmedPlacements.remove(seriesKey, entry);
         }
+    }
+
+    /** Conta um {@code NOT_OPEN} no total por status e, por causa, em {@code notOpen.<causa>}. */
+    private void recordNotOpen(String seriesKey) {
+        registry.recordNotOpen(seriesKey);
+        recordError(SeriesStatus.NOT_OPEN);
     }
 
     private void recordError(SeriesStatus status) {

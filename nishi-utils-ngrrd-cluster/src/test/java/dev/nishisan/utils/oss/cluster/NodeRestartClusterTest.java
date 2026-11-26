@@ -40,6 +40,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -144,6 +145,13 @@ class NodeRestartClusterTest {
                     "escrita+checkpoint pós-restart para " + seriesKey + " levou " + elapsedMs
                             + " ms, esperava < " + RECOVERY_BUDGET.toMillis() + " ms");
         }
+
+        // F.3: o restart zera a definição em memória do nó; o NOT_OPEN da primeira operação é classificado como
+        // restart e nenhum cliente fez CLOSE, então clientClosed fica em 0. A soma das causas é o total.
+        Map<String, Long> lifecycle = harness.nodes().get(restartedIndex).metricsSnapshot().lifecycleMetrics();
+        assertTrue(lifecycle.getOrDefault("notOpen.restart", 0L) > 0L,
+                "esperava notOpen.restart > 0 depois do restart: " + lifecycle);
+        assertEquals(0L, lifecycle.getOrDefault("notOpen.clientClosed", 0L));
 
         client.close();
     }

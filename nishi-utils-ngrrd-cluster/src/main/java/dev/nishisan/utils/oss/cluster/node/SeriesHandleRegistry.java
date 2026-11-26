@@ -31,6 +31,8 @@ import java.time.Clock;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.EnumMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -123,6 +125,84 @@ public final class SeriesHandleRegistry implements Closeable {
 
     private static final Logger LOGGER = Logger.getLogger(SeriesHandleRegistry.class.getName());
 
+    /** Teto de chaves de cada LRU usado para classificar {@code NOT_OPEN} por causa. */
+    static final int NOT_OPEN_CAUSE_LRU_LIMIT = 65_536;
+
+    /**
+     * Causa de uma resposta {@code NOT_OPEN}. A classificação é aproximada: os conjuntos que a sustentam são LRUs
+     * limitados e, estourado o teto, uma chave antiga cai em {@link #RESTART}.
+     */
+    public enum NotOpenCause {
+        /** Definição desconhecida neste processo: reinício do nó ou série nunca aberta aqui. */
+        RESTART("notOpen.restart"),
+        /** A série foi fechada explicitamente por um cliente ({@code CLOSE}). */
+        CLIENT_CLOSED("notOpen.clientClosed"),
+        /** A série foi esquecida (origem) ou recebida por migração (destino) e ainda não foi reaberta. */
+        MIGRATED("notOpen.migrated"),
+        /** A definição é conhecida, mas a reabertura automática falhou. */
+        REOPEN_FAILED("notOpen.reopenFailed"),
+        /** A série está congelada por uma migração em curso. */
+        FROZEN("notOpen.frozen");
+
+        private final String metricKey;
+
+        NotOpenCause(String metricKey) {
+            this.metricKey = metricKey;
+        }
+
+        /** Chave em {@code lifecycleMetrics}. */
+        public String metricKey() {
+            return metricKey;
+        }
+    }
+
+    private static Map<NotOpenCause, AtomicLong> newNotOpenCounters() {
+        Map<NotOpenCause, AtomicLong> counters = new EnumMap<>(NotOpenCause.class);
+        for (NotOpenCause cause : NotOpenCause.values()) {
+            counters.put(cause, new AtomicLong());
+        }
+        return counters;
+    }
+
+    /** Conjunto de chaves com teto fixo e despejo LRU (ordem de acesso), sob lock próprio. */
+    static final class BoundedKeySet {
+        private final Object lock = new Object();
+        private final LinkedHashMap<String, Boolean> keys;
+
+        BoundedKeySet(int limit) {
+            this.keys = new LinkedHashMap<>(16, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, Boolean> eldest) {
+                    return size() > limit;
+                }
+            };
+        }
+
+        void add(String key) {
+            synchronized (lock) {
+                keys.put(key, Boolean.TRUE);
+            }
+        }
+
+        void remove(String key) {
+            synchronized (lock) {
+                keys.remove(key);
+            }
+        }
+
+        boolean contains(String key) {
+            synchronized (lock) {
+                return keys.get(key) != null;
+            }
+        }
+
+        int size() {
+            synchronized (lock) {
+                return keys.size();
+            }
+        }
+    }
+
     private final BlobVolume volume;
     private final String volumeName;
     private final Duration idleTtl;
@@ -133,6 +213,18 @@ public final class SeriesHandleRegistry implements Closeable {
      * desce em {@link #removeEntry}, ambos sob o lock da entrada: sem varredura.
      */
     private final AtomicLong idleTtlExtended = new AtomicLong();
+    /** Handles fechados por ociosidade ({@code handles.idleClosed}). */
+    private final AtomicLong idleClosed = new AtomicLong();
+    /** Handles despejados por {@code maxOpenHandles} ({@code handles.evicted}). */
+    private final AtomicLong evicted = new AtomicLong();
+    /** Reaberturas automáticas que de fato abriram o handle ({@code handles.selfHealed}). */
+    private final AtomicLong selfHealed = new AtomicLong();
+    /** Respostas {@code NOT_OPEN} por causa ({@code notOpen.*}); a soma é o total de {@code NOT_OPEN}. */
+    private final Map<NotOpenCause, AtomicLong> notOpenByCause = newNotOpenCounters();
+    /** Séries fechadas explicitamente por um cliente ({@link #close}); LRU limitado, classificação aproximada. */
+    private final BoundedKeySet recentlyClosedByClient = new BoundedKeySet(NOT_OPEN_CAUSE_LRU_LIMIT);
+    /** Séries cuja imagem acabou de ser recebida por migração neste nó; LRU limitado, classificação aproximada. */
+    private final BoundedKeySet recentlyMigratedIn = new BoundedKeySet(NOT_OPEN_CAUSE_LRU_LIMIT);
     /** Parses de {@code baseStepSec} feitos por este registro; um por hash de definição. */
     private final AtomicLong baseStepParses = new AtomicLong();
     private final int maxOpenHandles;
@@ -301,6 +393,8 @@ public final class SeriesHandleRegistry implements Closeable {
                 // StorageRequestHandler#ownership (isForgotten força placementStrong antes de chegar
                 // aqui) — é o único lugar que limpa a marca de esquecida.
                 forgotten.remove(seriesKey);
+                recentlyClosedByClient.remove(seriesKey);
+                recentlyMigratedIn.remove(seriesKey);
                 entry.touch(clock.millis());
                 handle = entry.handle;
                 break;
@@ -603,6 +697,7 @@ public final class SeriesHandleRegistry implements Closeable {
                         entry.handle = Ngrrd.open(volume, NgrrdUri.of(volumeName, seriesKey),
                                 definition.yaml(), definition.options().withCreateIfMissing(false));
                         applyIdleTtl(entry, definition);
+                        selfHealed.incrementAndGet();
                     } catch (SeriesNotFoundException e) {
                         // Reabertura automática nunca cria: o objeto sumiu entre o fechamento por
                         // ociosidade/LRU e esta tentativa de auto-cura — devolve vazio (o chamador decide
@@ -635,7 +730,47 @@ public final class SeriesHandleRegistry implements Closeable {
         Objects.requireNonNull(seriesKey, "seriesKey");
         // Primeiro a definição, depois a entrada: ver a reconferência sob o lock em reopenIfKnown.
         hashBySeriesKey.remove(seriesKey);
+        recentlyClosedByClient.add(seriesKey);
         discard(seriesKey);
+    }
+
+    /**
+     * Registra que a imagem da série acabou de ser recebida por migração neste nó (destino, no
+     * {@code MIGRATE_COMMIT}): enquanto ninguém a reabrir, um {@code NOT_OPEN} é classificado como
+     * {@link NotOpenCause#MIGRATED}. LRU limitado; {@link #open} remove a chave.
+     */
+    public void noteMigratedIn(String seriesKey) {
+        Objects.requireNonNull(seriesKey, "seriesKey");
+        recentlyMigratedIn.add(seriesKey);
+    }
+
+    /**
+     * Classifica por que a série responde {@code NOT_OPEN} agora. Ordem: congelada, esquecida/migrada, fechada por
+     * cliente, definição conhecida (reabertura falhou), senão {@link NotOpenCause#RESTART}. Aproximada: os LRUs
+     * têm teto de {@value #NOT_OPEN_CAUSE_LRU_LIMIT} chaves e, estourado, a causa cai em {@code RESTART}.
+     */
+    public NotOpenCause notOpenCause(String seriesKey) {
+        Objects.requireNonNull(seriesKey, "seriesKey");
+        if (isMigrationFrozen(seriesKey)) {
+            return NotOpenCause.FROZEN;
+        }
+        if (forgotten.contains(seriesKey) || recentlyMigratedIn.contains(seriesKey)) {
+            return NotOpenCause.MIGRATED;
+        }
+        if (recentlyClosedByClient.contains(seriesKey)) {
+            return NotOpenCause.CLIENT_CLOSED;
+        }
+        if (hashBySeriesKey.containsKey(seriesKey)) {
+            return NotOpenCause.REOPEN_FAILED;
+        }
+        return NotOpenCause.RESTART;
+    }
+
+    /** Classifica a causa do {@code NOT_OPEN} e a conta em {@code notOpen.<causa>}. */
+    public NotOpenCause recordNotOpen(String seriesKey) {
+        NotOpenCause cause = notOpenCause(seriesKey);
+        notOpenByCause.get(cause).incrementAndGet();
+        return cause;
     }
 
     /**
@@ -798,6 +933,7 @@ public final class SeriesHandleRegistry implements Closeable {
                 }
                 closeQuietly(seriesKey, entry);
                 removeEntry(seriesKey, entry);
+                idleClosed.incrementAndGet();
                 closedCount++;
             } finally {
                 entry.lock.unlock();
@@ -831,6 +967,7 @@ public final class SeriesHandleRegistry implements Closeable {
                     }
                     closeQuietly(seriesKey, entry);
                     removeEntry(seriesKey, entry);
+                    evicted.incrementAndGet();
                     evictedOne = true;
                 } finally {
                     entry.lock.unlock();
@@ -1057,10 +1194,25 @@ public final class SeriesHandleRegistry implements Closeable {
 
     /**
      * Métricas de ciclo de vida dos handles, para {@code NodeMetricsSnapshot.lifecycleMetrics}:
-     * {@code handles.idleTtlExtended} = entradas abertas cujo TTL efetivo é maior que o global.
+     * {@code handles.idleTtlExtended} = entradas abertas cujo TTL efetivo é maior que o global;
+     * {@code handles.idleClosed}, {@code handles.evicted} e {@code handles.selfHealed} = churn de fechar e reabrir;
+     * {@code notOpen.<causa>} = respostas {@code NOT_OPEN} por {@link NotOpenCause}.
      */
     public Map<String, Long> handleMetrics() {
-        return Map.of("handles.idleTtlExtended", idleTtlExtended.get());
+        Map<String, Long> metrics = new LinkedHashMap<>();
+        metrics.put("handles.idleTtlExtended", idleTtlExtended.get());
+        metrics.put("handles.idleClosed", idleClosed.get());
+        metrics.put("handles.evicted", evicted.get());
+        metrics.put("handles.selfHealed", selfHealed.get());
+        for (NotOpenCause cause : NotOpenCause.values()) {
+            metrics.put(cause.metricKey(), notOpenByCause.get(cause).get());
+        }
+        return metrics;
+    }
+
+    /** Tamanho atual dos LRUs de causa (fechadas por cliente, recebidas por migração); para testes. */
+    int[] notOpenCauseSetSizes() {
+        return new int[] {recentlyClosedByClient.size(), recentlyMigratedIn.size()};
     }
 
     /**
