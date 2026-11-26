@@ -1064,7 +1064,7 @@ public final class SeriesHandleRegistry implements Closeable {
                 } catch (RuntimeException e) {
                     // Falha de UMA série não aborta a varredura: a entrada fica e só volta a ser tentada depois do
                     // backoff.
-                    entry.closeRetryNotBeforeMs = now + CLOSE_RETRY_BACKOFF_MS;
+                    entry.closeRetryNotBeforeMs = clock.millis() + CLOSE_RETRY_BACKOFF_MS;
                     continue;
                 }
                 removeEntry(seriesKey, entry);
@@ -1074,6 +1074,7 @@ public final class SeriesHandleRegistry implements Closeable {
             // Só chega aqui quem fechou e removeu a entrada (os demais saem por continue).
             pruneIndex(seriesKey);
         }
+        flushSuppressedCloseFailures();
         return closedCount;
     }
 
@@ -1113,7 +1114,7 @@ public final class SeriesHandleRegistry implements Closeable {
                         }
                     } catch (RuntimeException e) {
                         // Esta roda dentro do open de OUTRA série: a falha desta não pode se propagar a ele.
-                        entry.closeRetryNotBeforeMs = now + CLOSE_RETRY_BACKOFF_MS;
+                        entry.closeRetryNotBeforeMs = clock.millis() + CLOSE_RETRY_BACKOFF_MS;
                         failed.add(entry);
                         continue;
                     }
@@ -1173,8 +1174,8 @@ public final class SeriesHandleRegistry implements Closeable {
         CheckpointWaitTimeoutException timedOut = null;
         entry.lock.lock();
         try {
-            // An acknowledged write must reach the image before migration closes its writer.
-            // A failed checkpoint leaves the handle available for a safe abort/retry.
+            // Uma escrita confirmada precisa chegar à imagem antes de a migração fechar o writer.
+            // Um checkpoint que falha deixa o handle disponível para abortar ou tentar de novo com segurança.
             if (entries.get(seriesKey) == entry && entry.handle != null) {
                 try {
                     awaitCheckpointLocked(seriesKey, entry);
@@ -1194,6 +1195,10 @@ public final class SeriesHandleRegistry implements Closeable {
         if (removed) {
             pruneIndex(seriesKey);
         }
+        if (abandoned != null && timedOut != null) {
+            // Estourou o teto do checkpoint e o close abandonou o writer: o abandono volta, sem perder o estouro.
+            abandoned.addSuppressed(timedOut);
+        }
         rethrowAbandoned(abandoned);
         if (timedOut != null) {
             throw timedOut;
@@ -1207,23 +1212,23 @@ public final class SeriesHandleRegistry implements Closeable {
         fireOwnershipChange(seriesKey);
     }
 
-    /** Marks an online copy; existing same-geometry handles remain writable until markMigrating. */
+    /** Marca uma cópia online; handles existentes de mesma geometria continuam graváveis até o {@link #markMigrating}. */
     public void beginMigrationCopy(String seriesKey) {
         migrating.add(seriesKey);
         copying.add(seriesKey);
         fireOwnershipChange(seriesKey);
     }
 
-    /** True only for the short cutover, not the initial online copy. */
+    /** Verdadeiro só durante a troca curta de dono, não na cópia online inicial. */
     public boolean isMigrationFrozen(String seriesKey) {
         return migrating.contains(seriesKey) && !copying.contains(seriesKey);
     }
 
-    /** Whether this source still accepts writes while copying an image. */
+    /** Indica se esta origem ainda aceita escritas enquanto copia uma imagem. */
     public boolean isCopying(String seriesKey) { return copying.contains(seriesKey); }
 
     /**
-     * Checkpoints and snapshots one series under its write lock, then immediately releases writers.
+     * Faz o checkpoint e o snapshot de uma série sob o lock de escrita da entrada e libera os writers em seguida.
      *
      * <p>A espera pelo checkpoint tem o teto {@link #CLOSE_CHECKPOINT_WAIT}: estourado, lança {@link
      * CheckpointWaitTimeoutException} (a migração aborta) e mantém o handle; quem fecha a série presa é o caminho de
@@ -1537,6 +1542,29 @@ public final class SeriesHandleRegistry implements Closeable {
         } else {
             LOGGER.log(Level.WARNING, message, failure);
         }
+    }
+
+    /**
+     * Emite o WARNING das falhas de fechamento ainda suprimidas quando a janela de log já venceu e nenhuma nova falha
+     * apareceu para carregar a contagem. Chamado no fim de cada {@link #closeIdle()}, para que a contagem das
+     * suprimidas não se perca quando as séries presas entram em backoff e a varredura seguinte passa sem falhar.
+     */
+    private void flushSuppressedCloseFailures() {
+        long now = clock.millis();
+        long suppressed;
+        long sinceLastMs;
+        synchronized (closeFailureLogLock) {
+            if (suppressedCloseFailures == 0 || lastCloseFailureLogMs < 0
+                    || now - lastCloseFailureLogMs < CLOSE_FAILURE_LOG_INTERVAL_MS) {
+                return;
+            }
+            suppressed = suppressedCloseFailures;
+            sinceLastMs = now - lastCloseFailureLogMs;
+            suppressedCloseFailures = 0;
+            lastCloseFailureLogMs = now;
+        }
+        LOGGER.log(Level.WARNING, suppressed + " falhas de fechamento suprimidas nos últimos "
+                + TimeUnit.MILLISECONDS.toSeconds(sinceLastMs) + " s");
     }
 
     /**

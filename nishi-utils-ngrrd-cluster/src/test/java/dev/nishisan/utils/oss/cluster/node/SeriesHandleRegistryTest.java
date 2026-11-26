@@ -1459,6 +1459,42 @@ class SeriesHandleRegistryTest {
     }
 
     @Test
+    void varreduraSemFalhaDepoisDaJanelaEmiteAsSuprimidasPendentes() {
+        List<java.util.logging.LogRecord> records = new CopyOnWriteArrayList<>();
+        java.util.logging.Handler capture = capturing(records);
+        java.util.logging.Logger logger = java.util.logging.Logger.getLogger(SeriesHandleRegistry.class.getName());
+        MutableClock clock = new MutableClock(Instant.ofEpochMilli(10_000_000L));
+        logger.addHandler(capture);
+        try (SeriesHandleRegistry registry = registry(Duration.ofMinutes(1), 10, clock)) {
+            for (String key : List.of("a-stuck", "b-stuck", "c-stuck")) {
+                entries(registry).put(key, newEntry(closeFailingHandle(SeriesHandleRegistryTest::plainFailure)));
+            }
+
+            registry.closeIdle();
+            assertEquals(1, warnings(records).size(), "uma série por janela em WARNING: " + warnings(records));
+
+            // Dentro da janela e em backoff: nada novo falha, nada novo é logado.
+            clock.advance(Duration.ofSeconds(5));
+            registry.closeIdle();
+            assertEquals(1, warnings(records).size(), "ainda dentro da janela: " + warnings(records));
+
+            // Janela vencida, séries ainda em backoff: a varredura sem falha emite a contagem pendente.
+            clock.advance(Duration.ofSeconds(6));
+            registry.closeIdle();
+
+            List<String> warnings = warnings(records);
+            assertEquals(2, warnings.size(), "as suprimidas pendentes saem num WARNING próprio: " + warnings);
+            assertTrue(warnings.get(1).startsWith("2 falhas de fechamento suprimidas nos últimos 11 s"), warnings::toString);
+
+            registry.closeIdle();
+            assertEquals(2, warnings(records).size(), "a contagem emitida não se repete");
+            entries(registry).clear();
+        } finally {
+            logger.removeHandler(capture);
+        }
+    }
+
+    @Test
     void falhaDeFechamentoNosCaminhosExplicitosSaiSempreEmWarning() {
         List<java.util.logging.LogRecord> records = new CopyOnWriteArrayList<>();
         java.util.logging.Handler capture = capturing(records);
@@ -1639,8 +1675,11 @@ class SeriesHandleRegistryTest {
             fixture.openStuck("stuck");
             fixture.registry.beginMigrationCopy("stuck");
 
-            assertThrows(WriterAbandonedException.class, () -> fixture.registry.markMigrating("stuck"),
-                    "a migração tem que abortar");
+            WriterAbandonedException thrown = assertThrows(WriterAbandonedException.class,
+                    () -> fixture.registry.markMigrating("stuck"), "a migração tem que abortar");
+            assertTrue(Arrays.stream(thrown.getSuppressed())
+                            .anyMatch(SeriesHandleRegistry.CheckpointWaitTimeoutException.class::isInstance),
+                    "o estouro do checkpoint não se perde: " + Arrays.toString(thrown.getSuppressed()));
 
             assertTrue(fixture.registry.isMigrating("stuck"));
             assertFalse(entries(fixture.registry).containsKey("stuck"));
@@ -1655,7 +1694,7 @@ class SeriesHandleRegistryTest {
             fixture.openStuck("stuck");
             fixture.registry.beginMigrationCopy("stuck");
 
-            assertThrows(IllegalStateException.class,
+            assertThrows(SeriesHandleRegistry.CheckpointWaitTimeoutException.class,
                     () -> fixture.registry.migrationSnapshot("stuck", () -> new byte[0]));
 
             assertTrue(entries(fixture.registry).containsKey("stuck"),
