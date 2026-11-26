@@ -43,6 +43,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -75,11 +76,19 @@ final class SeriesReleaser implements AutoCloseable {
     private final PlacementLookup resolver;
     private final Duration defaultTimeout;
     private final BooleanSupplier clientClosed;
+    private final Consumer<String> admissionProbe;
     private final ExecutorService executor = Executors.newThreadPerTaskExecutor(
             Thread.ofVirtual().name("ngrrd-release-", 0).factory());
 
     SeriesReleaser(SeriesHandleCache handles, WriteDispatcher dispatcher, PlacementLookup resolver,
             Duration defaultTimeout, BooleanSupplier clientClosed) {
+        this(handles, dispatcher, resolver, defaultTimeout, clientClosed, key -> { });
+    }
+
+    /** Como o construtor acima, com um gancho chamado antes da admissão de cada série (para testes). */
+    SeriesReleaser(SeriesHandleCache handles, WriteDispatcher dispatcher, PlacementLookup resolver,
+            Duration defaultTimeout, BooleanSupplier clientClosed, Consumer<String> admissionProbe) {
+        this.admissionProbe = Objects.requireNonNull(admissionProbe, "admissionProbe");
         this.handles = Objects.requireNonNull(handles, "handles");
         this.dispatcher = Objects.requireNonNull(dispatcher, "dispatcher");
         this.resolver = Objects.requireNonNull(resolver, "resolver");
@@ -131,24 +140,25 @@ final class SeriesReleaser implements AutoCloseable {
         long deadlineNanos = System.nanoTime() + timeout.toNanos();
         Map<String, SeriesRelease> results = new LinkedHashMap<>();
         Map<String, Held> held = new LinkedHashMap<>();
-        for (String key : keys) {
-            Held entry = handles.withOpenLock(key, () -> closeAdmission(key));
-            if (entry == null) {
-                results.put(key, NOT_HELD);
-            } else {
-                results.put(key, RELEASED);
-                held.put(key, entry);
-            }
-        }
-
-        List<ReleaseTicket> tickets = new ArrayList<>(held.size());
-        for (Held entry : held.values()) {
-            if (entry.ticket() != null) {
-                tickets.add(entry.ticket());
-            }
-        }
         Set<String> finished = new HashSet<>();
         try {
+            for (String key : keys) {
+                admissionProbe.accept(key);
+                Held entry = handles.withOpenLock(key, () -> closeAdmission(key));
+                if (entry == null) {
+                    results.put(key, NOT_HELD);
+                } else {
+                    results.put(key, RELEASED);
+                    held.put(key, entry);
+                }
+            }
+
+            List<ReleaseTicket> tickets = new ArrayList<>(held.size());
+            for (Held entry : held.values()) {
+                if (entry.ticket() != null) {
+                    tickets.add(entry.ticket());
+                }
+            }
             Map<String, ReleaseDrain> drained = dispatcher.drainForRelease(tickets, remaining(deadlineNanos));
             drained.forEach((key, drain) -> results.put(key, toRelease(drain)));
 

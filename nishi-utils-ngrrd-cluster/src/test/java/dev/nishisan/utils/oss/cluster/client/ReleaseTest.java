@@ -59,6 +59,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiFunction;
+import java.util.function.Consumer;
 import java.util.function.Function;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -302,6 +303,32 @@ class ReleaseTest {
         assertEquals(0L, dispatcher.mark().completion().get(10, TimeUnit.SECONDS).samplesFailed(),
                 "a falha entregue aos releases não vai para a marca seguinte");
         assertFalse(dispatcher.hasRoute("s"));
+    }
+
+    @Test
+    void falhaDuranteAAdmissaoFinalizaOsTicketsDasSeriesJaAdmitidas() throws Exception {
+        start(WriteFailureReporting.MARKS);
+        Consumer<String> failOnSecond = key -> {
+            if (key.equals("b")) {
+                throw new Error("falha na admissão simulada");
+            }
+        };
+        releaser.close();
+        releaser = new SeriesReleaser(handles, dispatcher, lookup, Duration.ofSeconds(5), () -> clientClosed,
+                failOnSecond);
+        RemoteSeriesHandle a = open("a");
+        RemoteSeriesHandle b = open("b");
+        a.write("ds", new Sample(1, 1));
+        b.write("ds", new Sample(1, 1));
+        Await.untilTrue("escritas confirmadas", WAIT, () -> dispatcher.samplesSent() == 2);
+
+        var failure = assertThrows(ExecutionException.class, () -> releaser.release(List.of("a", "b"),
+                ReleaseOptions.defaults()).get(10, TimeUnit.SECONDS));
+
+        assertTrue(String.valueOf(failure.getCause()).contains("falha na admissão simulada"), String.valueOf(failure));
+        assertFalse(dispatcher.hasRoute("a"), "o ticket de a, já admitido, foi finalizado: a rota ociosa sem holder saiu");
+        assertNull(handles.get("a"));
+        assertTrue(dispatcher.hasRoute("b"), "b não chegou a ser admitida e segue com o handle");
     }
 
     @Test
