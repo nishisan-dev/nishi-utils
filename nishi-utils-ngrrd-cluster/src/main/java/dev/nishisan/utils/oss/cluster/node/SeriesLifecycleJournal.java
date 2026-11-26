@@ -1,5 +1,6 @@
 package dev.nishisan.utils.oss.cluster.node;
 
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.nishisan.utils.ngrid.common.JsonFactories;
 import dev.nishisan.utils.oss.cluster.catalog.SeriesPlacement;
@@ -23,7 +24,9 @@ public final class SeriesLifecycleJournal implements AutoCloseable {
     private static final int MAX_RECORD = 16 * 1024 * 1024;
     private static final long COMPACT_BYTES = 16L * 1024 * 1024;
     // Snapshot keyed by series key: no field-name canonicalization/intern (see JsonFactories).
-    private final ObjectMapper mapper = new ObjectMapper(JsonFactories.dynamicKeys());
+    // Campos de versões futuras são descartados na leitura, para que um rollback não falhe ao reler o journal.
+    private final ObjectMapper mapper = new ObjectMapper(JsonFactories.dynamicKeys())
+            .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
     // Reads on the write path (gate) never wait behind an fsync; mutations publish only after durability.
     private final Map<String, Entry> entries = new ConcurrentHashMap<>();
     // Disk I/O happens under this lock; a monitor would pin virtual-thread carriers on JDK 21.
