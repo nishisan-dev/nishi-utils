@@ -20,6 +20,7 @@ package dev.nishisan.utils.oss.cluster.node;
 import dev.nishisan.utils.oss.Ngrrd;
 import dev.nishisan.utils.oss.NgrrdHandle;
 import dev.nishisan.utils.oss.api.ConsolidationFunction;
+import dev.nishisan.utils.oss.api.Durability;
 import dev.nishisan.utils.oss.api.Sample;
 import dev.nishisan.utils.oss.api.SeriesResult;
 import dev.nishisan.utils.oss.api.ViewQuery;
@@ -162,6 +163,116 @@ class SeriesHandleRegistryTest {
             assertEquals(1, registry.openCount());
             assertTrue(registry.existing("series-fria").isEmpty());
             assertTrue(registry.existing("series-quente").isPresent());
+        }
+    }
+
+    private SeriesHandleRegistry registryWithStepFactor(Duration idleTtl, int stepFactor, Clock clock) {
+        return new SeriesHandleRegistry(volume, VOLUME_NAME, idleTtl, stepFactor, 10, clock);
+    }
+
+    /** Variante do YAML de teste com outro passo base; o passo do RRA acompanha para a definição continuar válida. */
+    private String yamlWithBaseStep(int baseStepSec) {
+        String changed = yaml
+                .replace("baseStepSec: 300", "baseStepSec: " + baseStepSec)
+                .replace("        stepSec: 300\n", "        stepSec: " + baseStepSec + "\n")
+                .replace("targetStepSec: 300", "targetStepSec: " + baseStepSec);
+        assertTrue(!changed.equals(yaml), "o YAML de teste deveria ter sido alterado");
+        return changed;
+    }
+
+    @Test
+    void ttlEfetivoUsaPassoDaDefinicao() {
+        MutableClock clock = new MutableClock(Instant.parse("2026-01-01T00:00:00Z"));
+        try (SeriesHandleRegistry registry = registryWithStepFactor(Duration.ofMinutes(15), 2, clock)) {
+            registry.open("series-passo", yamlWithBaseStep(900), Ngrrd.OpenOptions.defaults());
+            registry.open("series-curta", yaml, Ngrrd.OpenOptions.defaults());
+
+            clock.advance(Duration.ofMinutes(16));
+            assertEquals(1, registry.closeIdle(), "só a série de passo curto (TTL efetivo 15 min) deveria fechar");
+            // openCount não toca lastAccess; isOpen passaria por withHandle e renovaria a ociosidade.
+            assertEquals(1, registry.openCount(), "passo de 900 s com k=2 mantém a série aberta com 16 min");
+
+            clock.advance(Duration.ofMinutes(15));
+            assertEquals(1, registry.closeIdle(), "com 31 min de ociosidade passa dos 30 min (2 x 900 s)");
+            assertEquals(0, registry.openCount());
+        }
+    }
+
+    @Test
+    void fatorZeroMantemTtlGlobal() {
+        MutableClock clock = new MutableClock(Instant.parse("2026-01-01T00:00:00Z"));
+        try (SeriesHandleRegistry registry = registryWithStepFactor(Duration.ofMinutes(15), 0, clock)) {
+            registry.open("series-passo", yamlWithBaseStep(900), Ngrrd.OpenOptions.defaults());
+
+            clock.advance(Duration.ofMinutes(16));
+
+            assertEquals(1, registry.closeIdle());
+            assertEquals(0, registry.openCount());
+            assertEquals(0L, registry.handleMetrics().get("handles.idleTtlExtended"));
+        }
+    }
+
+    @Test
+    void definicaoParseadaUmaVezPorHash() {
+        try (SeriesHandleRegistry registry = registryWithStepFactor(Duration.ofMinutes(15), 2, Clock.systemUTC())) {
+            String stepYaml = yamlWithBaseStep(900);
+            registry.open("series-a", stepYaml, Ngrrd.OpenOptions.defaults());
+            registry.open("series-a", stepYaml, Ngrrd.OpenOptions.defaults());
+            registry.open("series-b", stepYaml, Ngrrd.OpenOptions.defaults());
+            registry.open("series-c", stepYaml, Ngrrd.OpenOptions.durability(Durability.FSYNC));
+            assertEquals(1, registry.baseStepParseCount(), "mesmo hash: um parse só, inclusive com opções diferentes");
+
+            registry.open("series-d", yaml, Ngrrd.OpenOptions.defaults());
+            assertEquals(2, registry.baseStepParseCount(), "outro hash: mais um parse");
+        }
+    }
+
+    @Test
+    void contadorIdleTtlExtendedAcompanhaAberturaEFechamento() {
+        MutableClock clock = new MutableClock(Instant.parse("2026-01-01T00:00:00Z"));
+        try (SeriesHandleRegistry registry = registryWithStepFactor(Duration.ofMinutes(15), 2, clock)) {
+            assertEquals(0L, registry.handleMetrics().get("handles.idleTtlExtended"));
+
+            registry.open("series-passo", yamlWithBaseStep(900), Ngrrd.OpenOptions.defaults());
+            registry.open("series-passo", yamlWithBaseStep(900), Ngrrd.OpenOptions.defaults());
+            registry.open("series-curta", yaml, Ngrrd.OpenOptions.defaults());
+            assertEquals(1L, registry.handleMetrics().get("handles.idleTtlExtended"),
+                    "só a série cujo TTL efetivo supera o global conta, e uma só vez");
+
+            registry.close("series-passo");
+            assertEquals(0L, registry.handleMetrics().get("handles.idleTtlExtended"));
+        }
+    }
+
+    @Test
+    void reaberturaPelaAutocuraRecalculaOTtlEfetivoEOContador() {
+        MutableClock clock = new MutableClock(Instant.parse("2026-01-01T00:00:00Z"));
+        try (SeriesHandleRegistry registry = registryWithStepFactor(Duration.ofMinutes(15), 2, clock)) {
+            registry.open("series-passo", yamlWithBaseStep(900), Ngrrd.OpenOptions.defaults());
+            clock.advance(Duration.ofMinutes(31));
+            assertEquals(1, registry.closeIdle());
+            assertEquals(0L, registry.handleMetrics().get("handles.idleTtlExtended"));
+
+            assertTrue(registry.reopenIfKnown("series-passo").isPresent());
+            assertEquals(1L, registry.handleMetrics().get("handles.idleTtlExtended"));
+
+            clock.advance(Duration.ofMinutes(16));
+            assertEquals(0, registry.closeIdle(), "a série reaberta herda o TTL efetivo da definição");
+            assertEquals(1, registry.openCount());
+        }
+    }
+
+    @Test
+    void despejoPorMaxOpenHandlesIgnoraOTtlEstendidoEDecrementaOContador() {
+        MutableClock clock = new MutableClock(Instant.parse("2026-01-01T00:00:00Z"));
+        try (SeriesHandleRegistry registry = new SeriesHandleRegistry(volume, VOLUME_NAME, Duration.ofMinutes(15), 2, 1,
+                clock)) {
+            registry.open("series-1", yamlWithBaseStep(900), Ngrrd.OpenOptions.defaults());
+            clock.advance(Duration.ofSeconds(1));
+            registry.open("series-2", yamlWithBaseStep(900), Ngrrd.OpenOptions.defaults());
+
+            assertEquals(1, registry.openCount(), "o teto de maxOpenHandles continua valendo");
+            assertEquals(1L, registry.handleMetrics().get("handles.idleTtlExtended"));
         }
     }
 

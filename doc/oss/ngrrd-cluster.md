@@ -445,6 +445,7 @@ ngrrd:
   statusReportInterval: 10s            # opcional, default 10s
   nodeStatusStaleAfter: 50s            # opcional, default max(5x statusReportInterval, 15s)
   handleIdleTtl: 15m                   # opcional, default 15m
+  handleIdleTtlStepFactor: 2           # opcional, inteiro >= 0, default 2 (0 = só handleIdleTtl) — 8.15.0
   maxOpenHandles: 10000                # opcional, default 10000
   requestTimeout: 20s                  # opcional, default 20s
   defaultDurability: FSYNC             # opcional
@@ -552,7 +553,12 @@ Repassados ao `NGridNodeBuilder` por baixo do `StorageNodeConfig`:
 ### 6.3. `SeriesHandleRegistry`
 
 Mapa `seriesKey → NgrrdHandle` aberto localmente via `Ngrrd.open(volume, locator, yaml, options)`.
-Fecha handles ociosos após `handleIdleTtl` (LRU) e limita `maxOpenHandles`. Toda operação passa por
+Fecha handles ociosos após o TTL efetivo da série, `max(handleIdleTtl, handleIdleTtlStepFactor × baseStepSec)`
+(`baseStepSec` de `spec.time`, lido uma vez por definição), e limita `maxOpenHandles`. Com os padrões, uma série de
+passo 900 s fica aberta por 30 min em vez de 15, o que evita fechar e reabrir a série a cada passo; o custo é mais
+handles abertos, limitados por `maxOpenHandles` (confira `openHandles` contra `maxOpenHandles` antes do upgrade).
+`handleIdleTtlStepFactor: 0` restaura o comportamento anterior. A métrica `handles.idleTtlExtended`
+(`lifecycleMetrics`) conta as entradas abertas com TTL maior que o global. Toda operação passa por
 `withHandle`, que serializa contra fechamento concorrente; `withHandleSelfHealing` tenta
 `reopenIfKnown` antes de devolver `NOT_OPEN` — mas **não** reabre uma série fechada por `CLOSE`
 explícito do cliente: o `CLOSE` descarta a definição em cache da série (mesmo que o handle já

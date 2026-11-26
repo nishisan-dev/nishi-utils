@@ -594,6 +594,27 @@ class StorageNodeConfigYamlTest {
         }
     }
 
+    @Test
+    void handleIdleTtlStepFactorTemPadraoDoisELeOValorDoYaml() {
+        assertEquals(2, StorageNodeConfig.fromYaml(CHECKPOINT_BASE, NO_ENV).handleIdleTtlStepFactor());
+
+        assertEquals(0, StorageNodeConfig.fromYaml(CHECKPOINT_BASE + """
+                  handleIdleTtlStepFactor: 0
+                """, NO_ENV).handleIdleTtlStepFactor());
+        assertEquals(5, StorageNodeConfig.fromYaml(CHECKPOINT_BASE + """
+                  handleIdleTtlStepFactor: ${STEP_FACTOR:5}
+                """, NO_ENV).handleIdleTtlStepFactor());
+    }
+
+    @Test
+    void handleIdleTtlStepFactorNegativoFalhaNoBootComOCampoNaMensagem() {
+        IllegalArgumentException negative = assertThrows(IllegalArgumentException.class,
+                () -> StorageNodeConfig.fromYaml(CHECKPOINT_BASE + """
+                          handleIdleTtlStepFactor: -1
+                        """, NO_ENV));
+        assertTrue(negative.getMessage().contains("handleIdleTtlStepFactor"), negative.getMessage());
+    }
+
     private static final String CHECKPOINT_BASE = """
             node:
               id: storage-0

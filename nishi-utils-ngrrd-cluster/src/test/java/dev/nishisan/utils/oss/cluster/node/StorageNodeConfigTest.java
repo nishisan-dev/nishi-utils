@@ -75,6 +75,16 @@ class StorageNodeConfigTest {
     }
 
     @Test
+    void handleIdleTtlStepFactorTemDefaultDoisAceitaZeroERejeitaNegativo(@TempDir Path base) {
+        assertEquals(2, minimal(base).build().handleIdleTtlStepFactor());
+        assertEquals(StorageNodeConfig.DEFAULT_HANDLE_IDLE_TTL_STEP_FACTOR,
+                minimal(base).build().handleIdleTtlStepFactor());
+        assertEquals(0, minimal(base).handleIdleTtlStepFactor(0).build().handleIdleTtlStepFactor());
+        assertEquals(7, minimal(base).handleIdleTtlStepFactor(7).build().handleIdleTtlStepFactor());
+        assertThrows(IllegalArgumentException.class, () -> minimal(base).handleIdleTtlStepFactor(-1).build());
+    }
+
+    @Test
     void avisoDeSubidaQuandoPlacementInspectTimeoutNaoFicaAbaixoDoRequestTimeout() {
         assertTrue(NgrrdStorageNode.placementInspectTimeoutWarning(Duration.ofSeconds(2), Duration.ofSeconds(20))
                 .isEmpty());

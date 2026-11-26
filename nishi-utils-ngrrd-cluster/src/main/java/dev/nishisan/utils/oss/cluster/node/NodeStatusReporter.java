@@ -406,6 +406,7 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
     /** Métricas do lifecycle das séries e do checkpoint local, num mapa só. */
     private Map<String, Long> lifecycleMetrics() {
         Map<String, Long> merged = new LinkedHashMap<>();
+        merged.putAll(registry.handleMetrics());
         if (registry.lifecycle() != null) {
             merged.putAll(registry.lifecycle().metrics());
         }

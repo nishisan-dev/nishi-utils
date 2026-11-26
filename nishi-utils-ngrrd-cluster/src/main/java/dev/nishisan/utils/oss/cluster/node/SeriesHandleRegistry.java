@@ -23,6 +23,7 @@ import dev.nishisan.utils.oss.NgrrdHandle.CheckpointTiming;
 import dev.nishisan.utils.oss.api.SeriesNotFoundException;
 import dev.nishisan.utils.oss.blob.BlobVolume;
 import dev.nishisan.utils.oss.blob.NgrrdUri;
+import dev.nishisan.utils.oss.config.NgrrdYamlLoader;
 import dev.nishisan.utils.oss.format.DefinitionHash;
 
 import java.io.Closeable;
@@ -125,6 +126,15 @@ public final class SeriesHandleRegistry implements Closeable {
     private final BlobVolume volume;
     private final String volumeName;
     private final Duration idleTtl;
+    /** Fator {@code k} do TTL por série ({@link IdleTtlPolicy}); 0 = só {@link #idleTtl}. */
+    private final int idleTtlStepFactor;
+    /**
+     * Entradas abertas cujo TTL efetivo é maior que o global ({@code handles.idleTtlExtended}). Sobe na abertura e
+     * desce em {@link #removeEntry}, ambos sob o lock da entrada: sem varredura.
+     */
+    private final AtomicLong idleTtlExtended = new AtomicLong();
+    /** Parses de {@code baseStepSec} feitos por este registro; um por hash de definição. */
+    private final AtomicLong baseStepParses = new AtomicLong();
     private final int maxOpenHandles;
     /**
      * Stripes de operação. Criados por {@link dev.nishisan.utils.oss.cluster.rpc.CoordinationLocks#newStripe()}:
@@ -172,8 +182,22 @@ public final class SeriesHandleRegistry implements Closeable {
     /** Ver {@link #addOwnershipChangeListener}. */
     private final List<Consumer<String>> ownershipChangeListeners = new CopyOnWriteArrayList<>();
 
+    /** Registro sem extensão do TTL por série ({@code idleTtlStepFactor = 0}): só {@code idleTtl} vale. */
     public SeriesHandleRegistry(BlobVolume volume, String volumeName, Duration idleTtl, int maxOpenHandles,
             Clock clock) {
+        this(volume, volumeName, idleTtl, 0, maxOpenHandles, clock);
+    }
+
+    /**
+     * @param idleTtlStepFactor fator {@code k} de {@link IdleTtlPolicy#effectiveIdleTtlMs}: o TTL de cada série é
+     *                          {@code max(idleTtl, k × baseStepSec)}; {@code 0} usa só {@code idleTtl}
+     */
+    public SeriesHandleRegistry(BlobVolume volume, String volumeName, Duration idleTtl, int idleTtlStepFactor,
+            int maxOpenHandles, Clock clock) {
+        if (idleTtlStepFactor < 0) {
+            throw new IllegalArgumentException("idleTtlStepFactor deve ser >= 0: " + idleTtlStepFactor);
+        }
+        this.idleTtlStepFactor = idleTtlStepFactor;
         this.volume = Objects.requireNonNull(volume, "volume");
         this.volumeName = Objects.requireNonNull(volumeName, "volumeName");
         this.idleTtl = Objects.requireNonNull(idleTtl, "idleTtl");
@@ -261,17 +285,17 @@ public final class SeriesHandleRegistry implements Closeable {
                     continue;
                 }
                 if (migrating.contains(seriesKey)) {
-                    entries.remove(seriesKey, entry);
+                    removeEntry(seriesKey, entry);
                     throw new IllegalStateException("MIGRATING");
                 }
                 if (entry.handle == null) {
                     try {
                         entry.handle = Ngrrd.open(volume, NgrrdUri.of(volumeName, seriesKey), yaml, options);
                     } catch (RuntimeException e) {
-                        entries.remove(seriesKey, entry);
+                        removeEntry(seriesKey, entry);
                         throw e;
                     }
-                    cacheDefinition(seriesKey, yaml, options);
+                    applyIdleTtl(entry, cacheDefinition(seriesKey, yaml, options));
                 }
                 // Reabertura legítima: quem chama open() já passou pela checagem forte de dono em
                 // StorageRequestHandler#ownership (isForgotten força placementStrong antes de chegar
@@ -565,27 +589,28 @@ public final class SeriesHandleRegistry implements Closeable {
                     // que o Refuter pegou: remover incondicionalmente fora do lock podia derrubar do
                     // mapa uma entrada que um open() concorrente acabara de popular, vazando o handle).
                     if (entry.handle == null) {
-                        entries.remove(seriesKey, entry);
+                        removeEntry(seriesKey, entry);
                     }
                     return Optional.empty();
                 }
                 if (entry.handle == null) {
                     DefinitionRecord definition = definitionByHash.get(hash);
                     if (definition == null) {
-                        entries.remove(seriesKey, entry);
+                        removeEntry(seriesKey, entry);
                         return Optional.empty();
                     }
                     try {
                         entry.handle = Ngrrd.open(volume, NgrrdUri.of(volumeName, seriesKey),
                                 definition.yaml(), definition.options().withCreateIfMissing(false));
+                        applyIdleTtl(entry, definition);
                     } catch (SeriesNotFoundException e) {
                         // Reabertura automática nunca cria: o objeto sumiu entre o fechamento por
                         // ociosidade/LRU e esta tentativa de auto-cura — devolve vazio (o chamador decide
                         // NOT_OPEN) em vez de propagar; só um novo open() explícito do cliente recria.
-                        entries.remove(seriesKey, entry);
+                        removeEntry(seriesKey, entry);
                         return Optional.empty();
                     } catch (RuntimeException e) {
-                        entries.remove(seriesKey, entry);
+                        removeEntry(seriesKey, entry);
                         throw e;
                     }
                 }
@@ -636,7 +661,7 @@ public final class SeriesHandleRegistry implements Closeable {
         try {
             if (entries.get(seriesKey) == entry) {
                 closeQuietly(seriesKey, entry);
-                removed = entries.remove(seriesKey, entry);
+                removed = removeEntry(seriesKey, entry);
             }
         } finally {
             entry.lock.unlock();
@@ -671,7 +696,7 @@ public final class SeriesHandleRegistry implements Closeable {
             try {
                 if (entries.get(seriesKey) == entry) {
                     if (entry.handle != null) entry.handle.closeForDeletion();
-                    removed = entries.remove(seriesKey, entry);
+                    removed = removeEntry(seriesKey, entry);
                 }
             } finally { entry.lock.unlock(); }
             if (removed) {
@@ -742,7 +767,9 @@ public final class SeriesHandleRegistry implements Closeable {
     }
 
     /**
-     * Fecha handles ociosos há mais de {@code idleTtl}. Candidatos são
+     * Fecha handles ociosos há mais do TTL efetivo da própria série
+     * ({@code max(idleTtl, k × baseStepSec)}, ver {@link IdleTtlPolicy}); uma entrada sem TTL próprio cai no
+     * {@code idleTtl} global. O despejo por {@code maxOpenHandles} não muda. Candidatos são
      * escolhidos por um snapshot ordenado por {@code lastAccess}, sem lock;
      * cada um só é fechado se {@link ReentrantLock#tryLock()} conseguir a
      * entrada na hora — se estiver ocupada (ex.: um {@code checkpoint} em
@@ -751,12 +778,12 @@ public final class SeriesHandleRegistry implements Closeable {
      */
     public int closeIdle() {
         long now = clock.millis();
-        long ttlMillis = idleTtl.toMillis();
+        long globalTtlMillis = idleTtl.toMillis();
         int closedCount = 0;
         for (AccessSnapshot candidate : snapshotByLastAccess()) {
             String seriesKey = candidate.seriesKey();
             HandleEntry entry = candidate.entry();
-            if (now - entry.lastAccessMs < ttlMillis) {
+            if (now - entry.lastAccessMs < entry.effectiveIdleTtlMs(globalTtlMillis)) {
                 continue;
             }
             if (!entry.lock.tryLock()) {
@@ -766,11 +793,11 @@ public final class SeriesHandleRegistry implements Closeable {
                 if (entries.get(seriesKey) != entry || entry.handle == null) {
                     continue;
                 }
-                if (now - entry.lastAccessMs < ttlMillis) {
+                if (now - entry.lastAccessMs < entry.effectiveIdleTtlMs(globalTtlMillis)) {
                     continue;
                 }
                 closeQuietly(seriesKey, entry);
-                entries.remove(seriesKey, entry);
+                removeEntry(seriesKey, entry);
                 closedCount++;
             } finally {
                 entry.lock.unlock();
@@ -803,7 +830,7 @@ public final class SeriesHandleRegistry implements Closeable {
                         continue;
                     }
                     closeQuietly(seriesKey, entry);
-                    entries.remove(seriesKey, entry);
+                    removeEntry(seriesKey, entry);
                     evictedOne = true;
                 } finally {
                     entry.lock.unlock();
@@ -856,7 +883,7 @@ public final class SeriesHandleRegistry implements Closeable {
             if (entries.get(seriesKey) == entry && entry.handle != null) { checkpointLocked(entry); }
             if (entries.get(seriesKey) == entry) {
                 closeQuietly(seriesKey, entry);
-                removed = entries.remove(seriesKey, entry);
+                removed = removeEntry(seriesKey, entry);
             }
         } finally {
             entry.lock.unlock();
@@ -898,7 +925,7 @@ public final class SeriesHandleRegistry implements Closeable {
                 if (entry.handle != null) { checkpointLocked(entry); }
                 return image.get();
             } finally {
-                if (entry.handle == null) { entries.remove(seriesKey, entry); }
+                if (entry.handle == null) { removeEntry(seriesKey, entry); }
                 entry.lock.unlock();
             }
         }
@@ -933,7 +960,7 @@ public final class SeriesHandleRegistry implements Closeable {
             try {
                 if (entries.get(seriesKey) == entry && entry.handle != null) {
                     closeQuietly(seriesKey, entry);
-                    removed = entries.remove(seriesKey, entry);
+                    removed = removeEntry(seriesKey, entry);
                 }
             } finally {
                 entry.lock.unlock();
@@ -964,10 +991,76 @@ public final class SeriesHandleRegistry implements Closeable {
     private record AccessSnapshot(String seriesKey, HandleEntry entry, long lastAccessMs) {
     }
 
-    private void cacheDefinition(String seriesKey, String yaml, Ngrrd.OpenOptions options) {
+    /**
+     * Guarda a definição da série e devolve o registro corrente do hash. O {@code baseStepSec} é calculado uma
+     * única vez por hash: um segundo {@code open} do mesmo YAML não reparseia. As opções continuam sendo as da
+     * última abertura; como o registro é imutável, uma opção diferente troca o registro reaproveitando o
+     * {@code baseStepSec} já calculado.
+     */
+    private DefinitionRecord cacheDefinition(String seriesKey, String yaml, Ngrrd.OpenOptions options) {
         String hash = DefinitionHash.hex(yaml);
         hashBySeriesKey.put(seriesKey, hash);
-        definitionByHash.put(hash, new DefinitionRecord(yaml, options));
+        DefinitionRecord record = definitionByHash.computeIfAbsent(hash,
+                h -> new DefinitionRecord(yaml, options, parseBaseStepSec(yaml)));
+        if (!record.options().equals(options)) {
+            record = definitionByHash.compute(hash, (h, current) -> current == null
+                    ? new DefinitionRecord(yaml, options, parseBaseStepSec(yaml))
+                    : new DefinitionRecord(current.yaml(), options, current.baseStepSec()));
+        }
+        return record;
+    }
+
+    /**
+     * {@code spec.time.baseStepSec} da definição, ou {@code 0} se não puder ser lido (sem extensão do TTL). O YAML
+     * já foi aceito por {@link Ngrrd#open}, então a falha aqui não é esperada.
+     */
+    private int parseBaseStepSec(String yaml) {
+        baseStepParses.incrementAndGet();
+        try {
+            return NgrrdYamlLoader.parse(yaml, System::getenv).spec().time().baseStepSec();
+        } catch (RuntimeException e) {
+            LOGGER.log(Level.WARNING,
+                    "Não foi possível ler spec.time.baseStepSec; o TTL de ociosidade fica no global", e);
+            return 0;
+        }
+    }
+
+    /** Número de parses de {@code baseStepSec} feitos por este registro (um por hash de definição). */
+    long baseStepParseCount() {
+        return baseStepParses.get();
+    }
+
+    /**
+     * Preenche {@link HandleEntry#idleTtlMs} de uma entrada recém-aberta pelo helper único e mantém o contador
+     * {@code handles.idleTtlExtended}. Chamado sob o lock da entrada, logo depois de abrir o handle.
+     */
+    private void applyIdleTtl(HandleEntry entry, DefinitionRecord definition) {
+        entry.idleTtlMs = IdleTtlPolicy.effectiveIdleTtlMs(idleTtl, idleTtlStepFactor, definition.baseStepSec());
+        if (entry.idleTtlMs > idleTtl.toMillis() && !entry.extendedCounted) {
+            entry.extendedCounted = true;
+            idleTtlExtended.incrementAndGet();
+        }
+    }
+
+    /**
+     * Único ponto que tira uma entrada do mapa: mantém o contador {@code handles.idleTtlExtended}. Chamado sob o
+     * lock da entrada.
+     */
+    private boolean removeEntry(String seriesKey, HandleEntry entry) {
+        boolean removed = entries.remove(seriesKey, entry);
+        if (removed && entry.extendedCounted) {
+            entry.extendedCounted = false;
+            idleTtlExtended.decrementAndGet();
+        }
+        return removed;
+    }
+
+    /**
+     * Métricas de ciclo de vida dos handles, para {@code NodeMetricsSnapshot.lifecycleMetrics}:
+     * {@code handles.idleTtlExtended} = entradas abertas cujo TTL efetivo é maior que o global.
+     */
+    public Map<String, Long> handleMetrics() {
+        return Map.of("handles.idleTtlExtended", idleTtlExtended.get());
     }
 
     /**
@@ -1001,7 +1094,7 @@ public final class SeriesHandleRegistry implements Closeable {
     }
 
     /** Definição cacheada (YAML + opções de abertura) para reabertura via {@link #reopenIfKnown}. */
-    private record DefinitionRecord(String yaml, Ngrrd.OpenOptions options) {
+    private record DefinitionRecord(String yaml, Ngrrd.OpenOptions options, int baseStepSec) {
     }
 
     /**
@@ -1025,6 +1118,17 @@ public final class SeriesHandleRegistry implements Closeable {
          * sob {@link #lock} (por {@link SeriesAccess#recordWrite()} e {@link #pruneIndex}).
          */
         private volatile boolean indexed;
+        /**
+         * TTL de ociosidade efetivo desta série, em ms ({@link IdleTtlPolicy}); {@code 0} = não preenchido, vale o
+         * global. Escrito só sob {@link #lock}, na abertura.
+         */
+        private volatile long idleTtlMs;
+        /** Esta entrada está contada em {@code handles.idleTtlExtended}. Só muda sob {@link #lock}. */
+        private boolean extendedCounted;
+
+        long effectiveIdleTtlMs(long globalMs) {
+            return idleTtlMs > 0 ? idleTtlMs : globalMs;
+        }
 
         void touch(long now) {
             this.lastAccessMs = now;
