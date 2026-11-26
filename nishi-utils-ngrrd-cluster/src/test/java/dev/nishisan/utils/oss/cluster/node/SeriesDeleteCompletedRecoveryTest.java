@@ -396,6 +396,71 @@ class SeriesDeleteCompletedRecoveryTest {
     }
 
     @Test
+    void finishDeGeracaoSubstituidaSaiComODriveLockLivre() throws Exception {
+        var handler = leader("leader", new AtomicBoolean(true));
+        rpc.beforeCall = (node, command) -> {
+            if (Commands.DELETE_FINISH.equals(command) && OWNER.equals(node))
+                throw new NgrrdClusterException(ErrorCode.TIMEOUT, "finish perdido");
+        };
+        assertEquals(DeleteStatus.DELETED, handler.delete(request()).status());
+        SeriesPlacement journaled = ownerJournal.get(KEY).placement();
+        SeriesPlacement recreated = SeriesPlacement.active(COPY, NOW);
+        catalog.placements.put(KEY, recreated);
+        int putsBefore = catalog.puts.size();
+        CountDownLatch finishReached = new CountDownLatch(1);
+        CountDownLatch releaseFinish = new CountDownLatch(1);
+        rpc.beforeCall = (node, command) -> {
+            if (Commands.DELETE_FINISH.equals(command) && OWNER.equals(node)) {
+                finishReached.countDown();
+                await(releaseFinish);
+            }
+        };
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            Future<DeleteResult> recovery = pool.submit(() -> recover(handler, OWNER, journaled));
+            assertTrue(finishReached.await(10, TimeUnit.SECONDS));
+            // O FINISH remoto está em andamento: o stripe da série (mesma chave) não pode estar preso a ele.
+            Future<DeleteResult> other = pool.submit(() -> handler.delete(request()));
+            assertEquals(DeleteStatus.NOT_FOUND, other.get(5, TimeUnit.SECONDS).status());
+            assertFalse(recovery.isDone());
+            releaseFinish.countDown();
+            assertEquals(DeleteStatus.NOT_FOUND, recovery.get(10, TimeUnit.SECONDS).status());
+        } finally {
+            releaseFinish.countDown();
+            pool.shutdownNow();
+        }
+        assertEquals(FINISHED, ownerJournal.get(KEY).phase());
+        assertEquals(putsBefore, catalog.puts.size());
+        assertEquals(recreated, catalog.placements.get(KEY));
+        assertEquals(1, completed(handler));
+    }
+
+    @Test
+    void participanteComEntradaCommittedDeGeracaoSubstituidaNaoReenvia() throws Exception {
+        var handler = leader("leader", new AtomicBoolean(true));
+        rpc.beforeCall = (node, command) -> {
+            if (Commands.DELETE_APPLY.equals(command) && OWNER.equals(node))
+                throw new NgrrdClusterException(ErrorCode.TIMEOUT, "apply perdido");
+        };
+        assertEquals(DeleteStatus.ERROR, handler.delete(request()).status());
+        assertEquals(COMMITTED, ownerJournal.get(KEY).phase());
+        rpc.beforeCall = (node, command) -> { };
+        // Outra geração ocupa o catálogo: a COMMITTED do journal não tem mais fase a conduzir pelo líder.
+        SeriesPlacement recreated = SeriesPlacement.active(COPY, NOW);
+        catalog.placements.put(KEY, recreated);
+        int putsBefore = catalog.puts.size();
+        rpc.calls.clear();
+
+        cyclesEverySecond(participant(handler), 200);
+
+        assertEquals(0, rpc.count(Commands.DELETE_RECOVER, "leader"), "nenhum reenvio para geração substituída");
+        assertEquals(0, metric(handler, "seriesDelete.recoveryAttempts"));
+        assertEquals(putsBefore, catalog.puts.size());
+        assertEquals(recreated, catalog.placements.get(KEY));
+        assertEquals(COMMITTED, ownerJournal.get(KEY).phase());
+    }
+
+    @Test
     void sondaDaRecuperacaoUsaOPrazoDeInspecao() throws Exception {
         var handler = leader("leader", new AtomicBoolean(true));
         rpc.beforeCall = (node, command) -> {

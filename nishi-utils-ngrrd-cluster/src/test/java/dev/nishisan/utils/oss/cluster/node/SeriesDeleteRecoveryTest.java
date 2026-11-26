@@ -455,6 +455,106 @@ class SeriesDeleteRecoveryTest {
         assertEquals(1, catalog.strongReads.get());
     }
 
+    private Map<String, SeriesPlacement> resolveFinishedHistory(int history) throws Exception {
+        Map<String, SeriesLifecycleJournal.Entry> finished = new LinkedHashMap<>();
+        Map<String, SeriesPlacement> placements = new LinkedHashMap<>();
+        for (int i = 0; i < history; i++) {
+            SeriesPlacement done = pending("op-" + i, true);
+            placements.put("done-" + i, done);
+            finished.put("done-" + i, new SeriesLifecycleJournal.Entry(done.generationId(), 0,
+                    SeriesLifecycleJournal.Phase.FINISHED, done));
+        }
+        journal.putAll(finished);
+        handler.recover();
+        assertEquals(history, catalog.strongReads.get(), "o primeiro ciclo confere cada FINISHED uma vez");
+        assertEquals(history, handler.resolvedFinishedSize());
+        return placements;
+    }
+
+    @Test
+    void catalogoQueRegrideDepoisDaResolucaoEPercebidoDentroDaJanela() throws Exception {
+        leader = false; // só o laço do journal
+        int history = 20;
+        Map<String, SeriesPlacement> placements = resolveFinishedHistory(history);
+
+        // O catálogo regride: o placement da mesma geração volta, com a reserva confirmada.
+        rawMap.put("done-0", placements.get("done-0"));
+
+        // Dentro da janela (10 min) ninguém relê o catálogo: o custo segue O(pendentes), aqui zero.
+        clock.advance(Duration.ofMinutes(9));
+        catalog.resetCounters();
+        handler.recover();
+        assertEquals(0, catalog.strongReads.get());
+        assertEquals(0, handler.journalRecoveryBackoffSize());
+
+        // Passada a janela mais o espalhamento, cada resolvida é reconferida uma vez e a regressão aparece.
+        clock.advance(SeriesDeleteHandler.RESOLVED_RECHECK.plus(SeriesDeleteHandler.RESOLVED_RECHECK_SPREAD)
+                .minus(Duration.ofMinutes(9)));
+        catalog.resetCounters();
+        handler.recover();
+        assertEquals(history, catalog.strongReads.get(), "reconferência de cada resolvida");
+        assertEquals(1, handler.journalRecoveryBackoffSize(), "a regressão virou DELETE_RECOVER");
+        assertEquals(history - 1, handler.resolvedFinishedSize());
+
+        // De volta a O(pendentes): só a entrada que regrediu é lida por ciclo.
+        clock.advance(Duration.ofSeconds(1));
+        catalog.resetCounters();
+        handler.recover();
+        assertEquals(1, catalog.strongReads.get());
+    }
+
+    @Test
+    void reconferenciaDasResolvidasEEspalhadaNoTempo() throws Exception {
+        leader = false;
+        int history = 200;
+        resolveFinishedHistory(history);
+        clock.advance(SeriesDeleteHandler.RESOLVED_RECHECK);
+        int maxPerCycle = 0;
+        int total = 0;
+        long end = SeriesDeleteHandler.RESOLVED_RECHECK_SPREAD.toSeconds();
+        for (long second = 0; second <= end; second++) {
+            catalog.resetCounters();
+            handler.recover();
+            long reads = catalog.strongReads.get();
+            maxPerCycle = Math.max(maxPerCycle, (int) reads);
+            total += (int) reads;
+            clock.advance(Duration.ofSeconds(1));
+        }
+        assertEquals(history, total, "cada resolvida é reconferida uma única vez no espalhamento");
+        assertTrue(maxPerCycle < history / 2, "não relê o histórico todo no mesmo ciclo: " + maxPerCycle);
+    }
+
+    @Test
+    void relogioQueRecuaReconfereAsResolvidas() throws Exception {
+        leader = false;
+        int history = 10;
+        resolveFinishedHistory(history);
+        clock.advance(Duration.ofMinutes(-60));
+        catalog.resetCounters();
+        handler.recover();
+        assertEquals(history, catalog.strongReads.get(), "relógio que recuou não congela a entrada como resolvida");
+        catalog.resetCounters();
+        handler.recover();
+        assertEquals(0, catalog.strongReads.get());
+    }
+
+    @Test
+    void entradaQuarentenaNaoLeOCatalogo() {
+        leader = false;
+        SeriesPlacement placement = pending("op-q", true);
+        journal.put("q", new SeriesLifecycleJournal.Entry(placement.generationId(), 0,
+                SeriesLifecycleJournal.Phase.QUARANTINED, placement));
+        catalog.resetCounters();
+
+        handler.recover();
+        handler.recover();
+
+        assertEquals(0, catalog.strongReads.get());
+        assertEquals(0, handler.journalRecoveryBackoffSize());
+        assertEquals(0, handler.resolvedFinishedSize());
+        assertEquals(0, metric("seriesDelete.recoveryAttempts"));
+    }
+
     @Test
     void relogioQueRecuaNaoPrendeOBackoff() {
         service.putPlacement("s", pending("op-s", true));

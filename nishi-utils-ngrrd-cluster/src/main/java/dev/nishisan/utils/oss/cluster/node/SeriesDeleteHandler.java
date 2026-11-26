@@ -67,6 +67,18 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
     static final Duration PENDING_INDEX_RESYNC = Duration.ofSeconds(60);
     private static final long NEVER_REBUILT = Long.MIN_VALUE;
     /**
+     * Idade a partir da qual uma entrada {@code FINISHED} resolvida ({@link #resolvedFinished}) volta a ser
+     * conferida no catálogo. Cobre o catálogo que regride depois da resolução (placement da mesma geração
+     * ressuscitado) sem custar uma leitura por entrada por ciclo.
+     */
+    static final Duration RESOLVED_RECHECK = Duration.ofMinutes(10);
+    /**
+     * Espalhamento da reconferência: cada série soma à {@link #RESOLVED_RECHECK} um atraso fixo, derivado da
+     * chave, de zero a esta duração. Depois de um restart todo o histórico é resolvido no mesmo ciclo; sem o
+     * espalhamento, as reconferências também cairiam todas juntas, a cada 10 min.
+     */
+    static final Duration RESOLVED_RECHECK_SPREAD = Duration.ofMinutes(2);
+    /**
      * Instante ({@link #clock}) da última reconstrução do índice de pendentes; {@link #NEVER_REBUILT} força
      * a próxima. Volta a {@link #NEVER_REBUILT} sempre que o nó deixa de ser líder sincronizado, para que
      * o novo mandato comece de uma varredura completa. Só a thread de recuperação (ou o teste) toca.
@@ -91,7 +103,8 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
      * leitura do catálogo, não tinha mais o que pedir ao líder. {@link #recoverJournal()} não lê o catálogo de
      * novo para elas; o histórico de exclusões concluídas custa uma leitura por entrada por processo, e não uma
      * por ciclo. Só em memória: depois de um restart, cada uma é conferida uma vez. Sai quando a entrada do
-     * journal muda.
+     * journal muda e expira depois de {@link #RESOLVED_RECHECK} (mais o espalhamento de {@link #resolvedJitterMs}),
+     * para que um catálogo que regrediu depois da resolução seja percebido sem esperar um restart.
      */
     private final Map<String, ResolvedFinish> resolvedFinished = new ConcurrentHashMap<>();
     /** Janela do log com taxa limitada de falha do ciclo de recuperação. */
@@ -110,8 +123,15 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
      */
     private record RecoveryKey(String seriesKey, String operationId) { }
 
-    /** Geração e operação de uma entrada {@code FINISHED} já resolvida ({@link #resolvedFinished}). */
-    private record ResolvedFinish(String generationId, String operationId) { }
+    /**
+     * Geração e operação de uma entrada {@code FINISHED} já resolvida ({@link #resolvedFinished}) e o instante
+     * ({@link #clock}) da resolução, de onde sai a expiração.
+     */
+    private record ResolvedFinish(String generationId, String operationId, long resolvedAtMs) {
+        boolean sameEntry(ResolvedFinish other) {
+            return other != null && generationId.equals(other.generationId) && operationId.equals(other.operationId);
+        }
+    }
 
     /**
      * @param reachableNodeIds        storages alcançáveis na visão do líder (o próprio nó é sempre
@@ -428,15 +448,19 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
                     else catalog.putPlacement(key, placement);
                 }
             }
-            if (superseded) return finishSuperseded(key, request.placement(), source);
-            if (placement == null) return recoverWithoutPlacement(key, request.placement(), source);
-            return drive(key, placement);
+            if (!superseded) {
+                if (placement == null) return recoverWithoutPlacement(key, request.placement(), source);
+                return drive(key, placement);
+            }
         }
+        // O FINISH é idempotente e protegido por geração e operationId: não precisa do driveLock, e um RPC
+        // remoto demorado não deve prender o stripe da série (nem os de outras séries que o dividem).
+        return finishSuperseded(key, request.placement(), source);
     }
 
     /**
-     * {@code DELETE_RECOVER} de uma geração que o catálogo já substituiu por outra. Chamado sob o
-     * {@code driveLock} da série, depois da leitura forte que viu a geração nova.
+     * {@code DELETE_RECOVER} de uma geração que o catálogo já substituiu por outra. Chamado depois da leitura
+     * forte que viu a geração nova, já fora do {@code driveLock} e do lock de placement da série.
      *
      * <p>Só {@link #drive} remove um placement, e só depois do {@code DELETE_APPLY} de todos; uma geração nova
      * só nasce com a anterior fora do catálogo. Então a operação do pedido já concluiu: o participante
@@ -552,7 +576,9 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
      * <p>Só lê o catálogo para as entradas que ainda podem ter o que fazer: as fases não terminais
      * ({@code PREPARED}, {@code COMMITTED}, {@code DELETED}) e a {@code FINISHED} ainda não resolvida
      * ({@link #resolvedFinished}). {@code ACTIVE} e {@code QUARANTINED} não são da recuperação de exclusão.
-     * Leituras por ciclo: O(exclusões pendentes neste nó), não O(histórico do journal).</p>
+     * Leituras por ciclo: O(exclusões pendentes neste nó), não O(histórico do journal); a cada
+     * {@link #RESOLVED_RECHECK} cada resolvida é reconferida uma vez, espalhadas por
+     * {@link #RESOLVED_RECHECK_SPREAD}.</p>
      */
     private void recoverJournal() {
         Set<RecoveryKey> candidates = new HashSet<>();
@@ -564,8 +590,9 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
             if (phase != PREPARED && phase != COMMITTED && phase != DELETED && phase != FINISHED) continue;
             String operationId = entry.placement().deletion().operationId();
             ResolvedFinish finish = phase == FINISHED
-                    ? new ResolvedFinish(entry.placement().generationId(), operationId) : null;
-            if (finish != null && finish.equals(resolvedFinished.get(key))) {
+                    ? new ResolvedFinish(entry.placement().generationId(), operationId, clock.millis()) : null;
+            if (finish != null && finish.sameEntry(resolvedFinished.get(key))
+                    && !resolutionExpired(key, resolvedFinished.get(key), finish.resolvedAtMs())) {
                 resolved.add(key);
                 continue;
             }
@@ -599,6 +626,23 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
         }
         journalRecoveryBackoff.keySet().retainAll(candidates);
         resolvedFinished.keySet().retainAll(resolved);
+    }
+
+    /**
+     * Se a resolução de uma entrada {@code FINISHED} já passou da idade de reconferência
+     * ({@link #RESOLVED_RECHECK} mais o atraso da chave). Relógio que recuou ({@code now < resolvedAt}) conta
+     * como vencida, para que o recuo não congele a entrada como resolvida.
+     */
+    private static boolean resolutionExpired(String key, ResolvedFinish resolved, long now) {
+        long age = now - resolved.resolvedAtMs();
+        return age < 0 || age >= RESOLVED_RECHECK.toMillis() + resolvedJitterMs(key);
+    }
+
+    /** Atraso fixo da série, em {@code [0, RESOLVED_RECHECK_SPREAD)}, somado à {@link #RESOLVED_RECHECK}. */
+    private static long resolvedJitterMs(String key) {
+        // Chaves parecidas ("done-1", "done-2") têm hashCode vizinho: o mix de Fibonacci os espalha pelo intervalo.
+        long mixed = (key.hashCode() * 0x9E3779B97F4A7C15L) >>> 33;
+        return mixed % RESOLVED_RECHECK_SPREAD.toMillis();
     }
 
     /**
