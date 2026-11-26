@@ -1578,6 +1578,58 @@ class WriteDispatcherTest {
         assertEquals(dispatcher.samplesEnqueued(), dispatcher.samplesSent() + dispatcher.samplesFailed());
     }
 
+    @Test
+    void fimDaReaberturaDaGeracaoAntigaNaoRetomaAPausaDaGeracaoNova() throws Exception {
+        var firstReopenEntered = new CountDownLatch(1);
+        var secondReopenEntered = new CountDownLatch(1);
+        var firstReopenGate = new CountDownLatch(1);
+        var secondReopenGate = new CountDownLatch(1);
+        AtomicInteger reopens = new AtomicInteger();
+        newDispatcher(1, Duration.ofMillis(10), 1000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> {
+            if (reopens.incrementAndGet() == 1) {
+                firstReopenEntered.countDown();
+                awaitLatch(firstReopenGate);
+            } else {
+                secondReopenEntered.countDown();
+                awaitLatch(secondReopenGate);
+            }
+            return true;
+        });
+        AtomicInteger g2Batches = new AtomicInteger();
+        rpc.respondDefault((command, body) -> {
+            WriteBatchRequest request = (WriteBatchRequest) body;
+            if ("g2".equals(request.writes().getFirst().generationId())) {
+                g2Batches.incrementAndGet();
+                return secondReopenGate.getCount() == 0 ? okFor(request) : statusFor(request, SeriesStatus.NOT_OPEN);
+            }
+            return statusFor(request, SeriesStatus.NOT_OPEN);
+        });
+        try {
+            // g1: NOT_OPEN → pausa sem prazo e reabertura presa no primeiro portão.
+            dispatcher.beginGeneration("s", "g1", OWNER_A.value(), new Object());
+            dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 1, 1, "g1"));
+            assertTrue(firstReopenEntered.await(5, TimeUnit.SECONDS));
+
+            // g2 troca a g1 e também recebe NOT_OPEN: a chave fica com a pausa sem prazo da g2.
+            dispatcher.beginGeneration("s", "g2", OWNER_A.value(), new Object());
+            dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 2, 2, "g2"));
+            assertTrue(secondReopenEntered.await(5, TimeUnit.SECONDS));
+            assertEquals(1, g2Batches.get());
+
+            // Fim da reabertura da g1 (rota destacada): desfaz só a própria pausa, nunca a da g2.
+            firstReopenGate.countDown();
+            Thread.sleep(500L);
+
+            assertEquals(1, g2Batches.get(), "a escrita da g2 continua pausada até a reabertura dela terminar");
+            assertEquals(2, reopens.get());
+        } finally {
+            firstReopenGate.countDown();
+            secondReopenGate.countDown();
+        }
+        dispatcher.flushGenerationSync("s", "g2", OWNER_A.value(), Duration.ofSeconds(5));
+        assertEquals(1, dispatcher.samplesSent());
+    }
+
     private static final class FakePlacementLookup implements PlacementLookup {
         final List<String> notedOwners = new CopyOnWriteArrayList<>();
         final List<String> invalidated = new CopyOnWriteArrayList<>();

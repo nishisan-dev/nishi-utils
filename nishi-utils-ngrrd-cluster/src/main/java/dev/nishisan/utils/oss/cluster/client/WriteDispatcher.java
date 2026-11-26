@@ -2018,7 +2018,24 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         private final PriorityQueue<Delay> wakeups = new PriorityQueue<>(Comparator.comparingLong(Delay::until));
         private final Map<String, Integer> attempts = new HashMap<>();
         private int size;
-        private record Delay(String key, long until) { }
+        /**
+         * Pausa de uma série. Igualdade por identidade, de propósito: toda pausa sem prazo de uma chave vale
+         * {@code (key, Long.MAX_VALUE)}, e {@link #resume} só pode desfazer a pausa que o chamador aplicou — nunca a
+         * de outra geração da mesma chave aplicada depois ({@code paused.remove(key, delay)} e
+         * {@code wakeups.remove(delay)} comparam por {@code equals}).
+         */
+        private static final class Delay {
+            private final String key;
+            private final long until;
+
+            private Delay(String key, long until) {
+                this.key = key;
+                this.until = until;
+            }
+
+            String key() { return key; }
+            long until() { return until; }
+        }
 
         int size() { return size; }
         boolean isEmpty() { return size == 0; }
