@@ -89,6 +89,24 @@ import java.util.stream.Collectors;
  * captura a {@code writeSeq} sob o lock, no enfileiramento, e só a grava como {@code checkpointedSeq}
  * quando conclui com sucesso. Uma entrada nova nasce limpa: o fechamento faz checkpoint+close antes de
  * remover a entrada.</p>
+ *
+ * <h2>Índice incremental de séries sujas (8.15.0)</h2>
+ *
+ * <p>Com o checkpoint local ligado ({@link #trackDirtyIndex}, na montagem do nó), o registro mantém
+ * {@code dirtyIndex}, um <strong>superconjunto</strong> das séries sujas, e {@link #dirtySeries()}/{@link
+ * #dirtyCount()} deixam de varrer {@code entries}. Cada entrada tem a marca {@code indexed}, escrita só sob o
+ * lock dela: {@link SeriesAccess#recordWrite()} liga a marca e insere a chave na primeira escrita depois da
+ * última poda. A chave só sai do índice pelo helper único {@link #pruneIndex}, chamado sem nenhum lock de
+ * entrada tomado: ele remove a chave e, sob o lock da entrada corrente, a devolve se ela estiver suja (ou
+ * desliga a marca se estiver limpa). A poda roda quando o ciclo encontra a série limpa, ausente ou fechada
+ * ({@link #tryCheckpointAsync}) e nos seis caminhos que tiram uma entrada do mapa ({@link #close()}, {@link
+ * #discard}, {@link #closeIdle()}, {@link #evictIfOverLimit()}, {@link #closeForDeletion} e {@link
+ * #markMigrating}). Nunca em {@code markCheckpointed}, que roda fora do lock e perderia uma escrita
+ * concorrente. Por isso uma série checkpointada no ciclo N só sai do índice quando o ciclo N+1 a encontra
+ * limpa ou quando ela fecha: {@link #dirtyCount()} é um limite superior atrasado em um ciclo.</p>
+ *
+ * <p>Com o checkpoint local desligado (o padrão), nenhum índice é mantido e as duas consultas varrem
+ * {@code entries}, como antes.</p>
  */
 public final class SeriesHandleRegistry implements Closeable {
 
@@ -121,6 +139,13 @@ public final class SeriesHandleRegistry implements Closeable {
     private final Clock clock;
 
     private final ConcurrentMap<String, HandleEntry> entries = new ConcurrentHashMap<>();
+    /**
+     * Índice incremental de séries sujas: superconjunto das sujas, mantido só com {@link #dirtyIndexTracked}.
+     * Entra por {@link SeriesAccess#recordWrite()}, sai só por {@link #pruneIndex}. Ver o Javadoc da classe.
+     */
+    private final Set<String> dirtyIndex = ConcurrentHashMap.newKeySet();
+    /** Liga o {@link #dirtyIndex}; definido na montagem do nó, antes da primeira abertura de série. */
+    private volatile boolean dirtyIndexTracked;
     /**
      * Definição (hash do YAML) de cada série aberta neste processo e ainda não fechada pelo cliente nem
      * esquecida — é o que permite a {@link #reopenIfKnown} reabrir sem o cliente reenviar o YAML. A
@@ -157,6 +182,27 @@ public final class SeriesHandleRegistry implements Closeable {
         }
         this.maxOpenHandles = maxOpenHandles;
         this.clock = Objects.requireNonNull(clock, "clock");
+    }
+
+    /**
+     * Liga ou desliga o índice incremental de séries sujas. O nó liga quando o checkpoint local está ligado
+     * ({@code ngrrd.checkpoint.enabled}), porque é o ciclo dele que poda o índice. Desligado (o padrão),
+     * {@link SeriesAccess#recordWrite()} não toca índice nenhum e {@link #dirtySeries()}/{@link #dirtyCount()}
+     * varrem as entradas.
+     *
+     * @throws IllegalStateException se já houver entrada aberta: as escritas anteriores não estariam no índice
+     */
+    void trackDirtyIndex(boolean enabled) {
+        if (!entries.isEmpty()) {
+            throw new IllegalStateException("trackDirtyIndex só pode ser definido antes da primeira abertura de série");
+        }
+        dirtyIndexTracked = enabled;
+        dirtyIndex.clear();
+    }
+
+    /** Indica se o índice incremental de séries sujas está ligado (ver {@link #trackDirtyIndex}). */
+    boolean dirtyIndexTracked() {
+        return dirtyIndexTracked;
     }
 
     /**
@@ -292,7 +338,8 @@ public final class SeriesHandleRegistry implements Closeable {
                 return Optional.empty();
             }
             entry.touch(clock.millis());
-            return Optional.ofNullable(fn.apply(new SeriesAccess(entry)));
+            return Optional.ofNullable(fn.apply(
+                    new SeriesAccess(seriesKey, entry, dirtyIndexTracked ? dirtyIndex : null)));
         } finally {
             entry.lock.unlock();
         }
@@ -307,6 +354,11 @@ public final class SeriesHandleRegistry implements Closeable {
      * na future). O lock é solto antes de devolver: quem chama espera a future fora dele. Callbacks
      * encadeados na future podem rodar na thread do pool de force: nunca devem bloquear.
      *
+     * <p>Com o índice de sujas ligado, {@link CheckpointAttempt.Outcome#CLEAN} e entrada ausente ou fechada
+     * podam a chave ({@link #pruneIndex}) depois de soltar o lock. {@link CheckpointAttempt.Outcome#BUSY} não
+     * poda, e {@link CheckpointAttempt.Outcome#UNAVAILABLE} por congelamento de migração também não: a
+     * migração pode abortar e a série voltar a aceitar escrita, ainda suja.</p>
+     *
      * @return o desfecho; a future só existe em {@link CheckpointAttempt.Outcome#STARTED}
      * @throws RuntimeException se o próprio enfileiramento falhar (raro: pool de writers recusando tarefa)
      */
@@ -314,24 +366,35 @@ public final class SeriesHandleRegistry implements Closeable {
         Objects.requireNonNull(seriesKey, "seriesKey");
         HandleEntry entry = entries.get(seriesKey);
         if (entry == null) {
+            pruneIndex(seriesKey);
             return CheckpointAttempt.UNAVAILABLE;
         }
         if (!entry.lock.tryLock()) {
             return CheckpointAttempt.BUSY;
         }
+        CheckpointAttempt attempt;
+        boolean prune = false;
         try {
-            // Congelada por migração conferida só aqui, sob o lock: é a checagem que vale contra um
-            // markMigrating concorrente (que também trava a entrada antes de fechá-la).
-            if (entries.get(seriesKey) != entry || entry.handle == null || isMigrationFrozen(seriesKey)) {
-                return CheckpointAttempt.UNAVAILABLE;
+            if (entries.get(seriesKey) != entry || entry.handle == null) {
+                prune = true;
+                attempt = CheckpointAttempt.UNAVAILABLE;
+            } else if (isMigrationFrozen(seriesKey)) {
+                // Congelada por migração conferida só aqui, sob o lock: é a checagem que vale contra um
+                // markMigrating concorrente (que também trava a entrada antes de fechá-la).
+                attempt = CheckpointAttempt.UNAVAILABLE;
+            } else if (!entry.dirty()) {
+                prune = true;
+                attempt = CheckpointAttempt.CLEAN;
+            } else {
+                attempt = new CheckpointAttempt(CheckpointAttempt.Outcome.STARTED, checkpointAsyncTimedLocked(entry));
             }
-            if (!entry.dirty()) {
-                return CheckpointAttempt.CLEAN;
-            }
-            return new CheckpointAttempt(CheckpointAttempt.Outcome.STARTED, checkpointAsyncTimedLocked(entry));
         } finally {
             entry.lock.unlock();
         }
+        if (prune) {
+            pruneIndex(seriesKey);
+        }
+        return attempt;
     }
 
     /** Indica se a série está aberta e com escritas admitidas ainda não cobertas por checkpoint. */
@@ -340,17 +403,70 @@ public final class SeriesHandleRegistry implements Closeable {
         return entry != null && entry.handle != null && entry.dirty();
     }
 
-    /** Instantâneo das séries abertas e sujas (ver {@link #isDirty}). */
+    /**
+     * Instantâneo das séries candidatas a checkpoint. Com o índice de sujas ligado ({@link #trackDirtyIndex}),
+     * é uma cópia do índice, sem varrer as entradas: um <strong>superconjunto</strong> das sujas, que pode
+     * trazer séries já limpas (checkpointadas desde a última poda) ou já fechadas. Desligado, varre as
+     * entradas e devolve exatamente as abertas e sujas agora (ver {@link #isDirty}).
+     */
     public Set<String> dirtySeries() {
+        if (dirtyIndexTracked) {
+            return Set.copyOf(dirtyIndex);
+        }
         return entries.entrySet().stream()
                 .filter(entry -> entry.getValue().handle != null && entry.getValue().dirty())
                 .map(Map.Entry::getKey)
                 .collect(Collectors.toUnmodifiableSet());
     }
 
-    /** Quantidade de séries abertas e sujas agora (instantâneo, sem lock). */
+    /**
+     * Quantidade de séries sujas (instantâneo, sem lock). Com o índice de sujas ligado, é o tamanho do índice:
+     * um limite superior atrasado em um ciclo (uma série checkpointada só sai quando o ciclo seguinte a
+     * encontra limpa, ou quando fecha). Desligado, varre as entradas e conta as abertas e sujas agora.
+     */
     public int dirtyCount() {
+        if (dirtyIndexTracked) {
+            return dirtyIndex.size();
+        }
         return (int) entries.values().stream().filter(entry -> entry.handle != null && entry.dirty()).count();
+    }
+
+    /**
+     * Helper único de poda do índice de sujas. Chamado <strong>sem</strong> nenhum lock de entrada tomado (o
+     * registro nunca segura dois locks de entrada): remove a chave e, sob o lock da entrada corrente, a devolve
+     * se a entrada estiver indexada e suja, ou desliga a marca {@code indexed} se estiver limpa. Uma escrita
+     * que se indexou antes da remoção é vista na reconferência, sob o mesmo lock que ela usou; uma escrita
+     * posterior encontra {@code indexed == false} e se insere sozinha. Nada se perde.
+     *
+     * <p>Usa {@code tryLock}: se a entrada corrente estiver ocupada, devolve a chave ao índice sem esperar (o
+     * índice continua superconjunto, e o próximo ciclo poda de novo). Assim a poda nunca bloqueia a thread do
+     * ciclo, a de status ({@link #closeIdle()}) nem quem fecha a série. No-op com o índice desligado. Visível
+     * para testes.</p>
+     */
+    void pruneIndex(String seriesKey) {
+        if (!dirtyIndexTracked) {
+            return;
+        }
+        dirtyIndex.remove(seriesKey);
+        HandleEntry current = entries.get(seriesKey);
+        if (current == null) {
+            return;
+        }
+        if (!current.lock.tryLock()) {
+            dirtyIndex.add(seriesKey);
+            return;
+        }
+        try {
+            if (current.indexed) {
+                if (current.dirty()) {
+                    dirtyIndex.add(seriesKey);
+                } else {
+                    current.indexed = false;
+                }
+            }
+        } finally {
+            current.lock.unlock();
+        }
     }
 
     /**
@@ -515,14 +631,18 @@ public final class SeriesHandleRegistry implements Closeable {
         if (entry == null) {
             return;
         }
+        boolean removed = false;
         entry.lock.lock();
         try {
             if (entries.get(seriesKey) == entry) {
                 closeQuietly(seriesKey, entry);
-                entries.remove(seriesKey, entry);
+                removed = entries.remove(seriesKey, entry);
             }
         } finally {
             entry.lock.unlock();
+        }
+        if (removed) {
+            pruneIndex(seriesKey);
         }
     }
 
@@ -546,13 +666,17 @@ public final class SeriesHandleRegistry implements Closeable {
     public void closeForDeletion(String seriesKey) {
         HandleEntry entry = entries.get(seriesKey);
         if (entry != null) {
+            boolean removed = false;
             entry.lock.lock();
             try {
                 if (entries.get(seriesKey) == entry) {
                     if (entry.handle != null) entry.handle.closeForDeletion();
-                    entries.remove(seriesKey, entry);
+                    removed = entries.remove(seriesKey, entry);
                 }
             } finally { entry.lock.unlock(); }
+            if (removed) {
+                pruneIndex(seriesKey);
+            }
         }
         hashBySeriesKey.remove(seriesKey);
         forgotten.add(seriesKey);
@@ -651,6 +775,8 @@ public final class SeriesHandleRegistry implements Closeable {
             } finally {
                 entry.lock.unlock();
             }
+            // Só chega aqui quem fechou e removeu a entrada (os demais saem por continue).
+            pruneIndex(seriesKey);
         }
         return closedCount;
     }
@@ -682,6 +808,8 @@ public final class SeriesHandleRegistry implements Closeable {
                 } finally {
                     entry.lock.unlock();
                 }
+                // Só chega aqui quem fechou e removeu a entrada (os demais saem por continue).
+                pruneIndex(seriesKey);
             }
             if (!evictedOne) {
                 // Todas as candidatas estavam ocupadas agora — desiste até a próxima chamada
@@ -720,6 +848,7 @@ public final class SeriesHandleRegistry implements Closeable {
         if (entry == null) {
             return;
         }
+        boolean removed = false;
         entry.lock.lock();
         try {
             // An acknowledged write must reach the image before migration closes its writer.
@@ -727,10 +856,13 @@ public final class SeriesHandleRegistry implements Closeable {
             if (entries.get(seriesKey) == entry && entry.handle != null) { checkpointLocked(entry); }
             if (entries.get(seriesKey) == entry) {
                 closeQuietly(seriesKey, entry);
-                entries.remove(seriesKey, entry);
+                removed = entries.remove(seriesKey, entry);
             }
         } finally {
             entry.lock.unlock();
+        }
+        if (removed) {
+            pruneIndex(seriesKey);
         }
     }
 
@@ -796,14 +928,18 @@ public final class SeriesHandleRegistry implements Closeable {
             if (entry == null) {
                 continue;
             }
+            boolean removed = false;
             entry.lock.lock();
             try {
                 if (entries.get(seriesKey) == entry && entry.handle != null) {
                     closeQuietly(seriesKey, entry);
-                    entries.remove(seriesKey, entry);
+                    removed = entries.remove(seriesKey, entry);
                 }
             } finally {
                 entry.lock.unlock();
+            }
+            if (removed) {
+                pruneIndex(seriesKey);
             }
         }
         if (lifecycle != null) {
@@ -884,6 +1020,11 @@ public final class SeriesHandleRegistry implements Closeable {
         private volatile long writeSeq;
         /** Maior {@link #writeSeq} já coberta por um checkpoint concluído com sucesso. */
         private final AtomicLong checkpointedSeq = new AtomicLong();
+        /**
+         * A chave desta entrada foi inserida no índice de sujas e ainda não foi podada como limpa. Escrita só
+         * sob {@link #lock} (por {@link SeriesAccess#recordWrite()} e {@link #pruneIndex}).
+         */
+        private volatile boolean indexed;
 
         void touch(long now) {
             this.lastAccessMs = now;
@@ -903,10 +1044,15 @@ public final class SeriesHandleRegistry implements Closeable {
      * da série na thread chamadora. Usar fora disso lança {@link IllegalStateException}.
      */
     public static final class SeriesAccess {
+        private final String seriesKey;
         private final HandleEntry entry;
+        /** Índice de sujas do registro, ou {@code null} com o índice desligado. */
+        private final Set<String> dirtyIndex;
 
-        private SeriesAccess(HandleEntry entry) {
+        private SeriesAccess(String seriesKey, HandleEntry entry, Set<String> dirtyIndex) {
+            this.seriesKey = seriesKey;
             this.entry = entry;
+            this.dirtyIndex = dirtyIndex;
         }
 
         /** Handle da série; o mesmo contrato de {@link #withHandle}. */
@@ -915,10 +1061,18 @@ public final class SeriesHandleRegistry implements Closeable {
             return entry.handle;
         }
 
-        /** Registra uma escrita admitida (já enfileirada no writer): a série passa a estar suja. */
+        /**
+         * Registra uma escrita admitida (já enfileirada no writer): a série passa a estar suja. Com o índice de
+         * sujas ligado, a primeira escrita desde a última poda liga a marca {@code indexed} da entrada e insere
+         * a chave no índice, nessa ordem e sob o lock da série.
+         */
         public void recordWrite() {
             requireHeld();
             entry.writeSeq++;
+            if (dirtyIndex != null && !entry.indexed) {
+                entry.indexed = true;
+                dirtyIndex.add(seriesKey);
+            }
         }
 
         /**

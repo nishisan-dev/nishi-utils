@@ -35,6 +35,10 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
 import java.lang.management.ThreadMXBean;
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -45,17 +49,26 @@ import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Random;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BiConsumer;
+import java.util.function.Function;
+import java.util.function.UnaryOperator;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -67,7 +80,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * Cobre o ciclo de vida de {@link SeriesHandleRegistry} sobre um
  * {@link BlobVolume} real em {@code @TempDir}: abertura/reuso, fechamento por
  * ociosidade, eviction LRU, reabertura pelo cache de definições, bloqueio por
- * migração e durabilidade dos dados através de um ciclo close/reopen.
+ * migração e durabilidade dos dados através de um ciclo close/reopen. Cobre também o índice incremental de
+ * séries sujas (8.15.0): indexação, poda no ciclo e nos fechamentos, corridas de poda e escrita, e o modo
+ * desligado.
  */
 class SeriesHandleRegistryTest {
 
@@ -786,6 +801,394 @@ class SeriesHandleRegistryTest {
             assertTrue(reopened.isPresent(),
                     "reopenIfKnown deveria continuar reabrindo normalmente quando o objeto físico existe");
             assertEquals(1, registry.openCount());
+        }
+    }
+
+    // ------------------------------------------------------------------ índice incremental de sujas (8.15.0)
+
+    @Test
+    void indiceContemSeriesEscritas() {
+        try (SeriesHandleRegistry registry = trackedRegistry(Duration.ofMinutes(15), 10, Clock.systemUTC())) {
+            for (String key : List.of("a", "b", "c")) {
+                registry.open(key, yaml, Ngrrd.OpenOptions.defaults());
+            }
+            recordWrite(registry, "a");
+            recordWrite(registry, "b");
+            recordWrite(registry, "b");
+
+            assertEquals(Set.of("a", "b"), registry.dirtySeries());
+            assertEquals(2, registry.dirtyCount());
+        }
+    }
+
+    @Test
+    void checkpointLimpaPodaIndice() {
+        try (SeriesHandleRegistry registry = trackedRegistry(Duration.ofMinutes(15), 10, Clock.systemUTC())) {
+            registry.open("a", yaml, Ngrrd.OpenOptions.defaults());
+            recordWrite(registry, "a");
+
+            SeriesHandleRegistry.CheckpointAttempt attempt = registry.tryCheckpointAsync("a");
+            assertEquals(SeriesHandleRegistry.CheckpointAttempt.Outcome.STARTED, attempt.outcome());
+            attempt.future().join();
+            assertFalse(registry.isDirty("a"));
+            assertEquals(Set.of("a"), registry.dirtySeries(),
+                    "a conclusão do checkpoint não poda: a série sai só quando o ciclo seguinte a encontra limpa");
+
+            assertEquals(SeriesHandleRegistry.CheckpointAttempt.Outcome.CLEAN,
+                    registry.tryCheckpointAsync("a").outcome());
+            assertTrue(registry.dirtySeries().isEmpty());
+            assertEquals(0, registry.dirtyCount());
+
+            recordWrite(registry, "a");
+            assertEquals(Set.of("a"), registry.dirtySeries(), "escrita depois da poda volta a indexar a série");
+        }
+    }
+
+    @Test
+    @Timeout(value = 120, unit = TimeUnit.SECONDS)
+    void escritaConcorrenteAoCheckpointNaoSaiDoIndice() throws Exception {
+        String key = "race";
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try (SeriesHandleRegistry registry = trackedRegistry(Duration.ofMinutes(15), 10, Clock.systemUTC())) {
+            entries(registry).put(key, newEntry(FAKE_HANDLE));
+            CyclicBarrier start = new CyclicBarrier(2);
+            for (int i = 0; i < 10_000; i++) {
+                Future<?> writer = pool.submit(() -> {
+                    start.await();
+                    recordWrite(registry, key);
+                    return null;
+                });
+                Future<?> checkpointer = pool.submit(() -> {
+                    start.await();
+                    // Dois disparos: o primeiro costuma enfileirar o checkpoint, o segundo costuma achar a
+                    // série limpa e podar, ambos concorrendo com a escrita.
+                    for (int round = 0; round < 2; round++) {
+                        SeriesHandleRegistry.CheckpointAttempt attempt = registry.tryCheckpointAsync(key);
+                        if (attempt.outcome() == SeriesHandleRegistry.CheckpointAttempt.Outcome.STARTED) {
+                            attempt.future().join();
+                        }
+                    }
+                    return null;
+                });
+                writer.get(10, TimeUnit.SECONDS);
+                checkpointer.get(10, TimeUnit.SECONDS);
+                if (registry.isDirty(key)) {
+                    assertTrue(registry.dirtySeries().contains(key), "série suja fora do índice na iteração " + i);
+                }
+            }
+            recordWrite(registry, key);
+            assertTrue(registry.dirtySeries().contains(key));
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void entradaFechadaEReabertaMantemIndice() {
+        try (SeriesHandleRegistry registry = trackedRegistry(Duration.ofMinutes(15), 10, Clock.systemUTC())) {
+            registry.open("a", yaml, Ngrrd.OpenOptions.defaults());
+            recordWrite(registry, "a");
+            registry.discard("a");
+            assertFalse(registry.dirtySeries().contains("a"), "o fechamento checkpointa e poda");
+
+            assertTrue(registry.reopenIfKnown("a").isPresent());
+            recordWrite(registry, "a");
+            assertEquals(Set.of("a"), registry.dirtySeries(), "a entrada nova se indexa na primeira escrita");
+
+            // Entrada antiga indexada e substituída por uma nova antes da poda dela: a escrita na nova
+            // encontra a chave já no índice (inserção sem efeito), e a poda atrasada da antiga não pode
+            // tirá-la de lá.
+            entries(registry).put("b", newEntry(FAKE_HANDLE));
+            recordWrite(registry, "b");
+            entries(registry).put("b", newEntry(FAKE_HANDLE));
+            recordWrite(registry, "b");
+            registry.pruneIndex("b");
+            assertTrue(registry.dirtySeries().contains("b"));
+        }
+    }
+
+    @Test
+    void dirtySeriesNaoVarreEntradas() throws Exception {
+        try (SeriesHandleRegistry registry = trackedRegistry(Duration.ofMinutes(15), 200_000, Clock.systemUTC())) {
+            ScanCountingMap<String, Object> counting = new ScanCountingMap<>();
+            Field entriesField = SeriesHandleRegistry.class.getDeclaredField("entries");
+            entriesField.setAccessible(true);
+            entriesField.set(registry, counting);
+
+            for (int i = 0; i < 10; i++) {
+                registry.open("dirty-" + i, yaml, Ngrrd.OpenOptions.defaults());
+                recordWrite(registry, "dirty-" + i);
+            }
+            for (int i = 0; i < 100_000; i++) {
+                counting.put("clean-" + i, newEntry(FAKE_HANDLE));
+            }
+            registry.openCount();
+            assertTrue(counting.scans.get() > 0, "o mapa instrumentado deveria contar uma varredura");
+
+            counting.scans.set(0);
+            Set<String> dirty = registry.dirtySeries();
+            int dirtyCount = registry.dirtyCount();
+
+            assertTrue(dirty.size() <= 10, "dirtySeries devolveu " + dirty.size());
+            assertEquals(10, dirty.size());
+            assertEquals(10, dirtyCount);
+            assertEquals(0, counting.scans.get(), "dirtySeries/dirtyCount não podem varrer as entradas");
+        }
+    }
+
+    @Test
+    void indiceNaoExisteComCheckpointLocalDesligado() throws Exception {
+        try (SeriesHandleRegistry registry = registry(Duration.ofMinutes(15), 10, Clock.systemUTC())) {
+            assertFalse(registry.dirtyIndexTracked(), "o padrão é sem índice");
+            registry.open("a", yaml, Ngrrd.OpenOptions.defaults());
+            registry.open("b", yaml, Ngrrd.OpenOptions.defaults());
+            recordWrite(registry, "a");
+
+            assertEquals(Set.of("a"), registry.dirtySeries());
+            assertEquals(1, registry.dirtyCount());
+            assertTrue(dirtyIndex(registry).isEmpty(), "recordWrite não toca índice nenhum");
+
+            SeriesHandleRegistry.CheckpointAttempt attempt = registry.tryCheckpointAsync("a");
+            assertEquals(SeriesHandleRegistry.CheckpointAttempt.Outcome.STARTED, attempt.outcome());
+            attempt.future().join();
+            assertTrue(registry.dirtySeries().isEmpty(), "sem índice, a varredura vê a série limpa na hora");
+            assertEquals(0, registry.dirtyCount());
+            assertTrue(dirtyIndex(registry).isEmpty());
+
+            assertThrows(IllegalStateException.class, () -> registry.trackDirtyIndex(true),
+                    "ligar o índice com entradas abertas perderia as escritas anteriores");
+        }
+    }
+
+    @Test
+    void fechamentoPorOciosidadeEDescartePodamIndice() {
+        MutableClock clock = new MutableClock(Instant.parse("2026-01-01T00:00:00Z"));
+        try (SeriesHandleRegistry registry = trackedRegistry(Duration.ofMinutes(10), 10, clock)) {
+            registry.open("idle", yaml, Ngrrd.OpenOptions.defaults());
+            recordWrite(registry, "idle");
+            clock.advance(Duration.ofMinutes(11));
+            for (String key : List.of("discarded", "client-closed", "deleted", "migrated")) {
+                registry.open(key, yaml, Ngrrd.OpenOptions.defaults());
+                recordWrite(registry, key);
+            }
+            assertEquals(Set.of("idle", "discarded", "client-closed", "deleted", "migrated"),
+                    registry.dirtySeries());
+
+            assertEquals(1, registry.closeIdle());
+            assertFalse(registry.dirtySeries().contains("idle"), "closeIdle poda");
+            registry.discard("discarded");
+            assertFalse(registry.dirtySeries().contains("discarded"), "discard poda");
+            registry.close("client-closed");
+            assertFalse(registry.dirtySeries().contains("client-closed"), "close(seriesKey) poda (via discard)");
+            registry.closeForDeletion("deleted");
+            assertFalse(registry.dirtySeries().contains("deleted"), "closeForDeletion poda");
+            registry.markMigrating("migrated");
+            assertFalse(registry.dirtySeries().contains("migrated"), "markMigrating poda");
+            registry.clearMigrating("migrated");
+            assertTrue(registry.dirtySeries().isEmpty());
+        }
+
+        try (SeriesHandleRegistry registry = trackedRegistry(Duration.ofMinutes(10), 1, clock)) {
+            registry.open("evicted", yaml, Ngrrd.OpenOptions.defaults());
+            recordWrite(registry, "evicted");
+            clock.advance(Duration.ofMinutes(1));
+            registry.open("kept", yaml, Ngrrd.OpenOptions.defaults());
+            recordWrite(registry, "kept");
+            assertEquals(Set.of("kept"), registry.dirtySeries(), "evictIfOverLimit poda");
+        }
+
+        SeriesHandleRegistry closing = trackedRegistry(Duration.ofMinutes(10), 10, clock);
+        closing.open("open-at-close", yaml, Ngrrd.OpenOptions.defaults());
+        recordWrite(closing, "open-at-close");
+        closing.close();
+        assertTrue(closing.dirtySeries().isEmpty(), "close() do registro poda");
+    }
+
+    @Test
+    void congeladoPorMigracaoNaoPoda() {
+        try (SeriesHandleRegistry registry = trackedRegistry(Duration.ofMinutes(15), 10, Clock.systemUTC())) {
+            registry.open("frozen", yaml, Ngrrd.OpenOptions.defaults());
+            recordWrite(registry, "frozen");
+            registry.tryCheckpointAsync("frozen").future().join();
+            assertFalse(registry.isDirty("frozen"));
+            assertEquals(Set.of("frozen"), registry.dirtySeries(), "limpa, mas ainda no índice até a poda");
+
+            AtomicBoolean failCheckpoint = new AtomicBoolean(true);
+            wrapHandle(registry, "frozen", original -> delegating(original, method -> {
+                if (method.equals("checkpoint") && failCheckpoint.getAndSet(false)) {
+                    throw new IllegalStateException("checkpoint do cutover falhou");
+                }
+                return null;
+            }));
+            registry.beginMigrationCopy("frozen");
+            assertThrows(IllegalStateException.class, () -> registry.markMigrating("frozen"));
+            assertTrue(registry.isMigrationFrozen("frozen"));
+
+            assertEquals(SeriesHandleRegistry.CheckpointAttempt.Outcome.UNAVAILABLE,
+                    registry.tryCheckpointAsync("frozen").outcome());
+            assertEquals(Set.of("frozen"), registry.dirtySeries(),
+                    "congelada por migração não poda: a migração pode abortar e a série voltar suja");
+
+            registry.clearMigrating("frozen");
+            assertEquals(SeriesHandleRegistry.CheckpointAttempt.Outcome.CLEAN,
+                    registry.tryCheckpointAsync("frozen").outcome());
+            assertTrue(registry.dirtySeries().isEmpty());
+        }
+    }
+
+    @Test
+    @Timeout(value = 120, unit = TimeUnit.SECONDS)
+    void podaConcorrenteComEscritaNaoPerdeChave() throws Exception {
+        String key = "prune-race";
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try (SeriesHandleRegistry registry = trackedRegistry(Duration.ofMinutes(15), 10, Clock.systemUTC())) {
+            CyclicBarrier start = new CyclicBarrier(2);
+            for (int i = 0; i < 10_000; i++) {
+                // A entrada antiga deixou a chave no índice e foi substituída (fechada e reaberta) antes de a
+                // poda dela rodar: a poda atrasada concorre com a primeira escrita na entrada nova.
+                entries(registry).put(key, newEntry(FAKE_HANDLE));
+                recordWrite(registry, key);
+                entries(registry).put(key, newEntry(FAKE_HANDLE));
+
+                Future<?> pruner = pool.submit(() -> {
+                    start.await();
+                    registry.pruneIndex(key);
+                    return null;
+                });
+                Future<?> writer = pool.submit(() -> {
+                    start.await();
+                    recordWrite(registry, key);
+                    return null;
+                });
+                pruner.get(10, TimeUnit.SECONDS);
+                writer.get(10, TimeUnit.SECONDS);
+                assertTrue(registry.isDirty(key));
+                assertTrue(registry.dirtySeries().contains(key), "chave perdida do índice na iteração " + i);
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    // ------------------------------------------------------------------ apoio do índice de sujas
+
+    /** Handle falso: checkpoints concluem (o assíncrono em outra thread) e o resto não faz nada. */
+    private static final NgrrdHandle FAKE_HANDLE = (NgrrdHandle) Proxy.newProxyInstance(
+            NgrrdHandle.class.getClassLoader(), new Class<?>[]{NgrrdHandle.class}, (proxy, method, args) ->
+                    switch (method.getName()) {
+                        case "checkpointAsyncTimed" ->
+                                CompletableFuture.supplyAsync(() -> NgrrdHandle.CheckpointTiming.NONE);
+                        case "checkpointAsync" -> CompletableFuture.completedFuture(null);
+                        case "toString" -> "fake-handle";
+                        case "hashCode" -> System.identityHashCode(proxy);
+                        case "equals" -> proxy == args[0];
+                        default -> null;
+                    });
+
+    private SeriesHandleRegistry trackedRegistry(Duration idleTtl, int maxOpenHandles, Clock clock) {
+        SeriesHandleRegistry registry = registry(idleTtl, maxOpenHandles, clock);
+        registry.trackDirtyIndex(true);
+        return registry;
+    }
+
+    private static void recordWrite(SeriesHandleRegistry registry, String key) {
+        assertTrue(registry.withSeries(key, access -> {
+            access.recordWrite();
+            return true;
+        }).orElse(false), "série " + key + " deveria estar aberta");
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> entries(SeriesHandleRegistry registry) {
+        try {
+            Field field = SeriesHandleRegistry.class.getDeclaredField("entries");
+            field.setAccessible(true);
+            return (Map<String, Object>) field.get(registry);
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Set<String> dirtyIndex(SeriesHandleRegistry registry) {
+        try {
+            Field field = SeriesHandleRegistry.class.getDeclaredField("dirtyIndex");
+            field.setAccessible(true);
+            return (Set<String>) field.get(registry);
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    /** Entrada nova (limpa, não indexada) do registro, com o handle dado. */
+    private static Object newEntry(NgrrdHandle handle) {
+        try {
+            Class<?> type = Class.forName(SeriesHandleRegistry.class.getName() + "$HandleEntry");
+            Constructor<?> constructor = type.getDeclaredConstructor();
+            constructor.setAccessible(true);
+            Object entry = constructor.newInstance();
+            Field handleField = type.getDeclaredField("handle");
+            handleField.setAccessible(true);
+            handleField.set(entry, handle);
+            return entry;
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    private static void wrapHandle(SeriesHandleRegistry registry, String key, UnaryOperator<NgrrdHandle> wrapper) {
+        try {
+            Object entry = entries(registry).get(key);
+            Field handleField = entry.getClass().getDeclaredField("handle");
+            handleField.setAccessible(true);
+            handleField.set(entry, wrapper.apply((NgrrdHandle) handleField.get(entry)));
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    /** Proxy que delega ao original, exceto quando {@code override} devolve um valor não nulo pelo nome do método. */
+    private static NgrrdHandle delegating(NgrrdHandle original, Function<String, Object> override) {
+        return (NgrrdHandle) Proxy.newProxyInstance(NgrrdHandle.class.getClassLoader(),
+                new Class<?>[]{NgrrdHandle.class}, (proxy, method, args) -> {
+                    Object overridden = override.apply(method.getName());
+                    if (overridden != null) {
+                        return overridden;
+                    }
+                    try {
+                        return method.invoke(original, args);
+                    } catch (InvocationTargetException e) {
+                        throw e.getCause();
+                    }
+                });
+    }
+
+    /** Mapa que conta toda varredura (chaves, valores, entradas, {@code forEach}). */
+    private static final class ScanCountingMap<K, V> extends ConcurrentHashMap<K, V> {
+        private final AtomicInteger scans = new AtomicInteger();
+
+        @Override
+        public KeySetView<K, V> keySet() {
+            scans.incrementAndGet();
+            return super.keySet();
+        }
+
+        @Override
+        public Collection<V> values() {
+            scans.incrementAndGet();
+            return super.values();
+        }
+
+        @Override
+        public Set<Map.Entry<K, V>> entrySet() {
+            scans.incrementAndGet();
+            return super.entrySet();
+        }
+
+        @Override
+        public void forEach(BiConsumer<? super K, ? super V> action) {
+            scans.incrementAndGet();
+            super.forEach(action);
         }
     }
 

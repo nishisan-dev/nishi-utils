@@ -283,6 +283,8 @@ public final class NgrrdStorageNode implements Closeable {
                         .ifPresent(LOGGER::warning);
                 SeriesHandleRegistry registry = new SeriesHandleRegistry(volume, cfg.volumeName(),
                         cfg.handleIdleTtl(), cfg.maxOpenHandles(), Clock.systemUTC());
+                // Índice incremental de sujas só com o checkpoint local ligado: é o ciclo dele que poda.
+                registry.trackDirtyIndex(cfg.localCheckpoint().enabled());
 
                 startupRegistry = registry;
                 var lifecycleJournal = new SeriesLifecycleJournal(cfg.volumeDir().resolve(cfg.volumeName()));
