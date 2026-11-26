@@ -46,8 +46,8 @@ import java.util.logging.Logger;
  * anterior, então ciclos nunca se sobrepõem. Cada ciclo:</p>
  * <ol>
  *   <li>tira um instantâneo das séries sujas ({@link SeriesHandleRegistry#dirtySeries()});</li>
- *   <li>espalha os disparos por ~80% do intervalo com cadência por prazo: o disparo {@code i} de
- *       {@code n} sai no instante {@code início + i × 0,8 × interval / n}. A thread só dorme quando está
+ *   <li>espalha os disparos por {@code spreadFraction} do intervalo (padrão 0,8) com cadência por prazo: o
+ *       disparo {@code i} de {@code n} sai no instante {@code início + i × spreadFraction × interval / n}. A thread só dorme quando está
  *       adiantada em pelo menos 1 ms, então a cadência se mantém mesmo com centenas de milhares de séries
  *       (pausas de microssegundos viram rajadas curtas de poucos disparos, sem acumular atraso);</li>
  *   <li>para cada série, adquire uma vaga do semáforo de {@code maxInFlight} (fora de qualquer lock) e
@@ -74,8 +74,6 @@ public final class LocalCheckpointer implements Closeable {
 
     private static final Logger LOGGER = Logger.getLogger(LocalCheckpointer.class.getName());
 
-    /** Fração do intervalo pela qual os disparos de um ciclo são espalhados. */
-    private static final double SPREAD_FRACTION = 0.8;
     /** Folga mínima para a thread dormir em vez de seguir disparando. */
     private static final long MIN_SLEEP_NANOS = TimeUnit.MILLISECONDS.toNanos(1);
     /** Prazo de cada etapa do encerramento. */
@@ -148,7 +146,7 @@ public final class LocalCheckpointer implements Closeable {
         long startedNanos = System.nanoTime();
         List<String> dirty = new ArrayList<>(registry.dirtySeries());
         int count = dirty.size();
-        long spreadNanos = (long) (settings.interval().toNanos() * SPREAD_FRACTION);
+        long spreadNanos = (long) (settings.interval().toNanos() * settings.spreadFraction());
         for (int i = 0; i < count && !closed; i++) {
             long dueNanos = startedNanos + (count > 1 ? spreadNanos / count * i : 0L);
             long aheadNanos = dueNanos - System.nanoTime();

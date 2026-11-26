@@ -570,6 +570,30 @@ class StorageNodeConfigYamlTest {
         assertTrue(negative.getMessage().contains("ngrrd.checkpoint.threads"), negative.getMessage());
     }
 
+    @Test
+    void checkpointSpreadFractionTemPadraoOitentaELeODoYaml() {
+        assertEquals(0.8, StorageNodeConfig.fromYaml(CHECKPOINT_BASE, NO_ENV).localCheckpoint().spreadFraction());
+
+        assertEquals(0.5, StorageNodeConfig.fromYaml(CHECKPOINT_BASE + """
+                  checkpoint:
+                    spreadFraction: 0.5
+                """, NO_ENV).localCheckpoint().spreadFraction());
+        assertEquals(1.0, StorageNodeConfig.fromYaml(CHECKPOINT_BASE + """
+                  checkpoint:
+                    spreadFraction: 1
+                """, NO_ENV).localCheckpoint().spreadFraction());
+    }
+
+    @Test
+    void checkpointSpreadFractionForaDaFaixaFalhaNoBootComOCampoNaMensagem() {
+        for (String invalid : new String[] {"0", "-0.2", "1.5"}) {
+            IllegalArgumentException e = assertThrows(IllegalArgumentException.class,
+                    () -> StorageNodeConfig.fromYaml(CHECKPOINT_BASE + "  checkpoint:\n    spreadFraction: " + invalid
+                            + "\n", NO_ENV));
+            assertTrue(e.getMessage().contains("ngrrd.checkpoint.spreadFraction"), e.getMessage());
+        }
+    }
+
     private static final String CHECKPOINT_BASE = """
             node:
               id: storage-0

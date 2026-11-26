@@ -147,7 +147,8 @@ class NgrrdStorageNodeForcePoolTest {
                 .initialShardCapacityBytes(1L << 20)
                 .bootDiscoveryWindow(Duration.ZERO)
                 .localCheckpoint(new LocalCheckpointSettings(false, LocalCheckpointSettings.DEFAULT_INTERVAL,
-                        LocalCheckpointSettings.defaultMaxInFlight(), threads))
+                        LocalCheckpointSettings.defaultMaxInFlight(), threads,
+                        LocalCheckpointSettings.DEFAULT_SPREAD_FRACTION))
                 .build();
     }
 

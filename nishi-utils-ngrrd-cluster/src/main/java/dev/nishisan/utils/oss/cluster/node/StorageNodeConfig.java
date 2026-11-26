@@ -182,7 +182,7 @@ import java.util.function.Function;
  *                                 evita que o mmap suje o folio inteiro do page cache (ver
  *                                 {@code doc/oss/ngrrd-blob-volume.md}); a leitura continua pelo mmap
  * @param localCheckpoint          checkpoint local periódico das séries sujas ({@code ngrrd.checkpoint}:
- *                                 {@code enabled}, {@code interval}, {@code maxInFlight}, {@code threads}). Default
+ *                                 {@code enabled}, {@code interval}, {@code maxInFlight}, {@code threads}, {@code spreadFraction}). Default
  *                                 {@link LocalCheckpointSettings#disabled()}; ver {@link LocalCheckpointer}
  */
 public record StorageNodeConfig(
@@ -926,8 +926,10 @@ public record StorageNodeConfig(
             Duration interval = NgrrdYamlSupport.duration(section.interval, "ngrrd.checkpoint.interval");
             int maxInFlight = section.maxInFlight != null ? section.maxInFlight : defaults.maxInFlight();
             int threads = section.threads != null ? section.threads : defaults.threads();
+            double spreadFraction = section.spreadFraction != null ? section.spreadFraction
+                    : defaults.spreadFraction();
             return new LocalCheckpointSettings(enabled, interval != null ? interval : defaults.interval(), maxInFlight,
-                    threads);
+                    threads, spreadFraction);
         }
 
         private static void applyDuration(String raw, String fieldName, java.util.function.Consumer<Duration> setter) {
@@ -1008,6 +1010,7 @@ public record StorageNodeConfig(
         public String interval;
         public Integer maxInFlight;
         public Integer threads;
+        public Double spreadFraction;
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)

@@ -163,9 +163,16 @@ class StorageNodeConfigTest {
                 () -> new LocalCheckpointSettings(true, Duration.ofSeconds(1), 0));
         assertThrows(NullPointerException.class, () -> new LocalCheckpointSettings(true, null, 1));
         assertThrows(IllegalArgumentException.class,
-                () -> new LocalCheckpointSettings(true, Duration.ofSeconds(1), 1, -1));
+                () -> new LocalCheckpointSettings(true, Duration.ofSeconds(1), 1, -1, 0.8));
         assertEquals(0, new LocalCheckpointSettings(true, Duration.ofSeconds(1), 1).threads());
-        assertEquals(3, new LocalCheckpointSettings(false, Duration.ofSeconds(1), 1, 3).threads());
+        assertEquals(3, new LocalCheckpointSettings(false, Duration.ofSeconds(1), 1, 3, 0.8).threads());
+        assertEquals(0.8, new LocalCheckpointSettings(true, Duration.ofSeconds(1), 1).spreadFraction());
+        assertEquals(1.0, new LocalCheckpointSettings(true, Duration.ofSeconds(1), 1, 0, 1.0).spreadFraction());
+        for (double invalid : new double[] {0.0, -0.1, 1.0001, Double.NaN, Double.POSITIVE_INFINITY}) {
+            assertThrows(IllegalArgumentException.class,
+                    () -> new LocalCheckpointSettings(true, Duration.ofSeconds(1), 1, 0, invalid),
+                    "spreadFraction " + invalid);
+        }
     }
 
     @Test

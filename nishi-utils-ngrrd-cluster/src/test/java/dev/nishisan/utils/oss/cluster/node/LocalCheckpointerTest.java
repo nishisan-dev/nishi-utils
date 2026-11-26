@@ -332,6 +332,35 @@ class LocalCheckpointerTest {
     }
 
     @Test
+    void spreadFractionConfiguravelDefineAduracaoDaCadenciaDoCiclo() throws Exception {
+        List<String> keys = List.of("p0", "p1", "p2");
+        for (String key : keys) {
+            open(key);
+            write(key, T0);
+        }
+        // Intervalo de 3 s e fração 1,0: o disparo i de 3 sai em i × 1 s, então o ciclo dura ~2 s.
+        try (LocalCheckpointer wide = new LocalCheckpointer(registry,
+                new LocalCheckpointSettings(true, Duration.ofSeconds(3), 3, 0, 1.0))) {
+            wide.runCycle();
+            awaitTrue(() -> wide.inFlightCount() == 0);
+            assertTrue(wide.metrics().get("localCheckpoint.lastCycleMs") >= 1_900L,
+                    "fração 1,0 espalha pelo intervalo inteiro: " + wide.metrics());
+        }
+        for (String key : keys) {
+            write(key, T0 + 300_000L);
+        }
+        // Mesma entrada com fração 0,1: os disparos se espalham por 300 ms, e o ciclo dura ~200 ms.
+        try (LocalCheckpointer narrow = new LocalCheckpointer(registry,
+                new LocalCheckpointSettings(true, Duration.ofSeconds(3), 3, 0, 0.1))) {
+            narrow.runCycle();
+            awaitTrue(() -> narrow.inFlightCount() == 0);
+            long elapsed = narrow.metrics().get("localCheckpoint.lastCycleMs");
+            assertTrue(elapsed < 1_000L, "fração 0,1 espalha por ~300 ms: " + elapsed + " ms");
+            assertEquals(3L, narrow.metrics().get("localCheckpoint.checkpointed"));
+        }
+    }
+
+    @Test
     void serieLimpaOuIndisponivelDevolveAVagaDoSemaforo() throws Exception {
         open("clean");
         open("frozen");
