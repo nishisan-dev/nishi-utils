@@ -492,5 +492,7 @@ As specs da 8.15, 8.16 e 8.18 passaram por revisão independente e foram revisad
       - na primeira escrita ou OPEN com YAML, e na 8.17 pelo reenvio do `DefinitionRef`;
       - ferramenta administrativa de vinculação em lote, para séries frias, que recebe o YAML das definições do cluster e vincula por `definitionName` + `geometryId` + hash do cabeçalho;
       - métrica de séries sem vínculo por nó, para medir quanto falta.
-    - **NÃO VERIFICADO:** se o cabeçalho do `.ngrr` guarda informação bastante para reconstruir a definição sem o YAML. Se guardar, o backfill pode ser feito pelo próprio nó, sem ajuda do cliente.
-    - **Release:** entra na 8.16 se couber sem atrasar a cerca e a manutenção; senão, na 8.17, junto com o `DefinitionRef`.
+    - **Cabeçalho do `.ngrr` (verificado em 26/11):** guarda só a geometria: step, DS e RRA. Faltam heartbeat, min/max, política de reset, `lateSamplePolicy` e o nome da definição. O hash gravado ali é o da geometria, não o do YAML. Por isso o nó não consegue fazer o backfill sozinho.
+    - **Release (aprovado em 26/11):**
+      - **8.16:** métrica `definitions.unboundSeries` por nó. O backfill preguiçoso já acontece no OPEN de toda série escrita ou aberta depois do upgrade.
+      - **8.17:** ferramenta de vinculação em lote, junto com o `DefinitionRef`. Ela vincula só quando há exatamente um YAML com o mesmo `definitionName` + `geometryId` + hash; nos outros casos, reporta a ambiguidade.
