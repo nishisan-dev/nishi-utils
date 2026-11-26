@@ -519,15 +519,22 @@ public final class Ngrrd {
         @Override
         public void closeForDeletion() {
             closed = true;
-            writer.closeForDeletion();
-            closeOwnedStorageOnce();
+            try {
+                writer.closeForDeletion();
+            } finally {
+                closeOwnedStorageOnce();
+            }
         }
 
+        /** Repassa as falhas do writer sem embrulhar (inclusive {@link dev.nishisan.utils.oss.writer.WriterAbandonedException}). */
         @Override
         public void close() {
             closed = true;
-            writer.close();
-            closeOwnedStorageOnce();
+            try {
+                writer.close();
+            } finally {
+                closeOwnedStorageOnce();
+            }
         }
 
         private void closeOwnedStorageOnce() {

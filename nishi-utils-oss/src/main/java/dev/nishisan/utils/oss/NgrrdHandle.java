@@ -160,9 +160,23 @@ public interface NgrrdHandle extends AutoCloseable {
      */
     SeriesResult read(String dsName, ViewQuery query, long endExclusiveEpochMs);
 
-    /** Stop without a final checkpoint, before deletion. Unsupported implementations must fail closed. */
+    /**
+     * Stop without a final checkpoint, before deletion. Unsupported implementations must fail closed.
+     *
+     * <p>No handle local, lança {@link IllegalStateException} enquanto um force do checkpoint,
+     * preso no fechamento, continuar em voo sobre a região; terminado o force, uma nova chamada
+     * volta normalmente (ver {@code NgrrdWriter.closeForDeletion()}).</p>
+     */
     default void closeForDeletion() { throw new UnsupportedOperationException("closeForDeletion"); }
 
+    /**
+     * Fecha o handle (ver o Javadoc da interface).
+     *
+     * @throws dev.nishisan.utils.oss.writer.WriterAbandonedException no handle local, se o fechamento encontrou um force do
+     *         checkpoint preso e encerrou o writer sem checkpoint final (amostras desde o último
+     *         checkpoint podem ter sido perdidas). Repassada sem embrulho e lançada em toda chamada
+     *         seguinte; descarte o handle (ver {@code NgrrdWriter.close()})
+     */
     @Override
     void close();
 }

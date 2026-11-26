@@ -135,14 +135,11 @@ public final class NgrrdWriter implements AutoCloseable {
     // Futures de Syncs encadeados num force destacado (completeAfterPendingForce) ainda pendentes.
     // O Shutdown com force preso as falha: o force pode nunca terminar.
     private final Set<CompletableFuture<Void>> chainedSyncs = ConcurrentHashMap.newKeySet();
-    // Desfecho do Shutdown com force preso, publicado pela worker antes de liberar o latch e lido
-    // pelo stop(): os forces que estouraram o teto, a causa e se era um close() com checkpoint.
+    // Desfecho do Shutdown com force preso, decidido uma única vez pela worker e publicado antes de
+    // liberar o latch (stuckForceFailure por último). Pegajoso: o stop() só o lê. stuckForces são os
+    // forces que estouraram o teto, consultados a cada closeForDeletion() (isDone()).
     private volatile List<CompletableFuture<Void>> stuckForces = List.of();
     private volatile IllegalStateException stuckForceFailure;
-    private volatile boolean stuckOnCheckpoint;
-    // A primeira chamada do stop() depois de um close() com force preso sempre lança, mesmo que o
-    // force já tenha terminado: a série ficou sem checkpoint final.
-    private final AtomicBoolean stuckCloseReported = new AtomicBoolean();
 
     private final WriterScheduler scheduler;
     private final LinkedBlockingQueue<Command> queue = new LinkedBlockingQueue<>();
@@ -478,27 +475,46 @@ public final class NgrrdWriter implements AutoCloseable {
         }
     }
 
+    /**
+     * Fecha o writer: materializa o CDP em progresso, força a série e encerra a worker
+     * (checkpoint final). Idempotente quando o fechamento é limpo.
+     *
+     * @throws WriterAbandonedException se o Shutdown encontrou um force destacado preso além do
+     *         teto ({@value #SHUTDOWN_FORCE_WAIT_SECONDS} s) e encerrou sem checkpoint final: as
+     *         amostras desde o último checkpoint podem ter sido perdidas. Lançada em toda chamada,
+     *         concorrente ou posterior, mesmo depois de o force terminar (o writer está
+     *         abandonado; descarte-o)
+     * @throws IllegalStateException se a worker não terminar em {@value #STOP_TIMEOUT_SECONDS} s
+     */
     @Override
     public void close() {
         stop(true);
     }
 
-    /** Wait for the worker to stop before its region can be returned to the allocator. */
+    /**
+     * Encerra a worker sem checkpoint final, antes de a região voltar ao alocador. Espera os
+     * forces destacados em voo (até {@value #SHUTDOWN_FORCE_WAIT_SECONDS} s).
+     *
+     * @throws IllegalStateException enquanto um force destacado preso no Shutdown continuar em voo
+     *         sobre a região (a região não pode ser liberada ainda). Decidido a cada chamada:
+     *         terminados os forces, com sucesso ou falha, uma nova chamada volta normalmente,
+     *         porque a deleção não precisa de durabilidade. Também se a worker não terminar em
+     *         {@value #STOP_TIMEOUT_SECONDS} s
+     */
     public void closeForDeletion() {
         stop(false);
     }
 
     /**
-     * Enfileira o Shutdown e espera a worker terminar. Lança {@link IllegalStateException} se a
-     * worker não terminar em {@value #STOP_TIMEOUT_SECONDS} s, ou se o Shutdown encerrou com um
-     * force destacado preso (ver {@code awaitPendingForces}):
+     * Enfileira o Shutdown (uma única vez) e espera a worker terminar. Lança
+     * {@link IllegalStateException} se ela não terminar em {@value #STOP_TIMEOUT_SECONDS} s.
+     * Se o Shutdown encerrou com um force destacado preso (ver {@code awaitPendingForces}), o
+     * desfecho é pegajoso, decidido pela worker antes de liberar o latch:
      * <ul>
-     *   <li>a primeira chamada depois de um {@code close()} com force preso sempre lança: a
-     *       série ficou sem checkpoint final;</li>
-     *   <li>qualquer chamada lança enquanto o force preso continuar em voo sobre a região;</li>
-     *   <li>terminado o force, uma nova chamada volta normalmente, para que quem tenta de novo
-     *       (fechamento ocioso, despejo, migração, exclusão) consiga tirar o handle do lugar. O
-     *       Shutdown já ocorreu; nada mais é escrito.</li>
+     *   <li>{@code close()} ({@code checkpoint = true}): {@link WriterAbandonedException} em toda
+     *       chamada, concorrente ou posterior, mesmo depois de o force terminar;</li>
+     *   <li>{@code closeForDeletion()}: {@link IllegalStateException} enquanto algum force preso
+     *       não estiver {@code isDone()}; depois, volta normalmente.</li>
      * </ul>
      */
     private void stop(boolean checkpoint) {
@@ -517,7 +533,7 @@ public final class NgrrdWriter implements AutoCloseable {
             throw new IllegalStateException("writer shutdown interrupted", e);
         }
         try {
-            IllegalStateException stuck = stuckForceFailureForCaller();
+            IllegalStateException stuck = stuckForceFailureForCaller(checkpoint);
             if (stuck != null) {
                 throw stuck;
             }
@@ -526,19 +542,28 @@ public final class NgrrdWriter implements AutoCloseable {
         }
     }
 
-    /** Falha a devolver ao chamador do stop() por causa de um force preso no Shutdown, ou {@code null}. */
-    private IllegalStateException stuckForceFailureForCaller() {
+    /**
+     * Falha a devolver ao chamador do stop() por causa de um force preso no Shutdown, ou
+     * {@code null}. Sem estado mutável próprio: depende só do desfecho publicado pela worker e,
+     * na deleção, do {@code isDone()} dos forces presos.
+     *
+     * @param checkpoint {@code true} para {@code close()}, {@code false} para {@code closeForDeletion()}
+     */
+    private IllegalStateException stuckForceFailureForCaller(boolean checkpoint) {
         IllegalStateException cause = stuckForceFailure;
         if (cause == null) {
             return null;
         }
-        boolean inFlight = stuckForces.stream().anyMatch(force -> !force.isDone());
-        boolean firstCloseReport = stuckOnCheckpoint && stuckCloseReported.compareAndSet(false, true);
-        if (!inFlight && !firstCloseReport) {
+        if (checkpoint) {
+            return new WriterAbandonedException("writer de " + storageKey + " abandonado no fechamento: "
+                    + "um force em voo não terminou no teto, e o writer encerrou sem checkpoint final; as "
+                    + "amostras desde o último checkpoint concluído podem ter sido perdidas", cause);
+        }
+        if (stuckForces.stream().allMatch(CompletableFuture::isDone)) {
             return null;
         }
-        return new IllegalStateException("writer shutdown sem checkpoint final: " + cause.getMessage()
-                + (inFlight ? " (force ainda em voo)" : ""), cause);
+        return new IllegalStateException("closeForDeletion de " + storageKey + ": force em voo ainda não "
+                + "terminou sobre a região, que não pode ser liberada; tente de novo depois", cause);
     }
 
     public String seriesKey() {
@@ -640,11 +665,17 @@ public final class NgrrdWriter implements AutoCloseable {
                         try {
                             // Com force preso, o canal não é fechado: o close() de um canal que
                             // destaca o force só força a região, e travaria como o force em voo.
+                            // O BlobSeriesChannel não tem recurso próprio (o mapping é do shard).
+                            // Um canal futuro que destaque o force e tenha recurso próprio precisa
+                            // ser fechado na retentativa, depois de o force terminar.
                             if (!forceStuck) {
                                 closeChannelQuietly();
                             }
                         } finally {
-                            if (!s.checkpoint() && !forceStuck) {
+                            if (forceStuck) {
+                                orphanedSyncFailure = new IllegalStateException(
+                                        "Writer encerrado com force preso", finalFailure);
+                            } else if (!s.checkpoint()) {
                                 orphanedSyncFailure = new IllegalStateException(
                                         "Writer encerrado sem checkpoint final (closeForDeletion)");
                             } else if (finalFailure != null) {
@@ -1091,7 +1122,7 @@ public final class NgrrdWriter implements AutoCloseable {
      * mesma causa, publica o desfecho para o {@code stop()} e devolve a causa: o Shutdown
      * encerra sem escrever nem forçar a região.
      *
-     * @param checkpoint se o Shutdown é de um {@code close()} (com checkpoint final)
+     * @param checkpoint se o Shutdown é de um {@code close()} (com checkpoint final), só para a mensagem
      * @return {@code null} se todos terminaram; senão, a causa do force preso
      */
     private IllegalStateException awaitPendingForces(boolean checkpoint) {
@@ -1117,12 +1148,14 @@ public final class NgrrdWriter implements AutoCloseable {
         IllegalStateException stuck = null;
         if (!completed) {
             changedSinceForce = true;
+            String outcome = checkpoint
+                    ? "close() encerrou o writer sem checkpoint final; as amostras desde o último checkpoint "
+                            + "podem ter sido perdidas e a série fica pendente de force no próximo open"
+                    : "closeForDeletion() encerrou o writer com o force ainda em voo sobre a região";
             stuck = new IllegalStateException("force em voo de " + storageKey + " não terminou em "
-                    + TimeUnit.NANOSECONDS.toMillis(shutdownForceWaitNanos) + " ms; writer encerrado sem "
-                    + "checkpoint final, a série fica pendente de force no próximo open");
+                    + TimeUnit.NANOSECONDS.toMillis(shutdownForceWaitNanos) + " ms; " + outcome);
             System.err.println("ngrrd-writer: SEVERE: " + stuck.getMessage());
             stuckForces = List.copyOf(pendingForces);
-            stuckOnCheckpoint = checkpoint;
             stuckForceFailure = stuck;
             for (CompletableFuture<Void> chained : chainedSyncs) {
                 chained.completeExceptionally(stuck);
