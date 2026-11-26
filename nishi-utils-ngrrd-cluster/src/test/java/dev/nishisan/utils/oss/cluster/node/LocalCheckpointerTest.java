@@ -275,7 +275,8 @@ class LocalCheckpointerTest {
                 new LocalCheckpointSettings(true, Duration.ofMillis(50), 2));
         checkpointer.start();
         awaitTrue(() -> checkpointer.metrics().get("localCheckpoint.cycles") >= 2);
-        assertFalse(registry.isDirty("scheduled"));
+        // O ciclo termina ao enfileirar o checkpoint; a série só fica limpa quando ele conclui (assíncrono).
+        awaitTrue(() -> !registry.isDirty("scheduled"));
         assertTrue(threadAlive("ngrrd-local-checkpoint"));
 
         checkpointer.close();
