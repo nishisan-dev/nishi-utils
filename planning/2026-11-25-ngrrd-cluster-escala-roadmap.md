@@ -480,3 +480,17 @@ As specs da 8.15, 8.16 e 8.18 passaram por revisão independente e foram revisad
 9. **Época fornecida pela lib.** A 8.16 entrega `acquireWriterEpoch(scope)`: monotônica, durável no cluster e incrementada pelo líder, para que o consumidor não precise de uma fonte própria de época.
 10. **Exportação nativa `.ngrr` sai da 8.18.** Os clientes precisam de leitura de pontos em lote para o tier frio. A exportação nativa fica para uma release futura (backup, DR, migração entre clusters).
 11. **Teto do spill (8.16).** O padrão passa a ser derivado de taxa × prazo de manutenção, ou ao menos documentado com essa conta: 1 GiB não cobre 15 min num nó com ~20 mil amostras/s.
+
+## Decisões da revisão externa (26/11)
+
+12. **Metadados de toda série persistidos em disco no nó.**
+    - **O que a 8.16 já cobre:** o `DefinitionStore` grava o YAML e o journal grava o hash do vínculo. Isso vale para toda série aberta, reaberta ou migrada depois do upgrade.
+    - **O que falta:** uma série criada antes da 8.16 e que não foi reaberta desde então não tem vínculo em disco, porque a definição dela só existia na memória do processo antigo. Para essas séries, a resolução por `definitionName` + `geometryId` só funciona quando há um único hash candidato. O `readMany` com `legacyFallback` responde `DEFINITION_UNAVAILABLE`.
+    - **Requisito:** ao fim do ciclo, toda série tem os metadados persistidos em disco no nó que a serve: definição (hash + YAML), vínculo e `lastWrite` (8.18). Isso não pode depender de o cliente reabrir a série. `DEFINITION_UNAVAILABLE` deixa de ser estado permanente e vira só uma janela de upgrade.
+    - **Caminho candidato, a confirmar na spec:**
+      - backfill preguiçoso do vínculo;
+      - na primeira escrita ou OPEN com YAML, e na 8.17 pelo reenvio do `DefinitionRef`;
+      - ferramenta administrativa de vinculação em lote, para séries frias, que recebe o YAML das definições do cluster e vincula por `definitionName` + `geometryId` + hash do cabeçalho;
+      - métrica de séries sem vínculo por nó, para medir quanto falta.
+    - **NÃO VERIFICADO:** se o cabeçalho do `.ngrr` guarda informação bastante para reconstruir a definição sem o YAML. Se guardar, o backfill pode ser feito pelo próprio nó, sem ajuda do cliente.
+    - **Release:** entra na 8.16 se couber sem atrasar a cerca e a manutenção; senão, na 8.17, junto com o `DefinitionRef`.
