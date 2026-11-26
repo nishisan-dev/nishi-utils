@@ -29,11 +29,13 @@ import dev.nishisan.utils.oss.cluster.client.WriteDispatcher.ReleaseTicket;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -144,25 +146,26 @@ final class SeriesReleaser implements AutoCloseable {
                 tickets.add(entry.ticket());
             }
         }
-        Map<String, ReleaseDrain> drained = dispatcher.drainForRelease(tickets, remaining(deadlineNanos));
-        drained.forEach((key, drain) -> results.put(key, toRelease(drain)));
+        Set<String> finished = new HashSet<>();
+        try {
+            Map<String, ReleaseDrain> drained = dispatcher.drainForRelease(tickets, remaining(deadlineNanos));
+            drained.forEach((key, drain) -> results.put(key, toRelease(drain)));
 
-        if (options.checkpoint() || options.closeOnNode()) {
-            runRemoteCommands(held, results, options, deadlineNanos);
-        }
+            if (options.checkpoint() || options.closeOnNode()) {
+                runRemoteCommands(held, results, options, deadlineNanos);
+            }
 
-        for (Map.Entry<String, Held> entry : held.entrySet()) {
-            String key = entry.getKey();
-            Held value = entry.getValue();
-            ReleaseStatus status = results.get(key).status();
-            if (value.ticket() != null) {
-                dispatcher.finishRelease(value.ticket(), status != ReleaseStatus.TIMED_OUT);
+            for (Map.Entry<String, Held> entry : held.entrySet()) {
+                String key = entry.getKey();
+                ReleaseStatus status = results.get(key).status();
+                finish(key, entry.getValue(), status != ReleaseStatus.TIMED_OUT);
+                finished.add(key);
+                resolver.invalidate(key);
             }
-            if (value.writableClosed()) {
-                // Idempotente: cobre o handle cuja rota não era a do mapa (ticket sem holder).
-                dispatcher.endGeneration(key, value.handle().generationId(), value.handle());
+        } finally {
+            if (finished.size() < held.size()) {
+                abandon(held, finished);
             }
-            resolver.invalidate(key);
         }
         if (clientClosed.getAsBoolean()) {
             throw closed();
@@ -173,6 +176,36 @@ final class SeriesReleaser implements AutoCloseable {
                     + result.notReleased().size() + ", amostras com falha=" + result.failedSamples());
         }
         return result;
+    }
+
+    /** Etapa 5 de uma série: solta o ticket (e a proteção dele) e o holder do handle fechado pelo release. */
+    private void finish(String key, Held value, boolean delivered) {
+        if (value.ticket() != null) {
+            dispatcher.finishRelease(value.ticket(), delivered);
+        }
+        if (value.writableClosed()) {
+            // Idempotente: cobre o handle cuja rota não era a do mapa (ticket sem holder).
+            dispatcher.endGeneration(key, value.handle().generationId(), value.handle());
+        }
+    }
+
+    /**
+     * Saída do release por uma falha fora do desfecho por série (dispatcher fechado, erro inesperado): finaliza, sem
+     * dar falha alguma como entregue, os tickets que ainda não foram finalizados — senão a rota ficaria com holder e
+     * com a proteção contra marcas para sempre. Cada série uma vez só; uma falha aqui vai para o log e não esconde a
+     * original.
+     */
+    private void abandon(Map<String, Held> held, Set<String> finished) {
+        for (Map.Entry<String, Held> entry : held.entrySet()) {
+            if (finished.contains(entry.getKey())) {
+                continue;
+            }
+            try {
+                finish(entry.getKey(), entry.getValue(), false);
+            } catch (RuntimeException e) {
+                LOGGER.log(Level.WARNING, "Falha ao finalizar o release interrompido de " + entry.getKey(), e);
+            }
+        }
     }
 
     /**

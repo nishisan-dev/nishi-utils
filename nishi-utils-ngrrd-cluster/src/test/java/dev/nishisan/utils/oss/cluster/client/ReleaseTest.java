@@ -305,6 +305,24 @@ class ReleaseTest {
     }
 
     @Test
+    void falhaInesperadaNoReleaseAindaFinalizaOsTickets() throws Exception {
+        rpc.checkpoints = (owner, body) -> {
+            throw new Error("falha inesperada simulada");
+        };
+        start(WriteFailureReporting.MARKS);
+        RemoteSeriesHandle handle = open("s");
+        handle.write("ds", new Sample(1, 1));
+        Await.untilTrue("escrita confirmada", WAIT, () -> dispatcher.samplesSent() == 1);
+
+        var failure = assertThrows(ExecutionException.class, () -> releaser.release(List.of("s"),
+                ReleaseOptions.defaults().withCheckpoint(true)).get(10, TimeUnit.SECONDS));
+
+        assertTrue(String.valueOf(failure.getCause()).contains("falha inesperada simulada"), String.valueOf(failure));
+        assertFalse(dispatcher.hasRoute("s"), "o ticket foi finalizado: a rota ociosa sem holder saiu");
+        assertNull(handles.get("s"));
+    }
+
+    @Test
     void releaseComBarrierRemoveRotaComFalha() throws Exception {
         rpc.writes = (owner, request) -> respond(request, key -> SeriesStatus.ERROR);
         start(WriteFailureReporting.BARRIER);
