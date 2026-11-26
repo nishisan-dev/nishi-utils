@@ -43,8 +43,10 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -55,6 +57,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiConsumer;
+import java.util.function.Consumer;
 import java.util.function.Function;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -1483,13 +1486,104 @@ class WriteDispatcherTest {
         assertTrue(workers.awaitTermination(10, TimeUnit.SECONDS), "as threads terminam dentro de 10 s");
         assertNull(threadMx.findDeadlockedThreads());
         assertEquals(List.of(), failures);
+        Await.untilTrue("toda escrita admitida tem desfecho", AWAIT_TIMEOUT,
+                () -> dispatcher.samplesEnqueued() == dispatcher.samplesSent() + dispatcher.samplesFailed());
         Await.untilTrue("mapa de rotas vazio", AWAIT_TIMEOUT, () -> dispatcher.routes() == 0);
+    }
+
+    @Test
+    void trocaDeGeracaoConcorrenteContaCadaDesfechoUmaVez() throws Exception {
+        newDispatcher(1, Duration.ofMillis(1), 100_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        rpc.respondDefault((command, body) -> okFor((WriteBatchRequest) body));
+        AtomicLong generations = new AtomicLong();
+        AtomicBoolean stop = new AtomicBoolean();
+        List<Throwable> failures = new CopyOnWriteArrayList<>();
+        List<Thread> threads = new ArrayList<>();
+        for (int t = 0; t < 12; t++) {
+            threads.add(Thread.ofPlatform().name("generation-race-" + t).start(() -> {
+                long ts = 0;
+                try {
+                    while (!stop.get()) {
+                        String generation = "g" + generations.incrementAndGet();
+                        dispatcher.beginGeneration("s", generation, OWNER_A.value());
+                        for (int i = 0; i < 4; i++) {
+                            try {
+                                dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", ++ts, i, generation));
+                            } catch (NgrrdClusterException replaced) {
+                                // Geração trocada por outra thread: SERIES_DELETED.
+                                if (replaced.code() != ErrorCode.SERIES_DELETED) {
+                                    throw replaced;
+                                }
+                            }
+                        }
+                    }
+                } catch (Throwable e) {
+                    failures.add(e);
+                }
+            }));
+        }
+        Thread.sleep(2_000);
+        stop.set(true);
+        for (Thread thread : threads) {
+            thread.join(TimeUnit.SECONDS.toMillis(10));
+        }
+
+        assertEquals(List.of(), failures);
+        // A rota substituída é contada como falha dentro do compute; uma resposta tardia que a encontre antes da
+        // publicação da rota nova não pode contá-la de novo como enviada (nem uma admissão entrar nela).
+        long deadline = System.nanoTime() + AWAIT_TIMEOUT.toNanos();
+        while (System.nanoTime() < deadline
+                && dispatcher.samplesEnqueued() != dispatcher.samplesSent() + dispatcher.samplesFailed()) {
+            Thread.sleep(20);
+        }
+        assertEquals(dispatcher.samplesEnqueued(), dispatcher.samplesSent() + dispatcher.samplesFailed(),
+                "desfecho contado exatamente uma vez (gerações=" + generations.get() + ", enviadas="
+                        + dispatcher.samplesSent() + ", falhas=" + dispatcher.samplesFailed() + ")");
+    }
+
+    @Test
+    void reaberturaDeRotaDestacadaNaoPausaAGeracaoNova() throws Exception {
+        newDispatcher(1, Duration.ofMillis(10), 1000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        // g1: dica que aponta o próprio nó → consulta ao líder → líder não conhece a série → invalida e reabre.
+        Set<String> redirected = ConcurrentHashMap.newKeySet();
+        rpc.respondDefault((command, body) -> {
+            WriteBatchRequest request = (WriteBatchRequest) body;
+            SeriesWrite first = request.writes().getFirst();
+            return "g1".equals(first.generationId()) && redirected.add(first.seriesKey())
+                    ? moved(request, OWNER_A) : okFor(request);
+        });
+        placementLookup.atLeader = keys -> Map.of();
+        Map<String, CountDownLatch> replaced = new ConcurrentHashMap<>();
+        // Ainda sob o lock da rota g1, antes da reabertura: outra thread abre a g2, que destaca a g1. A janela entre
+        // destacar e publicar a g2 é estreita; várias chaves aumentam a chance de a reabertura cair nela.
+        placementLookup.onInvalidate = key -> Thread.ofPlatform().start(() -> {
+            dispatcher.beginGeneration(key, "g2", OWNER_A.value(), new Object());
+            replaced.get(key).countDown();
+        });
+        int keys = 50;
+        for (int i = 0; i < keys; i++) {
+            String key = "s-" + i;
+            replaced.put(key, new CountDownLatch(1));
+            dispatcher.beginGeneration(key, "g1", OWNER_A.value(), new Object());
+            dispatcher.enqueue(OWNER_A.value(), new SeriesWrite(key, "in_octets", 1, 1, "g1"));
+            assertTrue(replaced.get(key).await(5, TimeUnit.SECONDS), "g2 aberta durante a consulta ao líder: " + key);
+
+            dispatcher.enqueue(OWNER_A.value(), new SeriesWrite(key, "in_octets", 2, 2, "g2"));
+
+            // A reabertura da g1 destacada não pode deixar a chave pausada sem prazo para a g2.
+            dispatcher.flushGenerationSync(key, "g2", OWNER_A.value(), Duration.ofSeconds(5));
+        }
+        assertEquals(keys, dispatcher.samplesSent());
+        assertEquals(keys, dispatcher.samplesFailed(), "cada escrita da g1 é contada como falha na troca, uma vez");
+        assertEquals(dispatcher.samplesEnqueued(), dispatcher.samplesSent() + dispatcher.samplesFailed());
     }
 
     private static final class FakePlacementLookup implements PlacementLookup {
         final List<String> notedOwners = new CopyOnWriteArrayList<>();
         final List<String> invalidated = new CopyOnWriteArrayList<>();
         final AtomicInteger atLeaderCalls = new AtomicInteger();
+        /** Chamado em cada {@code invalidate}, na thread (e sob os locks) de quem invalida. */
+        volatile Consumer<String> onInvalidate = key -> { };
         volatile Function<Collection<String>, Map<String, SeriesPlacement>> atLeader = keys -> {
             throw new UnsupportedOperationException("consulta ao líder não esperada neste teste");
         };
@@ -1523,6 +1617,7 @@ class WriteDispatcherTest {
         @Override
         public void invalidate(String seriesKey) {
             invalidated.add(seriesKey);
+            onInvalidate.accept(seriesKey);
         }
 
         @Override

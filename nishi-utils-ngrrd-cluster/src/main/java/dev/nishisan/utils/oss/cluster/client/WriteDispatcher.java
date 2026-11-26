@@ -238,6 +238,9 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                     return previous;
                 }
                 // Explicit OPEN retires a removed generation, including buffered and in-flight writes.
+                // Destacada já aqui, sob previous.lock: o compute só publica a rota nova depois que este lambda
+                // solta o lock, e quem pegar o lock nessa janela ainda veria previous no mapa.
+                previous.detached = true;
                 for (NodeBuffer buffer : buffers.values()) extractSeriesFrom(buffer, key);
                 long remaining = previous.submitted - previous.completed;
                 samplesFailedCount.add(remaining);
@@ -308,7 +311,8 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
      * {@code route.lock}; o chamador roda {@link #tryRemove} depois de soltá-lo.
      */
     private boolean retirable(SeriesRoute route) {
-        return route.holders.isEmpty()
+        return route.retired
+                && route.holders.isEmpty()
                 && (isIdle(route) || (route.failuresDelivered && route.submitted == route.completed))
                 && route.waiters.isEmpty()
                 && !route.redirectPending
@@ -333,6 +337,8 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 if (!retirable(current)) {
                     return current;
                 }
+                // Mesma janela do beginGeneration: o mapa só remove depois que o lambda solta o lock.
+                current.detached = true;
                 removed[0] = true;
                 return null;
             } finally {
@@ -517,8 +523,9 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 if (closed) {
                     throw new NgrrdClusterException(ErrorCode.CLOSED, "dispatcher fechado");
                 }
-                // Fora do mapa ou aposentada: por fechamento/release (CLOSED) ou por geração nova (SERIES_DELETED).
-                if (routes.get(write.seriesKey()) != route || route.retired) {
+                // Fora do mapa (ou destacada, ainda a caminho de sair) ou aposentada: por fechamento/release
+                // (CLOSED) ou por geração nova (SERIES_DELETED).
+                if (route.detached || routes.get(write.seriesKey()) != route || route.retired) {
                     throw route.retired ? closedRoute(write.seriesKey())
                             : new NgrrdClusterException(ErrorCode.SERIES_DELETED, "generation replaced: " + write.seriesKey());
                 }
@@ -1057,7 +1064,8 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         NgrrdClusterException terminal = null;
         currentRoute.lock.lock();
         try {
-        if (routes.get(seriesKey) != currentRoute || !Objects.equals(currentRoute.generation, writes.get(0).generationId())) return;
+        if (currentRoute.detached || routes.get(seriesKey) != currentRoute
+                || !Objects.equals(currentRoute.generation, writes.get(0).generationId())) return;
         SeriesStatus status = response.statusBySeries().getOrDefault(seriesKey, SeriesStatus.ERROR);
         switch (status) {
             case OK -> {
@@ -1083,13 +1091,13 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                     logRetryRateLimited(seriesKey, SeriesStatus.WRONG_OWNER,
                             "dono desconhecido — invalidando placement e reabrindo");
                     placementLookup.invalidate(seriesKey);
-                    reopenAsync(owner, buf, seriesKey, writes);
+                    reopenAsync(owner, buf, currentRoute, writes);
                 }
             }
             case NOT_OPEN -> {
                 recordRetry(SeriesStatus.NOT_OPEN);
                 logRetryRateLimited(seriesKey, SeriesStatus.NOT_OPEN, "reabrindo via reopener");
-                reopenAsync(owner, buf, seriesKey, writes);
+                reopenAsync(owner, buf, currentRoute, writes);
             }
             case MIGRATING -> {
                 recordRetry(SeriesStatus.MIGRATING);
@@ -1148,7 +1156,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         String visited;
         route.lock.lock();
         try {
-            if (routes.get(seriesKey) != route) return;
+            if (route.detached || routes.get(seriesKey) != route) return;
             contradictory = isContradictory(route, owner, newOwner);
             route.redirectAttempts++;
             route.redirectedBy.add(owner);
@@ -1354,7 +1362,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         boolean retire;
         route.lock.lock();
         try {
-            if (routes.get(seriesKey) != route || !route.ownerLookupPending) return;
+            if (route.detached || routes.get(seriesKey) != route || !route.ownerLookupPending) return;
             if (drained) {
                 route.ownerLookupPending = false;
                 return;
@@ -1417,7 +1425,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         }
         if (reopenBuf != null) {
             logRetryRateLimited(seriesKey, SeriesStatus.WRONG_OWNER, "líder não conhece a série — reabrindo");
-            reopenAsync(flushOwner, reopenBuf, seriesKey, List.of());
+            reopenAsync(flushOwner, reopenBuf, route, List.of());
         } else {
             triggerRetryAfter(flushOwner, Duration.ofMillis(delayMs));
         }
@@ -1665,31 +1673,69 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         } finally { buf.lock.unlock(); }
     }
 
-    private void reopenAsync(String owner, NodeBuffer buf, String key, List<SeriesWrite> writes) {
-        SeriesRoute expected = routes.get(key);
-        if (expected == null && writes.isEmpty()) {
-            // Rota já removida (ociosa): uma pausa sem prazo aqui nunca seria desfeita.
-            return;
-        }
-        buf.lock.lock();
+    /**
+     * Pausa a série de {@code expected} em {@code buf} (com {@code writes} na frente) até a reabertura terminar. A
+     * pausa sem prazo só é aplicada a uma rota ainda no mapa, sob o lock dela: uma rota destacada (substituída ou
+     * removida) não pausa a chave, que já pode ser de outra geração. Ao terminar, se a rota tiver saído do mapa
+     * nesse meio tempo, desfaz só a própria pausa (a da geração nova, se houver, fica).
+     */
+    private void reopenAsync(String owner, NodeBuffer buf, SeriesRoute expected, List<SeriesWrite> writes) {
+        String key = expected.key;
+        PendingWrites.Delay pause;
+        expected.lock.lock();
         try {
-            for (int i = writes.size() - 1; i >= 0; i--) { buf.queue.addFirst(writes.get(i)); }
-            buf.queue.defer(key, Long.MAX_VALUE);
-        } finally { buf.lock.unlock(); }
+            if (!isCurrent(expected)) {
+                // Desfecho já contado na troca/remoção; nada a reenviar nem a pausar.
+                return;
+            }
+            buf.lock.lock();
+            try {
+                for (int i = writes.size() - 1; i >= 0; i--) { buf.queue.addFirst(writes.get(i)); }
+                pause = buf.queue.pause(key, Long.MAX_VALUE);
+            } finally { buf.lock.unlock(); }
+        } finally { expected.lock.unlock(); }
         try {
             recoveryPool.execute(() -> {
                 boolean opened = false;
-                try { if (routes.get(key) == expected) opened = Boolean.TRUE.equals(reopener.apply(key)); }
+                try { if (isCurrentLocked(expected)) opened = Boolean.TRUE.equals(reopener.apply(key)); }
                 catch (RuntimeException e) { LOGGER.log(Level.FINE, "Reabertura pendente de " + key, e); }
-                finally {
-                    if (routes.get(key) == expected) {
-                        deferSeries(buf, key, opened ? 0 : -1);
-                        scheduleFlush(owner, buf);
-                    }
-                }
+                finally { finishReopen(owner, buf, expected, pause, opened); }
             });
         } catch (RejectedExecutionException closing) {
             deferSeries(buf, key, -1);
+        }
+    }
+
+    /** Fim da reabertura: libera a série com o atraso devido, ou desfaz a própria pausa de uma rota que saiu do mapa. */
+    private void finishReopen(String owner, NodeBuffer buf, SeriesRoute expected, PendingWrites.Delay pause,
+            boolean opened) {
+        boolean current;
+        expected.lock.lock();
+        try {
+            current = isCurrent(expected);
+            if (current) {
+                deferSeries(buf, expected.key, opened ? 0 : -1);
+            } else {
+                buf.lock.lock();
+                try {
+                    buf.queue.resume(expected.key, pause);
+                } finally { buf.lock.unlock(); }
+            }
+        } finally { expected.lock.unlock(); }
+        scheduleFlush(owner, buf);
+    }
+
+    /** {@code route} ainda é a rota da chave no mapa. Chamado sob {@code route.lock}. */
+    private boolean isCurrent(SeriesRoute route) {
+        return !route.detached && routes.get(route.key) == route;
+    }
+
+    private boolean isCurrentLocked(SeriesRoute route) {
+        route.lock.lock();
+        try {
+            return isCurrent(route);
+        } finally {
+            route.lock.unlock();
         }
     }
 
@@ -1777,6 +1823,12 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         private final Set<Object> holders = Collections.newSetFromMap(new IdentityHashMap<>());
         /** Sem holder (fechamento ou release): novas admissões recebem {@code CLOSED}. Só muda sob {@link #lock}. */
         private boolean retired;
+        /**
+         * A rota saiu (ou está saindo) do mapa: substituída por outra geração ou removida. Ligado sob {@link #lock}
+         * dentro do {@code compute} que a tira do mapa, antes da publicação; quem pega o lock depois trata a rota
+         * como fora do mapa mesmo que {@code routes.get} ainda a devolva. Nunca volta a {@code false}.
+         */
+        private boolean detached;
         /**
          * A falha da rota já foi entregue ao chamador (por um {@code release}): dispensa {@code isIdle} na remoção,
          * mas não {@code submitted == completed}. Só muda sob {@link #lock}.
@@ -1984,6 +2036,18 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             size--;
             if (queue.isEmpty()) { series.remove(key); } else { ready.add(key); }
             return write;
+        }
+        /** Como {@link #defer}, devolvendo a pausa aplicada, para desfazê-la depois só se ainda for ela. */
+        Delay pause(String key, long until) {
+            defer(key, until);
+            return paused.get(key);
+        }
+        /** Desfaz {@code delay} se ela ainda for a pausa de {@code key}; a série volta a ficar pronta se tiver escrita. */
+        void resume(String key, Delay delay) {
+            if (delay != null && paused.remove(key, delay)) {
+                wakeups.remove(delay);
+                if (series.containsKey(key)) { ready.add(key); }
+            }
         }
         void defer(String key, long until) {
             Delay old = paused.put(key, new Delay(key, until));
