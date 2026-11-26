@@ -225,6 +225,47 @@ class ReleaseTest {
     }
 
     @Test
+    void releasesSobrepostosDaMesmaSerieMantemAProtecaoDaMarca() throws Exception {
+        var entered = gate();
+        var ack = gate();
+        AtomicInteger calls = new AtomicInteger();
+        rpc.writes = (owner, request) -> {
+            if (calls.incrementAndGet() == 1) {
+                return respond(request, k -> SeriesStatus.ERROR);
+            }
+            entered.countDown();
+            awaitGate(ack);
+            return respond(request, k -> SeriesStatus.OK);
+        };
+        start(WriteFailureReporting.MARKS);
+        RemoteSeriesHandle handle = open("s");
+        handle.write("ds", new Sample(1, 1));
+        Await.untilTrue("falha final", WAIT, () -> dispatcher.samplesFailed() == 1);
+        handle.write("ds", new Sample(2, 2));
+        assertTrue(entered.await(5, TimeUnit.SECONDS));
+
+        // R1 encerra a admissão; a marca nasce durante R1 e espera a escrita em voo; R2 da mesma chave começa antes de
+        // R1 terminar.
+        CompletableFuture<ReleaseResult> first = releaser.release(List.of("s"), ReleaseOptions.defaults());
+        Await.untilTrue("admissão encerrada", WAIT, () -> !handle.isOpen());
+        Thread.sleep(100L);
+        var mark = dispatcher.mark();
+        CompletableFuture<ReleaseResult> second = releaser.release(List.of("s"), ReleaseOptions.defaults());
+        Thread.sleep(300L);
+        ack.countDown();
+        ReleaseResult r1 = first.get(10, TimeUnit.SECONDS);
+        ReleaseResult r2 = second.get(10, TimeUnit.SECONDS);
+        var marked = mark.completion().get(10, TimeUnit.SECONDS);
+
+        assertEquals(0L, marked.samplesFailed(), "a marca criada durante o release não colhe a falha dele");
+        // A falha vai a exatamente um dos dois releases sobrepostos: o primeiro que colher a rota.
+        assertEquals(1L, r1.failedSamples() + r2.failedSamples(), "r1=" + r1.series() + " r2=" + r2.series());
+        assertTrue(r1.series().get("s").status() == ReleaseStatus.WRITE_FAILURES
+                || r2.series().get("s").status() == ReleaseStatus.WRITE_FAILURES);
+        assertFalse(dispatcher.hasRoute("s"));
+    }
+
+    @Test
     void releaseComBarrierRemoveRotaComFalha() throws Exception {
         rpc.writes = (owner, request) -> respond(request, key -> SeriesStatus.ERROR);
         start(WriteFailureReporting.BARRIER);

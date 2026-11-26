@@ -706,13 +706,16 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
      * esperando só a fronteira fotografada.
      *
      * <p>A rota só é aposentada se {@code holder} for o ÚNICO holder dela na geração {@code generation}, ou se ela já
-     * não tiver holder; com outro holder (um handle aberto por fora do release), a rota segue viva e é só drenada. O holder continua na rota até {@link #finishRelease}. O chamador
-     * segura o lock de abertura da chave no cache de handles, de modo que um {@code open()} concorrente da mesma chave
-     * só religa a rota depois desta fotografia. Devolve {@code null} se não houver rota para a chave.</p>
+     * não tiver holder; com outro holder (um handle aberto por fora do release), a rota segue viva e é só drenada. O
+     * holder continua na rota até {@link #finishRelease}. O chamador segura o lock de abertura da chave no cache de
+     * handles, de modo que um {@code open()} concorrente da mesma chave só religa a rota depois desta fotografia.
+     * Devolve {@code null} se não houver rota para a chave.</p>
      *
      * <p>Em {@code MARKS}, a fronteira também fica guardada na rota, junto com o id da primeira marca criada depois
      * daqui (sob {@code markLock}, então nenhuma marca fica pela metade): marcas criadas durante o release não colhem as
-     * falhas até a fronteira, que são do release. Uma marca aberta antes continua colhendo-as (spec 8.15.0, 3.7).</p>
+     * falhas até a fronteira, que são do release. Uma marca aberta antes continua colhendo-as (spec 8.15.0, 3.7). Com
+     * releases sobrepostos da mesma rota, vale a união: o menor id de marca (o do primeiro release ativo) e a maior
+     * fronteira; a proteção só sai quando o último release ativo termina ({@link #endReleaseProtection}).</p>
      */
     ReleaseTicket beginRelease(String key, String generation, Object holder) {
         SeriesRoute route = routes.get(key);
@@ -732,10 +735,15 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                     route.retired = true;
                 }
                 if (marksMode) {
-                    route.releaseBoundary = route.submitted;
-                    route.releaseFirstMarkId = nextMarkId;
+                    if (route.activeReleases == 0) {
+                        route.releaseFirstMarkId = nextMarkId;
+                        route.releaseBoundary = route.submitted;
+                    } else {
+                        route.releaseBoundary = Math.max(route.releaseBoundary, route.submitted);
+                    }
+                    route.activeReleases++;
                 }
-                return new ReleaseTicket(key, route, route.submitted, owned ? holder : null);
+                return new ReleaseTicket(key, route, route.submitted, owned ? holder : null, marksMode);
             } finally {
                 route.lock.unlock();
             }
@@ -777,7 +785,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                         }
                         if (route.completed >= ticket.boundary) {
                             marksReady |= releaseWaiters(route);
-                            outcomes.put(ticket.key, harvestForRelease(route, ticket.boundary));
+                            outcomes.put(ticket.key, harvestForRelease(route, ticket));
                             break;
                         }
                         long remaining = budgetNanos - (System.nanoTime() - startedAt);
@@ -805,13 +813,14 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     }
 
     /** Colhe o desfecho de uma rota que alcançou {@code boundary} (ver {@link #drainForRelease}). Chamado sob {@code route.lock}. */
-    private ReleaseDrain harvestForRelease(SeriesRoute route, long boundary) {
+    private ReleaseDrain harvestForRelease(SeriesRoute route, ReleaseTicket ticket) {
+        long boundary = ticket.boundary;
         Map<SeriesStatus, Long> failed = new EnumMap<>(SeriesStatus.class);
         boolean writeFailures;
         String message;
         if (marksMode) {
             route.collectFailures((status, count) -> failed.merge(status, count, Long::sum), boundary);
-            route.releaseBoundary = NO_RELEASE;
+            endReleaseProtection(route, ticket);
             if (isIdle(route)) {
                 synchronized (pendingLock) {
                     pendingRoutes.remove(route);
@@ -856,13 +865,28 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             if (delivered && route.holders.isEmpty() && onlyDeliveredFailures) {
                 route.failuresDelivered = true;
             }
-            route.releaseBoundary = NO_RELEASE;
+            endReleaseProtection(route, ticket);
             candidate = retirable(route);
         } finally {
             route.lock.unlock();
         }
         if (candidate) {
             tryRemove(route);
+        }
+    }
+
+    /**
+     * O release do ticket deixa de proteger as falhas da rota contra marcas novas, uma única vez por ticket (na
+     * colheita ou no {@link #finishRelease}). A proteção da rota só sai quando o último release ativo termina. Chamado
+     * sob {@code route.lock}.
+     */
+    private static void endReleaseProtection(SeriesRoute route, ReleaseTicket ticket) {
+        if (!ticket.protecting) {
+            return;
+        }
+        ticket.protecting = false;
+        if (--route.activeReleases == 0) {
+            route.releaseBoundary = NO_RELEASE;
         }
     }
 
@@ -2029,6 +2053,11 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         private long releaseBoundary = NO_RELEASE;
         /** Id da primeira marca criada depois do {@code beginRelease} em curso. Só muda sob {@link #lock}. */
         private long releaseFirstMarkId;
+        /**
+         * {@code MARKS}: releases desta rota com proteção ativa (tickets ainda sem colheita nem fim). Só muda sob
+         * {@link #lock}.
+         */
+        private int activeReleases;
 
         SeriesRoute(String key, String owner, String generation, Object holder) {
             this.key = key;
@@ -2110,12 +2139,15 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         private final SeriesRoute route;
         private final long boundary;
         private final Object holder;
+        /** Este ticket ainda conta em {@code route.activeReleases}. Só muda sob o {@code route.lock} da rota. */
+        private boolean protecting;
 
-        private ReleaseTicket(String key, SeriesRoute route, long boundary, Object holder) {
+        private ReleaseTicket(String key, SeriesRoute route, long boundary, Object holder, boolean protecting) {
             this.key = key;
             this.route = route;
             this.boundary = boundary;
             this.holder = holder;
+            this.protecting = protecting;
         }
 
         /** Chave da série. */
