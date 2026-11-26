@@ -264,7 +264,13 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
                 }
                 generation = placement.generationId();
                 owner = candidateOwner;
-                dispatcher.beginGeneration(seriesKey, generation, owner);
+                // Só o handle gravável é holder da rota de escrita: o close do somente leitura nunca a liberaria.
+                dispatcher.beginGeneration(seriesKey, generation, owner, writable ? this : null);
+                if (writable && state.get().closed()) {
+                    // Fechado durante uma reabertura: o fechamento pode já ter liberado a rota; não deixa
+                    // holder órfão (endGeneration é idempotente).
+                    dispatcher.endGeneration(seriesKey, generation, this);
+                }
                 return;
             }
             switch (response.status()) {
@@ -356,6 +362,7 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
                 return;
             }
             if (state.compareAndSet(current, current.closedByTerminalFailure(cause))) {
+                releaseRoute(current);
                 onClose.accept(seriesKey, this);
                 return;
             }
@@ -383,7 +390,20 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
      * escrita passou por ele, e um {@code CLOSE} fecharia no storage a série que o handle vencedor usa.
      */
     void discard() {
-        closeLocally();
+        State closedFrom = closeLocally();
+        if (closedFrom != null) {
+            releaseRoute(closedFrom);
+        }
+    }
+
+    /**
+     * Deixa de ser holder da rota de escrita (só handles graváveis o são), no fim de todo caminho que leva o handle
+     * a fechado. Sem holder e ociosa, a rota sai do mapa do dispatcher.
+     */
+    private void releaseRoute(State closedFrom) {
+        if (closedFrom.writable()) {
+            dispatcher.endGeneration(seriesKey, generation, this);
+        }
     }
 
     /** Recusa de escrita em handle (ou vista) somente leitura; mensagem única para os dois. */
@@ -533,22 +553,27 @@ public final class RemoteSeriesHandle implements NgrrdHandle {
         }
         long deadlineMs = clock.millis() + budget.toMillis();
         try {
-            dispatcher.flushSeriesSync(seriesKey, owner, budget);
-        } catch (RuntimeException e) {
-            LOGGER.log(Level.WARNING, "Falha ao drenar buffer de escrita ao fechar a série " + seriesKey, e);
-        }
-        long remainingMs = deadlineMs - clock.millis();
-        NodeId ownerNodeId = NodeId.of(owner);
-        if (remainingMs <= 0 || !rpc.isConnected(ownerNodeId)) {
-            LOGGER.log(Level.WARNING, "Pulando o CLOSE remoto da série " + seriesKey + " em " + owner
-                    + " (orçamento esgotado ou dono inalcançável) — a referência local é liberada mesmo assim");
-        } else {
             try {
-                callWithTransportRetry(ownerNodeId, Commands.CLOSE, new SeriesCommandRequest(seriesKey, generation),
-                        SeriesStatusResponse.class, deadlineMs);
+                dispatcher.flushSeriesSync(seriesKey, owner, budget);
             } catch (RuntimeException e) {
-                LOGGER.log(Level.WARNING, "Falha ao fechar remotamente a série " + seriesKey, e);
+                LOGGER.log(Level.WARNING, "Falha ao drenar buffer de escrita ao fechar a série " + seriesKey, e);
             }
+            long remainingMs = deadlineMs - clock.millis();
+            NodeId ownerNodeId = NodeId.of(owner);
+            if (remainingMs <= 0 || !rpc.isConnected(ownerNodeId)) {
+                LOGGER.log(Level.WARNING, "Pulando o CLOSE remoto da série " + seriesKey + " em " + owner
+                        + " (orçamento esgotado ou dono inalcançável) — a referência local é liberada mesmo assim");
+            } else {
+                try {
+                    callWithTransportRetry(ownerNodeId, Commands.CLOSE, new SeriesCommandRequest(seriesKey, generation),
+                            SeriesStatusResponse.class, deadlineMs);
+                } catch (RuntimeException e) {
+                    LOGGER.log(Level.WARNING, "Falha ao fechar remotamente a série " + seriesKey, e);
+                }
+            }
+        } finally {
+            // Depois do flush/CLOSE: a rota sai do dispatcher quando a última escrita em voo tiver desfecho.
+            releaseRoute(closedFrom);
         }
         onClose.accept(seriesKey, this);
     }

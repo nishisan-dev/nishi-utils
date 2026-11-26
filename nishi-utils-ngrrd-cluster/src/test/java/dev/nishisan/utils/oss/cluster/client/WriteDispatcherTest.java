@@ -52,6 +52,7 @@ import java.util.function.BiConsumer;
 import java.util.function.Function;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -97,6 +98,17 @@ class WriteDispatcherTest {
         return dispatcher;
     }
 
+    /**
+     * Admite {@code write} como antes da 8.15.0: sem rota, abre uma com holder permanente
+     * ({@code beginGeneration} sem holder), porque o {@code enqueue} não cria mais rota.
+     */
+    private void enqueueWithRoute(String owner, SeriesWrite write) {
+        if (!dispatcher.hasRoute(write.seriesKey())) {
+            dispatcher.beginGeneration(write.seriesKey(), write.generationId(), owner);
+        }
+        dispatcher.enqueue(owner, write);
+    }
+
     private static SeriesWrite write(String seriesKey, long ts, double value) {
         return new SeriesWrite(seriesKey, "in_octets", ts, value);
     }
@@ -123,9 +135,9 @@ class WriteDispatcherTest {
             return okFor(request);
         });
         try {
-            for (int i = 0; i < 4; i++) { dispatcher.enqueue("node-" + i, write("slow-" + i, 1, 1)); }
+            for (int i = 0; i < 4; i++) { enqueueWithRoute("node-" + i, write("slow-" + i, 1, 1)); }
             assertTrue(started.await(2, TimeUnit.SECONDS));
-            dispatcher.enqueue("healthy-node", write("healthy", 1, 1));
+            enqueueWithRoute("healthy-node", write("healthy", 1, 1));
             dispatcher.flushSeriesSync("healthy", "healthy-node", Duration.ofSeconds(2));
             assertEquals(1, dispatcher.samplesSent());
         } finally { release.countDown(); }
@@ -144,12 +156,12 @@ class WriteDispatcherTest {
         rpc.respondDefault((cmd, body) -> open.get() ? okFor((WriteBatchRequest) body)
                 : new WriteBatchResponse(Map.of("s1", SeriesStatus.NOT_OPEN), Map.of(), Map.of()));
         try {
-            dispatcher.enqueue(OWNER_A.value(), write("s1", 1, 1));
+            enqueueWithRoute(OWNER_A.value(), write("s1", 1, 1));
             assertTrue(entered.await(2, TimeUnit.SECONDS));
-            dispatcher.enqueue(OWNER_A.value(), write("s1", 2, 2));
+            enqueueWithRoute(OWNER_A.value(), write("s1", 2, 2));
             assertEquals(2L, dispatcher.bufferedSamples().get(OWNER_A.value()));
             assertEquals(ErrorCode.BUFFER_FULL, assertThrows(NgrrdClusterException.class,
-                    () -> dispatcher.enqueue(OWNER_A.value(), write("s1", 3, 3))).code());
+                    () -> enqueueWithRoute(OWNER_A.value(), write("s1", 3, 3))).code());
         } finally { release.countDown(); }
         dispatcher.flushAllSync();
         assertEquals(2, dispatcher.samplesSent());
@@ -175,7 +187,7 @@ class WriteDispatcherTest {
         rpc.respondDefault((cmd, body) -> open.get() ? okFor((WriteBatchRequest) body)
                 : new WriteBatchResponse(Map.of("s1", SeriesStatus.NOT_OPEN), Map.of(), Map.of()));
         try {
-            dispatcher.enqueue(OWNER_A.value(), write("s1", 1, 1));
+            enqueueWithRoute(OWNER_A.value(), write("s1", 1, 1));
             assertTrue(redirected.await(2, TimeUnit.SECONDS));
             assertTrue(reopening.await(2, TimeUnit.SECONDS));
             releaseRedirect.countDown();
@@ -205,12 +217,12 @@ class WriteDispatcherTest {
             return new WriteBatchResponse(statuses, Map.of(), Map.of());
         });
         try {
-            dispatcher.enqueue(OWNER_A.value(), write("moving", 1, 1));
-            dispatcher.enqueue(OWNER_A.value(), write("moving", 2, 2));
+            enqueueWithRoute(OWNER_A.value(), write("moving", 1, 1));
+            enqueueWithRoute(OWNER_A.value(), write("moving", 2, 2));
             assertTrue(started.await(2, TimeUnit.SECONDS));
             for (int i = 1; i <= 100; i++) {
-                dispatcher.enqueue(OWNER_A.value(), write("healthy", i, i));
-                dispatcher.enqueue(OWNER_A.value(), write("moving", i + 2, i));
+                enqueueWithRoute(OWNER_A.value(), write("healthy", i, i));
+                enqueueWithRoute(OWNER_A.value(), write("moving", i + 2, i));
             }
             release.countDown();
             dispatcher.flushSeriesSync("healthy", OWNER_A.value(), Duration.ofSeconds(2));
@@ -238,9 +250,9 @@ class WriteDispatcherTest {
                     ? new WriteBatchResponse(Map.of("cold", SeriesStatus.NOT_OPEN), Map.of(), Map.of()) : okFor(req);
         });
         try {
-            dispatcher.enqueue(OWNER_A.value(), write("cold", 1, 1));
+            enqueueWithRoute(OWNER_A.value(), write("cold", 1, 1));
             assertTrue(reopening.await(2, TimeUnit.SECONDS));
-            dispatcher.enqueue(OWNER_A.value(), write("healthy", 1, 1));
+            enqueueWithRoute(OWNER_A.value(), write("healthy", 1, 1));
             dispatcher.flushSeriesSync("healthy", OWNER_A.value(), Duration.ofSeconds(2));
             assertEquals(1, dispatcher.samplesSent());
         } finally { release.countDown(); }
@@ -253,9 +265,9 @@ class WriteDispatcherTest {
         newDispatcher(3, Duration.ofSeconds(30), 1_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
         rpc.respondDefault((cmd, body) -> okFor((WriteBatchRequest) body));
 
-        dispatcher.enqueue(OWNER_A.value(), write("s1", 1L, 1.0));
-        dispatcher.enqueue(OWNER_A.value(), write("s1", 2L, 2.0));
-        dispatcher.enqueue(OWNER_A.value(), write("s1", 3L, 3.0));
+        enqueueWithRoute(OWNER_A.value(), write("s1", 1L, 1.0));
+        enqueueWithRoute(OWNER_A.value(), write("s1", 2L, 2.0));
+        enqueueWithRoute(OWNER_A.value(), write("s1", 3L, 3.0));
 
         // Espera o EFEITO (samplesSent), não só a chamada ter sido registrada: countWriteBatchCalls()
         // conta a partir do momento em que RecordingClusterRpc.call é invocado, antes da resposta ser
@@ -270,8 +282,8 @@ class WriteDispatcherTest {
         newDispatcher(100, Duration.ofMillis(50), 1_000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
         rpc.respondDefault((cmd, body) -> okFor((WriteBatchRequest) body));
 
-        dispatcher.enqueue(OWNER_A.value(), write("s1", 1L, 1.0));
-        dispatcher.enqueue(OWNER_A.value(), write("s1", 2L, 2.0));
+        enqueueWithRoute(OWNER_A.value(), write("s1", 1L, 1.0));
+        enqueueWithRoute(OWNER_A.value(), write("s1", 2L, 2.0));
 
         Await.untilTrue("lote incompleto confirmado pelo tick", AWAIT_TIMEOUT, () -> dispatcher.samplesSent() == 2L);
         assertTrue(countWriteBatchCalls() >= 1);
@@ -283,7 +295,7 @@ class WriteDispatcherTest {
         rpc.respondDefault((cmd, body) -> okFor((WriteBatchRequest) body));
 
         for (int i = 0; i < 5; i++) {
-            dispatcher.enqueue(OWNER_A.value(), write("s1", i, i));
+            enqueueWithRoute(OWNER_A.value(), write("s1", i, i));
         }
 
         Await.untilTrue("lote enviado", AWAIT_TIMEOUT, () -> countWriteBatchCalls() == 1);
@@ -303,7 +315,7 @@ class WriteDispatcherTest {
         });
         rpc.respondDefault((cmd, body) -> okFor((WriteBatchRequest) body));
 
-        dispatcher.enqueue(OWNER_A.value(), write("s1", 1L, 42.0));
+        enqueueWithRoute(OWNER_A.value(), write("s1", 1L, 42.0));
 
         Await.untilTrue("re-roteado e confirmado no novo dono", AWAIT_TIMEOUT, () -> dispatcher.samplesSent() == 1L);
         assertTrue(placementLookup.notedOwners.contains("s1=" + OWNER_B.value()));
@@ -338,10 +350,10 @@ class WriteDispatcherTest {
             return okFor(req);
         });
 
-        dispatcher.enqueue(OWNER_A.value(), write("s1", 1L, 1.0));
+        enqueueWithRoute(OWNER_A.value(), write("s1", 1L, 1.0));
         Await.untilTrue("primeira chamada em andamento", AWAIT_TIMEOUT, () -> countWriteBatchCalls() >= 1);
-        dispatcher.enqueue(OWNER_A.value(), write("s1", 2L, 2.0));
-        dispatcher.enqueue(OWNER_A.value(), write("s1", 3L, 3.0));
+        enqueueWithRoute(OWNER_A.value(), write("s1", 2L, 2.0));
+        enqueueWithRoute(OWNER_A.value(), write("s1", 3L, 3.0));
         releaseFirstCall.countDown();
 
         Await.untilTrue("as 3 amostras confirmadas no novo dono", AWAIT_TIMEOUT, () -> dispatcher.samplesSent() == 3L);
@@ -371,12 +383,12 @@ class WriteDispatcherTest {
         rpc.respondNext((cmd, body) -> new WriteBatchResponse(Map.of("s1", SeriesStatus.WRONG_OWNER),
                 Map.of("s1", OWNER_B.value()), Map.of()));
         rpc.respondDefault((cmd, body) -> okFor((WriteBatchRequest) body));
-        dispatcher.enqueue(OWNER_A.value(), write("s1", 1, 1));
+        enqueueWithRoute(OWNER_A.value(), write("s1", 1, 1));
         try {
             assertTrue(callbackEntered.await(5, TimeUnit.SECONDS));
             var producer = CompletableFuture.runAsync(() -> {
                 producerStarted.countDown();
-                dispatcher.enqueue(OWNER_B.value(), write("s1", 2, 2));
+                enqueueWithRoute(OWNER_B.value(), write("s1", 2, 2));
             });
             assertTrue(producerStarted.await(5, TimeUnit.SECONDS));
             assertThrows(TimeoutException.class, () -> producer.get(100, TimeUnit.MILLISECONDS),
@@ -384,7 +396,7 @@ class WriteDispatcherTest {
             releaseCallback.countDown();
             producer.get(5, TimeUnit.SECONDS);
             // Simulates a producer that captured A before the redirect but enqueues afterwards.
-            dispatcher.enqueue(OWNER_A.value(), write("s1", 3, 3));
+            enqueueWithRoute(OWNER_A.value(), write("s1", 3, 3));
             Await.untilTrue("três escritas confirmadas", AWAIT_TIMEOUT, () -> dispatcher.samplesSent() == 3);
             assertEquals(List.of(1L, 2L, 3L), timestampsAt(OWNER_B));
             assertEquals(List.of(1L), timestampsAt(OWNER_A));
@@ -405,11 +417,11 @@ class WriteDispatcherTest {
                     Map.of("s1", OWNER_B.value()), Map.of());
         });
         rpc.respondDefault((cmd, body) -> okFor((WriteBatchRequest) body));
-        dispatcher.enqueue(OWNER_A.value(), write("s1", 1, 1));
+        enqueueWithRoute(OWNER_A.value(), write("s1", 1, 1));
         try {
             assertTrue(firstEntered.await(5, TimeUnit.SECONDS));
-            dispatcher.enqueue(OWNER_A.value(), write("s1", 2, 2));
-            var third = CompletableFuture.runAsync(() -> dispatcher.enqueue(OWNER_A.value(), write("s1", 3, 3)));
+            enqueueWithRoute(OWNER_A.value(), write("s1", 2, 2));
+            var third = CompletableFuture.runAsync(() -> enqueueWithRoute(OWNER_A.value(), write("s1", 3, 3)));
             assertThrows(TimeoutException.class, () -> third.get(100, TimeUnit.MILLISECONDS));
             releaseFirst.countDown();
             third.get(5, TimeUnit.SECONDS);
@@ -457,7 +469,7 @@ class WriteDispatcherTest {
         });
         rpc.respondDefault((cmd, body) -> okFor((WriteBatchRequest) body));
 
-        dispatcher.enqueue(OWNER_A.value(), write("s1", 1L, 42.0));
+        enqueueWithRoute(OWNER_A.value(), write("s1", 1L, 42.0));
 
         Await.untilTrue("re-roteado e confirmado no novo dono", AWAIT_TIMEOUT, () -> dispatcher.samplesSent() == 1L);
         assertEquals(List.of("s1=" + OWNER_B.value()), ownerChangedCalls);
@@ -480,7 +492,7 @@ class WriteDispatcherTest {
         });
         rpc.respondDefault((cmd, body) -> okFor((WriteBatchRequest) body));
 
-        dispatcher.enqueue(OWNER_A.value(), write("s1", 1L, 3.0));
+        enqueueWithRoute(OWNER_A.value(), write("s1", 1L, 3.0));
 
         Await.untilTrue("lote drena após WRONG_OWNER sem dono", AWAIT_TIMEOUT, () -> dispatcher.samplesSent() == 1L);
         assertEquals(1, reopenCalls.get(), "o reopener deveria ter sido chamado (mesmo caminho do NOT_OPEN)");
@@ -503,7 +515,7 @@ class WriteDispatcherTest {
         });
         rpc.respondDefault((cmd, body) -> okFor((WriteBatchRequest) body));
 
-        dispatcher.enqueue(OWNER_A.value(), write("s1", 1L, 7.0));
+        enqueueWithRoute(OWNER_A.value(), write("s1", 1L, 7.0));
 
         Await.untilTrue("reenviado após NOT_OPEN", AWAIT_TIMEOUT, () -> dispatcher.samplesSent() == 1L);
         assertEquals(1, reopenCalls.get());
@@ -519,7 +531,7 @@ class WriteDispatcherTest {
             return new WriteBatchResponse(Map.of(key, SeriesStatus.ERROR), Map.of(), Map.of(key, "boom"));
         });
 
-        dispatcher.enqueue(OWNER_A.value(), write("s1", 1L, 1.0));
+        enqueueWithRoute(OWNER_A.value(), write("s1", 1L, 1.0));
 
         Await.untilTrue("amostra contabilizada como falha", AWAIT_TIMEOUT, () -> dispatcher.samplesFailed() == 1L);
         assertEquals(0L, dispatcher.samplesSent());
@@ -530,12 +542,12 @@ class WriteDispatcherTest {
         newDispatcher(100, Duration.ofMillis(30), 2, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
         rpc.respondDefault((cmd, body) -> okFor((WriteBatchRequest) body));
 
-        dispatcher.enqueue(OWNER_A.value(), write("s1", 1L, 1.0));
-        dispatcher.enqueue(OWNER_A.value(), write("s1", 2L, 2.0));
+        enqueueWithRoute(OWNER_A.value(), write("s1", 1L, 1.0));
+        enqueueWithRoute(OWNER_A.value(), write("s1", 2L, 2.0));
 
         AtomicBoolean thirdEnqueued = new AtomicBoolean(false);
         Thread producer = new Thread(() -> {
-            dispatcher.enqueue(OWNER_A.value(), write("s1", 3L, 3.0));
+            enqueueWithRoute(OWNER_A.value(), write("s1", 3L, 3.0));
             thirdEnqueued.set(true);
         }, "test-blocked-producer");
         producer.start();
@@ -550,10 +562,10 @@ class WriteDispatcherTest {
     void failLancaBufferFullImediatamenteQuandoOBufferEstaCheio() {
         newDispatcher(100, Duration.ofSeconds(30), 1, NgrrdClusterConfig.BufferFullPolicy.FAIL, key -> true);
         // Sem responder nada: a 1a amostra fica parada no buffer (batchMaxSamples=100, sem tick a tempo).
-        dispatcher.enqueue(OWNER_A.value(), write("s1", 1L, 1.0));
+        enqueueWithRoute(OWNER_A.value(), write("s1", 1L, 1.0));
 
         NgrrdClusterException ex = assertThrows(NgrrdClusterException.class,
-                () -> dispatcher.enqueue(OWNER_A.value(), write("s1", 2L, 2.0)));
+                () -> enqueueWithRoute(OWNER_A.value(), write("s1", 2L, 2.0)));
         assertEquals(ErrorCode.BUFFER_FULL, ex.code());
     }
 
@@ -568,7 +580,7 @@ class WriteDispatcherTest {
             return okFor((WriteBatchRequest) body);
         });
 
-        dispatcher.enqueue(OWNER_A.value(), write("s1", 1L, 9.0));
+        enqueueWithRoute(OWNER_A.value(), write("s1", 1L, 9.0));
 
         Await.untilTrue("amostra reenviada com sucesso após a falha de transporte", AWAIT_TIMEOUT,
                 () -> dispatcher.samplesSent() == 1L);
@@ -582,7 +594,7 @@ class WriteDispatcherTest {
         rpc.respondDefault((cmd, body) -> okFor((WriteBatchRequest) body));
 
         for (int i = 0; i < 10; i++) {
-            dispatcher.enqueue(OWNER_A.value(), write("s1", i, i));
+            enqueueWithRoute(OWNER_A.value(), write("s1", i, i));
         }
 
         dispatcher.close();
@@ -640,8 +652,8 @@ class WriteDispatcherTest {
         // Menos amostras que batchMaxSamples (500): só o flush por TEMPO do tickLoop as envia. Se o
         // Error escapado de onClientMetrics tivesse matado a thread ngrrd-write-dispatcher (o bug
         // antes desta correção), este lote incompleto nunca seria drenado.
-        dispatcher.enqueue(OWNER_A.value(), write("s1", 1L, 1.0));
-        dispatcher.enqueue(OWNER_A.value(), write("s1", 2L, 2.0));
+        enqueueWithRoute(OWNER_A.value(), write("s1", 1L, 1.0));
+        enqueueWithRoute(OWNER_A.value(), write("s1", 2L, 2.0));
 
         Await.untilTrue("lote incompleto drenado mesmo com o listener de métricas lançando Error repetidamente",
                 AWAIT_TIMEOUT, () -> dispatcher.samplesSent() == 2L);
@@ -668,7 +680,7 @@ class WriteDispatcherTest {
         });
 
         for (int i = 1; i <= 5; i++) {
-            dispatcher.enqueue(OWNER_A.value(), write("s1", i, i));
+            enqueueWithRoute(OWNER_A.value(), write("s1", i, i));
         }
 
         Await.untilTrue("todas as amostras confirmadas", AWAIT_TIMEOUT, () -> dispatcher.samplesSent() == 5L);
@@ -692,7 +704,7 @@ class WriteDispatcherTest {
         rpc.respondByTarget((target, cmd, body) -> accept.get() ? okFor((WriteBatchRequest) body)
                 : moved((WriteBatchRequest) body, OWNER_A));
 
-        dispatcher.enqueue(OWNER_A.value(), write("s1", 1, 1));
+        enqueueWithRoute(OWNER_A.value(), write("s1", 1, 1));
         Thread.sleep(500);
 
         long batches = countWriteBatchCalls();
@@ -717,7 +729,7 @@ class WriteDispatcherTest {
             return okFor(req);
         });
 
-        dispatcher.enqueue(OWNER_A.value(), write("s1", 1, 1));
+        enqueueWithRoute(OWNER_A.value(), write("s1", 1, 1));
         dispatcher.flushAllSync();
 
         assertEquals(1L, dispatcher.samplesSent());
@@ -748,9 +760,9 @@ class WriteDispatcherTest {
             return key.equals("stuck") && !stuckAccepted.get() ? moved(req, OWNER_A) : okFor(req);
         });
         try {
-            dispatcher.enqueue(OWNER_A.value(), write("stuck", 1, 1));
+            enqueueWithRoute(OWNER_A.value(), write("stuck", 1, 1));
             assertTrue(lookupEntered.await(5, TimeUnit.SECONDS), "a contradição deveria consultar o líder");
-            dispatcher.enqueue(OWNER_A.value(), write("healthy", 1, 1));
+            enqueueWithRoute(OWNER_A.value(), write("healthy", 1, 1));
             dispatcher.flushSeriesSync("healthy", OWNER_A.value(), Duration.ofSeconds(2));
             assertEquals(1L, dispatcher.samplesSent(), "a série saudável no mesmo nó é confirmada");
             assertEquals(1L, writeBatchesFor("stuck"), "com a consulta em andamento, a série fica pausada");
@@ -776,7 +788,7 @@ class WriteDispatcherTest {
             return okFor(req);
         });
 
-        dispatcher.enqueue(OWNER_A.value(), write("s1", 1, 1));
+        enqueueWithRoute(OWNER_A.value(), write("s1", 1, 1));
 
         Await.untilTrue("confirmada em storage-c", AWAIT_TIMEOUT, () -> dispatcher.samplesSent() == 1L);
         assertEquals(0, placementLookup.atLeaderCalls.get());
@@ -795,9 +807,9 @@ class WriteDispatcherTest {
             return ts == 1 ? okFor(req) : moved(req, OWNER_A);
         });
 
-        dispatcher.enqueue(OWNER_A.value(), write("s1", 1, 1));
+        enqueueWithRoute(OWNER_A.value(), write("s1", 1, 1));
         Await.untilTrue("primeira amostra confirmada em storage-c", AWAIT_TIMEOUT, () -> dispatcher.samplesSent() == 1L);
-        dispatcher.enqueue(OWNER_A.value(), write("s1", 2, 2));
+        enqueueWithRoute(OWNER_A.value(), write("s1", 2, 2));
         Await.untilTrue("segunda amostra confirmada em storage-a", AWAIT_TIMEOUT, () -> dispatcher.samplesSent() == 2L);
 
         assertEquals(0, placementLookup.atLeaderCalls.get(),
@@ -826,7 +838,7 @@ class WriteDispatcherTest {
                     : okFor(req);
         });
 
-        dispatcher.enqueue(OWNER_A.value(), write("s1", 1, 1));
+        enqueueWithRoute(OWNER_A.value(), write("s1", 1, 1));
         dispatcher.flushAllSync();
 
         assertEquals(1L, dispatcher.samplesSent());
@@ -854,7 +866,7 @@ class WriteDispatcherTest {
             return caughtUp ? okFor(req) : moved(req, OWNER_A);
         });
 
-        dispatcher.enqueue(OWNER_C.value(), write("s1", 1, 1));
+        enqueueWithRoute(OWNER_C.value(), write("s1", 1, 1));
 
         Await.untilTrue("amostra confirmada no dono real", AWAIT_TIMEOUT, () -> dispatcher.samplesSent() == 1L);
         assertTrue(placementLookup.atLeaderCalls.get() >= 1, "a contradição deveria ter tentado o líder");
@@ -876,7 +888,7 @@ class WriteDispatcherTest {
             return callsToA.incrementAndGet() == 1 ? moved(req, OWNER_A) : okFor(req);
         });
 
-        dispatcher.enqueue(OWNER_A.value(), write("s1", 1, 1));
+        enqueueWithRoute(OWNER_A.value(), write("s1", 1, 1));
 
         Await.untilTrue("amostra confirmada apesar do Error na consulta", AWAIT_TIMEOUT,
                 () -> dispatcher.samplesSent() == 1L);
@@ -901,7 +913,7 @@ class WriteDispatcherTest {
             return okFor(req);
         });
 
-        dispatcher.enqueue(OWNER_A.value(), write("s1", 1, 1));
+        enqueueWithRoute(OWNER_A.value(), write("s1", 1, 1));
 
         Await.untilTrue("amostra confirmada em storage-d", AWAIT_TIMEOUT, () -> dispatcher.samplesSent() == 1L);
         assertTrue(rpc.calls().stream().anyMatch(c -> c.target().equals(OWNER_D)));
@@ -924,7 +936,7 @@ class WriteDispatcherTest {
         int perSeries = 20;
         for (int i = 0; i < perSeries; i++) {
             for (int s = 0; s < seriesCount; s++) {
-                dispatcher.enqueue(OWNER_A.value(), write("s" + s, i, i));
+                enqueueWithRoute(OWNER_A.value(), write("s" + s, i, i));
             }
         }
 
@@ -957,7 +969,7 @@ class WriteDispatcherTest {
             return target.equals(OWNER_A) ? moved(req, OWNER_C) : moved(req, OWNER_A);
         });
 
-        dispatcher.enqueue(OWNER_A.value(), write("s1", 1, 1));
+        enqueueWithRoute(OWNER_A.value(), write("s1", 1, 1));
         Thread.sleep(1_000);
         long batchesFirstSecond = countWriteBatchCalls();
         int lookupsFirstSecond = placementLookup.atLeaderCalls.get();
@@ -994,7 +1006,7 @@ class WriteDispatcherTest {
             return caughtUp ? okFor(req) : moved(req, OWNER_A);
         });
 
-        dispatcher.enqueue(OWNER_A.value(), write("s1", 1, 1));
+        enqueueWithRoute(OWNER_A.value(), write("s1", 1, 1));
 
         Await.untilTrue("amostra confirmada em storage-c", AWAIT_TIMEOUT, () -> dispatcher.samplesSent() == 1L);
         assertTrue(lookups.get() >= 2, "a consulta deveria ter falhado ao menos uma vez depois da confirmação");
@@ -1023,7 +1035,7 @@ class WriteDispatcherTest {
             return Map.of("s1", SeriesPlacement.active(OWNER_C.value(), 1L));
         };
         rpc.respondByTarget((target, cmd, body) -> moved((WriteBatchRequest) body, OWNER_A));
-        dispatcher.enqueue(OWNER_A.value(), write("s1", 1, 1));
+        enqueueWithRoute(OWNER_A.value(), write("s1", 1, 1));
         assertTrue(lookupEntered.await(5, TimeUnit.SECONDS));
 
         dispatcher.close(Duration.ofMillis(50));
@@ -1073,20 +1085,20 @@ class WriteDispatcherTest {
         });
         rpc.respondDefault((command, body) -> okFor((WriteBatchRequest) body));
         try {
-            dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 1, 1, "old"));
+            enqueueWithRoute(OWNER_A.value(), new SeriesWrite("s", "in_octets", 1, 1, "old"));
             assertTrue(entered.await(2, TimeUnit.SECONDS));
-            dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 2, 2, "old"));
+            enqueueWithRoute(OWNER_A.value(), new SeriesWrite("s", "in_octets", 2, 2, "old"));
             dispatcher.beginGeneration("s", "new", OWNER_B.value());
             assertEquals(ErrorCode.SERIES_DELETED, assertThrows(NgrrdClusterException.class,
                     () -> dispatcher.flushGenerationSync("s", "old", OWNER_A.value(), AWAIT_TIMEOUT)).code());
-            dispatcher.enqueue(OWNER_B.value(), new SeriesWrite("s", "in_octets", 3, 3, "new"));
+            enqueueWithRoute(OWNER_B.value(), new SeriesWrite("s", "in_octets", 3, 3, "new"));
             dispatcher.flushGenerationSync("s", "new", OWNER_B.value(), AWAIT_TIMEOUT);
             assertEquals(2, dispatcher.samplesFailed());
             assertEquals(1, dispatcher.samplesSent());
         } finally { release.countDown(); }
         dispatcher.flushAllSync();
         assertEquals(ErrorCode.SERIES_DELETED, assertThrows(NgrrdClusterException.class,
-                () -> dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 4, 4, "old"))).code());
+                () -> enqueueWithRoute(OWNER_A.value(), new SeriesWrite("s", "in_octets", 4, 4, "old"))).code());
     }
 
     @Test
@@ -1096,12 +1108,97 @@ class WriteDispatcherTest {
         dispatcher.beginGeneration("s", "g", OWNER_A.value());
         rpc.respondDefault((command, body) -> new WriteBatchResponse(Map.of("s", SeriesStatus.QUARANTINED),
                 Map.of(), Map.of("s", "execute reconcile --adopt")));
-        dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 1, 1, "g"));
+        enqueueWithRoute(OWNER_A.value(), new SeriesWrite("s", "in_octets", 1, 1, "g"));
         assertEquals(ErrorCode.QUARANTINED, assertThrows(NgrrdClusterException.class,
                 () -> dispatcher.flushGenerationSync("s", "g", OWNER_A.value(), AWAIT_TIMEOUT)).code());
         assertEquals(ErrorCode.QUARANTINED, assertThrows(NgrrdClusterException.class,
-                () -> dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 2, 2, "g"))).code());
+                () -> enqueueWithRoute(OWNER_A.value(), new SeriesWrite("s", "in_octets", 2, 2, "g"))).code());
         assertEquals(1, rpc.calls().size());
+    }
+
+    @Test
+    void reaberturaDoMesmoHandleNaoDuplicaHolder() {
+        newDispatcher(1, Duration.ofMillis(10), 1000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        Object handle = new Object();
+
+        dispatcher.beginGeneration("s", "g", OWNER_A.value(), handle);
+        dispatcher.beginGeneration("s", "g", OWNER_A.value(), handle);
+
+        assertEquals(1, dispatcher.routeHolders("s"));
+        dispatcher.beginGeneration("s", "g", OWNER_A.value(), null);
+        assertEquals(1, dispatcher.routeHolders("s"), "somente leitura não é holder");
+    }
+
+    @Test
+    void enqueueSemRotaLancaClosedENaoRecriaRota() {
+        newDispatcher(1, Duration.ofMillis(10), 1000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        rpc.respondDefault((command, body) -> okFor((WriteBatchRequest) body));
+
+        NgrrdClusterException error = assertThrows(NgrrdClusterException.class,
+                () -> dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 1, 1, "g")));
+
+        assertEquals(ErrorCode.CLOSED, error.code());
+        assertFalse(dispatcher.hasRoute("s"));
+        assertEquals(0, dispatcher.samplesEnqueued());
+        assertTrue(rpc.calls().isEmpty());
+    }
+
+    @Test
+    void enqueueEmRotaAposentadaLancaClosedEGeracaoNovaLancaSeriesDeleted() throws Exception {
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        newDispatcher(1, Duration.ofMillis(10), 1000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        rpc.respondNext((command, body) -> {
+            entered.countDown();
+            awaitLatch(release);
+            return okFor((WriteBatchRequest) body);
+        });
+        rpc.respondDefault((command, body) -> okFor((WriteBatchRequest) body));
+        Object handle = new Object();
+        dispatcher.beginGeneration("s", "g1", OWNER_A.value(), handle);
+        try {
+            dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 1, 1, "g1"));
+            assertTrue(entered.await(2, TimeUnit.SECONDS));
+            dispatcher.endGeneration("s", "g1", handle);
+
+            assertTrue(dispatcher.hasRoute("s"), "a escrita em voo segura a rota");
+            assertEquals(ErrorCode.CLOSED, assertThrows(NgrrdClusterException.class,
+                    () -> dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 2, 2, "g1"))).code());
+
+            dispatcher.beginGeneration("s", "g2", OWNER_A.value(), new Object());
+            assertEquals(ErrorCode.SERIES_DELETED, assertThrows(NgrrdClusterException.class,
+                    () -> dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 3, 3, "g1"))).code());
+        } finally {
+            release.countDown();
+        }
+        assertEquals(1, dispatcher.samplesEnqueued());
+    }
+
+    @Test
+    void reaberturaDeRotaAposentadaComAMesmaGeracaoVoltaAAdmitir() throws Exception {
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        newDispatcher(1, Duration.ofMillis(10), 1000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        rpc.respondNext((command, body) -> {
+            entered.countDown();
+            awaitLatch(release);
+            return okFor((WriteBatchRequest) body);
+        });
+        rpc.respondDefault((command, body) -> okFor((WriteBatchRequest) body));
+        Object first = new Object();
+        dispatcher.beginGeneration("s", "g", OWNER_A.value(), first);
+        try {
+            dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 1, 1, "g"));
+            assertTrue(entered.await(2, TimeUnit.SECONDS));
+            dispatcher.endGeneration("s", "g", first);
+
+            dispatcher.beginGeneration("s", "g", OWNER_A.value(), new Object());
+            dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 2, 2, "g"));
+        } finally {
+            release.countDown();
+        }
+        dispatcher.flushAllSync();
+        assertEquals(2, dispatcher.samplesSent());
     }
 
     private static final class FakePlacementLookup implements PlacementLookup {

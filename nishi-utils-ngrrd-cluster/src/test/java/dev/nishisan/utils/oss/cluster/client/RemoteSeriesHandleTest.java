@@ -655,6 +655,70 @@ class RemoteSeriesHandleTest {
     }
 
     @Test
+    void handleGravavelEHolderDaRotaEODescarteChamaEndGeneration() {
+        RemoteSeriesHandle handle = openedHandle();
+        String generation = handle.generationId();
+
+        handle.discard();
+        handle.discard();
+
+        assertEquals(List.of(new NoOpWriteBuffer.GenerationEvent("begin", generation, handle),
+                new NoOpWriteBuffer.GenerationEvent("end", generation, handle)), dispatcher.generations,
+                "o descarte libera a rota uma única vez");
+    }
+
+    @Test
+    void markTerminalDeHandleGravavelChamaEndGeneration() {
+        RemoteSeriesHandle handle = openedHandle();
+        String generation = handle.generationId();
+
+        handle.failGeneration(generation, new NgrrdClusterException(ErrorCode.SERIES_DELETED, "removida"));
+
+        assertFalse(handle.isOpen());
+        assertEquals(List.of(SERIES_KEY), onCloseCalls);
+        assertEquals(new NoOpWriteBuffer.GenerationEvent("end", generation, handle),
+                dispatcher.generations.getLast());
+        assertEquals(2, dispatcher.generations.size());
+    }
+
+    @Test
+    void closeDeHandleGravavelChamaEndGenerationDepoisDoCloseRemoto() {
+        RemoteSeriesHandle handle = openedHandle();
+        String generation = handle.generationId();
+        rpc.respondDefault((cmd, body) -> response(cmd, SeriesStatus.OK, OWNER_A.value()));
+
+        handle.close();
+
+        assertEquals(List.of(Commands.OPEN, Commands.CLOSE), commands());
+        assertEquals(List.of(new NoOpWriteBuffer.GenerationEvent("begin", generation, handle),
+                new NoOpWriteBuffer.GenerationEvent("end", generation, handle)), dispatcher.generations);
+    }
+
+    @Test
+    void handleSomenteLeituraNaoEHolderDaRotaNemChamaEndGeneration() {
+        RemoteSeriesHandle handle = readOnlyOpenedHandle();
+        String generation = handle.generationId();
+
+        handle.close();
+
+        assertEquals(List.of(new NoOpWriteBuffer.GenerationEvent("begin", generation, null)),
+                dispatcher.generations, "somente leitura abre sem holder e não libera rota");
+    }
+
+    @Test
+    void reaberturaDeHandleFechadoNaoDeixaHolderOrfao() {
+        RemoteSeriesHandle handle = openedHandle();
+        String generation = handle.generationId();
+        rpc.respondDefault((cmd, body) -> response(cmd, SeriesStatus.OK, OWNER_A.value()));
+        handle.close();
+
+        assertTrue(handle.reopen(), "a reabertura de um handle gravável fechado ainda faz o OPEN");
+
+        assertEquals(new NoOpWriteBuffer.GenerationEvent("end", generation, handle),
+                dispatcher.generations.getLast(), "o holder religado pela reabertura é liberado de novo");
+    }
+
+    @Test
     void modoDoHandleEhFixoDesdeAConstrucao() {
         assertTrue(openedHandle().isWritable());
         assertFalse(readOnlyOpenedHandle().isWritable());
@@ -948,6 +1012,21 @@ class RemoteSeriesHandleTest {
 
         final List<Enqueued> enqueued = new CopyOnWriteArrayList<>();
         final AtomicInteger calls = new AtomicInteger();
+        /** {@code beginGeneration}/{@code endGeneration} recebidos, fora de {@link #calls}. */
+        final List<GenerationEvent> generations = new CopyOnWriteArrayList<>();
+
+        record GenerationEvent(String kind, String generation, Object holder) {
+        }
+
+        @Override
+        public void beginGeneration(String key, String generation, String owner, Object holder) {
+            generations.add(new GenerationEvent("begin", generation, holder));
+        }
+
+        @Override
+        public void endGeneration(String key, String generation, Object holder) {
+            generations.add(new GenerationEvent("end", generation, holder));
+        }
 
         @Override
         public void enqueue(String ownerNodeId, SeriesWrite write) {

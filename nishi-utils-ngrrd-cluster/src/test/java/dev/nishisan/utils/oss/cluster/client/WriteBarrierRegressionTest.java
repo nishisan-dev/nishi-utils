@@ -328,6 +328,8 @@ class WriteBarrierRegressionTest {
         open();
         handle.write("ds", new Sample(1, 1));
         assertTrue(slowEntered.await(5, TimeUnit.SECONDS));
+        // O enqueue não cria rota: "fast" é aberta como um handle faria.
+        dispatcher.beginGeneration("fast", null, "B");
         dispatcher.enqueue("B", new dev.nishisan.utils.oss.cluster.protocol.SeriesWrite("fast", "ds", 2, 2));
         Await.untilTrue("other node acknowledged", Duration.ofSeconds(5), () -> dispatcher.samplesSent() == 1);
         var flush = CompletableFuture.runAsync(dispatcher::flushAllSync);

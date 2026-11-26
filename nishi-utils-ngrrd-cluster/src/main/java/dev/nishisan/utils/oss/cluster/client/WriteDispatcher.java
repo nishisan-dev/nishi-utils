@@ -39,8 +39,10 @@ import java.time.Clock;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -114,6 +116,8 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     static final int MAX_REDIRECT_HOPS = 4;
     /** Teto de cada consulta ao líder para desempatar dicas contraditórias (limitado também por {@code retryPolicy.timeout()}). */
     static final Duration OWNER_LOOKUP_MAX_WAIT = Duration.ofSeconds(5);
+    /** Holder das rotas abertas sem holder explícito ({@link #beginGeneration(String, String, String)}): nunca sai. */
+    private static final Object PINNED_HOLDER = new Object();
 
     private final ClusterRpc rpc;
     private final PlacementLookup placementLookup;
@@ -198,13 +202,40 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         terminalListener = listener;
     }
 
+    /**
+     * Sem holder explícito: a rota fica presa a um holder permanente ({@link #PINNED_HOLDER}) e nunca sai do
+     * mapa, como antes da 8.15.0. Os handles usam {@link #beginGeneration(String, String, String, Object)}.
+     */
     @Override public void beginGeneration(String key, String generation, String owner) {
+        beginGeneration(key, generation, owner, PINNED_HOLDER);
+    }
+
+    /**
+     * Abre (ou reaproveita) a rota da geração {@code generation} de {@code key} para {@code holder}.
+     *
+     * <ul>
+     *   <li>Mesma geração: adiciona o holder (por identidade; a reabertura do mesmo handle é idempotente) e zera
+     *       {@code retired}. Sem holder ({@code null}, handle somente leitura), mantém a rota como está.</li>
+     *   <li>Geração diferente: aposenta a rota anterior, com as escritas em buffer e em voo, e cria a nova com
+     *       {@code {holder}}. Sem holder, não cria rota: a geração antiga sai do mapa e nenhuma é publicada.</li>
+     *   <li>Sem rota: cria com {@code {holder}}; sem holder, não cria.</li>
+     * </ul>
+     *
+     * <p>Roda dentro de {@code routes.compute} (bin do mapa → {@code route.lock}); nunca remove outra rota daqui.</p>
+     */
+    @Override public void beginGeneration(String key, String generation, String owner, Object holder) {
         boolean[] marksReady = {false};
         routes.compute(key, (ignored, previous) -> {
-            if (previous == null) return new SeriesRoute(key, owner, generation);
+            if (previous == null) return holder == null ? null : new SeriesRoute(key, owner, generation, holder);
             previous.lock.lock();
             try {
-                if (Objects.equals(previous.generation, generation)) return previous;
+                if (Objects.equals(previous.generation, generation)) {
+                    if (holder != null) {
+                        previous.holders.add(holder);
+                        previous.retired = false;
+                    }
+                    return previous;
+                }
                 // Explicit OPEN retires a removed generation, including buffered and in-flight writes.
                 for (NodeBuffer buffer : buffers.values()) extractSeriesFrom(buffer, key);
                 long remaining = previous.submitted - previous.completed;
@@ -222,10 +253,37 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 if (!marksMode || isIdle(previous)) {
                     synchronized (pendingLock) { pendingRoutes.remove(previous); }
                 }
-                return new SeriesRoute(key, owner, generation);
+                return holder == null ? null : new SeriesRoute(key, owner, generation, holder);
             } finally { previous.lock.unlock(); }
         });
         if (marksReady[0]) scheduleMarkCompletion();
+    }
+
+    /**
+     * {@code holder} deixou de usar a rota da geração {@code generation} de {@code key}. Sem holder, a rota fica
+     * {@code retired}: novas admissões recebem {@link ErrorCode#CLOSED}, e as escritas já admitidas seguem até o
+     * desfecho. Um holder que não está na rota (ou outra geração no mapa) é no-op. Nunca chamar sob
+     * {@code route.lock}.
+     */
+    @Override public void endGeneration(String key, String generation, Object holder) {
+        if (holder == null) {
+            return;
+        }
+        SeriesRoute route = routes.get(key);
+        if (route == null) {
+            return;
+        }
+        route.lock.lock();
+        try {
+            if (!Objects.equals(route.generation, generation) || !route.holders.remove(holder)) {
+                return;
+            }
+            if (route.holders.isEmpty()) {
+                route.retired = true;
+            }
+        } finally {
+            route.lock.unlock();
+        }
     }
 
     @Override public void checkGeneration(String key, String generation) {
@@ -363,7 +421,12 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
     public void enqueue(String ownerNodeId, SeriesWrite write) {
         Objects.requireNonNull(ownerNodeId, "ownerNodeId");
         Objects.requireNonNull(write, "write");
-        SeriesRoute route = routes.computeIfAbsent(write.seriesKey(), key -> new SeriesRoute(key, ownerNodeId, write.generationId()));
+        // Só beginGeneration cria rota: uma escrita que passou do ensureWritable antes de um close/release não
+        // recria a rota depois da remoção (seria admitida sem dreno).
+        SeriesRoute route = routes.get(write.seriesKey());
+        if (route == null) {
+            throw closedRoute(write.seriesKey());
+        }
         for (;;) {
             NodeBuffer buf;
             String owner;
@@ -381,7 +444,12 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 if (closed) {
                     throw new NgrrdClusterException(ErrorCode.CLOSED, "dispatcher fechado");
                 }
-                if (routes.get(write.seriesKey()) != route || !Objects.equals(route.generation, write.generationId()))
+                // Fora do mapa ou aposentada: por fechamento/release (CLOSED) ou por geração nova (SERIES_DELETED).
+                if (routes.get(write.seriesKey()) != route || route.retired) {
+                    throw route.retired ? closedRoute(write.seriesKey())
+                            : new NgrrdClusterException(ErrorCode.SERIES_DELETED, "generation replaced: " + write.seriesKey());
+                }
+                if (!Objects.equals(route.generation, write.generationId()))
                     throw new NgrrdClusterException(ErrorCode.SERIES_DELETED, "generation replaced: " + write.seriesKey());
                 if (route.failureCode == ErrorCode.SERIES_DELETED || route.failureCode == ErrorCode.QUARANTINED)
                     throw new NgrrdClusterException(route.failureCode, route.failureMessage);
@@ -665,6 +733,29 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
                 LOGGER.log(Level.SEVERE, remaining + " amostra(s) pendente(s) para " + entry.getKey()
                         + " descartada(s) ao fechar o dispatcher (orçamento de " + budgetMillis + " ms esgotado)");
             }
+        }
+    }
+
+    private static NgrrdClusterException closedRoute(String seriesKey) {
+        return new NgrrdClusterException(ErrorCode.CLOSED, "série liberada ou handle fechado: " + seriesKey);
+    }
+
+    /** Se há rota de escrita para {@code seriesKey} — visível para testes. */
+    boolean hasRoute(String seriesKey) {
+        return routes.containsKey(seriesKey);
+    }
+
+    /** Holders da rota de {@code seriesKey} ({@code 0} sem rota) — visível para testes. */
+    int routeHolders(String seriesKey) {
+        SeriesRoute route = routes.get(seriesKey);
+        if (route == null) {
+            return 0;
+        }
+        route.lock.lock();
+        try {
+            return route.holders.size();
+        } finally {
+            route.lock.unlock();
         }
     }
 
@@ -1543,12 +1634,17 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         private final ArrayDeque<FailedRange> unreportedFailures = new ArrayDeque<>();
         /** MARKS: marcas esperando esta rota, em ordem de marca (fronteiras não decrescentes). */
         private final ArrayDeque<MarkWaiter> waiters = new ArrayDeque<>();
+        /** Handles graváveis que usam a rota, por identidade (normalmente um). Só muda sob {@link #lock}. */
+        private final Set<Object> holders = Collections.newSetFromMap(new IdentityHashMap<>());
+        /** Sem holder (fechamento ou release): novas admissões recebem {@code CLOSED}. Só muda sob {@link #lock}. */
+        private boolean retired;
 
-        SeriesRoute(String key, String owner, String generation) {
+        SeriesRoute(String key, String owner, String generation, Object holder) {
             this.key = key;
             this.generation = generation;
             this.owner = owner;
             destinations.add(owner);
+            holders.add(holder);
         }
 
         void resetRedirectEpisode() {

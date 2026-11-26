@@ -97,6 +97,17 @@ class WriteMarkTest {
         return newDispatcher(NgrrdClusterConfig.WriteFailureReporting.MARKS, 1, Duration.ofMillis(10));
     }
 
+    /**
+     * Admite {@code write} como antes da 8.15.0: sem rota, abre uma com holder permanente
+     * ({@code beginGeneration} sem holder), porque o {@code enqueue} não cria mais rota.
+     */
+    private void enqueueWithRoute(String owner, SeriesWrite write) {
+        if (!dispatcher.hasRoute(write.seriesKey())) {
+            dispatcher.beginGeneration(write.seriesKey(), write.generationId(), owner);
+        }
+        dispatcher.enqueue(owner, write);
+    }
+
     private CountDownLatch gate() {
         var gate = new CountDownLatch(1);
         gates.add(gate);
@@ -128,8 +139,8 @@ class WriteMarkTest {
             return respond(request, key -> SeriesStatus.OK);
         };
         marksDispatcher();
-        dispatcher.enqueue(OWNER, write("a", 1));
-        dispatcher.enqueue(OWNER, write("b", 1));
+        enqueueWithRoute(OWNER, write("a", 1));
+        enqueueWithRoute(OWNER, write("b", 1));
         assertTrue(entered.await(5, TimeUnit.SECONDS));
 
         WriteMark mark = CompletableFuture.supplyAsync(dispatcher::mark).get(2, TimeUnit.SECONDS);
@@ -153,9 +164,9 @@ class WriteMarkTest {
             return respond(request, key -> SeriesStatus.OK);
         };
         marksDispatcher();
-        dispatcher.enqueue(OWNER, write("a", 1));
+        enqueueWithRoute(OWNER, write("a", 1));
         WriteMark first = dispatcher.mark();
-        dispatcher.enqueue(OWNER, write("b", 1));
+        enqueueWithRoute(OWNER, write("b", 1));
         WriteMark second = dispatcher.mark();
         List<Long> order = new CopyOnWriteArrayList<>();
         first.completion().thenRun(() -> order.add(first.id()));
@@ -177,7 +188,7 @@ class WriteMarkTest {
             return respond(request, key -> SeriesStatus.ERROR);
         };
         marksDispatcher();
-        dispatcher.enqueue(OWNER, write("s", 1));
+        enqueueWithRoute(OWNER, write("s", 1));
         List<WriteMark> marks = new ArrayList<>();
         for (int i = 0; i < 50; i++) {
             marks.add(dispatcher.mark());
@@ -206,7 +217,7 @@ class WriteMarkTest {
             return respond(request, key -> SeriesStatus.OK);
         };
         marksDispatcher();
-        dispatcher.enqueue(OWNER, write("s", 1));
+        enqueueWithRoute(OWNER, write("s", 1));
         WriteMark first = dispatcher.mark();
         WriteMark second = dispatcher.mark();
 
@@ -228,11 +239,11 @@ class WriteMarkTest {
             return (key.equals("a") && ts == 1) || (key.equals("b") && ts == 2) ? SeriesStatus.ERROR : SeriesStatus.OK;
         });
         marksDispatcher();
-        dispatcher.enqueue(OWNER, write("a", 1));
-        dispatcher.enqueue(OWNER, write("b", 1));
+        enqueueWithRoute(OWNER, write("a", 1));
+        enqueueWithRoute(OWNER, write("b", 1));
         WriteMark first = dispatcher.mark();
-        dispatcher.enqueue(OWNER, write("a", 2));
-        dispatcher.enqueue(OWNER, write("b", 2));
+        enqueueWithRoute(OWNER, write("a", 2));
+        enqueueWithRoute(OWNER, write("b", 2));
         WriteMark second = dispatcher.mark();
 
         WriteMarkResult firstResult = first.completion().get(10, TimeUnit.SECONDS);
@@ -249,7 +260,7 @@ class WriteMarkTest {
         rpc.writes = (owner, request) -> respond(request,
                 key -> request.writes().getFirst().tsEpochMs() == 1 ? SeriesStatus.ERROR : SeriesStatus.OK);
         marksDispatcher();
-        dispatcher.enqueue(OWNER, write("s", 1));
+        enqueueWithRoute(OWNER, write("s", 1));
 
         WriteMarkResult first = dispatcher.mark().completion().get(10, TimeUnit.SECONDS);
         assertEquals(1L, first.samplesFailed());
@@ -257,7 +268,7 @@ class WriteMarkTest {
         assertEquals(List.of("s"), first.failedSeriesSample());
         assertFalse(first.failedSeriesTruncated());
 
-        dispatcher.enqueue(OWNER, write("s", 2));
+        enqueueWithRoute(OWNER, write("s", 2));
         dispatcher.flushAllSync();
         dispatcher.flushSeriesSync("s", OWNER, WAIT);
 
@@ -271,10 +282,10 @@ class WriteMarkTest {
     void faixaQueCruzaAFronteiraEPartidaEntreDuasMarcas() throws Exception {
         rpc.writes = (owner, request) -> respond(request, key -> SeriesStatus.ERROR);
         newDispatcher(NgrrdClusterConfig.WriteFailureReporting.MARKS, 10, Duration.ofMinutes(1));
-        dispatcher.enqueue(OWNER, write("s", 1));
-        dispatcher.enqueue(OWNER, write("s", 2));
+        enqueueWithRoute(OWNER, write("s", 1));
+        enqueueWithRoute(OWNER, write("s", 2));
         WriteMark first = dispatcher.mark();
-        dispatcher.enqueue(OWNER, write("s", 3));
+        enqueueWithRoute(OWNER, write("s", 3));
         WriteMark second = dispatcher.mark();
 
         dispatcher.flushAllSync();
@@ -288,7 +299,7 @@ class WriteMarkTest {
     void falhaAntesDeQualquerMarcaComRotaOciosaEColhidaPelaProximaMarca() throws Exception {
         rpc.writes = (owner, request) -> respond(request, key -> SeriesStatus.ERROR);
         marksDispatcher();
-        dispatcher.enqueue(OWNER, write("s", 1));
+        enqueueWithRoute(OWNER, write("s", 1));
         Await.untilTrue("ERROR final", WAIT, () -> dispatcher.samplesFailed() == 1);
 
         WriteMark first = dispatcher.mark();
@@ -302,7 +313,7 @@ class WriteMarkTest {
     void modoMarksSerieTerminalLancaSoNaBarreiraPorSerie() throws Exception {
         rpc.writes = (owner, request) -> respond(request, key -> SeriesStatus.QUARANTINED);
         marksDispatcher();
-        dispatcher.enqueue(OWNER, write("s", 1));
+        enqueueWithRoute(OWNER, write("s", 1));
         Await.untilTrue("QUARANTINED final", WAIT, () -> dispatcher.samplesFailed() == 1);
 
         dispatcher.flushAllSync();
@@ -310,7 +321,7 @@ class WriteMarkTest {
         var perSeries = assertThrows(NgrrdClusterException.class,
                 () -> dispatcher.flushSeriesSync("s", OWNER, WAIT));
         assertEquals(ErrorCode.QUARANTINED, perSeries.code());
-        var admission = assertThrows(NgrrdClusterException.class, () -> dispatcher.enqueue(OWNER, write("s", 2)));
+        var admission = assertThrows(NgrrdClusterException.class, () -> enqueueWithRoute(OWNER, write("s", 2)));
         assertEquals(ErrorCode.QUARANTINED, admission.code());
 
         WriteMarkResult result = dispatcher.mark().completion().get(10, TimeUnit.SECONDS);
@@ -321,7 +332,7 @@ class WriteMarkTest {
     void modoBarrierMantemFalhaGrudentaERecusaMark() {
         rpc.writes = (owner, request) -> respond(request, key -> SeriesStatus.ERROR);
         newDispatcher(NgrrdClusterConfig.WriteFailureReporting.BARRIER, 1, Duration.ofMillis(10));
-        dispatcher.enqueue(OWNER, write("s", 1));
+        enqueueWithRoute(OWNER, write("s", 1));
 
         assertThrows(IllegalStateException.class, dispatcher::mark);
         assertThrows(NgrrdClusterException.class, dispatcher::flushAllSync);
@@ -341,7 +352,7 @@ class WriteMarkTest {
         };
         marksDispatcher();
         for (long ts = 1; ts <= 5; ts++) {
-            dispatcher.enqueue(OWNER, write("s", ts));
+            enqueueWithRoute(OWNER, write("s", ts));
         }
 
         WriteMarkResult result = dispatcher.mark().completion().get(10, TimeUnit.SECONDS);
@@ -361,8 +372,8 @@ class WriteMarkTest {
         };
         marksDispatcher();
         dispatcher.beginGeneration("s", "g1", OWNER);
-        dispatcher.enqueue(OWNER, new SeriesWrite("s", "ds", 1, 1.0, "g1"));
-        dispatcher.enqueue(OWNER, new SeriesWrite("s", "ds", 2, 2.0, "g1"));
+        enqueueWithRoute(OWNER, new SeriesWrite("s", "ds", 1, 1.0, "g1"));
+        enqueueWithRoute(OWNER, new SeriesWrite("s", "ds", 2, 2.0, "g1"));
         assertTrue(entered.await(5, TimeUnit.SECONDS));
         WriteMark mark = dispatcher.mark();
 
@@ -384,7 +395,7 @@ class WriteMarkTest {
         };
         marksDispatcher();
         dispatcher.beginGeneration("s", "g1", OWNER);
-        dispatcher.enqueue(OWNER, new SeriesWrite("s", "ds", 1, 1.0, "g1"));
+        enqueueWithRoute(OWNER, new SeriesWrite("s", "ds", 1, 1.0, "g1"));
 
         dispatcher.beginGeneration("s", "g2", OWNER);
 
@@ -400,7 +411,7 @@ class WriteMarkTest {
             return respond(request, key -> SeriesStatus.OK);
         };
         marksDispatcher();
-        dispatcher.enqueue(OWNER, write("s", 1));
+        enqueueWithRoute(OWNER, write("s", 1));
         WriteMark mark = dispatcher.mark();
         CompletableFuture<WriteMarkResult> completion = mark.completion();
 
@@ -421,7 +432,7 @@ class WriteMarkTest {
         marksDispatcher();
         int series = WriteMarkResult.MAX_FAILED_SERIES_SAMPLE + 50;
         for (int i = 0; i < series; i++) {
-            dispatcher.enqueue(OWNER, write("s-" + i, 1));
+            enqueueWithRoute(OWNER, write("s-" + i, 1));
         }
 
         WriteMarkResult result = dispatcher.mark().completion().get(10, TimeUnit.SECONDS);
@@ -435,9 +446,9 @@ class WriteMarkTest {
     void callbackDaMarcaPodeEscreverEMarcarSemDeadlock() throws Exception {
         rpc.writes = (owner, request) -> respond(request, key -> SeriesStatus.OK);
         marksDispatcher();
-        dispatcher.enqueue(OWNER, write("s", 1));
+        enqueueWithRoute(OWNER, write("s", 1));
         CompletableFuture<WriteMark> nested = dispatcher.mark().completion().thenApply(result -> {
-            dispatcher.enqueue(OWNER, write("s", 2));
+            enqueueWithRoute(OWNER, write("s", 2));
             return dispatcher.mark();
         });
 
@@ -460,7 +471,7 @@ class WriteMarkTest {
                 int producer = p;
                 tasks.add(producers.submit(() -> {
                     for (int i = 0; i < 2_000; i++) {
-                        dispatcher.enqueue(OWNER, write("s-" + producer + "-" + (i % 37), i));
+                        enqueueWithRoute(OWNER, write("s-" + producer + "-" + (i % 37), i));
                         admitted.incrementAndGet();
                     }
                 }));

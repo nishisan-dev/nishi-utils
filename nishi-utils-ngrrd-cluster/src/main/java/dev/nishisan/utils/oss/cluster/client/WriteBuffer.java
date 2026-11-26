@@ -33,6 +33,18 @@ public interface WriteBuffer {
 
     /** Explicit open starts a distinct admission/barrier generation. */
     default void beginGeneration(String key, String generation, String owner) { }
+
+    /**
+     * Como {@link #beginGeneration(String, String, String)}, registrando {@code holder} como dono da rota da
+     * série. Só handles graváveis são holders; um handle somente leitura passa {@code null} e nunca cria rota.
+     */
+    default void beginGeneration(String key, String generation, String owner, Object holder) {
+        beginGeneration(key, generation, owner);
+    }
+
+    /** O holder deixou de usar a rota; rota sem holder e ociosa sai do mapa. */
+    default void endGeneration(String key, String generation, Object holder) { }
+
     default void checkGeneration(String key, String generation) { }
     default void flushGenerationSync(String key, String generation, String owner, Duration wait) {
         flushSeriesSync(key, owner, wait);
