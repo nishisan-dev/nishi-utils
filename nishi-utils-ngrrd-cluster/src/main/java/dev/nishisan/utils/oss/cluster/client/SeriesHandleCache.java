@@ -51,7 +51,13 @@ import java.util.function.Supplier;
  * {@link CoordinationLocks}) serializa as aberturas DA MESMA série, e o {@code OPEN} remoto do handle novo
  * roda sob ele, como na 8.5.0 — é um {@code ReentrantLock}, que libera o carrier de uma virtual thread
  * durante a espera, e só bloqueia quem abre a mesma chave. Ele evita que aberturas concorrentes abram
- * vários handles; a correção não depende dele — depende da publicação condicional.</p>
+ * vários handles; a correção da publicação não depende dele — depende da publicação condicional. Já o release
+ * depende dele para que nenhum {@code open} da mesma chave intercale com a admissão encerrada.</p>
+ *
+ * <p>O lock da chave só sai de {@code openLocks} quando o último usuário (dono ou em espera) o devolve: a contagem
+ * muda dentro de {@code compute}, então quem chega depois sempre recebe o mesmo lock de quem ainda espera por ele. Sem
+ * isso, o dono soltava o lock e o tirava do mapa; quem já esperava entrava com o lock antigo, e quem chegava em seguida
+ * criava um novo — os dois rodavam juntos.</p>
  */
 final class SeriesHandleCache {
 
@@ -61,7 +67,13 @@ final class SeriesHandleCache {
         if (handle != null) handle.failGeneration(generation, failure);
     }
 
-    private final ConcurrentMap<String, Object> openLocks = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, OpenLock> openLocks = new ConcurrentHashMap<>();
+
+    /** Lock de abertura de uma chave e quantos o seguram ou esperam por ele. {@code users} só muda dentro de {@code compute}. */
+    private static final class OpenLock {
+        private final Object identity = CoordinationLocks.newStripe();
+        private int users;
+    }
 
     /**
      * Devolve o handle de {@code seriesKey} segundo as regras da classe, abrindo um novo com
@@ -79,30 +91,25 @@ final class SeriesHandleCache {
         if (reusable != null) {
             return reusable;
         }
-        Object lock = openLocks.computeIfAbsent(seriesKey, key -> new Object());
-        try {
-            try (var guard = CoordinationLocks.acquire(lock)) {
-                RemoteSeriesHandle opened = null;
-                for (;;) {
-                    RemoteSeriesHandle current = handles.get(seriesKey);
-                    reusable = reusable(current, createIfMissing);
-                    if (reusable != null) {
-                        if (opened != null) {
-                            opened.discard();
-                        }
-                        return reusable;
+        return withOpenLock(seriesKey, () -> {
+            RemoteSeriesHandle opened = null;
+            for (;;) {
+                RemoteSeriesHandle current = handles.get(seriesKey);
+                NgrrdHandle existing = reusable(current, createIfMissing);
+                if (existing != null) {
+                    if (opened != null) {
+                        opened.discard();
                     }
-                    if (opened == null) {
-                        opened = opener.get();
-                    }
-                    if (publish(seriesKey, current, opened)) {
-                        return opened;
-                    }
+                    return existing;
+                }
+                if (opened == null) {
+                    opened = opener.get();
+                }
+                if (publish(seriesKey, current, opened)) {
+                    return opened;
                 }
             }
-        } finally {
-            openLocks.remove(seriesKey, lock);
-        }
+        });
     }
 
     /**
@@ -113,14 +120,28 @@ final class SeriesHandleCache {
     <T> T withOpenLock(String seriesKey, Supplier<T> action) {
         Objects.requireNonNull(seriesKey, "seriesKey");
         Objects.requireNonNull(action, "action");
-        Object lock = openLocks.computeIfAbsent(seriesKey, key -> new Object());
+        OpenLock lock = openLocks.compute(seriesKey, (key, current) -> {
+            OpenLock acquired = current != null ? current : new OpenLock();
+            acquired.users++;
+            return acquired;
+        });
         try {
-            try (var guard = CoordinationLocks.acquire(lock)) {
+            try (var guard = CoordinationLocks.acquire(lock.identity)) {
                 return action.get();
             }
         } finally {
-            openLocks.remove(seriesKey, lock);
+            openLocks.computeIfPresent(seriesKey, (key, current) -> {
+                if (current != lock) {
+                    return current;
+                }
+                return --current.users == 0 ? null : current;
+            });
         }
+    }
+
+    /** Locks de abertura no mapa agora — visível para testes. */
+    int openLocks() {
+        return openLocks.size();
     }
 
     /**

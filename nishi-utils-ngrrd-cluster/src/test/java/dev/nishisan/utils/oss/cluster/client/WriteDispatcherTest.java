@@ -1469,6 +1469,26 @@ class WriteDispatcherTest {
     }
 
     @Test
+    void releaseNaoAposentaRotaComOutroHolder() {
+        newDispatcher(1, Duration.ofMillis(10), 1000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
+        rpc.respondDefault((command, body) -> okFor((WriteBatchRequest) body));
+        Object released = new Object();
+        Object other = new Object();
+        dispatcher.beginGeneration("s", "g", OWNER_A.value(), released);
+        dispatcher.beginGeneration("s", "g", OWNER_A.value(), other);
+
+        WriteDispatcher.ReleaseTicket ticket = dispatcher.beginRelease("s", "g", released);
+        dispatcher.enqueue(OWNER_A.value(), new SeriesWrite("s", "in_octets", 1, 1, "g"));
+        dispatcher.drainForRelease(List.of(ticket), AWAIT_TIMEOUT);
+        dispatcher.finishRelease(ticket, true);
+
+        assertTrue(dispatcher.hasRoute("s"), "a rota de outro holder segue viva");
+        assertEquals(1, dispatcher.routeHolders("s"));
+        dispatcher.flushAllSync();
+        assertEquals(1, dispatcher.samplesSent());
+    }
+
+    @Test
     void rotaReligadaDuranteOReleaseNaoEntraNaFronteiraNemSaiDoMapa() {
         newDispatcher(1, Duration.ofMillis(10), 1000, NgrrdClusterConfig.BufferFullPolicy.BLOCK, key -> true);
         rpc.respondDefault((command, body) -> okFor((WriteBatchRequest) body));

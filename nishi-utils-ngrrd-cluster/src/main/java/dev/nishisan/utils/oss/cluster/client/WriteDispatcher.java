@@ -705,8 +705,8 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
      * um {@link #beginGeneration} posterior com a mesma geração religa a rota (zera {@code retired}), e o dreno continua
      * esperando só a fronteira fotografada.
      *
-     * <p>A rota só é aposentada se {@code holder} for holder dela na geração {@code generation}, ou se ela já não tiver
-     * holder; a rota de outro holder é só drenada. O holder continua na rota até {@link #finishRelease}. O chamador
+     * <p>A rota só é aposentada se {@code holder} for o ÚNICO holder dela na geração {@code generation}, ou se ela já
+     * não tiver holder; com outro holder (um handle aberto por fora do release), a rota segue viva e é só drenada. O holder continua na rota até {@link #finishRelease}. O chamador
      * segura o lock de abertura da chave no cache de handles, de modo que um {@code open()} concorrente da mesma chave
      * só religa a rota depois desta fotografia. Devolve {@code null} se não houver rota para a chave.</p>
      *
@@ -728,7 +728,7 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
             try {
                 boolean owned = holder != null && Objects.equals(route.generation, generation)
                         && route.holders.contains(holder);
-                if (owned || route.holders.isEmpty()) {
+                if ((owned && route.holders.size() == 1) || route.holders.isEmpty()) {
                     route.retired = true;
                 }
                 if (marksMode) {
