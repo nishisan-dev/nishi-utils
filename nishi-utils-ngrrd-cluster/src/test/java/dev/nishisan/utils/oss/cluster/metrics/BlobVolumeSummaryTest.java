@@ -100,4 +100,52 @@ class BlobVolumeSummaryTest {
         assertNull(summary.writeMode());
         assertEquals(0L, summary.bytesWritten());
     }
+
+    @Test
+    void fromPreencheCapacidadeDeclaradaReservadoEFill() {
+        BlobVolumeStats stats = new BlobVolumeStats(1, new long[]{1_000L}, new long[]{100L}, new long[]{1L},
+                new double[]{0.1}, 1, 0L, 0L, VolumeWriteMode.MMAP, 0L, 1_000L, 700L, 150L);
+
+        BlobVolumeSummary summary = BlobVolumeSummary.from(stats);
+
+        assertEquals(1_000L, summary.declaredCapacityBytes());
+        assertEquals(150L, summary.reservedBytes());
+        assertEquals(0.85, summary.fillOfDeclaredCapacity(), 1e-9);
+    }
+
+    @Test
+    void roundTripPreservaOsCamposDaCapacidadeDeclarada() throws IOException {
+        BlobVolumeSummary original = new BlobVolumeSummary(4, 10L, 100L, 0.42, 3, 8L, "MMAP", 5L,
+                2_000L, 300L, 1.25);
+
+        for (ObjectMapper mapper : new ObjectMapper[]{transportMapper, new ObjectMapper()}) {
+            BlobVolumeSummary roundTripped = mapper.readValue(mapper.writeValueAsString(original),
+                    BlobVolumeSummary.class);
+            assertEquals(original, roundTripped);
+        }
+    }
+
+    @Test
+    void jsonDaVersao8_14SemOsCamposDeCapacidadeDeclaradaDesserializaComoDesconhecido() throws IOException {
+        String json814 = "{\"shardCount\":4,\"usedBytes\":10,\"capacityBytes\":100,\"maxFillRatio\":0.1,"
+                + "\"catalogEntryCount\":7,\"walBytes\":32,\"writeMode\":\"PWRITE\",\"bytesWritten\":9}";
+
+        for (ObjectMapper mapper : new ObjectMapper[]{transportMapper, new ObjectMapper()}) {
+            BlobVolumeSummary summary = mapper.readValue(json814, BlobVolumeSummary.class);
+            assertEquals("PWRITE", summary.writeMode());
+            assertEquals(9L, summary.bytesWritten());
+            assertEquals(0L, summary.declaredCapacityBytes());
+            assertEquals(0L, summary.reservedBytes());
+            assertEquals(0.0, summary.fillOfDeclaredCapacity(), "0 = desconhecido");
+        }
+    }
+
+    @Test
+    void construtorDeCompatibilidadeDaForma8_13_0DeixaACapacidadeDeclaradaDesconhecida() {
+        BlobVolumeSummary summary = new BlobVolumeSummary(1, 100L, 1_000L, 0.1, 5, 0L, "MMAP", 7L);
+
+        assertEquals(0L, summary.declaredCapacityBytes());
+        assertEquals(0L, summary.reservedBytes());
+        assertEquals(0.0, summary.fillOfDeclaredCapacity());
+    }
 }

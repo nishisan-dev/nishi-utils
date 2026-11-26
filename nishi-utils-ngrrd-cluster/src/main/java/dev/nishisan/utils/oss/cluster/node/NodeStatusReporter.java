@@ -29,6 +29,7 @@ import dev.nishisan.utils.oss.cluster.metrics.BlobVolumeSummary;
 import dev.nishisan.utils.oss.cluster.metrics.NgrrdClusterMetricsListener;
 import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
 import dev.nishisan.utils.oss.cluster.rebalance.MigrationExecutor;
+import dev.nishisan.utils.oss.metrics.BlobVolumeMetrics;
 import dev.nishisan.utils.oss.metrics.BlobVolumeStats;
 
 import java.io.Closeable;
@@ -158,6 +159,9 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
      * ({@link LocalCheckpointer#disabledMetrics}).
      */
     private volatile Supplier<Map<String, Long>> localCheckpointMetrics;
+    private volatile BlobVolumeMetrics volumeMetrics;
+    /** Faixa de fill sobre a capacidade declarada; só acessada pela thread do tick (publishMetrics). */
+    private final VolumeFillBands fillBands = new VolumeFillBands();
 
     /** Configura a fonte das métricas do checkpoint local; {@code null} volta ao "desligado". */
     public void localCheckpointMetrics(Supplier<Map<String, Long>> supplier) {
@@ -316,7 +320,7 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
                         + "leaderConfirmationP99us=%d catalogLag=%s redirectConfirmations=%d redirectOverrides=%d "
                         + "redirectConfirmationFailures=%d redirectCacheHits=%d lcEnabled=%d lcDirty=%d lcCycles=%d "
                         + "lcLastCycleMs=%d lcLastCycleSeries=%d lcCheckpointed=%d lcSkippedBusy=%d lcFailures=%d "
-                        + "lcOverruns=%d lcQwP99=%d lcForceP99=%d",
+                        + "lcOverruns=%d lcQwP99=%d lcForceP99=%d fillDeclared=%.3f",
                 snapshot.nodeId(), snapshot.leader(), snapshot.seriesCount(), snapshot.usedBytes(),
                 snapshot.openHandles(), samplesPerSecond, snapshot.writeBatchLatency().p99Micros(),
                 snapshot.checkpointLatency().p99Micros(), snapshot.readLatency().p99Micros(),
@@ -328,10 +332,31 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
                 localCheckpointMetric(snapshot, "lastCycleSeries"), localCheckpointMetric(snapshot, "checkpointed"),
                 localCheckpointMetric(snapshot, "skippedBusy"), localCheckpointMetric(snapshot, "failures"),
                 localCheckpointMetric(snapshot, "overruns"), localCheckpointMetric(snapshot, "queueWaitMsP99"),
-                localCheckpointMetric(snapshot, "forceMsP99")));
+                localCheckpointMetric(snapshot, "forceMsP99"), snapshot.blobStats().fillOfDeclaredCapacity()));
+        logFillBandChange(snapshot.blobStats());
         if (metricsListener != null) {
             metricsListener.onNodeMetrics(snapshot);
         }
+    }
+
+    /**
+     * Emite {@code NGRRD_VOLUME_FILL} só quando a faixa de fill sobre a capacidade declarada muda. Capacidade
+     * declarada {@code 0} (snapshot degradado ou nó sem declaração) é "desconhecido" e não conta como descida.
+     */
+    private void logFillBandChange(BlobVolumeSummary blob) {
+        if (blob.declaredCapacityBytes() <= 0L) {
+            return;
+        }
+        double fill = blob.fillOfDeclaredCapacity();
+        VolumeFillBands.Band previous = fillBands.current();
+        VolumeFillBands.Band band = fillBands.update(fill);
+        if (band == previous) {
+            return;
+        }
+        LOGGER.log(band == VolumeFillBands.Band.NORMAL ? Level.INFO : Level.WARNING, String.format(Locale.ROOT,
+                "NGRRD_VOLUME_FILL nodeId=%s level=%s previous=%s fill=%.3f declaredCapacityBytes=%d "
+                        + "reservedBytes=%d", nodeId, band, previous, fill, blob.declaredCapacityBytes(),
+                blob.reservedBytes()));
     }
 
     /**
@@ -411,8 +436,32 @@ public final class NodeStatusReporter implements Closeable, LeadershipListener {
             merged.putAll(registry.lifecycle().metrics());
         }
         Supplier<Map<String, Long>> checkpointMetrics = localCheckpointMetrics;
+        merged.putAll(volumeMetrics());
         merged.putAll(checkpointMetrics != null ? checkpointMetrics.get() : LocalCheckpointer.disabledMetrics(registry));
         return merged;
+    }
+
+    /**
+     * Métricas de volume que não vêm de {@code BlobVolume.stats()}: o crescimento de shard medido pelo
+     * {@link BlobVolumeMetrics} registrado no volume. Chaves {@code volume.shardGrows} e
+     * {@code volume.shardGrowMs{Total,Max,Last}} (nanossegundos acumulados convertidos para ms).
+     */
+    private Map<String, Long> volumeMetrics() {
+        BlobVolumeMetrics metrics = volumeMetrics;
+        if (metrics == null) {
+            return Map.of();
+        }
+        Map<String, Long> result = new LinkedHashMap<>();
+        result.put("volume.shardGrows", metrics.shardGrowCount());
+        result.put("volume.shardGrowMsTotal", TimeUnit.NANOSECONDS.toMillis(metrics.shardGrowNanosTotal()));
+        result.put("volume.shardGrowMsMax", TimeUnit.NANOSECONDS.toMillis(metrics.shardGrowNanosMax()));
+        result.put("volume.shardGrowMsLast", TimeUnit.NANOSECONDS.toMillis(metrics.lastShardGrowNanos()));
+        return result;
+    }
+
+    /** Registra as métricas de volume do nó (crescimento de shard), expostas em {@code lifecycleMetrics}. */
+    public void volumeMetrics(BlobVolumeMetrics metrics) {
+        this.volumeMetrics = metrics;
     }
 
     private static long localCheckpointMetric(NodeMetricsSnapshot snapshot, String name) {

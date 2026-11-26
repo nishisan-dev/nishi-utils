@@ -38,6 +38,14 @@ import java.util.Objects;
  * @param bytesWritten      bytes lógicos entregues a {@code writeAt} em todos os shards desde a abertura do
  *                          volume (contador acumulado, não persistido); {@code 0} quando o nó reportante é
  *                          anterior à 8.13.0
+ * @param declaredCapacityBytes   capacidade lógica declarada do volume ({@code capacityBytes} do nó);
+ *                          {@code 0} = desconhecida (nó anterior à 8.15.0 ou snapshot degradado)
+ * @param reservedBytes     bytes de crescimento reservados pela admissão e ainda não gravados; {@code 0} quando
+ *                          o nó reportante é anterior à 8.15.0
+ * @param fillOfDeclaredCapacity {@code (vivos + reservados) / declarada}, a mesma conta da recusa de admissão a
+ *                          95%; pode passar de {@code 1.0}. {@code 0} = desconhecido (nó anterior à 8.15.0 ou
+ *                          sem capacidade declarada). Diferente de {@code maxFillRatio}, que é por shard sobre o
+ *                          tamanho atual do arquivo (dente de serra, não serve para alerta)
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 public record BlobVolumeSummary(
@@ -48,12 +56,25 @@ public record BlobVolumeSummary(
         int catalogEntryCount,
         long walBytes,
         String writeMode,
-        long bytesWritten) {
+        long bytesWritten,
+        long declaredCapacityBytes,
+        long reservedBytes,
+        double fillOfDeclaredCapacity) {
+
+    /**
+     * Construtor de compatibilidade (forma da 8.13.0): capacidade declarada, reservados e fill sobre a capacidade
+     * declarada ficam em {@code 0} (desconhecidos).
+     */
+    public BlobVolumeSummary(int shardCount, long usedBytes, long capacityBytes, double maxFillRatio,
+                             int catalogEntryCount, long walBytes, String writeMode, long bytesWritten) {
+        this(shardCount, usedBytes, capacityBytes, maxFillRatio, catalogEntryCount, walBytes, writeMode,
+                bytesWritten, 0L, 0L, 0.0);
+    }
 
     /** Construtor de compatibilidade (forma da 8.12.0): modo de escrita desconhecido e {@code bytesWritten} zero. */
     public BlobVolumeSummary(int shardCount, long usedBytes, long capacityBytes, double maxFillRatio,
                              int catalogEntryCount, long walBytes) {
-        this(shardCount, usedBytes, capacityBytes, maxFillRatio, catalogEntryCount, walBytes, null, 0L);
+        this(shardCount, usedBytes, capacityBytes, maxFillRatio, catalogEntryCount, walBytes, null, 0L, 0L, 0L, 0.0);
     }
 
     /** Deriva o resumo a partir do {@link BlobVolumeStats} bruto de um {@code BlobVolume}. */
@@ -61,7 +82,8 @@ public record BlobVolumeSummary(
         Objects.requireNonNull(stats, "stats");
         return new BlobVolumeSummary(stats.shardCount(), sum(stats.shardUsedBytes()), sum(stats.shardCapacityBytes()),
                 max(stats.fillRatioPerShard()), stats.catalogEntryCount(), stats.walBytes(),
-                stats.writeMode().name(), stats.bytesWritten());
+                stats.writeMode().name(), stats.bytesWritten(), stats.declaredCapacityBytes(), stats.reservedBytes(),
+                stats.fillOfDeclaredCapacity());
     }
 
     private static long sum(long[] values) {

@@ -45,6 +45,7 @@ import dev.nishisan.utils.oss.cluster.rebalance.RebalanceSettings;
 import dev.nishisan.utils.oss.cluster.rebalance.Rebalancer;
 import dev.nishisan.utils.oss.cluster.rpc.LocalRequestHandler;
 import dev.nishisan.utils.oss.cluster.rpc.TransportClusterRpc;
+import dev.nishisan.utils.oss.metrics.BlobVolumeMetrics;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -225,6 +226,7 @@ public final class NgrrdStorageNode implements Closeable {
         Objects.requireNonNull(lookupDecorator, "lookupDecorator");
 
         ThreadPoolExecutor forcePool = newForcePool(cfg.localCheckpoint().threads());
+        BlobVolumeMetrics blobMetrics = new BlobVolumeMetrics();
         BlobVolumeRegistry volumeRegistry;
         try {
             volumeRegistry = NgrrdBlob.registry()
@@ -234,6 +236,7 @@ public final class NgrrdStorageNode implements Closeable {
                     .initialShardCapacityBytes(cfg.initialShardCapacityBytes())
                     .writeMode(cfg.volumeWriteMode())
                     .checkpointForceExecutor(forcePool)
+                    .volumeMetricsListener(blobMetrics)
                     .volume(cfg.volumeName())
                     .build();
         } catch (RuntimeException e) {
@@ -388,6 +391,7 @@ public final class NgrrdStorageNode implements Closeable {
 
                 statusReporter.distribution(cfg.distributionMode(), cfg.weight());
                 // Issue #167 (item 3): cota dura e fingerprint das regras de placement em todo status.
+                statusReporter.volumeMetrics(blobMetrics);
                 statusReporter.quota(cfg.quotaMaxSeries(), cfg.quotaMaxBytes());
                 statusReporter.placementRulesHash(cfg.placementRules().fingerprint());
                 LOGGER.info("NGRRD_PLACEMENT_RULES loaded count=" + cfg.placementRules().size() + " hash="

@@ -38,6 +38,7 @@ import dev.nishisan.utils.oss.cluster.metrics.LatencySnapshot;
 import dev.nishisan.utils.oss.cluster.metrics.NgrrdClusterMetricsListener;
 import dev.nishisan.utils.oss.cluster.metrics.NodeMetricsSnapshot;
 import dev.nishisan.utils.oss.cluster.protocol.SeriesStatus;
+import dev.nishisan.utils.oss.metrics.BlobVolumeMetrics;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -152,6 +153,63 @@ class NodeStatusReporterTest {
         BlobVolumeSummary blobStats = snapshot.blobStats();
         assertEquals(1, blobStats.catalogEntryCount());
         assertTrue(blobStats.usedBytes() > 0, "série com amostra escrita deveria ocupar bytes reais no volume");
+    }
+
+    @Test
+    void marcadorDeFillSoNaMudancaDeFaixa() {
+        VolumeFillBands bands = new VolumeFillBands();
+
+        assertEquals(VolumeFillBands.Band.NORMAL, bands.update(0.79));
+        assertEquals(VolumeFillBands.Band.WARN, bands.update(0.80));
+        assertEquals(VolumeFillBands.Band.WARN, bands.update(0.85), "mesma faixa: sem mudança");
+        assertEquals(VolumeFillBands.Band.CRITICAL, bands.update(0.90));
+        assertEquals(VolumeFillBands.Band.REFUSING, bands.update(0.95));
+        assertEquals(VolumeFillBands.Band.REFUSING, bands.update(1.30), "fill pode passar de 1,0");
+        // salto direto sobre faixas intermediárias
+        VolumeFillBands jump = new VolumeFillBands();
+        assertEquals(VolumeFillBands.Band.REFUSING, jump.update(0.97));
+    }
+
+    @Test
+    void histereseNaDescida() {
+        VolumeFillBands bands = new VolumeFillBands();
+        bands.update(0.96);
+
+        assertEquals(VolumeFillBands.Band.REFUSING, bands.update(0.945), "dentro de 1 ponto abaixo de 0,95");
+        assertEquals(VolumeFillBands.Band.CRITICAL, bands.update(0.939));
+        assertEquals(VolumeFillBands.Band.CRITICAL, bands.update(0.895));
+        assertEquals(VolumeFillBands.Band.WARN, bands.update(0.889));
+        assertEquals(VolumeFillBands.Band.WARN, bands.update(0.795));
+        assertEquals(VolumeFillBands.Band.NORMAL, bands.update(0.789));
+        // oscilando em torno do limiar não gera mudança de faixa
+        bands.update(0.81);
+        assertEquals(VolumeFillBands.Band.WARN, bands.update(0.795));
+        assertEquals(VolumeFillBands.Band.WARN, bands.update(0.805));
+        // queda grande desce várias faixas de uma vez
+        bands.update(0.97);
+        assertEquals(VolumeFillBands.Band.NORMAL, bands.update(0.10));
+    }
+
+    @Test
+    void lifecycleMetricsExpoeCrescimentoDoShardEFillDeclarado() {
+        volume.storage().configureCapacity(1_000_000L);
+        BlobVolumeMetrics volumeMetrics = new BlobVolumeMetrics();
+        volumeMetrics.onShardGrow(0, 1_000L, 2_000L, 3_000_000L);
+        volumeMetrics.onShardGrow(1, 1_000L, 2_000L, 9_000_000L);
+        volumeMetrics.onShardGrow(0, 2_000L, 3_000L, 4_000_000L);
+        NodeStatusReporter reporter = newReporter(new MutableClock(Instant.parse("2026-01-01T00:00:00Z")), null,
+                Duration.ofSeconds(10));
+        reporter.volumeMetrics(volumeMetrics);
+
+        NodeMetricsSnapshot snapshot = reporter.metricsSnapshot();
+
+        assertEquals(3L, snapshot.lifecycleMetrics().get("volume.shardGrows"));
+        assertEquals(16L, snapshot.lifecycleMetrics().get("volume.shardGrowMsTotal"));
+        assertEquals(9L, snapshot.lifecycleMetrics().get("volume.shardGrowMsMax"));
+        assertEquals(4L, snapshot.lifecycleMetrics().get("volume.shardGrowMsLast"));
+        assertEquals(1_000_000L, snapshot.blobStats().declaredCapacityBytes());
+        assertEquals(0L, snapshot.blobStats().reservedBytes());
+        assertEquals(0.0, snapshot.blobStats().fillOfDeclaredCapacity(), 1e-9);
     }
 
     @Test
