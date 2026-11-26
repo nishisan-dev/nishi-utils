@@ -21,6 +21,17 @@ public interface BlobVolumeMetricsListener {
     default void onShardGrow(int shardId, long oldCapacityBytes, long newCapacityBytes) {
     }
 
+    /**
+     * Um shard cresceu em disco de {@code oldCapacityBytes} para {@code newCapacityBytes}, levando
+     * {@code durationNanos} (crescimento do arquivo + persistência do superbloco, sob o lock estrutural,
+     * portanto é o tempo em que toda criação no volume ficou bloqueada). O volume emite sempre esta forma;
+     * a implementação padrão delega à forma de três argumentos, preservando listeners existentes.
+     * Mesmo contrato de thread-safety: a implementação deve ser O(1).
+     */
+    default void onShardGrow(int shardId, long oldCapacityBytes, long newCapacityBytes, long durationNanos) {
+        onShardGrow(shardId, oldCapacityBytes, newCapacityBytes);
+    }
+
     /** Uma nova região de {@code regionBytes} foi alocada no shard {@code shardId}. */
     default void onRegionAllocate(int shardId, long regionBytes) {
     }

@@ -66,4 +66,17 @@ class BlobVolumeMetricsTest {
         assertEquals(1, frees[0]);
         assertEquals(1, checkpoints[0]);
     }
+
+    @Test
+    void coletorAcumulaTotalMaximoEUltimoDaDuracaoDoCrescimento() {
+        BlobVolumeMetrics metrics = new BlobVolumeMetrics();
+        metrics.onShardGrow(0, 64L, 128L, 300L);
+        metrics.onShardGrow(0, 128L, 192L, 900L);
+        metrics.onShardGrow(0, 192L, 256L, 100L);
+
+        assertEquals(3, metrics.shardGrowCount());
+        assertEquals(1300L, metrics.shardGrowNanosTotal());
+        assertEquals(900L, metrics.shardGrowNanosMax());
+        assertEquals(100L, metrics.lastShardGrowNanos());
+    }
 }

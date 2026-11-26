@@ -27,14 +27,31 @@ import java.util.Objects;
  * @param writeMode          modo de escrita dos shards do volume
  * @param bytesWritten       bytes lógicos entregues a {@code writeAt} em todos os shards desde a
  *                           abertura do volume (contador acumulado, não persistido)
+ * @param declaredCapacityBytes capacidade lógica declarada do volume ({@code capacityBytes});
+ *                           {@code 0} = não declarada ou desconhecida (ex.: snapshot de nó mais antigo)
+ * @param liveBytes          soma dos bytes de região das séries vivas no catálogo
+ * @param reservedBytes      bytes lógicos de crescimento reservados (reservas de admissão em aberto)
  */
 public record BlobVolumeStats(int shardCount, long[] shardCapacityBytes, long[] shardUsedBytes,
                               long[] seriesPerShard, double[] fillRatioPerShard,
                               int catalogEntryCount, long catalogImageBytes, long walBytes,
-                              VolumeWriteMode writeMode, long bytesWritten) {
+                              VolumeWriteMode writeMode, long bytesWritten,
+                              long declaredCapacityBytes, long liveBytes, long reservedBytes) {
 
     public BlobVolumeStats {
         Objects.requireNonNull(writeMode, "writeMode é obrigatório");
+    }
+
+    /**
+     * Compatibilidade com a forma da 8.13 (com modo de escrita e bytes escritos): capacidade declarada,
+     * bytes vivos e reservados ficam em {@code 0}.
+     */
+    public BlobVolumeStats(int shardCount, long[] shardCapacityBytes, long[] shardUsedBytes,
+                           long[] seriesPerShard, double[] fillRatioPerShard,
+                           int catalogEntryCount, long catalogImageBytes, long walBytes,
+                           VolumeWriteMode writeMode, long bytesWritten) {
+        this(shardCount, shardCapacityBytes, shardUsedBytes, seriesPerShard, fillRatioPerShard,
+                catalogEntryCount, catalogImageBytes, walBytes, writeMode, bytesWritten, 0L, 0L, 0L);
     }
 
     /** Compatibilidade: snapshot sem modo de escrita (assume {@link VolumeWriteMode#MMAP}) e sem bytes escritos. */
@@ -43,5 +60,19 @@ public record BlobVolumeStats(int shardCount, long[] shardCapacityBytes, long[] 
                            int catalogEntryCount, long catalogImageBytes, long walBytes) {
         this(shardCount, shardCapacityBytes, shardUsedBytes, seriesPerShard, fillRatioPerShard,
                 catalogEntryCount, catalogImageBytes, walBytes, VolumeWriteMode.MMAP, 0L);
+    }
+
+    /**
+     * Fill sobre a capacidade <strong>declarada</strong>: {@code (liveBytes + reservedBytes) / declaredCapacityBytes},
+     * a mesma conta usada pela recusa de admissão ({@code CapacityBudget}). Diferente de
+     * {@code fillRatioPerShard}, que é por shard sobre o tamanho atual do arquivo (dente de serra, não serve
+     * para alerta).
+     *
+     * @return o fill; {@code 0.0} quando não há capacidade declarada ({@code 0} = desconhecido)
+     */
+    public double fillOfDeclaredCapacity() {
+        return declaredCapacityBytes > 0
+                ? (double) (liveBytes + reservedBytes) / declaredCapacityBytes
+                : 0.0;
     }
 }

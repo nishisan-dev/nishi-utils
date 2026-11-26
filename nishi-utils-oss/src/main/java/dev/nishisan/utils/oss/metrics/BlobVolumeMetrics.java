@@ -14,6 +14,9 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class BlobVolumeMetrics implements BlobVolumeMetricsListener {
 
     private final AtomicLong shardGrowCount = new AtomicLong();
+    private final AtomicLong shardGrowNanosTotal = new AtomicLong();
+    private final AtomicLong shardGrowNanosMax = new AtomicLong();
+    private final AtomicLong lastShardGrowNanos = new AtomicLong();
     private final AtomicLong regionAllocateCount = new AtomicLong();
     private final AtomicLong regionFreeCount = new AtomicLong();
     private final AtomicLong checkpointCount = new AtomicLong();
@@ -31,6 +34,21 @@ public final class BlobVolumeMetrics implements BlobVolumeMetricsListener {
 
     public long shardGrowCount() {
         return shardGrowCount.get();
+    }
+
+    /** Soma, em nanossegundos, da duração de todos os crescimentos de shard medidos. */
+    public long shardGrowNanosTotal() {
+        return shardGrowNanosTotal.get();
+    }
+
+    /** Maior duração, em nanossegundos, de um crescimento de shard. */
+    public long shardGrowNanosMax() {
+        return shardGrowNanosMax.get();
+    }
+
+    /** Duração, em nanossegundos, do último crescimento de shard medido. */
+    public long lastShardGrowNanos() {
+        return lastShardGrowNanos.get();
     }
 
     public long regionAllocateCount() {
@@ -58,6 +76,17 @@ public final class BlobVolumeMetrics implements BlobVolumeMetricsListener {
         shardGrowCount.incrementAndGet();
         if (forward != null) {
             forward.onShardGrow(shardId, oldCapacityBytes, newCapacityBytes);
+        }
+    }
+
+    @Override
+    public void onShardGrow(int shardId, long oldCapacityBytes, long newCapacityBytes, long durationNanos) {
+        shardGrowCount.incrementAndGet();
+        shardGrowNanosTotal.addAndGet(durationNanos);
+        shardGrowNanosMax.accumulateAndGet(durationNanos, Math::max);
+        lastShardGrowNanos.set(durationNanos);
+        if (forward != null) {
+            forward.onShardGrow(shardId, oldCapacityBytes, newCapacityBytes, durationNanos);
         }
     }
 
