@@ -4,6 +4,102 @@
 
 ---
 
+## 2026-11-26 — Entrega de séries entre clientes, pool de force do checkpoint e métricas de operação — 8.15.0
+
+Release do ngrrd-cluster (`nishi-utils-ngrrd-cluster`) com apoio no `nishi-utils-oss`. O formato em disco e o
+protocolo de comandos não mudam. Guia de atualização em `doc/oss/ngrrd-cluster-operacao.md` ("Atualização para 8.15.0").
+
+### Cliente
+- **`release(seriesKeys)`**: entrega de séries entre clientes (por exemplo, na revogação de uma partição).
+  Drena as escritas pendentes, devolve um `ReleaseResult` por série e só aposenta a rota quando nenhum outro
+  handle gravável do cliente a usa. O padrão não faz checkpoint nem manda `CLOSE`; `ReleaseOptions` controla
+  `checkpoint`, `closeOnNode`, `timeout` e `maxConcurrentPerNode` por chamada. Protocolo completo em
+  `doc/oss/ngrrd-cluster.md` (seção 5.3). Usa os comandos `CHECKPOINT` e `CLOSE` que já existiam.
+- **Rota com dono e removida ao fechar**: a rota de escrita passa a pertencer ao handle e sai do mapa quando ele
+  fecha. Corrige o vazamento de rotas em clientes com séries rotativas (`routes` / `routesRemoved`).
+- **Interner de definições**: definições YAML iguais compartilham a mesma instância (`internedDefinitions`),
+  reduzindo memória em clientes com muitas séries do mesmo modelo.
+- **Latência de RPC por comando e máximo recente**: `rpcLatencyByCommand` separa a latência por comando e
+  `recentMaxMicros` traz o máximo dos últimos 60 a 120 s. O `rpcLatency` agregado fica obsoleto.
+
+### Storage node
+- **Pool dedicado de force do checkpoint** (`ngrrd.checkpoint.threads`, padrão `0` = inline como na 8.14): tira o
+  `fsync` da fila do writer. Atende também o `CHECKPOINT`/`FLUSH` remoto e a migração.
+- **`ngrrd.checkpoint.spreadFraction`** (padrão `0.8`): fração do intervalo em que os disparos do checkpoint
+  local são espalhados, com cadência por prazo.
+- **Índice incremental de séries sujas**: o ciclo do checkpoint local deixa de varrer todas as séries.
+- **TTL de ociosidade por série** (`ngrrd.handleIdleTtlStepFactor`, padrão `2`): o TTL passa a ser
+  `max(handleIdleTtl, 2 × baseStepSec)`. Séries de passo longo deixam de ser fechadas e reabertas a cada passo.
+  **Muda o comportamento por padrão**: essas séries deixam de ganhar o checkpoint incidental do fechamento por
+  ociosidade; se a durabilidade delas dependia disso, ligue o checkpoint local. `0` restaura o TTL global.
+- **`NOT_OPEN` por causa e churn de handles**: `notOpen.restart`, `notOpen.clientClosed`, `notOpen.migrated`,
+  `notOpen.frozen`, `notOpen.reopenFailed`, além de `handles.idleClosed`, `handles.evicted`, `handles.selfHealed` e
+  `handles.idleTtlExtended`.
+- **Métricas de exclusão de séries**: `seriesDelete.requests.<STATUS>`, `seriesDelete.completed`,
+  `seriesDelete.cancelled`, `seriesDelete.attemptFailed.{NO_LEADER,TIMEOUT,PARTICIPANT,STALE,OTHER}`,
+  `seriesDelete.recoveryAttempts`, `seriesDelete.pending` e o marcador `NGRRD_DELETE_PENDING`.
+- **Recuperação de exclusões sem cópia do catálogo**: o ciclo de recuperação usa um índice de exclusões pendentes
+  e backoff, em vez de copiar o catálogo do líder a cada passada. Uma exclusão já concluída não é mais
+  ressuscitada pela recuperação; o participante reenvia no máximo uma vez por geração e entradas `FINISHED` já
+  resolvidas só são reconferidas a cada ~10 a 12 min.
+- **Writer abandonado com prazo**: um force preso no fechamento deixa de travar o fechamento. A espera pelo
+  checkpoint prévio e o `close()` do writer têm 20 s cada (pior caso ~40 s por série presa). O nó registra
+  `NGRRD_WRITER_ABANDONED` em `SEVERE`, incrementa `handles.writerAbandoned` e reabre a série do disco no próximo
+  acesso. O primeiro `CHECKPOINT`/`FLUSH` remoto depois do abandono é recusado (`REMOTE_ERROR` no cliente, sem
+  retentativa; `handles.abandonedCheckpointRejected`), para não confirmar durabilidade em falso.
+- **Fill sobre a capacidade declarada**: `fillDeclared=` no `NGRRD_NODE_STATUS` e `blobStats.fillOfDeclaredCapacity`
+  (`0` = capacidade desconhecida), com o marcador `NGRRD_VOLUME_FILL` nas faixas 80/90/95%.
+- **Duração do crescimento do shard**: `volume.shardGrows`, `volume.shardGrowMsMax` e `volume.shardGrowMsLast`.
+  O crescimento do shard deixa de fazer *probing*: a série sempre vai para o shard calculado pelo hash.
+
+### nishi-utils-oss
+- Force do blob destacável do writer, com `checkpointAsyncTimed` (checkpoint assíncrono com prazo e medição de
+  fila e force) e `WriterAbandonedException` para o writer abandonado.
+- Fill sobre a capacidade declarada e duração do crescimento do shard no `BlobVolumeStats`.
+- O journal de lifecycle do storage node ignora campos desconhecidos, de modo que um nó pode voltar a uma versão
+  anterior sem invalidar o journal.
+
+### Correções de defeitos anteriores encontradas no caminho
+- Corrida na troca de geração da rota de escrita (dupla contagem de `completed`/`submitted` e rota presa).
+- Ordem de conclusão das marcas de escrita e proteção de marcas com releases sobrepostos da mesma série.
+- Lock de abertura de séries: `open()` concorrentes da mesma chave não são mais excluídos entre si.
+- `open()` durante a migração da série não remove mais a entrada de um handle vivo (o writer não vaza sem checkpoint).
+- Laço de recuperação do journal de exclusões: isolado, com backoff, sem reconsultar o histórico `FINISHED` a cada
+  segundo em todos os nós e sem reenviar `DELETE_RECOVER` indefinidamente após a recriação da série.
+
+### Chaves novas (YAML do storage node)
+| Chave | Padrão |
+|---|---|
+| `ngrrd.checkpoint.threads` | `0` (force inline) |
+| `ngrrd.checkpoint.spreadFraction` | `0.8` |
+| `ngrrd.handleIdleTtlStepFactor` | `2` (`0` = TTL global) |
+
+Valor inválido falha a subida do nó com o nome da chave. O cliente não ganha chave de YAML.
+
+### Métricas obsoletas (saem na 9.0)
+- `rpcLatency` (cliente): use `rpcLatencyByCommand` e `recentMaxMicros`.
+- `seriesDelete.<STATUS>` sem prefixo (nó): conta tentativas, inclusive as da recuperação; migre alertas para
+  `seriesDelete.requests.<STATUS>` e `seriesDelete.attemptFailed.*`. Continuam funcionando na 8.15.x.
+
+### Compatibilidade e atualização
+- Atualização contínua (rolling): os campos novos de métrica são aditivos, nada muda em disco e não há comando novo
+  no protocolo. Qualquer combinação de nós e clientes 8.14.2 e 8.15.0 funciona.
+- Ordem recomendada: storage nodes primeiro, um por vez; depois os clientes. Confira `openHandles` contra
+  `maxOpenHandles` antes, porque o TTL estendido mantém mais handles abertos.
+- Rollback: `handleIdleTtlStepFactor: 0`, `checkpoint.threads: 0` e `spreadFraction: 0.8` preservam o comportamento
+  da 8.14; voltar ao jar 8.14.2 é seguro. Quem já usa `release` precisa voltar ao `close()` por handle.
+- Limite conhecido: sem cerca contra "zumbi" até a 8.16. Um cliente que estourou o prazo do `release` e segue
+  escrevendo depois da reatribuição disputa a série (vale o último escritor).
+
+### Validação
+- `nishi-utils-oss`: 354 testes, sem falhas.
+- `nishi-utils-ngrrd-cluster`: cerca de 1,1 mil testes (1.089 na última execução integrada), sem falhas.
+- Perfil `ngrrd-cluster` (testes de cluster em processo): 26 classes `*ClusterTest`, sem falhas.
+- Falhas intermitentes conhecidas da base, sem relação com a release: `WeightedGeometryClusterTest`,
+  `ContinuousIngestionRebalanceClusterTest` sob latência e `IfaceTrafficSmokeIT` (preset yearly).
+
+---
+
 ## 2026-10-15 — Recuperação de mapas voláteis após shutdown limpo — 8.14.2
 
 ### Correção (#212)
