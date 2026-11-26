@@ -27,6 +27,7 @@ import dev.nishisan.utils.oss.api.ViewQuery;
 import dev.nishisan.utils.oss.blob.BlobVolume;
 import dev.nishisan.utils.oss.blob.BlobVolumeRegistry;
 import dev.nishisan.utils.oss.blob.NgrrdBlob;
+import dev.nishisan.utils.oss.writer.WriterAbandonedException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -1179,6 +1180,212 @@ class SeriesHandleRegistryTest {
         } finally {
             pool.shutdownNow();
         }
+    }
+
+    // ------------------------------------------------------------------ writer abandonado e falhas de fechamento
+
+    private static final Clock LATE_CLOCK = Clock.fixed(Instant.ofEpochMilli(10_000_000L), ZoneOffset.UTC);
+
+    /** Handle falso cujo {@code close()} lança o que {@code closeFailure} devolver (nada, se {@code null}). */
+    private static NgrrdHandle closeFailingHandle(java.util.function.Supplier<RuntimeException> closeFailure) {
+        return (NgrrdHandle) Proxy.newProxyInstance(NgrrdHandle.class.getClassLoader(),
+                new Class<?>[]{NgrrdHandle.class}, (proxy, method, args) -> {
+                    if (method.getName().equals("close")) {
+                        RuntimeException failure = closeFailure.get();
+                        if (failure != null) {
+                            throw failure;
+                        }
+                        return null;
+                    }
+                    return switch (method.getName()) {
+                        case "checkpointAsyncTimed" ->
+                                CompletableFuture.completedFuture(NgrrdHandle.CheckpointTiming.NONE);
+                        case "checkpointAsync" -> CompletableFuture.completedFuture(null);
+                        case "toString" -> "closing-handle";
+                        case "hashCode" -> System.identityHashCode(proxy);
+                        case "equals" -> proxy == args[0];
+                        default -> null;
+                    };
+                });
+    }
+
+    private static RuntimeException abandonedFailure() {
+        return new WriterAbandonedException("force preso", new RuntimeException("cause"));
+    }
+
+    private static RuntimeException plainFailure() {
+        return new IllegalStateException("close falhou");
+    }
+
+    private SeriesHandleRegistry lateRegistry(int maxOpenHandles) {
+        SeriesHandleRegistry registry = registry(Duration.ofMinutes(1), maxOpenHandles, LATE_CLOCK);
+        registry.trackDirtyIndex(true);
+        return registry;
+    }
+
+    private static long abandonedCount(SeriesHandleRegistry registry) {
+        return registry.handleMetrics().get("handles.writerAbandoned");
+    }
+
+    @Test
+    void discardComWriterAbandonadoRemoveAEntradaConteELancaSemMarcarLimpa() {
+        try (SeriesHandleRegistry registry = lateRegistry(10)) {
+            entries(registry).put("stuck",
+                    newEntry(closeFailingHandle(SeriesHandleRegistryTest::abandonedFailure)));
+            recordWrite(registry, "stuck");
+            assertTrue(registry.dirtySeries().contains("stuck"));
+
+            assertThrows(WriterAbandonedException.class, () -> registry.discard("stuck"));
+
+            assertFalse(entries(registry).containsKey("stuck"), "a entrada abandonada tem que sair do mapa");
+            assertFalse(registry.dirtySeries().contains("stuck"), "o índice de sujas é podado depois do unlock");
+            assertEquals(1L, abandonedCount(registry));
+            assertEquals(SeriesHandleRegistry.CheckpointAttempt.Outcome.UNAVAILABLE,
+                    registry.tryCheckpointAsync("stuck").outcome(),
+                    "checkpoint de série abandonada não pode reportar sucesso");
+            assertFalse(registry.isOpen("stuck"));
+        }
+    }
+
+    @Test
+    void markMigratingComWriterAbandonadoRemoveAEntradaELanca() {
+        try (SeriesHandleRegistry registry = lateRegistry(10)) {
+            entries(registry).put("stuck",
+                    newEntry(closeFailingHandle(SeriesHandleRegistryTest::abandonedFailure)));
+
+            assertThrows(WriterAbandonedException.class, () -> registry.markMigrating("stuck"));
+
+            assertFalse(entries(registry).containsKey("stuck"));
+            assertTrue(registry.isMigrating("stuck"));
+            assertEquals(1L, abandonedCount(registry));
+        }
+    }
+
+    @Test
+    void markMigratingComFalhaComumMantemAEntradaEPropaga() {
+        AtomicBoolean fail = new AtomicBoolean(true);
+        try (SeriesHandleRegistry registry = lateRegistry(10)) {
+            entries(registry).put("flaky", newEntry(closeFailingHandle(
+                    () -> fail.get() ? plainFailure() : null)));
+
+            assertThrows(IllegalStateException.class, () -> registry.markMigrating("flaky"));
+
+            assertTrue(entries(registry).containsKey("flaky"), "falha comum mantém o comportamento: a entrada fica");
+            assertEquals(0L, abandonedCount(registry));
+            fail.set(false);
+        }
+    }
+
+    @Test
+    void closeIdleRemoveAbandonadaESegueParaAsDemais() {
+        try (SeriesHandleRegistry registry = lateRegistry(10)) {
+            entries(registry).put("a-stuck",
+                    newEntry(closeFailingHandle(SeriesHandleRegistryTest::abandonedFailure)));
+            entries(registry).put("b-ok", newEntry(FAKE_HANDLE));
+
+            assertEquals(1, registry.closeIdle(), "só o fechamento normal conta como ocioso fechado");
+
+            assertTrue(entries(registry).isEmpty());
+            assertEquals(1L, abandonedCount(registry));
+            assertEquals(1L, registry.handleMetrics().get("handles.idleClosed"));
+        }
+    }
+
+    @Test
+    void closeIdleComFalhaComumNaoAbortaAVarreduraEMantemAEntrada() {
+        AtomicBoolean fail = new AtomicBoolean(true);
+        try (SeriesHandleRegistry registry = lateRegistry(10)) {
+            entries(registry).put("a-flaky", newEntry(closeFailingHandle(
+                    () -> fail.get() ? plainFailure() : null)));
+            entries(registry).put("b-ok", newEntry(FAKE_HANDLE));
+
+            assertEquals(1, registry.closeIdle());
+
+            assertEquals(Set.of("a-flaky"), entries(registry).keySet());
+            fail.set(false);
+            assertEquals(1, registry.closeIdle(), "a próxima rodada tenta de novo e converge");
+            assertTrue(entries(registry).isEmpty());
+        }
+    }
+
+    @Test
+    void openDeOutraSerieNaoFalhaPorCausaDoDespejoDeUmaSeriePresa() {
+        AtomicBoolean fail = new AtomicBoolean(true);
+        try (SeriesHandleRegistry registry = lateRegistry(1)) {
+            entries(registry).put("stuck", newEntry(closeFailingHandle(
+                    () -> fail.get() ? plainFailure() : null)));
+
+            NgrrdHandle opened = registry.open("fresh", yaml, Ngrrd.OpenOptions.defaults());
+
+            assertTrue(opened != null);
+            assertTrue(entries(registry).containsKey("stuck"));
+            assertTrue(registry.isOpen("fresh"),
+                    "a série recém-aberta não pode ser despejada no lugar da que está presa");
+            fail.set(false);
+        }
+    }
+
+    @Test
+    void despejoRemoveSerieAbandonadaDentroDoOpenDeOutra() {
+        try (SeriesHandleRegistry registry = lateRegistry(1)) {
+            entries(registry).put("stuck",
+                    newEntry(closeFailingHandle(SeriesHandleRegistryTest::abandonedFailure)));
+
+            registry.open("fresh", yaml, Ngrrd.OpenOptions.defaults());
+
+            assertFalse(entries(registry).containsKey("stuck"));
+            assertTrue(registry.isOpen("fresh"));
+            assertEquals(1L, abandonedCount(registry));
+            assertEquals(0L, registry.handleMetrics().get("handles.evicted"));
+        }
+    }
+
+    @Test
+    void closeDoRegistryAgregaFalhasEFechaAsDemais() {
+        SeriesHandleRegistry registry = lateRegistry(10);
+        AtomicBoolean fail = new AtomicBoolean(true);
+        NgrrdHandle failing = closeFailingHandle(() -> fail.get() ? plainFailure() : null);
+        entries(registry).put("a-fail", newEntry(failing));
+        entries(registry).put("b-abandoned",
+                newEntry(closeFailingHandle(SeriesHandleRegistryTest::abandonedFailure)));
+        entries(registry).put("c-fail", newEntry(failing));
+        AtomicInteger closedOk = new AtomicInteger();
+        entries(registry).put("d-ok", newEntry(closeFailingHandle(() -> {
+            closedOk.incrementAndGet();
+            return null;
+        })));
+
+        IllegalStateException thrown = assertThrows(IllegalStateException.class, registry::close);
+
+        assertEquals(2, thrown.getSuppressed().length, "uma falha comum por série presa: " + thrown);
+        assertEquals(1, closedOk.get(), "as demais séries continuam sendo fechadas");
+        assertEquals(Set.of("a-fail", "c-fail"), entries(registry).keySet());
+        assertEquals(1L, abandonedCount(registry));
+        fail.set(false);
+        registry.close();
+        assertTrue(entries(registry).isEmpty());
+    }
+
+    @Test
+    void writerAbandonadoLogaSevereComMarcador() {
+        java.util.logging.Logger logger = java.util.logging.Logger.getLogger(SeriesHandleRegistry.class.getName());
+        List<java.util.logging.LogRecord> records = new java.util.concurrent.CopyOnWriteArrayList<>();
+        java.util.logging.Handler capture = new java.util.logging.Handler() {
+            @Override public void publish(java.util.logging.LogRecord record) { records.add(record); }
+            @Override public void flush() { }
+            @Override public void close() { }
+        };
+        logger.addHandler(capture);
+        try (SeriesHandleRegistry registry = lateRegistry(10)) {
+            entries(registry).put("stuck",
+                    newEntry(closeFailingHandle(SeriesHandleRegistryTest::abandonedFailure)));
+            registry.closeIdle();
+        } finally {
+            logger.removeHandler(capture);
+        }
+        assertTrue(records.stream().anyMatch(record -> record.getLevel() == java.util.logging.Level.SEVERE
+                        && record.getMessage().contains("NGRRD_WRITER_ABANDONED seriesKey=stuck")),
+                "esperava o marcador SEVERE: " + records);
     }
 
     // ------------------------------------------------------------------ apoio do índice de sujas
