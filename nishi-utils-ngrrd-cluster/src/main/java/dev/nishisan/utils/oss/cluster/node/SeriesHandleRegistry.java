@@ -130,8 +130,16 @@ public final class SeriesHandleRegistry implements Closeable {
 
     private static final Logger LOGGER = Logger.getLogger(SeriesHandleRegistry.class.getName());
 
-    /** Intervalo mínimo entre logs completos (WARNING) de falha de fechamento por série. */
+    /** Janela dos WARNINGs agrupados de falha de fechamento: no máximo um por janela, por registro. */
     private static final long CLOSE_FAILURE_LOG_INTERVAL_MS = 10_000L;
+
+    /**
+     * Espaçamento mínimo entre tentativas de fechar a mesma série nas varreduras ({@link #closeIdle()} e {@link
+     * #evictIfOverLimit()}) depois de um close que falhou. Sem ele, k séries presas custariam k vezes o teto do
+     * fechamento a cada varredura (e a cada abertura de outra série). Os caminhos explícitos ({@link #discard},
+     * {@link #markMigrating}, {@link #close()}) não respeitam o backoff.
+     */
+    static final long CLOSE_RETRY_BACKOFF_MS = 60_000L;
 
     /**
      * Teto da espera, com a série travada, pelo checkpoint que o registro faz antes de fechar o handle ({@link
@@ -257,8 +265,15 @@ public final class SeriesHandleRegistry implements Closeable {
     private final BoundedKeySet abandonedSinceCheckpoint = new BoundedKeySet(ABANDONED_WRITER_LRU_LIMIT);
     /** Espera efetiva pelo checkpoint de fechamento, em ns ({@link #CLOSE_CHECKPOINT_WAIT}); só testes a reduzem. */
     private volatile long closeCheckpointWaitNanos = CLOSE_CHECKPOINT_WAIT.toNanos();
-    /** Instante (ms do relógio) do último log completo de falha de fechamento; {@code -1} = nunca. */
-    private final AtomicLong lastCloseFailureLogMs = new AtomicLong(-1);
+    /**
+     * Instante (ms do relógio) do último WARNING agrupado de falha de fechamento; {@code -1} = nunca. Sob {@link
+     * #closeFailureLogLock}.
+     */
+    private long lastCloseFailureLogMs = -1;
+    /** Falhas de fechamento logadas em FINE desde o último WARNING agrupado. Sob {@link #closeFailureLogLock}. */
+    private long suppressedCloseFailures;
+    /** Guarda {@link #lastCloseFailureLogMs} e {@link #suppressedCloseFailures}. */
+    private final Object closeFailureLogLock = new Object();
     /** Respostas {@code NOT_OPEN} por causa ({@code notOpen.*}); a soma é o total de {@code NOT_OPEN}. */
     private final Map<NotOpenCause, AtomicLong> notOpenByCause = newNotOpenCounters();
     /** Séries fechadas explicitamente por um cliente ({@link #close}); LRU limitado, classificação aproximada. */
@@ -898,7 +913,7 @@ public final class SeriesHandleRegistry implements Closeable {
         entry.lock.lock();
         try {
             if (entries.get(seriesKey) == entry) {
-                abandoned = closeQuietly(seriesKey, entry, true);
+                abandoned = closeQuietly(seriesKey, entry, true, CloseLog.DIRECT);
                 removed = removeEntry(seriesKey, entry);
             }
         } finally {
@@ -1037,13 +1052,19 @@ public final class SeriesHandleRegistry implements Closeable {
                 if (now - entry.lastAccessMs < entry.effectiveIdleTtlMs(globalTtlMillis)) {
                     continue;
                 }
+                if (now < entry.closeRetryNotBeforeMs) {
+                    // O close desta série falhou há pouco: espera o backoff em vez de pagar o teto de novo.
+                    continue;
+                }
                 try {
-                    if (closeQuietly(seriesKey, entry, true) == null) {
+                    if (closeQuietly(seriesKey, entry, true, CloseLog.GROUPED) == null) {
                         idleClosed.incrementAndGet();
                         closedCount++;
                     }
                 } catch (RuntimeException e) {
-                    // Falha de UMA série não aborta a varredura: a entrada fica e a próxima rodada tenta de novo.
+                    // Falha de UMA série não aborta a varredura: a entrada fica e só volta a ser tentada depois do
+                    // backoff.
+                    entry.closeRetryNotBeforeMs = now + CLOSE_RETRY_BACKOFF_MS;
                     continue;
                 }
                 removeEntry(seriesKey, entry);
@@ -1080,12 +1101,19 @@ public final class SeriesHandleRegistry implements Closeable {
                     if (entries.get(seriesKey) != entry || entry.handle == null) {
                         continue;
                     }
+                    long now = clock.millis();
+                    if (now < entry.closeRetryNotBeforeMs) {
+                        // Em backoff depois de um close que falhou: conta como falha desta chamada, sem nova tentativa.
+                        failed.add(entry);
+                        continue;
+                    }
                     try {
-                        if (closeQuietly(seriesKey, entry, true) == null) {
+                        if (closeQuietly(seriesKey, entry, true, CloseLog.GROUPED) == null) {
                             evicted.incrementAndGet();
                         }
                     } catch (RuntimeException e) {
                         // Esta roda dentro do open de OUTRA série: a falha desta não pode se propagar a ele.
+                        entry.closeRetryNotBeforeMs = now + CLOSE_RETRY_BACKOFF_MS;
                         failed.add(entry);
                         continue;
                     }
@@ -1157,7 +1185,7 @@ public final class SeriesHandleRegistry implements Closeable {
             }
             if (entries.get(seriesKey) == entry) {
                 // O checkpoint do corte já foi feito (ou estourou o teto): o close() vai direto, sem nova espera.
-                abandoned = closeQuietly(seriesKey, entry, false);
+                abandoned = closeQuietly(seriesKey, entry, false, CloseLog.DIRECT);
                 removed = removeEntry(seriesKey, entry);
             }
         } finally {
@@ -1232,7 +1260,13 @@ public final class SeriesHandleRegistry implements Closeable {
         return definition != null ? Optional.of(definition.yaml()) : Optional.empty();
     }
 
-    /** Fecha (checkpoint+close) todos os handles abertos. */
+    /**
+     * Fecha (checkpoint+close) todos os handles abertos, mesmo que alguns falhem.
+     *
+     * @throws IllegalStateException no fim, se alguma série falhou: agrega como {@code suppressed} as falhas comuns
+     *                               (a entrada fica), os abandonos de writer ({@link WriterAbandonedException}; a
+     *                               entrada sai) e a falha do journal
+     */
     @Override
     public void close() {
         RuntimeException failure = null;
@@ -1245,8 +1279,16 @@ public final class SeriesHandleRegistry implements Closeable {
             entry.lock.lock();
             try {
                 if (entries.get(seriesKey) == entry && entry.handle != null) {
-                    closeQuietly(seriesKey, entry, true);
+                    WriterAbandonedException abandoned = closeQuietly(seriesKey, entry, true, CloseLog.GROUPED);
                     removed = removeEntry(seriesKey, entry);
+                    if (abandoned != null) {
+                        // A entrada abandonada já saiu (SEVERE e métrica em closeQuietly); o abandono volta também
+                        // no agregado, para quem fecha o registro saber que houve perda possível.
+                        if (failure == null) {
+                            failure = new IllegalStateException("Falha ao fechar uma ou mais séries do registry");
+                        }
+                        failure.addSuppressed(abandoned);
+                    }
                 }
             } catch (RuntimeException e) {
                 // Continua fechando as demais séries; as falhas voltam agregadas no fim.
@@ -1404,13 +1446,16 @@ public final class SeriesHandleRegistry implements Closeable {
      * marcador {@code NGRRD_WRITER_ABANDONED}), contada em {@code handles.writerAbandoned} e
      * <strong>devolvida</strong> (sem lançar), para o chamador remover a entrada pelo caminho normal
      * ({@link #removeEntry}) sem marcar a série como limpa; a próxima abertura reabre do disco. Qualquer outra
-     * falha do {@code close()} é logada (com limite de frequência) e propagada, e a entrada permanece.</p>
+     * falha do {@code close()} é logada (ver {@code log}) e propagada, e a entrada permanece.</p>
      *
      * @param checkpointFirst {@code false} quando o chamador já fez o checkpoint (ou já estourou o teto dele), como
      *                        o corte da migração: o {@code close()} vai direto, sem uma segunda espera
+     * @param log             como logar as falhas de checkpoint e de fechamento: agrupadas por janela nas varreduras
+     *                        e no fechamento do registro, diretas nos caminhos explícitos de uma série
      * @return {@code null} se fechou normalmente (ou não havia handle); a exceção de abandono, se for o caso
      */
-    private WriterAbandonedException closeQuietly(String seriesKey, HandleEntry entry, boolean checkpointFirst) {
+    private WriterAbandonedException closeQuietly(String seriesKey, HandleEntry entry, boolean checkpointFirst,
+            CloseLog log) {
         NgrrdHandle handle = entry.handle;
         if (handle == null) {
             return null;
@@ -1419,7 +1464,7 @@ public final class SeriesHandleRegistry implements Closeable {
             try {
                 awaitCheckpointLocked(seriesKey, entry);
             } catch (RuntimeException e) {
-                logCloseFailure("Falha no checkpoint final da série " + seriesKey + " antes de fechar", e);
+                logCloseFailure(log, "Falha no checkpoint final da série " + seriesKey + " antes de fechar", e);
             }
         }
         try {
@@ -1434,9 +1479,20 @@ public final class SeriesHandleRegistry implements Closeable {
                     + " amostras desde o último checkpoint podem ter sido perdidas; a entrada foi removida", e);
             return e;
         } catch (RuntimeException e) {
-            logCloseFailure("Falha ao fechar handle da série " + seriesKey, e);
+            logCloseFailure(log, "Falha ao fechar handle da série " + seriesKey, e);
             throw e;
         }
+    }
+
+    /** Como {@link #closeQuietly} loga as falhas de checkpoint e de fechamento de uma série. */
+    private enum CloseLog {
+        /**
+         * Varreduras ({@link #closeIdle()}, {@link #evictIfOverLimit()}) e {@link #close()}: no máximo um WARNING por
+         * janela, com a contagem das suprimidas (ver {@link #logCloseFailure}).
+         */
+        GROUPED,
+        /** Caminhos explícitos de uma série ({@link #discard}, {@link #markMigrating}): sempre WARNING. */
+        DIRECT
     }
 
     /** Lança o abandono devolvido por {@link #closeQuietly}, depois de a entrada sair e do unlock. */
@@ -1447,18 +1503,39 @@ public final class SeriesHandleRegistry implements Closeable {
     }
 
     /**
-     * Loga a falha de fechamento por série com limite de frequência: no máximo um log completo (WARNING com
-     * stack) a cada {@link #CLOSE_FAILURE_LOG_INTERVAL_MS}; os demais saem em FINE. Evita inundar o log quando
-     * muitas séries presas falham a cada varredura.
+     * Loga uma falha de checkpoint ou de fechamento de uma série. {@link CloseLog#DIRECT} sai sempre em WARNING. Em
+     * {@link CloseLog#GROUPED}, sai no máximo um WARNING (com stack) a cada {@link #CLOSE_FAILURE_LOG_INTERVAL_MS}
+     * para todo o registro; as demais da janela saem em FINE e são contadas, e o WARNING seguinte diz quantas foram
+     * suprimidas desde o anterior. Assim, com muitas séries presas falhando a cada varredura, o log não inunda e
+     * as que não aparecem por nome continuam visíveis na contagem.
      */
-    private void logCloseFailure(String message, RuntimeException failure) {
-        long now = clock.millis();
-        long last = lastCloseFailureLogMs.get();
-        if ((last < 0 || now - last >= CLOSE_FAILURE_LOG_INTERVAL_MS)
-                && lastCloseFailureLogMs.compareAndSet(last, now)) {
+    private void logCloseFailure(CloseLog log, String message, RuntimeException failure) {
+        if (log == CloseLog.DIRECT) {
             LOGGER.log(Level.WARNING, message, failure);
-        } else {
+            return;
+        }
+        long now = clock.millis();
+        long suppressed;
+        long sinceLastMs;
+        synchronized (closeFailureLogLock) {
+            if (lastCloseFailureLogMs >= 0 && now - lastCloseFailureLogMs < CLOSE_FAILURE_LOG_INTERVAL_MS) {
+                suppressedCloseFailures++;
+                suppressed = -1;
+                sinceLastMs = 0;
+            } else {
+                suppressed = suppressedCloseFailures;
+                sinceLastMs = lastCloseFailureLogMs >= 0 ? now - lastCloseFailureLogMs : 0;
+                suppressedCloseFailures = 0;
+                lastCloseFailureLogMs = now;
+            }
+        }
+        if (suppressed < 0) {
             LOGGER.log(Level.FINE, message, failure);
+        } else if (suppressed > 0) {
+            LOGGER.log(Level.WARNING, message + " (" + suppressed + " falhas de fechamento suprimidas nos últimos "
+                    + TimeUnit.MILLISECONDS.toSeconds(sinceLastMs) + " s)", failure);
+        } else {
+            LOGGER.log(Level.WARNING, message, failure);
         }
     }
 
@@ -1506,6 +1583,12 @@ public final class SeriesHandleRegistry implements Closeable {
         private volatile long idleTtlMs;
         /** Esta entrada está contada em {@code handles.idleTtlExtended}. Só muda sob {@link #lock}. */
         private boolean extendedCounted;
+        /**
+         * Antes deste instante (ms do relógio), {@link #closeIdle()} e {@link #evictIfOverLimit()} não tentam fechar
+         * a entrada de novo: o último close delas falhou ({@link #CLOSE_RETRY_BACKOFF_MS}). Lido e escrito só sob
+         * {@link #lock}.
+         */
+        private long closeRetryNotBeforeMs;
 
         long effectiveIdleTtlMs(long globalMs) {
             return idleTtlMs > 0 ? idleTtlMs : globalMs;

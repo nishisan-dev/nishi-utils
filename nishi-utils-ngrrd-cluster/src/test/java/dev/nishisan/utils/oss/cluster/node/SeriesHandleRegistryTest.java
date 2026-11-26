@@ -1384,18 +1384,106 @@ class SeriesHandleRegistryTest {
     @Test
     void closeIdleComFalhaComumNaoAbortaAVarreduraEMantemAEntrada() {
         AtomicBoolean fail = new AtomicBoolean(true);
-        try (SeriesHandleRegistry registry = lateRegistry(10)) {
-            entries(registry).put("a-flaky", newEntry(closeFailingHandle(
-                    () -> fail.get() ? plainFailure() : null)));
+        AtomicInteger closeAttempts = new AtomicInteger();
+        MutableClock clock = new MutableClock(Instant.ofEpochMilli(10_000_000L));
+        try (SeriesHandleRegistry registry = registry(Duration.ofMinutes(1), 10, clock)) {
+            entries(registry).put("a-flaky", newEntry(closeFailingHandle(() -> {
+                closeAttempts.incrementAndGet();
+                return fail.get() ? plainFailure() : null;
+            })));
             entries(registry).put("b-ok", newEntry(FAKE_HANDLE));
 
             assertEquals(1, registry.closeIdle());
 
             assertEquals(Set.of("a-flaky"), entries(registry).keySet());
             fail.set(false);
-            assertEquals(1, registry.closeIdle(), "a próxima rodada tenta de novo e converge");
+            assertEquals(0, registry.closeIdle(), "dentro do backoff a série que falhou não é tentada de novo");
+            assertEquals(1, closeAttempts.get());
+
+            clock.advance(Duration.ofMillis(SeriesHandleRegistry.CLOSE_RETRY_BACKOFF_MS));
+            assertEquals(1, registry.closeIdle(), "passado o backoff, a próxima rodada tenta de novo e converge");
+            assertEquals(2, closeAttempts.get());
             assertTrue(entries(registry).isEmpty());
         }
+    }
+
+    @Test
+    void despejoNaoRetentaSerieEmBackoffEDespejaAProximaDaFila() {
+        AtomicInteger closeAttempts = new AtomicInteger();
+        MutableClock clock = new MutableClock(Instant.ofEpochMilli(10_000_000L));
+        try (SeriesHandleRegistry registry = registry(Duration.ofMinutes(1), 1, clock)) {
+            entries(registry).put("stuck", newEntry(closeFailingHandle(() -> {
+                closeAttempts.incrementAndGet();
+                return plainFailure();
+            })));
+
+            registry.open("fresh", yaml, Ngrrd.OpenOptions.defaults());
+            assertEquals(1, closeAttempts.get());
+            clock.advance(Duration.ofSeconds(1));
+            registry.open("third", yaml, Ngrrd.OpenOptions.defaults());
+
+            assertEquals(1, closeAttempts.get(), "a série em backoff não é tentada de novo no despejo");
+            assertEquals(Set.of("stuck", "third"), entries(registry).keySet(),
+                    "o despejo cai na próxima da fila LRU, não na recém-aberta");
+            assertEquals(1L, registry.handleMetrics().get("handles.evicted"));
+            entries(registry).remove("stuck");
+        }
+    }
+
+    @Test
+    void falhasDeFechamentoNasVarredurasSaemAgrupadasComContagemDeSuprimidas() {
+        List<java.util.logging.LogRecord> records = new CopyOnWriteArrayList<>();
+        java.util.logging.Handler capture = capturing(records);
+        java.util.logging.Logger logger = java.util.logging.Logger.getLogger(SeriesHandleRegistry.class.getName());
+        MutableClock clock = new MutableClock(Instant.ofEpochMilli(10_000_000L));
+        logger.addHandler(capture);
+        try (SeriesHandleRegistry registry = registry(Duration.ofMinutes(1), 10, clock)) {
+            for (String key : List.of("a-stuck", "b-stuck", "c-stuck")) {
+                entries(registry).put(key, newEntry(closeFailingHandle(SeriesHandleRegistryTest::plainFailure)));
+            }
+
+            registry.closeIdle();
+            assertEquals(1, warnings(records).size(), "uma série por janela em WARNING: " + warnings(records));
+
+            clock.advance(Duration.ofMillis(SeriesHandleRegistry.CLOSE_RETRY_BACKOFF_MS));
+            registry.closeIdle();
+
+            List<String> warnings = warnings(records);
+            assertEquals(2, warnings.size(), "um WARNING por janela: " + warnings);
+            assertTrue(warnings.get(1).contains("(2 falhas de fechamento suprimidas nos últimos 60 s)"),
+                    "o WARNING seguinte conta as suprimidas: " + warnings);
+            entries(registry).clear();
+        } finally {
+            logger.removeHandler(capture);
+        }
+    }
+
+    @Test
+    void falhaDeFechamentoNosCaminhosExplicitosSaiSempreEmWarning() {
+        List<java.util.logging.LogRecord> records = new CopyOnWriteArrayList<>();
+        java.util.logging.Handler capture = capturing(records);
+        java.util.logging.Logger logger = java.util.logging.Logger.getLogger(SeriesHandleRegistry.class.getName());
+        logger.addHandler(capture);
+        try (SeriesHandleRegistry registry = lateRegistry(10)) {
+            for (String key : List.of("a-stuck", "b-stuck")) {
+                entries(registry).put(key, newEntry(closeFailingHandle(SeriesHandleRegistryTest::plainFailure)));
+            }
+
+            assertThrows(IllegalStateException.class, () -> registry.discard("a-stuck"));
+            assertThrows(IllegalStateException.class, () -> registry.markMigrating("b-stuck"));
+
+            List<String> warnings = warnings(records);
+            assertEquals(2, warnings.size(), "sem limitador nos caminhos explícitos: " + warnings);
+            assertTrue(warnings.get(0).contains("a-stuck") && warnings.get(1).contains("b-stuck"), warnings::toString);
+            entries(registry).clear();
+        } finally {
+            logger.removeHandler(capture);
+        }
+    }
+
+    private static List<String> warnings(List<java.util.logging.LogRecord> records) {
+        return records.stream().filter(record -> record.getLevel() == java.util.logging.Level.WARNING)
+                .map(java.util.logging.LogRecord::getMessage).toList();
     }
 
     @Test
@@ -1447,7 +1535,9 @@ class SeriesHandleRegistryTest {
 
         IllegalStateException thrown = assertThrows(IllegalStateException.class, registry::close);
 
-        assertEquals(2, thrown.getSuppressed().length, "uma falha comum por série presa: " + thrown);
+        assertEquals(3, thrown.getSuppressed().length, "uma falha comum por série presa e o abandono: " + thrown);
+        assertEquals(1, Arrays.stream(thrown.getSuppressed())
+                .filter(WriterAbandonedException.class::isInstance).count(), "o abandono vai no agregado");
         assertEquals(1, closedOk.get(), "as demais séries continuam sendo fechadas");
         assertEquals(Set.of("a-fail", "c-fail"), entries(registry).keySet());
         assertEquals(1L, abandonedCount(registry));
@@ -1583,8 +1673,10 @@ class SeriesHandleRegistryTest {
             fixture.openStuck("stuck-a");
             fixture.openStuck("stuck-b");
 
-            fixture.registry.close();
+            IllegalStateException thrown = assertThrows(IllegalStateException.class, fixture.registry::close);
 
+            assertEquals(2, Arrays.stream(thrown.getSuppressed())
+                    .filter(WriterAbandonedException.class::isInstance).count(), "os abandonos vão no agregado: " + thrown);
             assertTrue(entries(fixture.registry).isEmpty(), "o abandono da primeira não impede o fechamento da segunda");
             assertEquals(2L, abandonedCount(fixture.registry));
         }
