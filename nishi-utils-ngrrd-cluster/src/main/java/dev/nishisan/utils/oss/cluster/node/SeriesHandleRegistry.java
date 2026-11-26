@@ -362,6 +362,10 @@ public final class SeriesHandleRegistry implements Closeable {
      * cacheia sua definição — um novo {@code open} é o único jeito de reabrir
      * uma série {@link #close fechada pelo cliente} ou {@link #forget esquecida}.
      *
+     * <p>A recusa por migração nunca fecha nem descarta um handle já aberto: se a marca chega entre a
+     * checagem inicial e o lock da entrada, a entrada viva fica no mapa para {@link #markMigrating} ou para a
+     * cópia online ({@link #beginMigrationCopy}) tratarem.</p>
+     *
      * @throws IllegalStateException se a série está marcada como
      *                                 {@link #markMigrating migrating}
      */
@@ -386,7 +390,15 @@ public final class SeriesHandleRegistry implements Closeable {
                     continue;
                 }
                 if (migrating.contains(seriesKey)) {
-                    removeEntry(seriesKey, entry);
+                    // A migração começou entre a checagem fora do lock e aqui. Só sai do mapa a entrada vazia
+                    // (criada por este open() ou por outro caminho que ainda não abriu o handle). Com handle
+                    // aberto, a entrada fica para quem marcou a migração: markMigrating faz checkpoint, close e
+                    // poda no caminho dele, e na cópia online (beginMigrationCopy) o handle segue gravável até
+                    // o corte. Removê-la aqui vazaria o writer, esconderia a entrada do markMigrating (a escrita
+                    // confirmada poderia não chegar à imagem) e deixaria reopenIfKnown abrir um segundo handle.
+                    if (entry.handle == null) {
+                        removeEntry(seriesKey, entry);
+                    }
                     throw new IllegalStateException("MIGRATING");
                 }
                 if (entry.handle == null) {

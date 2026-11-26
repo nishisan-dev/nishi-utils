@@ -183,7 +183,7 @@ public final class LocalCheckpointer implements Closeable {
         if (elapsedMs > settings.interval().toMillis()) {
             overruns.incrementAndGet();
             LOGGER.warning("NGRRD_LOCAL_CHECKPOINT_OVERRUN ciclo de checkpoint local levou " + elapsedMs
-                    + " ms para " + count + " séries sujas, acima do intervalo de " + settings.interval()
+                    + " ms para " + count + " séries candidatas, acima do intervalo de " + settings.interval()
                     + " — considere aumentar ngrrd.checkpoint.interval ou maxInFlight");
         } else {
             LOGGER.fine(() -> "NGRRD_LOCAL_CHECKPOINT cycle series=" + count + " elapsedMs=" + elapsedMs);

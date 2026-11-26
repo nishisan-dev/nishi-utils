@@ -59,6 +59,7 @@ import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
@@ -68,6 +69,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiConsumer;
 import java.util.function.Function;
 import java.util.function.UnaryOperator;
@@ -75,6 +77,7 @@ import java.util.function.UnaryOperator;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -368,6 +371,93 @@ class SeriesHandleRegistryTest {
                 h.checkpoint();
                 return true;
             }).orElse(false));
+        }
+    }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void openRecusadoPorCorteConcorrenteDeixaAEntradaParaOMarkMigrating() throws Exception {
+        String key = "open-vs-cutover";
+        try (SeriesHandleRegistry registry = trackedRegistry(Duration.ofMinutes(15), 10, Clock.systemUTC())) {
+            registry.open(key, yaml, Ngrrd.OpenOptions.defaults());
+            recordWrite(registry, key);
+            List<String> calls = recordHandleCalls(registry, key);
+            ReentrantLock lock = entryLock(registry, key);
+            AtomicReference<Throwable> openFailure = new AtomicReference<>();
+            AtomicReference<Throwable> cutoverFailure = new AtomicReference<>();
+            Thread opener = new Thread(() -> runCapturing(openFailure,
+                    () -> registry.open(key, yaml, Ngrrd.OpenOptions.defaults())), "racing-open");
+            Thread cutover = new Thread(() -> runCapturing(cutoverFailure,
+                    () -> registry.markMigrating(key)), "racing-cutover");
+
+            lock.lock();
+            try {
+                // O open() passa da checagem fora do lock (ainda sem migração) e para no lock da entrada.
+                opener.start();
+                awaitQueued(lock, opener);
+                // O corte marca a migração, acha a entrada no mapa e para no mesmo lock, atrás do open().
+                cutover.start();
+                awaitQueued(lock, cutover);
+                assertTrue(registry.isMigrating(key));
+            } finally {
+                // Threads já enfileiradas adquirem em ordem: o open() entra primeiro e vê a migração sob o lock.
+                lock.unlock();
+            }
+            opener.join();
+            cutover.join();
+
+            assertMigratingRefusal(openFailure.get());
+            assertNull(cutoverFailure.get(), "o corte não pode falhar");
+            assertEquals(1, calls.stream().filter(call -> call.startsWith("close@")).count(),
+                    "o handle tem que ser fechado exatamente uma vez: " + calls);
+            assertTrue(calls.stream().allMatch(call -> call.endsWith("@racing-cutover")),
+                    "só o markMigrating fecha e faz checkpoint do handle, nunca o open() recusado: " + calls);
+            assertTrue(calls.contains("checkpoint@racing-cutover"),
+                    "a escrita confirmada tem que chegar à imagem antes do corte: " + calls);
+            assertEquals("close@racing-cutover", calls.get(calls.size() - 1), "checkpoint antes do close: " + calls);
+            assertFalse(entries(registry).containsKey(key), "o markMigrating remove a entrada");
+            assertEquals(0, registry.openCount());
+            assertFalse(registry.dirtySeries().contains(key), "o markMigrating poda o índice de sujas");
+        }
+    }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void openRecusadoPorCopiaOnlineConcorrenteMantemOHandleSemAbrirOutro() throws Exception {
+        String key = "open-vs-copy";
+        try (SeriesHandleRegistry registry = trackedRegistry(Duration.ofMinutes(15), 10, Clock.systemUTC())) {
+            registry.open(key, yaml, Ngrrd.OpenOptions.defaults());
+            List<String> calls = recordHandleCalls(registry, key);
+            NgrrdHandle current = registry.existing(key).orElseThrow();
+            ReentrantLock lock = entryLock(registry, key);
+            AtomicReference<Throwable> openFailure = new AtomicReference<>();
+            Thread opener = new Thread(() -> runCapturing(openFailure,
+                    () -> registry.open(key, yaml, Ngrrd.OpenOptions.defaults())), "racing-open");
+
+            lock.lock();
+            try {
+                opener.start();
+                awaitQueued(lock, opener);
+                registry.beginMigrationCopy(key);
+            } finally {
+                lock.unlock();
+            }
+            opener.join();
+
+            assertMigratingRefusal(openFailure.get());
+            assertTrue(calls.isEmpty(), "o open() recusado não fecha nem faz checkpoint do handle: " + calls);
+            assertTrue(entries(registry).containsKey(key), "na cópia online a entrada segue no mapa até o corte");
+            recordWrite(registry, key);
+            assertSame(current, registry.reopenIfKnown(key).orElseThrow(),
+                    "a reabertura tem que devolver o handle vivo, não abrir um segundo sobre o mesmo objeto");
+            assertEquals(1, registry.openCount());
+
+            registry.markMigrating(key);
+
+            assertEquals(1, calls.stream().filter(call -> call.startsWith("close@")).count(),
+                    "o corte fecha o handle exatamente uma vez: " + calls);
+            assertFalse(entries(registry).containsKey(key));
+            assertFalse(registry.dirtySeries().contains(key));
         }
     }
 
@@ -1463,6 +1553,57 @@ class SeriesHandleRegistryTest {
         } catch (ReflectiveOperationException e) {
             throw new AssertionError(e);
         }
+    }
+
+    /**
+     * Envolve o handle da série num proxy que registra cada {@code checkpoint}/{@code close} como
+     * {@code "método@thread"}, na ordem das chamadas.
+     */
+    private static List<String> recordHandleCalls(SeriesHandleRegistry registry, String key) {
+        List<String> calls = new CopyOnWriteArrayList<>();
+        wrapHandle(registry, key, original -> delegating(original, method -> {
+            if (method.equals("checkpoint") || method.equals("close")) {
+                calls.add(method + "@" + Thread.currentThread().getName());
+            }
+            return null;
+        }));
+        return calls;
+    }
+
+    /** Lock da entrada corrente da série: segurá-lo enfileira as threads de uma corrida numa ordem conhecida. */
+    private static ReentrantLock entryLock(SeriesHandleRegistry registry, String key) {
+        try {
+            Object entry = entries(registry).get(key);
+            Field lockField = entry.getClass().getDeclaredField("lock");
+            lockField.setAccessible(true);
+            return (ReentrantLock) lockField.get(entry);
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    /** Espera {@code thread} ficar enfileirada no {@code lock}, sem depender de tempo fixo. */
+    private static void awaitQueued(ReentrantLock lock, Thread thread) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (!lock.hasQueuedThread(thread)) {
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError("a thread " + thread.getName() + " não chegou ao lock da entrada");
+            }
+            Thread.sleep(1);
+        }
+    }
+
+    private static void runCapturing(AtomicReference<Throwable> failure, Runnable action) {
+        try {
+            action.run();
+        } catch (Throwable t) {
+            failure.set(t);
+        }
+    }
+
+    private static void assertMigratingRefusal(Throwable failure) {
+        assertTrue(failure instanceof IllegalStateException && "MIGRATING".equals(failure.getMessage()),
+                "o open() concorrente tem que ser recusado com MIGRATING: " + failure);
     }
 
     /** Proxy que delega ao original, exceto quando {@code override} devolve um valor não nulo pelo nome do método. */
