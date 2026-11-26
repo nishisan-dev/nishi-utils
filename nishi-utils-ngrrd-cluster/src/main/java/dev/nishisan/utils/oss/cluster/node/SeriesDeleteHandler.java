@@ -83,6 +83,14 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
      * a entrada do journal deixa de ser candidata ao reenvio.
      */
     private final Map<RecoveryKey, RecoveryBackoff> journalRecoveryBackoff = new ConcurrentHashMap<>();
+    /**
+     * Entradas {@code FINISHED} do journal já resolvidas, por série: geração e operação da entrada que, numa
+     * leitura do catálogo, não tinha mais o que pedir ao líder. {@link #recoverJournal()} não lê o catálogo de
+     * novo para elas; o histórico de exclusões concluídas custa uma leitura por entrada por processo, e não uma
+     * por ciclo. Só em memória: depois de um restart, cada uma é conferida uma vez. Sai quando a entrada do
+     * journal muda.
+     */
+    private final Map<String, ResolvedFinish> resolvedFinished = new ConcurrentHashMap<>();
     /** Janela do log com taxa limitada de falha do ciclo de recuperação. */
     static final Duration RECOVERY_LOG_WINDOW = Duration.ofMinutes(1);
     /** Instante ({@link #clock}) do último log de falha do ciclo de recuperação. */
@@ -98,6 +106,9 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
      * séries (um lote pode reusar o mesmo), então só ele não identifica a reserva.
      */
     private record RecoveryKey(String seriesKey, String operationId) { }
+
+    /** Geração e operação de uma entrada {@code FINISHED} já resolvida ({@link #resolvedFinished}). */
+    private record ResolvedFinish(String generationId, String operationId) { }
 
     /**
      * @param reachableNodeIds        storages alcançáveis na visão do líder (o próprio nó é sempre
@@ -533,21 +544,37 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
      * ({@code DELETE_RECOVER}) que conclua o que já foi confirmado. Cada entrada tem o próprio
      * {@code try}: a falha de uma (RPC, líder indisponível) não pula as demais nem a parte do líder em
      * {@link #recover()}. O reenvio de cada operação segue {@link #journalRecoveryBackoff}.
+     *
+     * <p>Só lê o catálogo para as entradas que ainda podem ter o que fazer: as fases não terminais
+     * ({@code PREPARED}, {@code COMMITTED}, {@code DELETED}) e a {@code FINISHED} ainda não resolvida
+     * ({@link #resolvedFinished}). {@code ACTIVE} e {@code QUARANTINED} não são da recuperação de exclusão.
+     * Leituras por ciclo: O(exclusões pendentes neste nó), não O(histórico do journal).</p>
      */
     private void recoverJournal() {
         Set<RecoveryKey> candidates = new HashSet<>();
+        Set<String> resolved = new HashSet<>();
         for (var local : lifecycle.journal().snapshot().entrySet()) {
             var entry = local.getValue(); String key = local.getKey();
             if (entry.placement() == null || entry.placement().deletion() == null) continue;
-            RecoveryKey operation = new RecoveryKey(key, entry.placement().deletion().operationId());
-            boolean confirmed = entry.phase() == COMMITTED || entry.phase() == DELETED || entry.phase() == FINISHED;
+            var phase = entry.phase();
+            if (phase != PREPARED && phase != COMMITTED && phase != DELETED && phase != FINISHED) continue;
+            String operationId = entry.placement().deletion().operationId();
+            ResolvedFinish finish = phase == FINISHED
+                    ? new ResolvedFinish(entry.placement().generationId(), operationId) : null;
+            if (finish != null && finish.equals(resolvedFinished.get(key))) {
+                resolved.add(key);
+                continue;
+            }
+            RecoveryKey operation = new RecoveryKey(key, operationId);
+            boolean confirmed = phase != PREPARED;
             // Candidata antes da leitura do catálogo: uma falha transitória ali não zera o backoff da operação.
             if (confirmed) candidates.add(operation);
             try {
                 var current = catalog.placementStrong(key);
-                if (entry.phase() == PREPARED && (current.isEmpty() || current.get().deletion() == null)) {
-                    lifecycle.abort(new DeleteControlRequest(key, entry.placement()));
-                } else if (confirmed && needsLeader(entry, current)) {
+                if (phase == PREPARED) {
+                    if (current.isEmpty() || current.get().deletion() == null)
+                        lifecycle.abort(new DeleteControlRequest(key, entry.placement()));
+                } else if (needsLeader(entry, current)) {
                     NodeId target = rpc.leaderId().orElse(null);
                     if (target == null) continue;
                     RecoveryBackoff backoff = journalRecoveryBackoff.get(operation);
@@ -555,14 +582,19 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
                     journalRecoveryBackoff.put(operation, nextBackoff(backoff));
                     rpc.call(target, Commands.DELETE_RECOVER, new DeleteControlRequest(key, entry.placement()),
                             DeleteResult.class);
-                } else if (confirmed) {
+                } else {
                     candidates.remove(operation);
+                    if (finish != null) {
+                        resolvedFinished.put(key, finish);
+                        resolved.add(key);
+                    }
                 }
             } catch (RuntimeException e) {
                 logRecoveryDeferred(e);
             }
         }
         journalRecoveryBackoff.keySet().retainAll(candidates);
+        resolvedFinished.keySet().retainAll(resolved);
     }
 
     /**
@@ -644,6 +676,11 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
     /** Operações com backoff de reenvio de {@code DELETE_RECOVER} registrado (diagnóstico e testes). */
     int journalRecoveryBackoffSize() {
         return journalRecoveryBackoff.size();
+    }
+
+    /** Entradas {@code FINISHED} do journal já resolvidas, sem leitura de catálogo por ciclo (diagnóstico e testes). */
+    int resolvedFinishedSize() {
+        return resolvedFinished.size();
     }
 
     /**

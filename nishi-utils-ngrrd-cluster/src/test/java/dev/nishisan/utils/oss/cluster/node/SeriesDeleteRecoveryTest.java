@@ -53,6 +53,7 @@ import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -402,6 +403,56 @@ class SeriesDeleteRecoveryTest {
         handler.recover();
 
         assertEquals(0, handler.journalRecoveryBackoffSize());
+    }
+
+    @Test
+    void journalComHistoricoFinishedLeOCatalogoSoParaAsPendentes() throws Exception {
+        leader = false; // só o laço do journal: a parte do líder tem as próprias leituras
+        int history = 200;
+        Map<String, SeriesLifecycleJournal.Entry> finished = new LinkedHashMap<>();
+        for (int i = 0; i < history; i++) {
+            SeriesPlacement done = pending("op-" + i, true);
+            finished.put("done-" + i, new SeriesLifecycleJournal.Entry(done.generationId(), 0,
+                    SeriesLifecycleJournal.Phase.FINISHED, done));
+        }
+        journal.putAll(finished);
+        SeriesPlacement placement = pending("op-s", true);
+        rawMap.put("s", placement);
+        journal.put("s", new SeriesLifecycleJournal.Entry(placement.generationId(), 0,
+                SeriesLifecycleJournal.Phase.DELETED, placement));
+
+        handler.recover();
+        assertEquals(history + 1, catalog.strongReads.get(), "o primeiro ciclo confere cada FINISHED uma vez");
+
+        catalog.resetCounters();
+        int cycles = 30;
+        for (int i = 0; i < cycles; i++) {
+            clock.advance(Duration.ofSeconds(1));
+            handler.recover();
+        }
+        assertEquals(cycles, catalog.strongReads.get(), "uma leitura por ciclo: só a exclusão pendente");
+        assertEquals(history, handler.resolvedFinishedSize());
+
+        // A entrada resolvida que muda (outra operação) volta a ser conferida, uma vez.
+        SeriesPlacement other = pending("op-new", true);
+        journal.put("done-0", new SeriesLifecycleJournal.Entry(other.generationId(), 0,
+                SeriesLifecycleJournal.Phase.FINISHED, other));
+        catalog.resetCounters();
+        handler.recover();
+        handler.recover();
+        assertEquals(3, catalog.strongReads.get());
+        assertEquals(history, handler.resolvedFinishedSize());
+
+        // Restart: um handler novo sobre o mesmo journal confere o histórico uma vez e volta a O(pendentes).
+        handler.close();
+        handler = new SeriesDeleteHandler(fakeTransport(), catalog, rpc, lifecycle, () -> leader, () -> true, clock,
+                () -> java.util.Set.of(SELF, OTHER), Duration.ofSeconds(1));
+        catalog.resetCounters();
+        handler.recover();
+        assertEquals(history + 1, catalog.strongReads.get());
+        catalog.resetCounters();
+        handler.recover();
+        assertEquals(1, catalog.strongReads.get());
     }
 
     @Test
