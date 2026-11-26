@@ -45,6 +45,13 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
     private final AtomicLong unavailableLoggedAtMs = new AtomicLong(NEVER_LOGGED);
     /** Ocorrências suprimidas desde o último WARNING {@code NGRRD_PLACEMENT_UNAVAILABLE}. */
     private final AtomicLong unavailableSuppressed = new AtomicLong();
+    /** Ciclos seguidos de {@code recover()} com exclusão pendente antes do primeiro WARNING. */
+    static final int PENDING_CYCLES_BEFORE_WARNING = 5;
+    /** Janela do log com taxa limitada de {@code NGRRD_DELETE_PENDING}. */
+    static final Duration PENDING_LOG_WINDOW = Duration.ofMinutes(1);
+    /** Só a thread de recuperação (ou o teste, no lugar dela) toca estes dois campos. */
+    private volatile int pendingCycles;
+    private volatile long pendingLoggedAtMs = NEVER_LOGGED;
 
     /**
      * @param reachableNodeIds        storages alcançáveis na visão do líder (o próprio nó é sempre
@@ -173,7 +180,27 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
                 + " suppressed=" + suppressed);
     }
 
+    /** Origem de uma tentativa de exclusão: pedido de cliente ou laço de recuperação do líder. */
+    enum Origin { CLIENT, RECOVERY }
+
+    /**
+     * Ponto único de contagem de {@code seriesDelete.recoveryAttempts}: toda chamada de {@code delete} ou
+     * {@code recoverReservation} com origem {@link Origin#RECOVERY} passa por aqui, seja qual for o laço que a
+     * dispara (hoje {@link #recover()}).
+     */
+    private void beginAttempt(Origin origin) {
+        if (origin == Origin.RECOVERY) lifecycle.recordRecoveryAttempt();
+    }
+
+    /** Pedido de cliente: o status devolvido conta em {@code seriesDelete.requests.<STATUS>}. */
     public DeleteResult delete(DeleteRequest request) {
+        DeleteResult result = delete(request, Origin.CLIENT);
+        lifecycle.recordRequest(result.status());
+        return result;
+    }
+
+    private DeleteResult delete(DeleteRequest request, Origin origin) {
+        beginAttempt(origin);
         String key = request.seriesKey();
         try (var drive = CoordinationLocks.acquire(driveLocks[Math.floorMod(key.hashCode(), driveLocks.length)])) {
             ensureLeader();
@@ -189,15 +216,18 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
                 if (placement.deletion() == null) {
                     List<String> participants = new ArrayList<>();
                     for (var node : catalog.nodesLocal()) {
-                        var status = catalog.nodeStatusStrong(node.nodeId()).orElseThrow(() -> new IllegalStateException("missing status: " + node.nodeId()));
+                        var status = catalog.nodeStatusStrong(node.nodeId()).orElseThrow(() -> new DeleteFailureCause.MissingNodeStatusException(node.nodeId()));
                         if (!status.capabilities().contains(StorageCapabilities.SERIES_DELETE)) {
                             lifecycle.record(DeleteStatus.ERROR);
+                            lifecycle.recordAttemptFailed(DeleteFailureCause.PARTICIPANT);
                             return DeleteResult.error(ErrorCode.UNSUPPORTED_BY_NODE, node.nodeId() + " does not announce series.delete");
                         }
                         participants.add(node.nodeId());
                     }
-                    if (!participants.contains(placement.ownerNodeId()))
+                    if (!participants.contains(placement.ownerNodeId())) {
+                        lifecycle.recordAttemptFailed(DeleteFailureCause.PARTICIPANT);
                         return DeleteResult.error(ErrorCode.UNSUPPORTED_BY_NODE, "owner status unavailable: " + placement.ownerNodeId());
+                    }
                     participants.sort(String::compareTo);
                     placement = placement.withDeletion(new SeriesDeletion(request.operationId(), request.precondition().lastWriteBefore(), participants, false), clock.millis());
                     catalog.putPlacement(key, placement);
@@ -206,6 +236,7 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
             return drive(key, placement);
         } catch (RuntimeException e) {
             lifecycle.record(DeleteStatus.ERROR);
+            lifecycle.recordAttemptFailed(DeleteFailureCause.of(e));
             return DeleteResult.error(e instanceof NgrrdClusterException n ? n.code() : ErrorCode.REMOTE_ERROR, e.getMessage());
         }
     }
@@ -229,6 +260,8 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
                     DeleteResult response = phase(node, Commands.DELETE_PREPARE, key, placement);
                     if (response.status() != DeleteStatus.DELETED) {
                         cancel(key, placement);
+                        lifecycle.recordCancelled();
+                        lifecycle.recordAttemptFailed(DeleteFailureCause.PARTICIPANT);
                         lifecycle.record(response.status());
                         return response;
                     }
@@ -254,6 +287,7 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
             if (current.isPresent()) {
                 requireSame(current.get(), placement);
                 catalog.removePlacement(key);
+                lifecycle.recordCompleted();
             }
         }
         // Finish changes only the matching local tombstone. A fresh generation is never touched.
@@ -267,7 +301,7 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
     private void requireSame(SeriesPlacement current, SeriesPlacement expected) {
         if (!current.generationId().equals(expected.generationId()) || current.deletion() == null
                 || !current.deletion().operationId().equals(expected.deletion().operationId()))
-            throw new IllegalStateException("stale deletion reservation");
+            throw new DeleteFailureCause.StaleReservationException();
     }
     private void cancel(String key, SeriesPlacement placement) {
         try (var guard = CoordinationLocks.acquire(catalog.placementLock(key))) {
@@ -286,6 +320,16 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
     }
 
     private DeleteResult recoverReservation(DeleteControlRequest request) {
+        beginAttempt(Origin.RECOVERY);
+        try {
+            return doRecoverReservation(request);
+        } catch (RuntimeException e) {
+            lifecycle.recordAttemptFailed(DeleteFailureCause.of(e));
+            throw e;
+        }
+    }
+
+    private DeleteResult doRecoverReservation(DeleteControlRequest request) {
         String key = request.seriesKey();
         try (var drive = CoordinationLocks.acquire(driveLocks[Math.floorMod(key.hashCode(), driveLocks.length)])) {
             ensureLeader();
@@ -309,7 +353,13 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
         }
     }
 
-    private void recover() {
+    /**
+     * Ciclo de recuperação (a cada 1 s). Contagem de métricas: {@code seriesDelete.recoveryAttempts} sai de
+     * {@link #beginAttempt}, chamado por {@code delete(request, Origin.RECOVERY)} e por
+     * {@code recoverReservation}; {@code seriesDelete.pending} e o alarme {@code NGRRD_DELETE_PENDING} saem de
+     * {@link #trackPending}. Quem reescrever este laço só precisa manter essas chamadas.
+     */
+    void recover() {
         if (closed || !synced.getAsBoolean()) return;
         try {
             for (var local : lifecycle.journal().snapshot().entrySet()) {
@@ -326,14 +376,39 @@ public final class SeriesDeleteHandler extends RequestHandlerSupport implements 
                 }
             }
             if (leader.getAsBoolean()) {
+                List<Map.Entry<String, SeriesPlacement>> pending = new ArrayList<>();
                 for (var item : catalog.placementsLocal().entrySet()) {
-                    if (item.getValue().deletion() != null) {
-                        delete(new DeleteRequest(item.getKey(), new DeletePrecondition(item.getValue().deletion().lastWriteBefore()),
-                                item.getValue().deletion().operationId()));
-                    }
+                    if (item.getValue().deletion() != null) pending.add(item);
                 }
+                trackPending(pending);
+                for (var item : pending) {
+                    delete(new DeleteRequest(item.getKey(), new DeletePrecondition(item.getValue().deletion().lastWriteBefore()),
+                            item.getValue().deletion().operationId()), Origin.RECOVERY);
+                }
+            } else {
+                trackPending(List.of());
             }
         } catch (RuntimeException e) { LOG.log(Level.FINE, "series deletion recovery deferred", e); }
+    }
+
+    /**
+     * Atualiza o gauge {@code seriesDelete.pending} e emite, no máximo uma vez por
+     * {@link #PENDING_LOG_WINDOW}, o WARNING {@code NGRRD_DELETE_PENDING} quando há exclusão pendente por mais
+     * de {@link #PENDING_CYCLES_BEFORE_WARNING} ciclos seguidos. A "mais antiga" é a de menor
+     * {@code updatedAtEpochMs} do placement (instante da reserva).
+     */
+    private void trackPending(List<Map.Entry<String, SeriesPlacement>> pending) {
+        lifecycle.pendingDeletes(pending.size());
+        if (pending.isEmpty()) { pendingCycles = 0; return; }
+        if (++pendingCycles <= PENDING_CYCLES_BEFORE_WARNING) return;
+        long now = clock.millis();
+        long last = pendingLoggedAtMs;
+        if (last != NEVER_LOGGED && now - last < PENDING_LOG_WINDOW.toMillis()) return;
+        pendingLoggedAtMs = now;
+        String oldest = pending.stream()
+                .min(Comparator.comparingLong((Map.Entry<String, SeriesPlacement> e) -> e.getValue().updatedAtEpochMs()))
+                .map(e -> e.getValue().deletion().operationId()).orElse("?");
+        LOG.log(Level.WARNING, "NGRRD_DELETE_PENDING count=" + pending.size() + " oldestOperationId=" + oldest);
     }
 
     @Override public void close() {
