@@ -32,6 +32,7 @@ import java.nio.file.Path;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
@@ -128,7 +129,7 @@ public final class Ngrrd {
         NgrrdDefinition def = NgrrdYamlLoader.parse(yamlContent, System::getenv);
         dev.nishisan.utils.oss.config.NgrrdDefinitionValidator.validate(def);
         String seriesKey = resolveSeriesKey(def.spec().identity().seriesKeyTemplate(), tags);
-        return buildHandle(def, bindings, seriesKey, metricsListener, options);
+        return buildHandle(def, bindings, seriesKey, metricsListener, options, null);
     }
 
     // ------------------------------------------------------------ blob locator
@@ -161,8 +162,10 @@ public final class Ngrrd {
         NgrrdDefinition def = NgrrdYamlLoader.parse(yamlContent, System::getenv);
         dev.nishisan.utils.oss.config.NgrrdDefinitionValidator.validate(def);
         // Propaga o listener de qualidade default do volume a cada handle (coleta
-        // central por série); null quando não configurado preserva o comportamento atual.
-        return buildHandle(def, volume.bindings(), locator.seriesPath(), volume.qualityListener(), options);
+        // central por série) e o executor de force dos checkpoints; null quando não
+        // configurados preserva o comportamento atual.
+        return buildHandle(def, volume.bindings(), locator.seriesPath(), volume.qualityListener(), options,
+                volume.checkpointForceExecutor());
     }
 
     // ------------------------------------------------------------ exists
@@ -269,7 +272,7 @@ public final class Ngrrd {
 
     private static NgrrdHandle buildHandle(NgrrdDefinition def, StorageFactory.StorageBindings bindings,
                                            String seriesKey, NgrrdMetricsListener metricsListener,
-                                           OpenOptions options) {
+                                           OpenOptions options, Executor checkpointForceExecutor) {
         StorageSpec storageSpec = def.spec().storage();
         // Durabilidade efetiva: override de abertura > default do YAML > FSYNC.
         Durability durability = resolveDurability(options, storageSpec);
@@ -298,7 +301,8 @@ public final class Ngrrd {
         NgrrdWriter writer;
         try {
             writer = new NgrrdWriter(def, storage, seriesKey, metrics, seriesLock,
-                    durability, onGeometryChange, System::currentTimeMillis, options.createIfMissing());
+                    durability, onGeometryChange, System::currentTimeMillis, options.createIfMissing(),
+                    checkpointForceExecutor);
         } catch (RuntimeException e) {
             // SeriesNotFoundException com createIfMissing=false é um caminho
             // esperado e frequente (varredura de catálogo): sem fechar aqui, um

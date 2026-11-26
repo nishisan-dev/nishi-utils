@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.util.concurrent.Executor;
 
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -40,6 +41,19 @@ class NgrrdBlobBuilderTest {
             BlobVolume v = reg.require("ifaceStats");
             assertNull(v.qualityListener());
             assertNull(v.volumeMetricsListener());
+            assertNull(v.checkpointForceExecutor(), "sem executor, o force do checkpoint é inline");
+        }
+    }
+
+    @Test
+    void propagaExecutorDeForceParaVolume(@TempDir Path base) {
+        Executor forceExecutor = Runnable::run;
+        try (BlobVolumeRegistry reg = NgrrdBlob.registry()
+                .basePath(base).shardCount(2).segmentBytes(1L << 20)
+                .checkpointForceExecutor(forceExecutor)
+                .volume("ifaceStats")
+                .build()) {
+            assertSame(forceExecutor, reg.require("ifaceStats").checkpointForceExecutor());
         }
     }
 }

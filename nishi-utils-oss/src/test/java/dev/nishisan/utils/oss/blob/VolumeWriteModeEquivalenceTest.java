@@ -4,12 +4,20 @@ import dev.nishisan.utils.oss.Ngrrd;
 import dev.nishisan.utils.oss.NgrrdHandle;
 import dev.nishisan.utils.oss.api.Sample;
 import dev.nishisan.utils.oss.storage.blob.BlobStorage;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.InputStream;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -20,6 +28,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * escritas, aplicada a um volume {@code MMAP} e a outro {@code PWRITE}, deve produzir o mesmo
  * objeto de série. O superblock de cada shard tem UUID aleatório, então a comparação é feita
  * sobre o objeto lido pela API de storage, e não sobre o arquivo de shard inteiro.
+ *
+ * <p>Os casos de equivalência rodam também com {@code checkpointForceExecutor} (force dos
+ * checkpoints fora da thread do writer), e o objeto produzido com executor tem de ser o mesmo
+ * produzido sem ele, inclusive depois de reabrir o volume.</p>
  */
 class VolumeWriteModeEquivalenceTest {
 
@@ -34,10 +46,27 @@ class VolumeWriteModeEquivalenceTest {
         }
     }
 
+    private final ExecutorService forcePool = Executors.newFixedThreadPool(2);
+    private final AtomicInteger detachedForces = new AtomicInteger();
+    private final Executor countingForcePool = task -> {
+        detachedForces.incrementAndGet();
+        forcePool.execute(task);
+    };
+
+    @AfterEach
+    void shutdownForcePool() {
+        forcePool.shutdownNow();
+    }
+
     private BlobVolumeRegistry registry(Path base, VolumeWriteMode mode) {
+        return registry(base, mode, false);
+    }
+
+    private BlobVolumeRegistry registry(Path base, VolumeWriteMode mode, boolean forceExecutor) {
         return NgrrdBlob.registry()
                 .basePath(base).shardCount(4).segmentBytes(SEG)
                 .writeMode(mode)
+                .checkpointForceExecutor(forceExecutor ? countingForcePool : null)
                 .volume("ifaceStats")
                 .build();
     }
@@ -71,12 +100,13 @@ class VolumeWriteModeEquivalenceTest {
         return "series/device:" + series + ".ngrr";
     }
 
-    @Test
-    void mmapEPwriteProduzemOMesmoObjetoDeSerie(@TempDir Path tmp) throws Exception {
+    @ParameterizedTest(name = "forceExecutor={0}")
+    @ValueSource(booleans = {false, true})
+    void mmapEPwriteProduzemOMesmoObjetoDeSerie(boolean forceExecutor, @TempDir Path tmp) throws Exception {
         Path mmapBase = tmp.resolve("mmap");
         Path pwriteBase = tmp.resolve("pwrite");
-        try (BlobVolumeRegistry mm = registry(mmapBase, VolumeWriteMode.MMAP);
-             BlobVolumeRegistry pw = registry(pwriteBase, VolumeWriteMode.PWRITE)) {
+        try (BlobVolumeRegistry mm = registry(mmapBase, VolumeWriteMode.MMAP, forceExecutor);
+             BlobVolumeRegistry pw = registry(pwriteBase, VolumeWriteMode.PWRITE, forceExecutor)) {
             for (String s : SERIES) {
                 applyWrites(mm, s, false);
                 applyWrites(pw, s, false);
@@ -98,22 +128,24 @@ class VolumeWriteModeEquivalenceTest {
             assertEquals(b.bytesWritten(), b.positionalBytesWritten());
             assertEquals(a.bytesWritten(), b.bytesWritten(), "mesmos bytes lógicos nos dois modos");
         }
+        assertEquals(forceExecutor, detachedForces.get() > 0, "o force dos checkpoints usou o executor configurado");
     }
 
-    @Test
-    void mmapEPwriteProduzemOMesmoObjetoAposReabrir(@TempDir Path tmp) throws Exception {
+    @ParameterizedTest(name = "forceExecutor={0}")
+    @ValueSource(booleans = {false, true})
+    void mmapEPwriteProduzemOMesmoObjetoAposReabrir(boolean forceExecutor, @TempDir Path tmp) throws Exception {
         Path mmapBase = tmp.resolve("mmap");
         Path pwriteBase = tmp.resolve("pwrite");
-        try (BlobVolumeRegistry mm = registry(mmapBase, VolumeWriteMode.MMAP);
-             BlobVolumeRegistry pw = registry(pwriteBase, VolumeWriteMode.PWRITE)) {
+        try (BlobVolumeRegistry mm = registry(mmapBase, VolumeWriteMode.MMAP, forceExecutor);
+             BlobVolumeRegistry pw = registry(pwriteBase, VolumeWriteMode.PWRITE, forceExecutor)) {
             for (String s : SERIES) {
                 applyWrites(mm, s, false);
                 applyWrites(pw, s, false);
             }
         }
         // reabre cada volume no modo OPOSTO ao da escrita e aplica uma segunda fase de escritas
-        try (BlobVolumeRegistry mm = registry(mmapBase, VolumeWriteMode.PWRITE);
-             BlobVolumeRegistry pw = registry(pwriteBase, VolumeWriteMode.MMAP)) {
+        try (BlobVolumeRegistry mm = registry(mmapBase, VolumeWriteMode.PWRITE, forceExecutor);
+             BlobVolumeRegistry pw = registry(pwriteBase, VolumeWriteMode.MMAP, forceExecutor)) {
             for (String s : SERIES) {
                 applyWrites(mm, s, true);
                 applyWrites(pw, s, true);
@@ -134,6 +166,37 @@ class VolumeWriteModeEquivalenceTest {
                         "objeto divergente na releitura para " + s);
             }
         }
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @EnumSource(VolumeWriteMode.class)
+    void comExecutorDeForceProduzOMesmoObjetoQueInlineAposReabrir(VolumeWriteMode mode, @TempDir Path tmp)
+            throws Exception {
+        Path inlineBase = tmp.resolve("inline");
+        Path detachedBase = tmp.resolve("detached");
+        try (BlobVolumeRegistry inline = registry(inlineBase, mode, false);
+             BlobVolumeRegistry detached = registry(detachedBase, mode, true)) {
+            for (String s : SERIES) {
+                applyWrites(inline, s, false);
+                applyWrites(detached, s, false);
+            }
+        }
+        int firstPhaseForces = detachedForces.get();
+        assertTrue(firstPhaseForces > 0, "o force dos checkpoints usou o executor");
+        // Reabre (o executor não faz parte da identidade do volume) e escreve a segunda fase.
+        try (BlobVolumeRegistry inline = registry(inlineBase, mode, false);
+             BlobVolumeRegistry detached = registry(detachedBase, mode, true)) {
+            for (String s : SERIES) {
+                applyWrites(inline, s, true);
+                applyWrites(detached, s, true);
+            }
+            for (String s : SERIES) {
+                assertArrayEquals(inline.require("ifaceStats").storage().get(key(s)).orElseThrow(),
+                        detached.require("ifaceStats").storage().get(key(s)).orElseThrow(),
+                        "objeto com executor divergente do inline para " + s);
+            }
+        }
+        assertTrue(detachedForces.get() > firstPhaseForces);
     }
 
     @Test

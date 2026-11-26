@@ -23,15 +23,21 @@ import dev.nishisan.utils.oss.storage.SeriesChannel;
 import dev.nishisan.utils.oss.storage.SeriesChannelProvider;
 import dev.nishisan.utils.oss.storage.StorageKey;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
@@ -59,8 +65,20 @@ import java.util.function.LongSupplier;
  * ponteiro, sobrescrevendo o mais antigo — retenção como ring buffer). O
  * {@link #checkpoint()} materializa também o CDP em progresso como parcial
  * (legível antes do fechamento) e torna o estado durável.</p>
+ *
+ * <p>Force fora do writer (opcional): com um {@code checkpointForceExecutor}, o
+ * checkpoint vira duas fases. A fase A (CDPs parciais, live-state e
+ * {@link SeriesChannel#prepareForce()}) continua na worker; a fase B (o force
+ * capturado no {@link SeriesChannel.ForceTicket}) roda no executor, e a future do
+ * checkpoint só conclui depois dela. Um checkpoint sem amostra nova enquanto há
+ * force em voo espera esse force (e falha se ele falhar). Sem executor, ou com um
+ * canal que não destaca o force (disco local, S3), o checkpoint é inline, como
+ * sempre foi.</p>
  */
 public final class NgrrdWriter implements AutoCloseable {
+
+    /** Teto da espera, no fechamento, pelos forces destacados ainda em voo. */
+    private static final long SHUTDOWN_FORCE_WAIT_SECONDS = 30;
 
     private final NgrrdDefinition definition;
     private final String seriesKey;
@@ -90,6 +108,15 @@ public final class NgrrdWriter implements AutoCloseable {
     // durável naquele estado. Confinado à worker thread (como ringDirty); init true
     // garante o primeiro checkpoint.
     private boolean changedSinceForce = true;
+
+    // Executor opcional da fase B do checkpoint (o force). null = force inline na worker.
+    private final Executor forceExecutor;
+    // Force destacado mais recente ainda não confirmado por ForceDone: um Sync sem amostra
+    // nova encadeia nele. O campo só é lido e escrito na worker thread.
+    private CompletableFuture<Void> inFlightForce;
+    // Todos os forces destacados ainda não confirmados por ForceDone, para o Shutdown esperar
+    // (um ForceDone novo limpa inFlightForce antes de um force antigo terminar). Só na worker.
+    private final List<CompletableFuture<Void>> pendingForces = new ArrayList<>();
 
     private final WriterScheduler scheduler;
     private final LinkedBlockingQueue<Command> queue = new LinkedBlockingQueue<>();
@@ -181,6 +208,24 @@ public final class NgrrdWriter implements AutoCloseable {
                        NgrrdMetricsListener metrics, ReadWriteLock seriesLock,
                        Durability durability, OnGeometryChange onGeometryChange,
                        LongSupplier nowEpochMs, boolean createIfMissing) {
+        this(definition, storage, seriesKey, metrics, seriesLock, durability, onGeometryChange,
+                nowEpochMs, createIfMissing, null);
+    }
+
+    /**
+     * Variante completa com {@code checkpointForceExecutor}: quando não nulo, o force
+     * de cada checkpoint (fase B) roda nesse executor, se o canal o destacar
+     * ({@link SeriesChannel#prepareForce()}); a fase A continua na worker thread.
+     * {@code null} (padrão) mantém o force inline. O executor tem de continuar
+     * aceitando tarefas até este writer fechar: o {@link #close()} espera os forces
+     * em voo. Se ele recusar uma tarefa, o force roda inline.
+     */
+    public NgrrdWriter(NgrrdDefinition definition, NgrrdStorage storage, String seriesKey,
+                       NgrrdMetricsListener metrics, ReadWriteLock seriesLock,
+                       Durability durability, OnGeometryChange onGeometryChange,
+                       LongSupplier nowEpochMs, boolean createIfMissing,
+                       Executor checkpointForceExecutor) {
+        this.forceExecutor = checkpointForceExecutor;
         this.nowEpochMs = Objects.requireNonNull(nowEpochMs, "nowEpochMs é obrigatório");
         this.definition = Objects.requireNonNull(definition, "definition é obrigatório");
         Objects.requireNonNull(storage, "storage é obrigatório");
@@ -315,8 +360,9 @@ public final class NgrrdWriter implements AutoCloseable {
      *       {@link IllegalStateException}. Nenhuma future fica pendente para sempre.</li>
      * </ul>
      *
-     * <p>Callbacks encadeados na future podem rodar na thread do pool de writers:
-     * devem ser curtos e nunca bloquear.</p>
+     * <p>Callbacks encadeados na future podem rodar na thread do pool de writers (ou,
+     * com {@code checkpointForceExecutor}, na thread desse executor): devem ser
+     * curtos e nunca bloquear.</p>
      *
      * @return future concluída quando o checkpoint termina
      */
@@ -471,11 +517,11 @@ public final class NgrrdWriter implements AutoCloseable {
                     }
                 }
                 case Command.Sync s -> {
-                    // Sempre conclui a future; uma falha vai para o chamador por ela.
+                    // Sempre conclui a future (aqui ou, com force destacado, no executor);
+                    // uma falha vai para o chamador por ela.
                     try {
                         throwIfWriteFailed();
-                        checkpointAndForce();
-                        s.future().complete(null);
+                        checkpointForSync(s);
                     } catch (RuntimeException e) {
                         s.future().completeExceptionally(e);
                     } catch (Error e) {
@@ -483,12 +529,16 @@ public final class NgrrdWriter implements AutoCloseable {
                         throw e;
                     }
                 }
+                case Command.ForceDone d -> onForceDone(d.force());
                 case Command.Shutdown s -> {
                     // Throwable, não só RuntimeException: um Error no checkpoint final também precisa
                     // falhar os Syncs órfãos. RuntimeException segue só logada; Error é relançado
                     // depois de concluir as futures e liberar o close(), como antes.
                     Throwable finalFailure = null;
                     try {
+                        // O prepareForce já limpou a marca de sujo do canal: o force do close não
+                        // cobriria um force destacado ainda em voo. Espera-o antes de fechar.
+                        awaitPendingForces();
                         if (s.checkpoint()) {
                             throwIfWriteFailed();
                             checkpointAndForce();
@@ -769,7 +819,8 @@ public final class NgrrdWriter implements AutoCloseable {
      * == false}), é um no-op de durabilidade (idle-skip): a re-emissão parcial
      * seria byte-idêntica e o canal já está limpo, então o {@code force()} seria
      * inócuo. O early-return é normal (nunca via exceção): a future do Sync é
-     * concluída com sucesso pelo chamador em {@link #processOne}.
+     * concluída com sucesso pelo chamador ({@link #checkpointForSync}). Sempre
+     * inline: é o caminho do Sync sem executor e do checkpoint final do Shutdown.
      */
     private void checkpointAndForce() {
         if (!changedSinceForce) {
@@ -778,22 +829,7 @@ public final class NgrrdWriter implements AutoCloseable {
             }
             return;
         }
-        writeLock.lock();
-        try {
-            for (int col = 0; col < d; col++) {
-                long slot = state.pdpSlotSec[col];
-                if (slot == -1L) {
-                    continue;
-                }
-                for (int arch = 0; arch < a; arch++) {
-                    long windowStart = TimeBucket.alignDown(slot, geo.archives().get(arch).stepSec());
-                    emit(arch, col, windowStart, false);
-                }
-            }
-            persistLiveState();
-        } finally {
-            writeLock.unlock();
-        }
+        materializePartials();
         // fsync (disco) / PUT (S3) fora do lock: não muta a imagem e não deve
         // bloquear leitores durante o I/O de durabilidade.
         if (durability == Durability.FSYNC) {
@@ -810,6 +846,181 @@ public final class NgrrdWriter implements AutoCloseable {
         changedSinceForce = false;
     }
 
+    /**
+     * Checkpoint de um {@link Command.Sync}. Sem executor de force, é exatamente o
+     * {@link #checkpointAndForce()} de sempre, com a future concluída na hora. Com
+     * executor:
+     * <ul>
+     *   <li>sem amostra nova e com force destacado em voo, a future encadeia nesse
+     *       force (sucesso → sucesso; falha → falha), qualquer que seja o estado dele;</li>
+     *   <li>com amostra nova, faz a fase A e chama {@link SeriesChannel#prepareForce()}.
+     *       Um ticket não destacado (o force já foi inline) conclui a future; um ticket
+     *       destacado vai para o executor, que conclui a future depois do force.</li>
+     * </ul>
+     */
+    private void checkpointForSync(Command.Sync s) {
+        if (forceExecutor == null) {
+            checkpointAndForce();
+            s.future().complete(null);
+            return;
+        }
+        if (!changedSinceForce) {
+            if (metrics != null) {
+                metrics.onCheckpointCoalesced(seriesKey);
+            }
+            completeAfterPendingForce(s);
+            return;
+        }
+        materializePartials();
+        if (durability != Durability.FSYNC) {
+            changedSinceForce = false;
+            s.future().complete(null);
+            return;
+        }
+        SeriesChannel.ForceTicket ticket = channel.prepareForce();
+        if (!ticket.detached()) {
+            // Force inline feito pelo canal. Um force destacado anterior ainda em voo
+            // continua valendo para esta future: encadeia nele, como no caso coalescido.
+            changedSinceForce = false;
+            completeAfterPendingForce(s);
+            return;
+        }
+        detachForce(ticket, s);
+    }
+
+    /** Conclui a future do Sync na hora, ou, com force destacado em voo, quando ele concluir. */
+    private void completeAfterPendingForce(Command.Sync s) {
+        CompletableFuture<Void> pending = inFlightForce;
+        if (pending == null) {
+            s.future().complete(null);
+            return;
+        }
+        pending.whenComplete((ignored, failure) -> {
+            if (failure == null) {
+                s.future().complete(null);
+            } else {
+                s.future().completeExceptionally(unwrap(failure));
+            }
+        });
+    }
+
+    /**
+     * Entrega a fase B ao executor. O canal já está limpo ({@code prepareForce}), e
+     * {@code changedSinceForce} também: uma escrita posterior liga os dois de novo. Se o
+     * executor recusar a tarefa, a fase B roda aqui, inline.
+     */
+    private void detachForce(SeriesChannel.ForceTicket ticket, Command.Sync s) {
+        changedSinceForce = false;
+        CompletableFuture<Void> force = new CompletableFuture<>();
+        inFlightForce = force;
+        pendingForces.add(force);
+        Runnable phaseB = () -> runDetachedForce(ticket, force, s);
+        try {
+            forceExecutor.execute(phaseB);
+        } catch (RejectedExecutionException e) {
+            phaseB.run();
+        }
+    }
+
+    /**
+     * Fase B, na thread do executor: roda o ticket, conclui a future do force e a do
+     * Sync com o desfecho e, por fim, avisa a worker com {@link Command.ForceDone}. Em
+     * falha, o ticket já remarcou o canal como sujo.
+     */
+    private void runDetachedForce(SeriesChannel.ForceTicket ticket, CompletableFuture<Void> force,
+                                  Command.Sync s) {
+        Throwable failure = null;
+        try {
+            ticket.run();
+        } catch (Throwable e) {
+            failure = e;
+        }
+        if (failure == null) {
+            force.complete(null);
+            s.future().complete(null);
+        } else {
+            force.completeExceptionally(failure);
+            s.future().completeExceptionally(failure);
+        }
+        enqueue(new Command.ForceDone(force));
+        if (failure instanceof Error error) {
+            throw error;
+        }
+    }
+
+    /**
+     * Confirmação de um force destacado, na worker. Uma falha volta a exigir force no
+     * próximo checkpoint (o ticket já remarcou o canal como sujo). Um ForceDone de um
+     * force antigo não limpa o campo de um force mais novo. Um ForceDone enfileirado
+     * depois do Shutdown nunca é processado (a fila não é mais drenada).
+     */
+    private void onForceDone(CompletableFuture<Void> force) {
+        if (force.isCompletedExceptionally()) {
+            changedSinceForce = true;
+        }
+        if (inFlightForce == force) {
+            inFlightForce = null;
+        }
+        pendingForces.remove(force);
+    }
+
+    /**
+     * No Shutdown, espera os forces destacados em voo, com teto de
+     * {@value #SHUTDOWN_FORCE_WAIT_SECONDS} s. É o único ponto em que a worker bloqueia
+     * num force do executor. Se algum falhou (ou estourou o teto), marca
+     * {@code changedSinceForce}: o checkpoint final rematerializa a série, o que suja o
+     * canal de novo, e força inline.
+     */
+    private void awaitPendingForces() {
+        if (pendingForces.isEmpty()) {
+            return;
+        }
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(SHUTDOWN_FORCE_WAIT_SECONDS);
+        for (CompletableFuture<Void> force : pendingForces) {
+            try {
+                force.get(Math.max(0L, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+            } catch (ExecutionException e) {
+                changedSinceForce = true;
+            } catch (TimeoutException e) {
+                changedSinceForce = true;
+                System.err.println("ngrrd-writer: SEVERE: force em voo de " + storageKey + " não terminou em "
+                        + SHUTDOWN_FORCE_WAIT_SECONDS + " s; o fechamento força inline");
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                changedSinceForce = true;
+            }
+        }
+        pendingForces.clear();
+        inFlightForce = null;
+    }
+
+    private static Throwable unwrap(Throwable failure) {
+        if (failure instanceof CompletionException && failure.getCause() != null) {
+            return failure.getCause();
+        }
+        return failure;
+    }
+
+    /** Fase A: emite os CDPs em progresso como parciais e regrava o live-state, sob o write-lock. */
+    private void materializePartials() {
+        writeLock.lock();
+        try {
+            for (int col = 0; col < d; col++) {
+                long slot = state.pdpSlotSec[col];
+                if (slot == -1L) {
+                    continue;
+                }
+                for (int arch = 0; arch < a; arch++) {
+                    long windowStart = TimeBucket.alignDown(slot, geo.archives().get(arch).stepSec());
+                    emit(arch, col, windowStart, false);
+                }
+            }
+            persistLiveState();
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
     private void closeChannelQuietly() {
         try {
             channel.close();
@@ -824,6 +1035,10 @@ public final class NgrrdWriter implements AutoCloseable {
 
         /** Checkpoint; {@code future} é concluída pela worker com o desfecho (sucesso ou a exceção). */
         record Sync(CompletableFuture<Void> future) implements Command {
+        }
+
+        /** Fim de um force destacado; processado na worker (ver {@code onForceDone}). */
+        record ForceDone(CompletableFuture<Void> force) implements Command {
         }
 
         record Shutdown(CountDownLatch latch, boolean checkpoint) implements Command {

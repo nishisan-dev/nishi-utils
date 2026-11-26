@@ -2,6 +2,7 @@ package dev.nishisan.utils.oss.writer;
 
 import dev.nishisan.utils.oss.api.ConsolidationFunction;
 import dev.nishisan.utils.oss.api.Durability;
+import dev.nishisan.utils.oss.api.OnGeometryChange;
 import dev.nishisan.utils.oss.api.Sample;
 import dev.nishisan.utils.oss.api.SeriesResult;
 import dev.nishisan.utils.oss.api.ViewQuery;
@@ -13,8 +14,10 @@ import dev.nishisan.utils.oss.storage.LocalDiskStorage;
 import dev.nishisan.utils.oss.storage.NgrrdStorage;
 import dev.nishisan.utils.oss.storage.SeriesChannel;
 import dev.nishisan.utils.oss.storage.SeriesChannelProvider;
-import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
@@ -22,6 +25,8 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
@@ -37,6 +42,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <p>O storage de teste delega a um {@link LocalDiskStorage} real (escrita
  * in-place num arquivo, page cache compartilhado entre writer e reader) e conta
  * as chamadas a {@link SeriesChannel#force()}.</p>
+ *
+ * <p>Cada caso roda também com {@code checkpointForceExecutor}: o canal de contagem então
+ * destaca o force ({@link SeriesChannel#prepareForce()}), que roda no executor.</p>
  */
 class NgrrdWriterDurabilityTest {
 
@@ -55,9 +63,17 @@ class NgrrdWriterDurabilityTest {
         }
     }
 
-    private NgrrdWriter writer(NgrrdDefinition def, NgrrdStorage storage, Durability durability) {
+    private final ExecutorService forcePool = Executors.newFixedThreadPool(2);
+
+    @AfterEach
+    void shutdownForcePool() {
+        forcePool.shutdownNow();
+    }
+
+    private NgrrdWriter writer(NgrrdDefinition def, ForceCountingStorage storage, Durability durability) {
         return new NgrrdWriter(def, storage, SERIES_KEY, null,
-                new ReentrantReadWriteLock(), durability);
+                new ReentrantReadWriteLock(), durability, OnGeometryChange.FAIL, System::currentTimeMillis, true,
+                storage.detached ? forcePool : null);
     }
 
     private List<Double> readInBps(NgrrdDefinition def, NgrrdStorage storage, long endMs) {
@@ -68,10 +84,11 @@ class NgrrdWriterDurabilityTest {
                 .filter(v -> !Double.isNaN(v)).toList();
     }
 
-    @Test
-    void deletionStopsTheWorkerWithoutWritingFinalLiveState(@TempDir Path tempDir) throws Exception {
+    @ParameterizedTest(name = "forceExecutor={0}")
+    @ValueSource(booleans = {false, true})
+    void deletionStopsTheWorkerWithoutWritingFinalLiveState(boolean forceExecutor, @TempDir Path tempDir) throws Exception {
         var def = definition();
-        var storage = new ForceCountingStorage(tempDir);
+        var storage = new ForceCountingStorage(tempDir, forceExecutor);
         var writer = writer(def, storage, Durability.FSYNC);
         writer.write("in_octets", new Sample(START_MS, 1_000_000));
         writer.closeForDeletion();
@@ -85,10 +102,11 @@ class NgrrdWriterDurabilityTest {
                 () -> writer.write("in_octets", new Sample(START_MS + STEP_MS, 2_000_000)));
     }
 
-    @Test
-    void fsyncForcaPorCheckpoint(@TempDir Path tempDir) throws Exception {
+    @ParameterizedTest(name = "forceExecutor={0}")
+    @ValueSource(booleans = {false, true})
+    void fsyncForcaPorCheckpoint(boolean forceExecutor, @TempDir Path tempDir) throws Exception {
         NgrrdDefinition def = definition();
-        ForceCountingStorage storage = new ForceCountingStorage(tempDir);
+        ForceCountingStorage storage = new ForceCountingStorage(tempDir, forceExecutor);
 
         try (NgrrdWriter w = writer(def, storage, Durability.FSYNC)) {
             int afterCreate = storage.forceCount.get(); // createFresh já forçou (=1)
@@ -106,10 +124,11 @@ class NgrrdWriterDurabilityTest {
         }
     }
 
-    @Test
-    void checkpointOciosoNaoForcaEmFsync(@TempDir Path tempDir) throws Exception {
+    @ParameterizedTest(name = "forceExecutor={0}")
+    @ValueSource(booleans = {false, true})
+    void checkpointOciosoNaoForcaEmFsync(boolean forceExecutor, @TempDir Path tempDir) throws Exception {
         NgrrdDefinition def = definition();
-        ForceCountingStorage storage = new ForceCountingStorage(tempDir);
+        ForceCountingStorage storage = new ForceCountingStorage(tempDir, forceExecutor);
 
         try (NgrrdWriter w = writer(def, storage, Durability.FSYNC)) {
             int afterCreate = storage.forceCount.get();
@@ -127,10 +146,11 @@ class NgrrdWriterDurabilityTest {
         }
     }
 
-    @Test
-    void amostraNoSlotAbertoSemVirarPassoNaoEhPulada(@TempDir Path tempDir) throws Exception {
+    @ParameterizedTest(name = "forceExecutor={0}")
+    @ValueSource(booleans = {false, true})
+    void amostraNoSlotAbertoSemVirarPassoNaoEhPulada(boolean forceExecutor, @TempDir Path tempDir) throws Exception {
         NgrrdDefinition def = definition();
-        ForceCountingStorage storage = new ForceCountingStorage(tempDir);
+        ForceCountingStorage storage = new ForceCountingStorage(tempDir, forceExecutor);
 
         try (NgrrdWriter w = writer(def, storage, Durability.FSYNC)) {
             w.write("in_octets", new Sample(START_MS, 1_000_000L));
@@ -148,10 +168,11 @@ class NgrrdWriterDurabilityTest {
         }
     }
 
-    @Test
-    void checkpointOciosoNaoMudaLeituraDoSlotEmProgresso(@TempDir Path tempDir) throws Exception {
+    @ParameterizedTest(name = "forceExecutor={0}")
+    @ValueSource(booleans = {false, true})
+    void checkpointOciosoNaoMudaLeituraDoSlotEmProgresso(boolean forceExecutor, @TempDir Path tempDir) throws Exception {
         NgrrdDefinition def = definition();
-        ForceCountingStorage storage = new ForceCountingStorage(tempDir);
+        ForceCountingStorage storage = new ForceCountingStorage(tempDir, forceExecutor);
         long end = START_MS + 2L * STEP_MS;
 
         try (NgrrdWriter w = writer(def, storage, Durability.FSYNC)) {
@@ -172,10 +193,11 @@ class NgrrdWriterDurabilityTest {
         }
     }
 
-    @Test
-    void dadoCheckpointadoSobreviveAoCloseComIdleSkip(@TempDir Path tempDir) throws Exception {
+    @ParameterizedTest(name = "forceExecutor={0}")
+    @ValueSource(booleans = {false, true})
+    void dadoCheckpointadoSobreviveAoCloseComIdleSkip(boolean forceExecutor, @TempDir Path tempDir) throws Exception {
         NgrrdDefinition def = definition();
-        ForceCountingStorage storage = new ForceCountingStorage(tempDir);
+        ForceCountingStorage storage = new ForceCountingStorage(tempDir, forceExecutor);
         long end = START_MS + 2L * STEP_MS;
 
         NgrrdWriter w = writer(def, storage, Durability.FSYNC);
@@ -190,10 +212,11 @@ class NgrrdWriterDurabilityTest {
                 "dado checkpointado deve permanecer legível após close com idle-skip: " + values);
     }
 
-    @Test
-    void osCacheNaoForcaPorCheckpoint(@TempDir Path tempDir) throws Exception {
+    @ParameterizedTest(name = "forceExecutor={0}")
+    @ValueSource(booleans = {false, true})
+    void osCacheNaoForcaPorCheckpoint(boolean forceExecutor, @TempDir Path tempDir) throws Exception {
         NgrrdDefinition def = definition();
-        ForceCountingStorage storage = new ForceCountingStorage(tempDir);
+        ForceCountingStorage storage = new ForceCountingStorage(tempDir, forceExecutor);
 
         try (NgrrdWriter w = writer(def, storage, Durability.OS_CACHE)) {
             int afterCreate = storage.forceCount.get();
@@ -212,10 +235,11 @@ class NgrrdWriterDurabilityTest {
         }
     }
 
-    @Test
-    void closeDescarregaMesmoEmOsCache(@TempDir Path tempDir) throws Exception {
+    @ParameterizedTest(name = "forceExecutor={0}")
+    @ValueSource(booleans = {false, true})
+    void closeDescarregaMesmoEmOsCache(boolean forceExecutor, @TempDir Path tempDir) throws Exception {
         NgrrdDefinition def = definition();
-        ForceCountingStorage storage = new ForceCountingStorage(tempDir);
+        ForceCountingStorage storage = new ForceCountingStorage(tempDir, forceExecutor);
 
         NgrrdWriter w = writer(def, storage, Durability.OS_CACHE);
         w.write("in_octets", new Sample(START_MS, 1_000_000L));
@@ -229,14 +253,19 @@ class NgrrdWriterDurabilityTest {
                 "um close() limpo deveria forçar mesmo em OS_CACHE");
     }
 
-    /** Storage que delega ao {@link LocalDiskStorage} e conta chamadas a {@code force()}. */
+    /**
+     * Storage que delega ao {@link LocalDiskStorage} e conta chamadas a {@code force()}.
+     * Com {@code detached}, o canal destaca o force num ticket (contado ao rodar).
+     */
     private static final class ForceCountingStorage implements NgrrdStorage, SeriesChannelProvider {
 
         private final LocalDiskStorage delegate;
+        private final boolean detached;
         final AtomicInteger forceCount = new AtomicInteger();
 
-        ForceCountingStorage(Path root) {
+        ForceCountingStorage(Path root, boolean detached) {
             this.delegate = new LocalDiskStorage(root);
+            this.detached = detached;
         }
 
         @Override
@@ -310,6 +339,14 @@ class NgrrdWriterDurabilityTest {
             public void force() {
                 forceCount.incrementAndGet();
                 inner.force();
+            }
+
+            @Override
+            public ForceTicket prepareForce() {
+                if (!detached) {
+                    return SeriesChannel.super.prepareForce();
+                }
+                return this::force;
             }
 
             @Override

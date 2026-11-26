@@ -1,6 +1,7 @@
 package dev.nishisan.utils.oss.writer;
 
 import dev.nishisan.utils.oss.api.Durability;
+import dev.nishisan.utils.oss.api.OnGeometryChange;
 import dev.nishisan.utils.oss.api.Sample;
 import dev.nishisan.utils.oss.config.NgrrdYamlLoader;
 import dev.nishisan.utils.oss.definition.NgrrdDefinition;
@@ -8,8 +9,10 @@ import dev.nishisan.utils.oss.storage.NgrrdStorage;
 import dev.nishisan.utils.oss.storage.NgrrdStorageException;
 import dev.nishisan.utils.oss.storage.SeriesChannel;
 import dev.nishisan.utils.oss.storage.SeriesChannelProvider;
-import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.InputStream;
 import java.lang.reflect.Field;
@@ -23,6 +26,8 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -37,7 +42,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * Cobre {@link NgrrdWriter#checkpointAsync()}: ordem FIFO com as escritas, chamador nunca
  * bloqueado pela worker, writer fechado, falhas propagadas pela future e a convivência com o
- * Shutdown — nenhuma future pode ficar pendente para sempre.
+ * Shutdown — nenhuma future pode ficar pendente para sempre. Cada caso roda também com
+ * {@code checkpointForceExecutor} e um canal que destaca o force.
  */
 @Timeout(30)
 class NgrrdWriterCheckpointAsyncTest {
@@ -45,17 +51,34 @@ class NgrrdWriterCheckpointAsyncTest {
     private static final long START_MS = 1_747_339_200L * 1000L;
     private static final String SERIES = "device:r1/iface:eth0";
 
+    private final ExecutorService forcePool = Executors.newFixedThreadPool(2);
+
+    @AfterEach
+    void shutdownForcePool() {
+        forcePool.shutdownNow();
+    }
+
     private NgrrdDefinition definition() throws Exception {
         try (InputStream in = getClass().getResourceAsStream("/iface-traffic-local-disk.yaml")) {
             return NgrrdYamlLoader.parse(new String(in.readAllBytes(), StandardCharsets.UTF_8), k -> null);
         }
     }
 
-    @Test
-    void checkpointAsyncConcluiSoDepoisDasEscritasAnterioresSemBloquearOChamador() throws Exception {
-        GatedStorage storage = new GatedStorage();
+    private NgrrdWriter writer(GatedStorage storage) throws Exception {
+        return writer(storage, new ReentrantReadWriteLock());
+    }
+
+    private NgrrdWriter writer(GatedStorage storage, ReentrantReadWriteLock seriesLock) throws Exception {
+        return new NgrrdWriter(definition(), storage, SERIES, null, seriesLock, Durability.FSYNC,
+                OnGeometryChange.FAIL, System::currentTimeMillis, true, storage.detached ? forcePool : null);
+    }
+
+    @ParameterizedTest(name = "forceExecutor={0}")
+    @ValueSource(booleans = {false, true})
+    void checkpointAsyncConcluiSoDepoisDasEscritasAnterioresSemBloquearOChamador(boolean forceExecutor) throws Exception {
+        GatedStorage storage = new GatedStorage(forceExecutor);
         ReentrantReadWriteLock seriesLock = new ReentrantReadWriteLock();
-        try (NgrrdWriter writer = new NgrrdWriter(definition(), storage, SERIES, null, seriesLock)) {
+        try (NgrrdWriter writer = writer(storage, seriesLock)) {
             int forcesBefore = storage.forces.get();
             // Segura o read-lock da série: a worker trava no write-lock da primeira escrita.
             seriesLock.readLock().lock();
@@ -77,10 +100,11 @@ class NgrrdWriterCheckpointAsyncTest {
         }
     }
 
-    @Test
-    void checkpointAsyncNaoEsperaUmForceLento() throws Exception {
-        GatedStorage storage = new GatedStorage();
-        try (NgrrdWriter writer = new NgrrdWriter(definition(), storage, SERIES)) {
+    @ParameterizedTest(name = "forceExecutor={0}")
+    @ValueSource(booleans = {false, true})
+    void checkpointAsyncNaoEsperaUmForceLento(boolean forceExecutor) throws Exception {
+        GatedStorage storage = new GatedStorage(forceExecutor);
+        try (NgrrdWriter writer = writer(storage)) {
             writer.write("in_octets", new Sample(START_MS, 1_000_000L));
             storage.gateForces();
             CompletableFuture<Void> future = writer.checkpointAsync();
@@ -91,19 +115,21 @@ class NgrrdWriterCheckpointAsyncTest {
         }
     }
 
-    @Test
-    void writerFechadoDevolveFutureJaConcluida() throws Exception {
-        NgrrdWriter writer = new NgrrdWriter(definition(), new GatedStorage(), SERIES);
+    @ParameterizedTest(name = "forceExecutor={0}")
+    @ValueSource(booleans = {false, true})
+    void writerFechadoDevolveFutureJaConcluida(boolean forceExecutor) throws Exception {
+        NgrrdWriter writer = writer(new GatedStorage(forceExecutor));
         writer.close();
         CompletableFuture<Void> future = writer.checkpointAsync();
         assertTrue(future.isDone());
         assertFalse(future.isCompletedExceptionally());
     }
 
-    @Test
-    void falhaNoForceFalhaAFutureComAMesmaExcecaoDoCheckpointSincrono() throws Exception {
-        GatedStorage storage = new GatedStorage();
-        NgrrdWriter writer = new NgrrdWriter(definition(), storage, SERIES);
+    @ParameterizedTest(name = "forceExecutor={0}")
+    @ValueSource(booleans = {false, true})
+    void falhaNoForceFalhaAFutureComAMesmaExcecaoDoCheckpointSincrono(boolean forceExecutor) throws Exception {
+        GatedStorage storage = new GatedStorage(forceExecutor);
+        NgrrdWriter writer = writer(storage);
         try {
             writer.write("in_octets", new Sample(START_MS, 1_000_000L));
             storage.failForce = true;
@@ -118,10 +144,11 @@ class NgrrdWriterCheckpointAsyncTest {
         }
     }
 
-    @Test
-    void falhaAnteriorDeEscritaFalhaAFuture() throws Exception {
-        GatedStorage storage = new GatedStorage();
-        try (NgrrdWriter writer = new NgrrdWriter(definition(), storage, SERIES)) {
+    @ParameterizedTest(name = "forceExecutor={0}")
+    @ValueSource(booleans = {false, true})
+    void falhaAnteriorDeEscritaFalhaAFuture(boolean forceExecutor) throws Exception {
+        GatedStorage storage = new GatedStorage(forceExecutor);
+        try (NgrrdWriter writer = writer(storage)) {
             storage.failWrite = true;
             // Só o avanço de slot grava células: escreve passos seguidos até a falha aparecer.
             for (int i = 0; i < 5; i++) {
@@ -142,10 +169,11 @@ class NgrrdWriterCheckpointAsyncTest {
         }
     }
 
-    @Test
-    void shutdownEnfileiradoDepoisDosSyncsConcluiTodasAsFutures() throws Exception {
-        GatedStorage storage = new GatedStorage();
-        NgrrdWriter writer = new NgrrdWriter(definition(), storage, SERIES);
+    @ParameterizedTest(name = "forceExecutor={0}")
+    @ValueSource(booleans = {false, true})
+    void shutdownEnfileiradoDepoisDosSyncsConcluiTodasAsFutures(boolean forceExecutor) throws Exception {
+        GatedStorage storage = new GatedStorage(forceExecutor);
+        NgrrdWriter writer = writer(storage);
         writer.write("in_octets", new Sample(START_MS, 1_000_000L));
         storage.gateForces();
         CompletableFuture<Void> first = writer.checkpointAsync();
@@ -160,16 +188,17 @@ class NgrrdWriterCheckpointAsyncTest {
         assertDoesNotThrow(() -> closing.get(10, TimeUnit.SECONDS));
     }
 
-    @Test
-    void syncQueEntraNaFilaDepoisDoShutdownConcluiComODesfechoDoCheckpointFinal() throws Exception {
-        NgrrdWriter closedWithCheckpoint = new NgrrdWriter(definition(), new GatedStorage(), SERIES);
+    @ParameterizedTest(name = "forceExecutor={0}")
+    @ValueSource(booleans = {false, true})
+    void syncQueEntraNaFilaDepoisDoShutdownConcluiComODesfechoDoCheckpointFinal(boolean forceExecutor) throws Exception {
+        NgrrdWriter closedWithCheckpoint = writer(new GatedStorage(forceExecutor));
         closedWithCheckpoint.close();
         // Reproduz a corrida: a checagem de `closed` passou antes do Shutdown, o enqueue vem depois.
         reopenClosedFlag(closedWithCheckpoint);
         CompletableFuture<Void> orphan = closedWithCheckpoint.checkpointAsync();
         assertDoesNotThrow(() -> orphan.get(5, TimeUnit.SECONDS));
 
-        NgrrdWriter closedForDeletion = new NgrrdWriter(definition(), new GatedStorage(), SERIES);
+        NgrrdWriter closedForDeletion = writer(new GatedStorage(forceExecutor));
         closedForDeletion.closeForDeletion();
         reopenClosedFlag(closedForDeletion);
         ExecutionException failure = assertThrows(ExecutionException.class,
@@ -177,11 +206,11 @@ class NgrrdWriterCheckpointAsyncTest {
         assertInstanceOf(IllegalStateException.class, failure.getCause());
     }
 
-    @Test
-    void checkpointSincronoDelegaParaAFilaEEsperaOResultado() throws Exception {
-        GatedStorage storage = new GatedStorage();
-        try (NgrrdWriter writer = new NgrrdWriter(definition(), storage, SERIES, null,
-                new ReentrantReadWriteLock(), Durability.FSYNC)) {
+    @ParameterizedTest(name = "forceExecutor={0}")
+    @ValueSource(booleans = {false, true})
+    void checkpointSincronoDelegaParaAFilaEEsperaOResultado(boolean forceExecutor) throws Exception {
+        GatedStorage storage = new GatedStorage(forceExecutor);
+        try (NgrrdWriter writer = writer(storage)) {
             writer.write("in_octets", new Sample(START_MS, 1_000_000L));
             int forcesBefore = storage.forces.get();
             writer.checkpoint();
@@ -191,10 +220,11 @@ class NgrrdWriterCheckpointAsyncTest {
         }
     }
 
-    @Test
-    void errorNoCheckpointFinalFalhaOsSyncsOrfaosSemTravarOClose() throws Exception {
-        GatedStorage storage = new GatedStorage();
-        NgrrdWriter writer = new NgrrdWriter(definition(), storage, SERIES);
+    @ParameterizedTest(name = "forceExecutor={0}")
+    @ValueSource(booleans = {false, true})
+    void errorNoCheckpointFinalFalhaOsSyncsOrfaosSemTravarOClose(boolean forceExecutor) throws Exception {
+        GatedStorage storage = new GatedStorage(forceExecutor);
+        NgrrdWriter writer = writer(storage);
         writer.write("in_octets", new Sample(START_MS, 1_000_000L));
         storage.errorOnForce = true;
         // O Error do checkpoint final é relançado na thread do pool, depois de liberar o close().
@@ -226,12 +256,17 @@ class NgrrdWriterCheckpointAsyncTest {
     private static final class GatedStorage implements NgrrdStorage, SeriesChannelProvider {
 
         private final Map<String, byte[]> objects = new ConcurrentHashMap<>();
+        private final boolean detached;
         private final AtomicInteger forces = new AtomicInteger();
         private volatile CountDownLatch forceGate;
         private final CountDownLatch forceBlocked = new CountDownLatch(1);
         volatile boolean failForce;
         volatile boolean errorOnForce;
         volatile boolean failWrite;
+
+        GatedStorage(boolean detached) {
+            this.detached = detached;
+        }
 
         void gateForces() {
             forceGate = new CountDownLatch(1);
@@ -358,6 +393,11 @@ class NgrrdWriterCheckpointAsyncTest {
                 }
                 forces.incrementAndGet();
                 objects.put(key, image.clone());
+            }
+
+            @Override
+            public ForceTicket prepareForce() {
+                return detached ? this::force : SeriesChannel.super.prepareForce();
             }
 
             @Override
