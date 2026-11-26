@@ -246,9 +246,8 @@ public record StorageNodeConfig(
     /** Default de {@link #placementInspectTimeout()}. */
     public static final Duration DEFAULT_PLACEMENT_INSPECT_TIMEOUT = Duration.ofSeconds(2);
 
-    /** Construtor de compatibilidade (forma da 8.15.0 sem o fator), com {@code handleIdleTtlStepFactor} no default. */
+    /** Construtor de compatibilidade (forma da 8.14.0 sem o fator), com {@code handleIdleTtlStepFactor} no default. */
     public StorageNodeConfig(
-
         String nodeId,
         String host,
         int port,

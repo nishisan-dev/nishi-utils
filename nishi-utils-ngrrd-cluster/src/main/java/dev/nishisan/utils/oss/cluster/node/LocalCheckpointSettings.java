@@ -27,7 +27,7 @@ import java.util.Objects;
  *
  * @param enabled     liga o checkpoint local; desligado por padrão (nenhum executor é criado)
  * @param interval    intervalo entre o fim de um ciclo e o início do próximo; o ciclo espalha os
- *                    checkpoints por ~80% dele. Positivo; padrão {@link #DEFAULT_INTERVAL}
+ *                    checkpoints pela fração {@code spreadFraction} dele. Positivo; padrão {@link #DEFAULT_INTERVAL}
  * @param maxInFlight teto de checkpoints locais em voo (enfileirados e ainda não concluídos) ao mesmo
  *                    tempo; {@code >= 1}. Padrão {@link #defaultMaxInFlight()}
  * @param threads     tamanho do pool dedicado de force ({@code ngrrd.checkpoint.threads}, 8.15.0): o

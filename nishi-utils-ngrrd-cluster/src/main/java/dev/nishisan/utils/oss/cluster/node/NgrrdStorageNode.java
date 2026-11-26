@@ -163,7 +163,7 @@ public final class NgrrdStorageNode implements Closeable {
     /**
      * Encerra o pool de force: {@code shutdown()} (os forces já aceitos terminam) e espera até 5 s. Só
      * deve rodar depois do {@code registry.close()}, que espera os forces em voo de cada writer. Passado o
-     * prazo, loga e interrompe o que sobrou. {@code null} é ignorado.
+     * prazo, loga (com a quantidade de tarefas descartadas) e interrompe o que sobrou. {@code null} é ignorado.
      */
     private static void shutdownForcePool(ExecutorService pool, String nodeId) {
         if (pool == null) {
@@ -172,9 +172,9 @@ public final class NgrrdStorageNode implements Closeable {
         pool.shutdown();
         try {
             if (!pool.awaitTermination(FORCE_POOL_TERMINATION_SECONDS, TimeUnit.SECONDS)) {
+                int dropped = pool.shutdownNow().size();
                 LOGGER.warning("NGRRD_CHECKPOINT_FORCE_POOL storage node " + nodeId + ": forces em voo não terminaram em "
-                        + FORCE_POOL_TERMINATION_SECONDS + " s; interrompendo");
-                pool.shutdownNow();
+                        + FORCE_POOL_TERMINATION_SECONDS + " s; interrompendo dropped=" + dropped);
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -595,7 +595,7 @@ public final class NgrrdStorageNode implements Closeable {
     }
 
     /** Pool de force dos checkpoints; vazio com {@code ngrrd.checkpoint.threads=0} (o padrão). */
-    public Optional<ExecutorService> checkpointForcePool() {
+    Optional<ExecutorService> checkpointForcePool() {
         return Optional.ofNullable(forcePool);
     }
 
@@ -660,7 +660,9 @@ public final class NgrrdStorageNode implements Closeable {
         });
         safely("series handle registry", registry::close);
         // Só agora: o registry.close() espera os forces em voo de cada writer, e esses forces rodam neste
-        // pool. Encerrá-lo antes travaria cada close até o teto de 30 s do writer. O volume fecha por último.
+        // pool. Encerrá-lo antes faria o shutdownNow descartar as fases B (force) de writers ainda abertos,
+        // com Sync pendurado ou writer abandonado (o teto de espera do Shutdown do writer é de 20 s,
+        // SHUTDOWN_FORCE_WAIT_SECONDS). O volume fecha por último.
         safely("checkpoint force pool", () -> shutdownForcePool(forcePool, config.nodeId()));
         safely("NGrid node", () -> {
             try {

@@ -60,6 +60,20 @@ class NgrrdStorageNodeLocalCheckpointTest {
     }
 
     @Test
+    void metricasDeCicloDeVidaDosHandlesAparecemNoSnapshotDoNo(@TempDir Path tempDir) throws Exception {
+        try (NgrrdStorageNode node = NgrrdStorageNode.start(config(tempDir, null))) {
+            Map<String, Long> metrics = node.metricsSnapshot().lifecycleMetrics();
+            for (String key : List.of("handles.idleTtlExtended", "handles.idleClosed", "handles.evicted",
+                    "handles.selfHealed", "handles.writerAbandoned")) {
+                assertEquals(0L, metrics.get(key), key + " em lifecycleMetrics: " + metrics);
+            }
+            for (SeriesHandleRegistry.NotOpenCause cause : SeriesHandleRegistry.NotOpenCause.values()) {
+                assertEquals(0L, metrics.get(cause.metricKey()), cause.metricKey() + " em lifecycleMetrics: " + metrics);
+            }
+        }
+    }
+
+    @Test
     void checkpointLocalLigadoSobeComONoEParaNoClose(@TempDir Path tempDir) throws Exception {
         LocalCheckpointSettings settings = new LocalCheckpointSettings(true, Duration.ofMillis(100), 2);
         List<String> statusLines = new CopyOnWriteArrayList<>();

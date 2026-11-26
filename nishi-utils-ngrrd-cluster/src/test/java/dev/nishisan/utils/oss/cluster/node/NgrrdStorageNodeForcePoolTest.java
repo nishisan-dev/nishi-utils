@@ -65,12 +65,31 @@ class NgrrdStorageNodeForcePoolTest {
             assertTrue(node.checkpointForcePool().isPresent());
             openAndWrite(node, "forced");
 
+            // Os dois workers do pool presos: o force do checkpoint fica na fila e só conclui depois do registro
+            // do whenComplete, que então roda na thread do pool, nunca na do teste.
+            ExecutorService pool = node.checkpointForcePool().orElseThrow();
+            CountDownLatch release = new CountDownLatch(1);
+            CountDownLatch blocking = new CountDownLatch(2);
+            for (int i = 0; i < 2; i++) {
+                pool.execute(() -> {
+                    blocking.countDown();
+                    awaitQuietly(release);
+                });
+            }
+            assertTrue(blocking.await(10, TimeUnit.SECONDS));
+
             AtomicReference<String> completionThread = new AtomicReference<>();
-            node.registry().withSeries("forced", access -> {
-                access.checkpointAsync().whenComplete((ignored, failure) -> completionThread.set(
-                        Thread.currentThread().getName()));
-                return null;
-            });
+            try {
+                CompletableFuture<Void> checkpoint = node.registry().withSeries("forced", access -> {
+                    CompletableFuture<Void> future = access.checkpointAsync();
+                    future.whenComplete((ignored, failure) -> completionThread.set(
+                            Thread.currentThread().getName()));
+                    return future;
+                }).orElseThrow();
+                assertFalse(checkpoint.isDone(), "o force deveria estar na fila atrás dos workers presos");
+            } finally {
+                release.countDown();
+            }
             awaitTrue(() -> completionThread.get() != null);
             assertTrue(completionThread.get().startsWith(POOL_THREAD_PREFIX),
                     "a future do checkpoint conclui na thread do pool de force: " + completionThread.get());
@@ -85,7 +104,8 @@ class NgrrdStorageNodeForcePoolTest {
     /**
      * Ordem de encerramento (spec 8.15.0, D.2): com o pool de uma thread ocupado e o force da série
      * enfileirado atrás dele, o {@code registry.close()} do {@code close()} do nó fica esperando esse force.
-     * O pool NÃO pode ter sido encerrado nesse ponto (senão o close do writer travaria até o teto de 30 s).
+     * O pool NÃO pode ter sido encerrado nesse ponto (senão o {@code shutdownNow} descartaria as fases B de
+     * writers ainda abertos, com Sync pendurado ou writer abandonado).
      * Liberado o bloqueio, o close termina rápido e só então o pool está terminado.
      */
     @Test
