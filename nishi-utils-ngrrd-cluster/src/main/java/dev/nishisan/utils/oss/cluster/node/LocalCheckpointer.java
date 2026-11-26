@@ -272,8 +272,9 @@ public final class LocalCheckpointer implements Closeable {
      * {@code checkpointAsyncTimed()}), em milissegundos: {@code queueWaitMsP99}/{@code queueWaitMsMax} (do
      * enfileiramento do Sync até o início do force: fila FIFO da série, pool de writers e pool de force),
      * {@code forceMsP99}/{@code forceMsMax} (duração do force) e {@code coalesced} (checkpoints sem escrita
-     * nova, que não forçaram; resultados sem medida, {@code CheckpointTiming.NONE}, não contam). Os percentis e o máximo cobrem só os que forçaram. O checkpoint remoto tem a
-     * própria métrica ({@code checkpointLatency}).
+     * nova, que não forçaram; resultados sem medida, {@code CheckpointTiming.NONE}, não contam). Os percentis e o
+     * máximo cobrem só os que forçaram; o máximo é o recente (janela de 60 a 120 s, {@code recentMaxMicros}). O
+     * checkpoint remoto tem a própria métrica ({@code checkpointLatency}).
      *
      * <p>Com o índice incremental de sujas (8.15.0), {@code dirtySeries} é o tamanho do índice: um limite
      * superior atrasado em um ciclo. {@code lastCycleSeries} conta as candidatas do último ciclo (sujas e
@@ -308,9 +309,9 @@ public final class LocalCheckpointer implements Closeable {
         metrics.put("localCheckpoint.failures", failures);
         metrics.put("localCheckpoint.overruns", overruns);
         metrics.put("localCheckpoint.queueWaitMsP99", queueWait.p99Micros() / 1_000L);
-        metrics.put("localCheckpoint.queueWaitMsMax", queueWait.maxMicros() / 1_000L);
+        metrics.put("localCheckpoint.queueWaitMsMax", queueWait.recentMaxMicros() / 1_000L);
         metrics.put("localCheckpoint.forceMsP99", force.p99Micros() / 1_000L);
-        metrics.put("localCheckpoint.forceMsMax", force.maxMicros() / 1_000L);
+        metrics.put("localCheckpoint.forceMsMax", force.recentMaxMicros() / 1_000L);
         metrics.put("localCheckpoint.coalesced", coalesced);
         metrics.put("localCheckpoint.lastCycleStarted", lastCycleStarted);
         return metrics;
