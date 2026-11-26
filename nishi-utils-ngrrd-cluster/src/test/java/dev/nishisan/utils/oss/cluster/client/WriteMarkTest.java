@@ -52,6 +52,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiFunction;
 
@@ -207,6 +208,57 @@ class WriteMarkTest {
         Await.untilTrue("callbacks das marcas", WAIT, () -> order.size() == marks.size());
         assertEquals(marks.stream().map(WriteMark::id).toList(), order);
         assertEquals(0, dispatcher.markWaiters("s"));
+    }
+
+    @Test
+    void callbacksDasMarcasRodamEmOrdemNaThreadInternaMesmoComConsultasConcorrentes() throws Exception {
+        var release = gate();
+        rpc.writes = (owner, request) -> {
+            awaitGate(release);
+            return respond(request, key -> SeriesStatus.ERROR);
+        };
+        marksDispatcher();
+        enqueueWithRoute(OWNER, write("s", 1));
+        List<WriteMark> marks = new ArrayList<>();
+        for (int i = 0; i < 1_000; i++) {
+            marks.add(dispatcher.mark());
+        }
+        List<Long> order = new CopyOnWriteArrayList<>();
+        List<String> foreignThreads = new CopyOnWriteArrayList<>();
+        marks.forEach(mark -> mark.completion().thenRun(() -> {
+            String thread = Thread.currentThread().getName();
+            if (!thread.startsWith("ngrrd-write-mark-")) {
+                foreignThreads.add(mark.id() + "@" + thread);
+            }
+            order.add(mark.id());
+        }));
+        // completion() concorrente com a conclusão: quem consulta não pode executar, na própria thread, os callbacks
+        // já registrados na marca (o que deixaria a marca seguinte concluir antes deles).
+        AtomicBoolean done = new AtomicBoolean();
+        List<Thread> pollers = new ArrayList<>();
+        for (int t = 0; t < 4; t++) {
+            pollers.add(Thread.ofPlatform().name("mark-poller-" + t).start(() -> {
+                while (!done.get()) {
+                    for (WriteMark mark : marks) {
+                        mark.completion();
+                    }
+                }
+            }));
+        }
+        try {
+            release.countDown();
+            for (WriteMark mark : marks) {
+                mark.completion().get(10, TimeUnit.SECONDS);
+            }
+            Await.untilTrue("callbacks das marcas", WAIT, () -> order.size() == marks.size());
+        } finally {
+            done.set(true);
+            for (Thread poller : pollers) {
+                poller.join(5_000L);
+            }
+        }
+        assertEquals(List.of(), foreignThreads, "callbacks rodam na thread interna de conclusão das marcas");
+        assertEquals(marks.stream().map(WriteMark::id).toList(), order);
     }
 
     @Test

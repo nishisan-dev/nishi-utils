@@ -1839,6 +1839,14 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
         private final AtomicLong remaining = new AtomicLong(1L);
         private final CompletableFuture<WriteMarkResult> future = new CompletableFuture<>();
         private final Lock stateLock = new ReentrantLock();
+        /**
+         * Futures entregues por {@link #completion()} antes da conclusão, sob {@link #stateLock}. Só quem conclui a
+         * marca as completa, em ordem e na própria thread: um {@code future.copy()} deixaria uma thread que chama
+         * {@code completion()} durante a conclusão executar os callbacks já registrados nesta marca (o
+         * {@code postComplete} do {@code CompletableFuture} é cooperativo), enquanto a thread de conclusão já
+         * conclui a marca seguinte — callbacks de marcas diferentes sairiam fora de ordem.
+         */
+        private final List<CompletableFuture<WriteMarkResult>> dependents = new ArrayList<>();
         private long samplesFailed;
         private final Map<SeriesStatus, Long> failuresByStatus = new LinkedHashMap<>();
         private final Set<String> failedSeries = new LinkedHashSet<>();
@@ -1882,25 +1890,60 @@ public final class WriteDispatcher implements WriteBuffer, Closeable {
 
         void complete() {
             WriteMarkResult built;
+            List<CompletableFuture<WriteMarkResult>> pending;
             stateLock.lock();
             try {
                 built = new WriteMarkResult(id, samplesAdmitted, samplesFailed, failuresByStatus,
                         List.copyOf(failedSeries), failedSeriesTruncated);
+                result = built;
+                future.complete(built);
+                pending = takeDependents();
             } finally {
                 stateLock.unlock();
             }
-            result = built;
-            future.complete(built);
+            for (CompletableFuture<WriteMarkResult> dependent : pending) {
+                dependent.complete(built);
+            }
         }
 
         void fail(NgrrdClusterException failure) {
-            future.completeExceptionally(failure);
+            List<CompletableFuture<WriteMarkResult>> pending;
+            stateLock.lock();
+            try {
+                future.completeExceptionally(failure);
+                pending = takeDependents();
+            } finally {
+                stateLock.unlock();
+            }
+            for (CompletableFuture<WriteMarkResult> dependent : pending) {
+                dependent.completeExceptionally(failure);
+            }
+        }
+
+        /** Chamado sob {@link #stateLock}. */
+        private List<CompletableFuture<WriteMarkResult>> takeDependents() {
+            List<CompletableFuture<WriteMarkResult>> pending = List.copyOf(dependents);
+            dependents.clear();
+            return pending;
         }
 
         @Override public long id() { return id; }
         @Override public boolean isDone() { return future.isDone(); }
         @Override public Optional<WriteMarkResult> result() { return Optional.ofNullable(result); }
-        @Override public CompletableFuture<WriteMarkResult> completion() { return future.copy(); }
+        @Override public CompletableFuture<WriteMarkResult> completion() {
+            stateLock.lock();
+            try {
+                if (!future.isDone()) {
+                    CompletableFuture<WriteMarkResult> dependent = new CompletableFuture<>();
+                    dependents.add(dependent);
+                    return dependent;
+                }
+            } finally {
+                stateLock.unlock();
+            }
+            // Já concluída: a cópia nasce concluída e não toca os dependentes de outras threads.
+            return future.copy();
+        }
         @Override public String toString() { return "WriteMark[" + id + "]"; }
     }
 
