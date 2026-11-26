@@ -230,6 +230,76 @@ class LatencyHistogramTest {
     }
 
     @Test
+    void amostraAtrasadaVaiAoBaldeAnteriorMesmoVazio() {
+        AtomicLong clock = new AtomicLong(11 * MINUTE);
+        LatencyHistogram histogram = new LatencyHistogram(clock::get);
+        // A virada para o minuto 11 acontece antes de qualquer amostra do minuto 10 chegar.
+        histogram.record(1_000_000L);
+
+        clock.set(10 * MINUTE + MINUTE - 1);
+        histogram.record(9_000_000L);
+
+        clock.set(11 * MINUTE + 1);
+        assertEquals(9_000L, histogram.snapshot().recentMaxMicros(), "a amostra atrasada entra no balde anterior");
+        clock.set(12 * MINUTE + 1);
+        assertEquals(1_000L, histogram.snapshot().recentMaxMicros(), "e sai com ele, depois de dois minutos");
+    }
+
+    @Test
+    void relogioRecuandoEIgnoradoNoMaximoRecente() {
+        AtomicLong clock = new AtomicLong(10 * MINUTE);
+        LatencyHistogram histogram = new LatencyHistogram(clock::get);
+        histogram.record(2_000_000L);
+        clock.set(12 * MINUTE);
+        histogram.record(1_000_000L);
+
+        clock.set(9 * MINUTE);
+        histogram.record(50_000_000L);
+
+        clock.set(12 * MINUTE);
+        LatencySnapshot snapshot = histogram.snapshot();
+        assertEquals(1_000L, snapshot.recentMaxMicros(), "amostra de um minuto já fora da janela não entra");
+        assertEquals(50_000L, snapshot.maxMicros(), "o máximo desde a subida continua contando tudo");
+    }
+
+    @Test
+    void viradaDeMinutoConcorrenteNaoPerdeMaximo() throws InterruptedException {
+        int threads = 8;
+        int perThread = 2_000;
+        long step = 1_000L;
+        // Cada leitura do relógio avança 1 µs; a virada do minuto 10 para o 11 cai no meio das gravações.
+        long base = 11 * MINUTE - (long) threads * perThread / 2 * step;
+        AtomicLong ticks = new AtomicLong();
+        LatencyHistogram histogram = new LatencyHistogram(() -> base + ticks.getAndIncrement() * step);
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch start = new CountDownLatch(1);
+        CountDownLatch done = new CountDownLatch(threads);
+        for (int t = 0; t < threads; t++) {
+            pool.execute(() -> {
+                try {
+                    start.await();
+                    // Decrescente: o maior valor de cada thread tende a cair no minuto 10, antes da virada.
+                    for (int i = perThread; i >= 1; i--) {
+                        histogram.record(i * 1_000L);
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    done.countDown();
+                }
+            });
+        }
+        start.countDown();
+        assertTrue(done.await(10, TimeUnit.SECONDS), "gravações concorrentes não terminaram a tempo");
+        pool.shutdown();
+
+        LatencySnapshot snapshot = histogram.snapshot();
+        assertEquals((long) perThread, snapshot.maxMicros());
+        assertEquals(snapshot.maxMicros(), snapshot.recentMaxMicros(),
+                "o máximo do minuto anterior sobrevive à virada concorrente");
+    }
+
+    @Test
     void maximoDesdeSubidaPreservado() {
         AtomicLong clock = new AtomicLong(10 * MINUTE);
         LatencyHistogram histogram = new LatencyHistogram(clock::get);

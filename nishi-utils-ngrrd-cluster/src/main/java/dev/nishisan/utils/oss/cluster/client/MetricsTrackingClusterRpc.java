@@ -24,10 +24,10 @@ import dev.nishisan.utils.oss.cluster.protocol.Commands;
 import dev.nishisan.utils.oss.cluster.rpc.ClusterRpc;
 
 import java.time.Duration;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.LongAdder;
@@ -35,8 +35,9 @@ import java.util.function.Supplier;
 
 /**
  * Decorador de {@link ClusterRpc} que mede, do lado do cliente, a latência de
- * toda chamada síncrona ({@link #call}) e conta quantas foram {@link Commands#PLACE}
- * — alimenta {@code rpcLatency}/{@code placeCount} de {@code ClientMetricsSnapshot}.
+ * toda chamada síncrona ({@link #call}), agregada e por comando, e conta quantas foram
+ * {@link Commands#PLACE} — alimenta {@code rpcLatencyByCommand}, {@code rpcLatency} (obsoleto desde a
+ * 8.15.0) e {@code placeCount} de {@code ClientMetricsSnapshot}.
  *
  * <p>A latência é medida mesmo quando {@link #call} lança exceção (timeout,
  * erro remoto): o tempo gasto esperando uma falha também é sinal útil sobre o
@@ -119,9 +120,12 @@ final class MetricsTrackingClusterRpc implements ClusterRpc {
         return latency.snapshot();
     }
 
-    /** Snapshot da latência de cada comando já chamado, ordenado por nome. */
+    /**
+     * Snapshot da latência de cada comando já chamado, sem ordem definida: o {@code ClientMetricsSnapshot}
+     * guarda uma cópia imutável ({@code Map.copyOf}), que não preserva ordem.
+     */
     Map<String, LatencySnapshot> latencySnapshotByCommand() {
-        Map<String, LatencySnapshot> result = new TreeMap<>();
+        Map<String, LatencySnapshot> result = new HashMap<>();
         byCommand.forEach((command, histogram) -> result.put(command, histogram.snapshot()));
         return result;
     }

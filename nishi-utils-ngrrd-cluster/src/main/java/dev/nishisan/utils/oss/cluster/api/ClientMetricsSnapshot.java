@@ -60,7 +60,7 @@ public record ClientMetricsSnapshot(
         Map<SeriesStatus, Long> retriesByStatus,
         Map<String, Long> bufferedSamples,
         int openHandles,
-        @Deprecated LatencySnapshot rpcLatency,
+        @Deprecated(since = "8.15.0") LatencySnapshot rpcLatency,
         long placeCount,
         long ownerLookups,
         long redirectCycles,

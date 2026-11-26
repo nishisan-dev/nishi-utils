@@ -133,13 +133,17 @@ public final class LatencyHistogram {
                         ? current.current()
                         : Bucket.EMPTY;
                 next = new Window(new Bucket(minute, nanos), previous);
-            } else if (current.previous().minute() == minute) {
-                // Amostra atrasada de um minuto que já virou: atualiza o balde anterior.
+            } else if (current.previous().minute() == minute
+                    || (current.previous().isEmpty() && minute == current.current().minute() - 1)) {
+                // Amostra atrasada de um minuto que já virou: atualiza o balde anterior — também quando ele ainda
+                // está vazio (a virada aconteceu antes de qualquer amostra daquele minuto chegar). Um balde
+                // vazio tem máximo negativo, então a comparação abaixo nunca o descarta.
                 if (current.previous().maxNanos() >= nanos) {
                     return;
                 }
                 next = new Window(current.current(), new Bucket(minute, nanos));
             } else {
+                // Relógio recuou mais de um minuto (ou amostra muito atrasada): ignorada no máximo recente.
                 return;
             }
             if (window.compareAndSet(current, next)) {
