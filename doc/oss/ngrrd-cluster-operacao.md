@@ -1245,8 +1245,8 @@ ngrrd:
   ou no shutdown do coordinator, já faz checkpoint + close no nó. O commit no modo janela das marcas
   ([seção 5.2](ngrrd-cluster.md#52-marcas-de-escrita-8120)) não depende do flush remoto.
 - **Janela de perda.** Uma escrita confirmada pelo dono fica durável no próximo ciclo local,
-  tipicamente em até ~1,8 × `interval`: a pausa entre ciclos mais os ~80% do intervalo que o ciclo
-  leva para espalhar os disparos. Uma série ocupada no disparo (`skippedBusy`), um checkpoint que
+  tipicamente em até ~1,8 × `interval`: a pausa entre ciclos mais a fração `spreadFraction` do intervalo
+  (80% por padrão, desde a 8.15.0 configurável) que o ciclo leva para espalhar os disparos. Uma série ocupada no disparo (`skippedBusy`), um checkpoint que
   falhou ou um ciclo com overrun fica para o ciclo seguinte, e aí a janela passa de ~2,8 × `interval`.
   Um `CLOSE` ou um fechamento por ociosidade antecipa o checkpoint. Escolha o `interval` pela perda
   aceitável num crash abrupto do nó.
@@ -1269,8 +1269,8 @@ ngrrd:
 
 | Métrica (`ngrrd-admin metrics <nodeId>`) | Leitura |
 |---|---|
-| `localCheckpoint.dirtySeries` | Séries com escrita ainda não coberta por checkpoint. Oscila com a ingestão e cai a cada ciclo. Crescer sem parar indica ciclo que não dá conta. |
-| `localCheckpoint.lastCycleMs` / `.lastCycleSeries` | Duração e tamanho do último ciclo. Pela cadência, o normal é ~80% do `interval`. |
+| `localCheckpoint.dirtySeries` | Séries com escrita ainda não coberta por checkpoint. Oscila com a ingestão. Desde a 8.15.0, com o checkpoint local ligado, é um **limite superior atrasado em um ciclo** (tamanho do índice de sujas): uma série limpa só sai na poda seguinte, então o valor não cai a zero entre ciclos. Crescer sem parar indica ciclo que não dá conta. |
+| `localCheckpoint.lastCycleMs` / `.lastCycleSeries` | Duração e tamanho do último ciclo. Pela cadência, o normal é ~`spreadFraction` (80% por padrão) do `interval`. Desde a 8.15.0, `lastCycleSeries` conta **candidatas** (sujas e limpas ainda no índice); `localCheckpoint.lastCycleStarted` traz quantos checkpoints o ciclo de fato enfileirou. |
 | `localCheckpoint.overruns` | Ciclos mais longos que o `interval`, cada um com `NGRRD_LOCAL_CHECKPOINT_OVERRUN` em `WARNING`. Aumente `maxInFlight` se o disco tiver folga, ou o `interval`. |
 | `localCheckpoint.skippedBusy` | Séries puladas porque o lock estava ocupado (escrita ou leitura em curso). Voltam no ciclo seguinte. Um valor alto e constante para as mesmas séries merece investigação. |
 | `localCheckpoint.failures` | Checkpoints que falharam. A série segue suja e entra no próximo ciclo. O log de `WARNING` sai no máximo uma vez por minuto. |
@@ -1279,3 +1279,148 @@ ngrrd:
 
 Volte o coordinator para o flush periódico **antes** de desligar o checkpoint local ou de voltar o
 jar dos nós. O formato em disco não muda.
+
+## Atualização para 8.15.0
+
+A 8.15.0 reúne a liberação de séries entre clientes (`release`), um pool dedicado para o `fsync` do
+checkpoint, o crescimento do shard sem *probing*, o TTL de ociosidade por série e métricas novas para
+enxergar fill, `NOT_OPEN`, exclusões e latência. Referência técnica em
+[`ngrrd-cluster.md`](ngrrd-cluster.md) (seções 5.3, 6.3, 6.5, 6.7 e 10) e em
+[`ngrrd-blob-volume.md`](ngrrd-blob-volume.md) (seções 8, 10.0 e 11).
+
+### O que muda
+
+- **`release` no cliente** (API nova, por chamada, sem chave de YAML): entrega de séries entre
+  clientes. Quem não chama `release` não percebe diferença, a não ser pela correção do vazamento de rotas
+  de escrita (`routes`/`routesRemoved`) e pelo interning de definições (`internedDefinitions`), que não
+  têm botão.
+- **TTL de ociosidade por série (muda o comportamento por padrão).** `ngrrd.handleIdleTtlStepFactor`
+  (padrão `2`) estende o TTL de uma série para `max(handleIdleTtl, 2 × baseStepSec)`. Séries de passo
+  longo (ex.: 900 s com TTL de 15 min) deixam de ser fechadas e reabertas a cada passo e **deixam de ganhar
+  o checkpoint incidental do fechamento por ociosidade**. Se a durabilidade delas dependia disso, ligue o
+  checkpoint local. `0` restaura o TTL global.
+- **Crescimento de shard sem *probing*.** A série sempre vai para o shard calculado pelo hash; o shard
+  cresce em passos de `segmentBytes`. Nada muda em disco. O tempo de cada crescimento é medido
+  (`volume.shardGrow*`).
+- **Pool de force do checkpoint (opt-in).** `ngrrd.checkpoint.threads` tira o `fsync` da fila do writer.
+- **Recuperação de exclusões** com índice de pendentes e backoff (menos carga no líder e fim da
+  inflação de `seriesDelete.ERROR`).
+- **Writer abandonado.** Um force preso por mais de 20 s no fechamento passa a ser tratado como
+  abandono controlado em vez de travar o fechamento (ver abaixo).
+
+### Chaves e padrões
+
+| Chave (YAML do storage node) | Tipo / faixa | Padrão | Efeito do padrão |
+|---|---|---|---|
+| `ngrrd.checkpoint.threads` | inteiro `>= 0` | `0` | force inline no writer, como na 8.14 |
+| `ngrrd.checkpoint.spreadFraction` | número em `(0, 1]` | `0.8` | igual à constante de antes (80% do `interval`) |
+| `ngrrd.handleIdleTtlStepFactor` | inteiro `>= 0` | `2` | **muda** para séries com `baseStepSec > handleIdleTtl / 2`; `0` = TTL global |
+
+```yaml
+ngrrd:
+  handleIdleTtlStepFactor: 2     # 0 volta ao TTL global
+  checkpoint:
+    enabled: true
+    interval: 300s
+    maxInFlight: 8
+    threads: 2                   # 0 = force inline (padrão)
+    spreadFraction: 0.8
+```
+
+Valor inválido falha a subida do nó com o nome da chave. O `ReleaseOptions` do cliente
+(`checkpoint=false`, `closeOnNode=false`, `timeout=closeTimeout`, `maxConcurrentPerNode=32`) é por
+chamada. Nenhuma chave nova no YAML do cliente.
+
+### Ordem de deploy
+
+A atualização é compatível nos dois sentidos: os campos novos de métrica são aditivos (o cliente 8.14.2
+ignora os campos que não conhece; um nó 8.14.2 devolve os novos zerados ou ausentes), nada muda em
+disco e não há comando novo no protocolo. O `release` usa os `CHECKPOINT`/`CLOSE` que já existem.
+
+1. **Storage nodes, um por vez** (rolling), com os padrões. Confira `openHandles` contra
+   `maxOpenHandles` antes: o TTL estendido deixa mais handles abertos.
+2. **Clientes** depois. É a ordem de menor ruído de métrica, não uma exigência.
+3. Só então, se for o caso, ligue `ngrrd.checkpoint.threads` (um nó por vez, com restart gracioso) e
+   passe os consumidores a usar `release`.
+
+### Como ler as métricas novas
+
+| Sinal | Como ler |
+|---|---|
+| `fillDeclared=` no `NGRRD_NODE_STATUS` e `blobStats.fillOfDeclaredCapacity` | `(live + reservado) / capacidade declarada`: a mesma conta da recusa de criação. Pode passar de 1,0 se `capacityBytes` foi reduzido com dados no volume. **`0` significa capacidade desconhecida**, não volume vazio. Alerte sobre este valor, **não** sobre `maxFillRatio` (dente de serra: cai a cada crescimento de shard). |
+| `NGRRD_VOLUME_FILL level=WARN\|CRITICAL\|REFUSING` | Faixas 80/90/95%, emitidas só na mudança (`WARNING` ao subir, `INFO level=NORMAL` na volta, com histerese de 1 ponto). A 95% a criação de séries novas passa a ser recusada. Os limiares não são configuráveis. Ação: aumente a capacidade ou redistribua séries antes de `REFUSING`. |
+| `volume.shardGrows` / `volume.shardGrowMsMax` / `volume.shardGrowMsLast` | Crescimentos de shard e o tempo que cada um **bloqueou todas as criações** do volume (ms truncados). Um máximo de segundos indica disco lento no `setLength`/`fsync`; considere `initialShardCapacityBytes` maior para crescer menos vezes. |
+| `notOpen.restart` | `NOT_OPEN` porque a definição é desconhecida neste processo: reinício do nó ou série nunca aberta ali. Sobe depois de um restart até os clientes reabrirem as séries. |
+| `notOpen.clientClosed` | `CLOSE` explícito de um cliente. O `release` com `closeOnNode=true` conta aqui; o padrão (`false`) evita isso. |
+| `notOpen.migrated` / `notOpen.frozen` | Série recém-migrada para o nó e série congelada pela migração em curso. Esperado durante rebalance. |
+| `notOpen.reopenFailed` | A definição era conhecida mas a reabertura falhou. **É o que merece investigação** (disco, quarentena, objeto sumido). |
+| `handles.idleClosed` / `handles.evicted` / `handles.selfHealed` | Churn de handles. Fechar por ociosidade ou despejar **não** gera `NOT_OPEN`; o custo de um TTL curto aparece aqui (fechar, reabrir pela autocura). `evicted` alto indica `maxOpenHandles` pequeno. |
+| `handles.idleTtlExtended` | Entradas abertas com TTL maior que o global (efeito do `handleIdleTtlStepFactor`). |
+| `handles.writerAbandoned` e `NGRRD_WRITER_ABANDONED` | Writers abandonados com force preso. Qualquer valor acima de 0 é incidente de disco: ver abaixo. |
+| `seriesDelete.requests.<STATUS>` | Respostas devolvidas a pedidos de exclusão de **clientes**. |
+| `seriesDelete.completed` / `.cancelled` | Exclusões concluídas e reservas canceladas, uma por operação. |
+| `seriesDelete.attemptFailed.{NO_LEADER,TIMEOUT,PARTICIPANT,STALE,OTHER}` | Tentativas que falharam, por causa. Cresce com líder instável (`NO_LEADER`), rede ou nó lento (`TIMEOUT`) ou nó participante recusando (`PARTICIPANT`). |
+| `seriesDelete.recoveryAttempts` / `seriesDelete.pending` | Reenvios feitos pela recuperação e exclusões pendentes agora. `pending` sempre > 0 por minutos indica exclusão presa; o líder emite `NGRRD_DELETE_PENDING count=... oldestOperationId=...`. |
+| `seriesDelete.<STATUS>` (sem prefixo) | **Obsoleto** (sai na 9.0): conta tentativas, inclusive as da recuperação. Migre alertas para as chaves acima. |
+| `rpcLatencyByCommand` / `recentMaxMicros` | No cliente, latência por comando. `recentMaxMicros` é o máximo dos últimos 60 a 120 s; use-o para pico recente e o `maxMicros` só como histórico desde a subida. O `rpcLatency` agregado é obsoleto. |
+| `routes` / `routesRemoved` / `internedDefinitions` | No cliente, rotas de escrita ativas, rotas removidas por ociosidade e definições YAML internadas. `routes` deve acompanhar o número de séries com handle gravável aberto; se cresce sem parar com séries rotativas, há handle sem `close`/`release`. |
+
+### Guia de `ngrrd.checkpoint.threads`
+
+- **Quando ligar:** discos em que o `fsync` do checkpoint é lento e segura a fila do writer, e o
+  `ngrrd-writer-pool` inteiro por tabela. Sintomas: `localCheckpoint.forceMsP99`/`.queueWaitMsP99`
+  altos, ou `WRITE_BATCH` e checkpoints remotos com latência alta em horários de checkpoint.
+  `lcQwP99=` e `lcForceP99=` no `NGRRD_NODE_STATUS` mostram os dois.
+- **Valor inicial:** `2` a `4`. O pool é fixo e de fila sem limite (a entrada já é limitada por
+  `maxInFlight` e pela concorrência de RPC); mais threads só ajudam se o dispositivo aguenta
+  `fsync`s em paralelo. Aumente se `queueWaitMsP99` seguir alto com o disco ocioso; reduza se o
+  `forceMsP99` subir junto com as threads (o disco é o gargalo).
+- **Como ler:** `queueWaitMs*` é o tempo do enfileiramento até o início do force (fila FIFO da série,
+  pool de writers, materialização e fila do pool de force) e `forceMs*` é a duração do force. Valores
+  em **ms truncados**: abaixo de 1 ms aparece `0`. Os `*Max` são o **máximo recente** (60 a 120 s).
+  `coalesced` conta checkpoints sem amostra nova, que não fizeram force.
+- **Vale com ou sem `ngrrd.checkpoint.enabled`**: o pool também atende o `CHECKPOINT`/`FLUSH` remoto e a
+  migração. Medem só o checkpoint **local** as métricas `localCheckpoint.*` acima; o checkpoint remoto
+  continua em `checkpointLatency`.
+- **Encerramento:** o pool é parado depois do fechamento do registry. Se forces em voo não terminarem
+  em 5 s, o nó registra `NGRRD_CHECKPOINT_FORCE_POOL ... dropped=N`.
+- **Antes de ligar:** o padrão `0` preserva a 8.14. Ligue num nó, compare `forceMsP99`, a latência
+  de `WRITE_BATCH` e o `lcCycles`, e só então estenda.
+
+### Writer abandonado (force preso)
+
+Se o `fsync` de uma série não terminar em 20 s durante o fechamento do handle (disco travado, NFS
+preso), o writer **não** espera para sempre: ele é abandonado sem o checkpoint final. O nó registra
+`SEVERE` com `NGRRD_WRITER_ABANDONED seriesKey=...`, incrementa `handles.writerAbandoned`, remove a
+série do registry e a **reabre do disco** no próximo acesso.
+
+- **Perda possível:** amostras confirmadas desde o último checkpoint concluído daquela série.
+- **Durabilidade não é confirmada em falso:** o **primeiro `CHECKPOINT`/`FLUSH` remoto** da série depois
+  do abandono é **recusado** (resposta de falha, não `OK`); o seguinte volta ao normal. O cliente
+  deve tratar a falha como checkpoint não confirmado e reenviar o que ainda não tiver como perdido.
+- **Ação:** investigue o dispositivo (`iostat`, `dmesg`, montagem de rede). Qualquer abandono é incidente.
+  As escritas depois dele seguem o fluxo normal.
+
+### Entrega de séries entre clientes (`release`)
+
+Resumo operacional (protocolo completo na [seção 5.3](ngrrd-cluster.md#53-liberação-de-séries-e-entrega-entre-clientes-8150)):
+
+- No callback de revogação de uma partição, **pare de escrever**, chame `release(séries).join()` e só
+  confirme o offset se `allReleased()`.
+- O `timeout` do `release` precisa ser **menor** que o prazo do grupo para o callback.
+- O padrão não faz checkpoint (ACK do dono, sem fsync) nem manda `CLOSE`. Com `checkpoint: true` a
+  garantia é fsync no dono, ao custo de uma RPC por série. O `ngrrd.checkpoint` ligado limita a janela
+  de perda do padrão.
+- **Limite:** sem cerca contra "zumbi" até a 8.16: um cliente que estourou o prazo e segue escrevendo
+  depois da reatribuição disputa a série (vale o último escritor).
+
+### Rollback
+
+- **Nó:** os padrões preservam a 8.14, exceto o TTL. Para voltar a ele sem trocar o jar:
+  `ngrrd.handleIdleTtlStepFactor: 0` (TTL global), `ngrrd.checkpoint.threads: 0` (force inline) e
+  `spreadFraction: 0.8`. Voltar ao jar 8.14.2 também é seguro: o formato em disco não muda. Um nó 8.16
+  volta para a 8.15 com segurança, porque o journal de lifecycle ignora os campos que a 8.16 acrescenta.
+- **Cliente:** voltar ao jar 8.14.2. Quem já chama `release` precisa voltar ao `close()` por handle
+  e ao `flush`/`checkpoint` por série; as métricas novas desaparecem do snapshot.
+- Alertas baseados em `seriesDelete.<STATUS>` ou em `rpcLatency` continuam funcionando na 8.15.x e
+  precisam migrar antes da 9.0.
