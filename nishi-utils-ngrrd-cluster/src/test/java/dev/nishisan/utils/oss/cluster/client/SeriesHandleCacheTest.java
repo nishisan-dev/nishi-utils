@@ -71,9 +71,31 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class SeriesHandleCacheTest {
 
+    private static final String SERIES_KEY = "device:r1/iface:eth0";
+    private static final NodeId OWNER = NodeId.of("storage-a");
+    private static final Duration JOIN_TIMEOUT = Duration.ofSeconds(10);
+    private static final Ngrrd.OpenOptions READ_ONLY = Ngrrd.OpenOptions.defaults().withCreateIfMissing(false);
+
+    private SeriesHandleCache cache;
+    private RecordingClusterRpc rpc;
+    private RecordingWriteBuffer dispatcher;
+    private AtomicInteger opened;
+    /** Fechamento do cliente visto pelos handles abertos por este teste. */
+    private volatile boolean clientClosed;
+
+    @BeforeEach
+    void setUp() {
+        cache = new SeriesHandleCache();
+        rpc = new RecordingClusterRpc(NodeId.of("client-under-test"));
+        rpc.respondDefault((cmd, body) -> Commands.READ_PRESET.equals(cmd)
+                ? new ReadPresetResponse(SeriesStatus.OK, OWNER.value(), Map.of("in_bps", result()), null)
+                : new SeriesStatusResponse(SeriesStatus.OK, OWNER.value(), null, Boolean.TRUE));
+        dispatcher = new RecordingWriteBuffer();
+        opened = new AtomicInteger();
+    }
+
     @Test
     void lockDeAberturaExcluiUmTerceiroQueChegaDepoisDaTroca() throws Exception {
-        SeriesHandleCache cache = new SeriesHandleCache();
         var firstInside = new CountDownLatch(1);
         var firstRelease = new CountDownLatch(1);
         var secondInside = new CountDownLatch(1);
@@ -117,29 +139,6 @@ class SeriesHandleCacheTest {
         assertFalse(thirdEnteredEarly, "o terceiro entrou com o segundo ainda na seção crítica");
         assertEquals(1, maxInside.get());
         assertEquals(0, cache.openLocks(), "o lock sai do mapa com o último usuário");
-    }
-
-    private static final String SERIES_KEY = "device:r1/iface:eth0";
-    private static final NodeId OWNER = NodeId.of("storage-a");
-    private static final Duration JOIN_TIMEOUT = Duration.ofSeconds(10);
-    private static final Ngrrd.OpenOptions READ_ONLY = Ngrrd.OpenOptions.defaults().withCreateIfMissing(false);
-
-    private SeriesHandleCache cache;
-    private RecordingClusterRpc rpc;
-    private RecordingWriteBuffer dispatcher;
-    private AtomicInteger opened;
-    /** Fechamento do cliente visto pelos handles abertos por este teste. */
-    private volatile boolean clientClosed;
-
-    @BeforeEach
-    void setUp() {
-        cache = new SeriesHandleCache();
-        rpc = new RecordingClusterRpc(NodeId.of("client-under-test"));
-        rpc.respondDefault((cmd, body) -> Commands.READ_PRESET.equals(cmd)
-                ? new ReadPresetResponse(SeriesStatus.OK, OWNER.value(), Map.of("in_bps", result()), null)
-                : new SeriesStatusResponse(SeriesStatus.OK, OWNER.value(), null, Boolean.TRUE));
-        dispatcher = new RecordingWriteBuffer();
-        opened = new AtomicInteger();
     }
 
     @Test

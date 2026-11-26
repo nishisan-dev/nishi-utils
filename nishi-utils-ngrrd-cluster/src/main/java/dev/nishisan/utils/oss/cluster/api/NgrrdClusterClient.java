@@ -274,7 +274,9 @@ public interface NgrrdClusterClient extends Closeable {
      *       toa (além de descartar a definição no nó, o que custa um {@code NOT_OPEN} ao cliente que já a abriu). Série
      *       abandonada de vez fecha pela ociosidade do nó.</li>
      *   <li><b>Limpeza local.</b> A rota de escrita sai do cliente quando não houver mais escrita em voo — com a falha
-     *       entregue por este release, sai mesmo com falha —, e o dono em cache da série é esquecido.</li>
+     *       entregue por este release, sai mesmo com falha —, e o dono em cache da série é esquecido. Se outro handle
+     *       gravável deste cliente ainda segura a rota (aberto por fora do release), o release só drena: a rota
+     *       continua, e as escritas desse handle seguem normalmente.</li>
      *   <li><b>{@link ReleaseStatus#TIMED_OUT}.</b> O handle já está fechado e a rota fica sem dono; as escritas
      *       pendentes continuam sendo entregues em segundo plano e a rota sai quando ficar ociosa. Falhas que surgirem
      *       depois vão para a próxima marca ({@code MARKS}) ou ficam na rota ({@code BARRIER}). <b>Não confirme</b> o
@@ -293,8 +295,10 @@ public interface NgrrdClusterClient extends Closeable {
      * chamada de {@code release} (o limite não é global: releases simultâneos somam). Sem {@code checkpoint} nem
      * {@code closeOnNode}, o custo é só local (dreno e limpeza), sem RPC por série. A espera pelo lock de abertura de uma
      * chave fica fora do prazo: ela só acontece se um {@link #open} da mesma chave estiver em curso neste cliente (o
-     * {@code OPEN} remoto roda sob esse lock, limitado pelo {@code retryTimeout}), o que o protocolo de entrega abaixo
-     * não prevê — quem libera parou de usar as séries, e quem as assume é outro cliente.</p>
+     * {@code OPEN} remoto roda sob esse lock, limitado pelo {@link NgrrdClusterConfig#retryTimeout()}, de 5 min por
+     * padrão), o que o protocolo de entrega abaixo não prevê — quem libera parou de usar as séries, e quem as assume é
+     * outro cliente. Se acontecer, essa espera pode estourar o prazo do grupo de consumo para o callback de revogação:
+     * não abra no mesmo cliente as séries que estão sendo liberadas.</p>
      *
      * <p><b>Protocolo de entrega entre clientes</b> (consumidores particionados, com séries particionadas de forma
      * disjunta entre clientes): o cliente que perde a partição P para de chamar {@code write} nas séries de P, chama
