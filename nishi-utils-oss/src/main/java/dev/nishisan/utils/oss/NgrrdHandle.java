@@ -87,8 +87,9 @@ public interface NgrrdHandle extends AutoCloseable {
      * <p>A future conclui com sucesso quando o checkpoint termina (ou é um no-op de
      * idle-skip) e falha com a mesma exceção que {@link #checkpoint()} lançaria.
      * Handle já fechado: future concluída com sucesso, como {@link #checkpoint()}.
-     * Callbacks encadeados nela podem rodar na thread do writer: devem ser curtos e
-     * nunca bloquear.</p>
+     * Callbacks encadeados nela podem rodar na thread do writer ou, com executor de
+     * force configurado ({@code NgrrdBlob.Builder.checkpointForceExecutor}), na thread
+     * desse executor: devem ser curtos e nunca bloquear.</p>
      *
      * <p>O padrão desta interface executa {@link #checkpoint()} de forma síncrona na
      * thread chamadora e devolve a future já concluída (ou falha com a exceção):
@@ -113,7 +114,9 @@ public interface NgrrdHandle extends AutoCloseable {
      * <p>O padrão desta interface não mede nada: devolve {@link CheckpointTiming#NONE}
      * quando {@link #checkpointAsync()} conclui (e falha como ela). O handle local
      * devolvido por {@link Ngrrd} sobrescreve com a medida real. Callbacks encadeados
-     * na future seguem a mesma regra de {@link #checkpointAsync()}.</p>
+     * na future podem rodar na thread do writer ou na thread do executor de force
+     * ({@code NgrrdBlob.Builder.checkpointForceExecutor}): devem ser curtos e nunca
+     * bloquear.</p>
      *
      * @return future com os tempos, concluída quando o checkpoint termina
      */

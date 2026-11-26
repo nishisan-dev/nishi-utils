@@ -79,8 +79,16 @@ import java.util.function.LongSupplier;
  */
 public final class NgrrdWriter implements AutoCloseable {
 
-    /** Teto da espera, no fechamento, pelos forces destacados ainda em voo. */
-    private static final long SHUTDOWN_FORCE_WAIT_SECONDS = 30;
+    /** Teto da espera do {@link #close()}/{@link #closeForDeletion()} pelo fim da worker. */
+    private static final long STOP_TIMEOUT_SECONDS = 30;
+
+    /**
+     * Teto da espera, no Shutdown, pelos forces destacados ainda em voo. Fica abaixo de
+     * {@link #STOP_TIMEOUT_SECONDS}: quando ele estoura, a worker encerra sem tocar na
+     * região (ver {@code awaitPendingForces}) antes de o {@code close()} desistir de
+     * esperá-la, e nada é escrito depois de o {@code close()} voltar.
+     */
+    private static final long SHUTDOWN_FORCE_WAIT_SECONDS = 20;
 
     private final NgrrdDefinition definition;
     private final String seriesKey;
@@ -119,6 +127,8 @@ public final class NgrrdWriter implements AutoCloseable {
     // Todos os forces destacados ainda não confirmados por ForceDone, para o Shutdown esperar
     // (um ForceDone novo limpa inFlightForce antes de um force antigo terminar). Só na worker.
     private final List<CompletableFuture<Void>> pendingForces = new ArrayList<>();
+    // Teto efetivo da espera do Shutdown pelos forces em voo. Só os testes do pacote o reduzem.
+    private long shutdownForceWaitNanos = TimeUnit.SECONDS.toNanos(SHUTDOWN_FORCE_WAIT_SECONDS);
 
     private final WriterScheduler scheduler;
     private final LinkedBlockingQueue<Command> queue = new LinkedBlockingQueue<>();
@@ -472,7 +482,7 @@ public final class NgrrdWriter implements AutoCloseable {
             }
         }
         try {
-            if (!shutdownComplete.await(30, TimeUnit.SECONDS)) {
+            if (!shutdownComplete.await(STOP_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
                 throw new IllegalStateException("writer shutdown timed out");
             }
         } catch (InterruptedException e) {
@@ -558,11 +568,19 @@ public final class NgrrdWriter implements AutoCloseable {
                     // falhar os Syncs órfãos. RuntimeException segue só logada; Error é relançado
                     // depois de concluir as futures e liberar o close(), como antes.
                     Throwable finalFailure = null;
+                    boolean forceStuck = false;
                     try {
                         // O prepareForce já limpou a marca de sujo do canal: o force do close não
                         // cobriria um force destacado ainda em voo. Espera-o antes de fechar.
-                        awaitPendingForces();
-                        if (s.checkpoint()) {
+                        forceStuck = !awaitPendingForces();
+                        if (forceStuck) {
+                            // Force preso: encerra sem rematerializar nem forçar a região. A série
+                            // fica como está, não confirmada; o próximo open começa com
+                            // changedSinceForce = true e o primeiro checkpoint dele força de novo.
+                            finalFailure = new IllegalStateException("force em voo de " + storageKey
+                                    + " não terminou em " + SHUTDOWN_FORCE_WAIT_SECONDS
+                                    + " s; writer encerrado sem checkpoint final");
+                        } else if (s.checkpoint()) {
                             throwIfWriteFailed();
                             checkpointAndForce();
                         }
@@ -571,9 +589,13 @@ public final class NgrrdWriter implements AutoCloseable {
                         System.err.println("ngrrd-writer: falha no checkpoint final: " + e);
                     } finally {
                         try {
-                            closeChannelQuietly();
+                            // Com force preso, o canal não é fechado: o close() de um canal que
+                            // destaca o force só força a região, e travaria como o force em voo.
+                            if (!forceStuck) {
+                                closeChannelQuietly();
+                            }
                         } finally {
-                            if (!s.checkpoint()) {
+                            if (!s.checkpoint() && !forceStuck) {
                                 orphanedSyncFailure = new IllegalStateException(
                                         "Writer encerrado sem checkpoint final (closeForDeletion)");
                             } else if (finalFailure != null) {
@@ -1009,32 +1031,49 @@ public final class NgrrdWriter implements AutoCloseable {
 
     /**
      * No Shutdown, espera os forces destacados em voo, com teto de
-     * {@value #SHUTDOWN_FORCE_WAIT_SECONDS} s. É o único ponto em que a worker bloqueia
-     * num force do executor. Se algum falhou (ou estourou o teto), marca
-     * {@code changedSinceForce}: o checkpoint final rematerializa a série, o que suja o
-     * canal de novo, e força inline.
+     * {@value #SHUTDOWN_FORCE_WAIT_SECONDS} s (abaixo do {@value #STOP_TIMEOUT_SECONDS} s do
+     * {@code close()}). É o único ponto em que a worker bloqueia num force do executor.
+     * Se algum falhou, marca {@code changedSinceForce}: o checkpoint final rematerializa a
+     * série, o que suja o canal de novo, e força inline. Se o teto estourar (ou a espera for
+     * interrompida), loga {@code SEVERE} e devolve {@code false}: o Shutdown encerra sem
+     * escrever nem forçar a região.
+     *
+     * @return {@code false} se algum force continuou em voo depois do teto
      */
-    private void awaitPendingForces() {
+    private boolean awaitPendingForces() {
         if (pendingForces.isEmpty()) {
-            return;
+            return true;
         }
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(SHUTDOWN_FORCE_WAIT_SECONDS);
+        long deadline = System.nanoTime() + shutdownForceWaitNanos;
+        boolean completed = true;
         for (CompletableFuture<Void> force : pendingForces) {
             try {
                 force.get(Math.max(0L, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
             } catch (ExecutionException e) {
                 changedSinceForce = true;
             } catch (TimeoutException e) {
-                changedSinceForce = true;
-                System.err.println("ngrrd-writer: SEVERE: force em voo de " + storageKey + " não terminou em "
-                        + SHUTDOWN_FORCE_WAIT_SECONDS + " s; o fechamento força inline");
+                completed = false;
+                break;
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                changedSinceForce = true;
+                completed = false;
+                break;
             }
+        }
+        if (!completed) {
+            changedSinceForce = true;
+            System.err.println("ngrrd-writer: SEVERE: force em voo de " + storageKey + " não terminou em "
+                    + TimeUnit.NANOSECONDS.toMillis(shutdownForceWaitNanos) + " ms; writer encerrado sem "
+                    + "checkpoint final, a série fica pendente de force no próximo open");
         }
         pendingForces.clear();
         inFlightForce = null;
+        return completed;
+    }
+
+    /** Reduz o teto da espera do Shutdown pelos forces em voo. Só para testes deste pacote. */
+    void shutdownForceWaitForTests(long nanos) {
+        this.shutdownForceWaitNanos = nanos;
     }
 
     private static Throwable unwrap(Throwable failure) {

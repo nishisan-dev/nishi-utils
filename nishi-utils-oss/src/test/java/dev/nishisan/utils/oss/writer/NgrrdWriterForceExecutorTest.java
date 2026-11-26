@@ -33,6 +33,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -338,6 +339,94 @@ class NgrrdWriterForceExecutorTest {
         String closingThread = storage.forceThreads.get(storage.forceThreads.size() - 2);
         assertTrue(closingThread.startsWith("ngrrd-writer-pool-"), "force inline na worker: " + closingThread);
         assertArrayEquals(storage.image(), storage.durable(), "nada se perde com o force falho no close");
+    }
+
+    @Test
+    void forcePresoNoFechamentoEncerraSemEscreverNaRegiao() throws Exception {
+        SpyStorage storage = new SpyStorage(true);
+        NgrrdWriter w = writer(storage, forcePool(1), null);
+        w.shutdownForceWaitForTests(TimeUnit.MILLISECONDS.toNanos(300));
+        CountDownLatch gate = storage.gateNextTicket(); // force que não termina durante o close()
+        try {
+            w.write("in_octets", new Sample(START_MS, 1_000_000L));
+            CompletableFuture<Void> checkpoint = w.checkpointAsync();
+            storage.awaitTicketStarted(); // fase A feita; nada mais na fila do writer
+            int beforeClose = storage.log.size();
+
+            long started = System.nanoTime();
+            assertDoesNotThrow(w::close, "o close() volta dentro do próprio teto");
+            assertTrue(TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - started) < 10);
+            assertFalse(checkpoint.isDone(), "o force continua em voo");
+            // Antes, o timeout remarcava a série e o checkpoint final a rematerializava e forçava.
+            assertEquals(List.of(), List.copyOf(storage.log.subList(beforeClose, storage.log.size())),
+                    "com o force preso, o fechamento não escreve, não força nem fecha o canal");
+
+            gate.countDown();
+            assertDoesNotThrow(() -> checkpoint.get(10, TimeUnit.SECONDS));
+            Thread.sleep(200); // ForceDone tardio: ignorado depois do Shutdown
+            List<String> afterClose = List.copyOf(storage.log.subList(beforeClose, storage.log.size()));
+            assertTrue(afterClose.stream().noneMatch(c -> c.startsWith("write:") || c.equals("force")
+                    || c.equals("close")), "nada tocou a região depois de o close() voltar: " + afterClose);
+        } finally {
+            gate.countDown();
+        }
+        ExecutionException orphan = assertThrows(ExecutionException.class,
+                () -> reopenAndCheckpoint(w).get(10, TimeUnit.SECONDS),
+                "sem checkpoint final, um Sync órfão falha em vez de confirmar a série");
+        assertInstanceOf(IllegalStateException.class, orphan.getCause());
+    }
+
+    @Test
+    void executorQueRecusaRodaFaseBInline() throws Exception {
+        SpyStorage storage = new SpyStorage(true);
+        Executor rejecting = task -> {
+            throw new RejectedExecutionException("pool encerrado");
+        };
+        try (NgrrdWriter w = writer(storage, rejecting, null)) {
+            w.write("in_octets", new Sample(START_MS, 1_000_000L));
+            storage.failNextTicket();
+            ExecutionException failure = assertThrows(ExecutionException.class,
+                    () -> w.checkpointAsync().get(10, TimeUnit.SECONDS));
+            assertInstanceOf(NgrrdStorageException.class, failure.getCause(), "a falha do force vai ao chamador");
+            assertTrue(storage.ticketThreads.get(0).startsWith("ngrrd-writer-pool-"),
+                    "recusado pelo executor, o ticket roda inline na worker: " + storage.ticketThreads);
+
+            // Barreira: o ForceDone foi enfileirado pela worker antes de ela processar este Sync,
+            // então o próximo já o encontra processado (pode encadear na falha ou forçar).
+            w.checkpointAsync().handle((ignored, e) -> null).get(10, TimeUnit.SECONDS);
+            assertDoesNotThrow(() -> w.checkpointAsync().get(10, TimeUnit.SECONDS));
+            assertTrue(storage.ticketThreads.size() >= 2, "o Sync seguinte forçou de novo");
+            assertTrue(storage.ticketThreads.stream().allMatch(n -> n.startsWith("ngrrd-writer-pool-")));
+            assertArrayEquals(storage.image(), storage.durable(), "o Sync seguinte deixou a imagem durável");
+        }
+    }
+
+    @Test
+    void closeForDeletionEsperaForceEmVoo() throws Exception {
+        SpyStorage storage = new SpyStorage(true);
+        NgrrdWriter w = writer(storage, forcePool(1), null);
+        CountDownLatch gate = storage.gateNextTicket();
+        w.write("in_octets", new Sample(START_MS, 1_000_000L));
+        CompletableFuture<Void> checkpoint = w.checkpointAsync();
+        storage.awaitTicketStarted();
+
+        CompletableFuture<Void> deleting = CompletableFuture.runAsync(w::closeForDeletion);
+        assertThrows(TimeoutException.class, () -> deleting.get(300, TimeUnit.MILLISECONDS),
+                "o closeForDeletion() não pode voltar com o force em voo sobre a região");
+        gate.countDown();
+        assertDoesNotThrow(() -> deleting.get(10, TimeUnit.SECONDS));
+        assertDoesNotThrow(() -> checkpoint.get(10, TimeUnit.SECONDS));
+        int forced = storage.log.indexOf("ticket.done");
+        assertTrue(forced >= 0 && forced < storage.log.indexOf("close"),
+                "o force terminou antes de o canal fechar: " + storage.log);
+    }
+
+    /** Reabre a flag {@code closed} e enfileira um Sync, como na corrida entre a checagem e o Shutdown. */
+    private static CompletableFuture<Void> reopenAndCheckpoint(NgrrdWriter w) throws ReflectiveOperationException {
+        java.lang.reflect.Field closed = NgrrdWriter.class.getDeclaredField("closed");
+        closed.setAccessible(true);
+        closed.setBoolean(w, false);
+        return w.checkpointAsync();
     }
 
     @Test
