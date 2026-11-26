@@ -1240,7 +1240,7 @@ ngrrd:
 ### Com o checkpoint local ligado
 
 - **Desligue o flush periódico remoto no coordinator.** Com o checkpoint local cuidando da
-  durabilidade, o `flush()`/`checkpoint()` periódico por série da aplicação (no tems, o `flushMode`)
+  durabilidade, o `flush()`/`checkpoint()` periódico por série da aplicação (o modo de flush periódico, nas aplicações clientes)
   só gera RPC. Use `flushMode onShutdown`: o `CLOSE` remoto de cada série, no desalojamento do cache
   ou no shutdown do coordinator, já faz checkpoint + close no nó. O commit no modo janela das marcas
   ([seção 5.2](ngrrd-cluster.md#52-marcas-de-escrita-8120)) não depende do flush remoto.
@@ -1304,9 +1304,11 @@ enxergar fill, `NOT_OPEN`, exclusões e latência. Referência técnica em
   (`volume.shardGrow*`).
 - **Pool de force do checkpoint (opt-in).** `ngrrd.checkpoint.threads` tira o `fsync` da fila do writer.
 - **Recuperação de exclusões** com índice de pendentes e backoff (menos carga no líder e fim da
-  inflação de `seriesDelete.ERROR`).
-- **Writer abandonado.** Um force preso por mais de 20 s no fechamento passa a ser tratado como
-  abandono controlado em vez de travar o fechamento (ver abaixo).
+  inflação de `seriesDelete.ERROR`). O reenvio do participante é limitado por geração, e as entradas
+  `FINISHED` já resolvidas não leem o catálogo a cada ciclo (reconferência a cada ~10 a 12 min).
+- **Writer abandonado.** Um force preso no fechamento passa a ser tratado como abandono controlado em
+  vez de travar o fechamento: a espera pelo checkpoint prévio e o `close()` do writer têm 20 s cada (pior
+  caso ~40 s por série presa), ver abaixo.
 
 ### Chaves e padrões
 
@@ -1357,6 +1359,7 @@ disco e não há comando novo no protocolo. O `release` usa os `CHECKPOINT`/`CLO
 | `handles.idleClosed` / `handles.evicted` / `handles.selfHealed` | Churn de handles. Fechar por ociosidade ou despejar **não** gera `NOT_OPEN`; o custo de um TTL curto aparece aqui (fechar, reabrir pela autocura). `evicted` alto indica `maxOpenHandles` pequeno. |
 | `handles.idleTtlExtended` | Entradas abertas com TTL maior que o global (efeito do `handleIdleTtlStepFactor`). |
 | `handles.writerAbandoned` e `NGRRD_WRITER_ABANDONED` | Writers abandonados com force preso. Qualquer valor acima de 0 é incidente de disco: ver abaixo. |
+| `handles.abandonedCheckpointRejected` | `CHECKPOINT`/`FLUSH` remotos recusados por serem o primeiro da série depois de um abandono (no cliente, `REMOTE_ERROR`, sem retentativa). No máximo um por abandono; vale 0 sem `handles.writerAbandoned`. |
 | `seriesDelete.requests.<STATUS>` | Respostas devolvidas a pedidos de exclusão de **clientes**. |
 | `seriesDelete.completed` / `.cancelled` | Exclusões concluídas e reservas canceladas, uma por operação. |
 | `seriesDelete.attemptFailed.{NO_LEADER,TIMEOUT,PARTICIPANT,STALE,OTHER}` | Tentativas que falharam, por causa. Cresce com líder instável (`NO_LEADER`), rede ou nó lento (`TIMEOUT`) ou nó participante recusando (`PARTICIPANT`). |
@@ -1389,15 +1392,27 @@ disco e não há comando novo no protocolo. O `release` usa os `CHECKPOINT`/`CLO
 
 ### Writer abandonado (force preso)
 
-Se o `fsync` de uma série não terminar em 20 s durante o fechamento do handle (disco travado, NFS
-preso), o writer **não** espera para sempre: ele é abandonado sem o checkpoint final. O nó registra
-`SEVERE` com `NGRRD_WRITER_ABANDONED seriesKey=...`, incrementa `handles.writerAbandoned`, remove a
-série do registry e a **reabre do disco** no próximo acesso.
+Se o `fsync` de uma série não terminar durante o fechamento do handle (disco travado, NFS preso), o
+writer **não** espera para sempre. O fechamento do registry (ociosidade, despejo, migração, `CLOSE`
+remoto, shutdown) espera o checkpoint prévio por no máximo 20 s e segue para o `close()` do writer, que
+tem teto próprio de 20 s: **pior caso ~40 s por série presa**, com o lock da série tomado (operações da
+mesma série esperam). Depois disso o writer é abandonado sem o checkpoint final. O nó registra `SEVERE`
+com `NGRRD_WRITER_ABANDONED seriesKey=...`, incrementa `handles.writerAbandoned`, remove a série do
+registry e a **reabre do disco** no próximo acesso.
 
 - **Perda possível:** amostras confirmadas desde o último checkpoint concluído daquela série.
 - **Durabilidade não é confirmada em falso:** o **primeiro `CHECKPOINT`/`FLUSH` remoto** da série depois
-  do abandono é **recusado** (resposta de falha, não `OK`); o seguinte volta ao normal. O cliente
-  deve tratar a falha como checkpoint não confirmado e reenviar o que ainda não tiver como perdido.
+  do abandono é **recusado** (status `ERROR` no nó; no cliente, `REMOTE_ERROR`, **sem retentativa**) e
+  conta em `handles.abandonedCheckpointRejected`; o seguinte volta ao normal. A marca sai no primeiro
+  `CHECKPOINT`/`FLUSH`, na exclusão da série ou por despejo do LRU (65.536 chaves) e sobrevive a `CLOSE` e
+  à reabertura. O cliente deve tratar a falha como checkpoint não confirmado e reenviar o que ainda não
+  tiver como perdido.
+- **Logs de falha de fechamento.** Falhas comuns (que não são abandono) saem em `WARNING` agrupado nas
+  varreduras do registry (ociosidade, despejo, `close()`): no máximo um a cada 10 s, com a contagem de
+  suprimidas; em `discard` e migração o `WARNING` é direto. Uma série cujo fechamento falhou só é
+  tentada de novo pelas varreduras depois de 60 s.
+- **Migração.** O checkpoint de corte e o snapshot da cópia online também têm prazo de 20 s; estourado, a
+  migração falha e é refeita depois.
 - **Ação:** investigue o dispositivo (`iostat`, `dmesg`, montagem de rede). Qualquer abandono é incidente.
   As escritas depois dele seguem o fluxo normal.
 
@@ -1409,8 +1424,15 @@ Resumo operacional (protocolo completo na [seção 5.3](ngrrd-cluster.md#53-libe
   confirme o offset se `allReleased()`.
 - O `timeout` do `release` precisa ser **menor** que o prazo do grupo para o callback.
 - O padrão não faz checkpoint (ACK do dono, sem fsync) nem manda `CLOSE`. Com `checkpoint: true` a
-  garantia é fsync no dono, ao custo de uma RPC por série. O `ngrrd.checkpoint` ligado limita a janela
-  de perda do padrão.
+  garantia é fsync no dono, ao custo de uma RPC por série. O `ngrrd.checkpoint` limita a janela de
+  perda do padrão **só se estiver ligado no nó** (vem desligado).
+- Marcas criadas depois do início do release não colhem as falhas da série liberada; só uma marca aberta
+  antes pode tê-las colhido, e então elas não aparecem no `ReleaseResult`. Se outro handle gravável do
+  mesmo cliente segura a rota da série, o release só drena (não a aposenta nem fecha o handle alheio).
+- `CHECKPOINT_FAILED` com `errorCode` `CLOSED` significa checkpoint **não executado** (sem handle gravável
+  deste release): não confirme o progresso.
+- `maxConcurrentPerNode` vale por chamada de `release`; a espera pelo lock de abertura de um `open()`
+  concorrente da mesma chave fica fora do `timeout`.
 - **Limite:** sem cerca contra "zumbi" até a 8.16: um cliente que estourou o prazo e segue escrevendo
   depois da reatribuição disputa a série (vale o último escritor).
 

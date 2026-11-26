@@ -444,10 +444,10 @@ else { log.warn("não entregues: {}", r.notReleased()); }
 
 | Status | Significado | Pode confirmar o progresso? |
 |---|---|---|
-| `RELEASED` | toda escrita admitida antes do release teve `OK` final do dono (e o `CHECKPOINT` confirmou, se pedido) | sim |
+| `RELEASED` | toda escrita admitida antes do release teve `OK` final do dono, sem falha ainda não reportada (e o `CHECKPOINT` confirmou, se pedido) | sim |
 | `NOT_HELD` | o cliente não tinha handle nem rota de escrita da série | sim |
 | `WRITE_FAILURES` | drenou, mas há escritas anteriores com falha final ainda não reportadas a uma marca; elas vêm em `failedSamplesByStatus` e não vão mais a nenhuma marca | não |
-| `CHECKPOINT_FAILED` | as escritas tiveram `OK`, mas o `CHECKPOINT` pedido falhou ou estourou o prazo | não |
+| `CHECKPOINT_FAILED` | as escritas tiveram `OK`, mas o `CHECKPOINT` pedido falhou, estourou o prazo ou **não foi executado**: as escritas vieram de um handle que já estava fechando quando o release começou, e não há handle gravável deste release para mandar o `CHECKPOINT` (`errorCode` `CLOSED`) | não |
 | `TIMED_OUT` | o dreno não terminou no prazo (`errorCode` `TIMEOUT`) | não |
 | `SERIES_DELETED` | a geração foi removida ou posta em quarentena durante o release | não |
 
@@ -456,11 +456,18 @@ else { log.warn("não entregues: {}", r.notReleased()); }
 1. **Admissão encerrada.** Sob o lock de abertura da chave (o mesmo do `open`), o handle sai do cache
    e é fechado localmente, e a rota de escrita é aposentada com a fronteira fotografada (tudo o que
    foi admitido até ali). Um `write` concorrente no handle liberado lança `CLOSED`: **pare de escrever
-   nas séries antes de chamar o `release`**. Um `open` concorrente espera esse lock; um `open`
-   posterior cria um handle novo.
+   nas séries antes de chamar o `release`**. Um `open` concorrente espera esse lock, de modo que nenhuma
+   escrita dele entra na fronteira; um `open` posterior cria um handle novo. A rota só é aposentada se o
+   handle liberado for o único a segurá-la. Se **outro handle gravável do mesmo cliente** (aberto por
+   fora do release) também a segura, o release **só drena**: a rota segue viva e o handle alheio não é
+   fechado nem impedido de escrever. O status é o do dreno (`RELEASED` ou `WRITE_FAILURES`), e o que
+   esse outro handle escrever depois da fronteira não é coberto pelo release.
 2. **Dreno.** Espera a resposta final de toda escrita até a fronteira, sem lançar. No modo `marks`
-   (seção 5.2), as falhas ainda não reportadas a uma marca até a fronteira são entregues no resultado:
-   **cada falha é reportada uma única vez**, a uma marca ou a um release. No modo `barrier`, a
+   (seção 5.2), as falhas até a fronteira que ainda não foram reportadas a uma marca são entregues no
+   resultado e não vão mais a nenhuma marca. Marcas criadas **depois do início do release** não colhem as
+   falhas da série liberada até a fronteira: elas são do release. Só uma marca aberta **antes** do release
+   pode tê-las colhido; as que ela colheu foram reportadas por ela e **não aparecem** no `ReleaseResult`.
+   Cada falha é reportada uma única vez, a uma marca ou ao release. No modo `barrier`, a
    primeira falha da série, se estiver até a fronteira, vira `WRITE_FAILURES`, e
    `failedSamplesByStatus` fica vazio.
 3. **Checkpoint opcional**, só nas séries sem falha de escrita.
@@ -477,9 +484,15 @@ else { log.warn("não entregues: {}", r.notReleased()); }
 
 **Durabilidade.** Sem `checkpoint`, `RELEASED` tem a mesma garantia de uma marca de escrita: **ACK do
 dono, sem fsync**. Uma queda abrupta do nó logo depois pode perder as últimas amostras; o checkpoint
-local periódico do nó (seção 6.7) só limita essa janela quando `ngrrd.checkpoint` está ligado. Com
-`checkpoint: true`, a garantia é **fsync confirmado no dono**, ao custo de uma RPC por série. Sem
+local periódico do nó (seção 6.7) só limita essa janela quando `ngrrd.checkpoint` está ligado no nó
+(desligado por padrão); sem ele, a janela não tem esse limite. Com `checkpoint: true`, a garantia é **fsync confirmado no dono**, ao custo de uma RPC por série. Sem
 `checkpoint` nem `closeOnNode`, o custo do release é só local (dreno e limpeza), sem RPC por série.
+
+**Prazo e concorrência.** O `timeout` vale para dreno, checkpoint e `CLOSE`, mas **não** inclui a espera
+pelo lock de abertura da chave: ela só acontece se um `open()` da mesma chave estiver em curso neste
+cliente (o `OPEN` remoto roda sob esse lock, limitado pelo `retryTimeout`), o que o protocolo de entrega
+abaixo não prevê. O `maxConcurrentPerNode` vale **por chamada** de `release`, não por cliente: releases
+simultâneos somam seus tetos.
 
 **Protocolo de entrega entre clientes** (cliente A perde a partição P; cliente B a ganha):
 
@@ -677,14 +690,36 @@ conjuntos limitados a 65.536 chaves cada: acima disso a classificação cai em `
 aproximada.
 
 **Writer abandonado.** O `close()` de um handle com force preso além do teto do writer
-(`WriterAbandonedException`, ver [blob volume §10.0](ngrrd-blob-volume.md)) não trava o registry:
-o fechamento do registry (ociosidade, despejo, migração, shutdown) tem prazo próprio. A série é então
-tratada como **abandonada**: o nó registra `SEVERE` com o marcador `NGRRD_WRITER_ABANDONED seriesKey=...`,
-incrementa `handles.writerAbandoned`, remove a entrada do registry e reabre a série do disco no
-próximo acesso. As amostras confirmadas desde o último checkpoint concluído podem ter sido perdidas.
-Por isso, o **primeiro `CHECKPOINT`/`FLUSH` remoto da série depois do abandono é recusado** (resposta de
-falha, não `OK`), para o cliente não receber uma confirmação de durabilidade falsa; o checkpoint
-seguinte volta ao normal. Escritas depois do abandono seguem o fluxo normal (reabrem a série). Toda operação passa por
+(`WriterAbandonedException`, ver [blob volume §10.0](ngrrd-blob-volume.md)) não trava o registry.
+O fechamento do registry (ociosidade, despejo, migração, `CLOSE` remoto, shutdown) segura o lock da série
+e tem dois tetos em sequência: espera o checkpoint prévio por no máximo `CLOSE_CHECKPOINT_WAIT` (20 s) e,
+estourado ele (ou se o checkpoint falhar), segue para o `close()` do handle, que tem o teto próprio do writer
+(20 s). **Pior caso: cerca de 40 s por série presa**, com o lock da série tomado. Se o force continuar
+preso, a série é tratada como **abandonada**: o nó registra `SEVERE` com o marcador
+`NGRRD_WRITER_ABANDONED seriesKey=...`, incrementa `handles.writerAbandoned`, remove a entrada do registry
+e reabre a série do disco no próximo acesso. As amostras confirmadas desde o último checkpoint concluído
+podem ter sido perdidas.
+
+Por isso, o **primeiro `CHECKPOINT`/`FLUSH` remoto da série depois do abandono é recusado**: o nó responde
+com status `ERROR` (no cliente vira `REMOTE_ERROR`, **sem retentativa**) e conta
+`handles.abandonedCheckpointRejected`, para o cliente não receber uma confirmação de durabilidade falsa;
+o checkpoint seguinte volta ao normal. A marca de abandono sai no primeiro `CHECKPOINT`/`FLUSH`, na
+exclusão da série ou por despejo do LRU (65.536 chaves; acima disso a mais antiga sai e o checkpoint
+seguinte responde normalmente), e **sobrevive a `CLOSE` e à reabertura** da série. Escritas depois do
+abandono seguem o fluxo normal (reabrem a série).
+
+**Falhas comuns de fechamento.** Uma falha de fechamento que não é abandono (erro no checkpoint ou no
+`close()`) mantém a entrada. Nas varreduras do registry (ociosidade, despejo por `maxOpenHandles` e
+`close()` do registry) o log é um `WARNING` **agrupado**: no máximo um a cada 10 s, com a contagem das
+ocorrências suprimidas. Nos caminhos explícitos de `discard` e de migração o `WARNING` é direto, sem
+agrupamento. As varreduras só tentam fechar de novo a mesma série depois de 60 s, para que k séries presas
+não custem k vezes o teto a cada varredura; os caminhos explícitos ignoram esse intervalo.
+
+**Migração.** O checkpoint do corte e o snapshot da cópia online esperam no máximo `CLOSE_CHECKPOINT_WAIT`.
+Estourado o prazo, a migração falha (o handle segue disponível para o aborto, ou é fechado e abandonado se
+o force continuar preso) e é refeita num ciclo posterior de rebalanceamento.
+
+Toda operação passa por
 `withHandle`, que serializa contra fechamento concorrente; `withHandleSelfHealing` tenta
 `reopenIfKnown` antes de devolver `NOT_OPEN` — mas **não** reabre uma série fechada por `CLOSE`
 explícito do cliente: o `CLOSE` descarta a definição em cache da série (mesmo que o handle já
@@ -744,7 +779,17 @@ ressincronizado com o catálogo a cada 60 s e atualizado de forma oportunista qu
 reservada; as leituras do laço de recuperação custam O(pendentes). Cada série tem **backoff por
 operação** (`seriesKey` + `operationId`), de 1 s a 60 s: uma exclusão presa deixa de gerar tentativas
 a cada segundo. A recuperação não recria o placement de uma exclusão já concluída (a remoção do
-placement é o marco de conclusão), e o reenvio de recuperação ao participante é limitado por geração.
+placement é o marco de conclusão).
+
+O **reenvio do participante** (o pedido de recuperação que cada storage faz ao líder a partir do seu
+journal) é limitado por geração: uma entrada `PREPARED`, `COMMITTED` ou `FINISHED` cuja geração já foi
+substituída no catálogo não reenvia nada, porque não há fase a conduzir; uma entrada `DELETED` sempre
+pede, e o líder responde só com um `DELETE_FINISH` idempotente, depois do qual a entrada para. O líder
+manda esse `FINISH` da geração substituída **fora do lock de condução** da série. No participante, as
+entradas `FINISHED` já resolvidas (que, numa leitura do catálogo, não tinham mais o que pedir) **não leem o
+catálogo a cada ciclo**: ficam só em memória e são reconferidas uma vez a cada 10 a 12 minutos, com
+espalhamento por série para não concentrar as leituras. Depois de um restart, cada uma é conferida uma vez.
+O custo por ciclo é O(exclusões pendentes do nó), não O(histórico do journal).
 Uma exclusão presa por mais de 5 ciclos seguidos emite `NGRRD_DELETE_PENDING count=... oldestOperationId=...`
 em `WARNING`, no máximo uma vez por minuto.
 
@@ -1105,7 +1150,8 @@ chaves `localCheckpoint.*` (seção 6.7).
   - `localCheckpoint.queueWaitMsP99`/`.queueWaitMsMax`/`.forceMsP99`/`.forceMsMax`/`.coalesced`/
     `.lastCycleStarted` (seção 6.7);
   - `handles.idleTtlExtended`, `handles.idleClosed`, `handles.evicted`, `handles.selfHealed` e
-    `handles.writerAbandoned` (seções 6.3);
+    `handles.writerAbandoned` e `handles.abandonedCheckpointRejected` (`CHECKPOINT`/`FLUSH` remotos
+    recusados por serem os primeiros depois de um abandono) (seção 6.3);
   - `notOpen.restart`, `.clientClosed`, `.migrated`, `.reopenFailed` e `.frozen` (seção 6.3);
   - `seriesDelete.requests.<STATUS>` (resposta a cada pedido de **cliente**, uma por chave),
     `seriesDelete.completed` (exclusões concluídas, uma por operação), `seriesDelete.cancelled` (reservas
